@@ -45,6 +45,19 @@ def forbid_admission_calls() -> AbstractContextManager[object]:
     return mock.patch.object(client, "_call", side_effect=AssertionError("unmocked admission service call"))
 
 
+def forbid_owner_configuration_read() -> AbstractContextManager[object]:
+    """Allow the fixture service to read configuration during the owner's cleanup."""
+    owner_thread = get_ident()
+    read_config = records.read_memory_config
+
+    def read_service_config(*, report: bool = True) -> records.MemoryConfig:
+        if get_ident() == owner_thread:
+            raise AssertionError("late configuration read")
+        return read_config(report=report)
+
+    return mock.patch.object(records, "read_memory_config", read_service_config)
+
+
 def gate_source(fixture: PlacementFixture, repository: str, *, enabled: str = "on") -> Path:
     """Give the gate a private registry and repository origin."""
     _ = write_config_fixture(fixture.root / "build_targets.conf",
@@ -83,17 +96,9 @@ class FirstStepTests(unittest.TestCase):
             assignment = client.read_assignment(admitted.assignment_file).assignment
             args = copies.CopyArguments(repo=str(fixture.root), targets="mac-linux")
             child = mock.Mock(return_value=subprocess.CompletedProcess(GATE_COMMAND, 0))
-            owner_thread = get_ident()
-            read_config = records.read_memory_config
-
-            def read_service_config(*, report: bool = True) -> records.MemoryConfig:
-                if get_ident() == owner_thread:
-                    raise AssertionError("late configuration read")
-                return read_config(report=report)
-
             with (fixture.serving(), mock.patch.dict(os.environ),
                   mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)),
-                  mock.patch.object(records, "read_memory_config", read_service_config),
+                  forbid_owner_configuration_read(),
                   mock.patch.object(copies, "subprocess", SimpleNamespace(run=child))):
                 self.assertEqual(copies.run_gate_step(args, GATE_COMMAND), 0)
             child.assert_called_once()
@@ -117,6 +122,24 @@ class FirstStepTests(unittest.TestCase):
                     report.assert_not_called()
                 self.assertEqual(fixture.server.assignments[key], saved)
                 self.assertIsInstance(admitted.grant, first_step.GatePlacement)
+
+    def test_guest_cleanup_uses_saved_configuration_after_skipped_or_refused_report(self) -> None:
+        for status in (-9, 1):
+            with self.subTest(status=status), PlacementFixture() as fixture:
+                admitted = self.consumed_guest_gate(fixture)
+                assignment = client.read_assignment(admitted.assignment_file).assignment
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                saved = fixture.server.assignments[key]
+                result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(GATE_COMMAND, status)
+                with (fixture.serving(), forbid_owner_configuration_read(), redirect_stderr(io.StringIO()),
+                      mock.patch.object(client, "report_owner_end", side_effect=wire.AdmissionUnavailable("refused")) as report,
+                      mock.patch.object(client, "cancel_placement", wraps=client.cancel_placement) as cancel):
+                    self.assertIs(admitted.run_gate(lambda: result), result)
+                    admitted.close()
+                self.assertEqual(report.call_count, int(status == 1))
+                cancel.assert_called_once()
+                self.assertEqual(fixture.server.assignments[key], saved)
+                self.assertIsInstance(admitted.grant, first_step.HandedOff)
 
     def test_guest_owner_end_retries_until_the_queue_answers(self) -> None:
         with PlacementFixture() as fixture:

@@ -398,19 +398,30 @@ def _waits_for_live_service(request: wire.Request) -> bool:
         isinstance(request, status_wire.PlacementStatusRequest) and not request.include_permission)
 
 
+@dataclass(frozen=True)
+class ReadConfigurationAtUse:
+    """Read local admission configuration when a request needs it."""
+
+
+READ_CONFIGURATION_AT_USE = ReadConfigurationAtUse()
+
+
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
-           | wire.CancelPlacement | status_wire.PlacementStatusRequest) -> wire.Reply:
+           | wire.CancelPlacement | status_wire.PlacementStatusRequest, *,
+           configuration: records.MemoryConfig | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
     if _waits_for_live_service(request):
-        reply = _call(request, lambda _wait: None, report_refusal=False)
+        reply = _call(request, lambda _wait: None, report_refusal=False, configuration=configuration)
         if isinstance(reply, LeftQueue):
             raise _QueueLeft()
         if isinstance(reply, wire.Refused):
             raise wire.AdmissionUnavailable(reply.reason)
         return reply
     request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
-    timeout = records.read_memory_config().query_timeout_seconds
+    if isinstance(configuration, ReadConfigurationAtUse):
+        configuration = records.read_memory_config()
+    timeout = configuration.query_timeout_seconds
     deadline = CLOCK.monotonic() + timeout
     try:
         with _connect(_remaining_seconds(deadline)) as connection:
@@ -522,9 +533,10 @@ def report_prerequisite(request: wire.PrerequisiteReport, *, unit: str = "", rep
     raise wire.AdmissionUnavailable("invalid prerequisite answer")
 
 
-def cancel_placement(request: wire.CancelPlacement, *, unit: str = "") -> wire.Ok:
+def cancel_placement(request: wire.CancelPlacement, *, unit: str = "",
+                     configuration: records.MemoryConfig | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE) -> wire.Ok:
     try:
-        reply = _query(request)
+        reply = _query(request, configuration=configuration)
     except wire.AdmissionUnavailable as error:
         if (line := replaced_line(error.reason, unit)) is not None:
             raise RunReplaced(line) from error
@@ -667,14 +679,6 @@ class EstimateRefresh:
 
 
 _ESTIMATE_REFRESH: ContextVar[EstimateRefresh | None] = ContextVar("estimate_refresh", default=None)
-
-
-@dataclass(frozen=True)
-class ReadConfigurationAtUse:
-    """Read local admission configuration when a request needs it."""
-
-
-READ_CONFIGURATION_AT_USE = ReadConfigurationAtUse()
 
 
 def build_history_generation(configuration: records.MemoryConfig | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE) -> records.BuildHistoryGeneration:

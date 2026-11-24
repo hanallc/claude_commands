@@ -46,9 +46,8 @@ class HandedOff:
     """The command now owns the next admission of this run."""
 
 
-def _owner_end_timing() -> client.OwnerEndTiming:
-    config = records.read_memory_config(report=False)
-    return client.OwnerEndTiming(config.query_timeout_seconds, config.reconnect_seconds, config.unreachable_limit_seconds)
+def _gate_configuration() -> records.MemoryConfig:
+    return records.read_memory_config(report=False)
 
 
 @dataclass(frozen=True)
@@ -57,7 +56,7 @@ class GatePlacement:
 
     grant: wire.LocalPlacementGranted | wire.Assignment
     request: wire.PlacementRequest
-    owner_end_timing: client.OwnerEndTiming = field(default_factory=_owner_end_timing)
+    configuration: records.MemoryConfig = field(default_factory=_gate_configuration)
 
 
 @dataclass
@@ -128,8 +127,10 @@ class FirstStepAdmission:
                 return
             if not assignment_matches_request(assignment, grant.request):
                 raise wire.AdmissionUnavailable('the saved assignment does not match the gate request')
-            client.report_owner_end(wire.OwnerEnd(uuid4().hex, assignment, grant.request.owner, status),
-                                    grant.owner_end_timing)
+            config = grant.configuration
+            timing = client.OwnerEndTiming(config.query_timeout_seconds, config.reconnect_seconds,
+                                           config.unreachable_limit_seconds)
+            client.report_owner_end(wire.OwnerEnd(uuid4().hex, assignment, grant.request.owner, status), timing)
         except (OSError, ValueError, wire.AdmissionUnavailable) as error:
             if isinstance(error, TimeoutError):
                 # The queue checks the assignment when the owner exits.
@@ -151,9 +152,10 @@ class FirstStepAdmission:
         elif isinstance(grant, (wire.Assignment, GatePlacement)):
             assignment = grant.grant.assignment if isinstance(grant, GatePlacement) else grant.assignment
             reason = 'the gate caller ended' if isinstance(grant, GatePlacement) else 'slot preparation failed'
+            configuration = grant.configuration if isinstance(grant, GatePlacement) else client.READ_CONFIGURATION_AT_USE
             try:
                 _ = client.cancel_placement(wire.CancelPlacement(uuid4().hex, assignment.episode,
-                    assignment.owner, reason))
+                    assignment.owner, reason), configuration=configuration)
             except wire.AdmissionUnavailable as error:
                 if error.reason != wire.PLACEMENT_REQUEST_MISSING_REASON and not self._guest_end_report_failed:
                     raise
@@ -385,8 +387,8 @@ def admitted_run(command: Sequence[str], source: Path, *,
                 grant = _placement_grant(request)
             elif targets:
                 gate_request = _gate_request(command, source, targets, owner, position, run, folder / 'placement.cgroup')
-                timing = _owner_end_timing()
-                grant = GatePlacement(_placement_grant(gate_request), gate_request, timing)
+                configuration = _gate_configuration()
+                grant = GatePlacement(_placement_grant(gate_request), gate_request, configuration)
             else:
                 grant = _program_grant(command, source, owner, position, run)
             admitted = FirstStepAdmission(position, grant, assignment_file)
