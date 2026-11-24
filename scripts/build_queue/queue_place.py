@@ -609,7 +609,8 @@ class PlaceSetup:
 
 @contextmanager
 def place_setup(program: str | Sequence[str], repo: Path, *, batch: bool = False,
-                sizing: admission_records.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK
+                sizing: admission_records.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
+                since: float | None = None, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN,
                 ) -> Generator[PlaceSetup]:
     """Use full commands for purpose selection; retain named batch reservations.
 
@@ -651,10 +652,12 @@ def place_setup(program: str | Sequence[str], repo: Path, *, batch: bool = False
             start = admission_records.process_start_time(pid)
             if start is None:
                 raise QueuePlaceRefused("owner no longer exists")
-            owner, episode, since = wire.Owner(pid, start), uuid.uuid4().hex, time.time()
+            owner, episode = wire.Owner(pid, start), uuid.uuid4().hex
+            submitted = time.time() if since is None else since
 
             def refresh() -> wire.AdmitRequest:
-                return admission_client.step_request(list(arguments) or [name], str(repo), owner, since, str(sidecar), episode, profile)
+                return admission_client.step_request(
+                    list(arguments) or [name], str(repo), owner, submitted, str(sidecar), episode, profile, run=run)
             request = refresh
         yield PlaceSetup(temporary, sidecar, config, purpose, arguments, request)
 
@@ -662,10 +665,11 @@ def place_setup(program: str | Sequence[str], repo: Path, *, batch: bool = False
 @contextmanager
 def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False,
                 sizing: admission_records.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
-                before_check: Callable[[], None] = no_hold_wait) -> Generator[QueuePlace]:
+                before_check: Callable[[], None] = no_hold_wait,
+                since: float | None = None, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN) -> Generator[QueuePlace]:
     """Wait for the reservation of the program in the queue, and hold it while the program runs."""
     # The reservation ends before its folder: the service can read the sidecar until release.
-    with place_setup(program, repo, batch=batch, sizing=sizing) as setup, ExitStack() as reservation:
+    with place_setup(program, repo, batch=batch, sizing=sizing, since=since, run=run) as setup, ExitStack() as reservation:
         grant: HeldReservation | UnreservedProgram = UnreservedProgram()
         if setup.request is not None:
             grant = reservation.enter_context(held_reservation(RefreshedRequest(setup.request), before_check=before_check))

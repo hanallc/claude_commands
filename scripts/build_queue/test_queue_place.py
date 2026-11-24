@@ -1750,6 +1750,30 @@ class HeldReservationTests(unittest.TestCase):
                     with queue.held_reservation(self.step_request()):
                         self.fail("a refused request entered its holder")
 
+    def test_reservation_waits_under_a_build_hold_with_zero_launch_limit(self) -> None:
+        checked_hold = False
+        open_connection = client.AcquisitionSockets.open
+        with (AdmissionFixture() as fixture, fixture.serving(),
+              mock.patch.dict(os.environ, {"BUILDLOG_MEM_WAIT_LIMIT_S": "0"}),
+              mock.patch.object(client.AcquisitionSockets, "open", autospec=True, side_effect=open_connection) as connect,
+              redirect_stderr(io.StringIO())):
+            request = fixture.request()
+
+            def admits() -> bool:
+                nonlocal checked_hold
+                if checked_hold:
+                    return True
+                connect.assert_not_called()
+                checked_hold = True
+                return False
+
+            before_check = client.AdmissionHoldCheck(queue.no_hold_wait, admits)
+            with queue.held_reservation(queue.RefreshedRequest(lambda: request), before_check=before_check) as held:
+                self.assertTrue(checked_hold)
+                self.assertEqual(held.grant.need, request.profile.peak.bytes)
+                held.status = 0
+            connect.assert_called_once()
+
     def test_service_estimate_request_uses_the_service_estimate(self) -> None:
         request = cast(wire.ServiceEstimateRequest, object())
         with mock.patch.object(client, "admit", side_effect=AssertionError("service request used a step request")), \
