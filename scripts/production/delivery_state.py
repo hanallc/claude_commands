@@ -32,12 +32,23 @@ class QuestionSendState(StrEnum):
 
 
 @dataclass(frozen=True)
+class NoSavedListKeeper:
+    """An Image question or an older List attempt has no saved keeper."""
+
+
+@dataclass(frozen=True)
 class QuestionSource:
     path: str
     item_id: str
     question_id: str
     words: str
     row: str
+    keeper: staff.StaffId | NoSavedListKeeper = NoSavedListKeeper()
+
+    def matches_attempt(self, previous: QuestionSource) -> bool:
+        """Allow an older attempt to omit the keeper."""
+        return (self == previous or isinstance(previous.keeper, NoSavedListKeeper)
+                and self == replace(previous, keeper=self.keeper))
 
     def message_id(self, recipient: staff.StaffId) -> str:
         parts = [self.path, self.item_id, self.question_id, recipient]
@@ -152,9 +163,10 @@ def decode_question_attempt(fields: dict[str, object]) -> QuestionAttempt:
     requests = data.get("resend_requests", [])
     if not isinstance(requests, list) or not all(isinstance(request, str) for request in cast(list[object], requests)):
         raise ValueError("Invalid question resend requests.")
+    keeper = staff.StaffId(_text(source, "keeper")) if "keeper" in source else NoSavedListKeeper()
     record = QuestionAttempt(
         QuestionSource(_text(source, "path"), _text(source, "item_id"), _text(source, "question_id"),
-                       _text(source, "words"), _text(source, "row")),
+                       _text(source, "words"), _text(source, "row"), keeper),
         staff.StaffId(_text(data, "recipient_id")), _text(data, "message"), _positive_int(data, "revision"),
         QuestionSendState(_text(data, "state")), _hex_id(data, "attempt_id"), owner, receipt, _text(data, "error"),
         earlier_unconfirmed, tuple(cast(list[str], requests)))
