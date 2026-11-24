@@ -33,7 +33,7 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.copies import copies
 from scripts.lib import conf, scratch
 from scripts.lib.build_slots import SlotQueuePosition
-from scripts.lib.build_steps import GATE_UNSETTLED_LAUNCH_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
+from scripts.lib.build_steps import GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.lib.process_start import Gone
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, gate, staff
@@ -181,6 +181,64 @@ class DirectGatePlacementTests(unittest.TestCase):
             settle.assert_called_once_with(admission_wire.SettlementRequest(assignment))
             self.assertIn(str(failure), errors.getvalue())
             self.assertIn("Gate placement blocked during launch settlement", errors.getvalue())
+
+    def test_gate_recovery_keeps_placement_status_when_finish_fails(self) -> None:
+        checkpoint = ["--merge-branch", "main", "--unit-branch", "fixture", "--checkpoint", "tip",
+                      "--previous-checkpoint", "base", "--unit", "fixture", "--phase", "1"]
+        for arguments in (checkpoint, ["--tests-only"]):
+            for status, refusal in (
+                (GATE_PRELAUNCH_REFUSED_STATUS, gate.MacLinuxTookNoRun("fixture guest took no run")),
+                (GATE_UNSETTLED_LAUNCH_STATUS, gate.GateSettlementPending("fixture guest end is unproven")),
+            ):
+                with (self.subTest(arguments=arguments, status=status), tempfile.TemporaryDirectory() as directory,
+                      mock.patch.object(gate, "current_gate_placement", return_value=placed("mac-linux")),
+                      mock.patch.object(gate, "gate_state_dir", return_value=Path(directory)),
+                      mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
+                      mock.patch.object(copies, "source_owner", return_value=""),
+                      mock.patch.object(gate, "merge_checkpoint", side_effect=refusal),
+                      mock.patch.object(gate, "run_gate_suites", side_effect=refusal),
+                      mock.patch.object(gate.GateRecovery, "finish",
+                                        side_effect=PermissionError("fixture recovery cleanup failed")) as finish,
+                      redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(gate.main(arguments), status, errors.getvalue())
+                    finish.assert_called_once()
+                    self.assertIn(str(refusal), errors.getvalue())
+                    self.assertIn("fixture recovery cleanup failed", errors.getvalue())
+
+    def test_direct_affected_gate_keeps_placement_status_through_folder_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = self.checkout(folder)
+            arguments = ("--affected", "--repo", str(source))
+            for status, failed_cleanup in ((GATE_PRELAUNCH_REFUSED_STATUS, ""),
+                                           (GATE_PRELAUNCH_REFUSED_STATUS, "folder"),
+                                           (GATE_UNSETTLED_LAUNCH_STATUS, "folder"),
+                                           (GATE_PRELAUNCH_REFUSED_STATUS, "admission")):
+                with self.subTest(status=status, failed_cleanup=failed_cleanup):
+                    admitted = self.admission(source, ("gate.py", *arguments))
+
+                    @contextmanager
+                    def admit() -> Generator[first_step.FirstStepAdmission]:
+                        yield admitted
+                        if failed_cleanup == "admission":
+                            raise PermissionError("fixture admission cleanup failed")
+
+                    @contextmanager
+                    def run_folder() -> Generator[Path]:
+                        yield source
+                        if failed_cleanup == "folder":
+                            raise PermissionError("fixture folder cleanup failed")
+
+                    with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
+                          mock.patch.object(first_step, "admitted_run", return_value=admit()),
+                          mock.patch.object(gate, "test_run_folder", side_effect=run_folder),
+                          mock.patch.object(gate, "run_tests_only", return_value=status) as run,
+                          mock.patch.object(admission_client, "request_settlement",
+                                            side_effect=admission_wire.AdmissionUnavailable("fixture settlement failure")),
+                          redirect_stderr(io.StringIO()) as errors):
+                        self.assertEqual(gate.main(arguments), status, errors.getvalue())
+                        run.assert_called_once()
+                        if failed_cleanup:
+                            self.assertIn(f"fixture {failed_cleanup} cleanup failed", errors.getvalue())
 
     def test_named_gate_refuses_an_inherited_assignment_for_a_different_source(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
