@@ -897,7 +897,7 @@ run_verify_verbs() {
     VERIFY_VERB_PREVIOUS_JOB=${!:-}
     trap 'finish_verify_verb_list "$?" "$BASH_COMMAND"' EXIT
     for length in "${VERIFY_STEP_LENGTHS[@]}"; do
-        # Doc can leave its grant without a memory handoff when it takes its own slot.
+        # Doc can leave its grant without a memory handoff when it takes its own copy.
         list_run=""
         if [[ "${VERIFY_STEP_WORDS[offset]}" != doc ]]; then list_run=${BUILDLOG_RUN:-}; fi
         env -u UNIT_DETACHED_RECORD UNIT_DETACHED_RUN=1 VERIFY_STEP_LIST_RUN="$list_run" bash "$VERIFY_START_DIR/verify.sh" \
@@ -1254,7 +1254,7 @@ run_step() {
     fi
     local attempt status started ended step_log monitor=0 LINT_REPAIR_REUSED_GRANT=0
     local STEP_WRITES_TREE=0
-    local VERIFY_SLOT_SOURCE="" VERIFY_SLOT_TREE="" VERIFY_SLOT_HEAD=""
+    local VERIFY_COPY_SOURCE="" VERIFY_COPY_TREE="" VERIFY_COPY_HEAD=""
     if [[ "${PLACEMENT_OUTCOME:-}" == unresolved ]] && buildlog_step_compiles "$@"; then
         build_check_record_failure "$PLACEMENT_CLEANUP_ERROR"
         return 2
@@ -1284,10 +1284,10 @@ run_step() {
     step_log="$(mktemp "${HOLD_WAIT_DIR:-${TMPDIR:-/tmp}}/step-output.XXXXXX")"
     if buildlog_step_compiles "$@"; then
         if [[ "${CMD:-}" == doc && -n "${DOC_REPO_TOP:-}" && "${BUILDLOG_PREPARED_COPY:-}" != "$DOC_REPO_TOP" ]]; then
-            VERIFY_SLOT_SOURCE=$DOC_REPO_TOP
+            VERIFY_COPY_SOURCE=$DOC_REPO_TOP
         elif [[ "$STEP_WRITES_TREE" == 0 && -n "${COPIES_STEP_SOURCE:-}" &&
                 "$(git rev-parse --show-toplevel)" == "$COPIES_STEP_SOURCE" ]]; then
-            VERIFY_SLOT_SOURCE=$COPIES_STEP_SOURCE
+            VERIFY_COPY_SOURCE=$COPIES_STEP_SOURCE
         fi
     fi
     attempt=1
@@ -1345,8 +1345,8 @@ run_step() {
             status=$?
         fi
         RUN_STEP_PID=""
-        if [[ -n "$VERIFY_SLOT_SOURCE" && "${CMD:-}" != doc ]]; then
-            VERIFY_SLOT_EXECUTED_TREE=$VERIFY_SLOT_TREE
+        if [[ -n "$VERIFY_COPY_SOURCE" && "${CMD:-}" != doc ]]; then
+            VERIFY_COPY_EXECUTED_TREE=$VERIFY_COPY_TREE
         fi
         if [[ -n "${PLACEMENT_GRANT_FILE:-}" && -e "$PLACEMENT_GRANT_FILE.outcome" ]]; then apply_placement_outcome; fi
         if [[ -n "${TREE_WATCH_DIR:-}" ]]; then cancel_tree_run; fi
@@ -3139,7 +3139,7 @@ placement_once() {
     local parent_run=${BUILDLOG_RUN:-}
     # The parent marker lets a list step keep its queue place during checkout.
     local BUILDLOG_RUN=$parent_run
-    if [[ -n "${VERIFY_SLOT_SOURCE:-}" && "${VERIFY_STEP_LIST_RUN:-}" != "$parent_run" ]]; then BUILDLOG_RUN=""; fi
+    if [[ -n "${VERIFY_COPY_SOURCE:-}" && "${VERIFY_STEP_LIST_RUN:-}" != "$parent_run" ]]; then BUILDLOG_RUN=""; fi
     export BUILDLOG_RUN
     if [[ -z "$PLACEMENT_EPISODE" ]]; then
         PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
@@ -3153,13 +3153,13 @@ placement_once() {
         local tree="" key head="" snapshot
         if [[ -n "${DOC_SOURCE_KEY:-}" ]]; then
             tree=$DOC_TREE key=$DOC_SOURCE_KEY
-        elif [[ -n "${VERIFY_SLOT_SOURCE:-}" ]]; then
-            snapshot=$(verify_helper "$STEP_COPIES_SCRIPT" snapshot-tree --repo "$VERIFY_SLOT_SOURCE") || return $?
+        elif [[ -n "${VERIFY_COPY_SOURCE:-}" ]]; then
+            snapshot=$(verify_helper "$STEP_COPIES_SCRIPT" snapshot-tree --repo "$VERIFY_COPY_SOURCE") || return $?
             read -r tree key head <<< "$snapshot"
         else
             key=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "$repository") || return $?
         fi
-        VERIFY_SLOT_TREE=$tree PLACEMENT_SOURCE_KEY=$key VERIFY_SLOT_HEAD=$head
+        VERIFY_COPY_TREE=$tree PLACEMENT_SOURCE_KEY=$key VERIFY_COPY_HEAD=$head
         # A step can still clean up after a new call reuses the wait directory.
         local placement_path="$HOLD_WAIT_DIR/placement-$step_id"
         PLACEMENT_ASSIGNMENT_FILE="$placement_path.json"
@@ -3414,7 +3414,7 @@ route_test() {
             local token_status=0
             take_local_placement || token_status=$?
             if (( token_status == 10 )); then continue; fi
-            if (( token_status == 0 )) && [[ "$CMD" == doc && -n "${VERIFY_SLOT_SOURCE:-}" ]] \
+            if (( token_status == 0 )) && [[ "$CMD" == doc && -n "${VERIFY_COPY_SOURCE:-}" ]] \
                     && [[ "$(doc_tree)" != "$DOC_TREE" ]]; then
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
                     --pid "$PLACEMENT_OWNER_PID" --reason "the staged tree changed before doc" >/dev/null || return $?
@@ -3429,13 +3429,13 @@ route_test() {
         fi
         local STEP_REMOTE_REPO_ROOT=${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}
         # Direct doc keeps its own repository as the runner's repo root.
-        if [[ -n "${VERIFY_SLOT_SOURCE:-}" && ( "$STEP_ASSIGNED_TARGET" == hana-gpu || -f "$MAC_RUNNER" ) ]]; then
+        if [[ -n "${VERIFY_COPY_SOURCE:-}" && ( "$STEP_ASSIGNED_TARGET" == hana-gpu || -f "$MAC_RUNNER" ) ]]; then
             if [[ "$PLACEMENT_PROVIDER" == ssh && "$STEP_ASSIGNED_PLATFORM" == linux &&
-                    ( "$CMD" != doc || "$VERIFY_SLOT_SOURCE" == "${COPIES_STEP_SOURCE:-}" ) ]]; then
-                doc_checkout "$VERIFY_SLOT_SOURCE" "$VERIFY_SLOT_TREE" "${COPIES_STEP_REPOSITORY:-$VERIFY_SLOT_SOURCE}" || return $?
+                    ( "$CMD" != doc || "$VERIFY_COPY_SOURCE" == "${COPIES_STEP_SOURCE:-}" ) ]]; then
+                doc_checkout "$VERIFY_COPY_SOURCE" "$VERIFY_COPY_TREE" "${COPIES_STEP_REPOSITORY:-$VERIFY_COPY_SOURCE}" || return $?
                 STEP_REMOTE_REPO_ROOT=$MAC_SOURCE_ROOT
-            elif [[ "$CMD" != doc && "$VERIFY_SLOT_TREE" != "$VERIFY_SLOT_HEAD" ]]; then
-                doc_checkout "$VERIFY_SLOT_SOURCE" "$VERIFY_SLOT_TREE" || return $?
+            elif [[ "$CMD" != doc && "$VERIFY_COPY_TREE" != "$VERIFY_COPY_HEAD" ]]; then
+                doc_checkout "$VERIFY_COPY_SOURCE" "$VERIFY_COPY_TREE" || return $?
                 STEP_REMOTE_REPO_ROOT=$MAC_SOURCE_ROOT
             fi
         fi
@@ -3721,10 +3721,10 @@ cache_record() {
     local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail key_options=()
     # A lost token gives no verdict about the tree.
     (( EXIT_STATUS != 125 )) || return 1
-    if [[ -n "${VERIFY_SLOT_EXECUTED_TREE:-}" ]]; then
+    if [[ -n "${VERIFY_COPY_EXECUTED_TREE:-}" ]]; then
         local snapshot
         snapshot=$(verify_helper "$STEP_COPIES_SCRIPT" snapshot-tree --repo "$COPIES_STEP_SOURCE") || return 1
-        [[ "${snapshot%% *}" == "$VERIFY_SLOT_EXECUTED_TREE" ]] || return 1
+        [[ "${snapshot%% *}" == "$VERIFY_COPY_EXECUTED_TREE" ]] || return 1
     fi
     if [[ "$CMD" == lint ]]; then
         # A remote mend result has no binary identity in the local key.
@@ -4296,15 +4296,15 @@ eval "$(declare -f buildlog_exec | sed '1s/buildlog_exec/buildlog_exec_unowned/'
 eval "$(declare -f buildlog_write_step | sed '1s/buildlog_write_step/buildlog_write_worktree_step/')"
 
 buildlog_write_step() {
-    if [[ -z "${VERIFY_SLOT_SOURCE:-}" || ( "$CMD" != doc && "$VERIFY_SLOT_TREE" == "$VERIFY_SLOT_HEAD" ) ]] \
+    if [[ -z "${VERIFY_COPY_SOURCE:-}" || ( "$CMD" != doc && "$VERIFY_COPY_TREE" == "$VERIFY_COPY_HEAD" ) ]] \
             || ! buildlog_step_compiles "${@:7}"; then
         buildlog_write_worktree_step "$@"
         return
     fi
-    # The slot can be in use again by the time the recorder reads the tree.
+    # Another step can take the copy before the recorder reads the tree.
     BUILDLOG_TARGET_FOLDER="${BUILDLOG_TARGET_FOLDER:-}" BUILDLOG_TEST_PHASE_FILE="${BUILDLOG_TEST_PHASE_FILE:-}" \
         BUILDLOG_TREE_START="$PLACEMENT_SOURCE_KEY" BUILDLOG_MEM_WAIT_S="${BUILDLOG_MEM_WAIT_S:-0}" \
-        "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE" --tree "$VERIFY_SLOT_TREE" --scratch -- \
+        "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_COPY_SOURCE" --tree "$VERIFY_COPY_TREE" --scratch -- \
         "$BUILD_HELPER_ROOT/lib/py" "$BUILDLOG_RECORD" step "$@" </dev/null >/dev/null 2>&1
 }
 
@@ -4358,8 +4358,8 @@ stop_token_renewer() {
 }
 
 buildlog_exec() {
-    if [[ -n "${VERIFY_SLOT_SOURCE:-}" ]] && buildlog_step_compiles "$@"; then
-        set -- "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE" --tree "$VERIFY_SLOT_TREE" \
+    if [[ -n "${VERIFY_COPY_SOURCE:-}" ]] && buildlog_step_compiles "$@"; then
+        set -- "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_COPY_SOURCE" --tree "$VERIFY_COPY_TREE" \
             --step "$CMD" -- "$@"
     fi
     if [[ "${TOKEN_HELD}" -eq 1 ]]; then

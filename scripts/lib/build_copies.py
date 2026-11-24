@@ -31,40 +31,40 @@ _TOOL_OUTPUT_FOLDERS = ("__pycache__",)
 
 
 @dataclass(frozen=True)
-class ExactSlotRequest:
-    """Acquire only the slot number assigned to this command."""
+class ExactCopyRequest:
+    """Take the assigned copy number."""
 
     number: int
 
 
 @dataclass(frozen=True)
-class LowestFreeSlot:
+class LowestFreeCopy:
     """Acquire the lowest free copy number."""
 
 
-SlotSelection = ExactSlotRequest | LowestFreeSlot
-LOWEST_FREE_SLOT = LowestFreeSlot()
+CopySelection = ExactCopyRequest | LowestFreeCopy
+LOWEST_FREE_COPY = LowestFreeCopy()
 
 
 @dataclass(frozen=True)
-class SlotQueuePosition:
-    """Retain the admitted run's place when another run takes the last slot."""
+class CopyQueuePosition:
+    """Keep the admitted run's queue place when another run takes the copy."""
 
     episode: str
     since: float
 
 
-class SlotRepositoryMismatch(ValueError):
-    """The slot belongs to a different source repository."""
+class CopyRepositoryMismatch(ValueError):
+    """The copy belongs to a different source repository."""
 
     def __init__(self, path: Path, source: Path) -> None:
         self.path: Path = path
         self.source: Path = source
-        super().__init__(f"slots: {path} belongs to a different repository than {source}")
+        super().__init__(f"copies: {path} belongs to a different repository than {source}")
 
 
-class SlotGitFailure(RuntimeError):
-    """A slot Git command failed or exceeded its configured deadline."""
+class CopyGitFailure(RuntimeError):
+    """A Git command for the copy failed or timed out."""
 
 
 def _git(source: Path, *arguments: str, pass_fds: Sequence[int] = (), accepted: tuple[int, ...] = (0,)) -> str:
@@ -75,9 +75,9 @@ def _git(source: Path, *arguments: str, pass_fds: Sequence[int] = (), accepted: 
                                 pass_fds=tuple(dict.fromkeys((*pass_fds, *build_folders.held_build_folder_descriptors()))),
                                 timeout=timeout)
     except subprocess.TimeoutExpired as error:
-        raise SlotGitFailure(f"git {' '.join(arguments)} in {source}: timed out after {timeout:g} seconds") from error
+        raise CopyGitFailure(f"git {' '.join(arguments)} in {source}: timed out after {timeout:g} seconds") from error
     if result.returncode not in accepted:
-        raise SlotGitFailure(f"git {' '.join(arguments)} in {source}: {result.stderr.strip()}")
+        raise CopyGitFailure(f"git {' '.join(arguments)} in {source}: {result.stderr.strip()}")
     return result.stdout.strip()
 
 
@@ -98,12 +98,6 @@ def source_checkout(source: Path) -> Path:
     return (Path(common) / configured).resolve()
 
 
-def configured_maximum(settings: conf.ConfigRead, machine: str, repository: str) -> int:
-    """Read the Mac claim limit for the repository, or the machine's default limit."""
-    key = f"slots.{machine}.{repository}.max"
-    return settings.whole(key if key in settings.values() else f"slots.{machine}.default_max")
-
-
 def _persistent_source(source: Path) -> Path:
     seen: set[Path] = set()
     while True:
@@ -113,27 +107,27 @@ def _persistent_source(source: Path) -> Path:
         if isinstance(record, copy_record.NotRegistered):
             return source
         if source in seen:
-            raise SlotGitFailure(f"slots: copy sources form a cycle at {source}; cannot create a persistent slot")
+            raise CopyGitFailure(f"copies: copy sources form a cycle at {source}; cannot create a numbered copy")
         seen.add(source)
         original = record.fields.get("source_path") if isinstance(record, copy_record.Registered) else None
         if not isinstance(original, str) or not original or not Path(original).is_dir():
-            raise SlotGitFailure(f"slots: {source} has no available persistent source; create its pool from the original repository")
+            raise CopyGitFailure(f"copies: {source} has no available persistent source; create its pool from the original repository")
         source = source_checkout(Path(original))
 
 
 @contextmanager
-def _slot_commit(repository: Path, source: Path, commit: str) -> Generator[None]:
+def _copy_commit(repository: Path, source: Path, commit: str) -> Generator[None]:
     """Retain one imported commit in the owner repository until the take ends."""
     if git_files.at(repository).common_dir == git_files.at(source).common_dir:
         yield
         return
-    reference = f"refs/build-slots/take-{uuid4().hex}"
+    reference = f"refs/build-copies/take-{uuid4().hex}"
     previous = _git(repository, "rev-parse", "HEAD")
     try:
         _ = _git(repository, "fetch", "--no-tags", "--no-write-fetch-head", "--force", "--",
                  str(source), f"{commit}:{reference}")
         if not _git(repository, "merge-base", reference, previous, accepted=(0, 1)):
-            raise SlotRepositoryMismatch(repository, source)
+            raise CopyRepositoryMismatch(repository, source)
         yield
     finally:
         _ = _git(repository, "update-ref", "-d", reference)
@@ -170,7 +164,7 @@ def _enable_worktree_config(path: Path, common_dir: Path, descriptor: int) -> No
     if _git(path, *read_extension, accepted=(0, 1), pass_fds=(descriptor,)) == "true":
         return
     with (common_dir / "build-copy-config.lock").open("a") as lock:
-        # Git retains the lock if the slot process exits during a write.
+        # Git retains the lock if the copy process exits during a write.
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         descriptors = (descriptor, lock.fileno())
         if _git(path, *read_extension, accepted=(0, 1), pass_fds=descriptors) == "true":
@@ -185,8 +179,8 @@ def _enable_worktree_config(path: Path, common_dir: Path, descriptor: int) -> No
         _ = _git(path, "config", "--local", "extensions.worktreeConfig", "true", pass_fds=descriptors)
 
 
-def _exclude_slot_target(path: Path, descriptor: int) -> None:
-    """Keep build output ignored only in this slot's worktree."""
+def _exclude_copy_target(path: Path, descriptor: int) -> None:
+    """Ignore build output in this copy."""
     checkout = git_files.at(path)
     _enable_worktree_config(path, checkout.common_dir, descriptor)
     exclude = checkout.git_dir / "info/exclude"
@@ -231,26 +225,26 @@ def _copy_order(parent: Path) -> Generator[int]:
 
 @contextmanager
 def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: str,
-              purpose: str, selection: SlotSelection = LOWEST_FREE_SLOT) -> Generator[LeasedCopy]:
+              purpose: str, selection: CopySelection = LOWEST_FREE_COPY) -> Generator[LeasedCopy]:
     """Take the assigned number or the first free copy."""
     repository = _persistent_source(source_checkout(source))
     name = build_folders.repo_word(repository)
     revision = _git(source, "rev-parse", "--verify", "--end-of-options", f"{commit}^{{commit}}")
     if _git(source, "ls-tree", revision, "--", "target", build_folders.COPY_USE_STAMP):
-        raise SlotGitFailure(f"{revision}: the commit tracks a reserved copy path")
+        raise CopyGitFailure(f"{revision}: the commit tracks a reserved copy path")
     parent = build_folders.unit_folder(name, unit)
-    checkout = build_folders.SlotCheckout(repository, revision)
-    numbers = (selection.number,) if isinstance(selection, ExactSlotRequest) else _copy_order(parent)
-    with _slot_commit(repository, source, revision), ExitStack() as unit_claim:
+    checkout = build_folders.CopyCheckout(repository, revision)
+    numbers = (selection.number,) if isinstance(selection, ExactCopyRequest) else _copy_order(parent)
+    with _copy_commit(repository, source, revision), ExitStack() as unit_claim:
         _ = unit_claim.enter_context(build_folders.unit_allocation_lock(parent, exclusive=False))
         for number in numbers:
             spec = build_folders.BuildFolderSpec(kind="copy", parent=build_folders.build_root(),
-                suffix_length=0, repository=name, slot=number, showrunner=showrunner, unit=unit,
-                work=work, purpose=purpose, slot_checkout=checkout, machine=host_name())
+                suffix_length=0, repository=name, number=number, showrunner=showrunner, unit=unit,
+                work=work, purpose=purpose, copy_checkout=checkout, machine=host_name())
             with ExitStack() as held:
                 try:
-                    path = held.enter_context(build_folders.slot_build_folder(spec))
-                except build_folders.SlotSourceBusy:
+                    path = held.enter_context(build_folders.copy_build_folder(spec))
+                except build_folders.CopySourceBusy:
                     raise
                 except (BlockingIOError, FileExistsError):
                     continue
@@ -268,20 +262,20 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 rescued = False
                 try:
                     untracked = _git(path, *scan, pass_fds=(descriptor,))
-                except SlotGitFailure as error:
+                except CopyGitFailure as error:
                     if isinstance(error.__cause__, subprocess.TimeoutExpired):
                         raise
                     _rescue(path)
                     rescued = True
                     untracked = _git(path, *scan, pass_fds=(descriptor,))
                 if any(name.endswith("/") for name in untracked.split("\0")):
-                    print(f"kept for a manual removal list: {path} (build_slots, untracked folders)", file=sys.stderr)
+                    print(f"kept for a manual removal list: {path} (build_copies, untracked folders)", file=sys.stderr)
                     continue
                 unit_claim.close()
                 target = path / "target"
                 if target.is_symlink():
                     target.unlink()
-                _exclude_slot_target(path, descriptor)
+                _exclude_copy_target(path, descriptor)
                 if not rescued:
                     output = _git(path, *scan, "--ignored", pass_fds=(descriptor,))
                     _rescue(path, [entry for entry in output.split("\0") if entry.endswith("/")])
@@ -296,7 +290,7 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                     build_folders.NUMBERED_COPY_LOCK_ENV: str(descriptor),
                 }), (descriptor,))
                 return
-        if isinstance(selection, ExactSlotRequest):
+        if isinstance(selection, ExactCopyRequest):
             raise BlockingIOError(f"{parent}: assigned copy {selection.number} is unavailable")
 
 
@@ -306,7 +300,7 @@ def limit_copy_size(copy: LeasedCopy, limit: int) -> None:
     if size > limit:
         shutil.rmtree(copy.cargo_dir)
         copy.cargo_dir.mkdir()
-        print(f"slots: {copy.path} was {size / 2**30:g} GiB, over its {limit / 2**30:g} GiB limit. "
+        print(f"copies: {copy.path} was {size / 2**30:g} GiB, over its {limit / 2**30:g} GiB limit. "
               + "The maker deleted its Cargo output.")
 
 
@@ -316,7 +310,7 @@ def _check_directory_identity(path: Path, expected: build_folders.CopyDirectoryI
     except FileNotFoundError:
         return False
     if identity != expected:
-        raise SlotGitFailure(f"{path}: directory identity changed during copy removal")
+        raise CopyGitFailure(f"{path}: directory identity changed during copy removal")
     return True
 
 
@@ -354,7 +348,7 @@ def remove_copy_locked(path: Path, *, dry_run: bool = False) -> bool:
     if isinstance(record, build_folders.NoNumberedCopySource):
         return False
     if isinstance(record, build_folders.UnreadableNumberedCopySource):
-        raise SlotGitFailure(record.reason)
+        raise CopyGitFailure(record.reason)
     copy = record.copy if isinstance(record, build_folders.NumberedCopyRemovalPending) else record
     if not build_folders.may_remove_folder_tree(path, copy.git_directory):
         return False
@@ -373,7 +367,7 @@ def remove_copy_locked(path: Path, *, dry_run: bool = False) -> bool:
                     if store.is_relative_to(copy.git_directory) or store.is_relative_to(path.resolve()):
                         return False
         if not dry_run:
-            print(f"kept for a manual removal list: {path} (build_slots, numbered copy)", file=sys.stderr)
+            print(f"kept for a manual removal list: {path} (build_copies, numbered copy)", file=sys.stderr)
         return dry_run
 
 
@@ -433,7 +427,7 @@ def main(argv: Sequence[str]) -> int:
                            "BUILD_FOLDER_LOCK_FD": str(descriptor)}
             return build_folders.run_build_command(command, path=copy.path, environment=environment,
                                                    pass_fds=build_folders.held_build_folder_descriptors())
-    except (OSError, ValueError, SlotGitFailure, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, CopyGitFailure, subprocess.SubprocessError) as error:
         print(f"copies: {error}", file=sys.stderr)
         return 1
 

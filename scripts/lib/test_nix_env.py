@@ -15,8 +15,8 @@ from unittest.mock import patch
 
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
-from scripts.lib import build_folders, build_slots, conf, copy_record, nix_env, scratch
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib import build_folders, build_copies, conf, copy_record, nix_env, scratch
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lib.nix_env_test_support import HELPER, ROOT, NixFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
@@ -390,7 +390,7 @@ class RegisteredCopyTests(GitNixFixture):
             self.register(repository, checkout)
             yield checkout
             return
-        private = private_slot_config(self.root, repository=repository.name)
+        private = private_copy_config(self.root, repository=repository.name)
         nix_settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
         _ = private.settings.with_name("nix_env.conf").write_bytes(nix_settings.read_bytes())
         if kind == "trusted-numbered":
@@ -449,11 +449,11 @@ class RegisteredCopyTests(GitNixFixture):
 
     def test_ensure_holds_an_idle_copy_during_proof_and_refuses_a_busy_copy(self) -> None:
         repository = self.repository(self.home / "rust/repo")
-        private = private_slot_config(self.root, repository=repository.name)
+        private = private_copy_config(self.root, repository=repository.name)
         nix_settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
         _ = private.settings.with_name("nix_env.conf").write_bytes(nix_settings.read_bytes())
         with patch.dict(os.environ, private.environment):
-            with build_slots.take_copy(repository, "HEAD", showrunner="maker", unit="demo", work="test",
+            with build_copies.take_copy(repository, "HEAD", showrunner="maker", unit="demo", work="test",
                                        purpose="test envrc") as copy:
                 checkout = copy.path
             proof = nix_env.trusted_envrc

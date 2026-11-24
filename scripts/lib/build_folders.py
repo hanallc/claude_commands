@@ -236,18 +236,18 @@ BuildFolderKind = Literal["temporary", "gate", "standing", "editable", "main", "
 
 
 @dataclass(frozen=True)
-class SlotCheckout:
+class CopyCheckout:
     """The checkout holds the source repository and required commit for a numbered copy."""
     source: Path
     commit: str
 
 
-class SlotSourceBusy(BlockingIOError):
+class CopySourceBusy(BlockingIOError):
     """The source lock prevents creation of a numbered copy checkout."""
 
 
 @dataclass(frozen=True)
-class NoSlotCheckout:
+class NoCopyCheckout:
     """The folder does not contain a numbered copy checkout."""
 
 
@@ -260,14 +260,14 @@ class BuildFolderSpec:
     repository: str = ""
     owner: str = ""
     purpose: str = ""
-    slot: int = 0
+    number: int = 0
     suffix: str = ""
     showrunner: str = ""
     unit: str = ""
     work: str = ""
     # The process the lease names; 0 names the allocating process.
     owner_pid: int = 0
-    slot_checkout: SlotCheckout | NoSlotCheckout = NoSlotCheckout()
+    copy_checkout: CopyCheckout | NoCopyCheckout = NoCopyCheckout()
     machine: str = ""
 
 
@@ -605,7 +605,7 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
         return spec.parent / _form_name(spec.repository) / "main"
     settings = _settings()
     if spec.kind == "copy":
-        return copy_path(spec.repository, spec.unit, spec.slot)
+        return copy_path(spec.repository, spec.unit, spec.number)
     for component in (spec.repository, spec.owner, spec.purpose, spec.suffix, spec.showrunner, spec.unit, spec.work):
         _check_name(component)
     if spec.suffix_length < 0:
@@ -622,14 +622,14 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
     elif spec.kind == "editable":
         pattern = settings.text("patterns.editable")
     elif spec.kind == "mirror":
-        pattern = "{repository}/{owner}-s{slot}"
+        pattern = "{repository}/{owner}-s{number}"
     else:
         pattern = settings.text(f"patterns.{spec.kind}")
     for field, value in (("repository", spec.repository), ("owner", spec.owner), ("purpose", spec.purpose)):
         if "{" + field + "}" in pattern and not value and spec.kind != "legacy-unique":
             raise ValueError(f"{spec.kind} needs {field}")
     relative = pattern.format(
-        repository=spec.repository, owner=spec.owner, purpose=spec.purpose, suffix=suffix, slot=spec.slot,
+        repository=spec.repository, owner=spec.owner, purpose=spec.purpose, suffix=suffix, number=spec.number,
         showrunner=spec.showrunner, unit=spec.unit, work=spec.work or suffix)
     if not relative or Path(relative).is_absolute() or any(part in (".", "..") for part in relative.split("/")):
         raise ValueError("a build folder pattern must stay below its parent")
@@ -968,7 +968,7 @@ def _validate_numbered_copy_record(path: Path, form: BuildCopy, directory: int,
         return NoNumberedCopySource()
     commit = fields.get("commit")
     if (fields.get("unit") != form.unit or fields.get("repository") != form.repo
-            or fields.get("slot") != form.number or not isinstance(commit, str) or not _COMMIT_ID.fullmatch(commit)
+            or not isinstance(commit, str) or not _COMMIT_ID.fullmatch(commit)
             or _recorded_path(fields, "copy_path") != path.absolute()):
         raise ValueError("copy source record has the wrong path or commit")
     source = _recorded_path(fields, "source_path")
@@ -1078,11 +1078,11 @@ def _copy_creation_fields(path: Path, info: os.stat_result, source: Path, fields
 
 
 def _prepare_copy_reuse(path: Path, directory: int, spec: BuildFolderSpec, fields: dict[str, object]) -> bool:
-    form = BuildCopy(spec.repository, spec.unit, spec.slot)
-    assert isinstance(spec.slot_checkout, SlotCheckout)
+    form = BuildCopy(spec.repository, spec.unit, spec.number)
+    assert isinstance(spec.copy_checkout, CopyCheckout)
     try:
         record = _numbered_copy_record(path, form, directory)
-        if (not isinstance(record, NumberedCopySource) or record.source != spec.slot_checkout.source
+        if (not isinstance(record, NumberedCopySource) or record.source != spec.copy_checkout.source
                 or not may_remove_folder_tree(path, record.git_directory)):
             raise ValueError("copy has no matching source record")
         _copy_identity_fields(fields, record)
@@ -1091,9 +1091,9 @@ def _prepare_copy_reuse(path: Path, directory: int, spec: BuildFolderSpec, field
     except git_files.NotACheckout as error:
         try:
             lease = _read_copy_lease(path, directory)
-            repository = git_files.at(spec.slot_checkout.source)
+            repository = git_files.at(spec.copy_checkout.source)
             if (lease.get("ready") is False and "git_directory" not in lease
-                    and _recorded_path(lease, "source_path") == spec.slot_checkout.source
+                    and _recorded_path(lease, "source_path") == spec.copy_checkout.source
                     and _recorded_path(lease, "common_directory") == repository.common_dir
                     and _recorded_directory(lease, "common") == CopyDirectoryIdentity.from_stat(repository.common_dir_status)
                     and not any(path.iterdir())
@@ -1243,7 +1243,8 @@ def _copy_owner_record(path: Path, form: BuildCopy, fields: dict[str, object], *
                             form.unit, form.repo, commit, _lease_time(fields.get("last_use")))
 
 
-BUILD_ROOT_EXCEPTIONS = frozenset({
+USER_REMOVAL_ROOTS = frozenset({"slot"})
+BUILD_ROOT_EXCEPTIONS = USER_REMOVAL_ROOTS | frozenset({
     _UNIT_LOCKS, "sccache", "session", "lost+found", "old-cargo", "old-paths", "old-claude",
 })
 
@@ -1376,7 +1377,7 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released:
     record: dict[str, object] = {"showrunner": spec.showrunner, "unit": spec.unit or spec.owner,
               "work": spec.work, "purpose": spec.purpose, "pid": spec.owner_pid or os.getpid(),
               "start_time": now}
-    if spec.kind == "copy" and isinstance(spec.slot_checkout, SlotCheckout):
+    if spec.kind == "copy" and isinstance(spec.copy_checkout, CopyCheckout):
         if released:
             record = _read_copy_lease(path, directory)
         else:
@@ -1384,10 +1385,10 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released:
             if isinstance(started, (process_start.Started, process_start.Zombie)):
                 record["process_start"] = started.start
         record["released"] = released
-        record.update(machine=spec.machine, repository=spec.repository, slot=spec.slot,
+        record.update(machine=spec.machine, repository=spec.repository,
                       last_use=now)
         if not released:
-            record.update(commit=spec.slot_checkout.commit, ready=ready)
+            record.update(commit=spec.copy_checkout.commit, ready=ready)
             record.update(copy_fields)
     _publish_lease(path, directory, record)
 
@@ -1536,7 +1537,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                             raise FileExistsError(errno.EEXIST, "build folder is not a directory", str(path))
                     copy_fields: dict[str, object] = {}
                     checkout_ready = False
-                    if spec.kind == "copy" and isinstance(spec.slot_checkout, SlotCheckout):
+                    if spec.kind == "copy" and isinstance(spec.copy_checkout, CopyCheckout):
                         if existing is not None:
                             checkout_ready = _prepare_copy_reuse(path, directory, spec, copy_fields)
                         else:
@@ -1550,10 +1551,10 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                                 raise FileExistsError(f"{path}: a recorded copy checkout is missing")
                         if existing is None or not checkout_ready:
                             try:
-                                source_descriptors = allocation_scope.enter_context(_linked_source_locks(spec.slot_checkout.source))
+                                source_descriptors = allocation_scope.enter_context(_linked_source_locks(spec.copy_checkout.source))
                             except BlockingIOError as error:
-                                raise SlotSourceBusy(errno.EWOULDBLOCK, f"slot source is busy: {error}",
-                                                     str(spec.slot_checkout.source)) from error
+                                raise CopySourceBusy(errno.EWOULDBLOCK, f"copy source is busy: {error}",
+                                                     str(spec.copy_checkout.source)) from error
                     new_folder = existing is None
                     if spec.kind != "copy":
                         _write_lease(path, directory, allocation)
@@ -1592,18 +1593,18 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                         if made_inode is not None and callable(on_create):
                             on_create(path, made_inode)
                         return path
-                    if spec.kind == "copy" and isinstance(spec.slot_checkout, SlotCheckout):
+                    if spec.kind == "copy" and isinstance(spec.copy_checkout, CopyCheckout):
                         if not checkout_ready:
-                            _copy_creation_fields(path, allocated, spec.slot_checkout.source, copy_fields)
+                            _copy_creation_fields(path, allocated, spec.copy_checkout.source, copy_fields)
                         _write_lease(path, directory, allocation, ready=False, copy_fields=copy_fields.items())
-                    if (spec.kind == "copy" and isinstance(spec.slot_checkout, SlotCheckout)
+                    if (spec.kind == "copy" and isinstance(spec.copy_checkout, CopyCheckout)
                             and (new_folder or not checkout_ready)):
-                        _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "add", "--detach",
-                                            str(path), spec.slot_checkout.commit], check=True,
+                        _ = subprocess.run(["git", "-C", str(spec.copy_checkout.source), "worktree", "add", "--detach",
+                                            str(path), spec.copy_checkout.commit], check=True,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                             pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors),
                                            timeout=repository_git_timeout())
-                        form = BuildCopy(spec.repository, spec.unit, spec.slot)
+                        form = BuildCopy(spec.repository, spec.unit, spec.number)
                         record = _numbered_copy_record(path, form, directory)
                         if not isinstance(record, NumberedCopySource):
                             raise ValueError(f"{path}: copy registration has no source record")
@@ -1904,7 +1905,7 @@ def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder | MainOutput, 
 
 
 @contextmanager
-def slot_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
+def copy_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
     """Keep the checkout locked and record its last use before release."""
     path = create_build_folder(spec)
     try:

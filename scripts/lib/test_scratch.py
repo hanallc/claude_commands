@@ -29,7 +29,7 @@ from scripts.accounts import accounts
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.production.cli_fixture import ImmutableGitSeed
-from scripts.lib import build_folders, build_slots, cargo_output, copy_record, git_files, process_group, scratch, session_folder, time_limit
+from scripts.lib import build_folders, build_copies, cargo_output, copy_record, git_files, process_group, scratch, session_folder, time_limit
 from scripts.lint import sweep
 
 from scripts.lib import conf
@@ -3116,7 +3116,7 @@ print(scratch.target('gate:proof', 'tree'))
 
     def test_a_numbered_copy_keeps_its_source_and_uses_its_own_lease(self) -> None:
         source = self.numbered_copy_source()
-        with build_slots.take_copy(source, "HEAD", showrunner="maker", unit="demo", work="test",
+        with build_copies.take_copy(source, "HEAD", showrunner="maker", unit="demo", work="test",
                                    purpose="test lease") as copy:
             with scratch.copy_lock(copy.path):
                 self.assertEqual(build_folders.build_folder_state(copy.path), "held")
@@ -3145,7 +3145,7 @@ print(scratch.target('gate:proof', 'tree'))
 
     def test_an_unreadable_numbered_copy_keeps_git_sources(self) -> None:
         source = self.numbered_copy_source()
-        with build_slots.take_copy(source, "HEAD", showrunner="maker", unit="demo", work="test",
+        with build_copies.take_copy(source, "HEAD", showrunner="maker", unit="demo", work="test",
                                    purpose="test lease") as copy:
             pass
         _ = copy.path.with_name(copy.path.name + ".lease.json").write_text("invalid")

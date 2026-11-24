@@ -35,7 +35,7 @@ from scripts.build_targets import build_targets, mac_linux, target_config
 from scripts.build_targets.mac_linux import send_guest_execution
 from scripts.buildlog import store, treekey
 from scripts.lib import atomic_file, conf, process_group, process_start, scratch
-from scripts.lib.build_slots import SlotQueuePosition
+from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test
@@ -1549,7 +1549,7 @@ fi
         path = self.root / 'assignment.json'
         grant = wire.Assignment(guest)
         admission_client.write_assignment(path, grant)
-        admitted = first_step.FirstStepAdmission(SlotQueuePosition(guest.episode, guest.since),
+        admitted = first_step.FirstStepAdmission(CopyQueuePosition(guest.episode, guest.since),
             first_step.OwnedGatePlacement(grant, submitted), path)
         pending = wire.DispatchStatus(guest, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
         events: list[str] = []

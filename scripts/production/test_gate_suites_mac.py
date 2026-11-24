@@ -29,7 +29,7 @@ from scripts.buildlog import treekey
 from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib import conf, process_group, scratch
-from scripts.lib.build_slots import SlotQueuePosition
+from scripts.lib.build_copies import CopyQueuePosition
 from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
 from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, gate_job_for_command
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -352,7 +352,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         request, reply = self.natedev_grant(queue, targets)
         path = self.state / "gate-assignment.json"
         admission_wire.write_assignment(path, reply)
-        admitted = first_step.FirstStepAdmission(SlotQueuePosition(reply.assignment.episode, reply.assignment.since),
+        admitted = first_step.FirstStepAdmission(CopyQueuePosition(reply.assignment.episode, reply.assignment.since),
             first_step.OwnedGatePlacement(reply, request), path)
         admitted.handoff(self.checkout)
         self.assertEqual(self.queue_state(reply), placement.CurrentAssignment())
@@ -904,7 +904,7 @@ class MacGateSuitesTests(GateSuitesFixture):
             guest_assignment = replace(local_grant.assignment, attempt="guest-attempt",
                                        destination=request.constraints.candidates[0].destination)
             admission_wire.write_assignment(path, admission_wire.Assignment(guest_assignment))
-            admitted = first_step.FirstStepAdmission(SlotQueuePosition(guest_assignment.episode, guest_assignment.since),
+            admitted = first_step.FirstStepAdmission(CopyQueuePosition(guest_assignment.episode, guest_assignment.since),
                 first_step.OwnedGatePlacement(admission_wire.Assignment(guest_assignment), request), path)
 
             def guest_or_queue_status(episode: str, attempt: str) -> admission_wire.PlacementStatusReply:
@@ -964,7 +964,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         request = self.gate_request(guest_assignment)
         path = self.write_gate_assignment(guest_assignment)
         self.set_placement_status(guest_assignment, placement.CurrentAssignment())
-        admitted = first_step.FirstStepAdmission(SlotQueuePosition("episode", 1.0),
+        admitted = first_step.FirstStepAdmission(CopyQueuePosition("episode", 1.0),
             first_step.OwnedGatePlacement(admission_wire.Assignment(guest_assignment), request), path)
 
         def settle(_refusal: admission_wire.ClaimFailure) -> admission_wire.DispatchStatus:

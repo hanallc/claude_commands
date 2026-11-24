@@ -956,6 +956,7 @@ It exits 80 if a launch remains possible and no test verdict is available.
 A complete gate failure keeps its failed result and gets no retry.
 An uncertain launch or termination keeps its cost reservation until reconciliation confirms the end.
 The route reports pending settlement to the queue while the launch remains uncertain.
+A completed AWS run with open settlement keeps its verdict and prints one warning on standard error.
 The stop cleanup looks up an unknown instance by client token.
 Cleanup accepts a saved termination for the same booking, region, and set of instances.
 An empty lookup proves absence only if the lookup starts at or after the booking expiry.
@@ -1757,7 +1758,7 @@ The bootstrap downloads the payload inside the main checkout.
 The bootstrap extracts the runtime under `~/rust/hana/.git/hana-payload`.
 Systemd mounts that path as a bounded filesystem for each command.
 The runner stages the verified bundle in the main checkout's Git directory.
-`build_slots.take_copy` takes the assigned number under `~/build/hana/aws-hana`.
+`build_copies.take_copy` takes the assigned number under `~/build/hana/aws-hana`.
 The maker rescues source edits before reset and retains Cargo output within the configured size limit.
 The copy's `rust-toolchain.toml` digest must equal the manifest before execution.
 The shell cache lives at `~/build/hana/main/shells`.

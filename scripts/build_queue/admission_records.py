@@ -24,7 +24,7 @@ from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, HAND_MADE
     GateJobNotRecorded, NotVerifyCall as NotVerifyCall, StepJob, VerifyCall as VerifyCall,
     VerifyStep as VerifyStep, VerifyVerb as VerifyVerb)
 from scripts.build_queue.snapshot_codec import select_queue_name
-from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun, RunIdentity,
+from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
 from scripts.build_targets import target_config
@@ -837,7 +837,7 @@ class UnitPriorityEntry(TypedDict):
 class RunPriorityEntry(TypedDict):
     """The entry raises only the steps of one run; the unit and step name it on the page."""
     kind: Literal["RunPriorityEntry"]
-    run: RunIdentity
+    run: execution_identity.RunIdentity
     unit: str
     step: str
     why: str
@@ -861,7 +861,7 @@ def entry_asker(entry: PriorityEntry) -> Asker | AskerNotRecorded:
 def entry_covers(entry: PriorityEntry, unit: str, run: LiveBuildRun | NoLiveBuildRun) -> bool:
     """A run entry covers the steps of its run; a unit entry covers the steps of its unit."""
     if is_run_entry(entry):
-        return isinstance(run, LiveBuildRun) and RunIdentity(run.pid, run.start_time) == entry["run"]
+        return isinstance(run, LiveBuildRun) and execution_identity.RunIdentity(run.pid, run.start_time) == entry["run"]
     return entry["unit"] == unit
 
 

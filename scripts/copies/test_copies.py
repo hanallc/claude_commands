@@ -23,12 +23,13 @@ from unittest import mock
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.copies.workspace_test_support import registered_workspace
-from scripts.build_queue import slot_wait
+from scripts.build_queue import first_step, queue_wait
+from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
 from scripts.lib import build_folders, copy_record, nix_env, process_start, scratch, session_folder
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lint import folder_audit, tmp_sweep
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, write_config_fixture
 from textwrap import dedent
@@ -68,6 +69,29 @@ class ImportTests(unittest.TestCase):
             capture_output=True, text=True, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class RunCopyTests(unittest.TestCase):
+    def test_gate_cleanup_error_keeps_the_gate_status(self) -> None:
+        command = ["python3", "scripts/production/gate.py", "--tests-only"]
+        tree = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for status in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS):
+            with self.subTest(status=status), redirect_stderr(io.StringIO()) as errors:
+                run_gate = mock.Mock(return_value=subprocess.CompletedProcess(command, status))
+                admitted = mock.Mock(spec=first_step.FirstStepAdmission, run_gate=run_gate)
+
+                @contextmanager
+                def command_copy() -> Generator[copies.AdmittedCommandCopy]:
+                    yield copies.AdmittedCommandCopy(tree, admitted)
+                    raise copies.CopyError("cannot release gate placement")
+
+                with (mock.patch.object(copies, "caller_owner", return_value="fixture"),
+                      mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+                      mock.patch.object(copies, "_command_copy", return_value=command_copy())):
+                    result = copies.main(["run", "--repo", str(tree), "--commit", "HEAD", "--", *command])
+                self.assertEqual(result, status)
+                run_gate.assert_called_once()
+                self.assertEqual(errors.getvalue(), "Gate cleanup failed. cannot release gate placement\n")
 
 
 class StandingTests(unittest.TestCase):
@@ -117,11 +141,11 @@ class StandingTests(unittest.TestCase):
         temporary = self.base / "temporary"
         temporary.mkdir()
         _ = self.enterContext(mock.patch.object(tempfile, "tempdir", str(temporary)))
-        slot_configuration = private_slot_config(self.base, repository="origin", maximum=2, default_maximum=2)
-        configuration = Path(slot_configuration.environment["CONF_DIR"])
+        copy_configuration = private_copy_config(self.base, repository="origin", maximum=2, default_maximum=2)
+        configuration = Path(copy_configuration.environment["CONF_DIR"])
         home = self.base / "home"
         home.mkdir()
-        _ = write_config_fixture(slot_configuration.settings, """\
+        _ = write_config_fixture(copy_configuration.settings, """\
 locks.probe_wait_seconds=0.25
 locks.probe_retry_seconds=1
 names.repository_key_length=8
@@ -189,7 +213,7 @@ source_check_seconds=1
                            "UNIT_RUN_DIR", "CARGO_BUILD_BUILD_DIR", "CARGO_TARGET_DIR", "COPIES_RUN_PID",
                            "BASH_ENV", "STAFF_CONFIG")}
         environment.update({
-            **slot_configuration.environment,
+            **copy_configuration.environment,
             "HOME": str(home),
             "USER_ZONE": "UTC",
             "GIT_TERMINAL_PROMPT": "0", "GIT_AUTHOR_NAME": "Gate Tests",
@@ -317,14 +341,14 @@ source_check_seconds=1
                     self.assertEqual(result.stderr, "copies: calling session has no staff row or unit owner\n")
                     self.assertFalse(self.gates.exists())
 
-    def test_free_slot_does_not_resolve_the_queue_name(self) -> None:
+    def test_free_copy_does_not_resolve_the_queue_name(self) -> None:
         command = ("bash", "-c", "bash /fixture/verify.sh check hana")
-        with mock.patch.object(slot_wait, "command_slot_name", wraps=slot_wait.command_slot_name) as resolve:
+        with mock.patch.object(queue_wait, "command_queue_name", wraps=queue_wait.command_queue_name) as resolve:
             with copies.command_tree(self.owner_id, self.source, copies.CommittedSource(self.head), command) as tree:
                 self.assertTrue(tree.is_dir())
         resolve.assert_not_called()
 
-    def test_slot_uses_the_requested_tree_if_head_moves_after_lookup(self) -> None:
+    def test_copy_uses_the_requested_tree_if_head_moves_after_lookup(self) -> None:
         incoming = self.incoming()
         requested_tree = self.git(self.source, "rev-parse", f"{incoming}^{{tree}}")
         real_git = copies.git
@@ -343,22 +367,22 @@ source_check_seconds=1
                 advance_head()
             return result
 
-        output = self.base / "slot-tree"
+        output = self.base / "copy-tree"
         args = copies.CopyArguments()
         args.tree = requested_tree
-        args.command = ["sh", "-eu", "-c", 'git rev-parse HEAD^{tree} > "$1"', "slot-command", str(output)]
+        args.command = ["sh", "-eu", "-c", 'git rev-parse HEAD^{tree} > "$1"', "copy-command", str(output)]
         with mock.patch.object(copies, "git", side_effect=git):
-            self.assertEqual(copies.run_slot_step(self.source, args), 0)
+            self.assertEqual(copies.run_copy_step(self.source, args), 0)
         self.assertEqual(self.git(self.source, "rev-parse", "HEAD"), incoming)
         self.assertEqual(output.read_text().strip(), requested_tree)
 
-    def test_slot_accepts_a_source_that_configures_utf16_log_output(self) -> None:
+    def test_copy_accepts_a_source_that_configures_utf16_log_output(self) -> None:
         _ = self.git(self.source, "config", "i18n.logOutputEncoding", "UTF-16")
         tree = self.git(self.source, "rev-parse", "HEAD^{tree}")
-        output = self.base / "slot-head"
+        output = self.base / "copy-head"
         result = self.cli("hold", "--repo", str(self.source), "--tree", tree,
                           "--", "sh", "-eu", "-c",
-                          'git rev-parse HEAD > "$1"', "slot-command", str(output))
+                          'git rev-parse HEAD > "$1"', "copy-command", str(output))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(output.read_text().strip(), self.head)
 
@@ -465,8 +489,8 @@ source_check_seconds=1
         self.assertEqual(os.environ.get('CARGO_BUILD_BUILD_DIR'), previous)
         self.assertEqual(build_folders.build_folder_state(first), 'free')
         self.assertEqual(build_folders.build_folder_state(second), 'free')
-        # A command inside a build slot inherits that slot's cache; a gate it opens builds in its own slot's cache.
-        outer = str(self.base / "cargo" / "outer-slot1")
+        # A command inside a build copy inherits that copy's cache; a gate it opens builds in its own copy's cache.
+        outer = str(self.base / "cargo" / "outer-copy1")
         with mock.patch.dict(os.environ, {"CARGO_BUILD_BUILD_DIR": outer}):
             with copies.standing(self.owner_id, self.source, copies.CommittedSource('HEAD')) as first:
                 self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], str(first / "target"))
@@ -565,7 +589,7 @@ source_check_seconds=1
                 self.assertFalse(tree.exists())
                 root = copy_record.copies_root()
                 destination = (root.with_name(root.name + "-rescues.git") if source_gone
-                               else copies.slot_source(source))
+                               else copies.copy_source(source))
                 refs = self.git(destination, "for-each-ref", "--format=%(refname)", "refs/rescue/").splitlines()
                 self.assertTrue(refs)
                 self.assertTrue(any(subprocess.run(["git", "-C", str(destination), "merge-base", "--is-ancestor",
@@ -2422,7 +2446,7 @@ with patch.object(subprocess, 'run', pause_clone):
             exec "$python" "$script" hold --repo "$COPIES_STEP_SOURCE" --tree "$tree" \
                 -- "$python" -c "$@"
             """))
-        slot_write = program.replace("Path(relative)", "Path(os.environ['CARGO_TARGET_DIR']) / Path(relative).relative_to('target')").replace(
+        copy_write = program.replace("Path(relative)", "Path(os.environ['CARGO_TARGET_DIR']) / Path(relative).relative_to('target')").replace(
             "Path('target/debug/broken')", "(Path(os.environ['CARGO_TARGET_DIR']) / 'debug/broken')")
         cases = (
             ("plain", (), 7, False),
@@ -2434,13 +2458,13 @@ with patch.object(subprocess, 'run', pause_clone):
             ("not-built-command-failed", ("target/debug/missing",), 7, False),
             ("copy-failed", ("target/debug/x", "target/debug/broken"), 0, False),
             ("copy-and-command-failed", ("target/debug/x", "target/debug/broken"), 7, False),
-            ("retained-slot-file", ("target/debug/x",), 0, False),
-            ("touched-slot-file", ("target/debug/x",), 0, False),
+            ("retained-copy-file", ("target/debug/x",), 0, False),
+            ("touched-copy-file", ("target/debug/x",), 0, False),
             ("explicit-target-dir", ("target/debug/x",), 0, False),
             ("two-changed-target-dirs", ("target/debug/x",), 0, False),
             ("metadata-only", ("target/debug/x",), 0, False),
-            ("slot-symlink-loop", ("target/debug/loop", "report.txt"), 0, False),
-            ("replaced-slot-symlink-loop", ("target/debug/loop",), 0, False),
+            ("copy-symlink-loop", ("target/debug/loop", "report.txt"), 0, False),
+            ("replaced-copy-symlink-loop", ("target/debug/loop",), 0, False),
         )
         for label, requested, command_exit, apply in cases:
             with self.subTest(case=label):
@@ -2453,26 +2477,26 @@ with patch.object(subprocess, 'run', pause_clone):
                     options.extend(("--apply-uncommitted", str(self.source)))
                 folders_before = {folder.path for folder in scratch.folders()}
                 arguments = (str(output), "checkout={tree}/tracked.txt", str(evidence), str(command_exit))
-                if label in ("retained-slot-file", "touched-slot-file", "metadata-only", "slot-symlink-loop",
-                             "replaced-slot-symlink-loop"):
-                    with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as slot:
-                        old = slot / "target/debug/x"
+                if label in ("retained-copy-file", "touched-copy-file", "metadata-only", "copy-symlink-loop",
+                             "replaced-copy-symlink-loop"):
+                    with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as copy:
+                        old = copy / "target/debug/x"
                         old.parent.mkdir(parents=True, exist_ok=True)
                         _ = old.write_bytes(b"old binary")
-                        if label in ("slot-symlink-loop", "replaced-slot-symlink-loop"):
+                        if label in ("copy-symlink-loop", "replaced-copy-symlink-loop"):
                             loop = old.with_name("loop")
                             loop.unlink(missing_ok=True)
                             loop.symlink_to(loop.name)
                     touch = "from pathlib import Path\nPath('target/debug/x').touch()\n"
-                    slot_command = slot_write
-                    if label == "touched-slot-file":
-                        slot_command = touch + slot_write
+                    copy_command = copy_write
+                    if label == "touched-copy-file":
+                        copy_command = touch + copy_write
                     elif label == "metadata-only":
-                        slot_command = touch
-                    elif label == "slot-symlink-loop":
-                        slot_command = "from pathlib import Path\nPath('report.txt').write_text('step report\\n')"
-                    elif label == "replaced-slot-symlink-loop":
-                        slot_command = dedent("""
+                        copy_command = touch
+                    elif label == "copy-symlink-loop":
+                        copy_command = "from pathlib import Path\nPath('report.txt').write_text('step report\\n')"
+                    elif label == "replaced-copy-symlink-loop":
+                        copy_command = dedent("""
                             from pathlib import Path
                             path = Path("target/debug/loop")
                             path.unlink()
@@ -2480,23 +2504,23 @@ with patch.object(subprocess, 'run', pause_clone):
                             """)
                     result = self.run_cli(*options, command=(
                         "sh", "-eu", str(verifier), sys.executable,
-                        str(Path(copies.__file__).resolve()), slot_command, *arguments,
+                        str(Path(copies.__file__).resolve()), copy_command, *arguments,
                     ))
                     self.assertEqual(result.returncode, 0, result.stderr)
                     published = [Path(line.removeprefix("published: ").rsplit(" ", 1)[0])
                                  for line in result.stdout.splitlines() if line.startswith("published: ")]
                     if label == "metadata-only":
                         self.assertEqual(published, [])
-                    elif label == "slot-symlink-loop":
+                    elif label == "copy-symlink-loop":
                         self.assertEqual([path.name for path in published], ["report.txt"], result.stderr)
                         self.assertEqual(published[0].read_text(), "step report\n")
-                    elif label == "replaced-slot-symlink-loop":
+                    elif label == "replaced-copy-symlink-loop":
                         self.assertEqual([path.name for path in published], ["loop"], result.stderr)
                         self.assertEqual(published[0].read_bytes(), b"replacement")
                     else:
                         self.assertEqual(len(published), 1, result.stderr)
                         self.assertEqual(published[0].read_bytes(), b"binary\x00x")
-                    expected = b"binary\x00x" if label in ("retained-slot-file", "touched-slot-file") else b"old binary"
+                    expected = b"binary\x00x" if label in ("retained-copy-file", "touched-copy-file") else b"old binary"
                     self.assertEqual(old.read_bytes(), expected)
                     continue
                 if label in ("explicit-target-dir", "two-changed-target-dirs"):
@@ -3214,20 +3238,20 @@ with patch.object(subprocess, 'run', pause_clone):
             self.assertTrue(idle)
         self.assertEqual(build_folders.build_folder_state(tree), 'free')
 
-        slot = self.gates / "1"
+        copy = self.gates / "1"
         for verdict in ("green", "red"):
             with self.subTest(verdict=verdict):
                 with ExitStack() as patches, self.assertRaises(copies.PostUseError) as raised:
                     with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as held:
-                        self.assertEqual(held, slot)
+                        self.assertEqual(held, copy)
                         _ = patches.enter_context(mock.patch("scripts.lib.build_folders._write_lease",
                             side_effect=OSError("lease release failed")))
                         if verdict == "red":
                             raise failure
                 self.assertIs(raised.exception.caller_error, failure if verdict == "red" else None)
                 self.assertIn("lease release failed", str(raised.exception))
-                self.assertTrue(slot.exists())
-                self.assertEqual(build_folders.build_folder_state(slot), "free")
+                self.assertTrue(copy.exists())
+                self.assertEqual(build_folders.build_folder_state(copy), "free")
 
     def test_initial_record_names_requested_commit_before_git_initialization(self) -> None:
         real_git = shutil.which("git")
@@ -3322,7 +3346,7 @@ with patch.object(subprocess, 'run', pause_clone):
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
 
-    def test_slot_preparation_errors_name_the_git_command_and_stderr_before_use(self) -> None:
+    def test_copy_preparation_errors_name_the_git_command_and_stderr_before_use(self) -> None:
         real_git = shutil.which("git")
         assert real_git is not None
         wrappers = self.base / "bin"
@@ -3332,7 +3356,7 @@ with patch.object(subprocess, 'run', pause_clone):
             #!/bin/sh
             for arg do
                 if [ "$arg" = "$COPY_TEST_FAIL" ]; then
-                    printf '%s\\n' 'fixture slot Git failure' >&2
+                    printf '%s\\n' 'fixture copy Git failure' >&2
                     exit 47
                 fi
             done
@@ -3345,9 +3369,9 @@ with patch.object(subprocess, 'run', pause_clone):
                                                   "COPY_TEST_FAIL": step}):
                     with self.assertRaises(copies.CopyError) as refused:
                         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)):
-                            self.fail("a slot preparation failure reached the caller")
+                            self.fail("a copy preparation failure reached the caller")
                 self.assertIn(step, str(refused.exception))
-                self.assertIn("fixture slot Git failure", str(refused.exception))
+                self.assertIn("fixture copy Git failure", str(refused.exception))
                 with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as recovered:
                     self.assertEqual(self.git(recovered, "rev-parse", "HEAD"), self.head)
 

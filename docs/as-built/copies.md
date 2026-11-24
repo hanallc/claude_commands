@@ -11,7 +11,7 @@ The guard permits only original worktrees, the external upstream clone, and this
 The CLI converts its flags into these policies.
 
 Staged copies use a private source index and a synthetic commit without changing source refs.
-Local gates take a detached numbered copy through `build_slots.take_copy()`.
+Local gates take a detached numbered copy through `build_copies.take_copy()`.
 The repo word and unit select the parent folder under the host's build root.
 `copies.standing()` uses the caller's staff unit name when it finds the staff row.
 The maker takes the lowest free existing number or creates the smallest missing number.
@@ -160,8 +160,8 @@ The Mac floor sweep acquires idle mirror leases before it reads claims.
 It retains these leases through removal.
 It reads claims again before each removal group outside the acquired leases.
 The Linux floor sweep holds mirror leases while it checks and removes idle output.
-Admission takes available slot leases before it selects a claim.
-It releases unused slot leases after claim selection.
+Admission takes available mirror leases before it selects a claim.
+It releases unused mirror leases after claim selection.
 It skips busy mirrors and preserves their records.
 Cancellation closes its acquired descriptors.
 The lock files retain their inodes.

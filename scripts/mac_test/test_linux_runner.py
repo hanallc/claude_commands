@@ -452,7 +452,7 @@ class LinuxShellTests(unittest.TestCase):
         self.assertNotIn("BUILDLOG_REPO_IDENTITY", event["environment"])
 
 
-    def test_unchanged_inputs_reuse_exports_and_the_slot_build_folder(self) -> None:
+    def test_unchanged_inputs_reuse_exports_and_the_build_mirror(self) -> None:
         _ = self.assert_ran(self.request())
         self.write_input("src/main.rs", "fn main() { println!(\"changed\"); }\n")
 

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.review_links.browser_test_support import assert_status_states
-from scripts.build_queue import admission_records, admission_service, execution_identity, limits_view, placement, queue_evidence, slot_wait
+from scripts.build_queue import admission_records, admission_service, execution_identity, limits_view, placement, queue_evidence, queue_wait
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
 
@@ -40,7 +40,7 @@ from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue import memory_trace
 from scripts.build_queue.test_program_memory_feed import TRACE_POLICY
 from scripts.build_queue.test_queue_view import cloud_reading
-from scripts.build_queue.slot_wait import NoNamedStep, recorded_step
+from scripts.build_queue.queue_wait import NoNamedStep, recorded_step
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
 from scripts.build_targets import build_targets, mac_linux, target_config, targets
 from scripts.build_queue.queue_view import refresh_mac_builds
@@ -53,7 +53,7 @@ from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, 
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lint.memory_test_support import write_pressure_reading
 from scripts.lib import atomic_file, build_folders, conf, test_hang_guard
-from scripts.lib.build_slots_test_support import write_private_build_roots
+from scripts.lib.build_copies_test_support import write_private_build_roots
 from scripts.review_links import console_theme, page_frame, review_link, test_page_frame, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, StepNames, command_job, read_step_names
@@ -647,11 +647,7 @@ class MemoryFeedTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "build_steps.conf",
             "changes.default=no branch\nchanges.integrate={branch} branch\n"
             + "names.integrate=integrate\nnames.test-affected=test affected\nnames.test=test\n"
-            + "names.gate=gate\n"
-            + "owned.default={unit} {step}\n"
-            + "owned.test-affected={unit} {step}\n"
-            + "owned.ci-default=CI {step}\n"
-            + "owned.showrunner-default=showrunner {step}\n")
+            + "names.gate=gate\n")
         self.configure()
         self.configure_console()
         _ = (self.root / "mac-builds.json").write_text(json.dumps({"read_at": ADMISSION_NOW, "builds": [], "error": ""}))
@@ -1262,9 +1258,7 @@ process.stdout.write(JSON.stringify({
                     shown_name = names[f"{kind}:{row['key']}"]
                     step = (title["step"] if row["unit"] not in ("", "—") else
                             name.partition(": ")[2])
-                    shown_step = (" ".join(f'<span class="word">{word}</span>' for word in step.split(" "))
-                                  if kind == "wait" and " " in step else step)
-                    self.assertIn(f'<th scope="row" class="step"><span class="cell-text">{shown_step}</span></th>', cell)
+                    self.assertIn(f'<th scope="row" class="step"><span class="cell-text">{step}</span></th>', cell)
                     if row.get("kind") == "cloud":
                         unit = units[0 if kind == "row" else 1]
                         prefix, _, step = name.partition(": ")
@@ -2926,8 +2920,8 @@ const refresh = createPageRefresh(tick);
         )
         for unit, command, arguments, call in cases:
             with (self.subTest(unit=unit),
-                  mock.patch.object(slot_wait, "verify_package", return_value=arguments[0]) as parse):
-                name, _, facts = slot_wait.command_slot_job(("bash", "-c", command), RECORDED_STEP_NAMES)
+                  mock.patch.object(queue_wait, "verify_package", return_value=arguments[0]) as parse):
+                name, _, facts = queue_wait.command_queue_job(("bash", "-c", command), RECORDED_STEP_NAMES)
                 assert isinstance(name, memory_feed.QueueRowName)
                 step = f"test {arguments[0]}"
                 row = memory_feed.queue_row_labels(name, name, unit=memory_feed.StaffUnitName(unit))
@@ -4274,20 +4268,13 @@ const refresh = createPageRefresh(tick);
                     row, = [row for row in table if row.get("kind") == "cloud"]
                     self.assertEqual((row["name"], row["title"]["step"]), (expected, expected))
 
-    def test_unusable_cloud_templates_keep_the_owner_name(self) -> None:
+    def test_a_cloud_row_with_no_recorded_owner_keeps_the_owner_name(self) -> None:
         director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
                                           unit_labels.DirectsUnit("panes"))
-        config = self.root / "build_steps.conf"
-        template = config.read_text()
-        step = "test-affected"
-        for text in ("—", "owner not recorded", "${unit}", "556caf6e-713d-47c0-a8fc-5dd5e8c26ce4"):
-            with self.subTest(template=text):
-                _ = config.write_text(template.replace("owned.test-affected={unit} {step}",
-                                                        f"owned.test-affected={text}"))
-                page = self.cloud_owner_page(step, director, identity=wire.Identity("legacy", "", step, ""))
-                for table, pid in ((page["walk"], 700001), (page["waiters"], 700002)):
-                    row, = [row for row in table if row.get("kind") == "cloud"]
-                    self.assertEqual((row["pid"], row["name"], row["title"]["step"]), (pid, "panes", "panes"))
+        page = self.cloud_owner_page("test-affected", director, identity=wire.Identity("legacy", "", "test-affected", ""))
+        for table, pid in ((page["walk"], 700001), (page["waiters"], 700002)):
+            row, = [row for row in table if row.get("kind") == "cloud"]
+            self.assertEqual((row["pid"], row["name"], row["title"]["step"]), (pid, "panes", "panes"))
 
     def test_detached_and_systemd_cloud_rows_use_the_fixed_staff_owner(self) -> None:
         with isolated_staff_file(self.root / "staff.json", {}):

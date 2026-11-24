@@ -115,14 +115,14 @@ class FolderFormTests(unittest.TestCase):
         self.assertEqual(git.call_args.kwargs["timeout"], 10)
 
     def test_held_copy_reports_kernel_identity_and_missing_or_partial_lease(self) -> None:
-        from scripts.lib import build_slots, process_start
+        from scripts.lib import build_copies, process_start
 
         self.init_repository()
         self.set_origin("git@example.invalid:team/claude_commands.git")
         _ = subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Test",
                             "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "first"],
                            check=True, capture_output=True, timeout=10)
-        with build_slots.take_copy(self.root, "HEAD", showrunner="tools", unit="proof",
+        with build_copies.take_copy(self.root, "HEAD", showrunner="tools", unit="proof",
                                    work="test", purpose="test all") as copied:
             self.assertEqual(copied.path, folders.copy_path("claude", "proof", 1))
             lease, = folders.held_folder_leases()
@@ -148,13 +148,13 @@ class FolderFormTests(unittest.TestCase):
         self.assertEqual(list(folders.held_folder_leases()), [])
 
     def test_free_copy_with_a_damaged_lease_is_unknown(self) -> None:
-        from scripts.lib import build_slots
+        from scripts.lib import build_copies
 
         self.init_repository()
         self.set_origin("git@example.invalid:team/widget.git")
         _ = (self.root / "source.txt").write_text("source")
         revision = commit_repository(self.root, "source", "source.txt")
-        with build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+        with build_copies.take_copy(self.root, revision, showrunner="tools", unit="proof",
                                    work="test", purpose="test hold") as copy:
             lease = folders.lease_path(copy.path)
         self.assertEqual(list(folders.held_folder_leases()), [])
@@ -170,15 +170,15 @@ class FolderFormTests(unittest.TestCase):
                 settings.assert_called_once()
 
     def test_reuse_retains_a_copy_with_a_changed_git_back_pointer(self) -> None:
-        from scripts.lib import build_slots
+        from scripts.lib import build_copies
 
         self.init_repository()
         self.set_origin("git@example.invalid:team/widget.git")
         _ = (self.root / "source.txt").write_text("source")
         revision = commit_repository(self.root, "source", "source.txt")
 
-        def take() -> AbstractContextManager[build_slots.LeasedCopy]:
-            return build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+        def take() -> AbstractContextManager[build_copies.LeasedCopy]:
+            return build_copies.take_copy(self.root, revision, showrunner="tools", unit="proof",
                                          work="test", purpose="test reuse")
 
         with take() as first:
@@ -193,7 +193,7 @@ class FolderFormTests(unittest.TestCase):
         self.assertTrue(index_lock.exists())
 
     def test_interrupted_preparation_keeps_the_copy_eligible_for_expiry(self) -> None:
-        from scripts.lib import build_slots
+        from scripts.lib import build_copies
 
         self.init_repository()
         self.set_origin("git@example.invalid:team/widget.git")
@@ -201,8 +201,8 @@ class FolderFormTests(unittest.TestCase):
         _ = (self.root / "source.txt").write_text("source")
         revision = commit_repository(self.root, "source", "source.txt")
 
-        def take(unit: str) -> AbstractContextManager[build_slots.LeasedCopy]:
-            return build_slots.take_copy(self.root, revision, showrunner="tools", unit=unit,
+        def take(unit: str) -> AbstractContextManager[build_copies.LeasedCopy]:
+            return build_copies.take_copy(self.root, revision, showrunner="tools", unit=unit,
                                          work="test", purpose="test preparation")
 
         for existing in (False, True):
@@ -212,7 +212,7 @@ class FolderFormTests(unittest.TestCase):
                 if existing:
                     with take(unit) as first:
                         self.assertEqual(first.path, path)
-                    module, name = build_slots, "_exclude_slot_target"
+                    module, name = build_copies, "_exclude_copy_target"
                 else:
                     module, name = folders, "_copy_identity_fields"
                 before = folders.numbered_copy_record(path)
@@ -265,7 +265,7 @@ class FolderFormTests(unittest.TestCase):
         self.assertEqual(lease.path, path)
 
     def test_copy_reuses_an_existing_number_before_a_gap_and_keeps_output(self) -> None:
-        from scripts.lib import build_slots
+        from scripts.lib import build_copies
 
         self.init_repository()
         self.set_origin("git@example.invalid:team/widget.git")
@@ -282,8 +282,8 @@ class FolderFormTests(unittest.TestCase):
         first = commit("one")
         second = commit("two")
 
-        def take(revision: str) -> AbstractContextManager[build_slots.LeasedCopy]:
-            return build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+        def take(revision: str) -> AbstractContextManager[build_copies.LeasedCopy]:
+            return build_copies.take_copy(self.root, revision, showrunner="tools", unit="proof",
                                          work="test", purpose="test all")
 
         with take(first) as one, take(first) as two:
@@ -327,13 +327,13 @@ class FolderFormTests(unittest.TestCase):
             self.assertGreater(clock.stat().st_mtime, now)
 
     def test_numbered_copy_record_and_envrc_require_the_original_checkout(self) -> None:
-        from scripts.lib import build_slots
+        from scripts.lib import build_copies
 
         self.init_repository()
         self.set_origin("git@example.invalid:team/widget.git")
         _ = (self.root / ".envrc").write_text("export FIXTURE=one\n")
         revision = commit_repository(self.root, "source", ".envrc")
-        with build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+        with build_copies.take_copy(self.root, revision, showrunner="tools", unit="proof",
                                     work="test", purpose="test envrc") as copy:
             record = folders.numbered_copy_record(copy.path)
             assert isinstance(record, folders.NumberedCopySource)
@@ -342,7 +342,7 @@ class FolderFormTests(unittest.TestCase):
                 assert isinstance(reader, folders.NumberedCopyUseLease)
                 self.assertEqual(reader.source, record)
                 self.assertTrue(reader.pass_fds)
-            self.assertFalse(build_slots.remove_copy(record))
+            self.assertFalse(build_copies.remove_copy(record))
             envrc = copy.path / ".envrc"
             self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda source: source == self.root),
                              folders.NumberedCopyEnvrc.TRUSTED)
@@ -358,17 +358,17 @@ class FolderFormTests(unittest.TestCase):
         _ = copy.path.rename(copy.path.with_name("old"))
         copy.path.mkdir()
         self.assertIsInstance(folders.numbered_copy_record(copy.path), folders.UnreadableNumberedCopySource)
-        self.assertFalse(build_slots.remove_copy(record))
+        self.assertFalse(build_copies.remove_copy(record))
 
     def test_copy_removal_keeps_borrowers_and_resumes_after_git_deletes_the_checkout(self) -> None:
-        from scripts.lib import build_slots
+        from scripts.lib import build_copies
         from scripts.lint import sweep
 
         self.init_repository()
         self.set_origin("git@example.invalid:team/widget.git")
         _ = (self.root / "source.txt").write_text("checkout\n")
         revision = commit_repository(self.root, "source", "source.txt")
-        with build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+        with build_copies.take_copy(self.root, revision, showrunner="tools", unit="proof",
                                     work="test", purpose="test removal") as copy:
             _ = (copy.cargo_dir / "warm").write_text("warm")
         record = folders.numbered_copy_record(copy.path)
@@ -378,7 +378,7 @@ class FolderFormTests(unittest.TestCase):
         _ = (borrower / copy_record.RECORD).write_text(json.dumps({
             "task": "gate:borrower", "borrows_from": str(copy.path / ".git"),
         }))
-        self.assertFalse(build_slots.remove_copy(record))
+        self.assertFalse(build_copies.remove_copy(record))
         self.assertTrue((copy.cargo_dir / "warm").exists())
         shutil.rmtree(borrower)
 
@@ -388,7 +388,7 @@ class FolderFormTests(unittest.TestCase):
         self.assertTrue(record.git_directory.is_dir())
         pending, = folders.numbered_copy_records()
         self.assertIsInstance(pending, folders.NumberedCopyRemovalPending)
-        with build_slots.take_copy(self.root, revision, showrunner="tools", unit="proof",
+        with build_copies.take_copy(self.root, revision, showrunner="tools", unit="proof",
                                     work="test", purpose="test removal") as other:
             self.assertEqual(other.number, 2)
         _ = (self.root / "lint.conf").write_text("sweep_max_tree_depth=2\n")
@@ -2236,7 +2236,7 @@ assert not loaded, loaded
         for kind, expected in cases:
             with self.subTest(kind=kind):
                 spec = folders.BuildFolderSpec(kind=kind, parent=self.root, suffix_length=6,
-                                                repository="hana-key", owner="unit", purpose="proof", slot=3,
+                                                repository="hana-key", owner="unit", purpose="proof", number=3,
                                                 suffix="abcdef" if kind in ("temporary", "gate") else "")
                 self.assertEqual(folders.build_folder_path(spec), self.root / expected)
         with mock.patch.object(folders, "build_folder_path", wraps=folders.build_folder_path) as naming:

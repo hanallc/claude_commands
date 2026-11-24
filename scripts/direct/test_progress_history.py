@@ -2780,6 +2780,71 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual([(event["checkpoint_commit"], event["event_id"])
                           for event in self.phase_events(session.name, "checkpoint")], [(commit, recorded)])
 
+    def test_checkpoint_ignores_an_unreadable_override_for_a_commit_in_the_run_folder(self) -> None:
+        session = self.start_run("unreadable-override-checkpoint", 1000, unit_owned=True)
+        self.start_numbered_phase(session, "6", 1010)
+        commit = self.fixture_commit("Checkpoint in the run folder")
+        directory = phase_reservation.phase_directory(session, "6")
+        directory.mkdir(parents=True, exist_ok=True)
+        _ = (directory / phase_reservation.WORKTREE_FILE).write_bytes(b"\xff\n")
+
+        recorded = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6",
+                                    "--commit", commit, at=1020)
+        event, = self.phase_events(session.name, "checkpoint")
+        self.assertEqual((event["checkpoint_commit"], event["event_id"]), (commit, recorded))
+
+    def test_checkpoint_checks_the_style_phase_worktree(self) -> None:
+        self.check_style_phase_checkpoint(closed=False)
+
+    def test_checkpoint_closed_checks_the_style_phase_worktree(self) -> None:
+        self.check_style_phase_checkpoint(closed=True)
+
+    def check_style_phase_checkpoint(self, *, closed: bool) -> None:
+        session = self.start_run("style-checkpoint", 1000, unit_owned=True)
+        _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
+                             "--phase-title", "s3-declarations", at=1010)
+        checkout = self.root / "style-phase-worktree"
+        _ = subprocess.run(["git", "init", "-q", str(checkout)], check=True, capture_output=True)
+        baseline = commit_repository(checkout, "Style phase baseline", allow_empty=True)
+        commit = commit_repository(checkout, "Style checkpoint", allow_empty=True)
+        directory = phase_reservation.phase_directory(session, "6")
+        directory.mkdir(parents=True, exist_ok=True)
+        _ = (directory / phase_reservation.WORKTREE_FILE).write_text(f"{checkout}\n", encoding="utf-8")
+        command = ("checkpoint", "--session-dir", str(session), "--phase-id", "6", "--commit", commit)
+        if closed:
+            self.finish_numbered_phase(session, 1012, "--phase-id", "6")
+            command += ("--closed",)
+
+        refused = self.run_failing_command(*command, at=1015)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertEqual(refused.stderr.splitlines(),
+                         [f"checkpoint refused: {commit} is not a commit in {self.working_dir.resolve()}"])
+        self.assertEqual(self.phase_events(session.name, "checkpoint"), [])
+
+        _ = (directory / phase_reservation.BASELINE_FILE).write_text(f"{baseline}\n", encoding="utf-8")
+        recorded = self.run_command(*command, at=1020)
+        event, = self.phase_events(session.name, "checkpoint")
+        self.assertEqual((event["checkpoint_commit"], event["event_id"]), (commit, recorded))
+
+    def test_checkpoint_refuses_an_unrelated_repository_in_the_saved_worktree(self) -> None:
+        session = self.start_run("unrelated-checkpoint", 1000, unit_owned=True)
+        self.start_numbered_phase(session, "6", 1010)
+        checkout = self.root / "unrelated-worktree"
+        _ = subprocess.run(["git", "init", "-q", str(checkout)], check=True, capture_output=True)
+        commit = commit_repository(checkout, "Unrelated checkpoint", allow_empty=True)
+        baseline = self.fixture_commit("Phase baseline")
+        directory = phase_reservation.phase_directory(session, "6")
+        directory.mkdir(parents=True, exist_ok=True)
+        _ = (directory / phase_reservation.WORKTREE_FILE).write_text(f"{checkout}\n", encoding="utf-8")
+        _ = (directory / phase_reservation.BASELINE_FILE).write_text(f"{baseline}\n", encoding="utf-8")
+
+        refused = self.run_failing_command("checkpoint", "--session-dir", str(session), "--phase", "6",
+                                           "--commit", commit, at=1020)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertEqual(refused.stderr.splitlines(),
+                         [f"checkpoint refused: {commit} is not a commit in {self.working_dir.resolve()}"])
+        self.assertEqual(self.phase_events(session.name, "checkpoint"), [])
+
     def test_checkpoint_wait_matches_a_late_checkpoint_in_the_moved_worktree(self) -> None:
         session = self.start_run("moved-late-checkpoint", 1000, unit_owned=True)
         self.start_numbered_phase(session, "6", 1010)
@@ -3502,7 +3567,7 @@ with patch.object(fcntl, "flock", admission):
         phase = cast(list[dict[str, object]], report["phases"])[0]
         self.assertEqual((phase["state"], phase["wait_n"]), ("Covered", 0))
 
-    def test_slot_waits_follow_the_live_pass_across_reused_servers_and_parallel_phases(self) -> None:
+    def test_waits_follow_the_live_pass_across_reused_servers_and_parallel_phases(self) -> None:
         session = self.covered_wait_phase("wait-slot")
         self.team_slot = "impl"
         _ = self.run_command("start-pass", "--session-dir", str(session), "--phase-id", "6",
@@ -3529,7 +3594,7 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual((records[first]["phase_id"], records[second]["phase_id"]), ("6", "7"))
         self.assertNotEqual(records[first]["phase_instance_id"], records[second]["phase_instance_id"])
 
-    def test_unresolved_slot_wait_is_counted_without_borrowing_the_current_phase(self) -> None:
+    def test_wait_without_an_open_pass_is_counted_without_borrowing_the_current_phase(self) -> None:
         session = self.covered_wait_phase("wait-missing-slot")
         printed_id = self.run_command("start-wait", "--session-dir", str(session), "--slot", "absent",
                                       "--kind", "WaitingForMemoryOrSlot", "--reason", "admission busy", at=1020)
