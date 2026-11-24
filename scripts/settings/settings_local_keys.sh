@@ -12,9 +12,10 @@ SETTINGS_LOCAL_KEYS_SIDECAR="settings.local-keys.json"
 SETTINGS_LOCAL_KEYS_NOTICES="settings.local-key-notices.json"
 _SETTINGS_LOCAL_ROOT="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)"
 
-# Read HEAD and the four index stages in order. Emit null for unavailable objects.
+# Read the settings objects from HEAD and the index.
 _settings_local_keys_references() {
-    local objects oid kind reference head_oid="" head=null
+    local objects name oid kind reference head_oid="" head=null
+    local -a references=()
     objects="$(git -C "$_SETTINGS_LOCAL_ROOT" cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null <<'EOF'
 HEAD:settings.json
 :0:settings.json
@@ -22,8 +23,9 @@ HEAD:settings.json
 :2:settings.json
 :3:settings.json
 EOF
-    )" || { printf '%s\n' null; return; }
-    while read -r oid kind; do
+    )" || { printf '{}\n'; return; }
+    for name in head stage0 stage1 stage2 stage3; do
+        read -r oid kind || break
         reference=null
         if [[ "$kind" == blob ]]; then
             if [[ "$oid" == "$head_oid" ]]; then
@@ -34,24 +36,25 @@ EOF
                     reference=null
             fi
         fi
-        printf '%s\n' "$reference"
-        if [[ -z "$head_oid" ]]; then
+        references+=("\"$name\":$reference")
+        if [[ "$name" == head ]]; then
             head_oid="$oid"
             head="$reference"
         fi
     done <<<"$objects"
+    (IFS=,; printf '{%s}\n' "${references[*]}")
 }
 
-_SETTINGS_LOCAL_SHARED_KEYS='[.[] | objects | keys[]] | unique'
+_SETTINGS_LOCAL_REFERENCE_DEFS='
+def head_keys: (.head // {}) | keys;
+def conflict_keys: [.stage1, .stage2, .stage3 | objects | keys[]] | unique;
+def index_keys: ((.stage0 // {} | keys) + conflict_keys) | unique;
+def shared_keys: (head_keys + index_keys) | unique;'
 
 settings_local_keys_baseline() {
-    local references
-    references="$(_settings_local_keys_references)"
-    if [[ "${references%%$'\n'*}" == null ]]; then
-        echo "settings: cannot read committed HEAD:settings.json" >&2
-        return 1
-    fi
-    jq -cs "$_SETTINGS_LOCAL_SHARED_KEYS" <<<"$references"
+    jq -ce "$_SETTINGS_LOCAL_REFERENCE_DEFS"'
+        if .head == null then error("settings: cannot read committed HEAD:settings.json")
+        else shared_keys end' <<<"$1"
 }
 
 # Preserve hook groups that run commands on one machine.
@@ -97,7 +100,7 @@ with_entries(select(.key | local_key | not))
     | .enabledPlugins |= with_entries(select(local_plugin | not))
     | if $before > 0 and (.enabledPlugins | length) == 0 then del(.enabledPlugins) else . end
   else . end
-| if $ARGS.named.committed == null then . else committed_order($ARGS.named.committed) end'
+| if $ARGS.named.order_reference == null then . else committed_order($ARGS.named.order_reference) end'
 
 # jq: keep only the local-only keys of an object, plus its local hook groups.
 SETTINGS_LOCAL_KEYS_PICK='($ARGS.named.baseline // keys) as $baseline | '"$SETTINGS_LOCAL_DEFS"'
@@ -106,9 +109,12 @@ SETTINGS_LOCAL_KEYS_PICK='($ARGS.named.baseline // keys) as $baseline | '"$SETTI
 + ($s.hooks // {} | local_hooks | if length == 0 then {} else {hooks: .} end)
 + ($s.enabledPlugins // {} | with_entries(select(local_plugin)) | if length == 0 then {} else {enabledPlugins: .} end)'
 
-# Smudge preserves saved local values and uses the incoming keys as its baseline.
-# Restore supplies the committed baseline and keeps existing values.
-SETTINGS_LOCAL_KEYS_MERGE='($ARGS.named.baseline // keys) as $baseline | '"$SETTINGS_LOCAL_DEFS"'. as $cur | ($local[0] // {} | saved_entries) as $l
+# Smudge uses keys from the incoming blob and unresolved index stages.
+# Restore supplies the shared baseline and keeps existing values.
+SETTINGS_LOCAL_KEYS_MERGE='
+(($ARGS.named.baseline // keys) + ($ARGS.named.conflict_keys // [])) as $baseline
+| '"$SETTINGS_LOCAL_DEFS"'
+. as $cur | ($local[0] // {} | saved_entries) as $l
 | . + ($l | del(.hooks, .enabledPlugins) | with_entries(.key as $k | select(($ARGS.named.restore != true) or (($cur | has($k)) | not))))
 | reduce (($l.enabledPlugins // {}) | to_entries[]) as $p (.;
     if (.enabledPlugins // {} | has($p.key)) then . else .enabledPlugins[$p.key] = $p.value end)
@@ -155,14 +161,15 @@ settings_local_keys_notices() {
 
 # Keep an empty backup only when the previous values are still local.
 settings_local_keys_snapshot() {
-    local settings sidecar snapshot baseline unknown
+    local settings sidecar snapshot references baseline staged_only_keys unknown
     settings="$1"
     sidecar="$_SETTINGS_LOCAL_ROOT/$SETTINGS_LOCAL_KEYS_SIDECAR"
     [[ -f "$settings" ]] || return 0
+    references="${3:-$(_settings_local_keys_references)}"
     if [[ $# -ge 2 ]]; then
         baseline="$2"
     else
-        baseline="$(settings_local_keys_baseline)" || return 1
+        baseline="$(settings_local_keys_baseline "$references")" || return 1
     fi
     snapshot="$(jq --argjson baseline "$baseline" "$SETTINGS_LOCAL_KEYS_PICK" "$settings")" || return 1
     if [[ "$snapshot" == "{}" && ! -e "$sidecar" ]]; then
@@ -171,21 +178,32 @@ settings_local_keys_snapshot() {
     if [[ "$snapshot" == "{}" && -s "$sidecar" ]]; then
         snapshot="$(jq --argjson baseline "$baseline" "$SETTINGS_LOCAL_KEYS_PICK" "$sidecar")" || return 1
     fi
+    if [[ -f "$sidecar" && -s "$sidecar" ]]; then
+        # Keep the prior local value until HEAD holds the staged key.
+        staged_only_keys="$(jq -c "$_SETTINGS_LOCAL_REFERENCE_DEFS"'index_keys - head_keys' <<<"$references")" || return 1
+        if [[ "$staged_only_keys" != "[]" ]]; then
+            snapshot="$(jq --argjson baseline "$baseline" --argjson snapshot "$snapshot" --argjson staged_keys "$staged_only_keys" \
+                '$ARGS.named.baseline as $baseline | '"$SETTINGS_LOCAL_DEFS"'
+                $snapshot + with_entries(select(.key | (listed_key or merged_key | not)
+                    and (. as $key | $staged_keys | index($key) != null)))' "$sidecar")" || return 1
+        fi
+    fi
     if [[ ! -f "$sidecar" || "$(<"$sidecar")" != "$snapshot" ]]; then
         _settings_local_write "$sidecar" "$snapshot" || return 1
     fi
-    unknown="$(printf '%s\n' "$snapshot" | jq "$SETTINGS_LOCAL_DEFS"'keys | map(select(listed_key or merged_key | not))' \
-        --argjson baseline "$baseline" -c)" || return 1
+    unknown="$(jq --argjson baseline "$baseline" -c '$ARGS.named.baseline as $baseline | '"$SETTINGS_LOCAL_DEFS"'
+        keys | map(select(local_key and (listed_key | not)))' <<<"$snapshot")" || return 1
     settings_local_keys_notices record "$unknown"
 }
 
 # Restore missing values without replacing a recent user edit.
 settings_local_keys_restore() {
-    local settings sidecar missing merged baseline
+    local settings sidecar missing merged references baseline
     settings="$_SETTINGS_LOCAL_ROOT/settings.json"
     sidecar="$_SETTINGS_LOCAL_ROOT/$SETTINGS_LOCAL_KEYS_SIDECAR"
     [[ -f "$settings" && -s "$sidecar" ]] || return 0
-    baseline="$(settings_local_keys_baseline)" || return 1
+    references="$(_settings_local_keys_references)"
+    baseline="$(settings_local_keys_baseline "$references")" || return 1
     missing="$(jq --argjson baseline "$baseline" --slurpfile local "$sidecar" \
         "$SETTINGS_LOCAL_KEYS_MISSING" "$settings")" || return 1
     [[ "$missing" -gt 0 ]] || return 0

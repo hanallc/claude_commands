@@ -16,10 +16,10 @@ trap 'rm -f "$input"' EXIT
 cat >"$input" || exit 1
 
 references="$(_settings_local_keys_references)"
-baseline="$(jq -cs "$_SETTINGS_LOCAL_SHARED_KEYS" <<<"$references")" || exit 1
+baseline="$(jq -c "$_SETTINGS_LOCAL_REFERENCE_DEFS"'shared_keys' <<<"$references")" || exit 1
 # Use the stage 0 order so Git can compare the clean result with the index.
-ordered="$(jq -cs 'if .[0] == null then null else .[1] // .[0] end' <<<"$references")" || exit 1
-if [[ "$ordered" == null ]]; then
+order_reference="$(jq -c 'if .head == null then null else .stage0 // .head end' <<<"$references")" || exit 1
+if [[ "$order_reference" == null ]]; then
     live_keys="$(jq 'keys' "$input")" || exit 1
     sidecar="$_SETTINGS_LOCAL_ROOT/$SETTINGS_LOCAL_KEYS_SIDECAR"
     if [[ -s "$sidecar" ]]; then
@@ -33,9 +33,9 @@ fi
 
 # Keep snapshot errors even when Git discards filter stderr.
 log="$_SETTINGS_LOCAL_ROOT/settings.local-keys.errors.log"
-if ! errors="$(settings_local_keys_snapshot "$input" "$baseline" 2>&1)"; then
+if ! errors="$(settings_local_keys_snapshot "$input" "$baseline" "$references" 2>&1)"; then
     printf '%s\n' "$errors" >>"$log"
     echo "settings: cannot preserve local settings values; see $log" >&2
     exit 1
 fi
-jq --argjson baseline "$baseline" --argjson committed "$ordered" "$SETTINGS_LOCAL_KEYS_STRIP" "$input"
+jq --argjson baseline "$baseline" --argjson order_reference "$order_reference" "$SETTINGS_LOCAL_KEYS_STRIP" "$input"

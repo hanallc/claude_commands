@@ -276,16 +276,18 @@ else:
         _ = self.git("checkout", "-q", "baseline")
         _ = conflict.write_text("baseline\n")
         _ = self.git("commit", "-qam", "Edit the conflict file on the baseline branch")
-        local = {"worktreeOnly": "saved", "voice": {"enabled": True}}
+        local = {"newSetting": "local", "worktreeOnly": "saved", "voice": {"enabled": True}}
         self.write_settings({"shared": 1, **local})
         _ = self.refresh()
 
         merge = self.run_command("git", "merge", "--no-edit", "incoming", check=False)
         self.assertEqual(merge.returncode, 1, merge.stdout + merge.stderr)
         self.assertEqual(self.git("diff", "--name-only", "--diff-filter=U"), "conflict.txt\n")
-        self.assertEqual(self.read_json(self.settings), {**incoming, **local})
+        self.assertEqual(self.read_json(self.settings), {**local, **incoming})
         self.assertEqual(self.git("show", ":settings.json"), json.dumps(incoming, indent=2) + "\n")
         self.assertEqual(self.git("show", "HEAD:settings.json"), json.dumps({"shared": 1}, indent=2) + "\n")
+        self.assertEqual(self.git("hash-object", "--path=settings.json", "settings.json").strip(), blob)
+        self.assertEqual(self.read_json(self.sidecar), local)
 
         abort = self.run_command("git", "merge", "--abort", check=False)
         self.assertEqual(abort.returncode, 0, abort.stdout + abort.stderr)
@@ -297,8 +299,11 @@ else:
         staged = {"stagedKey": "shared", "voice": {"enabled": False}, "hooks": NATEDEV["hooks"]}
         local = {"worktreeOnly": "saved", "voice": {"enabled": True}}
         blob = self.git("hash-object", "-w", "--stdin", contents=json.dumps(staged)).strip()
+        snapshot = """source scripts/settings/settings_local_keys.sh
+settings_local_keys_snapshot settings.json"""
         for stage in (0, 1, 2, 3):
             with self.subTest(stage=stage):
+                self.sidecar.unlink(missing_ok=True)
                 _ = self.git("rm", "--cached", "-f", "settings.json")
                 _ = self.git("update-index", "--index-info", contents=f"100644 {blob} {stage}\tsettings.json\n")
                 self.write_settings({"shared": 1, **staged, **local})
@@ -310,16 +315,32 @@ else:
                         {"type": "command", "command": "shared.py"}]}]},
                 })
                 saved = {"stagedKey": "stale", **local}
-                _ = self.sidecar.write_text(json.dumps(saved))
                 self.write_settings({"shared": 1, "stagedKey": "current", **local})
-                _ = self.run_command(BASH, "-c", """source scripts/settings/settings_local_keys.sh
-settings_local_keys_snapshot settings.json""")
+                _ = self.run_command(BASH, "-c", snapshot)
                 self.assertEqual(self.read_json(self.sidecar), local)
                 _ = self.sidecar.write_text(json.dumps(saved))
+                _ = self.run_command(BASH, "-c", snapshot)
+                self.assertEqual(self.read_json(self.sidecar), saved)
                 self.write_settings({"shared": 1})
                 _ = self.run_command(BASH, "-c", """source scripts/settings/settings_local_keys.sh
 settings_local_keys_restore""")
                 self.assertEqual(self.read_json(self.settings), {"shared": 1, **local})
+
+    def test_checkout_ours_does_not_stage_a_saved_local_value(self) -> None:
+        local = {"newSetting": "local", "voice": {"enabled": True}}
+        self.write_settings({"shared": 1, **local})
+        _ = self.refresh()
+        ours = self.git("rev-parse", "HEAD:settings.json").strip()
+        theirs = self.git("hash-object", "-w", "--stdin", contents='{"shared": 2, "newSetting": "incoming"}').strip()
+        _ = self.git("rm", "--cached", "-f", "settings.json")
+        _ = self.git("update-index", "--index-info",
+                     contents=f"100644 {ours} 2\tsettings.json\n100644 {theirs} 3\tsettings.json\n")
+
+        _ = self.git("checkout", "--ours", "settings.json")
+        self.assertEqual(self.read_json(self.settings), {"shared": 1, "voice": {"enabled": True}})
+        _ = self.git("add", "settings.json")
+        self.assertEqual(self.git("rev-parse", ":settings.json").strip(), ours)
+        self.assertEqual(self.read_json(self.sidecar), local)
 
     def test_shared_edits_stay_tracked_while_listed_keys_stay_local(self) -> None:
         self.write_settings({"shared": 2, "theme": "dark", "voice": {"enabled": True}})
