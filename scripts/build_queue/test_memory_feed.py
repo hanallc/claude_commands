@@ -1611,9 +1611,11 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(configuration.report_refresh_seconds, 600)
 
     def test_report_reads_follow_the_configured_refresh_window(self) -> None:
+        fixed_costs = aws_costs.empty_costs(AWS_COST_TIME)
         report_calls_per_cycle: list[int] = []
         with (mock.patch.object(admission_client, "view", return_value=captured_reading()) as queue,
               mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
+              mock.patch.object(aws_costs, "read_saved_costs", return_value=fixed_costs),
               # Each cycle reads the clock for the loop, token dump, Mac source, and limits source.
               mock.patch.object(time, "monotonic", side_effect=(
                   0.0, 0.0, 0.0, 0.0,
@@ -1640,8 +1642,9 @@ process.stdout.write(JSON.stringify({
         report_text = (self.output / memory_feed.REPORT_NAME).read_text()
         page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
         self.assertNotIn("report", page)
-        self.assertEqual(page["report_version"], memory_feed.report_file(memory_feed.report_reading(7)).version)
-        self.assertEqual(report_text, memory_feed.report_file(memory_feed.report_reading(7)).text)
+        expected_report = memory_feed.report_file(memory_feed.report_reading(7), fixed_costs)
+        self.assertEqual(page["report_version"], expected_report.version)
+        self.assertEqual(report_text, expected_report.text)
 
     def test_mac_readings_follow_the_configured_refresh_window(self) -> None:
         for interval, expected in ((30, [710001, 710001, 710002]), (60, [710001, 710001, 710001])):
@@ -4918,27 +4921,39 @@ class BuildsPageProofTests(unittest.TestCase):
             _ = lease.write_text(json.dumps({"work": "test-nightly"}), encoding="utf-8")
             self.assertTrue(needs_all_page_proof_views(checkout))
 
-    def test_builds_page_renders_the_queue_and_tooltips_in_chrome(self) -> None:
+    def run_page_proof(self, *, gate: bool, mode: str | None = None) -> tuple[Path, dict[str, object]]:
         source = Path(__file__).resolve()
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
         proof = source.with_name("memory_page_proof.mjs")
-        all_views = needs_all_page_proof_views(source.parents[2])
-        mode = [] if all_views else ["--gate"]
+        # Chrome needs a short path for its Unix sockets.
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="builds-page-proof-", dir="/tmp")))
+        command = [executable, str(proof), *(["--gate"] if gate else []), str(directory)]
+        if mode is not None:
+            command.append(mode)
         environment = {**os.environ, "PYTHON": sys.executable}
         for setting in ("MEMORY_PAGE_SHOT", "SWAP_BEFORE_PAGE", "STEADY_BASELINE"):
             _ = environment.pop(setting, None)
-        with tempfile.TemporaryDirectory(prefix="builds-page-proof-") as directory:
-            write_private_slot_roots(Path(directory) / "build_folders.conf", Path(directory), FIXTURE_MACHINE)
-            result = subprocess.run([executable, str(proof), *mode, directory],
-                env={**environment, "CONF_DIR": directory, "TMPDIR": directory}, text=True, capture_output=True,
-                timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            verdict = cast(dict[str, object], json.loads(result.stdout.splitlines()[-1]))
-            self.assertIs(verdict.get("pass"), True)
-            self.assertEqual(verdict.get("views"), 6 if all_views else 1)
-            self.assertEqual(list(Path(directory).glob("*.png")), [])
-            for report in ("proof.json", "steady-refresh.json"):
-                self.assertFalse((Path(directory) / report).exists())
+        write_private_slot_roots(directory / "build_folders.conf", directory, FIXTURE_MACHINE)
+        result = subprocess.run(command,
+            env={**environment, "CONF_DIR": str(directory), "TMPDIR": str(directory)}, text=True, capture_output=True,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        verdict = cast(dict[str, object], json.loads(result.stdout.splitlines()[-1]))
+        self.assertIs(verdict.get("pass"), True)
+        return directory, verdict
+
+    def test_builds_page_renders_the_queue_and_tooltips_in_chrome(self) -> None:
+        all_views = needs_all_page_proof_views(Path(__file__).resolve().parents[2])
+        directory, verdict = self.run_page_proof(gate=not all_views)
+        self.assertEqual(verdict.get("views"), 6 if all_views else 1)
+        self.assertEqual(list(directory.glob("*.png")), [])
+        for report in ("proof.json", "steady-refresh.json"):
+            self.assertFalse((directory / report).exists())
+
+    def test_gate_flag_keeps_the_queue_rows_proof_mode(self) -> None:
+        directory, verdict = self.run_page_proof(gate=True, mode="--queue-rows")
+        self.assertIn("rows", verdict)
+        self.assertTrue((directory / "after-edge.png").is_file())
 
 
 def machine_icons(row: str) -> list[tuple[str, str]]:
