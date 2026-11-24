@@ -136,7 +136,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
         @contextmanager
         def admit(command: Sequence[str], source: Path, *, targets: tuple[str, ...]) -> Generator[object]:
-            self.assertEqual(command[0], 'gate.py')
+            self.assertEqual(command[0], 'scripts/production/gate.py')
             self.assertEqual(source, self.checkout)
             self.assertEqual(targets, ("natedev",))
             self.assertEqual(os.environ[admission_records.BUILDLOG_UNIT], "fixture")
