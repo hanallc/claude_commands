@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from scripts.lib.checkout_test_support import copy_startup
+from scripts.lib.checkout_test_support import copy_test_runner
 
 from collections.abc import Callable
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import chdir, redirect_stderr, redirect_stdout, suppress
 from datetime import datetime
 import errno
 import hashlib
@@ -15,9 +15,11 @@ import os
 from pathlib import Path
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from typing import ClassVar, Literal, cast, final, override
 import unittest
 from unittest.mock import patch
@@ -87,6 +89,35 @@ class ChangedValueTests(unittest.TestCase):
         with Path(os.environ["FAST_TRACK_TEST_EVENTS"]).open("a") as output:
             output.write(json.dumps(row) + "\\n")
 '''.replace("__HANG_GUARD__", str(TEST_HANG_GUARD_SECS))
+
+FIXTURE_GATE_RUNNER = '''from collections.abc import Sequence
+import json
+import os
+from pathlib import Path
+import sys
+
+from scripts.production import gate
+from scripts.test_times.gate_record import NoGateTimeLimit
+
+def run_named_modules(repo: Path, names: Sequence[str], mode: gate.SuiteMode) -> gate.GateRun:
+    with Path(os.environ["FAST_TRACK_TEST_EVENTS"]).open("a") as output:
+        output.write(json.dumps({"kind": "gate", "cwd": str(repo), "modules": list(names)}) + "\\n")
+    # Use the gate launcher and tripwires without live admission.
+    return gate.run_suites(repo, mode=mode, machine=gate.WholeMachine(),
+                           selected=gate.NamedModules(tuple("scripts/" + name for name in names)),
+                           time_limit=NoGateTimeLimit("named modules"))
+
+gate.run_named_modules = run_named_modules
+raise SystemExit(gate.main())
+'''
+GATE_FIXTURE = f'''import os
+import sys
+
+checkout = os.getcwd()
+os.chdir({str(REPOSITORY)!r})
+shim = {str(REPOSITORY / "scripts/lib/py")!r}
+os.execv(shim, [shim, "-c", {FIXTURE_GATE_RUNNER!r}, "--repo", checkout, *sys.argv[1:]])
+'''
 
 CHECK_PROBE = '''import fcntl
 import json
@@ -281,12 +312,16 @@ class FastTrackTests(MergeCheckpointFixture):
             "scripts/sample/bridge.py": "from scripts.production.add_unit import VALUE\n",
             **{f"folder/file{number}.txt": "before\n" for number in range(6)},
             "scripts/sample/test_item.py": DIRECT_TEST,
-            "scripts/sample/test_item_extra.py": DIRECT_TEST,
+            "scripts/sample/test_item_extra.py": DIRECT_TEST + '''
+    def test_second_function(self) -> None:
+        with Path(os.environ["FAST_TRACK_TEST_EVENTS"]).open("a") as output:
+            output.write('{"kind":"second-test"}\\n')
+''',
             "scripts/sample/test_unrelated.py": "raise AssertionError('full suite ran')\n",
-            "scripts/production/gate.py": "raise AssertionError('gate ran')\n",
+            "scripts/production/gate.py": GATE_FIXTURE,
         }.items():
             self.write(self.checkout, path, content)
-        copy_startup(self.checkout)
+        copy_test_runner(self.checkout)
         (self.checkout / "scripts/lib/py").chmod(0o755)
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "fast-track fixture modules")
@@ -304,6 +339,8 @@ class FastTrackTests(MergeCheckpointFixture):
         self.initial = self.fixture_initial_main
         # SIGKILL bypasses the child context, so the test owns its temporary parent.
         self.env["TMPDIR"] = self.enterContext(tempfile.TemporaryDirectory())
+        self.env["GATE_STATE_DIR"] = str(self.root / "gate-state")
+        (self.root / "gates").mkdir(exist_ok=True)
         self.config = self.root / "config/fast_track.conf"
         self.pin_configuration()
         self.records_dir = self.root / "fast-track-state"
@@ -356,6 +393,7 @@ roots.slots.{machine}={self.root / 'slots'}
 roots.workspace={self.root / 'workspaces'}
 roots.session={self.root / 'session'}
 patterns.tool={{purpose}}{{suffix}}
+patterns.legacy-unique={{purpose}}{{suffix}}
 patterns.named={{showrunner}}-{{unit}}/{{work}}-{{purpose}}
 patterns.slot={{repository}}-slot{{slot}}
 # range: 0.001..60
@@ -1147,7 +1185,7 @@ owner.verify=verify
 
     # Keep one complete CLI process case.
     @process_boundary
-    def test_push_checks_only_direct_tests_in_a_private_clone_and_restores_named_paths(self) -> None:
+    def test_push_queues_selected_tests_in_a_private_clone_and_restores_named_paths(self) -> None:
         self.enable_promotion()
         self.change_module()
         self.env.update(PYTHONUNBUFFERED="1", REFUSAL_WATCH_INVENTORY="fixture", STAFF_OPERATION_FD="-1")
@@ -1167,7 +1205,11 @@ owner.verify=verify
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
         self.assertEqual(len(self.events("ssh")), 1)
         tests = self.observations("test")
+        self.assertEqual(self.observations("gate"), [{
+            "kind": "gate", "cwd": tests[0]["cwd"], "modules": ["sample/test_item.py", "sample/test_item_extra.py"],
+        }])
         self.assertEqual({row["module"] for row in tests}, {"test_item", "test_item_extra"})
+        self.assertEqual(len(self.observations("second-test")), 1)
         for row in tests:
             with self.subTest(module=row["module"], case="package name"):
                 self.assertEqual(row["package_module"], "scripts.sample." + str(row["module"]))
@@ -1216,7 +1258,7 @@ owner.verify=verify
         self.write(self.unit, "scripts/sample/test_added.py", "# This module has no tests.\n")
         result = self.fast_track(path, "scripts/sample/test_added.py")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("Ran 0 tests", result.stdout)
+        self.assertIn("sample/test_added.py exit=0", result.stdout)
         self.assertIn("scripts/sample/added.py", self.git("ls-tree", "-r", "--name-only", "main", cwd=self.origin))
         self.assertFalse((self.unit / path).exists())
 
@@ -1224,6 +1266,7 @@ owner.verify=verify
         path = "scripts/sample/added.py"
         self.write(self.unit, path, "raise RuntimeError('broken package import')\n")
         self.assert_refused(self.fast_track(path))
+        self.assertEqual(self.observations("gate"), [])
 
     def test_no_change_and_outside_paths_are_refused_without_a_push(self) -> None:
         self.assert_refused(self.fast_track())
@@ -1287,11 +1330,23 @@ owner.verify=verify
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.observations("types"), [])
 
-    def test_red_direct_test_prevents_the_push(self) -> None:
+    def test_red_gate_test_prevents_the_push(self) -> None:
         self.write(self.unit, "scripts/sample/item.py", MODULE.replace('VALUE = "before"', 'VALUE = "incorrect"'))
         red_test = self.fast_track()
-        self.assert_refused(red_test, "-m unittest scripts.sample.test_item")
+        self.assert_refused(red_test, "gate.py --tests-only --module sample/test_item.py --module sample/test_item_extra.py")
         self.assertIn("AssertionError: 'incorrect' != 'after'", red_test.stdout)
+
+    def test_gate_tripwire_markers_prevent_the_push(self) -> None:
+        path = "scripts/sample/test_added.py"
+        for marker, detail in (("build-tool-calls.jsonl", "a test started real cargo"),
+                               ("live-memory-reads.jsonl", "a test read live memory")):
+            with self.subTest(marker=marker):
+                record = '["/fixture/cargo", "build"]\n' if marker.startswith("build") else '{}\n'
+                self.write(self.unit, path, "import os\nfrom pathlib import Path\nimport unittest\n"
+                    + "\nclass Fixture(unittest.TestCase):\n    def test_marker(self) -> None:\n"
+                    + f"        Path(os.environ['TMPDIR'], {marker!r}).write_text({record!r})\n")
+                result = self.fast_track(path)
+                self.assert_refused(result, detail)
 
     def test_origin_main_move_reapplies_and_rechecks_outside_the_push_lock(self) -> None:
         self.change_module()
@@ -1319,7 +1374,7 @@ owner.verify=verify
 
     def test_check_time_limit_stops_the_check_process_group(self) -> None:
         self.change_module()
-        self.settings["check_time_limit_seconds"] = 1
+        self.settings["check_time_limit_seconds"] = 5
         self.save_config()
         pid_file = self.root / "check-descendant.pid"
         self.env["FAST_TRACK_DESCENDANT_PID"] = str(pid_file)
@@ -1330,7 +1385,9 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
-child = subprocess.Popen([sys.executable, "-c", "import os, signal; signal.alarm(int(os.environ[\\\"FAST_TRACK_FIXTURE_ALARM_SECS\\\"])); signal.pause()"])
+child = subprocess.Popen(
+    [sys.executable, "-c", "import os, signal; signal.alarm(int(os.environ[\\\"FAST_TRACK_FIXTURE_ALARM_SECS\\\"])); signal.pause()"],
+    start_new_session=True)
 Path(os.environ["FAST_TRACK_DESCENDANT_PID"]).write_text(str(child.pid))
 signal.alarm(int(os.environ["FAST_TRACK_FIXTURE_ALARM_SECS"]))
 signal.pause()
@@ -1354,6 +1411,58 @@ signal.pause()
             finally:
                 os.close(descriptor)
         self.assertTrue(exited(), "the check descendant survived the limit")
+
+    @unittest.skipUnless(sys.platform == "linux", "Gate recovery requires Linux")
+    def test_check_time_limit_recovers_a_module_group_when_the_gate_stalls(self) -> None:
+        self.assert_stalled_gate_recovers(self.env["GATE_STATE_DIR"])
+
+    @unittest.skipUnless(sys.platform == "linux", "Gate recovery requires Linux")
+    def test_check_time_limit_recovers_a_gate_with_relative_state(self) -> None:
+        self.assert_stalled_gate_recovers("gate-state")
+
+    def assert_stalled_gate_recovers(self, state: str) -> None:
+        self.env["GATE_STATE_DIR"] = state
+        checkout = self.root / "timeout-checkout"
+        checkout.mkdir()
+        pid_file = self.root / "stalled-module.pid"
+        worker = f"""
+import ctypes, os, signal
+from pathlib import Path
+ctypes.CDLL(None).prctl(1, 0, 0, 0, 0)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+signal.alarm({2 * TEST_HANG_GUARD_SECS})
+Path({str(pid_file)!r}).write_text(str(os.getpid()))
+signal.pause()
+"""
+        launcher = f"""
+import os, signal, sys
+from pathlib import Path
+sys.path.insert(0, {str(REPOSITORY)!r})
+from scripts.production import gate
+gate.python_shim = lambda repo: Path({str(REPOSITORY / "scripts/lib/py")!r})
+repo = Path.cwd()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with gate.gate_recovery(repo):
+    job = gate.start_gate_job("production", repo / "scripts/production/test_fast_track.py",
+                             [sys.executable, "-c", {worker!r}], repo, dict(os.environ),
+                             Path({str(self.root / 'stalled-module.log')!r}))
+    job.process.wait()
+"""
+        try:
+            with (chdir(self.root), patch.dict(os.environ, self.env),
+                  patch.object(fast_track, "GATE_CLEANUP_SECONDS", 0.1),
+                  self.assertRaisesRegex(fast_track.Refused, "over the fast-track time limit")):
+                fast_track.check_command([sys.executable, "-c", launcher], checkout, self.env,
+                                         time.monotonic() + 4, gate=True)
+            pid = int(pid_file.read_text())
+            self.assertFalse((checkout / "gate-state").exists(), "the gate resolved state from its own cwd")
+            with suppress(FileNotFoundError):
+                state = Path(f"/proc/{pid}/stat").read_text().rpartition(") ")[2].split()[0]
+                self.assertEqual(state, "Z", "the separate module group survived recovery")
+        finally:
+            if pid_file.exists():
+                with suppress(ProcessLookupError):
+                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
 
     def test_reruns_after_restore_or_promotion_failure_do_not_push_twice(self) -> None:
         self.enable_promotion()

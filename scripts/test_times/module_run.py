@@ -756,13 +756,15 @@ def private_run_roots(owner: GateModuleLease | StandaloneModuleRun) -> Generator
             os.environ.update(previous)
 
 
-def run_with_descendant_cleanup(owner: GateModuleLease | StandaloneModuleRun, cleanup: ExitStack) -> None:
+def run_with_descendant_cleanup(
+        owner: GateModuleLease | StandaloneModuleRun, cleanup: ExitStack,
+        run: Callable[[GateModuleLease | StandaloneModuleRun, Path], None] = main) -> None:
     """Use kernel events while the supervisor reaps every adopted descendant."""
     global startup_cpu_s
     from scripts.lib.descendants import adopt_descendants
 
     if not adopt_descendants():
-        main(owner, cleanup.enter_context(private_run_roots(owner)))
+        run(owner, cleanup.enter_context(private_run_roots(owner)))
         return
     parent = gate_parent(consume=True)
     libc = ctypes.CDLL(None, use_errno=True)
@@ -796,7 +798,7 @@ def run_with_descendant_cleanup(owner: GateModuleLease | StandaloneModuleRun, cl
         startup_cpu_s = usage.ru_utime + usage.ru_stime
         _ = signal.signal(signal.SIGCHLD, previous_sigchld)
         _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-        main(owner, run_root)
+        run(owner, run_root)
         return
     status = 0
     received = 0

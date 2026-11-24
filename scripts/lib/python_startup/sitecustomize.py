@@ -22,7 +22,10 @@ from types import CodeType, ModuleType
 # Keep typing out of interpreter startup.
 TYPE_CHECKING = False
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from typing import Literal, Protocol, overload
+    from unittest import TestCase
+    from unittest.suite import BaseTestSuite
 
     class _CheckoutStartupAttributes(Protocol):
         def __contains__(self, key: Literal["ready"], /) -> bool: ...
@@ -37,6 +40,7 @@ if TYPE_CHECKING:
 
 STARTUP_FILES = ("scripts/lib/py", "scripts/lib/package_root.py", "scripts/lib/python_startup/sitecustomize.py")
 TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py",
+                     "scripts/production/gate_modules.py",
                      "scripts/lib/conf_reads.py", "scripts/lib/build_folders.py", "scripts/lib/build_folder_lock.py",
                      "scripts/lib/boot_identity.py", "scripts/lib/process_start.py",
                      "scripts/lib/conf.py", "scripts/lib/git_files.py", "config/build_folders.conf",
@@ -48,6 +52,8 @@ _SESSION_STARTUP = "session_python_startup"
 _SYSTEMD_SERVICE = "org.freedesktop.systemd1"
 _SYSTEMD_INFINITE_RUNTIME = (1 << 64) - 1
 _DIRECT_TEST_LIMIT_KEY = "direct_test.time_limit_seconds"
+_DIRECT_TEST_MAX_CASES = 1
+_TEST_RUN_FOLDER_ENV = "DEVTOOLS_TEST_RUN_FOLDER"
 _WATCHDOG_READY = b"ready\n"
 GATE_PARENT_SOURCE_FD = "DEVTOOLS_GATE_PARENT_SOURCE_FD"
 DATACLASS_CODE_FILENAME = "<string>"
@@ -384,11 +390,44 @@ def gate_parent(consume: bool = False) -> GateParent:
     return identity if accepted else UnverifiedGateParent()
 
 
+def _has_multiple_gate_tests(test: TestCase | BaseTestSuite) -> bool:
+    from pathlib import Path
+    from unittest import FunctionTestCase, TestCase
+
+    if test.countTestCases() <= _DIRECT_TEST_MAX_CASES:
+        return False
+
+    def cases(selection: TestCase | BaseTestSuite | None) -> Iterator[TestCase]:
+        if isinstance(selection, TestCase):
+            yield selection
+        elif selection is not None:
+            for child in selection:
+                yield from cases(child)
+
+    repo = Path(sys.modules["_devtools_checkout"].__path__[0]).resolve()
+    selected: list[Path] = []
+    for case in cases(test):
+        owner = vars(case).get("_testFunc") if isinstance(case, FunctionTestCase) else type(case)
+        module_name = getattr(owner, "__module__", None)
+        module = sys.modules.get(module_name) if isinstance(module_name, str) else None
+        filename = getattr(module, "__file__", None)
+        if isinstance(filename, str):
+            selected.append(Path(filename).resolve())
+    if len(selected) <= _DIRECT_TEST_MAX_CASES:
+        return False
+
+    from scripts.production.gate_modules import discover_test_modules
+
+    discovered = {path.resolve() for _, path in discover_test_modules(repo)}
+    return sum(path in discovered for path in selected) > _DIRECT_TEST_MAX_CASES
+
+
 def _unittest_boundary(module: ModuleType) -> None:
-    """Start the limit when the process first loads or runs tests."""
+    """Start the limit at load and check the selection before tests run."""
     from _thread import allocate_lock
     from functools import wraps
-    from unittest import TestCase, TestLoader, TestProgram, TestSuite, TextTestRunner
+    from typing import cast
+    from unittest import TestCase, TestLoader, TestProgram, TestSuite, TextTestResult, TextTestRunner
     from unittest.suite import BaseTestSuite
 
     if module.__dict__.get("_devtools_test_boundary"):
@@ -396,28 +435,80 @@ def _unittest_boundary(module: ModuleType) -> None:
     module.__dict__["_devtools_test_boundary"] = True
     lock = allocate_lock()
     started = False
+    enforce_case_count = False
+    direct_folder: str | None = None
+
+    def reset_after_fork() -> None:
+        nonlocal lock, started, enforce_case_count, direct_folder
+        lock = allocate_lock()
+        started = False
+        enforce_case_count = False
+        direct_folder = None
+
+    if hasattr(os, "register_at_fork"):
+        os.register_at_fork(after_in_child=reset_after_fork)
 
     def begin() -> None:
-        nonlocal started
+        nonlocal started, enforce_case_count, direct_folder
         if not started:
             with lock:
                 if not started:
-                    _begin_direct_test()
+                    has_runtime_limit = within_test_limit()
+                    enforce_case_count = not has_runtime_limit and not _has_inherited_test_folder()
+                    if not has_runtime_limit:
+                        direct_folder = _begin_direct_test()
                     started = True
+
+    def check(test: TestCase | BaseTestSuite) -> None:
+        nonlocal direct_folder
+        begin()
+        if enforce_case_count and _has_multiple_gate_tests(test):
+            print("more than one test: run it with copies.py --affected or --module",
+                  file=sys.stderr, flush=True)
+            raise SystemExit(1)
+        folder = direct_folder
+        if folder is not None:
+            os.environ[_TEST_RUN_FOLDER_ENV] = folder
+            direct_folder = None
+
+    def wrap_load(method: Callable[..., object]) -> None:
+        @wraps(method)
+        def load(*args: object, **kwargs: object) -> object:
+            begin()
+            return method(*args, **kwargs)
+
+        setattr(TestLoader, method.__name__, load)
+
+    for method in (TestLoader.discover, TestLoader.loadTestsFromModule, TestLoader.loadTestsFromName,
+                   TestLoader.loadTestsFromNames, TestLoader.loadTestsFromTestCase):
+        wrap_load(method)
+
+    run_program = TestProgram.runTests
+    run_text = TextTestRunner.run
+
+    @wraps(run_program)
+    def run_tests(program: TestProgram, /) -> None:
+        attributes: dict[str, object] = vars(program)
+        check(cast(TestCase | BaseTestSuite, attributes["test"]))
+        run_program(program)
+
+    @wraps(run_text)
+    def run_text_tests(runner: TextTestRunner, /, test: TestCase | TestSuite) -> TextTestResult:
+        check(test)
+        return run_text(runner, test)
+
+    setattr(TestProgram, "runTests", run_tests)
+    setattr(TextTestRunner, "run", run_text_tests)
 
     def wrap(owner: type[object], method: Callable[..., object]) -> None:
         @wraps(method)
-        def run(*args: object, **kwargs: object) -> object:
-            begin()
-            return method(*args, **kwargs)
+        def run(test: TestCase | BaseTestSuite, /, *args: object, **kwargs: object) -> object:
+            check(test)
+            return method(test, *args, **kwargs)
 
         setattr(owner, method.__name__, run)
 
     for owner, methods in (
-        (TestLoader, (TestLoader.discover, TestLoader.loadTestsFromModule, TestLoader.loadTestsFromName,
-                      TestLoader.loadTestsFromNames, TestLoader.loadTestsFromTestCase)),
-        (TestProgram, (TestProgram.runTests,)),
-        (TextTestRunner, (TextTestRunner.run,)),
         (BaseTestSuite, (BaseTestSuite.run, BaseTestSuite.debug)),
         (TestSuite, (TestSuite.run, TestSuite.debug)),
         (TestCase, (TestCase.run, TestCase.debug)),
@@ -514,12 +605,7 @@ def _descends_from_gate_module() -> bool:
     return False
 
 
-def within_test_limit() -> bool:
-    """Identify a gate module or an existing direct test scope."""
-    if _verified_gate():
-        return True
-    if sys.platform != "linux":
-        return False
+def _has_linux_test_scope() -> bool:
     if _descends_from_gate_module():
         return True
     try:
@@ -529,9 +615,32 @@ def within_test_limit() -> bool:
         return False
 
 
-def _begin_direct_test() -> None:
-    if within_test_limit():
-        return
+def _has_inherited_test_folder() -> bool:
+    """Check the lease of the test folder that the caller gave this process."""
+    folder = os.environ.get(_TEST_RUN_FOLDER_ENV)
+    if not folder:
+        return False
+
+    from pathlib import Path
+
+    path = Path(folder)
+    if not path.is_absolute() or path.parent.name != "test-runs":
+        return False
+    try:
+        from scripts.lib import build_folder_lock
+
+        return path.is_dir() and build_folder_lock.probe(
+            path, path.parent, lambda: build_folder_lock.ProbeTiming(0.0, 0.0)) == "held"
+    except (ImportError, OSError, ValueError):
+        return False
+
+
+def within_test_limit() -> bool:
+    """Identify a gate or a direct test scope that enforces a deadline."""
+    return _verified_gate() or (sys.platform == "linux" and _has_linux_test_scope())
+
+
+def _begin_direct_test() -> str | None:
     from contextlib import AbstractContextManager, nullcontext
     from pathlib import Path
     from typing import cast
@@ -541,7 +650,7 @@ def _begin_direct_test() -> None:
     checkout = Path(sys.modules["_devtools_checkout"].__path__[0])
     has_test_folder = (checkout / "scripts/lib/testing_folders.py").is_file()
     if not (linux or has_test_folder):
-        return
+        return None
 
     from scripts.lib import conf
 
@@ -569,9 +678,12 @@ def _begin_direct_test() -> None:
                 from scripts.lib.testing_folders import start_test_run
 
                 start_test_run()
+                # Pass the folder to children after the selection passes the limit.
+                return os.environ.pop(_TEST_RUN_FOLDER_ENV, None)
     except (OSError, conf.Unusable, ValueError) as error:
         print(f"direct test: {error}", file=sys.stderr, flush=True)
         raise SystemExit(1) from None
+    return None
 
 
 def _cgroup(pid: int) -> str:
@@ -629,7 +741,7 @@ def _start_direct_test_watchdog(seconds: int) -> None:
     """Bound a direct test with a watchdog process when no user systemd manager runs.
 
     The test starts only after the watchdog reports that it is ready.
-    Known limit: the watchdog stops only this process. Its children outlive the deadline.
+    The watchdog stops only this process.
     """
     descriptor = os.pidfd_open(os.getpid())
     ready_read, ready_write = os.pipe()

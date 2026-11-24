@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from scripts.lib.checkout_test_support import copy_test_runner
 
-from contextlib import ExitStack, redirect_stderr, redirect_stdout, suppress
+from contextlib import AbstractContextManager, ExitStack, nullcontext, redirect_stderr, redirect_stdout, suppress
 import ctypes
 import errno
 import fcntl
@@ -19,17 +19,47 @@ import sys
 import tempfile
 import threading
 import time
-from typing import cast
+from typing import cast, override
 import unittest
 from unittest import mock
 
+from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue.queue_place import QueuePlace
 from scripts.lib.descendants import adopt_descendants
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.test_times import module_cost, task_cpu
+from scripts.production import gate
+from scripts.production.gate_modules import GateRefused
+from scripts.test_times import measurement_gate, module_cost, task_cpu
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 class ModuleCostTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        def fixture_place(_tree: Path, _temporary: Path) -> AbstractContextManager[QueuePlace]:
+            place: QueuePlace = mock.Mock(spec=QueuePlace, child_environment=dict)
+            return nullcontext(place)
+
+        _ = self.enterContext(mock.patch.object(module_cost, "measurement_place", side_effect=fixture_place))
+
+    def test_macos_reports_linux_requirement_before_start(self) -> None:
+        with (mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.object(task_cpu, "measurement_timeout_s", side_effect=AssertionError("The run started")),
+              redirect_stderr(io.StringIO()) as stderr):
+            status = module_cost.main(["--tree", ".", "fixture/test_cost.py"])
+        self.assertEqual(status, 1)
+        self.assertEqual(stderr.getvalue(), "module_cost: process and exec measurements require Linux\n")
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux is required")
+    def test_admission_refusal_reports_blocked_before_measurement_starts(self) -> None:
+        with (mock.patch.object(module_cost, "measurement_place", measurement_gate.measurement_place),
+              mock.patch.object(gate, "gate_reservation", side_effect=GateRefused("queue refused")),
+              mock.patch.object(module_cost, "runner_command", side_effect=AssertionError("The stage started")),
+              redirect_stderr(io.StringIO()) as stderr):
+            status = module_cost.main(["--tree", ".", "fixture/test_refused.py"])
+        self.assertEqual(status, 1)
+        self.assertEqual(stderr.getvalue(), "module_cost: BLOCKED: queue refused\n")
+
     def test_reads_task_ids_without_decoding_the_task_name(self) -> None:
         samples = [
             (b"Name:\tworker\nTgid:\t401\nPid:\t402\nPPid:\t202\n", (401, 202)),
@@ -774,7 +804,9 @@ with (mock.patch.object(module_cost, 'supervise', side_effect=stall),
             status = module_cost.main(["--tree", temporary, *modules])
         self.assertEqual(status, 1, stdout.getvalue() + stderr.getvalue())
         self.assertIn(f"{modules[0]}: cannot attach tracer: [Errno {errno.EPERM}]", stderr.getvalue())
-        first, second = stdout.getvalue().splitlines()[1:3]
+        rows = stdout.getvalue().splitlines()[1:3]
+        self.assertEqual(len(rows), 2, stderr.getvalue())
+        first, second = rows
         self.assertEqual([first.split()[0], second.split()[0]], modules)
         self.assertTrue(first.endswith("RED (test=0, trace=1)"), first)
         self.assertTrue(second.endswith("PASS"), second)
@@ -796,7 +828,7 @@ with (mock.patch.object(module_cost, 'supervise', side_effect=stall),
                   redirect_stderr(io.StringIO()) as stderr):
                 status = module_cost.main(["--tree", temporary, *modules])
         self.assertNotEqual(status, 0, stdout.getvalue() + stderr.getvalue())
-        self.assertEqual(stderr.getvalue().count("fixture trace failure"), 2)
+        self.assertEqual(stderr.getvalue().count("fixture trace failure"), 2, stderr.getvalue())
         rows = stdout.getvalue().splitlines()
         for module, row in zip(modules, rows[1:3], strict=True):
             self.assertEqual(row.split()[0], module)
@@ -890,17 +922,21 @@ with (mock.patch.object(module_cost, 'supervise', side_effect=stall),
                 + "os.waitpid(child, 0)\n")
             _ = light.write_text("pass\n")
             _ = (folder / "test_commands.py").write_text(
-                "import subprocess, sys, unittest\n"
+                "import os, subprocess, sys, unittest\n"
                 + "class Commands(unittest.TestCase):\n"
                 + "    def test_heavy(self):\n"
+                + "        self.assertTrue(os.environ['BUILDLOG_RESERVED_STEP'])\n"
+                + "        self.assertIn('test_gate_pidfd', vars(sys.modules['_devtools_checkout']))\n"
                 + f"        self.assertEqual(sys.modules['__main__'].__file__, {str(tree / 'scripts/test_times/module_run.py')!r})\n"
                 + f"        subprocess.run([sys.executable, {str(heavy)!r}], check=True)\n"
                 + "    def test_light(self):\n"
                 + f"        subprocess.run([sys.executable, {str(light)!r}], check=True)\n", encoding="utf-8")
-            result = subprocess.run(
-                [sys.executable, str(Path(module_cost.__file__)), "--tree", str(tree),
-                 "--commands", "10", "fixture/test_commands.py"],
-                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+            with AdmissionFixture(root=tree / "admission") as admission, admission.serving():
+                result = subprocess.run(
+                    [sys.executable, str(Path(module_cost.__file__)), "--tree", str(tree),
+                     "--commands", "10", "fixture/test_commands.py"],
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                self.assertTrue(admission.callers_released(), result.stdout + result.stderr)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rows = result.stdout.splitlines()
         commands = rows[rows.index(next(line for line in rows if "test_commands.py command" in line)) + 1:]
