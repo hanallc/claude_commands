@@ -1,7 +1,7 @@
 """Shared admission records, configuration and wait phrases."""
 from __future__ import annotations
 
-from collections.abc import Generator, Iterable, Mapping, Sequence
+from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -1501,21 +1501,6 @@ class HeldPlace:
     position: int = field(default=0, kw_only=True)
 
 
-def number_held_places(waiting: tuple[WaitingStep, ...], held: tuple[HeldPlace, ...]) -> tuple[HeldPlace, ...]:
-    """Insert kept places by arrival time in the published order of the waiting steps."""
-    waiters = iter(waiting)
-    waiter = next(waiters, None)
-    position = 1
-    numbered: list[HeldPlace] = []
-    for place in sorted(held, key=lambda item: item.since):
-        while waiter is not None and waiter.since < place.since:
-            position += 1
-            waiter = next(waiters, None)
-        numbered.append(replace(place, position=position))
-        position += 1
-    return tuple(numbered)
-
-
 @dataclass(frozen=True)
 class QueueRead:
     """The queue reading holds its view, explanation, ordered waiters, and diagnostics."""
@@ -1525,10 +1510,32 @@ class QueueRead:
     diagnostics: tuple[ConfigurationDiagnostic, ...] = ()
     held_places: tuple[HeldPlace, ...] = field(default=(), kw_only=True)
 
+    def waiting_with_order_times(self) -> Iterator[tuple[WaitingStep, float]]:
+        """Return waiting steps in view order with the times used to rank them."""
+        order_times = {(row["pid"], row["since"]): row["order_since"] for _, row in self.ordered if "order_since" in row}
+        for step in self.view.waiting:
+            yield step, order_times.get((step.pid, step.since), job_order_since(step.since, step.ci_job_start))
+
+    def number_held_places(self, held: tuple[HeldPlace, ...]) -> tuple[HeldPlace, ...]:
+        """Insert kept places by arrival time in the published order of the waiting steps."""
+        if not held:
+            return ()
+        order_times = (since for _, since in self.waiting_with_order_times())
+        since = next(order_times, None)
+        position = 1
+        numbered: list[HeldPlace] = []
+        for place in sorted(held, key=lambda item: item.since):
+            while since is not None and since < place.since:
+                position += 1
+                since = next(order_times, None)
+            numbered.append(replace(place, position=position))
+            position += 1
+        return tuple(numbered)
+
     def numbered_held_places(self) -> tuple[HeldPlace, ...]:
         """Number kept places from a view that predates published positions."""
         if any(not place.position for place in self.held_places):
-            return number_held_places(self.view.waiting, self.held_places)
+            return self.number_held_places(self.held_places)
         return self.held_places
 
 

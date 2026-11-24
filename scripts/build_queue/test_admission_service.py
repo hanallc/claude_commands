@@ -91,7 +91,14 @@ class PlacementStatusTests(unittest.TestCase):
 
             path = fixture.state_dir / "state.json"
             saved = cast(dict[str, object], json.loads(path.read_text()))
-            del cast(list[dict[str, object]], saved["held_places"])[0]["failed_step"]
+            saved_place, = cast(list[dict[str, object]], saved["held_places"])
+            self.assertEqual(saved_place["failed_step"], "lint")
+            saved_place["failed_step"] = "test"
+            _ = path.write_text(json.dumps(saved))
+            fixture.restart()
+            self.assertEqual(fixture.server.held_places, (replace(kept, failed_step="test"),))
+
+            del saved_place["failed_step"]
             _ = path.write_text(json.dumps(saved))
             fixture.restart()
             self.assertEqual(fixture.server.held_places, (replace(kept, failed_step=""),))

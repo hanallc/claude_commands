@@ -673,7 +673,8 @@ A missing or unreadable view file gives the queue read error.
 The service saves a `HeldPlace` when a failed run qualifies to keep its place.
 The record keeps the failed step, the run identity, its targets, and the expiry time.
 An older record can omit the failed step.
-The view assigns the place number from the waiting order and the saved arrival time.
+The view compares the kept arrival time with the times the queue uses to rank the waiting steps.
+The Builds page recalculates the place numbers when the user moves a waiting step.
 The Builds page shows the unit in its role color in the row label.
 The Machine cell uses the same dim target icons as a waiting row.
 The deadline uses the user's time zone.

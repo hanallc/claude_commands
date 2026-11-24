@@ -679,6 +679,31 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual([row.get("place") for row in page["waiters"]], [1, 3, 4, 5])
         self.assertEqual(page["waiters"][0].get("order_note"), "Took the place of its failed run.")
 
+    def test_kept_place_follows_a_ci_job_that_started_before_it(self) -> None:
+        from scripts.build_queue import build_queue
+
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            now = fixture.clock.now()
+            ci = replace(fixture.service_request(), job_start=admission_records.JobStart(now - 30))
+            fixture.server.held_places = (admission_records.HeldPlace("queue", "fixture", "test-all", now - 20,
+                now, now + 100, "4242-99", ("natedev",), 1, "failed"),)
+            _ = fixture.server.handle_request(ci)
+            published = queue_snapshot.read_view_snapshot(fixture.state_dir)
+            ordered, = published.reading.ordered
+            self.assertEqual(gate.waiter_order(ordered[1])[1], now - 30)
+            self.assertEqual(ordered[1]["since"], now)
+
+        publish_fixture_view(self.root / "buildlog" / "admission", published.reading, published.written_at)
+        page = memory_feed.reading()
+        kept, = page["held_places"]
+        ci_row, = page["waiters"]
+        self.assertEqual((ci_row["since"], ci_row.get("order_since")), (now, now - 30))
+        self.assertEqual((ci_row.get("place"), kept["position"]), (1, 2))
+        self.assertEqual([(number, step.pid) for number, step in build_queue.waiting_positions(published.reading).items()],
+                         [(1, ci.owner.pid)])
+
     def test_queue_timeout_keeps_the_last_guest_row_in_running(self) -> None:
         now = 200_000.0
         step = GatePlacementStep("gate-session", "phases", "gate", "/fixture/claude_commands", 0,
