@@ -421,6 +421,12 @@ Each step also retains its own owner, episode, and reservation.
 Queue priority remains the first ordering field.
 A CI step uses the same `order_since` field for its job start; see "CI cargo admission".
 
+A local gate requests a reservation with the first step's arrival time and run identity.
+The first reservation ends before the gate requests its reservation.
+The service keeps the gate's place until the request arrives or the caller exits.
+A local waiter ahead of the gate can still start.
+Admission uses the gate's full estimate and the normal slot between steps.
+
 The service retains the run's process watch between steps.
 The run holds memory for a 10-second gap between steps. It holds no CPU token during that gap.
 When the run ends, waiting steps use their own arrival times for order again.

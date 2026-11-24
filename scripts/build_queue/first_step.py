@@ -57,6 +57,7 @@ class FirstStepAdmission:
     queue_position: SlotQueuePosition
     grant: wire.Admitted | wire.LocalPlacementGranted | wire.Assignment | GatePlacement | HandedOff
     assignment_file: Path
+    gate_program: bool = False
 
     def handoff(self, tree: Path) -> None:
         """End preparation or pass the assignment to the command."""
@@ -66,6 +67,8 @@ class FirstStepAdmission:
             self._hand_gate(grant)
             return
         if isinstance(grant, wire.Admitted):
+            if self.gate_program:
+                os.environ['BUILDLOG_FIRST_STEP_SINCE'] = str(self.queue_position.since)
             answer = queue_place.release_place(grant.reservation, 0, grant.cleanup_timing)
             if isinstance(answer, wire.Refused):
                 raise FirstStepRefused(answer.reason)
@@ -81,9 +84,10 @@ class FirstStepAdmission:
         self.grant = HandedOff()
 
     def _hand_gate(self, grant: GatePlacement) -> None:
-        # A local grant keeps its reservation, so the queue reads the assignment as current when the gate checks it.
-        # The gate ends that reservation after the check, before it takes its own (gate.gate_start_target).
-        # close() cancels the placement, and the cancel returns a reservation that the gate did not end.
+        # The gate checks the assignment before it releases the first reservation.
+        os.environ['BUILDLOG_FIRST_STEP_SINCE'] = str(self.queue_position.since)
+        if isinstance(run := grant.request.run, wire.RunIdentity):
+            os.environ['BUILDLOG_RUN'] = f'{run.pid}:{run.start_time}'
         os.environ['BUILDLOG_PLACEMENT_FILE'] = str(self.assignment_file)
         os.environ['BUILDLOG_PLACEMENT_EPISODE'] = grant.grant.assignment.episode
         if isinstance(grant.request.local, wire.LocalAdmissionContext):
@@ -320,7 +324,8 @@ def admitted_run(command: Sequence[str], source: Path, *,
     run = wire.RunIdentity(owner.pid, owner.start_time)
     position = SlotQueuePosition(uuid4().hex, time.time())
     keys = ('BUILDLOG_RUN', 'BUILDLOG_FIRST_STEP_ASSIGNMENT', 'BUILDLOG_FIRST_STEP_ROUTE',
-            'BUILDLOG_FIRST_STEP_SINCE', 'BUILDLOG_PLACEMENT_FILE', 'BUILDLOG_PLACEMENT_EPISODE',
+            'BUILDLOG_FIRST_STEP_SINCE',
+            'BUILDLOG_PLACEMENT_FILE', 'BUILDLOG_PLACEMENT_EPISODE',
             'BUILDLOG_PLACEMENT_SIDECAR',
             'BUILDLOG_PREPARED_COPY', 'UNIT_DETACHED_RUN')
     previous = {key: os.environ.get(key) for key in keys}
@@ -346,7 +351,7 @@ def admitted_run(command: Sequence[str], source: Path, *,
                 grant = GatePlacement(_placement_grant(gate_request), gate_request)
             else:
                 grant = _program_grant(command, source, owner, position, run)
-            admitted = FirstStepAdmission(position, grant, assignment_file)
+            admitted = FirstStepAdmission(position, grant, assignment_file, gate_program=gate)
             try:
                 if isinstance(grant, GatePlacement):
                     client.write_assignment(assignment_file, grant.grant)

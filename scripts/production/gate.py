@@ -454,6 +454,15 @@ class NoBuildHoldCheck:
     """Request admission while a build hold can be active."""
 
 
+@dataclass(frozen=True)
+class GateFirstStep:
+    since: float
+    run: admission_wire.RunIdentity
+
+
+ACTIVE_GATE_FIRST_STEP: ContextVar[GateFirstStep | None] = ContextVar("active_gate_first_step", default=None)
+
+
 @contextmanager
 def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait | NoBuildHoldCheck, *,
                      type_dirs: Sequence[str] = (),
@@ -464,7 +473,12 @@ def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait | NoBuildH
         program: str | Sequence[str] = (mode.value, "--type-dirs", *type_dirs) if type_dirs else mode.value
         before_check = (no_hold_wait if isinstance(hold, NoBuildHoldCheck)
                         else AdmissionHoldCheck(hold.wait_until_free, hold.admits))
-        with queue_place(program, repo, before_check=before_check) as place:
+        first = ACTIVE_GATE_FIRST_STEP.get()
+        queued = (queue_place(program, repo, before_check=before_check) if first is None else
+                  queue_place(program, repo, before_check=before_check, since=first.since, run=first.run))
+        with queued as place:
+            if first is not None:
+                _ = ACTIVE_GATE_FIRST_STEP.set(None)
             yield place
     except QueuePlaceRefused as error:
         raise GateRefused(str(error)) from error
@@ -1140,7 +1154,8 @@ def _gate_program_source() -> BinaryIO:
 
 
 # The placement belongs to this gate. A test child can run gate code, so it must not read the placement.
-_GATE_PLACEMENT_VARIABLES = ("BUILDLOG_PLACEMENT_FILE", "BUILDLOG_PLACEMENT_EPISODE", "BUILDLOG_PLACEMENT_SIDECAR")
+_GATE_PLACEMENT_VARIABLES = ("BUILDLOG_PLACEMENT_FILE", "BUILDLOG_PLACEMENT_EPISODE", "BUILDLOG_PLACEMENT_SIDECAR",
+                             "BUILDLOG_FIRST_STEP_SINCE")
 
 
 def _gate_job_environment(environment: Mapping[str, str], leases: tuple[int, ...]) -> dict[str, str]:
@@ -3163,13 +3178,8 @@ class GateAssignmentRefused(GateRefused):
     """The gate could not verify the placement supplied by the caller."""
 
 
-def gate_start_target(args: GateArguments, arguments: Sequence[str]) -> GateTarget:
-    """Check the assignment once, when the gate starts, before any merge, hold wait or run.
-
-    A mode that cannot route takes only a natedev assignment.
-    The caller keeps the reservation of a local grant through the handoff, so the queue reads the assignment as current.
-    After the check, the gate ends that reservation, because the gate takes its own reservation.
-    """
+def gate_start_target(args: GateArguments, arguments: Sequence[str]) -> tuple[GateTarget, GateFirstStep | None]:
+    """Check the assignment before any merge, hold wait or run."""
     placed = current_gate_placement(SuiteMode.TARGETED if args.affected else SuiteMode.GATE, args.gate_job)
     target = placement_target(placed)
     flag = gate_natedev_only_flag(arguments)
@@ -3177,13 +3187,32 @@ def gate_start_target(args: GateArguments, arguments: Sequence[str]) -> GateTarg
         raise GateAssignmentRefused(
             f"gate.py {flag} runs only on natedev and cannot take the {placed.assignment.destination.target} assignment")
     if isinstance(placed, admission_wire.LocalPlacementGranted):
+        assignment = placed.assignment
+        run = admission_client.parse_run_identity(os.environ.get("BUILDLOG_RUN", ""))
+        if isinstance(run, admission_wire.NoRun):
+            owner = assignment.owner
+            run = admission_wire.RunIdentity(owner.pid, owner.start_time)
         try:
             ended = release_place(placed.grant.reservation, 0, placed.grant.cleanup_timing)
         except (OverflowError, ValueError, OSError, admission_wire.AdmissionUnavailable) as error:
             raise GateAssignmentRefused(f"Cannot end the caller's local reservation: {error}") from error
         if isinstance(ended, admission_wire.Refused):
             raise GateAssignmentRefused(f"Cannot end the caller's local reservation: {ended.reason}")
-    return target
+        return target, GateFirstStep(assignment.since, run)
+    if isinstance(placed, NoGateAssignment) and (first_since := os.environ.get("BUILDLOG_FIRST_STEP_SINCE")):
+        try:
+            since = float(first_since)
+        except (OverflowError, ValueError) as error:
+            raise GateAssignmentRefused("Invalid first-step gate time") from error
+        run = admission_client.parse_run_identity(os.environ.get("BUILDLOG_RUN", ""))
+        if not math.isfinite(since) or since < 0:
+            raise GateAssignmentRefused("Invalid first-step gate time")
+        if (not isinstance(run, admission_wire.RunIdentity)
+                or build_hold.ProcessIdentity(run.pid, run.start_time)
+                not in build_hold.caller_processes(build_hold.PROC_ROOT, os.getpid())):
+            raise GateAssignmentRefused("The first-step gate run is not this process or a live ancestor")
+        return target, GateFirstStep(since, run)
+    return target, None
 
 
 def placement_target(
@@ -3627,10 +3656,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         if missing:
             parser.error(f"required: {', '.join('--' + name for name in missing)}")
     try:
-        target = gate_start_target(args, arguments)
+        target, first = gate_start_target(args, arguments)
     except GateRefused as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
+    token = ACTIVE_GATE_FIRST_STEP.set(first)
+    try:
+        return run_started_gate(args, target)
+    finally:
+        ACTIVE_GATE_FIRST_STEP.reset(token)
+
+
+def run_started_gate(args: GateArguments, target: GateTarget) -> int:
     if args.affected:
         with test_run_folder():
             return run_tests_only(args, SuiteMode.TARGETED, target)

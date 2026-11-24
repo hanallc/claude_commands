@@ -33,9 +33,8 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, Observe
 from scripts.buildlog import store
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
-from scripts.lint import memory_test_support
+from scripts.lint import memory_admit as gate, memory_test_support
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_pressure_reading
-from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -648,6 +647,96 @@ class PlacementTests(unittest.TestCase):
                 with PlacementFixture():
                     pass
             self.assertEqual(list(Path(outside).iterdir()), [])
+
+    def test_younger_run_cannot_start_between_gate_release_and_request(self) -> None:
+        with PlacementFixture() as fixture:
+            gib = records.GIB
+            caller = fixture.proc.spawn(used=0)
+            run = wire.RunIdentity(caller.pid, caller.start_time)
+            first = fixture.request(need=4 * gib, step="gate", owner=caller, run=run)
+            first_grant, = fixture.server.handle_request(first)
+            assert isinstance(first_grant, wire.Admitted), first_grant
+            fixture.allow_next_start()
+            fixture.free(0)
+            younger = fixture.request(need=2 * gib, step="gate")
+            self.assertIsInstance(fixture.server.handle_request(younger)[0], wire.Wait)
+
+            fixture.release(first_grant)
+            self.assertNotIn(first.episode, fixture.server.reservations)
+            fixture.free(20 * gib)
+            _ = fixture.run_pass()
+            self.assertIn(younger.episode, fixture.server.waiters)
+            self.assertNotIn(younger.episode, fixture.server.reservations)
+            fixture.restart()
+            wait, = fixture.server.handle_request(younger)
+            self.assertIsInstance(wait, wire.Wait)
+            self.assertNotIn(first_grant.reservation, fixture.server.slots)
+
+            child = fixture.proc.spawn(used=0)
+            write_process(fixture.proc.path, child.pid, parent=caller.pid, start=child.start_time)
+            request = fixture.request(need=6 * gib, step="gate", owner=child, since=first.since, run=run)
+            reply, = fixture.server.handle_request(request)
+            self.assertIsInstance(reply, wire.Admitted)
+            self.assertIn(request.episode, fixture.server.reservations)
+
+    def test_priority_run_can_start_before_the_gate_after_handoff(self) -> None:
+        with PlacementFixture() as fixture:
+            gib = records.GIB
+            caller = fixture.proc.spawn(used=0)
+            run = wire.RunIdentity(caller.pid, caller.start_time)
+            first = fixture.request(need=4 * gib, step="gate", owner=caller, run=run)
+            first_grant, = fixture.server.handle_request(first)
+            assert isinstance(first_grant, wire.Admitted), first_grant
+            fixture.allow_next_start()
+            fixture.free(0)
+            priority = fixture.request(need=5 * gib)
+            priority = replace(priority, identity=replace(priority.identity, unit="priority"))
+            self.assertIsInstance(fixture.server.handle_request(priority)[0], wire.Wait)
+            self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
+                "priority-gate-handoff", "priority", "fixture", "fixture")), [wire.Ok()])
+
+            fixture.release(first_grant)
+            fixture.free(7 * gib + memory_test_support.admission_policy_fixture().safety_bytes)
+            child = fixture.proc.spawn(used=0)
+            write_process(fixture.proc.path, child.pid, parent=caller.pid, start=child.start_time)
+            request = fixture.request(need=5 * gib, step="gate", owner=child, since=first.since, run=run)
+            self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            self.assertIn(priority.episode, fixture.server.reservations)
+            self.assertNotIn(first_grant.reservation, fixture.server.slots)
+
+    def test_gate_handoff_counts_its_new_repository_and_gpu_slots(self) -> None:
+        with PlacementFixture() as fixture:
+            config = fixture.root / "build_admission.conf"
+            _ = config.write_text(config.read_text() +
+                                  f"\nmax_runs.{fixture.server.host}.hana=1\nmax_runs.exempt_unit=natemerge\n")
+            caller = fixture.proc.spawn(used=0)
+            run = wire.RunIdentity(caller.pid, caller.start_time)
+            first = fixture.request(step="gate", owner=caller, run=run)
+            first = replace(first, profile=replace(first.profile, repo="hana"))
+            first_grant, = fixture.server.handle_request(first)
+            assert isinstance(first_grant, wire.Admitted), first_grant
+            fixture.release(first_grant)
+            fixture.allow_next_start()
+            child = fixture.proc.spawn(used=0)
+            write_process(fixture.proc.path, child.pid, parent=caller.pid, start=child.start_time)
+            gate_request = fixture.request(step="gate", owner=child, since=first.since, run=run)
+            gate_request = replace(gate_request, profile=replace(gate_request.profile, repo="hana"))
+
+            grant, = fixture.server.handle_request(gate_request)
+            assert isinstance(grant, wire.Admitted), grant
+            self.assertNotIn(first.episode, fixture.server.reservations)
+            _ = fixture.run_pass()
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, records.QueueInputs)
+            limits = records.RepositoryRunLimits({f"{fixture.server.host}.hana": 1})
+            self.assertEqual(gate.reserved_repository_runs(inputs, limits),
+                             {"hana": {records.run_owner(run.pid, run.start_time)}})
+
+            peer = fixture.request(step="gate")
+            peer = replace(peer, profile=replace(peer.profile, repo="hana"))
+            wait, = fixture.server.handle_request(peer)
+            assert isinstance(wait, wire.Wait), wait
+            self.assertEqual(wait.snapshot.decision.gpu, records.GpuSlotWait(1, 1))
 
     def test_gate_constraints_name_the_guest_and_natedev(self) -> None:
         from scripts.build_targets import build_targets

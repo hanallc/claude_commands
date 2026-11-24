@@ -21,10 +21,11 @@ from contextlib import redirect_stdout, redirect_stderr
 from unittest import mock
 from scripts.production import gate
 from scripts.lib import build_folders
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.gate_modules import GateRefused
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_protocol as wire, admission_service as service
-from scripts.build_queue import progress_profile as progress, step_estimator
-from scripts.build_queue.queue_fixture import fixture_reservation
+from scripts.build_queue import first_step, progress_profile as progress, step_estimator
+from scripts.build_queue.queue_fixture import fixture_reservation, write_process
 from scripts.build_queue.admission_test_support import only_admitted, FakeClock, wait_reply, snapshot_with_head_cause
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, write_config_fixture
@@ -236,6 +237,72 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         self.assert_gate_released()
         row, = self.gate_history()
         self.assertEqual(row["anon_peak_bytes"], 123 * 1024 * 1024)
+
+    @gate_suites("hooks")
+    def test_gate_handoff_waits_for_its_full_memory_need(self) -> None:
+        self.configure_gate("program_first_peak_gib.gate=0.5")
+        fixture = self.admission
+        busy = fixture.occupy_host()
+        gib = admission_records.GIB
+        used, grown_need = 3 * gib // 4, 61 * gib
+        command = ("gate.py", "--tests-only", "--module", "hooks/test_first.py")
+        waits: list[admission_records.AdmissionWaitSnapshot] = []
+        waiting = threading.Event()
+
+        def observe(snapshot: admission_records.AdmissionWaitSnapshot) -> None:
+            if snapshot.decision.state == "hold" and not waiting.is_set():
+                waits.append(snapshot)
+                waiting.set()
+
+        with (mock.patch.dict(os.environ, {**self.environment, "BUILDLOG_MEM_WAIT_LIMIT_S": "0"}),
+              first_step.admitted_run(command, self.checkout) as admitted):
+            first = admitted.grant
+            assert isinstance(first, wire.Admitted)
+            self.assertEqual(first.need, gib // 2)
+            with fixture.loop_turn():
+                record, = fixture.caller_reservations().values()
+                self.assertEqual(record.reservation_id, first.reservation)
+                recorded_owner = record.owner
+                write_process(fixture.proc.path, recorded_owner.pid, used, start=recorded_owner.start_time)
+            admitted.handoff(self.checkout)
+            with fixture.loop_turn():
+                self.configure_gate(f"program_first_peak_gib.gate={grown_need // gib}")
+                fixture.free(60 * gib - used)
+            with (self.observing_admission(observe),
+                  subprocess.Popen([*self.gate_command(), "--repo", str(self.checkout), *command[1:]],
+                    cwd=self.root, env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True) as process):
+                try:
+                    self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS), "the gate did not wait for memory")
+                    with fixture.loop_turn():
+                        snapshot, = waits
+                        self.assertTrue(snapshot.decision.reused_slot)
+                        self.assertEqual(snapshot.decision.room.need, grown_need - first.need)
+                        slot, = fixture.server.slots.values()
+                        self.assertEqual(memory_admit.between_steps(slot).bytes, first.need)
+                        reason = snapshot.head_reason
+                        assert isinstance(reason, admission_records.HeadAdmissionStatus), reason
+                        self.assertIsInstance(reason.cause, admission_records.NeedsMemory)
+                        self.assertEqual(self.module_events(), [])
+                        self.assertIsNone(process.poll())
+                        record, = fixture.server.reservations.values()
+                        self.assertEqual(record.reservation_id, busy.reservation)
+                        waiter, = fixture.server.waiters.values()
+                        self.assertEqual(waiter.request.since, admitted.queue_position.since)
+                        self.assertEqual(memory_admit.repository_run_owner(waiter.row),
+                                         admission_records.run_owner(recorded_owner.pid, recorded_owner.start_time))
+                        available = grown_need + snapshot.policy.safety_bytes + gib
+                        _ = fake_memory_readings(fixture.root, available_kib=available // 1024,
+                                                 total_kib=(available + used) // 1024)
+                        fixture.server.wake_loop()
+                    stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+            self.assert_all_modules_started()
+            fixture.release(busy)
+        self.assert_gate_released()
 
     def test_missing_and_legacy_profiles_keep_the_full_four_gib_first_need(self) -> None:
         history = self.admission_directory / "anon_peaks.jsonl"

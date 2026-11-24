@@ -50,14 +50,21 @@ from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 CHECKOUT = Path(__file__).resolve().parents[2]
 GATE_COMMAND = """from pathlib import Path
 import json, os, sys, time
+from unittest.mock import patch
 sys.path.insert(0, os.environ['SLOT_ORDER_CHECKOUT'])
-from scripts.build_queue.queue_place import queue_place
+from scripts.production import gate
 
-for phase in range(2):
-    with queue_place('gate', Path.cwd()):
-        print(json.dumps({'phase': phase, 'cwd': str(Path.cwd()), 'run': os.environ.get('BUILDLOG_RUN', ''), 'at': time.monotonic()}), flush=True)
-        if not sys.stdin.buffer.read(1):
-            break
+def run_steps(args, target):
+    repo = Path(args.repo)
+    for phase in range(2):
+        with gate.gate_reservation(repo, repo, gate.NoBuildHoldCheck()):
+            print(json.dumps({'phase': phase, 'cwd': str(repo), 'run': os.environ.get('BUILDLOG_RUN', ''), 'at': time.monotonic()}), flush=True)
+            if not sys.stdin.buffer.read(1):
+                break
+    return 0
+
+with patch.object(gate, 'run_started_gate', side_effect=run_steps):
+    raise SystemExit(gate.main())
 """
 
 # Use the real placement and copy APIs for callers that need no Cargo process.
@@ -528,6 +535,9 @@ placement_once
         self.assertGreaterEqual(len(memory_requests), 2)
         self.assertEqual({request.run for request in memory_requests},
             {wire.RunIdentity(process.pid, first["run"].split(":", 1)[1])})
+        prepared = memory_requests[0]
+        gate_step = next(request for request in memory_requests if request.episode != prepared.episode)
+        self.assertEqual(gate_step.since, prepared.since)
         release_times = [observed for request, observed in self.request_times if isinstance(request, wire.ReleaseRequest)]
         self.assertTrue(release_times)
         print(f"slot hand-off to the first step: {first['at'] - release_times[-1]:.3f} s")

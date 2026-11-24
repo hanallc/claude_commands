@@ -145,7 +145,7 @@ class FirstStepTests(unittest.TestCase):
                     guest = replace(mac_linux_candidate(), eligibility=guest_eligibility)
                     self.assertEqual(placed.request.constraints.candidates, (guest, local_candidate(fixture)))
 
-    def test_local_gate_keeps_its_reservation_and_assignment_through_the_handoff(self) -> None:
+    def test_local_gate_handoff_keeps_its_reservation_run_and_since(self) -> None:
         position = SlotQueuePosition("episode", 3)
         assignment = placement.PlacementAssignment(position.episode, "attempt",
             placement.PlacementDestination("local", "natedev", "fixture-host", claim_state.WHOLE_MAC),
@@ -155,7 +155,7 @@ class FirstStepTests(unittest.TestCase):
             records.HistoryPeakSizing(1, records.FirstProgramPeak(1), 0.0))
         request = wire.PlacementRequest(position.episode, assignment.owner, position.since, profile,
             placement.PlacementConstraints(assignment.source_key, ("gate.py",), "/fixture", "", assignment.session,
-                (placement.PlacementCandidate(assignment.destination),)))
+                (placement.PlacementCandidate(assignment.destination),)), run=wire.RunIdentity(1, "2"))
         grant = first_step.GatePlacement(wire.LocalPlacementGranted(assignment, PROGRAM_GRANT), request)
         admitted = first_step.FirstStepAdmission(position, grant, Path("/fixture/assignment.json"))
 
@@ -163,11 +163,13 @@ class FirstStepTests(unittest.TestCase):
               mock.patch.object(queue_place, "release_place", return_value=wire.Ok()) as release,
               mock.patch.object(client, "cancel_placement", return_value=wire.Ok()) as cancel):
             admitted.handoff(Path("/fixture"))
-            # The gate ends the reservation after it confirms the assignment.
+            # The gate checks the assignment before it ends the reservation.
             release.assert_not_called()
             cancel.assert_not_called()
             self.assertEqual(os.environ["BUILDLOG_PLACEMENT_FILE"], str(admitted.assignment_file))
             self.assertEqual(os.environ["BUILDLOG_PLACEMENT_EPISODE"], assignment.episode)
+            self.assertEqual(os.environ.get("BUILDLOG_FIRST_STEP_SINCE"), str(position.since))
+            self.assertEqual(os.environ.get("BUILDLOG_RUN"), "1:2")
             self.assertEqual(admitted.grant, grant)
             admitted.close()
             cancel.assert_called_once()
@@ -274,7 +276,9 @@ class FirstStepTests(unittest.TestCase):
                     self.assertFalse(admitted.assignment_file.exists())
                     admitted.handoff(fixture.root)
                     self.assertNotIn("BUILDLOG_PLACEMENT_FILE", os.environ)
+                    self.assertEqual(os.environ["BUILDLOG_FIRST_STEP_SINCE"], str(admitted.queue_position.since))
                 release.assert_called_once_with(PROGRAM_GRANT.reservation, 0, PROGRAM_GRANT.cleanup_timing)
+                self.assertNotIn("BUILDLOG_FIRST_STEP_SINCE", os.environ)
                 placement_grant.assert_not_called()
 
     def test_close_after_verify_cancels_the_completed_remote_placement(self) -> None:

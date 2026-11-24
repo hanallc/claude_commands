@@ -804,6 +804,7 @@ class ServiceState:
     pending_cloud_groups: dict[str, PendingCloudGroup] = field(default_factory=dict)
     queue_pins: QueuePins = ()
     verify_run_slots: dict[str, VerifyRunSlot] = field(default_factory=dict, kw_only=True)
+    gate_handoffs: dict[str, records.Waiter] = field(default_factory=dict, kw_only=True)
 
 
 def saved_verify_run_slots(state: ServiceState) -> dict[str, VerifyRunSlot]:
@@ -1764,6 +1765,7 @@ class AdmissionServer:
         self.lifecycle_outbox: tuple[PendingAdmission | PendingLeft, ...] = ()
         self.places: dict[str, WaiterPlace] = {}
         self.run_places: dict[str, wire.RunPlace] = {}
+        self.gate_handoffs: dict[str, records.Waiter] = {}
         self.build_history_generation: int = 0
         self.ledger: ReplayLedger = ReplayLedger({})
         self.placement_requests: dict[str, wire.PlacementRequest] = {}
@@ -1907,6 +1909,7 @@ class AdmissionServer:
             self.spacing, self.priority = state.spacing, state.priority
             self.build_history_generation = state.build_history_generation
             self.run_places = state.run_places
+            self.gate_handoffs = state.gate_handoffs
             self.verify_run_slots = saved_verify_run_slots(state)
             self.lifecycle_outbox = state.lifecycle_outbox
             self.caller_versions = state.caller_versions
@@ -1997,7 +2000,7 @@ class AdmissionServer:
         state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.priority,
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
             self.placement_requests, self.assignments, self.current_assignments, self.pending_cloud_groups,
-            queue_pins=self.queue_pins, verify_run_slots=self.verify_run_slots)
+            queue_pins=self.queue_pins, verify_run_slots=self.verify_run_slots, gate_handoffs=self.gate_handoffs)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         changed = False
 
@@ -2280,6 +2283,10 @@ class AdmissionServer:
                 self._watch_owner(owner)
             else:
                 del self.run_places[key]
+        for key, row in tuple(self.gate_handoffs.items()):
+            owner = wire.Owner(row["pid"], row["start_time"])
+            if not self._live(owner):
+                del self.gate_handoffs[key]
 
     def _free_claim(self, owner: str) -> None:
         for key, slot in list(self.slots.items()):
@@ -2942,7 +2949,7 @@ class AdmissionServer:
         # The placement pass rebuilds the local order from the queue order, so remove held waiters again.
         inputs = without_owners(self._placement_pass(inputs, captured.queue_order, policy, remote_start_hold_seconds),
                                 held_owners)
-        result = gate.admission_pass(inputs, inputs.now, policy)
+        result = gate.admission_pass(inputs, inputs.now, policy, gate_head=self._gate_head())
         for reservation in result.policy.returned_claims:
             del self.slots[reservation]
         self._check_reading_alert(inputs, result, config)
@@ -3572,9 +3579,34 @@ class AdmissionServer:
         for waiting, reply in zip(waiters, replies, strict=True):
             self._remove_waiter(waiting, reply)
 
+    def _gate_head(self) -> records.RankedWaiter | None:
+        """Find the first gate that has yet to send its admission request."""
+        rows = [(self.state_dir / key, gate.rank_waiter(row, records.NormalOrder()))
+                for key, row in self.gate_handoffs.items()]
+        if isinstance(self.priority, records.QueuePriority):
+            rows = self._rank_priority_waiters(rows, self.priority)
+        else:
+            rows = gate.sort_waiters(rows)
+        return rows[0][1] if rows else None
+
     def _end(self, episode: str, ending: ReservationEnding) -> None:
         record = self.reservations[episode]
         started = isinstance(ending, ReleaseStatus)
+        placement_request = self.placement_requests.get(episode)
+        # Gate preparation uses a placement or has no scope sidecar.
+        # Save its place before the release becomes visible to later passes.
+        gate_handoff = (
+            isinstance(ending, ReleaseStatus) and ending.status == 0
+            and isinstance(record.place, wire.LocalPlace)
+            and record.run == wire.RunIdentity(record.owner.pid, record.owner.start_time)
+            and record.step in ("gate", "test-affected")
+            and not (isinstance(record.gate_job, StepJob) and record.gate_job.step == "promote")
+            and (not record.sidecar or (
+                placement_request is not None and placement_request.constraints.command_kind == "final"))
+        )
+        if gate_handoff:
+            key = records.run_owner(record.owner.pid, record.owner.start_time)
+            self.gate_handoffs[key] = record.queue_waiter
         if not started and "verify" in record.queue_waiter and record.sidecar:
             try:
                 started = bool(Path(record.sidecar).read_text().strip())
@@ -4744,7 +4776,8 @@ done
                 _ = row.pop("token_left_at", None)
                 _ = row.pop("token_back_at", None)
             preview_ordered.append((path, row))
-        preview = gate.admission_pass(replace(inputs, ordered=preview_ordered), inputs.now, policy)
+        preview = gate.admission_pass(replace(inputs, ordered=preview_ordered), inputs.now, policy,
+                                      gate_head=self._gate_head())
         local_starts = {row.owner for row in preview.rows if isinstance(row.admission, gate.ProposedAdmission)}
         copies = tuple(request for request in owners.values() if isinstance(request.purpose, placement.SpeculativeCopy))
         held_copy_destinations = [saved.assignment.destination
@@ -5465,7 +5498,8 @@ done
                 ordered = self._queue_order()
                 if isinstance(self.last_policy, records.AdmissionPolicy):
                     self.last_inputs = self._refresh_pass_slots(self.last_inputs, ordered)
-                    self.last_result = gate.admission_pass(self.last_inputs, self.last_inputs.now, self.last_policy)
+                    self.last_result = gate.admission_pass(self.last_inputs, self.last_inputs.now, self.last_policy,
+                                                           gate_head=self._gate_head())
                 self.pass_stale = False
                 self._publish_replies(ordered)
             if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
@@ -5518,6 +5552,12 @@ done
             self.waiters[key] = WaitingAdmission(request, row, connection, continuation_claim=claim)
             self._save_place(request, row)
             self._watch_owner(request.owner)
+            if (isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.LocalPlace)
+                    and isinstance(run := request.run, wire.RunIdentity)):
+                run_key = records.run_owner(run.pid, run.start_time)
+                handoff = self.gate_handoffs.get(run_key)
+                if handoff is not None and request.since == handoff["since"] and request.profile.step == handoff.get("step"):
+                    del self.gate_handoffs[run_key]
             if (isinstance(request, wire.AdmitRequest) and request.token_back_at
                     and not isinstance(place.token_left_at, TokenNotLeft)):
                 gate.append_queue_time(self.state_dir, {"kind": "token_gap", "episode": key,

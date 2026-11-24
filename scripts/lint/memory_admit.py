@@ -2057,7 +2057,8 @@ def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | Re
     return memory_room(inputs.host, run_memories(inputs), policy, ci_use=ci_use)
 
 
-def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt) -> HeadPolicy:
+def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt,
+                gate_head: RankedWaiter | None = None) -> HeadPolicy:
     ordered = ranked_queue_waiters(inputs)
     candidate = first_queued_waiter((row for _, row in ordered), inputs.pending_remote_starts)
     queued_head: QueuedHead | NoQueuedHead = QueuedHead(candidate.waiter) if isinstance(candidate, QueuedWaiter) else NoQueuedHead()
@@ -2066,7 +2067,7 @@ def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_s
     while True:
         room = inputs_room(inputs, policy)
         kept, used = (room.kept, room.used) if isinstance(room, MemoryRoom) else (0, 0)
-        admissions = admission_walk(inputs, ordered, room, now, policy, kept, used, safety, next_start)
+        admissions = admission_walk(inputs, ordered, room, now, policy, kept, used, safety, next_start, gate_head)
         if not inputs.slots:
             break
         held_owners = {records.waiter_owner(entry.waiter) for entry in admissions
@@ -2132,7 +2133,7 @@ def can_use_natedev(row: Waiter) -> bool:
 def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]],
                    room: MemoryRoom | ReadingUnavailable,
                    now: float, policy: AdmissionPolicy, kept: int, used: int, safety: int,
-                   next_start: NextStartAt) -> list[WaiterAdmission]:
+                   next_start: NextStartAt, gate_head: RankedWaiter | None = None) -> list[WaiterAdmission]:
     """Admit local steps in order and name the first local step that waits."""
     if isinstance(room, MemoryRoom):
         remaining, readable = room.signed_room, True
@@ -2165,7 +2166,10 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     first_held_other_than_gpu: RankedWaiter | NoWaiter = NoWaiter()
     positions = ({records.waiter_owner(row): position for position, (_, row) in enumerate(ordered)}
                  if limits.by_machine_and_repository else {})
+    gate_order = waiter_order(gate_head) if gate_head is not None else None
     for _, row in ordered:
+        behind_gate = gate_order is not None and gate_order < waiter_order(row)
+        memory_head_seen |= behind_gate
         owner = records.waiter_owner(row)
         claim = claims.get(owner)
         held = claim.slot.bytes if claim is not None else 0
@@ -2226,6 +2230,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         may_pass = (ZERO_NEED_MAY_PASS and need == 0) or (CONTINUATION_MAY_PASS and within)
         if local and not may_pass and not isinstance(ahead, NoWaiter):
             order_hold = HeldBehindHead(records.stored_waiter(ahead))
+        elif local and behind_gate and gate_head is not None:
+            order_hold = HeldBehindHead(records.stored_waiter(gate_head))
         elif local and not isinstance(first_folder_wait, NoWaiter):
             order_hold = HeldBehindHead(first_folder_wait)
         elif ready and not isinstance(earlier, NoWaiter):
@@ -2306,9 +2312,10 @@ def admission_wait_holder(decision: AdmissionDecision, reason: WaitReason,
     return wait_holder_identity(session_id, session_name, unit)
 
 
-def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> PassResult:
+def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy, *,
+                   gate_head: RankedWaiter | None = None) -> PassResult:
     next_start = start_spacing_after(now, policy)
-    resolved = head_policy(inputs, now, policy, next_start)
+    resolved = head_policy(inputs, now, policy, next_start, gate_head)
     candidate = resolved.queued_head
     head_owner = records.waiter_owner(candidate.waiter) if isinstance(candidate, QueuedHead) else ""
     available = inputs.host.available if isinstance(inputs.host, HostMemory) else 0
@@ -2369,7 +2376,8 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
         blocker: BlockingIndex | NoSingleBlocker | BlockerNotRequested = BlockerNotRequested()
         if owner in inputs.blockers_for and decision.state == "hold" and isinstance(entry.state, QueuedWaiter):
             if not endings:
-                endings = tuple(admission_pass(inputs_after_steps_end(inputs, frozenset((ended,)), policy), now, policy)
+                endings = tuple(admission_pass(inputs_after_steps_end(inputs, frozenset((ended,)), policy),
+                                               now, policy, gate_head=gate_head)
                                 for ended in range(len(inputs.running)))
             blocker = blocking_index(owner, endings)
         rows.append(PassRow(owner, decision, reason, blocker, proposal,
