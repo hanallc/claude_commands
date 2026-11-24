@@ -34,37 +34,56 @@ class SelectedStep:
     place: int
 
 
-def select_step(directory: Path, selector: str) -> SelectedStep | admission_records.NoWaiter:
-    if not selector.isdecimal():
-        try:
-            published = queue_snapshot.read_view_snapshot(directory)
-        except admission_protocol.AdmissionUnavailable:
-            pass
-        else:
-            rows = published.reading.ordered
-            labels = unit_labels.unit_labels_for([row.get("session_id", "") for _, row in rows], os.environ)
-            for place, (_, row) in enumerate(rows, 1):
-                session = row.get("session_id", "")
-                label = labels.get(session)
-                if selector == session or (label is not None and selector == label.session):
-                    return SelectedStep(row, place)
-    snapshot = queue_snapshot.read_queue_snapshot(directory)
-    if isinstance(snapshot, queue_snapshot.NoQueueSnapshot):
-        raise admission_protocol.AdmissionUnavailable("no published queue order")
-    rows = memory_admit.ranked_queue_waiters(snapshot.inputs)
+def waiting_positions(reading: admission_records.QueueRead) -> dict[int, admission_records.WaitingStep]:
+    """Use the same place numbers as the Builds page."""
+    kept = {place.position for place in reading.numbered_held_places(memory_admit.waiter_order)}
+    waiting = iter(reading.view.waiting)
+    return {position: next(waiting) for position in range(1, len(reading.view.waiting) + len(kept) + 1)
+            if position not in kept}
+
+
+def select_step(directory: Path, selector: str) -> SelectedStep | admission_records.HeldPlace | admission_records.NoWaiter:
+    try:
+        reading = queue_snapshot.read_view_snapshot(directory).reading
+    except admission_protocol.AdmissionUnavailable:
+        snapshot = queue_snapshot.read_queue_snapshot(directory)
+        if isinstance(snapshot, queue_snapshot.NoQueueSnapshot):
+            raise admission_protocol.AdmissionUnavailable("no published queue order") from None
+        rows = memory_admit.ranked_queue_waiters(snapshot.inputs)
+        kept = {}
+        positions = {place: SelectedStep(row, place) for place, (_, row) in enumerate(rows, 1)}
+    else:
+        rows = reading.ordered
+        kept = {place.position: place for place in reading.numbered_held_places(memory_admit.waiter_order)}
+        ranked = {(row["pid"], row["since"]): row for _, row in rows}
+        positions = {place: SelectedStep(row, place) for place, step in waiting_positions(reading).items()
+                     if (row := ranked.get((step.pid, step.since))) is not None}
     if selector.isdecimal():
         position = int(selector)
-        return SelectedStep(rows[position - 1][1], position) if 1 <= position <= len(rows) else admission_records.NoWaiter()
-    for place, (_, row) in enumerate(rows, 1):
-        folder = row.get("folder", "")
+        if position in kept:
+            return kept[position]
+        return positions.get(position, admission_records.NoWaiter())
+    labels = unit_labels.unit_labels_for([row.get("session_id", "") for _, row in rows], os.environ)
+    for selected in positions.values():
+        session = selected.row.get("session_id", "")
+        label = labels.get(session)
+        if selector == session or (label is not None and selector == label.session):
+            return selected
+    for selected in positions.values():
+        folder = selected.row.get("folder", "")
         if selector in (folder, Path(folder).name):
-            return SelectedStep(row, place)
+            return selected
+        if selector == selected.row.get("session_name"):
+            return selected
     return admission_records.NoWaiter()
 
 
 def bump(selector: str, actor: str) -> int:
     directory = store.root() / "admission"
     selected = select_step(directory, selector)
+    if isinstance(selected, admission_records.HeldPlace):
+        print(f"build queue: place #{selected.position} is kept for {selected.unit}")
+        return 3
     if isinstance(selected, admission_records.NoWaiter):
         print(f"build queue: no waiting step matches {selector}")
         return 3
@@ -73,7 +92,7 @@ def bump(selector: str, actor: str) -> int:
     unit = row.get("unit", "")
     if not unit and session:
         unit = memory_admit.queue_unit(unit, session, memory_admit.priority_labels([session]))
-    if not unit or unit == unit_labels.OWNER_NOT_RECORDED:
+    if not unit or unit in (unit_labels.OWNER_NOT_RECORDED, "—"):
         print(f"build queue: waiting step {selector} has no unit")
         return 3
     step_key = row.get("move_id", "")

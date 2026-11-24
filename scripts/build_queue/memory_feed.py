@@ -1044,6 +1044,7 @@ class MemoryWaitRow(WaitRow):
     """A step that holds a place in the memory queue."""
 
     place: int
+    order_since: float
     move: NotRequired[admission_records.QueueMoveMember]
     order_note: NotRequired[str]
     job_start: NotRequired[str]
@@ -1054,6 +1055,35 @@ class MacStarter(TypedDict):
 
     name: str
     step: str
+
+
+class HeldPlaceRow(TypedDict):
+    """The place of a failed run (rule 20). It waits for the next run of its unit."""
+
+    kind: Literal["held"]
+    key: str
+    unit: UnitCell
+    since: float
+    position: int
+    targets: tuple[str, ...]
+    failed_run: str
+    failed_step: str
+    failed_at: str
+    kept_until: str
+    ended: admission_records.HeldPlaceEnd
+    match_rule: str
+
+
+def held_place_row(place: admission_records.HeldPlace, zone: tzinfo) -> HeldPlaceRow:
+    """Show the kept place and its times in the user's zone."""
+    unit = public_queue_text(place.unit)
+    match_rule = ("same repository and test family" if admission_records.place_kind(place.job) == "test"
+                  else "same repository and job")
+    return {"kind": "held", "key": place.failed_run, "unit": StaffUnitName(unit) if unit else "", "since": place.since,
+            "position": place.position, "targets": place.machines, "failed_run": place.failed_run,
+            "failed_step": public_queue_text(place.failed_step), "ended": place.ended, "match_rule": match_rule,
+            "failed_at": targets.clock(datetime.fromtimestamp(place.failed_at, UTC), zone),
+            "kept_until": targets.clock(datetime.fromtimestamp(place.ends_at, UTC), zone)}
 
 
 class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow):
@@ -1209,7 +1239,10 @@ class MemoryPage(TypedDict):
     swap: SwapTotals
     walk: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow]
     waiters: list[WaitRow | CloudWaitRow]
+    # Held places show among the waiters in arrival order; the page places them by since.
+    held_places: list[HeldPlaceRow]
     move_revision: NotRequired[str]
+    move_line: NotRequired[admission_records.QueueMoveLine]
     swap_by: list[SwapRow]
     priority_text: str
     queued_priority_units: list[str]
@@ -3175,6 +3208,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         for pid, held in counts.items():
             token_rows[pid]["tokens"] = held
     waiters: dict[int, MemoryWaitRow] = {}
+    held_places = parsed.numbered_held_places(gate.waiter_order)
+    kept_positions = {place.position for place in held_places}
+    waiting_position = 0
     checks = {row.waiter.pid: row.room for row in explanation.line.steps}
     order_holds = {row.waiter.pid: row.decision.order_hold for row in explanation.line.steps}
     if isinstance(explanation.head, admission_records.HeadExplanation):
@@ -3186,7 +3222,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                     if isinstance(move_line, admission_records.QueueMoveLine) else {})
     matched_move_ids: set[str] = set()
     positions = {waiter.pid: place for place, waiter in enumerate(waiting, 1)}
-    for place, waiter in enumerate(waiting, 1):
+    for place, (waiter, order_since) in enumerate(parsed.waiting_with_order_times(), 1):
         check = checks.get(waiter.pid)
         need = check.need if check is not None else waiter.need
         ci_label = recorded_ci_label(waiter, ci_runners)
@@ -3226,6 +3262,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                     move = moves_by_waiter.get((ordered_waiter["pid"], ordered_waiter["start_time"], waiter.since))
         if member is not None:
             matched_move_ids.add(member.row_id)
+        waiting_position += 1
+        while waiting_position in kept_positions:
+            waiting_position += 1
         if isinstance(named, NoNamedStep):
             continue
         notes: TargetNotes = {"runs_on": target_text, "targets": list(targets), "mac_text": ""} if targets else (
@@ -3235,10 +3274,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
                         **owner.fields(ci_label=ci_label),
                         "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": "" if ci_label else identity.unit,
-                        "need": gib(need), "since": waiter.since,
+                        "need": gib(need), "since": waiter.since, "order_since": order_since,
                         "reason": reason,
                         "fits": not targets and not isinstance(cause, admission_records.NatedevHeld)
-                                and need <= captured.signed_room, "place": place,
+                                and need <= captured.signed_room, "place": waiting_position,
                         "free": gib(max(0, check.room)) if check is not None else
                                 gib(waiter.reason.free) if isinstance(waiter.reason, admission_records.NeedsMemory) else gib(ram["room_bytes"]),
                         "why": "target" if targets and not isinstance(cause, admission_records.NatedevHeld)
@@ -3252,6 +3291,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                                     ci=bool(ci_label))}
         if waiter.speculative_copy:
             waiters[place]["order_note"] = "Newest eligible copy starts first"
+        elif waiter.took_place:
+            waiters[place]["order_note"] = f"Took the place of its {waiter.took_place} run."
         if isinstance(waiter.ci_job_start, admission_records.JobStart):
             waiters[place]["job_start"] = job_start_text(waiter.ci_job_start, explanation.now, zone)
         if member is not None:
@@ -3418,6 +3459,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                  "outside_bytes": swap.used - swap.builds_ci,
                  "reserve_share_percent": explanation.policy.agent_swap_share_percent},
         "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
+        "held_places": [held_place_row(place, zone) for place in held_places],
         "priority_text": head_facts.priority_text(explanation.priority),
         "queued_priority_units": queued_priority_units,
         "bump_notices": bump_notices(admission, zone, bump_progress),
@@ -3442,8 +3484,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     shown_move_ids = {row["move"].row_id for row in waiting_rows if "move" in row}
     if (any(move_members[row_id].movable for row_id in shown_move_ids)
             and matched_move_ids == move_members.keys()
-            and isinstance(move_line, admission_records.QueueMoveLine)):
+            and isinstance(move_line, admission_records.QueueMoveLine)
+            and move_line.kept_runs == tuple(place.failed_run for place in held_places)):
         page["move_revision"] = move_line.revision
+        page["move_line"] = move_line
     page["render_seconds"] = time.perf_counter() - started
     return page
 

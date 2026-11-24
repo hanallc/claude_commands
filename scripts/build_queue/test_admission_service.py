@@ -75,6 +75,88 @@ def setUpModule() -> None:
 
 
 class PlacementStatusTests(unittest.TestCase):
+    def test_kept_place_restores_its_failed_step_and_reads_an_old_record(self) -> None:
+        from scripts.build_queue.test_place_take import place_rules, run_steps
+
+        with AdmissionFixture(private=True) as fixture:
+            place_rules(fixture)
+            run = fixture.run_owner()
+            _ = run_steps(fixture, run, ("check", 0), ("lint", 1))
+            fixture.end_run(run)
+            _ = fixture.run_pass()
+            kept, = service.read_state(fixture.state_dir).held_places
+            self.assertEqual(kept.failed_step, "lint")
+            fixture.restart()
+            self.assertEqual(fixture.server.held_places, (kept,))
+
+            path = fixture.state_dir / "state.json"
+            saved = cast(dict[str, object], json.loads(path.read_text()))
+            saved_place, = cast(list[dict[str, object]], saved["held_places"])
+            self.assertEqual(saved_place["failed_step"], "lint")
+            saved_place["failed_step"] = "test"
+            _ = path.write_text(json.dumps(saved))
+            fixture.restart()
+            self.assertEqual(fixture.server.held_places, (replace(kept, failed_step="test"),))
+
+            del saved_place["failed_step"]
+            _ = path.write_text(json.dumps(saved))
+            fixture.restart()
+            self.assertEqual(fixture.server.held_places, (replace(kept, failed_step=""),))
+
+    def test_published_view_places_a_kept_place_between_two_waiting_steps(self) -> None:
+        from scripts.build_queue.test_place_take import place_rules, unit_request, wait_in_line
+
+        with AdmissionFixture(private=True) as fixture:
+            place_rules(fixture)
+            now = fixture.clock.now()
+            later = unit_request(fixture, fixture.run_owner(), unit="research", since=now - 10)
+            earlier = unit_request(fixture, fixture.run_owner(), unit="phases", since=now - 30)
+            wait_in_line(fixture, earlier)
+            wait_in_line(fixture, later)
+            fixture.server.held_places = (records.HeldPlace("queue", "fixture", "lint", now - 20,
+                now, now + 100, "4242-99", ("natedev",), 1, "failed"),)
+            _ = fixture.run_pass()
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            self.assertEqual([step.unit for step in reply.reading.view.waiting], ["phases", "research"])
+            kept, = reply.reading.held_places
+            self.assertEqual(kept.position, 2)
+            self.assertEqual(queue_snapshot.read_view_snapshot(fixture.state_dir).reading.held_places, (kept,))
+
+    def test_a_newer_priority_waiter_precedes_a_kept_place(self) -> None:
+        from scripts.build_queue.test_place_take import unit_request, wait_in_line
+
+        with AdmissionFixture(private=True) as fixture:
+            now = fixture.clock.now()
+            earlier = unit_request(fixture, fixture.run_owner(), unit="earlier", since=now - 30)
+            newer = unit_request(fixture, fixture.run_owner(), unit="newer", since=now - 10)
+            wait_in_line(fixture, earlier)
+            wait_in_line(fixture, newer)
+            fixture.server.held_places = (records.HeldPlace("queue", "fixture", "lint", now - 20,
+                now, now + 100, "4242-99", ("natedev",), 1, "failed"),)
+            fixture.server.priority = records.QueuePriority(({
+                "unit": "newer", "why": "fixture", "set_at": now, "set_by": "director"},))
+            _ = fixture.run_pass()
+            reading = queue_snapshot.read_view_snapshot(fixture.state_dir).reading
+            self.assertEqual([step.unit for step in reading.view.waiting], ["newer", "earlier"])
+            kept, = reading.held_places
+            self.assertEqual(kept.position, 3)
+            line = reading.view.move_line
+            assert isinstance(line, records.QueueMoveLine)
+            self.assertEqual(line.kept_runs, (kept.failed_run,))
+            self.assertEqual([member.kept_before for member in line.members], [0, 0])
+
+            fixture.server.priority = records.QueuePriority(({
+                "unit": "queue", "why": "fixture", "set_at": now, "set_by": "director"},))
+            _ = fixture.run_pass()
+            reading = queue_snapshot.read_view_snapshot(fixture.state_dir).reading
+            self.assertEqual([step.unit for step in reading.view.waiting], ["earlier", "newer"])
+            kept, = reading.held_places
+            self.assertEqual(kept.position, 1)
+            line = reading.view.move_line
+            assert isinstance(line, records.QueueMoveLine)
+            self.assertEqual([member.kept_before for member in line.members], [1, 1])
+
     def assert_unchanged_placement_poll(self, fixture: AdmissionFixture, request: wire.PlacementRequest | str,
                                         initial: wire.PlacementWait) -> None:
         with mock.patch.object(fixture.server, "run_pass", wraps=fixture.server.run_pass) as passed, \
@@ -5478,6 +5560,25 @@ class QueueLifecycleTests(unittest.TestCase):
                                  [grant.reservation, later.reservation])
                 self.assertEqual(len(lifetime.token_gaps), 1)
                 self.assertIsInstance(lifetime.end, gate.StepStillOpen)
+
+    def test_a_handoff_saved_before_a_crash_ends_as_a_handoff_after_the_restart(self) -> None:
+        for boundary in ("after_state_write", "after_finalization_intent"):
+            with self.subTest(boundary=boundary), AdmissionFixture() as fixture:
+                request = fixture.request()
+                request = replace(request, sidecar=str(fixture.scope(request.owner)))
+                grant = only_admitted(fixture.server.handle_request(request))
+                fixture.scoped_peak(grant)
+                fixture.clock.advance(2)
+                handoff = wire.ReleaseRequest("handoff-crash", grant.reservation, 0, "handed_off")
+                fixture.fault.stage = boundary
+                with self.assertRaises(InjectedCrash):
+                    _ = fixture.server.handle_request(handoff)
+                fixture.restart()
+                self.assertEqual(fixture.server.handle_request(handoff), [wire.Ok()])
+                ended, = self.events(fixture, "ended")
+                self.assertEqual((ended["reservation_id"], ended["outcome"], ended["end_kind"]),
+                                 (grant.reservation, "handed_off", {"kind": "HandOff"}))
+                self.assertFalse(fixture.history())
 
     def test_an_end_append_retry_preserves_the_saved_time_and_publishes_once(self) -> None:
         for sampled in (False, True):
