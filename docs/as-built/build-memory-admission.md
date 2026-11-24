@@ -673,13 +673,15 @@ A missing or unreadable view file gives the queue read error.
 The service saves a `HeldPlace` when a failed run qualifies to keep its place.
 The record keeps the failed step, the run identity, its targets, and the expiry time.
 An older record can omit the failed step.
-The view compares the kept arrival time with the times the queue uses to rank the waiting steps.
-The Builds page recalculates the place numbers when the user moves a waiting step.
+The view uses the queue rank, including priority, to place each kept row in the waiting order.
+The service supplies the full waiting order for moves, including waiters without a display name.
+The Builds page uses that order to number the preview and the confirmed move.
 The Builds page shows the unit in its role color in the row label.
 The Machine cell uses the same dim target icons as a waiting row.
 The deadline uses the user's time zone.
 The row has no reorder control or memory bar.
 The hover shows the failed run, step, failure time, and deadline.
+The hover shows the match rule for the saved job.
 `build_queue.py` uses the same place numbers and reports a kept place when the user selects it.
 
 The snapshot contains the pass readings, its policy, and the remaining waiters.

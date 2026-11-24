@@ -1071,12 +1071,13 @@ function tooltipRows(key, data) {
     const row = data.held_places?.find(place => place.key === index);
     if (!row) return [];
     const unit = ownerText(row.unit);
+    const match = row.match_rule ? ` (${row.match_rule})` : "";
     return [field('Kept place', `place ${row.position}`, 'title'),
       field('', `Kept for the next run of unit ${unit}`, 'caption'),
       field('Unit', unit, 'field', true), field('Failed run', row.failed_run),
       field('Failed step', row.failed_step || '—'), field(row.ended === 'no_result' ? 'Ended at' : 'Failed at', row.failed_at),
       field('Kept until', row.kept_until),
-      field('', `If the next run of unit ${unit} (same repository and test family) arrives before ${row.kept_until}, ` +
+      field('', `If the next run of unit ${unit}${match} arrives before ${row.kept_until}, ` +
         `it starts from place ${row.position}. Runs behind place ${row.position} do not wait for it.`, 'long')];
   }
   if (kind === 'swap' && index !== undefined) return swapTip(data.swap_by[+index]);
@@ -1730,14 +1731,7 @@ function queueReading(d) {
     return d;
   }
   if (queueReply.conflict) return {...d, queueReady:false};
-  const rows = new Map(d.waiters.filter(row => row.move).map(row => [row.move.row_id, row]));
-  const shown = queueReply.line.members.filter(member => rows.has(member.row_id));
-  if (shown.length !== rows.size) return {...d, queueReady:false};
-  const shownIds = new Set(shown.map(member => member.row_id));
-  const ordered = shown.map(member => ({...rows.get(member.row_id), move:member}));
-  let index = 0;
-  return queueWithOrder({...d, move_revision:queueReply.line.revision},
-    d.waiters.map(row => shownIds.has(row.move?.row_id) ? ordered[index++] : row));
+  return queueWithOrder(d, queueReply.line);
 }
 
 function showQueue(d) {
@@ -1764,7 +1758,7 @@ function showWalk(d) {
 function beginQueueDrag(id, pointer) {
   if (!latest || queueSending || !queueAccess?.token) return false;
   const reading = queueReading(latest);
-  if (!reading.move_revision || reading.queueReady === false) return false;
+  if (!reading.move_line || reading.queueReady === false) return false;
   const row = reading.waiters.find(item => item.move?.row_id === id);
   if (!row || row.move.movable === false) return false;
   queueDrag = {reading, rows:reading.waiters, row, pointer, destination:null};
@@ -1784,7 +1778,15 @@ function previewQueueMove(neighbor) {
   drag.rows = drag.rows.map(row => row.move ? rows[index++] : row);
   drag.destination = to === 0 ? {kind:"QueueHeadDrop"}
     : {kind:"QueueDrop", neighbor:neighbor.move.row_id, side:to < from ? "before" : "after"};
-  const preview = queueWithOrder(drag.reading, drag.rows);
+  const line = drag.reading.move_line;
+  const members = [...line.members];
+  const moving = members.findIndex(member => member.row_id === drag.row.move.row_id);
+  const [member] = members.splice(moving, 1);
+  const drop = drag.destination;
+  const destination = drop.kind === "QueueHeadDrop" ? 0
+    : members.findIndex(item => item.row_id === drop.neighbor) + Number(drop.side === "after");
+  members.splice(destination, 0, member);
+  const preview = queueWithOrder(drag.reading, {...line, members});
   const place = queuePlace(preview, drag.row.move.row_id, preview.move_revision);
   queueMessage(drag.pointer === null ? `Place ${place}` : "");
   showWalk(preview);
@@ -1810,8 +1812,7 @@ function queueRequestId() {
 
 function queuePlace(reading, id, revision) {
   if (reading.queueReady === false || reading.move_revision !== revision) return 0;
-  return queueRows(reading.waiters, reading.held_places || []).filter(row => row.kind !== "cloud")
-    .findIndex(row => row.move?.row_id === id) + 1;
+  return reading.waiters.find(row => row.move?.row_id === id)?.place ?? 0;
 }
 
 async function sendQueueMove(row, reading, request, id = queueRequestId()) {
@@ -1990,7 +1991,8 @@ function renderWalk(d) {
       rows.push(`<div class="wrow ${rowClass}" data-tip="${tip}">${rowLabel(labels)}</div>`);
       return;
     }
-    const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
+    if (w.kind !== "cloud") localPosition = w.place ?? localPosition + 1;
+    const place = w.kind === "cloud" ? "cloud" : String(localPosition);
     const tip = `wait:${w.key}`;
     const state = w.move && (w.move.row_id === lifted ? " queue-lift"
       : w.move.row_id === highlighted ? " queue-highlight" : "") || "";
@@ -2027,25 +2029,27 @@ function renderWalk(d) {
   $("walk-tokens").innerHTML = tokenPoolRows(d.tokens).map(row => `<dt>${esc(row.label)}</dt><dd>${esc(row.value)}</dd>`).join('');
 }
 
-function queueWithOrder(reading, waiters) {
-  if (!reading.held_places?.length) return {...reading, waiters};
-  const numbered = [...waiters];
-  let next = 0, position = 1;
-  const advance = () => {
-    const row = waiters[next];
-    if (row.kind !== "cloud") numbered[next] = {...row, place:position++};
-    next++;
+function queueWithOrder(reading, line) {
+  const kept = reading.held_places ?? [], keptRuns = line.kept_runs ?? [];
+  if (kept.length !== keptRuns.length || kept.some((row, index) => row.key !== keptRuns[index]))
+    return {...reading, queueReady:false};
+  const rows = new Map(reading.waiters.filter(row => row.move).map(row => [row.move.row_id, row]));
+  const ordered = [], held = [];
+  let position = 0;
+  const numberKept = count => {
+    while (held.length < count) held.push({...kept[held.length], position:++position});
   };
-  const held = reading.held_places.map(place => {
-    while (next < waiters.length) {
-      const row = waiters[next];
-      if (row.kind !== "cloud" && (row.order_since ?? row.since) >= place.since) break;
-      advance();
-    }
-    return {...place, position:position++};
-  });
-  while (next < waiters.length) advance();
-  return {...reading, waiters:numbered, held_places:held};
+  for (const member of line.members) {
+    numberKept(member.kept_before ?? 0);
+    position++;
+    const row = rows.get(member.row_id);
+    if (row) ordered.push({...row, move:member, place:position});
+  }
+  if (ordered.length !== rows.size) return {...reading, queueReady:false};
+  numberKept(kept.length);
+  let index = 0;
+  return {...reading, move_revision:line.revision, move_line:line, held_places:held,
+    waiters:reading.waiters.map(row => row.move ? ordered[index++] : row)};
 }
 
 // Cloud waits have no numbered place.
@@ -2053,12 +2057,12 @@ function queueRows(waiters, held) {
   const rows = [];
   let next = 0, position = 1;
   for (const row of waiters) {
-    while (held[next]?.position === position) {
+    while (held[next] && held[next].position <= (row.place ?? position)) {
+      position = held[next].position + 1;
       rows.push(held[next++]);
-      position++;
     }
     rows.push(row);
-    if (row.kind !== "cloud") position++;
+    if (row.kind !== "cloud") position = (row.place ?? position) + 1;
   }
   return [...rows, ...held.slice(next)];
 }

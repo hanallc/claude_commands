@@ -4728,9 +4728,11 @@ const refresh = createPageRefresh(tick);
                                ordered=[(self.root / "unnamed", unnamed_row), *reading.ordered]))):
             named = memory_feed.reading()
         self.assertEqual(named.get("move_revision"), line.revision)
+        self.assertEqual(named.get("move_line"), complete)
         shown, = named["waiters"]
         self.assertEqual(shown["name"], rows[0]["name"])
         self.assertEqual(shown.get("move"), member)
+        self.assertEqual(shown.get("place"), 2)
 
         incomplete = replace(line, members=(*line.members, admission_records.QueueMoveMember("new-wait")))
         with mock.patch.object(queue_snapshot, "read_view_snapshot",
