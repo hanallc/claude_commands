@@ -24,7 +24,7 @@ from scripts.build_queue.test_placement import (
 from scripts.copies import copies
 from scripts.lib import build_folders, conf
 from scripts.lib.build_slots import SlotQueuePosition
-from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, command_job
+from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, command_job
 from scripts.mac_test import claim_state
 from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -105,18 +105,18 @@ class FirstStepTests(unittest.TestCase):
             self.assertEqual(status.outcome, placement.AttemptCompleted(0))
             self.assertEqual(status.path, placement.DispatchPathSettled())
 
-    def test_guest_with_unknown_result_keeps_its_assignment_for_cleanup(self) -> None:
-        with PlacementFixture() as fixture:
-            admitted = self.consumed_guest_gate(fixture)
-            assignment = client.read_assignment(admitted.assignment_file).assignment
-            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
-            saved = fixture.server.assignments[key]
-            result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(GATE_COMMAND, GATE_RESULT_UNKNOWN_STATUS)
-            with (fixture.serving(), mock.patch.object(client, "report_owner_end", wraps=client.report_owner_end) as report):
-                self.assertIs(admitted.run_gate(lambda: result), result)
-                report.assert_not_called()
-            self.assertEqual(fixture.server.assignments[key], saved)
-            self.assertIsInstance(admitted.grant, first_step.GatePlacement)
+    def test_guest_without_a_verdict_keeps_its_assignment_for_cleanup(self) -> None:
+        for status in (-9, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS, 2):
+            with self.subTest(status=status), PlacementFixture() as fixture:
+                admitted = self.consumed_guest_gate(fixture)
+                assignment = client.read_assignment(admitted.assignment_file).assignment
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                saved = fixture.server.assignments[key]
+                with mock.patch.object(client, "report_owner_end") as report:
+                    admitted.report_gate_end(status)
+                    report.assert_not_called()
+                self.assertEqual(fixture.server.assignments[key], saved)
+                self.assertIsInstance(admitted.grant, first_step.GatePlacement)
 
     def test_guest_owner_end_retries_until_the_queue_answers(self) -> None:
         with PlacementFixture() as fixture:
@@ -136,7 +136,7 @@ class FirstStepTests(unittest.TestCase):
                 connection.connect(str(fixture.socket_path))
                 return connection
 
-            result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(GATE_COMMAND, 5)
+            result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(GATE_COMMAND, 1)
             with (fixture.serving(), mock.patch.object(client, "CLOCK", clock),
                   mock.patch.object(client, "_connect", side_effect=connect_after_refusal)):
                 self.assertIs(admitted.run_gate(lambda: result), result)
@@ -147,7 +147,7 @@ class FirstStepTests(unittest.TestCase):
             saved = fixture.server.assignments[key]
             self.assertEqual(saved.state, placement.ClosedAssignment("completed"))
             assert isinstance(saved.terminal_report, placement.TerminalAttemptReport), saved
-            self.assertEqual(saved.terminal_report.outcome, placement.AttemptCompleted(5))
+            self.assertEqual(saved.terminal_report.outcome, placement.AttemptCompleted(1))
 
     def test_guest_owner_end_deadline_warns_once_and_preserves_the_child_status(self) -> None:
         with PlacementFixture() as fixture:
@@ -155,7 +155,7 @@ class FirstStepTests(unittest.TestCase):
             assignment = client.read_assignment(admitted.assignment_file).assignment
             clock = FakeClock()
             timeout = records.read_memory_config().unreachable_limit_seconds
-            result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(GATE_COMMAND, 7)
+            result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(GATE_COMMAND, 1)
             with (mock.patch.object(client, "CLOCK", clock),
                   mock.patch.object(client, "_connect", side_effect=FileNotFoundError("fixture queue is down")) as connect,
                   mock.patch.object(client, "cancel_placement") as cancel,
