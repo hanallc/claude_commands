@@ -33,11 +33,12 @@ class ProjectSpec(NamedTuple):
     published: frozenset[str]
     checkouts: tuple[Path, ...]
     closes_by_change_review: bool = False
+    former_repos: tuple[str, ...] = ()
 
 
 PROJECTS: dict[str, ProjectSpec] = {
     "hana": ProjectSpec(
-        "natepiano/hana",
+        "hanallc/hana",
         frozenset(
             {
                 "fairy_dust",
@@ -81,9 +82,12 @@ PROJECTS: dict[str, ProjectSpec] = {
         ),
         (Path.home() / "rust/hana", Path.home() / "rust/hana_catalyst"),
         closes_by_change_review=True,
+        former_repos=("natepiano/hana",),
     ),
     "natedev": ProjectSpec(
-        "natepiano/nixos", frozenset(), frozenset(), (Path("/etc/nixos"),), closes_by_change_review=False,
+        "hanallc/nixos", frozenset(), frozenset(), (Path("/etc/nixos"),),
+        closes_by_change_review=False,
+        former_repos=("natepiano/nixos",),
     ),
     "cargo-liner": ProjectSpec(
         "natepiano/cargo-liner",
@@ -133,7 +137,9 @@ PROJECTS: dict[str, ProjectSpec] = {
         closes_by_change_review=False,
     ),
     "claude": ProjectSpec(
-        "natepiano/claude_commands", frozenset(), frozenset(), (Path.home() / ".claude",), closes_by_change_review=True,
+        "hanallc/claude_commands", frozenset(), frozenset(), (Path.home() / ".claude",),
+        closes_by_change_review=True,
+        former_repos=("natepiano/claude_commands",),
     ),
 }
 
@@ -833,10 +839,16 @@ def _canonical_link(project: str, value: str) -> str:
     spec = _validate_project(project)
     if SHA_RE.fullmatch(value):
         return f"https://github.com/{spec.repo}/commit/{value.lower()}"
-    prefix = f"https://github.com/{spec.repo}/commit/"
-    if not value.startswith(prefix) or not SHA_RE.fullmatch(value[len(prefix) :]):
-        raise FeatureLogError(f"link must be a 40-hex commit for {spec.repo}")
-    return prefix + value[len(prefix) :].lower()
+    for repo in (spec.repo, *spec.former_repos):
+        prefix = f"https://github.com/{repo}/commit/"
+        if value.startswith(prefix) and SHA_RE.fullmatch(value[len(prefix) :]):
+            return prefix + value[len(prefix) :].lower()
+    raise FeatureLogError(f"link must be a 40-hex commit for {spec.repo}")
+
+
+def _commit_identity(project: str, link: str) -> str:
+    """Return the current repository URL for a validated commit link."""
+    return f"https://github.com/{PROJECTS[project].repo}/commit/{link.rsplit('/', 1)[1].lower()}"
 
 
 def _commit_date(project: ProjectSpec, sha: str) -> str:
@@ -1302,11 +1314,12 @@ def _same_repeat(
     completed_date_was_defaulted: bool,
 ) -> bool:
     comparable = candidate.copy()
+    comparable["link"] = _commit_identity(candidate["project"], candidate["link"])
     comparable["date_created"] = existing["date_created"]
     comparable["date_modified"] = existing["date_modified"]
     if completed_date_was_defaulted:
         comparable["completed_date"] = existing["completed_date"]
-    return comparable == existing
+    return comparable == {**existing, "link": _commit_identity(existing["project"], existing["link"])}
 
 
 def _reject_duplicate_link(
@@ -1317,12 +1330,14 @@ def _reject_duplicate_link(
 ) -> None:
     if separate_result:
         return
-    for other_path, other in _project_notes(note["project"]):
+    project = note["project"]
+    commit = _commit_identity(project, note["link"])
+    for other_path, other in _project_notes(project):
         if (
             other_path != path
             and other["title"] not in replacing_titles
             and other["state"] == "live"
-            and other["link"] == note["link"]
+            and _commit_identity(project, other["link"]) == commit
         ):
             raise FeatureLogError(
                 f"link already belongs to live note {other['title']}; use --separate-result"
@@ -1338,9 +1353,10 @@ def _prepare_new(
 ) -> tuple[bool, Note]:
     path = _note_path(note)
     if path.exists():
+        project = note["project"]
         existing = parse_note(path)
-        validate_note(existing, note["project"])
-        if existing["link"] != note["link"]:
+        validate_note(existing, project)
+        if _commit_identity(project, existing["link"]) != _commit_identity(project, note["link"]):
             raise FeatureLogError("title already belongs to a different link; make the title more specific")
         if not _same_repeat(
             existing,
@@ -1878,7 +1894,7 @@ def _run_amend(arguments: argparse.Namespace) -> int:
             updated["kind"] = kind_argument
             changed.append("kind")
         if isinstance(provenance, CorrectAcceptingProvenance):
-            if updated["link"] != provenance.link:
+            if _commit_identity(project, note["link"]) != _commit_identity(project, provenance.link):
                 updated["link"] = provenance.link
                 changed.append("link")
             if updated["completed_date"] != provenance.completed:
@@ -1939,7 +1955,7 @@ def _run_amend(arguments: argparse.Namespace) -> int:
         validate_note(updated, project)
         event = _amend_event(note, updated, backfill, changed)
         if (
-            event["old_link"] != event["new_link"]
+            "link" in changed
             or event["old_completed"] != event["new_completed"]
             or event["releases_added"]
         ):
@@ -2355,7 +2371,10 @@ def project_of(path: str) -> str | None:
     slug = _github_slug(result.stdout)
     if slug is None:
         return None
-    return next((project for project, spec in PROJECTS.items() if spec.repo == slug), None)
+    return next(
+        (project for project, spec in PROJECTS.items() if slug in (spec.repo, *spec.former_repos)),
+        None,
+    )
 
 
 def _run_project_of(arguments: argparse.Namespace) -> int:

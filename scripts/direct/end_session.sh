@@ -4,18 +4,14 @@
 # Usage: end_session.sh
 #
 # Clears the run pointer that prepare_session.sh stores in staff.
-# Cleans each run folder that this session directs.
+# Ends each run that this session directs.
 
 # Keeps workers and app-servers while their unit director is live. Otherwise,
 # pauses Codex workers and stops this run's servers after preserving queues.
 # Removes only Claude workers no longer held by a unit or live director.
-# Removes the unit's idle standing trees and workspaces.
-#
-# Deletes each run's scratch copies (remove_run_scratch.py): its verify.sh pass
-# records (verify_cache/), whose saved time is already in
-# ~/.local/state/verify/saved.jsonl, and every git checkout and cargo target in
-# the run folder, at any depth, except any non-retired worker's live command cwd and
-# its containing checkout. Tracked run scratch follows the same retention rule.
+# Keeps the unit's standing trees and workspaces.
+# Reports retained workspaces, Verify caches, Git checkouts, and Cargo targets.
+# Ends tracked scratch tasks and protects live command working directories.
 #
 # UNIT_RUN_ROOT, set by tests, replaces both run roots for the scan.
 #
@@ -90,14 +86,13 @@ if (( ${#RUNS[@]} > 0 )); then
     cleanup "$PY" "${SCRIPT_DIR}/../astra/design_roles.py" unbind-run "${run}"
   done
   cleanup "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}"
-  cleanup "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked "${RUNS[@]}"
-  # remove_run_scratch also ends tracked run scratch while keeping live commands' cwd.
+  cleanup "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked --owned-workspaces "${RUNS[@]}"
   for run in "${RUNS[@]}"; do
     cleanup "$PY" "${SCRIPT_DIR}/../production/staff.py" clear-run "${DIRECTOR_SESSION_ID}" "${run}"
   done
+else
+  cleanup "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --owned-workspaces
 fi
-
-"$PY" "${SCRIPT_DIR}/../copies/copies.py" remove || true
 
 if [[ -n "${SESSION_DIR}" ]]; then
   if CURRENT_RUN="$(read_run_pointer)"; then

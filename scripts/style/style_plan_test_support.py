@@ -30,6 +30,7 @@ from scripts.style import style_proposals
 from scripts.production import proposal_issue
 
 from scripts.lib import berth_board
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.style import fake_fmt
 from scripts.style.style_child_test_support import style_cli_command, unqueued_style_children
 from scripts.style.style_reader_test_support import oracle_reader
@@ -40,6 +41,7 @@ from scripts.style import style_rules
 from scripts.production import staff, unit_config
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_unit_location, isolated_staff_file, recorded_showrunner
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 REAL_RUN = subprocess.run
@@ -172,7 +174,13 @@ class StylePlanFixture(unittest.TestCase):
     @override
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.template_repo = Path(cls.enterClassContext(tempfile.TemporaryDirectory())) / "sample"
+        fixture_parent = Path(tempfile.mkdtemp(prefix="style-plan-fixture-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, fixture_parent)
+        environment = fixture_git_environment(fixture_parent)
+        for key in ("BASH_ENV", "RIPGREP_CONFIG_PATH", "STAFF_CONFIG"):
+            _ = environment.pop(key, None)
+        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, environment, clear=True)))
+        cls.template_repo = fixture_parent / "sample"
         cls.template_repo.mkdir()
         fixture = cls(methodName="runTest")
         fixture.repo = cls.template_repo
@@ -204,8 +212,9 @@ class StylePlanFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        _ = shutil.copytree(self.snapshot, self.fixture_root, symlinks=True)
+        self.fixture_root.mkdir()
         self.addCleanup(shutil.rmtree, self.fixture_root)
+        _ = shutil.copytree(self.snapshot, self.fixture_root, symlinks=True, dirs_exist_ok=True)
         self.configure_fixture()
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.run_command))
 
@@ -229,7 +238,7 @@ class StylePlanFixture(unittest.TestCase):
             **copies_environment(self.root),
             "HOME": str(self.root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
-            "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_BIN": MISSING_HERDR_BIN,
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.rule_dir.parent),
             fake_fmt.STATE: str(self.root / "fmt"),
             "PATH": str(self.root / "bin") + os.pathsep + os.environ.get("PATH", ""),

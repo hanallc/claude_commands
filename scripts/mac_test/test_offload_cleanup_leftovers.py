@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.mac_test import eligibility, offload
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture
 from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
 from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent, write_mac_target_registry
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
@@ -30,9 +30,10 @@ class OffloadCommandTests(SeededCleanupFixture):
         self.sync_fixture()
         stream = offload.ProcessController.stream_mac_run
 
-        def change_settings(controller: offload.ProcessController,
-                            arguments: Sequence[str]) -> offload.RemoteRunStatus:
-            answer = stream(controller, arguments)
+        def change_settings(controller: offload.ProcessController, arguments: Sequence[str],
+                            cleanup_limit: offload.CleanupAfterVerdict | offload.CleanupOnly
+                            | offload.NoCommandTimeLimit = offload.NO_COMMAND_TIME_LIMIT) -> offload.RemoteRunStatus:
+            answer = stream(controller, arguments, cleanup_limit)
             # Keep the admission fixture configuration valid during later passes.
             _ = settings.write_text(configuration.replace(
                 "leftover_timeout_s=10\n", f"leftover_timeout_s={value}\n"))
@@ -78,7 +79,7 @@ class OffloadCommandTests(SeededCleanupFixture):
 
     def test_leftover_check_uses_connection_settings_and_the_recorded_host(self) -> None:
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
-        connection = eligibility.SshConnectionSettings("current-host", 7, 19)
+        connection = eligibility.SshConnectionSettings("current-host", 7, 19, UNREACHABLE_WAIT_FIXTURE_SECONDS)
         repository = eligibility.KnownRepository("hana")
         response = subprocess.CompletedProcess(["ssh"], 0, "leftovers=0\nrc=0\n", "")
         with mock.patch.object(subprocess, "run", return_value=response) as run:
@@ -99,13 +100,13 @@ class OffloadCommandTests(SeededCleanupFixture):
         self.config["leftover_timeout_s"] = "19"
         self.sync_config()
         self.assertEqual(eligibility.read_connection_settings(self.config_path),
-                         eligibility.SshConnectionSettings("first-host", 7, 19))
+                         eligibility.SshConnectionSettings("first-host", 7, 19, UNREACHABLE_WAIT_FIXTURE_SECONDS))
         self.config["host"] = "second-host"
         self.config["connect_timeout_s"] = "8"
         self.config["leftover_timeout_s"] = "21"
         self.sync_config()
         self.assertEqual(eligibility.read_connection_settings(self.config_path),
-                         eligibility.SshConnectionSettings("second-host", 8, 21))
+                         eligibility.SshConnectionSettings("second-host", 8, 21, UNREACHABLE_WAIT_FIXTURE_SECONDS))
 
     def test_unconfirmed_cleanup_checks_leftovers_before_release_and_keeps_test_result(self) -> None:
         self.fixture["run_cleanup_line"] = ""

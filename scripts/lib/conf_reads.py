@@ -1,10 +1,12 @@
 """Record config reads in one private log for a test module."""
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Iterator, Mapping
 from dataclasses import dataclass
 import os
+from contextlib import contextmanager
 import re
+from threading import local
 from typing import final, override
 
 _open = os.open
@@ -14,14 +16,36 @@ _close = os.close
 CONF_READ_LOG = "CONF_READ_LOG"
 CONF_SHIFT_READ_LOG = "CONF_SHIFT_READ_LOG"
 SHIFT_MARK = "# test config shift: "
-_read_log = os.environ.get(CONF_READ_LOG, "")
 _shift_read_log = os.environ.get(CONF_SHIFT_READ_LOG, "")
+# The log that ModuleReadLog sets for this process. None reads CONF_READ_LOG at each record,
+# because verify_helper.py runs many commands in one process.
+_read_log: str | None = None
+
+
+class _ThreadReadRecording(local):
+    def __init__(self) -> None:
+        self.excluded: bool = False
+
+
+_thread_recording = _ThreadReadRecording()
+
+
+@contextmanager
+def without_recording() -> Generator[None]:
+    """Exclude config reads in the current thread for this call."""
+    previous = _thread_recording.excluded
+    _thread_recording.excluded = True
+    try:
+        yield
+    finally:
+        _thread_recording.excluded = previous
 
 
 def record(stem: str) -> None:
-    if not _read_log:
+    log = os.environ.get(CONF_READ_LOG, "") if _read_log is None else _read_log
+    if not log or _thread_recording.excluded:
         return
-    descriptor = _open(_read_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    descriptor = _open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         _ = _write(descriptor, (stem + "\n").encode("utf-8"))
     finally:
@@ -48,7 +72,7 @@ def set_shift_read_log(destination: str) -> str:
 
 def record_shift(filename: str, key: str, original: str, shifted: str) -> None:
     destination = _shift_read_log
-    if not destination:
+    if not destination or _thread_recording.excluded:
         return
     try:
         descriptor = _open(destination, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -154,19 +178,21 @@ class ModuleReadLog:
 
     def __init__(self, destination: str | os.PathLike[str]) -> None:
         self.destination: str = os.fspath(destination)
-        self.previous_log: str = ""
+        self.previous_log: str | None = None
+        self.previous_environment: str | None = None
 
     def __enter__(self) -> None:
         global _read_log
         self.previous_log = _read_log
+        self.previous_environment = os.environ.get(CONF_READ_LOG)
         _read_log = self.destination
         os.environ[CONF_READ_LOG] = _read_log
 
     def __exit__(self, *_exception: object) -> None:
         global _read_log
         _read_log = self.previous_log
-        if _read_log:
-            os.environ[CONF_READ_LOG] = _read_log
+        if self.previous_environment:
+            os.environ[CONF_READ_LOG] = self.previous_environment
         else:
             _ = os.environ.pop(CONF_READ_LOG, None)
 

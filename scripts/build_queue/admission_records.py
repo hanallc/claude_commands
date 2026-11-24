@@ -1,14 +1,15 @@
 """Shared admission records, configuration and wait phrases."""
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Generator, Iterable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 import math
 import os
 import re
 from types import MappingProxyType
-from typing import Callable, Literal, NotRequired, TypedDict, assert_never, cast
+from typing import Callable, Literal, NamedTuple, NotRequired, TypedDict, assert_never, cast
 from zoneinfo import ZoneInfo
 
 import sys
@@ -18,9 +19,10 @@ from pathlib import Path
 from scripts.build_queue import execution_identity
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import placement
-from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, VERIFY_VERBS as VERIFY_VERBS,
+from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, HAND_MADE, VERIFY_VERBS as VERIFY_VERBS,
     GateJobNotRecorded, NotVerifyCall as NotVerifyCall, StepJob, VerifyCall as VerifyCall,
     VerifyStep as VerifyStep, VerifyVerb as VerifyVerb)
+from scripts.build_queue.snapshot_codec import select_queue_name
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
@@ -29,6 +31,9 @@ from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
 from scripts.lib.proc_text import read_proc_text
+from scripts.lib.process_stat import PROC_ROOT, process_fields
+from scripts.lib.showrunner_state import state_root
+from scripts.production import staff
 from scripts.production.staff import StaffId
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
                                    TestPhaseChargeUse as TestPhaseChargeUse)
@@ -101,6 +106,7 @@ class SavedPlacementAssignment:
         placement.UnknownAssignedSettingsGeneration())
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
+    placement_candidates: tuple[placement.CandidateEligibility, ...] = ()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
@@ -148,13 +154,52 @@ class GpuTestSlots:
 
 
 # These steps run test binaries; a GPU repository's tests open render apps.
-GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "targeted-test", "merge-gate"})
+GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "test-affected", "gate"})
 NO_GPU_TESTS = GpuTestSlots(1, frozenset())
+# A hand made run counts in the run limit of its machine and repository, as a gate does.
+REPOSITORY_GATE_STEPS = frozenset({"gate", "test-affected", HAND_MADE.step})
+RUN_LIMIT_EXEMPT_KEY = "max_runs.exempt_unit"
+
+
+@dataclass(frozen=True)
+class NoRepositoryRunLimit:
+    """The repository has no run limit for this admission."""
+
+
+@dataclass(frozen=True)
+class RepositoryRunLimit:
+    """Hold a new run when this many runs already use the machine."""
+    maximum: int
+
+    def __post_init__(self) -> None:
+        if self.maximum < 0:
+            raise ValueError("expected a non-negative run limit")
+
+
+@dataclass(frozen=True)
+class RepositoryRunLimits:
+    """Limit concurrent local runs by machine and repository."""
+    by_machine_and_repository: Mapping[str, int] = field(default_factory=dict[str, int])
+    exempt_unit: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "by_machine_and_repository", MappingProxyType(dict(self.by_machine_and_repository)))
+
+    def for_step(self, machine: str, repository: str, step: str) -> RepositoryRunLimit | NoRepositoryRunLimit:
+        if step not in REPOSITORY_GATE_STEPS:
+            return NoRepositoryRunLimit()
+        return self.for_repository(machine, repository)
+
+    def for_repository(self, machine: str, repository: str) -> RepositoryRunLimit | NoRepositoryRunLimit:
+        key = f"{machine}.{repository}"
+        if key not in self.by_machine_and_repository:
+            return NoRepositoryRunLimit()
+        return RepositoryRunLimit(self.by_machine_and_repository[key])
 
 
 @dataclass(frozen=True)
 class AdmissionPolicy:
-    """The policy holds memory, pressure, timing, and GPU limits for admission."""
+    """Set memory, pressure, timing, GPU, and repository run limits."""
     timing: AdmissionTiming
     pressure: PressurePolicy
     peak_hold: PeakHold
@@ -162,6 +207,7 @@ class AdmissionPolicy:
     progress_lookahead_percent: float = field(kw_only=True)
     agent_swap_share_percent: int = field(default=100, kw_only=True)
     gpu_tests: GpuTestSlots = field(default=NO_GPU_TESTS, kw_only=True)
+    repository_runs: RepositoryRunLimits = field(default_factory=RepositoryRunLimits, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -631,6 +677,21 @@ Pressure = NoPressureHold | MemoryPressure | PressureUnavailable
 NO_PRESSURE_HOLD = NoPressureHold()
 
 
+@dataclass(frozen=True)
+class JobStart:
+    """The queue clock time when the GitHub job of a CI step started. GitHub counts its 6-hour job limit from it."""
+    started_at: float
+
+
+@dataclass(frozen=True)
+class NoJobStart:
+    """The step has no GitHub job, or the client could not read the job start."""
+
+
+NO_JOB_START = NoJobStart()
+CiJobStart = JobStart | NoJobStart
+
+
 class Waiter(TypedDict):
     pid: int
     start_time: str
@@ -638,10 +699,13 @@ class Waiter(TypedDict):
     need: int
     since: float
     order_since: NotRequired[float]
+    move_id: NotRequired[str]
     label: NotRequired[str]
     session_id: NotRequired[str]
     session_name: NotRequired[str]
     unit: NotRequired[str]
+    ci_runner: NotRequired[str]
+    ci_job_start: NotRequired[JobStart]
     step: NotRequired[str]
     folder: NotRequired[str]
     token_left_at: NotRequired[float]
@@ -664,6 +728,8 @@ class Waiter(TypedDict):
     route: NotRequired[StepRoute]
     verify: NotRequired[VerifyCall]
     job: NotRequired[StepJob]
+    # The caller's own text for the work, such as the mac_queue_run --what text.
+    what: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -775,7 +841,7 @@ class EndedStepFactNotRecorded:
 
 @dataclass(frozen=True)
 class EndedStepFacts:
-    """The reservation's work and staff facts survive until the hold ends."""
+    """The reservation's caller, work, and staff facts survive until the hold ends."""
 
     step: str | EndedStepFactNotRecorded
     package: str | PackageNotRecorded
@@ -783,6 +849,7 @@ class EndedStepFacts:
     folder: str | EndedStepFactNotRecorded
     staff_id: StaffId | NoEndedStepStaff
     job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
+    caller_name: str | EndedStepFactNotRecorded = field(default_factory=EndedStepFactNotRecorded, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -915,6 +982,20 @@ class GpuSlotWait:
 
 
 @dataclass(frozen=True)
+class RunLimitFree:
+    """The repository run limit permits this step."""
+
+
+@dataclass(frozen=True)
+class RunLimitWait:
+    """The step waits for room under its repository run limit."""
+    used: int
+    limit: int
+    repository: str
+    machine: str
+
+
+@dataclass(frozen=True)
 class AdmissionDecision:
     """The decision holds admission state, memory charges, and reasons for a delay."""
     state: Literal["admit", "hold"]
@@ -930,12 +1011,32 @@ class AdmissionDecision:
     reused_slot: bool = False
     room: RoomCheck = RoomCheck(0, 0, True, basis=Fits())
     gpu: GpuSlotFree | GpuSlotWait = GpuSlotFree()
+    run_limit: RunLimitFree | RunLimitWait = RunLimitFree()
 
 
 @dataclass(frozen=True)
 class StartSpacingWait:
     """The step waits until this start time to preserve spacing."""
     at: float
+
+
+@dataclass(frozen=True)
+class BuildSpaceLow:
+    free_gib: int
+    floor_gib: int
+
+
+@dataclass(frozen=True)
+class BuildSpaceUnreadable:
+    error: str
+
+
+BuildSpaceHold = BuildSpaceLow | BuildSpaceUnreadable
+
+
+@dataclass(frozen=True)
+class NoBuildSpaceHold:
+    """The pass has no disk space hold."""
 
 
 @dataclass(frozen=True)
@@ -975,12 +1076,12 @@ class EstimateExpired:
 
 @dataclass(frozen=True)
 class NatedevHeld:
-    """A CI step waits for the release of a natedev hold."""
+    """A step waits for the release of a natedev hold."""
     holder: str
     purpose: str
 
 HeadCause = (MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSpacingWait | NeedsMemory | EstimateExpired
-             | BehindHead | GpuSlotWait | ReadyForAdmission | placement.CargoFolderWait)
+             | BehindHead | GpuSlotWait | RunLimitWait | ReadyForAdmission | BuildSpaceHold | placement.CargoFolderWait)
 
 
 @dataclass(frozen=True)
@@ -992,16 +1093,37 @@ class HeadAdmissionStatus:
     cause: HeadCause = field(kw_only=True)
 
 WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMemory | BehindHead | GpuSlotWait
-              | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter
-              | NatedevHeld | placement.CargoFolderWait)
+              | RunLimitWait | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter
+              | NatedevHeld | BuildSpaceHold | placement.CargoFolderWait)
+
+
+@dataclass(frozen=True)
+class MachineChoiceWait:
+    """The step waits for placement to choose a machine for it, such as a Mac Linux guest."""
+
+
+# Only a queue row waits for a machine choice. An admission reply never carries it.
+WaitingStepReason = WaitReason | MachineChoiceWait
 
 
 def held_text(wait: NatedevHeld) -> str:
-    return f"natedev is held by {wait.holder} for {wait.purpose}; waiting for release"
+    if wait.holder and wait.purpose:
+        return f"natedev is held by {wait.holder} for {wait.purpose}; waiting for release"
+    return f"{wait.holder} holds natedev" if wait.holder else "natedev is held"
+
+
+def build_space_text(wait: BuildSpaceHold) -> str:
+    if isinstance(wait, BuildSpaceUnreadable):
+        return f"cannot read /build free space: {wait.error}"
+    return f"/build has {wait.free_gib} GiB free, below the {wait.floor_gib} GiB floor"
 
 
 def gpu_slot_text(wait: GpuSlotWait) -> str:
     return f"waiting for the GPU test slot ({wait.used} of {wait.slots} in use)"
+
+
+def run_limit_text(wait: RunLimitWait) -> str:
+    return f"{wait.used} of {wait.limit} {wait.repository} runs on {wait.machine}"
 
 
 def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
@@ -1010,14 +1132,18 @@ def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
         return "head: " + cause.reason
     if isinstance(cause, MemoryPressure):
         return "head: " + pressure_text(cause)
+    if isinstance(cause, BuildSpaceHold):
+        return "head: " + build_space_text(cause)
     if isinstance(cause, StartSpacingWait):
         return "head: next start at " + datetime.fromtimestamp(cause.at, zone).strftime("%H:%M:%S")
     if isinstance(cause, EstimateExpired):
         return "head: estimate expired"
     if isinstance(cause, BehindHead):
-        return "head: behind " + cause.head_name
+        return "head: behind " + select_queue_name(cause.head_name)
     if isinstance(cause, GpuSlotWait):
         return "head: " + gpu_slot_text(cause)
+    if isinstance(cause, RunLimitWait):
+        return "head: " + run_limit_text(cause)
     if isinstance(cause, ReadyForAdmission):
         return "head: ready for admission"
     if isinstance(cause, placement.CargoFolderWait):
@@ -1031,6 +1157,25 @@ class PackageNotRecorded:
 
 
 @dataclass(frozen=True)
+class QueueMoveMember:
+    """Identify a queue row and show if it can move."""
+    row_id: str
+    movable: bool = field(default=True, kw_only=True)
+
+
+@dataclass(frozen=True)
+class QueueMoveLine:
+    """Keep the move revision and the order of the queue rows."""
+    revision: str
+    members: tuple[QueueMoveMember, ...]
+
+
+@dataclass(frozen=True)
+class QueueMoveUnavailable:
+    """The service did not publish an order that supports moves."""
+
+
+@dataclass(frozen=True)
 class WaitingStep:
     """The waiting step holds its caller, memory need, wait reason, and run identity."""
     pid: int
@@ -1040,7 +1185,7 @@ class WaitingStep:
     folder: str
     since: float
     need: int
-    reason: WaitReason
+    reason: WaitingStepReason
     unit: str = ""
     project: str = ""
     run: LiveBuildRun | NoLiveBuildRun = field(default=NoLiveBuildRun(), kw_only=True)
@@ -1048,6 +1193,19 @@ class WaitingStep:
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
+    ci_runner: str = field(default="", kw_only=True)
+    ci_job_start: CiJobStart = field(default=NO_JOB_START, kw_only=True)
+    placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
+    placement_targets: tuple[str, ...] = field(default=(), kw_only=True)
+    speculative_copy: bool = field(default=False, kw_only=True)
+    what: str = field(default="", kw_only=True)
+
+
+class ConfirmedGuestRun(TypedDict):
+    """Identify a confirmed Mac Linux attempt in a queue reading."""
+
+    target: Literal["mac-linux"]
+    attempt: str
 
 
 @dataclass(frozen=True)
@@ -1066,11 +1224,17 @@ class RunningStep:
     project: str = ""
     execution: execution_identity.ExecutionEvidence = execution_identity.ExecutionNotStarted()
     assignment_host: str = ""
+    assignment_target: str = field(default="", kw_only=True)
+    placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
+    confirmed_guest_run: ConfirmedGuestRun | None = field(default=None, kw_only=True)
+    counter: progress.ProgressCounter | progress.NoCounter = field(default_factory=progress.NoCounter, kw_only=True)
     mac_placement: str = field(default="", kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
+    ci_runner: str = field(default="", kw_only=True)
+    what: str = field(default="", kw_only=True)
 
 
 def execution_host(step: RunningStep, local_host: str) -> str:
@@ -1102,6 +1266,7 @@ class QueueView:
     promised: int
     reserve: int
     now: float
+    move_line: QueueMoveLine | QueueMoveUnavailable = field(default=QueueMoveUnavailable(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1228,6 +1393,14 @@ StartSpacing = ReadyToStart | NextStartAt
 
 
 @dataclass(frozen=True)
+class LocalAdmissionOccupancy:
+    """The service captures these reservations and owners after it grants starts."""
+
+    reservations: tuple[Reservation, ...]
+    verify_run_owners: Mapping[str, frozenset[str]]
+
+
+@dataclass(frozen=True)
 class QueueExplanation:
     """The explanation holds queue evidence, policy, decisions, and memory checks."""
     now: float
@@ -1243,6 +1416,8 @@ class QueueExplanation:
     spacing: StartSpacing = ReadyToStart()
     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
     room: MemoryRoom | ReadingUnavailable = ReadingUnavailable()
+    local_occupancy: LocalAdmissionOccupancy | None = field(
+        default=None, kw_only=True, metadata={"acquisition_unused": True})
 
 
 @dataclass(frozen=True)
@@ -1258,11 +1433,19 @@ class QueueInputs:
     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
     blockers_for: frozenset[str] = frozenset()
     waiter_orders: dict[str, PriorityUnit | NormalOrder] = field(default_factory=dict, kw_only=True)
+    order_captured: bool = field(default=False, kw_only=True)
     slots: tuple[RunSlot, ...] = field(default=(), kw_only=True)
     cargo_folders: dict[str, placement.CargoFolder] = field(default_factory=dict, kw_only=True)
     occupied_cargo_folders: frozenset[placement.CargoFolder] = field(default=frozenset(), kw_only=True)
     pending_remote_starts: frozenset[str] = field(default=frozenset(), kw_only=True)
     local_waits: dict[str, placement.EvidenceNeeded] = field(default_factory=dict, kw_only=True)
+    build_space: BuildSpaceHold | NoBuildSpaceHold = field(default=NoBuildSpaceHold(), kw_only=True)
+    local_machine: str = field(default="natedev", kw_only=True)
+    run_limit_exempt_owners: frozenset[str] = field(default=frozenset(), kw_only=True)
+    verify_run_owners: Mapping[str, frozenset[str]] = field(default_factory=dict[str, frozenset[str]], kw_only=True)
+    verify_slot_requests: Mapping[str, str] = field(default_factory=dict[str, str], kw_only=True)
+    placement_candidates: dict[str, tuple[placement.CandidateEligibility, ...]] = field(
+        default_factory=dict[str, tuple[placement.CandidateEligibility, ...]], kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
@@ -1410,6 +1593,7 @@ class MemoryConfig:
     program_sample_seconds: float
     program_stop_seconds: float
     peak_wave_seconds: float
+    free_floor_gib: int | None = field(default=None, kw_only=True)
     diagnostics: tuple[ConfigurationDiagnostic, ...] = field(default=(), compare=False)
 
 
@@ -1435,6 +1619,12 @@ def configuration_diagnostics(messages: Iterable[str]) -> tuple[ConfigurationDia
     return tuple(ConfigurationDiagnostic(message) for message in dict.fromkeys(messages))
 
 
+def _repository_run_maximum(raw: str) -> int:
+    if re.fullmatch(r"[+-]?[0-9]+", raw) is None:
+        raise ValueError("expected a whole number")
+    return RepositoryRunLimit(int(raw)).maximum
+
+
 def read_memory_config(*, report: bool = True) -> MemoryConfig:
     """Resolve the live configuration for one admission decision."""
     with conf.diagnostics(report=False) as messages:
@@ -1442,8 +1632,8 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
         keys = settings_read.settings
         values = keys if isinstance(keys, dict) else settings_read.values()
 
-        def value[Value](key: str, convert: Callable[[str], Value]) -> Value:
-            result = settings_read.origin(key, convert)
+        def value[Value](key: str, convert: Callable[[str], Value], *, use_file_limits: bool = True) -> Value:
+            result = settings_read.origin(key, convert, use_file_limits=use_file_limits)
             if isinstance(result, conf.UnavailableValue):
                 raise conf.Unusable(f"{result.reason}; no usable committed value")
             if isinstance(result, conf.RecoveredValue):
@@ -1482,6 +1672,12 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                      for key in values if key.startswith("peak_hold_seconds.")}
             first_peaks = {key.removeprefix("program_first_peak_gib."): gib(key)
                            for key in values if key.startswith("program_first_peak_gib.")}
+            # The admission policy also accepts zero for keys with older file limits.
+            run_limits = {
+                key.removeprefix("max_runs."): value(key, _repository_run_maximum, use_file_limits=False)
+                for key in values if key.startswith("max_runs.") and key != RUN_LIMIT_EXEMPT_KEY
+            }
+            exempt_unit = value(RUN_LIMIT_EXEMPT_KEY, str) if run_limits else ""
             if "cargo" not in first_peaks:
                 first_peaks["cargo"] = gib("program_first_peak_gib.cargo")
             config = MemoryConfig(
@@ -1489,7 +1685,8 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                                        progress_lookahead_percent=number("progress_lookahead_percent"),
                                        agent_swap_share_percent=whole("agent_swap_share_percent"),
                                        gpu_tests=GpuTestSlots(whole("gpu_test_slots"),
-                                                              value("gpu_test_repositories", lambda raw: frozenset(raw.split())))),
+                                                              value("gpu_test_repositories", lambda raw: frozenset(raw.split()))),
+                                       repository_runs=RepositoryRunLimits(run_limits, exempt_unit)),
                 ci_memory_slice=value("ci_memory_slice", _ci_slice_name),
                 ci_label=value("ci_label", _ci_label),
                 test_phase_margin=test_margin(),
@@ -1509,7 +1706,9 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 source_settle_seconds=number("source_settle_seconds"),
                 request_max_bytes=whole("request_max_bytes"), program_first_peaks=first_peaks,
                 program_sample_seconds=number("program_sample_seconds"), program_stop_seconds=number("program_stop_seconds"),
-                peak_wave_seconds=number("peak_wave_seconds"))
+                peak_wave_seconds=number("peak_wave_seconds"),
+                free_floor_gib=whole("free_floor_gib")
+                    if settings_read.effective_key("free_floor_gib") in values else None)
         finally:
             diagnostics = configuration_diagnostics(messages)
     config = replace(config, diagnostics=diagnostics)
@@ -1549,6 +1748,16 @@ def waiter_route(row: Waiter) -> StepRoute:
     return row.get("route", DIRECT_CARGO)
 
 
+def waiter_job_start(row: Waiter) -> CiJobStart:
+    """Return the CI job start of a queue row. A row without one has NO_JOB_START."""
+    return row.get("ci_job_start", NO_JOB_START)
+
+
+def job_order_since(since: float, job_start: CiJobStart) -> float:
+    """Rank a CI step at its job start when the job started before the step arrived."""
+    return min(since, job_start.started_at) if isinstance(job_start, JobStart) else since
+
+
 def direct_cargo_route() -> LocalRequired:
     """Keep the caller's reason when a direct command must run locally."""
     reason = os.environ.get("BUILD_QUEUE_LOCAL_REASON", "")
@@ -1567,14 +1776,283 @@ class FreshTest:
 BUILDLOG_UNIT = "BUILDLOG_UNIT"
 
 
-def waiter_identity(step: str, worktree: str) -> WaiterIdentity:
-    from scripts.production import staff
+@dataclass(frozen=True)
+class QueueCaller:
+    session_id: str
+    name: str
+    unit: str
 
+
+@dataclass(frozen=True)
+class StaffLookupSkipped:
+    """The caller has no staff reference to resolve."""
+
+
+NO_STAFF_LOOKUP = StaffLookupSkipped()
+type QueueStaff = staff.StaffSnapshot | staff.StaffUnreadable | StaffLookupSkipped
+
+
+def queue_staff() -> QueueStaff:
+    try:
+        return staff.local_snapshot()
+    except staff.StaffUnreadable as error:
+        return error
+
+
+def queue_caller(session_id: str, staff_id: str, exported_name: str, session_folder: str,
+                 *, members: QueueStaff = NO_STAFF_LOOKUP, unit: str = "") -> QueueCaller:
+    """Resolve the caller name and its unit for queue priority."""
+    reference = session_id or staff_id
+    staff_name = ""
+    if isinstance(members, staff.StaffSnapshot) and reference and (member := members.by_member_reference(reference)):
+        if not unit:
+            owner = members.parent_of(member) if member.kind == "worker" else member
+            unit = owner.name if owner is not None and owner.kind == "unit" else ""
+        session_id = session_id or member.current_session
+        staff_name = member.name
+    name = select_queue_name(staff_name, exported_name, Path(session_folder).name)
+    return QueueCaller(session_id, name, unit)
+
+
+SCRIPT_SUFFIXES = frozenset({".py", ".sh", ".zsh", ".bash"})
+# Python and shell options whose value is the next argument.
+VALUE_OPTIONS = frozenset({"-X", "-W", "-o", "+o", "-O", "+O"})
+AGENT_COMMANDS = frozenset({"claude", "codex"})
+FAMILY_LIMIT = 64
+
+
+class FamilyProcess(NamedTuple):
+    """One process of a caller family, the script file that it runs, and the name of its cgroup unit."""
+    argv: tuple[str, ...]
+    tty: int
+    script: Path | None
+    unit: str
+
+
+def run_script(argv: Sequence[str]) -> Path | None:
+    """Return the script file that a shell or Python command runs: its first argument that is not an option."""
+    arguments = iter(argv[1:])
+    for argument in arguments:
+        if argument in VALUE_OPTIONS:
+            _ = next(arguments, "")
+        elif not argument.startswith(("-", "+")):
+            path = Path(argument)
+            return path if path.suffix in SCRIPT_SUFFIXES and not any(c.isspace() for c in argument) else None
+    return None
+
+
+@dataclass(frozen=True)
+class TerminalOwner:
+    """The user started the work: at a terminal, in a login session, or in a desktop app."""
+    name: str = "terminal"
+
+
+TERMINAL_OWNER = TerminalOwner()
+
+
+@dataclass(frozen=True)
+class StaffOwner:
+    """A script under the state root of a staff member started the work."""
+    member_id: str
+    name: str
+
+
+@dataclass(frozen=True)
+class StateSessionOwner:
+    """A script under the state root of an id that no staff member has; the name is the short id."""
+    name: str
+
+
+@dataclass(frozen=True)
+class OwnerNotGiven:
+    """The request does not say who started it; the program names the work that asks."""
+    program: str
+    unit: str = ""
+
+
+type FamilyOwner = TerminalOwner | StaffOwner | StateSessionOwner | OwnerNotGiven
+# The user's own scopes: a desktop app (app-*.scope) and a login session (session-*.scope).
+USER_SCOPE_PREFIXES = ("app-", "session-")
+
+
+def cgroup_unit(pid: int, proc_root: Path) -> str:
+    """The name of the cgroup unit of a process, such as `run-p1-i2.service`; empty when it cannot be read."""
+    try:
+        cgroup = read_proc_text(proc_root / str(pid) / "cgroup")
+    except OSError:
+        return ""
+    return next((Path(line[3:]).name for line in cgroup.splitlines() if line.startswith("0::")), "")
+
+
+def service_owner(process: FamilyProcess, pid: int, proc_root: Path, scripts: Sequence[Path]) -> OwnerNotGiven:
+    """Name the systemd service that started the work."""
+    if not (process.unit.startswith("run-") and process.unit.endswith(".service")):
+        return OwnerNotGiven(f"systemd · {process.unit}")
+    # systemd-run generates the unit name, so the script or the folder names the work.
+    if scripts:
+        return OwnerNotGiven(f"systemd · {scripts[-1].name}")
+    try:
+        return OwnerNotGiven(f"systemd · {Path(os.readlink(proc_root / str(pid) / 'cwd')).name or process.unit}")
+    except OSError:
+        return OwnerNotGiven(f"systemd · {process.unit}")
+
+
+def family_owner(pid: int, proc_root: Path) -> FamilyOwner:
+    """Find the owner of a process that has no session and no staff reference.
+
+    Read the process and its parents once, up to the first claude or codex process.
+    A read error stops the read, and the next rule applies.
+    A script under the showrunner state root gives its staff member, or else the short session id.
+    A terminal with no agent above it gives TERMINAL_OWNER: the user.
+    A family with a process in a systemd service does not say who started it.
+    Otherwise a desktop app scope or a login session scope with no agent above it gives TERMINAL_OWNER.
+    Every other family, such as an agent family with no session, does not say who started it.
+    """
+    family: list[FamilyProcess] = []
+    under_agent = False
+    current = pid
+    while current > 0 and len(family) < FAMILY_LIMIT:
+        folder = proc_root / str(current)
+        try:
+            fields = process_fields(current, proc_root)
+            tty, parent = int(fields[4]), int(fields[1])
+            argv = tuple(part for part in read_proc_text(folder / "cmdline").split("\0") if part)
+        except (OSError, IndexError, ValueError):
+            break
+        if argv and Path(argv[0]).name in AGENT_COMMANDS:
+            under_agent = True
+            break
+        script = run_script(argv)
+        if script is not None and not script.is_absolute():
+            try:
+                script = Path(os.readlink(folder / "cwd")) / script
+            except OSError:
+                pass
+        family.append(FamilyProcess(argv, tty, script, cgroup_unit(current, proc_root)))
+        current = parent
+    if not family:
+        # macOS has no /proc. The caller is the user's terminal.
+        return TERMINAL_OWNER
+    scripts = [process.script for process in family if process.script is not None]
+    state = state_root()
+    for script in scripts:
+        if script.is_relative_to(state) and len(parts := script.relative_to(state).parts) > 1:
+            members = queue_staff()
+            member = members.by_member_reference(parts[0]) if isinstance(members, staff.StaffSnapshot) else None
+            return StaffOwner(member.id, member.name) if member else StateSessionOwner(parts[0][:8])
+    if not under_agent and any(process.tty for process in family):
+        return TERMINAL_OWNER
+    # A timer or another service can start a scope; a service anywhere in the family means no person started it.
+    service = next((process for process in family if process.unit.endswith(".service")), None)
+    if service is not None:
+        return service_owner(service, pid, proc_root, scripts)
+    own = family[0].unit
+    if not under_agent and own.startswith(USER_SCOPE_PREFIXES) and own.endswith(".scope"):
+        # A desktop app, such as Zed, or a login session started the work: the user.
+        return TERMINAL_OWNER
+    if scripts:
+        return OwnerNotGiven(f"script · {scripts[-1].name}")
+    return OwnerNotGiven(f"script · {Path(family[0].argv[0]).name if family[0].argv else 'unknown program'}")
+
+
+def request_owner(worktree: str) -> QueueCaller | OwnerNotGiven:
+    """Find who started a request, in this order: a session, a staff reference, a session name,
+    a state-root script or a terminal, and last the recorded owner of the worktree."""
     session = staff.caller_identity()
-    identity: WaiterIdentity = {"session_id": session, "session_name": os.environ.get("CLAUDE_SESSION_NAME", ""),
-                                "step": step, "folder": os.getcwd() if worktree else ""}
-    if unit := os.environ.get(BUILDLOG_UNIT):
-        identity["unit"] = unit
+    reference = os.environ.get("BUILDLOG_OWNER_STAFF_ID", "")
+    exported = os.environ.get("CLAUDE_SESSION_NAME", "")
+    unit = os.environ.get(BUILDLOG_UNIT, "")
+    if session or reference or exported:
+        return queue_caller(session, reference, exported, os.environ.get("CLAUDE_SESSION_FOLDER", ""),
+            members=queue_staff() if session or reference else NO_STAFF_LOOKUP, unit=unit)
+    family = family_owner(os.getpid(), PROC_ROOT)
+    if isinstance(family, StaffOwner):
+        return queue_caller("", family.member_id, family.name, "", members=queue_staff(), unit=unit)
+    if isinstance(family, (TerminalOwner, StateSessionOwner)):
+        return QueueCaller("", family.name, unit)
+    owner = folder_owner(Path(worktree)) if worktree and Path(worktree).is_absolute() else ""
+    if not owner:
+        return replace(family, unit=unit)
+    members = queue_staff()
+    if isinstance(members, staff.StaffSnapshot) and members.by_member_reference(owner):
+        return queue_caller("", owner, "", "", members=members, unit=unit)
+    return QueueCaller("", owner, unit)
+
+
+def folder_owner(worktree: Path) -> str:
+    """The owner that copies records for a worktree: a gate, a copy, or the staff member that holds it."""
+    from scripts.copies import copies
+    from scripts.lib import scratch
+
+    try:
+        # The queue request reads the owner only; it never clears a stale removal intent.
+        return copies.recorded_owner(worktree, intent=scratch.RemovalIntentAccess.READ_ONLY)
+    except (copies.CopyError, OSError):
+        return ""
+
+
+OWNER_VARIABLES = ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "BUILDLOG_OWNER_STAFF_ID", "CLAUDE_SESSION_NAME")
+
+
+def owner_given(environment: Mapping[str, str]) -> bool:
+    """True when the environment has a variable that says who started the work."""
+    return any(environment.get(name) for name in OWNER_VARIABLES)
+
+
+def named_owner(environment: Mapping[str, str], name: str) -> dict[str, str]:
+    """CLAUDE_SESSION_NAME set to this name when the environment says no owner; otherwise nothing."""
+    return {} if owner_given(environment) else {"CLAUDE_SESSION_NAME": name}
+
+
+def owner_environment() -> dict[str, str]:
+    """The owner variables for work that leaves this process family, such as a systemd unit.
+
+    A caller with no owner variable passes the owner that its process family gives.
+    A staff member goes in BUILDLOG_OWNER_STAFF_ID, so the staff link stays."""
+    given = {name: os.environ[name] for name in (*OWNER_VARIABLES, BUILDLOG_UNIT) if os.environ.get(name)}
+    if owner_given(given):
+        return given
+    family = family_owner(os.getpid(), PROC_ROOT)
+    if isinstance(family, StaffOwner):
+        return {**given, "BUILDLOG_OWNER_STAFF_ID": family.member_id}
+    return given if isinstance(family, OwnerNotGiven) else {**given, **named_owner(given, family.name)}
+
+
+@contextmanager
+def default_owner(reference: str) -> Generator[None]:
+    """Name this owner for the queue requests of this process and its children when the caller names none.
+
+    The name goes in CLAUDE_SESSION_NAME, and a staff unit also goes in BUILDLOG_UNIT when it is not set.
+    The owner never goes in BUILDLOG_OWNER_STAFF_ID: a hold sends its restart notice to that staff member,
+    and this owner did not start the run."""
+    if not reference or owner_given(os.environ):
+        yield
+        return
+    members = queue_staff()
+    caller = (queue_caller("", reference, reference, "", members=members)
+              if isinstance(members, staff.StaffSnapshot) else QueueCaller("", reference, ""))
+    names = {"CLAUDE_SESSION_NAME": caller.name}
+    if caller.unit and not os.environ.get(BUILDLOG_UNIT):
+        names[BUILDLOG_UNIT] = caller.unit
+    previous = {name: os.environ.get(name) for name in names}
+    os.environ.update(names)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                _ = os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def waiter_identity(step: str, worktree: str, owner: QueueCaller | OwnerNotGiven) -> WaiterIdentity:
+    """The stored parts of a request: who started it, and the step that says what it does."""
+    caller = owner if isinstance(owner, QueueCaller) else QueueCaller("", owner.program, owner.unit)
+    identity: WaiterIdentity = {"session_id": caller.session_id, "session_name": caller.name,
+        "step": step, "folder": os.getcwd() if worktree else ""}
+    if caller.unit:
+        identity["unit"] = caller.unit
     return identity
 
 
@@ -1645,8 +2123,10 @@ def behind_place(reason: BehindHead, waiting: Sequence[WaitingStep]) -> int:
                  if step.session_id == reason.head_session_id and step.since == reason.joined_at), 0)
 
 
-def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
+def reason_phrase(reason: WaitingStepReason, waiting: Sequence[WaitingStep]) -> str:
     match reason:
+        case MachineChoiceWait():
+            return "waits for a machine choice"
         case TokenWaitingWaiter():
             return "waiting for the cargo token"
         case EstimateExpired():
@@ -1661,12 +2141,16 @@ def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
             return reason.reason
         case StartSpacingWait():
             return "another step just started; the queue waits a few seconds between starts"
+        case BuildSpaceLow() | BuildSpaceUnreadable():
+            return build_space_text(reason)
         case NeedsMemory():
             return "free memory"
         case placement.CargoFolderWait():
             return placement.CARGO_FOLDER_WAIT_REASON
         case GpuSlotWait():
             return "GPU test slot"
+        case RunLimitWait():
+            return run_limit_text(reason)
         case BehindHead():
             place = behind_place(reason, waiting)
             return f"behind #{place}" if place else "behind the first step"

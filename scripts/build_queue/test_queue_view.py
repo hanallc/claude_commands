@@ -32,12 +32,12 @@ from scripts.build_queue.queue_fixture import write_memory_config
 def queue_model(fixture: QueueFixture) -> queue_view.QueueModel:
     """Read step labels from the queue fixture."""
     _ = (fixture.root / "build_steps.conf").write_text(
-        "names.targeted-test=targeted test\n"
-        + "names.merge-gate=merge gate\n"
-        + "prose.merge-gate=merge gate\n"
-        + "owned.targeted-test={unit} targeted\n"
-        + "owned.merge-gate={unit} merge\n"
-        + "owned.showrunner-merge-gate=showrunner merge\n"
+        "names.test-affected=test affected\n"
+        + "names.gate=gate\n"
+        + "prose.gate=the gate\n"
+        + "owned.test-affected={unit} targeted\n"
+        + "owned.gate={unit} merge\n"
+        + "owned.showrunner-gate=showrunner merge\n"
         + "owned.default={unit} {step}\n",
         encoding="utf-8",
     )
@@ -80,7 +80,7 @@ class RecordedOwnerQueueTests(unittest.TestCase):
                     "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
                     "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": str(owner.id),
                 }), mock.patch.object(unit_labels, "newest_sessions", return_value=[]):
-                    identity = admission_client.step_identity("targeted-test", "/private/tree")
+                    identity = admission_client.step_identity("test-affected", "/private/tree")
                     self.assertEqual(identity.session_id, owner.current_session)
                     labels = unit_labels.unit_labels_for([identity.session_id], os.environ)
                     waiter = replace(model.reading.view.waiting[0], session_id=identity.session_id,
@@ -90,9 +90,6 @@ class RecordedOwnerQueueTests(unittest.TestCase):
                     for step in (waiter, running):
                         expected = UnitLabels(owner.name, "hana", "demo", unit_labels.OwnerRole.UNIT, ran_by)
                         self.assertEqual(queue_evidence.step_labels(step, labels), expected)
-                    cloud = replace(cloud_reading(model.reading).cloud[0], identity=identity)
-                    self.assertEqual(queue_view.cloud_step_labels(cloud, replace(model, labels=labels)),
-                                     expected)
 
     def test_live_session_identity_takes_priority_over_the_recorded_staff_owner(self) -> None:
         from scripts.build_queue import admission_client
@@ -101,7 +98,7 @@ class RecordedOwnerQueueTests(unittest.TestCase):
                                          "BUILDLOG_OWNER_STAFF_ID": "other-owner"}):
             self.assertEqual(admission_client.step_identity("nextest", "").session_id, "live-session")
 
-    def test_missing_owner_records_have_explicit_labels_on_every_destination(self) -> None:
+    def test_missing_owner_records_have_explicit_labels_in_queue_evidence(self) -> None:
         from scripts.build_queue import admission_client
         from scripts.production.staff_test_support import isolated_staff_file
 
@@ -112,14 +109,11 @@ class RecordedOwnerQueueTests(unittest.TestCase):
                     "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
                     "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": reference,
                 }):
-                    identity = admission_client.step_identity("targeted-test", "")
+                    identity = admission_client.step_identity("test-affected", "")
                     self.assertEqual(identity.session_id, "")
                     for step in (model.reading.view.waiting[0], model.reading.view.running[0]):
                         label = queue_evidence.step_labels(replace(step, session_id="", session_name="", unit=""), {})
                         self.assertEqual((label.showrunner, label.unit), ("owner not recorded", "owner not recorded"))
-                    cloud = replace(cloud_reading(model.reading).cloud[0], identity=identity)
-                    label = queue_view.cloud_step_labels(cloud, replace(model, labels={}))
-                    self.assertEqual((label.showrunner, label.unit), ("owner not recorded", "owner not recorded"))
 
 
 def with_converted_executions(reading: admission_records.QueueRead) -> admission_records.QueueRead:
@@ -148,12 +142,12 @@ def cloud_reading(reading: admission_records.QueueRead) -> wire.CloudQueueRead:
     now = reading.explanation.now
     rows = (
         wire.CloudRow(wire.Owner(700001, "100"),
-            wire.Identity("cloud-session", "route-one", "merge-gate", "/private/cloud", "cloud-unit"),
+            wire.Identity("cloud-session", "route-one", "gate", "/private/cloud", "cloud-unit"),
             wire.CloudPlace("aws"), now - 245, now - 240,
             cloud_progress.CloudProgress("running", 32, 1, now - 120),
             progress_profile.ProgressCounter("modules", 7, 12), admission_records.ReadyForAdmission()),
         wire.CloudRow(wire.Owner(700002, "200"),
-            wire.Identity("cloud-waiter", "route-two", "targeted-test", "/private/waiting", "waiting-unit"),
+            wire.Identity("cloud-waiter", "route-two", "test-affected", "/private/waiting", "waiting-unit"),
             wire.CloudPlace("aws"), now - 60, 0,
             cloud_progress.NoCloudProgress(), progress_profile.NoCounter(), wire.CloudSlotWait(1, 1)),
     )
@@ -345,19 +339,64 @@ class MacQueueViewTests(unittest.TestCase):
                     self.assertEqual(rows[0]["ci_runner"], "hana-mac-1" if expected == "ci" else "")
                     self.assertEqual(rows[0]["ci_job"], "test-hana" if expected == "ci" else "")
 
-    def test_mac_names_use_the_package_then_the_repository(self) -> None:
-        for command, repository, expected in (
-            ("cargo build --release -p hana", "", "hana build"),
-            ("cargo build -phana", "other", "hana build"),
-            ("cargo build --package=hana", "other", "hana build"),
-            ("cargo check --package hana", "other", "hana check"),
-            ("cargo nextest run", "cargo-liner", "cargo-liner nextest"),
-            ("cargo build", "", "build"),
-            ("", "", "cargo"),
+    def test_mac_reader_names_the_launcher_of_each_build(self) -> None:
+        # bob, 2026-11-23: a Mac build with no unit names who started it, from its parent process chain.
+        with QueueFixture(captured=False) as fixture:
+            folder = str(fixture.root)
+            for name, launcher, marker, environment, kind, session in (
+                ("claude", ("claude --resume a", "/Users/nate/.local/share/claude/versions/2.0.76"), "",
+                 {"CLAUDE_CODE_SESSION_ID": "session-a"}, queue_view.MacLauncher.CLAUDE, "session-a"),
+                ("session marker", ("-zsh", "/bin/zsh"), "session-b", {}, queue_view.MacLauncher.CLAUDE, "session-b"),
+                ("CI", ("/actions/Runner.Worker spawn", "/actions/Runner.Worker"), "", {"RUNNER_NAME": "hana-mac-1"},
+                 queue_view.MacLauncher.CI, ""),
+                ("rust-analyzer", ("/Zed/rust-analyzer-2026-11-02", "/Zed/rust-analyzer-2026-11-02"), "", {},
+                 queue_view.MacLauncher.RUST_ANALYZER, ""),
+                ("terminal", ("-zsh", "/bin/zsh"), "", {}, queue_view.MacLauncher.TERMINAL, ""),
+            ):
+                with self.subTest(name=name):
+                    command, executable = launcher
+                    processes: dict[int, dict[str, object]] = {
+                        100: {"parent": 90, "command": "cargo build -p hana", "executable": "/bin/cargo",
+                              "resident_bytes": 1234, "started_at": NOW},
+                        90: {"parent": 80, "command": "/bin/zsh -c cargo build -p hana", "executable": "/bin/zsh",
+                             "resident_bytes": 0, "started_at": NOW},
+                        80: {"parent": 70, "command": command, "executable": executable,
+                             "resident_bytes": 0, "started_at": NOW},
+                        70: {"parent": 1, "command": "/Applications/Terminal.app/Contents/MacOS/Terminal",
+                             "executable": "/Applications/Terminal.app/Contents/MacOS/Terminal",
+                             "resident_bytes": 0, "started_at": NOW},
+                    }
+                    script = queue_view.mac_build_script().replace("print(json.dumps(read_reading()))",
+                        f"read_processes = lambda: {processes!r}\n"
+                        + "read_captures = lambda processes: {}\n"
+                        + f"output = lambda arguments: 'p100\\nn{folder}\\n'\n"
+                        + "repository_name = lambda folder: 'hana'\n"
+                        + f"project_record = lambda folder: dict(recorded_unit='', session={marker!r}, repository='')\n"
+                        + f"process_environment = lambda pid: {environment!r}\n"
+                        + "print(json.dumps(read_builds()))")
+                    result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    row, = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+                    _ = row.pop("progress_tail")
+                    row["counter"] = {}
+                    build = queue_view.mac_build_from_record(row)
+                    self.assertIs(build.launcher, kind)
+                    self.assertEqual(build.launcher_session, session)
+                    self.assertEqual(queue_view.mac_build_from_record(queue_view.mac_build_record(build)), build)
+
+    def test_mac_command_step_reads_the_verb_and_the_package(self) -> None:
+        for command, expected in (
+            ("cargo build --release -p hana", ("build", "hana")),
+            ("cargo build -phana", ("build", "hana")),
+            ("cargo build --package=hana", ("build", "hana")),
+            ("cargo check --package hana", ("check", "hana")),
+            ("cargo nextest run", ("nextest", "")),
+            ("cargo build", ("build", "")),
+            ("", ("", "")),
         ):
             with self.subTest(command=command):
-                self.assertEqual(queue_view.mac_step_name(queue_view.MacBuild(1, "/project", 0,
-                    command, repository)), expected)
+                self.assertEqual(queue_view.mac_command_step(queue_view.MacBuild(1, "/project", 0,
+                    command, "other")), expected)
 
     def test_mac_command_jobs_reads_all_supported_positive_values(self) -> None:
         for argument in ("--test-threads 12", "--test-threads=12", "-j12", "-j 12", "--jobs 12", "--jobs=12"):
@@ -392,7 +431,7 @@ class MacQueueViewTests(unittest.TestCase):
                     self.assertEqual(build.stage, queue_view.MacTesting(710002))
                     self.assertEqual(build.resident_bytes, 1048576)
                     self.assertEqual(build.jobs, 4)
-                    self.assertEqual(queue_view.mac_step_name(build), "hana nextest")
+                    self.assertEqual(queue_view.mac_command_step(build), ("nextest", ""))
 
 
     def test_mac_reader_finds_all_three_tile_runs_and_their_counters(self) -> None:
@@ -412,7 +451,7 @@ class MacQueueViewTests(unittest.TestCase):
                     "repo": "cargo-liner" if index == 2 else "hana" if index == 1 else ""}))
                 if index == 0:
                     _ = (folder / "Cargo.toml").write_text(
-                        '[workspace.package]\nrepository = "https://github.com/natepiano/hana"\n')
+                        '[workspace.package]\nrepository = "https://github.com/hanallc/hana"\n')
                 generation = f"fixture-{pid}"
                 log = f"run-{generation}-{pid}.log"
                 arguments = ["build", "--release", "-p", "hana"] if index == 0 else ["nextest", "run", "--test-threads", "12"]
@@ -564,34 +603,13 @@ class CloudQueueViewTests(unittest.TestCase):
                 waiting = queue_view.waiting_builds(replace(model, reading=replace(reading, cloud=(single, grouped))))
                 self.assertEqual([row for row in waiting if isinstance(row, wire.CloudRow)], [grouped, single])
 
-    def test_page_step_names_use_roles_and_configured_owner_templates(self) -> None:
+    def test_owner_templates_keep_the_step_name_and_prose(self) -> None:
         model = self.cloud_model()[0]
-        reading = model.reading
-        assert isinstance(reading, wire.CloudQueueRead)
-        row = reading.cloud[0]
-        director = unit_labels.make_labels("panes", unit_labels.NoShowrunner(), unit_labels.DirectsUnit("panes"))
-        runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
-        for step, owner, expected in (
-            ("targeted-test", director, "panes targeted"),
-            ("merge-gate", director, "panes merge"),
-            ("merge-gate", runner, "showrunner merge"),
-            ("merge-gate", unit_labels.UnitLabels("builds", "builds"), "merge gate"),
-            ("targeted-test", UnitLabels("worker", "sdlc", "panes"), "targeted test"),
-            ("merge-gate", UnitLabels("worker", "sdlc", "panes"), "merge gate"),
-            ("build", director, "panes build"),
-            ("literal{step}", director, "panes literal{step}"),
-        ):
-            with self.subTest(step=step, owner=owner):
-                current = replace(row, identity=replace(row.identity, step=step))
-                labeled = replace(model, labels={row.identity.session_id: owner})
-                self.assertEqual(queue_view.cloud_step_name(current, labeled), expected)
-        current = replace(row, identity=replace(row.identity, step="targeted-test"))
         settings = dict(model.names.settings)
-        settings["owned.targeted-test"] = "targeted for {unit}"
-        configured = replace(model, names=type(model.names)(settings), labels={row.identity.session_id: director})
-        self.assertEqual(queue_view.cloud_step_name(current, configured), "targeted for panes")
-        self.assertEqual(configured.names.shown("targeted-test"), "targeted test")
-        self.assertEqual(configured.names.prose("merge-gate"), "merge gate")
+        settings["owned.test-affected"] = "targeted for {unit}"
+        configured = replace(model, names=type(model.names)(settings))
+        self.assertEqual(configured.names.shown("test-affected"), "test affected")
+        self.assertEqual(configured.names.prose("gate"), "the gate")
 
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))

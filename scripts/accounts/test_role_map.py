@@ -105,7 +105,11 @@ class RoleMapTests(unittest.TestCase):
         self.assertNotIn("workers_claude", cast(dict[str, object], json.loads(server_config.read_text())))
 
     def test_stale_transition_metadata_reports_anomalies_and_keeps_the_account(self) -> None:
-        for change in ({"move_id": None}, {"reset": "old"}, {"why": 1}):
+        for change, anomaly in (
+            ({"move_id": None}, "invalid units transition metadata"),
+            ({"reset": "old"}, "invalid units reset"),
+            ({"why": 1}, "invalid units reason"),
+        ):
             with self.subTest(change=change):
                 output = io.StringIO()
                 selected = {"label": "claude2", "move_id": "move", "cause": "by hand", "window": "unknown"}
@@ -115,6 +119,8 @@ class RoleMapTests(unittest.TestCase):
                 self.assertEqual(result.groups.get("units"), "claude2" if "move_id" in change else selected)
                 self.assertEqual(len(output.getvalue().splitlines()), 1)
                 self.assertIn("anomaly:", output.getvalue())
+                with self.assertRaisesRegex(role_map.RoleMapAnomaly, anomaly):
+                    _ = role_map.decode_role_map_strict(text)
 
     def test_workers_launch_refuses_an_unreadable_map_without_a_cache(self) -> None:
         self.seed(self.home, groups={})
@@ -325,7 +331,7 @@ class RoleMapTests(unittest.TestCase):
                     role_map.write_role_map(change)
             self.assertEqual(json.loads(accounts.groups_file().read_text())["units"], {
                 "label": "claude3", "move_id": "interrupted-group-move", "cause": "auto",
-                "window": "weekly", "why": "auto: " + first.id, "reset": reset,
+                "window": "weekly", "why": "auto: " + first.id, "reset": reset, "at": change.at,
             })
 
             _ = refusal_watch.run_auto_moves(repair_at)
@@ -356,7 +362,7 @@ class RoleMapTests(unittest.TestCase):
         ssh.assert_not_called()
         groups = cast(dict[str, object], json.loads(accounts.groups_file().read_text()))
         self.assertEqual(groups["units"], {"label": "claude2", "move_id": "scratch-move",
-                                          "cause": "by hand", "window": "unknown", "why": "scratch selection"})
+                                          "cause": "by hand", "window": "unknown", "why": "scratch selection", "at": at})
         self.assertEqual(groups["showrunners"], "claude1")
         self.assertEqual(selected.groups, groups)
         self.assertEqual(selected.workers, "codex3")
@@ -409,7 +415,7 @@ class RoleMapTests(unittest.TestCase):
         self.assertEqual((before.groups, before.workers), ({"units": "claude3"}, "codex3"))
         stored = cast(dict[str, object], json.loads(accounts.groups_file().read_text()))
         self.assertEqual(stored["units"], {"label": "claude2", "move_id": "unread-login-move",
-                                          "cause": "by hand", "window": "unknown", "why": "isolated selection"})
+                                          "cause": "by hand", "window": "unknown", "why": "isolated selection", "at": change.at})
         self.assertEqual((after.groups, after.workers), (stored, "codex3"))
         history = accounts.groups_file().with_name("roles.jsonl").read_text().splitlines()
         self.assertEqual(len(history), 1)
@@ -433,7 +439,8 @@ class RoleMapTests(unittest.TestCase):
         self.assertEqual(stored["showrunners"], "claude1")
         selected = cast(dict[str, object], stored["units"])
         self.assertEqual(selected, {"label": "claude2", "cause": "refusal", "window": "weekly",
-                                   "reset": reset.isoformat(), "move_id": "move-from-mac", "why": "weekly refusal"})
+                                   "reset": reset.isoformat(), "move_id": "move-from-mac", "why": "weekly refusal",
+                                   "at": RoleMapReadTime.now(timezone.utc).isoformat()})
         history = (self.server_home / ".local/state/accounts/roles.jsonl").read_text().splitlines()
         self.assertEqual(len(history), 1)
         change = cast(dict[str, object], json.loads(history[0]))

@@ -1,5 +1,7 @@
 # Work without workers
 
+Launchers run `check-launch`, `start-pass`, and `finish-pass` through `scripts/direct/pass_record.py`.
+
 <NoWorkerMode>
 Complete the current work directly.
 This exception covers implementation, repairs, code review, style review, and phase review.
@@ -81,6 +83,8 @@ Run them from `${WORKING_DIR}` with the normal phase ID and paths.
    Stage the final tree and run `verify.sh doc` immediately before each Cargo checkpoint.
    Record the successful commit with `progress_history.py checkpoint --session-dir "${SESSION_DIR}" --phase "<id>" --commit "<full hash>"`.
    This command requires the open phase and commit hash, with no worker pass requirement.
+   It refuses a hash that is not a commit in the phase's working dir, and it prints the checkpoint event id.
+   To cancel a wrong checkpoint event, run `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py void-checkpoint --session-dir "${SESSION_DIR}" --event-id "<event id>" --reason "<reason>"`.
    Complete reservation release and push through <CheckpointCommit/>.
 7. Finish the phase with `progress_history.py finish-phase --session-dir "${SESSION_DIR}" --phase-id "<id>" --status completed`.
    Keep broadcast-on mode through later phases until the workers-back notice arrives.

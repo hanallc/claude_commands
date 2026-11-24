@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
 from scripts.production import change_routing, staff, unrouted_alert
 from scripts.lint.memory_test_support import copy_config_file_fixture, write_config_fixture
 from scripts.production.staff_test_support import fixture_member, production_staff_record
@@ -169,7 +170,9 @@ assert 'send' not in sys.modules
                 send.assert_called_once()
 
     def test_unaccepted_send_outcomes_keep_alerts_pending(self) -> None:
-        for code, header in ((0, "SKIPPED"), (0, "REPLACED"), (3, "FAILED"), (2, "REFUSED"), (4, "HELD"), (5, "PENDING"), (6, "RETRY")):
+        for code, header in ((0, "SKIPPED"), (0, "REPLACED"), (3, "FAILED"), (2, "REFUSED"),
+                             (4, "HELD"), (5, "PENDING"), (6, "RETRY"),
+                             (SEND_CLOSED_EXIT, "CLOSED"), (SEND_ABSENT_EXIT, "ABSENT")):
             with self.subTest(header=header):
                 error = StringIO()
                 with (patch.object(unrouted_alert, "send_message", side_effect=self.isolated_sender()),

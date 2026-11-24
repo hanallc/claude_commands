@@ -3,7 +3,6 @@ from __future__ import annotations
 import html
 import io
 import json
-import math
 import os
 import re
 import shutil
@@ -21,8 +20,8 @@ from unittest import mock
 
 from scripts.build_queue import memory_files
 from scripts.build_queue.test_memory_hover import RAM_FIXTURE, SWAP_FIXTURE
-from scripts.review_links.test_page_frame import assert_status_states
-from scripts.disks import disks_page
+from scripts.review_links.browser_test_support import assert_status_states
+from scripts.disks import disks_page, slots
 from scripts.production import staff
 from scripts.review_links import staff_names
 from scripts.lib import file_lock, test_hang_guard
@@ -49,14 +48,14 @@ TREE = folder("/build", 100 * GIB, [
 
 
 NOW = 1000 * 86400
-SLOTS: dict[str, object] = {"root": "/build/slot", "groups": [
-    {"repository": "hana", "maximum": 8, "slots": [
-        {"name": "hana-slot1", "number": 1, "size": 70 * GIB, "last_used": NOW, "deleted_tonight": False,
+SLOTS: slots.SlotReport = {"root": "/build", "machine": "natedev", "unused_days": 2, "groups": [
+    {"repository": "hana/report", "maximum": None, "slots": [
+        {"name": "1", "key": "hana/report/1", "number": 1, "size": 70 * GIB, "last_used": NOW, "needs_review": False,
          "used_by": {"name": "report integrate", "showrunner": "builds"}},
-        {"name": "hana-slot2", "number": 2, "size": 0, "last_used": NOW - 9 * 86400, "used_by": None,
-         "deleted_tonight": True}]},
-    {"repository": "<b>", "maximum": None, "slots": [
-        {"name": "x-slot1", "number": 1, "size": None, "last_used": None, "used_by": None, "deleted_tonight": False}]}]}
+        {"name": "2", "key": "hana/report/2", "number": 2, "size": 0, "last_used": NOW - 9 * 86400, "used_by": None,
+         "needs_review": True}]},
+    {"repository": "<b>/other", "maximum": None, "slots": [
+        {"name": "1", "key": "<b>/other/1", "number": 1, "size": None, "last_used": None, "used_by": None, "needs_review": False}]}]}
 
 
 def session(name: str, size: int | None, state: str, held: list[dict[str, object]] | None = None) -> dict[str, object]:
@@ -87,15 +86,15 @@ class DisksPageTests(unittest.TestCase):
             staff_names.StaffNames(staff.StaffSnapshot((member,))).registry())[8:-9]
         for waiting in (False, True):
             with self.subTest(waiting=waiting):
-                row = {"key": "current", "name": "builder check", "slot_folder": "hana-slot1",
+                row = {"key": "current", "name": "builder check", "slot_folder": "hana/report/1",
                     "slot_machine": "natedev", "name_parts": [{"kind": "staff", "text": "builder"},
                                                                {"kind": "text", "text": " check"}]}
                 result = str(self.run_drive(setup + """
                     Date.now = () => input.now * 1000;
                     slotReport = input.slots;
                     builds = input.builds;
-                    result = slotsHtml(slotReport, KEEP, input.now, new Set(['hana']), slotStep);
-                """, extra={"slots": {**SLOTS, "machine": "natedev"}, "now": NOW,
+                    result = slotsHtml(slotReport, KEEP, input.now, new Set(['hana/report']), slotStep);
+                """, extra={"slots": SLOTS, "now": NOW,
                             "builds": {"read_at": NOW, "walk": [] if waiting else [row],
                                        "waiters": [row] if waiting else []}}))
                 self.assertEqual(re.findall(r'<span class="staff-name"[^>]*>([^<]*)</span>', result),
@@ -106,19 +105,19 @@ class DisksPageTests(unittest.TestCase):
         members = staff.StaffSnapshot(tuple(staff.StaffRow(staff.StaffId(name), "unit", name,
             staff.StaffRoot(), current_session=staff.StaffId(name)) for name in ("builder", "helper")))
         setup = "globalThis.window=globalThis;" + staff_names.script(staff_names.StaffNames(members).registry())[8:-9]
-        report = {"root": "/slots", "groups": [{"repository": "repo", "maximum": 1, "slots": [
-            {"name": "slot1", "number": 1, "size": 0, "last_used": NOW, "deleted_tonight": False,
+        report = {"root": "/build", "groups": [{"repository": "repo/unit", "maximum": None, "slots": [
+            {"name": "1", "key": "repo/unit/1", "number": 1, "size": 0, "last_used": NOW, "needs_review": False,
              "used_by": {"name": "builder helper", "showrunner": "", "name_parts": [
                  {"kind": "staff", "text": "builder"}, {"kind": "text", "text": " helper"}]}}]}]}
         body = str(self.run_page("(()=>{" + setup + "return slotsHtml(" + json.dumps(report)
-            + ",0," + str(NOW) + ",new Set(['repo']),()=>null);})()"))
+            + ",0," + str(NOW) + ",new Set(['repo/unit']),()=>null);})()"))
         self.assertEqual(re.findall(r'<span class="staff-name"[^>]*>([^<]*)</span>', body), ["builder", "builder"])
         plain = str(self.run_page("(()=>{const report=" + json.dumps(report)
             + ";delete report.groups[0].slots[0].used_by.name_parts;return slotsHtml(report,0,"
-            + str(NOW) + ",new Set(['repo']),()=>null);})()"))
+            + str(NOW) + ",new Set(['repo/unit']),()=>null);})()"))
         self.assertEqual(re.sub(r'<[^>]+>', '', body), re.sub(r'<[^>]+>', '', plain))
         current = str(self.run_page("(()=>{" + setup + "return slotsHtml(" + json.dumps(report)
-            + ",0," + str(NOW) + ",new Set(['repo']),()=>({name:'Current work'}));})()"))
+            + ",0," + str(NOW) + ",new Set(['repo/unit']),()=>({name:'Current work'}));})()"))
         self.assertEqual(current.count('>Current work</span>'), 2)
         self.assertNotIn('class="staff-name"', current)
 
@@ -127,7 +126,7 @@ class DisksPageTests(unittest.TestCase):
         names = staff_names.StaffNames(staff.StaffSnapshot((runner,)))
         setup = "globalThis.window=globalThis;" + staff_names.script(names.registry())[8:-9]
         body = str(self.run_page("(()=>{" + setup + "return slotsHtml(" + json.dumps(SLOTS)
-                                + ", 0, " + str(NOW) + ", new Set(['hana']), ()=>null);})()"))
+                                + ", 0, " + str(NOW) + ", new Set(['hana/report']), ()=>null);})()"))
         self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>builds</span>')
         self.assertIn('>report integrate</span>', body)
         self.assertNotRegex(body, r'class="staff-name"[^>]*>report integrate</span>')
@@ -225,14 +224,40 @@ class DisksPageTests(unittest.TestCase):
                                   "The cleanup floor is unknown."])
 
     def test_the_slider_runs_on_a_log_scale_from_the_least_value_to_the_largest_top_folder(self) -> None:
-        calls = ("range.min", "range.max", "toSlider(range.min, range)", "toSlider(range.max, range)",
-                 "fromSlider(SLIDER_STEPS / 2, range)", "startLimit(range, data.settings)")
-        result = cast(list[float], self.run_page(
-            f"(() => {{ const range = sliderRange(data.tree, data.settings); return [{', '.join(calls)}]; }})()"))
-        self.assertEqual(result[:4], [GIB, 60 * GIB, 0, 1000])
-        middle: float = result[4]
-        self.assertAlmostEqual(middle, GIB * math.sqrt(60), delta=1)
-        self.assertEqual(result[5], 10 * GIB)
+        result = self.run_page("""(() => {
+            const range = sliderRange(data.tree, data.settings);
+            const limits = [0, SLIDER_STEPS / 2, SLIDER_STEPS].map(step => fromSlider(step, range));
+            const precise = sliderRange(data.tree, {slider_min_gib: 1.04});
+            const minimum = fromSlider(0, precise);
+            const drive = sliderRange({children: [{size: 27 * GIB}]}, {slider_min_gib: 0.7});
+            const sessions = sessionRange({sessions: [{size: 3 * GIB}]}, Math.ceil(0.7 * GIB));
+            const uneven = fromSlider(SLIDER_STEPS, {...range, max: range.max + 1});
+            const nearTib = 1023.99 * GIB;
+            const largeRange = {...range, max: 2048 * GIB};
+            const snapped = snapLimit(nearTib, largeRange);
+            const boundary = snapLimit(999.99 * GIB, largeRange);
+            const threeDigits = snapLimit(99.94 * GIB, largeRange);
+            return {
+                limits, labels: limits.map(limitLabel),
+                positions: [toSlider(range.min, range), toSlider(range.max, range)],
+                start: startLimit(range, data.settings),
+                minimum: [minimum, limitLabel(minimum)],
+                top: [fromSlider(SLIDER_STEPS, drive), sessionLimitAt(SLIDER_STEPS, sessions)],
+                uneven: [uneven, limitLabel(uneven)],
+                large: [limitLabel(nearTib), snapped, limitLabel(snapped), limitLabel(boundary),
+                        limitLabel(999.94 * GIB), threeDigits, limitLabel(threeDigits)],
+            };
+        })()""")
+        self.assertEqual(result, {
+            "limits": [GIB, 7.75 * GIB, 60 * GIB],
+            "labels": ["1.0 GiB", "7.75 GiB", "60 GiB"],
+            "positions": [0, 1000],
+            "start": 10 * GIB,
+            "minimum": [1.04 * GIB, "1.04 GiB"],
+            "top": [27 * GIB, 3 * GIB],
+            "uneven": [60 * GIB + 1, "≈60 GiB"],
+            "large": ["≈1.0 TiB", 1024 * GIB, "1.0 TiB", "0.98 TiB", "≈0.98 TiB", 99.9 * GIB, "99.9 GiB"],
+        })
 
     def test_the_status_line_uses_the_shared_reader_and_measured_facts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -624,16 +649,16 @@ const localStorage={getItem:()=>null};
             rows = cast(list[str], re.findall(r"<tr[^>]*>(.*?)</tr>", re.sub(r'<div class="narrow">.*?</div>', "", html)))
             return html, ["|".join(part for part in re.split(r"<[^>]+>", row) if part) for row in rows[1:]]
 
-        # The card starts with one band per repository; an open band lists its slots.
-        self.assertEqual(cells([])[1], ["hana|2 of 8 slots · 70 GiB", "&lt;b&gt;|1 slot · —"])
-        html, shown = cells(["hana", "<b>"])
-        self.assertEqual(shown, ["hana|2 of 8 slots · 70 GiB", "hana-slot1|70 GiB|now|report integrate|builds",
-                                 "hana-slot2|&lt; 256 MiB|9 days ago|deleted tonight", "&lt;b&gt;|1 slot · —",
-                                 "x-slot1|—|—|—"])
-        self.assertEqual(re.findall(r'aria-expanded="(\w+)" data-group="([^"]*)"', cells(["hana"])[0]),
-                         [("true", "hana"), ("false", "&lt;b&gt;")])
+        # An open group lists the numbered copies for that repository and unit.
+        self.assertEqual(cells([])[1], ["hana/report|2 slots · 70 GiB", "&lt;b&gt;/other|1 slot · —"])
+        html, shown = cells(["hana/report", "<b>/other"])
+        self.assertEqual(shown, ["hana/report|2 slots · 70 GiB", "1|70 GiB|now|report integrate|builds",
+                                 "2|&lt; 256 MiB|9 days ago|review", "&lt;b&gt;/other|1 slot · —",
+                                 "1|—|—|—"])
+        self.assertEqual(re.findall(r'aria-expanded="(\w+)" data-group="([^"]*)"', cells(["hana/report"])[0]),
+                         [("true", "hana/report"), ("false", "&lt;b&gt;/other")])
         self.assertEqual(re.findall(r'<div class="narrow">(.*?)</div>', html), [
-            '<span class="tag run">report integrate</span><span class="dim">builds</span>', '<span class="tag go">deleted tonight</span>'])
+            '<span class="tag run">report integrate</span><span class="dim">builds</span>', '<span class="tag go">review</span>'])
         empty = cast(str, self.run_page(f"slotsHtml({json.dumps({'root': '/s', 'groups': []})}, {KEEP}, {now}, new Set())"))
         self.assertIn("No slots yet.", empty)
 
@@ -838,15 +863,15 @@ async function checkSessionLayout() {
 
     def test_a_slot_shows_the_builds_tooltip_without_a_title_field(self) -> None:
         row = {"name": "report integrate", "unit": "report", "showrunner": "builds", "started_at": NOW - 60,
-               "key": "run", "used": 2.0, "slot": 1, "slot_folder": "hana-slot1", "slot_machine": "natedev",
+               "key": "run", "used": 2.0, "slot_folder": "hana/report/1", "slot_machine": "natedev",
                "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
         builds = {"read_at": NOW, "walk": [row], "waiters": [], "ram": RAM_FIXTURE, "swap": SWAP_FIXTURE}
         body = cast(str, self.run_drive("""
             Date.now = () => input.now * 1000;
             slotReport = input.slots;
             builds = input.builds;
-            result = tipFor("slot:hana-slot1");
-        """, extra={"slots": {**SLOTS, "machine": "natedev"}, "now": NOW, "builds": builds}))
+            result = tipFor("slot:hana/report/1");
+        """, extra={"slots": SLOTS, "now": NOW, "builds": builds}))
         self.assertIn("report · integrate", body)
 
     def test_each_row_and_card_title_has_a_tooltip_and_a_slot_in_use_shows_its_builds_step(self) -> None:
@@ -854,10 +879,10 @@ async function checkSessionLayout() {
         # the build queue so they share code and data".
         now = NOW
         step = {"name": "report integrate", "unit": "report", "showrunner": "builds", "started_at": now - 600, "used": 2.0,
-                "slot": 1, "slot_folder": "hana-slot1", "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
+                "slot_folder": "hana/report/1", "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
         builds = {"read_at": now, "waiters": [], "swap_by": [], "ram": RAM_FIXTURE, "swap": SWAP_FIXTURE,
                   "walk": [{**step, "key": "mac-run", "slot_machine": "mac"}, {**step, "key": "run", "slot_machine": "natedev"},
-                           {**step, "key": "free-run", "slot_folder": "hana-slot2", "slot_machine": "natedev"}]}
+                           {**step, "key": "free-run", "slot_folder": "hana/report/2", "slot_machine": "natedev"}]}
         result = cast(dict[str, str], self.run_drive("""
             Date.now = () => input.now * 1000;
             data = {keep_bytes: KEEP};
@@ -866,24 +891,25 @@ async function checkSessionLayout() {
             builds = input.builds;
             sessionLimit = 5 * GIB;
             const text = html => html.replace(/<[/](dt|dd)>/g, "|").replace(/<[^>]+>/g, "");
-            result = {run: tipFor("slot:hana-slot1"), shared: stepTip.tooltipHtml("row:run", builds),
-                      free: text(tipFor("slot:hana-slot2")), group: text(tipFor("group:hana")), slots: text(tipFor("about:slots")),
+            result = {run: tipFor("slot:hana/report/1"), shared: stepTip.tooltipHtml("row:run", builds),
+                      review: text(tipFor("slot:hana/report/2")), group: text(tipFor("group:hana/report")),
+                      slots: text(tipFor("about:slots")),
                       sessions: text(tipFor("about:sessions")), session: text(tipFor("session:fps")),
                       smaller: text(tipFor("smaller:sessions")), gone: tipFor("slot:gone")};
-            const usedBy = () => slotsHtml(slotReport, KEEP, input.now, new Set(["hana"]), slotStep).match(/<td class="use wide">(.*?)<[/]td>/)[1];
+            const usedBy = () => slotsHtml(slotReport, KEEP, input.now, new Set(["hana/report"]), slotStep).match(/<td class="use wide">(.*?)<[/]td>/)[1];
             result.runName = usedBy();
             // A step that waits in a held slot names the slot and gives its tooltip, as the Builds page waiting row does.
             builds.walk = builds.walk.filter(row => row.key !== "run");
-            builds.waiters = [{...input.wait, key: "wait", slot_folder: "hana-slot1", slot_machine: "natedev"}];
-            result.wait = [tipFor("slot:hana-slot1") === stepTip.tooltipHtml("wait:wait", builds), usedBy()];
+            builds.waiters = [{...input.wait, key: "wait", slot_folder: "hana/report/1", slot_machine: "natedev"}];
+            result.wait = [tipFor("slot:hana/report/1") === stepTip.tooltipHtml("wait:wait", builds), usedBy()];
             // Builds data older than the configured age gives the Disks rows and the lease's name.
             builds.read_at = input.now - 31;
-            result.stale = text(tipFor("slot:hana-slot1"));
+            result.stale = text(tipFor("slot:hana/report/1"));
             result.staleName = usedBy();
             // Builds data with no read time is not current.
             delete builds.read_at;
             result.noTime = usedBy();
-        """, extra={"slots": {**SLOTS, "machine": "natedev", "unused_days": 7}, "sessions": SESSIONS, "builds": builds,
+        """, extra={"slots": SLOTS, "sessions": SESSIONS, "builds": builds,
                     "now": now, "wait": {"name": "report test named", "unit": "report", "showrunner": "builds", "pid": 4343,
                                          "since": now - 60, "need": 3.0, "reason": "its turn", "fits": False, "why": "turn",
                                          "place": 1}}))
@@ -893,15 +919,17 @@ async function checkSessionLayout() {
         self.assertEqual(result["runName"], '<span class="tag run">report integrate</span><span class="dim">builds</span>')
         self.assertEqual(result["wait"], [True, '<span class="tag run">report test named</span><span class="dim">builds</span>'])
         self.assertIn("report · integrate", result["run"])
-        self.assertEqual(result["free"], "|".join(["hana-slot2", "deleted tonight", "Repository", "hana", "Size", "&lt; 256 MiB",
-                                                   "Last used", "9 days ago", "No run used it for 7 days, so the nightly sweep deletes it.", ""]))
-        self.assertEqual(result["group"], "hana|2 slots|Size|70 GiB|In use|1 of 2|Limit|8 slots|")
-        self.assertIn("The nightly sweep deletes a free slot unused for 7 days.", result["slots"])
+        self.assertEqual(result["review"], "|".join([
+            "2", "review", "Repository", "hana/report", "Size", "&lt; 256 MiB", "Last used", "9 days ago",
+            "The nightly sweep lists this folder after 2 days without use.", "",
+        ]))
+        self.assertEqual(result["group"], "hana/report|2 slots|Size|70 GiB|In use|1 of 2|Limit|not set|")
+        self.assertIn("The nightly sweep lists a free copy for review after 2 days without use.", result["slots"])
         self.assertIn("A session folder holds the temporary files of one Claude session", result["sessions"])
         self.assertEqual(result["session"], "fps|running|Size|28 GiB|run|held · Task phase:fps/3|center-shot|unsaved work · Task phase:fps/3|")
         self.assertEqual(result["smaller"], "3 smaller sessions|1.0 GiB|Each is below 5.0 GiB. Move the size filter to the left to show them.|")
         self.assertEqual(result["gone"], "")
-        self.assertTrue(result["stale"].startswith("hana-slot1|in use|Repository|hana|"), result["stale"])
+        self.assertTrue(result["stale"].startswith("1|in use|Repository|hana/report|"), result["stale"])
         self.assertEqual(result["staleName"], result["runName"])
         self.assertEqual(result["noTime"], result["runName"])
 
@@ -1016,7 +1044,7 @@ raise SystemExit(measure.measure(settings(folder, str(folder)), floors=no_floors
         child_code = """
 import sys
 from pathlib import Path
-from scripts.disks import disks_page
+from scripts.disks import disks_page, slots
 from scripts.lib import file_lock
 folder, descriptor = Path(sys.argv[1]), int(sys.argv[2])
 assert sys.stdin.buffer.read(1) == b'x'

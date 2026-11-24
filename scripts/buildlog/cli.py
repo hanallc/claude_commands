@@ -15,7 +15,7 @@
   buildlog ci                       record new GitHub Actions run attempts
   buildlog launches                 collect example build and start times from Claude Code
   buildlog disk                     measure disk usage for the next report
-  buildlog sample                   record memory counters and check for idle Mac test waits
+  buildlog sample                   record memory counters, check for idle Mac test waits, save machine facts
   buildlog snapshot                 record slice and zram counters now
   buildlog memory START END         report memory between offset-bearing instants
   buildlog usage-hours [YYYY-MM-DD]  measured memory, CPU, disk and free pool tokens over 24 h
@@ -239,7 +239,7 @@ def aws_snapshot() -> int:
     from scripts.build_targets.target_config import ssh_target_state_directory
     from scripts.lib import conf
 
-    return hourly(conf.path('aws_target'), ssh_target_state_directory('aws'))
+    return hourly(conf.path('aws_target'), ssh_target_state_directory('aws'), allow_aws_unavailable=True)
 
 
 def aws_page() -> int:
@@ -416,7 +416,7 @@ def main(argv: list[str]) -> int:
         return 0
     if command == "sample":
         from scripts.buildlog import sample
-        from scripts.buildlog import mac_idle
+        from scripts.buildlog import machine_watch
 
         if rest:
             print("usage: buildlog sample", file=sys.stderr)
@@ -424,15 +424,21 @@ def main(argv: list[str]) -> int:
         taken = sample.sample()
         if taken.host == "natedev":
             try:
-                mac_idle.watch_once(mac_idle.watch_paths(), taken.at)
+                machine_watch.watch_once(machine_watch.watch_paths(), taken.at)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
-                print(f"buildlog sample: Mac idle check failed: {error}", file=sys.stderr)
+                print(f"buildlog sample: machine watch failed: {error}", file=sys.stderr)
             from scripts.build_queue import head_stall
 
             try:
                 _ = head_stall.watch_once(head_stall.default_paths(), taken.at)
             except (OSError, ValueError) as error:
                 print(f"buildlog sample: head-stall check failed: {error}", file=sys.stderr)
+            from scripts.buildlog import machine_facts
+
+            try:
+                _ = machine_facts.sample_once(machine_facts.state_path(), taken.at)
+            except OSError as error:
+                print(f"buildlog sample: machine facts not saved: {error}", file=sys.stderr)
         return 0
     if command == "snapshot":
         from scripts.buildlog import memory

@@ -5,16 +5,21 @@ import fcntl
 import json
 import os
 import re
-from dataclasses import dataclass
+import shlex
+import sys
+from collections.abc import Generator
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from importlib import import_module
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, Protocol, cast, override, assert_never
+from typing import TYPE_CHECKING, Literal, NotRequired, ReadOnly, TypedDict, Protocol, cast, override, assert_never
 
 from scripts.accounts import role_map, worker_names
 from scripts.agents.stop_results import MoveHandedOff, StopFailed
+from scripts.lib import process_start
 from scripts.lib.atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
@@ -54,10 +59,15 @@ RequestedFields = TypedDict("RequestedFields", {"from": HistoricalAccountLabel, 
 MoveCause = Literal["refusal", "credits off", "by hand", "auto"]
 
 
-class RequestedMove(MoveCommon, RequestedFields):
+class RecordedMoveRequest(MoveCommon, RequestedFields):
     terminal: NotRequired[str]
     kind: Literal["requested"]
     cause: NotRequired[MoveCause]
+    scope: NotRequired[ReadOnly[Literal["group", "session"]]]
+
+
+class RequestedMove(RecordedMoveRequest):
+    scope: Literal["group", "session"]
 
 
 class ConfirmedMove(MoveCommon):
@@ -93,7 +103,9 @@ class RoomAgainMove(MoveCommon):
     label: HistoricalAccountLabel
 
 
-MoveEntry = RequestedMove | ConfirmedMove | FailedMove | WaitedMove | WaitEndedMove | NoRoomMove | RoomAgainMove
+MoveOutcomeEntry = ConfirmedMove | FailedMove | WaitedMove | WaitEndedMove | NoRoomMove | RoomAgainMove
+MoveEntry = RecordedMoveRequest | MoveOutcomeEntry
+MoveWriteEntry = RequestedMove | MoveOutcomeEntry
 
 
 @dataclass(frozen=True)
@@ -145,15 +157,26 @@ def store_file() -> Path:
 @dataclass(frozen=True)
 class MoveInProgress(MoveHandedOff):
     account: str
+    command: str = field(default="", compare=False)
 
 
 @dataclass(frozen=True)
 class MoveWaitingForRow(StopFailed):
-    """The batch could not take the row lock. A new command can retry the move."""
+    """The batch could not take the session or staff row lock."""
+
+    command: str = field(default="", compare=False)
+
+
+@dataclass(frozen=True)
+class MoveSuperseded(StopFailed):
+    """A later request replaced this detached move."""
+
+    reason: str = "a newer move ran"
 
 
 class ExplicitMoveTarget(Enum):
     REQUESTED_ACCOUNT = "use the requested account"
+    GROUP_ACCOUNT = "use the account requested by a group operation"
 
 
 @dataclass(frozen=True)
@@ -177,27 +200,173 @@ def native_row_key(reference: str) -> str:
     return "native-" + sha256(reference.encode()).hexdigest()
 
 
+@dataclass(frozen=True)
+class ClaimOwner:
+    """The process of a user command; its claim is live while this process lives."""
+
+    pid: int
+    start: str
+
+
+@dataclass(frozen=True)
+class LatestMoveRequest:
+    request_id: str
+    target: str
+    explicit_group_scope: bool = False
+    # The user command that wrote the claim; None for an automatic move or a plain request.
+    owner: ClaimOwner | None = field(default=None, compare=False)
+
+
+class NoLatestMoveRequest:
+    """The session has no saved move request."""
+
+
+@dataclass(frozen=True)
+class PendingMoveRequest:
+    member: MoveMember
+    request: LatestMoveRequest
+
+
+def latest_request_path(native_session: str) -> Path:
+    return store_file().parent / "latest-requests" / native_row_key(native_session)
+
+
+@contextmanager
+def claim_lock() -> Generator[None]:
+    """Make each read, check and write of the latest-request files one atomic step."""
+    path = latest_request_path("").parent.with_name("latest-requests.lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def own_claim_owner() -> ClaimOwner:
+    """Read the own process start, with one more read after a failure; no start is recorded after two failures."""
+    for _ in range(2):
+        started = process_start.process_start(os.getpid())
+        if isinstance(started, process_start.Started):
+            return ClaimOwner(os.getpid(), started.start)
+    return ClaimOwner(os.getpid(), "")
+
+
+def claim_is_live(request: LatestMoveRequest) -> bool:
+    """A user claim is live while its process lives or cannot be read; a claim with no start, while its pid exists."""
+    if request.owner is None:
+        return False
+    state = process_start.process_start(request.owner.pid)
+    return (isinstance(state, process_start.Unreadable)
+            or isinstance(state, process_start.Started) and request.owner.start in ("", state.start))
+
+
+def write_latest_request(native_session: str, request: LatestMoveRequest, *, name: str = "") -> None:
+    """Replace the request of a native session; a caller that reads and checks first holds `claim_lock`.
+
+    A move writes its request while it holds the session locks.
+    One exception: a user command writes its claim without the row lock while another operation holds the row.
+    The holder reads the request again before its stop and drops the row when the claim replaced its own.
+    An automatic move never takes a row while a live user claim is current.
+    A user command stops its wait for a row when its claim is missing or replaced, because a newer move ran.
+    """
+    path = latest_request_path(native_session)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields: dict[str, str | bool | int] = {"request_id": request.request_id, "target": request.target,
+        "name": name or "unnamed session", "native_session": native_session}
+    if request.explicit_group_scope:
+        fields["explicit_group_scope"] = True
+    if request.owner is not None:
+        fields["pid"], fields["start"] = request.owner.pid, request.owner.start
+    write_text_atomic(path, json.dumps(fields), new_file_mode=0o600)
+
+
+def _read_move_request(path: Path) -> PendingMoveRequest | NoLatestMoveRequest:
+    try:
+        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return NoLatestMoveRequest()
+    except RecursionError as error:
+        raise ValueError("move request JSON exceeds the nesting limit") from error
+    if isinstance(value, dict):
+        fields = cast(dict[str, object], value)
+        request_id, target = fields.get("request_id"), fields.get("target")
+        explicit_group_scope = fields.get("explicit_group_scope", False)
+        pid, start = fields.get("pid"), fields.get("start")
+        owner = ClaimOwner(pid, start) if isinstance(pid, int) and isinstance(start, str) else None
+        native_session, name = fields.get("native_session"), fields.get("name")
+        if (isinstance(request_id, str) and request_id and isinstance(target, str) and target
+                and (not target.startswith("group:") or target[6:] in role_map.CLAUDE_GROUPS)
+                and isinstance(native_session, str) and native_session and latest_request_path(native_session) == path
+                and isinstance(name, str) and name and isinstance(explicit_group_scope, bool)
+                and (owner is not None or pid is None and start is None)):
+            return PendingMoveRequest(MoveMember(native_session, name),
+                                      LatestMoveRequest(request_id, target, explicit_group_scope, owner))
+    raise ValueError("invalid latest move request")
+
+
+def read_latest_request(native_session: str) -> LatestMoveRequest | NoLatestMoveRequest:
+    saved = _read_move_request(latest_request_path(native_session))
+    return saved if isinstance(saved, NoLatestMoveRequest) else saved.request
+
+
+def pending_move_requests() -> tuple[PendingMoveRequest, ...]:
+    pending: list[PendingMoveRequest] = []
+    for path in sorted(latest_request_path("").parent.glob("native-*")):
+        try:
+            saved = _read_move_request(path)
+        except (OSError, ValueError):
+            print(f"Could not read move request {path.name}.", file=sys.stderr)
+            continue
+        if isinstance(saved, PendingMoveRequest):
+            pending.append(saved)
+    return tuple(pending)
+
+
+MOVE_COMMAND = "~/.claude/scripts/lib/py ~/.claude/scripts/agents/stop_resume.py"
+RETRY_COMMAND = f"{MOVE_COMMAND} retry"
+
+
+def batch_move_command(reference: str, destination: str | FollowGroupAccount, *, user_command: bool = False) -> str:
+    options = (["--group", destination.group] if isinstance(destination, FollowGroupAccount)
+               else ["--target", destination])
+    if user_command:
+        options.append("--user-command")
+    return f"{MOVE_COMMAND} batch {shlex.join([*options, '--', reference])}"
+
+
+def remove_latest_request(native_session: str, request_id: str) -> None:
+    """Remove only this request.
+
+    A move removes its request while it holds the session locks.
+    A user command that stops its wait for a held row removes its claim without the row lock.
+    The request id check under `claim_lock` keeps a newer request in place.
+    """
+    with claim_lock():
+        current = read_latest_request(native_session)
+        if isinstance(current, LatestMoveRequest) and current.request_id == request_id:
+            latest_request_path(native_session).unlink(missing_ok=True)
+
+
+def set_claim_owner(native_session: str, request_id: str, owner: ClaimOwner | None) -> bool:
+    """Give this request a new owner and keep its other fields; False when another request replaced it.
+
+    The detached child takes the claim of its parent. A user command at its end keeps a plain request for a retry.
+    """
+    with claim_lock():
+        saved = _read_move_request(latest_request_path(native_session))
+        if not isinstance(saved, PendingMoveRequest) or saved.request.request_id != request_id:
+            return False
+        if saved.request.owner != owner:
+            write_latest_request(native_session, replace(saved.request, owner=owner), name=saved.member.name)
+        return True
+
+
 def _batch_path(batch_id: str) -> Path:
     if not re.fullmatch(r"[a-f0-9]{32}", batch_id):
         raise ValueError("invalid move batch id")
     return store_file().parent / "move-results" / f"{batch_id}.json"
-
-
-def move_batch_id(decision: str, target: str | FollowGroupAccount, references: frozenset[str]) -> str:
-    """Retry a saved batch when only its pending members remain."""
-    prefix = sha256(json.dumps([decision, target.group if isinstance(target, FollowGroupAccount) else target]).encode()).hexdigest()[:16]
-    batch_id = prefix + sha256(json.dumps(sorted(references)).encode()).hexdigest()[:16]
-    path = _batch_path(batch_id)
-    if path.is_file():
-        return batch_id
-    for candidate in sorted(path.parent.glob(f"{prefix}*.json")):
-        try:
-            saved = read_batch_result(candidate.stem)
-        except (OSError, ValueError):
-            continue
-        if saved.target == target and references <= {member.reference for member in saved.pending}:
-            return candidate.stem
-    return batch_id
 
 
 def read_batch_result(batch_id: str) -> MoveBatchResult:
@@ -224,28 +393,18 @@ def read_batch_result(batch_id: str) -> MoveBatchResult:
     return MoveBatchResult(target, tuple(members))
 
 
-def save_batch_result(batch_id: str, target: str | FollowGroupAccount, pending: tuple[MoveMember, ...],
-                      finished: frozenset[str]) -> MoveBatchResult:
-    """Keep pending members from other attempts until a move resolves them."""
-    path = _batch_path(batch_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.with_suffix(".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+def legacy_batch_ids() -> tuple[str, ...]:
+    """Read newer reports first when more than one report names a session."""
+    directory = store_file().parent / "move-results"
+    reports: list[tuple[int, str]] = []
+    for path in directory.glob("*.json"):
+        if not re.fullmatch(r"[a-f0-9]{32}", path.stem):
+            continue
         try:
-            previous = read_batch_result(batch_id)
+            reports.append((path.stat().st_mtime_ns, path.stem))
         except FileNotFoundError:
-            previous = MoveBatchResult(target, ())
-        if previous.target != target:
-            raise ValueError("move batch intent changed")
-        members = {member.reference: member for member in previous.pending}
-        members.update((member.reference, member) for member in pending)
-        result = MoveBatchResult(target, tuple(sorted(
-            (member for member in members.values() if member.reference not in finished),
-            key=lambda member: (member.name, member.reference))))
-        destination = {"group": target.group} if isinstance(target, FollowGroupAccount) else {"target": target}
-        write_text_atomic(path, json.dumps({**destination, "pending": [
-            {"reference": member.reference, "name": member.name} for member in result.pending]}), new_file_mode=0o600)
-        return result
+            continue
+    return tuple(batch_id for _, batch_id in sorted(reports, reverse=True))
 
 
 def _valid(value: object) -> bool:
@@ -298,6 +457,8 @@ def _valid(value: object) -> bool:
     kind = fields.get("kind")
     if "cause" in fields and (kind != "requested" or fields["cause"] not in ("refusal", "credits off", "by hand", "auto")):
         return False
+    if "scope" in fields and (kind != "requested" or fields["scope"] not in ("group", "session")):
+        return False
     if kind in ("requested", "waited") and "reset" in fields:
         if not isinstance(fields["reset"], str) or not fields["reset"]:
             return False
@@ -309,7 +470,7 @@ def _valid(value: object) -> bool:
     return isinstance(kind, str) and kind in required and all(isinstance(fields.get(key), str) for key in required[kind])
 
 
-def _canonical_entry(entry: MoveEntry) -> MoveEntry:
+def _canonical_entry[Entry: MoveEntry](entry: Entry) -> Entry:
     from scripts.whoami.note_file import canonical_label
 
     fields: dict[str, object] = dict(entry)
@@ -317,7 +478,7 @@ def _canonical_entry(entry: MoveEntry) -> MoveEntry:
         value = fields.get(field)
         if isinstance(value, str):
             fields[field] = canonical_label(value)
-    return cast(MoveEntry, cast(object, fields))
+    return cast(Entry, cast(object, fields))
 
 
 
@@ -411,7 +572,7 @@ def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
     return evidence.history if isinstance(evidence, MoveReplayEvidence) else evidence
 
 
-def append_move(entry: MoveEntry) -> None:
+def append_move(entry: MoveWriteEntry) -> None:
     """Append a complete transition while holding the shared writer lock."""
     entry = _canonical_entry(entry)
     if entry["kind"] == "requested":
@@ -425,21 +586,24 @@ def append_move(entry: MoveEntry) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+", encoding="utf-8", errors="replace") as output:
         fcntl.flock(output.fileno(), fcntl.LOCK_EX)
-        _ = worker_names.migrate_locked_journal(output, path)
-        if entry["kind"] in ("confirmed", "wait ended", "room again", "failed"):
-            _ = output.seek(0)
-            for line in output:
+        lines = worker_names.migrate_locked_journal(output, path)
+        if entry["kind"] in ("requested", "confirmed", "wait ended", "room again", "failed"):
+            for line in lines:
                 try:
                     previous = cast(object, json.loads(line))
                 except ValueError:
                     continue
-                if _valid(previous):
-                    held = cast(dict[str, object], previous)
-                    if (held.get("kind") == entry["kind"] and held.get("move_id") == entry["move_id"]
-                            and held.get("tool") == entry["tool"] and held.get("subject") == entry["subject"]
-                            and (entry["kind"] != "confirmed" or
-                                 (held.get("worker") == entry.get("worker") and held.get("run") == entry.get("run")))):
-                        return
+                if not _valid(previous):
+                    continue
+                held = cast(dict[str, object], previous)
+                if held.get("kind") != entry["kind"] or held.get("move_id") != entry["move_id"]:
+                    continue
+                if entry["kind"] == "requested":
+                    return
+                if (held.get("tool") == entry["tool"] and held.get("subject") == entry["subject"]
+                        and (entry["kind"] != "confirmed" or
+                             (held.get("worker") == entry.get("worker") and held.get("run") == entry.get("run")))):
+                    return
         _ = output.seek(0, os.SEEK_END)
         append_journal_line(output.fileno(), json.dumps(entry, sort_keys=True))
 

@@ -23,6 +23,9 @@ class GateJobNotRecorded:
 
 GATE_JOB_NOT_RECORDED = GateJobNotRecorded()
 
+# A hand command that passed its model check (scripts/production/hand_made.py).
+HAND_MADE = StepJob("hand-made")
+
 
 VerifyVerb = Literal["check", "test", "lint", "doc", "example", "build", "final"]
 VERIFY_VERBS: tuple[VerifyVerb, ...] = ("check", "test", "lint", "doc", "example", "build", "final")

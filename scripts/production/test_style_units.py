@@ -29,6 +29,7 @@ from scripts.herdr.herdr import HerdrPlace
 from scripts.direct import plan_history
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 NOW = datetime(2026, 10, 28, 12, tzinfo=UTC)
@@ -60,7 +61,7 @@ class StyleUnitsTests(unittest.TestCase):
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.database = self.root / "ledger.sqlite"
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        self.enterContext(patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}))
+        self.enterContext(patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN}))
         self.doc = self.root / "style-production.md"
         _ = self.doc.write_text(f"# Production\n- **Merge branch:** main\n- **Showrunner checkout:** {self.root}\n")
         write_style_units(self.doc)

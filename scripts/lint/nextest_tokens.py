@@ -1,12 +1,14 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Share the jobserver between nextest test threads and nested Cargo jobs.
 
-Build and list the tests before taking tokens. Request at most the selected
-test count plus `nested_tokens`, within the requested width. Wait for at most
-`test_token_floor` tokens. Put up to `nested_tokens` tokens in a private FIFO.
-Give each test thread one of the remaining tokens. Return all the shared
-tokens when nextest exits. If a signal ends the launcher, steve reclaims
-its tokens and the step group ends the test child.
+Build and list the tests before taking tokens. Limit total tokens to the
+requested width and the selected test count plus `nested_tokens`. Wait for
+`test_token_floor` test tokens, up to the selected test count and requested width.
+Take more free tokens up to the limit. Give nested Cargo up to `nested_tokens`
+of the tokens above the test floor. Give the test child a private FIFO even
+when nested Cargo gets zero tokens. Give one remaining token to each test
+thread. Return all shared tokens when nextest exits. If a signal ends the launcher,
+steve reclaims its tokens and the step group ends the test child.
 """
 
 from __future__ import annotations
@@ -239,8 +241,6 @@ def clean_jobserver_parent(launcher_start: process_start.ProcessStart) -> Path:
 
 def run_test_phase(run: SizedTestRun, threads: int, nested: bytearray, parent: Path,
                    launcher_start: process_start.ProcessStart) -> int:
-    if not nested:
-        return run_child(run.with_threads(threads))
     pid = os.getpid()
     start = launcher_start.start.encode().hex() if isinstance(launcher_start, process_start.Started) else "unknown"
     with tempfile.TemporaryDirectory(dir=parent, prefix=f"{pid}-{start}-") as directory:
@@ -282,6 +282,7 @@ def run_with_tokens(run: SizedTestRun, pool_path: Path, floor: int, width_file: 
         return status
     selection = selected_test_count(run)
     limit = run.width
+    test_floor = min(floor, run.width)
     if isinstance(selection, UnavailableTestCount):
         print(f"nextest: {selection.reason}; using requested width {limit} as the token limit", flush=True)
     elif selection.tests == 0:
@@ -289,24 +290,21 @@ def run_with_tokens(run: SizedTestRun, pool_path: Path, floor: int, width_file: 
         return run_child(run.with_threads(run.width))
     else:
         limit = min(limit, selection.tests + nested_tokens)
+        test_floor = min(test_floor, selection.tests)
     try:
         pool = TokenPool(os.open(pool_path, os.O_RDWR | os.O_CLOEXEC))
     except OSError as error:
         print(f"nextest: {run.width} test threads with no jobserver tokens: {pool_path}: {error}", flush=True)
         return run_child(run.with_threads(run.width))
     try:
-        wanted = min(floor, limit)
-        pool.take_free(wanted)
-        if len(pool.held) < wanted:
+        pool.take_free(test_floor)
+        if len(pool.held) < test_floor:
             # The Builds page reads this line as the token wait stage.
-            line = progress_profile.token_wait_line(wanted - len(pool.held))
-            if nested_tokens and limit > 1:
-                line += " (tests and nested Cargo)"
-            print(line, flush=True)
-            pool.take_waiting(wanted)
+            print(progress_profile.token_wait_line(test_floor - len(pool.held)), flush=True)
+            pool.take_waiting(test_floor)
         pool.take_free(limit)
         held = len(pool.held)
-        nested = min(nested_tokens, held - 1)
+        nested = min(nested_tokens, held - test_floor)
         threads = held - nested
         if width_file is not None:
             _ = width_file.write_text(f"{threads}\n", encoding="utf-8")

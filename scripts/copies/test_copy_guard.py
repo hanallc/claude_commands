@@ -296,20 +296,35 @@ class CopyGuardTests(unittest.TestCase):
     def test_original_worktree_helper_is_allowed_but_bare_worktree_add_is_refused(self) -> None:
         scripts = Path(__file__).resolve().parents[1]
         helper = scripts / "worktree/make_worktree.sh"
-        checkout = self.root / "original checkout"
-        command = shlex.join(["bash", str(helper), str(checkout), "original-work"])
-        self.assertEqual(copy_guard.refusal(command, self.repo), "")
+        workspace = self.root / "workspace"
+        checkout = workspace / "origin/original/work"
+        config = self.root / "config"
+        config.mkdir()
+        _ = (config / "build_folders.conf").write_text(
+            f"roots.workspace={workspace}\nroots.build={self.root / 'build'}\n"
+            + "# range: 0..1\nlocks.probe_wait_seconds=0.05\n# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
+        copies_config = config / "copies.conf"
+        _ = copies_config.write_text("# range: 0.001..\ngit_timeout_seconds=5\n")
+        repository = self.root / "rust/origin"
+        repository.parent.mkdir()
+        _ = self.repo.rename(repository)
+        request = ["bash", str(helper), "origin", "original", "work"]
+        command = shlex.join(request)
+        self.assertEqual(copy_guard.refusal(command, repository), "")
         self.assertIn("copies.py run", copy_guard.refusal(
-            shlex.join(["git", "worktree", "add", str(checkout), "-b", "original-work"]), self.repo))
+            shlex.join(["git", "worktree", "add", str(checkout), "-b", "original-work"]), repository))
         refusal = copy_guard.hook_refusal(json.dumps({
-            "tool_name": "Bash", "cwd": str(self.repo),
+            "tool_name": "Bash", "cwd": str(repository),
             "tool_input": {"command": shlex.join(["git", "worktree", "add", str(checkout), "-b", "original-work"])},
         }))
         self.assertIn("copies.py run", refusal)
-        self.assertIn("make_worktree.sh <path> <branch>", refusal)
-        result = subprocess.run(["bash", str(helper), str(checkout), "original-work"],
-                                cwd=self.repo, text=True, capture_output=True, timeout=10, check=False,
-                                env={**os.environ, "WORKTREES_STATE_DIR": str(self.root / "worktree state")})
+        self.assertIn("worktrees.py make <repo> <unit> <short-name>", refusal)
+        result = subprocess.run(request,
+                                cwd=repository, text=True, capture_output=True, timeout=10, check=False,
+                                env={**os.environ, "HOME": str(self.root), "CONF_DIR": str(config),
+                                     "COPIES_CONFIG": str(copies_config),
+                                     "STAFF_FILE": str(self.root / "staff.json"),
+                                     "WORKTREES_STATE_DIR": str(self.root / "worktree state")})
         self.assertEqual(result.returncode, 0, result.stderr)
         branch = subprocess.run(["git", "-C", str(checkout), "branch", "--show-current"],
                                 text=True, capture_output=True, timeout=10, check=True).stdout.strip()
@@ -481,11 +496,11 @@ class CopyGuardTests(unittest.TestCase):
         self.assertTrue(all(finding.line >= 1 for finding in findings))
         self.assertTrue(all("copies.py run" in str(finding) for finding in findings))
 
-    def test_scan_finds_qualified_style_git_makers_without_refusing_git_reads(self) -> None:
+    def test_scan_finds_qualified_git_makers_without_refusing_git_reads(self) -> None:
         scripts = self.root / "scripts"
         scripts.mkdir()
         _ = (scripts / "crate_worker.py").write_text(
-            'import bulk_run as run\n'
+            'import copies as run\n'
             + 'run.git(repo, "clone", "--shared", str(repo), str(checkout))\n'
             + 'run.git(repo, "worktree", "add", str(checkout), "HEAD")\n'
             + 'run.git(repo, "show", "clone")\n')
@@ -504,30 +519,26 @@ class CopyGuardTests(unittest.TestCase):
         self.assertEqual([(finding.line, finding.operation) for finding in findings], expected)
 
     def test_scan_tracks_dotted_module_imports(self) -> None:
-        for module in ("scripts.style.bulk_run", "scripts.copies.copies"):
-            with self.subTest(module=module):
-                self.assert_import_policy(
-                    f'import {module}\n'
-                    + f'{module}.git(repo, "clone", "a", "b")  # refused: git clone\n'
-                    + f'{module}.git(repo, "worktree", "add", "b", "HEAD")  # refused: git worktree add\n'
-                    + f'{module}.git(repo, "show", "clone")\n'
-                    + 'def shadow(scripts):\n'
-                    + f'    {module}.git(repo, "clone", "a", "b")\n')
+        self.assert_import_policy(
+            'import scripts.copies.copies\n'
+            + 'scripts.copies.copies.git(repo, "clone", "a", "b")  # refused: git clone\n'
+            + 'scripts.copies.copies.git(repo, "worktree", "add", "b", "HEAD")  # refused: git worktree add\n'
+            + 'scripts.copies.copies.git(repo, "show", "clone")\n'
+            + 'def shadow(scripts):\n'
+            + '    scripts.copies.copies.git(repo, "clone", "a", "b")\n')
 
     def test_scan_tracks_from_import_module_aliases(self) -> None:
-        for package, module in (("scripts.style", "bulk_run"), ("scripts.copies", "copies")):
-            with self.subTest(module=module):
-                self.assert_import_policy(
-                    f'from {package} import {module} as run\n'
-                    + 'run.git(repo, "clone", "a", "b")  # refused: git clone\n'
-                    + 'run.git(repo, "worktree", "add", "b", "HEAD")  # refused: git worktree add\n'
-                    + 'run.git(repo, "status")\n'
-                    + 'def shadow(run):\n    run.git(repo, "clone", "a", "b")\n')
+        self.assert_import_policy(
+            'from scripts.copies import copies as run\n'
+            + 'run.git(repo, "clone", "a", "b")  # refused: git clone\n'
+            + 'run.git(repo, "worktree", "add", "b", "HEAD")  # refused: git worktree add\n'
+            + 'run.git(repo, "status")\n'
+            + 'def shadow(run):\n    run.git(repo, "clone", "a", "b")\n')
 
     def test_scan_tracks_function_local_imports(self) -> None:
         for statement, call in (
-                ("import bulk_run as run", "run.git"),
-                ("from scripts.style import bulk_run as run", "run.git"),
+                ("import copies as run", "run.git"),
+                ("from scripts.copies import copies as run", "run.git"),
                 ("import scripts.copies.copies", "scripts.copies.copies.git"),
                 ("from scripts.copies.copies import git as make", "make")):
             with self.subTest(statement=statement):
@@ -541,7 +552,7 @@ class CopyGuardTests(unittest.TestCase):
                     + f'    {call}(repo, "clone", "a", "b")\n')
 
     def test_scan_restores_aliases_after_reimports(self) -> None:
-        for module in ("bulk_run", "scripts.copies.copies"):
+        for module in ("copies", "scripts.copies.copies"):
             with self.subTest(module=module):
                 self.assert_import_policy(
                     f'import {module} as run\n'
@@ -561,7 +572,7 @@ class CopyGuardTests(unittest.TestCase):
     global run
     run.git(repo, "clone", "a", "b")
 
-from scripts.style import bulk_run as run
+from scripts.copies import copies as run
 make()
 '''
         findings = copy_guard.PythonPolicy(self.root / "maker.py").scan(ast.parse(program))
@@ -574,7 +585,7 @@ def outer():
         nonlocal run
         run.git(repo, "clone", "a", "b")
 
-    from scripts.style import bulk_run as run
+    from scripts.copies import copies as run
     make()
 outer()
 '''
@@ -593,10 +604,10 @@ def outer():
     def make(run):
         run.git(repo, "clone", "a", "b")
 
-    from scripts.style import bulk_run as run
+    from scripts.copies import copies as run
     make(unrelated)
 
-from scripts.style import bulk_run as run
+from scripts.copies import copies as run
 parameter(unrelated)
 local()
 outer()
@@ -605,7 +616,7 @@ outer()
         self.assertEqual(findings, [])
 
     def test_scan_finds_global_clone_called_before_module_rebinding(self) -> None:
-        program = '''from scripts.style import bulk_run as run
+        program = '''from scripts.copies import copies as run
 
 def make(repo):
     global run
@@ -618,7 +629,7 @@ run = object()
         self.assertEqual([(finding.line, finding.operation) for finding in findings], [(5, "git clone")])
 
     def test_scan_keeps_global_rebinding_before_definition_clean(self) -> None:
-        program = '''from scripts.style.bulk_run import git as run
+        program = '''from scripts.copies.copies import git as run
 run = lambda *args: None
 
 def make(repo):
@@ -631,7 +642,7 @@ make("repo")
         self.assertEqual(findings, [])
 
     def test_scan_keeps_global_rebinding_before_only_call_clean(self) -> None:
-        program = '''from scripts.style.bulk_run import git as run
+        program = '''from scripts.copies.copies import git as run
 
 def make(repo):
     global run
@@ -645,7 +656,7 @@ make("repo")
 
     def test_scan_finds_nonlocal_clone_called_before_enclosing_rebinding(self) -> None:
         program = '''def outer():
-    from scripts.style import bulk_run as run
+    from scripts.copies import copies as run
 
     def make(repo):
         nonlocal run
@@ -660,7 +671,7 @@ outer()
 
     def test_scan_keeps_nonlocal_rebinding_before_only_call_clean(self) -> None:
         program = '''def outer():
-    from scripts.style.bulk_run import git as run
+    from scripts.copies.copies import git as run
 
     def make(repo):
         nonlocal run
@@ -681,7 +692,7 @@ def make(repo):
     run.git(repo, "clone", "source", "copy")
 
 make("repo")
-from scripts.style import bulk_run as run
+from scripts.copies import copies as run
 make("repo")
 make("repo")
 run = object()
@@ -697,7 +708,7 @@ def make(repo):
     run.git(repo, "clone", "source", "copy")
 
 if selected:
-    from scripts.style import bulk_run as run
+    from scripts.copies import copies as run
     make("repo")
 run = object()
 '''
@@ -705,7 +716,7 @@ run = object()
         self.assertEqual([(finding.line, finding.operation) for finding in findings], [(5, "git clone")])
 
     def test_scan_permits_imported_git_reads_before_module_rebinding(self) -> None:
-        program = '''from scripts.style import bulk_run as run
+        program = '''from scripts.copies import copies as run
 
 def read(repo):
     global run
@@ -725,13 +736,13 @@ def make(repo):
     run(repo, "clone", "source", "copy")
 
 make("repo")
-from scripts.style.bulk_run import git as run
+from scripts.copies.copies import git as run
 '''
         findings = copy_guard.PythonPolicy(self.root / "maker.py").scan(ast.parse(program))
         self.assertEqual([(finding.line, finding.operation) for finding in findings], [(5, "git clone")])
 
     def test_scan_finds_indirect_global_clone_before_module_rebinding(self) -> None:
-        program = '''from scripts.style import bulk_run as run
+        program = '''from scripts.copies import copies as run
 
 def make(repo):
     global run
@@ -748,7 +759,7 @@ run = object()
 
     def test_scan_finds_indirect_nonlocal_clone_before_enclosing_rebinding(self) -> None:
         program = '''def outer():
-    from scripts.style import bulk_run as run
+    from scripts.copies import copies as run
 
     def make():
         nonlocal run
@@ -767,7 +778,7 @@ outer()
 
     def test_scan_keeps_indirect_nonlocal_rebinding_before_call_clean(self) -> None:
         program = '''def outer():
-    from scripts.style import bulk_run as run
+    from scripts.copies import copies as run
 
     def make():
         nonlocal run
@@ -785,7 +796,7 @@ outer()
         self.assertEqual(findings, [])
 
     def test_scan_finds_global_clone_through_two_level_call_chain(self) -> None:
-        program = '''from scripts.style import bulk_run as run
+        program = '''from scripts.copies import copies as run
 
 def make():
     global run
@@ -805,7 +816,7 @@ run = object()
 
     def test_scan_ends_nested_recursion_and_reports_indirect_nonlocal_clone(self) -> None:
         program = '''def outer():
-    from scripts.style import bulk_run as run
+    from scripts.copies import copies as run
 
     def make():
         nonlocal run
@@ -827,7 +838,7 @@ outer()
         self.assertEqual([(finding.line, finding.operation) for finding in findings], [(6, "git clone")])
 
     def test_scan_tracks_global_bindings_despite_local_assignments(self) -> None:
-        for module in ("bulk_run", "scripts.copies.copies"):
+        for module in ("copies", "scripts.copies.copies"):
             with self.subTest(module=module):
                 self.assert_import_policy(
                     f'import {module} as run\n'
@@ -843,7 +854,7 @@ outer()
                     + '    run.git(repo, "clone", "a", "b")\n')
 
     def test_scan_tracks_nonlocal_bindings_despite_local_assignments(self) -> None:
-        for module in ("bulk_run", "scripts.copies.copies"):
+        for module in ("copies", "scripts.copies.copies"):
             with self.subTest(module=module):
                 self.assert_import_policy(
                     'run = unrelated\n'
@@ -862,7 +873,7 @@ outer()
         scripts = self.root / "scripts"
         scripts.mkdir()
         _ = (scripts / "calls.py").write_text(
-            'import bulk_run as run\n'
+            'import copies as run\n'
             + 'run.git(repo, "clone", "a", "b")\n'
             + 'def parameter(run):\n    run.git(repo, "clone", "a", "b")\n'
             + 'def local():\n    run.git(repo, "clone", "a", "b")\n    run = unrelated\n'
@@ -875,7 +886,7 @@ outer()
         scripts = self.root / "scripts"
         scripts.mkdir()
         _ = (scripts / "calls.py").write_text(
-            'import bulk_run as run\n'
+            'import copies as run\n'
             + 'run.git(repo, "clone", "a", "b")\n'
             + 'def caught():\n'
             + '    try:\n        operation()\n'

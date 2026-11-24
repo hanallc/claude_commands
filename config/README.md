@@ -79,7 +79,9 @@ The per-call message uses `context_usage.conf`.
 `agents_slice` selects the systemd slice for agent panes and Codex app-server processes.
 Both callers read the value when they use it.
 
-## merge_gate.conf
+## gate.conf
+
+`merge_gate.conf` links to `gate.conf` for running gates; chunk 6 removes the link.
 
 `nightly_result_push=on` sends the nightly result or the reason that the checks did not run.
 `off` disables both pushes. The user can remove this push later.
@@ -211,7 +213,6 @@ Mac host and SSH settings remain in `mac_test.conf`.
 
 | Key | Meaning |
 | --- | --- |
-| `visible_root` | Root for visible scratch folders. |
 | `holds_file` | File that records scratch holds. |
 | `default_life_seconds` | Lifetime of a scratch folder without an explicit task. |
 | `repo_depth` | Maximum folder depth for the repository scan. |
@@ -552,6 +553,16 @@ The configured platform selects the mirror layout and slot protocol.
 Each SSH target names its platform and settings file.
 Natedev reads the SSH host from each active target's settings file before each record exchange.
 
+`unreachable_wait_seconds` is one value for every machine that the queue sends a run to.
+A run on a machine that does not answer for this many seconds ends as failed with the reason `unreachable`.
+The `mac-linux` route, the AWS route and the offload route read it. Every SSH build target on the offload route sets the SSH
+keepalive count from it: a routed command ends as lost after this many seconds with no answer.
+The allowed whole numbers are 1 through 86400.
+On AWS the wait starts when the box launches, so it includes EC2 start and boot.
+A value below the boot time ends every AWS box before its first log.
+An AWS run assigned by the queue then fails. An AWS run with no assignment runs again on natedev.
+A paired AWS trial pauses its log while it measures, so the AWS route does not apply the wait to it.
+
 `sync.hosts.<target>` lists host directory names for synchronized records.
 This mapping supplies all allowed host names, including recorder health aliases.
 The Mac mapping includes its explicit legacy host aliases, including `macbook`.
@@ -592,9 +603,9 @@ Rsync replaces complete files and preserves this host's append files.
 | `swap_rows` | `6` | Show this many of the largest swap users; one line sums the rest. |
 | `report_refresh_seconds` | `300` | Read the history charts and top costs again after this many seconds. |
 | `remote_memory_light` / `remote_memory_dark` | `#626a78` / `#a0a8b6` | Color memory bars that do not count against natedev. |
-| `machine_natedev_light` / `machine_natedev_dark` | `#6243a6` / `#bba0ef` | Color the natedev name in the Machine column. |
-| `machine_mac_light` / `machine_mac_dark` | `#526b13` / `#b5ca72` | Color the mac name in the Machine column. |
-| `machine_aws_light` / `machine_aws_dark` | `#855126` / `#dbaa7d` | Color the aws name in the Machine column. |
+| `machine_natedev_light` / `machine_natedev_dark` | `#6243a6` / `#bba0ef` | Color the natedev name. |
+| `machine_mac_light` / `machine_mac_dark` | `#526b13` / `#b5ca72` | Color the mac and mac-linux names. |
+| `machine_aws_light` / `machine_aws_dark` | `#855126` / `#dbaa7d` | Color the aws and hana-aws names. |
 
 Configuration values use six hexadecimal digits without `#`.
 The text colors exceed 4.5:1 contrast against both backgrounds in their theme.
@@ -679,9 +690,8 @@ file named.
 - `/zone <place>` changes it on both machines and tells every session; a bare
   `/zone` shows it. The status line reads the file in `statusline.sh`.
 
-A production document's old `User zone` line is ignored. A time stored without an offset keeps the zone it was
-recorded in: `scripts/model_study/turns.py` names Pacific for the model study's
-roster.
+The zone reader ignores a production document's old `User zone` line.
+A time stored without an offset keeps its original zone.
 
 ## statusline.conf
 
@@ -751,14 +761,6 @@ Cleanup ignores zombies and retains ownership when it cannot inspect a live proc
 Remaining children report `mac_cleanup=unconfirmed`. The sender confirms their termination before it releases the claim.
 Disk cleanup failures retain the separate `mac_cleanup=1` result.
 `leftover_timeout_s` bounds cleanup confirmation. Failed confirmation retains the claim.
-
-`loopback.*` settings control the manual Tailscale SSH proof on natedev.
-`loopback.port` selects the SSH port. An empty value uses the SSH default.
-`loopback.known_hosts` selects the known_hosts file. An empty value uses the user's normal known_hosts file.
-A selected known_hosts file requires strict host key checking for SSH and rsync.
-The proof creates a managed scratch home and a tiny Rust fixture.
-It uses private memory files and executes test, check, and staged doc in one warm slot.
-It removes the scratch home when the proof ends. Automated tests never execute this proof.
 
 ## dev_shell.conf
 
@@ -856,7 +858,9 @@ The command edits no tracked file.
 
 ### Cloud gate regions
 
-`cloud_gate.conf` uses `enabled=on` for cloud gates and `enabled=off` to run merge gates and targeted tests on natedev.
+`cloud_gate.conf` uses `enabled=on` for cloud gates.
+With `enabled=off`, merge gates and targeted tests without a placement assignment run on natedev.
+`enabled=off` also refuses the pinned `hana-gpu` route and stops the hourly placement-score reads.
 `cloud_gate.conf` sets `regions` to all 19 regions of `spot_candidate_regions`.
 The first region must match the home region in `aws_target.conf`.
 The list must contain at least one region and must not repeat a region.
@@ -880,3 +884,10 @@ All boxes use signed links to the home bucket.
 The command includes configured types and the r7a.8xlarge, m8a.8xlarge, and c8a.8xlarge candidates.
 `down` removes regional stacks and copied images.
 `remove-images` changes the home image and keeps regional stacks and copied images.
+
+The gate uses `gate` and `test-affected` as step names.
+`gate.py --affected` runs the affected modules.
+`build_steps.conf` defines `names.gate`, `names.test-affected`, and `prose.gate`.
+Its owner keys are `owned.gate`, `owned.test-affected`, and `owned.showrunner-gate`.
+`build_admission.conf` defines `program_first_peak_gib.gate` and `program_first_peak_gib.test-affected`.
+It also defines `peak_hold_seconds.gate` and `peak_hold_seconds.test-affected`.

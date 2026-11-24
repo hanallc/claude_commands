@@ -12,7 +12,7 @@ from scripts.lib import conf
 from scripts.lib.build_slots_test_support import private_slot_config
 from unittest import mock
 
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture
 
 import json
 import os
@@ -211,6 +211,7 @@ class VerifyDocFixture(unittest.TestCase):
         # the real shim's cache hit instead of revalidating Python every call.
         seed_interpreter_cache(self.root / "cache")
         _ = self.git("init", "-q", "-b", "test")
+        _ = self.git("remote", "add", "origin", "https://example.invalid/workspace.git")
         _ = self.git("add", "-A")
         _ = self.git("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
                      "commit", "-q", "-m", "base")
@@ -243,7 +244,7 @@ class VerifyDocFixture(unittest.TestCase):
         _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.repo.name}=\n", template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
-            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n")
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         self.environment["MAC_TEST_CONFIG"] = str(settings)
         self.environment["CONF_DIR"] = str(Path(settings).parent)
         self.environment["MAC_IDLE_STATE_DIR"] = str(self.root / "mac-idle")

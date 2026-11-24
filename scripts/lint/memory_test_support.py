@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from scripts.build_hold.override_guard import require_checkout
 from scripts.lib import conf, conf_reads
+from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
 
 if TYPE_CHECKING:
     from scripts.build_queue.admission_records import AdmissionPolicy, MemoryConfig
@@ -39,7 +40,14 @@ def admission_policy_fixture() -> AdmissionPolicy:
 
 
 def _template(name: str) -> Path:
+    if name == ADMISSION_CONFIG_FIXTURE.name:
+        return ADMISSION_CONFIG_FIXTURE
     return Path(__file__).resolve().parents[2] / "config" / name
+
+
+# Every SSH route reads this build target registry key. 45 seconds gives an SSH keepalive count of 3.
+UNREACHABLE_WAIT_FIXTURE_SECONDS = 45
+UNREACHABLE_WAIT_FIXTURE = f"# whole: 1..86400\nunreachable_wait_seconds={UNREACHABLE_WAIT_FIXTURE_SECONDS}\n"
 
 
 # Give real fixture commands short deadlines.
@@ -89,7 +97,6 @@ TEST_CONFIG_DEFAULTS = {
         "sync.rsync_timeout_s=60\n"
         "vault.lock_retries=5\n"
         "vault.lock_retry_delay_s=1\n"
-        "loopback.connect_timeout_s=6\n"
         "loopback.command_timeout_s=60\n"
         "loopback.shell_timeout_s=30\n"
     ),
@@ -235,8 +242,6 @@ TEST_CONFIG_DEFAULTS = {
         "STOP_GRACE_SECONDS=2\n"
         "KILL_GRACE_SECONDS=5\n"
         "MOVE_STOP_MARGIN_SECONDS=3\n"
-        "MOVE_BUILD_WAIT_MINUTES=1\n"
-        "MOVE_BUILD_POLL_SECONDS=5\n"
         "START_SECONDS=20\n"
         "OPENING_PROMPT_SECONDS=30\n"
         "STAY_SECONDS=10\n"
@@ -335,10 +340,13 @@ def shifted_config_lines(source: str) -> tuple[str, ...]:
 
 
 def fixture_config_lines(source: Path, existing: str, overrides: str) -> list[str]:
-    """Merge the shifted template and each explicit layer."""
-    lines = list(shifted_config_lines(source.read_text())) if source.exists() else []
+    """Shift inherited settings and keep explicit fixture settings."""
+    text = source.read_text() if source.exists() else ""
+    explicit = source == ADMISSION_CONFIG_FIXTURE
+    lines = text.splitlines() if explicit else list(shifted_config_lines(text))
+    defaults = "" if explicit else TEST_CONFIG_DEFAULTS.get(source.name, "")
     limit_prefixes = ("# whole:", "# range:", "# one of:")
-    for layer, keep_shifts in ((TEST_CONFIG_DEFAULTS.get(source.name, ""), False), (existing, True), (overrides, False)):
+    for layer, keep_shifts in ((defaults, False), (existing, True), (overrides, False)):
         previous = before_limit = ""
         for raw in layer.splitlines():
             limit = previous if previous.startswith(limit_prefixes) else ""
@@ -455,7 +463,7 @@ class FixtureConfigValues(Enum):
 def config_environment(root: Path, *, values: FixtureConfigValues = FixtureConfigValues.SHIFTED) -> dict[str, str]:
     """Give subprocess fixtures a configuration folder with the requested values."""
     folder = root
-    names = {source.name for source in _template(ADMISSION_CONFIG_FIXTURE.name).parent.glob("*.conf")}
+    names = {source.name for source in _template("build_targets.conf").parent.glob("*.conf")}
     names.add(ADMISSION_CONFIG_FIXTURE.name)
     for name in sorted(names):
         destination = folder / name
@@ -468,6 +476,11 @@ def config_environment(root: Path, *, values: FixtureConfigValues = FixtureConfi
     return {"CONF_DIR": str(folder), "BUILD_TARGETS_CONFIG": str(folder / "build_targets.conf")}
 
 
+def memory_gate_shell_environment() -> dict[str, str]:
+    """Keep the parent reservation out of a memory gate fixture shell."""
+    return {name: value for name, value in os.environ.items() if name != "BUILDLOG_RESERVED_STEP"}
+
+
 def gate_isolation_environment(root: Path) -> dict[str, str]:
     """Keep a gate subprocess outside the caller's holds and session records."""
     return {
@@ -478,6 +491,9 @@ def gate_isolation_environment(root: Path) -> dict[str, str]:
         "STAFF_FILE": str(root / "staff.json"),
         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+        # The fixture names its own owner and drops the caller's, so a test never reads the owner around it.
+        "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "", "BUILDLOG_OWNER_STAFF_ID": "",
+        "CLAUDE_SESSION_NAME": FIXTURE_OWNER,
     }
 
 
