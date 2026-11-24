@@ -61,7 +61,7 @@ from scripts.message.roster import UnitLabels
 from scripts.lint.build_shape import build_shape
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service
 from scripts.build_queue import admission_wire as status_wire
-from scripts.build_queue import admission_code, queue_snapshot, queue_view, head_facts, placement
+from scripts.build_queue import admission_code, queue_snapshot, queue_view, head_facts, person_actions, placement
 from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from zoneinfo import ZoneInfo
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
@@ -4037,6 +4037,19 @@ class PendingPriorityTests(unittest.TestCase):
                 self.assertIsInstance(viewed.reading.explanation.priority, records.NoQueuePriority)
             finally:
                 finish.set()
+
+    def test_saved_empty_clear_advances_the_offset_without_reading_history(self) -> None:
+        with AdmissionFixture(private=True) as fixture:
+            bump = person_actions.Bump("clear-all", person_actions.ClearBump(), "", "director",
+                                       fixture.clock.now(), "clear priorities")
+            person_actions.save_bump(fixture.state_dir, bump)
+            (offset, _), = person_actions.pending_bumps(fixture.state_dir, 0)
+            with mock.patch.object(store, "read_last_whole_row_end", side_effect=OSError("history unreadable")) as read:
+                _ = fixture.run_pass()
+                read.assert_not_called()
+            saved = service.read_state(fixture.state_dir)
+            self.assertEqual(saved.bumps, person_actions.BumpProgress(offset=offset))
+            self.assertIsInstance(saved.priority, records.NoQueuePriority)
 
 
 class OutageClaimTests(unittest.TestCase):
