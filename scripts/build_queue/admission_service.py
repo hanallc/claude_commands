@@ -2235,15 +2235,14 @@ class AdmissionServer:
 
     def _rank_priority_waiters(self, rows: list[tuple[Path, records.RankedWaiter]], priority: records.QueuePriority
                                ) -> list[tuple[Path, records.RankedWaiter]]:
-        # Read priority from the run's unit or the CI runner. Publish the step's own unit.
-        original_rows: dict[Path, records.RankedWaiter] = {}
+        # Match CI priority by runner. Publish the current step's unit.
+        ci_waiters: dict[Path, records.RankedWaiter] = {}
         sessions: list[str] = []
         ranking_rows: list[tuple[Path, records.Waiter]] = []
         for path, row in rows:
-            place = self._waiter_run_place(row)
-            name = place.unit if place is not None and place.move_id and place.unit else self._priority_name(row)
+            name = self._priority_name(row)
             if name != row.get("unit", ""):
-                original_rows[path] = row
+                ci_waiters[path] = row
                 row = row.copy()
                 row["unit"] = name
             elif not name:
@@ -2251,8 +2250,8 @@ class AdmissionServer:
             ranking_rows.append((path, row))
         labels: Mapping[str, gate.UnitMembership] = gate.priority_labels(sessions) if sessions else {}
         ranked, _ = gate.apply_queue_priority(ranking_rows, gate.QueueOrderContext(priority, labels))
-        return [(path, gate.rank_waiter(original_rows[path], records.waiter_priority(row))
-                 if path in original_rows else row) for path, row in ranked]
+        return [(path, gate.rank_waiter(ci_waiters[path], records.waiter_priority(row))
+                 if path in ci_waiters else row) for path, row in ranked]
 
     def _current_move_line(self, rows: list[tuple[Path, records.RankedWaiter]],
                            movable: set[str]) -> records.QueueMoveLine:

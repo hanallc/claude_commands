@@ -8821,6 +8821,34 @@ class RunPlaceTests(unittest.TestCase):
             _ = fixture.run_pass()
             self.assertEqual(set(fixture.server.reservations), {returning.episode})
 
+    def test_returning_gate_uses_its_current_units_priority(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run, step="gate")
+            first = replace(first, identity=replace(first.identity, unit="former"))
+            _ = fixture.finish_step(first)
+            saved, = service.read_state(fixture.state_dir).run_places.values()
+            self.assertEqual(saved.unit, "former")
+            fixture.hold_starts()
+            priority = ("former", "peer", "current")
+            fixture.server.priority = records.QueuePriority(tuple(
+                {"unit": unit, "why": "fixture", "set_at": fixture.clock.now(), "set_by": "fixture"}
+                for unit in priority))
+            peer = fixture.request(step="gate")
+            peer = replace(peer, identity=replace(peer.identity, unit="peer"))
+            returning = fixture.request(run=run, step="gate", need=first.profile.peak.bytes * 2)
+            returning = replace(returning, identity=replace(returning.identity, unit="current"))
+            for request in (peer, returning):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, records.QueueInputs)
+            self.assertEqual([records.waiter_priority(row) for _, row in gate.ranked_queue_waiters(inputs)],
+                             [records.PriorityUnit("peer", 1), records.PriorityUnit("current", 2)])
+            fixture.allow_next_start()
+            write_pressure_reading(fixture.root / "pressure")
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {peer.episode})
+
     def test_younger_run_logs_once_when_it_starts_in_a_gate_gap(self) -> None:
         with AdmissionFixture() as fixture:
             first_run, second_run = fixture.run_owner(), fixture.run_owner()
@@ -9088,6 +9116,14 @@ assert not hasattr(place, 'repository')
 
 
 class AdmissionConfigurationTests(unittest.TestCase):
+    def test_admission_fixture_leaves_an_inherited_config_folder_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            inherited = Path(temporary) / "inherited-conf"
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(inherited)}), AdmissionFixture() as fixture:
+                self.assertEqual(os.environ["CONF_DIR"], str(fixture.root))
+                self.assertTrue((fixture.root / "build_folders.conf").is_file())
+                self.assertFalse(inherited.exists())
+
     def test_invalid_remote_start_hold_is_refused_during_configuration_read(self) -> None:
         for value in (None, "invalid", "86401"):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
