@@ -66,15 +66,39 @@ Ask the style unit about a hard case.
 ## Work with showrunners and morty
 
 Check your assignments on The List. Keep the state, check time, status, next step, and ETA current for your items.
-An ETA is the time when the whole item is done: `Mon D HH:MM ZONE` or a date. Without a time, write `No time yet`, `Waiting for nate`, `Paused`, or `Delivered`. Put each cause, condition, and part time in the status.
-Write the status in two or three sentences that say where the item stands. Start the next step with who acts; put nate first when nate must act. Put phase names, commit ids, change ids and unit names in `--source` or `--evidence`.
-Read your items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all --latest-status`.
-Use `the_list.py update --id L<n>` to update your items.
+Keep the latest status brief. State the current result and the result of each action in the previous next step.
+For each missed time, give the reason in the status and set a new ETA.
+In the next step, give each actor one sentence with who acts, what they do, and when.
+Put nate first when he must act.
+In Done-when, name every result the item needs before it can close.
+Keep hashes, IDs, file names, and older history out of these fields.
+Put phase names, commit IDs, change IDs, and unit names in `--source` or `--evidence`.
+Use one short evidence line for each fact. Keep designs, detailed reasons, and number lists in your work record.
+
+An ETA gives the estimated time for the whole item.
+Use `Mon D HH:MM ZONE` or a date. Estimate the time for each working item and update it when facts change.
+Use `Waiting for nate`, `Paused`, or `Delivered` only when that is the state.
+Use `No time yet` only for an item less than one hour old.
+
+Read your items in morty's folder with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all --latest-status`.
+Use `the_list.py update --id L<n>` to update your items in morty's folder.
+For a legacy item, use `the_list.py update --keeper <keeper> --id L<n> --next-step "<step>"`.
+Run an `update` command from a List message as it is.
 Use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
 Write no time in `--source`.
-Add your own items with `the_list.py add`. Park or close your own item only on nate's word, and quote his words in `--source`. Ask morty only to assign an item to a different producer.
+
+Add your own item with `the_list.py add --owner <showrunner staff ID> --title <text> --source <source> --done-when <result>`.
+`park`, `close`, and `reopen` use morty's folder.
+Park, close, or reopen your own item only on nate's word. Quote his words in `--source`.
+Use Delivered only when the whole item is done and nate can check it. Use Working while more work follows.
+Act on nate's List words and record them in the item in the same turn.
+Answer a List question with the command in its message.
+`the_list.py answer L<n> --keeper <keeper> --question <id> --text "<answer>"`
+
+Ask morty to reassign an item.
 Ask morty to record updates and decisions that you cannot write with `the_list.py`.
-To add an item, name what to track, its owner when known, and the result that closes the item.
+morty handles `/recall` and New item requests. morty reads every item at each round.
+Correct an item when morty says that its text is unclear.
 Ask the showrunner or unit for facts. Verify claims against records such as commits, staff rows, and config files.
 Name the source of each fact you report.
 Use staff reporting lines for a survey of showrunner needs. Include child productions.
