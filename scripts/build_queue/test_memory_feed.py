@@ -5397,10 +5397,12 @@ def write_browser_fixture(folder: Path) -> None:
                                  current_session=staff.StaffId("builder"))
         builds = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
                                 current_session=staff.StaffId("builds"))
+        hana = staff.StaffRow(staff.StaffId("hana"), "showrunner", "hana", staff.StaffRoot(),
+                              current_session=staff.StaffId("hana"))
         units = tuple(staff.StaffRow(staff.StaffId(name), "unit", name, staff.ReportsTo(builds.id),
                                      current_session=staff.StaffId(name))
                       for name in ("queue", "natest", "admin-console"))
-        verify_page["staff_names"] = staff_names.StaffNames(staff.StaffSnapshot((builder, builds, *units))).registry()
+        verify_page["staff_names"] = staff_names.StaffNames(staff.StaffSnapshot((builder, builds, hana, *units))).registry()
         verified_waiter, = [row for row in verify_page["waiters"] if "verify" in row]
         builder_unit = memory_feed.StaffUnitName(builder.name)
         verified_waiter["unit"] = builder_unit

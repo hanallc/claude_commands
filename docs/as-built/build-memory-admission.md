@@ -2423,6 +2423,8 @@ On 2026-11-23, Nate approved the machine icons proposal of bob (List item 260): 
 - `hana-gpu` uses the cloud with a ⚡ badge.
 
 A hidden `<svg>` defines the Tux, Apple, and cloud symbols.
+The Tux and the Apple show in their own colors, not the machine color. The Tux has a white outline on every machine. The cloud uses the machine color.
+On 2026-11-24, bob ruled one Tux form for natedev, mac-linux and the AWS badge, because two Tux colors read as two things.
 Each SVG icon and SVG badge references its symbol with `<use href>`.
 CSS uses the icon's `data-badge` value for emoji badges.
 Each icon records its machine in `data-machine` and uses that name in `aria-label`.

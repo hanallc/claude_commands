@@ -648,24 +648,40 @@ try {
           break browserProof;
         }
         if (guestMemoryProof || !focusedProof) {
-          const local = {...readings.verify_calls.walk.find(row => row.queued && row.verify), machine:'natedev'};
-          const guest = readings.guest_gate.walk.find(row => row.guest_run);
-          const mac = readings.mac_three.walk.find(row => row.kind === 'mac-build' && row.started_by);
+          const local = {...readings.verify_calls.walk.find(row => row.queued && row.verify),
+            machine:'natedev', unit:'natest', showrunner:'builds', title:{unit:'natest',step:'nextest'}};
+          const guest = {...readings.guest_gate.walk.find(row => row.guest_run),
+            unit:'queue', showrunner:'builds', title:{unit:'queue',step:'gate'}};
+          const mac = readings.mac_three.walk.find(row => row.kind === 'mac-build' && row.unit && !row.started_by);
           const awsWait = readings.cloud.waiters.find(row => row.kind === 'cloud');
-          servedReading = {...base, walk:[local, guest, mac], waiters:[awsWait], held_places:[]};
+          servedReading = {...base, staff_names:readings.verify_calls.staff_names,
+            walk:[local, guest, mac], waiters:[awsWait], held_places:[]};
           await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
           await navigate('memory_live.html');
           const memoryCells = `[0,1,2].map(index => {
             const row = document.querySelector('.wrow[data-run="' + proofRun(index) + '"]');
             const machine = document.querySelector('tr[data-tip="' + proofTip('row',index) + '"] .machine-icon');
-            return {machine:machine.dataset.machine, text:row.querySelector('.amounts').textContent,
+            const name = row.querySelector('.name');
+            const owner = row.querySelector('.owner');
+            return {name:name.textContent, owner:owner.textContent,
+              unitColor:name.querySelector('.staff-name')?.dataset.colorText,
+              ownerColor:owner.querySelector('.staff-name')?.dataset.colorText,
+              machine:machine.dataset.machine, icons:[...machine.querySelectorAll('use')].map(use => use.getAttribute('href')),
+              text:row.querySelector('.amounts').textContent,
               memory:!!row.querySelector('.seg-used, .seg-remote'), progress:!!row.querySelector('.row-progress')};
           })`;
           const measured = await evaluate(memoryCells);
-          assert.deepEqual(measured.map(row => row.machine), ['natedev','mac-linux','mac']);
+          assert.deepEqual(measured.map(({name,owner,unitColor,ownerColor}) => [name,owner,unitColor,ownerColor]), [
+            ['natest','builds','role.unit-director','role.showrunner'],
+            ['queue','builds','role.unit-director','role.showrunner'],
+            ['trunk','hana','role.unit-director','role.showrunner'],
+          ]);
+          assert.deepEqual(measured.map(({machine,icons}) => [machine,...icons]), [
+            ['natedev','#machine-linux'], ['mac-linux','#machine-linux','#machine-apple'], ['mac','#machine-apple'],
+          ]);
           assert.deepEqual(measured.map(row => row.memory), [true,false,true]);
           assert.ok(measured[1].progress, 'The guest module counter has no progress bar.');
-          assert.equal(measured[1].text, 'Used unavailable');
+          assert.deepEqual(measured.map(row => row.text), ['1.0 GiB','Used unavailable','0.3 GiB']);
           assert.deepEqual(await evaluate(`[...document.querySelectorAll('tr.wait td.machine .machine-icon.dim')]
             .map(icon => [icon.dataset.machine, ...[...icon.querySelectorAll('use')].map(use => use.getAttribute('href'))])`),
           [['aws','#machine-cloud','#machine-linux']]);
