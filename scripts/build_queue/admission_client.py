@@ -389,7 +389,8 @@ class AdmissionResources:
 
 
 def _is_placement_control(request: wire.Request) -> bool:
-    return isinstance(request, (wire.ClaimFailure, wire.ConsumePermission, wire.ExecutionReport, wire.CancelPlacement))
+    return isinstance(request, (wire.ClaimFailure, wire.ConsumePermission, wire.ExecutionReport,
+                                wire.CancelPlacement, wire.SettlementRequest))
 
 
 def _waits_for_live_service(request: wire.Request) -> bool:
@@ -408,7 +409,7 @@ READ_CONFIGURATION_AT_USE = ReadConfigurationAtUse()
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
-           | wire.CancelPlacement | status_wire.PlacementStatusRequest, *,
+           | wire.CancelPlacement | wire.SettlementRequest | status_wire.PlacementStatusRequest, *,
            configuration: records.MemoryConfig | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
     if _waits_for_live_service(request):
@@ -418,6 +419,7 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | 
         if isinstance(reply, wire.Refused):
             raise wire.AdmissionUnavailable(reply.reason)
         return reply
+    assert isinstance(request, wire.CallerCode)
     request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
     if isinstance(configuration, ReadConfigurationAtUse):
         configuration = records.read_memory_config()
@@ -617,6 +619,11 @@ def report_execution(request: wire.ExecutionReport) -> wire.DispatchStatus:
     raise wire.AdmissionUnavailable("invalid execution report answer")
 
 
+def request_settlement(request: wire.SettlementRequest) -> None:
+    if not isinstance(_query(request), wire.Ok):
+        raise wire.AdmissionUnavailable("invalid settlement answer")
+
+
 @dataclass(frozen=True)
 class OwnerEndTiming:
     """Set the query and retry limits for a guest gate completion report."""
@@ -627,7 +634,10 @@ class OwnerEndTiming:
 
 
 def report_owner_end(request: wire.OwnerEnd, timing: OwnerEndTiming) -> None:
-    """Retry transport failures within the queue outage limit."""
+    """Retry transport failures within the queue outage limit.
+
+    The queue can accept the result and still require guest end proof.
+    """
     from scripts.build_queue import admission_protocol as wire
 
     deadline = CLOCK.monotonic() + timing.unreachable_limit_seconds
@@ -651,9 +661,8 @@ def report_owner_end(request: wire.OwnerEnd, timing: OwnerEndTiming) -> None:
     if isinstance(reply, wire.Refused):
         raise wire.AdmissionUnavailable(reply.reason)
     if (not isinstance(reply, wire.DispatchStatus) or reply.assignment != request.assignment
-            or not isinstance(reply.state, placement.ClosedAssignment)
             or not isinstance(reply.permission, placement.PermissionConsumed) or reply.reason):
-        raise wire.AdmissionUnavailable("the queue did not confirm the end of the guest assignment")
+        raise wire.AdmissionUnavailable("the queue did not accept the guest completion report")
 
 
 class _HistoryNeeded(BaseException):
@@ -793,6 +802,10 @@ class AcquisitionRetry:
 
 
 _ACQUISITION_RETRY: ContextVar[AcquisitionRetry | None] = ContextVar("acquisition_retry", default=None)
+
+
+def launch_wait_limit_seconds() -> int:
+    return _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
 
 
 @contextmanager
@@ -974,12 +987,11 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     retry = _ACQUISITION_RETRY.get() if acquisition else None
     owns_retry = retry is None
     if retry is None:
-        limit = _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
-        launch = isinstance(request, wire.LaunchRequest)
+        limit = launch_wait_limit_seconds() if isinstance(request, wire.LaunchRequest) else None
         deadline = (CLOCK.monotonic() + max(0.0, request.deadline - CLOCK.now())
                     if isinstance(request, wire.RepositorySlotRequest) else
-                    CLOCK.monotonic() + limit if launch and limit > 0 else float("inf"))
-        retry = AcquisitionRetry(deadline, launch_without_wait=launch and limit == 0)
+                    CLOCK.monotonic() + limit if limit is not None and limit > 0 else float("inf"))
+        retry = AcquisitionRetry(deadline, launch_without_wait=limit == 0)
     token = _ACQUISITION_RETRY.set(retry)
     try:
         from scripts.build_queue import admission_records as records
@@ -990,7 +1002,8 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 return refuse(str(error), checker=True)
         else:
             resolved = configuration
-        request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
+        if isinstance(request, wire.CallerCode):
+            request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
         if report_refusal and isinstance(resolved, records.MemoryConfig):
             records.warn_configuration_diagnostics(resolved.diagnostics)
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest, wire.ServiceEstimateRequest)):
@@ -1612,9 +1625,9 @@ def launch(request: wire.LaunchRequest, on_wait: Callable[[wire.Wait], None],
 def _first_request_wait[Request, Reply](launching: bool, refresh: Callable[[], Request],
                                         wait: Callable[[Request], Reply]) -> Reply | wire.Refused | LeftQueue:
     """Build the first request inside the retry schedule that its refreshes use."""
-    limit = _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
-    token = _ACQUISITION_RETRY.set(AcquisitionRetry(CLOCK.monotonic() + limit if launching and limit > 0 else float("inf"),
-                                                    launch_without_wait=launching and limit == 0))
+    limit = launch_wait_limit_seconds() if launching else None
+    deadline = CLOCK.monotonic() + limit if limit is not None and limit > 0 else float("inf")
+    token = _ACQUISITION_RETRY.set(AcquisitionRetry(deadline, launch_without_wait=limit == 0))
     try:
         try:
             request = refresh()
