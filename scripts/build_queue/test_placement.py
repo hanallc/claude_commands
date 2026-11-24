@@ -650,6 +650,85 @@ class CargoFolderTests(unittest.TestCase):
 
 
 class PlacementTests(unittest.TestCase):
+    def test_scaler_reconciles_only_pending_expired_bookings_on_the_worker(self) -> None:
+        from decimal import Decimal
+
+        from scripts.aws_target import ledger
+
+        class SingleReadWorker(service.HostEvidenceWorker):
+            @override
+            def _read(self) -> None:
+                LauncherHangGuard("Request scaler evidence").event(self.requested)
+                with self.lock:
+                    if self.stopped.is_set():
+                        return
+                    subscription = self.subscriptions[self.key]
+                _ = self._probe(self.key, subscription)
+                reading.set()
+
+        pending = placement.Pending("launch unknown")
+        for result, expired, supports_reconcile, release_slot, expected_calls in (
+                (pending, True, True, False, 1),
+                (placement.Settled(), True, True, False, 0),
+                (pending, False, True, False, 0),
+                (pending, True, False, False, 0),
+                (pending, True, True, True, 0)):
+            with (self.subTest(result=result, expired=expired, supports_reconcile=supports_reconcile,
+                               release_slot=release_slot),
+                  PlacementFixture() as fixture):
+                request = scaler_gate_request(fixture)
+                key = publish_candidate(fixture, request).key
+                assignment = assignment_for(fixture, request)
+                claim = placement.assigned_claim_reference(assignment)
+                consume = consume_permission("launch", assignment, claim)
+                self.assertIsInstance(fixture.server.handle_request(consume)[0], wire.FirstAuthorization)
+                now = int(fixture.clock.now())
+                booking = ledger.GateReservation("fixture", now - 2, now + (-1 if expired else 1),
+                                                 Decimal(0), Decimal(0))
+                settle = mock.Mock(return_value=result)
+                reading, released = threading.Event(), threading.Event()
+                guard = LauncherHangGuard("Read scaler evidence")
+                reconcile_threads: list[threading.Thread] = []
+
+                def record_reconcile(_episode: str, _attempt: int) -> None:
+                    reconcile_threads.append(threading.current_thread())
+
+                def read_bookings(_episode: str, _attempt: int) -> tuple[Path, tuple[ledger.GateReservation, ...]]:
+                    if release_slot:
+                        reading.set()
+                        guard.event(released)
+                    return fixture.root, (booking, replace(booking, attempt="fixture-retry"))
+
+                reconcile = mock.Mock(side_effect=record_reconcile)
+                bookings = mock.Mock(side_effect=read_bookings)
+                hooks = {"reconcile_expired": reconcile, "_claim_bookings": bookings} if supports_reconcile else {}
+                provider = mock.Mock(spec=placement.CloudGateProvider, settlement=settle, **hooks)
+                with (mock.patch.object(service, "scaler_provider", return_value=provider),
+                      mock.patch.object(service, "HostEvidenceWorker", SingleReadWorker)):
+                    self.assertIsInstance(fixture.server.handle_request(wire.SettlementRequest(assignment))[0], wire.Ok)
+                    worker = fixture.server.host_readers[key].worker
+                    if release_slot:
+                        try:
+                            guard.event(reading)
+                            report = wire.ExecutionReport("settled", assignment, claim,
+                                execution_identity.ExecutionNotStarted(), placement.AttemptDeclined("ended"),
+                                placement.DispatchPathSettled())
+                            _ = fixture.server.handle_request(report)
+                            self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+                        finally:
+                            released.set()
+                    guard.join(worker.thread)
+                exact_attempt = (assignment.episode, int(assignment.attempt, 16))
+                settle.assert_called_once_with(*exact_attempt)
+                if supports_reconcile and isinstance(result, placement.Pending):
+                    bookings.assert_called_once_with(*exact_attempt)
+                else:
+                    bookings.assert_not_called()
+                self.assertEqual(reconcile.call_count, expected_calls)
+                if expected_calls:
+                    reconcile.assert_called_once_with(*exact_attempt)
+                    self.assertEqual(reconcile_threads, [worker.thread])
+
     def test_pending_scaler_settlement_blocks_reassignment_across_restart(self) -> None:
         with PlacementFixture() as fixture:
             fixture.configure(cloud_gate_slots=1)
