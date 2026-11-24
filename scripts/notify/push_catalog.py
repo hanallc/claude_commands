@@ -44,6 +44,22 @@ def hide_sender_values(given: dict[str, str], *, hidden: tuple[str, ...]) -> Tem
     return TemplateValues(displayed, dict(given))
 
 
+AUTO_MODE_REFUSED_TITLE = "{session}: {count} {noun} refused"
+
+
+def auto_mode_refused_values(given: dict[str, str]) -> TemplateValues:
+    """Add the waits clause when it fits in the title."""
+    values = hide_sender_values(given, hidden=tuple(field for field in ("waits", "rule") if field in given))
+    waits = given.get("waits", "")
+    clause = ""
+    if waits and {"session", "count", "noun"} <= values.displayed.keys():
+        suffix = f"; {waits}"
+        title = AUTO_MODE_REFUSED_TITLE.format(**values.displayed)
+        if len(title + suffix) <= 44:
+            clause = suffix
+    return TemplateValues(values.displayed | {"waits_clause": clause}, values.supplied)
+
+
 def silence_auto_off_values(given: dict[str, str]) -> TemplateValues:
     """Shorten the held-push sentence for the title."""
     if "held" not in given:
@@ -398,26 +414,18 @@ ENTRIES = (
                                      + "Both are done, and both units run under their new names."})),
         purpose="An update that an agent writes for you with /nate adhoc.",
         header=False, agent_written=True),
-    # Auto-mode refusal (texts from 2026-11-06, on the user's question via natedev): a session sends it with send.py --text-id auto_mode.refused.
-    # send.py fills sender from the session's own name, action from the commands' first words (rca.action_of),
-    # refused from the command values (one per line), waits_line from waits when the 30 s push review passes it
-    # (else ""), noun and this from the number of commands, and rule_line from rule.
-    PushText("auto_mode.refused", "{sender}", "decision", "{sender}: {session} {noun} refused",
+    # send.py counts the refused commands and reviews the waits clause.
+    PushText("auto_mode.refused", "{sender}", "decision", AUTO_MODE_REFUSED_TITLE + "{waits_clause}",
         ActionTemplate("On {machine}, in the {session} pane, type: Go: run the refused {noun}"),
-        "Auto mode refused {action} in the {session} session.{waits_line}\n{refused}\n\n"
-        + "Go: the session runs {this} {noun} now, and auto mode can refuse {this} {noun} again.\n\n"
-        + "Allow rule: auto mode lets {this} {noun} run from then on.{rule_line}",
+        "",
         (PushExample("typical", {"sender": "cargo-liner-style", "session": "modules", "machine": "natedev",
-            "action": "2 shell commands", "refused": "implement.sh --to modules-impl\nreview.sh --to modules-test",
-            "noun": "commands", "this": "these", "waits_line": " The modules build waits for them.", "rule_line": ""}),
+            "count": "2", "noun": "commands", "waits": "its build waits"}),
          PushExample("one_with_rule", {"sender": "build-followups", "session": "messaging", "machine": "natedev",
-            "action": "a shell command", "refused": "git push origin build-followups-messaging", "noun": "command",
-            "this": "this", "waits_line": " The merge of the messaging work waits for it.", "rule_line": " The rule: Bash(git push:*)"}),
+            "count": "1", "noun": "command", "waits": "its work waits", "rule": "Bash(git push:*)"}),
          PushExample("file_change_no_waits", {"sender": "hana", "session": "demo", "machine": "natedev",
-            "action": "a file change", "refused": "write phases/34h/delegated_phase_reservation_state.json",
-            "noun": "command", "this": "this", "waits_line": "", "rule_line": ""})),
+            "count": "1", "noun": "command"})),
         purpose="Auto mode refused a session's commands. The commands wait for you.",
-        session=SessionTemplate("{session}")),
+        session=SessionTemplate("{session}"), expand_values=auto_mode_refused_values),
     # Permission root cause (user ask, 2026-10-23): rca.py sends these when the owner of a case starts it
     # (`rca.py start`) and when its fix merges (`rca.py fixed`), with --key rca-<case id>. sender is the
     # session's production, or messaging when it has none. rca.py fills time (silence.shown) and stop from the case.

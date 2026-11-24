@@ -674,12 +674,22 @@ class PushoverTests(unittest.TestCase):
     def assert_footer(self, message: str, sender: str, template: str) -> None:
         self.assertEqual(message.splitlines()[-2:], ["", f"Sent by: {sender} · Template: {template}"])
 
-    def test_cold_keys_template_has_only_its_action_and_delivery_footer(self) -> None:
-        code, form = self.run_send(["--text-id", "github.keys_cold", "--value", "sender=hana",
-                                    "--value", "machine=natedev"])
-        self.assertEqual(code, 0)
-        self.assertEqual(form["title"], ["GitHub keys locked on natedev"])
-        self.assertEqual(form["message"], [footed("Action: Run github-warmup in a terminal on natedev", "hana", "github.keys_cold")])
+    def test_action_only_templates_keep_their_approved_text(self) -> None:
+        entries = {entry.id: entry for entry in push_texts.catalog()}
+        for template, values, title, message in (
+            ("github.keys_cold", {"sender": "hana", "machine": "natedev"}, "GitHub keys locked on natedev",
+             "Action: Run github-warmup in a terminal on natedev"),
+            ("auto_mode.refused", entries["auto_mode.refused"].examples[0].values,
+             "modules: 2 commands refused; its build waits",
+             "Session: modules\nAction: On natedev, in the modules pane, type: Go: run the refused commands"),
+        ):
+            with self.subTest(template=template):
+                argv = ["--text-id", template, *(item for key, value in values.items()
+                                                for item in ("--value", f"{key}={value}"))]
+                code, form = self.run_send(argv)
+                self.assertEqual(code, 0)
+                self.assertEqual(form["title"], [title])
+                self.assertEqual(form["message"], [footed(message, values["sender"], template)])
 
     def test_emergency_agent_text_is_withheld_when_review_names_a_fixed_template(self) -> None:
         failure = review.RuleFailure("use-registered-template:mac.locked", "Every Mac screenshot is black.")
