@@ -46,8 +46,11 @@ A held target admits only work that its hold rules permit.
 A gate from the claude repository requests placement on every eligible target in `build_targets.conf`.
 The caller checks the targets in `targets` in the order the file lists them.
 It omits targets with `enabled.<target>=off` and applies the fixed placement rules to the rest.
-The current rules permit natedev and `mac-linux` for a full gate and for nightly suites.
-Named module tests and promotion without tests use natedev.
+The current rules permit natedev and `mac-linux` for full gates, named module tests, and nightly suites.
+Named module tests on `mac-linux` use `run.time_limit_seconds` from the guest settings.
+A nested named gate always reuses its live parent reservation on natedev.
+For named gates, `BUILDLOG_GATE_TARGETS` applies only to standalone runs.
+Promotion without tests uses natedev.
 Explicit targets take precedence over `BUILDLOG_GATE_TARGETS`, which takes precedence over the default.
 Hana gates have no repository default.
 The Builds page shows both candidates while a gate with both targets waits or runs.
