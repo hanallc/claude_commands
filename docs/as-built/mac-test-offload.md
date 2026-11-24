@@ -34,9 +34,24 @@ For a run with type checks, the guest checks for `basedpyright` and `uv` before 
 If a tool is missing, the guest stops the run before a test starts.
 The guest returns the type-check result with the test results.
 The guest runner writes the `mac-linux run start` line to standard error before the gate starts its suites.
-If the guest run fails before that line, the route returns `GuestNotStarted` with the cause, and the queue gives the gate to the next named target, for example natedev.
+The caller reads guest standard error while the run is active and keeps all its bytes for the result.
+The start line for the current guest attempt triggers one execution report for its queue assignment.
+The caller limits the configuration wait to the SSH connection timeout.
+The report uses the queue query timeout from the time the caller reads the start line.
+The caller waits for the report only until its deadline.
+After a stream failure, the caller stops SSH before it collects the report.
+A report failure or timeout prints one warning and leaves the guest run active.
+If the placement caller supplies `BUILDLOG_PLACEMENT_SIDECAR`, it names the placement request's progress sidecar.
+The caller removes the sidecar variable from the guest SSH environment.
+The guest sends runner records on the reply descriptor.
+The route publishes each change to the module count.
+The count excludes type checks.
+Older guest gate code can return its result without sending progress records.
+If the guest run fails before the start line, the route returns `GuestNotStarted` with the cause.
+The queue can then give the gate to the next named target.
 If the guest run fails after that line, the gate fails and reports the guest and the reason.
-Each failure with a stream status names that status and the last 1200 characters of the stream standard error.
+A stream failure reports its status and up to 1200 characters from standard error.
+A stream timeout reports the diagnostics it received before the deadline.
 A reply that the route cannot read also names its first 200 characters.
 The caller must submit a new run to retry a gate that failed after a test started.
 
@@ -85,9 +100,17 @@ natedev holds the SSH input open for the whole run.
 When the natedev process ends by any signal, the guest sees its input end and kills the run group, which frees the run lock.
 Item 191 B3 will keep the Mac claim until proof and bind the claim identity to the guest attempt.
 
-The Mac Linux route runs the suite in a numbered copy.
-The runner starts the copy's gate with a `scripts/lib/py -c` entry (`gate_entry_command`).
-Python gives a `-c` entry the argv `['-c', ...]`, so the entry removes `-c` before it runs the runner with `runner request --run-copy <reply descriptor>`.
+The Mac Linux route records the HEAD commit of the natedev runner's Git tree.
+It checks the index and worktree under `scripts/` against that commit.
+It refuses the run for changes, untracked files, or entries with the assume-unchanged or skip-worktree flag.
+The full and delta bundles include the runner commit.
+The bootstrap tar carries `request.json` with the runner commit.
+The guest extracts the runner's scripts and default configuration from that commit.
+Both guest entry points use the extracted Python shim and scripts.
+The guest main still resets to the candidate's `origin/main`.
+The gate runs the selected modules in the numbered copy of the candidate.
+The guest removes the bootstrap folder when the shell exits.
+After a forced stop, cleanup removes the folder under the run lock before it reports the end of the run.
 The reply descriptor is a copy of the stream standard output.
 The runner starts the sandbox, and `dbus-run-session` if the guest has it, for the gate run with standard output on standard error.
 Only the JSON reply line goes to the reply descriptor, so other output cannot come before it.
