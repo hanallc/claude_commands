@@ -290,6 +290,13 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
     builder = client.placement_constraint_builder()
     candidates: list[placement.PlacementCandidate] = []
     for name in ordered_names:
+        if name == "aws":
+            from scripts.build_targets.gate_targets import aws_gate_candidate
+
+            aws = aws_gate_candidate()
+            candidates.append(aws if flag is None else replace(aws,
+                eligibility=placement.FixedExclusion(f"{flag} runs only on natedev")))
+            continue
         fixed = builder(source, '', 'final', arguments, session, source_key, target_config.ANY_ELIGIBLE_TARGET,
             Pinned(name), writes_tree=False)
         named = tuple(candidate for candidate in fixed.candidates if candidate.destination.target == name)

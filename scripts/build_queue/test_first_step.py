@@ -47,6 +47,7 @@ def gate_source(fixture: PlacementFixture, repository: str, *, enabled: str = "o
     _ = write_config_fixture(fixture.root / "mac_linux.conf",
         "ssh.hops=fixture-mac fixture-guest\nguest.user=fixture\n")
     _ = write_config_fixture(fixture.root / "hana_aws.conf", "enabled=on\n")
+    _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=off\n")
     source = fixture.root / (".claude" if repository == "claude_commands" else repository)
     source.mkdir()
     for command in (("init", "-q"), ("remote", "add", "origin", f"https://example.invalid/{repository}.git")):
@@ -63,13 +64,13 @@ class FirstStepTests(unittest.TestCase):
                 self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source, requested="mac"), ("mac",))
                 self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source), ("mac-linux",))
 
-    def test_direct_nightly_default_excludes_aws_when_cloud_gates_are_enabled(self) -> None:
+    def test_direct_nightly_default_includes_aws_when_cloud_gates_are_enabled(self) -> None:
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "claude_commands")
             command = (*GATE_COMMAND[:2], "--nightly")
             _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=on\n")
             with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
-                self.assertEqual(first_step.gate_targets(command, source), ("mac-linux", "natedev"))
+                self.assertEqual(first_step.gate_targets(command, source), ("mac-linux", "natedev", "aws"))
 
     def test_hana_gate_has_no_default_targets(self) -> None:
         with PlacementFixture() as fixture:
