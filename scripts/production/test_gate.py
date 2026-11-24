@@ -47,6 +47,22 @@ class GateModuleOwnerTests(unittest.TestCase):
                 self.assertEqual({name: environment[name] for name in admission_records.OWNER_VARIABLES
                                   if environment.get(name)}, owner)
 
+    def test_gate_child_does_not_inherit_placement_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shim = root / "scripts" / "lib" / "py"
+            shim.parent.mkdir(parents=True)
+            shim.touch()
+            environment = {"PATH": os.defpath, "BUILDLOG_PLACEMENT_FILE": "/fixture/placement",
+                           "BUILDLOG_PLACEMENT_EPISODE": "fixture-episode",
+                           "BUILDLOG_PLACEMENT_SIDECAR": "/fixture/placement.cgroup"}
+            with mock.patch.object(subprocess, "Popen") as start:
+                job = gate.start_gate_job("hooks", Path("test_fixture.py"), (), root, environment, root / "module.log")
+            job.output.close()
+            child = cast(dict[str, str], start.call_args.kwargs["env"])
+        self.assertEqual(child["PATH"], os.defpath)
+        self.assertFalse(child.keys() & (environment.keys() - {"PATH"}))
+
 
 @final
 class MergeGateCheckpointTests(MergeGateFixture):
