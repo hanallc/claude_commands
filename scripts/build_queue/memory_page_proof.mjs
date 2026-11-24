@@ -14,6 +14,7 @@
 // Use --headcount to compare the Running and Queued headers.
 // Use --build-tools as the third argument for the Build tools proof.
 // Use --queue-rows as the third argument for the dark desktop queue screenshot and the card right edge shot; a fourth argument names the before page.
+// Use --guest-tip after the output folder for the guest row tooltip screenshot.
 // Use --standing-orders as the third argument for nate's standing orders on real-shape rows; a fourth argument names a rendered page to check.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
@@ -55,8 +56,9 @@ const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
 const queueDragProof = previousPage === '--queue-drag';
 const queueRowsProof = previousPage === '--queue-rows';
+const guestTipProof = previousPage === '--guest-tip';
 const standingProof = previousPage === '--standing-orders';
-const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || standingProof;
+const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || guestTipProof || standingProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Machine','vCPU','Tokens'];
@@ -620,7 +622,7 @@ try {
           console.log(JSON.stringify({pass:true,views}));
           break browserProof;
         }
-        if (queueRowsProof || !focusedProof) {
+        if (queueRowsProof || guestTipProof || !focusedProof) {
           // nate, 2026-11-21 and 2026-11-23: the unit starts the row with the showrunner under it. The Machine column
           // shows icons: one bright icon where a step runs, and one dim icon for each machine that can take a waiting step.
           // The gate checks these rows too; only --queue-rows takes the shot.
@@ -635,8 +637,10 @@ try {
           Object.assign(rust, {unit:'natest',showrunner:'builds',machine:'natedev',caller:'test',
             title:{unit:'natest',step:'nextest'}});
           const {verify:_verify, ...unverified} = rust;
+          const attempt = '82ba556d347749b08184ad3ab38ea22a_02242bdfe8464b389b20e16396f06c29';
           const guest = {...unverified, key:'shot-guest', pid:rust.pid + 1, name:'queue: gate', unit:'queue', caller:'impl3',
-            machine:'mac-linux', guest_run:{target:'mac-linux',attempt:'guest-attempt'},
+            changes:'no branch',
+            machine:'mac-linux', guest_run:{target:'mac-linux',attempt},
             targets:['natedev','mac-linux','hana-aws'], runs_on:'natedev or mac-linux or hana-aws', title:{unit:'queue',step:'gate'}};
           // admin-console is longer than every running label, so its widest word sets the label column.
           Object.assign(waiting, {unit:'admin-console',showrunner:'builds',caller:'impl3',
@@ -733,12 +737,58 @@ try {
               assert.equal(rows.machineColors.find(([name]) => name === 'mac-linux')[1], macColor,
                 'The mac-linux icon has no mac color.');
               if (width === 1440) assert.equal(rows.headingCut, false, 'The queued heading is cut.');
+              if (width >= 900) {
+                const pointer = await evaluate(`(() => {
+                  const icon = document.querySelector('tr[data-tip="row:shot-guest"] .machine-icon');
+                  icon.scrollIntoView({block:'center',inline:'nearest'});
+                  const box = icon.getBoundingClientRect();
+                  return {x:box.left + box.width/2, y:box.top + box.height/2};
+                })()`);
+                await call('Input.dispatchMouseEvent', {type:'mouseMoved', ...pointer});
+                const hover = await evaluate(`(() => {
+                  const tooltip = document.querySelector('#tip.on > .tip');
+                  const box = tooltip.getBoundingClientRect();
+                  const viewport = document.documentElement;
+                  const range = document.createRange();
+                  const clipped = Array.from(tooltip.children).filter(cell => {
+                    range.selectNodeContents(cell);
+                    const bounds = cell.getBoundingClientRect();
+                    return [...range.getClientRects()].some(rect =>
+                      rect.left < Math.max(box.left, bounds.left) - 1 || rect.right > Math.min(box.right, bounds.right) + 1
+                      || rect.top < bounds.top - 1 || rect.bottom > bounds.bottom + 1);
+                  }).map(cell => cell.textContent);
+                  const fields = Object.fromEntries([...tooltip.querySelectorAll('dt')]
+                    .map(cell => [cell.textContent, cell.nextElementSibling.textContent]));
+                  const card = document.querySelector('#walk').closest('.card').getBoundingClientRect();
+                  const left = Math.min(card.left, box.left), top = Math.min(card.top, box.top);
+                  const right = Math.max(card.right, box.right), bottom = Math.max(card.bottom, box.bottom);
+                  return {fields, clipped,
+                    visible:box.left >= 0 && box.right <= viewport.clientWidth
+                      && box.top >= 0 && box.bottom <= viewport.clientHeight,
+                    clip:{x:left+scrollX,y:top+scrollY,width:right-left,height:bottom-top,scale:1}};
+                })()`);
+                assert.equal(hover.fields['Guest attempt'], attempt);
+                assert.equal(hover.fields.Changes, guest.changes);
+                assert.equal(hover.fields.Showrunner, guest.showrunner);
+                assert.equal(hover.fields['Runs on'], guest.machine);
+                assert.ok(hover.visible, `The guest row tooltip is outside the viewport at ${width} px.`);
+                assert.deepEqual(hover.clipped, [], `The guest row tooltip clips text at ${width} px.`);
+                if (guestTipProof && width === 1440) {
+                  const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:hover.clip});
+                  await writeFile(join(folder, 'guesttip-dark-1.png'), Buffer.from(shot.data,'base64'));
+                }
+                await evaluate('hideTip()');
+              }
             }
             if (queueRowsProof) {
               const output = join(folder, shootBefore ? 'before.png' : width === 1440 ? 'after.png' : `after-${width}.png`);
               const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:rows.clip});
               await writeFile(output, Buffer.from(shot.data,'base64'));
             }
+          }
+          if (guestTipProof) {
+            console.log(JSON.stringify({pass:true,shot:join(folder, 'guesttip-dark-1.png')}));
+            break browserProof;
           }
           // nate, 2026-11-23: a white bar showed at the right edge of the Running/Queued card. The other checks hide
           // scrollbars, so one more load shows them. At 1440 px the sideways scroll box has no scrollbar and no overflow.
