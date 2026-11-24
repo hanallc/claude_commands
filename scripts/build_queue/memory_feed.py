@@ -50,6 +50,7 @@ from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import cloud_progress, limits_view, placement, queue_snapshot
 from scripts.build_targets import targets
+from scripts.build_targets.mac_linux import TRANSFER_ALLOWANCE_SECONDS
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.admission_wire import ReservedCloudSlot
@@ -508,8 +509,8 @@ class RowQueueNotes(CallNotes):
     mac_text: NotRequired[str]
     targets: NotRequired[list[str]]
     guest_run: NotRequired[ConfirmedGuestRun]
-    # A guest run whose gate consumed its launch permission before the queue confirmed the guest attempt.
-    guest_unconfirmed: NotRequired[Literal[True]]
+    # The gate consumed its permission and the queue has no matching start report.
+    guest_unconfirmed: NotRequired[Literal["starting", "not confirmed"]]
     mac_state: NotRequired[str]
     runner: NotRequired[unit_labels.Runner]
     worker: NotRequired[str]
@@ -653,14 +654,6 @@ def confirmed_guest_run(step: admission_records.RunningStep) -> ConfirmedGuestRu
     if fields.get("target") == MAC_LINUX_TARGET and isinstance(attempt, str) and attempt:
         return {"target": MAC_LINUX_TARGET, "attempt": attempt}
     return None
-
-
-def unconfirmed_guest_run(step: admission_records.RunningStep) -> bool:
-    """Tell whether a guest gate holds its consumed launch permission and the queue has not confirmed the attempt.
-
-    The queue sets started_at of a remote step from the consume time, so a consumed permission gives a start time.
-    """
-    return step.assignment_target == MAC_LINUX_TARGET and step.started_at > 0 and confirmed_guest_run(step) is None
 
 
 def mac_only_route(route: target_config.StepRoute, routes: target_availability.MacRoutes) -> bool:
@@ -2985,6 +2978,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     groups: dict[str, list[RunRow]] = {}
     remote_groups: set[str] = set()
     guest_placements: set[str] = set()
+    guest_start_limit_seconds: float | None = None
     for entry in explanation.running:
         step = entry.step
         memory = step.measured
@@ -2999,7 +2993,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         state = ""
         if isinstance(memory, admission_records.RemoteMemoryUnavailable):
             guest = confirmed_guest_run(step)
-            unconfirmed = unconfirmed_guest_run(step)
+            unconfirmed = guest is None and step.assignment_target == MAC_LINUX_TARGET and step.started_at > 0
             guest_gate = guest is not None or unconfirmed
             key = f"{MAC_LINUX_TARGET}:{guest['attempt']}" if guest else admission_records.execution_group(step, entry.owner)
             if key in remote_groups:
@@ -3038,7 +3032,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 if step.mac_placement:
                     guest_placements.add(step.mac_placement)
             elif unconfirmed:
-                remote_row["guest_unconfirmed"] = True
+                if guest_start_limit_seconds is None:
+                    report_timeout = conf.read("build_admission").number("query_timeout_seconds")
+                    guest_start_limit_seconds = TRANSFER_ALLOWANCE_SECONDS + report_timeout
+                deadline = step.started_at + guest_start_limit_seconds
+                remote_row["guest_unconfirmed"] = "starting" if published.written_at < deadline else "not confirmed"
             walk.append(remote_row)
             continue
         service = (isinstance(memory, admission_records.CompilerServiceMemory)

@@ -791,6 +791,25 @@ try {
                 }
                 await evaluate('hideTip()');
               }
+              if (width === 1440) {
+                const {guest_run:_guestRun, ...pending} = guest;
+                const guestStates = [
+                  {...pending, guest_unconfirmed:'starting'},
+                  {...pending, guest_unconfirmed:'not confirmed'},
+                  guest,
+                ];
+                const guestMachineCells = await evaluate(`(() => {
+                  const data = latest;
+                  const cells = ${JSON.stringify(guestStates)}.map(state => {
+                    renderWalk({...data, walk:data.walk.map(row => row.key === state.key ? state : row)});
+                    const cell = document.querySelector('tr[data-tip="row:shot-guest"] td.machine');
+                    return [cell.querySelector('.machine-icon.run')?.dataset.machine, cell.textContent.trim()];
+                  });
+                  renderWalk(data);
+                  return cells;
+                })()`);
+                assert.deepEqual(guestMachineCells, [['mac-linux','starting'], ['mac-linux','not confirmed'], ['mac-linux','']]);
+              }
             }
             if (queueRowsProof) {
               const output = join(folder, shootBefore ? 'before.png' : width === 1440 ? 'after.png' : `after-${width}.png`);

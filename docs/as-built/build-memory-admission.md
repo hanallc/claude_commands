@@ -300,12 +300,15 @@ Unavailable remote identity remains uncertain.
 Remote memory remains unavailable and contributes zero to local admission accounting.
 A Mac host run shows on the Builds page as its Mac build row; the page hides its queue row, so the run shows once.
 A `mac-linux` gate row has machine `mac-linux` after the gate consumes its launch permission.
-The service sets the remote `started_at` from the consume time, so `memory_feed.unconfirmed_guest_run` reads the consume from it.
-A confirmed guest attempt gives the row `guest_run`. A consumed attempt that the queue has not confirmed gives `guest_unconfirmed: true`.
+The service sets the remote `started_at` when the gate consumes its launch permission.
+The queue confirms the attempt when it receives matching execution evidence for that permission. The confirmed row has `guest_run`.
+The feed adds the guest setup allowance and `query_timeout_seconds` to `started_at` to set the deadline.
+Before the deadline, an unconfirmed row shows `starting`.
+At or after the deadline, it shows `not confirmed`.
 The Builds page shows both attempts in Running with the recorded job, unit, and caller.
 The Machine cell shows one bright Apple icon with a 🐧 badge.
 The Apple icon has a white fill and a black outline in light and dark modes.
-The cell shows `not confirmed` until confirmation, then `running`.
+The cell shows the unconfirmed state next to the icon. A confirmed row shows the icon alone.
 The tooltip shows `Runs on` and `Named targets`.
 The shared tooltip wraps long fields within its box. The tooltip adjusts its position to fit the viewport when it opens or its content changes.
 The memory column shows `on mac-linux`. The vCPU column shows `—`.
