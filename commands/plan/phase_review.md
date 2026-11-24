@@ -381,7 +381,7 @@ deliverable do?" is the same under both options, it is not the user's decision.
 </FilterFindingsForUserReview>
 
 <DecisionPresentationTemplate>
-Every user-facing decision must use this structure:
+Use this structure for inline decisions and pending decisions in Work Orders.
 
 ```markdown
 **Decision N: <concrete thing to decide>**
@@ -445,7 +445,8 @@ same wording softened. Afterwards, restate the pending question and wait.
 </ExplainOnDemand>
 
 <DispatchAdhocReview>
-Invoke `/adhoc_review` with the filtered user decisions. Each item must already use `<DecisionPresentationTemplate/>` so the user can decide one at a time without translating abstract review language. Apply each user decision into the plan as the walkthrough completes that item.
+Prepare the filtered decisions with the shared ad hoc review template and reader test in `<UserFacingText/>`.
+Invoke `/adhoc_review` with those items. Apply each decision to the plan when the user makes it.
 </DispatchAdhocReview>
 
 Write `${SESSION_DIR}/phase_review_outcomes_<phase>.md` instead of appending any
