@@ -1721,8 +1721,12 @@ function hoverTips(tip, content, fit, getAnchor) {
   const hide = () => { shown = null; tip.classList.remove("on"); };
   window.addEventListener("resize", () => {
     if (!shown) return;
-    const html = content(shown.key);
-    if (html) refresh(html); else hide();
+    // Let the resize handlers finish the layout before measuring the tooltip anchor.
+    requestAnimationFrame(() => {
+      if (!shown) return;
+      const html = content(shown.key);
+      if (html) refresh(html); else hide();
+    });
   });
   document.addEventListener("pointermove", (e) => {
     if (e.pointerType !== "mouse") return;
