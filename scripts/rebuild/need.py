@@ -327,29 +327,33 @@ def active_system(output: str, log: str = "") -> ActiveSystem | None:
     return unknown
 
 
-def clear_running_needs(machine: Machine, system: ActiveSystem, git: Callable[[list[str]], str]) -> None:
+def clear_running_needs(machine: Machine, system: ActiveSystem, nixos_repo: Path,
+                        run: Callable[[list[str]], str]) -> None:
     """Archive requests covered by the clean active revision."""
     revision = system.revision
     if not system.evidence or not REVISION.fullmatch(revision):
         return
+    repo = str(nixos_repo)
     unknown: set[str] = set()
     for record in _open_needs():
         if record["machine"] != machine:
             continue
         commit = record["nixos_commit"]
         if not FULL_NEED_COMMIT.fullmatch(commit):
-            resolved = git(["rev-parse", "--verify", "--quiet", "--end-of-options", f"{commit}^{{commit}}"])
+            resolved = run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", "--end-of-options",
+                            f"{commit}^{{commit}}"])
             if (not FULL_NEED_COMMIT.fullmatch(resolved) or not resolved.startswith(commit)
-                    or git(["rev-parse", f"--disambiguate={commit}"]) != resolved):
+                    or run(["git", "-C", repo, "rev-parse", f"--disambiguate={commit}"]) != resolved):
                 continue
             commit = resolved
-        base = git(["merge-base", commit, revision])
+        base = run(["git", "-C", repo, "merge-base", commit, revision])
         if base == commit:
             _archive(record, commit, system.evidence)
         elif not base:
             for candidate, label in ((revision, f"logged commit {revision}"),
                                      (commit, f"need commit {commit} (need {record['id']})")):
-                if candidate not in unknown and not git(["rev-parse", "--verify", f"{candidate}^{{commit}}"]):
+                if candidate not in unknown and not run(["git", "-C", repo, "rev-parse", "--verify",
+                                                        f"{candidate}^{{commit}}"]):
                     print(f"anomaly: unknown {label}")
                     unknown.add(candidate)
 
@@ -362,7 +366,7 @@ def clear_needs(machine: Machine, generations: Path, nixos_repo: Path) -> None:
         log = ""
     system = active_system(command_output(active_probe(machine)), log)
     if system is not None:
-        clear_running_needs(machine, system, lambda args: command_output(["git", "-C", str(nixos_repo), *args]))
+        clear_running_needs(machine, system, nixos_repo, command_output)
 
 
 def command_output(command: list[str], *, timeout: int = 30) -> str:

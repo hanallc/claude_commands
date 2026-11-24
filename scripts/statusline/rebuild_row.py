@@ -357,7 +357,7 @@ def write_changes(config: Path, run: CommandRunner = command_output) -> None:
                 changes = old.commits if isinstance(old, ComparedChanges) else old
             else:
                 try:
-                    need.clear_running_needs(machine, system, lambda args: run(["git", "-C", str(settings.repo), *args]))
+                    need.clear_running_needs(machine, system, settings.repo, run)
                 except (OSError, ValueError, KeyError, TypeError) as error:
                     print(f"rebuild needs: {error}", file=sys.stderr)
                 changes = machine_changes(settings, system, known, run, configured=configured)
