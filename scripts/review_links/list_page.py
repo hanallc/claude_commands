@@ -1728,7 +1728,7 @@ function bindFeedbackForm(form){
        tableView.showDraftCopy(drafts.get(key)?.words,nextForm.elements.words?.type==='textarea');
      }
     });
-    if(!stale && focusUnpark && document.hasFocus() &&
+    if(!stale && focusUnpark && listOwnsFocus() &&
        (focusParkedAfterClose || document.activeElement===document.body || document.activeElement===unpark)){
      const currentUnpark=recordDetails(item).querySelector('[value="unpark"]:not([hidden])');
      const target=saved && item.hidden ? content.querySelector('[data-filter-row="show"] [aria-pressed="true"]')
