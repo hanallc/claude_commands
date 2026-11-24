@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 from collections.abc import Callable
+import os
 from pathlib import Path
 import shlex
 import shutil
@@ -1151,6 +1152,72 @@ raise SystemExit(1)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("could not save the batch drop: log write refused", result.stdout)
         self.assert_rolled_back(start)
+
+    def test_failed_drop_replacement_rolls_back_the_batch(self) -> None:
+        start, _, _, rows = self.prepare_row_drop()
+        record = self.batch_record()
+        replace = os.replace
+
+        def refuse_drop(source: str | Path, target: str | Path, *,
+                        src_dir_fd: int | None = None, dst_dir_fd: int | None = None) -> None:
+            if target == record and "\ndrop\t" in Path(source).read_text():
+                self.assertNotIn("\ndrop\t", record.read_text())
+                raise OSError("fixture refused drop replacement")
+            replace(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        with (patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate([])),
+              patch.object(os, "replace", side_effect=refuse_drop)):
+            result = self.land_batch(rows)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("not replaced; previous content retained", result.stdout)
+        self.assertIn("send alpha:", result.stdout)
+        self.assertIn("send beta:", result.stdout)
+        self.assert_rolled_back(start)
+
+    def test_resumed_drop_requires_a_confirmed_directory_sync(self) -> None:
+        start, alpha, beta, rows = self.prepare_row_drop()
+        record = self.batch_record()
+        sync_folder = atomic_file.sync_folder
+        allow_sync = False
+        drop_syncs: list[bool] = []
+        runs: list[RowDropRun] = []
+
+        def sync(folder: Path) -> None:
+            if folder == record.parent and "\ndrop\t" in record.read_text():
+                drop_syncs.append(allow_sync)
+                if not allow_sync:
+                    raise OSError("fixture refused drop directory sync")
+            sync_folder(folder)
+
+        with (patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs)),
+              patch.object(atomic_file, "sync_folder", side_effect=sync)):
+            first = self.land_batch(rows)
+            self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
+            self.assertIn("new content visible; durability unconfirmed", first.stdout)
+            saved = record.read_text()
+            self.assertIn("\ndrop\t", saved)
+            self.assertNotEqual(self.git("rev-parse", "HEAD"), start)
+            runs.clear()
+
+            held = self.land_batch(rows)
+            self.assertEqual(held.returncode, 1, held.stdout + held.stderr)
+            self.assertIn("could not confirm the saved batch drop", held.stdout)
+            self.assertIn("send alpha:", held.stdout)
+            self.assertIn("send beta:", held.stdout)
+            self.assertEqual(self.git("rev-parse", "HEAD"), start)
+            self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+            self.assertEqual(record.read_text(), saved)
+            self.assertEqual(runs, [])
+            with patch.dict("os.environ", self.env):
+                self.assertNotEqual(land_runs.last_results()[alpha]["state"], "dropped")
+
+            allow_sync = True
+            result = self.land_batch(rows)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(drop_syncs[:3], [False, False, True])
+        self.assertEqual(runs, [RowDropRun(False, False, True, False)])
+        _ = self.assert_landed(start, [beta])
+        self.assertFalse(record.exists())
 
     def test_drop_stays_saved_until_the_result_is_written(self) -> None:
         start, alpha, beta, rows = self.prepare_row_drop()
