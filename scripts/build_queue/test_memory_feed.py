@@ -687,6 +687,7 @@ class MemoryFeedTests(unittest.TestCase):
             pid=8200, started_at=now - 30, assignment_host="guest-ssh-name", assignment_target="mac-linux",
             mac_placement="episode/placement-attempt",
             job=StepJob("gate"), confirmed_guest_run={"target": "mac-linux", "attempt": "guest-attempt"},
+            counter=progress_profile.ProgressCounter("modules", 7, 12),
             placement_candidates=gate_candidates(placement.AllowedHost()))
         # The queue names no Mac placement for an unconfirmed guest attempt.
         pending = replace(guest, pid=8201, started_at=now - 20, mac_placement="", confirmed_guest_run=None,
@@ -719,8 +720,11 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual(table.count(f'data-tip="row:{row.get("key")}" tabindex="0"'), 1)
         text = "\n".join(tips["walk"][page["walk"].index(row)])
         self.assertIn("Runs on  mac-linux", text)
-        self.assertIn("Guest attempt  guest-attempt", text)
+        self.assertIn("Testing  7 of 12 modules", text)
+        self.assertIn("Done  58.3%", text)
         self.assertIn("Named targets  natedev or mac-linux or hana-aws", text)
+        self.assertNotIn("Guest attempt", text)
+        self.assertNotIn("guest-attempt", text)
 
     def test_running_gate_target_cell_shows_only_the_running_machine(self) -> None:
         # The user, 11-23: a running row shows one icon where it runs; the named targets go in the tooltip.
@@ -740,6 +744,7 @@ class MemoryFeedTests(unittest.TestCase):
             admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
             pid=admission_records.PidNotRecorded(), started_at=now - 30, assignment_host="linux-guest",
             assignment_target="mac-linux", job=StepJob("gate"),
+            counter=progress_profile.ProgressCounter("modules", 2, 5),
             execution=execution_identity.ExecutionEvidenceUnavailable("guest has no start record", now),
             placement_candidates=gate_candidates(placement.AllowedHost()))
         # Before the consume, the queue has no start time and the gate starts nothing on the guest.
@@ -774,11 +779,15 @@ class MemoryFeedTests(unittest.TestCase):
                   for name, row in (("guest", guest), ("waiting", waiting), ("host", host_row), ("mac", mac_row))}
         # The Mac host run shows once, as its Mac build row; the guest run shows once, as its queue row.
         self.assertEqual(counts, {"guest": 1, "waiting": 0, "host": 0, "mac": 1})
-        # The guest row shows the bright mac-linux icon; its hover says the attempt is not confirmed.
+        # The Machine cell shows the bright guest icon and the confirmation status.
         self.assertIn('class="machine machine-icon run" data-machine="mac-linux"', table)
+        self.assertIn("</svg></span> not confirmed</td>", table)
         text = "\n".join(tips["walk"][page["walk"].index(guest)])
         self.assertIn("Runs on  mac-linux", text)
-        self.assertIn("Guest attempt  not confirmed", text)
+        self.assertIn("Testing  2 of 5 modules", text)
+        self.assertIn("Done  40.0%", text)
+        self.assertIn("Named targets  natedev or mac-linux or hana-aws", text)
+        self.assertNotIn("Guest attempt", text)
         self.assertNotIn("unavailable", text.splitlines()[0])
         # The confirmation adds a pid and an attempt; the row keeps its key, so an open hover stays.
         confirmed = cast(memory_feed.RunRow, guest.copy())

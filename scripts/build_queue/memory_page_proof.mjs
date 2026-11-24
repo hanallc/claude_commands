@@ -676,7 +676,7 @@ try {
                   new Set([...cell.querySelectorAll('.machine-icon')].map(icon => Math.round(icon.getBoundingClientRect().top))).size > 1)
                   .map(cell => cell.closest('tr').dataset.tip),
                 legend:[...document.querySelectorAll('#machine-key .key')].map(key =>
-                  [key.textContent, key.querySelector('.machine-icon')?.dataset.machine]),
+                  [key.lastChild.textContent, key.querySelector('.machine-icon')?.getAttribute('aria-label')]),
                 colors:[chart(keys[0]),chart(keys[4])].map(row => [
                   row.querySelector('.name [data-color-text]')?.dataset.colorText,
                   row.querySelector('.owner [data-color-text]')?.dataset.colorText]),
@@ -887,7 +887,7 @@ try {
         queueFixture = structuredClone(queueFixture);
         queueFixture.move_revision += 'joined';
         setQueueWaiters([{...template, key:'remote-start', pid:651,
-          name:'remote startup', machine:'mac', reason:'remote startup',
+          name:'remote startup', machine:'mac', targets:['mac'], reason:'remote startup',
           move:{row_id:'remote-start', movable:false}}, ...queueFixture.waiters]);
         await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...moveTarget, button:'left', buttons:0, clickCount:1});
         await waitForLine('The queue changed.');
@@ -925,8 +925,9 @@ try {
         assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:typesafe"] .place').textContent`), '2');
 
         queueFixture.move_revision += 'mac-only';
+        // The waiting row uses its eligible targets to select the dim icons.
         setQueueWaiters(queueFixture.waiters.toSpliced(3, 0, {...template, key:'mac-only', pid:652,
-          name:'Speculative Mac copy', since:fixtureTime - 75, machine:'mac', reason:'waiting for mac', why:'target',
+          name:'Speculative Mac copy', since:fixtureTime - 75, machine:'mac', targets:['mac'], reason:'waiting for mac', why:'target',
           order_note:'Newest eligible copy starts first',
           move:{row_id:'mac-only', movable:false}}));
         await evaluate('pageRefresh.refresh(true)');
@@ -938,7 +939,8 @@ try {
         await waitForLine('typesafe · test affected moved from 2 to 1');
         assert.deepEqual(await evaluate(`['typesafe', 'natemerge', 'new-unit', 'mac-only'].map(key =>
           document.querySelector('tr[data-tip="wait:' + key + '"] .place').textContent)`), ['1', '2', '3', '4']);
-        assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:mac-only"] td.machine .machine').dataset.machine`), 'mac');
+        assert.deepEqual(await evaluate(`[...document.querySelectorAll('tr[data-tip="wait:mac-only"] td.machine .machine')]
+          .map(icon => [icon.dataset.machine, icon.classList.contains('dim')])`), [['mac', true]]);
         assert.ok(!(await snapshot()).handles.includes('mac-only'));
         assert.ok(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"]').textContent.includes('Newest eligible copy starts first')`));
         assert.equal(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"] .amounts').textContent`), '');
@@ -1444,12 +1446,15 @@ try {
             const tokenColumn=await evaluate(`(()=>{
               const table=document.querySelector('.walk-table');
               const rows=[...table.querySelectorAll('tr[data-tip^="row:"]')];
+              const tokensIndex=table.querySelector('thead th.tokens').cellIndex;
               const box=${comparisonImages} ? table.getBoundingClientRect() : null;
               const bottom=box ? rows.at(-1).getBoundingClientRect().bottom : 0;
-              return {tokens:rows.map(row=>row.querySelector('.tokens').textContent),
+              return {tokens:rows.map(row=>{
+                  const cell=row.cells[tokensIndex];
+                  return cell?.matches('td.tokens') ? cell.textContent : null;
+                }),
                 pool:[...document.querySelectorAll('#walk-tokens dt')].map(label=>[label.textContent,label.nextElementSibling.textContent]),
                 poolAlignment:[...document.querySelectorAll('#walk-tokens dd')].map(value=>getComputedStyle(value).textAlign),
-                lastColumns:rows.map(row=>[...row.children].slice(-2).map(cell=>cell.className)),
                 overflow:document.documentElement.scrollWidth>document.documentElement.clientWidth,
                 clip:box ? {x:Math.floor(box.left)-4,y:Math.floor(box.top+scrollY)-4,
                   width:Math.ceil(box.width)+8,height:Math.ceil(bottom-box.top)+8,scale:1} : undefined};
@@ -1457,7 +1462,6 @@ try {
             assert.deepEqual(tokenColumn.tokens,['6','—']);
             assert.deepEqual(tokenColumn.pool,[['Total','31'],['Available','4']]);
             assert.deepEqual(tokenColumn.poolAlignment,['right','right']);
-            assert.deepEqual(tokenColumn.lastColumns,[['vcpus','tokens'],['vcpus','tokens']]);
             assert.equal(tokenColumn.overflow,false);
             if(comparisonImages&&theme==='dark'&&width===1400) {
               await saveScreenshot('token-column-dark-desktop',{captureBeyondViewport:true,clip:tokenColumn.clip});
@@ -2257,6 +2261,7 @@ try {
             position:getComputedStyle(line).position});
           const good=async()=>{
             reading.read_at=now/1000;
+            reading.fresh_until=reading.read_at;
             window.fetch=async()=>({ok:true,json:async()=>reading});
             await refresh.refresh(); fitLabels();
           };
