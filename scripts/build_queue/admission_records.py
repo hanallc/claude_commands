@@ -1,6 +1,7 @@
 """Shared admission records, configuration and wait phrases."""
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -1161,6 +1162,7 @@ class QueueMoveMember:
     """Identify a queue row and show if it can move."""
     row_id: str
     movable: bool = field(default=True, kw_only=True)
+    kept_before: int = field(default=0, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1168,6 +1170,7 @@ class QueueMoveLine:
     """Keep the move revision and the order of the queue rows."""
     revision: str
     members: tuple[QueueMoveMember, ...]
+    kept_runs: tuple[str, ...] = field(default=(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1501,6 +1504,20 @@ class HeldPlace:
     position: int = field(default=0, kw_only=True)
 
 
+def kept_place_order(held: tuple[HeldPlace, ...], rows: Iterable[Waiter],
+                     order: Callable[[Waiter], tuple[int, float, float, int]],
+                     ) -> tuple[list[HeldPlace], Iterator[int]]:
+    """Return the kept places and the count that ranks before each waiter."""
+    if not held:
+        return [], (0 for _ in rows)
+    # A kept place has normal priority and comes before a waiter at the same time.
+    ranked = sorted(((order({"pid": 0, "start_time": "", "need": 0, "since": place.since}), place)
+                     for place in held), key=lambda pair: pair[0])
+    keys = [key for key, _ in ranked]
+    kept = [place for _, place in ranked]
+    return kept, (bisect_right(keys, order(row)) for row in rows)
+
+
 @dataclass(frozen=True)
 class QueueRead:
     """The queue reading holds its view, explanation, ordered waiters, and diagnostics."""
@@ -1516,26 +1533,29 @@ class QueueRead:
         for step in self.view.waiting:
             yield step, order_times.get((step.pid, step.since), job_order_since(step.since, step.ci_job_start))
 
-    def number_held_places(self, held: tuple[HeldPlace, ...]) -> tuple[HeldPlace, ...]:
-        """Insert kept places by arrival time in the published order of the waiting steps."""
+    def number_held_places(self, held: tuple[HeldPlace, ...],
+                           order: Callable[[Waiter], tuple[int, float, float, int]]) -> tuple[HeldPlace, ...]:
+        """Insert kept places by queue rank in the published order."""
         if not held:
             return ()
-        order_times = (since for _, since in self.waiting_with_order_times())
-        since = next(order_times, None)
-        position = 1
+        by_owner: dict[tuple[int, float], Waiter] = {(row["pid"], row["since"]): row for _, row in self.ordered}
+        rows: list[Waiter] = []
+        for step, since in self.waiting_with_order_times():
+            row = by_owner.get((step.pid, step.since), Waiter(
+                pid=step.pid, start_time="", need=step.need, since=step.since))
+            rows.append({**row, "order_since": since})
+        kept, counts = kept_place_order(held, rows, order)
         numbered: list[HeldPlace] = []
-        for place in sorted(held, key=lambda item: item.since):
-            while since is not None and since < place.since:
-                position += 1
-                since = next(order_times, None)
-            numbered.append(replace(place, position=position))
-            position += 1
+        # The final count inserts the kept places after the last waiter.
+        for preceding, count in enumerate((*counts, len(kept))):
+            while len(numbered) < count:
+                numbered.append(replace(kept[len(numbered)], position=preceding + len(numbered) + 1))
         return tuple(numbered)
 
-    def numbered_held_places(self) -> tuple[HeldPlace, ...]:
+    def numbered_held_places(self, order: Callable[[Waiter], tuple[int, float, float, int]]) -> tuple[HeldPlace, ...]:
         """Number kept places from a view that predates published positions."""
         if any(not place.position for place in self.held_places):
-            return self.number_held_places(self.held_places)
+            return self.number_held_places(self.held_places, order)
         return self.held_places
 
 

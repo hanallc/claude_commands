@@ -2289,12 +2289,13 @@ class AdmissionServer:
 
     def _current_move_line(self, rows: list[tuple[Path, records.RankedWaiter]],
                            movable: set[str]) -> records.QueueMoveLine:
+        kept, counts = records.kept_place_order(self.held_places, (row for _, row in rows), gate.waiter_order)
         members: list[records.QueueMoveMember] = []
-        for _, row in rows:
+        for (_, row), count in zip(rows, counts, strict=True):
             row_id = row.get("move_id")
             assert row_id
-            members.append(records.QueueMoveMember(row_id, movable=row_id in movable))
-        return self._revise_move_line(tuple(members))
+            members.append(records.QueueMoveMember(row_id, movable=row_id in movable, kept_before=count))
+        return self._revise_move_line(tuple(members), tuple(place.failed_run for place in kept))
 
     def _published_queue_order(self, ordered: list[tuple[Path, records.RankedWaiter]]
                                ) -> list[tuple[Path, records.RankedWaiter]]:
@@ -2307,9 +2308,10 @@ class AdmissionServer:
                   and place.episode == request.episode}
         return [(path, row) for path, row in ordered if row.get("move_id") not in hidden]
 
-    def _revise_move_line(self, members: tuple[records.QueueMoveMember, ...]) -> records.QueueMoveLine:
-        if members != self.move_line.members:
-            self.move_line = records.QueueMoveLine(uuid.uuid4().hex, members)
+    def _revise_move_line(self, members: tuple[records.QueueMoveMember, ...],
+                          kept_runs: tuple[str, ...]) -> records.QueueMoveLine:
+        if members != self.move_line.members or kept_runs != self.move_line.kept_runs:
+            self.move_line = records.QueueMoveLine(uuid.uuid4().hex, members, kept_runs=kept_runs)
         return self.move_line
 
     def _movable_wait_ids(self, *, check_owners: bool = False) -> set[str]:
@@ -3613,7 +3615,7 @@ class AdmissionServer:
         reading = replace(reading, ordered=ordered, view=replace(reading.view, waiting=tuple(visible), move_line=move_line))
         reading = self._placement_reading(reading)
         reading = replace(self._cloud_reading(reading, self.configuration),
-                          held_places=reading.number_held_places(self.held_places))
+                          held_places=reading.number_held_places(self.held_places, gate.waiter_order))
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
         occupancy = self._local_occupancy(self.last_inputs)
         view = wire.ViewReply(replace(reading, explanation=replace(reading.explanation, local_occupancy=occupancy)))
@@ -5962,7 +5964,7 @@ done
             destination = QueueHeadAnchor() if place == 0 else drop
 
         self._move_pin(row_id, destination, full_order, full_index, previous_anchor)
-        updated = self._revise_move_line(tuple(by_id[member] for member in full_order if member in by_id))
+        updated = self._revise_move_line(tuple(by_id[member] for member in full_order if member in by_id), line.kept_runs)
         new_index = next(index for index, member in enumerate(updated.members) if member.row_id == row_id)
         return wire.QueueMoved(row_id, updated, old_index + 1, new_index + 1), previous_anchor
 

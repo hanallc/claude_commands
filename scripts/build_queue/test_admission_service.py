@@ -123,6 +123,29 @@ class PlacementStatusTests(unittest.TestCase):
             self.assertEqual(kept.position, 2)
             self.assertEqual(queue_snapshot.read_view_snapshot(fixture.state_dir).reading.held_places, (kept,))
 
+    def test_a_newer_priority_waiter_precedes_a_kept_place(self) -> None:
+        from scripts.build_queue.test_place_take import unit_request, wait_in_line
+
+        with AdmissionFixture() as fixture:
+            now = fixture.clock.now()
+            earlier = unit_request(fixture, fixture.run_owner(), unit="earlier", since=now - 30)
+            newer = unit_request(fixture, fixture.run_owner(), unit="newer", since=now - 10)
+            wait_in_line(fixture, earlier)
+            wait_in_line(fixture, newer)
+            fixture.server.held_places = (records.HeldPlace("queue", "fixture", "lint", now - 20,
+                now, now + 100, "4242-99", ("natedev",), 1, "failed"),)
+            fixture.server.priority = records.QueuePriority(({
+                "unit": "newer", "why": "fixture", "set_at": now, "set_by": "director"},))
+            _ = fixture.run_pass()
+            reading = queue_snapshot.read_view_snapshot(fixture.state_dir).reading
+            self.assertEqual([step.unit for step in reading.view.waiting], ["newer", "earlier"])
+            kept, = reading.held_places
+            self.assertEqual(kept.position, 3)
+            line = reading.view.move_line
+            assert isinstance(line, records.QueueMoveLine)
+            self.assertEqual(line.kept_runs, (kept.failed_run,))
+            self.assertEqual([member.kept_before for member in line.members], [0, 0])
+
     def assert_unchanged_placement_poll(self, fixture: AdmissionFixture, request: wire.PlacementRequest | str,
                                         initial: wire.PlacementWait) -> None:
         with mock.patch.object(fixture.server, "run_pass", wraps=fixture.server.run_pass) as passed, \

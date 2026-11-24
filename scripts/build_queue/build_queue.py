@@ -28,7 +28,7 @@ class NoWaitingStep:
 
 def waiting_positions(reading: admission_records.QueueRead) -> dict[int, admission_records.WaitingStep]:
     """Use the same place numbers as the Builds page."""
-    kept = {place.position for place in reading.numbered_held_places()}
+    kept = {place.position for place in reading.numbered_held_places(memory_admit.waiter_order)}
     waiting = iter(reading.view.waiting)
     return {position: next(waiting) for position in range(1, len(reading.view.waiting) + len(kept) + 1)
             if position not in kept}
@@ -42,7 +42,7 @@ def bump(selector: str, actor: str) -> int:
                if queue_evidence.step_labels(step, labels).session == selector]
     if not matches and selector.isdecimal():
         position = int(selector)
-        for kept in reading.numbered_held_places():
+        for kept in reading.numbered_held_places(memory_admit.waiter_order):
             if kept.position == position:
                 print(f"build queue: place #{position} is kept for {kept.unit}")
                 return 3

@@ -3,6 +3,7 @@ from __future__ import annotations
 from scripts.build_queue import admission_records
 
 import json
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 from pathlib import Path
 import shutil
@@ -879,11 +880,15 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertNotIn("last run failed in", str(html))
 
     def test_queue_drag_updates_the_kept_place_before_the_next_view(self) -> None:
+        first = {"row_id": "first", "kept_before": 0}
+        last = {"row_id": "last", "kept_before": 1}
+        line = {"revision": "original", "members": [first, last], "kept_runs": ["4242-99"]}
         reading = {"total": 64, "read_at": 200, "move_revision": "original",
+            "move_line": line,
             "held_places": [self.kept_place_row()],
-            "waiters": [{"name": "phases", "since": 70, "order_since": 40, "place": 1, "move": {"row_id": "first"}},
+            "waiters": [{"name": "phases", "since": 70, "order_since": 40, "place": 1, "move": first},
                         {"name": "cloud", "kind": "cloud", "since": 60},
-                        {"name": "research", "since": 60, "order_since": 60, "place": 3, "move": {"row_id": "last"}}]}
+                        {"name": "research", "since": 60, "order_since": 60, "place": 3, "move": last}]}
         result = self.page_expression("""(() => {
           const snapshot = JSON.stringify(data);
           const positions = reading => queueRows(reading.waiters, reading.held_places)
@@ -893,8 +898,8 @@ class MemoryHoverTests(unittest.TestCase):
           previewQueueMove(data.waiters[0]);
           const preview = positions(painted);
           const previewHover = pageTooltipHtml("held:4242-99", data).includes("place 1");
-          queueReply = {previousRevisions:[data.move_revision],
-            line:{revision:"confirmed", members:[{row_id:"last"}, {row_id:"first"}]}};
+          queueReply = {previousRevisions:[data.move_revision], line:{...data.move_line,
+            revision:"confirmed", members:[...data.move_line.members].reverse()}};
           const confirmed = queueReading(data);
           showWalk(confirmed);
           const confirmedHover = pageTooltipHtml("held:4242-99", data).includes("place 1");
@@ -907,6 +912,45 @@ class MemoryHoverTests(unittest.TestCase):
             [["4242-99", 1], ["fixture-wait-2", 2], ["fixture-wait-1", None], ["fixture-wait-0", 3]],
             2, True, True, True])
 
+    def test_queue_drag_counts_a_hidden_waiter_before_the_kept_place(self) -> None:
+        first = {"row_id": "first", "kept_before": 0}
+        hidden = {"row_id": "hidden", "kept_before": 0}
+        moving = {"row_id": "moving", "kept_before": 1}
+        last = {"row_id": "last", "kept_before": 1}
+        line = {"revision": "original", "members": [first, moving, hidden, last], "kept_runs": ["4242-99"]}
+        reading = {"total": 64, "read_at": 200, "move_revision": "original", "move_line": line,
+            "held_places": [self.kept_place_row()],
+            "waiters": [{"name": "first", "since": 35, "place": 1, "move": first},
+                        {"name": "moving", "since": 60, "place": 3, "move": moving},
+                        {"name": "last", "since": 55, "place": 5, "move": last}]}
+        confirmed = {**line, "revision": "confirmed", "members": [first, hidden, last, moving]}
+        result = self.page_expression("""(() => {
+          const kept = reading => reading.held_places[0].position;
+          queueDrag = {reading:data, rows:data.waiters, row:data.waiters[1], pointer:null};
+          previewQueueMove(data.waiters[2]);
+          const preview = kept(painted);
+          queueReply = {previousRevisions:[data.move_revision], line:data.confirmed};
+          const confirmed = queueReading(data);
+          showWalk(confirmed);
+          const published = {...data, move_revision:"confirmed", move_line:data.confirmed,
+            held_places:[{...data.held_places[0], position:3}],
+            waiters:[data.waiters[0], {...data.waiters[2], place:4}, {...data.waiters[1], place:5}]};
+          return [preview, kept(confirmed), kept(queueReading(published)),
+            queuePlace(confirmed, "moving", "confirmed"), painted.waiters.map(row => row.place)];
+        })()""", {**reading, "confirmed": confirmed}, walk=True, queue_move=True)
+        self.assertEqual(result, [3, 3, 3, 5, [1, 4, 5]])
+
+    def test_kept_place_hover_uses_the_saved_jobs_match_rule(self) -> None:
+        now = datetime(2026, 11, 24, tzinfo=UTC).timestamp()
+        for job, expected in (("test-all", "same repository and test family"),
+                              ("lint", "same repository and job")):
+            with self.subTest(job=job):
+                kept = admission_records.HeldPlace("queue", "fixture", job, now - 60, now, now + 60,
+                    "4242-99", ("natedev",), 1, "failed", failed_step="lint", position=2)
+                row = memory_feed.held_place_row(kept, UTC)
+                html = self.page_expression("tooltipHtml('held:4242-99', data)", {"held_places": [row]}, walk=True)
+                self.assertIn(f"({expected})", str(html))
+
     def test_kept_place_hover_names_the_failure_and_the_deadline(self) -> None:
         reading = {"held_places": [self.kept_place_row()]}
         html = self.page_expression("tooltipHtml('held:4242-99', data)", reading, walk=True)
@@ -918,14 +962,14 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual({node.text: tip[index + 1].text for index, node in enumerate(tip)
                           if node.tag == "dt" and index > 0}, fields)
         self.assertEqual(tip.findtext("dd[@class='long']"),
-            "If the next run of unit queue (same repository and test family) arrives before 22:37 PST, "
+            "If the next run of unit queue (same repository and job) arrives before 22:37 PST, "
             + "it starts from place 2. Runs behind place 2 do not wait for it.")
 
     @staticmethod
     def kept_place_row() -> dict[str, object]:
         return {"kind": "held", "key": "4242-99", "since": 50, "position": 2, "unit": "queue",
                 "failed_run": "4242-99", "failed_step": "lint", "failed_at": "22:07 PST",
-                "kept_until": "22:37 PST", "targets": ["natedev", "mac-linux"]}
+                "kept_until": "22:37 PST", "targets": ["natedev", "mac-linux"], "match_rule": "same repository and job"}
 
     def test_guest_row_shows_confirmation_and_caller(self) -> None:
         for guest, state in (({"guest_run": {"attempt": "fixture"}}, "running"),
