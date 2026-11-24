@@ -2769,6 +2769,9 @@ class RosterTests(unittest.TestCase):
             replace(base, kind="codex", role="worker", session=roster.NoClaudeSession(),
                     reach=roster.CannotReceiveMessages("between turns; no unit director is running"),
                     assignment=roster.WorkerAssignment("test", "/remote/no-thread")),
+            replace(base, role="worker", status="closed", reach=roster.CannotReceiveMessages("closed"),
+                    worker_closure=roster.WorkerClosure.CONFIRMED),
+            replace(base, role="worker", status="incomplete: closed", reach=roster.CannotReceiveMessages("closed")),
         ]
         result = roster.Roster(rows, ["remote source problem"])
         encoded = roster.RosterSnapshot(result).encode()
@@ -2979,6 +2982,10 @@ class PaneRosterTests(StaffTestCase):
             self.assertEqual(entries["open"].status, "working; pane w1:p1")
             self.assertIn("stopped", entries["stopped"].status)
             self.assertEqual(entries["closed"].reach, roster.CannotReceiveMessages("closed"))
+            self.assertEqual(
+                {worker.name for worker in rows if roster.is_closed_worker(entries[worker.name])},
+                {"closed"},
+            )
             self.assertNotIn("registry-copy", entries)
             self.assertNotIn("herdr agents:w1:p1", entries)
             self.assertNotIn(remote_worker.name, entries)
@@ -2989,6 +2996,10 @@ class PaneRosterTests(StaffTestCase):
             self.assertIsInstance(entries["unknown"].reach, roster.CannotReceiveMessages)
             self.assertIn("incomplete:", entries["closed"].status)
             self.assertIn("absence", entries["closed"].status)
+            incomplete = entries["closed"]
+            for entry in (incomplete, replace(incomplete, reach=roster.CannotReceiveMessages("closed"))):
+                with self.subTest(reason=entry.reach):
+                    self.assertFalse(roster.is_closed_worker(entry))
             self.assertEqual(self.staff_file.read_bytes(), before)
 
     def test_roster_names_owner_and_record_failures(self) -> None:
