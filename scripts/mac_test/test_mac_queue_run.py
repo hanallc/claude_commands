@@ -20,6 +20,7 @@ import unittest
 from unittest import mock
 
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib import conf
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -611,6 +612,49 @@ if sys.argv[1] == "prepare":
                 self.assertIn("caller watch ended unexpectedly", errors)
                 self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
                 self.assertIn("signal_group TERM", (root / "stop").read_text())
+            finally:
+                os.close(reader)
+                os.close(writer)
+
+    def test_caller_watch_accepts_ready_after_the_termination_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = queue_fixture(root)
+            grace = conf.read(root / "config/mac_gate.conf").number("terminate_grace_seconds")
+            watcher = root / "watcher.py"
+            _ = watcher.write_text(
+                """\
+import os, sys
+print('watcher started', file=sys.stderr, flush=True)
+assert os.read(int(sys.argv[2]), 1) == b'x'
+print('ready', flush=True)
+assert os.read(int(sys.argv[3]), 1) == b''
+""")
+            queue_program = """\
+import sys
+from scripts.mac_test import mac_queue_run
+mac_queue_run.__file__ = sys.argv[1]
+with mac_queue_run.caller_watch(int(sys.argv[2])):
+    print('queue ready', flush=True)
+"""
+            reader, writer = os.pipe()
+            try:
+                with subprocess.Popen([sys.executable, "-c", queue_program, str(watcher), str(reader)],
+                                      env=environment, start_new_session=True, pass_fds=(reader,),
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as queue:
+                    try:
+                        assert queue.stderr is not None
+                        self.assertTrue(select.select([queue.stderr], [], [], TEST_HANG_GUARD_SECS)[0])
+                        self.assertEqual(queue.stderr.readline(), "watcher started\n")
+                        with self.assertRaises(subprocess.TimeoutExpired):
+                            _ = queue.wait(timeout=2 * grace)
+                        self.assertEqual(os.write(writer, b"x"), 1)
+                        output, errors = queue.communicate(timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual(queue.returncode, 0, errors)
+                        self.assertEqual(output, "queue ready\n")
+                    finally:
+                        if queue.poll() is None:
+                            queue.kill()
             finally:
                 os.close(reader)
                 os.close(writer)

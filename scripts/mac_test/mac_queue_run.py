@@ -17,7 +17,6 @@ from collections.abc import Generator
 import contextlib
 import fcntl
 import json
-import math
 from dataclasses import dataclass
 import os
 import select
@@ -504,11 +503,9 @@ def caller_watch(caller: int) -> Generator[None]:
         with watcher:
             try:
                 assert watcher.stdout is not None
-                output = watcher.stdout.fileno()
-                readiness = select.poll()
-                readiness.register(output, select.POLLIN)
                 grace = conf.read("mac_gate").number("terminate_grace_seconds")
-                if not readiness.poll(math.ceil(grace * 1000)) or os.read(output, 6) != b"ready\n":
+                ready = b"ready\n"
+                if watcher.stdout.readline(len(ready)) != ready:
                     raise ValueError("the Mac queue caller watch did not start")
 
                 def monitor() -> None:
