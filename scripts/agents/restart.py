@@ -1016,12 +1016,12 @@ class RestoredWorkers(set[staff.StaffId]):
 def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
                      observed: RestartObservations | None = None,
                      target_account: str | accounts.AccountSelection = "",
-                     reports: WorkerRestoreReports | None = None) -> str:
+                     reports: WorkerRestoreReports | None = None,
+                     only: frozenset[staff.StaffId] | Literal["all"] = "all") -> str:
     from scripts.herdr.worker_panes import defer_worker_anomalies
     from scripts.production import worker
 
     started_panes: dict[staff.StaffId, str] = {}
-    only: frozenset[staff.StaffId] | Literal["all"] = "all"
     if row.kind == "worker":
         parent = record.parent_of(row)
         if parent is None:
@@ -1032,7 +1032,8 @@ def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
         if (bulk := _BULK_REPORT.get()) is not None:
             bulk.finish(row.id)
         parent = row
-        members = record.find(kind="worker", parent=parent.id)
+        members = [member for member in record.find(kind="worker", parent=parent.id)
+                   if only == "all" or member.id in only]
         if not members:
             return ""
     else:
@@ -1059,6 +1060,29 @@ def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
     if result != worker.ExitCode.OK:
         raise WorkerRestoreIncomplete(f"run worker.py restore in {parent.name}")
     return started_panes.get(row.id, "")
+
+
+def restore_moved_workers(row: staff.StaffRow, record: staff.StaffSnapshot,
+                          pending: frozenset[staff.StaffId]) -> frozenset[staff.StaffId]:
+    """Report each restored worker and return the workers that still need recovery."""
+    workers = [member for member in record.find(kind="worker", parent=row.id) if member.id in pending]
+    if not workers:
+        return frozenset()
+    pending = frozenset(member.id for member in workers)
+    reports = WorkerRestoreReports()
+    try:
+        _ = _restore_workers(row, record, reports=reports, only=pending)
+    except WorkerRestoreIncomplete:
+        pass
+    attempt = reports.attempts.get(row.id)
+    if attempt is None:
+        return pending
+    _, result = attempt
+    for member in workers:
+        if member.id in result.restored:
+            print(f"{row.name}: worker {member.name} resumed")
+    reports.report()
+    return pending - ((result.restored | result.skipped.keys()) - result.failures.keys())
 
 
 def pane_holds_other_work(client: herdr.Herdr, pane_id: str, identity: str) -> bool:
