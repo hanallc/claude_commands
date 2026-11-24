@@ -94,6 +94,8 @@ Fit the length to the size of the decision:
 
 - A small yes or no is **The point**, three fact lines or fewer, and the choice line. `elaborate` gives the rest.
 - Use the full item template only for a design decision.
+- Keep the chain complete: cause, action, result. A short item drops detail, not a link of the chain.
+- When an item asks the user for an action, such as a command, one line says what the action changes and why that removes the fault.
 
 Put a fact for later use, such as steps after an install, in the report after the decision.
 
@@ -148,13 +150,13 @@ The session that shows the items runs this test on each item before the user see
 For one live item, the writer runs it alone:
 
 1. Read only the title and **The point** as a reader who knows none of the work.
-2. State why the item exists.
+2. State why the item exists, and what happens after each choice and why.
 3. If you need more context to answer, rewrite the item and repeat the test.
 
 For a prepared batch, run it cold:
 
 1. Give a helper only the titles and **The point** blocks.
-2. The helper states why each item exists.
+2. The helper states why each item exists, and what happens after each choice and why.
 3. Rewrite each item where the helper cannot, and repeat the test for it.
 
 ## The comprehension gate
