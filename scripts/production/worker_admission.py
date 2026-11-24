@@ -224,6 +224,8 @@ def reply_ends_dispatch(reply: str, dispatch_id: str) -> bool:
 
 
 def transcript_entry(fields: dict[str, object], changed: set[str]) -> str:
+    if fields.get("isMeta") is True:
+        return ""
     if isinstance(fields.get("message"), dict) and fields.get("type") not in ("user", "assistant"):
         return ""
     raw = fields.get("message", fields.get("payload", {}))

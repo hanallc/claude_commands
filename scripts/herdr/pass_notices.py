@@ -14,13 +14,14 @@ from pathlib import Path
 from typing import cast
 
 from scripts.agents import worker_lifecycle
-from scripts.direct import pass_record
+from scripts.direct import pass_record, progress_history
 from scripts.lib import atomic_file, scratch, unit_runs
 from scripts.message import send
 from scripts.production import staff
 
 REPEAT_MINUTES = 52_596_000
 NOTICE_FILES = ".*.pass-notices.jsonseq"
+TURN_EVENT = "turn:"
 
 
 class NoticeKind(StrEnum):
@@ -38,6 +39,13 @@ class Notice:
     source_event_id: str = ""
     settled: bool = False
     legacy_stamp: str = ""
+    # A busy or uncertain notice sends only while this dispatch delivery stays unconfirmed.
+    unconfirmed_delivery: str = ""
+
+    @property
+    def ordered_turn(self) -> bool:
+        """Only the latest-turn check of the turn end sends this notice."""
+        return self.source_event_id.startswith(TURN_EVENT)
 
 
 @dataclass(frozen=True)
@@ -135,7 +143,8 @@ def _read_notice(path: Path, key: str, value: object) -> Notice:
         raise ValueError(f"{path}: incomplete pass notice {key}")
     return Notice(text, sender, NoticeKind(pass_record.string(fields.get("kind"))),
                   pass_record.string(fields.get("transition")), pass_record.string(fields.get("source_event_id")),
-                  fields.get("settled") is True, pass_record.string(fields.get("legacy_stamp")))
+                  fields.get("settled") is True, pass_record.string(fields.get("legacy_stamp")),
+                  pass_record.string(fields.get("unconfirmed_delivery")))
 
 
 def _append(path: Path, content: dict[str, object]) -> None:
@@ -302,6 +311,10 @@ def _deliver(path: Path, keys: Collection[str], *, retry: bool = False) -> None:
             if status_blocked and notice.kind == NoticeKind.STATUS:
                 continue
             try:
+                if notice.unconfirmed_delivery and not progress_history.dispatch_delivery_pending(
+                        path.parent, record.route.instance_id, notice.unconfirmed_delivery):
+                    _settle(path, key)
+                    continue
                 if not retry or not _received(record.route, key):
                     result = _send(path.parent, record.route, key, notice)
                     if not isinstance(result, send.RepeatGuardHeld) and result.outcome not in ("sent", "skipped"):
@@ -327,7 +340,7 @@ def deliver_status(run: Path, instance: str, event: str) -> None:
         return
     pending: list[str] = []
     for key, notice in record.notices.items():
-        if notice.kind == NoticeKind.STATUS and not notice.settled:
+        if notice.kind == NoticeKind.STATUS and not notice.settled and (key == event or not notice.ordered_turn):
             pending.append(key)
         if key == event:
             break
@@ -355,7 +368,8 @@ def retry(run: Path, worker: str = "", *, exclude_instance: str = "", retry_excl
             if record is None or (worker and record.route.worker_name != worker):
                 continue
             excluded = record.route.instance_id == exclude_instance
-            pending = tuple(key for key, notice in record.notices.items() if not notice.settled
+            # The pending-DONE retry of the turn end owns each ordered turn notice.
+            pending = tuple(key for key, notice in record.notices.items() if not notice.settled and not notice.ordered_turn
                             and (not excluded or retry_excluded_diagnostics and notice.kind == NoticeKind.DIAGNOSTIC))
             if pending:
                 _deliver(path, pending, retry=True)
