@@ -59,8 +59,8 @@ const standingProof = previousPage === '--standing-orders';
 const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || standingProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
-const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Machine','vCPU','Tokens'];
-const queuedHeaders = ['#','Done','Waiting','Verify','Step','Pid','Machine','vCPU'];
+const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Machine','vCPU','Tokens','Moved'];
+const queuedHeaders = ['#','Done','Waiting','Verify','Step','Pid','Machine','vCPU','Moved'];
 
 // nate's standing orders for the Builds page (docs/plans/builds-page-standing-orders.md), checked at 1440 px and 900 px
 // on the served reading, which has rows in the shape of the live feed. The path names the page to check.
@@ -322,6 +322,10 @@ try {
   let unnamedPlace = 0;
   let confirmedQueueLine = null;
   const undoAnchors = new Map();
+  function setQueueWaiters(rows) {
+    let place = 0;
+    queueFixture.waiters = rows.map(row => row.kind === 'cloud' ? row : {...row, place:++place});
+  }
   const server = createServer(async (req, res) => {
     if (req.url === '/console/builds/queue-move') {
       const json = (status, result) => {
@@ -363,8 +367,8 @@ try {
       unnamedPlace = members.indexOf(unnamed);
       const byId = new Map(ordered.map(row => [row.move.row_id, row]));
       const shown = members.filter(item => byId.has(item.row_id)).map(item => byId.get(item.row_id));
-      let place = 0;
-      queueFixture.waiters = rows.map(item => item.move ? shown[place++] : item);
+      let indexShown = 0;
+      setQueueWaiters(rows.map(item => item.move ? shown[indexShown++] : item));
       queueFixture.move_revision += '1';
       confirmedQueueLine = line();
       return json(200, {line:confirmedQueueLine});
@@ -648,7 +652,7 @@ try {
           reading.queued_priority_units = [];
           servedReading = reading;
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-          // At 800 px the walk is tight: a waiting step wraps, but no word is cut. No icon row wraps at any width.
+          // Require the wide and tight layouts at 1440 px and 800 px. At 900 px the content sets the layout.
           let rows;
           for (const width of shootBefore ? [1440] : [1440, 900, 800]) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1100,deviceScaleFactor:1,mobile:false});
@@ -698,7 +702,7 @@ try {
               assert.deepEqual(rows.wrappedIcons, [], `A Machine icon row wraps at ${width} px.`);
               assert.deepEqual(rows.legend, ['natedev','mac','mac-linux','aws','hana-aws','hana-gpu'].map(name => [name, name]));
               assert.deepEqual(rows.colors, [['role.unit-director','role.showrunner'],['role.unit-director','role.showrunner']]);
-              assert.equal(rows.tight, width === 800, `The walk at ${width} px has the wrong tight state.`);
+              if (width !== 900) assert.equal(rows.tight, width === 800, `The walk at ${width} px has the wrong tight state.`);
               assert.equal(rows.waitingNameLines, 1, `The waiting unit name breaks at ${width} px.`);
               assert.deepEqual(rows.cutSteps, [], `A Step cell is cut at ${width} px.`);
               assert.deepEqual(rows.machineColors.filter(([, color, row]) => color === row).map(([name]) => name), [],
@@ -882,9 +886,9 @@ try {
         await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...moveTarget, button:'left', buttons:1});
         queueFixture = structuredClone(queueFixture);
         queueFixture.move_revision += 'joined';
-        queueFixture.waiters.unshift({...template, key:'remote-start', pid:651,
+        setQueueWaiters([{...template, key:'remote-start', pid:651,
           name:'remote startup', machine:'mac', reason:'remote startup',
-          move:{row_id:'remote-start', movable:false}});
+          move:{row_id:'remote-start', movable:false}}, ...queueFixture.waiters]);
         await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...moveTarget, button:'left', buttons:0, clickCount:1});
         await waitForLine('The queue changed.');
         assert.deepEqual((await snapshot()).handles, []);
@@ -893,9 +897,9 @@ try {
         await evaluate('pageRefresh.refresh(true)');
         assert.deepEqual((await snapshot()).handles, ['natemerge', 'aws', 'unit-board', 'postmaster', 'typesafe']);
         queueFixture.move_revision += 'new-unit';
-        queueFixture.waiters.splice(2, 0, {...template, key:'new-unit', unit:'new-unit', pid:650,
+        setQueueWaiters(queueFixture.waiters.toSpliced(2, 0, {...template, key:'new-unit', unit:'new-unit', pid:650,
           name:'test affected', since:fixtureTime - 60, title:{unit:'new-unit', step:'test affected'},
-          move:{row_id:'new-unit'}});
+          move:{row_id:'new-unit'}}));
         await evaluate('pageRefresh.refresh(true)');
         const retryStart = await grip('typesafe');
         const retryTarget = await cell('new-unit', 'machine');
@@ -910,8 +914,8 @@ try {
         const nextTarget = await cell('postmaster', 'machine');
         await call('Input.dispatchMouseEvent',{type:'mousePressed', ...nextStart, button:'left', buttons:1, clickCount:1});
         await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...nextTarget, button:'left', buttons:1});
-        queueFixture = {...queueFixture, move_revision:queueFixture.move_revision + 'left',
-          waiters:queueFixture.waiters.filter(row => row.key !== 'remote-start')};
+        queueFixture = {...queueFixture, move_revision:queueFixture.move_revision + 'left'};
+        setQueueWaiters(queueFixture.waiters.filter(row => row.key !== 'remote-start'));
         servedReading = queueFixture;
         await evaluate('pageRefresh.refresh(true)');
         assert.ok(await evaluate('!latest.waiters.some(row => row.key === "remote-start")'));
@@ -921,10 +925,10 @@ try {
         assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:typesafe"] .place').textContent`), '2');
 
         queueFixture.move_revision += 'mac-only';
-        queueFixture.waiters.splice(3, 0, {...template, key:'mac-only', pid:652,
+        setQueueWaiters(queueFixture.waiters.toSpliced(3, 0, {...template, key:'mac-only', pid:652,
           name:'Speculative Mac copy', since:fixtureTime - 75, machine:'mac', reason:'waiting for mac', why:'target',
           order_note:'Newest eligible copy starts first',
-          move:{row_id:'mac-only', movable:false}});
+          move:{row_id:'mac-only', movable:false}}));
         await evaluate('pageRefresh.refresh(true)');
         const macStart = await grip('typesafe');
         const macTarget = await cell('natemerge', 'machine');

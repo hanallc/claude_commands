@@ -576,8 +576,12 @@ An expired estimate requires a client refresh through the service.
 | `view`, `explain`, `mine` | Read the stored pass |
 
 `/build:bump <position|session|folder>` selects a waiting step by position, session, or folder.
-It sets priority for that step's unit. An unmatched selector exits 3 without a priority change.
-The service refuses `priority_set` when no waiting step or current reservation belongs to the unit.
+The command resolves session names through the staff roster. It reads positions and folders from `queue.json`.
+Set and clear append to `admission/person_actions.jsonl` under a file lock and sync the file.
+Each record holds its id, actor, time and reason. A set also holds the selected step's queue key.
+The command prints `recorded` and the id after the write. It uses no service socket.
+An unmatched selector or unknown unit exits 3 and writes no record.
+The socket priority requests still serve existing clients.
 `/build:bump` works from any session or a plain shell.
 `queue_command_actor()` selects `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, then `"user"`.
 
@@ -1326,7 +1330,19 @@ Install on natedev from the repo root with `scripts/build_hold/install_cargo_wra
 `/build:bump` resolves the waiting step's recorded unit before it checks roster labels.
 The no-unit display placeholder supplies no unit.
 Unknown units keep the saved priority and return exit 3 with a refusal on stdout.
-The Builds page shows the saved priority order and reasons.
+Each pass applies bump records in file order before it ranks the waiters.
+The service persists the byte offset with the priority change in `admission/state.json`.
+A restart resumes at that offset. Complete records stay in the file.
+A set for a departed step saves a refusal with the offset.
+The Builds page shows the saved time of each waiting record in the user's zone.
+It shows the reason for each refusal. An applied record leaves the waiting list.
+A set record saves the selected step's queue place and the request time.
+When the service changes priority, it saves the applied bump with the admission episode and the journal offset.
+The applied record has the actor, source place, destination, and request time.
+The feed includes the bump on waiting and running rows for that episode.
+Moved is the last column. It shows the actor in an orange bump mark, or a dash when the row has no move.
+A kept place shows a dash.
+Hover on the mark to see the queue place, actor, source place, destination, and request time in the user's zone.
 
 Durable `Waiter` rows keep their join and token clocks. `RankedWaiter.order` holds `PriorityUnit` or `NormalOrder` only in the resolved queue. Priority transitions decode to `SettledPriority` or `PendingPriorityTransition`; a pending transition keeps its id and saved month-log offset through retries. One cleanup guard isolates both a failed token-wait intent and failed dead-owner reservation finalization. Each failure logs its record path and keeps the record for the next poll; other cleanup and admission continue.
 

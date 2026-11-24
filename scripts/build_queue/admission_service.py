@@ -46,7 +46,7 @@ from scripts.build_queue import placement
 from scripts.build_queue import step_estimator
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import cloud_progress
-from scripts.build_queue import queue_snapshot
+from scripts.build_queue import person_actions, queue_snapshot
 from scripts.build_targets import target_config
 from scripts.build_targets.execution_transport import ExecutionTransport, HanaGpuNextestTransport
 from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
@@ -804,6 +804,7 @@ class ServiceState:
     current_assignments: dict[str, str] = field(default_factory=dict)
     pending_cloud_groups: dict[str, PendingCloudGroup] = field(default_factory=dict)
     queue_pins: QueuePins = ()
+    bumps: person_actions.BumpProgress = field(default_factory=person_actions.BumpProgress)
     verify_run_slots: dict[str, VerifyRunSlot] = field(default_factory=dict, kw_only=True)
 
 
@@ -1825,6 +1826,7 @@ class AdmissionServer:
         self.pass_stale: bool = False
         self.pending_configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration | NoPass = NoPass()
         self.priority: records.QueuePriority | records.NoQueuePriority = records.NO_QUEUE_PRIORITY
+        self.bumps: person_actions.BumpProgress = person_actions.BumpProgress()
         self.pending_priority: PendingPriorityRoster | NoPendingPriorityRoster = NoPendingPriorityRoster()
         self.queue_changes: deque[OrderedQueueChange] = deque()
         self.last_diagnostics: tuple[records.ConfigurationDiagnostic, ...] = ()
@@ -1917,6 +1919,7 @@ class AdmissionServer:
             self.queue_pins = state.queue_pins
             self.ledger = ReplayLedger(state.ledger)
             self.spacing, self.priority = state.spacing, state.priority
+            self.bumps = state.bumps
             self.build_history_generation = state.build_history_generation
             self.run_places = state.run_places
             self.verify_run_slots = saved_verify_run_slots(state)
@@ -2006,10 +2009,15 @@ class AdmissionServer:
             self.ledger.expire(now - self.last_usable_configuration.replay_retention_seconds,
                                protected_keys, live_reservations)
             self._prune_ended_placements(now - self.last_usable_configuration.ended_placement_seconds)
+        if self.bumps.moves:
+            active = self.reservations.keys() | self.placement_requests.keys() | {place.episode for place in self.places.values()}
+            if not self.bumps.moves.keys() <= active:
+                self.bumps = replace(self.bumps, moves={episode: move for episode, move in self.bumps.moves.items()
+                                                       if episode in active})
         state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.priority,
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
             self.placement_requests, self.assignments, self.current_assignments, self.pending_cloud_groups,
-            queue_pins=self.queue_pins, verify_run_slots=self.verify_run_slots)
+            queue_pins=self.queue_pins, bumps=self.bumps, verify_run_slots=self.verify_run_slots)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         changed = False
 
@@ -2908,6 +2916,7 @@ class AdmissionServer:
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
               ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
         self.last_pass_started = self.clock.monotonic()
+        self._apply_bumps()
         self._prune_runs()
         self._prune_verify_run_slots()
         self.configuration = configuration
@@ -3302,7 +3311,8 @@ class AdmissionServer:
                 confirmed_guest_run=confirmed, counter=counter,
                 route=request.route if guest else records.DIRECT_CARGO, job=identity.job if guest else GATE_JOB_NOT_RECORDED,
                 mac_placement=f"{assignment.episode}/{assignment.attempt}"
-                    if assignment.destination.provider == "mac" or confirmed is not None else "",
+                    if (assignment.destination.provider == "mac" or confirmed is not None
+                        or guest and consumed and assignment.episode in self.bumps.moves) else "",
                 what=identity.what))
         if not remote:
             return reading
@@ -5764,10 +5774,10 @@ done
                             labels: Mapping[str, gate.UnitMembership]) -> list[wire.Reply]:
         key = request.request_id
         configuration = self._take_configuration()
+        entries = self._priority_entries()
         if isinstance(request, wire.PrioritySetRequest):
             if not request.unit.strip():
                 return self._mutation_reply(key, wire.Refused("unit is required"))
-            entries = self.priority.entries if isinstance(self.priority, records.QueuePriority) else ()
             if any(entry["unit"] == request.unit for entry in entries):
                 return self._mutation_reply(key, wire.Ok())
             rows = [waiting.row for waiting in self.waiters.values()]
@@ -5779,35 +5789,86 @@ done
             if request.unit == "—" or request.unit not in known_names:
                 return self._mutation_reply(key, wire.Refused(
                     f"unknown unit {request.unit}; the queue priority did not change"))
-            changed = True
-            entry: records.PriorityEntry = {"unit": request.unit, "why": request.why,
-                "set_at": self.clock.now(), "set_by": request.actor}
-            entries = (*entries, entry)
-            unit, why, actor = request.unit, request.why, request.actor
+            action = "set"
+            why = request.why
         else:
-            entries = self.priority.entries if isinstance(self.priority, records.QueuePriority) else ()
-            if request.unit and not any(entry["unit"] == request.unit for entry in entries):
-                return self._mutation_reply(key, wire.Refused(
-                    f"unknown unit {request.unit}; the queue priority did not change"))
-            removed = tuple(entry for entry in entries if not request.unit or entry["unit"] == request.unit)
-            changed = bool(removed)
-            entries = tuple(entry for entry in entries if request.unit and entry["unit"] != request.unit)
-            unit = request.unit or ", ".join(entry["unit"] for entry in removed)
-            why, actor = ", ".join(entry["why"] for entry in removed), request.actor
-        at = self.clock.now()
-        month_row_end = store.read_last_whole_row_end(store.host_file(self.host, at))
-        if not changed:
-            return self._mutation_reply(key, wire.Ok())
-        transition = records.PendingPriorityTransition(key,
-            "set" if isinstance(request, wire.PrioritySetRequest) else "clear", at,
-            month_row_end, unit, why, actor)
-        self.input_event_count += 1
-        self.priority = records.QueuePriority(entries, transition)
+            action = "clear"
+            if not entries and not request.unit:
+                return self._mutation_reply(key, wire.Ok())
+            why = ", ".join(entry["why"] for entry in entries if not request.unit or entry["unit"] == request.unit)
+        if refusal := self._change_priority(action, request.unit, why, request.actor, key, self.clock.now()):
+            return self._mutation_reply(key, wire.Refused(refusal))
         self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
         self.persist()
         self._finish_priority()
         _ = self._run_pass(configuration)
         return [self.ledger[key].reply]
+
+    def _priority_entries(self) -> tuple[records.PriorityEntry, ...]:
+        return self.priority.entries if isinstance(self.priority, records.QueuePriority) else ()
+
+    def _change_priority(self, action: Literal["set", "clear"], unit: str, why: str,
+                         actor: str, key: str, written_at: float) -> str:
+        entries = self._priority_entries()
+        if action == "set":
+            if any(entry["unit"] == unit for entry in entries):
+                return ""
+            entry: records.PriorityEntry = {"unit": unit, "why": why, "set_at": written_at, "set_by": actor}
+            entries = (*entries, entry)
+        else:
+            kept = tuple(entry for entry in entries if unit and entry["unit"] != unit)
+            if kept == entries:
+                return f"unknown unit {unit}; the queue priority did not change" if unit else ""
+            unit = unit or ", ".join(entry["unit"] for entry in entries)
+            entries = kept
+        at = self.clock.now()
+        month_row_end = store.read_last_whole_row_end(store.host_file(self.host, at))
+        transition = records.PendingPriorityTransition(key, action, at, month_row_end, unit, why, actor)
+        self.input_event_count += 1
+        self.priority = records.QueuePriority(entries, transition)
+        return ""
+
+    def _bump_place(self, step_key: str, unit: str) -> WaiterPlace | str:
+        # The saved place keeps the same key while a live waiter reconnects.
+        for place in self.places.values():
+            if not place.move_id or place.move_id != step_key:
+                continue
+            request = self.placement_requests.get(place.episode)
+            live = self._placement_owner_live(request.owner) if request is not None else self._live(place.owner)
+            if not live:
+                break
+            identity = place.queue_identity
+            recorded_unit = identity.get("unit", "")
+            session = identity["session_id"]
+            if not recorded_unit and session:
+                recorded_unit = gate.queue_unit(recorded_unit, session, gate.priority_labels([session]))
+            return place if recorded_unit == unit else "the step no longer belongs to this unit"
+        return "the step left the queue"
+
+    def _apply_bumps(self) -> None:
+        for offset, bump in person_actions.pending_bumps(self.state_dir, self.bumps.offset):
+            self._finish_priority()
+            action = bump.action
+            place = self._bump_place(action.step_key, bump.unit) if isinstance(action, person_actions.SetBump) else None
+            refusal = place if isinstance(place, str) else ""
+            moves = self.bumps.moves
+            if not refusal:
+                previous = self.priority
+                from_place = action.from_place if isinstance(action, person_actions.SetBump) else 0
+                if isinstance(place, WaiterPlace) and not from_place:
+                    from_place = next((index for index, (_, row) in enumerate(self._queue_order(), 1)
+                                       if row.get("move_id") == place.move_id), 0)
+                refusal = self._change_priority("set" if isinstance(action, person_actions.SetBump) else "clear",
+                    bump.unit, bump.reason, bump.actor, bump.id, bump.written_at)
+                if isinstance(place, WaiterPlace) and self.priority != previous and not refusal:
+                    moves = {**moves, place.episode: person_actions.AppliedBump(
+                        place.move_id, place.owner, place.since, bump.actor, from_place, 1, bump.written_at)}
+            refusals = self.bumps.refusals
+            if refusal:
+                refusals = (*refusals, person_actions.BumpNotApplied(bump.unit, refusal))
+            self.bumps = person_actions.BumpProgress(offset, refusals, moves)
+            self.persist()
+            self._finish_priority()
 
     def _mutation_reply(self, key: str, reply: wire.Ok | wire.Refused | wire.QueueMoveConflict,
                         reservation: str = "") -> list[wire.Reply]:

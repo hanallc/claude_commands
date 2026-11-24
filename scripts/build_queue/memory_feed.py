@@ -48,7 +48,7 @@ from scripts.buildlog import charts, cost_actions, mac_idle, mac_idle_alert, mac
 from scripts.buildlog.store import host_name, root
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
-from scripts.build_queue import cloud_progress, limits_view, placement, queue_snapshot
+from scripts.build_queue import cloud_progress, limits_view, person_actions, placement, queue_snapshot
 from scripts.build_targets import targets
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
@@ -487,7 +487,19 @@ class ConfirmedGuestRun(TypedDict):
     attempt: str
 
 
-class RowQueueNotes(CallNotes):
+class LastMove(TypedDict):
+    kind: Literal["bump"]
+    who: str
+    from_place: int
+    to_place: int
+    at: str
+
+
+class MoveFields(TypedDict):
+    last_move: NotRequired[LastMove]
+
+
+class RowQueueNotes(CallNotes, MoveFields):
     caller: NotRequired[str]
     owner_text: NotRequired[str]
     name_parts: NotRequired[list[staff_names.NamePart]]
@@ -1162,6 +1174,11 @@ class SwapTotals(TypedDict):
     reserve_share_percent: int
 
 
+class BumpNotice(TypedDict):
+    unit: str
+    detail: str
+
+
 class MemoryPage(TypedDict):
     colors: PageColors
     staff_names: NotRequired[dict[str, str]]
@@ -1196,6 +1213,7 @@ class MemoryPage(TypedDict):
     swap_by: list[SwapRow]
     priority_text: str
     queued_priority_units: list[str]
+    bump_notices: list[BumpNotice]
     unmatched_priority_text: str
     unmatched_priority_entries: list[admission_records.PriorityEntry]
     mac_idle_alert: str
@@ -2817,6 +2835,39 @@ def memory_status(explanation: admission_records.QueueExplanation, room: admissi
             "next_need_bytes": check.need, "check_room_bytes": check.room}
 
 
+def bump_notices(directory: Path, zone: tzinfo, progress: person_actions.BumpProgress) -> list[BumpNotice]:
+    notices: list[BumpNotice] = []
+    try:
+        status = person_actions.bump_status(directory, progress)
+    except (OSError, ValueError, TypeError) as error:
+        print(f"builds: cannot read bump records: {error}", file=sys.stderr)
+        return notices
+    for bump in status:
+        if isinstance(bump, person_actions.BumpNotApplied):
+            detail = f"not applied: {bump.reason}"
+        else:
+            saved = datetime.fromtimestamp(bump.written_at, zone).strftime("%H:%M %Z")
+            detail = f"saved at {saved}, waiting for the queue"
+        notices.append({"unit": bump.unit, "detail": detail})
+    return notices
+
+
+def move_progress(directory: Path) -> person_actions.BumpProgress:
+    try:
+        return person_actions.bump_progress(directory)
+    except (OSError, ValueError, TypeError) as error:
+        print(f"builds: cannot read applied bumps: {error}", file=sys.stderr)
+        return person_actions.BumpProgress()
+
+
+def move_fields(move: person_actions.AppliedBump | None, members: FeedStaff, zone: tzinfo) -> MoveFields:
+    if move is None:
+        return {}
+    who = members.member_name(move.who) or ("user" if move.who == "user" else "name not recorded")
+    return {"last_move": {"kind": "bump", "who": who, "from_place": move.from_place,
+            "to_place": move.to_place, "at": datetime.fromtimestamp(move.at, zone).strftime("%H:%M %Z")}}
+
+
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET,
             *, limit_source: Callable[[admission_records.QueueRead], limits_view.Background] | None = None,
@@ -2826,8 +2877,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         configuration = read_configuration()
     names = read_step_names()
     staff_display = staff_names.read()
+    admission = root() / "admission"
     with codec.snapshot_staff(staff_display.members):
-        published = queue_snapshot.read_view_snapshot(root() / "admission")
+        published = queue_snapshot.read_view_snapshot(admission)
     parsed = published.reading
     admission_records.warn_configuration_diagnostics(parsed.diagnostics)
     explanation = parsed.explanation
@@ -2850,6 +2902,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
              *target_availability.holder_sessions(snapshots)], os.environ)
     members = FeedStaff(staff_display.members)
     zone = user_zone()
+    bump_progress = move_progress(admission)
+    moves = bump_progress.moves
+    moves_by_key = {move.step_key: move for move in moves.values()}
+    moves_by_waiter = {(move.owner.pid, move.owner.start_time, move.since): move for move in moves.values()}
     routes = target_availability.MacRoutes(snapshots, labels, zone)
     ci_rows: dict[str, RunRow] = {}
     for entry in explanation.running:
@@ -2946,8 +3002,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                                   unit=staff_unit(labels_for_slot))
             display_name = title_step
             parts: list[staff_names.NamePart] = []
+            move = None
         else:
             step, reservation = running
+            saved_waiter = reservation.get("queue_waiter")
+            move = (moves_by_waiter.get((reservation["pid"], reservation["start_time"], saved_waiter["since"]))
+                    if saved_waiter is not None else None)
             ci_label = recorded_ci_label(step, ci_runners)
             job = NotGateStep() if ci_label else local_job(step)
             reservation_caller = reservation.get("queue_waiter", {}).get("session_name", reservation.get("session_name", ""))
@@ -2964,7 +3024,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         pid = (step.run.pid if isinstance(step.run, LiveBuildRun) else step.pid) if step is not None else (
             run.pid if isinstance(run, LiveBuildRun) else admission_records.PidNotRecorded())
         row_labels = queue_row_labels(title_step, display_name, unit=owner.unit, ci_label=ci_label, caller=owner.caller)
-        walk.append({**row_labels,
+        walk.append({**row_labels, **move_fields(move, members, zone),
                      "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                      **owner.fields(ci_label=ci_label), "between_steps": step is None,
                      "state": "", "pid": pid, "detail": detail, "used": use,
@@ -3033,6 +3093,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 remote_row["runs_on"] = placed["runs_on"]
                 remote_row["targets"] = placed["targets"]
                 remote_row["because"] = placed.get("because", "")
+            if step.mac_placement:
+                remote_row = {**remote_row, **move_fields(moves.get(step.mac_placement.partition("/")[0]), members, zone)}
             if guest:
                 remote_row["guest_run"] = guest
                 if step.mac_placement:
@@ -3153,10 +3215,15 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         shown_waiter = replace(waiter, step=job_step(job, waiter.step), unit=identity.unit)
         named = local_step_name(shown_waiter, owner, names, labels, ci_label, job)
         member = None
+        move = None
         if place <= len(parsed.ordered):
             _, ordered_waiter = parsed.ordered[place - 1]
             if (ordered_waiter["pid"], ordered_waiter["since"]) == (waiter.pid, waiter.since):
-                member = move_members.get(ordered_waiter.get("move_id", ""))
+                row_id = ordered_waiter.get("move_id", "")
+                member = move_members.get(row_id)
+                move = moves_by_key.get(row_id)
+                if move is None:
+                    move = moves_by_waiter.get((ordered_waiter["pid"], ordered_waiter["start_time"], waiter.since))
         if member is not None:
             matched_move_ids.add(member.row_id)
         if isinstance(named, NoNamedStep):
@@ -3164,6 +3231,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         notes: TargetNotes = {"runs_on": target_text, "targets": list(targets), "mac_text": ""} if targets else (
             ci_target_notes(machine) if ci_label else step_target_notes(waiter, routes))
         waiters[place] = {**queue_row_labels(named.title, named.name, unit=owner.unit, ci_label=ci_label, caller=owner.caller),
+                        **move_fields(move, members, zone),
                         "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
                         **owner.fields(ci_label=ci_label),
                         "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": "" if ci_label else identity.unit,
@@ -3209,9 +3277,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             identity = current if current is not None and public_owner_name(current.owner_text, build.session) else (
                 claim or current or unit_labels.UnitLabels(""))
             placed = mac_steps.get(build.gate_placement) if build.gate_label is queue_view.MacGateLabel.PLACEMENT else None
-            mac_row = mac_work_row(build, mac_reading, identity, names=names, slot_roots=slot_roots,
+            mac_row: MacBuildRow = mac_work_row(build, mac_reading, identity, names=names, slot_roots=slot_roots,
                                    slot_machine=mac_machine, placed_step=placed,
                                    launcher=mac_launcher_name(build, members))
+            if placed is not None:
+                mac_row = {**mac_row, **move_fields(moves.get(placed.mac_placement.partition("/")[0]), members, zone)}
             work_rows.append(mac_row)
     work_rows.sort(key=lambda row: row["started_at"])
     model = queue_view.QueueModel(parsed, labels, names=names)
@@ -3350,6 +3420,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
         "priority_text": head_facts.priority_text(explanation.priority),
         "queued_priority_units": queued_priority_units,
+        "bump_notices": bump_notices(admission, zone, bump_progress),
         "unmatched_priority_text": unmatched_priority_text,
         "unmatched_priority_entries": unmatched_priority_entries,
         "mac_idle_alert": "\n".join(text for text in (

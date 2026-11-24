@@ -232,9 +232,9 @@ class MemoryHoverTests(unittest.TestCase):
             + "return [$('walk').innerHTML, ...data.walk.map(row => tooltipHtml('row:'+row.key, data))];})()", data, walk=True))
         root = ElementTree.fromstring(f"<root>{rendered[0]}</root>")
         self.assertEqual([cell.text for cell in root.findall(".//thead/tr/th")],
-                         ["Stage", "Done", "Dur", "Verify", "Step", "Pid", "Machine", "vCPU", "Tokens"])
+                         ["Stage", "Done", "Dur", "Verify", "Step", "Pid", "Machine", "vCPU", "Tokens", "Moved"])
         self.assertEqual([cell.text for cell in root.findall(".//tr[@class='queue-head']/th")],
-                         ["#", "Done", "Waiting", "Verify", "Step", "Pid", "Machine", "vCPU"])
+                         ["#", "Done", "Waiting", "Verify", "Step", "Pid", "Machine", "vCPU", "Moved"])
         self.assertEqual(root.findall(".//*[@class='unit']") + root.findall(".//*[@class='slot']"), [])
         for key, verify, step in (("row:fixture-run-0", "test", "nextest hana"), ("row:fixture-run-2", "", "gate"),
                                   ("wait:fixture-wait-0", "", "test affected")):
@@ -304,6 +304,52 @@ class MemoryHoverTests(unittest.TestCase):
                 priority = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == "Priority")
                 self.assertEqual("".join(priority.itertext()), "builder, helper, <unknown>")
                 self.assertEqual([span.text for span in priority.findall("span")], ["builder", "helper"])
+
+    def test_bump_notices_use_the_unit_color_and_escape_the_detail(self) -> None:
+        data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "bump_notices": [
+            {"unit": "builder", "detail": "saved at 16:30 PST, waiting for the queue"},
+            {"unit": "", "detail": "not applied: <reason>"},
+        ]}
+        body, shown, hidden = cast(tuple[str, bool, bool], self.page_expression("(() => {" + self.role_setup()
+            + "renderWalk(data);const notices = $('bump-notices');"
+            + "const body = notices.innerHTML, shown = !notices.hidden;"
+            + "renderWalk({...data, bump_notices: []});return [body, shown, notices.hidden];})()", data, walk=True))
+        self.assertTrue(shown)
+        self.assertTrue(hidden)
+        notices = ElementTree.fromstring(f"<root>{body}</root>")
+        self.assertEqual([notice.tag for notice in notices], ["div", "div"])
+        self.assertEqual("".join(notices[0].itertext()), "Bump for builder saved at 16:30 PST, waiting for the queue")
+        self.assertEqual(notices[0][0].get("data-color-text"), "role.unit-director")
+        self.assertEqual("".join(notices[1].itertext()), "Bumps not applied: <reason>")
+
+    def test_bump_mark_is_last_and_shows_the_saved_move(self) -> None:
+        move = {"kind": "bump", "who": "nate <test>", "from_place": 31, "to_place": 1, "at": "12:22 PST"}
+        data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200,
+                "walk": [{"name": "phases", "queued": True, "last_move": move}],
+                "waiters": [{"name": "report", "since": 100, "need": 1, "place": 2, "last_move": move},
+                            {"name": "fps", "since": 100, "need": 1, "place": 3}],
+                "held_places": [{"kind": "held", "position": 4, "unit": "queue", "kept_until": "22:37 PST"}]}
+        rendered, running_tip, waiting_tip = cast(tuple[str, str, str], self.page_expression(
+            "(renderWalk(data), [$('walk').innerHTML, tooltipHtml('moved:row:fixture-run-0', data),"
+            + " tooltipHtml('moved:wait:fixture-wait-0', data)])", data, walk=True))
+        table = ElementTree.fromstring(f"<root>{rendered}</root>").find(".//table")
+        assert table is not None
+        self.assertTrue(all(row[-1].get("class") == "moved" for row in table.findall(".//tr")))
+        self.assertEqual(table.findtext("./thead/tr/th[@class='moved']"), "Moved")
+        self.assertEqual(table.findtext(".//tr[@class='queue-head']/th[@class='moved']"), "Moved")
+        self.assertEqual(table.findtext(".//tr[@class='held']/td[@class='moved']"), "—")
+        self.assertEqual(table.findtext(".//tr[@data-tip='wait:fixture-wait-1']/td[@class='moved']"), "—")
+        for key, hover, place in (("row:fixture-run-0", running_tip, "place 1"),
+                                  ("wait:fixture-wait-0", waiting_tip, "place 2")):
+            with self.subTest(key=key):
+                mark = table.find(f".//td[@class='moved']/span[@data-tip='moved:{key}']")
+                assert mark is not None
+                self.assertEqual(mark.findtext("span"), "nate <test>")
+                fields = ElementTree.fromstring(hover)
+                self.assertEqual(fields.get("class"), "tip")
+                self.assertEqual([cell.text for cell in fields.findall("dt")], ["Bump", "Moved by", "From", "To", "At"])
+                self.assertEqual([cell.text for cell in fields.findall("dd")],
+                                 [place, "nate <test>", "place 31", "the top", "12:22 PST"])
 
     def test_tooltip_colors_only_fields_that_name_staff(self) -> None:
         data = {"waiters": [{"name": "Compile", "unit": "builder", "showrunner": "helper",
@@ -808,22 +854,24 @@ class MemoryHoverTests(unittest.TestCase):
                 assert table is not None
                 headers = table.findall("./thead/tr/th")
                 self.assertEqual([cell.text for cell in headers],
-                                 ["Stage", "Done", "Dur", "Verify", "Step", "Pid", "Machine", "vCPU", "Tokens"])
+                                 ["Stage", "Done", "Dur", "Verify", "Step", "Pid", "Machine", "vCPU", "Tokens", "Moved"])
                 self.assertEqual(table.findall(".//*[@class='stage']"), [])
                 for index, expected in enumerate(("building", "testing", "—", "testing", "—", "testing", "—", "building")):
                     row = table.find(f"./tbody/tr[@data-tip='row:fixture-run-{index}']")
                     assert row is not None
                     self.assertEqual(row[0].get("class"), "place")
                     self.assertEqual(row[0].text, expected)
-                    self.assertEqual(row[-1].get("class"), "tokens")
-                    self.assertEqual(row[-2].get("class"), "vcpus")
+                    self.assertEqual(row[-1].get("class"), "moved")
+                    self.assertEqual(row[-1].text, "—")
+                    self.assertEqual(row[-2].get("class"), "tokens")
+                    self.assertEqual(row[-3].get("class"), "vcpus")
                 queue_headers = table.findall("./tbody/tr[@class='queue-head']")
                 spacers = root.findall("./div[@class='walk-chart']/div[@class='walk-chart-head queue-head']")
                 self.assertEqual(len(queue_headers), int(waiting))
                 self.assertEqual(len(spacers), 1)
                 if waiting:
                     self.assertEqual([cell.text for cell in queue_headers[0]],
-                                     ["#", "Done", "Waiting", "Verify", "Step", "Pid", "Machine", "vCPU"])
+                                     ["#", "Done", "Waiting", "Verify", "Step", "Pid", "Machine", "vCPU", "Moved"])
                     self.assertTrue(all(cell.get("scope") == "col" for cell in queue_headers[0]))
                     for index, expected in enumerate(("1", "cloud", "2")):
                         row = table.find(f"./tbody/tr[@data-tip='wait:fixture-wait-{index}']")

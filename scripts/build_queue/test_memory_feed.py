@@ -29,7 +29,7 @@ from unittest import mock
 
 from scripts.buildlog import charts, cost_actions, costs, machine_facts, parse
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config, write_live_mac_state
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, queue_snapshot, target_availability
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, person_actions, step_estimator, progress_profile, queue_lines, queue_view, queue_snapshot, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.slot_wait import NoNamedStep, recorded_step
@@ -42,6 +42,7 @@ from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
+from scripts.lint.memory_test_support import write_pressure_reading
 from scripts.lib import atomic_file, build_folders, conf, test_hang_guard
 from scripts.lib.build_slots_test_support import write_private_slot_roots
 from scripts.review_links import console_theme, page_frame, review_link, test_page_frame, test_serve
@@ -2608,6 +2609,80 @@ const refresh = createPageRefresh(tick);
                     with self.subTest(pid=row["pid"]):
                         self.assertTrue(row["name"].strip())
                         self.assertNotIn(row["name"], {"run", "Build step", "Between steps", "Unknown program"})
+
+    def bump_fixture(self) -> AdmissionFixture:
+        fixture = self.enterContext(AdmissionFixture(log_dir=self.root / "buildlog"))
+        fixture.free(0)
+        fixture.hold_starts()
+        fixture.clock.epoch = datetime(2026, 11, 23, 16, 30, tzinfo=UTC).timestamp()
+        request = fixture.request(owner=fixture.fixture_owner(200, "200"))
+        request = replace(request, identity=replace(request.identity, unit="report"))
+        _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for",
+            return_value={request.identity.session_id: unit_labels.UnitLabels("report", "fixture-runner", "report")}))
+        _ = fixture.server.handle_request(request)
+        person_actions.save_bump(fixture.state_dir, person_actions.Bump("gone",
+            person_actions.SetBump("departed-step"), "queue", "user", fixture.clock.now(), "urgent"))
+        _ = fixture.server.run_pass()
+        step_key = fixture.server.waiters[request.episode].row.get("move_id", "")
+        assert step_key
+        person_actions.save_bump(fixture.state_dir, person_actions.Bump("waiting",
+            person_actions.SetBump(step_key), "report", "user", fixture.clock.now(), "urgent"))
+        return fixture
+
+    def test_bump_notices_show_saved_time_and_refusal_until_the_pass(self) -> None:
+        fixture = self.bump_fixture()
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root), "USER_ZONE": "America/Los_Angeles"}):
+            waiting = memory_feed.reading()["bump_notices"]
+            self.assertEqual(waiting, [
+                {"unit": "queue", "detail": "not applied: the step left the queue"},
+                {"unit": "report", "detail": "saved at 08:30 PST, waiting for the queue"},
+            ])
+        _ = fixture.server.run_pass()
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root), "USER_ZONE": "America/Los_Angeles"}):
+            applied = memory_feed.reading()
+        self.assertEqual(applied["bump_notices"], waiting[:1])
+        self.assertEqual(applied["queued_priority_units"], ["report"])
+
+    def test_applied_bump_reaches_waiting_and_running_rows_after_restart(self) -> None:
+        fixture = self.enterContext(AdmissionFixture(log_dir=self.root / "buildlog"))
+        fixture.free(0)
+        fixture.hold_starts()
+        fixture.clock.epoch = datetime(2026, 11, 23, 20, 22, tzinfo=UTC).timestamp()
+        plain = fixture.request(owner=fixture.fixture_owner(200, "200"))
+        request = fixture.request(owner=fixture.fixture_owner(201, "201"), since=fixture.clock.now() + 1)
+        request = replace(request, identity=replace(request.identity, unit="report"),
+                          sidecar=str(fixture.scope(request.owner)))
+        _ = fixture.server.handle_request(plain)
+        _ = fixture.server.handle_request(request)
+        _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={
+            plain.identity.session_id: unit_labels.UnitLabels("phases", "fixture-runner", "phases"),
+            request.identity.session_id: unit_labels.UnitLabels("report", "fixture-runner", "report"),
+        }))
+        key = fixture.server.waiters[request.episode].row.get("move_id", "")
+        assert key
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        nate = fixture_member("showrunner", name="nate")
+        person_actions.save_bump(fixture.state_dir, person_actions.Bump("move-201",
+            person_actions.SetBump(key, 2), "report", str(nate.id), fixture.clock.now(), "urgent"))
+        _ = fixture.server.run_pass()
+        fixture.restart()
+        _ = fixture.server.handle_request(plain)
+        _ = fixture.server.handle_request(request)
+        _ = fixture.server.run_pass()
+        expected: memory_feed.LastMove = {
+            "kind": "bump", "who": "nate", "from_place": 2, "to_place": 1, "at": "12:22 PST"}
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root), "USER_ZONE": "America/Los_Angeles"}):
+            waiting = memory_feed.reading()["waiters"]
+            self.assertEqual([(row["pid"], row.get("last_move")) for row in waiting],
+                             [(201, expected), (200, None)])
+        fixture.free(60 * admission_records.GIB)
+        write_pressure_reading(fixture.root / "pressure")
+        _ = fixture.server.handle_request(request)
+        _ = fixture.server.run_pass()
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root), "USER_ZONE": "America/Los_Angeles"}):
+            running = memory_feed.reading()["walk"]
+            moved, = [row for row in running if row["pid"] == 201]
+            self.assertEqual(moved.get("last_move"), expected)
 
     def test_queue_priority_reaches_the_feed_and_clears_when_removed(self) -> None:
         base = captured_reading()

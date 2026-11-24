@@ -11,6 +11,7 @@ html { overflow-anchor: none; }
   --used: var(--accent); --cap: var(--error); --block: var(--warning);
   --res-a: #427caf; --res-b: #6b91b7;
   --building: #007e78; --testing: #b00079;
+  --bump: #9c381d; --bump-bg: rgba(156, 56, 29, .09); --bump-ring: rgba(156, 56, 29, .30);
   --remote-memory: var(--remote-memory-light); --machine-natedev: var(--machine-natedev-light);
   --machine-mac: var(--machine-mac-light); --machine-aws: var(--machine-aws-light);
   --other: #a3a19b; --free: #e7e5df; --floor: #eda100;
@@ -21,6 +22,7 @@ html { overflow-anchor: none; }
   :root:not([data-theme="light"]) {
     --res-a: #719fd8; --res-b: #567ca8;
     --building: #27c6b8; --testing: #ca458f;
+    --bump: #f08a6b; --bump-bg: rgba(240, 138, 107, .12); --bump-ring: rgba(240, 138, 107, .35);
     --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
     --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
     --other: #5c5b57; --free: #2a2a28; --floor: #c98500;
@@ -31,6 +33,7 @@ html { overflow-anchor: none; }
 :root[data-theme="dark"] {
   --res-a: #719fd8; --res-b: #567ca8;
   --building: #27c6b8; --testing: #ca458f;
+  --bump: #f08a6b; --bump-bg: rgba(240, 138, 107, .12); --bump-ring: rgba(240, 138, 107, .35);
   --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
   --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
   --other: #5c5b57; --free: #2a2a28; --floor: #c98500;
@@ -284,6 +287,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .swaprows .row small { color: var(--ink-2); font-size: inherit; min-width: 0; overflow-wrap: anywhere; }
 .swaprows .row .v { font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
 .error { color: var(--cap); font-weight: 600; }
+.bump-notices { margin-bottom: 8px; line-height: 1.3; overflow-wrap: anywhere; }
 .walk-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
 .walk-sum { margin-left: auto; color: var(--ink-2); font-size: 0.86rem; }
 .walk-tokens { display: flex; align-items: baseline; gap: 6px; color: var(--ink-2); font-size: 0.86rem; }
@@ -327,7 +331,7 @@ body:has(.queue-lift) #tip { visibility: hidden; }
   background: none; border: 0; padding: 0; cursor: pointer; }
 .queue-feedback button[hidden] { display: none; }
 .row-label .owner, .cloud-status .amounts { font-size: 0.75rem; }
-.row-label .wait-note { font-size: 0.75rem; color: var(--ink-2); }
+.wait-note { font-size: 0.75rem; color: var(--ink-2); }
 .row-memory { min-width: 0; }
 .cloud-status .cap { color: var(--cap); }
 .amounts { position: relative; height: 16px; margin-top: 2px; color: var(--ink-2); font-size: 0.7rem; line-height: 14px; font-variant-numeric: tabular-nums; }
@@ -358,6 +362,13 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .walk-table td.machine > * + * { margin-left: 10px; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .tokens { font-variant-numeric: tabular-nums; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .tokens { text-align: right; }
+.move-mark { display: inline-flex; align-items: center; gap: 5px; border-radius: 6px;
+  padding: 0 7px 0 5px; font-size: 12px; line-height: 18px; white-space: nowrap;
+  color: var(--bump); background: var(--bump-bg); box-shadow: 0 0 0 1px var(--bump-ring); }
+.move-mark svg { width: 15px; height: 15px; flex: none; fill: none; stroke: currentColor;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.move-mark[data-tip] { cursor: help; }
+#tip.move-tip dd { white-space: normal; overflow-wrap: anywhere; }
 .walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
 .walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus, .walk-table th.tokens { text-align: left; }
 /* A waiting step sizes the Step column (fitWalkDetails). In a tight pane it wraps between words inside the column.
@@ -536,6 +547,7 @@ body.queue-unavailable .card { display: none; }
 
   <section class="card">
     <div class="walk-head"><span class="section-head" id="walk-title" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span><div class="walk-tokens num" data-tip="tokens"><span>Tokens</span><dl id="walk-tokens"></dl></div></div>
+    <div class="bump-notices wait-note" id="bump-notices" role="status" hidden></div>
     <div class="walk-scroll"><div class="walk" id="walk"></div></div>
     <div class="queue-feedback" id="queue-feedback" hidden>
       <span id="queue-status" role="status"></span><button type="button" id="queue-action" hidden>Undo</button>
@@ -544,6 +556,7 @@ body.queue-unavailable .card { display: none; }
     <div class="walk-key">
       <span class="key" data-tip="waiting"><span class="sw waiting"></span>Waiting step, memory it needs</span>
       <span class="key" data-tip="progress">Progress: <span class="sw progress building"></span>building, <span class="sw progress testing"></span>testing</span>
+      <span class="key"><span id="bump-key"></span>someone moved the run to the top of the line</span>
     </div>
     <div class="machine-key" id="machine-key" aria-hidden="true"></div>
   </section>
@@ -1065,6 +1078,15 @@ function tooltipRows(key, data) {
   data = shownReading(data);
   const [kind, index] = key.split(':');
   if (kind === 'row' || kind === 'wait') return stepTooltip(key, data);
+  if (kind === 'moved') {
+    const row = stepRow(key.slice("moved:".length), data);
+    const move = row?.last_move;
+    if (move?.kind !== "bump") return [];
+    const place = row.place ?? move.to_place;
+    return [field("Bump", `place ${place}`, "title"), field("Moved by", move.who),
+      field("From", move.from_place > 0 ? `place ${move.from_place}` : "place not recorded"),
+      field("To", "the top"), field("At", move.at)];
+  }
   if (kind === 'swap' && index !== undefined) return swapTip(data.swap_by[+index]);
   if (kind === 'swap-pool') return poolTip(index, data);
   const rows = TIPS[key](data);
@@ -1073,7 +1095,13 @@ function tooltipRows(key, data) {
   return rows;
 }
 function tooltipHtml(key, data) {
-  return tipRowsHtml(tooltipRows(key, data));
+  const rows = tooltipRows(key, data);
+  return rows.length ? tipRowsHtml(rows) : '';
+}
+function bumpMark(who, tip = "") {
+  return `<span class="move-mark"${tip ? ` data-tip="${esc(tip)}" tabindex="0"` : ""}>` +
+    '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 3h14M18 13l-6-6-6 6M12 7v14"/></svg>' +
+    `<span>${esc(who)}</span></span>`;
 }
 function tipRowsHtml(rows) {
   return '<dl class="tip">'+rows.map(row => {
@@ -1211,36 +1239,57 @@ const f1 = (n) => recorded(n) ? n.toFixed(1) : "unavailable";
 const memoryAmount = (n) => recorded(n) ? `${f1(n)} GiB` : "use unavailable";
 // Show the tooltip of the [data-tip] element under the mouse, or of a clicked one; a second click hides it.
 // content(key) gives the tooltip HTML, or "" for no tooltip.
-function hoverTips(tip, content) {
+function hoverTips(tip, content, place = placeTipAt) {
   let shown = null;
-  const show = (key, x, y) => {
+  const show = (key, x, y, anchor) => {
     const html = content(key);
     if (!html) return;
     shown = key;
     tip.innerHTML = html;
     tip.classList.add("on");
-    placeTipAt(tip, x, y);
+    place(tip, x, y, anchor);
   };
   const hide = () => { shown = null; tip.classList.remove("on"); };
   document.addEventListener("pointermove", (e) => {
     const el = e.target.closest("[data-tip]");
     if (e.pointerType !== "mouse") return;
-    if (el) show(el.dataset.tip, e.clientX, e.clientY); else if (shown) hide();
+    if (el) show(el.dataset.tip, e.clientX, e.clientY, el); else if (shown) hide();
   });
   document.addEventListener("click", (e) => {
     const el = e.target.closest("[data-tip]");
-    if (el && shown !== el.dataset.tip) show(el.dataset.tip, e.clientX, e.clientY); else hide();
+    if (el && shown !== el.dataset.tip) show(el.dataset.tip, e.clientX, e.clientY, el); else hide();
   });
   return {show, hide, key: () => shown};
 }
 // shared:step-tip:end
 const tip = document.getElementById("tip");
-const tips = hoverTips(tip, key => latest ? pageTooltipHtml(key, latest) : "");
+function placeWalkTip(tip, x, y, anchor) {
+  const moved = Boolean(anchor?.classList.contains("move-mark"));
+  tip.classList.toggle("move-tip", moved);
+  if (!moved) {
+    placeTipAt(tip, x, y);
+    return;
+  }
+  const {left, right, top} = anchor.getBoundingClientRect();
+  const width = tip.offsetWidth;
+  const height = tip.offsetHeight;
+  const beside = right + 8 + width <= window.innerWidth - 8 ? right + 8 : left - 8 - width;
+  tip.style.left = `${Math.max(8, Math.min(beside, window.innerWidth - width - 8))}px`;
+  tip.style.top = `${Math.max(8, Math.min(top - 4, window.innerHeight - height - 8))}px`;
+}
+const tips = hoverTips(tip, key => latest ? pageTooltipHtml(key, latest) : "", placeWalkTip);
 const showTip = tips.show, hideTip = tips.hide;
 function placeTip(x, y) { placeTipAt(tip, x, y); }
 const SECONDS = __MEMORY_FEED_INTERVAL_SECONDS__;
 __PAGE_REFRESH_SCRIPT__
 const $ = (id) => document.getElementById(id);
+$("bump-key").innerHTML = bumpMark("bump");
+document.addEventListener("focusin", ({target}) => {
+  if (target.classList.contains("move-mark") && target.dataset.tip) showTip(target.dataset.tip, 0, 0, target);
+});
+document.addEventListener("focusout", ({target}) => {
+  if (target.dataset.tip?.startsWith("moved:") && tips.key() === target.dataset.tip) hideTip();
+});
 $("machine-key").innerHTML = "<span>Legend:</span>" + [...MACHINE_ICONS.keys()]
   .map(name => `<span class="key">${machineIcon(name)}${name}</span>`).join("");
 function setSeg(id, value, total) {
@@ -1288,7 +1337,14 @@ function restoreReportView(view) {
     if (!html) {
       hideTip();
       tip.replaceChildren();
-    } else tip.innerHTML = html;
+    } else {
+      tip.innerHTML = html;
+      if (tipKey.startsWith("moved:")) {
+        const mark = $("walk").querySelector(`.move-mark[data-tip="${CSS.escape(tipKey)}"]`);
+        if (mark) placeWalkTip(tip, 0, 0, mark);
+        else hideTip();
+      }
+    }
   }
 }
 function render(d) {
@@ -1719,7 +1775,7 @@ function queueReading(d) {
   const ordered = shown.map(member => ({...rows.get(member.row_id), move:member}));
   let index = 0;
   return {...d, move_revision:queueReply.line.revision,
-    waiters:d.waiters.map(row => shownIds.has(row.move?.row_id) ? ordered[index++] : row)};
+    waiters:d.waiters.map(row => shownIds.has(row.move?.row_id) ? {...ordered[index++], place:row.place} : row)};
 }
 
 function showQueue(d) {
@@ -1765,9 +1821,11 @@ function previewQueueMove(neighbor) {
   drag.rows = drag.rows.map(row => row.move ? rows[index++] : row);
   drag.destination = to === 0 ? {kind:"QueueHeadDrop"}
     : {kind:"QueueDrop", neighbor:neighbor.move.row_id, side:to < from ? "before" : "after"};
-  const place = drag.rows.slice(0, drag.rows.indexOf(drag.row) + 1).filter(row => row.kind !== "cloud").length;
+  const preview = drag.rows.map((row, position) => ({...row, place:drag.reading.waiters[position].place}));
+  const moved = drag.rows.indexOf(drag.row);
+  const place = preview[moved].place ?? preview.slice(0, moved + 1).filter(row => row.kind !== "cloud").length;
   queueMessage(drag.pointer === null ? `Place ${place}` : "");
-  showWalk({...drag.reading, waiters:drag.rows});
+  showWalk({...drag.reading, waiters:preview});
 }
 
 function finishQueueDrag(commit) {
@@ -1902,8 +1960,8 @@ function renderWalk(d) {
       <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>`;
   };
   const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="duration">${duration}</th>` +
-    `<th scope="col" class="verify">Verify</th><th scope="col" class="step">Step</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.machine}</th><th scope="col" class="vcpus">vCPU</th>` +
-    (running ? '<th scope="col" class="tokens">Tokens</th>' : "");
+    `<th scope="col" class="verify">Verify</th><th scope="col" class="step">Step</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.machine}</th><th scope="col" class="vcpus"${running ? "" : ' colspan="2"'}>vCPU</th>` +
+    (running ? '<th scope="col" class="tokens">Tokens</th>' : "") + '<th scope="col" class="moved">Moved</th>';
   // A step that runs shows the bright icon of its machine; the row tooltip names the other targets.
   // A step that waits shows a dim icon for each machine that can take it.
   const targetCell = (machine, named, state) => {
@@ -1913,11 +1971,15 @@ function renderWalk(d) {
   // A waiting step can wrap, but only between words: a word such as "cargo-style" never breaks at its hyphen.
   const stepText = (step, waiting) => waiting && step.includes(" ")
     ? step.split(" ").map(word => `<span class="word">${esc(word)}</span>`).join(" ") : esc(step);
-  const cells = (place, labels, duration, pid, target, vcpus, tip, className = "", done = "—", tokens = "—") => {
-    tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td>` +
+  const cells = (place, labels, duration, pid, target, vcpus, tip, className = "", done = "—", tokens = "—", move = null) => {
+    const queued = className.startsWith("wait") || className.startsWith("held");
+    const moved = move?.kind === "bump" ? bumpMark(move.who, `moved:${tip}`) : "—";
+    const hint = tip ? ` data-tip="${esc(tip)}" tabindex="0"` : "";
+    tableRows.push(`<tr class="${className}"${hint}><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td>` +
       `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(labels.verify)}</td><th scope="row" class="step"><span class="cell-text">${stepText(labels.step, className.startsWith("wait"))}</span></th><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
-      target + `<td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td>` +
-      (className.startsWith("wait") ? "" : `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
+      target + `<td class="vcpus"${queued ? ' colspan="2"' : ""}>${typeof vcpus === "number" ? vcpus : queued ? "" : "—"}</td>` +
+      (queued ? "" : `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) +
+      `<td class="moved">${moved}</td></tr>`);
   };
   const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || guestRow(row) || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
   const runningCount = ordered.filter(row => row.kind !== "mac-unavailable").length;
@@ -1934,15 +1996,21 @@ function renderWalk(d) {
     const guest = guestRow(r);
     const target = targetCell(r.machine, undefined, guest ? guestState(r) : undefined);
     cells(stageText(r), labels, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "",
-      r.pid, target, r.vcpus, `row:${r.key}`, "", doneText(r), r.tokens);
+      r.pid, target, r.vcpus, `row:${r.key}`, "", doneText(r), r.tokens, r.last_move);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(labels)}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`, guest ? `on ${r.machine}` : "")) + `</div>`;
   }));
   // The table row only holds the place of the chart room row beside it; its value shows in the chart.
-  const columnClasses = ["place", "done", "duration", "verify", "step", "pid", "machine", "vcpus", "tokens"];
+  const columnClasses = ["place", "done", "duration", "verify", "step", "pid", "machine", "vcpus", "tokens", "moved"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
   rows.push(`<div class="wrow room">${rowLabel({name: "Free"})}` + rowMemory("room") + `</div>`);
-  const waitingCount = d.waiters.length;
+  const notices = $("bump-notices");
+  const bumpLines = d.bump_notices || [];
+  notices.innerHTML = bumpLines.map(({unit, detail}) =>
+    `<div>${unit ? `Bump for ${unitName(unit)}` : "Bumps"} ${esc(detail)}</div>`).join("");
+  notices.hidden = !bumpLines.length;
+  const held = d.held_places || [];
+  const waitingCount = d.waiters.length + held.length;
   if (waitingCount) tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
   const units = waitingCount ? d.queued_priority_units || [] : [];
   const title = d.move_revision ? "Waiting, in queue order"
@@ -1953,15 +2021,27 @@ function renderWalk(d) {
     : `Queued, ${units.map(unit=>roleName(unit)).join(' followed by ')} and then in submission order`;
   rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}"><span>${titleHtml}</span><span> (${waitingCount})</span></span></div>`);
   let localPosition = 0;
-  d.waiters.forEach((w, i) => {
-    const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
+  const waiting = [...d.waiters, ...held];
+  if (held.length) waiting.sort((a, b) => (a.position ?? a.place ?? Infinity) - (b.position ?? b.place ?? Infinity));
+  waiting.forEach((w, i) => {
+    if (w.kind === "held") {
+      localPosition = w.position;
+      const rowClass = `held${i === 0 ? " wait-first" : ""}`;
+      cells(String(w.position), {step:"Kept place", verify:""}, `until ${w.kept_until}`,
+        null, targetCell("", w.targets), null, "", rowClass);
+      rows.push(`<div class="wrow ${rowClass}">${rowLabel({name:`${w.unit || "queue"}: kept place`,
+        repository:w.failed_step ? `last run failed in ${w.failed_step}` : ""})}</div>`);
+      return;
+    }
+    if (w.kind !== "cloud") localPosition = w.place ?? localPosition + 1;
+    const place = w.kind === "cloud" ? "cloud" : String(localPosition);
     const tip = `wait:${w.key}`;
     const state = w.move && (w.move.row_id === lifted ? " queue-lift"
       : w.move.row_id === highlighted ? " queue-highlight" : "") || "";
     const rowClass = `wait${i === 0 ? " wait-first" : ""}${state}`;
     const target = targetCell("", w.targets?.length ? w.targets : w.machine ? [w.machine] : []);
     const labels = queueRowLabels(w);
-    cells(place, labels, ago(w.since, d.read_at), w.pid, target, null, tip, rowClass);
+    cells(place, labels, ago(w.since, d.read_at), w.pid, target, null, tip, rowClass, "—", "—", w.last_move);
     const reason = w.order_note
       || (["build hold", "build space", "the build in the same Cargo folder", "machine choice"].includes(w.why) ? w.reason : "");
     const note = [reason, w.job_start && `job started ${w.job_start}`].filter(Boolean).join(" · ");
@@ -2276,7 +2356,9 @@ function placeMemoryBars(d) {
   placeDivider(roomRow, dividerTop);
   const dividerOffset = Math.floor(roomTrack.getBoundingClientRect().top) - dividerTop;
   for (const row of document.querySelectorAll(".wrow.wait-first")) {
-    placeDivider(row, Math.floor(row.querySelector(".track").getBoundingClientRect().top) - dividerOffset);
+    const track = row.querySelector(".track");
+    const top = (track || row).getBoundingClientRect().top;
+    placeDivider(row, Math.floor(top) - dividerOffset);
   }
 }
 
