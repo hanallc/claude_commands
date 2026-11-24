@@ -300,13 +300,18 @@ Unavailable remote identity remains uncertain.
 Remote memory remains unavailable and contributes zero to local admission accounting.
 A Mac host run shows on the Builds page as its Mac build row; the page hides its queue row, so the run shows once.
 A `mac-linux` gate row has machine `mac-linux` after the gate consumes its launch permission.
-The service sets the remote `started_at` from the consume time, so `memory_feed.unconfirmed_guest_run` reads the consume from it.
-A confirmed guest attempt gives the row `guest_run`. A consumed attempt that the queue has not confirmed gives `guest_unconfirmed: true`.
+The service sets the remote `started_at` when the gate consumes its launch permission.
+The queue confirms the attempt when it receives matching execution evidence for that permission. The confirmed row has `guest_run`.
+The feed adds the guest setup allowance and `query_timeout_seconds` to `started_at` to set the deadline.
+Before the deadline, an unconfirmed row shows `starting`.
+At or after the deadline, it shows `not confirmed`.
 The Builds page shows both attempts in Running with the recorded job, unit, and caller.
 The Machine cell shows one bright Apple icon with a 🐧 badge.
 The Apple icon has a white fill and a black outline in light and dark modes.
-The cell adds `not confirmed` until the queue confirms the run.
+The cell shows the unconfirmed state next to the icon. A confirmed row shows the icon alone.
 The tooltip shows `Runs on` and `Named targets`.
+The tooltip wraps long fields and fits the visible viewport when it opens, its content changes, or the window changes size.
+The tooltip clips content that exceeds the available height and lets clicks reach the rows beneath it.
 The memory column shows `on mac-linux`. The vCPU column shows `—`.
 The admission service reads the module counter from the current guest's placement request sidecar.
 It publishes the counter before and after the guest confirms the attempt.
@@ -338,6 +343,7 @@ Other Linux callers keep the local admission and hold checks.
 `scripts.lib.build_folders.create_build_folder(request) -> Path` allocates temporary build folders.
 
 1. `UniqueBuildFolder(prefix, parent)` creates a private folder atomically with mode `0700`.
+   When another run holds the name, it takes a new name at once and does not wait for the lock.
 2. `StableOwnerFolder(name, parent, mode)` retains the owner's folder, contents, and existing permissions.
 
 `FOLDER_PREFIXES` defines each build kind's prefix.
@@ -409,10 +415,11 @@ On 2026-10-06 06:54 PDT, two hung hana tests in one local `verify.sh test` step 
 
 ### The verify run place
 
-The outer Linux `verify.sh` sets `BUILDLOG_RUN` after detachment.
-The value contains its PID and the start-time string from `/proc/<pid>/stat`, separated by `:`.
-Nested calls retain that value.
-The Mac uses `NoRun` and retains claim admission without reading `/proc`.
+On Linux, `verify.sh` and the full CI check in `validate_ci.sh` use the same initializer in `scripts/lib/buildlog_run.sh`.
+`verify.sh` calls it after detachment. `validate_ci.sh` calls it when the validation shell starts.
+The initializer retains an inherited `BUILDLOG_RUN`. Otherwise it exports the shell PID and its start time from `/proc/<pid>/stat`, separated by `:`.
+Every validation step inherits this identity, including commands in the repository's `.claude/config/local_ci.sh`.
+On the Mac, the initializer creates no identity and reads no `/proc` data.
 
 `queue_place.py admit` inherits the exported `BUILDLOG_RUN` through `memory_gate.sh`.
 The client parses the value once into `RunIdentity` or `NoRun`.

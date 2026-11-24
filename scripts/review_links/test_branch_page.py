@@ -27,6 +27,7 @@ from scripts.lib import file_lock
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.review_links import branch_page, change_page, page_frame, serve
+from scripts.review_links.server_test_support import started_review_server
 
 
 class BranchForm(HTMLParser):
@@ -446,7 +447,7 @@ class BranchPageTests(unittest.TestCase):
             _ = self.enterContext(patch.object(change_page, "send_to_staff", side_effect=receive))
             _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
             address = serve.tailscale_ip()
-            with serve.ReviewLinksServer((address, 0), root) as server:
+            with started_review_server((address, 0), root) as server:
                 thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
                 thread.start()
                 try:
@@ -493,7 +494,7 @@ class BranchPageTests(unittest.TestCase):
                         with patch.object(serve, "loaded_module_stamps",
                                           return_value={Path(serve.__file__): serve.ModuleStampUnavailable.UNREADABLE}):
                             server.next_code_check = 0
-                            server.service_actions()
+                            serve.ReviewLinksServer.service_actions(server)
                         self.assertEqual(server.module_stamps, stamps)
                     identity, sender, message = messages.get(timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(completed.get(timeout=TEST_HANG_GUARD_SECS), page.folder)
