@@ -15,12 +15,13 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from typing import BinaryIO, TextIO, cast
 import unittest
 from unittest import mock
 
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.lib import conf
+from scripts.lib import conf, scratch
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -804,14 +805,15 @@ import json, os, shlex, signal, subprocess, sys
 from pathlib import Path
 root = Path(os.environ["FAKE_QUEUE_STATE"])
 command = shlex.split(sys.argv[-1])
-if "mac_smoke_status=" in command[-1]:
+if " smoke-status " in command[-1]:
     assert (root / "input_closed").exists(), "Status read before the first SSH call ended"
     (root / "status-read").touch()
     if os.environ.get("FAKE_STATUS_STALL") == "1":
         signal.alarm(3)
         with (root / "status-gate").open("rb"):
             raise AssertionError("The status gate opened")
-    subprocess.run(command, check=False)
+    _, _, _, action, episode = shlex.split(command[-1])
+    subprocess.run([sys.executable, os.environ["SMOKE_WORKER"], action, episode], check=False)
     raise SystemExit(0)
 (root / "smoke-ssh.json").write_text(json.dumps(sys.argv[1:]))
 drop = os.environ.get("FAKE_SMOKE_DROP")
@@ -835,7 +837,7 @@ if drop:
         raise SystemExit(255)
 else:
     subprocess.run(command, cwd=root / "checkout", check=False)
-    for status in (root / ".local/state/mac-queue/smoke").glob("*/status"):
+    for status in Path(os.environ["SCRATCH_ROOT"]).glob("mac-smoke-*/status"):
         if os.environ.get("FAKE_SMOKE_FILE") == "missing":
             status.unlink()
         elif os.environ.get("FAKE_SMOKE_FILE") == "malformed":
@@ -851,12 +853,12 @@ root = Path(os.environ["FAKE_QUEUE_STATE"])
 status = subprocess.run(sys.argv[1:], check=False).returncode
 (root / "worker-exit").write_text(str(status))
 episode = os.environ["MAC_PLACEMENT"].split("/")[0]
-path = Path.home() / ".local/state/mac-queue/smoke" / episode / "status"
+path = Path(os.environ["SCRATCH_ROOT"]) / f"mac-smoke-{episode}" / "status"
 if path.exists():
     (root / "early-status").write_text(path.read_text())
 raise SystemExit(int(os.environ.get("FAKE_SMOKE_LEASE_STATUS", status)))
 """)
-        environment.update(COPIES_KEEP_FILE=str(root / "copy.keep"),
+        environment.update(COPIES_KEEP_FILE=str(root / "copy.keep"), SCRATCH_ROOT=str(root / "scratch"),
                            SMOKE_WORKER=str(Path(mac_queue_run.__file__).resolve()), FAKE_SMOKE_WORK=work)
         callback = root / "mac_run.sh"
         write_stdlib_tool(callback, """
@@ -891,6 +893,7 @@ else:
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                 self.assertTrue((root / "cleanup").exists())
                 self.assertTrue((root / "input_closed").exists())
+                self.assertEqual(list((root / "scratch").iterdir()), [])
 
     def test_smoke_uses_the_remote_status_when_tailscale_exits_zero(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -936,8 +939,21 @@ else:
             self.assertTrue((root / "remote_cleanup").exists())
             self.assertFalse((root / "cleanup").exists())
             self.assertFalse((root / "status-read").exists())
-            self.assertEqual([event[0] for event in self.events(root)], ["place-step"])
+            placed, = self.events(root)
+            self.assertEqual(placed[0], "place-step")
             self.assertEqual(len(list((root / mac_queue_run.RUNS).glob("*/run.json"))), 1)
+            episode = placed[placed.index("--episode") + 1]
+            folder = root / "scratch" / f"mac-smoke-{episode}"
+            self.assertTrue((folder / "status").is_file(), "The status is missing from the scratch folder")
+            self.assertEqual((folder / "status").read_text(), "1\n")
+            with mock.patch.dict(os.environ, environment, clear=True):
+                now = time.time()
+                self.assertIsInstance(scratch.record_lifetime(folder, now), scratch.Live)
+                self.assertTrue(scratch.is_throwaway(folder))
+                expiry = now + conf.read("scratch").whole("default_life_seconds")
+                result = scratch.remove_folder(folder, scratch.ExpiredFolderRemoval(expiry))
+                self.assertIsInstance(result, scratch.RemovedCopy)
+            self.assertFalse(folder.exists())
 
     def test_smoke_disconnect_after_ready_does_not_publish_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -952,7 +968,7 @@ else:
             placed, = self.events(root)
             self.assertEqual(placed[0], "place-step")
             episode = placed[placed.index("--episode") + 1]
-            status_file = root / mac_queue_run.smoke_status_path(episode)
+            status_file = root / "scratch" / f"mac-smoke-{episode}" / "status"
             self.assertTrue(not status_file.exists() or status_file.read_text() != "0\n")
 
     def test_smoke_reports_a_failed_copy_lease_close(self) -> None:
@@ -979,6 +995,35 @@ else:
             self.assertIn("status read timed out after 0.5 seconds", result.stderr)
             self.assertTrue((root / "status-read").exists())
             self.assertEqual([event[0] for event in self.events(root)], ["place-step"])
+
+    def test_smoke_release_timeout_closes_the_lease_with_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment, _ = self.smoke_fixture(root, "true")
+            _ = write_config_fixture(root / "config/production.conf", "mac_run_status_grace_seconds=1\n")
+            episode = "73b79143c2c846a18d3bdb66b5dd15a0"
+            environment["MAC_PLACEMENT"] = episode + "/attempt"
+            runner = [sys.executable, environment["SMOKE_WORKER"]]
+            with subprocess.Popen(
+                [*runner, "smoke-copy", str(root / "copies.py"), *runner, "smoke-work", "true", "true"],
+                cwd=root / "checkout", env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            ) as process:
+                assert process.stdin is not None and process.stdout is not None
+                output = cast(BinaryIO, process.stdout)
+                try:
+                    self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0])
+                    self.assertEqual(output.readline(), b"\n")
+                    self.assertEqual(output.readline(), f"mac_smoke_ready={episode}\n".encode())
+                    try:
+                        self.assertEqual(process.wait(timeout=5), 0)
+                    except subprocess.TimeoutExpired:
+                        self.fail("The copy lease stayed open after the release deadline")
+                    self.assertIn(b"copy release timed out after 1s", output.read())
+                    self.assertEqual((root / "worker-exit").read_text(), "1")
+                    self.assertEqual((root / "scratch" / f"mac-smoke-{episode}" / "status").read_text(), "1\n")
+                finally:
+                    process.stdin.close()
 
     def test_ended_smoke_retires_the_legacy_scratch_record_after_cleanup(self) -> None:
         self.check_legacy_scratch_cleanup(clear=True)
@@ -1070,7 +1115,7 @@ if sys.argv[2] == "stop-checkout":
             cleanup_record = root / "cleanup"
             source = Path(mac_queue_run.__file__).resolve()
             episode = "73b79143c2c846a18d3bdb66b5dd15a0"
-            status_file = root / mac_queue_run.smoke_status_path(episode)
+            status_file = root / "scratch" / f"mac-smoke-{episode}" / "status"
             status_file.parent.mkdir(parents=True)
             check_stdin = shlex.join([sys.executable, "-c",
                 "import os; assert os.path.samestat(os.fstat(0), os.stat(os.devnull))"])
@@ -1090,7 +1135,9 @@ if sys.argv[2] == "stop-checkout":
                     runner = [sys.executable, str(source)]
                     with subprocess.Popen(
                         [*runner, "smoke-copy", *runner, "smoke-work", work, cleanup],
-                        cwd=checkout, env={**os.environ, "HOME": str(root), "COPIES_COMMAND_LEASE_FDS": "",
+                        cwd=checkout, env={**os.environ, **config_environment(root / "config"),
+                                           "HOME": str(root), "SCRATCH_ROOT": str(root / "scratch"),
+                                           "COPIES_COMMAND_LEASE_FDS": "",
                                            "MAC_PLACEMENT": episode + "/attempt",
                                            "COPIES_KEEP_FILE": str(keep), "CLEANUP_RECORD": str(cleanup_record)},
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

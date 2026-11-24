@@ -315,10 +315,24 @@ SmokeResult = (SmokeNotReady | SmokeConnectionLost | SmokeFinalStatus | SmokeMis
 
 
 def smoke_status_path(episode: str) -> Path:
-    """Name the file inside this smoke run's folder on the Mac."""
+    """Name the status file inside this run's Mac scratch folder."""
+    from scripts.lib import copy_record
+
     if uuid.UUID(hex=episode).hex != episode:
         raise ValueError("the Mac smoke run has an invalid episode")
-    return Path(".local/state/mac-queue/smoke") / episode / "status"
+    return copy_record.root() / f"mac-smoke-{episode}" / "status"
+
+
+def take_smoke_status(episode: str) -> int:
+    """Return the status and remove its scratch folder."""
+    path = smoke_status_path(episode)
+    try:
+        status = path.read_bytes()
+    except FileNotFoundError:
+        return 1
+    shutil.rmtree(path.parent)
+    _ = sys.stdout.buffer.write(b"mac_smoke_status=" + status)
+    return 0
 
 
 def read_smoke_ready(output: TextIO, episode: str) -> bool:
@@ -336,13 +350,8 @@ def read_smoke_result(placement: MacPlacement, ssh_status: int, *, ready: bool) 
         return SmokeNotReady()
     if ssh_status:
         return SmokeConnectionLost()
-    path = shlex.quote(str(smoke_status_path(placement.episode)))
-    command = (
-        f'status_file="$HOME"/{path}\n'
-        '[[ -f $status_file ]] || exit 1\n'
-        'builtin printf "mac_smoke_status="\n'
-        'cat -- "$status_file" && rm -f -- "$status_file" && rmdir -- "${status_file:h}"'
-    )
+    command = ('exec "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/mac_test/mac_queue_run.py"'
+               f' smoke-status {shlex.quote(placement.episode)}')
     timeout = conf.read("mac_test").number("probe_timeout_s")
     try:
         result = subprocess.run(
@@ -362,11 +371,16 @@ def read_smoke_result(placement: MacPlacement, ssh_status: int, *, ready: bool) 
 
 def run_smoke_copy(command: list[str]) -> int:
     """Publish the copy command's exit code after the lease closes."""
+    from scripts.lib import scratch
+
     episode = os.environ["MAC_PLACEMENT"].partition("/")[0]
-    status_file = Path.home() / smoke_status_path(episode)
+    status_file = smoke_status_path(episode)
     status_file.unlink(missing_ok=True)
     result = subprocess.run(command)
     status = result.returncode if result.returncode >= 0 else 128 - result.returncode
+    status_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    now = time.time()
+    scratch.write_record(status_file.parent, scratch.task_or_default("", now), now, throwaway=True)
     write_text_atomic(status_file, f"{status}\n", new_file_mode=0o600)
     return 0
 
@@ -420,8 +434,12 @@ def run_smoke_work(work: str, cleanup: str) -> int:
     if status < 0:
         status = 128 - status
     status = status or (cleared.returncode if cleared.returncode >= 0 else 128 - cleared.returncode)
+    release_timeout = conf.read("production").whole("mac_run_status_grace_seconds")
     print(f"\nmac_smoke_ready={episode}", flush=True)
-    return status if sys.stdin.buffer.read(1) == b"\n" else status or 1
+    if not select.select([incoming], [], [], release_timeout)[0]:
+        print(f"mac queue: the copy release timed out after {release_timeout}s", file=sys.stderr)
+        return status or 1
+    return status if os.read(incoming, 1) == b"\n" else status or 1
 
 
 def run(args: Arguments) -> int:
@@ -772,6 +790,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_smoke_work(words[1], words[2])
     if len(words) > 1 and words[0] == "smoke-copy":
         return run_smoke_copy(words[1:])
+    if len(words) == 2 and words[0] == "smoke-status":
+        return take_smoke_status(words[1])
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--what", required=True)
     _ = parser.add_argument("--kind", choices=("shot", "install", "probe", "run"), required=True)
