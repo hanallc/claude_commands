@@ -226,10 +226,8 @@ if ref := env["MAC_RUN_BUNDLE_REF"]:
     )
 command = [
     "/bin/zsh", "-c",
-    # Restore SSH input after shell startup and bundle setup.
     prepare + f"exec{py}{copies}run --repo {source} --owner " + quote(env["MAC_RUN_COPY_OWNER"])
     + " --commit " + env["MAC_RUN_SHA"] + f" --{py}{runner}smoke-work " + quote(work) + " " + quote(cleanup)
-    + " <&3 3<&-",
 ]
 Path(sys.argv[1]).write_text(json.dumps(command))
 ' "$argv_file"
