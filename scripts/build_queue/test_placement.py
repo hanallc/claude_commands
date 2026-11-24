@@ -43,7 +43,7 @@ from scripts.lib import conf
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
-from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, PinnedTarget
+from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, MAC_ONLY, PinnedTarget
 
 
 SUBMITTING_SESSION = OwningSession("submitting-session")
@@ -2438,7 +2438,8 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             self.assertNotIn(older_key, server.host_readers)
             candidate = placement.CandidateEligibility(destination, placement.EvidenceNeeded("probe unavailable"))
             make_hold = cast(Callable[[wire.PlacementRequest, placement.CandidateEligibility,
-                                      dict[tuple[str, placement.PlacementDestination], float]], service.PlacementHold | None],
+                                      dict[tuple[str, placement.PlacementDestination], placement.HostEvidence]],
+                                     service.PlacementHold | None],
                              getattr(server, "_placement_hold"))
             hold = make_hold(older, candidate, {})
 
@@ -2448,7 +2449,8 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             evidence = publish_candidate(fixture, younger)
             server.placement_host_keys[(younger.episode, destination)] = evidence.key
             held_for_older = cast(Callable[[wire.PlacementRequest, placement.PlacementDestination, list[service.PlacementHold],
-                dict[tuple[str, placement.PlacementDestination], float]], bool], getattr(server, "_held_for_older"))
+                dict[tuple[str, placement.PlacementDestination], service.PlacementHoldStart]], bool],
+                getattr(server, "_held_for_older"))
             self.assertFalse(held_for_older(younger, destination, [hold] if hold is not None else [], {}))
             self.assertIsNone(hold)
 
@@ -3124,6 +3126,11 @@ class ManualEvidenceWorker(service.HostEvidenceWorker):
         _ = self._probe(*ready)
         return ready[0]
 
+    def probe_key(self, key: placement.HostEvidenceKey) -> None:
+        with self.lock:
+            subscription = self.subscriptions[key]
+        _ = self._probe(key, subscription)
+
 
 @dataclass(frozen=True)
 class MacOrder:
@@ -3143,11 +3150,14 @@ HOLD_SECONDS = 1 + 5
 class MacOrderTests(unittest.TestCase):
     """A younger request never takes the Mac from an older request whose busy reading is older."""
 
-    def mac_order(self, fixture: PlacementFixture) -> MacOrder:
+    def mac_order(self, fixture: PlacementFixture, *, mac_only: bool = False) -> MacOrder:
         fixture.configure(waiting_pass_seconds=1)
         _ = write_config_fixture(fixture.root / "mac_test.conf", "probe_timeout_s=5\n", template="mac_test")
         _ = fixture.run_pass()
         older = placement_request(fixture, since=fixture.clock.now() - 60)
+        if mac_only:
+            older = replace(older, route=MAC_ONLY,
+                            constraints=replace(older.constraints, selection=placement.MacOnlyHost()))
         older_key = self.provide(fixture, older, placement.TemporaryExclusion("busy"))
         self.assertIsInstance(fixture.connect(older).replies()[-1], wire.PlacementWait)
         _ = fixture.run_pass()
@@ -3179,14 +3189,134 @@ class MacOrderTests(unittest.TestCase):
     def assigned(fixture: PlacementFixture, *requests: wire.PlacementRequest) -> list[str]:
         return [request.episode for request in requests if request.episode in fixture.server.current_assignments]
 
+    def test_a_refused_mac_only_request_cannot_hold_the_mac_on_a_later_busy_probe(self) -> None:
+        for reason in ("blocked", "backoff"):
+            with self.subTest(reason=reason):
+                self.assert_refused_mac_only_request_leaves_the_queue(reason)
+
+    def assert_refused_mac_only_request_leaves_the_queue(self, reason: str) -> None:
+        with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
+            fixture.configure(waiting_pass_seconds=1)
+            _ = write_config_fixture(fixture.root / "mac_test.conf", "probe_timeout_s=5\n", template="mac_test")
+            _ = fixture.run_pass()
+            older = placement_request(fixture, since=fixture.clock.now() - 60)
+            older = replace(older, route=MAC_ONLY,
+                            constraints=replace(older.constraints, selection=placement.MacOnlyHost()))
+            older_key = self.provide(fixture, older, placement.TemporaryExclusion(reason))
+            self.assertIsInstance(fixture.connect(older).replies()[-1], wire.PlacementWait)
+            _ = fixture.run_pass()
+            worker = fixture.server.host_targets[("mac", "mac")]
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), older_key)
+            _ = fixture.run_pass()
+            reply = fixture.connect(older).replies()[-1]
+            assert isinstance(reply, wire.DispatchStatus), reply
+            self.assertEqual(reply.state, placement.ClosedAssignment(reason))
+            self.assertEqual(reply.retry, placement.DoNotRetry(reason))
+
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, older, placement.TemporaryExclusion("busy"))
+            fixture.clock.advance(1)
+            younger = placement_request(fixture, session=OwningSession("younger-session"),
+                                        since=fixture.clock.now() - 10)
+            younger_key = self.provide(fixture, younger, ALLOWED_HOST)
+            self.assertIsInstance(fixture.connect(younger).replies()[-1], wire.PlacementWait)
+            _ = fixture.run_pass()
+            self.assertEqual(worker.probe_next(), younger_key)
+            _ = fixture.run_pass()
+            self.assertEqual(self.assigned(fixture, older, younger), [younger.episode])
+            self.assertEqual(fixture.server.placement_holds, {})
+            self.assertNotIn(older_key, fixture.server.host_readers)
+            if reason != "backoff":
+                self.assertEqual(fixture.connect(older).replies()[-1], reply)
+            fixture.restart()
+            self.assertNotIn(older.episode, fixture.server.placement_requests)
+
     def test_the_older_request_is_probed_next_and_takes_the_mac(self) -> None:
+        for mac_only in (False, True):
+            with (self.subTest(mac_only=mac_only), PlacementFixture() as fixture,
+                  mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+                order = self.mac_order(fixture, mac_only=mac_only)
+                fixture.clock.advance(1)
+                _ = self.provide(fixture, order.older, ALLOWED_HOST)
+                self.assertEqual(order.worker.probe_next(), order.older_key)
+                _ = fixture.run_pass()
+                self.assertEqual(self.assigned(fixture, order.older, order.younger), [order.older.episode])
+
+    def test_inflight_probe_answers_the_mac_hold_without_transferring_it(self) -> None:
+        for answer in (*(placement.TemporaryExclusion(reason) for reason in ("busy", "disk", "off", "state")),
+                       ALLOWED_HOST):
+            with (self.subTest(answer=answer), PlacementFixture() as fixture,
+                  mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+                self.assert_inflight_probe_answers_the_mac_hold(fixture, answer)
+
+    def test_the_oldest_mac_waiter_uses_a_free_answer_after_preparation(self) -> None:
         with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
             order = self.mac_order(fixture)
+            prepare = cast(Callable[[service.PlacementEvidenceKeys, int], None],
+                           getattr(fixture.server, "_prepare_placements"))
+
+            def finish_probe(keys: service.PlacementEvidenceKeys, hold_seconds: int) -> None:
+                prepare(keys, hold_seconds)
+                candidate, = fixture.server.placement_eligibility[order.older.episode]
+                self.assertEqual(candidate.eligibility, placement.TemporaryExclusion("busy"))
+                _ = self.provide(fixture, order.older, ALLOWED_HOST)
+                self.assertEqual(order.worker.probe_next(), order.older_key)
+
             fixture.clock.advance(1)
-            _ = self.provide(fixture, order.older, ALLOWED_HOST)
-            self.assertEqual(order.worker.probe_next(), order.older_key)
-            _ = fixture.run_pass()
+            with mock.patch.object(fixture.server, "_prepare_placements", side_effect=finish_probe):
+                _ = fixture.run_pass()
             self.assertEqual(self.assigned(fixture, order.older, order.younger), [order.older.episode])
+
+    def assert_inflight_probe_answers_the_mac_hold(self, fixture: PlacementFixture,
+                                                  answer: placement.HostEligibility) -> None:
+        fixture.configure(waiting_pass_seconds=1)
+        _ = write_config_fixture(fixture.root / "mac_test.conf", "probe_timeout_s=5\n", template="mac_test")
+        _ = fixture.run_pass()
+        busy = placement.TemporaryExclusion("busy")
+        first = replace(placement_request(fixture, session=OwningSession("older-a"),
+                                         since=fixture.clock.now() - 60), route=MAC_ONLY)
+        second = replace(placement_request(fixture, session=OwningSession("older-b"),
+                                          since=fixture.clock.now() - 59), route=MAC_ONLY)
+        younger = placement_request(fixture, session=OwningSession("younger-c"),
+                                    since=fixture.clock.now() - 10)
+        first_key = self.provide(fixture, first, busy)
+        second_key = self.provide(fixture, second, busy)
+        for request in (first, second):
+            self.assertIsInstance(fixture.connect(request).replies()[-1], wire.PlacementWait)
+        worker = fixture.server.host_targets[("mac", "mac")]
+        assert isinstance(worker, ManualEvidenceWorker)
+        worker.probe_key(first_key)
+        worker.probe_key(second_key)
+        fixture.clock.advance(1)
+        younger_key = self.provide(fixture, younger, ALLOWED_HOST)
+        self.assertIsInstance(fixture.connect(younger).replies()[-1], wire.PlacementWait)
+        worker.probe_key(younger_key)
+        first_pair = (first.episode, first_key.destination)
+        self.assertEqual(fixture.server.placement_holds, {})
+        provider_probe = worker.probe
+
+        def finish_first_probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+            self.assertEqual(key, first_key)
+            fixture.clock.advance(1)
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.placement_holds), {first_pair})
+            self.assertEqual(self.assigned(fixture, first, second, younger), [])
+            fixture.clock.advance(1)
+            _ = self.provide(fixture, first, answer)
+            return provider_probe(key)
+
+        fixture.clock.advance(1)
+        probe_started = fixture.clock.now()
+        with mock.patch.object(worker, "probe", side_effect=finish_first_probe):
+            worker.probe_key(first_key)
+
+        reading = fixture.server.host_readers[first_key].latest
+        self.assertEqual(reading.observed_at, probe_started)
+        _ = fixture.run_pass()
+        winner = first if answer == ALLOWED_HOST else younger
+        self.assertEqual(self.assigned(fixture, first, second, younger), [winner.episode])
+        self.assertEqual(fixture.server.placement_holds, {})
 
     def test_the_hold_never_lasts_past_one_probe_when_the_probe_fails_or_never_answers(self) -> None:
         for probe in ("fails", "never answers"):

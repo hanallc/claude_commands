@@ -251,7 +251,14 @@ An unavailable observation cannot substitute for confirmed cleanup or a settled 
 Busy, blocked, and disk refusals retain normal polling.
 A Mac that `free_now` reports busy is a busy exclusion in placement evidence, even though routing keeps it eligible.
 The step then waits for the Mac, or takes natedev when natedev is a candidate, and no attempt starts until the Mac is free.
+An explicit `--mac-only` request waits when the Mac is busy.
+When the service returns a refusal for that request, the request leaves the placement queue.
+After a backoff refusal, Verify can probe the Mac and submit the same request again.
 Before this rule, a waiting Mac step made one refused attempt each second.
+When a younger request reads the Mac free, the oldest eligible waiter can hold it for one probe.
+A probe that publishes during the hold answers it, even if the probe started before the hold.
+When the answer is free, placement considers the oldest waiter for the Mac in that pass.
+When the answer cannot grant the Mac, a second waiter cannot hold it against the same free reading.
 A kept Mac claim is not busy, because the next claim takes it over.
 Before this, a dead copy's kept claim held the Mac with no work until the claim watcher released it after 15 idle minutes.
 The service also freed the dead copy's placement only when the claim watcher released the claim. On 2026-11-14 this held the Mac with no hana step for 16 minutes.
