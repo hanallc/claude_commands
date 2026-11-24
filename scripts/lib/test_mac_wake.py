@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import chdir, redirect_stdout
 from pathlib import Path
 from typing import override
 from unittest import mock
@@ -24,11 +24,12 @@ def _done(code: int) -> subprocess.CompletedProcess[str]:
 
 class MacWakeTests(unittest.TestCase):
     root: Path = Path()
-    launched: list[tuple[list[str], bool]] = []
+    launched: list[tuple[list[str], bool, object]] = []
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(chdir(self.root))
         environment = {key: value for key, value in os.environ.items()
                        if key not in ("MAC_WAKE_PROGRAM", "ZONE_SSH")}
         environment["ZONE_STATE"] = str(self.root / "zone")
@@ -36,8 +37,9 @@ class MacWakeTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(platform, "system", return_value="Linux"))
         self.launched = []
 
-        def launch(arguments: list[str], *, start_new_session: bool = False, **_: object) -> None:
-            self.launched.append((arguments, start_new_session))
+        def launch(arguments: list[str], *, start_new_session: bool = False, cwd: object = None,
+                   **_: object) -> None:
+            self.launched.append((arguments, start_new_session, cwd))
 
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=launch))
 
@@ -48,8 +50,17 @@ class MacWakeTests(unittest.TestCase):
         self.queue_pull()
         os.environ["MAC_WAKE_PROGRAM"] = str(self.root / "watcher.py")
         self.assertEqual(mac_wake.start(), ["mac: a watcher sends the waiting pull as soon as the Mac answers"])
-        self.assertEqual([(arguments[1:], session) for arguments, session in self.launched],
-                         [([str(self.root / "watcher.py"), "watch"], True)])
+        self.assertEqual([(arguments[1:], session, cwd) for arguments, session, cwd in self.launched],
+                         [([str(self.root / "watcher.py"), "watch"], True, self.root / "zone")])
+
+    def test_start_runs_the_installed_watcher_for_the_live_queue(self) -> None:
+        home = self.root / "home"
+        os.environ["ZONE_STATE"] = str(home / ".local/state/zone")
+        self.queue_pull()
+        with mock.patch.object(mac_wake, "_home", return_value=home):
+            self.assertEqual(mac_wake.start(), ["mac: a watcher sends the waiting pull as soon as the Mac answers"])
+        self.assertEqual([arguments[1:] for arguments, _, _ in self.launched],
+                         [[str(home / ".claude/scripts/lib/mac_wake.py"), "watch"]])
 
     def test_start_runs_no_watcher_when_nothing_waits(self) -> None:
         os.environ["MAC_WAKE_PROGRAM"] = str(self.root / "watcher.py")
@@ -108,6 +119,19 @@ class MacWakeTests(unittest.TestCase):
             self.assertEqual(mac_wake.watch(), 0)
         self.assertEqual(run.call_count, 2)
         pause.assert_called_once_with(10)
+
+    def test_watch_leaves_the_caller_folder_for_the_lock_folder(self) -> None:
+        self.assertEqual(mac_wake.watch(), 0)
+        self.assertEqual(Path.cwd(), mac_wake.lock_path().parent.resolve())
+
+    def test_watch_stops_and_frees_the_lock_when_zone_py_is_gone(self) -> None:
+        self.queue_pull()
+        with mock.patch.object(mac_wake, "ZONE_SCRIPT", self.root / "gone/zone.py"), \
+                mock.patch.object(mac_wake, "_answers") as probe:
+            self.assertEqual(mac_wake.watch(), 1)
+        probe.assert_not_called()
+        with mac_wake.lock_path().open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_a_second_watcher_exits_while_the_first_holds_the_lock(self) -> None:
         self.queue_pull()
