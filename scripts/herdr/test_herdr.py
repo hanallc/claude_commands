@@ -8439,6 +8439,32 @@ class RowTabTests(StaffTestCase):
         self.assertEqual(set(self.client.scans[-1].found), {self.rows["worker"].id})
         self.assertEqual(errors.getvalue(), "")
 
+    def test_retitle_with_matching_titles_skips_process_queries(self) -> None:
+        title = self.rows["unit"].name
+        self.client.tabs[0]["label"] = title
+        self.client.record_layout()
+        self.assertIn(self.rows["unit"].id, [identity for _, identity in self.bindings()])
+
+        with patch.object(self.client, "result", wraps=self.client.result) as queries:
+            self.assertFalse(self.client.retitle("p0", title))
+
+        self.assertFalse(any(query.args[:2] == ("pane", "process-info") for query in queries.call_args_list))
+
+    def test_retitle_with_matching_titles_resolves_a_pending_reorder(self) -> None:
+        owner = self.rows["unit"]
+        other = self.rows["worker"]
+        self.client.tabs[0]["label"] = owner.name
+        self.client.record_layout()
+        self.client.mark_tab_rename(owner.id)
+        self.client.mark_tab_rename(other.id)
+
+        self.assertTrue(self.client.retitle("p0", owner.name))
+
+        saved = herdr.saved_layout("fixture")
+        pending = {entry["staff_id"] for space in saved["workspaces"] for entry in space["tabs"]
+                   if entry.get("sort_after_rename")}
+        self.assertEqual(pending, {other.id})
+
     def test_retitle_uses_proved_rows_and_reports_an_unknown_pane_once(self) -> None:
         self.client.unknown.add("p2")
         self.client.tabs[1]["pane_label"] = "old-worker-label"

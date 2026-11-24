@@ -2378,14 +2378,13 @@ class Herdr:
                 return False
             saved = saved_layout(self.session)
             reorder = False
-            record = _tab_staff()
             owner: staff.StaffRow | None = None
-            if tab and saved["workspaces"]:
+            if tab and (pending := {entry["staff_id"] for space in saved["workspaces"] for entry in space["tabs"]
+                                    if entry.get("sort_after_rename")}):
+                record = _tab_staff()
                 scan = self.scan_row_panes(record, self.listed("pane"))
                 owner = _tab_members(record, scan).get(str(row.get("tab_id", "")))
-                reorder = any(entry.get("sort_after_rename")
-                    and owner is not None and entry["staff_id"] == owner.id
-                    for space in saved["workspaces"] for entry in space["tabs"])
+                reorder = owner is not None and owner.id in pending
             changed = self._retitle(row, title, tab=tab)
             if not changed and not reorder:
                 return False
