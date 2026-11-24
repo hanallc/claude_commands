@@ -883,6 +883,8 @@ finish_verify_verb_list() {
 
 run_verify_verbs() {
     local verb length offset=0 status list_run step_list=0
+    local -a session_args=()
+    if (( VERIFY_SESSION_TEMP_REQUESTED )); then session_args=(--session-dir "$UNIT_SESSION_DIR"); fi
     if (( ${#VERIFY_STEP_LENGTHS[@]} )); then
         step_list=1
     fi
@@ -901,7 +903,7 @@ run_verify_verbs() {
         list_run=""
         if [[ "${VERIFY_STEP_WORDS[offset]}" != doc ]]; then list_run=${BUILDLOG_RUN:-}; fi
         env -u UNIT_DETACHED_RECORD UNIT_DETACHED_RUN=1 VERIFY_STEP_LIST_RUN="$list_run" bash "$VERIFY_START_DIR/verify.sh" \
-            "${VERIFY_STEP_WORDS[@]:offset:length}" <&0 &
+            ${session_args[@]+"${session_args[@]}"} "${VERIFY_STEP_WORDS[@]:offset:length}" <&0 &
         status=0
         wait "$!" || status=$?
         VERIFY_VERB_PREVIOUS_JOB=$!
@@ -1310,11 +1312,26 @@ run_step() {
             step_state local_noncompiling
         fi
         export BUILDLOG_TARGET=natedev
+        if [[ "${VERIFY_SESSION_TEMP_REQUESTED:-0}" == 1 && "${MAC_ONLY:-0}" == 0 ]] && buildlog_step_compiles "$@"; then
+            open_verify_session_temp
+        fi
         started="$(date '+%Y-%m-%d %H:%M:%S %z')"
+        if [[ -n "${VERIFY_SESSION_TEMP_INPUT:-}" ]]; then
+            # Open an inheritable writer for the step. Bash marks coprocess descriptors close-on-exec.
+            exec {VERIFY_SESSION_TEMP_STEP_FD}>"/dev/fd/$VERIFY_SESSION_TEMP_INPUT"
+        fi
         monitor=0
         [[ $- != *m* ]] || monitor=1
         set -m
+        RUN_STEP_PREVIOUS_JOB=${!:-}
+        RUN_STEP_LAUNCHING=1
         (
+            if [[ -n "${VERIFY_SESSION_STEP_TEMP:-}" ]]; then
+                export TMPDIR="$VERIFY_SESSION_STEP_TEMP"
+            fi
+            if [[ -n "${VERIFY_SESSION_TEMP_STEP_FD:-}" ]]; then
+                export VERIFY_SESSION_TEMP_LEASE_FD="$VERIFY_SESSION_TEMP_STEP_FD"
+            fi
             # The step and all of its children use the run output streams.
             [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
             set +m
@@ -1333,6 +1350,11 @@ run_step() {
             fi
         ) &
         RUN_STEP_PID=$!
+        RUN_STEP_LAUNCHING=0
+        if [[ -n "${VERIFY_SESSION_TEMP_STEP_FD:-}" ]]; then
+            exec {VERIFY_SESSION_TEMP_STEP_FD}>&-
+            VERIFY_SESSION_TEMP_STEP_FD=""
+        fi
         if [[ "$monitor" == 0 ]]; then set +m; fi
         # The Mac copy watcher (copy_watch.py) reads the step's group and log here.
         if [[ -n "${VERIFY_STEP_INFO_FILE:-}" ]]; then
@@ -1727,18 +1749,77 @@ finish_mac_fix() {
 }
 
 VERIFY_ORIGINAL_ARGS=("$@")
+VERIFY_SESSION_TEMP_INPUT=""
+VERIFY_SESSION_TEMP_PID=""
+VERIFY_SESSION_TEMP_PENDING=0
+VERIFY_SESSION_TEMP_STEP_FD=""
+VERIFY_SESSION_TEMP_PREVIOUS_JOB=""
+VERIFY_SESSION_STEP_TEMP=""
+close_verify_session_temp() {
+    local latest_job=${!:-} pid=$VERIFY_SESSION_TEMP_PID
+    if [[ -z "$pid" && "$VERIFY_SESSION_TEMP_PENDING" == 1 && "$latest_job" != "$VERIFY_SESSION_TEMP_PREVIOUS_JOB" ]]; then
+        pid=$latest_job
+    fi
+    if [[ -n "$VERIFY_SESSION_TEMP_STEP_FD" ]]; then
+        exec {VERIFY_SESSION_TEMP_STEP_FD}>&-
+        VERIFY_SESSION_TEMP_STEP_FD=""
+    fi
+    if [[ -n "$VERIFY_SESSION_TEMP_INPUT" ]]; then
+        exec {VERIFY_SESSION_TEMP_INPUT}>&-
+        VERIFY_SESSION_TEMP_INPUT=""
+    fi
+    if [[ -n "$pid" ]]; then
+        if [[ "$VERIFY_SESSION_TEMP_PENDING" == 1 ]]; then kill -TERM "$pid" 2>/dev/null || true; fi
+        wait "$pid" 2>/dev/null || true
+        VERIFY_SESSION_TEMP_PID=""
+    fi
+    VERIFY_SESSION_TEMP_PENDING=0
+}
+
+open_verify_session_temp() {
+    [[ -z "$VERIFY_SESSION_STEP_TEMP" ]] || return 0
+    local output="" reply="" reason="the helper did not report a temporary folder"
+    VERIFY_SESSION_TEMP_PREVIOUS_JOB=${!:-}
+    VERIFY_SESSION_TEMP_PENDING=1
+    coproc VERIFY_TEMP_LEASE {
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        exec 70>&- 71<&-
+        exec "$PY" "$BUILD_HELPER_ROOT/direct/verify_temp.py" "$VERIFY_REPO_ROOT"
+    }
+    VERIFY_SESSION_TEMP_PID=${VERIFY_TEMP_LEASE_PID:-}
+    VERIFY_SESSION_TEMP_INPUT=${VERIFY_TEMP_LEASE[1]:-}
+    output=${VERIFY_TEMP_LEASE[0]:-}
+    if [[ -n "$output" ]] && IFS= read -r -u "$output" reply; then
+        exec {output}<&-
+        case "$reply" in
+            'ready '*)
+                if [[ -d "${reply#ready }" ]]; then
+                    VERIFY_SESSION_STEP_TEMP=${reply#ready }
+                    VERIFY_SESSION_TEMP_PENDING=0
+                    return 0
+                fi
+                ;;
+            'fallback '*) reason=${reply#fallback }; VERIFY_SESSION_TEMP_PENDING=0 ;;
+        esac
+    fi
+    close_verify_session_temp
+    local fallback
+    fallback="$(verify_helper "$BUILD_FOLDERS_SCRIPT" run-temp-path "$UNIT_SESSION_DIR")" || fallback=""
+    if [[ -n "$fallback" ]] && { [[ -d "$fallback" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" stable --run-temp "$UNIT_SESSION_DIR" >/dev/null 2>&1; }; then
+        VERIFY_SESSION_STEP_TEMP=$fallback
+    else
+        VERIFY_SESSION_STEP_TEMP=${TMPDIR:-/tmp}
+    fi
+    printf 'verify.sh: using TMPDIR %s: %s\n' "$VERIFY_SESSION_STEP_TEMP" "$reason" >&2
+}
+
 # A flag, not an env prefix, so a call stays one plain command that the
 # settings.json allow rule matches.
+VERIFY_SESSION_TEMP_REQUESTED=0
 if [[ "${1:-}" == "--session-dir" ]]; then
     export UNIT_SESSION_DIR="${2:?verify.sh --session-dir <dir> <command> ...}"
     shift 2
-    # Test temp folders land in the run folder and end with it (tmp_sweep.py judges each entry).
-    verify_helper --start
-    SESSION_TMPDIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" run-temp-path "$UNIT_SESSION_DIR")"
-    # Other worker commands use the session TMPDIR after this verify process exits.
-    if [[ -d "$SESSION_TMPDIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" stable --run-temp "$UNIT_SESSION_DIR" >/dev/null 2>&1; then
-        export TMPDIR="$SESSION_TMPDIR"
-    fi
+    VERIFY_SESSION_TEMP_REQUESTED=1
 fi
 
 CMD="${1:-}"
@@ -4287,7 +4368,17 @@ with (lock.parent / "cargo.guard").open("a+") as guard:
     fcntl.flock(guard, fcntl.LOCK_UN)
 
 os.environ.pop("BUILDLOG_DEFER_SCOPE_SIDECAR", None)
-sys.exit(shell_status(subprocess.call(command)))
+lease_fd = os.environ.get("VERIFY_SESSION_TEMP_LEASE_FD")
+lease_fds = ()
+if lease_fd:
+    try:
+        os.fstat(int(lease_fd))
+    except OSError:
+        # A scope launcher can close descriptors. The step shell still holds the writer.
+        os.environ.pop("VERIFY_SESSION_TEMP_LEASE_FD", None)
+    else:
+        lease_fds = (int(lease_fd),)
+sys.exit(shell_status(subprocess.call(command, pass_fds=lease_fds)))
 '
 
 # Preserve the shared invocation policy (including systemd scopes and its
@@ -4732,6 +4823,10 @@ verify_exit() {
         fi
     fi
     finish_exit_diagnostics
+    if [[ -n "${VERIFY_SESSION_TEMP_PID:-}" || "${VERIFY_SESSION_TEMP_PENDING:-0}" == 1 ]]; then
+        trap '' INT TERM HUP
+        close_verify_session_temp
+    fi
     exit "$EXIT_STATUS"
 }
 # The hold folder is removed during cleanup. Keep diagnostics in the run's temp folder.
@@ -4745,17 +4840,23 @@ verify_interrupted() {
     # Ignore later signals until cleanup removes this call's records.
     trap '' INT TERM HUP
     EXIT_STATUS=$((128 + $1))
+    local latest_job=${!:-} step_pid=$RUN_STEP_PID
+    if [[ -z "$step_pid" && "${RUN_STEP_LAUNCHING:-0}" == 1 && "$latest_job" != "$RUN_STEP_PREVIOUS_JOB" ]]; then
+        step_pid=$latest_job
+    fi
+    if [[ "${VERIFY_SESSION_TEMP_PENDING:-0}" == 1 ]]; then close_verify_session_temp; fi
     interrupt_hold_wait >&2
-    if [[ -n "$RUN_STEP_PID" ]]; then
-        "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" "$1" 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
+    if [[ -n "$step_pid" ]]; then
+        "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$step_pid" "$1" 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$step_pid" >&2; }
         release_token || true
-        wait "$RUN_STEP_PID" 2>/dev/null || true
+        wait "$step_pid" 2>/dev/null || true
         RUN_STEP_PID=""
     fi
     verify_cleanup interrupted >&2
     finish_verify_run "$EXIT_STATUS" >&2
     finish_exit_diagnostics
     stop_interrupted_run_log
+    if [[ -n "${VERIFY_SESSION_TEMP_PID:-}" ]]; then close_verify_session_temp; fi
     if [[ "${TOKEN_WAIT_INTERRUPTED:-0}" == 1 ]]; then
         trap - INT TERM HUP
         kill -s "$1" "${BASHPID:-$$}"
