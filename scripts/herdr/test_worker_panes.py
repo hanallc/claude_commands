@@ -150,6 +150,9 @@ class PaneWorld(herdr.Herdr):
         write_text_atomic(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
                           + "agents_slice=app-agents.slice\n")
         write_text_atomic(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
+        source = Path(__file__).resolve().parents[2] / "config"
+        for name in ("detached_runs.conf", "postmaster.conf"):
+            write_text_atomic(config / name, (source / name).read_text())
         registry = write_registry(config / "models.conf")
         _ = cast(object, test.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(test.root / "state"), "CONF_DIR": str(config),
@@ -257,8 +260,7 @@ class PaneWorld(herdr.Herdr):
     def process_start(self, pid: int) -> str | None:
         """Read the process generation from the private stat file."""
         if pid in self.processes:
-            with patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(self.process_root)}):
-                observed = process_start.process_start(pid)
+            observed = process_start.proc_table_start(pid, self.process_root)
         else:
             observed = process_start.process_start(pid)
         return observed.start if isinstance(observed, process_start.Started) else None
@@ -269,8 +271,7 @@ class PaneWorld(herdr.Herdr):
         observed_start = process_start.process_start
         def read(pid: int) -> process_start.ProcessStart:
             if pid in self.processes:
-                with patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(self.process_root)}):
-                    return observed_start(pid)
+                return process_start.proc_table_start(pid, self.process_root)
             return observed_start(pid)
         with patch.object(process_start, "process_start", side_effect=read):
             yield
@@ -390,7 +391,7 @@ class PaneWorld(herdr.Herdr):
                                          if identity.split(":p")[-1].isdigit()), default=0))
             anchor = self.locations[destination.of_pane]
             self.locations[pane] = {**anchor, "pane_id": pane, "label": destination.label,
-                                    "terminal_id": "terminal-" + pane, "focused": False}
+                                    "terminal_id": "terminal-" + pane, "focused": False, "agent_status": "idle"}
             _ = self.locations[pane].pop("agent_session", None)
             self.split_leaf(destination.of_pane, pane, destination.direction, destination.ratio)
         else:
@@ -983,8 +984,10 @@ class WorkerPaneTests(StaffTestCase):
                 write_text_atomic(prompt, "Preserve the source behavior.\n")
                 _ = progress_history.begin_dispatch(run, slot="impl", phase="earlier", role="impl",
                     worker_name=row.name, worker_id=row.id, launcher_command=[], prompt=prompt, kind="impl", lens="")
-                self.record_command("finish-pass", "--status", status, "--orphaned-launcher", at=3)
                 before = self.staff_state()
+                self.record_command("finish-pass", "--status", status, "--orphaned-launcher", at=3)
+                if status == "canceled":
+                    self.assertEqual(self.world.closed, [*expected, (pane, "terminal-" + pane)])
                 result = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
                 self.assertIsInstance(result, worker_panes.Closed)
                 expected.append((pane, "terminal-" + pane))

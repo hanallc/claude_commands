@@ -310,6 +310,41 @@ class StopResumeTests(unittest.TestCase):
             self.assertEqual(exited.why, "keep stopped")
             self.assertEqual(stop_resume.resume_for_upkeep(row.id), held)
 
+    def test_stop_selects_a_worker_by_its_unit_path(self) -> None:
+        hana = fixture_member("showrunner", name="hana")
+        assembly = fixture_member("unit", name="assembly", parent=hana.id)
+        worker = fixture_member("worker", name="fix2", parent=assembly.id)
+        _ = fixture_member("worker", name="fix2", parent=fixture_member("unit", name="cables", parent=hana.id).id)
+        with (patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(worker.current_session)) as stop,
+              patch.object(stop_resume, "stop_unit_workers", return_value=[]) as stop_workers):
+            for path in ("assembly/fix2", "hana/assembly/fix2"):
+                with self.subTest(path=path), redirect_stdout(io.StringIO()):
+                    self.assertEqual(shutdown.main(["stop", path]), 0)
+                    self.assertEqual(stop.call_args.args, (str(worker.id),))
+            stop_workers.assert_not_called()
+            with self.subTest(path="hana/assembly"), redirect_stdout(io.StringIO()):
+                self.assertEqual(shutdown.main(["stop", "hana/assembly"]), 0)
+                self.assertEqual(stop_workers.call_args.args[0], assembly.id)
+                self.assertEqual(stop.call_args.args, (str(assembly.id),))
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(shutdown.main(["stop", "--dry-run", "assembly/fix2"]), 0)
+            self.assertEqual(output.getvalue(), "fix2: would stop\n")
+            stop.reset_mock()
+            other = fixture_member("unit", name="assembly", parent=fixture_member("showrunner", name="cad").id)
+            _ = fixture_member("worker", name="fix2", parent=other.id)
+            with redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(shutdown.main(["stop", "assembly/fix2"]), 2)
+            self.assertEqual(errors.getvalue(), "shutdown: StaffRefused: assembly/fix2: several staff rows match: "
+                             + "cad/assembly/fix2, hana/assembly/fix2; use the full path or the staff id\n")
+            stop.assert_not_called()
+
+    def test_stop_gives_a_path_with_no_staff_row_to_the_session_stop(self) -> None:
+        """A native session name can contain a slash, such as review/x."""
+        with (patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning("review/x")) as stop,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(shutdown.main(["stop", "review/x"]), 0)
+        self.assertEqual(stop.call_args.args, ("review/x",))
+
     def test_remote_producer_exit_stops_on_mac_and_saves_the_hold(self) -> None:
         row = fixture_member("producer", name="alpha", worktree=staff.PresentWorktree("mac", self.root))
         mac_state = self.root / "mac-shutdown"
