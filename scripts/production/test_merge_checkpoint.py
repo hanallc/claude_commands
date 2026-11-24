@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.production import checkpoint_gate
 
 from scripts.agents import remote
@@ -124,7 +125,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         checkout = Path(__file__).resolve().parents[2]
         records = self.root / "worktree-records"
         config = self.root / "staff.conf"
-        _ = config.write_text((checkout / "config/staff.conf").read_text())
+        _ = copy_config_file_fixture(checkout / "config/staff.conf", config)
         self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config)})
         _ = self.git("remote", "set-head", "origin", "production")
         checkpoint = self.checkpoint()

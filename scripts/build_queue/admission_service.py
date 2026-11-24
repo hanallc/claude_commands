@@ -821,6 +821,7 @@ class ServiceState:
     bumps: person_actions.BumpProgress = field(default_factory=person_actions.BumpProgress)
     verify_run_slots: dict[str, VerifyRunSlot] = field(default_factory=dict, kw_only=True)
     held_places: tuple[records.HeldPlace, ...] = field(default=(), kw_only=True)
+    placement_replacements: dict[str, ReplayEntry] = field(default_factory=dict, kw_only=True)
 
 
 def saved_verify_run_slots(state: ServiceState) -> dict[str, VerifyRunSlot]:
@@ -1827,6 +1828,7 @@ class AdmissionServer:
         self.held_places: tuple[records.HeldPlace, ...] = ()
         self.build_history_generation: int = 0
         self.ledger: ReplayLedger = ReplayLedger({})
+        self.placement_replacements: ReplayLedger = ReplayLedger({})
         self.placement_requests: dict[str, wire.PlacementRequest] = {}
         self.placement_request_digests: dict[str, bytes] = {}
         self.input_event_count: int = 0
@@ -1970,6 +1972,7 @@ class AdmissionServer:
             self.reservations, self.places = state.reservations, state.places
             self.queue_pins = state.queue_pins
             self.ledger = ReplayLedger(state.ledger)
+            self.placement_replacements = ReplayLedger(state.placement_replacements)
             self.spacing, self.priority = state.spacing, state.priority
             self.bumps = state.bumps
             self.build_history_generation = state.build_history_generation
@@ -2059,8 +2062,9 @@ class AdmissionServer:
             if key not in protected_keys and entry.reservation not in live_reservations:
                 self.ledger[key] = replace(entry, ended_at=now)
         if not isinstance(self.last_usable_configuration, NoPass):
-            self.ledger.expire(now - self.last_usable_configuration.replay_retention_seconds,
-                               protected_keys, live_reservations)
+            replay_cutoff = now - self.last_usable_configuration.replay_retention_seconds
+            self.ledger.expire(replay_cutoff, protected_keys, live_reservations)
+            self.placement_replacements.expire(replay_cutoff, set(), set())
             self._prune_ended_placements(now - self.last_usable_configuration.ended_placement_seconds)
         if self.bumps.moves:
             active = self.reservations.keys() | self.placement_requests.keys() | {place.episode for place in self.places.values()}
@@ -2071,7 +2075,7 @@ class AdmissionServer:
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
             self.placement_requests, self.assignments, self.current_assignments, self.pending_cloud_groups,
             queue_pins=self.queue_pins, bumps=self.bumps, verify_run_slots=self.verify_run_slots,
-            held_places=self.held_places)
+            held_places=self.held_places, placement_replacements=self.placement_replacements)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         changed = False
 
@@ -2088,13 +2092,12 @@ class AdmissionServer:
         parts: list[tuple[str, str]] = []
         for member in fields(state):
             value = cast(object, getattr(state, member.name))
-            if member.name == "ledger":
-                previous = self.durable_encodings.get(("ledger", ""))
-                if previous is None or previous.value != self.ledger.revision:
+            if isinstance(value, ReplayLedger):
+                previous = self.durable_encodings.get((member.name, ""))
+                if previous is None or previous.value != value.revision:
                     changed = True
-                    previous = DurableRecordEncoding(self.ledger.revision,
-                        wire.encode_record(dict(self.ledger)), "")
-                encodings["ledger", ""] = previous
+                    previous = DurableRecordEncoding(value.revision, wire.encode_record(dict(value)), "")
+                encodings[member.name, ""] = previous
                 encoded_value = previous.encoded
             elif isinstance(value, dict):
                 records = (encoded_record(member.name, key, item)
@@ -2553,6 +2556,8 @@ class AdmissionServer:
         for episode in episodes:
             submitted = self.placement_requests.pop(episode, None)
             if submitted is not None:
+                key = self._placement_replacement_key(episode, submitted.owner)
+                self.placement_replacements[key] = ReplayEntry(refused, self.clock.now())
                 _ = self.placement_request_digests.pop(episode, None)
                 self._end_placement_rank(submitted)
             waiting = self.waiters.get(episode)
@@ -2564,6 +2569,10 @@ class AdmissionServer:
         self.parked_placements = [item for item in self.parked_placements if item not in parked]
         for item in parked:
             self._send(item.connection, refused)
+
+    @staticmethod
+    def _placement_replacement_key(episode: str, owner: placement.SubmittingOwner) -> str:
+        return "placement-replaced:" + json.dumps((episode, owner.host, owner.pid, owner.start_time))
 
     def _granted(self, run: wire.RunIdentity | wire.NoRun, step: RunStep) -> None:
         """Count a grant of the run. A new grant of its first step does not count again.
@@ -5526,6 +5535,12 @@ done
         if isinstance(request, (wire.PrerequisiteReport, wire.CancelPlacement)):
             submitted = self.placement_requests.get(request.episode)
             if submitted is None:
+                key = self._placement_replacement_key(request.episode, request.owner)
+                replay = self.placement_replacements.get(key)
+                config = self.last_usable_configuration
+                if (replay is not None and not isinstance(replay.ended_at, LiveGrant) and isinstance(config, records.MemoryConfig)
+                        and replay.ended_at > self.clock.now() - config.replay_retention_seconds):
+                    return [replay.reply]
                 return [wire.Refused(wire.PLACEMENT_REQUEST_MISSING_REASON)]
             if submitted.owner != request.owner:
                 return [wire.Refused("placement coordinator does not match")]
