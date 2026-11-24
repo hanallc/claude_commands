@@ -67,9 +67,9 @@ class AffectedModulesTests(unittest.TestCase):
         _ = self.git("commit", "--allow-empty", "-m", "fixture")
         return self.git("rev-parse", "HEAD")
 
-    def certify(self) -> None:
+    def certify(self, *, run: dict[str, object] | None = None) -> None:
         self.base = affected.CertifiedBase(self.commit(), datetime.now(UTC).isoformat())
-        self.record_configs({})
+        self.record_history(self.config_gate({}) if run is None else run)
 
     def config_gate(self, reads: dict[str, list[str]]) -> dict[str, object]:
         modules = [{"suite": path.parent.name, "module": path.name, "attempt": 1,
@@ -445,6 +445,21 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertEqual(published, history)
         self.assertEqual(affected.latest_module_reads(), history)
 
+    def test_missing_local_snapshot_with_a_legacy_mac_snapshot_requests_every_module(self) -> None:
+        self.write("config/limits.conf", "value=one\n")
+        self.add_test("checks/test_reader.py", "VALUE = 1\n")
+        self.certify()
+        gate_record.latest_module_reads_path(store.host_name()).unlink()
+        mac_run = {**self.config_gate({"test_reader.py": ["tools"]}),
+                   "id": "Mac-20261101T000000-000000", "host": "Mac"}
+        self.record_history(mac_run, host="Mac")
+        mac_path = gate_record.latest_module_reads_path("Mac")
+        _ = mac_path.replace(store.root() / gate_record.LATEST_MODULE_READS_NAME)
+        self.write("config/limits.conf", "value=two\n")
+
+        result = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo))
+        self.assertEqual(result, affected.FullSuite("local module read snapshot unavailable"))
+
     def test_missing_empty_or_corrupt_local_snapshot_requests_every_module(self) -> None:
         self.add_test("checks/test_dynamic.py", "VALUE = 1\n")
         self.certify()
@@ -600,20 +615,18 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertEqual(result.modules, (self.repo / "scripts/buildlog/test_machine_facts.py",))
 
     def test_recorded_content_reads_select_a_test_whose_module_embeds_a_changed_source(self) -> None:
-        # Red 3 of item 191: gate_box.GUEST embeds the startup hook source through inspect.getsource.
+        # Item 191, case 3. gate_box.GUEST uses inspect.getsource to embed the startup hook.
         self.write("scripts/lib/sitecustomize.py", "NAME = 'gate'\n")
         # A computed module name keeps the import graph from selecting the test.
         self.write("scripts/aws_target/gate_box.py", "import importlib\nimport inspect\nHOOK = 'site' + 'customize'\n"
                    + "GUEST = inspect.getsource(importlib.import_module(f'scripts.lib.{HOOK}'))\n")
         self.add_test("aws_target/test_gate_box.py", "from scripts.aws_target import gate_box\n")
-        self.certify()
-        log = self.repo / ".git/buildlog/mac/fixture.jsonl"
-        run = cast(dict[str, object], json.loads(log.read_text()))
+        run = self.config_gate({})
         for row in cast(list[dict[str, object]], run["modules"]):
             row["folder_scans"] = []
             row["content_reads"] = (["scripts/lib/sitecustomize.py", "scripts/aws_target/gate_box.py"]
                                     if row["module"] == "test_gate_box.py" else [])
-        _ = log.write_text(json.dumps(run) + "\n")
+        self.certify(run=run)
         self.write("scripts/lib/sitecustomize.py", "NAME = 'merge_gate'\n")
         _ = self.commit()
         self.assertEqual(self.selection().modules, (self.repo / "scripts/aws_target/test_gate_box.py",))
