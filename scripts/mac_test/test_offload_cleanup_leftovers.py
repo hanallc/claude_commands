@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import redirect_stderr
 import io
 import json
@@ -37,6 +37,39 @@ class OffloadCommandTests(SeededCleanupFixture):
                 self.assertEqual(result, offload.ReportedMacStatus(42, offload.CleanupSkipped()))
                 self.assertIsInstance(controller.pending, offload.PendingStartOperation)
                 self.assertEqual(stderr.getvalue(), f"mac_test: the remote start fence {reason}\n")
+
+        # The direct runner checks the fence in a separate SSH call after the verdict.
+        self.fixture["run_status_line"] = "mac_exit=42"
+        self.fixture["run_cleanup_line"] = "mac_cleanup=skipped"
+        self.sync_fixture()
+        stream = offload.ProcessController.stream_mac_run
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        final_checks: list[object] = []
+
+        def remote_run(controller: offload.ProcessController, arguments: Sequence[str],
+                       cleanup_limit: offload.CleanupAfterVerdict | offload.CleanupOnly
+                       | offload.NoCommandTimeLimit = offload.NO_COMMAND_TIME_LIMIT) -> offload.RemoteRunStatus:
+            if not arguments[-1].endswith('exec 8<&-\nexit "$dispatch_status"'):
+                return stream(controller, arguments, cleanup_limit)
+            self.assertNotIn("fence_holders", arguments[-1])
+            lines = "mac_exit=42\nmac_cleanup=skipped\n"
+            return stream(controller, ["/bin/sh", "-c", 'printf "%s" "$1"', "fence", lines], cleanup_limit)
+
+        def ssh(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            script = arguments[-1]
+            if arguments[0] == "ssh" and "dispatch_start_settled=" in script and "fence_holders" in script:
+                final_checks.append(options.get("timeout"))
+                raise subprocess.TimeoutExpired(arguments, float(self.config["leftover_timeout_s"]), output=b"")
+            return run(arguments, **options)
+
+        with mock.patch.object(offload.ProcessController, "stream_mac_run", remote_run), \
+             mock.patch.object(subprocess, "run", side_effect=ssh):
+            result = self.command("--no-fail-fast", direct_placement=True, separate_stderr=True)
+        self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
+        self.assertEqual(final_checks, [float(self.config["leftover_timeout_s"])])
+        self.assertIn("the remote start fence gave no answer", result.stderr)
+        self.assert_wire("failed", "")
+        self.assertEqual(self.remote_claim()["remote_host"], "mac")
 
     def command_with_changed_cleanup_timeout(self, value: str) -> subprocess.CompletedProcess[str]:
         self.config["leftover_timeout_s"] = "10"

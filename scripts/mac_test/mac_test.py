@@ -2675,15 +2675,13 @@ def release_exact_claims(
                     fence = (offload.start_fence_relative(identity, paths.target, scope_key=scope_key).with_suffix(".lock")
                              if fence_pending and paths.platform == "macos" else None)
                     slot = record.get("slot", 0) or 1
-                    command = (offload.leftover_check_script(mirror, paths.target, slot, fence=fence,
-                                                           holder_timeout_s=connection.leftover_timeout_s) if fence is not None
-                               else offload.leftover_check_script(mirror, paths.target, slot)) + "\n"
+                    command = (offload.leftover_check_script(mirror, paths.target, slot, fence=fence)
+                               if fence is not None else offload.leftover_check_script(mirror, paths.target, slot)) + "\n"
                 else:
                     command = ""
                 if fence_pending:
-                    command += offload.start_fence_command(identity, paths.target, settle=True,
-                                                         scope_key=scope_key,
-                                                         holder_timeout_s=connection.leftover_timeout_s) + "\n"
+                    command += offload.start_fence_command(identity, paths.target, settle=True, scope_key=scope_key,
+                                                         report_holders=True) + "\n"
                 if isinstance(remote_work, KeepRemoteWork):
                     command += "printf 'leftovers=0\\nrc=0\\n'\n"
                 observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target,

@@ -469,17 +469,20 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   The claim watcher's activity check uses scope `ALL_MIRRORS`.
   The command selector uses `pgrep` for mirror command paths.
   The working-directory selector uses `lsof` and `awk`.
-  Mac cleanup also selects processes with the exact start fence file open on descriptor 8.
-  It excludes the processes that do the check.
-  The holder check uses `leftover_timeout_s`.
+  Mac cleanup counts processes with the exact start fence file open on descriptor 8.
+  Only the mirror command and working-directory selectors supply PIDs to TERM and KILL.
   A held fence keeps the claim.
-  The refusal lists each holder's PID and command when `lsof` identifies the holders.
-  If the fence is held and the check gives no answer, the refusal says so.
+  When the holder check succeeds, the release, watcher, and runner report each holder's PID and command.
+  When the holder check gives no answer, they report the failed check.
   A `KnownRepository` scope stops both patterns at the repository boundary.
   `extended_regex_literal` escapes the repository name.
   Thus a lost hana run does not stop a cargo-liner run or a run under `mirror/hana_other`.
   Cleanup sends TERM, then KILL, then counts again.
-  Its SSH call uses `leftover_timeout_s` from `OffloadConfig`.
+  The cleanup SSH call uses `leftover_timeout_s`.
+  After the remote command closes the fence descriptor, the Mac runner checks the fence in a separate SSH call.
+  The runner reads the current `leftover_timeout_s` before this call.
+  An SSH timeout gives no fence answer and keeps the claim.
+  The runner preserves the test verdict.
   Each routed Mac command uses that limit from the time it receives the verdict.
   A separate cleanup stream starts the limit before it starts SSH.
   It returns `LeftoversEnded`, `LeftoversRemain`, or `LeftoverCheckFailed`.

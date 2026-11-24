@@ -555,18 +555,14 @@ def start_fence_relative(identity: claim_state.ClaimIdentity, target: str, *, sc
 
 FENCE_HOLDER_PROGRAM = '''import os, subprocess
 
-def fence_holders(path, timeout):
+def fence_holders(path):
     try:
         path.stat()
     except FileNotFoundError:
         return {}
     arguments = ["lsof", "-n", "-P", "-a", "-u", str(os.getuid()), "-d", "8", "-F0pc", str(path)]
     with subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as probe:
-        try:
-            output, errors = probe.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired as error:
-            probe.kill()
-            raise OSError("lsof timed out while inspecting the start fence") from error
+        output, errors = probe.communicate()
         if probe.returncode == 1 and not output and not errors:
             return {}
         if probe.returncode != 0 or errors:
@@ -639,7 +635,7 @@ base.with_suffix(".lock").touch()
 
 
 def start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, settle: bool = False,
-                        scope_key: str = "run", holder_timeout_s: float | None = None) -> str:
+                        scope_key: str = "run", report_holders: bool = False) -> str:
     """Use the prepared identity without permitting recreation after release."""
     key = pending_start_key(identity)
     relative = str(start_fence_relative(identity, target, scope_key=scope_key))
@@ -648,9 +644,9 @@ def start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, set
         mac = target in ("", "mac") or target_config.uses_legacy_mac_layout(
             eligibility.configured_ssh_target(target).platform)
         pending_marker = "dispatch_start_pending_mac=" if mac else "dispatch_start_pending="
-        check_holders = mac and holder_timeout_s is not None
+        check_holders = mac and report_holders
         holders = '''        try:
-            for pid, command in fence_holders(path, float(sys.argv[4])).items():
+            for pid, command in fence_holders(path).items():
                 print("dispatch_start_holder=" + sys.argv[2] + " " + pid.decode() + " " + command, flush=True)
         except OSError:
             pass
@@ -673,7 +669,7 @@ with lock:
     path.unlink(missing_ok=True)
     print("dispatch_start_settled=" + sys.argv[2], flush=True)
 '''
-        return shlex.join(["python3", "-c", program, encoded, key, pending_marker, str(holder_timeout_s)])
+        return shlex.join(["python3", "-c", program, encoded, key, pending_marker])
     program = '''import fcntl, os, pathlib, sys
 base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
 fcntl.flock(8, fcntl.LOCK_EX)
@@ -695,14 +691,15 @@ if not matches:
 
 
 def fenced_start_command(identity: claim_state.ClaimIdentity, target: str, command: str, *,
-                         scope_key: str = "run", holder_timeout_s: float | None = None) -> str:
-    """Remove the prepared identity after the existing remote command ends."""
+                         scope_key: str = "run", defer_settle: bool = False) -> str:
+    """Close the start fence after the remote command ends."""
+    settle = "" if defer_settle else start_fence_command(identity, target, settle=True, scope_key=scope_key) + "\n"
     return (start_fence_command(identity, target, scope_key=scope_key)
             + clean_start_fences_command(identity, target, scope_key=scope_key) + " || exit 75\n"
             + "(\n" + command + "\n)\n"
             + "dispatch_status=$?\nexec 8<&-\n"
-            + start_fence_command(identity, target, settle=True, scope_key=scope_key, holder_timeout_s=holder_timeout_s)
-            + '\nexit "$dispatch_status"')
+            + settle
+            + 'exit "$dispatch_status"')
 
 
 @dataclass(frozen=True)
@@ -2666,8 +2663,7 @@ def extended_regex_literal(text: str) -> str:
     )
 
 
-def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 1, *,
-                           fence: Path | None = None, holder_timeout_s: float | None = None) -> str:
+def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 1) -> str:
     """Define select_leftovers: the user's processes running from the scoped mirrors.
 
     A repository's scope stops at its own mirror. Brackets around the first character prevent the pattern from matching its assignment.
@@ -2687,20 +2683,6 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
     else:
         command_pattern = f"{mirror}/"
         cwd_pattern = f"^n.*/{mirror}(/|$)"
-    fence_selector = "    fence_pids=\n"
-    if fence is not None:
-        if holder_timeout_s is None:
-            raise ValueError("A fence holder check requires the cleanup limit")
-        program = FENCE_HOLDER_PROGRAM + '''import pathlib, sys
-path = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
-try:
-    for pid in fence_holders(path, float(sys.argv[2])):
-        print(pid.decode())
-except OSError as error:
-    sys.exit(str(error))
-'''
-        command = shlex.join(["python3", "-c", program, str(fence).encode().hex(), str(holder_timeout_s)])
-        fence_selector = f"    fence_pids=$({command}) || return 1\n"
     return (
         f"mirror_command_pattern={shlex.quote(command_pattern)}\n"
         + f"mirror_cwd_pattern={shlex.quote(cwd_pattern)}\n"
@@ -2713,24 +2695,17 @@ except OSError as error:
     fi
     cwd_records=$(lsof -a -u "$(id -u)" -d cwd -Fpn) || return 1
     cwd_pids=$(printf '%s\n' "$cwd_records" | awk -v pattern="$mirror_cwd_pattern" '/^p/ { pid = substr($0, 2) } $0 ~ pattern { print pid }') || return 1
-''' + fence_selector + r'''    printf '%s\n%s\n%s\n' "$command_pids" "$cwd_pids" "$fence_pids" | awk '/^[0-9]+$/ && !seen[$0]++ { print }'
+    printf '%s\n%s\n' "$command_pids" "$cwd_pids" | awk '/^[0-9]+$/ && !seen[$0]++ { print }'
 }
 '''
     )
 
 
 def leftover_check_script(repository: MirrorScope, target: str = "mac", slot: int = 1, *,
-                          fence: Path | None = None, holder_timeout_s: float | None = None) -> str:
-    selector = (mirror_selector_script(repository, target, slot, fence=fence, holder_timeout_s=holder_timeout_s)
-                if fence is not None
-                else mirror_selector_script(repository, target, slot))
-    if isinstance(repository, AllMirrors):
-        return selector + r'''
-leftover_pids=$(select_leftovers) || exit "$?"
-leftover_count=$(printf '%s\n' "$leftover_pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
-printf 'leftovers=%s\nrc=0\n' "$leftover_count"
-'''
-    return selector + r'''
+                          fence: Path | None = None) -> str:
+    script = mirror_selector_script(repository, target, slot)
+    if isinstance(repository, KnownRepository):
+        script += r'''
 leftover_pids=$(select_leftovers) || exit "$?"
 printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
     [ -n "$leftover_pid" ] && kill "$leftover_pid" 2>/dev/null
@@ -2740,8 +2715,22 @@ leftover_pids=$(select_leftovers) || exit "$?"
 printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
     [ -n "$leftover_pid" ] && kill -9 "$leftover_pid" 2>/dev/null
 done
-leftover_pids=$(select_leftovers) || exit "$?"
-leftover_count=$(printf '%s\n' "$leftover_pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
+'''
+    script += 'leftover_pids=$(select_leftovers) || exit "$?"\n'
+    if fence is not None:
+        program = FENCE_HOLDER_PROGRAM + '''import pathlib, sys
+path = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
+try:
+    for pid in fence_holders(path):
+        print(pid.decode())
+except OSError as error:
+    sys.exit(str(error))
+'''
+        command = shlex.join(["python3", "-c", program, str(fence).encode().hex()])
+        script += f"fence_pids=$({command}) || exit 1\n"
+        script += r'''leftover_pids=$(printf '%s\n%s\n' "$leftover_pids" "$fence_pids" | awk '/^[0-9]+$/ && !seen[$0]++ { print }') || exit 1
+'''
+    return script + r'''leftover_count=$(printf '%s\n' "$leftover_pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
 printf 'leftovers=%s\nrc=0\n' "$leftover_count"
 '''
 
@@ -2786,10 +2775,8 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
             check=False,
             timeout=timeout,
         )
-    except subprocess.TimeoutExpired as error:
-        output = error.stdout or b""
-        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check timed out after {timeout:g} s"),
-                                   output.decode(errors="replace"))
+    except subprocess.TimeoutExpired:
+        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check timed out after {timeout:g} s"), "")
     except OSError:
         return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check could not start (time limit {timeout:g} s)"), "")
     ledger = transfer_bytes.active_transfers.get()
@@ -2812,12 +2799,12 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
 def check_leftovers(config: SshConnectionSettings, host: str, repository: MirrorScope,
                    target: str = "mac", slot: int = 1, *, fence: Path | None = None) -> LeftoverCheckResult:
     """End and count one mirror's work on its recorded host."""
-    script = leftover_check_script(repository, target, slot, fence=fence, holder_timeout_s=config.leftover_timeout_s)
+    script = leftover_check_script(repository, target, slot, fence=fence)
     return read_leftovers(config, host, script, target).result
 
 
 def settle_pending_start(controller: ProcessController, config: OffloadConfig, host: str,
-                         repository: MirrorScope, target: str = "mac", slot: int = 1
+                         repository: MirrorScope, target: str = "mac", slot: int = 1, *, check_work: bool = True,
                          ) -> StartSettled | StartUnsettled:
     """Keep the claim until the remote fence prevents a delayed start."""
     identity = controller.claim_identity
@@ -2828,11 +2815,13 @@ def settle_pending_start(controller: ProcessController, config: OffloadConfig, h
     except (OSError, ValueError) as error:
         return StartUnsettled(str(error), LeftoverCheckFailed(f"cleanup settings unavailable: {error}"))
     scope_key = controller.claim_scope_key
-    fence = start_fence_relative(identity, target, scope_key=scope_key).with_suffix(".lock")
-    command = (start_fence_command(identity, target, settle=True, scope_key=scope_key,
-                                  holder_timeout_s=connection.leftover_timeout_s) + " || exit 1\n"
-               + leftover_check_script(repository, target, slot, fence=fence,
-                                       holder_timeout_s=connection.leftover_timeout_s))
+    command = start_fence_command(identity, target, settle=True, scope_key=scope_key, report_holders=True) + " || exit 1\n"
+    if check_work:
+        mac = target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform)
+        fence = start_fence_relative(identity, target, scope_key=scope_key).with_suffix(".lock") if mac else None
+        command += leftover_check_script(repository, target, slot, fence=fence)
+    else:
+        command += "printf 'leftovers=0\\nrc=0\\n'\n"
     observed = read_leftovers(connection, host, command, target)
     reason = start_fence_reason(identity, observed.output)
     if reason is not None:
@@ -2988,6 +2977,7 @@ def claimed_run(
     release_allowed = True
     sync_after_release = False
     fence: Path | None = None
+    pending_path: Path | None = None
     evidence = controller.attempt_evidence
     evidence.slot = request.slot
     try:
@@ -3114,10 +3104,11 @@ def claimed_run(
         identity = controller.claim_identity
         if not linux and isinstance(identity, claim_state.ClaimIdentity):
             fence = start_fence_relative(identity, request.target, scope_key=controller.claim_scope_key).with_suffix(".lock")
+            pending_path = pending_start_path(request.target, identity, scope_key=controller.claim_scope_key)
         command = copies.remote_use_command(request_mirror(config, request, repository), step_command)
         if isinstance(identity, claim_state.ClaimIdentity):
             command = fenced_start_command(identity, request.target, command, scope_key=controller.claim_scope_key,
-                                           holder_timeout_s=config.leftover_timeout_s)
+                                           defer_settle=not linux)
         arguments = [*ssh_prefix(config), command]
         remote_status = (controller.stream_mac_run(arguments, CleanupAfterVerdict(config.leftover_timeout_s))
                          if routed_mac_command else controller.stream_mac_run(arguments))
@@ -3150,6 +3141,8 @@ def claimed_run(
             detail = (remote_status.detail if isinstance(remote_status, MissingMacStatus)
                       else "runner sent no final status")
             return LostMacRun(elapsed_seconds(started), detail)
+        if pending_path is not None and pending_path.exists():
+            controller.pending = PendingStartOperation()
         if not linux:
             eligibility.linux_version_decline_path(request.target, repository.name).unlink(missing_ok=True)
         setup_failed = (isinstance(remote_status, MacNextestSetupFailed)
@@ -3161,22 +3154,32 @@ def claimed_run(
             arguments = [*ssh_prefix(config),
                 copies.remote_use_command(request_mirror(config, request, repository),
                     f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository))]
-            cleanup = (controller.stream_mac_run(arguments, CleanupOnly(config.leftover_timeout_s))
-                       if routed_mac_command else controller.stream_mac_run(arguments))
+            pending_start = controller.pending
+            try:
+                cleanup = (controller.stream_mac_run(arguments, CleanupOnly(config.leftover_timeout_s))
+                           if routed_mac_command else controller.stream_mac_run(arguments))
+            finally:
+                if isinstance(pending_start, PendingStartOperation):
+                    controller.pending = pending_start
             remote_status = replace(remote_status, cleanup=(
                 cleanup.cleanup if isinstance(cleanup, (ReportedMacStatus, MissingMacStatus)) else CleanupUnconfirmed()))
         evidence.completion = "confirmed"
         report_cleanup(remote_status.cleanup, request.target,
                        path=f"~/{mirror_target(repository, request.target, request.slot)}",
                        free_floor_gib=config.free_floor_gib)
-        if isinstance(remote_status.cleanup, CleanupUnconfirmed):
-            if fence is not None and isinstance(controller.pending, PendingStartOperation):
-                settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
-                checked = settlement.leftovers
-                release_allowed = isinstance(settlement, StartSettled)
-            else:
-                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot, fence=fence)
-                release_allowed = isinstance(checked, LeftoversEnded)
+        if not isinstance(remote_status.cleanup, CleanupStreamTimedOut) and fence is not None and isinstance(
+            controller.pending, PendingStartOperation
+        ):
+            settlement = settle_pending_start(
+                controller, config, config.host, repository, request.target, request.slot,
+                check_work=isinstance(remote_status.cleanup, CleanupUnconfirmed),
+            )
+            release_allowed = isinstance(settlement, StartSettled)
+            observe_cleanup(evidence, settlement.leftovers)
+            report_leftover_check(settlement.leftovers, request)
+        elif isinstance(remote_status.cleanup, CleanupUnconfirmed):
+            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot, fence=fence)
+            release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
         elif not isinstance(remote_status.cleanup, CleanupStreamTimedOut):
