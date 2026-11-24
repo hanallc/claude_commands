@@ -1085,24 +1085,28 @@ class LocalReviewTests(unittest.TestCase):
                          (entry.id, "session-1", push_texts.fingerprint(entry)))
         self.assertIsNotNone(datetime.fromisoformat(ask["time"]).tzinfo)
 
-    def test_texts_ask_and_approval_review_show_a_one_line_text_as_posted(self) -> None:
-        entry = push_texts.PushText("test", "script", "note", "codex1 has {left} left", push_texts.NoActionNeeded(), "",
+    def test_texts_ask_and_approval_review_show_text_as_posted(self) -> None:
+        one_line = push_texts.PushText("test", "script", "note", "codex1 has {left} left", push_texts.NoActionNeeded(), "",
             (push_texts.PushExample("typical", {"left": "1%"}),), purpose="Test.", one_line=True)
-        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
-              mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2", "CLAUDE_CODE_SESSION_ID": "session-1"}),
-              redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(review.main(["texts", "--ask", "--id", entry.id]), 0)
-        self.assertEqual(output.getvalue(), "test/typical\nTitle: none (the phone shows the app name)\ncodex1 has 1% left\n")
-        reviewed: list[review.Draft] = []
-
-        def judge(draft: review.Draft, *_args: object, **_kwargs: object) -> review.ReviewOutcome:
-            reviewed.append(draft)
-            return review.Unreviewed("fixture")
-
-        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
-              mock.patch.object(review, "_review", side_effect=judge), redirect_stdout(io.StringIO())):
-            _ = review.texts(["test"], approve=False)
-        self.assertEqual([(draft.title, draft.body) for draft in reviewed], [("", "codex1 has 1% left")])
+        no_header = push_texts.PushText("test", "script", "note", "Nightly check failed", push_texts.NoActionNeeded(),
+            "Fix assigned to: {unit}.", (push_texts.PushExample("typical", {"unit": "staff"}),),
+            purpose="Test.", header=False)
+        for entry, ask_title, title, body in (
+                (one_line, "none (the phone shows the app name)", "", "codex1 has 1% left"),
+                (no_header, "Nightly check failed", "Nightly check failed", "Fix assigned to: staff.")):
+            with self.subTest(title=ask_title), mock.patch.object(push_texts, "catalog", return_value=(entry,)):
+                with (mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2", "CLAUDE_CODE_SESSION_ID": "session-1"}),
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(review.main(["texts", "--ask", "--id", entry.id]), 0)
+                self.assertEqual(output.getvalue(), f"test/typical\nTitle: {ask_title}\n{body}\n")
+                with (mock.patch.object(review, "_review", return_value=review.Unreviewed("fixture")) as judge,
+                      redirect_stdout(io.StringIO()) as output):
+                    _ = review.texts(["test"], approve=False)
+                judge.assert_called_once()
+                draft = cast(review.Draft, judge.call_args.args[0])
+                self.assertEqual((draft.title, draft.body), (title, body))
+                title_line = f"{title}\n" if title else ""
+                self.assertEqual(output.getvalue(), f"test/typical unreviewed: fixture; failed rules: none\n{title_line}{body}\n")
 
     def test_texts_ask_clears_the_previous_request_if_the_save_fails(self) -> None:
         entry = push_texts.PushText("test", "script", "note", "Finished", push_texts.NoActionNeeded(),
@@ -1259,6 +1263,10 @@ class LocalReviewTests(unittest.TestCase):
         self.assertIn("Title: {sender}: {session} waits for your go\nSession: {session}\n", shown)
         self.assertIn("Example (typical):\nTitle: natedev: trunk waits for your go\nSession: trunk\n", shown)
         self.assertNotIn("{", shown.split("Example (typical):")[1])
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(review.main(["show", "shutdown.restart_failed"]), 0)
+        self.assertTrue(output.getvalue().endswith("Example (typical):\nTitle: trunk did not start on claude4\n"
+            + "Action: In the natedev session, run: /agents resume trunk --to claude4\n"))
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(review.main(["show", "no.such"]), 1)
         self.assertEqual(output.getvalue(), f"No template named no.such.\n\n{listing}\n")

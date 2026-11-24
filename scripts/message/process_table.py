@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read the machine's process table and identify running Codex agents."""
+"""Read the process table and find named processes."""
 
 from __future__ import annotations
 
@@ -48,10 +48,3 @@ def nearest_named(
         seen.add(current.pid)
         current = table.get(current.parent)
     return None
-
-
-def is_codex_agent(process: Process) -> bool:
-    words = process.arguments.split()
-    if process.command == "codex":
-        return words[1:2] == ["exec"]
-    return False
