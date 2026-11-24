@@ -69,7 +69,7 @@ def ask(store: QuestionStore, target: change_page.QuestionDeliveryTarget,
             return change_page.question_envelope(page, record)
         if isinstance(previous, QuestionAttempt):
             same_list_slot = (target.initial_recipient is not question_record.DefaultQuestionRecipient.PAGE
-                              and replace(previous.source, words=words) == saved.source)
+                              and saved.source.matches_attempt(replace(previous.source, words=words)))
             unsaved_draft = (new_question and previous.state is QuestionSendState.PREPARED
                              and not previous.earlier_unconfirmed
                              and (previous.message_id == prepared.message_id or same_list_slot))

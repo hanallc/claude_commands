@@ -1591,6 +1591,12 @@ Older Closed records stay in the store in their original format.
 Question delivery checks the current List record under the same lock that Close uses.
 List, Images, and Review use the same send loop.
 The loop checks the saved source and recipient before each attempt.
+New List attempts save the keeper and the resolved item path.
+The sender checks that the keeper's item still resolves to that path.
+An older attempt can name the keeper only in its saved answer command.
+The sender checks that this keeper's item resolves to the saved path.
+For a command without `--keeper`, the sender can use the recipient, the source path, or Morty to locate the keeper.
+Recovery sends the original command.
 A close preserves the delivery result of a send already in progress.
 The sender checks the item again before it sends a failure alert.
 A read error during retry authorization preserves the confirmed failure and reports the read error separately.
@@ -1650,7 +1656,7 @@ The picker can resend the original request and instant after the parking time pa
 When the saved date has passed, the picker gives focus to an enabled day.
 The page keeps the words for Tell.
 **Unpark** clears parking through `the_list.unpark` and keeps the item state.
-It records one Unparked event and saves one notice for the item's producer.
+It records one Unparked event and saves one notice for the record keeper.
 If the item has no active parking time, the writer saves only a hidden request receipt.
 The receipt records whether the time expired or was absent.
 A replay of that request preserves any newer parking time.
@@ -1667,7 +1673,7 @@ If All is active when Unpark saves, the item dialog stays open.
 After Unpark, the item's saved state sets its status chip.
 After Park or Unpark saves, the List refreshes the server order even while the item waits for an answer.
 
-The CLI commands `park`, `close`, and `reopen` use morty's folder.
+The CLI commands `park`, `unpark`, `close`, and `reopen` use morty's folder.
 The item's producer can run `the_list.py park --id L<N> --until delivered --source "<nate's words>"`.
 Morty can use `--source morty` to set this condition.
 The List ends this park automatically when the producer sets the item state to Delivered.
@@ -1676,7 +1682,7 @@ Linked changes supply review information on the List.
 The List shows historical Unparked events that name a linked change.
 The unread delivery release returns to Needs me with its review links.
 After Mark read, an open question returns the item to Producer answering.
-A dated park remains active until its time or an explicit Unpark.
+A dated park stays active until its time, Unpark, or Close.
 The shared item writer saves the action and its pending notice in one locked write.
 The notice tells its recipient which action nate completed.
 A Go next-step notice names the item's producer as its recipient.
@@ -1720,7 +1726,8 @@ The page can mark an item read, close it, park it, unpark it, or append feedback
 The page uses signed forms and rejects invalid fields or tokens with HTTP 400.
 The List record saves the request ID, action, and words with each change in one locked write.
 The same write saves the pending notice and its recipient for actions that send a notice.
-The recipient is the producer named when the page renders the form.
+For Tell, the recipient is the producer named when the page renders the form.
+For Remove, Park, and Unpark, the recipient is the record keeper.
 For a Mark read notice, the recipient is the item's producer when the notice saves.
 Under the lock, each action checks the request ID against the saved actions.
 A retry changes no item fields and saves no second notice.
