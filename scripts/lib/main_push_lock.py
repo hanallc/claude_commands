@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
 import fcntl
 import json
 import os
@@ -69,35 +68,12 @@ def _acquired_at(line: str) -> float:
     return float(value) if isinstance(value, (int, float)) else 0.0
 
 
-@dataclass
-class LockWaitBudget:
-    """Limit the total time spent acquiring a lock across a series of calls."""
-
-    remaining_seconds: float
-
-    def acquire(self, descriptor: int) -> None:
-        deadline = time.monotonic() + self.remaining_seconds
-        try:
-            while True:
-                try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    return
-                except BlockingIOError:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise
-                    time.sleep(min(0.05, remaining))
-        finally:
-            self.remaining_seconds = max(0.0, deadline - time.monotonic())
-
-
 @contextmanager
-def main_push_lock(checkout: Path, holder: str = "", *, wait: bool | LockWaitBudget = True) -> Generator[None]:
+def main_push_lock(checkout: Path, holder: str = "", *, wait: bool = True) -> Generator[None]:
     """Hold the repository lock or use an active hold for this process.
 
     `holder` names the hold in the record; the default is the program name.
-    With wait=False, a busy lock raises BlockingIOError immediately.
-    A wait budget retries a busy lock until its time expires.
+    With wait=False, a lock held by another process raises BlockingIOError.
     """
     path = _lock_path(checkout)
     if path in _HELD_LOCKS:
@@ -114,10 +90,7 @@ def main_push_lock(checkout: Path, holder: str = "", *, wait: bool | LockWaitBud
         return
     with Path(path).open("a") as lock:
         asked = time.monotonic()
-        if isinstance(wait, LockWaitBudget):
-            wait.acquire(lock.fileno())
-        else:
-            fcntl.flock(lock, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
         _HELD_LOCKS.add(path)
         started = time.monotonic()
         acquired_at = time.time()

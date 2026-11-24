@@ -460,12 +460,10 @@ Each local Promote checkout must exist before the command pushes.
   A write commits only the list when the list is in a Git worktree.
   It never pushes the commit or changes another staged file.
   Commits share the vault's main push lock with the other Git writers.
-  The `lock_wait_seconds` setting in `config/change_review.conf` limits direct vault lock waits across one readiness scan.
-  Waits for the list directory lock and other locks are outside this budget.
-  After the budget expires, the scan can still acquire a free vault lock.
+  At the end of a readiness scan, the scan tries the vault lock once per list without waiting.
+  If the lock is busy, the list stays uncommitted. The next scan tries again.
   The scan reports each unresolved list and its commit errors in one warning at the end.
   The warning counts new writes separately from attempts to commit existing content.
-  A later successful commit of a list clears its earlier failures in that scan.
   Other list writes report a commit failure immediately.
   The next successful commit saves the complete list.
   The vault's Templater must exclude the change-review folder to prevent concurrent changes to new lists.

@@ -18,7 +18,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Generator
@@ -34,7 +33,7 @@ from scripts.lib import conf, copy_record, file_lock, main_push_lock, session_fo
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.lib.git_test_support import fixture_git_environment
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment
 from scripts.production import (
     showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config, unit_lookup,
 )
@@ -3987,14 +3986,10 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         self.assertIn("| C1 | A |", outside.read_text(encoding="utf-8"))
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
 
-    def ready_arguments(self, *, wait_seconds: int, names: tuple[str, ...] = ("First", "Second")) -> tuple[str, ...]:
+    def ready_arguments(self, *, names: tuple[str, ...] = ("First", "Second")) -> tuple[str, ...]:
         self.path = self.path.with_name("change-review - commit-scan.md")
         _ = self.enterContext(isolated_staff_file(self.repo.parent / "staff.json", {}))
-        self.enterContext(mock.patch.dict(os.environ, {
-            **config_environment(self.repo.parent / "fixture-config"),
-            "CHANGE_REVIEW_DIR": str(self.path.parent),
-        }))
-        _ = write_config_fixture(conf.path("change_review"), f"lock_wait_seconds={wait_seconds}\n")
+        self.enterContext(mock.patch.dict(os.environ, {"CHANGE_REVIEW_DIR": str(self.path.parent)}))
         source, _, _ = origin_commits(self.repo.parent)
         production = self.repo.parent / "production.md"
         _ = production.write_text(f"# Scan fixture\n- **Showrunner checkout:** `{source}`\n"
@@ -4033,106 +4028,64 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
             yield finish
 
     def test_list_ready_reports_uncommitted_writes_once_while_the_vault_lock_is_held(self) -> None:
-        arguments = self.ready_arguments(wait_seconds=0)
+        arguments = self.ready_arguments()
         with self.hold_vault_lock() as release:
             code, output, error = run(*arguments)
             self.assertEqual(code, 0)
             self.assertEqual(output.count("| C"), 2)
             self.assertEqual(len(error.splitlines()), 1, error)
-            self.assertIn("2 new list write(s) not committed", error)
+            self.assertIn("2 new list write(s) not committed. 1 unresolved commit attempt(s)", error)
             self.assertIn(self.path.name, error)
             self.assertIn(os.strerror(errno.EAGAIN), error)
             self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
             code, output, error = run(*arguments)
             self.assertEqual((code, output), (0, ""))
             self.assertEqual(len(error.splitlines()), 1, error)
-            self.assertIn("0 new list write(s) not committed. 2 unresolved commit attempt(s)", error)
+            self.assertIn("0 new list write(s) not committed. 1 unresolved commit attempt(s)", error)
+            release()
+
+    def test_list_ready_commits_after_agent_notes_releases_the_vault_lock(self) -> None:
+        arguments = self.ready_arguments()
+        with self.hold_vault_lock() as release:
+            code, output, error = run(*arguments)
+            self.assertEqual(code, 0)
+            self.assertEqual(output.count("| C"), 2)
+            self.assertEqual(len(error.splitlines()), 1, error)
+            self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
             release()
         self.assertEqual(run(*arguments), (0, "", ""))
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "2")
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertEqual([row["Change"] for row in change_review.pending(self.path)], ["First", "Second"])
 
-    def test_list_ready_commits_after_agent_notes_releases_the_vault_lock(self) -> None:
-        arguments = self.ready_arguments(wait_seconds=1)
-        with self.hold_vault_lock() as release:
-            lock = (self.repo / ".git" / "main-push.lock").stat()
-            real_flock = fcntl.flock
-            blocked = False
-
-            def release_on_contention(descriptor: int, operation: int) -> None:
-                nonlocal blocked
-                try:
-                    real_flock(descriptor, operation)
-                except BlockingIOError:
-                    if not blocked and os.path.samestat(os.fstat(descriptor), lock):
-                        blocked = True
-                        release()
-                    raise
-
-            with mock.patch.object(fcntl, "flock", release_on_contention):
-                code, output, error = run(*arguments)
-        self.assertTrue(blocked, error + output)
-        self.assertEqual((code, error), (0, ""))
-        self.assertEqual(output.count("| C"), 2)
-        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "3")
-        self.assertEqual(self.git("status", "--porcelain"), "")
-        self.assertEqual([row["Change"] for row in change_review.pending(self.path)], ["First", "Second"])
-
-    def test_list_ready_spends_one_wait_budget_across_lists(self) -> None:
-        arguments = self.ready_arguments(wait_seconds=1)
-        other = self.path.with_name("change-review - other.md")
-        elapsed = 0.0
-
-        def advance(seconds: float) -> None:
-            nonlocal elapsed
-            self.assertFalse(other.exists(), "The second list must have no wait budget.")
-            elapsed += seconds
-
-        clock = mock.Mock(wraps=time, monotonic=lambda: elapsed, sleep=advance)
-        with (self.hold_vault_lock() as release,
-              mock.patch.object(main_push_lock, "time", clock),
-              mock.patch.object(change_review, "list_path", side_effect=[self.path, other])):
-            code, output, error = run(*arguments)
-            release()
-        self.assertAlmostEqual(elapsed, 1.0)
-        self.assertEqual(code, 0, error)
-        self.assertEqual(output.count("| C"), 2)
-        self.assertEqual(error.count("change review:"), 1, error)
-        self.assertIn("2 new list write(s) not committed. 2 unresolved commit attempt(s)", error)
-        reason = BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN))
-        for path in (self.path, other):
-            self.assertIn(f"{path.name}: {reason}", error)
-        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
-
     def test_list_ready_warns_only_for_the_list_that_stays_uncommitted(self) -> None:
-        arguments = self.ready_arguments(wait_seconds=0, names=("First", "Second", "Third"))
+        arguments = self.ready_arguments(names=("First", "Second", "Third"))
         other = self.path.with_name("change-review - other.md")
         with self.hold_vault_lock() as release:
             lock = (self.repo / ".git" / "main-push.lock").stat()
             real_flock = fcntl.flock
 
-            def release_after_second_write(descriptor: int | TextIO, operation: int) -> None:
+            def release_after_first_attempt(descriptor: int | TextIO, operation: int) -> None:
                 try:
                     real_flock(descriptor, operation)
                 except BlockingIOError:
                     number = descriptor if isinstance(descriptor, int) else descriptor.fileno()
-                    if other.exists() and os.path.samestat(os.fstat(number), lock):
+                    if os.path.samestat(os.fstat(number), lock):
                         release()
                     raise
 
-            with (mock.patch.object(fcntl, "flock", release_after_second_write),
+            with (mock.patch.object(fcntl, "flock", release_after_first_attempt),
                   mock.patch.object(change_review, "list_path", side_effect=[self.path, other, self.path])):
                 code, output, error = run(*arguments)
         self.assertEqual(code, 0, error)
         self.assertEqual(output.count("| C"), 3)
         self.assertEqual(len(error.splitlines()), 1, error)
-        self.assertIn("1 new list write(s) not committed. 1 unresolved commit attempt(s)", error)
+        self.assertIn("2 new list write(s) not committed. 1 unresolved commit attempt(s)", error)
         reason = BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN))
-        self.assertIn(f"{other.name}: {reason}", error)
-        self.assertNotIn(self.path.name, error)
+        self.assertIn(f"{self.path.name}: {reason}", error)
+        self.assertNotIn(other.name, error)
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "2")
-        self.assertEqual(self.git("status", "--porcelain", "-z"), f"?? {other.relative_to(self.repo)}\0")
+        self.assertEqual(self.git("status", "--porcelain", "-z"), f"?? {self.path.relative_to(self.repo)}\0")
         self.assertEqual([row["Change"] for row in change_review.pending(self.path)], ["First", "Third"])
         self.assertEqual([row["Change"] for row in change_review.pending(other)], ["Second"])
 

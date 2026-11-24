@@ -574,17 +574,27 @@ def _print_warning(message: str) -> None:
 
 @dataclass
 class _ReadinessCommits:
-    wait: main_push_lock.LockWaitBudget
-    failures: dict[Path, list[tuple[bool, str]]] = field(default_factory=dict)
+    pending: dict[Path, tuple[str, int]] = field(default_factory=dict)
+    failures: dict[Path, str] = field(default_factory=dict)
+
+    def add(self, path: Path, subject: str, wrote: bool) -> None:
+        previous, writes = self.pending.get(path, (subject, 0))
+        self.pending[path] = (subject if wrote else previous, writes + wrote)
+
+    def commit(self) -> None:
+        for path, (subject, _) in self.pending.items():
+            try:
+                with _list_lock(path):
+                    _commit([path], subject, readiness=self)
+            except OSError as error:
+                self.failures[path] = next(iter(str(error).splitlines()), type(error).__name__)
 
     def report(self) -> None:
         if self.failures:
-            failures = [failure for pending in self.failures.values() for failure in pending]
-            writes = sum(wrote for wrote, _ in failures)
-            details = [f"{path.name}: " + " / ".join(dict.fromkeys(reason for _, reason in pending))
-                       for path, pending in self.failures.items()]
+            writes = sum(self.pending[path][1] for path in self.failures)
+            details = [f"{path.name}: {reason}" for path, reason in self.failures.items()]
             summary = (f"change review: {writes} new list write(s) not committed. "
-                       + f"{len(failures)} unresolved commit attempt(s).")
+                       + f"{len(self.failures)} unresolved commit attempt(s).")
             separator = " " if len(details) == 1 else "\n  "
             _print_warning(summary + separator + separator.join(details))
 
@@ -611,13 +621,16 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
                 _sort(path, lines)
                 _stamp(path, lines, production, day)
                 (publish or write_text_atomic)(path, "".join(lines))
-        _commit([path], f"{_owner(path)} {what(result)}", report_warning=report_warning,
-                readiness=readiness, wrote=wrote)
+        subject = f"{_owner(path)} {what(result)}"
+        if readiness is None:
+            _commit([path], subject, report_warning=report_warning)
+        else:
+            readiness.add(path, subject, wrote)
         return result
 
 
 def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str], None] = _print_warning,
-            readiness: _ReadinessCommits | None = None, wrote: bool = False) -> None:
+            readiness: _ReadinessCommits | None = None) -> None:
     """Commit only the lists through Git plumbing, without refreshing the index."""
     folder = paths[0].parent
 
@@ -643,7 +656,7 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
             return
         root = Path(checked("rev-parse", "--show-toplevel"))
         folder = root
-        with main_push_lock.main_push_lock(root, "change-review", wait=readiness.wait if readiness is not None else False):
+        with main_push_lock.main_push_lock(root, "change-review", wait=False):
             blobs = [(str(path.resolve().relative_to(root)),
                       checked("hash-object", "-w", "--path", str(path.resolve().relative_to(root)), "--", str(path.resolve())))
                      for path in paths]
@@ -658,13 +671,13 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
                         _ = checked("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}", env=environment)
                     tree = checked("write-tree", env=environment)
                     if head and tree == checked("rev-parse", head + "^{tree}"):
-                        break
+                        return
                     for name, blob in blobs:
                         _ = checked("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}")
                     commit = checked("commit-tree", tree, *(["-p", head] if head else []), "-m", subject)
                     updated = git("update-ref", "-m", subject, "HEAD", commit, head or "0" * len(commit))
                     if not updated.returncode:
-                        break
+                        return
                     if attempt == 4 or git("rev-parse", "--verify", "-q", "HEAD").stdout.strip() == head:
                         raise ChangeReviewError(updated.stderr.strip() or "git update-ref failed")
     except (ChangeReviewError, OSError) as error:
@@ -672,10 +685,7 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
         if readiness is None:
             report_warning(f"change review: {paths[0]} written but not committed: {reason}; the next write commits it")
         else:
-            readiness.failures.setdefault(paths[0], []).append((wrote, reason))
-    else:
-        if readiness is not None:
-            _ = readiness.failures.pop(paths[0], None)
+            readiness.failures[paths[0]] = reason
 
 
 def _table(path: Path, lines: list[str], section: str) -> tuple[list[str], int, int]:
@@ -2526,17 +2536,13 @@ def list_ready_rows(repo: Path, production: Path, merge_branch: str, *,
                     known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[WrittenReviewRow]:
     """Add live changes on origin/main, or release one completed step of one merge.
 
-    Share one `lock_wait_seconds` budget across direct vault lock acquisitions.
-    Time spent waiting for the list directory lock or other locks is outside the budget.
+    Try the vault lock once per list after the scan. Report any uncommitted lists together.
     """
-    try:
-        wait_seconds = conf.read_or_repository("change_review").whole("lock_wait_seconds")
-    except conf.Unusable as error:
-        raise ChangeReviewError(str(error)) from error
-    commits = _ReadinessCommits(main_push_lock.LockWaitBudget(wait_seconds))
+    commits = _ReadinessCommits()
     try:
         return _scan_ready_rows(repo, production, merge_branch, review_list, record, selection, known_producer, commits)
     finally:
+        commits.commit()
         commits.report()
 
 
