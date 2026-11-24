@@ -83,6 +83,27 @@ class InjectedCrash(RuntimeError):
     """A test stops the loop at a persistence boundary."""
 
 
+class FixedSystemReader:
+    """Publish private evidence without reading the operating system."""
+
+    def __init__(self, latest: service.SystemEvidence) -> None:
+        self.latest: service.SystemEvidence = latest
+        self.plans: list[service.SystemReadingPlan] = []
+        self.requests: int = 0
+
+    def update(self, plan: service.SystemReadingPlan) -> None:
+        self.plans.append(plan)
+
+    def request_read(self) -> None:
+        self.requests += 1
+
+    def raise_failure(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
 class Faults:
     def __init__(self) -> None:
         self.stage: str = ""
@@ -441,6 +462,8 @@ class AdmissionFixture(ExitStack):
             _ = self.enter_context(mock.patch.object(os.environ, "clear", refill.clear))
             _ = self.enter_context(mock.patch.object(os.environ, "update", refill.update))
             self.enter_context(mock.patch.dict(os.environ, environment))
+            _ = os.environ.pop("BUILD_TARGETS_STATE_DIR", None)
+            (self.root / ".local/state").mkdir(parents=True, exist_ok=True)
             if not (self.root / "build_admission.conf").exists():
                 write_memory_config(self.root / "build_admission.conf")
             self.readings: PrivateReadings = PrivateReadings(self.root)

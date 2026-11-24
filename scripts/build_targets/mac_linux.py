@@ -2135,7 +2135,8 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         root = target_config.build_targets_state_root()
         if not root.is_dir():
             return GuestNotStarted(f'The Mac Linux state root {root} must be a directory. '
-                                   + 'Run build_targets.py setup-mac-linux on natedev.')
+                                   + 'The admission service creates it at startup. '
+                                   + 'To repair it, run build_targets.py setup-mac-linux on natedev.')
         if not math.isfinite(module_time_limit_s) or module_time_limit_s <= 0:
             raise GuestUnavailable('the module time limit must be positive and finite')
         repo = repo.resolve()

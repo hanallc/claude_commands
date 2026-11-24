@@ -49,7 +49,7 @@ from scripts.buildlog import record as buildlog_record
 from scripts.build_hold import override_guard
 from scripts.build_hold.owning_session import OwningSession
 
-from scripts.lib import conf
+from scripts.lib import atomic_file, conf
 from scripts.lib import inotify, test_hang_guard
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib.user_zone import user_zone
@@ -65,7 +65,7 @@ from scripts.build_queue import admission_code, queue_snapshot, queue_view, head
 from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from zoneinfo import ZoneInfo
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
-from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted
+from scripts.build_queue.admission_test_support import AdmissionFixture, FixedSystemReader, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted
 
 
 def setUpModule() -> None:
@@ -1932,26 +1932,6 @@ class SwapInReadingsTests(unittest.TestCase):
                         assert isinstance(reading, records.ReadingUnavailable)
                         self.assertIn("swap-in reading unavailable", reading.reason)
                         self.assertIn(str(path), reading.reason)
-
-
-class FixedSystemReader:
-    """Publish private evidence without an operating-system reader."""
-    def __init__(self, latest: service.SystemEvidence) -> None:
-        self.latest: service.SystemEvidence = latest
-        self.plans: list[service.SystemReadingPlan] = []
-        self.requests: int = 0
-
-    def update(self, plan: service.SystemReadingPlan) -> None:
-        self.plans.append(plan)
-
-    def request_read(self) -> None:
-        self.requests += 1
-
-    def raise_failure(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
 
 
 class ReferenceActivityReader(ScopeActivityReader):
@@ -5439,7 +5419,8 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(saved.identity.step, request.profile.step)
 
     def assert_reload_hash_journal(self, journal: str, next_check: float) -> str:
-        schedule, ready, revision = journal.splitlines()
+        provision, schedule, ready, revision = journal.splitlines()
+        self.assertEqual(provision, f"memory admission: Mac Linux state root ready at {Path.home() / '.local/state/build-targets'}")
         self.assertEqual(schedule, f"memory admission: source watch checks 1 paths first at monotonic {next_check:.3f}")
         self.assertRegex(ready, r"^memory admission: reload ready, source hash [a-f0-9]{64}$")
         self.assertEqual(revision, "memory admission: ready with git revision unavailable")
@@ -6165,6 +6146,46 @@ class ServiceTests(unittest.TestCase):
             fixture.server.run_once(0)
             self.assertTrue(fixture.server.stopped)
 
+    def test_start_provisions_the_mac_linux_state_root_before_ready(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.server.close()
+            root = fixture.root / "guest-state"
+            server = fixture.new_server(start=False)
+            try:
+                with (mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(root)}),
+                      mock.patch.object(atomic_file, "sync_folder", wraps=atomic_file.sync_folder) as sync,
+                      mock.patch.object(service, "_notify") as notify,
+                      redirect_stderr(io.StringIO()) as journal):
+                    def ready(message: str) -> None:
+                        self.assertEqual(message, "READY=1")
+                        self.assertTrue(root.is_dir())
+                        sync.assert_called_once_with(root.parent)
+
+                    notify.side_effect = ready
+                    self.assertFalse(root.exists())
+                    server.start()
+                    server.start()
+                    notify.assert_called_once_with("READY=1")
+                self.assertEqual(journal.getvalue().splitlines()[0],
+                                 f"memory admission: Mac Linux state root ready at {root}")
+            finally:
+                server.close()
+
+    def test_start_continues_after_mac_linux_state_setup_fails(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.server.close()
+            root = fixture.root / "guest-state"
+            failure = OSError(errno.EIO, "fixture parent sync failed")
+            with (mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(root)}),
+                  mock.patch.object(atomic_file, "sync_folder", side_effect=failure) as sync,
+                  redirect_stderr(io.StringIO()) as journal):
+                fixture.server = fixture.new_server()
+            self.assertFalse(root.exists())
+            sync.assert_called_once_with(root.parent)
+            self.assertEqual(journal.getvalue().splitlines()[0],
+                             f"memory admission: Cannot prepare the Mac Linux state root. {failure}")
+            self.assertIsInstance(fixture.connect(wire.ViewRequest()).replies()[0], wire.ViewReply)
+
     def test_serve_binds_the_environment_socket_without_listen_fds(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.server.close()
@@ -6202,6 +6223,8 @@ class ServiceTests(unittest.TestCase):
                     ["git", "-C", str(Path(service.__file__).resolve().parent), "rev-parse", "HEAD"],
                     text=True).strip()
                 ready_revision = f"memory admission: ready with git revision {revision}"
+                state_root = fixture.root / ".local/state/build-targets"
+                state_ready = f"memory admission: Mac Linux state root ready at {state_root}"
                 original_watch = ""
                 changed_at = fixture.clock.monotonic()
 
@@ -6236,7 +6259,7 @@ class ServiceTests(unittest.TestCase):
                         _ = service.main()
                     reload_marker = os.environ.get(service.ADMISSION_SOURCE_RELOAD, "")
                 self.assertEqual(journal.getvalue().splitlines(),
-                    [original_watch, ready_revision,
+                    [state_ready, original_watch, ready_revision,
                      f"memory admission: source watch detected changes at monotonic {changed_at:.3f} in {source}",
                      "memory admission: source watch will reload after the changes settled",
                      f"memory admission: reload for changed source {source}"])
@@ -6252,6 +6275,7 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(len(states), 2)
                 self.assertEqual(states[0], "READY=1")
                 self.assertRegex(states[1], r"^RELOADING=1\nMONOTONIC_USEC=\d+$")
+                state_root.rmdir()
                 with mock.patch.dict(os.environ, {**environment, service.ADMISSION_SOURCE_RELOAD: reload_marker}), \
                      mock.patch.object(service, "LISTEN_FD", os.dup(listener.fileno())), \
                      redirect_stderr(io.StringIO()) as journal:
@@ -6262,7 +6286,8 @@ class ServiceTests(unittest.TestCase):
 
                     def notify_before_journal(message: str) -> None:
                         self.assertEqual(message, "READY=1")
-                        self.assertEqual(journal.getvalue().splitlines(), [replacement_watch])
+                        self.assertTrue(state_root.is_dir())
+                        self.assertEqual(journal.getvalue().splitlines(), [state_ready, replacement_watch])
                         notify(message)
 
                     try:
@@ -6272,7 +6297,8 @@ class ServiceTests(unittest.TestCase):
                         version = admission_code.reload_source_version(replacement.source_root)
                         self.assertRegex(version, r"^[0-9a-f]{64}$")
                         self.assertEqual(journal.getvalue().splitlines(),
-                            [replacement_watch, f"memory admission: reload ready, source hash {version}", ready_revision])
+                            [state_ready, replacement_watch, f"memory admission: reload ready, source hash {version}",
+                             ready_revision])
                         self.assertNotIn(service.ADMISSION_SOURCE_RELOAD, os.environ)
                     finally:
                         replacement.close()

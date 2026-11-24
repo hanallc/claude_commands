@@ -1740,8 +1740,9 @@ fi
         self.assertEqual(self.consumed, ())
         self.assertFalse(root.exists())
         reason = self.not_started(result)
-        self.assertIn(str(root), reason)
-        self.assertIn('build_targets.py setup-mac-linux', reason)
+        self.assertEqual(reason, f'The Mac Linux state root {root} must be a directory. '
+                         + 'The admission service creates it at startup. '
+                         + 'To repair it, run build_targets.py setup-mac-linux on natedev.')
         self.assert_guest_clean()
 
     def test_setup_mac_linux_creates_the_state_root_and_syncs_its_parent(self) -> None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from collections.abc import Callable, Generator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from enum import Enum, auto
 from pathlib import Path
@@ -17,7 +17,7 @@ from scripts.build_targets.execution_transport import (
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
-from scripts.lib import conf
+from scripts.lib import atomic_file, conf
 
 
 Platform = Literal["linux", "macos"]
@@ -205,6 +205,24 @@ def build_targets_state_root() -> Path:
     """Return the shared state root for SSH build targets."""
     configured = os.environ.get("BUILD_TARGETS_STATE_DIR")
     return Path(configured).expanduser() if configured else Path.home() / ".local/state/build-targets"
+
+
+def provision_mac_linux_state_root(root: Path) -> None:
+    """Create the root and sync its entry in the existing parent directory."""
+    created = False
+    try:
+        root.mkdir()
+        created = True
+    except FileExistsError:
+        if not root.is_dir():
+            raise
+    try:
+        atomic_file.sync_folder(root.parent)
+    except OSError:
+        if created:
+            with suppress(OSError):
+                root.rmdir()
+        raise
 
 
 def mac_linux_end_proof_journal() -> Path:

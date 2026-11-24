@@ -37,7 +37,7 @@ from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.disks.slots import lease_record
 from scripts.build_queue.queue_view import refresh_mac_builds
-from scripts.build_queue.admission_test_support import AdmissionFixture, NOW as ADMISSION_NOW, only_admitted
+from scripts.build_queue.admission_test_support import AdmissionFixture, FixedSystemReader, NOW as ADMISSION_NOW, only_admitted
 from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
@@ -4407,8 +4407,6 @@ process.stdout.write(JSON.stringify({
             self.assertEqual(memory.anonymous_source, admission_records.ScopeSource(child, frozenset({cargo_owner.pid})))
 
     def test_ci_scan_deducts_a_process_that_enters_a_reserved_scope_between_samples(self) -> None:
-        from scripts.build_queue.test_admission_service import FixedSystemReader
-
         gib = admission_records.GIB
         with AdmissionFixture() as fixture:
             ci = Path(os.environ["BUILDLOG_CI_CGROUP"])
