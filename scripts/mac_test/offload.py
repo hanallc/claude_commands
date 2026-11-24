@@ -73,7 +73,7 @@ from scripts.buildlog import store
 from scripts.buildlog import repository as buildlog_repository
 from scripts.buildlog import transfer_bytes
 from scripts.build_targets import target_config
-from scripts.mac_test import eligibility, nextest_log
+from scripts.mac_test import eligibility, floor_claims, nextest_log
 from scripts.mac_test.eligibility import (
     MacVerb,
     NonBusyMacDeclineReason,
@@ -632,9 +632,10 @@ if not matches:
 
 def fenced_start_command(identity: claim_state.ClaimIdentity, target: str, command: str, *, scope_key: str = "run") -> str:
     """Remove the prepared identity after the existing remote command ends."""
+    descriptors = floor_claims.MIRROR_LEASE_FDS
     return (start_fence_command(identity, target, scope_key=scope_key)
             + clean_start_fences_command(identity, target, scope_key=scope_key) + " || exit 75\n"
-            + "(\n" + command + "\n)\n"
+            + f'(\nexport {descriptors}="${{{descriptors}:+${descriptors},}}8"\n' + command + "\n)\n"
             + "dispatch_status=$?\nexec 8<&-\n"
             + start_fence_command(identity, target, settle=True, scope_key=scope_key)
             + '\nexit "$dispatch_status"')
@@ -4105,6 +4106,9 @@ def main() -> int:
     for name in arguments.environment:
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
             cli.error(f"--env {name}: not a variable name")
+        if name == floor_claims.MIRROR_LEASE_FDS:
+            print(f"offload: --env {name}: the runner sets it; it is not forwarded.", file=sys.stderr)
+            return 2
         if name not in os.environ:
             cli.error(f"--env {name}: not set here")
     if arguments.fetch is not None and not plain_fetch_folder(arguments.fetch):
