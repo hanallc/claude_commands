@@ -192,6 +192,7 @@ class GateArguments(argparse.Namespace):
     modules: list[str] = field(default_factory=list)
     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
     command: tuple[str, ...] = ()
+    prepared_copy: bool = False
 
 
 class NightlyRunState(Enum):
@@ -3158,8 +3159,6 @@ def nightly(args: GateArguments, target: GateTarget = "natedev") -> int:
                 else:
                     print(f"Assign the fix: gate.py nightly-assigned --result {identity} --unit UNIT", flush=True)
             return 1
-    except GatePlacementIncomplete:
-        raise
     except (Exception, KeyboardInterrupt) as error:
         if not result_sent and not (isinstance(run, GateRun) and not run.passed):
             reason = GateRefused("interrupted by SIGINT") if isinstance(error, KeyboardInterrupt) else error
@@ -3205,18 +3204,13 @@ class GateAssignmentRefused(GateRefused):
     """The gate could not verify the placement supplied by the caller."""
 
 
-def in_prepared_copy(args: GateArguments) -> bool:
-    prepared = os.environ.get("BUILDLOG_PREPARED_COPY")
-    return bool(prepared and Path(prepared) == Path(args.repo).expanduser().resolve())
-
-
 @contextmanager
 def gate_suite_target(args: GateArguments, source: Path, target: GateTarget) -> Generator[GateTarget]:
     """Keep the queue placement for the test checkout until the suites end."""
     if not isinstance(target, NoGateAssignment):
         yield target
         return
-    if in_prepared_copy(args):
+    if args.prepared_copy:
         yield "natedev" if args.nightly else target
         return
     requested = first_step.gate_targets(args.command, source)
@@ -3237,7 +3231,7 @@ def gate_suite_target(args: GateArguments, source: Path, target: GateTarget) -> 
         yield assigned
 
 
-def gate_start_target(args: GateArguments, arguments: Sequence[str], *, copied: bool = False) -> GateTarget:
+def gate_start_target(args: GateArguments, arguments: Sequence[str]) -> GateTarget:
     """Check the assignment once, when the gate starts, before any merge, hold wait or run.
 
     A mode that cannot route takes only a natedev assignment.
@@ -3245,7 +3239,7 @@ def gate_start_target(args: GateArguments, arguments: Sequence[str], *, copied: 
     """
     placed = current_gate_placement(SuiteMode.TARGETED if args.affected else SuiteMode.GATE, args.gate_job)
     target = placement_target(placed)
-    if target == "aws" and not copied:
+    if target == "aws" and not args.prepared_copy:
         raise GateAssignmentRefused("A direct gate cannot take an AWS assignment")
     flag = gate_natedev_only_flag(arguments)
     if flag is not None and not isinstance(placed, NoGateAssignment) and placed.assignment.destination.target != "natedev":
@@ -3646,6 +3640,8 @@ def _sweep_nightly_build_folders() -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    prepared = os.environ.get("BUILDLOG_PREPARED_COPY")
+    handed_off = copies.take_prepared_gate_handoff()
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
         nightly_parser = argparse.ArgumentParser(prog=f"gate.py {arguments[0]}", allow_abbrev=False)
@@ -3682,6 +3678,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = cast(GateArguments, parser.parse_args(arguments))
     args.command = ("gate.py", *arguments)
     args.gate_job = gate_job_for_command(args.command)
+    args.prepared_copy = bool(handed_off and prepared and Path(prepared) == Path(args.repo).expanduser().resolve())
     if args.affected and (args.tests_only or args.nightly or args.promote_only or args.promote):
         parser.error("--affected cannot be combined with --tests-only, --nightly or promotion")
     if args.promote_only and not args.merge_branch:
@@ -3700,7 +3697,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if missing:
             parser.error(f"required: {', '.join('--' + name for name in missing)}")
     try:
-        target = gate_start_target(args, args.command, copied=in_prepared_copy(args))
+        target = gate_start_target(args, args.command)
         if isinstance(target, NoGateAssignment) and (args.promote_only or args.modules
                 and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)):
             target = "natedev"

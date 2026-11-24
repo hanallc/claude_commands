@@ -47,8 +47,8 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.lib.build_steps import (
-    GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
-    StepJob, VerifyCommand, build_call_arguments, command_job, read_step_names, verify_command,
+    GATE_RESULT_UNKNOWN_STATUS, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
+    StepJob, VerifyCommand, build_call_arguments, command_job, command_program, read_step_names, verify_command,
 )
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
@@ -65,6 +65,7 @@ LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
 OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
 CLONE_STAGE = ".gate-clone"
 COMMAND_LOCKS: ContextVar[tuple[int, ...]] = ContextVar("gate_command_locks", default=())
+PREPARED_GATE_FD = "BUILDLOG_PREPARED_GATE_FD"
 
 
 @dataclass(frozen=True)
@@ -2582,6 +2583,19 @@ def command_tail(command: list[str]) -> list[str]:
     return command[1:] if command[:1] == ["--"] else command
 
 
+def take_prepared_gate_handoff() -> bool:
+    """Consume the pipe token passed to the prepared gate."""
+    try:
+        reader = int(os.environ.pop(PREPARED_GATE_FD, "0"))
+        if reader < 3 or not stat.S_ISFIFO(os.fstat(reader).st_mode):
+            return False
+        with os.fdopen(reader, "rb", buffering=0) as pipe:
+            os.set_blocking(reader, False)
+            return pipe.read(1) == b"1"
+    except (OSError, ValueError, OverflowError):
+        return False
+
+
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
     """Run verify from a snapshot and other commands under a numbered copy lease."""
     owner = caller_owner()
@@ -2612,9 +2626,18 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
             target = tree / "target"
             locks = COMMAND_LOCKS.get()
         arguments = [part.replace("{tree}", str(tree)) for part in command]
+        _ = environment.pop(PREPARED_GATE_FD, None)
         environment["COPIES_COMMAND_LEASE_FDS"] = ",".join(map(str, locks))
         before = publication_candidates(tree, target, arguments, args.publish)
-        result = subprocess.run(arguments, cwd=tree, pass_fds=locks, env=environment)
+        pass_fds = locks
+        if command_program(arguments) in GATE_SCRIPTS:
+            reader, writer = os.pipe()
+            _ = scope.callback(os.close, reader)
+            with os.fdopen(writer, "wb") as pipe:
+                _ = pipe.write(b"1")
+            environment[PREPARED_GATE_FD] = str(reader)
+            pass_fds = (*locks, reader)
+        result = subprocess.run(arguments, cwd=tree, pass_fds=pass_fds, env=environment)
         command_exit = result.returncode if result.returncode >= 0 else 128 - result.returncode
         selection = PublicationSelection.CHANGED
         if command_exit == 0 and not isinstance(verification, VerifyCommand):

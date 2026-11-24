@@ -35,6 +35,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, mac_gate
 from scripts.production import mac_gate_process, gate, targeted_test
+from scripts.copies import copies
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_routes import MacGateCancellation, ModuleCoverage, SuiteMode, TreeSelection
 from scripts.production.gate_suites_test_support import GateSuitesFixture
@@ -667,6 +668,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.set_placement_status(assignment, placement.CurrentAssignment())
         with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path),
                                           "BUILDLOG_PREPARED_COPY": str(self.checkout)}),
+              mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True),
               mock.patch.object(mac_linux, "route") as guest,
               mock.patch.object(gate, "run_suites") as local, redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(gate.main(["--tests-only", "--repo", str(self.checkout)]), 1)
@@ -851,6 +853,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.exclude_modules(LIB_FIRST)
         script = str(gate.__file__)
         with (mock.patch.dict(os.environ, {"BUILDLOG_PREPARED_COPY": str(self.checkout)}),
+              mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True),
               mock.patch.object(mac_gate_process, "load_mac_gate_route") as load_mac,
               mock.patch.object(sys, "argv", [script, "--tests-only", "--repo", str(self.checkout)]),
               self.assertRaises(SystemExit) as exited):
@@ -869,6 +872,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                 gate.GateJobResult("lib", "test_second.py", 0, 1, ""))
         self.cloud_route.return_value = gate.GateRun(jobs, 1, 0)
         with (mock.patch.dict(os.environ, {"BUILDLOG_PREPARED_COPY": str(self.checkout)}),
+              mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True),
               mock.patch.object(gate, "run_suites") as local):
             status = targeted_test.main(["--repo", str(self.checkout)])
         self.assertEqual(status, 0, self.output.getvalue())

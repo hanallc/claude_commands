@@ -26,6 +26,7 @@ from scripts.lib.release_waiter import LocalReleaseEvents
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import affected_modules, checkpoint_gate, gate, targeted_test
+from scripts.copies import copies
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import git_index, process_group
 from scripts.test_times import gate_record
@@ -225,6 +226,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
 
                 arguments = ["--repo", str(self.checkout)]
                 with (mock.patch.dict(os.environ, {**self.environment, "BUILDLOG_PREPARED_COPY": str(self.checkout)}),
+                      mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True),
                       mock.patch.object(cloud_gate, "route", side_effect=route),
                       mock.patch.object(gate, "select_affected", wraps=affected_modules.select_affected) as select,
                       contextlib.redirect_stdout(io.StringIO()) as output,

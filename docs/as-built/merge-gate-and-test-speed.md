@@ -117,7 +117,7 @@ If the guest cannot return a result after a test started, the gate fails and rep
 Each failure with a stream status names that status and the last 1200 characters of the stream standard error (`stream_report`).
 If the guest returns a failure, the gate reports the guest and the failed jobs.
 A targeted gate can reuse a certified test pass. The guest runs any requested type checks on the Mac.
-A merge gate or targeted test in a prepared copy can try AWS when it has no placement assignment.
+A merge gate or targeted test with a prepared copy handoff from `copies.py run` can try AWS without a placement assignment.
 If the cloud route returns a final refusal, natedev runs the selection.
 
 On natedev and on the Mac Linux guest, a hand made run starts its program under `bwrap` with a read limit.

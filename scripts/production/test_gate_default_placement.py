@@ -132,14 +132,65 @@ class GateDefaultPlacementTests(unittest.TestCase):
 
     def test_copied_gate_reuses_its_aws_assignment(self) -> None:
         assignment = placed('aws')
-        with (mock.patch.dict(os.environ, {'BUILDLOG_PLACEMENT_FILE': '/fixture/assignment.json',
-                                          'BUILDLOG_PREPARED_COPY': str(Path.cwd())}, clear=True),
-              mock.patch.object(gate, 'current_gate_placement', return_value=assignment),
-              mock.patch.object(first_step, 'admitted_run') as admit,
-              mock.patch.object(gate, 'run_tests_only', return_value=0) as run):
-            self.assertEqual(gate.main(['--tests-only']), 0)
+        with TemporaryDirectory() as directory:
+            tree = Path(directory)
+            command = ["./scripts/lib/py", "scripts/production/gate.py", "--tests-only"]
+
+            def launch(arguments: Sequence[str], *, cwd: Path, pass_fds: tuple[int, ...],
+                       env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+                self.assertEqual(arguments, command)
+                self.assertEqual(cwd, tree)
+                reader, = pass_fds
+                self.assertEqual(env[copies.PREPARED_GATE_FD], str(reader))
+                # The parent keeps its descriptor during the child run.
+                inherited = {**env, copies.PREPARED_GATE_FD: str(os.dup(reader))}
+                with mock.patch.dict(os.environ, inherited, clear=True):
+                    gate_arguments = ["--tests-only", "--repo", directory]
+                    status = gate.main(gate_arguments)
+                    self.assertEqual(gate.main(gate_arguments), 1)
+                return subprocess.CompletedProcess(arguments, status)
+
+            with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "aws"}, clear=True),
+                  mock.patch.object(copies, "caller_owner", return_value="fixture"),
+                  mock.patch.object(copies, "command_tree", return_value=nullcontext(tree)),
+                  mock.patch.object(subprocess, "run", side_effect=launch),
+                  mock.patch.object(gate, 'current_gate_placement', return_value=assignment),
+                  mock.patch.object(first_step, 'admitted_run') as admit,
+                  mock.patch.object(gate, 'run_tests_only', return_value=0) as run,
+                  redirect_stderr(StringIO()) as errors):
+                args = copies.CopyArguments(repo=directory)
+                self.assertEqual(copies.run_copy(args, command, copies.CommittedSource("HEAD"), copies.NO_MERGE), 0)
+            self.assertIn("A direct gate cannot take an AWS assignment", errors.getvalue())
         admit.assert_not_called()
+        run.assert_called_once()
         self.assertEqual(run.call_args.args[-1], 'aws')
+
+    def test_a_gate_inside_a_copy_shell_requires_direct_placement(self) -> None:
+        with TemporaryDirectory() as directory:
+            tree = Path(directory)
+            command = ["sh", "-c", "gate.py --tests-only"]
+
+            def launch(arguments: Sequence[str], *, cwd: Path, pass_fds: tuple[int, ...],
+                       env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+                self.assertEqual(arguments, command)
+                self.assertEqual(cwd, tree)
+                self.assertEqual(pass_fds, ())
+                with mock.patch.dict(os.environ, env, clear=True):
+                    status = gate.main(["--tests-only", "--repo", directory])
+                return subprocess.CompletedProcess(arguments, status)
+
+            with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "aws"}, clear=True),
+                  mock.patch.object(copies, "caller_owner", return_value="fixture"),
+                  mock.patch.object(copies, "command_tree", return_value=nullcontext(tree)),
+                  mock.patch.object(subprocess, "run", side_effect=launch),
+                  mock.patch.object(gate, "run_tests_only", return_value=0) as run,
+                  mock.patch.object(first_step, "admitted_run") as admit,
+                  redirect_stderr(StringIO()) as errors):
+                args = copies.CopyArguments(repo=directory)
+                self.assertEqual(copies.run_copy(args, command, copies.CommittedSource("HEAD"), copies.NO_MERGE), 1)
+            self.assertIn("Direct gates require natedev or mac-linux", errors.getvalue())
+            run.assert_not_called()
+            admit.assert_not_called()
 
     def test_each_assignment_runs_its_route(self) -> None:
         result = gate.GateRun((), 1, 0, selection_certified=True)
