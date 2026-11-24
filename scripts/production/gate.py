@@ -2493,6 +2493,9 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
         if isinstance(recovery, GateRecovery):
             recovery.rollback = ""
             recovery.save()
+        if isinstance(error, (AwsGateTookNoRun, AwsGateLaunchPending)):
+            print("Merge undone. The merge was not pushed.", file=sys.stderr, flush=True)
+            raise
         refused = MacLinuxTookNoRun if isinstance(error, MacLinuxTookNoRun) else GateRefused
         raise refused(f"{error or type(error).__name__}; merge undone, not pushed") from error
     if isinstance(recovery, GateRecovery):
@@ -3097,6 +3100,8 @@ def nightly(args: GateArguments, target: GateTarget = "natedev") -> int:
                 with gate_suite_target(args, clone, target) as assigned:
                     run = run_gate_suites(clone, NIGHTLY_TYPE_DIRS, module_time_limit_s=args.module_time_limit_s,
                                           full=True, gate_job=args.gate_job, target=assigned, nightly_types=True)
+            except (AwsGateTookNoRun, AwsGateLaunchPending):
+                raise
             except (GateRefused, first_step.FirstStepRefused, OSError, subprocess.SubprocessError) as error:
                 print(f"Nightly suite runner failed: {error}", flush=True)
                 run = GateRun((GateJobResult("runner", "suite-run", 1, 0, str(error),

@@ -2424,12 +2424,24 @@ class CostLedger:
                                read_settings(settings_path), request)
 
     def _book_gate(self, state: LedgerEvidence, settings: SpendingSettings, request: GateReservation) -> str:
-        costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
         state.gate_reservations.append(request)
-        reason = self.reservation_cap(state, settings, request.at, costs)
+        reason = self._gate_cap(state, settings, request, request.at)
         if reason:
-            state.gate_reservations = [r for r in state.gate_reservations if r.attempt != request.attempt]
+            _ = state.gate_reservations.pop()
         return reason
+
+    def recheck_gate_booking(self, settings_path: Path, attempt: str, now: int) -> str:
+        """Check the pending booking against the current account bill."""
+        with self._locked() as state:
+            booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+            if booking is None or not isinstance(booking.state, GateLaunchPending) or booking.expires <= now:
+                raise LedgerUnavailable('The gate booking cannot launch a box')
+            return self._gate_cap(state, read_settings(settings_path), booking, now)
+
+    def _gate_cap(self, state: LedgerEvidence, settings: SpendingSettings, booking: GateReservation, now: int) -> str:
+        prior = replace(state, gate_reservations=[row for row in state.gate_reservations if row is not booking])
+        costs = _charges(prior, settings, now, current_window=True, require_fresh=False)
+        return self.reservation_cap(state, settings, now, costs)
 
     @contextmanager
     def locked_snapshot(self) -> Generator[LedgerEvidence]:

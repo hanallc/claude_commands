@@ -62,7 +62,7 @@ Without a supplied assignment, the gate asks `first_step.admitted_run` to place 
 The queue offers natedev, the Mac Linux guest and AWS according to the target configuration.
 A direct merge gate asks after it creates the merge tree. The nightly gate asks after it prepares the fetched checkout.
 The gate keeps merge writes, validation, push, promotion and nightly publication on natedev.
-The natedev handoff returns the initial memory reservation before the local runner takes its reservation.
+The local runner keeps the queue grant until the suites end.
 A standalone `--module` run asks the queue for placement. A nested `--module` run keeps its parent reservation.
 The remote runner tests the requested module list. The result supplies no pass certificate.
 `--promote-only` runs on natedev.

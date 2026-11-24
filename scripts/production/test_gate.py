@@ -138,7 +138,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
             self.assertEqual(command[0], 'gate.py')
             self.assertEqual(source, self.checkout)
             self.assertEqual(self.git(source, 'rev-parse', 'HEAD^2'), self.checkpoint)
-            yield mock.Mock(spec=first_step.FirstStepAdmission, grant=mock.Mock(spec=first_step.GatePlacement))
+            yield mock.Mock(spec=first_step.FirstStepAdmission, grant=first_step.GatePlacement(assignment, None))
 
         assignment = placed('natedev')
         with (mock.patch.object(gate, "run_suites", side_effect=suites),

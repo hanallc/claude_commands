@@ -897,13 +897,16 @@ A confirmed Spot interruption before a final result starts another cloud attempt
 The retry uses the next choice in the saved launch order.
 The route keeps its cloud slot across retries.
 The route saves the interruption count and the next choice in `current.json` before each retry.
-Resume restores both values, so a crash cannot reset the retry budget.
+An assigned AWS run starts from its claim and clears the saved retry state.
+An unassigned resume restores the saved retry state.
 Each retry gets a new attempt ID and passes the existing spend and attempt checks.
 The worker confirms cleanup of the interrupted box and reservation before the retry.
 The final refusal row includes the interruption count when retries or capacity choices end.
 A complete gate failure keeps its failed result and gets no retry.
 An uncertain launch or termination keeps its cost reservation until reconciliation confirms the end.
 The route reports pending settlement to the queue while the launch remains uncertain.
+For an assigned launch with an unknown instance, the stop cleanup schedules its lookup at expiry.
+The cleanup records the confirmed end in the local ledger.
 The launch path uses Spot only; it has no on-demand choice.
 Paired trials use the same regional launch and cleanup path.
 
