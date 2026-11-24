@@ -1217,6 +1217,27 @@ def report_guest_start(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, *,
         raise wire.AdmissionUnavailable(response.reason or 'the queue did not confirm the guest attempt')
 
 
+def report_guest_completion(dispatch: GuestGateDispatch, run: GateRun) -> None:
+    """Report the result after the guest proves that the run ended."""
+    from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
+
+    status = 0 if run.passed else next((job.returncode for job in run.jobs if job.returncode), 1)
+    assignment = dispatch.assignment
+    request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
+        execution_identity.ExecutionEvidenceUnavailable('the guest run ended', time()),
+        placement.AttemptCompleted(status), placement.DispatchPathSettled(),
+        code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
+    try:
+        with conf.diagnostics(report=False):
+            timeout = conf.read('build_admission').number('query_timeout_seconds')
+        response = send_guest_execution(request, deadline=monotonic() + timeout, timeout=timeout)
+        if (response.assignment != assignment or response.state != placement.ClosedAssignment('completed')
+                or not isinstance(response.permission, placement.PermissionConsumed) or response.reason):
+            raise wire.AdmissionUnavailable(response.reason or 'the queue did not confirm the guest result')
+    except (wire.AdmissionUnavailable, OSError, ValueError) as error:
+        print(f'Mac Linux guest completion report failed: {error}', file=sys.stderr, flush=True)
+
+
 def warn_guest_report(reason: str) -> None:
     print(f'Mac Linux guest queue report failed: {reason}', file=sys.stderr, flush=True)
 
@@ -1833,6 +1854,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                 run = completed_run(reply, request, source)
         if gate.checked_git(repo, 'rev-parse', 'HEAD') != source.head or cloud_gate.working_tree(repo)[0] != source.tree:
             raise GuestUnavailable('the checkout changed during the guest run')
+        report_guest_completion(dispatch, run)
         return run
     except mac_run.MacRunRefused as error:
         return GuestNotStarted(str(error))
