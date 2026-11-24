@@ -108,11 +108,6 @@ __PAGE_FRAME_STYLE__
 .build-limit-cell .build-limit-mark:is(.free, .kept) { width: 9px; height: 9px; }
 .build-limit-wait { margin-top: 5px; }
 .build-limit-cell .build-limit-wait { margin-top: 0; }
-.build-limit-tip > .tip {
-  max-width: min(24rem, calc(100vw - 16px));
-  grid-template-columns: fit-content(44%) minmax(0, 1fr);
-}
-.build-limit-tip .tip dd { white-space: normal; overflow-wrap: anywhere; }
 .build-limit-legend { display: flex; flex-wrap: wrap; gap: 5px 16px; margin-top: 10px; color: var(--ink-2); font-size: .8rem; }
 .build-limit-legend > span { display: inline-flex; gap: 6px; align-items: center; }
 .bar > div:first-child { border-radius: 4px 2px 2px 4px; }
@@ -162,19 +157,17 @@ __PAGE_FRAME_STYLE__
 /* shared:step-tip:start — the Disks page uses these rules too (disks_page.shared_step_tip). */
 #tip { position: fixed; z-index: 10; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; }
 #tip.on { opacity: 1; }
-.tip { display: grid; grid-template-columns: max-content 1fr; column-gap: 0; row-gap: 2px; margin: 0;
-  width: max-content; min-width: 15rem; max-width: 24rem; padding: 10px 12px; border-radius: 8px;
+.tip { display: grid; grid-template-columns: fit-content(44%) minmax(0, 1fr); column-gap: 0; row-gap: 2px; margin: 0;
+  width: max-content; min-width: 15rem; max-width: min(24rem, calc(100vw - 16px)); padding: 10px 12px; border-radius: 8px;
   background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.45; }
-.tip dt { text-align: left; white-space: nowrap; }
-.tip dd { margin: 0; padding-left: 24px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tip :is(dt, dd) { overflow-wrap: anywhere; }
+.tip dt { text-align: left; }
+.tip dd { margin: 0; padding-left: 24px; text-align: right; font-variant-numeric: tabular-nums; }
 .tip .title { font-weight: 700; padding-bottom: 4px; }
 .tip .caption { grid-column: 1 / -1; margin-top: -4px; padding: 0 0 4px; text-align: left; white-space: normal; opacity: 0.7; }
 .tip .group { margin-top: 6px; padding-top: 6px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); }
 .tip .sum { font-weight: 700; }
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
-#tip > .tip { max-width: min(24rem, calc(100vw - 16px)); }
-.tip:has(dd.call) { grid-template-columns: fit-content(44%) minmax(0, 1fr); }
-.tip:has(dd.call) :is(dt, dd):not(.call) { white-space: normal; overflow-wrap: anywhere; }
 .tip dd.call > div { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
   overflow: hidden; white-space: normal; }
 .tip dd.call span { display: inline-block; width: max-content; max-width: 100%;
@@ -1202,8 +1195,10 @@ function ago(then, now) {
 // Put the tooltip above the pointer, or below it near the top, and keep it inside the window.
 function placeTipAt(tip, x, y) {
   const w = tip.offsetWidth, h = tip.offsetHeight;
-  const left = Math.min(Math.max(8, x - w / 2), window.innerWidth - w - 8);
-  const top = y - h - 14 < 8 ? y + 18 : y - h - 14;
+  const viewport = document.documentElement;
+  const left = Math.max(8, Math.min(x - w / 2, viewport.clientWidth - w - 8));
+  const above = y - h - 14;
+  const top = Math.max(8, Math.min(above < 8 ? y + 18 : above, viewport.clientHeight - h - 8));
   tip.style.left = `${left}px`;
   tip.style.top = `${top}px`;
 }
@@ -1213,13 +1208,17 @@ const memoryAmount = (n) => recorded(n) ? `${f1(n)} GiB` : "use unavailable";
 // content(key) gives the tooltip HTML, or "" for no tooltip.
 function hoverTips(tip, content) {
   let shown = null;
+  const refresh = html => {
+    if (!shown) return;
+    tip.innerHTML = html;
+    placeTipAt(tip, shown.x, shown.y);
+  };
   const show = (key, x, y) => {
     const html = content(key);
     if (!html) return;
-    shown = key;
-    tip.innerHTML = html;
+    shown = {key, x, y};
+    refresh(html);
     tip.classList.add("on");
-    placeTipAt(tip, x, y);
   };
   const hide = () => { shown = null; tip.classList.remove("on"); };
   document.addEventListener("pointermove", (e) => {
@@ -1229,9 +1228,9 @@ function hoverTips(tip, content) {
   });
   document.addEventListener("click", (e) => {
     const el = e.target.closest("[data-tip]");
-    if (el && shown !== el.dataset.tip) show(el.dataset.tip, e.clientX, e.clientY); else hide();
+    if (el && shown?.key !== el.dataset.tip) show(el.dataset.tip, e.clientX, e.clientY); else hide();
   });
-  return {show, hide, key: () => shown};
+  return {show, hide, refresh, key: () => shown?.key};
 }
 // shared:step-tip:end
 const tip = document.getElementById("tip");
@@ -1288,7 +1287,7 @@ function restoreReportView(view) {
     if (!html) {
       hideTip();
       tip.replaceChildren();
-    } else tip.innerHTML = html;
+    } else tips.refresh(html);
   }
 }
 function render(d) {
@@ -1515,7 +1514,7 @@ function limitTooltipRows(key, limits) {
 function pageTooltipHtml(key, data) {
   if (!key.startsWith("limit:")) return tooltipHtml(key, data);
   const rows = limitTooltipRows(key, data.build_limits);
-  return rows.length ? `<div class="build-limit-tip">${tipRowsHtml(rows)}</div>` : "";
+  return rows.length ? tipRowsHtml(rows) : "";
 }
 let lastBuildLimitsHtml = "";
 function renderBuildLimits(limits) {
