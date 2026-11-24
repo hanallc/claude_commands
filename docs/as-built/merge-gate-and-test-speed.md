@@ -116,7 +116,9 @@ The gate prints `Mac Linux guest took no run: <cause>`.
 A merge gate also reports that it undid the merge.
 When the guest proves that no test started, the gate can exit with status 79.
 It writes a claim failure next to the assignment file (`<assignment>.claim-failure`).
-Status 80 means the gate has no verdict and cannot return a confirmed no-run result.
+Status 80 means the gate has no verdict.
+When the guest proves that no test started but settlement is still pending, the gate writes the claim failure and returns status 80.
+`copies.py run` reads that claim failure to decide whether to ask for a replacement.
 A direct gate returns the status after one placement request.
 A gate with an inherited placement returns the status to its wrapper.
 `copies.py run` uses the exact claim failure to ask for a replacement when it owns the placement request.
