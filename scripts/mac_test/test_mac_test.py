@@ -3505,6 +3505,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         lock.parent.mkdir(parents=True)
         write_shell(self.root / "lsof", r'''
 [[ ${!#} == "$FENCE_FILE" ]] || exit 2
+[[ ${FENCE_CHECK:-} != failed ]] || exit 2
 printf 'p%s\0csettler\0\np2345\0ccargo helper\0\np3456\0crustc\0\n' "$PPID"
 ''')
         args = mac_test.CliArguments()
@@ -3516,6 +3517,34 @@ printf 'p%s\0csettler\0\np2345\0ccargo helper\0\np3456\0crustc\0\n' "$PPID"
             self.assertEqual((arguments[0], arguments[-2]), ("ssh", "claim-mac"))
             return self.run_private_shell(arguments[-1], self.root)
 
+        def slow_holder_check(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            # Make the holder probe exceed its limit without a wall-clock delay.
+            prelude = """python3() {
+    command python3 -c '
+import os, subprocess, sys
+from unittest.mock import MagicMock, patch
+
+def communicate(*args, timeout=None):
+    if timeout is None:
+        return b"p2345\\0ccargo\\0", b""
+    assert timeout == float(os.environ["FENCE_CHECK_LIMIT"]), timeout
+    raise subprocess.TimeoutExpired("lsof", timeout)
+
+probe = MagicMock()
+probe.__enter__.return_value = probe
+probe.communicate.side_effect = communicate
+probe.returncode = probe.poll.return_value = 0
+sys.argv = sys.argv[2:]
+with patch.object(subprocess, "Popen", return_value=probe):
+    exec(sys.argv[0])
+' "$@"
+}
+"""
+            with mock.patch.dict(os.environ, {"FENCE_CHECK_LIMIT": str(options["timeout"])}):
+                result = self.run_private_shell(prelude + arguments[-1], self.root)
+            self.assertEqual(result.stderr, "")
+            return result
+
         def no_answer(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
             del options
             return subprocess.CompletedProcess(arguments, 255, "", "")
@@ -3524,28 +3553,35 @@ printf 'p%s\0csettler\0\np2345\0ccargo helper\0\np3456\0crustc\0\n' "$PPID"
             "PATH": f"{self.root}:{os.environ['PATH']}", "FENCE_FILE": str(lock),
         }):
             fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            for reason, response in (
-                ("is held by 2345 cargo helper, 3456 rustc", remote),
-                ("gave no answer", no_answer),
+            for case, reason, response in (
+                ("found", "is held by 2345 cargo helper, 3456 rustc", remote),
+                ("unreachable", "gave no answer", no_answer),
+                ("failed", "is held; the holder check gave no answer", remote),
+                ("slow", "is held; the holder check gave no answer", slow_holder_check),
             ):
-                with self.subTest(reason=reason), mock.patch.object(subprocess, "run", side_effect=response):
+                with self.subTest(case=case), mock.patch.dict(os.environ, {"FENCE_CHECK": case}), \
+                        mock.patch.object(subprocess, "run", side_effect=response):
                     stderr = io.StringIO()
                     with redirect_stderr(stderr):
                         self.assertEqual(mac_test.command_release(args, self.paths), 12)
                     self.assertEqual(stderr.getvalue(), f"cannot release: the remote start fence {reason}\n")
                     self.assertTrue(pending.exists())
                     self.assertEqual(self.read_claim(), record)
-            stderr = io.StringIO()
-            with mock.patch.object(copies, "remote_registry", return_value=self.root / "mirror-registry"), \
-                 mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()), \
-                 mock.patch.object(mac_test, "send_message") as send, \
-                 mock.patch.object(subprocess, "run", side_effect=remote), redirect_stderr(stderr):
-                _ = self.watch_once()
-            send.assert_not_called()
-            self.assertTrue(pending.exists())
-            self.assertEqual(self.read_claim(), record)
-            self.assertEqual(stderr.getvalue(),
-                             "cannot release: the remote start fence is held by 2345 cargo helper, 3456 rustc\n")
+            for case, reason in (
+                ("found", "is held by 2345 cargo helper, 3456 rustc"),
+                ("failed", "is held; the holder check gave no answer"),
+            ):
+                with self.subTest(watcher=case), mock.patch.dict(os.environ, {"FENCE_CHECK": case}):
+                    stderr = io.StringIO()
+                    with mock.patch.object(copies, "remote_registry", return_value=self.root / "mirror-registry"), \
+                         mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()), \
+                         mock.patch.object(mac_test, "send_message") as send, \
+                         mock.patch.object(subprocess, "run", side_effect=remote), redirect_stderr(stderr):
+                        _ = self.watch_once()
+                    send.assert_not_called()
+                    self.assertTrue(pending.exists())
+                    self.assertEqual(self.read_claim(), record)
+                    self.assertEqual(stderr.getvalue(), f"cannot release: the remote start fence {reason}\n")
 
     def test_stopped_release_ends_processes_that_open_the_fence_outside_the_mirror(self) -> None:
         from scripts.copies import copies
@@ -3568,6 +3604,11 @@ printf 'p%s\0csettler\0\np2345\0ccargo helper\0\np3456\0crustc\0\n' "$PPID"
         write_shell(self.root / "lsof", r'''
 if [[ ${!#} == "$FENCE_FILE" ]]; then
     [[ -e ended ]] && exit 1
+    case " $* " in
+        *" -a "*" -d 8 "*) ;;
+        *) printf 'p3456\0cunrelated reader\0\n' ;;
+    esac
+    printf 'p%s\0cselector\0\np%s\0clsof\0\n' "$PPID" "$$"
     printf 'p2345\0coutside worker\0\n'
 else
     [[ ${!#} == -Fpn ]] || exit 2
@@ -3624,9 +3665,12 @@ fi
                 self.assertEqual(self.read_claim(), record)
                 self.assertTrue(pending.exists())
 
-                def end_work(repository: offload.MirrorScope, target: str, slot: int, *, fence: Path) -> str:
+                def end_work(repository: offload.MirrorScope, target: str, slot: int, *,
+                             fence: Path, holder_timeout_s: float) -> str:
                     self.assertEqual((repository, target, slot), (offload.ALL_MIRRORS, self.paths.target, 1))
                     self.assertEqual(self.root / fence, fence_directory / (pending.name + ".lock"))
+                    connection = eligibility.read_connection_settings(mac_test.config_path(target))
+                    self.assertEqual(holder_timeout_s, connection.leftover_timeout_s)
                     return f"echo ended-work; printf 'leftovers={leftovers}\\nrc=0\\n'"
 
                 def remote(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:

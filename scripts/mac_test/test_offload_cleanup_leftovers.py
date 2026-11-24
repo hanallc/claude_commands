@@ -21,18 +21,22 @@ from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
 class OffloadCommandTests(SeededCleanupFixture):
     def test_fence_holder_diagnostic_preserves_the_test_verdict(self) -> None:
-        controller = offload.ProcessController()
         identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
-        controller.claim_identity = identity
         key = offload.pending_start_key(identity)
-        lines = (f"mac_exit=42\nmac_cleanup=skipped\ndispatch_start_pending={key}\n"
-                 f"dispatch_start_holder={key} 2345 cargo helper\n")
-        stderr = io.StringIO()
-        with redirect_stderr(stderr):
-            result = controller.stream_mac_run(["/bin/sh", "-c", 'printf "%s" "$1"', "fence", lines])
-        self.assertEqual(result, offload.ReportedMacStatus(42, offload.CleanupSkipped()))
-        self.assertIsInstance(controller.pending, offload.PendingStartOperation)
-        self.assertEqual(stderr.getvalue(), "mac_test: the remote start fence is held by 2345 cargo helper\n")
+        for holders, reason in (
+            (f"dispatch_start_holder={key} 2345 cargo helper\n", "is held by 2345 cargo helper"),
+            ("", "is held; the holder check gave no answer"),
+        ):
+            with self.subTest(reason=reason):
+                controller = offload.ProcessController()
+                controller.claim_identity = identity
+                lines = f"mac_exit=42\nmac_cleanup=skipped\ndispatch_start_pending_mac={key}\n{holders}"
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    result = controller.stream_mac_run(["/bin/sh", "-c", 'printf "%s" "$1"', "fence", lines])
+                self.assertEqual(result, offload.ReportedMacStatus(42, offload.CleanupSkipped()))
+                self.assertIsInstance(controller.pending, offload.PendingStartOperation)
+                self.assertEqual(stderr.getvalue(), f"mac_test: the remote start fence {reason}\n")
 
     def command_with_changed_cleanup_timeout(self, value: str) -> subprocess.CompletedProcess[str]:
         self.config["leftover_timeout_s"] = "10"

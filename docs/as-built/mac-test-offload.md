@@ -469,8 +469,12 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   The claim watcher's activity check uses scope `ALL_MIRRORS`.
   The command selector uses `pgrep` for mirror command paths.
   The working-directory selector uses `lsof` and `awk`.
-  Mac cleanup also selects processes with the run's fence lock file open.
-  A held fence keeps the claim. If `lsof` identifies the holders, the refusal lists each PID and command.
+  Mac cleanup also selects processes with the exact start fence file open on descriptor 8.
+  It excludes the processes that do the check.
+  The holder check uses `leftover_timeout_s`.
+  A held fence keeps the claim.
+  The refusal lists each holder's PID and command when `lsof` identifies the holders.
+  If the fence is held and the check gives no answer, the refusal says so.
   A `KnownRepository` scope stops both patterns at the repository boundary.
   `extended_regex_literal` escapes the repository name.
   Thus a lost hana run does not stop a cargo-liner run or a run under `mirror/hana_other`.

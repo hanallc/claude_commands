@@ -555,22 +555,30 @@ def start_fence_relative(identity: claim_state.ClaimIdentity, target: str, *, sc
 
 FENCE_HOLDER_PROGRAM = '''import os, subprocess
 
-def fence_holders(path):
+def fence_holders(path, timeout):
     try:
         path.stat()
     except FileNotFoundError:
         return {}
-    result = subprocess.run(["lsof", "-a", "-u", str(os.getuid()), "-F0pc", str(path)],
-                            capture_output=True, check=False)
-    if result.returncode not in (0, 1) or (result.returncode == 1 and result.stderr):
-        raise OSError("lsof could not inspect the start fence")
+    arguments = ["lsof", "-n", "-P", "-a", "-u", str(os.getuid()), "-d", "8", "-F0pc", str(path)]
+    with subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as probe:
+        try:
+            output, errors = probe.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            probe.kill()
+            raise OSError("lsof timed out while inspecting the start fence") from error
+        if probe.returncode == 1 and not output and not errors:
+            return {}
+        if probe.returncode != 0 or errors:
+            raise OSError("lsof could not inspect the start fence")
+        excluded = {str(pid).encode() for pid in (0, os.getpid(), os.getppid(), probe.pid)}
     holders = {}
     pid = b""
-    for field in result.stdout.split(b"\\0"):
+    for field in output.split(b"\\0"):
         field = field.lstrip(b"\\n")
         if field.startswith(b"p"):
             pid = field[1:]
-            if pid.isdigit() and pid != b"0" and pid != str(os.getpid()).encode():
+            if pid.isdigit() and pid not in excluded:
                 holders[pid] = "(unknown command)"
         elif field.startswith(b"c") and pid in holders:
             command = field[1:].decode(errors="replace")
@@ -586,12 +594,15 @@ def start_fence_reason(identity: claim_state.ClaimIdentity, output: str) -> str 
     lines = output.splitlines()
     if f"dispatch_start_settled={key}" in lines:
         return None
-    if f"dispatch_start_pending={key}" not in lines:
+    mac_pending = f"dispatch_start_pending_mac={key}" in lines
+    if not mac_pending and f"dispatch_start_pending={key}" not in lines:
         return "the remote start fence gave no answer"
     prefix = f"dispatch_start_holder={key} "
     holders = [line.removeprefix(prefix) for line in lines if line.startswith(prefix)]
     if holders:
         return "the remote start fence is held by " + ", ".join(holders)
+    if mac_pending:
+        return "the remote start fence is held; the holder check gave no answer"
     return "the remote start fence is held"
 
 
@@ -628,7 +639,7 @@ base.with_suffix(".lock").touch()
 
 
 def start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, settle: bool = False,
-                        scope_key: str = "run") -> str:
+                        scope_key: str = "run", holder_timeout_s: float | None = None) -> str:
     """Use the prepared identity without permitting recreation after release."""
     key = pending_start_key(identity)
     relative = str(start_fence_relative(identity, target, scope_key=scope_key))
@@ -636,13 +647,15 @@ def start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, set
     if settle:
         mac = target in ("", "mac") or target_config.uses_legacy_mac_layout(
             eligibility.configured_ssh_target(target).platform)
+        pending_marker = "dispatch_start_pending_mac=" if mac else "dispatch_start_pending="
+        check_holders = mac and holder_timeout_s is not None
         holders = '''        try:
-            for pid, command in fence_holders(path).items():
+            for pid, command in fence_holders(path, float(sys.argv[4])).items():
                 print("dispatch_start_holder=" + sys.argv[2] + " " + pid.decode() + " " + command, flush=True)
         except OSError:
             pass
-''' if mac else ""
-        program = (FENCE_HOLDER_PROGRAM if mac else "") + '''import fcntl, pathlib, sys
+''' if check_holders else ""
+        program = (FENCE_HOLDER_PROGRAM if check_holders else "") + '''import fcntl, pathlib, sys
 base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
 path = base.with_suffix(".lock")
 try:
@@ -654,13 +667,13 @@ with lock:
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        print("dispatch_start_pending=" + sys.argv[2], flush=True)
+        print(sys.argv[3] + sys.argv[2], flush=True)
 ''' + holders + '''\
         sys.exit(0)
     path.unlink(missing_ok=True)
     print("dispatch_start_settled=" + sys.argv[2], flush=True)
 '''
-        return shlex.join(["python3", "-c", program, encoded, key])
+        return shlex.join(["python3", "-c", program, encoded, key, pending_marker, str(holder_timeout_s)])
     program = '''import fcntl, os, pathlib, sys
 base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
 fcntl.flock(8, fcntl.LOCK_EX)
@@ -681,13 +694,14 @@ if not matches:
             + shlex.join(["python3", "-c", program, encoded, key]) + " || exit 75\n")
 
 
-def fenced_start_command(identity: claim_state.ClaimIdentity, target: str, command: str, *, scope_key: str = "run") -> str:
+def fenced_start_command(identity: claim_state.ClaimIdentity, target: str, command: str, *,
+                         scope_key: str = "run", holder_timeout_s: float | None = None) -> str:
     """Remove the prepared identity after the existing remote command ends."""
     return (start_fence_command(identity, target, scope_key=scope_key)
             + clean_start_fences_command(identity, target, scope_key=scope_key) + " || exit 75\n"
             + "(\n" + command + "\n)\n"
             + "dispatch_status=$?\nexec 8<&-\n"
-            + start_fence_command(identity, target, settle=True, scope_key=scope_key)
+            + start_fence_command(identity, target, settle=True, scope_key=scope_key, holder_timeout_s=holder_timeout_s)
             + '\nexit "$dispatch_status"')
 
 
@@ -1382,7 +1396,8 @@ class ProcessController:
                         self.attempt_evidence.execution = execution_identity.ExecutionNotStarted()
                     continue
                 if (isinstance(identity, claim_state.ClaimIdentity)
-                        and marker == "dispatch_start_pending=" + pending_start_key(identity)):
+                        and marker in ("dispatch_start_pending=" + pending_start_key(identity),
+                                       "dispatch_start_pending_mac=" + pending_start_key(identity))):
                     self.pending = PendingStartOperation()
                     fence_messages.append(marker)
                     continue
@@ -2651,7 +2666,8 @@ def extended_regex_literal(text: str) -> str:
     )
 
 
-def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 1, *, fence: Path | None = None) -> str:
+def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 1, *,
+                           fence: Path | None = None, holder_timeout_s: float | None = None) -> str:
     """Define select_leftovers: the user's processes running from the scoped mirrors.
 
     A repository's scope stops at its own mirror. Brackets around the first character prevent the pattern from matching its assignment.
@@ -2673,15 +2689,17 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
         cwd_pattern = f"^n.*/{mirror}(/|$)"
     fence_selector = "    fence_pids=\n"
     if fence is not None:
+        if holder_timeout_s is None:
+            raise ValueError("A fence holder check requires the cleanup limit")
         program = FENCE_HOLDER_PROGRAM + '''import pathlib, sys
 path = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
 try:
-    for pid in fence_holders(path):
+    for pid in fence_holders(path, float(sys.argv[2])):
         print(pid.decode())
 except OSError as error:
     sys.exit(str(error))
 '''
-        command = shlex.join(["python3", "-c", program, str(fence).encode().hex()])
+        command = shlex.join(["python3", "-c", program, str(fence).encode().hex(), str(holder_timeout_s)])
         fence_selector = f"    fence_pids=$({command}) || return 1\n"
     return (
         f"mirror_command_pattern={shlex.quote(command_pattern)}\n"
@@ -2702,8 +2720,9 @@ except OSError as error:
 
 
 def leftover_check_script(repository: MirrorScope, target: str = "mac", slot: int = 1, *,
-                          fence: Path | None = None) -> str:
-    selector = (mirror_selector_script(repository, target, slot, fence=fence) if fence is not None
+                          fence: Path | None = None, holder_timeout_s: float | None = None) -> str:
+    selector = (mirror_selector_script(repository, target, slot, fence=fence, holder_timeout_s=holder_timeout_s)
+                if fence is not None
                 else mirror_selector_script(repository, target, slot))
     if isinstance(repository, AllMirrors):
         return selector + r'''
@@ -2767,8 +2786,10 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
             check=False,
             timeout=timeout,
         )
-    except subprocess.TimeoutExpired:
-        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check timed out after {timeout:g} s"), "")
+    except subprocess.TimeoutExpired as error:
+        output = error.stdout or b""
+        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check timed out after {timeout:g} s"),
+                                   output.decode(errors="replace"))
     except OSError:
         return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check could not start (time limit {timeout:g} s)"), "")
     ledger = transfer_bytes.active_transfers.get()
@@ -2791,7 +2812,8 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
 def check_leftovers(config: SshConnectionSettings, host: str, repository: MirrorScope,
                    target: str = "mac", slot: int = 1, *, fence: Path | None = None) -> LeftoverCheckResult:
     """End and count one mirror's work on its recorded host."""
-    return read_leftovers(config, host, leftover_check_script(repository, target, slot, fence=fence), target).result
+    script = leftover_check_script(repository, target, slot, fence=fence, holder_timeout_s=config.leftover_timeout_s)
+    return read_leftovers(config, host, script, target).result
 
 
 def settle_pending_start(controller: ProcessController, config: OffloadConfig, host: str,
@@ -2807,8 +2829,10 @@ def settle_pending_start(controller: ProcessController, config: OffloadConfig, h
         return StartUnsettled(str(error), LeftoverCheckFailed(f"cleanup settings unavailable: {error}"))
     scope_key = controller.claim_scope_key
     fence = start_fence_relative(identity, target, scope_key=scope_key).with_suffix(".lock")
-    command = (start_fence_command(identity, target, settle=True, scope_key=scope_key) + " || exit 1\n"
-               + leftover_check_script(repository, target, slot, fence=fence))
+    command = (start_fence_command(identity, target, settle=True, scope_key=scope_key,
+                                  holder_timeout_s=connection.leftover_timeout_s) + " || exit 1\n"
+               + leftover_check_script(repository, target, slot, fence=fence,
+                                       holder_timeout_s=connection.leftover_timeout_s))
     observed = read_leftovers(connection, host, command, target)
     reason = start_fence_reason(identity, observed.output)
     if reason is not None:
@@ -3092,7 +3116,8 @@ def claimed_run(
             fence = start_fence_relative(identity, request.target, scope_key=controller.claim_scope_key).with_suffix(".lock")
         command = copies.remote_use_command(request_mirror(config, request, repository), step_command)
         if isinstance(identity, claim_state.ClaimIdentity):
-            command = fenced_start_command(identity, request.target, command, scope_key=controller.claim_scope_key)
+            command = fenced_start_command(identity, request.target, command, scope_key=controller.claim_scope_key,
+                                           holder_timeout_s=config.leftover_timeout_s)
         arguments = [*ssh_prefix(config), command]
         remote_status = (controller.stream_mac_run(arguments, CleanupAfterVerdict(config.leftover_timeout_s))
                          if routed_mac_command else controller.stream_mac_run(arguments))
@@ -3155,7 +3180,7 @@ def claimed_run(
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
         elif not isinstance(remote_status.cleanup, CleanupStreamTimedOut):
-            release_allowed = True
+            release_allowed = isinstance(controller.pending, SettledDispatchOperations)
         sync_after_release = linux
         seconds = elapsed_seconds(started)
         if isinstance(remote_status, MacNextestSetupFailed) or setup_failed:
