@@ -68,7 +68,7 @@ scenario = os.environ['FIXTURE_GUEST_RESULT']
 identity = "printf 'checkout %s %s" in shell
 cleanup = 'prove_end()' in shell
 arm_records = 'full_suffix, window, lock_name, descriptor = sys.argv[1:]' in shell
-fence = arm_records and any(f' {mode} mac-linux-armed mac-linux-cancel ' in shell for mode in ('recover', 'recover-legacy'))
+fence = arm_records and ' recover mac-linux-armed mac-linux-cancel ' in shell
 probe = not cleanup and not arm_records and 'bundle unbundle -' not in shell
 trace_path = Path(os.environ['FIXTURE_SSH_TRACE'])
 if not identity or scenario == 'offline':
@@ -83,8 +83,6 @@ if 'FIXTURE_GUEST_PATH' in os.environ:
     environment['PATH'] = os.environ['FIXTURE_GUEST_PATH']
 if 'FIXTURE_GUEST_MACHINE' in os.environ:
     shell = shell.replace('cat /etc/machine-id', 'printf %s ' + shlex.quote(os.environ['FIXTURE_GUEST_MACHINE']))
-if 'FIXTURE_GUEST_ID_FILE' in os.environ:
-    shell = shell.replace('/etc/machine-id', os.environ['FIXTURE_GUEST_ID_FILE'])
 if identity:
     sys.exit(subprocess.call(['bash', '-c', shell], stdin=subprocess.DEVNULL, env=environment))
 if arm_records:
@@ -1314,6 +1312,7 @@ fi
             with patch.object(process_start, 'process_start', return_value=process_start.Gone()):
                 mac_linux.reconcile_unproven(episode, 43)
                 submit.assert_called_once()
+                self.assertIsInstance(mac_linux.settlement(episode, 43, legacy_holder_ended=True), placement.Pending)
                 mac_linux.reconcile_guest_end(episode, 43)
                 self.assertEqual(mac_linux.settlement(episode, 43), placement.Settled())
         self.assert_guest_clean('fence')
@@ -1328,54 +1327,6 @@ fi
         fence.assert_not_called()
         self.assertIsInstance(mac_linux.settlement(episode, 44), placement.Pending)
         self.assert_guest_clean()
-
-    def test_unrecorded_attempt_needs_idle_guest_proof(self) -> None:
-        episode = self.placed.episode
-        attempt = 44
-        legacy = placement.LegacyGuestClaim(FIXTURE_CLAIM.claim_id,
-            placement.ClaimHolderIdentity(store.host_name(), os.getpid(), 'fixture-holder'))
-        machine = 'a' * 32
-        machine_id = self.root / 'machine-id'
-        _ = machine_id.write_text(machine + '\n')
-
-        with (patch('scripts.aws_target.cloud_gate.start_reconcile_service') as submit,
-              patch.object(process_start, 'process_start', return_value=process_start.Started('fixture-holder')) as holder,
-              patch.dict(os.environ, {'FIXTURE_GUEST_ID_FILE': str(machine_id)}),
-              redirect_stderr(io.StringIO())):
-            mac_linux.reconcile_unproven(episode, attempt, legacy=legacy)
-            mac_linux.reconcile_guest_end(episode, attempt, legacy=legacy)
-            submit.assert_not_called()
-            self.assertEqual(self.trace.read_text(), '')
-            holder.return_value = process_start.Gone()
-            self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
-            mac_linux.reconcile_unproven(episode, attempt, legacy=legacy)
-            submit.assert_called_once()
-
-            lock = self.run_lock()
-            lock.parent.mkdir(parents=True)
-            with lock.open('wb') as descriptor:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                mac_linux.reconcile_guest_end(episode, attempt, legacy=legacy)
-            self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
-
-            mac_linux.reconcile_guest_end(episode, attempt + 1, legacy=legacy)
-            self.assertEqual(mac_linux.settlement(episode, attempt + 1), placement.Settled())
-            settings = mac_linux.read_settings(conf.read(self.registry))
-            unrelated = mac_linux.arm_guest(settings, 'unrelated-legacy')
-            mac_linux.reconcile_guest_end(episode, attempt, legacy=legacy)
-            self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
-            (lock.parent / f'{mac_linux.CANCEL_RECORD_PREFIX}.{unrelated.boot_id}.{unrelated.deadline_ns}.{unrelated.attempt}').touch()
-            _ = lock.write_text(f'{os.getpgrp()} {unrelated.attempt}\n')
-            mac_linux.reconcile_guest_end(episode, attempt, legacy=legacy)
-            self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
-            _ = lock.write_text('')
-            mac_linux.reconcile_guest_end(episode, attempt, legacy=legacy)
-
-        self.assertEqual(mac_linux.settlement(episode, attempt), placement.Settled())
-        journal = self.root / 'target-state/mac-linux/end-proofs.jsonl'
-        rows = [cast(dict[str, object], json.loads(line)) for line in journal.read_bytes().splitlines()]
-        self.assertEqual([(row['result'], row['guest_machine_id']) for row in rows],
-                         [('not started', machine), ('proven', machine)])
 
     def test_reconcile_unproven_checks_for_proof_after_preparing_submission(self) -> None:
         request = self.lose_guest_permission_reply(40)

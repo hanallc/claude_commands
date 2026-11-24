@@ -646,6 +646,7 @@ class ConsumePermission(CallerCode):
     claim: placement.ProviderClaimReference
     holder: placement.ClaimHolderIdentity | placement.ClaimHolderUnconfirmed = field(
         default_factory=lambda: placement.ClaimHolderUnconfirmed("not supplied"))
+    guest_proof_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -813,6 +814,8 @@ def _write_wire_record(value: object) -> object:
     # An older reader has no session field; a request with no session leaves it out.
     if record.get("kind") == "AdmitRequest" and record.get("session") == {"kind": "SessionNotSent"}:
         del record["session"]
+    if record.get("kind") == "ConsumePermission" and record.get("guest_proof_required") is False:
+        del record["guest_proof_required"]
     if record.get("kind") == "CloudPlace" and record.get("group") == codec.snapshot_value(NO_CLOUD_GROUP):
         del record["group"]
     if record.get("kind") == "CloudSlotWait" and record.get("state") == {"kind": "WaitingForCloudSlot"}:

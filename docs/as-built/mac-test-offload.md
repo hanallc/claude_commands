@@ -129,10 +129,8 @@ A guest with a held run lock leaves the attempt pending.
 For a known launch, the guest checks both arm names and records refusal under the run lock.
 The refusal prevents later arms and runs for that queue attempt.
 The service records `proven` if the guest found an arm and `not started` if it found none.
-An unrecorded legacy attempt needs proof from the guest.
-The queue starts legacy recovery after it confirms the holder exited and verifies the assigned settings.
-The guest checks for active gate runs and arm records under the run lock.
-The service saves the guest machine ID with the proof.
+An unrecorded legacy attempt settles after the launch holder and the submitting owner both exit.
+The queue uses this rule even if it received a start report.
 The recovery path records at most one warning per attempt under `mac-linux/end-proof-warnings`.
 
 natedev holds the SSH input open for the whole run.
