@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import timedelta
 import errno
 import fcntl
+from functools import partial
 import io
 import json
 import os
@@ -34,7 +35,7 @@ from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNot
 from scripts.build_targets import build_targets, mac_linux, target_config
 from scripts.build_targets.mac_linux import send_guest_execution
 from scripts.buildlog import store, treekey
-from scripts.lib import atomic_file, conf, process_group, process_start, scratch
+from scripts.lib import atomic_file, build_folders, conf, process_group, process_start, scratch
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint.memory_test_support import write_config_fixture
@@ -43,6 +44,7 @@ from scripts.production import checkpoint_gate, gate
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_routes import ALL_MODULES, AllModules, GateJobKind, GateResultUnknown, GateRun, GuestGateBlocked, ModuleCoverage, SuiteMode, TreeSelection
 from scripts.production.test_checkpoint_gate import GatePlacementFixture
+from scripts.test_times.gate_record import NoGateTimeLimit
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -3996,6 +3998,61 @@ fi
         self.assertTrue(reason.startswith('SSH or source stream exited 1:'), reason)
         self.assertIn(f'The guest cannot find the type-check tool {missing}', reason)
         self.assertIn('Guest cleanup: ended', reason)
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_missing_type_tool_on_guest_and_natedev_ends_the_gate_red(self) -> None:
+        fixture = GatePlacementFixture(self)
+        self.placed = guest = replace(fixture.guest, attempt=f'{48:032x}')
+        path = fixture.assignment_file
+        sidecar = path.with_name('progress')
+        local = replace(fixture.local, grant=replace(fixture.local.grant, max_path=str(self.root / 'gate.max')))
+        _ = write_config_fixture(self.registry.with_name('build_admission.conf'))
+        admission_wire.write_assignment(path, wire.Assignment(guest))
+        fixture.report_failure.return_value = wire.DispatchStatus(guest, placement.CurrentAssignment(),
+            placement.PermissionConsumed(1.0), retry=placement.RetryAt(1.0))
+        attempts: list[tuple[str, int]] = []
+        missing = self.root / 'missing-uv'
+
+        def run() -> subprocess.CompletedProcess[str]:
+            grant = admission_wire.read_assignment(path)
+            target = (gate.LocalGateAssignment(grant.grant, grant.assignment.owner, sidecar)
+                      if isinstance(grant, wire.LocalPlacementGranted) else gate.MacLinuxAssignment(grant.assignment))
+            error = ''
+            try:
+                result = gate.run_gate_suites(self.repo, ('scripts',), full=True, target=target)
+                status = int(not result.passed)
+            except gate.MacLinuxTookNoRun as refused:
+                status, error = refused.status, str(refused)
+                self.assertIn(f'The guest cannot find the type-check tool {missing}', error)
+            attempts.append((grant.assignment.destination.target, status))
+            return subprocess.CompletedProcess(fixture.request.constraints.command, status, '', error)
+
+        def place_again(request: wire.PlacementRequest) -> None:
+            self.assertEqual(request, fixture.request)
+            admission_wire.write_assignment(path, local)
+
+        place = Mock(side_effect=place_again)
+        run_types = partial(gate.run_suites, machine=gate.WholeMachine(), selected=gate.SelectedModules(()),
+                            time_limit=NoGateTimeLimit('type tool fixture'))
+        with (patch.dict(os.environ, {'GATE_UV': str(missing),
+                                     'FIXTURE_EXPECTED_MAIN': self.git('rev-parse', 'origin/main'),
+                                     'BUILDLOG_PLACEMENT_FILE': str(path)}),
+              patch.object(gate, 'module_runner', return_value=CHECKOUT / 'scripts/test_times/module_run.py'),
+              patch.object(build_folders, 'configured_gate_root', return_value=self.root),
+              patch.object(gate, 'run_suites', side_effect=run_types),
+              patch.object(gate, 'release_local_gate') as release,
+              redirect_stdout(io.StringIO()) as output):
+            result = first_step.run_gate_with_placement(run, path, fixture.request, place)
+        self.assertEqual(attempts, [('mac-linux', 79), ('natedev', 1)], result.stderr)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('basedpyright: RED\ntype-check venv missing:', output.getvalue())
+        self.assertIn(str(missing), output.getvalue())
+        refusal = wire.parse_request(fixture.report_file.read_bytes())
+        assert isinstance(refusal, wire.ClaimFailure), refusal
+        self.assertEqual((refusal.assignment, refusal.reason), (guest, first_step.MAC_LINUX_START_UNCONFIRMED))
+        fixture.report_failure.assert_called_once_with(refusal)
+        place.assert_called_once_with(fixture.request)
+        release.assert_called_once_with(gate.LocalGateAssignment(local.grant, guest.owner, sidecar), 1)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_command_request_runs_the_argv_in_the_numbered_copy_and_proves_the_end(self) -> None:
