@@ -209,7 +209,16 @@ Saved disk exclusions remain diagnostic evidence.
 `SourceKeyUnavailable` preserves the existing copy path when neither source key is available.
 An unavailable key permits placement and sends no source key with the copy.
 `PlacementWait` carries the original queue time, position and candidate eligibility.
-`Assignment` carries a persisted destination and attempt; it grants no execution permission.
+`wait_for_placement` polls after each configured waiting interval, which is one second by default.
+The timer controls polling even when the queue, view, hold, or release files change.
+The service publishes placement waits and grants after each pass.
+The service hashes poll bytes with SHA-256 before it fills in the caller identity or resolves the Cargo folder.
+Each published placement reply carries its request digest and the current input event count.
+A poll uses the published reply when the request digest and input event count both match.
+Reuse needs no pass or state write if the caller version matches.
+Readings, process exits, configuration changes and queue changes advance the count.
+The pass timer also advances the count so the next pass can read the provider journal and check deadlines.
+`Assignment` carries a saved destination and attempt. Launch permission requires a separate request.
 `ClaimFailure` closes the exact assignment before another placement decision.
 `ConsumePermission` carries the exact assignment, adopted provider claim reference, and checked claim-holder identity.
 The coordinator remains separate from its offload child.
@@ -293,12 +302,24 @@ A Mac host run shows on the Builds page as its Mac build row; the page hides its
 A `mac-linux` gate row has machine `mac-linux` after the gate consumes its launch permission.
 The service sets the remote `started_at` from the consume time, so `memory_feed.unconfirmed_guest_run` reads the consume from it.
 A confirmed guest attempt gives the row `guest_run`. A consumed attempt that the queue has not confirmed gives `guest_unconfirmed: true`.
-The page (`guestRow` in `memory_live.html`) shows both in the running table.
-The Machine cell of a guest row shows the bright `mac-linux` icon.
-The hover of an unconfirmed row shows `Guest attempt  not confirmed`.
-`memory_feed.step_key` builds the row key from `mac-linux` and the consume time.
-The key stays the same when the queue confirms the attempt, so the hover stays open.
-The `mac-linux` icon uses the Mac color in light and dark modes.
+The Builds page shows both attempts in Running with the recorded job, unit, and caller.
+The Machine cell shows one bright icon for `mac-linux` and the guest state.
+The icon uses the Mac color in light and dark modes.
+The cell shows `not confirmed` until confirmation, then `running`.
+The tooltip lists the named targets. It shows the attempt ID after confirmation.
+The memory column shows `on mac-linux`. The vCPU column shows `—`.
+The admission service reads the module counter from the current guest's placement request sidecar.
+It publishes the counter before and after the guest confirms the attempt.
+The Builds page uses the AWS counter format for Stage, Done, and the module count in the tooltip.
+Without a counter, Stage and Done show `—`.
+If a queue read fails, the page keeps the guest row from the last successful reading.
+`memory_feed.step_key` uses `mac-linux` and the consume time.
+The key stays the same when the queue confirms the attempt, so the tooltip stays open.
+The console server sends `X-Builds-Page-Version` on GET and HEAD for the published Builds page.
+The server puts the same version in the HTML. Nanosecond file times distinguish writes in the same second.
+At startup and on its timer, the page compares the HEAD version with its loaded version.
+The page checks again when the tab becomes visible. It reloads once when the versions differ.
+Manual pause and a hidden console frame stop these checks.
 A speculative local parent retains its actual reservation.
 The queue selects the newest eligible speculative copy by call start time, then call identity.
 The watcher keeps result collection and loser stopping.
@@ -363,7 +384,7 @@ An explicit private sweep root selects its own `copies` folder instead of the li
 Stable session folders retain their short paths and mode `0700`.
 The session hook defines the session temporary root.
 The admission fixture uses `short_socket_directory(prefix)` for its separate short socket parent.
-The service keeps `admission/state.json` and `admission/queue.json` outside temporary build folders.
+The service keeps `state.json`, `queue.json`, and `view.json` in the admission folder outside temporary build folders.
 `step_estimator.is_fresh_test()` and the disk sweep read `tmp_sweep.state_dir()` at use.
 `tmp_sweep.TARGET_DELETES_NAME` defines the shared deletion record name.
 
@@ -637,6 +658,17 @@ Importing `build_hold` or `build_targets` does not load the admission service.
 `ServiceState` and `read_state` retain one definition in `admission_service.py` because the state uses several service types.
 The service imports `argparse` inside `main()` and the reading alert message helpers inside `deliver_reading_alert()`.
 After each pass, the service publishes `admission/queue.json` atomically through `scripts/build_queue/queue_snapshot.py`.
+Each publication of the view also replaces `admission/view.json` atomically.
+The pass stores the current input event count with its placement replies before it replaces the view file.
+The file holds the publication time, `fresh_until`, and the encoded socket reply.
+`fresh_until` adds the longest configured pass interval or minimum pass gap to the publication time.
+A socket `ViewRequest` returns the last published view without starting a pass.
+Consuming a Mac Linux permission advances the input event count and marks the pass stale.
+The next eligible pass publishes the guest row.
+
+The Builds feed reads `view.json` and uses its publication time as the data time.
+The page shows `Late` when the time since `fresh_until` exceeds `status.builds.age_limit_seconds` in `config/console.conf`.
+A missing or unreadable view file gives the queue read error.
 The snapshot contains the pass readings, its policy, and the remaining waiters.
 The AWS controller reads this snapshot without a live queue request.
 It refuses a start when the snapshot is missing, stale, or incomplete.

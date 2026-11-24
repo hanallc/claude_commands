@@ -45,10 +45,10 @@ from scripts.build_queue import admission_code
 ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
 from scripts.buildlog import charts, cost_actions, mac_idle, mac_idle_alert, machine_facts, parse
-from scripts.buildlog.store import host_name
+from scripts.buildlog.store import host_name, root
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
-from scripts.build_queue import cloud_progress, limits_view, placement
+from scripts.build_queue import cloud_progress, limits_view, placement, queue_snapshot
 from scripts.build_targets import targets
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
@@ -266,13 +266,16 @@ def build_limit_icons() -> dict[str, str]:
     return {kind: page_frame.icon_svg(icon) for kind, icon in BUILD_LIMIT_ICONS.items()}
 
 
-def publish_page(configuration: FeedConfiguration) -> None:
-    """Publish the repository page with the configured refresh interval."""
+def page_html(interval_seconds: float) -> str:
     source = console_theme.with_theme(PAGE_SOURCE.read_text(encoding="utf-8"))
     page = page_frame.template(source, "Builds", "builds").replace(
-        "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(configuration.interval_seconds))
+        "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(interval_seconds))
     page = page.replace("__BUILD_LIMIT_ICONS__", json.dumps(build_limit_icons()))
-    page = page.replace('</head>', staff_names.script({}) + '</head>', 1)
+    return page.replace('</head>', staff_names.script({}) + '</head>', 1)
+
+
+def publish_page(configuration: FeedConfiguration) -> None:
+    page = page_html(configuration.interval_seconds)
     write_text_atomic(configuration.output_folder / PAGE_NAME, page, new_file_mode=0o644)
 
 
@@ -1165,6 +1168,7 @@ class MemoryPage(TypedDict):
     unit_open: NotRequired[str]
     ok: bool
     read_at: float
+    fresh_until: float
     render_seconds: float
     total: float
     available: float
@@ -2823,7 +2827,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     names = read_step_names()
     staff_display = staff_names.read()
     with codec.snapshot_staff(staff_display.members):
-        parsed = admission_client.view()
+        published = queue_snapshot.read_view_snapshot(root() / "admission")
+    parsed = published.reading
+    admission_records.warn_configuration_diagnostics(parsed.diagnostics)
     explanation = parsed.explanation
     captured = explanation.room
     host = explanation.decided_from.host
@@ -2994,32 +3000,32 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         if isinstance(memory, admission_records.RemoteMemoryUnavailable):
             guest = confirmed_guest_run(step)
             unconfirmed = unconfirmed_guest_run(step)
+            guest_gate = guest is not None or unconfirmed
             key = f"{MAC_LINUX_TARGET}:{guest['attempt']}" if guest else admission_records.execution_group(step, entry.owner)
             if key in remote_groups:
                 continue
-            verb = step.step
-            what = row_what(step.what, "")
-            unknown_gate = verb in GATE_STEPS and not what
-            who = step_owner_name(shown_step, labels)
-            title_step = (QueueRowName.owned(who, "") if unknown_gate else
-                          build_row_step(verb, step.package, step.project, step.folder, names, what=what))
-            if isinstance(title_step, NoNamedStep):
+            job = NotGateStep() if guest_gate and not isinstance(step.job, StepJob) else local_job(step)
+            if guest_gate:
+                guest_labels = replace(identity, unit=step.unit or identity.unit)
+                owner = replace(owner, labels=guest_labels, unit=staff_unit(guest_labels))
+                shown_step = replace(shown_step, step=job_step(job, step.step), unit=guest_labels.unit)
+            named = local_step_name(shown_step, owner, names, labels, "", job if guest_gate else NotGateStep())
+            if isinstance(named, NoNamedStep):
                 continue
             remote_groups.add(key)
-            display_name = title_step if unknown_gate else QueueRowName.owned(who, title_step)
-            parts = [] if unknown_gate else staff_names.row_parts(who, title_step, identity.unit)
-            remote_row: RunRow = {**queue_row_labels(title_step, display_name, unit=owner.unit, caller=owner.caller),
-                "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
+            remote_row: RunRow = {**queue_row_labels(named.title, named.name, unit=owner.unit, caller=owner.caller),
+                "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
                 **owner.fields(),
-                "state": "running" if guest or isinstance(step.execution, execution_identity.ObservedExecution) else "uncertain",
-                "pid": step.pid, "detail": detail, "used": admission_records.RunUseUnavailable(memory.reason),
+                "state": "running" if guest_gate or isinstance(step.execution, execution_identity.ObservedExecution) else "uncertain",
+                "pid": step.pid, "detail": owner.labels.unit, "used": admission_records.RunUseUnavailable(memory.reason),
                 "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
-                "progress": row_progress((step,), progress.TOKEN_WAIT_REASON),
+                "progress": (cloud_row_progress(step.counter) if guest_gate
+                             else row_progress((step,), progress.TOKEN_WAIT_REASON)),
                 "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
-                "machine": MAC_LINUX_TARGET if guest or unconfirmed else admission_records.execution_host(step, machine),
+                "machine": MAC_LINUX_TARGET if guest_gate else admission_records.execution_host(step, machine),
                 "vcpus": queue_view.UnknownCpuCount(),
                 **call_notes(step.verify, step.step),
-                **job_notes(local_job(step), names, step=step.step, verify=step.verify,
+                **job_notes(job, names, step=step.step, verify=step.verify,
                             ci=step.unit in ci_runners),
                 **build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
                     home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))}
@@ -3327,7 +3333,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     page: MemoryPage = {
         "colors": configuration.colors,
         "staff_names": staff_display.registry(), "unit_open": staff_display.unit_open(),
-        "ok": True, "read_at": explanation.now, "render_seconds": 0.0, "total": total, "available": gib(captured.available),
+        "ok": True, "read_at": published.written_at, "fresh_until": published.fresh_until,
+        "render_seconds": 0.0, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,
         "taken": gib(ram["cap_bytes"] - captured.room), "room": gib(captured.room), "room_source": "free",
