@@ -19,14 +19,14 @@ from typing import cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from scripts.review_links.browser_test_support import firefox_probe_results as firefox_probe_results
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results, newer_script_reload_results
 from scripts.accounts import accounts, next_moves, role_activity, role_map
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.agents.test_support import write_machine_config
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.review_links import accounts_page, console_theme, page_frame, serve
+from scripts.production import staff
+from scripts.review_links import accounts_page, console_theme, new_item_dialog, page_frame, serve
 from scripts.whoami import agent_accounts, quota_state, run_out, usage_store
 from scripts.whoami.account_test_support import create_claude_account, stored_room
 
@@ -192,104 +192,6 @@ MENU_PROBE = '''<script>
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
-
-
-NEWER_SCRIPT_PROBE = r"""<script>
-(async()=>{
- const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
- const send=()=>navigator.sendBeacon('/results',JSON.stringify(failures));
- const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
- const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
- const until=async test=>{for(let wait=0;wait<60;wait++){try{if(await test()) return true;}catch(_){}await pause(50);}return false;};
- const line=()=>document.querySelector('[data-page-status]');
- const status=()=>line().dataset.state+': '+line().textContent.replace(/\s+/g,' ');
- const refresh=async()=>{document.dispatchEvent(new Event('visibilitychange'));for(let wait=0;wait<10;wait++){await flush();await pause(50);}};
- const placed=()=>PLACED;
- const expected=JSON.parse(sessionStorage.getItem('reload-probe') || 'null');
- if(expected){
-  sessionStorage.removeItem('reload-probe');
-  if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
-  for(let wait=0;wait<10;wait++){await flush();await pause(50);}
-  check(expected.ready,'the page reloaded before the hold ended');
-  check(expected.top>0,'the end of the hold keeps a scrolled place');
-  check(Math.abs(scrollY-expected.top)<=1,'the reload keeps the scroll place: '+scrollY+' not '+expected.top);
-  check(placed(),'the reload keeps the open place');
-  if(expected.saves) check(sessionStorage.getItem('reload-probe-timeout'),'the save ends by its timeout');
-  sessionStorage.removeItem('reload-probe-timeout');
-  send();return;
- }
- try{
-  frameElement.style.width='1280px';frameElement.style.height='300px';await flush();
-  PLACE
-  await flush();
-  check(scrollY>0 && placed(),'the probe starts at a scrolled place');
-  // A reload before ready() is a failure. The reload must keep the scroll place that the page has when it unloads.
-  // The end of a hold can move that place, for example by scroll anchoring when a picker closes.
-  const ready=()=>sessionStorage.setItem('reload-probe',JSON.stringify({ready:true,top:scrollY,saves:SAVES}));
-  sessionStorage.setItem('reload-probe',JSON.stringify({ready:false,top:scrollY,saves:SAVES}));
-  addEventListener('pagehide',()=>{
-   const probe=JSON.parse(sessionStorage.getItem('reload-probe') || 'null');
-   if(probe) sessionStorage.setItem('reload-probe',JSON.stringify({...probe,top:scrollY}));
-  });
-  sessionStorage.removeItem('reload-probe-timeout');
-  const newer=NEWER,realFetch=window.fetch;
-  let posts=0,timedOut=false;
-  window.fetch=(url,options)=>{
-   // The save never answers, so only its timeout signal can end it. The reload after it checks the marker.
-   if(SAVES && options?.method==='POST'){
-    posts++;
-    return new Promise((_,reject)=>options.signal?.addEventListener('abort',()=>{
-     timedOut=true;sessionStorage.setItem('reload-probe-timeout','1');reject(options.signal.reason);
-    },{once:true}));
-   }
-   return newer(url,options,realFetch) ?? realFetch(url,options);
-  };
-  const type=(field,words)=>{field.value=words;field.dispatchEvent(new Event('input',{bubbles:true}));};
-  START
-  if(SAVES) check(await until(()=>posts>0),'the save starts');
-  if(HOLDS){
-   const held='A newer page loads when your edit ends.';
-   await refresh();
-   check(line().dataset.state==='Paused' && status().includes(held),'the hold defers the reload: '+status());
-   // A held reload answers now, so a hold that outlasts the age limit stays Paused, not Late.
-   const now=Date.now,options=JSON.parse(line().dataset.statusOptions);
-   Date.now=()=>now()+(options.ageLimit+5)*1000;
-   await refresh();
-   check(line().dataset.state==='Paused' && status().includes(held),'a long hold stays Paused: '+status());
-   Date.now=now;
-   // A save timeout ends the hold, so the checks above must run while the save still waits.
-   if(SAVES) check(!timedOut,'the Paused checks run before the save timeout');
-   ready();
-   // The end of the hold reloads the page at once. No refresh call follows.
-   END
-  }else{
-   ready();
-   await refresh();
-  }
-  // A save waits for its timeout, then the page reloads.
-  for(let wait=0;wait<100;wait++) await pause(100);
-  sessionStorage.removeItem('reload-probe');
-  failures.push('the page did not reload; its status is '+status());
- }catch(error){failures.push(String(error));}
- send();
-})();</script>"""
-
-
-def newer_script_reload_results(page: str, *, newer: str, place: str, start: str, placed: str = "true",
-                                holds: bool = True, saves: bool = False, end: str = "") -> list[list[str]]:
-    """Prove in Firefox when a newer page script reloads the page, and that the reload keeps the place.
-
-    `newer` is a JavaScript function `(url, options, fetch)` that answers a refresh request with the newer
-    page and returns undefined for other requests. `place` scrolls the page; `placed` is true while the open
-    place shows. `start` sets up the page state, for example a typed draft; `type(field, words)` types into a field.
-    When `holds` is true, a refresh shows Paused. Then `end` ends the hold, and the page must reload with no
-    refresh call. Else the next refresh reloads. When `saves` is true, `start` starts a save that never answers.
-    Its timeout ends the hold, and it must not end before the Paused checks are done.
-    """
-    probe = (NEWER_SCRIPT_PROBE.replace("PLACED", placed).replace("PLACE", place).replace("START", start)
-             .replace("END", end).replace("HOLDS", "true" if holds else "false")
-             .replace("SAVES", "true" if saves else "false").replace("NEWER", newer))
-    return firefox_probe_results(page.replace("</body>", probe + "</body>").encode())
 
 
 class AccountsPageTests(unittest.TestCase):
@@ -459,6 +361,7 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
         login = "warning-fixture@example.invalid"
         marker = b'data-quota-level="warning" data-quota-account="claude4"'
         resets_at = datetime.now(timezone.utc) + timedelta(days=1)
+        warning = accounts_page.quota_alert_settings().warning
 
         def render_fixture() -> accounts_page.AccountsRender:
             return accounts_page.AccountsRender(accounts_page.page(), .5, time.time())
@@ -476,13 +379,13 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
               patch.object(accounts_page, "render_with_facts", side_effect=render_fixture)):
             create_claude_account("claude4", login)
             self.assertTrue(usage_store.store_file().is_relative_to(home))
-            stored_room(login, 11, resets_at)
+            stored_room(login, warning + 1, resets_at)
             self.assertFalse(marker in cache.get())
             self.assertEqual(accounts_page.nav_quota(self.review_root)["level"], accounts_page.QuotaLevel.NONE)
 
-            stored_room(login, 10, resets_at)
+            stored_room(login, warning, resets_at)
             self.assertEqual(accounts_page.nav_quota(self.review_root),
-                             {"level": accounts_page.QuotaLevel.WARNING, "name": "Warning: 10% left"})
+                             {"level": accounts_page.QuotaLevel.WARNING, "name": f"Warning: {warning}% left"})
             reply = cache.get()
             with cache.condition:
                 self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
@@ -493,11 +396,14 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
         path = accounts_page.quota_state(self.review_root)
         path.parent.mkdir(parents=True)
         _ = path.write_text(json.dumps({"claude1": {"level": "urgent", "reset": reset.isoformat()}}), encoding="utf-8")
-        cases = ((reset - timedelta(microseconds=526917), 4, False),
-                 (reset + timedelta(seconds=3599), 4, False),
-                 (reset + timedelta(hours=1), 4, True),
+        settings = conf.read(Path(os.environ["CONF_DIR"]) / "review_links.conf")
+        urgent = settings.whole("accounts_quota_urgent_percent")
+        window = timedelta(seconds=settings.whole("accounts_quota_same_window_seconds"))
+        cases = ((reset - timedelta(microseconds=526917), urgent, False),
+                 (reset + window - timedelta(seconds=1), urgent, False),
+                 (reset + window, urgent, True),
                  (reset + timedelta(days=7), 100, False),
-                 (reset + timedelta(days=7), 4, True))
+                 (reset + timedelta(days=7), urgent, True))
         for observed_reset, left, shows_icon in cases:
             with self.subTest(reset=observed_reset, left=left):
                 row = replace(status_row("claude1"), resets_at=observed_reset, weekly_left_percent=left)
@@ -527,8 +433,10 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
                     self.assertNotIn('data-quota-account="claude1"', content)
 
     def test_weekly_quota_icons_follow_the_config_and_skip_missing_readings(self) -> None:
-        cases = ((11, ""), (10, "Warning: 10% left"), (6, "Warning: 6% left"),
-                 (5, "Urgent: 5% left"), (0, "Urgent: 0% left"), (accounts.StatusUnavailable(), ""))
+        settings = accounts_page.quota_alert_settings()
+        warning, urgent = settings.warning, settings.urgent
+        cases = ((warning + 1, ""), (warning, f"Warning: {warning}% left"), (urgent + 1, f"Warning: {urgent + 1}% left"),
+                 (urgent, f"Urgent: {urgent}% left"), (0, "Urgent: 0% left"), (accounts.StatusUnavailable(), ""))
         quota_rows = tuple(replace(status_row(label), tool="codex" if label.startswith("codex") else "claude",
                                    weekly_left_percent=left)
                            for label, (left, _) in zip(("claude1", "claude2", "codex1", "claude3", "codex2", "claude4"),
@@ -547,10 +455,11 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
                     else:
                         self.assertIsNone(button)
             _ = write_config_fixture(conf.path("review_links"),
-                                     "accounts_quota_warning_percent=12\naccounts_quota_urgent_percent=6\n")
+                                     f"accounts_quota_warning_percent={warning + 1}\n"
+                                     + f"accounts_quota_urgent_percent={urgent + 1}\n")
             changed = accounts_page.page().decode()
-            self.assertIn('aria-label="Warning: 11% left"', changed)
-            self.assertIn('aria-label="Urgent: 6% left"', changed)
+            self.assertIn(f'aria-label="Warning: {warning + 1}% left"', changed)
+            self.assertIn(f'aria-label="Urgent: {urgent + 1}% left"', changed)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_quota_panel_closes_and_clear_preserves_the_percentage_color(self) -> None:
@@ -1945,6 +1854,42 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         with (patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired((), 30)),
               self.assertRaisesRegex(OSError, "took longer than 30 s")):
             _ = accounts_page.render()
+
+    def test_new_item_opens_above_the_color_picker_and_its_screenshot_shows_the_picker(self) -> None:
+        from scripts.review_links.test_page_frame import PAGE_OWNER, WINDOW_BROWSERS, WINDOW_PROBE, window_probe_results
+
+        if not WINDOW_BROWSERS:
+            self.skipTest("Chrome or Firefox is required for the window rule.")
+        reading = accounts.StatusReading((status_row("claude1"), status_row("claude2")), (), (), timezone.utc, AT)
+        with patch.object(accounts, "read_status", return_value=reading):
+            content = accounts_page.page()
+        rendered = accounts_page.AccountsRender(content, .1, 200).with_recent_times((.1,))
+        markup = page_frame.with_owner(rendered, "accounts", PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)),
+                                       new_item_dialog.render)
+        probe = r'''
+(async()=>{
+ if(nested) return;
+ try{
+  await painted();
+  const popup=document.querySelector('[data-color-picker]');
+  document.querySelector('[data-color-key="account.claude1"]').click();
+  await until(()=>popup.open,'the color picker');
+  await painted();
+  check(pressNewItem('over the color picker')!==null,'The press reaches New item.');
+  const capture=await newItemOver(popup,'the color picker');
+  const address=location.pathname+location.search+location.hash;
+  check(capture.place===address+(location.hash ? '&' : '#')+'console-window='+encodeURIComponent('color:account.claude1'),
+   'The screenshot address names the open color picker: '+capture.place);
+  await closeNewItem(popup,'the color picker');
+  await opensAgain(capture.place,doc=>doc.querySelector('[data-color-picker]')?.open===true,'the color picker');
+ }catch(error){failures.push(String(error));}
+ await report();
+})();'''
+        page = markup.replace(b"</body>", b"<script>" + (WINDOW_PROBE + probe).encode() + b"</script></body>", 1)
+        for browser in WINDOW_BROWSERS:
+            with self.subTest(browser=browser):
+                self.assertEqual(window_probe_results({"/console/accounts.html": page}, "/console/accounts.html", browser),
+                                 [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_refresh_obeys_visibility_and_updates_the_load_time_and_data_age(self) -> None:

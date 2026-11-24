@@ -14,8 +14,7 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import urlencode
 
-from scripts.review_links.test_accounts_page import newer_script_reload_results
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states, newer_script_reload_results
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.production import investigation, staff
 from scripts.review_links import console, investigations_page, page_frame

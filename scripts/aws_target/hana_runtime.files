@@ -90,6 +90,7 @@ scripts/mac_test/abandoned_sessions.py
 scripts/mac_test/claim_state.py
 scripts/mac_test/floor_claims.py
 scripts/mac_test/linux_runner.py
+scripts/mac_test/mirror_root.py
 scripts/message/owner_role.py
 scripts/message/process_identity.py
 scripts/message/process_table.py

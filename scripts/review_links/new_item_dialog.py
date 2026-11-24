@@ -1269,7 +1269,8 @@ SCRIPT = r'''(() => {
   const seconds = Number(status?.dataset.renderSeconds ?? NaN);
   const data = visiblePageData();
   return {
-   place: location.pathname + location.search + location.hash,
+   // The page frame adds the open window under New item, so the screenshot shows it.
+   place: window.pageCapturePlace?.(dialog) ?? location.pathname + location.search + location.hash,
    viewport: viewport(),
    data,
    state: {url: clip(location.href, limits.pageUrlLength), title: data.title,
@@ -1467,7 +1468,13 @@ SCRIPT = r'''(() => {
  }
 
  async function open(trigger, page) {
-  if (dialog.open || sending) return;
+  // A press on the New item button inside the open New item window moves focus to the words.
+  // In the Saved state the words are hidden, so the focus goes to Done.
+  if (dialog.open) {
+   (body.hidden ? done : words).focus({preventScroll: true});
+   return;
+  }
+  if (sending) return;
   if (pendingItem) page = pendingItem.page;
   ownerPage = page;
   pageContext = collectPageContext();

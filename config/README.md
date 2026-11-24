@@ -862,7 +862,7 @@ The command edits no tracked file.
 ### Cloud gate regions
 
 `cloud_gate.conf` uses `enabled=on` for cloud gates.
-With `enabled=off`, merge gates and targeted tests without a placement assignment run on natedev.
+With `enabled=off`, gate jobs and targeted tests without a placement assignment run on natedev.
 `enabled=off` also refuses the pinned `hana-gpu` route and stops the hourly placement-score reads.
 `cloud_gate.conf` sets `regions` to all 19 regions of `spot_candidate_regions`.
 The first region must match the home region in `aws_target.conf`.

@@ -18,7 +18,7 @@ from typing import Literal, NamedTuple, TypedDict, cast
 from scripts.build_queue.first_step import FirstStepRefused, gate_targets
 from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, command_program
+from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, command_program
 from scripts.lib.process_failure import failure_detail
 from scripts.message import session_send
 from scripts.production import staff
@@ -151,9 +151,9 @@ def failed_tests(output: str) -> frozenset[str]:
     return frozenset(NEXTEST_FAIL.findall(output))
 
 
-# A red module in the merge gate output: `--- accounts/test_accounts.py exit=1 ---`.
+# A failed module in the gate output: `--- accounts/test_accounts.py exit=1 ---`.
 GATE_RED = re.compile(r"^--- (\S+) (?:rerun alone )?exit=(-?\d+) ---$", re.MULTILINE)
-# A module that the merge gate passed when it ran the module again alone.
+# A module that passed when the gate ran it again alone.
 GATE_GREEN_ALONE = re.compile(r"^--- (\S+) passed on rerun alone; first run exit=", re.MULTILINE)
 
 
@@ -162,7 +162,7 @@ def runs_merge_gate(command: Sequence[str]) -> bool:
 
 
 def red_names(command: Sequence[str], output: str) -> frozenset[str]:
-    """Return the red gate modules of a merge gate command, or the red nextest tests of another command."""
+    """Return the failed modules for a gate command or the failed nextest tests for another command."""
     if not runs_merge_gate(command):
         return failed_tests(output)
     green = frozenset(GATE_GREEN_ALONE.findall(output))
@@ -238,8 +238,9 @@ def stop_test_without_result(step: CheckpointTestStep, result: subprocess.Comple
     if result.returncode == TREE_CHANGED_STATUS:
         raise Stop("test", "cancelled", f"{step.label} cancelled because the tree changed; log {log}",
                    f"resubmit this checkpoint after your edits are done; test log: {log}")
-    if result.returncode == MAC_LINUX_PRELAUNCH_REFUSED_STATUS and command_program(step.command) in GATE_SCRIPTS:
-        raise Stop("test", "blocked", f"{step.label} could not complete placement. Log {log}",
+    if (result.returncode in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS)
+            and command_program(step.command) in GATE_SCRIPTS):
+        raise Stop("test", "blocked", f"{step.label} ended with gate status {result.returncode}. Log {log}",
                    f"Check the gate placement in {log}.")
 
 

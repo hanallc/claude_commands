@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from scripts.lib.checkout_test_support import copy_test_runner, direct_test_fixture_environment
+from scripts.lib.checkout_test_support import (STANDALONE_TEST_STARTUP, copy_test_runner,
+                                              direct_test_fixture_environment, without_user_test_manager)
 
 from contextlib import ExitStack, redirect_stderr
 from io import StringIO
@@ -595,6 +596,196 @@ config.write_text("expired")
         self.assertEqual(private.read_text(), "page.list.owner=fixture\n")
 
 
+FOLDER_PATHS = """import os, unittest
+from pathlib import Path
+
+class Folders(unittest.TestCase):
+    def test_paths(self):
+        for setting in ("CONF_READ_LOG", "SCRATCH_ROOT", "ASTRA_REVIEW_DIR"):
+            print(setting + "=" + str(Path(os.environ[setting]).parent.parent))
+        print("TMPDIR=" + str(Path(os.environ["TMPDIR"]).parent))
+"""
+# The timed runner starts as a direct run, also inside a gate module or a direct test scope.
+STANDALONE_RUNNER = STANDALONE_TEST_STARTUP + """import runpy
+runpy.run_path(sys.argv.pop(1), run_name="__main__")
+"""
+
+
+class ModuleRunnerFolderTests(unittest.TestCase):
+    def test_runner_recovers_an_ended_owners_folder_and_keeps_a_held_folder(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        checkout = root / "worktrees/claude/verify/work"
+        output = root / "build/claude/verify/work"
+        copy_test_runner(checkout)
+        parent = output / "test-runs"
+        parent.mkdir(parents=True)
+        (checkout / "target").symlink_to(output, target_is_directory=True)
+        source = checkout / "test_folders.py"
+        _ = source.write_text(FOLDER_PATHS)
+        shim = str(checkout / "scripts/lib/py")
+        processes = OwnedTestProcesses()
+        self.addCleanup(processes.finish)
+        environment = processes.environment(direct_test_fixture_environment(root))
+        owner_source = """import sys
+from pathlib import Path
+from scripts.lib import build_folders
+
+parent = build_folders.ExplicitBuildParent(Path(sys.argv[1]))
+folder = build_folders.create_build_folder(build_folders.UniqueBuildFolder(sys.argv[2], parent))
+print(folder, flush=True)
+sys.stdin.read(1)
+"""
+        owner = [shim, "-B", "-c", owner_source, str(parent)]
+        ended = subprocess.run([*owner, "config-reads-"], cwd=checkout, env=environment,
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True, timeout=30)
+        leftover = Path(ended.stdout.strip())
+        self.assertEqual(leftover.parent, parent)
+        self.assertTrue(leftover.is_dir())
+        live = subprocess.Popen([*owner, "test-run-roots-"], cwd=checkout, env=environment,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        processes.track(live)
+        assert live.stdout is not None
+        self.assertTrue(select.select([live.stdout], [], [], 30)[0], "The live owner did not report its folder")
+        held = Path(cast(str, live.stdout.readline()).strip())
+        self.assertEqual(held.parent, parent)
+        self.assertTrue(held.is_dir())
+
+        result = subprocess.run(
+            [shim, "-B", str(checkout / "scripts/test_times/module_run.py"), str(checkout), source.name],
+            cwd=checkout, env=environment, capture_output=True, text=True, check=False, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(leftover.exists(), f"The ended owner left {leftover}")
+        self.assertFalse(leftover.with_name(leftover.name + ".lease.json").exists())
+        self.assertFalse(leftover.with_name(leftover.name + ".lock").exists())
+        self.assertTrue(held.is_dir())
+        self.assertIsNone(live.poll())
+        stdout, stderr = live.communicate(timeout=30)
+        self.assertEqual(live.returncode, 0, stdout + stderr)
+
+    def test_concurrent_runners_do_not_wait_for_held_folder_names(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        checkout = root / "worktrees/claude/verify/work"
+        output = root / "build/claude/verify/work"
+        copy_test_runner(checkout)
+        output.mkdir(parents=True)
+        (checkout / "target").symlink_to(output, target_is_directory=True)
+        ready = root / "ready"
+        source = checkout / "test_folders.py"
+        _ = source.write_text("""import os, sys, unittest
+from pathlib import Path
+
+class Folders(unittest.TestCase):
+    def test_paths(self):
+        paths = [str(Path(os.environ[key]).parent)
+                 for key in ("CONF_READ_LOG", "SCRATCH_ROOT")]
+        if "FIXTURE_READY" in os.environ:
+            ready = Path(os.environ["FIXTURE_READY"])
+            ready.with_suffix(".tmp").write_text("\\n".join(paths))
+            ready.with_suffix(".tmp").rename(ready)
+            sys.stdin.read(1)
+        else:
+            print("\\n".join(paths))
+""")
+        entry = checkout / "run_fixture.py"
+        _ = entry.write_text("""import runpy, sys, time
+from types import SimpleNamespace
+from unittest.mock import patch
+from scripts.lib import build_folder_lock, build_folders
+
+create_folder = build_folders.create_build_folder
+new_suffix = build_folders._new_suffix
+first_suffixes = iter(("a", "b"))
+
+def fixture_suffix(length, settings):
+    initial = next(first_suffixes, "")
+    return initial * length if initial else new_suffix(length, settings)
+
+def refuse_wait(seconds):
+    raise AssertionError("A runner waited for a held folder name")
+
+def create_without_wait(*args, **kwargs):
+    clock = SimpleNamespace(monotonic=time.monotonic, sleep=refuse_wait)
+    with patch.object(build_folder_lock, "time", clock):
+        return create_folder(*args, **kwargs)
+
+build_folders._new_suffix = fixture_suffix
+build_folders.create_build_folder = create_without_wait
+sys.argv.pop(0)
+runpy.run_path(sys.argv[0], run_name="__main__")
+""")
+        processes = OwnedTestProcesses()
+        self.addCleanup(processes.finish)
+        environment = processes.environment(direct_test_fixture_environment(root))
+        command = [str(checkout / "scripts/lib/py"), "-B", str(entry),
+                   str(checkout / "scripts/test_times/module_run.py"), str(checkout), source.name]
+        first = subprocess.Popen(command, cwd=checkout, env={**environment, "FIXTURE_READY": str(ready)},
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        processes.track(first)
+        wait_until(lambda: ready.exists() or first.poll() is not None, root, timeout=30, processes=(first,))
+        if not ready.exists():
+            stdout, stderr = first.communicate(timeout=30)
+            self.fail(stdout + stderr)
+        held = tuple(Path(path) for path in ready.read_text().splitlines())
+        second = subprocess.run(command, cwd=checkout, env=environment, capture_output=True, text=True,
+                                check=False, timeout=30)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        allocated = tuple(Path(path) for path in second.stdout.splitlines())
+        self.assertEqual(len(allocated), 2)
+        self.assertTrue(all(path.parent == output / "test-runs" for path in (*held, *allocated)))
+        self.assertTrue(set(held).isdisjoint(allocated))
+        self.assertTrue(all(path.is_dir() for path in held))
+        stdout, stderr = first.communicate(timeout=30)
+        self.assertEqual(first.returncode, 0, stdout + stderr)
+        self.assertEqual(list((output / "test-runs").iterdir()), [])
+
+    def test_runner_folders_use_the_checkout_output(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        checkout = root / "worktrees/claude/verify/work"
+        output = root / "build/claude/verify/work"
+        copy_test_runner(checkout)
+        output.mkdir(parents=True)
+        (checkout / "target").symlink_to(output, target_is_directory=True)
+        source = checkout / "test_folders.py"
+        _ = source.write_text(FOLDER_PATHS)
+        environment = without_user_test_manager(root, direct_test_fixture_environment(root))
+        result = subprocess.run(
+            [str(checkout / "scripts/lib/py"), "-B", "-c", STANDALONE_RUNNER,
+             str(checkout / "scripts/test_times/module_run.py"), str(checkout), source.name],
+            cwd=checkout, env=environment, capture_output=True, text=True, check=False,
+            timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for setting in ("CONF_READ_LOG", "SCRATCH_ROOT", "ASTRA_REVIEW_DIR", "TMPDIR"):
+            self.assertIn(f"{setting}={output / 'test-runs'}", result.stdout.splitlines())
+        self.assertEqual(list((output / "test-runs").iterdir()), [])
+
+    def test_runner_folders_follow_start_dir_into_another_checkout(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        runner_checkout = root / "runner"
+        copy_test_runner(runner_checkout)
+        checkout = root / "worktrees/claude/verify/tested"
+        start_dir = checkout / "tests"
+        start_dir.mkdir(parents=True)
+        _ = subprocess.run(["git", "init", "-q", str(checkout)], check=True, timeout=30)
+        output = root / "build/claude/verify/tested"
+        output.mkdir(parents=True)
+        (checkout / "target").symlink_to(output, target_is_directory=True)
+        source = start_dir / "test_folders.py"
+        _ = source.write_text(FOLDER_PATHS)
+        environment = without_user_test_manager(root, {**direct_test_fixture_environment(root),
+                                                       "PYTHONPATH": str(start_dir)})
+        result = subprocess.run(
+            [str(runner_checkout / "scripts/lib/py"), "-B", "-c", STANDALONE_RUNNER,
+             str(runner_checkout / "scripts/test_times/module_run.py"), str(start_dir), source.name],
+            cwd=root, env=environment, capture_output=True, text=True, check=False, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for setting in ("CONF_READ_LOG", "SCRATCH_ROOT", "ASTRA_REVIEW_DIR", "TMPDIR"):
+            self.assertIn(f"{setting}={output / 'test-runs'}", result.stdout.splitlines())
+        self.assertEqual(list((output / "test-runs").iterdir()), [])
+
+
 class ModuleRunnerTests(unittest.TestCase):
     outcomes: ClassVar[FixtureRun]
     empty: ClassVar[FixtureRun]
@@ -919,6 +1110,40 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(fixture.timed.returncode, 0, fixture.timed.stderr)
         self.assertEqual(normalized_output(fixture.timed.stderr), normalized_output(fixture.standard.stderr))
         self.assertEqual(fixture.times["tests_run"], 1)
+
+    def test_failed_setup_reports_shifted_reads_from_a_child_with_a_private_environment(self) -> None:
+        checkout = str(RUNNER.parents[2])
+        for operation in ("setUpModule", "setUpClass"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                source = f"""
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+
+def fail_setup():
+    config = Path(__file__).with_name("fixture.conf")
+    config.write_text("# test config shift: 2 3\\n# whole: 1..\\nused=3\\n"
+                      "# test config shift: 4 5\\n# whole: 1..\\nunused=5\\n")
+    program = "from scripts.lib import conf; from pathlib import Path; import sys; conf.read(Path(sys.argv[1])).whole('used')"
+    subprocess.run([sys.executable, "-B", "-c", program, str(config)], check=True,
+                   env={{"PYTHONPATH": {checkout!r}}})
+    raise RuntimeError("setup failed")
+
+class FailingSetup(unittest.TestCase):
+    def test_never_runs(self):
+        raise AssertionError("unexpected test")
+
+if {operation!r} == "setUpModule":
+    setUpModule = fail_setup
+else:
+    FailingSetup.setUpClass = staticmethod(fail_setup)
+"""
+                fixture = run_fixture(Path(directory), "setup_shift", source)
+                self.assertEqual(fixture.timed.returncode, 1, fixture.timed.stderr)
+                self.assertIn(f"Shifted configuration reads for {operation}", fixture.timed.stderr)
+                self.assertIn("fixture.conf:used: 2 -> 3", fixture.timed.stderr)
+                self.assertNotIn("fixture.conf:unused", fixture.timed.stderr)
 
     def test_successful_class_fixture_has_its_own_cpu_measure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -20,6 +20,7 @@ from scripts.lib.git_test_support import commit_repository
 from scripts.lib.shell_test_support import shell_function
 from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.direct.tree_watch_test_support import TreeWatchFixture, write_workspace
+from scripts.direct.test_verify_lint_scope import assert_clippy_calls
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
 from scripts.direct.verify_lint_scope_test_support import VERIFY, CARGO_STUB, TAPLO_STUB, write_fixture_cargo_mend
@@ -55,7 +56,7 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         fixture.environment["VERIFY_PY_TRACE"] = str(trace)
         fixture.environment["TEST_CLIPPY_STATUSES"] = "[101, 0]"
         result = fixture.verify("lint", "sample")
-        fixture.assert_fix_and_judgment_calls()
+        assert_clippy_calls(fixture)
         rows = [line.split("\t") for line in trace.read_text().splitlines()]
         self.assertTrue(rows, result.stdout + result.stderr)
         for row in rows:
