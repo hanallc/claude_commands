@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Protocol, TypedDict, cast
+from typing import Protocol, TypedDict, cast
 
 from scripts.agents.remote import local_machine, this_machine
 from scripts.lib import atomic_file, conf
@@ -28,7 +28,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import investigation, proposal_issue, record_store, staff, update_registration
 from scripts.production.issues import Issue
 from scripts.production.production_doc import WRAPPED, Refusal
-from scripts.review_links import image_store, new_item_dialog, page_frame, reply_tokens, review_events, review_link
+from scripts.review_links import image_store, list_draft, new_item_dialog, page_frame, reply_tokens, review_events, review_link
 from scripts.review_links.new_item_dialog import (
     KEY_PREFIX as KEY_PREFIX, NATIVE_ID_PREFIX, check_recipient_id,
     ScopedSubmissionKey, read_submission_key, require_request_binding, submission_key as submission_key,
@@ -41,6 +41,10 @@ from scripts.review_links.new_item_dialog import (
     SubmissionConflict as SubmissionConflict, SubmissionError as SubmissionError, SubmissionKind as SubmissionKind,
     TipCaption as TipCaption, TipDetail as TipDetail, TipField as TipField,
     read_evidence as read_evidence, read_request as read_request,
+)
+from scripts.review_links.list_draft import (
+    ListAssignmentNotice as ListAssignmentNotice, ListDraftClaim as ListDraftClaim,
+    ListDraftOrigin as ListDraftOrigin, NewItemDraft as NewItemDraft, NoNewItemDraft as NoNewItemDraft,
 )
 
 DRAFT_ID = re.compile(r"r2-[0-9a-f]{32}")
@@ -452,47 +456,6 @@ class PendingFiling:
 
 
 @dataclass(frozen=True)
-class ListAssignmentNotice:
-    recipient: staff.StaffId
-    role: Literal["producer", "showrunner"]
-    text: str
-    producer_name: str = ""
-
-
-@dataclass(frozen=True)
-class ListDraftClaim:
-    """The data needed to recover a Scheduled save."""
-
-    payload_hash: str
-    keeper: staff.StaffId
-    assignment: str
-    readback: tuple[str, str]
-    notices: tuple[ListAssignmentNotice, ...] = ()
-    notice_warning: str = ""
-
-    def fields(self) -> dict[str, object]:
-        return cast(dict[str, object], asdict(self))
-
-
-@dataclass(frozen=True)
-class NewItemDraft:
-    """Identify the Scheduled draft that created a List item."""
-
-    id: new_item_dialog.ScheduledDraftId
-    claim: ListDraftClaim
-
-    def stored(self) -> str:
-        return json.dumps({"request_id": self.id.value, **self.claim.fields()}, ensure_ascii=False)
-
-
-class NoNewItemDraft(Enum):
-    ABSENT = "no New item draft"
-
-
-type ListDraftOrigin = NewItemDraft | NoNewItemDraft
-
-
-@dataclass(frozen=True)
 class ListItemDestination:
     id: str
     claim: ListDraftClaim
@@ -526,52 +489,8 @@ type FilingDestination = NativeSubmissionDestination | ListItemDestination
 type RequestFile = FilingDestination | PendingFiling | NoRequestFile | UnreadableRequestFile
 
 
-def _read_list_draft_claim(fields: dict[str, object], payload_hash: str) -> ListDraftClaim:
-    keeper, assignment, readback = (fields.get(key) for key in ("keeper", "assignment", "readback"))
-    warning = fields.get("notice_warning", "")
-    if not (isinstance(keeper, str) and isinstance(assignment, str) and isinstance(warning, str)
-            and isinstance(readback, list)):
-        raise ValueError("Invalid List draft details.")
-    if not keeper or Path(keeper).name != keeper or keeper in (".", ".."):
-        raise ValueError("Invalid List keeper staff ID.")
-    lines = cast(list[object], readback)
-    if len(lines) != 2 or not isinstance(lines[0], str) or not isinstance(lines[1], str):
-        raise ValueError("Invalid List readback.")
-    raw_notices = fields.get("notices")
-    if not isinstance(raw_notices, list):
-        raise ValueError("Invalid List draft notices.")
-    notices: list[ListAssignmentNotice] = []
-    for value in cast(list[object], raw_notices):
-        if not isinstance(value, dict):
-            raise ValueError("Invalid List draft notice.")
-        notice = cast(dict[str, object], value)
-        recipient, role, message = (notice.get(key) for key in ("recipient", "role", "text"))
-        producer_name = notice.get("producer_name")
-        if (not isinstance(recipient, str) or not isinstance(message, str) or not isinstance(producer_name, str)
-                or role not in ("producer", "showrunner")):
-            raise ValueError("Invalid List draft notice.")
-        notices.append(ListAssignmentNotice(staff.StaffId(recipient), role, message, producer_name))
-    return ListDraftClaim(payload_hash, staff.StaffId(keeper), assignment, (lines[0], lines[1]), tuple(notices), warning)
-
-
-def read_list_draft(header: dict[str, str]) -> ListDraftOrigin:
-    """Read the Scheduled draft claim from a List item header."""
-    stored = header.get("new_item_draft_id")
-    if stored is None:
-        return NoNewItemDraft.ABSENT
-    raw = cast(object, json.loads(stored))
-    if not isinstance(raw, dict):
-        raise ValueError("Invalid New item draft.")
-    fields = cast(dict[str, object], raw)
-    draft_id = new_item_dialog.read_scheduled_draft_id(fields.get("request_id"))
-    payload_hash = fields.get("payload_hash")
-    if not isinstance(payload_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", payload_hash):
-        raise ValueError("Invalid List draft fingerprint.")
-    return NewItemDraft(draft_id, _read_list_draft_claim(fields, payload_hash))
-
-
 def _list_request_file(path: Path, fields: dict[str, object], payload_hash: str) -> ListItemDestination:
-    claim = _read_list_draft_claim(fields, payload_hash)
+    claim = list_draft.read_claim(fields, payload_hash)
     identity = fields.get("id")
     confirmed = fields.get("confirmed", [])
     if (path.name not in ("pending.json", "receipt.json") or not isinstance(identity, str)
@@ -1155,10 +1074,9 @@ def locate_native_submission(address: SubmissionAddress, hint: RequestFile,
 
 
 def _publish_receipt(folder: Path, saved: FilingDestination) -> None:
-    from scripts.production import the_list
-
     # Sync the saved record directory before publishing the receipt.
-    record_folder = saved.path.parent if isinstance(saved, NativeSubmissionDestination) else the_list.folder(saved.claim.keeper)
+    record_folder = (saved.path.parent if isinstance(saved, NativeSubmissionDestination)
+                     else list_draft.list_records(saved.claim.keeper).folder())
     atomic_file.sync_folder(record_folder)
     receipt = folder / "receipt.json"
     try:
@@ -1677,17 +1595,23 @@ class NoListRecordForClaim:
     """The reserved List number has no record."""
 
 
-def _indexed_list_record(draft_id: str, planned: ListItemDestination) -> FiledDraft | NoListRecordForClaim:
-    from scripts.production import the_list
+type LoadListDraft = Callable[[staff.StaffId, str], ListDraftOrigin]
 
-    path = the_list.folder(planned.claim.keeper) / f"{planned.id}.md"
+
+class ListRecordCheck(Enum):
+    OMIT = "read the draft index only"
+
+
+def _indexed_list_record(draft_id: str, planned: ListItemDestination,
+                         load_list_draft: LoadListDraft) -> FiledDraft | NoListRecordForClaim:
+    path = list_draft.list_records(planned.claim.keeper).path(planned.id)
     try:
         _ = path.stat()
     except FileNotFoundError:
         return NoListRecordForClaim()
     try:
-        draft = the_list.load(planned.claim.keeper, planned.id).new_item_draft_id
-    except the_list.ListError as error:
+        draft = load_list_draft(planned.claim.keeper, planned.id)
+    except ValueError as error:
         raise OSError(f"Cannot read the saved List draft at {path}.") from error
     if not isinstance(draft, NewItemDraft) or draft.id.value != draft_id or draft.claim != planned.claim:
         raise OSError(f"{planned.id}: the saved List draft differs from the filing claim.")
@@ -1695,7 +1619,8 @@ def _indexed_list_record(draft_id: str, planned: ListItemDestination) -> FiledDr
     return FiledDraft(ListItemDestination(planned.id, draft.claim))
 
 
-def _draft_filing(folder: Path, *, repair_index: bool = True) -> DraftFiling:
+def _draft_filing(folder: Path, *, repair_index: bool = True,
+                  load_list_draft: LoadListDraft | ListRecordCheck = ListRecordCheck.OMIT) -> DraftFiling:
     """Read this draft's index and repair missing entries from its files."""
     for location in (_draft_index(folder), folder):
         receipt = _read_location_hint(location, receipt_only=True)
@@ -1710,8 +1635,11 @@ def _draft_filing(folder: Path, *, repair_index: bool = True) -> DraftFiling:
             if isinstance(pending, PendingFiling):
                 return pending
             if isinstance(pending, ListItemDestination):
-                record = _indexed_list_record(folder.name, pending)
-                filing = record if isinstance(record, FiledDraft) else ClaimedDraft(pending)
+                filing = ClaimedDraft(pending)
+                if load_list_draft is not ListRecordCheck.OMIT:
+                    record = _indexed_list_record(folder.name, pending, load_list_draft)
+                    if isinstance(record, FiledDraft):
+                        filing = record
             elif _is_earlier_native_draft(folder, pending):
                 return NativeDraftAwaitingReceipt(pending)
             else:
@@ -1766,12 +1694,13 @@ class ListDraftWriter(Protocol):
 
 def file_list_draft(draft_id: new_item_dialog.ScheduledDraftId, payload_hash: str, *,
                     prepare: Callable[[], AbstractContextManager[tuple[ListDraftClaim, ListDraftWriter]]],
-                    deliver: Callable[[ListAssignmentNotice, str, str], bool]) -> ListItemDestination:
+                    deliver: Callable[[ListAssignmentNotice, str, str], bool],
+                    load_list_draft: LoadListDraft) -> ListItemDestination:
     """Recover the first Send or file a List item under its draft lock."""
     request_id = draft_id.value
     with _locked_filing_draft(request_id) as folder:
         _sync_draft_parents(folder)
-        filing = _draft_filing(folder)
+        filing = _draft_filing(folder, load_list_draft=load_list_draft)
         candidate = filing.destination if isinstance(filing, (ClaimedDraft, FiledDraft)) else filing
         if not isinstance(candidate, (ListItemDestination, UnclaimedDraft)):
             raise DraftPending()
@@ -2055,6 +1984,20 @@ def _locked_list_draft(address: SubmissionAddress, members: staff.StaffSnapshot 
             yield lookup
 
 
+def refuse_scheduled_draft_reuse(
+        request_id: str, *, load_list_draft: LoadListDraft | ListRecordCheck = ListRecordCheck.OMIT) -> None:
+    """Refuse a native Send with a Scheduled draft ID."""
+    if not new_item_dialog.SCHEDULED_DRAFT_ID.fullmatch(request_id):
+        return
+    with _locked_filing_draft(request_id) as folder:
+        filing = _draft_filing(folder, load_list_draft=load_list_draft)
+        if isinstance(filing, FiledDraft) and isinstance(filing.destination, ListItemDestination):
+            raise DraftAlreadyFiled(filing.destination.id)
+        if isinstance(filing, ClaimedDraft) and isinstance(filing.destination, ListItemDestination):
+            raise DraftPending()
+        raise SubmissionConflict("This draft ID is for Scheduled. Start a new draft for this item type.")
+
+
 def submit(
     request: NewItemRequest | new_item_dialog.UnverifiedDraftRetry | ListDraftSend, *, members: staff.StaffSnapshot | None = None,
     screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT,
@@ -2064,14 +2007,7 @@ def submit(
     initial_delivery: InitialDelivery | NoInitialDelivery = NO_INITIAL_DELIVERY,
 ) -> SavedSubmission:
     """Save the native item or recover the first Send for this draft."""
-    if new_item_dialog.SCHEDULED_DRAFT_ID.fullmatch(request.request_id):
-        with _locked_filing_draft(request.request_id) as folder:
-            filing = _draft_filing(folder)
-            if isinstance(filing, FiledDraft) and isinstance(filing.destination, ListItemDestination):
-                raise DraftAlreadyFiled(filing.destination.id)
-            if isinstance(filing, ClaimedDraft) and isinstance(filing.destination, ListItemDestination):
-                raise DraftPending()
-            raise SubmissionConflict("This draft ID is for Scheduled. Start a new draft for this item type.")
+    refuse_scheduled_draft_reuse(request.request_id)
     if isinstance(capture_intent, new_item_dialog.DeferredCaptureIntent) and (
             capture_intent.submitted_draft_id != request.request_id
             or not new_item_dialog.capture_key_matches_draft(capture_intent.capture_key, request.request_id)

@@ -25,7 +25,7 @@ from scripts.lib import conf, main_publish
 from scripts.lib.user_zone import user_zone
 from scripts.message import send_result
 from scripts.production import investigation, producer_map, repeat_rule, staff, the_list, unrouted_alert
-from scripts.review_links import change_page, for_you, new_item_dialog, review_page, review_submissions
+from scripts.review_links import change_page, for_you, list_draft, new_item_dialog, review_page, review_submissions
 
 SOURCE = "nate via /new_item"
 OPTIONS_TARGET = f"{review_page.NEW_ITEM_PATH}?page=list"
@@ -587,6 +587,14 @@ def _deliver_scheduled_notice(notice: review_submissions.ListAssignmentNotice, i
     return False
 
 
+def _load_list_draft(keeper: staff.StaffId, identity: str) -> list_draft.ListDraftOrigin:
+    return the_list.load(keeper, identity).new_item_draft_id
+
+
+def refuse_scheduled_draft_reuse(request_id: str) -> None:
+    review_submissions.refuse_scheduled_draft_reuse(request_id, load_list_draft=_load_list_draft)
+
+
 def submit_scheduled(request: new_item_dialog.ScheduledSubmission) -> review_submissions.ListItemDestination:
     """File a browser Schedule and recover its receipt and notices on Retry."""
     digest = hashlib.sha256(json.dumps([request.page, request.recipient_id, request.words]).encode()).hexdigest()
@@ -607,7 +615,7 @@ def submit_scheduled(request: new_item_dialog.ScheduledSubmission) -> review_sub
             yield claim, save
 
     return review_submissions.file_list_draft(request.request_id, digest, prepare=prepare,
-                                              deliver=_deliver_scheduled_notice)
+                                              deliver=_deliver_scheduled_notice, load_list_draft=_load_list_draft)
 
 
 def scheduled_notice(item: the_list.ListItem, keeper: staff.StaffId, members: staff.StaffSnapshot) -> str:

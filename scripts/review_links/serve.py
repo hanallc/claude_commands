@@ -1698,6 +1698,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             authorization = (review_submissions.CurrentBrowserDraftToken(digest) if valid_token
                              else review_submissions.BrowserDraftRecoveryToken(digest))
         try:
+            if request is not None and new_item_dialog.SCHEDULED_DRAFT_ID.fullmatch(request.request_id):
+                with server.list_store_access(), server.staff_read_scope():
+                    new_item.refuse_scheduled_draft_reuse(request.request_id)
             if key and valid_token and legacy_page_draft:
                 server.resume_page_capture(key)
             has_deferred = isinstance(deferred, new_item_dialog.DeferredCaptureIntent)

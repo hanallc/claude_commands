@@ -1181,6 +1181,64 @@ the_list.fire_scheduled(timedelta(minutes=2))
                 rows = self.command("list")[1].splitlines()
                 row = next(line for line in rows if line.startswith(f"| {identity.removeprefix('L')} |"))
                 self.assertIn(f"· {description} · next ", row)
+        _ = self.list_config.write_text(settings)
+
+        old_words, new_words = "Read the figures.", "Read new figures."
+        fourth = start + timedelta(days=3, hours=2)
+        early = second - timedelta(hours=1)
+        daily = the_list.ScheduledSeries(the_list.ScheduledRun(start, old_words),
+                                        repeat_rule.parse("FREQ=DAILY;COUNT=5"), the_list.series_run_limit(),
+                                         runs_used=1, finished_runs=frozenset({1}))
+        tokyo_first = datetime(2026, 11, 24, 0, 30, tzinfo=ZoneInfo("Asia/Tokyo"))
+        tokyo_second = tokyo_first + timedelta(days=7)
+        later_in_tokyo = tokyo_second.replace(hour=1, minute=0)
+        ny_start = "2026-11-30T11:00:00-05:00[America/New_York]"
+        between_runs = tokyo_first + timedelta(days=1)
+        new_repeat = ("--repeat", "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU")
+        weekly = the_list.ScheduledSeries(the_list.ScheduledRun(tokyo_first, old_words),
+                                         repeat_rule.parse("FREQ=WEEKLY;BYDAY=TU"), the_list.series_run_limit(),
+                                          runs_used=1, finished_runs=frozenset({1}))
+        moved_run = the_list.RunException(2, the_list.ScheduledRun(moved, old_words))
+        for schedule, now_at, repeat_options, expected, repeat_label in (
+            (replace(daily, runs_used=2, exceptions=(moved_run, the_list.RunException(3, the_list.SkippedRun("")),
+                                        the_list.RunException(4, the_list.ScheduledRun(fourth, old_words)))),
+             second, (), ((2, moved, new_words), (4, fourth, new_words), (5, start + timedelta(days=4), new_words)),
+             "Repeats: Daily"),
+            (replace(daily, exceptions=(the_list.RunException(3, the_list.ScheduledRun(early, old_words)),)),
+             early, (), ((3, early, new_words), (2, second, old_words), (4, start + timedelta(days=3), new_words)),
+             "Repeats: Daily"),
+            (replace(daily, exceptions=(moved_run,)), second + timedelta(minutes=30),
+             ("--repeat", ""), the_list.ScheduledRun(moved, new_words), "Does not repeat"),
+            (weekly, between_runs, new_repeat,
+             ((2, tokyo_second, new_words), (3, tokyo_second + timedelta(days=14), new_words)),
+             "Repeats: Every 2 weeks on Tuesday"),
+            (weekly, between_runs, (*new_repeat, "--start", ny_start),
+             ((2, later_in_tokyo, new_words), (3, later_in_tokyo + timedelta(days=14), new_words)),
+             "Repeats: Every 2 weeks on Tuesday"),
+            (weekly, between_runs, (),
+             ((2, tokyo_second, new_words), (3, tokyo_second + timedelta(days=7), new_words)),
+             "Repeats: Weekly on Tuesday"),
+            (weekly, between_runs, ("--start", ny_start),
+             ((2, later_in_tokyo, new_words), (3, later_in_tokyo + timedelta(days=7), new_words)),
+             "Repeats: Weekly on Tuesday"),
+        ):
+            with self.subTest(scope="following", exceptions=schedule.exceptions, repeat_options=repeat_options):
+                item = self.add(changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+                with patch.object(the_list, "now", return_value=now_at):
+                    code, output, errors = self.command("update", "--id", item.id, "--source", "nate",
+                                                        "--scope", "following", "--do", new_words, *repeat_options)
+                self.assertEqual((code, errors), (0, ""))
+                self.assertIn(repeat_label, output)
+                saved = the_list.load(MORTY.id, item.id).schedule
+                if isinstance(expected, the_list.ScheduledRun):
+                    self.assertEqual(saved, expected)
+                    continue
+                assert isinstance(saved, the_list.ScheduledSeries)
+                pending = saved.runs()
+                for number, date, words in expected:
+                    next_run = next(pending)
+                    self.assertEqual((next_run.number, next_run.run), (number, the_list.ScheduledRun(date, words)))
+                    self.assertEqual(next_run.run.start.tzinfo, date.tzinfo)
 
     def test_repeated_item_removals_use_the_selected_scope(self) -> None:
         start = datetime(2026, 11, 30, 17, tzinfo=UTC)
@@ -1278,6 +1336,35 @@ the_list.fire_scheduled(timedelta(minutes=2))
                     code, output, errors = self.command(verb, "--id", identity, "--source", "nate", *flags)
                 self.assertEqual((code, output), (1, ""))
                 self.assertIn(reason, errors)
+                self.assertEqual(path.read_bytes(), before)
+
+        for scope, moment, finished, run_number in (
+            (the_list.ScheduleScope.THIS, start + timedelta(days=2), frozenset({1, 2}), 2),
+            (the_list.ScheduleScope.FOLLOWING, start + timedelta(days=3), frozenset({1, 2, 3}), 2),
+            (the_list.ScheduleScope.ALL, start + timedelta(days=2), frozenset({1, 2}), 2),
+            (the_list.ScheduleScope.ALL, start, frozenset[int](), repeat_rule.NoNextRun.REMAINING),
+        ):
+            with self.subTest(scope=scope, moment=moment, run_number=run_number):
+                code, output, errors = self.add_scheduled(start.isoformat(), "--repeat", "FREQ=DAILY;COUNT=3")
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                self.save_series_progress(identity, finished=finished)
+                path = the_list.folder(MORTY.id) / f"{identity}.md"
+                before = path.read_bytes()
+                saved = the_list.load(MORTY.id, identity)
+                expected = the_list.ScheduleExpectation(the_list.schedule_revision(saved.schedule), run_number)
+                with (patch.object(the_list, "now", return_value=moment),
+                      self.assertRaisesRegex(the_list.ScheduleSelectionChanged, "The next run changed")):
+                    if scope is the_list.ScheduleScope.ALL:
+                        _ = the_list.save_page_schedule(
+                            MORTY.id, identity, the_list.ScheduleOperation.EDIT,
+                            {"words": "Read new figures.", "repeat": repeat_rule.parse("FREQ=DAILY;INTERVAL=2")},
+                            scope=scope, expected=expected, repeat_zone=ZoneInfo("America/New_York"),
+                            receipt=the_list.PageRequest("repeat", "park", "Repeat"),
+                        )
+                    else:
+                        _ = the_list.close(MORTY.id, identity, "Stop", source="nate", schedule_scope=scope,
+                                           expected_schedule=expected)
                 self.assertEqual(path.read_bytes(), before)
 
     def test_text_limits_on_add_and_update(self) -> None:

@@ -1535,20 +1535,20 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummar
  const dayLabel=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',dateStyle:'full'});
  let selected=new Date(),display=new Date();
  const today=()=>{const now=zoneParts(zone,Date.now());return new Date(Date.UTC(now.year,now.month-1,now.day));};
- const update=(normalize=false)=>{
+ const update=(normalize=false,edited=false)=>{
   const minutes=dateTimeMinutes(time.value),valid=Number.isFinite(minutes);
   const clock=valid ? dateTimeClock(minutes) : '';
   time.setAttribute('aria-invalid',String(!valid));
   if(valid && normalize) time.value=clock;
   field.value=valid ? dayText(selected)+'T'+clock : '';
-  field.dispatchEvent(new Event('input',{bubbles:true}));
+  field.dispatchEvent(new CustomEvent('input',{bubbles:true,detail:{edited}}));
   const retry=retryTime();
   const at=Number.isFinite(retry) ? retry : valid ? dateTimeEpoch(zone,selected,minutes) : NaN;
   custom.querySelector('[data-later-summary]').textContent=Number.isFinite(at)
    ? summaryPrefix+formatSummary(at) : 'Choose a time';
   save.disabled=!Number.isFinite(retry) && !(at>Date.now());
  };
- const draw=()=>{
+ const draw=(edited=false)=>{
   const current=today(),currentText=dayText(current),selectedText=dayText(selected);
   month.textContent=monthText.format(display);grid.replaceChildren();
   grid.setAttribute('aria-label',month.textContent);
@@ -1574,9 +1574,9 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummar
    button.setAttribute('aria-selected',String(button.dataset.date===selectedText));
    button.tabIndex=button.dataset.date===tabDate ? 0 : -1;button.disabled=date<current;
    if(button.dataset.date===currentText) button.setAttribute('aria-current','date');
-   button.addEventListener('click',()=>{selected=date;draw();focusCalendar();});row.append(button);
+   button.addEventListener('click',()=>{selected=date;draw(true);focusCalendar();});row.append(button);
   }
-  update();
+  update(false,edited);
  };
  function choose(){
   const draft=parseDateTimeDraft(field.value);
@@ -1598,7 +1598,7 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummar
   draw();
   if(hadFocus && button.disabled) focusCalendar();
  }));
- time.addEventListener('input',()=>update());
+ time.addEventListener('input',()=>update(false,true));
  time.addEventListener('blur',()=>update(true));
  time.addEventListener('keydown',event=>{
   const step={ArrowUp:15,ArrowDown:-15}[event.key];
@@ -1606,7 +1606,7 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummar
   event.preventDefault();
   const minutes=dateTimeMinutes(time.value);
   if(!Number.isFinite(minutes)) return;
-  time.value=dateTimeClock((minutes+step+1440)%1440);update();
+  time.value=dateTimeClock((minutes+step+1440)%1440);update(false,true);
  });
  grid.addEventListener('keydown',event=>{
   const days={ArrowLeft:-1,ArrowRight:1,ArrowUp:-7,ArrowDown:7}[event.key];
@@ -1616,12 +1616,12 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummar
   const date=new Date(day+'T00:00:00Z');
   date.setUTCDate(date.getUTCDate()+days);
   if(date<today()) return;
-  selected=date;display=new Date(date);draw();focusCalendar();
+  selected=date;display=new Date(date);draw(true);focusCalendar();
  });
  menu.addEventListener('keydown',event=>{
   if(event.key==='Escape'){event.preventDefault();closeDateTimePicker(menu,true);return;}
   if(custom.contains(event.target)){
-   if(event.key==='Enter'){
+   if(event.key==='Enter' && (event.target===time || grid.contains(event.target))){
     event.preventDefault();update(true);if(!save.disabled) form.requestSubmit(save);
    }
    return;
