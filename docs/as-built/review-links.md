@@ -1638,17 +1638,21 @@ The console lists it as **Images**, with the Lucide `image` icon.
 A showrunner or unit registers each image, or a before and after pair, with one command:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image PATH | --before PATH --after PATH) --caption "TEXT" --owner STAFF_ID (--change ID | --phase ID)
+~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image PATH | --before PATH --after PATH) --title "TITLE" [--look-for "POINT"]... --owner STAFF_ID (--change ID | --phase ID)
 ```
 
-- The caption is the change in the fewest plain words that stay accurate. It adds a second line, `Look for: <place>`, only when the change is hard to find.
+- The title says what the image shows. Give one `--look-for` for each point the user needs to check.
+- `image_title_max_chars` in `config/review_links.conf` limits the title to 80 characters.
 - `scripts/review_links/reply_shot.py <markdown> <columns> <png>` renders a Markdown reply in the Claude Code terminal.
   It resumes a placeholder transcript in Xvfb and xterm, so no model call happens.
   It cuts the shot at the first blank band of `reply_shot_gap_rows` pixel rows, so the page shows readable text.
   `config/review_links.conf` sets the wait, the terminal rows and the band height.
 - The owner is the staff id that made the image. The command refuses an id that is not in the staff record.
-- The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files and refuses an empty caption.
+- The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files.
+- The title and each optional point must each contain one nonempty line.
 - It copies the image to `<review root>/images/<12-hex id>/image<suffix>` with a private `.review-link-image.json` record.
+  The record stores `title` and the `look_for` list. It also stores the full text in `caption` for older services.
+  The page uses the full `caption` as the title if the record has no `title`.
   A pair copies `before<suffix>` and `after<suffix>` to one folder with one record and one id.
   The record keeps the after image in `file` and the before image in `before`.
   It builds the folder under a private draft name, then renames it, so the page never shows a partial image.
@@ -1659,11 +1663,12 @@ A showrunner or unit registers each image, or a before and after pair, with one 
 
 Each card shows, in this order:
 
-1. The caption as the card title, in a larger font.
-2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
-3. The image link. A pair shows its two images side by side, under **Before** and **After** labels.
-4. The **Feedback** field, with `feedback_rows` rows from `config/review_links.conf`.
-5. The answer buttons: **Approved** and **Send Feedback**.
+1. The full title in normal weight at the List title size. The title wraps when it exceeds the card width.
+2. The optional points as bullets in the secondary text color.
+3. The details with aligned labels for the owner, subject, and time.
+4. The image link. A pair shows both images under **Before** and **After** labels.
+5. The **Feedback** field. `feedback_rows` in `config/review_links.conf` sets its height.
+6. The **Approved**, **Send Feedback**, and **Ask question** buttons.
 
 A plain click on a single image or either pair image opens the shared image zoom.
 The zoom centers the full image over a dark backdrop within the page view.
@@ -1684,7 +1689,8 @@ The modal dialog takes focus and uses the image's alt text as its accessible nam
 **Owner** is `<name> (<kind>)`, or `Unknown session: <id>`. **For** is `Change <id>` or `Phase <id>`.
 **Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).
 The Images page shows every waiting image, oldest first, with no age filter.
-A pair has one caption, one details block, one Feedback field and one set of answer buttons. The owner delete removes both images.
+A pair shares one title, bullet list, details block, Feedback field, and set of answer buttons.
+The owner can delete both images with one command.
 On a page 1108px or wider, a single card is 680px wide while the group panel is 300px or narrower, and a pair card is up to 1376px wide; both are centered in the images pane.
 When a pair card is narrower than 600px, its images stack, before on top.
 A page URL with `#image=<id>` opens at that card.
@@ -1719,7 +1725,8 @@ The server sends one message to the owner's staff id, resolved to its current se
 It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
 The first line names the answer: `From the user (via the Images page): ` and then `your image is approved.` or `your image is not approved. The feedback follows.`
 A `Feedback:` line follows when the user wrote text.
-Then come the image link (a `Before:` and an `After:` link for a pair), the caption, the For line and the delete command for the owner to run after it acts.
+The message includes the image links, the title, any points to check, the subject, and the delete command.
+The question message also includes the title and any points to check.
 After a send, the record gets `feedback_at` and the page hides the image; the image file stays until the owner deletes it.
 A page loaded before the answer buttons can still post a delete, which removes the image folder under `images/.review-link-images.lock` and sends no message.
 When no try reaches the owner, the server answers 503 and writes nothing.
