@@ -2420,7 +2420,7 @@ def end(parent: StaffId, name: WorkerName, *,
         return ExitCode.OK
 
 
-def resume_receipt(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch, *, run: Path | None = None
+def resume_receipt(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch, *, run: Path
                    ) -> DispatchNotSubmitted | DispatchSubmitted | DispatchComplete | DispatchEvidenceUnknown | DispatchAwaitingReply:
     """Read acceptance and closure once before choosing the worker's resume step."""
     backend = staff.backend(row)
@@ -2430,16 +2430,15 @@ def resume_receipt(row: staff.StaffRow, dispatch: progress_history.ActiveDispatc
         DispatchPrompt(dispatch.instance_id, include_stage_two=True), DoneReply(dispatch.instance_id)).receipt
     if isinstance(receipt, DispatchAwaitingReply) and isinstance(receipt.matching_done, DispatchComplete):
         try:
-            directory = worker_panes.worker_run(row) if run is None else run
-            _, other_passes = detached_runs.worker_results(directory / worker_lifecycle.DETACHED_RUNS_DIR, row,
-                                                           since=0, pane_dispatch_id=dispatch.instance_id)
+            if detached_runs.later_results_from_other_passes(
+                run / worker_lifecycle.DETACHED_RUNS_DIR, row,
+                pane_dispatch_id=dispatch.instance_id, result_ids=receipt.runs,
+            ):
+                return receipt.matching_done
         except worker_lifecycle.OperationDeadlineExpired:
             raise
-        except (OSError, worker_lifecycle.WorkerStateUnreadable) as error:
+        except OSError as error:
             unit_runs.report_anomaly(f"anomaly: {row.name}: {error}")
-            return receipt
-        if other_passes.issuperset(receipt.runs):
-            return receipt.matching_done
     return receipt
 
 

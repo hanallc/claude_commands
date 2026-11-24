@@ -1514,6 +1514,11 @@ class WorkerCommandTests(unittest.TestCase):
         result.update(pane_dispatch_id="other-pass", delivery=f"sent: worker {row.name} at {pane}")
         atomic_file.write_text_atomic(path, json.dumps(result))
         self.agent.append(pane, "user", "Detached run: other-check\nRun finished: private verification")
+        dispatch = progress_history.active_dispatch(row.id, self.run_dir)
+        assert isinstance(dispatch, progress_history.ActiveDispatch)
+        with patch.object(worker_panes, "worker_run", return_value=self.run_dir.parent / "newer") as latest_run:
+            self.assertIsInstance(worker.resume_receipt(row, dispatch, run=self.run_dir), worker.DispatchComplete)
+        latest_run.assert_not_called()
         _ = self.fixture.world.stop(row, self.fixture.world)
         launches, prompts = len(self.fixture.world.launches), len(self.fixture.prompts())
 
@@ -1801,33 +1806,46 @@ class WorkerCommandTests(unittest.TestCase):
                                              PaneWorkerResume(idle.row.id, IdleWorker())])
         self.assertEqual(result.results, [])
 
-    def test_resume_workers_keeps_both_steps_when_a_detached_record_is_unreadable(self) -> None:
+    def test_resume_workers_keeps_only_the_step_with_an_unreadable_result(self) -> None:
         from scripts.lib.resume_message import BusyPass, PaneWorkerResume
 
         first, second = sorted((self.opened("impl"), self.opened("fix")), key=lambda opened: opened.row.id)
-        steps: list[PaneWorkerResume] = []
-        for opened in (first, second):
+        steps: dict[staff.StaffId, PaneWorkerResume] = {}
+        paths: dict[staff.StaffId, Path] = {}
+        for opened, run_id in ((first, "first-check"), (second, f"second-check@{second.row.id}")):
             row = opened.row
             dispatch = progress_history.begin_dispatch(self.run_dir, slot=row.name, phase="8", role="impl",
                 worker_name=row.name, worker_id=row.id, launcher_command=["assign.sh"], prompt=self.prompt,
                 kind="impl", lens="")
             self.agent.append(opened.pane, "user", f"End your final reply with DONE {dispatch}.")
-            steps.append(PaneWorkerResume(row.id, BusyPass(dispatch)))
-            if opened == first:
-                self.agent.append(opened.pane, "assistant", f"Report.\nDONE {dispatch}")
+            self.agent.append(opened.pane, "assistant", f"Report.\nDONE {dispatch}")
+            self.agent.append(opened.pane, "user", f"Detached run: {run_id}\nRun finished: private verification")
+            step = PaneWorkerResume(row.id, BusyPass(dispatch))
+            path, result = self.detached_record(row, run_id)
+            result.update(pane_dispatch_id="other-pass", delivery=f"sent: worker {row.name} at {opened.pane}")
+            atomic_file.write_text_atomic(path, json.dumps(result))
+            steps[row.id] = step
+            paths[row.id] = path
 
-        self.agent.append(first.pane, "user", "Detached run: other-check\nRun finished: private verification")
-        path, result = self.detached_record(first.row, "other-check")
-        result.update(pane_dispatch_id="other-pass", delivery=f"sent: worker {first.row.name} at {first.pane}")
-        atomic_file.write_text_atomic(path, json.dumps(result))
-        broken = path.with_name("old.json")
+        broken = paths[first.row.id].with_name("old.json")
         atomic_file.write_text_atomic(broken, "{")
-
         with redirect_stderr(io.StringIO()) as errors:
             resumes = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
-        self.assertEqual(resumes.panes, steps)
+        self.assertEqual(resumes.panes, [])
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
-        self.assertIn(f"anomaly: {first.row.name}: {broken}: worker state unreadable", errors.getvalue())
+        self.assertIn(f"anomaly: {broken}: worker state unreadable", errors.getvalue())
+
+        for row in (first.row, second.row):
+            path = paths[row.id]
+            with self.subTest(path=path):
+                saved = path.read_text()
+                atomic_file.write_text_atomic(path, "{")
+                with redirect_stderr(io.StringIO()) as errors:
+                    resumes = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
+                self.assertEqual(resumes.panes, [steps[row.id]])
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertIn(f"anomaly: {path}: worker state unreadable", errors.getvalue())
+                atomic_file.write_text_atomic(path, saved)
 
     def test_resume_workers_keeps_a_claude_child_launcher_without_a_native_pass(self) -> None:
         from scripts.lib.resume_message import BusyPass, IdleWorker, PaneWorkerResume, Resumable, Unavailable, resume_message
