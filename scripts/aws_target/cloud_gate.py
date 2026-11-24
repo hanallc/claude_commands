@@ -431,7 +431,8 @@ _RESULT_NOT_RECEIVED = _ResultNotReceived()
 class GateWorker:
     """Own one durable launch, result transfer, and confirmed termination."""
     def __init__(self, api: AwsCli, book: ledger.CostLedger, settings_path: Path, sidecar: Path, *,
-                 clock: Callable[[], float] = time.time, pause: Callable[[float], None] = time.sleep) -> None:
+                 clock: Callable[[], float] = time.time, pause: Callable[[float], None] = time.sleep,
+                 dispatch: ledger.GateDispatchRecord | UnassignedCloudGate = UNASSIGNED_CLOUD_GATE) -> None:
         self.api = api
         self.box_region = api.region
         self.box_zone: str = ''
@@ -441,6 +442,7 @@ class GateWorker:
         self.sidecar = sidecar
         self.clock = clock
         self.pause = pause
+        self.dispatch = dispatch
         self.size_vcpus: int = 0
         self.price_read_evidence: tuple[dict[str, object], ...] = ()
 
@@ -708,6 +710,25 @@ class GateWorker:
             return capacity_order(variant), price is None, cost, type_rank(variant), position
         return [variant for _, variant in sorted(enumerate(eligibility.variants), key=order)]
 
+    def launch_switch(self, request: dict[str, object]) -> AwsOn | LocalFallback:
+        """Read the live switches before a worker sends a launch."""
+        if request.get('task') == 'paired':
+            return AwsOn()
+        switch = aws_switch(settings())
+        if not isinstance(switch, AwsOn):
+            return LocalFallback(cloud_gate_off_reason(switch))
+        if isinstance(self.dispatch, ledger.GateDispatchRecord):
+            from scripts.build_targets.gate_targets import configured_scaler_gate
+
+            binding = self.dispatch.binding
+            try:
+                candidate = configured_scaler_gate(conf.read(binding.registry), binding.claim.target)
+            except conf.Unusable as error:
+                return LocalFallback(str(error))
+            if not isinstance(candidate.eligibility, placement.AllowedHost):
+                return LocalFallback(f'The AWS scaler is {candidate.eligibility.reason}')
+        return switch
+
     def launch(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> str | LocalFallback:
         path = folder / 'launch.json'
         launch: dict[str, object] = read(path) if path.exists() else {}
@@ -830,6 +851,11 @@ class GateWorker:
                         if retry == 0:
                             cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress(
                                 'requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
+                        permission = self.launch_switch(request)
+                        if isinstance(permission, LocalFallback):
+                            if not earlier_call_may_have_launched:
+                                self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
+                            return permission
                         reply = api.call('run-instances', '--cli-input-json', launch_json)
                         self.record_launch(request, size, zone, 'launched')
                         break
@@ -1755,11 +1781,11 @@ def main() -> int:
     if sidecar is None and not reconcile:
         parser.error('--worker and --cleanup require --sidecar')
 
-    def gate_worker() -> GateWorker:
+    def gate_worker(dispatch: ledger.GateDispatchRecord | UnassignedCloudGate = UNASSIGNED_CLOUD_GATE) -> GateWorker:
         configuration = conf.read(settings_path)
         api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'), settings().number('api_timeout_s'))
         # The reconcile step publishes no progress, so it has no sidecar.
-        return GateWorker(api, ledger.CostLedger(directory), settings_path, sidecar or Path(os.devnull))
+        return GateWorker(api, ledger.CostLedger(directory), settings_path, sidecar or Path(os.devnull), dispatch=dispatch)
 
     if reconcile:
         gate_worker().reconcile()
@@ -1777,9 +1803,9 @@ def main() -> int:
         with journal.lock():
             dispatch = journal.read()
             if (dispatch.state != "prelaunch" or folder not in dispatch.folders
-                    or dispatch.directory != directory):
+                    or dispatch.binding.directory != directory):
                 return 0
-            return execute_gate_worker(folder, gate_worker)
+            return execute_gate_worker(folder, lambda: gate_worker(dispatch))
 
 
 def execute_gate_worker(folder: Path, worker: Callable[[], GateWorker]) -> int:

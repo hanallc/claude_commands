@@ -1339,6 +1339,38 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
         self.assertEqual(self.fake.launches, [first['arguments']] * 4)
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated)
 
+    def test_worker_checks_both_switches_at_the_launch_boundary(self) -> None:
+        registry = self.root / 'build_targets.conf'
+        _ = write_config_fixture(registry, 'targets=claude-aws\nkind.claude-aws=scaler\n'
+            + 'settings.claude-aws=cloud_gate.conf\nenabled.claude-aws=on\n')
+        claim = placement.ProviderClaimReference('scaler', 'claude-aws', WHOLE_MAC, 'claim', 'episode', 'attempt')
+        binding = ledger.GateDispatchBinding(claim, self.root / 'journal.json', self.book.directory, registry)
+        dispatch = ledger.GateDispatchRecord(binding, placement.ClaimHolderIdentity('host', 1, '1'))
+        for switch in ('enabled', 'enabled.claude-aws'):
+            with self.subTest(switch=switch):
+                folder = self.root / switch
+                folder.mkdir()
+                _ = write_config_fixture(registry, 'enabled.claude-aws=on\n')
+                self.configure_gate('enabled=on\n')
+                request = {**self.request, 'attempt': folder.name, 'source_key': ''}
+                cloud_gate.save(folder / 'request.json', request)
+                path = registry if '.' in switch else self.root / 'cloud_gate.conf'
+
+                def disable_at_launch(_sidecar: Path, progress: cloud_progress.CloudProgress) -> None:
+                    if progress.stage == 'launch':
+                        override_fixture_settings(path, f'{switch}=off\n')
+
+                worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=self.fake),
+                    self.book, self.settings, folder / 'progress', clock=lambda: self.now, pause=self.advance,
+                    dispatch=dispatch)
+                with mock.patch.object(cloud_progress, 'publish', side_effect=disable_at_launch):
+                    outcome = worker.execute(folder, request, self.deployment)
+                self.assertEqual(outcome['status'], 'fallback')
+                self.assertIn('off', str(outcome['reason']))
+                self.assertEqual(self.fake.launches, [])
+                booking = next(row for row in self.book.read_snapshot().gate_reservations if row.attempt == folder.name)
+                self.assertIsInstance(booking.state, ledger.GateAbsent)
+
     def test_unreachable_last_region_still_falls_back(self) -> None:
         def outage(arguments: list[str]) -> bool:
             return 'run-instances' in arguments
@@ -2980,7 +3012,7 @@ class GateDispatchJournalTests(unittest.TestCase):
                     execution_identity.SourceKeyKnown('tree'), placement.SubmittingOwner('host', 1, '1'),
                     NoOwningSession(), 1)
                 claim = placement.assigned_claim_reference(assignment)
-                binding = ledger.GateDispatchBinding(claim, root / 'journal.json', root / 'aws')
+                binding = ledger.GateDispatchBinding(claim, root / 'journal.json', root / 'aws', root / 'build_targets.conf')
                 binding.publish(ledger.gate_dispatch_binding_path(sidecar))
                 reports: list[wire.ExecutionReport] = []
 
@@ -3016,7 +3048,7 @@ class GateDispatchJournalTests(unittest.TestCase):
 
     def dispatch_fixture(self, root: Path) -> cloud_gate.AssignedCloudGate:
         claim = placement.ProviderClaimReference('scaler', 'claude-aws', WHOLE_MAC, 'claim', 'episode', 'attempt')
-        binding = ledger.GateDispatchBinding(claim, root / 'queue' / 'claim.json', root / 'aws')
+        binding = ledger.GateDispatchBinding(claim, root / 'queue' / 'claim.json', root / 'aws', root / 'build_targets.conf')
         dispatch = cloud_gate.AssignedCloudGate(binding, placement.ClaimHolderIdentity('host', 1, '1'))
         dispatch.journal.begin(binding, dispatch.holder)
         return dispatch
@@ -3081,7 +3113,7 @@ class GateDispatchJournalTests(unittest.TestCase):
             journal = ledger.GateDispatchJournal(root / 'queue' / 'claim.json')
             claim = placement.ProviderClaimReference('scaler', 'aws', WHOLE_MAC, 'claim', 'episode', 'attempt')
             holder = placement.ClaimHolderIdentity('host', 1, '1')
-            journal.begin(ledger.GateDispatchBinding(claim, journal.path, book.directory), holder)
+            journal.begin(ledger.GateDispatchBinding(claim, journal.path, book.directory, root / 'build_targets.conf'), holder)
             folder = root / 'worker'
             journal.register(claim, holder, folder)
             self.assertEqual(journal.read().state, 'prelaunch')
@@ -3137,7 +3169,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
 
         def dispatch_for(attempt: str) -> cloud_gate.AssignedCloudGate:
             claim = placement.ProviderClaimReference('scaler', 'claude-aws', WHOLE_MAC, attempt, 'episode', attempt)
-            binding = ledger.GateDispatchBinding(claim, self.root / f'{attempt}.json', self.state)
+            binding = ledger.GateDispatchBinding(claim, self.root / f'{attempt}.json', self.state, self.root / 'build_targets.conf')
             dispatch = cloud_gate.AssignedCloudGate(binding, holder)
             dispatch.journal.begin(binding, holder)
             return dispatch
@@ -3149,8 +3181,12 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
             return 0
 
         def run(dispatch: cloud_gate.AssignedCloudGate) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
-            return cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
-                                  module_time_limit_s=1800, dispatch=dispatch, service=service)
+            with mock.patch.object(cloud_gate, 'cloud_reservation',
+                                   side_effect=AssertionError('The assignment already owns the cloud slot')) as reserve:
+                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
+                                         module_time_limit_s=1800, dispatch=dispatch, service=service)
+            reserve.assert_not_called()
+            return outcome
 
         earlier = dispatch_for('earlier')
         self.assertIsInstance(run(earlier), cloud_gate.LocalFallback)

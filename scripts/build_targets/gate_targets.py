@@ -35,6 +35,15 @@ def scaler_gate_candidate(registry: conf.ConfigRead, target: target_config.Scale
     return placement.PlacementCandidate(destination, eligibility, placement.ExplicitProviderSettings(target.settings))
 
 
+def configured_scaler_gate(registry: conf.ConfigRead, name: str) -> placement.PlacementCandidate:
+    """Read the named scaler in the current registry."""
+    for target in target_config.read_registered_targets(selected=name,
+            purpose=target_config.RegistryRead.PLACEMENT, configuration=registry):
+        if isinstance(target, target_config.ScalerTarget):
+            return scaler_gate_candidate(registry, target)
+    raise conf.Unusable(f"The scaler {name} is absent from the target registry")
+
+
 def eligible_gate_targets(repo_root: Path, command: tuple[str, ...]) -> tuple[str, ...] | NoEnabledTarget:
     """Select the enabled targets that can run a Claude gate."""
     program = parse_command_program(command)

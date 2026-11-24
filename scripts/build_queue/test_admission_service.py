@@ -65,7 +65,6 @@ from scripts.build_queue import admission_code, queue_snapshot, queue_view, head
 from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from zoneinfo import ZoneInfo
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
-from scripts.build_queue.test_placement import FixedSystemReader
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted
 from scripts.build_queue.admission_test_support import FixedSystemReader as FixedSystemReader
 

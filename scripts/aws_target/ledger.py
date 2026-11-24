@@ -194,6 +194,7 @@ class GateDispatchBinding:
     claim: placement.ProviderClaimReference
     journal: Path
     directory: Path
+    registry: Path
 
     def publish(self, path: Path) -> None:
         try:
@@ -217,9 +218,8 @@ GateDispatchSettlement = Literal["no launch", "launch ended"]
 @dataclass(frozen=True)
 class GateDispatchRecord:
     """Bind the service folders to the exact queue claim and caller."""
-    claim: placement.ProviderClaimReference
+    binding: GateDispatchBinding
     holder: placement.ClaimHolderIdentity
-    directory: Path
     state: Literal["prelaunch"] | GateDispatchSettlement = "prelaunch"
     folders: tuple[Path, ...] = ()
 
@@ -239,17 +239,17 @@ class GateDispatchJournal:
 
     def begin(self, binding: GateDispatchBinding, holder: placement.ClaimHolderIdentity) -> None:
         """Persist the caller before it requests launch permission."""
-        fresh = GateDispatchRecord(binding.claim, holder, binding.directory)
+        fresh = GateDispatchRecord(binding, holder)
         if not create_text_atomic(self.path, _gate_dispatch_text(fresh)):
             saved = self.require_open(binding.claim, holder)
-            if saved.directory != binding.directory:
-                raise LedgerUnavailable('The AWS journal names a different accounting directory')
+            if saved.binding != binding:
+                raise LedgerUnavailable('The AWS journal names a different binding')
             sync_folder(self.path.parent)
 
     def require_open(self, claim: placement.ProviderClaimReference,
                      holder: placement.ClaimHolderIdentity) -> GateDispatchRecord:
         record = self.read()
-        if (record.claim, record.holder) != (claim, holder):
+        if (record.binding.claim, record.holder) != (claim, holder):
             raise LedgerUnavailable('The AWS journal names a different claim or caller')
         if record.state != "prelaunch":
             raise LedgerUnavailable('The AWS dispatch is closed')
@@ -268,7 +268,7 @@ class GateDispatchJournal:
 
     def previous_dispatch_closed(self, binding: GateDispatchBinding) -> bool:
         record = self.read()
-        if (record.claim, record.directory) != (binding.claim, binding.directory):
+        if record.binding != binding:
             raise LedgerUnavailable('The saved AWS request names a different dispatch')
         if record.state == "prelaunch":
             return False
@@ -282,14 +282,14 @@ class GateDispatchJournal:
                 if access is LockResult.BUSY:
                     return placement.DispatchPathPending('The AWS worker holds the dispatch lock')
                 record = self.read()
-                if (record.claim, record.holder) != (claim, holder):
+                if (record.binding.claim, record.holder) != (claim, holder):
                     raise LedgerUnavailable('The AWS journal names a different claim or caller')
                 if record.state != "prelaunch":
                     sync_folder(self.path.parent)
                     return record.state
                 state: GateDispatchSettlement = "no launch"
                 if record.folders:
-                    book = CostLedger(record.directory)
+                    book = CostLedger(record.binding.directory)
                     reservations = ({row.attempt: row for row in book.read_snapshot().gate_reservations}
                                     if book.path.exists() else {})
                     for folder in record.folders:

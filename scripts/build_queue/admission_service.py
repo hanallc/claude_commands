@@ -3958,17 +3958,14 @@ class AdmissionServer:
                     holder = placement.ResourceHolderSession(blocking.key)
             return placement.FreshHostEvidence(key, self.clock.now(), "", local_eligibility, holder=holder)
         if destination.provider == "scaler":
-            from scripts.build_targets.gate_targets import scaler_gate_candidate
+            from scripts.build_targets.gate_targets import configured_scaler_gate
 
-            registry = conf.read("build_targets")
-            configured = target_config.read_registered_targets(selected=destination.target,
-                purpose=target_config.RegistryRead.PLACEMENT, configuration=registry)
-            target = next((entry for entry in configured if isinstance(entry, target_config.ScalerTarget)), None)
-            eligibility = placement.FixedExclusion("The scaler is absent from the target registry")
-            if target is not None:
-                candidate = scaler_gate_candidate(registry, target)
+            try:
+                candidate = configured_scaler_gate(conf.read("build_targets"), destination.target)
                 eligibility = (candidate.eligibility if (destination, key.settings) == (candidate.destination, candidate.settings)
                                else placement.FixedExclusion("The scaler differs from the configured target"))
+            except conf.Unusable as error:
+                eligibility = placement.FixedExclusion(str(error))
             if isinstance(eligibility, placement.AllowedHost):
                 eligibility = self._aws_gate_spending()
             return placement.FreshHostEvidence(key, self.clock.now(), key.configuration_generation, eligibility)
@@ -4682,7 +4679,7 @@ done
         claim = placement.assigned_claim_reference(assignment)
         journal = self.state_dir / f"aws-gate-{claim.claim_id}.json"
         directory = target_config.ssh_target_state_directory("aws").resolve()
-        return aws_ledger.GateDispatchBinding(claim, journal, directory)
+        return aws_ledger.GateDispatchBinding(claim, journal, directory, conf.path("build_targets").resolve())
 
     def _publish_aws_gate_binding(self, request: wire.PlacementRequest,
                                   assignment: placement.PlacementAssignment) -> None:
@@ -5085,14 +5082,20 @@ done
                     return self._placement_status(assignment, f"adoption evidence is unavailable: {error}")
         if destination.provider == "scaler":
             from scripts.aws_target import ledger as aws_ledger
+            from scripts.build_targets.gate_targets import configured_scaler_gate
 
             binding = self._aws_gate_binding(assignment)
             if reference != binding.claim:
                 return self._placement_status(assignment, "the exact AWS claim does not match")
             try:
+                candidate = configured_scaler_gate(conf.read(binding.registry), destination.target)
+                if not isinstance(candidate.eligibility, placement.AllowedHost):
+                    return self._placement_status(assignment, f"The AWS scaler is {candidate.eligibility.reason}")
+                if (candidate.destination, candidate.settings) != (destination, self._placement_settings(submitted, destination)):
+                    return self._placement_status(assignment, "The AWS scaler differs from the assigned target")
                 record = aws_ledger.GateDispatchJournal(binding.journal).require_open(reference, request.holder)
-                if record.directory != binding.directory:
-                    raise ValueError("The AWS journal names a different accounting directory")
+                if record.binding != binding:
+                    raise ValueError("The AWS journal names a different binding")
             except (OSError, ValueError) as error:
                 return self._placement_status(assignment, f"AWS prelaunch evidence is unavailable. {error}")
         elif isinstance(transport, hana_placement.HanaControlTransport):

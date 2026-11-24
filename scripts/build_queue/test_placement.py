@@ -65,26 +65,6 @@ def write_config_fixture(path: Path, overrides: str = "", *, template: str | Non
     return memory_test_support.write_config_fixture(path, pins + overrides, template=template)
 
 
-class FixedSystemReader:
-    """Publish private evidence without an operating-system reader."""
-    def __init__(self, latest: service.SystemEvidence) -> None:
-        self.latest: service.SystemEvidence = latest
-        self.plans: list[service.SystemReadingPlan] = []
-        self.requests: int = 0
-
-    def update(self, plan: service.SystemReadingPlan) -> None:
-        self.plans.append(plan)
-
-    def request_read(self) -> None:
-        self.requests += 1
-
-    def raise_failure(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
-
-
 class PlacementFixture(AdmissionFixture):
     """Supply private provider evidence across each service restart."""
 
@@ -723,6 +703,19 @@ class AwsGatePlacementTests(unittest.TestCase):
                     self.assertEqual(journal.read().state, "no launch")
                     self.assertEqual(aws_ledger.CostLedger(binding.directory).read_snapshot().gate_reservations, [])
 
+    def test_disabling_the_scaler_after_grant_refuses_launch_permission(self) -> None:
+        with PlacementFixture() as fixture:
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state")}):
+                request, assignment, binding = self.assigned_gate(fixture)
+                holder = placement.ClaimHolderIdentity(request.owner.host, request.owner.pid, request.owner.start_time)
+                aws_ledger.GateDispatchJournal(binding.journal).begin(binding, holder)
+                _ = write_config_fixture(binding.registry, "enabled.claude-aws=off\n")
+
+                reply, = fixture.server.handle_request(wire.ConsumePermission("consume", assignment, binding.claim, holder))
+                assert isinstance(reply, wire.DispatchStatus)
+                self.assertEqual(reply.permission, placement.PermissionAvailable())
+                self.assertIn("The AWS scaler is off", reply.reason)
+
     def test_caller_uses_the_queue_journal_with_a_different_aws_state_root(self) -> None:
         from scripts.aws_target import cloud_gate
 
@@ -735,7 +728,7 @@ class AwsGatePlacementTests(unittest.TestCase):
                                              "BUILDLOG_PLACEMENT_SIDECAR": request.local.sidecar}):
                 dispatch = cloud_gate.begin_assigned_gate(assignment)
             self.assertEqual(dispatch.binding, binding)
-            self.assertEqual(dispatch.journal.read().directory, binding.directory)
+            self.assertEqual(dispatch.journal.read().binding.directory, binding.directory)
             self.assertFalse(caller_root.exists())
 
 
