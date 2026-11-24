@@ -1258,8 +1258,8 @@ raise SystemExit(1)
         _ = self.interrupt_batch_before_row(rows, beta)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), alpha)
         self.write(self.checkout, "crates/damaged/Cargo.toml", "[package]\n")
-        self.executable(self.bin / "verify.sh", STUB + '''
-Path("Cargo.toml").write_text("[package]\\n")
+        self.executable(self.bin / "verify.sh", STUB + f'''
+Path({str(self.checkout / manifest)!r}).write_text("[package]\\n")
 raise SystemExit(1)
 ''')
 
