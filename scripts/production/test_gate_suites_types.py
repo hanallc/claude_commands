@@ -412,7 +412,7 @@ class NightlyPushTests(unittest.TestCase):
               mock.patch.object(gate, "checked_git", return_value="fixture-tree"),
               mock.patch.object(gate, "nightly_owner", return_value="sdlc"),
               mock.patch.object(copies, "standing", return_value=nullcontext(self.root)),
-              mock.patch.object(gate, "run_suites", return_value=run,
+              mock.patch.object(gate, "run_gate_suites", return_value=run,
                                 side_effect=run if isinstance(run, Exception) else None),
               mock.patch.object(showrunners, "tell", return_value="told sdlc"),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
@@ -778,7 +778,6 @@ class NightlyPushTests(unittest.TestCase):
                 (gate.MacLinuxTookNoRun("fixture guest did not start"), MAC_LINUX_PRELAUNCH_REFUSED_STATUS),
                 (GateResultUnknown("fixture guest gave no verdict"), GATE_RESULT_UNKNOWN_STATUS)):
             with (self.subTest(status=status), self.execution(failure) as sent,
-                  mock.patch.object(gate, "run_gate_suites", side_effect=failure),
                   mock.patch.object(gate, "_sweep_nightly_build_folders"),
                   mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
                   redirect_stdout(io.StringIO()),
@@ -795,7 +794,7 @@ class NightlyPushTests(unittest.TestCase):
 
     def test_interrupt_push_preserves_the_exception(self) -> None:
         run = gate.GateRun((), 0, 0)
-        for stage in ("nightly_git", "run_suites"):
+        for stage in ("nightly_git", "run_gate_suites"):
             failure = KeyboardInterrupt()
             with self.subTest(stage=stage), self.execution(run) as sent:
                 with mock.patch.object(gate, stage, side_effect=failure):

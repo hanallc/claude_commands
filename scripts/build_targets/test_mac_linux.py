@@ -1788,14 +1788,15 @@ fi
 
             try:
                 with (patch.object(mac_linux, 'prove_guest_end', pending), redirect_stderr(blocked_stderr)):
-                    result = self.route()
+                    with self.assertRaises(GateResultUnknown) as result:
+                        _ = self.route()
                     returned = time.monotonic()
             finally:
                 if started:
                     guard.cancel()
                     guard.join()
         first_probe, = started
-        self.assertIn('guest unreachable: fixture-guest', str(result))
+        self.assertIn('guest unreachable: fixture-guest', str(result.exception))
         self.assertLess(returned - first_probe, 1.75)
 
     def test_local_read_past_the_proof_deadline_starts_no_cleanup_ssh(self) -> None:
@@ -1815,10 +1816,10 @@ fi
 
         with (patch.object(Path, 'read_text', read_with_delay),
               patch.object(mac_linux, 'monotonic', lambda: now)):
-            result = self.route()
+            with self.assertRaisesRegex(GateResultUnknown, 'guest unreachable: fixture-guest'):
+                _ = self.route()
         # The run command and the cleanup command each read the helper once; the cleanup read passes the deadline.
         self.assertEqual(now, 2.5)
-        self.assertIn('guest unreachable: fixture-guest', str(result))
         self.assert_guest_clean('probe', 'arm', 'run')
 
     def test_proof_received_at_the_deadline_refuses(self) -> None:
@@ -1833,8 +1834,8 @@ fi
 
         with (patch.object(mac_linux, 'monotonic', lambda: now),
               patch.object(mac_linux, 'prove_guest_end', late_proof)):
-            result = self.route()
-        self.assertIn('guest unreachable: fixture-guest', str(result))
+            with self.assertRaisesRegex(GateResultUnknown, 'guest unreachable: fixture-guest'):
+                _ = self.route()
 
     def test_cleanup_error_timeout_or_unexpected_reply_is_pending(self) -> None:
         settings = mac_linux.read_settings(conf.read(self.registry))
@@ -2044,10 +2045,9 @@ fi
         _ = configuration.write_text(configuration.read_text().replace('seconds=7', 'seconds=3'))
         with (patch.dict(os.environ, {'FIXTURE_RUN_SECONDS': '3', 'FIXTURE_TRANSFER_SECONDS': '4'}),
               patch.object(mac_linux, 'TRANSFER_ALLOWANCE_SECONDS', 4)):
-            result = self.route('hang')
-        self.assertIsInstance(result, str)
-        self.assertRegex(str(result), r'SSH or source stream exited (9|137):')
-        self.assertIn('Guest cleanup: ended', str(result))
+            with self.assertRaisesRegex(GateResultUnknown, r'SSH or source stream exited (9|137):') as result:
+                _ = self.route('hang')
+        self.assertIn('Guest cleanup: ended', str(result.exception))
         self.assertTrue((self.root / 'run.group').is_file())
         self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
@@ -2245,10 +2245,9 @@ fi
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_guest_runner_failure_returns_reason_and_cleans(self) -> None:
-        result = self.route('runner-failure')
-        self.assertIsInstance(result, str)
-        self.assertIn('fixture guest runner failed', str(result))
-        self.assertIn('Guest cleanup: ended', str(result))
+        with self.assertRaisesRegex(GateResultUnknown, 'fixture guest runner failed') as result:
+            _ = self.route('runner-failure')
+        self.assertIn('Guest cleanup: ended', str(result.exception))
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_runner_failure_before_a_test_lets_natedev_take_the_gate(self) -> None:
@@ -2304,8 +2303,8 @@ fi
         send = mac_linux.BundleSend('', '', mac_linux.BundleForm.FIRST, mac_linux.BundleReason.FIRST_RUN)
         for stderr, error in ((b'fixture stderr\n', mac_linux.GuestTookNoRun),
                               (mac_linux.run_start_line(attempt).encode() + b'\nfixture stderr\n',
-                               mac_linux.GuestUnavailable)):
-            with self.subTest(started=error is mac_linux.GuestUnavailable):
+                               mac_linux.GuestResultUnavailable)):
+            with self.subTest(started=error is mac_linux.GuestResultUnavailable):
                 stream = subprocess.CompletedProcess[bytes]([], 0, b'{"reply": 1}\nno count\xff\n', stderr)
                 with self.assertRaises(mac_linux.GuestUnavailable) as refusal:
                     _ = mac_linux.stream_reply(stream, attempt, 10, send, 'Guest cleanup: ended.')

@@ -856,7 +856,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
               mock.patch.object(self.admission.server, "host", machine),
               mock.patch.object(self.admission.server, "reply_filter", observe),
               mock.patch.object(gate, "local_release_waiter", side_effect=release_fixture_hold),
-              mock.patch.object(gate, "run_gate_suites", side_effect=AssertionError("run_gate_suites")),
+              mock.patch("scripts.aws_target.cloud_gate.route", side_effect=AssertionError("unexpected cloud route")),
               contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
             try:
                 for _slot in range(2):
@@ -903,7 +903,9 @@ class MergeGateSuitesTests(GateSuitesFixture):
         output = io.StringIO()
         with (mock.patch.dict(os.environ, self.environment),
               contextlib.ExitStack() as blocked, contextlib.redirect_stdout(output)):
-            for name in ("PassedTreeLedger", "record_gate_run", "run_gate_suites"):
+            _ = blocked.enter_context(mock.patch("scripts.aws_target.cloud_gate.route",
+                                                 side_effect=AssertionError("unexpected cloud route")))
+            for name in ("PassedTreeLedger", "record_gate_run"):
                 _ = blocked.enter_context(mock.patch.object(gate, name, side_effect=AssertionError(name)))
             code = gate.main(["--tests-only", "--repo", str(self.checkout),
                               "--module-time-limit-s", "0.000001",
