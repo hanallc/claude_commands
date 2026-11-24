@@ -103,7 +103,10 @@ class RenderedPush:
     def message(self) -> str:
         if self.one_line:
             return self.title
-        return first_line(self.action, self.session) + "\n" + self.body if self.header else self.body
+        if not self.header:
+            return self.body
+        header = first_line(self.action, self.session)
+        return f"{header}\n{self.body}" if self.body else header
 
 
 def catalog() -> tuple[PushText, ...]:
