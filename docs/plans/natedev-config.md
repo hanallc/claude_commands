@@ -755,36 +755,22 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 **Ruled out:** lazy `math`, `collections.abc` and `sys` imports: measured, and no module leaves the load list.
 
 ### Phase 17 — Build tool limits follow-ups  · status: done
-**Depends on:** Phase 10
 
-#### Work Order
+#### As-built
 
-**Goal:** One build report uses one edited-crate limit in all its sections, and a Mac nextest run with an unusable Summary scan limit keeps its log, its status and a clear diagnostic.
-
-**Spec:**
-
-1. **One limit for each report.** `scripts/buildlog/report.py` `report()` reads `RebuildClasses` for the rebuilds section, and `moments_section()` reads a second one. A `/tune` write between the two reads can give the rebuild table and the moments groups different labels. Pass the one `RebuildClasses` value from `report()` through every section. The standalone moments command (`scripts/buildlog/cli.py`, line 222) reads its own value.
-2. **Report test.** Add a row to the existing report test: one report pass reads `report.edited_crate_max_crates` once, and both sections use the same labels.
-3. **Unusable scan limit.** Add a row to `scripts/mac_test/test_offload_cleanup.py` `test_nextest_replays_success_and_retains_bounded_failure_output`: an unusable `nextest.summary_scan_bytes` (above its `# whole: 1..1048576` limit) and no recovery source. Check the diagnostic, the retained log path and the original nextest status, and that no Summary line is sent. Keep the `run TAIL SUMMARY COMMAND...` interface. Change `scripts/mac_test/nextest_log.py` only if the row fails.
+- `report.RebuildClasses()` reads `report.edited_crate_max_crates` at first use and keeps it (`cached_property` on `edited_crate_max`, `edited_label` and `cascade_label`). `labels()` and `label(crates_compiled, warm)` are the one bin rule.
+- `report()` makes one `RebuildClasses` and passes it to the rebuild table, the package rows and `moments_section(connection, day, classes)`. `power_profile_section` and `buildlog moments` (`scripts/buildlog/cli.py`) each make their own instance.
+- A moments report with an unusable edited-crate limit and no comparison window succeeds; with a comparison window it raises `conf.Unusable`.
+- `nextest_log.run_logged` collects the replay error and conf warnings with `conf.diagnostics(report=False)`. It writes them to the output stream and flushes before `main` prints `mac_exit`. It writes to stderr only if that write fails. The `run TAIL SUMMARY COMMAND...` form does not change.
 
 **Files:**
-- `scripts/buildlog/report.py`, `scripts/buildlog/cli.py`
-- `scripts/buildlog/test_report.py`, `scripts/buildlog/test_moments.py`
-- `scripts/mac_test/test_offload_cleanup.py`, `scripts/mac_test/nextest_log.py` — the code only if the new row fails
+- `scripts/buildlog/report.py`, `scripts/buildlog/cli.py` — lazy classes, one per report
+- `scripts/buildlog/test_report.py` — one read for each report pass, with a write between reads
+- `scripts/buildlog/test_moments.py` — `test_moments_command_shows_profile_without_a_usable_rebuild_limit`
+- `scripts/mac_test/nextest_log.py` — replay diagnostics on the output stream
+- `scripts/mac_test/test_offload_cleanup.py` — row `1048577` of `test_nextest_replays_success_and_retains_bounded_failure_output` checks the diagnostic order under `/bin/sh` and `zsh -f`
+- `docs/as-built/build-targets.md`, `docs/as-built/build-followups.md` — the new forms
 
-**Workers:** 1 writer + 1 tester — split by folder.
-- `impl` — `scripts/buildlog/report.py`, `scripts/buildlog/cli.py`, `scripts/buildlog/test_report.py`, `scripts/buildlog/test_moments.py`
-- `test` — `scripts/mac_test/test_offload_cleanup.py`, and `scripts/mac_test/nextest_log.py` if the new row shows a defect
+**Gotchas:** over SSH, stdout and stderr have no order. `offload.py` merges them and treats output after `mac_exit=` as `MISSING_MAC_STATUS`. A Mac-side diagnostic goes on the status stream before the status line.
 
-**State:** none
-
-**Constraints from prior phases:**
-- Phase 10: `RebuildClasses` (a frozen dataclass in `report.py`) holds the edited-crate maximum and the labels. `RebuildClasses.read()` reads `conf.read("buildlog").whole("report.edited_crate_max_crates")`. `label(crates_compiled, warm)` is the one bin rule. `rebuild_timings`, `package_rebuild_rows`, `rebuilds_section` and `profile_step_durations(connection, start, end, classes, *, hana_only=False)` take `classes`. `moments_section(connection, day)` reads `RebuildClasses.read()` once and passes it to `grouped()`.
-- Phase 10: `test_moments.py` spies on `report.profile_step_durations`. Keep each spy target current.
-- Phase 10: `config/mac_test.conf` has `# whole: 1..1048576` above `nextest.summary_scan_bytes=8192`. `replay_log` reads the key under `if status:` and calls `parse.bounded_displayed_lines(log, scan_bytes)`. `run_logged` catches `(OSError, conf.Unusable)`. The macOS target gets no per-run script copy, so the `run TAIL SUMMARY COMMAND...` form must not change.
-- Tests write keys in a `CONF_DIR` fixture with `write_config_fixture`.
-
-**Acceptance gate:**
-- `test_report.py`, `test_moments.py` and `test_offload_cleanup.py` pass. The report test proves one read for each report pass.
-- The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
-- basedpyright reports zero errors and zero warnings on each changed Python file.
+**Ruled out:** a cap in code on the edited-crate maximum: the limit line `whole: 1..48` holds the bound.
