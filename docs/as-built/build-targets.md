@@ -647,6 +647,7 @@ The `step_wait_s` field gives the wait for each step, including separate waits f
 Verify counts the placement samples after it receives a grant, a refusal, or a confirmed cancellation.
 A confirmed cancellation includes the cancellation that Verify requests before lint formatting.
 A canceled episode stops accruing wait before formatting starts.
+That mend wait ends at the last queue reply before Verify cancels; the cancel call itself, about one second, is not counted.
 If Verify stops before it reads a final reply or a sample is missing, it records null for the step and admission totals.
 The `hold_wait_s` field is null when the call has no valid hold sample.
 A standalone step with its own checkout slot also uses `NO_RUN`.
