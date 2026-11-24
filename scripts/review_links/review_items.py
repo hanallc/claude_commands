@@ -21,8 +21,7 @@ if TYPE_CHECKING:
     from scripts.production.update_registration import QuestionStaff
 
 from scripts.lib import urgency
-from scripts.lib import user_zone as user_zone_config
-from scripts.lib.user_zone import user_zone
+from scripts.lib.user_zone import settings_path as user_zone_path, user_zone
 from scripts.nightly_review import candidates
 from scripts.production import change_review, change_routing, delivery_state, investigation, staff, update_registration
 from scripts.production import issues as issue_store
@@ -1599,7 +1598,7 @@ def question_counts(owner: staff.StaffRow, _production_zone: ZoneInfo, identitie
                     source: str = '') -> tuple[int,str]:
     """Count Questions in the same zone as Review and /next."""
     if sources is not None and not os.environ.get('USER_ZONE'):
-        sources.append(Path(user_zone_config.CONF))
+        sources.append(Path(user_zone_path()))
     zone = user_zone()
     items = read_kind(ReviewType.QUESTION,owner,identities.record,sources=sources,show='open',zone=zone)
     now = datetime.now(zone)

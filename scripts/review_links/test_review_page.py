@@ -6229,6 +6229,19 @@ window.fetch=async(url,options={})=>{
         page = self.new_item_filter_page(new_item_dialog.SubmissionKind.QUESTION, matches_filters=True)
         self.assertEqual(firefox_probe_results(page), [[]])
 
+    def test_question_counts_records_the_current_zone_file(self) -> None:
+        _ = self.question()
+        identities = update_registration.QuestionStaff.for_record(staff.snapshot())
+        owner = next(row for row in identities.record.rows if row.name == 'page-owner')
+        zone_path = self.fixture.temporary / 'question-zone.conf'
+        _ = zone_path.write_text('zone=UTC\n')
+        sources: list[Path] = []
+        with patch.dict(os.environ, {'USER_ZONE_CONF': str(zone_path)}):
+            _ = os.environ.pop('USER_ZONE', None)
+            counts = review_items.question_counts(owner, ZoneInfo('UTC'), identities, sources)
+        self.assertEqual(counts, (1, ''))
+        self.assertIn(zone_path, sources)
+
     def test_the_reader_counts_only_for_you_across_all_five_stores(self) -> None:
         _ = self.investigation()
         _ = self.investigation(False)
