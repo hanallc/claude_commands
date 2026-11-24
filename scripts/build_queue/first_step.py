@@ -17,7 +17,7 @@ from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
 from scripts.build_targets import target_config
 from scripts.buildlog import store, treekey
 from scripts.direct.step_selection import Pinned
-from scripts.lib import build_folders
+from scripts.lib import build_folders, conf
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.build_queue.admission_wire import read_assignment
@@ -263,13 +263,49 @@ def read_gate_claim_failure(assignment_file: Path, request: wire.PlacementReques
     return refusal
 
 
-def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> tuple[str, ...]:
+def canonical_gate_command(command: Sequence[str], source: Path) -> bool:
+    """Check for a direct call to the checkout's gate script."""
+    program = parse_command_program(command, keep_path=True)
+    if isinstance(program, OtherCommand) or Path(command[0]).name in {"bash", "sh"}:
+        return False
+    root = source.resolve()
+    path = root / program[0]
+    canonical = root / "scripts/production/gate.py"
+    return path == canonical and path.resolve() == canonical
+
+
+def _gate_targets_for_command(command: Sequence[str], source: Path, targets: tuple[str, ...],
+                              scalers: set[str]) -> tuple[str, ...]:
+    from scripts.build_targets.gate_targets import aws_gate_command
+
+    if scalers.isdisjoint(targets) or aws_gate_command(source, tuple(command)):
+        return targets
+    remaining = tuple(target for target in targets if target not in scalers)
+    if not remaining:
+        raise FirstStepRefused("AWS requires scripts/production/gate.py without --nightly, --module, or --promote-only")
+    return remaining
+
+
+def gate_targets(command: Sequence[str], source: Path, requested: str = "", *, direct: bool = False) -> tuple[str, ...]:
     """Read the caller's gate targets or the source repository's default."""
     if command_program(command) not in GATE_SCRIPTS:
         return ()
     names = requested or os.environ.get('BUILDLOG_GATE_TARGETS', '')
     if names:
-        return tuple(dict.fromkeys(name for value in names.split(',') if (name := value.strip())))
+        targets = tuple(dict.fromkeys(name for value in names.split(',') if (name := value.strip())))
+        configured = target_config.read_registered_targets(purpose=target_config.RegistryRead.PLACEMENT)
+        scalers = {target.name for target in configured if isinstance(target, target_config.ScalerTarget)}
+        if direct:
+            targets = tuple(name for name in targets if name in ("natedev", "mac-linux") or name in scalers)
+            if not targets:
+                raise FirstStepRefused("Direct gates require natedev, mac-linux, or a registered scaler")
+        targets = _gate_targets_for_command(command, source, targets, scalers)
+        if not canonical_gate_command(command, source):
+            local = tuple(name for name in targets if name in ("natedev", "mac-linux"))
+            if targets and not local:
+                raise FirstStepRefused("Direct gates require natedev or mac-linux")
+            return local
+        return targets
     from scripts.build_targets.gate_targets import NoEnabledTarget, eligible_gate_targets
 
     selected = eligible_gate_targets(source, tuple(command))
@@ -281,7 +317,13 @@ def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> t
 def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...],
                   owner: wire.Owner, position: SlotQueuePosition, run: wire.RunIdentity,
                   sidecar: Path) -> wire.PlacementRequest:
+    from scripts.build_targets.gate_targets import scaler_gate_candidate
+
+    registry = conf.read("build_targets")
+    configured = target_config.read_registered_targets(purpose=target_config.RegistryRead.PLACEMENT, configuration=registry)
+    scalers = {target.name: target for target in configured if isinstance(target, target_config.ScalerTarget)}
     arguments = tuple(command)
+    targets = _gate_targets_for_command(command, source, targets, set(scalers))
     flag = gate_natedev_only_flag(arguments)
     if flag is not None and "natedev" not in targets:
         raise FirstStepRefused(f"gate.py {flag} runs only on natedev")
@@ -291,11 +333,13 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
                   else execution_identity.SourceKeyUnavailable('source key is unavailable'))
     session = claim_state.submitting_session(claim_state.CALLING_SESSION)
     # Keep the registry order when more than one named target can start.
-    configured = target_config.read_targets(purpose=target_config.RegistryRead.PLACEMENT)
     ordered_names = dict.fromkeys((*(target.name for target in configured if target.name in targets), *targets))
     builder = client.placement_constraint_builder()
     candidates: list[placement.PlacementCandidate] = []
     for name in ordered_names:
+        if name in scalers:
+            candidates.append(scaler_gate_candidate(registry, scalers[name]))
+            continue
         fixed = builder(source, '', 'final', arguments, session, source_key, target_config.ANY_ELIGIBLE_TARGET,
             Pinned(name), writes_tree=False)
         named = tuple(candidate for candidate in fixed.candidates if candidate.destination.target == name)

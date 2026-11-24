@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, time as day_time, timedelta
 from decimal import Decimal
@@ -21,8 +21,10 @@ from uuid import uuid4
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import create_text_atomic, sync_folder, write_text_atomic
 from scripts.lib import conf
+from scripts.lib.file_lock import LockResult, exclusive
+from scripts.build_queue import placement, snapshot_codec
 from scripts.aws_target import hana_result, remote
 from scripts.message import send_result, session_send
 from scripts.aws_target.config import (
@@ -170,9 +172,152 @@ class GateReservation:
     root_gib: int = 0
 
 
+def gate_booking(values: conf.ConfigRead, attempt: str, now: int, expires: int) -> GateReservation:
+    """Use the same booking terms for placement and the worker."""
+    return GateReservation(attempt, now, expires, money(str(values.number('spot_max_usd_per_hour'))),
+        money(str(values.number('attempt_allowance_usd'))), instance_type=values.words('instance_types')[0])
+
+
 def gate_is_open(reservation: GateReservation) -> bool:
     """Keep pending and running reservations open until AWS confirms closure."""
     return isinstance(reservation.state, (GateLaunchPending, GateRunning))
+
+
+def gate_dispatch_binding_path(sidecar: Path) -> Path:
+    """Locate the queue's AWS binding beside the placement progress file."""
+    return sidecar.with_name(sidecar.name + '.aws-dispatch.json')
+
+
+@dataclass(frozen=True)
+class GateDispatchBinding:
+    """Identify the queue journal and AWS accounting directory for one claim."""
+    claim: placement.ProviderClaimReference
+    journal: Path
+    directory: Path
+    registry: Path
+    account_settings: Path
+
+    def publish(self, path: Path) -> None:
+        try:
+            saved = self.read(path)
+        except FileNotFoundError:
+            if create_text_atomic(path, json.dumps(snapshot_codec.snapshot_value(self)) + '\n'):
+                return
+            saved = self.read(path)
+        if saved != self:
+            raise LedgerUnavailable('The AWS placement binding differs from the queue assignment')
+
+    @staticmethod
+    def read(path: Path) -> GateDispatchBinding:
+        return cast(GateDispatchBinding, snapshot_codec.parse_snapshot_value(
+            cast(object, json.loads(path.read_text())), GateDispatchBinding))
+
+
+GateDispatchSettlement = Literal["no launch", "launch ended"]
+
+
+@dataclass(frozen=True)
+class GateDispatchRecord:
+    """Bind the service folders to the exact queue claim and caller."""
+    binding: GateDispatchBinding
+    holder: placement.ClaimHolderIdentity
+    state: Literal["prelaunch"] | GateDispatchSettlement = "prelaunch"
+    folders: tuple[Path, ...] = ()
+
+
+def _gate_dispatch_text(record: GateDispatchRecord) -> str:
+    return json.dumps(snapshot_codec.snapshot_value(record), sort_keys=True) + '\n'
+
+
+@dataclass(frozen=True)
+class GateDispatchJournal:
+    """Use the path the queue assigned to this gate."""
+    path: Path
+
+    def read(self) -> GateDispatchRecord:
+        return cast(GateDispatchRecord, snapshot_codec.parse_snapshot_value(
+            cast(object, json.loads(self.path.read_text())), GateDispatchRecord))
+
+    def begin(self, binding: GateDispatchBinding, holder: placement.ClaimHolderIdentity) -> None:
+        """Persist the caller before it requests launch permission."""
+        fresh = GateDispatchRecord(binding, holder)
+        if not create_text_atomic(self.path, _gate_dispatch_text(fresh)):
+            saved = self.require_open(binding.claim, holder)
+            if saved.binding != binding:
+                raise LedgerUnavailable('The AWS journal names a different binding')
+            sync_folder(self.path.parent)
+
+    def require_open(self, claim: placement.ProviderClaimReference,
+                     holder: placement.ClaimHolderIdentity) -> GateDispatchRecord:
+        record = self.read()
+        if (record.binding.claim, record.holder) != (claim, holder):
+            raise LedgerUnavailable('The AWS journal names a different claim or caller')
+        if record.state != "prelaunch":
+            raise LedgerUnavailable('The AWS dispatch is closed')
+        return record
+
+    def lock(self, *, wait: bool = True) -> AbstractContextManager[LockResult]:
+        return exclusive(self.path.with_suffix('.lock'), wait=wait)
+
+    def register(self, claim: placement.ProviderClaimReference, holder: placement.ClaimHolderIdentity,
+                 folder: Path) -> None:
+        """Persist a service folder before the service can start."""
+        with self.lock():
+            record = self.require_open(claim, holder)
+            if folder not in record.folders:
+                write_text_atomic(self.path, _gate_dispatch_text(replace(record, folders=(*record.folders, folder))))
+
+    def previous_dispatch_closed(self, binding: GateDispatchBinding) -> bool:
+        record = self.read()
+        if record.binding != binding:
+            raise LedgerUnavailable('The saved AWS request names a different dispatch')
+        if record.state == "prelaunch":
+            return False
+        sync_folder(self.path.parent)
+        return True
+
+    def settle(self, claim: placement.ProviderClaimReference, holder: placement.ClaimHolderIdentity) -> GateDispatchSettlement | placement.DispatchPathPending:
+        """Use only local evidence to close a dispatch and fence its workers."""
+        try:
+            with self.lock(wait=False) as access:
+                if access is LockResult.BUSY:
+                    return placement.DispatchPathPending('The AWS worker holds the dispatch lock')
+                record = self.read()
+                if (record.binding.claim, record.holder) != (claim, holder):
+                    raise LedgerUnavailable('The AWS journal names a different claim or caller')
+                if record.state != "prelaunch":
+                    sync_folder(self.path.parent)
+                    return record.state
+                state: GateDispatchSettlement = "no launch"
+                if record.folders:
+                    book = CostLedger(record.binding.directory)
+                    reservations = ({row.attempt: row for row in book.read_snapshot().gate_reservations}
+                                    if book.path.exists() else {})
+                    for folder in record.folders:
+                        reservation = reservations.get(folder.name)
+                        try:
+                            launch = mapping(cast(object, json.loads((folder / 'launch.json').read_text())))
+                        except FileNotFoundError:
+                            launch = {}
+                        if reservation is not None and gate_is_open(reservation):
+                            if not isinstance(reservation.state, GateLaunchPending) or 'arguments' in launch or 'instance' in launch:
+                                return placement.DispatchPathPending(f'AWS launch {folder.name} remains open')
+                            request = mapping(cast(object, json.loads((folder / 'request.json').read_text())))
+                            if request.get('attempt') != folder.name:
+                                raise LedgerUnavailable('The AWS service folder names a different attempt')
+                            book.resolve_gate(folder.name, GateAbsent(int(time.time())))
+                        if reservation is not None and isinstance(reservation.state, GateTerminated):
+                            state = "launch ended"
+                        if 'instance' in launch:
+                            state = "launch ended"
+                        if reservation is None and ('arguments' in launch or 'instance' in launch):
+                            return placement.DispatchPathPending(f'AWS launch {folder.name} has no confirmed end')
+                    if book.path.exists():
+                        sync_folder(book.directory)
+                write_text_atomic(self.path, _gate_dispatch_text(replace(record, state=state)))
+                return state
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            return placement.DispatchPathPending(f'Local AWS dispatch evidence is unavailable. {error}')
 
 
 @dataclass(frozen=True)
@@ -2416,15 +2561,23 @@ class CostLedger:
                 total = sum((trial_gate_cost(row, settings.box_minimum_seconds) for row in scoped), Decimal(0))
                 if total + trial_gate_cost(request, settings.box_minimum_seconds) > limit:
                     return GateCapReached('gpu_size_trial_limit_usd')
-            costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
-            state.gate_reservations.append(request)
-            reason = self.reservation_cap(state, settings, request.at, costs)
-            if reason:
-                state.gate_reservations = [r for r in state.gate_reservations if r.attempt != request.attempt]
-                self._save(state)
-                return GateCapReached(reason)
+            reason = self._book_gate(state, settings, request)
             self._save(state)
+            if reason:
+                return GateCapReached(reason)
             return GateReserved(state.gate_reservations[-1])
+
+    def gate_booking_refusal(self, snapshot: LedgerEvidence, settings_path: Path, request: GateReservation) -> str:
+        """Project the booking against local account evidence without changing the ledger."""
+        return self._book_gate(snapshot, read_settings(settings_path), request)
+
+    def _book_gate(self, state: LedgerEvidence, settings: SpendingSettings, request: GateReservation) -> str:
+        costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
+        state.gate_reservations.append(request)
+        reason = self.reservation_cap(state, settings, request.at, costs)
+        if reason:
+            _ = state.gate_reservations.pop()
+        return reason
 
     @contextmanager
     def locked_snapshot(self) -> Generator[LedgerEvidence]:

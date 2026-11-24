@@ -47,12 +47,20 @@ def gate_source(fixture: PlacementFixture, repository: str, *, enabled: str = "o
     _ = write_config_fixture(fixture.root / "mac_linux.conf",
         "ssh.hops=fixture-mac fixture-guest\nguest.user=fixture\n")
     _ = write_config_fixture(fixture.root / "hana_aws.conf", "enabled=on\n")
+    _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=off\n")
     source = fixture.root / (".claude" if repository == "claude_commands" else repository)
     source.mkdir()
     for command in (("init", "-q"), ("remote", "add", "origin", f"https://example.invalid/{repository}.git")):
         _ = subprocess.run(("git", "-C", str(source), *command), capture_output=True,
                            check=True, timeout=TEST_HANG_GUARD_SECS)
     return source
+
+
+def register_scaler(root: Path, *, enabled: str = "on") -> None:
+    _ = write_config_fixture(root / "build_targets.conf",
+        "targets=mac-linux,natedev,mac,hana-aws,claude-aws\n"
+        + "kind.claude-aws=scaler\nsettings.claude-aws=cloud_gate.conf\n"
+        + f"enabled.claude-aws={enabled}\n")
 
 
 class FirstStepTests(unittest.TestCase):
@@ -67,9 +75,61 @@ class FirstStepTests(unittest.TestCase):
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "claude_commands")
             command = (*GATE_COMMAND[:2], "--nightly")
-            _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=on\n")
+            register_scaler(fixture.root)
             with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
                 self.assertEqual(first_step.gate_targets(command, source), ("mac-linux", "natedev"))
+
+    def test_only_the_canonical_gate_can_request_aws(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands")
+            with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
+                self.assertEqual(first_step.gate_targets(GATE_COMMAND, source), ("mac-linux", "natedev"))
+                canonical = source / "scripts/production/gate.py"
+                # Aliases never receive a scaler assignment.
+                canonical.parent.mkdir(parents=True)
+                canonical.touch()
+                (source / "gate.py").symlink_to(canonical)
+                (source / "gate-alias.py").symlink_to(canonical)
+                register_scaler(fixture.root, enabled="off")
+                self.assertEqual(first_step.gate_targets(GATE_COMMAND, source), ("mac-linux", "natedev"))
+                register_scaler(fixture.root)
+                self.assertEqual(first_step.gate_targets(GATE_COMMAND, source), ("mac-linux", "natedev", "claude-aws"))
+                self.assertEqual(first_step.gate_targets(GATE_COMMAND, source, requested="claude-aws"), ("claude-aws",))
+                self.assertEqual(first_step.gate_targets(("python3", "gate-alias.py"), source,
+                                                         requested="claude-aws,natedev"), ())
+                for command in (("python3", "scripts/production/merge_gate.py", "--tests-only"),
+                                ("python3", "scripts/production/targeted_test.py"),
+                                ("python3", "-m", "scripts.production.gate", "--tests-only"),
+                                ("python3", "gate.py", "--tests-only"),
+                                (*GATE_COMMAND[:2], "--nightly"), MODULE_GATE_COMMAND):
+                    with self.subTest(command=command):
+                        self.assertNotIn("claude-aws", first_step.gate_targets(command, source))
+                        self.assertEqual(first_step.gate_targets(command, source, requested="claude-aws,natedev"), ("natedev",))
+                        with self.assertRaisesRegex(first_step.FirstStepRefused, "AWS requires scripts/production/gate.py"):
+                            _ = first_step.gate_targets(command, source, requested="claude-aws")
+
+
+    def test_first_step_submits_the_registered_scaler(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands")
+            register_scaler(fixture.root)
+            owner = fixture.fixture_owner(os.getpid(), "123")
+
+            def grant(request: wire.PlacementRequest, _reason: str) -> wire.Assignment:
+                candidate, = request.constraints.candidates
+                self.assertEqual(candidate.destination.target, "claude-aws")
+                self.assertEqual(candidate.destination.provider, "scaler")
+                self.assertEqual(candidate.settings, placement.ExplicitProviderSettings(fixture.root / "cloud_gate.conf"))
+                self.assertEqual(candidate.eligibility, placement.AllowedHost())
+                raise first_step.FirstStepRefused("The fixture checked the gate request")
+
+            with (mock.patch.object(records, "process_start_time", return_value=owner.start_time),
+                  mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
+                  mock.patch.object(queue_place, "wait_for_placement", side_effect=grant) as place,
+                  self.assertRaisesRegex(first_step.FirstStepRefused, "The fixture checked the gate request")):
+                with first_step.admitted_run(GATE_COMMAND, source, targets=("claude-aws",)):
+                    self.fail("The gate received a placement")
+            place.assert_called_once()
 
     def test_hana_gate_has_no_default_targets(self) -> None:
         with PlacementFixture() as fixture:

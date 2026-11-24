@@ -35,7 +35,7 @@ from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 
-from scripts.lib import build_folders, build_slots, conf, copy_record, file_lock, git_index, git_rescue, process_start, scratch, session_folder
+from scripts.lib import build_folders, build_slots, cancellation, conf, copy_record, file_lock, git_index, git_rescue, process_start, scratch, session_folder
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
     SelectedRepository as SelectedRepository,
@@ -47,8 +47,9 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.lib.build_steps import (
-    GATE_RESULT_UNKNOWN_STATUS, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
-    StepJob, VerifyCommand, build_call_arguments, command_job, command_program, read_step_names, verify_command,
+    GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
+    StepJob, VerifyCommand, build_call_arguments, command_job, read_step_names,
+    verify_command,
 )
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
@@ -2609,13 +2610,13 @@ def command_tail(command: list[str]) -> list[str]:
 
 def take_prepared_gate_handoff() -> bool:
     """Consume the pipe token passed to the prepared gate."""
+    # The pipe skips placement. Only the queue can confirm an AWS assignment.
     try:
         reader = int(os.environ.pop(PREPARED_GATE_FD, "0"))
         if reader < 3 or not stat.S_ISFIFO(os.fstat(reader).st_mode):
             return False
         with os.fdopen(reader, "rb", buffering=0) as pipe:
-            os.set_blocking(reader, False)
-            return pipe.read(1) == b"1"
+            return pipe.read(32) == f"{os.getpid()}\n".encode("ascii")
     except (OSError, ValueError, OverflowError):
         return False
 
@@ -2644,7 +2645,8 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
                 _ = (output / "paths.json").write_text(json.dumps(args.publish))
                 captured = environment["COPIES_STEP_OUTPUT"] = str(output)
         else:
-            targets = first_step.gate_targets(command, source, args.targets)
+            source_arguments = [part.replace("{tree}", str(source)) for part in command]
+            targets = first_step.gate_targets(source_arguments, source, args.targets)
             prepared = scope.enter_context(_command_copy(owner, source, policy, command, merge=merge,
                                                          gate_targets=targets))
             tree = prepared.tree
@@ -2659,16 +2661,24 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
         def launch() -> subprocess.CompletedProcess[str]:
             child_environment = {**os.environ, **environment}
             _ = child_environment.pop(PREPARED_GATE_FD, None)
-            pass_fds = locks
-            with ExitStack() as handoff:
-                if command_program(arguments) in GATE_SCRIPTS:
-                    reader, writer = os.pipe()
-                    _ = handoff.callback(os.close, reader)
-                    with os.fdopen(writer, "wb") as pipe:
-                        _ = pipe.write(b"1")
-                    child_environment[PREPARED_GATE_FD] = str(reader)
-                    pass_fds = (*locks, reader)
-                return subprocess.run(arguments, cwd=tree, pass_fds=pass_fds, env=child_environment, text=True)
+            if not first_step.canonical_gate_command(arguments, tree):
+                return subprocess.run(arguments, cwd=tree, pass_fds=locks, env=child_environment, text=True)
+            with ExitStack() as pipes:
+                reader, writer = os.pipe()
+                _ = pipes.callback(os.close, reader)
+                _ = pipes.callback(os.close, writer)
+                child_environment[PREPARED_GATE_FD] = str(reader)
+                with subprocess.Popen(arguments, cwd=tree, pass_fds=(*locks, reader),
+                                      env=child_environment, text=True) as child:
+                    try:
+                        _ = os.write(writer, f"{child.pid}\n".encode("ascii"))
+                        pipes.close()
+                        return subprocess.CompletedProcess(arguments, child.wait())
+                    except BaseException:
+                        with cancellation.defer_cleanup_signals():
+                            child.kill()
+                            _ = child.wait()
+                        raise
 
         if isinstance(prepared, AdmittedCommandCopy):
             result = prepared.admission.run_gate(launch)

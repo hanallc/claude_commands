@@ -71,6 +71,7 @@ from scripts.lib.atomic_file import atomic_sample, write_text_atomic
 from scripts.accounts import outage_alerts
 
 if TYPE_CHECKING:
+    from scripts.aws_target import ledger as aws_ledger
     from scripts.mac_test.claim_state import RemoteJobClaim
 
 
@@ -2253,8 +2254,22 @@ class AdmissionServer:
                 key = records.waiter_owner(row) if grant is not None else place.move_id
                 rows.append((self.state_dir / key, ranked))
         if isinstance(self.priority, records.QueuePriority):
-            return self._rank_priority_waiters(rows, self.priority)
-        return gate.sort_waiters(rows)
+            rows = self._rank_priority_waiters(rows, self.priority)
+        return sorted(rows, key=lambda item: self._waiter_order(item[1]))
+
+    def _waiter_run_place(self, row: records.Waiter) -> wire.RunPlace | None:
+        place = self.places.get(_place_key(wire.Owner(row["pid"], row["start_time"]), row["since"]))
+        if place is not None and isinstance(place.run, wire.RunIdentity):
+            return self.run_places.get(records.run_owner(place.run.pid, place.run.start_time))
+        return None
+
+    def _waiter_order(self, row: records.RankedWaiter) -> tuple[int, float, float, int, int]:
+        priority, order_since, since, pid = gate.waiter_order(row)
+        place = self._waiter_run_place(row)
+        if place is not None and order_since == place.since:
+            # Keep the original tie-break when a new step uses the run's rank.
+            return priority, order_since, place.since, place.first_owner.pid, pid
+        return priority, order_since, since, pid, pid
 
     def _full_queue_order(self, ranked: list[tuple[Path, records.RankedWaiter]]
                           ) -> list[tuple[Path, records.RankedWaiter]]:
@@ -2284,7 +2299,7 @@ class AdmissionServer:
 
     def _rank_priority_waiters(self, rows: list[tuple[Path, records.RankedWaiter]], priority: records.QueuePriority
                                ) -> list[tuple[Path, records.RankedWaiter]]:
-        # Match CI priority by runner. Keep the runner out of the published unit field.
+        # Match CI priority by runner. Publish the current step's unit.
         ci_waiters: dict[Path, records.RankedWaiter] = {}
         sessions: list[str] = []
         ranking_rows: list[tuple[Path, records.Waiter]] = []
@@ -3383,6 +3398,16 @@ class AdmissionServer:
             self._prune_watches()
         return groups
 
+    def _cloud_slots_used(self) -> int:
+        """Count legacy cloud reservations and current AWS placements."""
+        return (sum(isinstance(record.place, wire.CloudPlace) for record in self.reservations.values())
+                + sum(self.assignments[key].assignment.destination.provider == "scaler"
+                      for key in self.current_assignments.values()))
+
+    def _cloud_slots_full(self) -> bool:
+        return (not isinstance(self.configuration, gate.UsableAdmissionConfiguration)
+                or self._cloud_slots_used() >= self.configuration.cloud_gate_slots)
+
     def _cloud_pass(self, inputs: records.QueueInputs, configuration: gate.UsableAdmissionConfiguration) -> bool:
         waiting_cloud = self._cloud_waiters()
         if not waiting_cloud and not self.pending_cloud_groups:
@@ -3393,7 +3418,7 @@ class AdmissionServer:
         disconnected = min(((pending.group.started_at, 0, key)
             for key, pending in self.pending_cloud_groups.items() if key not in groups),
             default=(float("inf"), 0, ""))
-        used = sum(isinstance(record.place, wire.CloudPlace) for record in self.reservations.values())
+        used = self._cloud_slots_used()
         started = False
         blocked = False
         position = 0
@@ -3428,7 +3453,7 @@ class AdmissionServer:
                        ) -> records.QueueRead | wire.CloudQueueRead:
         rows: list[wire.CloudRow] = []
         reservations = [record for record in self.reservations.values() if isinstance(record.place, wire.CloudPlace)]
-        used, slots = len(reservations), configuration.cloud_gate_slots
+        used, slots = self._cloud_slots_used(), configuration.cloud_gate_slots
         recorded_launch = False
         for record in reservations:
             place = record.place
@@ -3850,12 +3875,55 @@ class AdmissionServer:
             record = replace(record, slot_staff=step_staff(record.queue_waiter, self.host))
         return self._freeze_test_phase_need(record, config, share_percent)
 
+    def _save_gate_rank(self, admission: ReservationRecord, move_id: str) -> None:
+        run = admission.run
+        row = admission.queue_waiter
+        if (not move_id or not isinstance(run, wire.RunIdentity) or not isinstance(admission.place, wire.LocalPlace)
+                or row.get("step") not in ("gate", "test-affected")):
+            return
+        key = records.run_owner(run.pid, run.start_time)
+        rank = self.run_places.get(key)
+        if rank is None or rank.first_owner != admission.owner or (rank.move_id and rank.repository):
+            return
+        line = rank.unit_place
+        inherited = isinstance(line, status_wire.UnitPlace) and line.took_place != "" and line.reservations == 0
+        if rank.since == row["since"] or inherited:
+            self.run_places[key] = replace(rank, move_id=rank.move_id or move_id,
+                                          repository=rank.repository or row.get("repository_name", admission.repo))
+
+    def _gate_gap_start(self, admission: ReservationRecord, now: float) -> str | None:
+        """Describe a local grant during an older gate's existing memory gap."""
+        run = admission.run
+        if not self.slots or not isinstance(run, wire.RunIdentity) or not isinstance(admission.place, wire.LocalPlace):
+            return None
+        current = self.run_places.get(records.run_owner(run.pid, run.start_time))
+        if current is None:
+            return None
+        active = {record.run for record in self.reservations.values()}
+        current_order = (current.since, current.first_owner.pid)
+        older: wire.RunPlace | None = None
+        for slot in self.slots.values():
+            gap = gate.between_steps(slot)
+            if gap.expires_at <= now:
+                continue
+            rank = self.run_places.get(records.run_owner(gap.run.pid, gap.run.start_time))
+            if rank is None or not rank.move_id or not rank.repository or rank.run in active:
+                continue
+            order = (rank.since, rank.first_owner.pid)
+            if order < current_order and (older is None or order < (older.since, older.first_owner.pid)):
+                older = rank
+        if older is None:
+            return None
+        return (f"memory admission: run {run.pid}:{run.start_time} started in the gate gap of "
+                f"{older.run.pid}:{older.run.start_time} for {older.repository} on {self.host}")
+
     def _admit(self, waiters: list[WaitingAdmission], config: records.MemoryConfig, share_percent: int, *,
                cargo_folder: placement.CargoFolder | placement.NoCargoFolder,
                verify_slots: Mapping[str, VerifyRunSlot]) -> None:
         now = self.clock.now()
         prepared = [self._prepare_admission(waiting, now, config, share_percent, cargo_folder) for waiting in waiters]
         replies: list[wire.Admitted | wire.LaunchAdmitted] = []
+        gap_starts: list[str] = []
         for waiting, admission in zip(waiters, prepared, strict=True):
             request = waiting.request
             if isinstance(admission, wire.LaunchAdmitted):
@@ -3869,6 +3937,9 @@ class AdmissionServer:
                     isinstance(candidate, gate.QueuedHead)
                         and records.waiter_owner(candidate.waiter) == records.waiter_owner(waiting.row),
                     max(0.0, now - waiting.row["since"])))
+                if (line := self._gate_gap_start(admission, now)) is not None:
+                    gap_starts.append(line)
+                self._save_gate_rank(admission, waiting.row.get("move_id", ""))
                 self.reservations[request.episode] = admission
                 if isinstance(request, wire.AdmitRequest) and isinstance(admission.place, wire.LocalPlace):
                     self._granted(request.run, _local_step(admission))
@@ -3903,6 +3974,8 @@ class AdmissionServer:
             self._prune_watches()
         # Save every grant before sending any reply for the group.
         self.persist()
+        for line in gap_starts:
+            print(line, file=sys.stderr, flush=True)
         for waiting, reply in zip(waiters, replies, strict=True):
             self._remove_waiter(waiting, reply)
 
@@ -3992,6 +4065,8 @@ class AdmissionServer:
             request.constraints.command_kind)
 
     def _host_probe_timeout(self, key: placement.HostEvidenceKey) -> float:
+        if key.destination.provider == "scaler":
+            return 0.0
         if key.destination.provider == "ssh" and key.destination.target == "mac-linux":
             from scripts.build_targets.mac_linux import GUEST_REF_TIMEOUT_SECONDS
 
@@ -4210,6 +4285,16 @@ class AdmissionServer:
                 else:
                     holder = placement.ResourceHolderSession(blocking.key)
             return placement.FreshHostEvidence(key, self.clock.now(), "", local_eligibility, holder=holder)
+        if destination.provider == "scaler":
+            from scripts.build_targets.gate_targets import configured_scaler_gate
+
+            try:
+                candidate = configured_scaler_gate(conf.read("build_targets"), destination.target)
+                eligibility = (candidate.eligibility if (destination, key.settings) == (candidate.destination, candidate.settings)
+                               else placement.FixedExclusion("The scaler differs from the configured target"))
+            except conf.Unusable as error:
+                eligibility = placement.FixedExclusion(str(error))
+            return placement.FreshHostEvidence(key, self.clock.now(), key.configuration_generation, eligibility)
         request = self.host_requests[key]
         if destination.provider not in ("mac", "ssh"):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "provider uses its existing admission path")
@@ -4450,7 +4535,8 @@ done
                                  evidence: placement.HostEvidence | placement.EvidenceNeeded | NoSubmittedPlacementRequest) -> bool:
         """Confirm claim release under the same rules for status, replay, and settlement."""
         assignment = saved.assignment
-        if (not isinstance(saved.state, placement.CurrentAssignment)
+        if (assignment.destination.provider == "scaler"
+                or not isinstance(saved.state, placement.CurrentAssignment)
                 or self.current_assignments.get(assignment.episode) != execution_identity.attempt_key(assignment.episode, assignment.attempt)
                 or assignment.episode not in self.placement_requests):
             return False
@@ -4530,7 +4616,7 @@ done
 
         destination = saved.assignment.destination
         if destination.provider != "ssh":
-            return destination.provider != "local"
+            return destination.provider not in ("local", "scaler")
         transport = self._ssh_transport(saved)
         return transport is not None and not isinstance(
             transport, (hana_placement.HanaControlTransport, HanaGpuNextestTransport))
@@ -4745,6 +4831,8 @@ done
                         permitted = placement.TemporaryExclusion("busy")
                     elif evidence.observed_at < max((item[1] for item in retained), default=float("-inf")):
                         permitted = placement.EvidenceNeeded("provider evidence predates the retained claim report")
+            if destination.provider == "scaler" and isinstance(permitted, placement.AllowedHost) and self._cloud_slots_full():
+                permitted = placement.TemporaryExclusion("cloud slots full")
             result.append(placement.CandidateEligibility(destination, permitted))
         return tuple(result), local_holder
 
@@ -4853,7 +4941,8 @@ done
             if not self._placement_owner_live(request.owner):
                 self._end_placement_rank(request)
                 if saved is not None:
-                    if isinstance(saved.permission, placement.PermissionAvailable) and not self._start_pending(saved):
+                    if (saved.assignment.destination.provider != "scaler"
+                            and isinstance(saved.permission, placement.PermissionAvailable) and not self._start_pending(saved)):
                         self._close_placement(saved, "cancelled", placement.DoNotRetry("coordinator ended"))
                     else:
                         self.assignments[key] = self._end_remote_start_hold(request, saved)
@@ -4899,6 +4988,73 @@ done
             remote_start_hold=hold, placement_candidates=self._placement_candidate_reading(request))
         self.current_assignments[request.episode] = key
         return assignment
+
+    def _aws_gate_spending(self) -> placement.AllowedHost | placement.TemporaryExclusion:
+        """Include grants that the worker has yet to book."""
+        from scripts.aws_target import ledger as aws_ledger
+        from scripts.aws_target.config import account_settings_path
+
+        try:
+            directory = target_config.ssh_target_state_directory("aws").resolve()
+            book = aws_ledger.CostLedger(directory)
+            evidence = book.read_snapshot()
+            booked = {row.attempt for row in evidence.gate_reservations if aws_ledger.gate_is_open(row)}
+            values = conf.read_or_repository("cloud_gate")
+            now = int(self.clock.now())
+            offered = aws_ledger.gate_booking(values, "placement-preview", now, now + values.whole("lifetime_minutes") * 60)
+            for key in self.current_assignments.values():
+                assignment = self.assignments[key].assignment
+                if assignment.destination.provider != "scaler":
+                    continue
+                binding = self._aws_gate_binding(assignment)
+                journal = aws_ledger.GateDispatchJournal(binding.journal)
+                try:
+                    record = journal.read()
+                except FileNotFoundError:
+                    pass
+                else:
+                    if record.binding != binding:
+                        raise ValueError("The AWS journal names a different binding")
+                    if record.state != "prelaunch" or any(folder.name in booked for folder in record.folders):
+                        continue
+                evidence.gate_reservations.append(replace(offered, attempt=binding.claim.claim_id))
+            reason = book.gate_booking_refusal(evidence, account_settings_path(), offered)
+        except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
+            return placement.TemporaryExclusion(f"AWS spending evidence is unavailable. {error}")
+        return placement.TemporaryExclusion(reason) if reason else placement.AllowedHost()
+
+    def _aws_gate_binding(self, assignment: placement.PlacementAssignment) -> aws_ledger.GateDispatchBinding:
+        from scripts.aws_target import ledger as aws_ledger
+        from scripts.aws_target.config import account_settings_path
+
+        claim = placement.assigned_claim_reference(assignment)
+        journal = self.state_dir / f"aws-gate-{claim.claim_id}.json"
+        directory = target_config.ssh_target_state_directory("aws").resolve()
+        return aws_ledger.GateDispatchBinding(claim, journal, directory, conf.path("build_targets").resolve(),
+                                               account_settings_path().resolve())
+
+    def _require_enabled_scaler(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
+                                registry: Path) -> None:
+        from scripts.build_targets.gate_targets import configured_scaler_gate
+
+        candidate = configured_scaler_gate(conf.read(registry), destination.target)
+        if not isinstance(candidate.eligibility, placement.AllowedHost):
+            raise ValueError(f"The AWS scaler is {candidate.eligibility.reason}")
+        if (candidate.destination, candidate.settings) != (destination, self._placement_settings(request, destination)):
+            raise ValueError("The AWS scaler differs from the assigned target")
+
+    def _publish_aws_gate_binding(self, request: wire.PlacementRequest,
+                                  assignment: placement.PlacementAssignment) -> None:
+        from scripts.aws_target import ledger as aws_ledger
+
+        local = request.local
+        if not isinstance(local, wire.LocalAdmissionContext) or not local.sidecar:
+            raise ValueError("The AWS gate placement has no sidecar")
+        binding = self._aws_gate_binding(assignment)
+        self._require_enabled_scaler(request, assignment.destination, binding.registry)
+        path = aws_ledger.gate_dispatch_binding_path(Path(local.sidecar))
+        self.writes.require(path)
+        binding.publish(path)
 
     def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder,
                          keys: PlacementEvidenceKeys | None = None
@@ -4974,6 +5130,13 @@ done
                     self.placement_eligibility.get(request.episode, ()),
                     provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
                     retry_notices=retry_notices)
+            if saved.assignment.destination.provider == "scaler":
+                try:
+                    self._publish_aws_gate_binding(request, saved.assignment)
+                except (OSError, ValueError) as error:
+                    reason = f"The AWS placement binding is unavailable. {error}"
+                    self._close_placement(saved, "cancelled", placement.DoNotRetry(reason))
+                    return self._placement_status(saved.assignment, reason, check_lifetime=False)
             return wire.Assignment(saved.assignment, diagnostics, disk_exclusions, stale_hana)
         terminal = [saved for saved in self.assignments.values() if saved.assignment.episode == request.episode
                     and isinstance(saved.state, placement.ClosedAssignment) and saved.state.reason in ("completed", "cancelled")]
@@ -5139,8 +5302,15 @@ done
                         break
                     continue
                 if destination.provider == "scaler":
-                    continue
-                if (any(same_remote_resource(other, destination) for other in taken)
+                    if self._cloud_slots_full():
+                        continue
+                    spending = self._aws_gate_spending()
+                    if isinstance(spending, placement.TemporaryExclusion):
+                        self.placement_eligibility[request.episode] = tuple(
+                            replace(item, eligibility=spending) if item.destination == destination else item
+                            for item in self.placement_eligibility[request.episode])
+                        continue
+                elif (any(same_remote_resource(other, destination) for other in taken)
                         or self._held_for_older(request, destination, held, holds)):
                     continue
                 assignment = self._new_assignment(request, destination, remote_start_hold_seconds)
@@ -5280,7 +5450,20 @@ done
                                 return self._placement_status(assignment, f'Hana admission refused: {memory.reason}')
                 except (OSError, ValueError) as error:
                     return self._placement_status(assignment, f"adoption evidence is unavailable: {error}")
-        if isinstance(transport, hana_placement.HanaControlTransport):
+        if destination.provider == "scaler":
+            from scripts.aws_target import ledger as aws_ledger
+
+            binding = self._aws_gate_binding(assignment)
+            if reference != binding.claim:
+                return self._placement_status(assignment, "the exact AWS claim does not match")
+            try:
+                self._require_enabled_scaler(submitted, destination, binding.registry)
+                record = aws_ledger.GateDispatchJournal(binding.journal).require_open(reference, request.holder)
+                if record.binding != binding:
+                    raise ValueError("The AWS journal names a different binding")
+            except (OSError, ValueError) as error:
+                return self._placement_status(assignment, f"AWS prelaunch evidence is unavailable. {error}")
+        elif isinstance(transport, hana_placement.HanaControlTransport):
             from scripts.aws_target.hana_placement_adapter import read_assigned_adoption
 
             adopted = read_assigned_adoption(assignment, request.holder, transport)
@@ -5410,6 +5593,9 @@ done
             assignment = saved.assignment
             if self.current_assignments.get(assignment.episode) != key:
                 continue
+            if assignment.destination.provider == "scaler":
+                self._settle_aws_dispatch(saved)
+                continue
             report = saved.terminal_report
             if (isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.path, placement.DispatchPathPending)
@@ -5456,6 +5642,51 @@ done
                 report = self._lost_report()
                 saved = replace(saved, terminal_report=report)
             self._close_for_report(saved, report)
+
+    def _settle_aws_dispatch(self, saved: records.SavedPlacementAssignment) -> None:
+        """Close an AWS assignment with local evidence and fence a late worker."""
+        from scripts.aws_target import ledger as aws_ledger
+
+        assignment = saved.assignment
+        binding = self._aws_gate_binding(assignment)
+        journal = aws_ledger.GateDispatchJournal(binding.journal)
+        report = saved.terminal_report
+        holder = saved.holder
+        if isinstance(saved.permission, placement.PermissionAvailable):
+            owner = assignment.owner
+            if (owner.host != self.host
+                    or owner_may_be_live(self.proc.owner_start(owner.pid), owner.start_time)):
+                return
+            try:
+                record = journal.read()
+            except FileNotFoundError:
+                holder = placement.ClaimHolderIdentity(owner.host, owner.pid, owner.start_time)
+                try:
+                    journal.begin(binding, holder)
+                except (OSError, ValueError):
+                    return
+            except (OSError, ValueError):
+                return
+            else:
+                holder = record.holder
+        elif saved.provider != binding.claim:
+            return
+        if not isinstance(holder, placement.ClaimHolderIdentity) or holder.host != self.host:
+            return
+        if (isinstance(report, placement.NoTerminalReport)
+                and owner_may_be_live(self.proc.owner_start(holder.pid), holder.start_time)):
+            return
+        settlement = journal.settle(binding.claim, holder)
+        if isinstance(settlement, placement.DispatchPathPending):
+            return
+        path = placement.DispatchPathSettled()
+        if isinstance(report, placement.TerminalAttemptReport) and isinstance(report.outcome, placement.AttemptCompleted):
+            terminal = replace(report, path=path)
+        else:
+            terminal = placement.TerminalAttemptReport(placement.AttemptCancelled(
+                "The AWS gate ended without a verdict" if settlement == "launch ended" else "no launch"),
+                path, self.clock.now())
+        self._close_for_report(replace(saved, terminal_report=terminal), terminal)
 
     def _close_for_report(self, saved: records.SavedPlacementAssignment, report: placement.TerminalAttemptReport) -> None:
         outcome = report.outcome
@@ -5657,7 +5888,12 @@ done
                     self.assignments[key] = replace(saved, provider=request.claim, terminal_report=terminal)
             saved = self.assignments[key]
             report = saved.terminal_report
-            if (self.current_assignments.get(assignment.episode) == key
+            if assignment.destination.provider == "scaler":
+                self.persist()
+                if self.current_assignments.get(assignment.episode) == key:
+                    self._settle_aws_dispatch(saved)
+                self.next_pass = self.clock.monotonic()
+            elif (self.current_assignments.get(assignment.episode) == key
                     and isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.path, placement.DispatchPathSettled)
                     and not isinstance(report.outcome, placement.AttemptDeclined)):
