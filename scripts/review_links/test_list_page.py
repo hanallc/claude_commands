@@ -3680,12 +3680,31 @@ window.fetch=async(_path,options={})=>{
 
         second = first + timedelta(days=7)
         with patch.object(the_list, "now", return_value=first + timedelta(days=1)):
+            revision = list_page.schedule_revision(saved.schedule)
+            for action, scope, run, reason in (
+                ("park", "this", "2", "to park a repeated item"),
+                ("schedule", "this", "1", "The next run changed"),
+            ):
+                with self.subTest(action=action, run=run):
+                    fields = self.fields(saved, action, scope=scope, run=run, until=second.isoformat(),
+                                         schedule_words="Check the second run.", schedule_revision=revision)
+                    with self.assertRaisesRegex(ValueError, reason):
+                        _ = list_page.submit(root, urlencode(fields))
+                    self.assertEqual(the_list.load(MORTY.id, item.id), saved)
             change = self.fields(saved, "schedule", scope="this", run="2", schedule_words="Check the second run.")
             _ = list_page.submit(root, urlencode(change))
             next_run = the_list.load(MORTY.id, item.id).schedule
             assert isinstance(next_run, the_list.ScheduledSeries)
             self.assertEqual(next_run.exceptions[0].run, the_list.ScheduledRun(second, change["schedule_words"]))
             self.assertEqual(next_run.first.words, create["schedule_words"])
+            current = the_list.load(MORTY.id, item.id)
+            for action, scope in (("schedule", "all"), ("unschedule", "all"), ("remove", "this"), ("park", "following")):
+                with self.subTest(action=action, scope=scope):
+                    fields = self.fields(saved, action, scope=scope, run="2", schedule_words="Use the old schedule.",
+                                         schedule_revision=revision)
+                    with self.assertRaisesRegex(the_list.ListError, "The schedule changed"):
+                        _ = list_page.submit(root, urlencode(fields))
+                    self.assertEqual(the_list.load(MORTY.id, item.id), current)
             change = self.fields(saved, "schedule", scope="following", run="2",
                                  schedule_words="Check the remaining runs.")
             _ = list_page.submit(root, urlencode(change))
@@ -3905,6 +3924,48 @@ window.fetch=async(_path,options={})=>{
  dialog.querySelector('[data-cancel]').click();
 })();
 """)
+                for control, expected in (("data-schedule-words", "Read the result.\n"), ("data-repeat", None)):
+                    with self.subTest(control=control):
+                        evaluate(r"""
+(() => {
+ const form=openItem(1);
+ form.querySelector('[data-later-toggle]').click();
+ const field=form.querySelector('['+""" + json.dumps(control) + r"""+']');
+ window.keySubmissions=0;
+ window.parkKeySubmit=event=>{event.preventDefault();event.stopImmediatePropagation();keySubmissions++;};
+ form.addEventListener('submit',parkKeySubmit,{capture:true});
+ if(field.matches('textarea')){
+  field.value='Read the result.';
+  field.focus();
+  field.setSelectionRange(field.value.length,field.value.length);
+ }else{
+  field.focus();
+  const enter=new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true});
+  field.dispatchEvent(enter);
+  check(!enter.defaultPrevented,'Repeat receives Enter.');
+ }
+})();
+""")
+                        if expected is not None:
+                            key = {"key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13}
+                            _ = browser.command("Input.dispatchKeyEvent", {**key, "type": "keyDown", "text": "\r"}, session)
+                            _ = browser.command("Input.dispatchKeyEvent", {**key, "type": "keyUp"}, session)
+                        evaluate(r"""
+(() => {
+ const form=recordDetails(row(1)).querySelector('form');
+ const instruction=form.querySelector('[data-schedule-words]');
+ const expected=""" + json.dumps(expected) + r""";
+ check(keySubmissions===0,'Enter in the schedule fields does not submit.');
+ if(expected!==null){
+  check(instruction.value===expected,'Enter inserts a newline in the instruction.');
+  instruction.value=instruction.defaultValue;
+  instruction.dispatchEvent(new Event('input',{bubbles:true}));
+ }
+ form.removeEventListener('submit',parkKeySubmit,{capture:true});
+ form.querySelector('[data-later-toggle]').click();
+ row(1).querySelector('.list-toggle').click();
+})();
+""")
                 evaluate(r"""
 (async () => {
  show('all');
@@ -3919,7 +3980,7 @@ window.fetch=async(_path,options={})=>{
   form.querySelector('[data-later-month-step="1"]').click();
   form.querySelector('[data-date="'+date+'"]').click();
  };
- const waitForSave=async(form,save,scope,{lost=false,date}={})=>{
+ const waitForSave=async(form,save,scope,{lost=false,date,instruction}={})=>{
   let posted;
   let readback;
   const send=window.fetch;
@@ -3947,6 +4008,8 @@ window.fetch=async(_path,options={})=>{
   check(!result.reason,result.reason);
   if(scope) check(posted.get('scope')===scope,'The selected scope is sent.');
   if(date) check(posted.get('until')===date && !posted.has('repeat'),'The move keeps the saved repeat rule.');
+  if(instruction) check(posted.get('schedule_words')===instruction && !posted.get('until') && !posted.has('repeat'),
+   'The edit sends only the instruction for all runs.');
   await new Promise(resolve=>{
    const sent=()=>!form.dataset.sending;
    const observer=new MutationObserver(()=>{if(sent()){observer.disconnect();resolve();}});
@@ -3995,15 +4058,17 @@ window.fetch=async(_path,options={})=>{
  }
  for(const [number,action,scope,options] of [
   [1,'park','this',{date:'2026-12-01T14:00:00.000Z'}],
+  [1,'park','all',{instruction:'Compare the revised predictions.'}],
   [2,'unpark',null,{}],
   [1,'remove','this',{lost:true}],
   [3,'remove','all',{}],
   [1,'remove','following',{}],
  ]){
   const form=openItem(number);
-  if(options.date){
+  if(options.date || options.instruction){
    form.querySelector('[data-later-toggle]').click();
-   pickDate(form,'2026-12-01');
+   if(options.date) pickDate(form,'2026-12-01');
+   if(options.instruction){words(form).value=options.instruction;edit(words(form));}
   }
   await waitForSave(form,form.querySelector('[value='+action+']'),scope,options);
   if(action==='unpark'){
@@ -4012,6 +4077,62 @@ window.fetch=async(_path,options={})=>{
    check(words(current).value==='','Unpark clears the saved instruction from the next editor.');
    current.querySelector('[data-later-toggle]').click();
   }
+ }
+})();
+""")
+                for number in (14, 15):
+                    _ = the_list.add(MORTY.id, f"Review the schedule draft for item {number}", owner=OWNER.id, source="nate",
+                                     changes={"state": the_list.ItemState.SCHEDULED, "schedule": one_time})
+                evaluate(r"""
+(async () => {
+ window.refreshSchedules=()=>new Promise(resolve=>{
+  const list=document.querySelector('[data-list]');
+  const observer=new MutationObserver(()=>{
+   if(!list.isConnected){observer.disconnect();resolve();}
+  });
+  observer.observe(list.parentElement,{childList:true});
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ });
+ await refreshSchedules();
+ for(const [number,edited] of [[14,false],[15,true]]){
+  const form=openItem(number);
+  form.querySelector('[data-later-toggle]').click();
+  check(form.elements.until.value==='2026-11-27T16:00','The editor opens at the saved start.');
+  if(edited){
+   const words=form.querySelector('[data-schedule-words]');
+   words.value='Use this draft.';
+   words.dispatchEvent(new Event('input',{bubbles:true}));
+   form.querySelector('[data-date="2026-11-28"]').click();
+  }
+  form.querySelector('[data-later-toggle]').click();
+ }
+})();
+""")
+                _ = the_list.update(MORTY.id, "L15", {"latest_status": "The schedule did not change."}, source="nate")
+                evaluate(r"""
+(async () => {
+ await refreshSchedules();
+ const form=recordDetails(row(15)).querySelector('form');
+ form.querySelector('[data-later-toggle]').click();
+ check(form.elements.until.value==='2026-11-28T16:00' &&
+  form.querySelector('[data-schedule-words]').value==='Use this draft.',
+  'Refresh preserves edits against the same schedule revision.');
+ form.querySelector('[data-later-toggle]').click();
+})();
+""")
+                for number in (14, 15):
+                    changed = the_list.ScheduledRun(one_time.start + timedelta(days=3), "Use the current schedule.")
+                    _ = the_list.update(MORTY.id, f"L{number}", {"schedule": changed}, source="nate")
+                evaluate(r"""
+(async () => {
+ await refreshSchedules();
+ for(const number of [15,14]){
+  const form=recordIsOpen(row(number)) ? recordDetails(row(number)).querySelector('form') : openItem(number);
+  form.querySelector('[data-later-toggle]').click();
+  check(form.elements.until.value==='2026-11-30T16:00' &&
+   form.querySelector('[data-schedule-words]').value==='Use the current schedule.',
+   'Refresh uses the new start and instruction for item '+number+'.');
+  form.querySelector('[data-later-toggle]').click();
  }
 })();
 """)

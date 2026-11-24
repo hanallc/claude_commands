@@ -464,12 +464,16 @@ REPEAT_CHOICES = (
 )
 
 
+def schedule_revision(schedule: the_list.Schedule) -> str:
+    return hashlib.sha256(repr(schedule).encode()).hexdigest()
+
+
 def schedule_fields(entry: ListRecord, schedule: DisplayedSchedule,
                     members: staff.StaffSnapshot, key: str, zone: ZoneInfo) -> str:
     owner = html.escape(owner_name(members, entry.item.owner))
     producer = html.escape(owner_name(members, entry.item.producer))
     options = ''.join(f'<option value="{value}">{label}</option>' for value, label in REPEAT_CHOICES)
-    attributes = ""
+    attributes = f' data-revision="{schedule_revision(entry.item.schedule)}"'
     words = ""
     if isinstance(schedule, (UpcomingSeriesRun, ExhaustedSeries)):
         series = schedule.series
@@ -477,7 +481,8 @@ def schedule_fields(entry: ListRecord, schedule: DisplayedSchedule,
         attributes += f' data-rule="{html.escape(series.rule.rrule, quote=True)}" data-repeat-start="{origin}"'
         words = series.first.words
     if isinstance(schedule, UpcomingSeriesRun):
-        attributes += f' data-run="{schedule.selected.number}"'
+        original = schedule.selected.original.strftime("%Y-%m-%dT%H:%M")
+        attributes += f' data-run="{schedule.selected.number}" data-run-start="{original}"'
         schedule = schedule.selected.run
     if isinstance(schedule, the_list.ScheduledRun):
         start = schedule.start.astimezone(zone).strftime("%Y-%m-%dT%H:%M")
@@ -1002,6 +1007,7 @@ class SchedulePageAction:
     run_number: int
     words: str
     repeat: str | KeepRepeat
+    revision: str = ""
 
     @classmethod
     def parse(cls, fields: Mapping[str, list[str]]) -> SchedulePageAction:
@@ -1012,11 +1018,20 @@ class SchedulePageAction:
         words = fields.get("schedule_words", [""])[0].strip()
         if len(words) > 10000:
             raise question_record.AnswerRefused("Use at most 10000 characters for the instruction.")
-        return cls(scope, int(number), words, fields["repeat"][0] if "repeat" in fields else KeepRepeat.UNCHANGED)
+        revision = fields.get("schedule_revision", [""])[0]
+        if revision and re.fullmatch(r"[0-9a-f]{64}", revision) is None:
+            raise question_record.AnswerRefused("Use the schedule shown on the List page.")
+        return cls(scope, int(number), words, fields["repeat"][0] if "repeat" in fields else KeepRepeat.UNCHANGED,
+                   revision)
 
     def receipt_words(self, action: str, until: str) -> str:
         rule = self.repeat if isinstance(self.repeat, str) else None
-        return json.dumps((action, self.scope, self.run_number, self.words, rule, until))
+        fields = (action, self.scope, self.run_number, self.words, rule, until)
+        return json.dumps((*fields, self.revision) if self.revision else fields)
+
+    def require_revision(self, schedule: the_list.Schedule) -> None:
+        if self.revision and self.revision != schedule_revision(schedule):
+            raise the_list.ListError("The schedule changed. Open the item again.")
 
     def require_selected_run(self, schedule: the_list.Schedule, moment: datetime) -> None:
         if self.scope not in (the_list.ScheduleScope.THIS, the_list.ScheduleScope.FOLLOWING):
@@ -1052,6 +1067,7 @@ def save_schedule(keeper: staff.StaffId, identity: str, request: str, action: st
         if item.state is the_list.ItemState.CLOSED:
             raise the_list.ListError("Reopen the item before changing its schedule.")
         existing = item.schedule
+        submitted.require_revision(existing)
         submitted.require_selected_run(existing, moment)
         if action == "unschedule":
             if item.state is not the_list.ItemState.SCHEDULED:
@@ -1090,7 +1106,8 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
     """Accept signed item actions and save their notices."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     required = {"keeper", "id", "request", "token", "action", "words", "until"}
-    if (not required <= fields.keys() or fields.keys() - required - {"scope", "run", "schedule_words", "repeat"}
+    if (not required <= fields.keys()
+            or fields.keys() - required - {"scope", "run", "schedule_words", "repeat", "schedule_revision"}
             or any(len(values) != 1 for values in fields.values())):
         raise question_record.AnswerRefused("use the form on this page")
     keeper, identity = staff.StaffId(fields["keeper"][0]), fields["id"][0]
@@ -1147,6 +1164,9 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
             return ListQuestionDelivery(question, status)
         return question
     if action in {"remove", "park"} and request not in the_list.feedback_requests(item):
+        if action == "park" and submitted.scope is the_list.ScheduleScope.THIS:
+            raise question_record.AnswerRefused("Choose This and following runs or All runs to park a repeated item.")
+        submitted.require_revision(item.schedule)
         submitted.require_selected_run(item.schedule, the_list.now())
     if action == "remove":
         one_run = submitted.scope is the_list.ScheduleScope.THIS
@@ -1997,10 +2017,15 @@ function bindScheduleFields(form,until,zone,draft,edit){
  observer.observe(menu,{attributes:true,attributeFilter:['hidden']});
  const custom=panel.querySelector('[data-edit-custom]');
  const label=panel.querySelector('[for="'+select.id+'"]');
- const {start,rule='',repeatStart}=panel.dataset,number=Number(panel.dataset.run || 0);
- if(!until.value && start) until.value=start;
- if(draft) words.value=draft.words;
- let choice=draft?.choice,customRule=draft?.customRule ?? rule,repeatEdited=draft?.repeatEdited ?? false;
+ const {start='',rule='',repeatStart,runStart,revision}=panel.dataset,number=Number(panel.dataset.run || 0);
+ const savedWords=words.value;
+ const currentDraft=draft?.revision===revision && draft.number===number ? draft : undefined;
+ until.value=currentDraft?.until ?? start;
+ words.value=currentDraft?.words ?? savedWords;
+ let pickerUntil=until.value,editedUntil=currentDraft?.until;
+ const draftUntil=()=>until.value===pickerUntil ? editedUntil : until.value;
+ let choice=currentDraft?.repeat?.choice,customRule=currentDraft?.repeat?.rule ?? rule;
+ let repeatEdited=Boolean(currentDraft?.repeat);
  const preset=(at,value)=>repeatChoices(at)[value]?.[1];
  function update(){
   const at=scheduleDate(until.value);
@@ -2024,7 +2049,11 @@ function bindScheduleFields(form,until,zone,draft,edit){
   const summary=menu.querySelector('[data-later-summary]');
   summary.textContent=summary.textContent.replace(/^(Starts|Parks until) /,words.value.trim() ? 'Starts ' : 'Parks until ');
  });
- until.addEventListener('input',()=>{status.textContent='';update();});
+ until.addEventListener('input',event=>{
+  if(event.detail?.edited!==false && until.value!==pickerUntil) editedUntil=until.value;
+  pickerUntil=until.value;
+  status.textContent='';update();
+ });
  const openCustom=async()=>{
   const at=scheduleDate(until.value);
   const saved=await customRepeat(menu,at,choice==='custom' ? customRule : preset(at,choice),zone);
@@ -2041,17 +2070,28 @@ function bindScheduleFields(form,until,zone,draft,edit){
  });
  return {
   attach:()=>save.before(panel),
-  draft:()=>({words:words.value,choice,customRule,repeatEdited}),
+  draft:()=>{
+   const date=draftUntil();
+   const changes={};
+   if(date!==undefined && date!==start) changes.until=date;
+   if(words.value!==savedWords) changes.words=words.value;
+   if(repeatEdited) changes.repeat={choice,rule:customRule};
+   if(Object.keys(changes).length) return {revision,number,...changes};
+  },
+  retainDate:()=>{pickerUntil=editedUntil=until.value;},
   data:(action)=>{
    const text=words.value.trim(),at=scheduleDate(until.value);
-   const base={number,scope:'',repeat:undefined,words:text,startChanged:!start || start!==until.value};
+   const startChanged=!start || (draftUntil()!==undefined && start!==until.value);
+   const base={number,revision,scope:'',repeat:undefined,words:text,startChanged};
    if(action!=='schedule' || !repeatEdited) return base;
    const repeat=choice==='custom' ? customRule : at ? preset(at,choice) : '';
    return {...base,repeat:repeat===rule ? undefined : repeat};
   },
   applySeriesRepeat:data=>{
-   const at=scheduleDate(until.value);
-   if(!at || data.scope==='this') return true;
+   if(data.scope==='this' || (!data.startChanged && data.repeat===undefined)) return true;
+   const scopedStart=data.startChanged ? until.value : data.scope==='following' ? runStart : start || repeatStart;
+   const at=scheduleDate(scopedStart);
+   if(!at) return true;
    if(!repeatEdited && data.startChanged && choice!=='custom'){
     const repeat=preset(at,choice);
     if(repeat!==rule) data.repeat=repeat;
@@ -2197,7 +2237,7 @@ function bindFeedbackForm(form){
    ...signed,
    request:signed.request+'.'+Array.from(crypto.getRandomValues(new Uint8Array(16)),byte=>byte.toString(16).padStart(2,'0')).join(''),
   });
-  const draft=drafts.get(key);if(draft && !waitingForm){words.value=draft.words;until.value=draft.until;}
+  const draft=drafts.get(key);if(draft && !waitingForm) words.value=draft.words;
   let draftStamp=draft?.stamp ?? 0;
   const unconfirmed=draft?.unconfirmed ?? new Set();
   const edit=()=>{draftStamp++;retain();};
@@ -2211,8 +2251,7 @@ function bindFeedbackForm(form){
   const retainDraft=()=>{
    if(retiredDraft) return;
    drafts.set(key,{words:waitingForm ? draft?.words ?? '' : words.value,
-    until:waitingForm ? draft?.until ?? '' : until.value,stamp:draftStamp,unconfirmed,
-    schedule:scheduleEditor?.draft() ?? draft?.schedule});
+    stamp:draftStamp,unconfirmed,schedule:waitingForm ? draft?.schedule : scheduleEditor.draft()});
    identity(matching() ?? fresh);
   };
   const retain=()=>{retainDraft();syncTell();};
@@ -2272,11 +2311,13 @@ function bindFeedbackForm(form){
    const data=new URLSearchParams(new FormData(form));data.set('action',parkForDelivery ? 'park' : action);
    if(parks || scheduleWrite){data.set('until',parks ? parkingTime : '');data.set('words','');}
    if(schedule?.scope){data.set('scope',schedule.scope);data.set('run',schedule.number);}
+   if(scheduleWrite || schedule?.scope) data.set('schedule_revision',schedule.revision);
    if(action==='schedule'){
     data.set('schedule_words',schedule.words);
     if(schedule.repeat!==undefined) data.set('repeat',schedule.repeat);
    }
    if(!retry){unconfirmed.add(attempt);fresh=newRequest();}
+   if(action==='park' || (action==='schedule' && schedule.startChanged)) scheduleEditor?.retainDate();
    retainDraft();
    const stampAtSubmit=draftStamp;
    const clearConfirmedScheduleDraft=()=>{
@@ -2284,7 +2325,7 @@ function bindFeedbackForm(form){
     unconfirmed.delete(attempt);
     const latest=drafts.get(key);
     if(draftStamp!==stampAtSubmit || latest?.stamp!==stampAtSubmit) return;
-    drafts.set(key,{...latest,schedule:undefined,until:''});
+    drafts.set(key,{...latest,schedule:undefined});
     retiredDraft=true;
    };
    const request=tableView.startItemRequest(key);
@@ -2369,13 +2410,16 @@ function bindFeedbackForm(form){
     const hasDetail=typeof text==='string' && Boolean(revision);
     tableView.preserveRecordRowTop(()=>{
      nextForm=applySavedState(result,{keepDetailFocus:changesParking,hasDetail});
+     if(action==='unpark' && result.unpark_outcome==='cleared'){
+      until.value='';
+      scheduleEditor?.retainDate();
+     }
      if(hasDetail){
       unconfirmed.delete(attempt);
       retainDraft();
       installSavedListDetail(request,revision,text);
      }
      if(action==='unpark'){
-      if(result.unpark_outcome==='cleared') until.value='';
       showUnparkResult(result);
      }else if(action==='tell'){
       const message='sent to '+attempt.recipientName+(result.unread==='true' ? '; update remains unread' : '');
