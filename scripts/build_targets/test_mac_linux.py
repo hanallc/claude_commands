@@ -914,6 +914,35 @@ fi
         self.assertIsInstance(result, mac_linux.GuestNotStarted)
         report.assert_not_called()
 
+    def test_completion_report_does_not_wait_for_stalled_configuration(self) -> None:
+        entered = Event()
+        release = Event()
+        finished = Event()
+        read = conf.read
+
+        def read_config(file: str | Path) -> conf.ConfigRead:
+            if file == 'build_admission':
+                entered.set()
+                _ = release.wait(3)
+                finished.set()
+            return read(file)
+
+        with (patch.object(conf, 'read', read_config),
+              patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', 0.2),
+              patch.object(mac_linux, 'send_guest_execution') as send,
+              redirect_stderr(io.StringIO()) as errors):
+            try:
+                mac_linux.report_guest_completion(self.guest_dispatch(), GateRun((), 1, 0, selection_certified=True))
+                self.assertTrue(entered.is_set())
+                self.assertFalse(finished.is_set(), 'The completion report waited for configuration.')
+            finally:
+                release.set()
+                if entered.is_set():
+                    self.assertTrue(finished.wait(1))
+            send.assert_not_called()
+        self.assertEqual(errors.getvalue(), 'Mac Linux guest completion report failed: '
+                         + 'the queue report configuration read timed out\n')
+
     def test_guest_report_failure_warns_once_and_keeps_the_result(self) -> None:
         with (redirect_stderr(io.StringIO()) as errors,
               patch.object(mac_linux, 'send_guest_execution', side_effect=wire.AdmissionUnavailable('fixture refusal'))):

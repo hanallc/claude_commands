@@ -1219,23 +1219,27 @@ def report_guest_start(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, *,
 
 def report_guest_completion(dispatch: GuestGateDispatch, run: GateRun) -> None:
     """Report the result after the guest proves that the run ended."""
-    from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
+    ended_at = time()
 
-    status = 0 if run.passed else next((job.returncode for job in run.jobs if job.returncode), 1)
-    assignment = dispatch.assignment
-    request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
-        execution_identity.ExecutionEvidenceUnavailable('the guest run ended', time()),
-        placement.AttemptCompleted(status), placement.DispatchPathSettled(),
-        code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
-    try:
-        with conf.diagnostics(report=False):
-            timeout = conf.read('build_admission').number('query_timeout_seconds')
-        response = send_guest_execution(request, deadline=monotonic() + timeout, timeout=timeout)
+    def send(deadline: float, timeout: float) -> None:
+        from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
+
+        status = 0 if run.passed else next((job.returncode for job in run.jobs if job.returncode), 1)
+        assignment = dispatch.assignment
+        request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
+            execution_identity.ExecutionEvidenceUnavailable('the guest run ended', ended_at),
+            placement.AttemptCompleted(status), placement.DispatchPathSettled(),
+            code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
+        response = send_guest_execution(request, deadline=deadline, timeout=timeout)
         if (response.assignment != assignment or response.state != placement.ClosedAssignment('completed')
                 or not isinstance(response.permission, placement.PermissionConsumed) or response.reason):
             raise wire.AdmissionUnavailable(response.reason or 'the queue did not confirm the guest result')
-    except (wire.AdmissionUnavailable, OSError, ValueError) as error:
-        print(f'Mac Linux guest completion report failed: {error}', file=sys.stderr, flush=True)
+
+    def warn(reason: str) -> None:
+        print(f'Mac Linux guest completion report failed: {reason}', file=sys.stderr, flush=True)
+
+    with ExitStack() as reports:
+        _start_guest_queue_report(send, math.inf, reports, warn)
 
 
 def warn_guest_report(reason: str) -> None:
@@ -1244,16 +1248,24 @@ def warn_guest_report(reason: str) -> None:
 
 def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, transfer_deadline: float,
                        reports: ExitStack) -> None:
+    def send(deadline: float, timeout: float) -> None:
+        report_guest_start(armed, dispatch, deadline=deadline, timeout=timeout)
+
+    _start_guest_queue_report(send, transfer_deadline, reports, warn_guest_report)
+
+
+def _start_guest_queue_report(send: Callable[[float, float], None], deadline_limit: float,
+                              reports: ExitStack, warn: Callable[[str], None]) -> None:
     """Read the timeout before starting the report worker. Bound both waits."""
     started = monotonic()
-    preparation_deadline = min(transfer_deadline, started + SSH_CONNECT_TIMEOUT_SECONDS)
+    preparation_deadline = min(deadline_limit, started + SSH_CONNECT_TIMEOUT_SECONDS)
     ready: Future[Callable[[], None]] = Future()
 
     def prepare() -> None:
         try:
             with conf.diagnostics(report=False):
                 timeout = conf.read('build_admission').number('query_timeout_seconds')
-            deadline = min(transfer_deadline, started + timeout)
+            deadline = min(deadline_limit, started + timeout)
             dispatch_deadline = min(preparation_deadline, deadline)
             if monotonic() >= dispatch_deadline:
                 raise TimeoutError('the queue report deadline expired during configuration')
@@ -1263,7 +1275,7 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
                 try:
                     if monotonic() >= dispatch_deadline:
                         raise TimeoutError(f'no answer in {timeout:g} s')
-                    report_guest_start(armed, dispatch, deadline=deadline, timeout=timeout)
+                    send(deadline, timeout)
                     if monotonic() >= deadline:
                         raise TimeoutError(f'no answer in {timeout:g} s')
                 except Exception as error:
@@ -1289,18 +1301,18 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
     try:
         preparation.start()
     except RuntimeError as error:
-        warn_guest_report(str(error))
+        warn(str(error))
         return
 
     def collect() -> None:
         preparation.join(timeout=max(0.0, preparation_deadline - monotonic()))
         if not ready.done():
-            warn_guest_report('the queue report configuration read timed out')
+            warn('the queue report configuration read timed out')
             return
         try:
             ready.result()()
         except Exception as error:
-            warn_guest_report(str(error) or type(error).__name__)
+            warn(str(error) or type(error).__name__)
 
     _ = reports.callback(collect)
 
