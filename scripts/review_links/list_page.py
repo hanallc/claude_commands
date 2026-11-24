@@ -1008,6 +1008,7 @@ class SchedulePageAction:
 
 def save_schedule(keeper: staff.StaffId, identity: str, request: str, operation: the_list.ScheduleOperation,
                   until: str, submitted: SchedulePageAction, expected: the_list.ScheduleExpectation) -> None:
+    zone = user_zone()
     edits: the_list.ScheduleChanges = {}
     if until:
         if the_list.ISO_TIME.fullmatch(until) is None or "T" not in until:
@@ -1015,14 +1016,14 @@ def save_schedule(keeper: staff.StaffId, identity: str, request: str, operation:
         moment = datetime.fromisoformat(until)
         if moment.utcoffset() is None:
             raise question_record.AnswerRefused("Choose a start time with a UTC offset.")
-        edits["start"] = moment.astimezone(user_zone())
+        edits["start"] = moment.astimezone(zone)
     if submitted.words:
         edits["words"] = submitted.words
     if isinstance(submitted.repeat, str):
         edits["repeat"] = repeat_rule.parse(submitted.repeat) if submitted.repeat else the_list.NoSchedule.UNSET
     receipt = the_list.PageRequest(request, "park", submitted.receipt_words(operation, until))
     _ = the_list.save_page_schedule(keeper, identity, operation, edits, scope=submitted.scope, expected=expected,
-                                    receipt=receipt)
+                                    repeat_zone=zone, receipt=receipt)
 
 
 def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None = None, *,

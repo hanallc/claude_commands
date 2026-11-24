@@ -30,6 +30,7 @@ from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
 from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
 
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
@@ -4014,8 +4015,24 @@ window.fetch=async(_path,options={})=>{
  row(1).querySelector('.list-toggle').click();
 })();
 """)
+                for number in (14, 15):
+                    _ = the_list.add(MORTY.id, f"Review the schedule draft for item {number}", owner=OWNER.id, source="nate",
+                                     changes={"state": the_list.ItemState.SCHEDULED, "schedule": one_time})
+                tokyo = the_list.ScheduledRun(datetime(2026, 12, 1, 0, 30, tzinfo=ZoneInfo("Asia/Tokyo")),
+                                              "Review the weekly figures.")
+                tokyo_item = the_list.add(MORTY.id, "Review the Tokyo schedule", owner=OWNER.id, source="nate",
+                                          changes={"state": the_list.ItemState.SCHEDULED, "schedule": tokyo})
                 evaluate(r"""
 (async () => {
+ window.refreshSchedules=()=>new Promise(resolve=>{
+  const list=document.querySelector('[data-list]');
+  const observer=new MutationObserver(()=>{
+   if(!list.isConnected){observer.disconnect();resolve();}
+  });
+  observer.observe(list.parentElement,{childList:true});
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ });
+ await refreshSchedules();
  show('all');
  const cases=[
   [5,'','none'],[6,'Start once','none'],[7,'Run daily','daily'],[8,'Run weekly','weekly'],
@@ -4121,6 +4138,7 @@ window.fetch=async(_path,options={})=>{
   [1,'park','all',{instruction:'Compare the revised predictions.'}],
   [1,'park','following',{instruction:'Compare the remaining predictions.'}],
   [1,'park','following',{repeat:'custom',rule:'FREQ=WEEKLY;BYDAY=TU',note:'Weekly on Tuesday · next Dec 1 09:00 EST'}],
+  [16,'park',null,{repeat:'weekly',rule:'FREQ=WEEKLY;BYDAY=MO',note:'Weekly on Monday · next Nov 30 10:30 EST'}],
   [2,'unpark',null,{}],
   [1,'remove','this',{lost:true}],
   [1,'park','all',{repeat:'daily',rule:'FREQ=DAILY',advanceRun:true}],
@@ -4154,7 +4172,7 @@ window.fetch=async(_path,options={})=>{
     'The instruction edit keeps the moved start.');
   if(options.note)
    check(row(number).querySelector('[data-scheduled-note]').textContent===options.note,
-    'The changed rule starts on the moved date.');
+    'The changed rule keeps the displayed start.');
   if(action==='unpark'){
    const current=openItem(number);
    current.querySelector('[data-later-toggle]').click();
@@ -4164,20 +4182,8 @@ window.fetch=async(_path,options={})=>{
  }
 })();
 """)
-                for number in (14, 15):
-                    _ = the_list.add(MORTY.id, f"Review the schedule draft for item {number}", owner=OWNER.id, source="nate",
-                                     changes={"state": the_list.ItemState.SCHEDULED, "schedule": one_time})
                 evaluate(r"""
 (async () => {
- window.refreshSchedules=()=>new Promise(resolve=>{
-  const list=document.querySelector('[data-list]');
-  const observer=new MutationObserver(()=>{
-   if(!list.isConnected){observer.disconnect();resolve();}
-  });
-  observer.observe(list.parentElement,{childList:true});
-  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
- });
- await refreshSchedules();
  for(const [number,edited] of [[14,false],[15,true]]){
   const form=openItem(number);
   form.querySelector('[data-later-toggle]').click();
@@ -4231,6 +4237,10 @@ window.fetch=async(_path,options={})=>{
         self.assertEqual(parked.parked_until, start.start)
         self.assertIs(parked.state, the_list.ItemState.WORKING)
         self.assertEqual(single.schedule, the_list.ScheduledRun(start.start, "Start once"))
+        saved_tokyo = the_list.load(MORTY.id, tokyo_item.id).schedule
+        assert isinstance(saved_tokyo, the_list.ScheduledSeries)
+        self.assertEqual(saved_tokyo.first.start, tokyo.start)
+        self.assertEqual(saved_tokyo.first.start.tzinfo, ZoneInfo("America/New_York"))
         for number, rule in enumerate(("FREQ=DAILY", "FREQ=WEEKLY;BYDAY=MO", "FREQ=MONTHLY;BYDAY=-1MO",
                                        "FREQ=YEARLY", "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
                                        "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TH;COUNT=5",
