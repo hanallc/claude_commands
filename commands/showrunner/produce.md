@@ -795,16 +795,14 @@ files for a small fix checkpoint. Log each point and its result. Pass
 
 **Mac run.** After every green CI on the merge branch, run its sha on the Mac
 in the background: `HANA_TEST_PURPOSE="CI promotion smoke" zsh ~/.claude/scripts/production/mac_run.sh <CHECKOUT> <sha> 60`.
-It builds, checks hana stays up 60 s, and stops it, then builds and runs each
-demo example (list in the script) for 20 s with the command you would type, so
-each starts from a task-owned scratch clone. The script ends its `gate:` task
-and removes the clone when the run ends. Exit 3 means the
-Mac is unreachable: skip it. Exit 9 means the Mac is blocked, busy with a test,
-or its coordination state cannot be read: skip the run; it is not an outage.
-It never gates a merge; a failure (7 hana, 8 an example) goes to the unit whose
-merge it was. Never skip it. For a separate test clone on either machine,
-use `copies.py clone <source> --task gate:<id>` and `scratch.py end --task gate:<id>`
-when the test ends; a phase task must name a real phase.
+The run builds in a numbered copy under `~/build/hana/<unit>/<n>` on the Mac.
+It runs Hana for 60 s and each configured demo example for 20 s.
+The run returns the copy after SSH input closes and the checkout passes its process check.
+If the check fails, the copy stays kept with the reason.
+Exit 3 means the Mac is unreachable. Exit 9 means the Mac is busy, blocked, or has unreadable state.
+The Mac run does not gate a merge.
+Send exit 7 for Hana or exit 8 for an example to the unit that owns the merge.
+For a separate numbered test copy, use `copies.py run --repo <source> --commit <sha> -- <command>`.
 </CIPoint>
 
 ---

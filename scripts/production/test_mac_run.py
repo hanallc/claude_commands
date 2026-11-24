@@ -12,24 +12,19 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from collections.abc import Callable
 from unittest import mock
 from pathlib import Path
 from typing import ClassVar, TypedDict, cast, final, override
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, FIXTURE_OWNER, copy_helpers
-from scripts.lib import copy_record, scratch
 from scripts.lib.git_test_support import fixture_git_environment
 
-from scripts.copies import copies
-from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint.memory_test_support import config_environment, memory_gate_shell_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
-from scripts.lib.shell_test_support import fixture_zsh_environment, shell_functions
+from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.mac_test import claim_state, floor_claims
-from scripts.production.cli_fixture import ImmutableGitSeed
+from scripts.mac_test import claim_state
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -68,29 +63,23 @@ class CommandEvent(TypedDict):
 
 
 COMMAND_STUB = r'''
-run_real_copies() {
-    export PATH=$MAC_RUN_REAL_PATH
-    export COPIES_CONFIG=$MAC_RUN_REMOTE_COPIES_CONFIG
-    export MAC_TEST_STATE_DIR=$MAC_RUN_REMOTE_CLAIMS
-    eval "$remote"
-    exit $?
-}
 state=$MAC_RUN_STUB_STATE
 command=${0:t}
 remote=${@[-1]}
 placed_run=0
-if [[ $command == ssh && $remote == *mac_group=* ]]; then
+if [[ $command == ssh && $remote == *smoke-work* ]]; then
     outer=("${(@Q)${(z)remote}}")
-    wrapper=("${(@Q)${(z)outer[3]}}")
-    work=${wrapper[1]#work=}
+    wrapper=${outer[3]}
+    work=${wrapper%'; printf '*}
     printf '%s\0' "$work" >> "$state/placed-commands"
-    # (z) reads each newline of the wrapper as a ";" word.
-    print -rn -- "${wrapper[3]#on_close=}" > "$state/on-close"
     words=("${(@Q)${(z)work}}")
-    remote=${words[4]}
+    lease=${words[4]}
+    print -r -- "$lease" > "$state/lease-command"
+    inner=("${(@Q)${(z)lease}}")
+    worker_index=${inner[(Ie)smoke-work]}
+    remote=${inner[$((worker_index + 1))]}
     set -- "${@[1,-2]}" "$remote"
     placed_run=1
-    print -r -- mac_group=4567
 fi
 claimed=false
 [[ ! -e $MAC_TEST_STATE_DIR/run.json ]] || claimed=true
@@ -110,10 +99,6 @@ printf '%s\0' "$command" "$claimed" "$input" "$#" "$@" >> "$state/events"
 case $command in
     systemd-run|scp|curl) exit 0 ;;
     git)
-        if (( ${@[(Ie)merge-base]} && ${@[(Ie)--is-ancestor]} )); then
-            [[ -n $MAC_RUN_CLONE_DESCENDANT && ${@[-2]} == $MAC_RUN_SHA && ${@[-1]} == $MAC_RUN_CLONE_DESCENDANT ]]
-            exit $?
-        fi
         if (( ${@[(Ie)remote]} && ${@[(Ie)get-url]} )); then
             # Each fixture repository has a distinct origin, so it has a history key.
             folder=${@[$((${@[(Ie)-C]} + 1))]}
@@ -128,10 +113,6 @@ case $command in
             exit $code
         fi
         if (( ${@[(Ie)bundle]} && ${@[(Ie)create]} )); then
-            if [[ -n $MAC_RUN_CLONE_DESCENDANT ]] && (( ${@[(Ie)^$MAC_RUN_CLONE_DESCENDANT]} )); then
-                print -u2 -- 'fatal: Refusing to create empty bundle.'
-                exit 128
-            fi
             bundle_index=${@[(Ie)-q]}
             print -r -- bundle > "${@[$((bundle_index + 1))]}"
         fi
@@ -145,75 +126,32 @@ if [[ ${@[-1]} == true ]] && (( ${@[(Ie)-o]} )); then
     exit 255
 fi
 
-remote=${@[-1]}
-if [[ $remote == *mac_stopped=* ]]; then
-    print -r -- mac_stopped=4567
-    exit 0
-fi
-clone_head=$state/clone-head
-if [[ $MAC_RUN_REAL_COPIES == 1 && $remote == *'copies.py '* ]]; then
-    run_real_copies
-fi
-if [[ $remote == *'hana_instances.py stop-checkout '* ]]; then
-    print -r -- called > "$state/cleanup-called"
-    code=${MAC_RUN_CLEANUP_STATUS:-0}
-    if [[ $code == 0 && ${MAC_RUN_CONFIRM_STOP:-1} == 1 ]]; then
-        print -r -- 'hana-instances: checkout clear'
-        print -r -- confirmed > "$state/checkout-clear"
-    fi
-    print -r -- "mac_exit=$code"
-    exit 0
-fi
-if [[ $remote == *'scratch.py end '* ]]; then
-    if [[ ! -e $state/checkout-clear ]]; then
-        print -u2 -- 'task end before confirmed exit'
-        exit 98
-    fi
-    if [[ $MAC_RUN_REAL_COPIES == 1 ]]; then
-        run_real_copies
-    fi
-    print -r -- mac_exit=0
-    exit 0
-fi
-if [[ $remote == *'copies.py clone '* ]]; then
-    print -rl -- "$MAC_RUN_CHECKOUT" mac_exit=0
-    exit 0
-fi
-if [[ $remote == *'checkout -q --detach'* ]]; then
-    print -rn -- "$MAC_RUN_SHA" > "$clone_head"
-fi
-if [[ $MAC_RUN_HOLD_BUILD == 1 && $remote == *'cargo build -q -p hana'* ]]; then
-    # Like the Mac wrapper, the held build ends when the SSH input closes.
+if (( placed_run )); then
     exec "$MAC_RUN_PYTHON" -c '
 import os, sys
 from pathlib import Path
-Path(os.environ["MAC_RUN_STUB_STATE"], "build-started").write_text("started\n")
-_ = sys.stdin.read()
-Path(os.environ["MAC_RUN_STUB_STATE"], "input-closed").write_text("closed\n")
-raise SystemExit(255)
+state = Path(os.environ["MAC_RUN_STUB_STATE"])
+os.setsid()
+print("HEAD=" + os.environ["MAC_RUN_SHA"], flush=True)
+if os.environ.get("MAC_RUN_HOLD_BUILD") == "1":
+    (state / "build-started").touch()
+    _ = sys.stdin.read()
+    (state / "input-closed").touch()
+    (state / "cleanup-called").touch()
+    print("mac_exit=1", flush=True)
+else:
+    (state / "cleanup-called").touch()
+    print("mac_smoke_complete=0", flush=True)
+    _ = sys.stdin.read()
+    (state / "input-closed").touch()
+    print("mac_exit=0", flush=True)
 '
 fi
-if (( placed_run )); then
-    print -r -- "HEAD=$MAC_RUN_SHA"
-    print -r -- mac_exit=0
+if [[ $remote == *'rev-parse --verify HEAD'* ]]; then
+    print -r -- "${MAC_RUN_SOURCE_COMMIT:-abcdef1234567890abcdef1234567890abcdef12}"
     exit 0
 fi
-if [[ $remote == *'; echo mac_exit=$?'* ]]; then
-    code=0
-    [[ $remote != *'perl -e'* ]] || code=142
-    print -r -- "mac_exit=$code"
-    exit 0
-fi
-if [[ $remote == *'git -C '* && $remote == *'rev-parse HEAD'* ]]; then
-    if [[ -e $clone_head ]]; then
-        print -r -- "$(< "$clone_head")"
-    else
-        print -r -- "${MAC_RUN_CLONE_DESCENDANT:-$MAC_RUN_SHA}"
-    fi
-    exit 0
-fi
-[[ $remote != *'cat /tmp/mac_run_hana.status'* ]] || print -r -- 142
-exit 0
+exit 99
 '''
 
 
@@ -407,7 +345,6 @@ class MacRunTests(unittest.TestCase):
             "MAC_RUN_STUB_STATE": str(self.stub_state),
             "MAC_RUN_SHA": SHA,
             "MAC_RUN_PYTHON": sys.executable,
-            "MAC_RUN_CHECKOUT": str(self.home / "scratch" / "gate-mac-run-private" / "checkout"),
             "HANA_TEST_PURPOSE": "Mac launch coordination",
             "TMPDIR": str(self.temp_directory),
         }
@@ -755,12 +692,12 @@ class MacRunTests(unittest.TestCase):
         self.assertGreater(len(remote_events), 1)
         self.assertFalse(remote_events[0]["claimed"])
         changing = [event for event in remote_events[1:] if event["command"] == "ssh"
-                    and any(action in event["args"][-1] for action in ("clone ", "fetch ", "checkout ", "cargo "))]
+                    and any(action in event["args"][-1] for action in ("fetch ", "checkout ", "cargo "))]
         self.assertTrue(all(event["claimed"] for event in changing))
 
-    def test_ancestor_of_the_clone_head_checks_out_without_a_bundle(self) -> None:
+    def test_commit_on_the_mac_source_uses_the_numbered_copy_without_a_bundle(self) -> None:
         result = self.mac_run(extra={
-            "MAC_RUN_CLONE_DESCENDANT": "abcdef1234567890abcdef1234567890abcdef12",
+            "MAC_RUN_SOURCE_COMMIT": SHA,
         })
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -774,9 +711,11 @@ class MacRunTests(unittest.TestCase):
             event["args"][-1] for event in events if event["command"] == "ssh"
         ]
         self.assertFalse(any("fetch" in command for command in remote_commands), events)
-        self.assertEqual(sum(
-            f"checkout -q --detach {SHA}" in command for command in remote_commands
-        ), 1, events)
+        lease = shlex.split((self.stub_state / "lease-command").read_text())
+        self.assertIn("copies.py", Path(lease[2]).name)
+        self.assertEqual(lease[3], "run")
+        self.assertEqual(lease[lease.index("--commit") + 1], SHA)
+        self.assertEqual(lease[lease.index("--repo") + 1], "$HOME/rust/hana")
         self.assertTrue(any(
             "cargo build -q -p hana" in command for command in remote_commands
         ), events)
@@ -800,10 +739,11 @@ class MacRunTests(unittest.TestCase):
         events = self.events()
         copy = next(event for event in events if event["command"] == "scp")
         destination = copy["args"][-1].split(":", 1)[1]
-        command = next(event["args"][-1] for event in events
-                       if event["command"] == "ssh" and " fetch -q " in event["args"][-1])
-        arguments = shlex.split(command)
-        fetched = arguments[arguments.index("fetch") + 2]
+        command = (self.stub_state / "lease-command").read_text()
+        arguments = shlex.split(command.splitlines()[0])
+        fetched = arguments[arguments.index("--") + 1]
+        lease = shlex.split(command)
+        self.assertEqual(lease[lease.index("--commit") + 1], SHA)
         self.assertEqual(destination, remote_bundle)
         self.assertEqual(fetched, remote_bundle)
         self.assertEqual(destination, fetched)
@@ -846,7 +786,7 @@ class MacRunTests(unittest.TestCase):
                 self.assertEqual(self.events(), [])
                 self.assert_claim_released()
 
-    def test_scratch_clone_launch_keeps_purpose_and_owner(self) -> None:
+    def test_numbered_copy_launch_keeps_purpose_and_owner(self) -> None:
         purpose = "camera's $(touch PURPOSE_INJECTION); frame & light"
         for explicit_owner in (False, True):
             with self.subTest(explicit_owner=explicit_owner):
@@ -859,18 +799,17 @@ class MacRunTests(unittest.TestCase):
                 })
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 remote = [event for event in self.events() if event["command"] == "ssh"]
-                creation = next(event for event in remote if "copies.py clone " in event["args"][-1])
-                create_words = shlex.split(creation["args"][-1])
-                task = create_words[create_words.index("--task") + 1]
-                self.assertRegex(task, rf"^gate:mac-run-{SHA}-\d+$")
-                self.assertIn("--name", create_words)
+                command = (self.stub_state / "lease-command").read_text()
+                words = shlex.split(command)
+                lease = words[words.index("exec"):]
+                self.assertEqual(lease[3], "run")
+                self.assertEqual(lease[lease.index("--owner") + 1], "verify")
                 launch = next(event["input"] for event in remote if event["input"])
-                self.assertIn(f"cd {self.environment['MAC_RUN_CHECKOUT']}", launch)
                 line = next(line for line in launch.splitlines() if line.startswith("HANA_TEST_PURPOSE="))
                 words = shlex.split(line)
                 self.assertIn(f"HANA_TEST_PURPOSE={purpose}", words)
                 self.assertIn(f"HANA_TEST_OWNER={owner}", words)
-                self.assertIn(f"{self.environment['MAC_RUN_CHECKOUT']}/target/debug/hana", words)
+                self.assertIn("$checkout/target/debug/hana", words)
                 # Evaluate the original label assignments with Zsh, replacing only the launched program.
                 labels = line.partition(" BEVY_ASSET_ROOT=")[0]
                 evaluated = subprocess.run(
@@ -881,158 +820,36 @@ class MacRunTests(unittest.TestCase):
                 self.assertEqual(json.loads(evaluated.stdout), [purpose, owner])
                 self.assertFalse((self.root / "PURPOSE_INJECTION").exists())
                 self.assertFalse((self.root / "OWNER_INJECTION").exists())
-                ends = [event for event in remote if f"scratch.py end --task {task}" in event["args"][-1]]
-                self.assertEqual(len(ends), 1)
-                self.assertTrue(ends[0]["claimed"])
+                self.assertTrue((self.stub_state / "cleanup-called").exists())
                 self.assert_claim_released()
 
-    def test_task_end_requires_confirmed_exit_and_failed_stops_keep_the_checkout(self) -> None:
-        result = self.mac_run()
-        events = self.events()
-        stop = [event for event in events if event["command"] == "ssh"
-                and "hana_instances.py stop-checkout " in event["args"][-1]]
-        self.assertEqual(len(stop), 1, events)
-        self.assertTrue(stop[0]["claimed"])
-        words = shlex.split(stop[0]["args"][-1])
-        self.assertEqual(words[words.index("stop-checkout") + 1].rstrip(";"),
-                         self.environment["MAC_RUN_CHECKOUT"])
-        ended = [event for event in events if event["command"] == "ssh"
-                 and "scratch.py end --task " in event["args"][-1]]
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(len(ended), 1, events)
-        self.assertLess(events.index(stop[0]), events.index(ended[0]))
-        self.assertTrue(ended[0]["claimed"])
-        self.assert_claim_released()
-
-        program = shell_functions(SCRIPT, "cleanup_mac_run") + r'''
-clone=$1
-clone_arg=${(q)clone}
-clone_task=$2
-argv_file=$3
-bundle=''
-on_mac() {
-    printf '%s\0' "$1" >> "$MAC_RUN_STUB_STATE/cleanup-commands"
-    return "$MAC_RUN_CLEANUP_STATUS"
-}
-cleanup_mac_run
-'''
-        commands_path = self.stub_state / "cleanup-commands"
-        for stop_status, confirm in ((23, "0"), (0, "0")):
-            with self.subTest(stop_status=stop_status, confirm=confirm):
-                commands_path.unlink(missing_ok=True)
-                result = subprocess.run(
-                    ["zsh", "-f", "-c", program, "cleanup-test",
-                     self.environment["MAC_RUN_CHECKOUT"], f"gate:mac-run-{SHA}-123",
-                     str(self.stub_state / "cleanup-argv")],
-                    cwd=self.root,
-                    env={**self.environment, "MAC_RUN_CLEANUP_STATUS": str(stop_status)},
-                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
-                )
-                commands = commands_path.read_text().split("\0")[:-1]
-                stops = [command for command in commands if "hana_instances.py stop-checkout " in command]
-                self.assertEqual(len(stops), 1, commands)
-                words = shlex.split(stops[0])
-                self.assertEqual(words[words.index("stop-checkout") + 1].rstrip(";"),
-                                 self.environment["MAC_RUN_CHECKOUT"])
-                ends = [command for command in commands if "scratch.py end --task " in command]
-                self.assertEqual(ends, [], commands)
-                self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
-                self.assertIn(self.environment["MAC_RUN_CHECKOUT"], result.stderr)
-                self.assertIn("kept checkout", result.stderr.lower())
-
-    def clone_registry_records(self, config: str) -> list[dict[str, object]]:
-        with mock.patch.dict(os.environ, {"COPIES_CONFIG": config}):
-            return [cast(dict[str, object], json.loads(copies.remote_record_path(mirror).read_text()))
-                    for mirror in copies.remote_mirrors()]
-
-    def assert_clone_records_after_cleanup(self, cleanup_status: int, *,
-                                           prepare_cleanup: Callable[[Path], None] = lambda _: None) -> str:
-        source = ImmutableGitSeed.create(self.root, "main", "Clone Tests", "clone@example.invalid",
-                                         {"source.txt": "content\n"}).checkout
-        head = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
-                              capture_output=True, text=True, check=True).stdout.strip()
-        self.write_production_config(mac_run_source=str(source))
-        local = self.root / "local-copies"
-        remote = self.root / "remote-copies"
-        local.mkdir()
-        remote.mkdir()
-        local_environment = copies_environment(local)
-        remote_environment = copies_environment(remote)
-        _ = shutil.copy2(Path(local_environment["CONF_DIR"]) / "build_folders.conf",
-                         Path(self.environment["CONF_DIR"]) / "build_folders.conf")
-        self.environment.update({key: value for key, value in local_environment.items()
-                                 if key not in ("HOME", "CONF_DIR")})
-        self.environment.update({
-            "MAC_RUN_SHA": head, "MAC_RUN_REAL_COPIES": "1", "MAC_RUN_REAL_PATH": os.environ["PATH"],
-            "MAC_RUN_REMOTE_COPIES_CONFIG": remote_environment["COPIES_CONFIG"],
-            "MAC_RUN_REMOTE_CLAIMS": str(self.root / "remote-claims"),
-        })
-        process = self.start_mac_run(extra={"MAC_RUN_HOLD_BUILD": "1", "MAC_RUN_CLEANUP_STATUS": str(cleanup_status)})
-        try:
-            ready = self.stub_state / "build-started"
-            wait_until(lambda: ready.exists() or process.poll() is not None, self.stub_state, processes=(process,))
-            if process.poll() is not None:
-                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                self.fail(output + errors)
-            before_local = self.clone_registry_records(local_environment["COPIES_CONFIG"])
-            before_remote = self.clone_registry_records(remote_environment["COPIES_CONFIG"])
-            self.assertEqual(len(before_local), 1)
-            self.assertEqual(len(before_remote), 1)
-            self.assertEqual(before_local[0]["path"], before_remote[0]["path"])
-            self.assertEqual(before_local[0]["host"], "natemccoy@mac")
-            self.assertEqual(before_remote[0]["host"], "localhost")
-            with mock.patch.dict(os.environ, {"COPIES_CONFIG": local_environment["COPIES_CONFIG"]}):
-                prepare_cleanup(Path(str(before_local[0]["path"])))
-            send_process_group(process.pid, signal.SIGTERM)
-            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        finally:
-            if process.poll() is None:
-                send_process_group(process.pid, signal.SIGKILL)
-                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
-        # The next run cleans the records of the run that the signal ended.
-        after = self.mac_run(extra={"MAC_RUN_CLEANUP_STATUS": str(cleanup_status)})
-        self.assertEqual(after.returncode, cleanup_status and 4, after.stdout + after.stderr)
-        for name, settings, before in (("natedev", local_environment["COPIES_CONFIG"], before_local),
-                                       ("Mac", remote_environment["COPIES_CONFIG"], before_remote)):
-            with self.subTest(registry=name):
-                records = self.clone_registry_records(settings)
-                if cleanup_status:
-                    # The failed cleanup keeps the ended run's record; the next run keeps its own too.
-                    self.assertIn(before[0], records)
-                else:
-                    self.assertEqual(records, [])
-        return after.stderr
-
-    def test_successful_clone_cleanup_removes_both_registry_records(self) -> None:
-        _ = self.assert_clone_records_after_cleanup(0)
-
-    def test_old_mirror_cleanup_keeps_the_clone_and_removes_both_registry_records(self) -> None:
-        checkouts: list[Path] = []
-
-        def remove_exclusions(checkout: Path) -> None:
-            checkouts.append(checkout)
-            exclude = checkout / ".git/info/exclude"
-            patterns = {f"/{name}" for name in floor_claims.MIRROR_METADATA}
-            _ = exclude.write_text("\n".join(line for line in exclude.read_text().splitlines()
-                                           if line not in patterns) + "\n")
-            status = copies.git(checkout, "status", "--porcelain").decode().splitlines()
-            self.assertEqual(set(status), {f"?? {name}" for name in floor_claims.MIRROR_METADATA})
-
-        errors = self.assert_clone_records_after_cleanup(0, prepare_cleanup=remove_exclusions)
-        self.assertEqual(len(checkouts), 1)
-        [checkout] = checkouts
-        self.assertEqual((checkout / "source.txt").read_text(), "content\n")
-        record = copy_record.read_record(checkout / copy_record.RECORD)
-        self.assertIsInstance(record, copy_record.Registered)
-        assert isinstance(record, copy_record.Registered)
-        self.assertTrue(scratch.task_has_end_evidence(record))
-        expected = f"kept for a manual removal list: {checkout} (scratch, task {record.task} ended)"
-        self.assertEqual([line for line in errors.splitlines() if line.startswith(
-            f"kept for a manual removal list: {checkout} (")], [expected])
-
-    def test_failed_clone_cleanup_keeps_both_registry_records(self) -> None:
-        _ = self.assert_clone_records_after_cleanup(23)
+    def test_cleanup_keeps_the_copy_when_checkout_clear_is_unconfirmed(self) -> None:
+        installed = self.root / "installed"
+        library = installed / "lib"
+        library.mkdir(parents=True)
+        for name in ("conf.sh", "conf_record.sh"):
+            _ = shutil.copy2(SCRIPT.parents[1] / "lib" / name, library / name)
+        self.write_executable(library / "py", """
+if [[ ${1:t} != hana_instances.py || $2 != stop-checkout ]]; then
+    print -u2 "expected stop-checkout, got $*"
+    exit 92
+fi
+print "hana-instances: a process still uses the checkout"
+""")
+        script = installed / "production/mac_run.sh"
+        script.parent.mkdir()
+        _ = shutil.copy2(SCRIPT, script)
+        keep = self.root / "copy.keep"
+        launch = self.root / "launch.command"
+        launch.touch()
+        result = subprocess.run(
+            ["zsh", str(script), "cleanup-copy", str(self.repository), str(launch)],
+            env={**self.environment, "COPIES_KEEP_FILE": str(keep)},
+            cwd=self.root, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertIn("a process still uses the checkout", keep.read_text())
+        self.assertFalse(launch.exists())
 
     def test_build_marker_wait_reports_a_failed_child(self) -> None:
         with subprocess.Popen([sys.executable, "-c", "import sys; sys.exit('fixture start failed')"],
@@ -1044,20 +861,13 @@ cleanup_mac_run
         runs = self.home / ".local/state/mac-queue/runs"
         return sorted(runs.iterdir()) if runs.is_dir() else []
 
-    def test_a_signal_leaves_the_cleanup_to_the_mac_and_the_next_run(self) -> None:
-        for signal_number, cleanup_status, whole_group in (
-            (signal.SIGTERM, 0, True),
-            (signal.SIGHUP, 23, True),
-            (signal.SIGTERM, 0, False),
-        ):
-            with self.subTest(
-                signal_number=signal_number, cleanup_status=cleanup_status, whole_group=whole_group
-            ):
+    def test_a_signal_closes_ssh_and_the_next_run_removes_the_local_bundle(self) -> None:
+        for signal_number, whole_group in ((signal.SIGTERM, True), (signal.SIGHUP, True), (signal.SIGTERM, False)):
+            with self.subTest(signal_number=signal_number, whole_group=whole_group):
                 self.clear_events()
-                for name in ("build-started", "cleanup-called", "checkout-clear", "input-closed", "on-close"):
+                for name in ("build-started", "cleanup-called", "input-closed"):
                     (self.stub_state / name).unlink(missing_ok=True)
-                extra = {"MAC_RUN_CLEANUP_STATUS": str(cleanup_status)}
-                process = self.start_mac_run(extra={**extra, "MAC_RUN_HOLD_BUILD": "1"})
+                process = self.start_mac_run(extra={"MAC_RUN_HOLD_BUILD": "1"})
                 try:
                     self.wait_for_path(self.stub_state / "build-started", process)
                     if whole_group:
@@ -1069,39 +879,16 @@ cleanup_mac_run
                     send_process_group(process.pid, signal.SIGKILL)
                     _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                     raise
-                # No handler: the signal ends the run with its default action.
                 self.assertEqual(process.returncode, -signal_number, output + errors)
-                self.assertFalse((self.stub_state / "cleanup-called").exists())
-                if not whole_group:
-                    # The SSH input closes when the run ends, so the Mac work stops at once.
-                    wait_until((self.stub_state / "input-closed").exists, self.stub_state)
-                # The Mac runs this close step when the SSH input closes.
-                checkout = self.environment["MAC_RUN_CHECKOUT"]
-                close_step = (self.stub_state / "on-close").read_text()
-                self.assertIn("hana_instances.py stop-checkout " + shlex.quote(checkout), close_step)
-                self.assertIn("scratch.py end --task gate:mac-run-" + SHA, close_step)
-                self.assertLess(close_step.index("stop-checkout"), close_step.index("scratch.py end"))
+                wait_until((self.stub_state / "cleanup-called").exists, self.stub_state)
+                self.assertTrue((self.stub_state / "input-closed").exists())
                 self.assertEqual(len(self.ended_runs()), 1)
+                self.assertEqual(len(list(self.temp_directory.glob("*.bundle"))), 1)
 
-                # The next run finishes the cleanup of the ended run under its own placement.
-                self.clear_events()
-                after = self.mac_run(extra=extra)
-                stops = [event for event in self.events() if event["command"] == "ssh"
-                         and "hana_instances.py stop-checkout " in event["args"][-1]]
-                self.assertEqual(len(stops), 2, self.events())
-                self.assertTrue(all(stop["claimed"] for stop in stops))
-                ends = [event for event in self.events() if event["command"] == "ssh"
-                        and "scratch.py end --task " in event["args"][-1]]
-                if cleanup_status == 0:
-                    self.assertEqual(after.returncode, 0, after.stdout + after.stderr)
-                    self.assertEqual(len(ends), 2, self.events())
-                    self.assertEqual(self.ended_runs(), [])
-                else:
-                    self.assertEqual(ends, [], self.events())
-                    self.assertIn("cleanup of an ended run failed", after.stderr)
-                    self.assertEqual(len(self.ended_runs()), 2)
-                    for kept in self.ended_runs():
-                        shutil.rmtree(kept)
+                after = self.mac_run()
+                self.assertEqual(after.returncode, 0, after.stdout + after.stderr)
+                self.assertEqual(self.ended_runs(), [])
+                self.assertEqual(list(self.temp_directory.glob("*.bundle")), [])
                 self.assert_claim_released()
 
 if __name__ == "__main__":

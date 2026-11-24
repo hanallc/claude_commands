@@ -798,6 +798,86 @@ else:
                              [f"{callback} cleanup {called}", f"{installed} cleanup-ended {called}"])
             self.assertFalse(saved.exists())
 
+    def test_smoke_cleanup_runs_before_ssh_input_closes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_ssh = SSH.replace('print(f"mac_exit={status}", flush=True)', """
+if "smoke-work" in args[-1] and "mac_group=" not in args[-1]:
+    print("mac_smoke_complete=0", flush=True)
+    _ = sys.stdin.read()
+(root / "input_closed").touch()
+print(f"mac_exit={status}", flush=True)
+""")
+            environment = queue_fixture(root, fake_ssh)
+            callback = root / "mac_run.sh"
+            write_stdlib_tool(callback, """
+import json, os, sys
+from pathlib import Path
+root = Path(os.environ["FAKE_QUEUE_STATE"])
+phase, argv_file = sys.argv[1:3]
+if phase == "prepare":
+    Path(argv_file).write_text(json.dumps(["smoke-work"]))
+else:
+    assert not (root / "input_closed").exists(), "SSH closed before cleanup"
+    (root / "cleanup").touch()
+""")
+            command = self.command(root, "run")
+            command[command.index("--")] = "--lifecycle-script"
+            command[command.index("--lifecycle-script") + 1:command.index("--lifecycle-script") + 1] = [
+                str(callback), "--",
+            ]
+            result = subprocess.run(command, env=environment, capture_output=True, text=True,
+                                    timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((root / "cleanup").exists())
+            self.assertTrue((root / "input_closed").exists())
+
+    def test_smoke_worker_checks_outside_the_copy_and_waits_for_ssh_eof(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            keep = root / "1.keep"
+            cleanup_record = root / "cleanup"
+            source = Path(mac_queue_run.__file__).resolve()
+            for disconnected in (False, True):
+                with self.subTest(disconnected=disconnected):
+                    cleanup_record.unlink(missing_ok=True)
+                    fifo = root / "gate"
+                    fifo.unlink(missing_ok=True)
+                    if disconnected:
+                        os.mkfifo(fifo)
+                    work = "print -r -- work-ready"
+                    if disconnected:
+                        work += "; cat " + shlex.quote(str(fifo))
+                    cleanup = 'print -rl -- "$PWD" "$1" > "$CLEANUP_RECORD"; rm -- "$COPIES_KEEP_FILE"'
+                    with subprocess.Popen(
+                        [sys.executable, str(source), "smoke-work", work, cleanup],
+                        cwd=checkout, env={**os.environ, "HOME": str(root), "COPIES_COMMAND_LEASE_FDS": "",
+                                           "COPIES_KEEP_FILE": str(keep), "CLEANUP_RECORD": str(cleanup_record)},
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    ) as process:
+                        assert process.stdin is not None and process.stdout is not None
+                        try:
+                            self.assertTrue(select.select([process.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
+                            self.assertEqual(process.stdout.readline(), b"work-ready\n")
+                            if not disconnected:
+                                self.assertEqual(process.stdout.readline(), b"\n")
+                                self.assertEqual(process.stdout.readline(), b"mac_smoke_complete=0\n")
+                                self.assertIsNone(process.poll())
+                                self.assertTrue(cleanup_record.exists())
+                            else:
+                                self.assertTrue(keep.exists())
+                                self.assertFalse(cleanup_record.exists())
+                            process.stdin.close()
+                            self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), int(disconnected))
+                        finally:
+                            if process.poll() is None:
+                                process.kill()
+                                _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(cleanup_record.read_text().splitlines(), [str(root), str(checkout)])
+                    self.assertFalse(keep.exists())
+
     def test_ended_custom_callback_uses_its_saved_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

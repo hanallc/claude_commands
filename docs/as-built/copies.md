@@ -32,7 +32,12 @@ The shell cache lives at `~/build/hana/main/shells`.
 The caller holds the copy lease through preparation and execution.
 The lease records the source checkout, commit, Git directory identities, and holder.
 Python callers pass the lock descriptor and its environment setting to build and test children.
-The copy becomes free when the kernel lock is free.
+The lease gives the child a `COPIES_KEEP_FILE` path beside the copy.
+A nonempty file keeps the copy after the kernel lock is free.
+The file contains the reason. The collector and copy allocator skip kept copies.
+Remove the keep file only after a manual check confirms that the copy is clear.
+The Mac smoke run uses this lease and keeps the copy if its process check fails.
+The smoke run passes its owner to the Mac with `copies.py run --owner`.
 A lease release failure after use raises `PostUseError` and retains the caller error.
 
 The maker rescues source work before Git resets the copy to the requested commit.

@@ -29,7 +29,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import TypedDict, cast
+from typing import TextIO, TypedDict, cast
 import uuid
 
 from scripts.build_hold import override_guard
@@ -38,8 +38,8 @@ from scripts.build_queue import admission_wire as wire
 from scripts.lib import conf, process_group
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import claim_state, mac_test
-from scripts.mac_test.mac_transport import (MacPlacement, RemoteRun, RemoteState, remote_command, stop_command,
-                                            stop_remote, stream_remote)
+from scripts.mac_test.mac_transport import (BATCH_MODE, MacPlacement, RemoteRun, RemoteState, placement_value,
+                                            remote_command, stop_command, stop_remote, stream_remote)
 
 
 def admission_command() -> list[str]:
@@ -269,6 +269,75 @@ def shell_session() -> OwningSession | NoOwningSession:
     return OwningSession(session) if session else NoOwningSession()
 
 
+def smoke_session(placement: MacPlacement, command: list[str], ssh: contextlib.ExitStack) -> subprocess.Popen[str]:
+    """Run the numbered copy with the SSH input open."""
+    work = f"MAC_PLACEMENT={shlex.quote(placement_value(placement))} {shlex.join(command)}"
+    wrapper = work + r"; printf '\nmac_exit=%s\n' $?"
+    process = ssh.enter_context(subprocess.Popen(
+        ["ssh", *BATCH_MODE, placement.host, "/bin/zsh -c " + shlex.quote(wrapper)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace"))
+    _ = ssh.callback(stop_command, process)
+    return process
+
+
+def read_smoke_status(process: subprocess.Popen[str]) -> tuple[str, int] | None:
+    assert process.stdout is not None
+    for line in cast(TextIO, process.stdout):
+        name, separator, code = line.rstrip("\n").partition("=")
+        if separator and name in ("mac_smoke_complete", "mac_exit") and code.isascii() and code.isdecimal():
+            return name, int(code)
+        print(line, end="", flush=True)
+    return None
+
+
+def run_smoke_work(work: str, cleanup: str) -> int:
+    """Stop the smoke work on SSH EOF and settle the copy before its lease ends."""
+    from scripts.lib.build_folders import COPY_KEEP_ENV
+
+    incoming = sys.stdin.fileno()
+    if select.select([incoming], [], [], 0)[0]:
+        return 1
+    checkout = Path.cwd()
+    keep_file = Path(os.environ[COPY_KEEP_ENV])
+    _ = keep_file.write_text("Mac smoke checkout clearance is unconfirmed.\n")
+    home = Path.home()
+    os.chdir(home)
+    locks = tuple(int(number) for number in os.environ.get("COPIES_COMMAND_LEASE_FDS", "").split(",") if number)
+    group = subprocess.Popen(["/bin/zsh", "-c", work], cwd=checkout, start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, pass_fds=locks)
+    assert group.stdout is not None
+    output = group.stdout.fileno()
+    disconnected = False
+    try:
+        while True:
+            ready, _, _ = select.select([incoming, output], [], [])
+            if incoming in ready:
+                disconnected = True
+                break
+            chunk = os.read(output, 65536)
+            if not chunk:
+                _ = group.wait()
+                break
+            _ = sys.stdout.buffer.write(chunk)
+            _ = sys.stdout.buffer.flush()
+    finally:
+        if group.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process_group.send_process_group(group.pid, signal.SIGKILL)
+            _ = group.wait()
+        _ = group.stdout.close()
+        cleared = subprocess.run(["/bin/zsh", "-c", cleanup, "cleanup-copy", str(checkout)], cwd=home)
+    if disconnected:
+        return 1
+    status = group.wait()
+    if status < 0:
+        status = 128 - status
+    status = status or (cleared.returncode if cleared.returncode >= 0 else 128 - cleared.returncode)
+    print(f"\nmac_smoke_complete={status}", flush=True)
+    _ = sys.stdin.read()
+    return status
+
+
 def run(args: Arguments) -> int:
     since = time.time()
     # A block admits its holding unit's workers, so each kind checks the block as the unit's session.
@@ -338,6 +407,8 @@ def run_attempt(
         callback_environment = dict(os.environ)
         cleanup_leased = False
         mac_run = args.is_mac_run
+        smoke: subprocess.Popen[str] | None = None
+        smoke_complete = False
         try:
             while True:
                 code, output, errors = capture_command(admission_command() + placement_arguments(episode, since, pid,
@@ -402,8 +473,17 @@ def run_attempt(
                         status = 1
                         if args.owned_close and not on_close:
                             raise ValueError("the run needs a close hook")
-                        status = stream_remote(remote_command(placement, args.cwd, command, on_close,
-                                                              owned_close=args.owned_close), remote, ssh)
+                        if mac_run:
+                            smoke = smoke_session(placement, command, ssh)
+                            remote.state = RemoteState.LIVE
+                            if (reported := read_smoke_status(smoke)) is not None:
+                                name, status = reported
+                                smoke_complete = name == "mac_smoke_complete"
+                                if not smoke_complete:
+                                    remote.state = RemoteState.EXITED
+                        else:
+                            status = stream_remote(remote_command(placement, args.cwd, command, on_close,
+                                                                  owned_close=args.owned_close), remote, ssh)
             if isinstance(block, mac_test.ClaimDenied):
                 print(block.reason)
                 status = MAC_RUN_REFUSED_STATUS
@@ -411,10 +491,9 @@ def run_attempt(
             print(f"mac queue: {error}", file=sys.stderr)
             status = 2
         finally:
-            if not args.owned_close:
+            safe = remote.state != RemoteState.LIVE or smoke_complete
+            if not safe and not args.owned_close and not mac_run:
                 ssh.close()
-            safe = remote.state != RemoteState.LIVE
-            if not safe and not args.owned_close:
                 try:
                     safe = stop_remote(placement, remote)
                 except OSError:
@@ -433,7 +512,24 @@ def run_attempt(
                 else:
                     safe = True
                     (directory / "run.json").unlink()
-            # Owned cleanup uses the close hook while SSH still holds its input open.
+            if smoke is not None:
+                assert smoke.stdin is not None
+                try:
+                    smoke.stdin.close()
+                    if remote.state is RemoteState.EXITED:
+                        safe = True
+                    elif (reported := read_smoke_status(smoke)) is not None and reported[0] == "mac_exit":
+                        remote.state = RemoteState.EXITED
+                        status = status or reported[1]
+                        safe = True
+                    else:
+                        print("mac queue: the Mac returned no exit status", file=sys.stderr)
+                        status = status or 255
+                        safe = False
+                except (OSError, ValueError) as error:
+                    print(f"mac queue: the Mac smoke session did not finish: {error}", file=sys.stderr)
+                    status = status or 2
+                    safe = False
             ssh.close()
             mirror.close()
             # A Mac placement has no local grant, so the run returns it with a cancel that names the result.
@@ -567,6 +663,8 @@ def main(argv: list[str] | None = None) -> int:
     words = sys.argv[1:] if argv is None else argv
     if len(words) == 3 and words[0] == "watch-caller":
         return watch_caller(int(words[1]), int(words[2]))
+    if len(words) == 3 and words[0] == "smoke-work":
+        return run_smoke_work(words[1], words[2])
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--what", required=True)
     _ = parser.add_argument("--kind", choices=("shot", "install", "probe", "run"), required=True)

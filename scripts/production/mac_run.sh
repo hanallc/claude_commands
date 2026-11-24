@@ -1,17 +1,24 @@
 #!/usr/bin/env zsh
-# Run a sha on the Mac: ship it from this machine, build hana, run it, check it
-# stays up for SECONDS, then stop it. User, 2026-10-04: after each green CI on
-# the merge branch, when the Mac is reachable.
-#
-# Then it builds each demo example with the same cargo arguments you would
-# type, so `cargo run` in the clone starts at once, and runs it for
-# EXAMPLE_HOLD seconds. User, 2026-10-05: the Ian Hubert demo runs from this clone.
-#
-# Usage: mac_run.sh <repo dir> <sha> [seconds; production.conf mac_run_hold_seconds sets the default]
-# Exit: 0 all stayed up; 3 Mac unreachable; 5 wrong tree; 6 build failed;
-# 7 hana exited early; 8 hana stayed up but an example failed; 9 Mac blocked,
-# busy with a test, or coordination state unreadable.
+# Build and run a commit on the Mac in a numbered copy.
+# Usage: mac_run.sh <repo dir> <sha> [seconds]
+# Exit: 0 passed, 3 Mac unreachable, 4 setup or cleanup failed, 5 wrong tree,
+# 6 build failed, 7 Hana exited early, 8 an example failed, 9 Mac unavailable.
 set -o pipefail
+lib=${0:A:h}/../lib
+if [[ $1 == cleanup-copy ]]; then
+  checkout=$2
+  launch=$3
+  if confirmation=$(rm -f -- "$launch" 2>&1 &&
+      "$lib/py" "$lib/../hana_instances/hana_instances.py" stop-checkout "$checkout" 2>&1) &&
+     [[ ${confirmation##*$'\n'} == 'hana-instances: checkout clear' ]]; then
+    rm -f -- "${COPIES_KEEP_FILE:?}" || exit 4
+    exit 0
+  fi
+  reason="mac_run: checkout clearance unconfirmed for $checkout${confirmation:+: $confirmation}"
+  print -r -- "$reason" >> "${COPIES_KEEP_FILE:?}"
+  print -u2 -r -- "$reason"
+  exit 4
+fi
 callback_mode=''
 argv_file=''
 if [[ $1 == prepare || $1 == cleanup ]]; then
@@ -19,26 +26,28 @@ if [[ $1 == prepare || $1 == cleanup ]]; then
   argv_file=$2
   shift 2
 fi
+if [[ $callback_mode == cleanup ]]; then
+  if [[ -r $argv_file.bundle ]]; then
+    bundle=$(< "$argv_file.bundle")
+    rm -f -- "$bundle"
+    exit $?
+  fi
+  exit 0
+fi
 purpose=${HANA_TEST_PURPOSE:-}
 owner=${HANA_TEST_OWNER:-${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}}
-[[ $callback_mode == cleanup || -n ${purpose//[[:space:]]/} ]] || { print -u2 'mac_run: set HANA_TEST_PURPOSE to the feature under test'; exit 2 }
+[[ -n ${purpose//[[:space:]]/} ]] || { print -u2 'mac_run: set HANA_TEST_PURPOSE to the feature under test'; exit 2 }
 # zsh's q flag quotes labels for the generated command without evaluating them.
 purpose_arg=${(q)purpose}
 owner_arg=${(q)owner}
-lib=${0:A:h}/../lib
 source "$lib/conf.sh"
 repo=$1 sha=$2
 hold=${3:-$(conf_value production mac_run_hold_seconds)} || exit 2
 host=$(conf_value production mac_run_host) || exit 2
-# Each run owns a scratch task; EXIT ends it after the test processes finish.
-clone=""
-clone_arg=""
-clone_task=""
 port=$(conf_value production mac_run_port) || exit 2
 log=$(conf_value production mac_run_log) || exit 2
 launch=$(conf_value production mac_run_launch) || exit 2
 status_file=$(conf_value production mac_run_status) || exit 2
-bundle=""
 example_hold=$(conf_value production mac_run_example_seconds) || exit 2
 # Each entry names a crate, an example, and its optional feature.
 example_settings=$(conf_value production mac_run_examples) || exit 2
@@ -53,21 +62,9 @@ example_log_prefix=$(conf_value production mac_run_example_log_prefix) || exit 2
 log_arg=${(q)log}
 launch_arg=${(q)launch}
 status_arg=${(q)status_file}
-bundle_arg=${(q)remote_bundle}
 source_repo=$(conf_value production mac_run_source) || exit 2
 source_arg=${(q)source_repo}
 [[ $source_repo != \~/* ]] || source_arg="\$HOME/${(q)${source_repo#\~/}}"
-
-# Tailscale SSH serves the Mac, and its exit status is always 0, so a command
-# whose status matters prints it as its last line and on_mac returns that.
-on_mac() {
-  local out code
-  out=$(ssh $host "$1; echo mac_exit=\$?") || return $?
-  print -rn -- "${out%mac_exit=*}"
-  code=${out##*mac_exit=}
-  [[ $code == <-> ]] || code=255
-  return $code
-}
 
 if [[ -z $callback_mode ]]; then
   ssh -o BatchMode=yes $host true 2>/dev/null || { print "mac unreachable"; exit 3 }
@@ -75,86 +72,43 @@ if [[ -z $callback_mode ]]; then
     --worktree "$repo" --cwd '' --lifecycle-script "${0:A}" -- "$repo" "$sha" "$hold"
 fi
 host=$MAC_QUEUE_HOST
-copies_script=$lib/../copies/copies.py
-save_state() {
-  print -rl -- "clone=${(q)clone}" "clone_arg=${(q)clone_arg}" "clone_task=${(q)clone_task}" \
-    "bundle=${(q)bundle}" > "$argv_file.state"
-}
-cleanup_mac_run() {
-  [[ ! -r $argv_file.state ]] || source "$argv_file.state"
-  [[ -z $bundle ]] || rm -f -- "$bundle"
-  [[ -n $clone_task && -n $clone ]] || return 0
-  local confirmation
-  if confirmation=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/hana_instances/hana_instances.py stop-checkout $clone_arg") && [[ ${confirmation##*$'\n'} == 'hana-instances: checkout clear' ]]; then
-    on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py end --task $clone_task" >/dev/null || return 4
-    on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py unregister-remote --host localhost --path $clone_arg" >/dev/null || return 4
-    "$lib/py" $copies_script unregister-remote --host $host --path $clone || return 4
-  else
-    print -u2 "mac_run: process exit not confirmed; kept checkout $clone and task $clone_task${confirmation:+: $confirmation}"
-    return 4
-  fi
-}
-if [[ $callback_mode == cleanup ]]; then
-  cleanup_mac_run
-  exit $?
-fi
-save_state
-sha=$(git -C $repo rev-parse --verify "$sha^{commit}") || exit 2
+sha=$(git -C "$repo" rev-parse --verify "$sha^{commit}") || exit 2
+copy_owner=$("$lib/py" -c 'import sys; from pathlib import Path; from scripts.copies import copies; print(copies.source_owner(Path(sys.argv[2])))' "$lib/../copies/copies.py" "$repo") || exit 4
 
-# The Mac cannot fetch from GitHub over ssh, so the commits go as a bundle.
-# When the source already holds the commit, no bundle is needed.
-clone_task=gate:mac-run-${sha}-$$
-save_state
-copies_script=$lib/../copies/copies.py
-copy_owner=$("$lib/py" -c 'import sys; from pathlib import Path; from scripts.copies import copies; print(copies.source_owner(Path(sys.argv[2])))' $copies_script $repo) || exit 4
-copy_owner_arg=${(q)copy_owner}
-copy_session=${owner:-pid-$$}
-copy_session_arg=${(q)copy_session}
-clone=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py clone $source_arg --task $clone_task --name hana --owner $copy_owner_arg --repository hana --session $copy_session_arg") || exit 4
-[[ $clone == /* && $clone != *$'\n'* ]] || { print -u2 'mac_run: scratch clone returned no absolute checkout'; exit 4 }
-clone_arg=${(q)clone}
-save_state
-# The Mac runs this when the SSH input closes, so the checkout and its task end at once.
-# The natedev record and the bundle wait for the next run's cleanup.
-print -r -- "checkout_out=\$(~/.claude/scripts/lib/py ~/.claude/scripts/hana_instances/hana_instances.py stop-checkout $clone_arg) && [[ \${checkout_out##*\$'\\n'} == 'hana-instances: checkout clear' ]] && ~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py end --task $clone_task && ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py unregister-remote --host localhost --path $clone_arg" > "$argv_file.close"
-registry_args=(--repository hana --owner $copy_owner --host $host --path $clone --session $copy_session)
-mirror_lease=$("$lib/py" $copies_script register-remote "${registry_args[@]}" --shell-lease) || exit 4
-print -r -- "$mirror_lease" > "$argv_file.lease"
-"$lib/py" $copies_script register-remote "${registry_args[@]}" || exit 4
-base=$(ssh $host "git -C $clone_arg rev-parse HEAD")
-if git -C $repo merge-base --is-ancestor $sha $base 2>/dev/null; then
-  checkout_command="git -C $clone_arg checkout -q --detach $sha"
-else
+# Prefer the exact commit when the Mac source already has it.
+base=$(ssh -o BatchMode=yes "$host" "git -C $source_arg rev-parse --verify $sha^{commit} 2>/dev/null || git -C $source_arg rev-parse --verify HEAD") || exit 4
+[[ $base =~ '^[0-9a-f]{40}$' ]] || {
+  print -u2 "mac_run: the Mac source returned no commit"
+  exit 4
+}
+ref=''
+if [[ $base != $sha ]]; then
   ref=refs/mac-run/tip
-  bundle=$(mktemp --suffix=.bundle)
-  save_state
-  git -C $repo update-ref $ref $sha
-  if git -C $repo cat-file -e "$base^{commit}" 2>/dev/null && [[ $base != $sha ]]; then
-    git -C $repo bundle create -q $bundle $ref "^$base"
+  bundle=$(mktemp --suffix=.bundle) || exit 4
+  print -r -- "$bundle" > "$argv_file.bundle"
+  git -C "$repo" update-ref $ref $sha || exit 4
+  if git -C "$repo" cat-file -e "$base^{commit}" 2>/dev/null; then
+    git -C "$repo" bundle create -q "$bundle" $ref "^$base"
   else
-    git -C $repo bundle create -q $bundle $ref
+    git -C "$repo" bundle create -q "$bundle" $ref
   fi
   bundle_exit=$?
-  git -C $repo update-ref -d $ref
-  (( bundle_exit == 0 )) || { rm -f $bundle; exit 4 }
-  scp -q $bundle "$host:$remote_bundle" || { rm -f $bundle; exit 4 }
-  rm -f $bundle
-
-  checkout_command="git -C $clone_arg fetch -q $bundle_arg $ref && git -C $clone_arg checkout -q --detach FETCH_HEAD; rm -f $bundle_arg"
+  git -C "$repo" update-ref -d $ref
+  (( bundle_exit == 0 )) || exit 4
+  scp -q "$bundle" "$host:$remote_bundle" || exit 4
 fi
 remote_work=$(cat <<EOF
-$checkout_command
-head=\$(git -C $clone_arg rev-parse HEAD)
+checkout=\$PWD
+head=\$(git rev-parse HEAD)
 print "HEAD=\$head"
 [[ \$head == $sha ]] || { print "wrong tree: wanted $sha"; exit 5 }
-cd $clone_arg || exit 5
 MACOSX_DEPLOYMENT_TARGET=$deployment_target cargo build -q -p hana || { print 'build failed'; exit 6; }
 # Terminal holds the camera grant. The launch file records the child status.
 rm -f $status_arg
 printf '#!/bin/zsh\nexport MAC_PLACEMENT=%q\n' "\$MAC_PLACEMENT" > $launch_arg
+printf 'export checkout=%q; cd %q\\n' "\$checkout" "\$checkout" >> $launch_arg
 cat >> $launch_arg <<'HANA_LAUNCH'
-cd $clone_arg
-HANA_TEST_PURPOSE=$purpose_arg HANA_TEST_OWNER=$owner_arg BEVY_ASSET_ROOT=$clone_arg/crates/hana BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $hold $clone_arg/target/debug/hana > $log_arg 2>&1
+HANA_TEST_PURPOSE=$purpose_arg HANA_TEST_OWNER=$owner_arg BEVY_ASSET_ROOT="\$checkout/crates/hana" BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $hold "\$checkout/target/debug/hana" > $log_arg 2>&1
 echo \$? > $status_arg
 exit 0
 HANA_LAUNCH
@@ -191,9 +145,9 @@ for entry in \$examples; do
     failed=1
     continue
   fi
-  BEVY_ASSET_ROOT=$clone_arg/crates/\$parts[1] BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $example_hold $clone_arg/target/debug/examples/\$parts[2] > \$example_log 2>&1
+  BEVY_ASSET_ROOT="\$checkout/crates/\$parts[1]" BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $example_hold "\$checkout/target/debug/examples/\$parts[2]" > \$example_log 2>&1
   example_exit=\$?
-  pkill -f $clone_arg/'[t]arget/debug/examples/'\$parts[2]
+  pkill -f "\$checkout"/'[t]arget/debug/examples/'\$parts[2]
   if (( example_exit == 142 )); then
     print "example \$parts[2]: stayed up ${example_hold}s  (cargo run \$args)"
   else
@@ -207,5 +161,35 @@ done
 exit \$result
 EOF
 )
-export MAC_RUN_REMOTE_WORK=$remote_work
-"$lib/py" -c 'import json,os,sys; from pathlib import Path; Path(sys.argv[1]).write_text(json.dumps(["/bin/zsh", "-c", os.environ["MAC_RUN_REMOTE_WORK"]]))' "$argv_file"
+# Use the installed helpers on the Mac. Only the smoke commands come from this callback.
+export MAC_RUN_REMOTE_WORK=$remote_work MAC_RUN_SOURCE=$source_repo MAC_RUN_SHA=$sha MAC_RUN_COPY_OWNER=$copy_owner
+export MAC_RUN_LAUNCH=$launch MAC_RUN_BUNDLE=$remote_bundle MAC_RUN_BUNDLE_REF=$ref
+"$lib/py" -c '
+import json, os, sys
+from pathlib import Path
+from shlex import quote
+
+env = os.environ
+source = env["MAC_RUN_SOURCE"]
+source = "$HOME/" + quote(source[2:]) if source.startswith("~/") else quote(source)
+py = """ "$HOME/.claude/scripts/lib/py" """
+copies = """ "$HOME/.claude/scripts/copies/copies.py" """
+runner = """ "$HOME/.claude/scripts/mac_test/mac_queue_run.py" """
+cleanup = """exec "$HOME/.claude/scripts/production/mac_run.sh" cleanup-copy "$1" """ + quote(env["MAC_RUN_LAUNCH"])
+work = env["MAC_RUN_REMOTE_WORK"]
+prepare = ""
+if ref := env["MAC_RUN_BUNDLE_REF"]:
+    bundle = quote(env["MAC_RUN_BUNDLE"])
+    prepare = (
+        f"git -C {source} fetch -q --no-tags --no-write-fetch-head -- {bundle} {quote(ref)}\n"
+        + "status=$?\n"
+        + f"rm -f -- {bundle}\n"
+        + "(( status == 0 )) || exit 5\n"
+    )
+command = [
+    "/bin/zsh", "-c",
+    prepare + f"exec{py}{copies}run --repo {source} --owner " + quote(env["MAC_RUN_COPY_OWNER"])
+    + " --commit " + env["MAC_RUN_SHA"] + f" --{py}{runner}smoke-work " + quote(work) + " " + quote(cleanup),
+]
+Path(sys.argv[1]).write_text(json.dumps(command))
+' "$argv_file"

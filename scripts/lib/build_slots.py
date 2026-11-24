@@ -304,6 +304,7 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 yield LeasedCopy(path, name, number, MappingProxyType({
                     "CARGO_TARGET_DIR": str(target), "CARGO_BUILD_BUILD_DIR": str(target),
                     build_folders.NUMBERED_COPY_LOCK_ENV: str(descriptor),
+                    build_folders.COPY_KEEP_ENV: str(build_folders.copy_keep_file(path)),
                 }), (descriptor,))
                 return
         if isinstance(selection, ExactSlotRequest):

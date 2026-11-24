@@ -1515,6 +1515,8 @@ def list_trees() -> None:
         number += 1
         owner = held.pop(path, None)
         state = "busy" if isinstance(owner, build_folders.KnownFolderLease) else "unknown" if owner else "idle"
+        if owner is None and build_folders.build_folder_state(path) == "kept":
+            state = "kept"
         try:
             fields = build_folders.folder_lease_fields(path)
         except (OSError, ValueError):
@@ -2647,7 +2649,7 @@ def run_prepared_gate(command: Sequence[str], *, cwd: Path, descriptors: tuple[i
 
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
     """Run verify from a snapshot and other commands under a numbered copy lease."""
-    owner = caller_owner()
+    owner = checked_owner(args.owner) if args.owner else caller_owner()
     source = Path(args.repo or "").expanduser().resolve()
     verification = verify_command(command)
     with ExitStack() as scope:
@@ -3088,6 +3090,7 @@ def parse_copy_arguments(argv: list[str] | None) -> CopyArguments:
     _ = run.add_argument("--repo", required=True)
     _ = remove.add_argument("--repo")
     _ = run.add_argument("--commit", required=True)
+    _ = run.add_argument("--owner", default="", help="select a fixed owner or staff member ID")
     _ = run.add_argument("--apply-uncommitted")
     _ = run.add_argument("--merge")
     _ = run.add_argument("--targets", default="", help="name the gate targets in a comma-separated list")
