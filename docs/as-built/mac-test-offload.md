@@ -100,9 +100,17 @@ natedev holds the SSH input open for the whole run.
 When the natedev process ends by any signal, the guest sees its input end and kills the run group, which frees the run lock.
 Item 191 B3 will keep the Mac claim until proof and bind the claim identity to the guest attempt.
 
-The Mac Linux route runs the suite in a numbered copy.
-The runner starts the copy's gate with a `scripts/lib/py -c` entry (`gate_entry_command`).
-Python gives a `-c` entry the argv `['-c', ...]`, so the entry removes `-c` before it runs the runner with `runner request --run-copy <reply descriptor>`.
+The Mac Linux route records the HEAD commit of the natedev runner's Git tree.
+It checks the index and worktree under `scripts/` against that commit.
+It refuses the run for changes, untracked files, or entries with the assume-unchanged or skip-worktree flag.
+The full and delta bundles include the runner commit.
+The bootstrap tar carries `request.json` with the runner commit.
+The guest extracts the runner's scripts and default configuration from that commit.
+Both guest entry points use the extracted Python shim and scripts.
+The guest main still resets to the candidate's `origin/main`.
+The gate runs the selected modules in the numbered copy of the candidate.
+The guest removes the bootstrap folder when the shell exits.
+After a forced stop, cleanup removes the folder under the run lock before it reports the end of the run.
 The reply descriptor is a copy of the stream standard output.
 The runner starts the sandbox, and `dbus-run-session` if the guest has it, for the gate run with standard output on standard error.
 Only the JSON reply line goes to the reply descriptor, so other output cannot come before it.
