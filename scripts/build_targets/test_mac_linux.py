@@ -1832,12 +1832,15 @@ fi
             (76, '', 'The guest run lock is still held.\n',
              mac_linux.GuestEndPending('The guest run lock is still held.')),
         ):
-            with self.subTest(status=status), patch.object(
-                    subprocess, 'run', return_value=subprocess.CompletedProcess(command, status, stdout, stderr)) as ssh:
+            with (self.subTest(status=status),
+                  patch.dict(os.environ, {'BUILDLOG_PLACEMENT_SIDECAR': '/fixture/reservation.cgroup'}),
+                  patch.object(subprocess, 'run',
+                               return_value=subprocess.CompletedProcess(command, status, stdout, stderr)) as ssh):
+                environment = {key: value for key, value in os.environ.items() if key != 'BUILDLOG_PLACEMENT_SIDECAR'}
                 self.assertEqual(mac_linux.prove_kept_guest_end(armed), expected)
                 ssh.assert_called_once_with(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                             errors='replace', timeout=mac_linux.GUEST_CLEANUP_TIMEOUT_SECONDS,
-                                            check=False)
+                                            check=False, env=environment)
 
     def test_keyboard_interrupt_proves_the_end_before_release(self) -> None:
         def interrupt_source(process: subprocess.Popen[bytes], bootstrap: bytes, _timeout: int,
