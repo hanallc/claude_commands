@@ -15,6 +15,7 @@ from typing import cast, final
 from unittest import mock
 from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_hold import build_hold
+from scripts.build_hold.build_hold_test_support import TEST_HOLD_USER_WORDS
 from scripts.direct.verify_mac_offload_test_support import TARGETS_WRAPPER
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY, stub_build_tool_path as stub_build_tool_path, processes_carrying
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, FixtureHang
@@ -219,7 +220,7 @@ Path({str(completed)!r}).touch()
                     try:
                         _ = build_hold.start_hold(Path(self.environment["BUILD_HOLD_DIR"]),
                             build_hold.HolderIdentity(f"hana-{delayed_start}", "hana"), "fixture recording", build_hold.NoReleaseEta(),
-                            datetime.now().astimezone())
+                            datetime.now().astimezone(), user_words=TEST_HOLD_USER_WORDS)
                     except BaseException as error:
                         failures.append(error)
 
@@ -295,7 +296,7 @@ signal.pause()
                         for key in ("first", "second"):
                             _ = build_hold.start_hold(Path(self.environment["BUILD_HOLD_DIR"]),
                                 build_hold.HolderIdentity(key, key), "blocked recording", build_hold.NoReleaseEta(),
-                                datetime.now().astimezone())
+                                datetime.now().astimezone(), user_words=TEST_HOLD_USER_WORDS)
                             self.wait_for_path(ready / key)
                 self.assertEqual(len(children), 2)
                 self.assertEqual(len(threads), 2)

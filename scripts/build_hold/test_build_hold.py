@@ -32,7 +32,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 
 from scripts.build_hold.build_hold_test_support import (
     IsolatedBuildHoldTest as IsolatedBuildHoldTest,
-    HoldEventRecord, SCRIPT, invoke_hold, recorded_hold_events, write_holder,
+    HoldEventRecord, SCRIPT, TEST_HOLD_USER_WORDS, invoke_hold, recorded_hold_events, write_holder,
 )
 from scripts.direct import step_record
 from scripts.build_queue import admission_protocol, admission_service
@@ -450,7 +450,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                 with self.subTest(action=action, target=target), redirect_stdout(io.StringIO()) as output:
                     arguments = [action, target]
                     if action != "release":
-                        arguments.extend(["--for", "private test"])
+                        arguments.extend(["--for", "private test", "--user-words", TEST_HOLD_USER_WORDS])
                     self.assertEqual(build_hold.main(arguments), 2)
                     self.assertEqual(output.getvalue(), f"{action} {target} is not supported yet\n")
                     self.assertFalse((self.scratch / "holders").exists())
@@ -468,7 +468,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
             self.assertEqual(target_config.command_target_name(None), "natedev")
             _ = path.write_text(path.read_text().replace("default_target=natedev", "default_target=all"))
             for action in ("clear", "drain", "release"):
-                arguments = [action] if action == "release" else [action, "--for", "private test"]
+                arguments = [action] if action == "release" else [action, "--for", "private test", "--user-words", TEST_HOLD_USER_WORDS]
                 with self.subTest(action=action), redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(build_hold.main(arguments), 2)
                     self.assertEqual(output.getvalue(), f"{action} all is not supported yet\n")
@@ -479,7 +479,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
             for selection in (["--target", "natedev"], ["target", "natedev"]):
                 arguments = [action, *selection]
                 if action != "release":
-                    arguments.extend(["--for", "private test"])
+                    arguments.extend(["--for", "private test", "--user-words", TEST_HOLD_USER_WORDS])
                 with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()):
                     with self.assertRaises(SystemExit) as result:
                         _ = build_hold.main(arguments)
@@ -487,16 +487,47 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
 
 
 class CommandTests(PrivateReleaseBroadcastTest):
+    def test_clear_and_drain_refuse_missing_or_blank_user_words(self) -> None:
+        folder = self.scratch / "holders"
+        for action in ("clear", "drain"):
+            for words in ([], ["--user-words", ""], ["--user-words", " \t\n"]):
+                with self.subTest(action=action, words=words):
+                    command = [action, "natedev", "--holder", "slot", "--for", "one test",
+                               "--release-eta", "23:59", "--zone", "Etc/GMT+12", *words]
+                    result = invoke_hold(command, {**os.environ, "BUILD_HOLD_DIR": str(folder)})
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("--user-words", result.stderr)
+                    if words:
+                        self.assertIn("a hold requires Nate's explicit request", result.stderr)
+                    self.assertFalse(folder.exists())
+                    self.assertFalse((self.scratch / "release" / "current").exists())
+
+    def test_python_hold_writers_refuse_missing_or_blank_user_words(self) -> None:
+        folder = self.scratch / "holders"
+        identity = build_hold.HolderIdentity("slot", "slot")
+        request = build_hold.NoReleaseEta()
+        now = datetime.now(timezone.utc)
+        for write in (build_hold.write_hold, build_hold.start_hold):
+            with self.subTest(write=write.__name__):
+                with self.assertRaisesRegex(ValueError, "a hold requires Nate's explicit request"):
+                    _ = write(folder, identity, "one test", request, now)
+                with self.assertRaisesRegex(ValueError, "a hold requires Nate's explicit request"):
+                    _ = write(folder, identity, "one test", request, now, user_words=" \t\n")
+                self.assertFalse(folder.exists())
+                self.assertFalse((self.scratch / "release" / "current").exists())
+
     def test_live_holder_precedes_a_former_name_release_receipt(self) -> None:
         folder = self.scratch / "holders"
         for index, by_id in enumerate((False, True)):
             old_name, name, session_id = f"old-{index}", f"new-{index}", f"id-{index}"
             _ = build_hold.start_hold(folder, build_hold.HolderIdentity(old_name, old_name), "old hold",
-                                      build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                                      build_hold.NoReleaseEta(), datetime.now(timezone.utc),
+                                      user_words=TEST_HOLD_USER_WORDS)
             self.assertEqual(self.run_cli(folder, "release", "--holder", old_name).returncode, 0)
             self.session(session_id, name, old_name)
             _ = build_hold.start_hold(folder, build_hold.holder_of(name), "new hold",
-                                      build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                                      build_hold.NoReleaseEta(), datetime.now(timezone.utc),
+                                      user_words=TEST_HOLD_USER_WORDS)
             with self.subTest(by_id=by_id):
                 result = self.run_cli(folder, "release", "--holder", session_id if by_id else name)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -508,7 +539,10 @@ class CommandTests(PrivateReleaseBroadcastTest):
         audit_args = ["--proc-root", str(self.scratch / "proc")] if args[0] in {"clear", "drain", "status", "audit"} else []
         eta_args = (["--release-eta", "23:59", "--zone", "Etc/GMT+12"]
                     if args[0] in {"clear", "drain"} and "--release-eta" not in args else [])
-        return invoke_hold([*args, *eta_args, *audit_args], {**os.environ, "BUILD_HOLD_DIR": str(folder)})
+        words_args = (["--user-words", TEST_HOLD_USER_WORDS]
+                      if args[0] in {"clear", "drain"} and "--user-words" not in args else [])
+        return invoke_hold([*args, *words_args, *eta_args, *audit_args],
+                           {**os.environ, "BUILD_HOLD_DIR": str(folder)})
 
     def damage_record(self, kind: str, scratch: Path, *, two_holders: bool = False) -> tuple[Path, bytes]:
         folder = scratch / "holders"
@@ -550,13 +584,13 @@ class CommandTests(PrivateReleaseBroadcastTest):
     def hold(self, folder: Path, given: str | None) -> str:
         identity = build_hold.holder_of(given)
         return build_hold.write_hold(folder, identity, "one test", build_hold.release_request(None, None),
-                                     datetime.now().astimezone())
+                                     datetime.now().astimezone(), user_words=TEST_HOLD_USER_WORDS)
 
     def test_session_rename_keeps_begin_and_end_events_under_the_session_id(self) -> None:
         folder = self.scratch / "holders"
         self.session("id-1", "old-name")
         _ = build_hold.start_hold(folder, build_hold.holder_of("old-name"), "render checks",
-                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc), user_words=TEST_HOLD_USER_WORDS)
         self.session("id-1", "new-name", "old-name")
         (self.scratch / "release" / "current").unlink()
         _ = build_hold.release_cycle(folder, build_hold.held_key(folder, "new-name"))
@@ -842,28 +876,33 @@ class CommandTests(PrivateReleaseBroadcastTest):
 
 
     def test_hold_writes_unknown_and_status_names_it(self) -> None:
+        words = "  " + TEST_HOLD_USER_WORDS + "  "
         for action in ("clear", "drain"):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as scratch, \
                  mock.patch.object(hold_enforcer, "claimed_processes", return_value=build_hold.LiveClaims(frozenset())):
                 folder = Path(scratch)
-                result = self.run_cli(folder, action, "--holder", "slot one", "--for", "the focused test")
+                result = self.run_cli(folder, action, "--holder", "slot one", "--for", "the focused test",
+                                      "--user-words", words)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 path = folder / "slot-one"
                 fields = cast(dict[str, object], json.loads(path.read_text()))
                 self.assertEqual(fields["holder"], "slot one")
                 self.assertEqual(fields["for"], "the focused test")
+                self.assertEqual(fields["user_words"], words)
                 self.assertTrue(cast(str, fields["release_eta"]).endswith("T23:59:00-12:00"))
                 self.assertIsNotNone(datetime.fromisoformat(cast(str, fields["since"])).tzinfo)
                 if action == "drain":
                     self.assertEqual(result.stdout.splitlines()[-1], "drained; natedev stays held until release")
                 _ = build_hold.start_hold(folder, build_hold.HolderIdentity("slot-one", "slot one"),
-                                          "the focused test", build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                                          "the focused test", build_hold.NoReleaseEta(), datetime.now(timezone.utc),
+                                          user_words=words)
                 fields = cast(dict[str, object], json.loads(path.read_text()))
                 self.assertEqual(fields["release_eta"], "unknown")
                 status = self.run_cli(folder, "status")
                 self.assertEqual(status.returncode, 0, status.stderr)
                 self.assertIn("slot one", status.stdout)
                 self.assertIn("the focused test", status.stdout)
+                self.assertIn(f'Nate\'s words: "{words}"', status.stdout)
                 self.assertIn("unknown", status.stdout)
                 self.assertIn("release eta unknown", build_hold.holder_text(build_hold.read_holder(path)))
 
@@ -1010,7 +1049,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
                     folder = Path(scratch) / "holders"
                     with mock.patch.object(build_hold, "datetime", FixedDatetime), \
                          mock.patch.object(hold_enforcer, "start") as start:
-                        result = invoke_hold([action, "--holder", "slot", "--for", "the test", *eta],
+                        result = invoke_hold([action, "--holder", "slot", "--for", "the test", "--user-words", TEST_HOLD_USER_WORDS, *eta],
                                              {**os.environ, "BUILD_HOLD_DIR": str(folder),
                                               "BUILD_HOLD_RELEASE_DIR": str(Path(scratch) / "release"),
                                               "BUILD_HOLD_ENFORCER_DIR": str(Path(scratch) / "enforcer")})
@@ -1030,7 +1069,8 @@ class CommandTests(PrivateReleaseBroadcastTest):
             folder = Path(scratch)
             now = datetime.fromisoformat("2026-11-01T00:30:00-07:00")
             request = build_hold.release_request("02:30", "America/Los_Angeles")
-            _ = build_hold.write_hold(folder, build_hold.HolderIdentity("slot", "slot"), "clock change", request, now)
+            _ = build_hold.write_hold(folder, build_hold.HolderIdentity("slot", "slot"), "clock change", request, now,
+                                      user_words=TEST_HOLD_USER_WORDS)
             fields = cast(dict[str, object], json.loads((folder / "slot").read_text()))
             self.assertEqual(fields["release_eta"], "2026-11-01T02:30:00-08:00")
 
@@ -1055,6 +1095,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
                             with mock.patch.object(build_hold, "datetime", FixedDatetime), \
                                  redirect_stdout(output), redirect_stderr(errors):
                                 result = build_hold.main([action, "--holder", "slot", "--for", "the test",
+                                                          "--user-words", TEST_HOLD_USER_WORDS,
                                                           "--release-eta", eta, "--zone", "America/Los_Angeles"])
                     finally:
                         time.tzset()
@@ -1136,7 +1177,8 @@ class ReleaseDeliveryTests(IsolatedBuildHoldTest):
                 }):
                     folder = self.scratch / "holders"
                     _ = build_hold.start_hold(folder, build_hold.HolderIdentity("holder", "holder"),
-                                              "worker tests", build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                                              "worker tests", build_hold.NoReleaseEta(), datetime.now(timezone.utc),
+                                              user_words=TEST_HOLD_USER_WORDS)
                     self.assertIn("registered", build_hold.register_wait(recipient, "worker"))
                     status = invoke_hold(["status"], dict(os.environ))
                     self.assertEqual(status.returncode, 0, status.stderr)
@@ -1190,7 +1232,7 @@ class ReleaseDeliveryTests(IsolatedBuildHoldTest):
                     started = datetime(2026, 11, 11, 12, minute, second, tzinfo=timezone.utc)
                     folder = self.scratch / "holders"
                     _ = build_hold.start_hold(folder, build_hold.HolderIdentity("fps", "fps"), purpose,
-                                              build_hold.NoReleaseEta(), started)
+                                              build_hold.NoReleaseEta(), started, user_words=TEST_HOLD_USER_WORDS)
                     build_hold.record_recipients([("waiting session", "session-a")])
                     cycle = build_hold.read_cycle()
                     assert not isinstance(cycle, build_hold.NoCycle)
@@ -1200,7 +1242,8 @@ class ReleaseDeliveryTests(IsolatedBuildHoldTest):
                         build_hold.save_cycle(cycle)
                     if record in ("multiple-holders", "recovered-cycle"):
                         _ = build_hold.start_hold(folder, build_hold.HolderIdentity("resources", "resources"),
-                                                  "render checks", build_hold.NoReleaseEta(), started + timedelta(minutes=1))
+                                                  "render checks", build_hold.NoReleaseEta(), started + timedelta(minutes=1),
+                                                  user_words=TEST_HOLD_USER_WORDS)
                         _ = build_hold.release_cycle(folder, "fps")
                     key = "resources" if record in ("multiple-holders", "recovered-cycle") else "fps"
                     if record == "broadcast":
@@ -1395,7 +1438,8 @@ class AtomicWriteTests(IsolatedBuildHoldTest):
             with self.subTest(existing=existing):
                 path = build_hold.holder_path(folder, "holder")
                 if existing:
-                    _ = build_hold.write_hold(folder, build_hold.HolderIdentity("holder", "holder"), "old purpose", build_hold.NoReleaseEta(), self.now)
+                    _ = build_hold.write_hold(folder, build_hold.HolderIdentity("holder", "holder"), "old purpose", build_hold.NoReleaseEta(), self.now,
+                                              user_words=TEST_HOLD_USER_WORDS)
                 else:
                     path.unlink(missing_ok=True)
                 old = path.read_bytes() if path.exists() else b""
@@ -1409,13 +1453,17 @@ class AtomicWriteTests(IsolatedBuildHoldTest):
                     self.assertEqual(list(folder.iterdir()), old_files)
                     self.assertEqual(source, folder.parent / f"{folder.name}.{path.name}.tmp")
                     content = cast(object, json.loads(source.read_text()))
-                    expected: dict[str, object] = {"holder": "holder", "since": self.now.isoformat(), "for": "new purpose", "release_eta": "unknown", "keep": []}
+                    expected: dict[str, object] = {
+                        "holder": "holder", "since": self.now.isoformat(), "for": "new purpose",
+                        "release_eta": "unknown", "keep": [], "user_words": TEST_HOLD_USER_WORDS,
+                    }
                     self.assertEqual(content, expected)
                     seen.append(source)
                     replace(source, destination)
 
                 with mock.patch.object(os, "replace", side_effect=rename):
-                    _ = build_hold.write_hold(folder, build_hold.HolderIdentity("holder", "holder"), "new purpose", build_hold.NoReleaseEta(), self.now)
+                    _ = build_hold.write_hold(folder, build_hold.HolderIdentity("holder", "holder"), "new purpose", build_hold.NoReleaseEta(), self.now,
+                                              user_words=TEST_HOLD_USER_WORDS)
                 self.assertEqual(seen, [folder.parent / f"{folder.name}.{path.name}.tmp"])
                 self.assertEqual(build_hold.read_holder(path).purpose, "new purpose")
 
@@ -1430,7 +1478,8 @@ class AtomicWriteTests(IsolatedBuildHoldTest):
         with mock.patch.object(override_guard, "user_home", return_value=home), \
              self.assertRaises(override_guard.SharedStateWriteRefused) as raised:
             _ = build_hold.write_hold(folder, build_hold.HolderIdentity("holder", "holder"),
-                                      "refused purpose", build_hold.NoReleaseEta(), self.now)
+                                      "refused purpose", build_hold.NoReleaseEta(), self.now,
+                                      user_words=TEST_HOLD_USER_WORDS)
         self.assertIn("build_hold/build_hold.py", str(raised.exception))
         self.assertEqual(shared.read_bytes(), b"shared holder bytes\n")
         self.assertEqual(path.read_bytes(), before)
@@ -1444,7 +1493,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
     def begin(self, key: str = "session-id", name: str = "old name") -> Path:
         folder = self.scratch / "holders"
         _ = build_hold.start_hold(folder, build_hold.HolderIdentity(key, name), "render checks",
-                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc), user_words=TEST_HOLD_USER_WORDS)
         return folder
 
     def test_locked_log_does_not_delay_hold_or_keep_the_release_lock(self) -> None:
@@ -1455,6 +1504,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
             try:
                 result = subprocess.run(
                     ["python3", str(SCRIPT), "clear", "--holder", "alice", "--for", "render checks",
+                     "--user-words", TEST_HOLD_USER_WORDS,
                      "--release-eta", "23:59", "--zone", "Etc/GMT+12", "--proc-root", str(self.scratch / "proc")],
                     env=dict(os.environ), capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -1527,7 +1577,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
     def test_repeated_hold_and_renamed_release_keep_one_begin_and_the_file_key(self) -> None:
         folder = self.begin("unsafe name", "old name")
         _ = build_hold.start_hold(folder, build_hold.HolderIdentity("unsafe name", "new name"), "new work",
-                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc), user_words=TEST_HOLD_USER_WORDS)
         self.assertEqual(len(self.events()), 1)
         _ = (self.scratch / "release" / "current").unlink()
         _ = build_hold.release_cycle(folder, "unsafe name")
@@ -1544,7 +1594,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
     def test_partial_and_final_release_write_end_events_only_after_file_removal(self) -> None:
         folder = self.begin()
         _ = build_hold.start_hold(folder, build_hold.HolderIdentity("other", "other"), "other work",
-                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc), user_words=TEST_HOLD_USER_WORDS)
         _ = build_hold.release_cycle(folder, "session-id")
         self.assertFalse((folder / "session-id").exists())
         cycle = build_hold.read_cycle()
@@ -2406,7 +2456,7 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))):
             folder = self.scratch / "holders"
             _ = build_hold.start_hold(folder, build_hold.holder_of(member.name), "rename recovery",
-                                      build_hold.NoReleaseEta(), self.now)
+                                      build_hold.NoReleaseEta(), self.now, user_words=TEST_HOLD_USER_WORDS)
             build_hold.record_recipients([("waiting", "rename-recipient")])
             self.assertEqual(self.stop_release_after_unlink(member.name).returncode, 1)
             intent = build_hold.read_release_intent(build_hold.release_directory() / "pending-release.json")
@@ -2453,7 +2503,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.begin()
         build_hold.record_recipients([("waiting", "one")])
         _ = build_hold.write_hold(self.scratch / "holders", build_hold.HolderIdentity("holder", "holder"),
-                                  "updated hold", build_hold.NoReleaseEta(), self.now + timedelta(seconds=1))
+                                  "updated hold", build_hold.NoReleaseEta(), self.now + timedelta(seconds=1),
+                                  user_words=TEST_HOLD_USER_WORDS)
         with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/fake")), \
              mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as send:
             result = invoke_hold(["release", "--holder", "holder"], dict(os.environ))
@@ -2575,7 +2626,7 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         for pid in (10, 20):
             _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("holder", "holder"),
                                       "again", build_hold.NoReleaseEta(), self.now,
-                                      (build_hold.ProcessIdentity(pid, str(pid * 10)),))
+                                      (build_hold.ProcessIdentity(pid, str(pid * 10)),), user_words=TEST_HOLD_USER_WORDS)
         self.assertEqual(self.cycle()["release_started_at"], "")
         self.assertEqual(self.cycle()["holders"]["holder"]["released_at"], "")
         self.assertIn("wait for release", build_hold.register_wait("waiter"))
@@ -2592,7 +2643,7 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
 
     def begin(self, name: str = "holder") -> None:
         _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity(name, name),
-                                  "tests", build_hold.NoReleaseEta(), self.now)
+                                  "tests", build_hold.NoReleaseEta(), self.now, user_words=TEST_HOLD_USER_WORDS)
 
     def cycle(self) -> build_hold.HoldCycle:
         cycle = build_hold.read_cycle()
@@ -2871,6 +2922,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                         self.holders, build_hold.HolderIdentity("holder", "holder"),
                         "app test", build_hold.NoReleaseEta(), datetime.now(timezone.utc),
                         (build_hold.ProcessIdentity(kept_pid, str(kept_pid * 10)),),
+                        user_words=TEST_HOLD_USER_WORDS,
                     )
                     holders = build_hold.natedev_holds(self.holders).in_force
                     kept = hold_enforcer.decide_builds(table, holders, os.getuid(), 999, self.claimed)
@@ -3060,10 +3112,10 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         output = io.StringIO()
         with redirect_stdout(output):
             for pid in (10, 20):
-                self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "app test",
+                self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "app test", "--user-words", TEST_HOLD_USER_WORDS,
                                                  "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                                                  "--proc-root", str(self.proc), "--keep", str(pid)]), 0)
-            self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "app test",
+            self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "app test", "--user-words", TEST_HOLD_USER_WORDS,
                                              "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                                              "--proc-root", str(self.proc), "--keep", "999"]), 1)
         holder, = build_hold.natedev_holds(self.holders).in_force
@@ -3079,7 +3131,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                               ("audit", "import"), ("audit", "__main__")):
             args = [action, "--proc-root", str(self.proc)]
             if action == "clear":
-                args.extend(["--holder", "holder", "--for", "app test",
+                args.extend(["--holder", "holder", "--for", "app test", "--user-words", TEST_HOLD_USER_WORDS,
                              "--release-eta", "23:59", "--zone", "Etc/GMT+12"])
             output = io.StringIO()
             if entry == "__main__":
@@ -3113,7 +3165,7 @@ with mock.patch("sys.exit", side_effect=exit_code):
 
     def test_audit_read_failure_does_not_fail_hold_or_status(self) -> None:
         missing_proc = self.scratch / "missing-proc"
-        for args in (["clear", "--holder", "holder", "--for", "app test",
+        for args in (["clear", "--holder", "holder", "--for", "app test", "--user-words", TEST_HOLD_USER_WORDS,
                       "--release-eta", "23:59", "--zone", "Etc/GMT+12"], ["status"]):
             output = io.StringIO()
             with redirect_stdout(output):

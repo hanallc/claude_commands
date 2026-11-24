@@ -21,7 +21,7 @@ import threading
 import uuid
 from collections import Counter
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, time as ClockTime, timezone
@@ -358,6 +358,12 @@ class Holder:
     key: str
     keep: tuple[ProcessIdentity, ...] = ()
     start_recorded: bool = True
+    user_words: str = ""
+
+    def display_reason(self) -> str:
+        if not self.user_words:
+            return self.purpose
+        return f"{self.purpose} (Nate's words: {json.dumps(self.user_words, ensure_ascii=False)})"
 
 
 @dataclass(frozen=True)
@@ -889,7 +895,9 @@ def read_holder(path: Path) -> Holder:
                             pid, start = entry.get("pid"), entry.get("start_time")
                             if isinstance(pid, int) and pid > 0 and isinstance(start, str) and start.isdecimal():
                                 keep.append(ProcessIdentity(pid, start))
-                return Holder(now, aware_instant(since), purpose, eta, path.name, tuple(keep))
+                words = fields.get("user_words")
+                return Holder(now, aware_instant(since), purpose, eta, path.name, tuple(keep),
+                              user_words=words if isinstance(words, str) and words.strip() else "")
     except (ValueError, TypeError):
         pass
     match = INSTANT.search(content)
@@ -1053,13 +1061,22 @@ class KeptRunRecord(TypedDict):
 
 HoldFileRecord = TypedDict("HoldFileRecord", {
     "holder": str, "since": str, "for": str, "release_eta": str, "keep": list[KeptRunRecord],
+    "user_words": str,
 })
+
+
+def require_user_words(user_words: str) -> str:
+    if not user_words.strip():
+        raise ValueError("a hold requires Nate's explicit request. Give his exact words with --user-words")
+    return user_words
 
 
 def write_hold(directory: Path, identity: HolderIdentity, purpose: str, request: ReleaseRequest, now: datetime,
                keep: Sequence[ProcessIdentity] = (), *,
+               user_words: str = "",
                before_publish: Callable[[], None] | None = None) -> str:
     """Keep a hold under its resolved key and display name."""
+    words = require_user_words(user_words)
     path = holder_path(directory, identity.key)
     temporary = directory.parent / f"{directory.name}.{path.name}.tmp"
     require_hold_write(directory, temporary)
@@ -1078,6 +1095,7 @@ def write_hold(directory: Path, identity: HolderIdentity, purpose: str, request:
     record: HoldFileRecord = {
         "holder": identity.name, "since": now.isoformat(), "for": purpose.strip(), "release_eta": release_eta,
         "keep": [{"pid": item.pid, "start_time": item.start_time} for item in dict.fromkeys((*previous, *keep))],
+        "user_words": words,
     }
     _ = temporary.write_text(json.dumps(record, ensure_ascii=False) + "\n")
     if before_publish is not None:
@@ -1694,18 +1712,22 @@ def open_cycle(now: datetime) -> HoldCycle:
 
 def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request: ReleaseRequest, now: datetime,
                keep: Sequence[ProcessIdentity] = (), *,
-               before_publish: Callable[[], None] | None = None) -> str:
+               user_words: str = "",
+               before_publish: Callable[[], None] | None = None,
+               after_publish: Callable[[Path], None] | None = None) -> str:
+    words = require_user_words(user_words)
     with release_lock(directory) as held:
         at = datetime.now(timezone.utc)
-        new_hold = not holder_path(directory, identity.key).is_file()
+        path = holder_path(directory, identity.key)
+        new_hold = not path.is_file()
         if isinstance(read_holders(directory), NoHolders):
             cycle = open_cycle(now)
         else:
             cycle = read_cycle_for_change(held)
-        notice = write_hold(directory, identity, purpose, request, now, keep,
+        notice = write_hold(directory, identity, purpose, request, now, keep, user_words=words,
                             before_publish=before_publish)
         if new_hold:
-            record_hold_event("began", read_holder(holder_path(directory, identity.key)), at)
+            record_hold_event("began", read_holder(path), at)
         if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
             if cycle["release_started_at"]:
                 cycle["release_started_at"] = ""
@@ -1714,6 +1736,8 @@ def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request:
             cycle["holders"][identity.key] = {"name": identity.name, "purpose": purpose,
                                               "since": now.isoformat(), "released_at": ""}
             save_cycle(cycle)
+        if after_publish is not None:
+            after_publish(path)
         return notice
 
 
@@ -2286,6 +2310,7 @@ def main(arguments: list[str]) -> int:
     clear = commands.add_parser("clear")
     _ = clear.add_argument("--holder")
     _ = clear.add_argument("--for", dest="purpose", required=True)
+    _ = clear.add_argument("--user-words", required=True, help="Nate's exact words requesting the hold")
     _ = clear.add_argument("--release-eta")
     _ = clear.add_argument("--zone")
     _ = clear.add_argument("target", nargs="?")
@@ -2294,6 +2319,7 @@ def main(arguments: list[str]) -> int:
     drain = commands.add_parser("drain")
     _ = drain.add_argument("--holder")
     _ = drain.add_argument("--for", dest="purpose", required=True)
+    _ = drain.add_argument("--user-words", required=True, help="Nate's exact words requesting the hold")
     _ = drain.add_argument("--release-eta")
     _ = drain.add_argument("--zone")
     _ = drain.add_argument("target", nargs="?")
@@ -2315,6 +2341,12 @@ def main(arguments: list[str]) -> int:
     options = parser.parse_args(arguments)
     try:
         action = cast(str, options.action)
+        user_words = ""
+        if action in {"clear", "drain"}:
+            try:
+                user_words = require_user_words(cast(str, options.user_words))
+            except ValueError as error:
+                commands.choices[action].error(str(error))
         if action in {"clear", "drain", "release"}:
             try:
                 target_name = command_target_name(cast(str | None, options.target))
@@ -2378,20 +2410,34 @@ def main(arguments: list[str]) -> int:
                 nonlocal publication_bound
                 publication_bound = time.clock_gettime_ns(time.CLOCK_BOOTTIME) * os.sysconf("SC_CLK_TCK") // 1_000_000_000
 
-            _ = start_hold(holder_directory(), identity, purpose, request, now, kept,
-                           before_publish=record_publication_bound)
-            kept = [run for run in hold_enforcer().drain_identities(proc_root, identity)
-                    if int(run.start_time) < publication_bound]
-            with release_lock():
-                if not holder_path(holder_directory(), identity.key).is_file():
-                    print("the hold was released; drain ends", flush=True)
-                    return 0
-                _ = write_hold(holder_directory(), identity, purpose, request, now, kept)
+            directory = holder_directory()
+            path = holder_path(directory, identity.key)
+            with ExitStack() as files:
+                published: list[TextIO] = []
+
+                def keep_published_file(record: Path) -> None:
+                    # Keep the inode from reuse until the second scan ends.
+                    published.append(files.enter_context(record.open()))
+
+                _ = start_hold(directory, identity, purpose, request, now, kept, user_words=user_words,
+                               before_publish=record_publication_bound, after_publish=keep_published_file)
+                kept = [run for run in hold_enforcer().drain_identities(proc_root, identity)
+                        if int(run.start_time) < publication_bound]
+                with release_lock(directory):
+                    try:
+                        current = path.stat()
+                    except FileNotFoundError:
+                        print("The hold was released. The drain ends.", flush=True)
+                        return 0
+                    if not os.path.samestat(os.fstat(published[0].fileno()), current):
+                        print("The holder has a newer hold. The drain ends.", flush=True)
+                        return 0
+                    _ = write_hold(directory, identity, purpose, request, now, kept, user_words=user_words)
+                    holder = read_holder(path)
             print(f"natedev is draining for {purpose}. Existing runs finish; new natedev work waits until release.",
                   flush=True)
             hold_enforcer().start()
-            return hold_enforcer().wait_for_kept_runs(
-                read_holder(holder_path(holder_directory(), identity.key)), proc_root)
+            return hold_enforcer().wait_for_kept_runs(holder, proc_root)
         elif action == "clear":
             request = release_request(cast(str | None, options.release_eta), cast(str | None, options.zone))
             identity = holder_of(cast(str | None, options.holder))
@@ -2408,7 +2454,7 @@ def main(arguments: list[str]) -> int:
                 hold_enforcer().record_clear_cutoff(identity, now)
 
             print(start_hold(holder_directory(), identity, cast(str, options.purpose), request,
-                             now, keep, before_publish=record_clear_cutoff))
+                             now, keep, user_words=user_words, before_publish=record_clear_cutoff))
             hold_enforcer().start()
             print_hold_audit(holder_directory(), proc_root, beginning=True)
             hold_enforcer().clear_queued_runs(proc_root)
@@ -2468,7 +2514,10 @@ def main(arguments: list[str]) -> int:
             else:
                 for holder in state.holders:
                     overdue = ", overdue" if release_overdue(holder.release, now) else ""
-                    print(f"{holder.name} since {holder.since.astimezone(user_zone()):%H:%M %Z}, for {holder.purpose} - release eta: {release_eta_text(holder.release)}{overdue} - {holder_state(holder, cast(Path, options.proc_root))}")
+                    since = holder.since.astimezone(user_zone()).strftime("%H:%M %Z")
+                    eta = release_eta_text(holder.release)
+                    state_text = holder_state(holder, cast(Path, options.proc_root))
+                    print(f"{holder.name} since {since}, for {holder.display_reason()} - release eta: {eta}{overdue} - {state_text}")
                     for run in live_kept_runs(holder, cast(Path, options.proc_root)):
                         print(f"  kept by {holder.name}: pid {run.pid}, start {run.start_time}")
                 for line in ci_placement_lines(cast(Path, options.proc_root)):

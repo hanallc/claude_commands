@@ -34,6 +34,7 @@ from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.production.cli_fixture import process_boundary_for_case
 
 _finish_writers: ContextVar[Callable[[], None] | None] = ContextVar("finish_hold_writers", default=None)
+TEST_HOLD_USER_WORDS = "Please hold builds for this test."
 
 
 def invoke_hold(arguments: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
