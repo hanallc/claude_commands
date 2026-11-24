@@ -124,9 +124,11 @@ with start_mac_gate(sys.argv[3], state, mode=SuiteMode.TARGETED, full=False,
 
 
 def queue_release(queue: placement_fixture.PlacementFixture, reservation: str, status: int,
-                  _timing: object) -> admission_wire.Ok | admission_wire.Refused:
+                  _timing: admission_wire.CleanupTiming,
+                  ending: admission_wire.ReleaseEnding) -> admission_wire.Ok | admission_wire.Refused:
     """Send a release to the fixture queue in place of the admission socket."""
-    ended, = queue.connect(admission_wire.ReleaseRequest(admission_client.request_id(), reservation, status)).replies()
+    ended, = queue.connect(admission_wire.ReleaseRequest(
+        admission_client.request_id(), reservation, status, ending)).replies()
     assert isinstance(ended, (admission_wire.Ok, admission_wire.Refused)), ended
     return ended
 
@@ -358,20 +360,20 @@ class MacGateSuitesTests(GateSuitesFixture):
     def test_a_gate_that_names_natedev_and_mac_linux_runs_on_natedev_after_the_handoff(self) -> None:
         status, errors, reply, released, local = self.run_handed_off_gate(("natedev", "mac-linux"))
         self.assertEqual((status, errors), (0, ""))
-        released.assert_called_once_with(reply.grant.reservation, 0, reply.grant.cleanup_timing)
+        released.assert_called_once_with(reply.grant.reservation, 0, reply.grant.cleanup_timing, "result")
         local.assert_called_once()
 
     def test_a_targeted_gate_that_names_only_natedev_runs_on_natedev_after_the_handoff(self) -> None:
         status, errors, reply, released, local = self.run_handed_off_gate(("natedev",), mode_flag="--affected")
         self.assertEqual((status, errors), (0, ""))
-        released.assert_called_once_with(reply.grant.reservation, 0, reply.grant.cleanup_timing)
+        released.assert_called_once_with(reply.grant.reservation, 0, reply.grant.cleanup_timing, "result")
         local.assert_called_once()
 
     def test_a_named_module_gate_ends_the_natedev_reservation_when_it_starts(self) -> None:
         status, errors, reply, released, local = self.run_handed_off_gate(
             ("natedev", "mac-linux"), "--module", "lib/test_first.py")
         self.assertEqual((status, errors), (0, ""))
-        released.assert_called_once_with(reply.grant.reservation, 0, reply.grant.cleanup_timing)
+        released.assert_called_once_with(reply.grant.reservation, 0, reply.grant.cleanup_timing, "result")
         local.assert_called_once()
 
     def test_a_mode_that_cannot_route_refuses_a_mac_linux_assignment_before_any_work(self) -> None:
@@ -464,7 +466,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                     self.assertEqual(gate.main(argv), 1)
         self.assertEqual(errors.getvalue(), "REFUSED: the fixture stops at the hold wait\n")
         self.assertEqual(waits, [placement.ClosedAssignment("local reservation has ended")])
-        released.assert_called_once_with(reply.grant.reservation, 0, reply.grant.cleanup_timing)
+        released.assert_called_once_with(reply.grant.reservation, 0, reply.grant.cleanup_timing, "result")
 
     def test_mac_linux_runs_the_whole_gate_when_enabled_and_placed(self) -> None:
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
@@ -850,7 +852,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                 self.assertEqual(os.environ["BUILDLOG_PLACEMENT_EPISODE"], local_grant.assignment.episode)
             self.assert_reservation_ended(local_grant)
         self.assertEqual(result.returncode, 0)
-        released.assert_called_once_with(local_grant.grant.reservation, 0, local_grant.grant.cleanup_timing)
+        released.assert_called_once_with(local_grant.grant.reservation, 0, local_grant.grant.cleanup_timing, "result")
         guest.assert_called_once()
         local.assert_called_once()
         settled.assert_called_once()
