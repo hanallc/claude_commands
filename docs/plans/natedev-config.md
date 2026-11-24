@@ -20,7 +20,7 @@ Add this rule to the plan: each config file has a blank line between its comment
 Key rule: steps 1, 2, 4, 7 and 8 change no key and can start. Steps 3, 5 and 6 rename or move keys. Each of them waits for nate's go typed in this unit's session.
 
 devtools of sdlc wrote P807. sdlc sends you the hand-over from devtools.
-Use Codex workers, not subagents (nate, 11-23 14:04 PST). claude_commands gate and test runs name --targets natedev,mac-linux until slice 1 is on main.
+Use Codex workers, not subagents (nate, 11-23 14:04 PST). A claude_commands `--affected` run gives no `--targets`; the default is natedev and mac-linux. A `gate.py --module` run names `--targets natedev` only (builds, 00:07 PST Nov 24).
 Send the showrunner the time for the first step and for the full item.
 
 Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; step 4 → Phases 4 and 5; step 3 → Phase 6; step 5 → Phase 7; step 6 → Phase 8; step 7 → Phases 10 to 13; step 8 → Phase 14. Phase 9 is an add-on from Phase 1 (showrunner, 11-23 17:52 PST). Phase 15 is an add-on from Phase 3 (showrunner, 11-23 19:16 PST).
@@ -53,7 +53,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
   - `scripts/lib/config_form_exceptions.py` — the typed allow lists of the form test.
 - **Test lanes:** `scripts/lib/test_conf.py`, `scripts/lib/test_conf_sh.py`, `scripts/lib/test_models_registry.py`, `scripts/lib/test_tune.py`, and the `test_*.py` beside each changed module. The new form test is `scripts/lib/test_config_form.py`.
 - **Build:** none.
-- **Test:** a queued run: `~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --repo <worktree> --commit HEAD --apply-uncommitted <worktree> --targets natedev,mac-linux -- ./scripts/lib/py scripts/production/gate.py --affected` (while iterating, add `--module <suite>/<test_module>.py` and name `--targets natedev`: the queue runs `--module` only on natedev). A direct run names single test functions only: `./scripts/lib/py -m unittest scripts.<suite>.<test_module>.<Class>.<test>`. `--targets` stays until the queue default is on main (nate, 11-23). Never start `targeted_test.py` by hand (builds, 11-23).
+- **Test:** a queued run: `~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --repo <worktree> --commit HEAD --apply-uncommitted <worktree> -- ./scripts/lib/py scripts/production/gate.py --affected`, with no `--targets` (the default is natedev and mac-linux). While iterating, add `--module <suite>/<test_module>.py` and name `--targets natedev`: the queue runs `--module` only on natedev. A direct run names single test functions only: `./scripts/lib/py -m unittest scripts.<suite>.<test_module>.<Class>.<test>`. The run target rule is from builds, 00:07 PST Nov 24. Never start `targeted_test.py` by hand (builds, 11-23).
 - **Lint:** `basedpyright` on each changed Python file: zero errors, zero warnings. `bash -n` on each changed shell file.
 - **Invariants:**
   - Values do not change. A key that moves keeps its value byte for byte (P807 rule 8).
@@ -535,7 +535,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - A host override limited by the base key's limit line: an add-on held for nate, because it adds a refusal.
 - A test of the offload doc wording: it would compare constants.
 
-### Phase 12 — AWS and review tool literals to config  · status: todo
+### Phase 12 — AWS and review tool literals to config  · status: done
 **Depends on:** Phase 3
 
 #### Work Order

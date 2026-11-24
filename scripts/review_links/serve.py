@@ -53,9 +53,6 @@ from scripts.whoami import usage_store
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
 # A restart passes the listening socket to the new process in this variable.
 LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
-# Allow page state and rows in addition to the existing words and image budget.
-MAX_NEW_ITEM_BODY = (4 * ((new_item_dialog.MAX_TOTAL_IMAGE_BYTES + 2) // 3) + 256 * 1024
-                     + new_item_dialog.MAX_PAGE_DATA_BYTES + new_item_dialog.MAX_BUG_PAGE_STATE_BYTES)
 QUEUE_MOVE_PATH = "/console/builds/queue-move"
 SCREENSHOT_RELOAD = "Reload the page to send the screenshot."
 STALE_NEW_ITEM_TOKEN = "The New item token expired. Try Send again."
@@ -140,6 +137,7 @@ def _compressed_review_shell(content: bytes) -> bytes:
 
 def page_screenshot(firefox: str, url: str, request: new_item_dialog.PageCaptureRequest) -> bytes:
     """Capture the console page in a clean Firefox profile."""
+    limit = new_item_dialog.read_stored_image_byte_limit()
     with tempfile.TemporaryDirectory(prefix="console-capture-") as folder:
         profile = Path(folder)
         output = profile / "page.png"
@@ -153,8 +151,8 @@ def page_screenshot(firefox: str, url: str, request: new_item_dialog.PageCapture
                             "--window-size", f"{request.width},{request.height}", "--screenshot", str(output), url],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=15)
         with output.open("rb") as stream:
-            image = stream.read(new_item_dialog.MAX_IMAGE_BYTES + 1)
-    if not image.startswith(b"\x89PNG\r\n\x1a\n") or len(image) > new_item_dialog.MAX_IMAGE_BYTES:
+            image = stream.read(limit + 1)
+    if not image.startswith(b"\x89PNG\r\n\x1a\n") or len(image) > limit:
         raise OSError("Firefox did not return a PNG within the attachment limit.")
     return image
 
@@ -162,7 +160,6 @@ def page_screenshot(firefox: str, url: str, request: new_item_dialog.PageCapture
 PAGE_CAPTURE_TTL_SECONDS = 600
 PAGE_CAPTURE_PREVIEW_SECONDS = 20
 PAGE_CAPTURE_FOLDER = ".review-link-page-captures"
-MAX_PAGE_CAPTURES = 8
 PAGE_ATTACHMENT_RETRY_SECONDS = 5
 
 
@@ -250,8 +247,9 @@ class PageCaptures:
                             state = PageCaptureToResume(new_item_dialog.read_page_capture(values.get("request")))
                         case "ready":
                             viewport = new_item_dialog.read_capture_viewport(values.get("viewport"))
-                            png = stream.read(new_item_dialog.MAX_IMAGE_BYTES + 1)
-                            if not png.startswith(b"\x89PNG\r\n\x1a\n") or len(png) > new_item_dialog.MAX_IMAGE_BYTES:
+                            limit = new_item_dialog.read_stored_image_byte_limit()
+                            png = stream.read(limit + 1)
+                            if not png.startswith(b"\x89PNG\r\n\x1a\n") or len(png) > limit:
                                 raise ValueError("Invalid saved screenshot.")
                             state = new_item_dialog.PageScreenshot(png, viewport)
                         case "filed" | "attached":
@@ -269,6 +267,8 @@ class PageCaptures:
                 if not isinstance(state, PageCaptureToResume):
                     capture.completed.set()
                 self._sessions[path.name] = capture
+            except conf.Unusable as error:
+                print(f"review-links page captures: {error}", file=sys.stderr)
             except (OSError, ValueError, RecursionError):
                 self._forget(path.name)
 
@@ -327,12 +327,12 @@ class PageCaptures:
         with self._lock:
             self._expire()
 
-    def start(self, request: new_item_dialog.PageCaptureRequest) -> str:
+    def start(self, request: new_item_dialog.PageCaptureRequest, *, limit: int) -> str:
         """Reserve space for a dialog capture."""
         key = secrets.token_hex(16)
-        return key if self.reserve(key, request) is CaptureReservation.STARTED else ""
+        return key if self.reserve(key, request, limit=limit) is CaptureReservation.STARTED else ""
 
-    def reserve(self, key: str, request: new_item_dialog.PageCaptureRequest) -> CaptureReservation:
+    def reserve(self, key: str, request: new_item_dialog.PageCaptureRequest, *, limit: int) -> CaptureReservation:
         """Reserve one worker for the key from the dialog."""
         with self._lock:
             self._expire()
@@ -340,7 +340,7 @@ class PageCaptures:
                 return CaptureReservation.PRESENT
             active = sum(1 for capture in self._sessions.values() if not isinstance(
                 capture.state, (new_item_dialog.FiledPageScreenshot, UnavailableBoundCapture)))
-            if active >= MAX_PAGE_CAPTURES:
+            if active >= limit:
                 return CaptureReservation.FULL
             capture = self._sessions[key] = PageCapture(time.time() + PAGE_CAPTURE_TTL_SECONDS, PageCapturePending(request))
             self._save(key, capture)
@@ -921,6 +921,8 @@ def builds_operator(peer: tuple[str, int]) -> bool:
 
 class ReviewLinksHandler(SimpleHTTPRequestHandler):
     """Serve regular files within the snapshot root, without directory indexes."""
+
+    close_connection: bool
 
     @override
     def send_head(self) -> BinaryIO | None:
@@ -1599,11 +1601,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(403, {"error": "Use the New item dialog on Review."})
             return
         try:
+            limits = new_item_dialog.read_new_item_limits()
+        except conf.Unusable as error:
+            print(f"review-links New item limits: {error}", file=sys.stderr)
+            self.close_connection = True
+            self.json_response(503, {"error": "New item limits are unavailable. Try Send again."})
+            return
+        try:
             lengths = self.headers.get_all("Content-Length", [])
             if len(lengths) != 1 or self.headers.get("Transfer-Encoding") or not re.fullmatch(r"[0-9]{1,10}", lengths[0]):
                 raise new_item_dialog.SubmissionError("Invalid New item request size.")
             size = int(lengths[0])
-            if not 0 < size <= MAX_NEW_ITEM_BODY:
+            if not 0 < size <= limits.body_read_bytes:
                 raise new_item_dialog.SubmissionError("Invalid New item request size.")
             body = self.rfile.read(size)
             if len(body) != size:
@@ -1626,9 +1635,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     or not browser_draft):
                 self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
                 return
+
+            def check_live_body_size() -> None:
+                if size > limits.body_bytes:
+                    raise new_item_dialog.SubmissionError("Invalid New item request size.")
+
+            if "page_capture" in fields or "discard_capture" in fields:
+                check_live_body_size()
             if "page_capture" in fields:
                 key = new_item_dialog.read_capture_key(fields["capture_key"]) if "capture_key" in fields else ""
-                self.new_item_capture(new_item_dialog.read_page_capture(fields["page_capture"]), key)
+                self.new_item_capture(new_item_dialog.read_page_capture(fields["page_capture"]), key,
+                                      limit=limits.active_captures)
                 return
             if "discard_capture" in fields:
                 server.page_captures.discard(new_item_dialog.read_capture_key(fields["discard_capture"]))
@@ -1642,7 +1659,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             def read_submission() -> new_item_dialog.NewItemRequest:
                 try:
                     item = new_item_dialog.read_request(
-                        fields, has_capture="capture_key" in fields and not has_capture_metadata)
+                        fields, has_capture="capture_key" in fields and not has_capture_metadata, limits=limits)
                 except new_item_dialog.SubmissionError:
                     raise
                 except (ValueError, RecursionError) as error:
@@ -1656,6 +1673,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 try:
                     if not valid_token:
                         raise new_item_dialog.SubmissionScreenshotExpired()
+                    check_live_body_size()
                     request = read_submission()
                     if ("capture_key" not in fields and request.page_state is not None
                             and request.page_state.include_screenshot):
@@ -1727,9 +1745,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                             screenshot = capture
                         return review_submissions.ListDraftFiling(item, screenshot, bool(preview_key))
 
-                    submission = review_submissions.ListDraftSend(list_draft_id, prepare_list_draft)
+                    submission = review_submissions.ListDraftSend(
+                        list_draft_id, prepare_list_draft, check_first_send=check_live_body_size)
                     created = server.review_cache.create_submission(
-                        submission, capture_intent=deferred, capture_target=capture_target,
+                        submission, limits=limits, capture_intent=deferred, capture_target=capture_target,
                         initial_delivery=initial_delivery)
                 else:
                     assert request is not None
@@ -1743,7 +1762,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     with (review_submissions.browser_draft_token(authorization)
                           if authorization is not None else nullcontext()):
                         created = server.review_cache.create_submission(
-                            request, screenshot=screenshot, capture_requested=capture_requested, refusal=refusal,
+                            request, limits=limits, screenshot=screenshot, capture_requested=capture_requested, refusal=refusal,
                             capture_intent=deferred, capture_target=capture_target, initial_delivery=initial_delivery)
                 saved = created.saved
                 details = saved.details
@@ -1758,7 +1777,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     server.page_captures.mark_filed(key, screenshot)
                 main_request = request if isinstance(request, new_item_dialog.NewItemRequest) and (
                     request.page == "list" or review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None) else None
-                has_saved_evidence = ((legacy_page_draft and key) or details.images or details.page_state is not None
+                has_saved_evidence = ((legacy_page_draft and key) or details.images
+                                      or isinstance(details.page_state, new_item_dialog.BugPageState)
                                       or (main_request is not None and main_request.page_state is not None)
                                       or isinstance(details.evidence, new_item_dialog.PageDataEvidence)
                                       or isinstance(details.capture_intent, new_item_dialog.DeferredCaptureIntent))
@@ -1824,14 +1844,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                             and review_submissions.PAGE_SCREENSHOT not in details.images):
                         server.attach_page_screenshot(saved, screenshot.png)
                 if saved.kind == new_item_dialog.SubmissionKind.BUG and (
-                        details.page_state is not None or (main_request is not None and main_request.page_state is not None)):
+                        isinstance(details.page_state, new_item_dialog.BugPageState)
+                        or (main_request is not None and main_request.page_state is not None)):
                     server.finish_bug_evidence(created, main_request, self.headers.get("Host", ""), screenshot)
             if not respond_first and not delivery_failed:
                 self.new_item_saved(response, saved.id, edited)
         finally:
             if isinstance(details.capture_intent, new_item_dialog.DeferredCaptureIntent):
                 server.process_committed_capture(new_item_dialog.read_submission_key(saved.key), details.capture_intent,
-                                                 attached=review_submissions.PAGE_SCREENSHOT in details.images)
+                                                 attached=review_submissions.PAGE_SCREENSHOT in details.images,
+                                                 limit=limits.active_captures)
 
     def new_item_saved(self, response: Mapping[str, object], identity: str, edited: bool) -> None:
         if edited:
@@ -1842,7 +1864,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         else:
             self.json_response(200, response)
 
-    def new_item_capture(self, capture: new_item_dialog.PageCaptureRequest, key: str) -> None:
+    def new_item_capture(self, capture: new_item_dialog.PageCaptureRequest, key: str, *, limit: int) -> None:
         """Start a screenshot only for a known page on this server."""
         server = cast(ReviewLinksServer, self.server)
         if not capture_page_key(server.root, capture.place):
@@ -1851,7 +1873,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if key:
             if len(key) <= 32:
                 raise new_item_dialog.SubmissionError("Use a key for this draft.")
-            if server.ensure_page_capture(key, capture):
+            if server.ensure_page_capture(key, capture, limit=limit):
                 self.json_response(202, {"capture_key": key})
             else:
                 self.json_response(503, {"error": "The page screenshot is unavailable."})
@@ -1860,7 +1882,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if not firefox or not server.capture_slot.acquire(blocking=False):
             self.json_response(503, {"error": "The page screenshot is unavailable."})
             return
-        key = server.page_captures.start(capture)
+        key = server.page_captures.start(capture, limit=limit)
         if not key:
             server.capture_slot.release()
             self.json_response(503, {"error": "The page screenshot is unavailable."})
@@ -1893,9 +1915,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             media = ATTACHMENT_MEDIA[image.file]
             if path.resolve() != path:
                 raise FileNotFoundError()
+            limit = new_item_dialog.read_stored_image_byte_limit()
             with path.open("rb") as stream:
-                content = stream.read(new_item_dialog.MAX_IMAGE_BYTES + 1)
-            if not 0 < len(content) <= new_item_dialog.MAX_IMAGE_BYTES:
+                content = stream.read(limit + 1)
+            if not 0 < len(content) <= limit:
                 raise FileNotFoundError()
         except (KeyError, OSError, ValueError):
             self.send_error(404)
@@ -2444,8 +2467,9 @@ class ReviewLinksServer(ThreadingHTTPServer):
     def recover_page_captures(self) -> None:
         """Recover capture work from committed native submissions."""
         try:
+            limit = conf.read("review_links").whole_upper_bound("page_capture.max_active")
             for target, intent, attached in review_submissions.committed_page_captures():
-                self.process_committed_capture(target, intent, attached=attached)
+                self.process_committed_capture(target, intent, attached=attached, limit=limit)
         except (OSError, ValueError, RuntimeError) as error:
             print(f"review-links capture recovery: {error}", file=sys.stderr)
         self.retry_page_attachments()
@@ -2505,12 +2529,12 @@ class ReviewLinksServer(ThreadingHTTPServer):
             return cache.linked_records()
         return list_page.LinkedReviewRead.FROM_DISK
 
-    def ensure_page_capture(self, key: str, request: new_item_dialog.PageCaptureRequest) -> bool:
+    def ensure_page_capture(self, key: str, request: new_item_dialog.PageCaptureRequest, *, limit: int) -> bool:
         """Start the capture once, even if Send arrives first."""
         firefox = shutil.which("firefox")
         if not firefox:
             return False
-        match self.page_captures.reserve(key, request):
+        match self.page_captures.reserve(key, request, limit=limit):
             case CaptureReservation.STARTED:
                 return self.launch_page_capture(key, firefox, request, queued=not self.capture_slot.acquire(blocking=False))
             case CaptureReservation.PRESENT:
@@ -2520,7 +2544,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
         return True
 
     def process_committed_capture(self, target: new_item_dialog.ScopedSubmissionKey,
-                                  intent: new_item_dialog.DeferredCaptureIntent, *, attached: bool) -> None:
+                                  intent: new_item_dialog.DeferredCaptureIntent, *, attached: bool, limit: int) -> None:
         """Process capture work after Send publishes and responds."""
         key, draft, request = intent.capture_key, intent.submitted_draft_id, intent.request
         try:
@@ -2532,7 +2556,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
             if attached and self.page_captures.target(key) is new_item_dialog.NoBoundCaptureTarget.UNBOUND:
                 image = review_submissions.read_attached_page_screenshot(target, request)
                 self.page_captures.restore_ready(key, target, image)
-            match self.page_captures.reserve(key, request):
+            match self.page_captures.reserve(key, request, limit=limit):
                 case CaptureReservation.STARTED:
                     _ = self.page_captures.bind(key, draft, target)
                     firefox = shutil.which("firefox")
@@ -2595,6 +2619,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
             image = new_item_dialog.PageScreenshot(png, new_item_dialog.PageViewport(capture.width, capture.height, capture.dark))
         except (OSError, subprocess.SubprocessError):
             pass
+        except conf.Unusable as error:
+            print(f"review-links page capture: {error}", file=sys.stderr)
         finally:
             self.capture_slot.release()
             saved = self.page_captures.complete(key, image)
@@ -2678,6 +2704,9 @@ class ReviewLinksServer(ThreadingHTTPServer):
             url = f"http://{self.bound_address}:{self.server_port}{capture.place}"
             image = page_screenshot(firefox, url, capture)
         except (OSError, subprocess.SubprocessError):
+            return False
+        except conf.Unusable as error:
+            print(f"review-links page capture: {error}", file=sys.stderr)
             return False
         finally:
             self.capture_slot.release()

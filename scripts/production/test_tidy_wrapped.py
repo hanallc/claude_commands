@@ -23,6 +23,7 @@ from urllib.parse import urlencode
 from scripts.lib import atomic_file, copy_record
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.staff_test_support import (
     fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment,
 )
@@ -95,6 +96,7 @@ class TidyWrappedTests(unittest.TestCase):
                               timeout=TEST_HANG_GUARD_SECS)
 
     def review_wrap_fixture(self) -> tuple[Path, staff.StaffRow, staff.StaffRow]:
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "review_links.conf")
         environment = {**source_environment(self.root / "sources"), "SHOWRUNNER_STATE_DIR": str(self.state),
                        "REVIEW_LINKS_ROOT": str(self.root / "review")}
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))

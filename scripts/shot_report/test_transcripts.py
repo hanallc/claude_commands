@@ -8,14 +8,19 @@ import pickle
 import subprocess
 import tempfile
 import unittest
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import AbstractContextManager, redirect_stderr
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
 from time import monotonic
 from typing import TypedDict, cast
 from unittest.mock import patch
 
 from scripts.lib.transcript_test_support import compressed_copy
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.shot_report import transcripts
 
 from scripts.shot_report.episodes import (
     EpisodeTimeline, NoObservablePath, NoneCited, OneCitedShot, SeveralCitedShots,
@@ -29,6 +34,12 @@ from scripts.shot_report.transcripts import (
 )
 from scripts.shot_report.transcripts import _classify, _claude_encoded, _parse_lines, _remember  # pyright: ignore[reportPrivateUsage]
 from scripts.shot_report.transcripts import CachedScanEvidence
+
+
+def setUpModule() -> None:
+    config = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory())) / "config"
+    _ = write_config_fixture(config / "shot_report.conf", "# whole: 1..\ntranscripts.parallel_scan_bytes=1000000000\n")
+    _ = unittest.enterModuleContext(cast(AbstractContextManager[object], patch.dict(os.environ, {"CONF_DIR": str(config)})))
 
 
 class ShellCases(TypedDict):
@@ -391,6 +402,33 @@ class TranscriptTest(unittest.TestCase):
                         actual = scan_calls(root / "claude", root / "codex", cache=mode)
                         self.assertEqual(list(actual), list(expected))
                         self.assertEqual(actual.tool_events, expected.tool_events)
+
+    def test_configured_parallel_scan_threshold_keeps_transcript_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            claude, codex = root / "claude", root / "codex"
+            _claude_case(claude / "session.jsonl", [("Bash", "python3 hana_shot.py shot", "saved /tmp/front.png")])
+            expected = scan_calls(claude, codex)
+            config = root / "config/shot_report.conf"
+            for threshold in (1, 0):
+                _ = write_config_fixture(config, f"# whole: 1..\ntranscripts.parallel_scan_bytes={threshold}\n")
+                cache = PersistentScanCache(root / f"scan-{threshold}.pickle")
+                for mode in (NO_SCAN_CACHE, cache):
+                    with (self.subTest(threshold=threshold, cache=type(mode).__name__),
+                          patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
+                          patch.object(transcripts, "ProcessPoolExecutor", wraps=ProcessPoolExecutor) as pool):
+                        errors = StringIO()
+                        with redirect_stderr(errors):
+                            actual = scan_calls(claude, codex, cache=mode)
+                        self.assertEqual(list(actual), list(expected))
+                        self.assertEqual(actual.tool_events, expected.tool_events)
+                        if threshold == 1:
+                            pool.assert_called_once()
+                            self.assertEqual(errors.getvalue(), "")
+                        else:
+                            pool.assert_not_called()
+                            self.assertIn("transcripts.parallel_scan_bytes", errors.getvalue())
+                            self.assertIn("no usable committed value", errors.getvalue())
 
     def test_version_seven_cache_keeps_citations_across_compression_without_parsing(self) -> None:
         for agent in ("claude", "codex"):

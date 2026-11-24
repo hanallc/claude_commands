@@ -450,7 +450,7 @@ class ListPageTests(unittest.TestCase):
         _ = (config / "statusline.conf").write_text(
             "role.showrunner=#a379fd\nrole.unit-director=#ffaf02\n"
             + "role.producer=#90fe42\nrole.worker=#ff0404\n")
-        _ = (config / "review_links.conf").write_text(
+        _ = write_config_fixture(config / "review_links.conf",
             "# whole: 1..20\ndelivery_tries=3\n# range: 0..300\ndelivery_pause_seconds=0\n"
             + "# whole: 1..20\nfeedback_rows=5\n# whole: 1..20\nreview_words_rows=4\n"
             + "# whole: 1..1440\nlater_soon_minutes=60\n"
@@ -1604,10 +1604,11 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                 class Probe(serve.ReviewLinksHandler):
                     @override
                     def html_response(self, status: int, content: bytes, *,
-                                      delivery_pending: bool | None = None) -> None:
+                                      delivery_pending: bool | None = None, builds_version: str = "") -> None:
                         if self.path in (list_page.PAGE_PATH + "?direct=1", list_page.PAGE_PATH + "?direct=1&short=1"):
                             content = content.replace(b'</body>', probe.encode() + b'</body>')
-                        super().html_response(status, content, delivery_pending=delivery_pending)
+                        super().html_response(status, content, delivery_pending=delivery_pending,
+                                              builds_version=builds_version)
 
                     @override
                     def review_response(self, content: bytes, content_type: str, prepared: bytes = b"", *,

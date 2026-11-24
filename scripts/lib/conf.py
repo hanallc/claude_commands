@@ -192,6 +192,21 @@ class ConfigRead:
                  recover_invalid: bool = True, use_file_limits: bool = True,
                  host_override: HostOverride = HostOverride.APPLIES
                  ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
+        def read_value(setting: Setting) -> Result:
+            if not use_file_limits:
+                return convert(setting.value)
+            if allow_blank and not setting.value and not setting.limit.startswith(_LIMIT_PREFIXES):
+                return convert("")
+            return _converted(setting, convert, self.source, key)
+
+        return self._resolve_setting(key, read_value, warn=warn, default=default, recover_invalid=recover_invalid,
+                                     use_file_limits=use_file_limits, host_override=host_override)
+
+    def _resolve_setting(self, key: str, convert: Callable[[Setting], Result], *, warn: bool,
+                         default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT,
+                         recover_invalid: bool = True, use_file_limits: bool = True,
+                         host_override: HostOverride
+                         ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
         bad = "<missing>"
 
         def read_key(settings: dict[str, Setting]) -> tuple[Result, str | None]:
@@ -203,11 +218,7 @@ class ConfigRead:
                     raise
                 return default, None
             bad = setting.value
-            if not use_file_limits:
-                return convert(setting.value), setting.value
-            if allow_blank and not setting.value and not setting.limit.startswith(_LIMIT_PREFIXES):
-                return convert(""), setting.value
-            return _converted(setting, convert, self.source, key), setting.value
+            return convert(setting), setting.value
 
         repository_allowed = False
         try:
@@ -286,6 +297,26 @@ class ConfigRead:
 
     def whole(self, key: str) -> int:
         return self.value(key, _whole)
+
+    def whole_upper_bound(self, key: str) -> int:
+        """Read the upper bound of the base key's whole-number limit."""
+        def read_bound(setting: Setting) -> int:
+            limit = setting.limit
+            if not limit.startswith("# whole:"):
+                raise ValueError("expected a # whole: limit")
+            low, high = _range_bounds(limit, "# whole:")
+            if not high:
+                raise ValueError("expected an upper bound")
+            upper = _whole(high)
+            if low and upper < _whole(low):
+                raise ValueError(f"invalid limit {limit}")
+            return upper
+
+        result = self._resolve_setting(key, read_bound, warn=True, use_file_limits=False,
+                                       host_override=HostOverride.IGNORED)
+        if isinstance(result, UnavailableValue):
+            raise Unusable(f"{result.reason}; no usable whole-number upper bound")
+        return result.value
 
     def words(self, key: str) -> tuple[str, ...]:
         return self.value(key, lambda value: tuple(value.split()))
@@ -443,6 +474,13 @@ def _setting(settings: dict[str, Setting], key: str, host_override: HostOverride
         raise _MissingKey("key is missing") from None
 
 
+def _range_bounds(limit: str, form: str) -> tuple[str, str]:
+    bounds = limit.removeprefix(form).split("..")
+    if len(bounds) != 2:
+        raise ValueError(f"invalid limit {limit}")
+    return bounds[0].strip(_CONF_WHITESPACE), bounds[1].strip(_CONF_WHITESPACE)
+
+
 def _limits(limit: str, value: str, source: Path, key: str) -> None:
     if limit.startswith("# agent:"):
         _agent_limit(limit.removeprefix("# agent:").strip(_CONF_WHITESPACE), value, source, key)
@@ -455,12 +493,9 @@ def _limits(limit: str, value: str, source: Path, key: str) -> None:
             raise ValueError(f"expected one of {', '.join(choices)}")
     elif limit.startswith(("# whole:", "# range:")):
         form = "# whole:" if limit.startswith("# whole:") else "# range:"
-        bounds = limit.removeprefix(form).split("..")
-        if len(bounds) != 2:
-            raise ValueError(f"invalid limit {limit}")
+        low, high = _range_bounds(limit, form)
         convert = _whole if form == "# whole:" else decimal
         number = convert(value)
-        low, high = (bound.strip(_CONF_WHITESPACE) for bound in bounds)
         if (low and number < convert(low)) or (high and number > convert(high)):
             raise ValueError(f"outside range {low}..{high}")
 

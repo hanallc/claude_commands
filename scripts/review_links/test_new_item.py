@@ -15,6 +15,7 @@ from unittest import mock
 
 from scripts.production import producer_map, staff, the_list
 from scripts.lib import main_publish
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.review_links import for_you, new_item, new_item_dialog, review_page, review_submissions
 
 ListItemCall = tuple[str, str, staff.StaffId, staff.StaffRow, producer_map.MappedProducer]
@@ -98,6 +99,7 @@ class ServerFixture(unittest.TestCase):
         self.folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.config = self.folder / "producer_map.conf"
         _ = self.config.write_text("# The producer of a showrunner or of a unit.\n", encoding="utf-8")
+        _ = write_config_fixture(self.folder / "review_links.conf")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.folder)})))
         self.server = FakeServer()
         _ = self.enterContext(mock.patch.object(new_item, "exchange", side_effect=self.server.exchange))

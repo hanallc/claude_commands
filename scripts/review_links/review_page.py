@@ -346,7 +346,7 @@ def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str
                 +'</p><strong>'+html.escape(evidence.tip_title)+'</strong><p>'+html.escape(evidence.tip_status)
                 +'</p><dl>'+tip+'</dl></section>')
     page_data = origin.bug_page_data
-    if origin.page_state is not None:
+    if isinstance(origin.page_state, new_item_dialog.BugPageState):
         screenshot = review_submissions.PAGE_SCREENSHOT
         title = origin.page_state.title or (page_data.title if page_data else origin.page)
         body += bug_page_state_box(key, origin.page_state, title, screenshot in images)
@@ -701,6 +701,7 @@ class ReviewSnapshotCache:
         self, request: (new_item_dialog.NewItemRequest | new_item_dialog.UnverifiedDraftRetry
                         | review_submissions.ListDraftSend), *,
         screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT,
+        limits: new_item_dialog.NewItemLimits | None = None,
         capture_requested: bool = False,
         refusal: new_item_dialog.SubmissionError | None = None,
         capture_intent: new_item_dialog.SubmissionCaptureIntent = new_item_dialog.NoDeferredCapture.ABSENT,
@@ -716,7 +717,7 @@ class ReviewSnapshotCache:
             remote_staff = not staff.is_owner()
             members = staff.snapshot()
             with staff.supplied_snapshot(members) if remote_staff else nullcontext():
-                saved = review_submissions.submit(request, members=members, screenshot=screenshot,
+                saved = review_submissions.submit(request, members=members, limits=limits, screenshot=screenshot,
                                                   capture_requested=capture_requested, refusal=refusal,
                                                   capture_intent=capture_intent, capture_target=capture_target,
                                                   initial_delivery=initial_delivery)

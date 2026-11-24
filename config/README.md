@@ -671,12 +671,27 @@ The text colors exceed 4.5:1 contrast against both backgrounds in their theme.
 The service publishes the repository page with an atomic write at each start.
 The service retains the last successful reading when the admission service does not answer.
 
+## screen_record.conf
+
+`recording.max_bytes` sets the ffmpeg file cap and the size that marks a clip as capped.
+`retention.max_directory_bytes` sets the size limit for stored clips before recording.
+
+## shot_report.conf
+
+`transcripts.parallel_scan_bytes` sets the total file size above which a transcript scan uses parallel workers.
+The scan runs in series if the setting is unusable.
+
+## style_ledger.conf
+
+`write.lock_attempts` sets the maximum number of attempts when ledger rows change before the write lock.
+
 ## test_times.conf
 
 `SLOW_TEST_S` sets the minimum gate test time retained in the build log.
 `NEXTEST_SLOW_TEST_S` sets the recording threshold for nextest rows.
 Failed tests, errors, and unexpected successes remain in the log at every duration.
 `TOP_RUNS` sets the number of recent gate runs used to rank each module by its median CPU time.
+`module_cost.output_replay_limit_bytes` limits the bytes replayed from each module cost output stream.
 Callers read these settings through `scripts/lib/conf.py` at each use.
 `CONF_DIR` selects a fixture folder for tests.
 

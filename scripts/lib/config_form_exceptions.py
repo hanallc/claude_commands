@@ -170,7 +170,6 @@ VARIABLE_EXCEPTIONS: tuple[VariableException, ...] = (
 )
 
 _PRODUCTION_BATCH = RemoveInPhase("Production and direct literals to config")
-_AWS_REVIEW_BATCH = RemoveInPhase("AWS and review tool literals to config")
 
 LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...] = (
     InternalLiteral(
@@ -196,10 +195,6 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
     InternalLiteral(
         "scripts/agents/pane_record.py", "ANCESTOR_LIMIT",
         "Bound the process walk that identifies a pane.",
-    ),
-    TunableLiteral(
-        "scripts/aws_target/gpu_size_trial.py", "NEXTEST_LOG_TAIL_BYTES", "1024 * 1024",
-        "cloud_gate", "gpu_size_trial.nextest_log_tail_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
     ),
     InternalLiteral(
         "scripts/aws_target/gpu_size_trial.py", "NEXTEST_LOG_TAIL_CHUNK_BYTES",
@@ -228,6 +223,10 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
     InternalLiteral(
         "scripts/aws_target/quota_requests.py", "MAX_REQUESTED_VCPUS",
         "Validate AWS response counts against both limits in cloud_gate.conf.",
+    ),
+    ExternalLiteral(
+        "scripts/build_hold/build_hold.py", "RELEASE_NOTICE_RUN_LIMIT",
+        "Linux limits one argv string to 128 KiB; 500 run lines keep one release notice under it.",
     ),
     InternalLiteral(
         "scripts/build_queue/admission_records.py", "FAMILY_LIMIT",
@@ -325,81 +324,17 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
         "scripts/production/worker_capacity.py", "STOP_ATTEMPTS", "2",
         "shutdown", "worker.stop_attempts", "# whole: 1..", _PRODUCTION_BATCH,
     ),
-    TunableLiteral(
-        "scripts/review_links/new_item_dialog.py", "MAX_WORDS_LENGTH", "40_000",
-        "review_links", "new_item.max_words_chars", "# whole: 1..", _AWS_REVIEW_BATCH,
-    ),
     InternalLiteral(
         "scripts/review_links/new_item_dialog.py", "MAX_REQUEST_ID_LENGTH",
         "Bound the request ID that identifies a submission.",
-    ),
-    TunableLiteral(
-        "scripts/review_links/new_item_dialog.py", "MAX_IMAGES", "4",
-        "review_links", "new_item.max_images", "# whole: 1..", _AWS_REVIEW_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/review_links/new_item_dialog.py", "MAX_IMAGE_BYTES", "5 * 1024 * 1024",
-        "review_links", "new_item.max_image_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/review_links/new_item_dialog.py", "MAX_TOTAL_IMAGE_BYTES", "12 * 1024 * 1024",
-        "review_links", "new_item.max_total_image_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/review_links/new_item_dialog.py", "MAX_PAGE_DATA_BYTES", "64 * 1024",
-        "review_links", "new_item.max_page_data_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/review_links/new_item_dialog.py", "MAX_PAGE_ROWS", "48",
-        "review_links", "new_item.max_page_rows", "# whole: 1..", _AWS_REVIEW_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/review_links/new_item_dialog.py", "MAX_PAGE_SECTIONS", "16",
-        "review_links", "new_item.max_page_sections", "# whole: 1..", _AWS_REVIEW_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/review_links/new_item_dialog.py", "MAX_PAGE_SECTION_ROWS", "128",
-        "review_links", "new_item.max_page_section_rows", "# whole: 1..", _AWS_REVIEW_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/review_links/new_item_dialog.py", "MAX_BUG_PAGE_STATE_BYTES", "512 * 1024",
-        "review_links", "new_item.max_bug_page_state_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/review_links/new_item_dialog.py", "MAX_PAGE_URL_LENGTH", "8192",
-        "review_links", "new_item.max_page_url_chars", "# whole: 1..", _AWS_REVIEW_BATCH,
     ),
     InternalLiteral(
         "scripts/review_links/reply_tokens.py", "KEY_BYTES",
         "Reply tokens use a fixed 32-byte key.",
     ),
-    TunableLiteral(
-        "scripts/review_links/serve.py", "MAX_PAGE_CAPTURES", "8",
-        "review_links", "page_capture.max_active", "# whole: 1..", _AWS_REVIEW_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/screen_record/screen_record.py", "MAX_BYTES", "500_000_000",
-        "screen_record", "recording.max_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/screen_record/screen_record.py", "DIRECTORY_LIMIT", "2_147_483_648",
-        "screen_record", "retention.max_directory_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/shot_report/transcripts.py", "PARALLEL_SCAN_BYTES", "1_000_000_000",
-        "shot_report", "transcripts.parallel_scan_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
-    ),
     InternalLiteral(
         "scripts/style/style_footprint.py", "FILE_CHANGED_LINE_LIMIT",
         "Check 5 of docs/style_production.md fixes the size threshold.",
-    ),
-    TunableLiteral(
-        "scripts/style/style_ledger.py", "LOCK_ATTEMPTS", "3",
-        "style_ledger", "write.lock_attempts", "# whole: 1..", _AWS_REVIEW_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/test_times/module_cost.py", "OUTPUT_REPLAY_LIMIT_BYTES", "1024 * 1024",
-        "test_times", "module_cost.output_replay_limit_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
     ),
     ExternalLiteral(
         "scripts/usage/collect.py", "MAX_SQLITE_INTEGER",

@@ -16,6 +16,7 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import investigation, staff
 from scripts.review_links import console_theme, new_item_dialog, page_frame, reply_tokens, review_submissions
 from scripts.review_links.test_review_submissions import OWNER, PNG, identify_fixture_image
@@ -1193,6 +1194,8 @@ class DialogFixture:
 
 
 def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: dict[int, bytes] | None = None) -> None:
+    for fixture in fixtures.values():
+        _ = write_config_fixture(fixture.root / "config/review_links.conf")
     if pages is None:
         pages = {width: fixture_page(width, photo=False) for width in fixtures}
     documents = pages
@@ -1340,6 +1343,12 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
 
 
 class NewItemDialogTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = write_config_fixture(configuration / "review_links.conf")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+
     def test_legacy_reply_token_has_the_same_digest_as_the_stored_proof(self) -> None:
         token = "a" * 43
         details = new_item_dialog.ReviewSubmission("fixture", "b" * 64, new_item_dialog.NoEvidence(), (),

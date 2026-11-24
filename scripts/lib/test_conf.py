@@ -762,11 +762,48 @@ conf_reads.record('disabled')
         for bounds, accepted, refused in (("..-2", "-2", "-1"), ("2..", "2", "1"),
                                           ("..", "-100", "1.5")):
             with self.subTest(bounds=bounds):
-                self.write(f"# whole: {bounds}\namount={accepted}\n")
+                self.write(f"# whole: {bounds}\namount={accepted}\n# whole: 1..10\namount.testhost=3\n")
                 conf.check("example", "amount", accepted)
                 self.assertEqual(conf.read("example").whole("amount"), int(accepted))
                 with self.assertRaises(conf.Unusable):
                     conf.check("example", "amount", refused)
+                settings = conf.read("example")
+                with mock.patch("socket.gethostname", return_value="testhost.example"):
+                    if bounds == "..-2":
+                        self.assertEqual(settings.whole_upper_bound("amount"), -2)
+                    else:
+                        reason = f"amount={accepted!r}: expected an upper bound"
+                        with self.assertRaisesRegex(conf.Unusable, re.escape(reason)):
+                            _ = settings.whole_upper_bound("amount")
+
+        self.history()
+        self.commit("# whole: 1..10\namount=3\n")
+        self.commit("# whole: 1..\namount=3\n")
+        repository = self.root / "repository-config/example.conf"
+        _ = write_config_fixture(repository, "# whole: 1..20\namount=4\n")
+        for case, live, repository_allowed, expected, warning_count in (
+            ("missing file uses repository", b"", True, 20, 0),
+            ("missing key uses repository", b"other=2\n", True, 20, 0),
+            ("missing file uses history", b"", False, 10, 1),
+            ("missing key uses history", b"other=2\n", False, 10, 1),
+            ("bad encoding uses history", b"amount=\xff\n", True, 10, 1),
+            ("wrong limit form uses history", b"# range: 1..8\namount=2\n", True, 10, 1),
+            ("open limit uses history", b"# whole: 1..\namount=2\n", True, 10, 1),
+            ("inverted limit uses history", b"# whole: 8..1\namount=2\n", True, 10, 1),
+        ):
+            with (self.subTest(case=case), mock.patch.dict(os.environ), redirect_stderr(io.StringIO()) as warning,
+                  mock.patch.object(conf, "directory", return_value=self.directory),
+                  mock.patch.object(conf, "_repository_path", return_value=repository)):
+                if repository_allowed:
+                    del os.environ["CONF_DIR"]
+                if live:
+                    _ = self.path.write_bytes(live)
+                else:
+                    self.path.unlink(missing_ok=True)
+                self.assertEqual(conf.read("example").whole_upper_bound("amount"), expected)
+                self.assertEqual(len(warning.getvalue().splitlines()), warning_count)
+                if warning_count:
+                    self.assertTrue(warning.getvalue().startswith(f"warning: {self.path}: amount="))
 
     def test_numeric_readers_refuse_the_wrong_limit_form_and_missing_limits(self) -> None:
         for reader, form in ((conf.ConfigRead.whole, "range"), (conf.ConfigRead.number, "whole"),
