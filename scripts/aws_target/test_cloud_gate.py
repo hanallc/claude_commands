@@ -10,6 +10,7 @@ from functools import cached_property, partial
 from hashlib import sha256
 from io import StringIO
 import base64
+import errno
 import faulthandler
 import fcntl
 import gzip
@@ -2014,14 +2015,18 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
             self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
         read = cloud_gate.read
 
-        def confirm_after_selection(path: Path) -> dict[str, object]:
-            if path == launch:
-                with mock.patch.object(cloud_gate, 'read', read):
-                    self.assertTrue(aws_trial.cleanup_trial(self.folder, worker))
-            return read(path)
+        disk_full = OSError(errno.ENOSPC, 'fixture disk full')
+        with ExitStack() as stack:
+            def confirm_after_selection(path: Path) -> dict[str, object]:
+                if path == launch:
+                    with mock.patch.object(cloud_gate, 'read', read):
+                        self.assertTrue(aws_trial.cleanup_trial(self.folder, worker))
+                    _ = stack.enter_context(mock.patch.object(ledger, 'write_text_atomic', side_effect=disk_full))
+                return read(path)
 
-        with mock.patch.object(cloud_gate, 'read', side_effect=confirm_after_selection):
-            self.assertTrue(aws_trial.cleanup_trial(self.folder, worker))
+            with mock.patch.object(cloud_gate, 'read', side_effect=confirm_after_selection):
+                self.assertTrue(aws_trial.cleanup_trial(self.folder, worker))
+            worker.terminate(attempt, 'i-' + attempt, ledger.GateWorkerOwner(101, 'fixture-start', str(self.folder)))
         self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
                          ledger.GateTerminated(int(self.now), 'i-' + attempt))
         calls = [command[command.index('--instance-ids') - 1] for command in self.fake.commands]

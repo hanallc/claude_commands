@@ -599,7 +599,7 @@ class GateWorker:
     def terminate(self, attempt: str, instance: str, owner: ledger.GateWorkerOwner, *,
                   result_seen_at: int | ledger.GateResultNotReceived = ledger.GATE_RESULT_NOT_RECEIVED) -> None:
         targets = ledger.GateCleanupTargets(self.box_region, (instance,))
-        with self.book.transaction() as state:
+        with self.book.gate_cleanup_transaction() as state:
             cleanup = ledger.mark_gate_cleanup(state, attempt, owner, targets, result_seen_at=result_seen_at)
         if isinstance(cleanup, ledger.GateTerminated):
             return
@@ -678,7 +678,7 @@ class GateWorker:
             current: list[GateTermination] = []
             superseded: list[str] = []
             try:
-                with self.book.transaction() as state:
+                with self.book.gate_cleanup_transaction() as state:
                     for box in boxes:
                         if box.targets.region != region:
                             continue
