@@ -820,11 +820,14 @@ The Mac retains its single slot per repository.
 The Terminal launcher enters the numbered copy before it checks its per-run token.
 Cleanup removes the token before `stop-checkout` scans the copy.
 The copy stays kept if `stop-checkout` cannot confirm it is clear.
-The queue sends the run token on SSH input after the smoke worker requests it.
-Shell startup, the test, and cleanup read stdin from `/dev/null`.
-It accepts the exit status from the final output line after it reads the ready line.
-It checks the run token in both lines.
-It keeps the run record if the final status is missing or invalid.
+The smoke worker removes any old `status` file from its run folder on the Mac.
+The file path is `~/.local/state/mac-queue/smoke/<episode>/status`.
+The test and cleanup read stdin from `/dev/null`.
+After cleanup, the worker reports readiness and keeps the copy until SSH input closes.
+The worker writes the exit code to a temporary sibling and renames it to `status`.
+After the first SSH call ends, the queue reads and removes the file through a separate SSH call.
+The queue uses the file only if the worker reported readiness.
+The queue returns 255 and keeps the run record if the status is missing or invalid.
 For an old scratch run, the callback confirms checkout clearance before it ends the task and removes both registry rows.
 The queue removes the old run record and receipt after successful cleanup.
 

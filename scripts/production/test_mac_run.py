@@ -70,11 +70,7 @@ remote=${@[-1]}
 placed_run=0
 if [[ $command == ssh && $remote == *smoke-work* ]]; then
     outer=("${(@Q)${(z)remote}}")
-    if [[ -n $MAC_RUN_REMOTE_HOME ]]; then
-        HOME=$MAC_RUN_REMOTE_HOME ZDOTDIR=$MAC_RUN_REMOTE_HOME exec "${outer[@]}"
-    fi
-    work=${outer[-1]#*$'\n'}
-    work=${work%%$' 3<&0 </dev/null |\n'*}
+    work=${outer[-1]}
     printf '%s\0' "$work" >> "$state/placed-commands"
     words=("${(@Q)${(z)work}}")
     lease=${words[-1]}
@@ -130,8 +126,13 @@ if [[ ${@[-1]} == true ]] && (( ${@[(Ie)-o]} )); then
     exit 255
 fi
 
+if [[ $remote == *mac_smoke_status=* ]]; then
+    outer=("${(@Q)${(z)remote}}")
+    exec "${outer[@]}"
+fi
+
 if (( placed_run )); then
-    exec "$MAC_RUN_PYTHON" -c '
+    MAC_PLACEMENT=${words[1]#MAC_PLACEMENT=} exec "$MAC_RUN_PYTHON" -c '
 import os, subprocess, sys
 from pathlib import Path
 state = Path(os.environ["MAC_RUN_STUB_STATE"])
@@ -143,9 +144,6 @@ if os.environ.get("MAC_RUN_CHECKOUT_CLEANUP"):
         "touch \"$MAC_RUN_STUB_STATE/build-started\"; cat \"$MAC_RUN_STUB_STATE/hold-build\"",
         "exec \"$MAC_RUN_CHECKOUT_CLEANUP\" cleanup-copy \"$1\" \"$MAC_RUN_LAUNCH\""], check=False)
     sys.exit(0)
-print("mac_smoke_request", flush=True)
-cookie = sys.stdin.readline().strip()
-assert cookie
 if os.environ.get("MAC_RUN_HOLD_BUILD") == "1":
     (state / "build-started").touch()
     _ = sys.stdin.read()
@@ -154,10 +152,13 @@ if os.environ.get("MAC_RUN_HOLD_BUILD") == "1":
     sys.exit(0)
 else:
     (state / "cleanup-called").touch()
-    print("mac_smoke_complete=" + cookie, flush=True)
+    episode = os.environ["MAC_PLACEMENT"].split("/")[0]
+    print("mac_smoke_ready=" + episode, flush=True)
     _ = sys.stdin.read()
     (state / "input-closed").touch()
-    print(f"mac_smoke_complete={cookie}:0", flush=True)
+    status_file = Path.home() / ".local/state/mac-queue/smoke" / episode / "status"
+    status_file.parent.mkdir(parents=True)
+    status_file.write_text("0" + chr(10))
 '
 fi
 if [[ $remote == *'rev-parse --verify HEAD'* ]]; then
@@ -522,67 +523,6 @@ class MacRunTests(unittest.TestCase):
         assigned = cast(dict[str, str], json.loads((self.stub_state / "assigned").read_text()))
         self.assertEqual(placed_arguments[0], "MAC_PLACEMENT=" + placed[placed.index("--episode") + 1]
                          + "/" + assigned["attempt"])
-
-    def test_shell_setup_reads_no_smoke_token(self) -> None:
-        remote_home = self.root / "remote-home"
-        installed = remote_home / ".claude/scripts"
-        for directory in ("lib", "copies", "mac_test", "production", "hana_instances"):
-            (installed / directory).mkdir(parents=True)
-        checkout = self.root / "numbered-copy"
-        checkout.mkdir()
-        keep = build_folders.copy_keep_file(checkout)
-        _ = (remote_home / ".zshenv").write_text("""\
-if IFS= read -r unexpected; then
-    print -u2 'Shell startup received smoke input'
-    exit 91
-fi
-print -r -- 'empty' >> "$MAC_RUN_STUB_STATE/startup-input"
-""")
-        shim = installed / "lib/py"
-        _ = shim.write_text(f'''#!/usr/bin/env bash
-if [[ -L $1 ]]; then
-    set -- "$(readlink "$1")" "${{@:2}}"
-fi
-exec {shlex.quote(str(SCRIPT.parents[1] / "lib/py"))} "$@"
-''')
-        shim.chmod(0o755)
-        _ = (installed / "copies/copies.py").write_text("""\
-import os, select, subprocess, sys
-from pathlib import Path
-assert (Path(os.environ["MAC_RUN_STUB_STATE"]) / "startup-input").read_text().splitlines() == ["empty", "empty"]
-assert not select.select([sys.stdin], [], [], 0)[0], "Smoke input arrived before the worker requested it"
-args = sys.argv[sys.argv.index("--") + 1:]
-raise SystemExit(subprocess.run(args, cwd=os.environ["MAC_RUN_CHECKOUT"], check=False).returncode)
-""")
-        (installed / "mac_test/mac_queue_run.py").symlink_to(SCRIPT.parents[1] / "mac_test/mac_queue_run.py")
-        _ = shutil.copy2(SCRIPT, installed / "production/mac_run.sh")
-        _ = (installed / "hana_instances/hana_instances.py").write_text('print("hana-instances: checkout clear")\n')
-        for name, source in {
-            "cargo": """\
-if IFS= read -r unexpected; then
-    exit 92
-fi
-print -r -- 'empty' >> "$MAC_RUN_STUB_STATE/cargo-input"
-""",
-            "open": 'print -r -- 142 > "$MAC_RUN_STATUS"\n',
-            "perl": "exit 142\n",
-            "pkill": "exit 0\n",
-        }.items():
-            self.write_executable(self.bin_directory / name, source)
-        status = self.root / "hana.status"
-        self.write_production_config(mac_run_status=str(status), mac_run_launch=str(self.root / "launch.command"),
-                                     mac_run_bundle=str(self.root / "remote.bundle"),
-                                     mac_run_example_log_prefix=str(self.root / "example-"),
-                                     mac_run_examples="hana_diegetic typography")
-        result = self.mac_run(extra={
-            "MAC_RUN_REMOTE_HOME": str(remote_home), "MAC_RUN_CHECKOUT": str(checkout),
-            "MAC_RUN_STATUS": str(status), "COPIES_KEEP_FILE": str(keep),
-        })
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual((self.stub_state / "cargo-input").read_text().splitlines(), ["empty", "empty"])
-        self.assertFalse(keep.exists())
-        self.assert_claim_released()
-
 
     def test_busy_mac_exits_nine_without_starting_build(self) -> None:
         claimed = self.state_command(

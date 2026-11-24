@@ -272,18 +272,7 @@ def shell_session() -> OwningSession | NoOwningSession:
 
 def smoke_session(placement: MacPlacement, command: list[str], ssh: contextlib.ExitStack) -> subprocess.Popen[str]:
     """Run the numbered copy with the SSH input open."""
-    work = (
-        'typeset +x smoke_cookie=""\n'
-        f"MAC_PLACEMENT={shlex.quote(placement_value(placement))} {shlex.join(command)} 3<&0 </dev/null |\n"
-        'while IFS= read -r line || [[ -n $line ]]; do\n'
-        '    if [[ $line == mac_smoke_complete=* && $line != *:* ]]; then\n'
-        '        smoke_cookie=${line#*=}\n'
-        '    fi\n'
-        '    builtin print -r -- "$line"\n'
-        'done\n'
-        'smoke_status=$pipestatus[1]\n'
-        '[[ -z $smoke_cookie ]] || builtin printf "mac_smoke_complete=%s:%s\\n" "$smoke_cookie" "$smoke_status"'
-    )
+    work = f"MAC_PLACEMENT={shlex.quote(placement_value(placement))} {shlex.join(command)}"
     process = ssh.enter_context(subprocess.Popen(
         ["ssh", *BATCH_MODE, placement.host, "/bin/zsh -f -c " + shlex.quote(work)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace"))
@@ -306,60 +295,62 @@ class SmokeMissingStatus:
     pass
 
 
-SmokeResult = SmokeNotReady | SmokeFinalStatus | SmokeMissingStatus
+@dataclass(frozen=True)
+class SmokeInvalidStatus:
+    pass
 
 
-SMOKE_TOKEN_REQUEST = "mac_smoke_request\n"
+SmokeResult = SmokeNotReady | SmokeFinalStatus | SmokeMissingStatus | SmokeInvalidStatus
 
 
-def read_smoke_ready(output: TextIO, input_stream: TextIO, cookie: str) -> bool:
-    ready = f"mac_smoke_complete={cookie}"
-    sent = False
+def smoke_status_path(episode: str) -> Path:
+    """Name the file inside this smoke run's folder on the Mac."""
+    if uuid.UUID(hex=episode).hex != episode:
+        raise ValueError("the Mac smoke run has an invalid episode")
+    return Path(".local/state/mac-queue/smoke") / episode / "status"
+
+
+def read_smoke_ready(output: TextIO, episode: str) -> bool:
+    ready = f"mac_smoke_ready={episode}\n"
     for line in output:
-        if line == SMOKE_TOKEN_REQUEST:
-            if not sent:
-                _ = input_stream.write(cookie + "\n")
-                input_stream.flush()
-                sent = True
-            continue
-        if line == ready + "\n":
-            if sent:
-                return True
-            continue
-        if not line.startswith(ready + ":"):
-            print(line, end="", flush=True)
+        if line == ready:
+            return True
+        print(line, end="", flush=True)
     return False
 
 
-def read_smoke_result(output: TextIO, cookie: str, *, ready: bool) -> SmokeResult:
-    """Accept a final status only after readiness and at the end of the log."""
+def read_smoke_result(placement: MacPlacement, *, ready: bool) -> SmokeResult:
+    """Read and remove the status file after the first SSH command ends."""
     if not ready:
         return SmokeNotReady()
-    prefix = f"mac_smoke_complete={cookie}:"
-    last = ""
-    for line in output:
-        if not line.startswith(prefix):
-            print(line, end="", flush=True)
-        last = line
-    if last.startswith(prefix) and last.endswith("\n"):
-        status = last[len(prefix):-1]
-        if 1 <= len(status) <= 3 and status.isascii() and status.isdecimal() and int(status) <= 255:
+    path = shlex.quote(str(smoke_status_path(placement.episode)))
+    command = (
+        f'status_file="$HOME"/{path}\n'
+        '[[ -f $status_file ]] || exit 1\n'
+        'builtin printf "mac_smoke_status="\n'
+        'cat -- "$status_file" && rm -f -- "$status_file" && rmdir -- "${status_file:h}"'
+    )
+    result = subprocess.run(
+        ["ssh", *BATCH_MODE, placement.host, "/bin/zsh -f -c " + shlex.quote(command)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+    if result.returncode or not result.stdout:
+        return SmokeMissingStatus()
+    prefix = b"mac_smoke_status="
+    if result.stdout.startswith(prefix) and result.stdout.endswith(b"\n"):
+        status = result.stdout[len(prefix):-1]
+        if 1 <= len(status) <= 3 and status.isdigit() and int(status) <= 255:
             return SmokeFinalStatus(int(status))
-    return SmokeMissingStatus()
+    return SmokeInvalidStatus()
 
 
 def run_smoke_work(work: str, cleanup: str) -> int:
     """Stop the smoke work on SSH EOF and settle the copy before its lease ends."""
     from scripts.lib.build_folders import COPY_KEEP_ENV
 
-    token_length = 32
-    print("\n" + SMOKE_TOKEN_REQUEST, end="", flush=True)
-    cookie_line = sys.stdin.buffer.readline(token_length + 1)
-    cookie = cookie_line[:-1]
-    if len(cookie) != token_length or not cookie_line.endswith(b"\n"):
-        return 1
-    if not all(byte in b"0123456789abcdef" for byte in cookie):
-        return 1
+    episode = os.environ["MAC_PLACEMENT"].partition("/")[0]
+    home = Path.home()
+    status_file = home / smoke_status_path(episode)
+    status_file.unlink(missing_ok=True)
     incoming = sys.stdin.fileno()
     if select.select([incoming], [], [], 0)[0]:
         return 1
@@ -370,7 +361,6 @@ def run_smoke_work(work: str, cleanup: str) -> int:
     descriptor, token = tempfile.mkstemp(prefix=".mac-smoke-launch-", dir=checkout)
     os.close(descriptor)
     environment["MAC_SMOKE_LAUNCH_TOKEN"] = token
-    home = Path.home()
     os.chdir(home)
     locks = tuple(int(number) for number in os.environ.get("COPIES_COMMAND_LEASE_FDS", "").split(",") if number)
     group = subprocess.Popen(["/bin/zsh", "-c", work], cwd=checkout, start_new_session=True,
@@ -404,8 +394,9 @@ def run_smoke_work(work: str, cleanup: str) -> int:
     if status < 0:
         status = 128 - status
     status = status or (cleared.returncode if cleared.returncode >= 0 else 128 - cleared.returncode)
-    print(f"\nmac_smoke_complete={cookie.decode('ascii')}", flush=True)
+    print(f"\nmac_smoke_ready={episode}", flush=True)
     _ = sys.stdin.buffer.read()
+    write_text_atomic(status_file, f"{status}\n", new_file_mode=0o600)
     return status
 
 
@@ -478,7 +469,6 @@ def run_attempt(
         callback_environment = dict(os.environ)
         cleanup_leased = False
         mac_run = args.is_mac_run
-        cookie = uuid.uuid4().hex if mac_run else ""
         smoke: subprocess.Popen[str] | None = None
         smoke_ready = False
         cleaned = False
@@ -550,7 +540,7 @@ def run_attempt(
                             smoke = smoke_session(placement, command, ssh)
                             remote.state = RemoteState.LIVE
                             assert smoke.stdin is not None and smoke.stdout is not None
-                            smoke_ready = read_smoke_ready(cast(TextIO, smoke.stdout), cast(TextIO, smoke.stdin), cookie)
+                            smoke_ready = read_smoke_ready(cast(TextIO, smoke.stdout), placement.episode)
                             if smoke_ready:
                                 status = 0
                         else:
@@ -588,14 +578,16 @@ def run_attempt(
                 assert smoke.stdin is not None and smoke.stdout is not None
                 try:
                     smoke.stdin.close()
-                    smoke_result = read_smoke_result(cast(TextIO, smoke.stdout), cookie, ready=smoke_ready)
+                    for line in cast(TextIO, smoke.stdout):
+                        print(line, end="", flush=True)
                     _ = smoke.wait()
+                    smoke_result = read_smoke_result(placement, ready=smoke_ready)
                     match smoke_result:
                         case SmokeFinalStatus(remote_status):
                             remote.state = RemoteState.EXITED
                             status = remote_status or status
                             safe = True
-                        case SmokeNotReady() | SmokeMissingStatus():
+                        case SmokeNotReady() | SmokeMissingStatus() | SmokeInvalidStatus():
                             detail = " because the ready line is missing" if isinstance(smoke_result, SmokeNotReady) else ""
                             print(f"mac queue: the Mac returned no valid final status{detail}", file=sys.stderr)
                             status = 255
