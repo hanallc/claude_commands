@@ -20,7 +20,7 @@ from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import memory_feed
 from scripts.disks import disks_page
 from scripts.lib import conf
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import copy_config_file_fixture, write_config_fixture
 from scripts.production import investigation, staff
 from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links.browser_test_support import firefox_probe_results, load_firefox
@@ -55,8 +55,8 @@ class ConsoleTests(unittest.TestCase):
         self.configuration = self.root / "config"
         self.configuration.mkdir()
         for stem in ("console", "review_links", "change_review"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf",
-                                self.configuration / f"{stem}.conf")
+            _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / f"config/{stem}.conf",
+                                         self.configuration / f"{stem}.conf")
         _ = write_config_fixture(self.configuration / "console.conf",
             "page.accounts.label=Accounts\npage.accounts.title=Accounts\npage.accounts.icon=users\n"
             + "page.accounts.url=python:scripts.review_links.accounts_page:page_url\n"

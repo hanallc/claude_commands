@@ -14,8 +14,8 @@ from scripts.lib.checkout_test_support import python_tool_source, write_python_t
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.copies.copies_test_support import copies_environment
-from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture,
-                                              write_pressure_reading)
+from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, config_environment, copy_config_fixture,
+                                              write_config_fixture, write_pressure_reading)
 from scripts.lib.build_folders_test_support import tool_folders
 
 import json
@@ -1188,7 +1188,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         scripts = claude / "scripts"
         scripts.mkdir(parents=True)
         _ = copy_helpers(self.home, *VERIFY_HELPERS)
-        _ = shutil.copytree(VERIFY.parent.parent.parent / "config", claude / "config")
+        _ = copy_config_fixture(VERIFY.parent.parent.parent / "config", claude / "config")
         log = scripts / "buildlog"
         # Keep the recorder's import interface while the command records fixture observations.
         record_source = (VERIFY.parent.parent / "buildlog/record.py").read_text()
