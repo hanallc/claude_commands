@@ -153,6 +153,8 @@ def status_action_args(*, remote: bool, rebuild: rebuild_row.RebuildAnswer | Non
                        else for_you.read_for_status_line(rebuild_row.DEFAULT_CONFIG, rebuild=rebuild).status_line_actions())
             names = rebuild_row.rebuild_names(actions.rebuild_machines)
             count = str(actions.other_count)
+            if actions.partial:
+                count += "+"
         except Exception:
             pass
     return ["--arg", "for_you", count, "--arg", "rebuild", names]
