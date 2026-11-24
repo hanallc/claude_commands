@@ -487,22 +487,30 @@ cd "$checkout"'''
 
 GUEST_CHECKOUT_IDENTITY = '''
 machine_id=$(cat /etc/machine-id)
-physical_home=$(cd -P -- "${checkout%/*}" && pwd -P)
+physical_home=$(CDPATH= cd -P -- "${checkout%/*}" >/dev/null && pwd -P)
 physical_checkout="${physical_home%/}/.claude"'''
 
 
-def read_guest_checkout(settings: GuestSettings) -> GuestCheckoutIdentity:
+def read_guest_checkout(settings: GuestSettings, repo: Path) -> GuestCheckoutIdentity:
     shell = guest_shell(settings) + GUEST_CHECKOUT_IDENTITY + '''
 printf 'checkout %s %s\\n' "$machine_id" "$physical_checkout"'''
-    reply = subprocess.run(settings.command(shell), stdin=subprocess.DEVNULL, capture_output=True,
-                           text=True, errors='replace', timeout=GUEST_REF_TIMEOUT_SECONDS, check=False,
-                           env=guest_ssh_environment())
-    if reply.returncode:
-        raise GuestUnavailable(reply.stderr.strip() or f'guest checkout probe exited {reply.returncode}')
-    identity = re.fullmatch(r'checkout ([0-9a-f]{32}) (/[^\n\0]*)\n', reply.stdout)
-    if identity is None:
-        raise GuestUnavailable('the guest checkout probe returned an invalid identity')
-    return GuestCheckoutIdentity(identity[1], identity[2])
+    diagnostics: list[str] = []
+    reason = 'the guest checkout probe returned an invalid identity'
+    for _ in range(2):
+        reply = subprocess.run(settings.command(shell), stdin=subprocess.DEVNULL, capture_output=True,
+                               timeout=GUEST_REF_TIMEOUT_SECONDS, check=False, env=guest_ssh_environment())
+        stdout = reply.stdout.decode(errors='replace')
+        identity = re.fullmatch(r'checkout ([0-9a-f]{32}) (/[^\r\n\0]*)\r?\n', stdout)
+        if not reply.returncode and identity is not None:
+            return GuestCheckoutIdentity(identity[1], identity[2])
+
+        stderr = reply.stderr.decode(errors='replace')
+        diagnostics.append(f'exit {reply.returncode} stdout={repr(stdout[:300])[:300]} '
+                           + f'stderr={repr(stderr[:300])[:300]}')
+        if reply.returncode:
+            reason = 'the guest checkout probe exited with an error'
+            break
+    raise GuestUnavailable(f'{reason} in natedev checkout {str(repo)!r}. ' + ' | '.join(diagnostics))
 
 
 def guest_checkout_guard(settings: GuestSettings) -> str:
@@ -2340,7 +2348,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         try:
             with mac_linux_reservation(repo, mode, gate_job) as claim:
                 try:
-                    identity = read_guest_checkout(settings)
+                    identity = read_guest_checkout(settings, repo)
                 except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
                     raise guest_probe_failure('checkout', error) from error
                 settings = replace(settings, checkout_identity=identity)

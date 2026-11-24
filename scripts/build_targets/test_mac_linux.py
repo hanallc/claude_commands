@@ -404,6 +404,135 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 '''
 
 
+class GuestCheckoutTests(unittest.TestCase):
+    settings: mac_linux.GuestSettings = mac_linux.GuestSettings(
+        ('unused-mac', 'unused-guest'), pwd.getpwuid(os.getuid()).pw_name, 1, 10, 5)
+    machine_id: str = 'a' * 32
+    repo: Path = Path('/natedev/verify checkout')
+
+    @contextmanager
+    def probe_replies(self, *replies: tuple[str, str, int]) -> Generator[Mock]:
+        commands: list[tuple[str, ...]] = []
+        for stdout, stderr, status in replies:
+            script = (f'import sys\nsys.stdout.buffer.write({stdout.encode()!r})\n'
+                      + f'sys.stderr.buffer.write({stderr.encode()!r})\nraise SystemExit({status})')
+            commands.append((sys.executable, '-I', '-S', '-c', script))
+        with patch.object(mac_linux.GuestSettings, 'command', side_effect=commands) as probe:
+            yield probe
+
+    def probe_reply(self, stdout: str, stderr: str = '') -> mac_linux.GuestCheckoutIdentity:
+        with self.probe_replies((stdout, stderr, 0), (stdout, stderr, 0)):
+            return mac_linux.read_guest_checkout(self.settings, self.repo)
+
+    def test_read_guest_checkout_quotes_probe_output_on_invalid_identity(self) -> None:
+        identity = f'checkout {self.machine_id} /guest/.claude\n'
+        stderr = 'fixture warning\r\nsecond line\n'
+        for stdout in ('shell notice\n' + identity, identity + 'shell notice\n',
+                       f'checkout {self.machine_id} relative/path\n', identity.replace('/guest', '/gu\0est'),
+                       identity.replace('/guest', '/gu\rest'), identity.replace(self.machine_id, 'A' * 32)):
+            with self.subTest(stdout=stdout):
+                with self.assertRaises(mac_linux.GuestUnavailable) as caught:
+                    _ = self.probe_reply(stdout, stderr)
+                self.assertIn('the guest checkout probe returned an invalid identity', str(caught.exception))
+                self.assertIn(f'natedev checkout {str(self.repo)!r}', str(caught.exception))
+                self.assertIn(f'exit 0 stdout={stdout!r} stderr={stderr!r}', str(caught.exception))
+
+    def test_read_guest_checkout_bounds_probe_diagnostics(self) -> None:
+        stdout, stderr = 'out\n' * 200, 'err\r' * 200
+        for status in (0, 255):
+            with self.subTest(status=status):
+                reply = (stdout, stderr, status)
+                with (self.probe_replies(reply, reply), self.assertRaises(mac_linux.GuestUnavailable) as caught):
+                    _ = mac_linux.read_guest_checkout(self.settings, self.repo)
+                details = str(caught.exception).split(' | ')
+                self.assertEqual(len(details), 1 if status else 2)
+                for diagnostic in details:
+                    bounded = f'exit {status} stdout={repr(stdout)[:300]} stderr={repr(stderr)[:300]}'
+                    self.assertTrue(diagnostic.endswith(bounded), diagnostic)
+
+    def test_read_guest_checkout_accepts_only_lf_and_crlf_line_endings(self) -> None:
+        path = '/guest home/.claude'
+        identity = f'checkout {self.machine_id} {path}'
+        expected = mac_linux.GuestCheckoutIdentity(self.machine_id, path)
+        self.assertEqual(self.probe_reply(identity + '\n'), expected)
+        self.assertEqual(self.probe_reply(identity + '\r\n'), expected)
+        with self.assertRaises(mac_linux.GuestUnavailable):
+            _ = self.probe_reply(identity + '\r')
+
+    def test_read_guest_checkout_retries_one_invalid_reply(self) -> None:
+        path = '/guest/.claude'
+        identity = f'checkout {self.machine_id} {path}\n'
+        with self.probe_replies(('shell notice\n' + identity, '', 0), (identity, '', 0)) as probe:
+            self.assertEqual(mac_linux.read_guest_checkout(self.settings, self.repo),
+                             mac_linux.GuestCheckoutIdentity(self.machine_id, path))
+        self.assertEqual(probe.call_count, 2)
+
+    def test_read_guest_checkout_reports_both_invalid_replies(self) -> None:
+        first = ('first bad reply\n', 'first warning\n', 0)
+        second = ('second bad reply\r\n', 'second warning\r\n', 0)
+        with (self.probe_replies(first, second) as probe, self.assertRaises(mac_linux.GuestUnavailable) as caught):
+            _ = mac_linux.read_guest_checkout(self.settings, self.repo)
+        self.assertEqual(probe.call_count, 2)
+        message = str(caught.exception)
+        self.assertIn(f'natedev checkout {str(self.repo)!r}', message)
+        first_stdout, first_stderr, _ = first
+        second_stdout, second_stderr, _ = second
+        self.assertTrue(message.endswith(f'exit 0 stdout={first_stdout!r} stderr={first_stderr!r} | '
+                                         + f'exit 0 stdout={second_stdout!r} stderr={second_stderr!r}'), message)
+
+    def test_read_guest_checkout_does_not_cache_a_failed_probe(self) -> None:
+        bad = ('unexpected reply\n', '', 0)
+        path = '/other-guest/.claude'
+        with self.probe_replies(bad, bad, (f'checkout {self.machine_id} {path}\n', '', 0)) as probe:
+            with self.assertRaises(mac_linux.GuestUnavailable):
+                _ = mac_linux.read_guest_checkout(self.settings, self.repo)
+            self.assertEqual(probe.call_count, 2)
+            self.assertEqual(mac_linux.read_guest_checkout(self.settings, self.repo),
+                             mac_linux.GuestCheckoutIdentity(self.machine_id, path))
+        self.assertEqual(probe.call_count, 3)
+
+    def test_read_guest_checkout_does_not_retry_nonzero_exit(self) -> None:
+        stdout = f'checkout {self.machine_id} /guest/.claude\n'
+        stderr = 'fixture connection closed\n'
+        with (self.probe_replies((stdout, stderr, 255)) as probe,
+              self.assertRaises(mac_linux.GuestUnavailable) as caught):
+            _ = mac_linux.read_guest_checkout(self.settings, self.repo)
+        probe.assert_called_once()
+        self.assertIn(f'exit 255 stdout={stdout!r} stderr={stderr!r}', str(caught.exception))
+
+    def test_read_guest_checkout_does_not_retry_a_timeout(self) -> None:
+        with (self.probe_replies(('', '', 0)) as probe,
+              patch.object(subprocess, 'run', side_effect=subprocess.TimeoutExpired('fixture', 1)) as run,
+              self.assertRaises(subprocess.TimeoutExpired)):
+            _ = mac_linux.read_guest_checkout(self.settings, self.repo)
+        probe.assert_called_once()
+        run.assert_called_once()
+
+    def test_guest_checkout_ignores_cd_output_in_the_probe_and_guard(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        home = root / 'physical home'
+        home.mkdir()
+        alias = root / 'linked-home'
+        alias.symlink_to(home, target_is_directory=True)
+        expected = mac_linux.GuestCheckoutIdentity(Path('/etc/machine-id').read_text().strip(),
+                                                   str(home.resolve() / '.claude'))
+        preamble = 'cd() { builtin cd "$@" && printf "cd output\\n"; }\n'
+
+        def local_bash(shell: str) -> tuple[str, ...]:
+            return ('bash', '-c', preamble + shell)
+
+        with patch.dict(os.environ, {'HOME': str(alias), 'CDPATH': str(root)}):
+            with (self.subTest(command='probe'),
+                  patch.object(mac_linux.GuestSettings, 'command', side_effect=local_bash)):
+                self.assertEqual(mac_linux.read_guest_checkout(self.settings, self.repo), expected)
+            with self.subTest(command='guard'):
+                settings = replace(self.settings, checkout_identity=expected)
+                reply = subprocess.run(local_bash(mac_linux.guest_checkout_guard(settings)), capture_output=True,
+                                       check=False, timeout=5)
+                self.assertEqual(reply.returncode, 0, reply.stderr)
+                self.assertEqual(reply.stdout, b'')
+
+
 class GuestEntryTests(unittest.TestCase):
     def test_gate_entry_gives_the_runner_the_request_and_the_run_copy_word(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -2017,6 +2146,21 @@ fi
             self.assertAlmostEqual(float(backoff.read_text()), now + 30, places=5)
             self.assertEqual(self.not_started(self.route()), 'guest unreachable during retry backoff')
         self.assert_guest_clean('probe')
+
+    def test_invalid_checkout_replies_record_backoff_before_launch_permission(self) -> None:
+        first = ('bash', '-c', 'printf "first bad reply\\n"')
+        second = ('bash', '-c', 'printf "second bad reply\\n"')
+        now = time.time()
+        with (patch.object(mac_linux, 'time', return_value=now),
+              patch.object(mac_linux.GuestSettings, 'command', side_effect=(first, second)) as probe):
+            reason = self.not_started(self.route())
+        self.assertEqual(probe.call_count, 2)
+        self.assertIn(f'natedev checkout {str(self.repo.resolve())!r}', reason)
+        self.assertIn('first bad reply', reason)
+        self.assertIn('second bad reply', reason)
+        self.assertEqual(self.consumed, ())
+        self.assertIs(eligibility.read_backoff(now + 29, mac_linux.TARGET), eligibility.ACTIVE_BACKOFF)
+        self.assert_guest_clean()
 
     def test_backoff_write_error_keeps_the_probe_failure(self) -> None:
         _ = (self.root / 'target-state/mac-linux').write_text('This file blocks the backoff directory.\n')
