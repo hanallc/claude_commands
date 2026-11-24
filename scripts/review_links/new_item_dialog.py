@@ -316,6 +316,7 @@ class ReviewSubmission:
     capture_intent: SubmissionCaptureIntent = NoDeferredCapture.ABSENT
     reply_token_nonce: str = ""
     legacy_reply_token: str = field(default="", repr=False, compare=False)
+    image_digests: tuple[tuple[str, str], ...] = field(default=(), kw_only=True)
 
     def __post_init__(self) -> None:
         if reply_tokens.valid(self.reply_token_sha256):
@@ -655,6 +656,10 @@ def stored_submission(details: ReviewSubmission) -> dict[str, object]:
     fields = cast(dict[str, object], asdict(details))
     fields["evidence"] = evidence_fields(details.evidence)
     _ = fields.pop("legacy_reply_token")
+    if details.image_digests:
+        fields["image_digests"] = dict(details.image_digests)
+    else:
+        _ = fields.pop("image_digests")
     if not details.reply_token_nonce:
         _ = fields.pop("reply_token_nonce")
     if details.page_state is None:
@@ -686,7 +691,13 @@ def _read_capture_intent(value: object) -> DeferredCaptureIntent:
 
 def read_submission(value: object) -> ReviewSubmission:
     row = _mapping(value, "Review submission")
-    images = _entries(row.get("images"), "Image references", MAX_IMAGES)
+    images = tuple(read_image_reference(image) for image in _entries(row.get("images"), "Image references", MAX_IMAGES))
+    image_ids = {image.id for image in images}
+    image_digests: list[tuple[str, str]] = []
+    for identity, digest in _mapping(row.get("image_digests", {}), "Image digests").items():
+        if identity not in image_ids or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise SubmissionError("Invalid saved image digest.")
+        image_digests.append((identity, digest))
     page = _text(row.get("page", ""), "Console page", 32, allow_empty=True)
     if page and page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Invalid page in Review submission.")
@@ -704,10 +715,11 @@ def read_submission(value: object) -> ReviewSubmission:
         raise SubmissionError("Invalid reply token nonce.")
     return ReviewSubmission(
         read_request_id(row.get("request_id")), _text(row.get("request_digest"), "Request digest", 64),
-        read_evidence(row.get("evidence")), tuple(read_image_reference(image) for image in images),
+        read_evidence(row.get("evidence")), images,
         digest, page, read_bug_page_state(row.get("page_state")), data,
         capture_intent=_read_capture_intent(row["capture_intent"]) if "capture_intent" in row else NoDeferredCapture.ABSENT,
         reply_token_nonce=nonce,
+        image_digests=tuple(image_digests),
         legacy_reply_token=legacy if isinstance(legacy, str) and reply_tokens.matches(digest, legacy) else "")
 
 
@@ -840,7 +852,10 @@ def render() -> str:
    <p data-send-disabled role="status" hidden></p>
    <p class="new-item-error" role="alert" hidden></p>
    <p id="new-item-saved" role="status" hidden></p>
-   <div data-send-controls><button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button></div>
+   <div data-send-controls>
+    <button type="button" data-later-draft hidden>Edit a separate draft</button>
+    <button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button>
+   </div>
    <div data-saved-controls hidden><button type="button" data-done aria-describedby="new-item-saved">Done</button></div>
   </footer>
 '''
@@ -963,6 +978,7 @@ STYLE = '''
  padding-top: 14px;
 }
 #review-new-item [data-replace-capture]:not([hidden]) { display: flex; gap: 8px; flex-wrap: wrap; }
+#review-new-item [data-send-controls] { flex-wrap: wrap; }
 #review-new-item footer button, #review-new-item [data-replace-capture] button {
  min-height: 38px; padding: 6px 14px; border: 1px solid var(--ink-3, #9a988f); border-radius: 8px;
  background: transparent; color: inherit;
@@ -1001,6 +1017,7 @@ SCRIPT = r'''(() => {
  const replaceCapture = sentDetails.querySelector('[data-replace-capture]');
  const renewButton = replaceCapture.querySelector('[data-renew-capture]');
  const omitButton = replaceCapture.querySelector('[data-omit-capture]');
+ const laterButton = dialog.querySelector('[data-later-draft]');
  const send = dialog.querySelector('[type="submit"]'), error = dialog.querySelector('.new-item-error');
  const scheduledHelp = dialog.querySelector('[data-scheduled-help]');
  const kindInputs = [...form.querySelectorAll('input[name="kind"]')];
@@ -1017,7 +1034,7 @@ SCRIPT = r'''(() => {
  // Null means the user must choose again. An empty string means the page has no default.
  let selectedRecipient = '';
  let pageOwner = '';
- let captureSession, pageContext, savedItem, laterDraft;
+ let captureSession, pageContext, savedItem, laterDraft, laterBase;
  let awaitingEarlierSend = false, submittedDraft;
  let draftDatabase;
 
@@ -1038,11 +1055,15 @@ SCRIPT = r'''(() => {
  }
 
  function isRecovering() {
-  return Boolean(submittedDraft && submittedDraft.mode !== 'live');
+  return submittedDraft?.mode === 'retry' || submittedDraft?.mode === 'screenshot-expired';
+ }
+
+ function isEditingLater() {
+  return submittedDraft?.mode === 'edit-later';
  }
 
  function pendingPayload() {
-  if (isRecovering() || submittedDraft?.payload.defer_capture) return submittedDraft.payload;
+  if (isRecovering()) return submittedDraft.payload;
  }
 
  function updateSend() {
@@ -1056,13 +1077,16 @@ SCRIPT = r'''(() => {
   for (const button of previews.querySelectorAll('button')) button.disabled = sending || locked;
   for (const fieldset of form.querySelectorAll('fieldset')) fieldset.disabled = sending || locked;
   send.textContent = sending ? 'Sending…' : recovering ? 'Retry' : 'Send';
+  laterButton.hidden = !submittedDraft || !['retry', 'edit-later'].includes(submittedDraft.mode);
+  laterButton.disabled = sending;
+  laterButton.textContent = isEditingLater() ? 'Return to Retry' : 'Edit a separate draft';
   sentDetails.hidden = scheduled;
   scheduledHelp.hidden = !scheduled || !!savedItem;
   words.placeholder = scheduled ? 'Enter the instruction, start time, and repeat.' : wordsPlaceholder;
   for (const input of kindInputs) {
    input.disabled = sending || locked || !!savedItem || (input.value === 'scheduled' && awaitingEarlierSend);
   }
-  send.disabled = !!savedItem || sending || !token || submittedDraft?.mode === 'screenshot-expired' ||
+  send.disabled = !!savedItem || sending || !token || isEditingLater() || submittedDraft?.mode === 'screenshot-expired' ||
     (scheduled && awaitingEarlierSend && !recovering) ||
     (!pendingPayload() && (!recipient || !words.value.trim() || words.value.length > words.maxLength));
   renewButton.disabled = sending || !token || !pageContext?.place;
@@ -1110,7 +1134,6 @@ SCRIPT = r'''(() => {
 
  function editDraft(event) {
   if (sending || isRecovering()) return;
-  if (submittedDraft) submittedDraft.edited = true;
   if (event?.target.name === 'kind') {
    showRecipients();
    showBugPage();
@@ -1189,7 +1212,7 @@ SCRIPT = r'''(() => {
   const data = await response.json().catch(() => null);
   if (!response.ok || !data) {
    const failure = new Error(data?.error || data?.reason || fallback);
-   failure.definiteRefusal = response.status >= 400 && response.status < 500 && data?.code !== 'draft_pending';
+   failure.definiteRefusal = response.status >= 400 && response.status < 500 && !['draft_pending', 'saved_attachment_missing'].includes(data?.code);
    failure.staleToken = response.status === 403 && data?.code === 'stale_token';
    failure.screenshotExpired = response.status === 409 && data?.code === 'screenshot_expired';
    if (response.status === 409 && data?.code === 'already_filed' &&
@@ -1390,12 +1413,15 @@ SCRIPT = r'''(() => {
  function showSentDetails() {
   const choosing = submittedDraft?.mode === 'screenshot-expired';
   replaceCapture.hidden = !choosing;
-  if (isRecovering()) {
+  const key = submittedDraft?.payload.capture_key;
+  const hasOriginalPreview = key && (captureSession?.capture.key === key || captureSession?.image?.key === key);
+  if (isRecovering() && (choosing || !hasOriginalPreview || !captureSession?.image)) {
    slot.hidden = true;
    expired.hidden = !choosing;
    fallback.hidden = choosing || !includePage.checked;
-   fallback.textContent = submittedDraft.payload.capture_key
-    ? 'Retry includes the screenshot.' : 'Retry sends the page data without a screenshot.';
+   fallback.textContent = submittedDraft.payload.defer_capture
+    ? 'The screenshot joins the saved item when ready.'
+    : key ? 'Retry includes the screenshot.' : 'Retry sends the page data without a screenshot.';
    updateSend();
    return;
   }
@@ -1414,7 +1440,7 @@ SCRIPT = r'''(() => {
  }
 
  function startCapture(renewed = false) {
-  if (isScheduled() || isRecovering() || (savedItem && !renewed) || !pageContext || !includePage.checked || !token || captureSession) return;
+  if (isScheduled() || isRecovering() || isEditingLater() || (savedItem && !renewed) || !pageContext || !includePage.checked || !token || captureSession) return;
   const {place, viewport} = pageContext;
   const item = pendingPayload();
   const capturing = item?.defer_capture;
@@ -1603,7 +1629,15 @@ SCRIPT = r'''(() => {
 
  function showSubmittedDraft(draft) {
   const original = draft.payload;
-  if (keepDraft && draft.edited && !isRecovering()) laterDraft = editSnapshot();
+  const editingLater = isEditingLater();
+  if (editingLater) {
+   const draft = editSnapshot();
+   const sameFiles = draft.files.length === laterBase.files.length &&
+    draft.files.every((file, index) => file === laterBase.files[index]);
+   if (draft.words !== laterBase.words || draft.kind !== laterBase.kind || draft.recipient !== laterBase.recipient ||
+       draft.include !== laterBase.include || !sameFiles) laterDraft = draft;
+   laterBase = undefined;
+  }
   draft.mode = draft.mode === 'screenshot-expired' ? 'screenshot-expired' : 'retry';
   draftId = original.request_id;
   ownerPage = original.page;
@@ -1618,18 +1652,35 @@ SCRIPT = r'''(() => {
    place: original.defer_capture?.place || (url ? url.pathname + url.search + url.hash : ''),
    viewport: original.defer_capture || original.page_state?.viewport || viewport()
   };
-  if (draft.edited || images.length !== (original.images?.length || 0)) {
+  if (editingLater || images.length !== (original.images?.length || 0)) {
    replaceImages((original.images || []).map(image => new File([
     Uint8Array.from(atob(image.base64_data), character => character.charCodeAt(0))
    ], 'Pasted image', {type: image.media_type})));
   }
-  draft.edited = false;
   if (!keepDraft || error.hidden || draft.mode === 'screenshot-expired') {
    setError(draft.mode === 'retry' ? 'Retry to confirm the save.' : '');
   }
+  showRecipients();
   showBugPage();
   showSentDetails();
  }
+
+ laterButton.addEventListener('click', () => {
+  if (isEditingLater()) {
+   showSubmittedDraft(submittedDraft);
+   setError('Retry to confirm the save.');
+   send.focus();
+   return;
+  }
+  if (!isRecovering()) return;
+  laterBase = editSnapshot();
+  submittedDraft.mode = 'edit-later';
+  discardCapture();
+  showLaterDraft();
+  setError('Confirm the earlier Send before you send these edits.');
+  showSentDetails();
+  words.focus();
+ });
 
  async function chooseScreenshot(renew) {
   if (submittedDraft?.mode !== 'screenshot-expired' || sending) return;
@@ -1678,6 +1729,7 @@ SCRIPT = r'''(() => {
  function close({sent = false} = {}) {
   if (!dialog.open || sending) return;
   const result = savedItem;
+  if (isEditingLater()) showSubmittedDraft(submittedDraft);
   discardCapture();
   opening.abort();
   dialog.close();
@@ -1799,21 +1851,24 @@ SCRIPT = r'''(() => {
   if (send.disabled) return;
   const onList = ownerPage === 'list';
   const hadEarlierSend = awaitingEarlierSend;
-  let saved, usedPreview = false;
+  let saved, usedPreview = false, posted = false;
   setError('');
   setSending(true);
   try {
    const item = await submissionPayload();
    if (submittedDraft?.payload !== item) {
     const recipientName = recipientChips.querySelector('input:checked')?.nextElementSibling.textContent;
-    const mode = item.kind === 'scheduled' ? 'retry' : 'live';
-    await storeSubmittedDraft({payload: item, mode, recipientName, pageContext, selectedKind: form.elements.kind.value,
+    await storeSubmittedDraft({payload: item, mode: 'live', recipientName, pageContext, selectedKind: form.elements.kind.value,
                                includeScreenshot: includePage.checked});
    }
    awaitingEarlierSend = true;
    storeListDraft();
    usedPreview = Boolean(item.capture_key && !item.defer_capture);
-   const sendItem = () => post({...item, token});
+   const sendItem = () => {
+    posted = true;
+    if (usedPreview && captureSession?.image?.key === item.capture_key) captureSession.sent = true;
+    return post({...item, token});
+   };
    let result;
    try {
     result = await sendItem();
@@ -1830,6 +1885,10 @@ SCRIPT = r'''(() => {
    }
    saved = result;
   } catch (failure) {
+   if (posted && !failure?.definiteRefusal && submittedDraft && !isRecovering()) {
+    showSubmittedDraft(submittedDraft);
+    try { await storeSubmittedDraft(submittedDraft); } catch (_) {}
+   }
    const chooseCapture = failure?.screenshotExpired && isRecovering();
    if (chooseCapture) {
     submittedDraft.mode = 'screenshot-expired';
@@ -1875,10 +1934,11 @@ SCRIPT = r'''(() => {
    setSending(false);
   }
   if (saved) {
-   const keepEdits = Boolean(laterDraft || submittedDraft?.edited);
+   const keepEdits = Boolean(laterDraft);
    discardCapture(usedPreview);
    finishDraft();
    showLaterDraft();
+   showSentDetails();
    if (keepEdits) {
     setError('Saved ' + saved.id + '. Your edits are still in the dialog.');
     dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));

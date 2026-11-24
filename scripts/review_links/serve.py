@@ -1791,6 +1791,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 # The dialog refreshes the token and retries the same draft.
                 self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
             return
+        except review_submissions.SavedAttachmentMissing as error:
+            if valid_token:
+                self.json_response(409, {"code": "saved_attachment_missing", "id": error.id, "error": str(error)})
+            else:
+                self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
+            return
         except review_submissions.DraftAlreadyFiled as error:
             self.new_item_saved({"id": error.id}, error.id, True)
             return

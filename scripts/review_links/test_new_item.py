@@ -175,6 +175,8 @@ class NewItemTests(unittest.TestCase):
         cases = (
             (NATEDEV, DWIGHT, first_words, "Start Fri Nov 27 13:00.", "",
              "2026-11-27T13:00:00-08:00", "", "Does not repeat"),
+            (NATEDEV, DWIGHT, "Check the queue?", monday, "",
+             "2026-11-30T09:00:00-08:00", "", "Does not repeat"),
             (NATEDEV, DWIGHT, words, monday, "Does not repeat.",
              "2026-11-30T09:00:00-08:00", "", "Does not repeat"),
             (NATEDEV, DWIGHT, words, monday, "Repeat Daily.",
@@ -251,6 +253,7 @@ class NewItemTests(unittest.TestCase):
                     self.assertEqual([target for target, _ in notices], expected)
                     for notice_target, text in notices:
                         self.assertIn(f"item {number}: {instruction}", text, notice_target)
+                        self.assertNotIn(instruction + ".", text, notice_target)
                     zone = ("America/New_York" if owner is BOB else "America/Los_Angeles")
                     if not start_words.endswith("+02:00."):
                         self.assertEqual(run.start.tzinfo, ZoneInfo(zone))

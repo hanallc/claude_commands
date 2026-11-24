@@ -18,13 +18,13 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time
 from enum import IntEnum, StrEnum
 from http.client import HTTPConnection, HTTPException
-from typing import Literal, Protocol, cast
+from typing import Literal, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib import conf, main_publish
 from scripts.lib.user_zone import user_zone
 from scripts.message import send_result
-from scripts.production import investigation, producer_map, repeat_rule, staff, the_list, unrouted_alert
+from scripts.production import investigation, producer_map, record_store, repeat_rule, staff, the_list, unrouted_alert
 from scripts.review_links import change_page, for_you, new_item_dialog, review_page, review_submissions
 
 SOURCE = "nate via /new_item"
@@ -489,25 +489,6 @@ def _checked_schedule(words: str) -> Scheduled:
         raise FilingRefused(FilingRefusal.INVALID_SCHEDULE, str(error)) from error
 
 
-class ListAssignmentNotice(Protocol):
-    def __call__(self, item: the_list.ListItem, previous_producer: staff.StaffId, keeper: staff.StaffId, *,
-                 caller: staff.StaffId) -> int: ...
-
-
-def _assignment_warning(item: the_list.ListItem, keeper: staff.StaffId, member: staff.StaffRow,
-                        members: staff.StaffSnapshot) -> str:
-    # Use the List CLI sender until the List exports its assignment notice function.
-    send = cast(ListAssignmentNotice, getattr(the_list, "_notify_producer_assignment"))
-    showrunner = producer_map.showrunner_of(member, members)
-    notice_item = replace(item, owner=showrunner.id) if showrunner.id != item.owner else item
-    try:
-        if send(notice_item, keeper, keeper, caller=keeper) == 0:
-            return ""
-    except (ValueError, OSError, staff.StaffRefused) as error:
-        print(f"new_item: {error}", file=sys.stderr)
-    return "At least one assignment notice failed. The List item is saved."
-
-
 class DirectScheduledFiling(StrEnum):
     CLI = "direct CLI filing"
 
@@ -532,14 +513,15 @@ class ScheduledFiling:
         run = self.schedule.first if isinstance(self.schedule, the_list.ScheduledSeries) else self.schedule
         return " ".join(run.words.split())
 
-    def save(self, draft: ScheduledDraftFiling | DirectScheduledFiling = DirectScheduledFiling.CLI) -> the_list.ListItem:
+    def save(self, draft: ScheduledDraftFiling | DirectScheduledFiling = DirectScheduledFiling.CLI, *,
+             number: int | the_list.NextNumber = the_list.NextNumber.AVAILABLE) -> the_list.ListItem:
         changes: the_list.ItemChanges = {
             "state": the_list.ItemState.SCHEDULED, "schedule": self.schedule, "producer": self.producer,
             "unit": self.member.name if self.member.kind == "unit" else "",
         }
         if isinstance(draft, ScheduledDraftFiling):
             changes["evidence"] = review_submissions.list_draft_evidence(draft.request_id, draft.claim)
-        return the_list.add(self.keeper, self.title, owner=self.member.id, source=SOURCE, changes=changes)
+        return the_list.add(self.keeper, self.title, owner=self.member.id, source=SOURCE, changes=changes, number=number)
 
 
 def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff.StaffSnapshot) -> ScheduledFiling:
@@ -566,40 +548,42 @@ def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff
     return ScheduledFiling(keeper, member, mapped.producer.id, schedule, assignment, schedule_lines(schedule))
 
 
-def _scheduled_draft_claim(filing: ScheduledFiling, digest: str,
-                           members: staff.StaffSnapshot) -> review_submissions.ListDraftClaim:
-    notices: list[review_submissions.ListAssignmentNotice] = []
-    warning = ""
-    if filing.producer != filing.keeper:
-        producer = members.by_id(filing.producer)
-        assert producer is not None
-        showrunner = producer_map.showrunner_of(filing.member, members)
-        if showrunner.kind == "showrunner":
-            owner_text = f"Its showrunner is {showrunner.name}."
-            notices.append(review_submissions.ListAssignmentNotice(
-                producer.id, "producer", f"{filing.title}. {owner_text}"))
-            notices.append(review_submissions.ListAssignmentNotice(
-                showrunner.id, "showrunner", f"{filing.title}. {producer.name} is its producer. "
-                + f"Send design questions on this item to {producer.name}."))
-        else:
-            notices.append(review_submissions.ListAssignmentNotice(
-                producer.id, "producer", f"{filing.title}. The item has no assigned showrunner."))
-            warning = "At least one assignment notice failed. The List item is saved."
-    return review_submissions.ListDraftClaim(digest, filing.keeper, filing.assignment, filing.readback,
-                                             tuple(notices), warning)
+def _assignment_notices(title: str, producer_id: staff.StaffId, keeper: staff.StaffId, member: staff.StaffRow,
+                        members: staff.StaffSnapshot) -> tuple[tuple[review_submissions.ListAssignmentNotice, ...], str]:
+    if producer_id == keeper:
+        return (), ""
+    producer = members.by_id(producer_id)
+    if producer is None:
+        return (), "At least one assignment notice failed. The List item is saved."
+    showrunner = producer_map.showrunner_of(member, members)
+    title = title if title.endswith((".", "?", "!")) else title + "."
+    if showrunner.kind == "showrunner":
+        notices = (
+            review_submissions.ListAssignmentNotice(producer.id, "producer", f"{title} Its showrunner is {showrunner.name}."),
+            review_submissions.ListAssignmentNotice(showrunner.id, "showrunner", f"{title} "
+                + f"Send design questions on this item to {producer.name}.", producer_name=producer.name),
+        )
+        return notices, ""
+    notice = review_submissions.ListAssignmentNotice(producer.id, "producer", f"{title} The item has no assigned showrunner.")
+    return (notice,), "At least one assignment notice failed. The List item is saved."
 
 
-def _deliver_scheduled_notice(notice: review_submissions.ListAssignmentNotice, identity: str, key: str) -> bool:
+def _assignment_message(notice: review_submissions.ListAssignmentNotice, identity: str) -> str:
     number = identity.removeprefix("L")
     if notice.role == "producer":
         launcher = cast(str, getattr(the_list, "_LAUNCHER"))
         options = cast(tuple[str, ...], getattr(the_list, "_PRODUCER_UPDATE_OPTIONS"))
         update = ", ".join(f"`{option}`" for option in options)
-        message = (f"You are the producer of item {number}: {notice.text}\n"
-                   + f"Run `{launcher} list --all --latest-status` to read it. "
-                   + f"Run `{launcher} update --id {identity}` to update it. Use any of {update}.")
-    else:
-        message = f"Item {number}: {notice.text}"
+        return (f"You are the producer of item {number}: {notice.text}\n"
+                + f"Run `{launcher} list --all --latest-status` to read it. "
+                + f"Run `{launcher} update --id {identity}` to update it. Use any of {update}.")
+    if notice.producer_name:
+        return f"{notice.producer_name} is the producer of item {number}: {notice.text}"
+    return f"Item {number}: {notice.text}"
+
+
+def _deliver_scheduled_notice(notice: review_submissions.ListAssignmentNotice, identity: str, key: str) -> bool:
+    message = _assignment_message(notice, identity)
     try:
         outcome, error = unrouted_alert.message_outcome(
             notice.recipient, "morty", message, "--recipient-kind", notice.role,
@@ -619,13 +603,32 @@ def submit_scheduled(request: new_item_dialog.ScheduledSubmission) -> review_sub
     digest = hashlib.sha256(json.dumps([request.page, request.recipient_id, request.words]).encode()).hexdigest()
 
     @contextmanager
-    def prepare() -> Generator[tuple[review_submissions.ListDraftClaim, Callable[[], the_list.ListItem]]]:
+    def prepare() -> Generator[tuple[review_submissions.ListDraftClaim, review_submissions.ListDraftWriter]]:
         with investigation.recipient_locks(request.recipient_id):
             members = staff.snapshot()
             owner = review_submissions.selected_recipient(request.recipient_id, members)
             filing = prepare_scheduled(owner, request.words, members)
-            claim = _scheduled_draft_claim(filing, digest, members)
-            yield claim, lambda: filing.save(ScheduledDraftFiling(request.request_id, claim))
+            notices, warning = _assignment_notices(filing.title, filing.producer, filing.keeper, owner, members)
+            claim = review_submissions.ListDraftClaim(digest, filing.keeper, filing.assignment, filing.readback, notices, warning)
+            draft = ScheduledDraftFiling(request.request_id, claim)
+
+            def save(claim_number: Callable[[int], None]) -> the_list.ListItem:
+                store_for = cast(Callable[[staff.StaffId], record_store.NumberedRecords], getattr(the_list, "_store"))
+                store = store_for(filing.keeper)
+                while True:
+                    with store.list_allocation():
+                        number = store.next_number()
+                        claim_number(number)
+                    try:
+                        return filing.save(draft, number=number)
+                    except the_list.ListError as error:
+                        # List reports a displaced number with these allocation errors.
+                        message = str(error)
+                        if (message != f"L{number}: the item already exists"
+                                and re.fullmatch(fr"L{number}: the next available number is L[1-9][0-9]*", message) is None):
+                            raise
+
+            yield claim, save
 
     return review_submissions.file_list_draft(request.request_id, digest, prepare=prepare,
                                               deliver=_deliver_scheduled_notice)
@@ -636,7 +639,20 @@ def scheduled_notice(item: the_list.ListItem, keeper: staff.StaffId, members: st
     member = members.by_id(staff.StaffId(item.owner))
     if member is None:
         return "The owner is unavailable. The List item is saved."
-    return _assignment_warning(item, keeper, member, members)
+    notices, warning = _assignment_notices(item.title, item.producer, keeper, member, members)
+    send = cast(Callable[[staff.StaffRow, str], None], getattr(the_list, "_send_assignment_notice"))
+    if warning and notices:
+        print(f"the_list: {item.id} was saved. The showrunner notice to {item.owner} failed. "
+              + "the owner has no current showrunner staff row", file=sys.stderr)
+    for notice in notices:
+        recipient = members.by_id(notice.recipient)
+        assert recipient is not None
+        try:
+            send(recipient, _assignment_message(notice, item.id))
+        except (ValueError, OSError, staff.StaffRefused, subprocess.SubprocessError) as error:
+            print(f"new_item: {item.id} notice to {notice.recipient}: {error}", file=sys.stderr)
+            warning = "At least one assignment notice failed. The List item is saved."
+    return warning
 
 
 class Arguments(argparse.Namespace):

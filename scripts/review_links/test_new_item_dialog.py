@@ -116,6 +116,14 @@ function untilError() {
   observer.observe(dialog, {attributes:true, subtree:true});
  });
 }
+function stageLaterEdit(edit) {
+ const later = dialog.querySelector('[data-later-draft]');
+ later.click();
+ check(!textarea.readOnly && send.disabled && later.textContent === 'Return to Retry',
+       'The separate draft is editable and waits for Retry.');
+ edit();
+ later.click();
+}
 async function confirmEarlierSend() {
  const saved = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
  send.click();
@@ -456,7 +464,7 @@ async function sendSaved() {
    await trySend();
    check(error.textContent === 'The Send response was lost.', 'The page Send files before the response is lost.');
    const ownerRequest = ownerPosts.findLast(post => post.request_id);
-   type('Keep this draft and its image after editing.');
+   stageLaterEdit(() => type('Keep this draft and its image after editing.'));
    dialog.querySelector('[data-cancel]').click();
    await open();
    await whenShown(noScreenshot);
@@ -481,8 +489,10 @@ async function sendSaved() {
    await trySend();
    check(error.textContent === 'The Send response was lost.', 'The first item files before the response is lost.');
    const firstDraft = ownerPosts.at(-1);
-   type('The replacement item.');
-   to()[1].click();
+   stageLaterEdit(() => {
+    type('The replacement item.');
+    to()[1].click();
+   });
    dialog.querySelector('[data-cancel]').click();
    await open();
    check(textarea.value === firstDraft.words && textarea.readOnly && send.textContent === 'Retry' &&
@@ -503,8 +513,10 @@ async function sendSaved() {
    dropPageReply = true;
    await trySend();
    check(error.textContent === 'The Send response was lost.', 'F013 files before the response is lost.');
-   type('Edit the draft.');
-   type(undoWords);
+   stageLaterEdit(() => {
+    type('Edit the draft.');
+    type(undoWords);
+   });
    check((await sendSaved()).detail.id === 'I6', 'F013 returns the first item after undo.');
 
    const pageTitle = main.querySelector('h1');
@@ -535,14 +547,21 @@ async function sendSaved() {
     failNextSend = true;
     await trySend();
     const first = ownerPosts.at(-1);
-    check(!checkbox.disabled, 'A failed Send keeps the screenshot choice available.');
-    checkbox.click();
-    dialog.querySelector('[name="kind"][value="bug"]').click();
-    await sendSaved();
+    check(checkbox.disabled && textarea.readOnly && send.textContent === 'Retry',
+          'An uncertain Send locks the submitted screenshot choice.');
+    stageLaterEdit(() => {
+     checkbox.click();
+     dialog.querySelector('[name="kind"][value="bug"]').click();
+    });
+    await confirmEarlierSend();
     const retry = ownerPosts.findLast(post => post.request_id);
-    check(retry.request_id === first.request_id && Boolean(retry.capture_key) === !checked &&
-          retry.kind === 'bug' && retry.evidence.kind === 'page-data',
-          'The retry uses the current kind and evidence for the same draft.');
+    check(JSON.stringify(retry) === JSON.stringify(first), 'Retry sends the submitted screenshot choice and kind.');
+    if (!checked) await whenShown(shot);
+    await sendSaved();
+    const next = ownerPosts.findLast(post => post.request_id);
+    check(next.request_id !== first.request_id && Boolean(next.capture_key) === !checked &&
+          next.kind === 'bug' && next.evidence.kind === 'page-data',
+          'The separate draft sends the changed kind and evidence under a new ID.');
    }
    restartScenario = true;
    const alreadyFiled = 'This item was already filed as I9. Any change after that Send was not sent.';
@@ -553,8 +572,8 @@ async function sendSaved() {
     failNextSend = true;
     await trySend();
     const first = ownerPosts.at(-1);
-    if (changed) type('Keep these edited words after a restart.');
-    const wordsBeforeRetry = textarea.value;
+    const wordsBeforeRetry = changed ? 'Keep these edited words after a restart.' : textarea.value;
+    if (changed) stageLaterEdit(() => type(wordsBeforeRetry));
     filedReply = true;
     await trySend();
     const retry = ownerPosts.findLast(post => post.request_id);
@@ -775,17 +794,21 @@ RESTORED_SEND_PROBE = r"""
  const http = window.fetch;
  let posted, expired = false;
  const captureChoice = ['renew', 'omit'].includes(scenario);
+ const deferred = ['reopen', 'open', 'unconfirmed'].includes(scenario);
  window.fetch = async (path, options) => {
   if (path.startsWith('/console/review/new-item?capture_key=')) {
    return new Response(Uint8Array.from(atob('__PNG__'), c => c.charCodeAt(0)), {headers:{'Content-Type':'image/png'}});
   }
   if (path === '/console/review/new-item' && options?.body) {
    const payload = JSON.parse(options.body);
-   if (payload.page_capture && scenario === 'reopen') return new Promise(() => {});
+   if (payload.page_capture && deferred) return new Promise(() => {});
    if (payload.page_capture && captureChoice) return Response.json({capture_key:payload.capture_key}, {status:202});
    if (payload.discard_capture) return Response.json({});
    if (payload.kind === kind) {
     posted = payload;
+    if (!original && scenario === 'unconfirmed') {
+     return Response.json({error:'The result is uncertain.'}, {status:503});
+    }
     if (!original) throw new TypeError('The Send response was lost.');
     if (captureChoice && !expired) {
      expired = true;
@@ -812,7 +835,7 @@ RESTORED_SEND_PROBE = r"""
   button.closest('[data-page-owner]').dataset.pageOwner = original ? 'review' : '__FIRST_PAGE__';
   button.click();
   const include = dialog.querySelector('[name="include_page"]');
-  const withCapture = captureChoice || scenario === 'reopen';
+  const withCapture = captureChoice || deferred;
   if (!original && !withCapture && include.checked) include.click();
   await ready(() => !!recipient('cargo-liner') && (!original || !send.disabled));
   if (!original) {
@@ -827,21 +850,26 @@ RESTORED_SEND_PROBE = r"""
     words.dispatchEvent(event);
    }
    if (captureChoice) await ready(() => !dialog.querySelector('[data-shot]').hidden);
-   if (scenario === 'reopen') await ready(() => !dialog.querySelector('[data-capture-slot]').hidden);
+   if (deferred) await ready(() => !dialog.querySelector('[data-capture-slot]').hidden);
    send.click();
    await ready(() => posted && send.form.getAttribute('aria-busy') === 'false');
-   if (kind === 'scheduled') {
-    check(send.textContent === 'Retry' && !send.disabled && words.readOnly &&
-          recipient('cargo-liner').matches(':disabled'), 'A lost Scheduled Send locks the submitted fields.');
-   }
-   if (scenario === 'reopen') {
-    check(Boolean(posted.defer_capture), 'The lost Bug Send includes a deferred screenshot.');
+   check(send.textContent === 'Retry' && !send.disabled && words.readOnly &&
+         recipient('cargo-liner').matches(':disabled'), 'An uncertain Send locks the submitted fields immediately.');
+   if (deferred) {
+    check(Boolean(posted.defer_capture), 'The uncertain Bug Send includes a deferred screenshot.');
     original = posted;
+    const later = dialog.querySelector('[data-later-draft]');
+    later.click();
+    check(!words.readOnly && send.disabled, 'The separate draft cannot send before Retry.');
     enter('Keep my later edit.');
     recipient('builds-staff').click();
-    dialog.querySelector('[data-cancel]').click();
-    button.click();
-    await ready(() => !!recipient('cargo-liner') && !send.disabled);
+    if (scenario === 'reopen') {
+     dialog.querySelector('[data-cancel]').click();
+     button.click();
+     await ready(() => !!recipient('cargo-liner') && !send.disabled);
+    } else {
+     later.click();
+    }
    } else if (!failures.length) {
     sessionStorage.setItem('test-restored-send', JSON.stringify(posted));
     location.reload();
@@ -886,7 +914,7 @@ RESTORED_SEND_PROBE = r"""
    } else {
     check(JSON.stringify(posted) === JSON.stringify(original), 'Retry sends the original payload.');
    }
-   if (scenario === 'reopen') {
+   if (deferred) {
     check(dialog.open && !words.readOnly && words.value === 'Keep my later edit.' && recipient('builds-staff').checked,
           'The later edits return in a separate draft after the receipt.');
     const next = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
@@ -1103,7 +1131,11 @@ const send = async () => {
    });
    const listFirst = wire.at(-1);
    const started = wire.length;
+   const later = dialog.querySelector('[data-later-draft]');
+   check(words.readOnly && listSend.textContent === 'Retry', 'A lost List response locks the submitted fields.');
+   later.click();
    type('Keep these edits for a new Send.');
+   later.click();
    const listSaved = new Promise(resolve =>
     document.addEventListener('review-item-saved', resolve, {once:true}));
    listSend.click();
@@ -1181,6 +1213,9 @@ window.fetch = async (path, options) => {
   if (item.discard_capture) return Response.json({});
   if (item.request_id) {
    posts.push(item);
+   if (item.defer_capture) {
+    return fetchHTTP(path, {...options, body:JSON.stringify({...item, capture_key: readyKey})});
+   }
    if (!restored && posts.length === 1) {
     if (reloadAfterSend) {
      const response = await fetchHTTP(path, options);
@@ -1223,24 +1258,26 @@ function enterWords(value) {
   }
   send.click();
   await waitFor(sendFinished);
-  check(editable() && !words.readOnly, 'A failed Send leaves the draft editable after recovery.');
   if (restored) {
+   check(editable() && !words.readOnly, 'A saved item response unlocks the draft.');
    check(posts.length === 1 && JSON.stringify(posts[0]) === JSON.stringify(restored),
          'Reload keeps the draft ID and sends the original payload.');
    check(error.textContent === 'This item was already filed as I1. Any change after that Send was not sent.',
          'The retry shows the first saved item ID.');
    check(!sessionStorage.getItem(draftKey), 'An already filed response clears the draft ID.');
   } else if (reloadAfterSend && !failures.length) {
+   check(words.readOnly && send.textContent === 'Retry', 'The lost reply locks Retry before reload.');
    sessionStorage.setItem(probeKey, JSON.stringify(posts[0]));
    location.reload();
    return;
   } else if (!reloadAfterSend && !failures.length) {
-   const preview = shot.href;
+   check(words.readOnly && send.textContent === 'Retry', 'The lost reply locks Retry before renewal.');
    send.click();
-   await waitFor(sendFinished);
-   check(error.textContent === 'The screenshot expired.' && editable(),
-         'The expired screenshot leaves the draft editable.');
-   await waitFor(() => !shot.hidden && shot.href !== preview && !send.disabled);
+   const renew = dialog.querySelector('[data-renew-capture]');
+   await waitFor(() => !renew.closest('[data-replace-capture]').hidden && !renew.disabled);
+   check(words.readOnly && send.disabled, 'Retry pauses until the user chooses how to handle the expired screenshot.');
+   renew.click();
+   await waitFor(() => !send.disabled);
    const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
    send.click();
    const event = await Promise.race([
@@ -1249,8 +1286,9 @@ function enterWords(value) {
    check(event.detail.id === 'I1' && !dialog.open, 'The replacement screenshot saves one item.');
    check(posts.length === 3 && posts.every(item => item.request_id === posts[0].request_id),
          'Each Send uses the same draft ID.');
-   check(posts[0].capture_key === firstKey && posts[1].capture_key === firstKey && posts[2].capture_key === readyKey,
-         'Send uses the new capture after the first one expires.');
+   check(posts[0].capture_key === firstKey && posts[1].capture_key === firstKey &&
+         posts[2].capture_key.startsWith(posts[0].request_id) && posts[2].capture_key !== firstKey &&
+         posts[2].defer_capture, 'Retry requests a new capture after the first one expires.');
    check(!sessionStorage.getItem(draftKey), 'A successful Send clears the draft ID.');
   }
  } catch (error) {
@@ -1644,6 +1682,8 @@ class NewItemDialogTests(unittest.TestCase):
                                            (412, "scheduled", "list", "reload"),
                                            (1152, "bug", "builds", "reload"),
                                            (1120, "bug", "builds", "reopen"),
+                                           (1100, "bug", "builds", "open"),
+                                           (1090, "bug", "builds", "unconfirmed"),
                                            (1080, "bug", "builds", "renew"),
                                            (1040, "bug", "builds", "omit")):
             probes[width] = (RESTORED_SEND_PROBE.replace("__FIRST_PAGE__", page).replace("__KIND__", kind)
@@ -1651,7 +1691,7 @@ class NewItemDialogTests(unittest.TestCase):
         fixtures = {width: DialogFixture(temporary / str(width), owner_reason=OWNER_REASON) for width in probes}
         capture_dialogs(temporary / "options.png", fixtures,
                         pages={width: fixture_page(width, photo=False, script=probe) for width, probe in probes.items()})
-        self.assertEqual({width: fixture.results for width, fixture in fixtures.items()}, {1440: [], 390: [], 1280: [], 412: [], 1152: [], 1120: [], 1080: [], 1040: []})
+        self.assertEqual({width: fixture.results for width, fixture in fixtures.items()}, {1440: [], 390: [], 1280: [], 412: [], 1152: [], 1120: [], 1100: [], 1090: [], 1080: [], 1040: []})
 
     def test_render_mounts_one_dialog_with_six_types(self) -> None:
         markup = new_item_dialog.render()
