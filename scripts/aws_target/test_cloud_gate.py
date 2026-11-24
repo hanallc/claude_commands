@@ -1377,6 +1377,28 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
                 booking = next(row for row in self.book.read_snapshot().gate_reservations if row.attempt == folder.name)
                 self.assertIsInstance(booking.state, ledger.GateAbsent)
 
+    def test_worker_with_earlier_permission_makes_no_aws_call_after_scaler_removal(self) -> None:
+        registry = self.root / 'build_targets.conf'
+        _ = write_config_fixture(registry, 'targets=natedev,claude-aws\nkind.claude-aws=scaler\n'
+            + 'settings.claude-aws=cloud_gate.conf\nenabled.claude-aws=on\n')
+        self.configure_gate('enabled=on\n')
+        claim = placement.ProviderClaimReference('scaler', 'claude-aws', WHOLE_MAC, 'claim', 'episode', 'attempt')
+        journal = ledger.GateDispatchJournal(self.root / 'journal.json')
+        binding = ledger.GateDispatchBinding(claim, journal.path, self.book.directory, registry, self.settings)
+        holder = placement.ClaimHolderIdentity('host', 1, '1')
+        journal.begin(binding, holder)
+        journal.register(claim, holder, self.folder)
+        _ = registry.write_text('targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n')
+        execute = mock.Mock(side_effect=AssertionError('An absent scaler must make no AWS call'))
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=execute),
+            self.book, self.settings, self.folder / 'progress', dispatch=journal.read())
+        outcome = worker.execute(self.folder, self.request, self.deployment)
+        self.assertEqual(outcome['status'], 'fallback')
+        self.assertIn('absent from the target registry', str(outcome['reason']))
+        execute.assert_not_called()
+        self.assertFalse((self.folder / 'launch.json').exists())
+        self.assertEqual(self.book.read_snapshot().gate_reservations, [])
+
     def test_unreachable_last_region_still_falls_back(self) -> None:
         def outage(arguments: list[str]) -> bool:
             return 'run-instances' in arguments

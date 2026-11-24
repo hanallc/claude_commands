@@ -898,6 +898,18 @@ Capacity refusals and unsupported types select the next variant.
 The canonical `scripts/production/gate.py` can run suites on an AWS queue assignment.
 The queue offers AWS only when the target registry lists an enabled scaler.
 The live registry has no AWS scaler entry.
+Keep the AWS machine off until `awsfix` is on main.
+
+The item 291 closure review found seven defects.
+
+1. A pending launch can block its own cleanup by using the last slot or the remaining budget.
+2. Assigned reconciliation can use the caller's AWS account.
+3. Placement can miss a booking during journal closure, and the worker can use different booking terms.
+4. The `{tree}` placeholder can prevent AWS admission for a canonical gate.
+5. An isolated launcher in another checkout can lose the gate job identity.
+6. A repeat can lose a saved verdict and reset the retry count.
+7. The Builds page omits current assigned AWS gates.
+
 The queue checks slot availability and daily spending room before it grants AWS.
 The budget check counts each current grant until the worker records its booking.
 The queue reads the registry again when it returns an unused grant or consumes launch permission.
@@ -924,7 +936,8 @@ A closed journal prevents a late worker from reserving spend or starting a box.
 Queue recovery makes no AWS call.
 A booking without a saved launch request can close while the journal lock excludes workers.
 A request has one current AWS dispatch across worktrees.
-A repeat can start cleanup of an earlier booking after the earlier caller ends.
+A repeat can start cleanup after the earlier caller ends if the queue grants a slot.
+An open booking can block the grant until the recovery fix lands.
 The repeat launches only after the ledger records the release and the journal confirms closure.
 The queue syncs the ledger directory before it records closure.
 If AWS might have accepted a launch, the worker keeps its first token until it confirms the result.
@@ -934,7 +947,8 @@ A confirmed Spot interruption before a final result starts another cloud attempt
 The retry uses the next choice in the saved launch order.
 The route keeps its cloud slot across retries.
 The route saves the interruption count and the next choice in the claim state before each retry.
-Resume restores both values, so a crash cannot reset the retry budget.
+Resume restores both values under the same claim.
+A repeat with a new claim can reset the retry budget until the recovery fix lands.
 Each retry gets a new attempt ID and passes the existing spend and attempt checks.
 The worker confirms cleanup of the interrupted box and reservation before the retry.
 The final fallback row includes the interruption count when retries or capacity choices end.

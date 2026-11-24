@@ -3653,10 +3653,12 @@ def _gate_invocation(arguments: Sequence[str], argv: Sequence[str] | None) -> tu
     """Keep the script or module that invoked the gate."""
     original = tuple(sys.orig_argv)
     program = parse_command_program(original, keep_path=True)
-    if isinstance(program, OtherCommand) and "-c" in original:
-        root_at = original.index("-c") + 2
-        root = str(Path(__file__).resolve().parents[2])
-        if original[root_at:root_at + 3] == (root, "file", sys.argv[0]):
+    bootstrap_at = len(original) - len(sys.argv) - 4
+    if (isinstance(program, OtherCommand) and bootstrap_at > 0
+            and original[bootstrap_at + 4:] == tuple(sys.argv)):
+        option, code, launcher_root, mode = original[bootstrap_at:bootstrap_at + 4]
+        if (option == "-c" and 'run_name="_shim_python_startup"' in code
+                and Path(launcher_root).is_absolute() and mode == "file"):
             return (str(Path(sys.argv[0]).absolute()), *arguments)
     if argv is not None and command_program(original) not in GATE_SCRIPTS:
         return ("scripts/production/gate.py", *arguments)
