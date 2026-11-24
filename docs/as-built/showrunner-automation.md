@@ -312,6 +312,16 @@ Each local Promote checkout must exist before the command pushes.
      It selects every changed path from the tip before the checkpoint merge through the prepared tip.
      Packages run through `verify.sh test`, and changed examples run through `verify.sh example`.
      Then each configured Merge tests command runs without a shell.
+     Gate commands run through `copies.py run --repo <checkout> --commit <tested tip> -- <command>`.
+     The gate uses the copy path for `--checkout` and the normal target selection.
+     The copy uses the local commit before the push.
+     AWS receives the commit in a Git bundle.
+     Admission uses `BUILDLOG_UNIT` or the calling session's unit from the staff record.
+     Before publication, check that the merge checkout and branch still point to the tested tip.
+     A moved tip cancels publication with status 77 and keeps the local changes.
+     The direct Git push uses the checked commit ID as the source.
+     A failed validation can roll back formatter commits from this run.
+     The branch reflog must show only updates from this validation since the checked commit.
      `parse_merge_tests` reads backticked entries before the first unquoted parenthesis and splits them with `shlex`.
      Each word expands home and environment variables.
      A remaining `$VAR` or an unavailable executable refuses the command by name.
@@ -319,6 +329,7 @@ Each local Promote checkout must exist before the command pushes.
      A command that cannot start has exit 127.
      A shrink runs no tests.
   7. *red*: run each failed command once alone.
+     A gate rerun uses `copies.py run` with the same commit.
      If every nextest `FAIL` row names a Known flaky test, run only those tests again.
      Use `verify.sh test [<package>] --filter <name>` per test, or `-E test(=<name>)` for other nextest commands.
      A pass alone continues with a LOG note in this case, or when Known flakes lists the package.
@@ -327,8 +338,11 @@ Each local Promote checkout must exist before the command pushes.
      A failure names the failed nextest tests or the failed gate modules (`--- <suite>/<module> exit=<rc> ---`).
      A module green on its rerun alone is not a red name. The rerun's names replace the first run's names when it names any.
   8. *base check*: merge the same `origin/main` into the restored tip, and run each red command there once.
+     A gate base check uses `copies.py run` with the prepared base commit.
      Limit the run to failed names with `--filter`, `-E test(=<name>)`, or the gate's `--module <suite>/<module>`.
-     The log gets `<name>_BASE_EXIT=<rc>` lines. The check then resets to the restored tip. A green checkpoint runs no base check.
+      The log gets `<name>_BASE_EXIT=<rc>` lines.
+      The check resets the checkout to the restored tip only if the checkout still points to the expected base commit.
+      A green checkpoint runs no base check.
      A name red on the base too goes to the merge director. The run prints `merge director: <commands and names> red on base <commit> without the checkpoint; repair the base, then run the checkpoint again; test log: <log>`.
      The unit gets a repair line only for its own red names.
      When every red name is also red on the base, the stop is `red: held`, and the unit's line tells it to send nothing.
