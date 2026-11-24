@@ -7,7 +7,7 @@ from types import MappingProxyType
 from typing import Literal
 
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, HAND_MADE as HAND_MADE, GateJobNotRecorded, StepJob as StepJob
-from scripts.build_queue.snapshot_codec import RAW_ID
+from scripts.build_queue.snapshot_codec import RAW_ID, public_queue_text
 from scripts.buildlog.parse import CARGO_BUILD_VERBS, CI_CARGO_FRONT, cargo_front_call
 from scripts.lib import conf
 from scripts.lib.proc_text import read_proc_text
@@ -21,7 +21,9 @@ class StepNames:
         return self.settings.get(f"names.{step}", step)
 
     def queue_name(self, step: str) -> str:
-        """Use the verb or its recognized display form."""
+        """Use the configured gate name or the recognized form of another step."""
+        if step == "gate":
+            return public_queue_text(self.shown(step)) or step
         display = QUEUE_STEP_DISPLAY.get(step, step.replace("-", " "))
         if step == "run":
             return display
@@ -43,7 +45,7 @@ class StepNames:
 
 @dataclass(frozen=True)
 class OtherCommand:
-    """The command is not a merge gate, a targeted test or verify.sh."""
+    """A command outside the gate and verify.sh routes."""
 
 
 OTHER_COMMAND = OtherCommand()
@@ -92,7 +94,7 @@ VERIFY_VERBS = frozenset({"check", "test", "lint", "doc", "build", "example", "f
 RECORDED_VERBS = VERIFY_VERBS | CARGO_BUILD_VERBS | {"cargo", "fmt", "sweep", "taplo", "rust-analyzer",
     "targeted-test", "merge-gate", "gate", "integrate", "test-all", "test-modules",
     "test-affected", "test-nightly", "fast-track", "toolchain-trial", "promote", HAND_MADE.step}
-QUEUE_STEP_DISPLAY = {"run": "cargo run", "gate": "merge gate", "test-modules": "test named", HAND_MADE.step: "hand made"}
+QUEUE_STEP_DISPLAY = {"run": "cargo run", "test-modules": "test named", HAND_MADE.step: "hand made"}
 MERGE_GATE_PROGRAMS = ("gate.py", "merge_gate.py")
 GATE_PROGRAMS = {
     "gate": MERGE_GATE_PROGRAMS,
@@ -274,7 +276,7 @@ def gate_job_from_process(step: str, process: Path, *, start_time: str = "") -> 
 
 
 def _test_job(arguments: Sequence[str], *, affected: bool) -> StepJob:
-    """A merge gate tests every module; a targeted test tests the affected modules unless --full."""
+    """A gate test runs all modules by default. Targeted tests select affected modules unless --full is set."""
     modules = _count(arguments, "--module")
     if modules:
         return StepJob("test-modules", modules=modules)
@@ -282,7 +284,7 @@ def _test_job(arguments: Sequence[str], *, affected: bool) -> StepJob:
 
 
 def command_job(argv: Sequence[str]) -> StepJob | OtherCommand:
-    """Name the job of a merge gate, targeted test or verify.sh command."""
+    """Name the job of a gate or verify.sh command."""
     program = parse_command_program(argv)
     if isinstance(program, OtherCommand):
         return program

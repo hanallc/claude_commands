@@ -1,4 +1,4 @@
-# Merge gate and test speed
+# Gate and test speed
 
 Code reviews now use the unit's persistent `review` and `review2` workers
 through `assign.sh --role review`. Any pool maintenance paths described below
@@ -6,7 +6,7 @@ remain only for the pending archive cleanup; they do not dispatch new reviews.
 
 ## Failed module output
 
-Each merge gate record keeps a gzip log for each failed module attempt.
+Each gate record keeps a gzip log for each failed module attempt.
 The first failure keeps its log when the retry passes.
 Passing attempts and attempts stopped for a hold have an empty `log` field.
 The gate removes each temporary job folder after reading its output.
@@ -120,11 +120,19 @@ The queue's guestkeep change will retain the Mac claim until a later proof.
 If the guest starts no test run, the route returns `GuestNotStarted`.
 This covers a Mac block or busy Mac claim, a refused or unavailable launch permission, an active retry backoff, a failed guest probe and a failed arm step.
 It also covers a guest run that fails before the runner writes the `mac-linux run start` line, which comes before the gate starts its suites.
+The gate writes a claim failure to `<assignment>.claim-failure`.
 The gate prints `Mac Linux guest took no run: <cause>` and exits with status 79.
+In merge mode, it undoes the merge and reports the rollback.
 Status 80 identifies an unknown result after a guest could have started tests.
-A direct gate or `copies.py gate-step` makes one placement request per run.
+A direct gate or `copies.py gate-step` places the run once.
 Checkpoint and bump stop after status 79 or 80.
 `copies.py gate-step` preserves both statuses if cancellation fails and prints the cleanup error on standard error.
+When `copies.py run` owns placement, it reports the claim failure to the queue on status 79 and requests placement again.
+The queue accepts a claim failure after launch permission was used if a new process read confirms the gate ended.
+The caller writes the new assignment to the same file and runs the gate on the assigned machine.
+A 180-second delay applies to another attempt on the same guest. A free named machine can take the run during that delay.
+A second decline excludes the guest for the rest of the run.
+If placement fails, the caller reports `Gate placement blocked`.
 A confirmed test failure gives status 1.
 Checkpoint and bump gates use `copies.py gate-step` when they have placement targets.
 A claude gate requests every enabled target that the fixed placement rules permit when the caller gives no targets.
@@ -380,7 +388,7 @@ File tokens can occur in a test or its imported test-support modules.
 A changed shell script (a non-Python file under `scripts/` that ends in `.sh` or has an execute bit) also selects the tests that name any script that calls it, directly or through other scripts.
 A script calls another when it names its path by the test rule, by a token that ends in `/` and the full path, or by a token that ends in `/` and the name in the same folder (`"$SCRIPT_DIR/board.sh"`).
 Python files are not callers in this rule.
-Merge gates and nightly runs use all modules.
+The integrate, test all, and test nightly jobs use all modules.
 Merge and tests-only runs skip basedpyright.
 The daily `--nightly` run checks all of `scripts`, including hooks.
 The queue reservation and the runner governor use separate configuration keys.
@@ -426,7 +434,7 @@ On failure, it undoes the merge and prints the failed suites' output.
 
 **Offload cleanup tests.** `test_offload_cleanup.py` keeps the real sh/zsh cleanup and selector protocols; the results, leftovers and takeover modules cover the command outcomes. `offload_cleanup_test_support.py` copies a private Git and tool seed at the original paths for each case and creates fresh FIFO descriptors. Ordinary calls reuse the existing in-process CLI helper; claim-owner exit, streaming and timeout cases retain real subprocesses and the two-second timeout assertion.
 
-**Merge gate suite tests.** `test_gate_suites.py` covers discovery, isolation and reporting; the resources, tripwires, reruns, types, signals and admission modules keep each subject independently runnable. `gate_suites_test_support.py` reuses the committed class seed and private copies, launches Python directly for real module jobs, and uses directory events and process descriptors for fixture barriers and cleanup. Admission arithmetic needs no Git fixture. Signal, process-group, memory-growth and timeout contracts retain real children; the controlled timeout clock and memory-growth pacing are unchanged.
+**Gate suite tests.** `test_gate_suites.py` covers discovery, isolation and reporting; the resources, tripwires, reruns, types, signals and admission modules keep each subject independently runnable. `gate_suites_test_support.py` reuses the committed class seed and private copies, launches Python directly for real module jobs, and uses directory events and process descriptors for fixture barriers and cleanup. Admission arithmetic needs no Git fixture. Signal, process-group, memory-growth and timeout contracts retain real children; the controlled timeout clock and memory-growth pacing are unchanged.
 
 `discover_test_modules` finds every `scripts/**/test_*.py` file outside `__pycache__`, in path order. The first folder under `scripts/` is its suite; a test file directly under `scripts/` is refused. `test_module_name` keeps the path within the suite in timing keys, results and log lines. Retries keep the original job path, so a nested failure reruns the same file. Job kind is independent of suite name: a test suite named `types` still runs unittests, and the type check has its own job kind. Discovery tests check real regression paths and nested retries.
 
@@ -531,14 +539,14 @@ Explicit type checks, settings, ancestry, production doc checks, and change-revi
 A dirty tree records no reusable pass.
 Without exact reuse, a targeted test selects affected modules as described below.
 `--full` bypasses reuse.
-A red nightly marker bypasses reuse only in a merge gate.
+A red nightly marker bypasses reuse only for full gate runs.
 
 An added or removed test folder changes the ledger suite set and prevents reuse of a pass with another suite set.
 
 **Affected modules for targeted tests** (`scripts/production/affected_modules.py`).
 The certified base is the newest full record on this host with the complete suite set and an ancestor of `HEAD`.
 Other candidates are the merge bases of `HEAD` and the origin refs in `landing_branches` in `config/gate.conf`.
-These branches hold commits that passed a merge gate, which runs all modules.
+These branches hold commits that passed the integrate job.
 The selector uses the candidate with the fewest changed paths to `HEAD`.
 A tie keeps the certified base first, then the branch order in the config.
 The selector ignores missing refs and refs without a common ancestor.
@@ -571,10 +579,10 @@ The current and base graphs share one cache read and one cache update.
 A warm selection reads base blobs only when the cache lacks their facts.
 Dirty sources never enter the cache or cause cache writes.
 A targeted test runs all modules only for `--full`, no base candidate, or a graph error.
-The nightly-red marker widens only a merge gate. It does not block targeted test reuse or selection.
+The nightly-red marker requires the full suite for integrate and test all jobs. Targeted tests keep their selection and reuse rules.
 A targeted test leaves the marker in place, including after `--full`.
-`--full` bypasses reuse in both modes. The marker bypasses reuse only in a merge gate.
-A passing merge gate removes the marker. An unreadable marker also requires all modules in a merge gate.
+`--full` bypasses reuse in both modes. The marker bypasses reuse only for full gate runs.
+A passing full gate run removes the marker. An unreadable marker also requires the full suite for full gate runs.
 
 The selection reads three record kinds from the caller's build log: config reads, folder scans and content reads.
 Each kind comes from the newest full, non-aborted gate that recorded it.
@@ -588,7 +596,7 @@ A full run prints `full suite: <reason>` and repeats the reason in the final `Ga
 An untouched suite prints `skipped (not affected)`.
 A selection of zero modules passes.
 Affected passes record `kind: affected` and never replace the full base.
-Types, admission, isolated reruns, and later merge checks keep their existing behavior.
+Types, admission, isolated reruns, and later checks on the merge keep their existing behavior.
 
 **Nightly.** `merge_gate.py --nightly --merge-branch B [--production <showrunner name>] [--checkout DIR]` fetches `origin/B`.
 It uses the production's standing checkout through `copies.standing(owner, repo, copies.CommittedSource(commit))`.
@@ -614,8 +622,8 @@ Promotion stays separate and runs no tests.
 A green nightly records a full pass.
 A failed test module or runner writes `${GATE_STATE_DIR:-~/.local/state/gate}/full-required` atomically.
 The marker records the tree, UTC time and failed modules.
-While the marker exists, every merge gate runs all modules until a merge gate passes.
-An unreadable marker also requires all modules in a merge gate.
+While the marker exists, every full gate run uses all modules until one passes.
+An unreadable marker also requires all modules in full gate runs.
 A failure of only the type check removes an existing marker and does not require full test runs.
 Every red nightly waits for the result lock before it saves its result.
 It then notifies the production owner through the existing messaging path.
@@ -1058,7 +1066,7 @@ The command applies the patch with `git apply --3way`.
 It runs the direct tests for changed Python files and imports each changed module.
 The check uses `merge_gate.test_module_environment` and its tripwires.
 An empty helper module can pass discovery; a failed package import cannot.
-The fast check uses no full merge gate or queue admission.
+The fast check uses no full gate run or queue admission.
 `config/fast_track.conf` supplies the size, file, time, push-attempt, and refused-path limits.
 Imports of refused repository modules also refuse the fix, including indirect imports.
 
@@ -1089,7 +1097,7 @@ HEAD ancestry containing the pushed commit also closes restore.
 `records.jsonl` under `FAST_TRACK_STATE_DIR`, default `~/.local/state/fast-track/`, records publication and pending review.
 `--pending --unit <unit>` prints pending review diffs.
 Broad reviews include these diffs and record their review pass.
-Later merge gates and the nightly run test published fixes through their normal paths.
+Later integrate and test nightly jobs test published fixes through their normal paths.
 
 `fetch_main` retries only Git failures containing `cannot lock ref`.
 It uses `fetch_lock_attempts` and `fetch_lock_wait_seconds` from the command's configuration read.
@@ -1464,7 +1472,7 @@ Memory-growth reproductions use a bounded scope, such as `MemoryMax=3G` with swa
 `step_selection.py` must remain cheap because every target command imports it.
 `parse_port_cell` imports `cell_value` locally, so progress-history startup avoids unrelated production and message imports.
 
-The merge gate owns each module folder through a `tool_folder` context.
+The gate owns each module folder through a `tool_folder` context.
 The gate passes the absolute path of the module folder in `MERGE_GATE_MODULE_DIR`.
 The runner puts its config-read log, scratch root, and review root inside that folder.
 Before test discovery, the runner guards the real home’s `.claude/config` against Python writes.
