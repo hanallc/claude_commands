@@ -126,7 +126,7 @@ if [ "${STATUSLINE_SYSTEM:-$(uname -s)}" = Linux ]; then
   payload=${payload%.}
   state="${SHOWRUNNER_STATE_DIR:-$HOME/.local/state/showrunner}"
   if [ -n "$session" ]; then
-    render_fresh "$state/statusline-render-v2/$session" "$@" && exit 0
+    render_fresh "$state/counts/statusline-render-v2/$session" "$@" && exit 0
   else
     render_key=
   fi

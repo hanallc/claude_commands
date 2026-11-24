@@ -800,7 +800,7 @@ class ForYouStatusTests(unittest.TestCase):
             _ = config.write_text(fixture_rebuild_settings("~/.local/state/showrunner/rebuilds"))
             _ = record.write_text(staff_text(replace(OWNER, run=staff.OpenRun(home))))
             state = home / recorder_state.STATE_FILENAME
-            cache = home / ".local/state/showrunner/statusline-render-v2/s-"
+            cache = home / ".local/state/showrunner/counts/statusline-render-v2/s-"
             seed_rebuild_cache(home, config)
             with patch.dict(os.environ, {"HOME": directory}, clear=True):
                 need.add_need("mac", "a" * 40, "Rebuild", OWNER.id)
@@ -843,7 +843,7 @@ class ForYouStatusTests(unittest.TestCase):
 
             with patch.object(Path, "read_text", autospec=True, side_effect=moved_need):
                 self.assertEqual(self.render_for_you_fixture(home, config, record), ("1", "rebuild natedev, rebuild mac"))
-            cache = home / ".local/state/showrunner/statusline-render-v2/s-"
+            cache = home / ".local/state/showrunner/counts/statusline-render-v2/s-"
             self.assertFalse(cache.exists())
 
     def test_linux_does_not_publish_when_the_unit_review_refresh_fails(self) -> None:
@@ -864,7 +864,7 @@ class ForYouStatusTests(unittest.TestCase):
                   patch.object(os, "execvp")):
                 assignment.render_status(remote=False)
             refresh.assert_called_once_with(UNIT.id)
-            self.assertEqual(list(state.glob(f"statusline-render-v*/s-{UNIT.id}")), [])
+            self.assertEqual(list(state.glob(f"counts/statusline-render-v*/s-{UNIT.id}")), [])
 
     def test_linux_renders_when_the_action_folder_has_an_unknown_home(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1262,7 +1262,7 @@ class RoleTests(ConfiguredShellTests):
                     self.assertEqual(len(launches.read_text(encoding="utf-8").splitlines()), index)
 
     def saved_render(self) -> Path:
-        cache, = (self.home / ".local/state/showrunner").glob(f"statusline-render-v*/s-{UNIT.id}")
+        cache, = (self.home / ".local/state/showrunner/counts").glob(f"statusline-render-v*/s-{UNIT.id}")
         return cache
 
     def test_shell_rejects_an_incomplete_source_record(self) -> None:
@@ -2551,17 +2551,23 @@ class CountsRowTests(ConfiguredShellTests):
                   ("wrapped status", staff.LiveDoc(remote.local_machine(), doc), doc))
         environment = {"HOME": str(self.home), "STAFF_FILE": str(record), "CONF_DIR": str(config),
                        "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent)}
+        self.cache.parent.mkdir()
+        read_started = 10**18
+        source_time = read_started - 10**9
         for name, location, watched in states:
             with self.subTest(state=name):
                 _ = record.write_text(staff_text(replace(OWNER, doc=location)), encoding="utf-8")
-                with patch.dict(os.environ, environment):
+                expected = {instance / "conf", record, self.cache.parent.parent}
+                if watched is not None:
+                    expected.add(watched)
+                # Put the first shell render after the count read, even on a coarse clock.
+                for path in expected:
+                    os.utime(path, ns=(source_time, source_time))
+                with patch.dict(os.environ, environment), patch.object(time, "time_ns", return_value=read_started):
                     cache = counts_row.write(instance)
                 line, due, *sources = cache.read_text(encoding="utf-8").splitlines()
                 self.assertEqual((line, due), ("", ""))
-                expected = {str(instance / "conf"), str(record), str(self.cache.parent.parent)}
-                if watched is not None:
-                    expected.add(str(watched))
-                self.assertEqual(set(sources), expected)
+                self.assertEqual(set(sources), {str(path) for path in expected})
                 built = cache.stat().st_mtime_ns
                 self.assertFalse(any(line.startswith("Review:") for line in self.lines()))
                 self.assertEqual(cache.stat().st_mtime_ns, built)
