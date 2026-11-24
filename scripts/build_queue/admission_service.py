@@ -1400,10 +1400,10 @@ def durable_copy(value: object) -> object:
 
 
 @dataclass(frozen=True)
-class PublishedPlacement:
+class PublishedPlacementWait:
     input_event_count: int
     request_digest: bytes
-    reply: wire.PlacementWait | wire.Assignment | wire.LocalPlacementGranted
+    reply: wire.PlacementWait
 
 
 @dataclass
@@ -1411,7 +1411,7 @@ class PublishedReplies:
     view: wire.ViewReply
     explain: wire.ExplainReply
     wait_positions: dict[str, int]
-    placements: dict[str, PublishedPlacement]
+    placement_waits: dict[str, PublishedPlacementWait]
     view_bytes: bytes
     explain_bytes: bytes = b""
     mine_bytes: bytes = b""
@@ -1853,6 +1853,7 @@ class AdmissionServer:
         self.listener_started_at: float = float("inf")
         self.configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration = gate.UnusableAdmissionConfiguration("configuration not read")
         self.last_usable_configuration: records.MemoryConfig | NoPass = NoPass()
+        self.request_slow_seconds: float = float("inf")
         self.caller_versions: dict[str, str] = {}
         self.slots: dict[str, records.RunSlot] = {}
         self.progress_history: progress.ProfileHistory = progress.ProfileHistory(state_dir / "progress_profiles")
@@ -3055,12 +3056,19 @@ class AdmissionServer:
         configuration = gate.read_admission_configuration()
         if isinstance(configuration, gate.UsableAdmissionConfiguration):
             self.last_usable_configuration = configuration.config
+            try:
+                with conf.diagnostics(report=False) as messages:
+                    self.request_slow_seconds = conf.read("build_admission").number("request_slow_seconds")
+            except conf.Unusable as error:
+                records.warn_configuration_diagnostics((records.ConfigurationDiagnostic(str(error)),))
+            else:
+                records.warn_configuration_diagnostics(records.configuration_diagnostics(messages))
         return configuration
 
     def _take_configuration(self) -> gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration:
         configuration = self.pending_configuration
         self.pending_configuration = NoPass()
-        return self._read_configuration() if isinstance(configuration, NoPass) else configuration
+        return self._read_configuration() if self._configuration_changed() or isinstance(configuration, NoPass) else configuration
 
 
     def _check_reading_alert(self, inputs: records.QueueInputs, result: gate.PassResult, config: records.MemoryConfig) -> None:
@@ -3270,7 +3278,7 @@ class AdmissionServer:
             if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                 self._deliver(waiting, reply)
                 waiting.last_reply, waiting.last_sent = reply, inputs.now
-        self._publish_replies(published, complete_pass=True)
+        self._publish_replies(published, placement_keys=evidence_keys)
         interval = (config.waiting_pass_seconds if self.waiters or any(self._placement_waiting(request)
                     for request in self.placement_requests.values()) else config.running_pass_seconds)
         self.next_pass = self.clock.monotonic() + interval
@@ -3621,15 +3629,16 @@ class AdmissionServer:
         occupancy = self._local_occupancy(self.last_inputs)
         view = wire.ViewReply(replace(reading, explanation=replace(reading.explanation, local_occupancy=occupancy)))
         view_bytes = wire.encode_reply(view).encode()
-        placements = self.published.placements if isinstance(self.published, PublishedReplies) else {}
-        return PublishedReplies(view, explain, positions, placements, view_bytes)
+        waits = self.published.placement_waits if isinstance(self.published, PublishedReplies) else {}
+        return PublishedReplies(view, explain, positions, waits, view_bytes)
 
-    def _publish_replies(self, published: PublishedReplies | NoPass, *, complete_pass: bool = False) -> None:
+    def _publish_replies(self, published: PublishedReplies | NoPass, *,
+                         placement_keys: PlacementEvidenceKeys | None = None) -> None:
         if isinstance(published, NoPass):
             return
         self.published = published
-        if complete_pass:
-            published.placements = self._placement_replies()
+        if placement_keys is not None:
+            published.placement_waits = self._publish_placement_waits(placement_keys)
         assert isinstance(self.configuration, gate.UsableAdmissionConfiguration)
         config = self.configuration.config
         written_at = self.clock.now()
@@ -3640,17 +3649,17 @@ class AdmissionServer:
             # Keep the last complete file when publication fails.
             pass
 
-    def _placement_replies(self) -> dict[str, PublishedPlacement]:
-        input_event_count = self.input_event_count
-        replies: dict[str, PublishedPlacement] = {}
+    def _publish_placement_waits(self, keys: PlacementEvidenceKeys) -> dict[str, PublishedPlacementWait]:
+        waits: dict[str, PublishedPlacementWait] = {}
         for episode, request in self.placement_requests.items():
-            request_digest = self.placement_request_digests.get(episode)
-            if request_digest is None or not self._placement_owner_live(request.owner):
+            digest = self.placement_request_digests.get(episode)
+            if digest is None or not self._placement_waiting(request):
                 continue
-            reply = self._placement_reply(request, self.local_hold_holders.get(episode, placement.ResourceHolderUnknown()))
-            if not isinstance(reply, wire.DispatchStatus):
-                replies[episode] = PublishedPlacement(input_event_count, request_digest, reply)
-        return replies
+            reply = self._placement_reply(request,
+                self.local_hold_holders.get(episode, placement.ResourceHolderUnknown()), keys)
+            if isinstance(reply, wire.PlacementWait):
+                waits[episode] = PublishedPlacementWait(self.input_event_count, digest, reply)
+        return waits
 
     def _took_places(self) -> dict[str, str]:
         """Name each waiting step whose run took the place of an older run of its unit."""
@@ -4400,7 +4409,8 @@ done
         key = self._placement_evidence_key(submitted, saved.assignment.destination, keys)
         return key if isinstance(key, placement.EvidenceNeeded) else self.host_evidence(key)
 
-    def _assignment_state(self, saved: records.SavedPlacementAssignment) -> placement.AssignmentState:
+    def _assignment_state(self, saved: records.SavedPlacementAssignment, keys: PlacementEvidenceKeys | None = None
+                          ) -> placement.AssignmentState:
         """Project placement lifetime without changing records or requesting evidence."""
         if isinstance(saved.state, placement.ClosedAssignment):
             return saved.state
@@ -4416,7 +4426,7 @@ done
                 return placement.ClosedAssignment("local run has ended")
             if isinstance(self._lifetime(reservation), gate.EndedStep):
                 return placement.ClosedAssignment("local execution has ended")
-        elif self._provider_claim_released(saved, self._provider_release_evidence(saved)):
+        elif self._provider_claim_released(saved, self._provider_release_evidence(saved, keys)):
             return placement.ClosedAssignment("provider claim released")
         return saved.state
 
@@ -4874,7 +4884,8 @@ done
         self.current_assignments[request.episode] = key
         return assignment
 
-    def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder
+    def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder,
+                         keys: PlacementEvidenceKeys | None = None
                          ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
         diagnostics = tuple(evidence.provider_diagnostic
             for candidate in self.placement_eligibility.get(request.episode, ())
@@ -4928,7 +4939,7 @@ done
         position = self.published.wait_positions.get(owner, 0) if isinstance(self.published, PublishedReplies) else 0
         saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
         if saved is not None:
-            state = self._assignment_state(saved)
+            state = self._assignment_state(saved, keys)
             if isinstance(state, placement.ClosedAssignment) and saved.assignment.destination.provider == "local":
                 return self._placement_status(saved.assignment, state.reason)
             if isinstance(state, placement.ClosedAssignment):
@@ -5506,8 +5517,12 @@ done
             digest = connection.placement_request_digest if isinstance(connection, Connection) else None
             if digest is None:
                 digest = hashlib.sha256(wire.encode_request(request).encode().removesuffix(b"\n")).digest()
-            if (isinstance(self.published, PublishedReplies)
-                    and (published := self.published.placements.get(request.episode)) is not None
+            _ = self._configuration_changed()
+            if (isinstance(self.pending_configuration, NoPass)
+                    and request.episode not in self.current_assignments
+                    and request.episode not in self.reservations
+                    and isinstance(self.published, PublishedReplies)
+                    and (published := self.published.placement_waits.get(request.episode)) is not None
                     and published.input_event_count == self.input_event_count
                     and published.request_digest == digest):
                 return [published.reply]
@@ -5730,17 +5745,11 @@ done
             self._log_request_timing(request, started, cpu_started)
 
     def _log_request_timing(self, request: wire.Request, started: float, cpu_started: float) -> None:
-        try:
-            with conf.diagnostics(report=False) as messages:
-                limit = conf.read("build_admission").number("request_slow_seconds")
-        except conf.Unusable as error:
-            records.warn_configuration_diagnostics((records.ConfigurationDiagnostic(str(error)),))
-        else:
-            records.warn_configuration_diagnostics(records.configuration_diagnostics(messages))
-            wall, cpu = self.clock.monotonic() - started, time.thread_time() - cpu_started
-            if wall > limit:
-                print(f"admission request {type(request).__name__}: wall={wall:.3f}s cpu={cpu:.3f}s",
-                      file=sys.stderr, flush=True)
+        wall = self.clock.monotonic() - started
+        if wall > self.request_slow_seconds:
+            cpu = time.thread_time() - cpu_started
+            print(f"admission request {type(request).__name__}: wall={wall:.3f}s cpu={cpu:.3f}s",
+                  file=sys.stderr, flush=True)
 
     def _handle_request(self, request: wire.Request, connection: Connection | NoConnection
                         ) -> list[wire.Reply]:
@@ -6438,6 +6447,8 @@ done
                     inotify.remove_watch(self.config_events, self.config_watch)
                     self.config_watch = -1
         if changed:
+            self.pending_configuration = NoPass()
+            self._schedule_pass()
             self._arm_config_watch()
         return changed
 
@@ -6456,6 +6467,7 @@ done
     def run_once(self, timeout: float = 0) -> None:
         self.start()
         now = self.clock.monotonic()
+        # While steps wait, the effective pass interval is the larger of the waiting interval and the minimum pass gap.
         due = max(self.next_pass, self._pass_allowed_at())
         delay = min(timeout, max(0, min(due, self.next_source_check, self.next_config_watch_retry) - now))
         ready = self.epoll.poll(-1 if delay == float("inf") else delay)

@@ -252,12 +252,12 @@ class MemoryHoverTests(unittest.TestCase):
             with self.subTest(key=key):
                 cell = root.find(f".//tr[@data-tip='{key}']/td[@class='machine']")
                 assert cell is not None
-                self.assertEqual([(icon.get("class"), icon.get("aria-label")) for icon in cell],
-                                 [("machine machine-icon run", machine)])
+                self.assertEqual([(icon.get("class"), icon.get("aria-label"), icon.get("data-machine")) for icon in cell],
+                                 [("machine machine-icon run", machine, machine)])
         waiting_target = root.find(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='machine']")
         assert waiting_target is not None
-        self.assertEqual([(icon.get("class"), icon.get("aria-label")) for icon in waiting_target],
-                         [("machine machine-icon dim", name) for name in ("natedev", "mac-linux", "hana-aws")])
+        self.assertEqual([(icon.get("class"), icon.get("aria-label"), icon.get("data-machine")) for icon in waiting_target],
+                         [("machine machine-icon dim", name, name) for name in ("natedev", "mac-linux", "hana-aws")])
         # Each machine name in the hover shows in its machine color.
         def machines(*names: str) -> str:
             return " or ".join(f'<span class="machine" data-machine="{name}">{name}</span>' for name in names)
@@ -273,6 +273,38 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertIn("<dt>Caller</dt><dd>impl3</dd>", rendered[1])
         self.assertIn("<dt>Detail</dt><dd>building tests</dd>", rendered[1])
         self.assertIn("<dt>Detail</dt><dd>doctests</dd>", rendered[2])
+
+    def test_each_machine_has_its_icon_in_both_states(self) -> None:
+        forms = {
+            "natedev": (None, None, "🐧"),
+            "mac": ("#machine-apple", None, None),
+            "mac-linux": ("#machine-apple", "🐧", None),
+            "aws": ("#machine-cloud", "🐧", None),
+            "hana-aws": ("#machine-cloud", "🌸", None),
+            "hana-gpu": ("#machine-cloud", "⚡", None),
+        }
+        rendered = self.page_expression(
+            'data.states.flatMap(state => data.names.map(name => machineIcon(name, state))).join("")',
+            {"states": ["run", "dim"], "names": list(forms)}, walk=True)
+        icons = ElementTree.fromstring(f"<root>{rendered}</root>")
+        self.assertEqual(len(icons), 2 * len(forms))
+        for index, state in enumerate(("run", "dim")):
+            for offset, (name, (symbol, badge, emoji)) in enumerate(forms.items()):
+                with self.subTest(name=name, state=state):
+                    icon = icons[index * len(forms) + offset]
+                    self.assertEqual(icon.get("class"), f"machine machine-icon {state}")
+                    self.assertEqual(icon.get("data-machine"), name)
+                    self.assertEqual(icon.get("aria-label"), name)
+                    self.assertEqual(icon.get("role"), "img")
+                    self.assertEqual(icon.get("data-badge"), badge)
+                    self.assertEqual(len(icon), 1)
+                    self.assertEqual(icon[0].get("aria-hidden"), "true")
+                    if emoji is None:
+                        self.assertEqual(icon[0].tag, "svg")
+                        self.assertEqual([use.get("href") for use in icon[0].findall("use")], [symbol])
+                    else:
+                        self.assertEqual(icon[0].get("class"), "machine-emoji")
+                        self.assertEqual("".join(icon.itertext()), emoji)
 
     def role_setup(self) -> str:
         members = tuple(staff.StaffRow(staff.StaffId(name), "unit", name, staff.StaffRoot(),
@@ -972,7 +1004,7 @@ class MemoryHoverTests(unittest.TestCase):
                 "kept_until": "22:37 PST", "targets": ["natedev", "mac-linux"], "match_rule": "same repository and job"}
 
     def test_guest_row_shows_confirmation_and_caller(self) -> None:
-        for guest, state in (({"guest_run": {"attempt": "fixture"}}, "running"),
+        for guest, state in (({"guest_run": {"attempt": "fixture-attempt"}}, ""),
                              ({"guest_unconfirmed": True}, "not confirmed")):
             with self.subTest(state=state):
                 reading = {"total": 64, "read_at": 200, "walk": [{
@@ -987,12 +1019,15 @@ class MemoryHoverTests(unittest.TestCase):
                 assert row is not None
                 machine = row.find("td[@class='machine']")
                 assert machine is not None
-                self.assertEqual([(icon.get("class"), icon.get("aria-label")) for icon in machine],
-                                 [("machine machine-icon run", "mac-linux")])
+                self.assertEqual([(icon.get("class"), icon.get("aria-label"), icon.get("data-machine")) for icon in machine],
+                                 [("machine machine-icon run", "mac-linux", "mac-linux")])
                 self.assertEqual("".join(machine.itertext()).strip(), state)
                 for column in ("place", "done", "vcpus"):
                     self.assertEqual(row.findtext(f"td[@class='{column}']"), "—")
                 self.assertIn("Caller  phases", tip)
+                self.assertIn("Runs on  mac-linux", tip)
+                self.assertNotIn("Guest attempt", tip)
+                self.assertNotIn("fixture-attempt", tip)
 
     def test_guest_row_shows_on_mac_linux_in_the_memory_column(self) -> None:
         reading = {"total": 64, "read_at": 200, "walk": [{
@@ -1006,7 +1041,9 @@ class MemoryHoverTests(unittest.TestCase):
     def test_guest_shows_one_running_icon_and_names_targets_in_the_hover(self) -> None:
         targets = ["natedev", "mac-linux"]
         reading = {"total": 64, "read_at": 200, "walk": [{
-            "name": "guest", "guest_unconfirmed": True, "machine": "mac-linux", "targets": targets}],
+            "name": "guest", "guest_run": {"attempt": "fixture-attempt"}, "machine": "mac-linux",
+            "targets": targets, "progress": {"kind": "RowProgress", "phase": "testing", "done": 2, "total": 5,
+                                             "unit": "modules"}}],
             "waiters": [{"name": "gate", "machine": "natedev", "targets": targets, "since": 100}]}
         rendered, tip = cast(tuple[str, str], self.page_expression(
             "(renderWalk(data), [$('walk').innerHTML, tipText('row:fixture-run-0', data).join('\\n')])",
@@ -1015,12 +1052,17 @@ class MemoryHoverTests(unittest.TestCase):
         running = table.find(".//tr[@data-tip='row:fixture-run-0']/td[@class='machine']")
         waiting = table.find(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='machine']")
         assert running is not None and waiting is not None
-        self.assertEqual([(icon.get("class"), icon.get("aria-label")) for icon in running],
-                         [("machine machine-icon run", "mac-linux")])
-        self.assertEqual("".join(running.itertext()).strip(), "not confirmed")
+        self.assertEqual([(icon.get("class"), icon.get("aria-label"), icon.get("data-machine")) for icon in running],
+                         [("machine machine-icon run", "mac-linux", "mac-linux")])
+        self.assertEqual("".join(running.itertext()).strip(), "")
+        self.assertIn("Runs on  mac-linux", tip.splitlines())
         self.assertIn("Named targets  natedev or mac-linux", tip.splitlines())
-        self.assertEqual([(icon.get("class"), icon.get("aria-label")) for icon in waiting],
-                         [("machine machine-icon dim", target) for target in targets])
+        self.assertIn("Testing  2 of 5 modules", tip.splitlines())
+        self.assertIn("Done  40.0%", tip.splitlines())
+        self.assertNotIn("Guest attempt", tip)
+        self.assertNotIn("fixture-attempt", tip)
+        self.assertEqual([(icon.get("class"), icon.get("aria-label"), icon.get("data-machine")) for icon in waiting],
+                         [("machine machine-icon dim", target, target) for target in targets])
 
     def test_ci_row_requires_a_running_job_and_preserves_the_used_total(self) -> None:
         for state in ("idle", "waiting", "unmatched", "busy", "unreadable"):

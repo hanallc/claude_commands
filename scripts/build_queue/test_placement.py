@@ -1673,6 +1673,9 @@ class PlacementTests(unittest.TestCase):
                     renewed = fixture.server.assignments[key].assignment
                     self.assertNotEqual(renewed.attempt, assigned.attempt)
                     self.assertEqual((renewed.destination, renewed.since), (assigned.destination, assigned.since))
+                    repeated, = fixture.server.handle_request(request)
+                    assert isinstance(repeated, wire.Assignment)
+                    self.assertEqual(repeated.assignment, renewed)
 
     def test_an_older_settings_refusal_without_a_generation_can_retry(self) -> None:
         with PlacementFixture() as fixture:
