@@ -538,9 +538,21 @@ def positive_whole_seconds(value: str) -> float:
     return float(positive_whole(value))
 
 
+_GIT_REPOSITORY_OVERRIDES = frozenset({
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+})
+
+
 def _git(folder: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    environment = {name: value for name, value in os.environ.items() if name not in _GIT_REPOSITORY_OVERRIDES}
     try:
-        return subprocess.run(["git", "-C", str(folder), *arguments], capture_output=True, text=True, check=False)
+        return subprocess.run(["git", "-C", str(folder), *arguments], env=environment,
+                              capture_output=True, text=True, check=False)
     except (OSError, UnicodeError) as error:
         return subprocess.CompletedProcess(["git", *arguments], 1, "", str(error))
 
