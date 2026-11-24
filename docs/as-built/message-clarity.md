@@ -302,8 +302,12 @@ Legacy failure records remain readable by the existing tools.
   A resend with the template is not skipped by `--repeat-minutes`.
   The three rca.py pushes in `RCA_TEXTS` are exempt: `permission.rca_started`, `permission.rca_fixed` and `permission.rca_fixed_rewritten`.
   They describe permission stops or refusals. A cause can name an auto-mode refusal.
-- Paid credit use goes only through `--text-id quota.paid_credits`. A free-text or agent-written push (`nate.adhoc`) whose title, text or action has `paid credits` or `codex_credit_accounts` is held the same way (`wrong_template()`). Other registered `quota.*` pushes that name paid credits are not held.
-- `--text-id quota.paid_credits`: the caller gives `account`, `machine`, `credits`, `refill` and `next_reset`. `paid_credits_values()` fills `sender` from the session's own record; with no record (a script such as `quota_alert.py` on its timer, or the far side of `--machine`), it uses `--value sender`, then `--from`, and refuses a run with none.
+- For a paid credit decision, use `--text-id quota.paid_credits` or `--text-id quota.paid_credits_queued`.
+  `wrong_template()` holds a free-text or `nate.adhoc` push whose title, text, or action reports paid credit use.
+- The ordinary decision accepts `account`, `machine`, `credits`, `refill`, `next_reset`, and `credit_accounts`.
+  The queued decision omits `next_reset`. Older callers can omit `credit_accounts` to use the live config.
+  `paid_credits_values()` uses the session name as the sender. Without a session record, it uses `--value sender`, then `--from`.
+  It refuses the call if it has no sender.
 - `--text-id auto_mode.refused`: the session gives `session`, `machine`, one `command` for each refused command (in order), `waits` and an optional `rule`. `command` is the only key that can repeat, and only for this template; `parse()` collects the items in a list. `auto_mode_values()` fills `sender` from the session's own record (`own_session_name()`), `action` from the commands' first words (`rca.action_of()`: `a file change`, `a shell command`, `an action`, `2 shell commands`, or `2 actions` for mixed kinds), `refused` from the commands (one per line), `waits_line` from `waits` (`rca.waits_line()`), `noun` and `this` from the number of commands, and `rule_line` from `rule`. It drops the final periods from `waits` and cuts a command longer than 90 characters to its first 89 and `…`. A send with no `--key` gets the key `auto-mode:<session>:<first 12 hex of the sha256 of the sorted one-line commands>` (`auto_mode_key()`), so `rca.py fixed` can retire the alert. The waits sentence is a value the session writes, so `send()` keeps it only when the cold-read review approves the whole alert within `WAITS_REVIEW_SECONDS` (30 s, `review.review(…, limit=30)`; `reviewed_waits()`). A timeout or a `Failed`, `Rewritten`, `Withheld` or `Unreviewed` verdict sends the alert without it and prints why to stderr. With the review off the alert goes as given. It refuses no command, an empty command, a `waits` that has a thing to type or names a pane or session (`waits` says only what waits; the Action line says what the user does), `--value sender`, `--from`, `--machine` and a run with no session record. `send.py --help` lists the registered pushes (`SESSION_TEMPLATES`): the templates a session sends, and the three rca.py pushes with the rca.py call that sends them. `Options.commands` keeps each `command` value as given, before the cut, for the rca.py case.
   The send rule lives beside `auto_mode.refused` in `send.py --help`. The session applies it before sending; no program checks it.
 - After `parse()` renders a registered text, it refuses the run when `action_conflicts()` gives a reason: `<id> gives a second action: <reasons>`. A template value cannot add a second action. Registered texts other than agent-written ids are sent as rendered and skip live review when approved (2026-10-23: a `waits` value told the user to type `! kill …` in a second session).
@@ -360,14 +364,21 @@ New escalate holds retain their registered template and values.
 ### Script push texts
 
 - `scripts/notify/push_texts.py`:
-  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False, one_line: bool = False)` and `PushExample(name, values)`. `purpose` is one line (72 characters at most) that says when the push goes out. It is not part of the fingerprint, so a change to it moves no approval. With `header=False` the phone shows only the title and the body, with no `No action needed.` line. `catalog()` refuses `header=False` on an entry that has an action or a session. `nate.adhoc` uses it, and `fingerprint` includes it only when it is False. `nate.adhoc`, `alert.blocked`, `alert.decision`, `decision.choices`, and `review_watch.acknowledge` have `agent_written=True`; this field is excluded from the fingerprint. `agent_written(text_id: str) -> bool` returns False for unknown ids.
+  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False, one_line: bool = False)` and `PushExample(name, values)`.
+    The `purpose` field says when the script sends the push. It has one line of at most 72 characters.
+    The fingerprint excludes `purpose`. An edit to `purpose` keeps the approval.
+    With `header=False`, the phone shows only the title and the body.
+    `catalog()` refuses `header=False` on an entry with an action or a session.
+    `nate.adhoc` uses `header=False`. The fingerprint includes `header` only when it is False.
+    `nate.adhoc`, `alert.blocked`, `alert.decision`, and `decision.choices` have `agent_written=True`.
+    The fingerprint excludes `agent_written`. `agent_written(text_id: str) -> bool` returns False for unknown IDs.
   - `one_line=True` (item 172, 2026-11-22): the push posts no title, so the phone shows the app name, and the message is the rendered title alone. It has no `No action needed.` line, no action line and no body; the `Sent by:` footer stays. `catalog()` refuses `one_line` on an entry with an action, a session or a body. `RenderedPush.posted_title` is empty for such a text, and `posted_body` is the line. `pushover.parse` and the `review.py texts` approval review both build the Draft from these two, so the approval judges the posted form. `pushover.fields` leaves out an empty `title`. `shown()` and `texts --ask` print `Title: none (the phone shows the app name)`. `fingerprint` includes `one_line` only when it is True. `quota.codex_next_move` and `quota.codex_workers_stay` set it.
   - `render(id, **values)` and `render_entry(entry, values) -> RenderedPush`. An unknown id, a missing value or an extra value raises `ValueError`.
   - `user_send_argv(rendered, *, sender, machine, priority, timeout)` builds the `send.py --to user --from … --need … --text-id … --value …` argv. User-send wrappers take a rendered push, never a string.
   - `fingerprint(entry)` is the sha256 over the templates and every example's values and filled text.
   - `listing(entries)` gives one line per entry, sorted by id: the id in one column, then its purpose. `shown(entry)` gives the entry's purpose, its template with the `{placeholders}` (Title, Session, Action, body, as the phone lays them out) and its first example filled through `render_entry`. `review.py list` and `review.py show <id>` print them with no network and no reviewer; an unknown id prints `No template named <id>.` and the list, and exits 1. `/nate`, `/nate help` and `/nate usage` print the `adhoc`, `silence` and `show` lines and then `review.py list`; `/nate show <id>` prints `review.py show <id>` (user request, 2026-10-21).
   - `REVIEWED_FILE` and `catalog()`, which loads `push_catalog.ENTRIES` and checks for unique ids and named examples.
-- `scripts/notify/push_catalog.py` holds every fixed phone text, from scripts and from nixos, each with realistic examples. A comment says where the examples come from. Entry ids include `shutdown.*`, `quota.*`, `rust.*`, `sweep.disk_floor`, `codex.reset_ready` and `nixos.{disk_low,gpu_stopped,ups_battery,ups_shutdown}`.
+- `scripts/notify/push_catalog.py` holds every fixed phone text, from scripts and from nixos, each with realistic examples. A comment says where the examples come from. Entry ids include `shutdown.*`, `quota.*`, `rust.*`, `sweep.disk_floor` and `nixos.{disk_low,gpu_stopped,ups_battery,ups_shutdown}`.
 - `shutdown.restart_failed` uses the title `{session} did not start on {account}`.
   The title uses an ellipsis when it shortens a long name or account.
   The title fits 44 characters.
@@ -380,10 +391,11 @@ New escalate holds retain their registered template and values.
   Pushover drops an old push with one log entry if the saved text lacks either value.
 - `nixos.gpu_stopped`: sender `gpu`, need `decision` (priority 0 without an in-window `--due`), values `xid`, `meaning`, and `time` as `HH:MM <zone>` in the user's zone; wording lives in `push_catalog.py`. `scripts/notify/gpu_xid.py` owns the code-to-meaning table and CLI: `gpu_xid.py <code>` prints the meaning and exits 0; an unknown code exits 2.
 - `nightly.result` reports the branch, finish time, type result and full test result.
-  `nightly.not_run` reports the reason that the checks could not start.
+  `nightly.not_run` shows `Nightly check did not run`, the reason, and the next scheduled run in the user's time zone.
   Both texts use sender `nightly`, need `note`, and key `nightly-result`.
-  The result requires no action. The failure text includes an action.
-  The gate says the next nightly run tries again. The cold credentials example directs the user to run `github-warmup`.
+  The gate sends `nightly.not_run` with an empty action.
+  `ActionTemplate(omit_when_empty=True)` omits the action line when its value is empty.
+  The timer keeps the `github-warmup` action line when GitHub credentials are cold.
   Silence keeps only the newest push and delivers it when silence ends.
   The gate reads `nightly_result_push=on` and `nightly_result_modules=8` from `gate.conf` at use.
   `off` disables both pushes. The module limit controls how many failed modules the result names.
@@ -396,8 +408,13 @@ New escalate holds retain their registered template and values.
   `Go: the session runs {this} {noun} now, and auto mode can refuse {this} {noun} again.`
   `Allow rule: auto mode lets {this} {noun} run from then on.{rule_line}`.
 - `session.needs_go` (user approved 2026-10-21, need `decision`): title `{sender}: {session} waits for your go`, `Session: {session}`, Action `On {machine}, in the {session} pane, type: {go}`, then `{why}.` and `Your go {does}.`
-- `quota.paid_credits` (user approved 2026-10-21, need `decision`): title `{sender}: {account} now uses paid credits`, Action `To stop it, remove {account} from codex_credit_accounts in ~/.claude/config/accounts.conf on {machine}` (changed 2026-11-13: the setting moved to the accounts config), then the credits and refill line, `Leave on (recommended):` and `Turn off:`. `quota_alert.py` sends this id, or `quota.paid_credits_queued` while a workers move is queued. The old paid-credits ids are no longer sent.
-- `quota.paid_credits_queued` (agreed with accounts 2026-10-21 under the user's approval): the same title, Action, need and sender rule as `quota.paid_credits`, for when the user queued a workers move. Workers never go to Claude: `Leave on` spends credits until the queued move runs, and `Turn off` stops the workers until it runs. Values: `sender`, `account`, `machine`, `credits`, `refill` (no `next_reset`). `paid_credits_values()` fills its sender, and the paid-credit hold detail names both calls.
+- `quota.codex_workers_moved` has only a title. It names the exhausted account and the account that takes the work.
+  The title says when the target spends paid credits.
+- `quota.paid_credits` shows `<account> now spends paid credits: <balance> left` for a known balance.
+  Its action gives the `/tune accounts codex_credit_accounts` command to run in a natedev Claude session.
+  The command lists the other accounts from the live config or gives `none` for an empty list.
+- `quota.paid_credits_queued` uses the same action. For a known balance, its title is `<account> uses credits until move: <balance> left`.
+  The alert uses this decision while a workers move is queued. The held-push message names both send commands.
 - `scripts/notify/push_texts_reviewed.json` has the form `{text_id: {example_name: {sha256, time, reviewer, objections?}}}`:
   - It is read only through `review.text_approvals()`.
   - `texts --approve` writes approvals for examples that pass review or have a current user approval.
@@ -495,6 +512,9 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
     The fixed push has no waits sentence. rca.py puts cause and fix on one line each and removes their final periods.
   - `permission.rca_fixed_rewritten`: title `{title}`, body `{body}`: the reviewer's rewrite of a fixed text it refused twice.
 - Hooks:
+  - `stall_watch.permission_prompt` uses the title `<unit> is stuck at a permission prompt` and keeps the Session line.
+    The action tells the user to open the unit's herdr tab and answer its prompt.
+    The body shows the request in one line.
   - `stall_watch.py`: after a 60-second prompt wait, its owner receives the unit, machine and request first. The saved `told` mark stops repeated owner notices. The prompt start plus 60 seconds plus `prompt_grace_seconds` from `config/stall_watch.conf` determines user escalation, even if owner delivery keeps failing. Missing or invalid grace is reported and uses zero grace. A prompt that clears before that deadline sends no push. A prompt alert's `Delivery` carries an `rca.Report` (`prompt_report()`: the unit, the machine, kind `prompt`, the pending Bash call's command or else the pending tool's name, the session's transcript, the showrunner staff name, `stopped` (the wait's start), source `stall-watch` and key `stall-watch:prompt:<showrunner name>:<unit>`). `send_all()` immediately saves a successful alert's `alerted` flag and its report as `case_pending` in the prompt state. After the batch, `retry_cases()` attempts each pending case and clears its report only when the case opened or joined. A failed case retries on later ticks without another alert. When the prompt clears, its alert is retired as usual; successful retirement atomically moves a prompt with a pending case to `<report hash>.case.json` in the same stall-watch state directory. This saved snapshot is solely a case obligation, so a new prompt starts its own wait and can alert while the old case still fails. `retry_cases()` also reads these case files and removes each only after its case opened or joined. With no pending case, retirement deletes the prompt state. Failed alerts still retry with the same alert key.
   - `send.py`: when a local `auto_mode.refused` push ends `sent` or `kept` (silence on), `send()` opens a case with `refusal_report()`: the `session` value (the session with refused commands, not the sender), the `machine` value, kind `auto_mode`, each `--value command=` as given (`Options.commands`, not cut), the waits sentence the alert showed (`""` when the review dropped it), and the alert's sender and key. It defers owner delivery to the next `rca.remind()` pass, so completing the refusal send does not wait for the owner. It gives no transcript, so rca.py finds that session's transcript by the `session` value. A held, replaced, refused or failed push opens no case. `auto_mode.refused` takes no `--machine`, so no remote send opens one.
 
@@ -680,7 +700,8 @@ At release, a closed question drops its push.
 An open question with a different `since` also drops its push.
 A same-minute reopening keeps `since`, so release sends the push because the question is open again.
 A missing or unreadable question record permits delivery and adds an anomaly to `pushover.jsonl`.
-A kept `review_watch.acknowledge` push drops when `review_regime.acknowledged()` reports acknowledgment.
 Legacy kept pushes without a reference still release.
 The release output counts delivered pushes and dropped pushes separately.
 Immediate delivery does not apply these release checks.
+
+The 2026-11-24 change removed the review watch and its push.
