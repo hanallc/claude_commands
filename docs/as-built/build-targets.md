@@ -41,12 +41,24 @@ A held target admits only work that its hold rules permit.
   Cloud gates and teardown read the AWS state folder without target registration.
   [AWS cloud gates and the former build target](builds-aws-target.md) describes that state.
 
+### Gate placement
+
+A gate from the claude repository requests placement on every eligible target in `build_targets.conf`.
+The caller checks the targets in `targets` in the order the file lists them.
+It omits targets with `enabled.<target>=off` and applies the fixed placement rules to the rest.
+The current rules permit natedev and mac-linux for a full gate.
+Named module tests, nightly gates, and promotion without tests use natedev.
+Explicit targets take precedence over `BUILDLOG_GATE_TARGETS`, which takes precedence over the default.
+Hana gates have no repository default.
+The Builds page shows both candidates while a gate with both targets waits or runs.
+
 ### Target state and eligibility: `scripts/build_targets/targets.py`
 
-- `target_state(target) -> TargetState` writes nothing and opens no connection. `TargetState = Free | Running(jobs: tuple[RunningJob, ...]) | Held(holder, reason, since, end: HoldEnd, holder_session) | Unreachable(reason) | StateUnreadable(reason)`, with `RunningJob(what, since, idle: IdleSince(when) | NotSeenIdle, holder_session)`, `holder_session: HolderSession(session_id) | NoHolderSession` (default `NO_HOLDER_SESSION`) and `HoldEnd = ExpiresAt(when) | ReleaseEstimated(when) | UntilReleased | AwaitingBlockRemoval`. All are frozen dataclasses.
-- A `RunningJob`'s `holder_session` is the claim record's `holder_session`. natedev's `Held` carries the local hold key (the holder's Claude session id, or its given name when it is no live session); the Mac block's `Held` carries its `RecordedSession` name, else `NO_HOLDER_SESSION`.
+- `target_state(target) -> TargetState` writes nothing and opens no connection. `TargetState = Free(kept_claims) | Running(jobs: tuple[RunningJob, ...], kept_claims) | Held(holder, reason, since, end: HoldEnd, holder_session, kept_claims) | Unreachable(reason) | StateUnreadable(reason)`, with `RunningJob(what, since, idle: IdleSince(when) | NotSeenIdle, holder_session)`, `KeptClaim(what, repository, since, holder_session)` (`kept_claims: tuple[KeptClaim, ...]`, default empty), `holder_session: HolderSession(session_id) | NoHolderSession` (default `NO_HOLDER_SESSION`) and `HoldEnd = ExpiresAt(when) | ReleaseEstimated(when) | UntilReleased | AwaitingBlockRemoval`. All are frozen dataclasses.
+- A `RunningJob`'s or `KeptClaim`'s `holder_session` is the claim record's `holder_session`. A `KeptClaim`'s `repository` is the claim's repository scope name, else the name of its worktree folder. natedev's `Held` carries the local hold key (the holder's Claude session id, or its given name when it is no live session); the Mac block's `Held` carries its `RecordedSession` name, else `NO_HOLDER_SESSION`.
+- `nix_env/heal.py` `hold_reason` reads the state of each target with the local platform. On natedev that includes `mac-linux`, whose state reads the Mac claim folder first, so an unreadable Mac claim file gives `build hold state unavailable`.
 - natedev is `Held` while `build_hold.natedev_holds` finds a hold in force: `ReleaseEstimated` with an ETA, else `UntilReleased`. The last release removes its file at once and natedev becomes free. Old cycle records still identify files left by a completed hold.
-- The Mac is `Held` whenever a block record exists (`read_claim_block`, the same reader `claim` uses): `ExpiresAt` before its expiry, `AwaitingBlockRemoval` after it. It is `Running` when `mac_test.read_claims` finds a live claim (a kept remote claim counts as live), with one `RunningJob` per live claim, oldest first, otherwise `Free`. A claim file it cannot read, `claims/<repo>.json` or `run.json`, is `StateUnreadable`.
+- The Mac is `Held` whenever a block record exists (`read_claim_block`, the same reader `claim` uses): `ExpiresAt` before its expiry, `AwaitingBlockRemoval` after it. It is `Running` when `mac_test.read_claims` finds a claim that holds work (`mac_test.run_holds_work`), with one `RunningJob` per such claim, oldest first, otherwise `Free`. Each kept claim (`mac_test.run_is_kept`) gives one `KeptClaim` in the `Held`, `Running` or `Free` state. `Unreachable` and `StateUnreadable` carry no kept claims. The state does not change or remove a kept claim. `status_claims` splits the Mac claim folder by `mac_test.claim_kind`: a `GUEST` claim belongs to `mac-linux`, and the `mac` state reads only the other claims. `TargetSnapshot.claims` keeps every claim, because the guest run shares the Mac repository limit. A claim file it cannot read, `claims/<repo>.json` or `run.json`, is `StateUnreadable`.
 - `StateUnreadable` carries the `OSError`, `UnicodeError` or `mac_test.StateReadError` text. A failed-probe record also makes a target `Unreachable`, before any AWS state lookup.
 - `target_eligibility(repo_root, package, routing: Routing) -> tuple[EligibleTarget | ExcludedTarget, ...]` gives one result per configured target in config order. `Routing = AnyEligibleTarget | LocalRequired(reason)`, with `ANY_ELIGIBLE_TARGET` as the shared value. A `linux` target is always eligible. A `macos` target is excluded with the `LocalRequired` reason under `--local`, with `repo` when the repository is unknown, its settings have no `linux_only.<repo>` key, or its workspace cannot be read. It is excluded with `linux_only` under the one rule in `eligibility.linux_only_policy`: a named package is checked alone, and no package checks every workspace member. A `check`, `lint` or `doc` step ignores `linux_only` (`eligibility.linux_only_applies`). Each `ssh` target is judged by its own settings file.
 
@@ -56,7 +68,7 @@ Every command checks holds through `target_state`. The sole holder may run its o
 
 | Command | Role |
 | --- | --- |
-| `status [--probe]` | One line per target through `format_state`, in the user's zone: `natedev: free`, `mac: held by <holder> since <HH:MM> until <HH:MM> — <why>`, `release expected <HH:MM>` for an eta, `mac: running <what> since <HH:MM>` (with `, idle since <HH:MM>` while the claim watcher has seen the Mac idle, from the claim's `idle_since`), one `running ...` part per job joined by `; `; a held or running part whose holder session resolves adds ` (showrunner <name>, unit <name>)` after `since <HH:MM>`, `<name>: unreachable — <reason>`, `<name>: state unreadable — <error>`. `--probe` adds a read-only `ssh true` per `ssh` target (`offload.probe_reachability`). `/build:status` runs it. |
+| `status [--probe]` | One line per target through `format_state`, in the user's zone: `natedev: free`, `mac: held by <holder> since <HH:MM> until <HH:MM> — <why>`, `release expected <HH:MM>` for an eta, `mac: running <what> since <HH:MM>` (with `, idle since <HH:MM>` while the claim watcher has seen the Mac idle, from the claim's `idle_since`), one `running ...` part per job joined by `; `; each kept claim adds ` · kept for cleanup: <owner> <what> since <HH:MM>` (`since <Mon DD, YYYY, HH:MM TZ>` from `user_zone.shown_time(..., zone, labeled=True)` for a start before today, `kept_since_text`) to a held, free or running line, after the hold reason on a held line, where the owner is the holder session name when known, else the repository (`kept_claim_text`), and there is no timer and no automatic removal; a guest claim (claim id prefix `mac-linux-`) shows on the `mac-linux` line, which reads `mac-linux: running mac-linux <step> since <HH:MM>` while the guest claim is live; a held or running part whose holder session resolves adds ` (showrunner <name>, unit <name>)` after `since <HH:MM>`, `<name>: unreachable — <reason>`, `<name>: state unreadable — <error>`. `--probe` adds a read-only `ssh true` per `ssh` target (`offload.probe_reachability`). `/build:status` runs it. |
 | `eligible --repo-root <p> --package <n> [--local <why>] [--kind <kind>] [--target <name>]` | Each target row has five tab-separated fields: name, eligibility, reason, settings path and platform. Eligibility is `eligible` or `excluded`. An eligible target has reason `-`. An SSH target has its settings path and platform (`macos` or `linux`). A local target has `-` for settings and platform. Errors print `build targets: <error>` and exit 2. |
 | `register-local --call-id <id> --pid <pid>` | A nonblocking hold check for routing. Stores no call record. |
 | `wait-local --call-id <id> [--pid <pid>] [--leave-hook <command>] [--caller <name>]` | Waits while a hold is in force. Release events wake it at once; polling checks every 15 s as a fallback. Prints the holder once and the 2 h notice once. An unmatched run adds `<speaker>: build has no run pointer (<run>); waits on <holder> hold for <purpose>.` Without a session, it adds `<speaker>: build has no session; waits on <holder> hold for <purpose>.` It prints this line once and sends the same line to the holder once. `hold_sender_timeout_seconds` limits the send to 30 seconds by default. A failed send prints `<speaker>: could not tell <holder>: <reason>` and the wait continues. A timeout reason names the limit in seconds. Invalid sender bytes use replacement characters. SIGINT and SIGTERM exit 130 and 143. From the second poll, a successful leave hook exits 75 for the free Mac. Records wait seconds and its PID for interruption, with no hold-cycle call record. |
@@ -250,7 +262,7 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 | --- | --- | --- |
 | `/build:hold` | `build_hold.py` | Clear, drain, or release natedev; check quiet and show holds. Use `/build:mac block` for the Mac. |
 | `/build:mac` | `mac_test.py` | Block, unblock, settle and show the Mac; audit which packages belong on it; claim it for a job of one's own (released after 15 idle minutes). |
-| `/build:status` | `build_targets.py status [--probe]` | Each target's state, read only, with the holder's showrunner and unit when its session is known. |
+| `/build:status` | `build_targets.py status [--probe]` | Each target's state, read only, with each kept claim and the holder's showrunner and unit when its session is known. |
 | `/build:bump <selector>`, `/build:bump clear [unit]` | `build_queue.py` | Changes unit priority. A bare command prints usage and the Builds page link. Use `/build:page` for the queue view. |
 | `/build:page` | `memory_feed.py link` | Prints the shared build page link. Use the `buildlog` CLI for detailed records. |
 | `/build:mac_report` | `buildlog mac-report` | How often tests finish on the Mac when it is usable. |
@@ -588,6 +600,11 @@ No package selects the whole workspace.
 | `doc [<package>]` | Workspace rustdoc against staged content. |
 | `example [<package>] [--name <name>]` | Workspace or named example selection. |
 | `final [<package>] [--saved] [--tree <tree>]` | Workspace check and selected tests, or a saved-pass query. |
+| `test,lint,doc [<package>]` | Run a comma list of `test`, `lint`, and `doc` in the given order. |
+
+A verb list accepts one optional package and no verb flags. The first failure ends the list with its status.
+On Linux, the parent initializes `BUILDLOG_RUN` once. Each verb inherits it and uses its own call record.
+Steps that require a checkout slot omit the identity from placement requests. Such a step can leave its grant without a memory handoff.
 
 `parse_routing_arguments` removes routing flags into named shell values and returns the remaining `ARGS`.
 `parse_command_arguments` reads the command form.

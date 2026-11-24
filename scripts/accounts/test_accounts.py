@@ -2801,7 +2801,8 @@ class AccountsTests(unittest.TestCase):
             self.assertIsInstance(result, accounts.MoveStarted)
             listing.assert_called_once_with()
             moved.assert_called_once_with([owner.session_id], "claude2", why="fixture move", cause="by hand",
-                                          source_accounts={owner.session_id: "claude1"} if live else {})
+                                          source_accounts={owner.session_id: "claude1"} if live else {},
+                                          user_command=True)
 
         self.login_directory("claude1", "move@example.invalid")
         stored_room("move@example.invalid", 0, datetime.now(timezone.utc) + timedelta(days=1))
@@ -7603,7 +7604,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             ["systemctl", "--user", "is-active", "--quiet", "accounts-workers-move"],
             ["systemd-run", "--user", "--collect", "--quiet", "--unit=accounts-workers-move",
              str(accounts.SCRIPTS / "lib/py"), str(accounts.SCRIPTS / "accounts/accounts.py"),
-             "move", "workers", "codex1", "--follow-role", "--why", "auto: workers-entry"],
+             "move", "workers", "codex1", "--follow-role", "--why", "auto: workers-entry", "--cause", "auto"],
             ["systemctl", "--user", "is-active", "--quiet", "accounts-workers-move"],
         ])
 
@@ -7952,6 +7953,47 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual([(entry["to"], entry.get("scope")) for entry in requests], [("codex1", "group"), ("codex1", "group")])
         self.assertEqual(moves.pending_move_requests(), ())
 
+    def test_automatic_workers_swap_passes_its_cause_and_never_a_user_command(self) -> None:
+        source, _ = self.workers_fixture()
+        machine = cast(Callable[[], str], getattr(accounts, "_session_counts_machine"))()
+        producer = fixture_member("producer", name="codex-producer", backend=staff.CodexBackend(source),
+            doc=staff.LiveDoc(machine, self.root / "codex-producer/plan.md"),
+            worktree=staff.PresentWorktree(machine, self.root / "codex-producer"))
+        registry = write_registry(self.root / "producer-models.conf", {"producers": {"codex-producer": "codex:gpt-test:high"}})
+
+        with (patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH}),
+              patch.object(stop_resume, "move_sessions", return_value=[stop_results.ResumePending(
+                  producer.current_session, "codex1", "destination is not ready")]) as producer_move,
+              redirect_stdout(io.StringIO())):
+            _ = accounts.swap("workers", "codex1", why="auto: fixture", cause="auto")
+        producer_move.assert_called_once_with([str(producer.current_session)], "codex1", why="auto: fixture",
+                                             cause="auto", source_accounts={},
+                                             intent=moves.ExplicitMoveTarget.GROUP_ACCOUNT, user_command=False)
+
+        launch = cast(Callable[..., None], getattr(accounts, "_launch_worker_moves"))
+        for user_command in (False, True):
+            with self.subTest(user_command=user_command), \
+                    patch.object(shutil, "which", return_value=None), patch.object(subprocess, "Popen") as popen:
+                launch("codex1", "auto: fixture", cause="auto", user_command=user_command)
+                command = cast(list[str], popen.call_args.args[0])
+                self.assertEqual(command[command.index("--cause") + 1], "auto")
+                self.assertEqual("--user-command" in command, user_command)
+
+        for extra, user_command in (((), False), (("--user-command",), True)):
+            with self.subTest(extra=extra), \
+                    patch.object(accounts, "move_workers", return_value=accounts.MoveRefused("fixture")) as moved:
+                _ = self.run_cli("move", "workers", "codex1", "--follow-role", "--why", "auto: fixture",
+                                 "--cause", "auto", *extra)
+                self.assertEqual((moved.call_args.kwargs["cause"], moved.call_args.kwargs["user_command"]),
+                                 ("auto", user_command))
+
+        # Only the workers branch reads the hidden flags.
+        for arguments in (("units", "claude3", "--cause", "auto"), ("alpha", "claude3", "--user-command")):
+            with self.subTest(arguments=arguments), \
+                    patch.object(accounts, "move_group", side_effect=AssertionError("group moved")), \
+                    patch.object(accounts, "move", side_effect=AssertionError("session moved")):
+                self.assertEqual(self.run_cli("move", *arguments)[0], 1)
+
     def test_workers_swap_selects_the_target_before_stops_and_keeps_pending_and_refused_workers(self) -> None:
         for missing_settings in (False, True):
             with self.subTest(missing_settings=missing_settings):
@@ -8009,7 +8051,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 self.assertEqual(stopped.call_count, 2)
                 producer_move.assert_called_once_with([str(producer.current_session)], "codex1", why="by hand",
                                                      cause="by hand", source_accounts={},
-                                                     intent=moves.ExplicitMoveTarget.GROUP_ACCOUNT)
+                                                     intent=moves.ExplicitMoveTarget.GROUP_ACCOUNT, user_command=True)
                 self.assertEqual(observed, [target, target])
                 self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
                 lines = output.splitlines()

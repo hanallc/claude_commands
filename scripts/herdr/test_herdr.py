@@ -40,6 +40,7 @@ from scripts.herdr.fake_herdr import CommandResponse
 from scripts.lib.agent_scope import agents_slice
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import operation_deadline, session_folder
+from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, fake_unit_host
 from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
@@ -3342,7 +3343,8 @@ class LaunchDestinationTests(StaffTestCase):
                         setup = (command + "\n") * setups
                         shell = subprocess.run([shutil.which("zsh") or "/bin/zsh", "-dfi"],
                             input=f'{kind}() {{ print agent-returned; return 23; }}\n{setup}{kind}\nprint shell-retained\n',
-                            cwd=self.root, env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                            cwd=self.root, env={**environment, **fixture_zsh_environment()},
+                            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
                         self.assertIn("agent-returned", shell.stdout)
                         self.assertIn("shell-retained", shell.stdout)
                         self.assertEqual(shell.returncode, 0, shell.stderr)
@@ -3502,7 +3504,8 @@ class LaunchDestinationTests(StaffTestCase):
                     alias = shlex.quote(f"CODEX_HOME=/wrong {shlex.quote(str(program))}")
                     shell = subprocess.run([shutil.which("zsh") or "/bin/zsh", "-c",
                                             f"alias codex={alias}\n{command}\ncodex\n"],
-                                           env=prepared.env, capture_output=True, text=True, check=True)
+                                           env={**prepared.env, **fixture_zsh_environment()},
+                                           capture_output=True, text=True, check=True)
                     self.assertEqual(shell.stdout.strip(), "/account")
                     return herdr.PromptSubmissionNotRequired()
                 prepared = herdr.PreparedAgentEnvironment(Path("/tmp"),

@@ -86,7 +86,8 @@ The route takes the Mac repository claim before the first SSH request.
 Then the gate consumes the launch permission of its assignment (`ConsumePermission`) before the first SSH request.
 The gate process is the claim holder, and the Mac claim id is the claim reference.
 The queue keeps a consumed guest assignment current while the gate process lives.
-So the queue places no other run on the busy guest, and the Builds page shows a running guest row.
+So the queue places no other run on the busy guest, and the Builds page shows a guest row with machine `mac-linux`.
+Until the queue confirms the guest attempt, the row shows `mac-linux (not confirmed)`.
 A refused consume, or a queue that does not answer, starts nothing on the guest.
 The guest run holds a separate lock. Before it can prove the run ended, the guest checks its machine ID and the checkout path from the arm step. The route also refuses the proof when the guest account in the settings differs from the armed account.
 If the wait expires, the gate fails with `guest unreachable` and the guest alias from `ssh.hops`.
@@ -106,7 +107,10 @@ A second decline from the guest in the same run ends the guest for that run, so 
 If no named machine remains, the gate step stops with "Gate placement blocked".
 A refused placement during the retry stops the gate step with "Gate placement blocked".
 A failure after the first test started is not placed again: the gate fails.
-`copies.py run` with named gate targets does not place the gate again yet.
+`copies.py run` does not place a gate again after a guest decline.
+Checkpoint and bump gates use `copies.py gate-step` when they have placement targets.
+A claude gate requests every enabled target that the fixed placement rules permit when the caller gives no targets.
+See [Gate placement](build-targets.md#gate-placement).
 If the guest cannot return a result after a test started, the gate fails and reports the guest and the reason.
 Each failure with a stream status names that status and the last 1200 characters of the stream standard error (`stream_report`).
 If the guest returns a failure, the gate reports the guest and the failed jobs.
@@ -720,7 +724,9 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   The outer gate removes the nested gate files when it removes the module folder.
   The short names leave room for Unix socket paths below `TMPDIR`.
   The runner reads the output and removes the temporary folder when the job ends.
-  At the first unittest load or run, the bootstrap checks whether the process already runs under a test limit.
+  At the first unittest load or run, the bootstrap disables bytecode writes for the test.
+  Python child processes inherit `PYTHONDONTWRITEBYTECODE=1`.
+  The bootstrap then checks whether the process already runs under a test limit.
   On Linux, the bootstrap first checks for a verified gate parent.
   It then reads at most 32 ancestor records and up to 64 KiB of environment data per session leader.
   If neither check proves a gate launch, it reads the cgroup name once.
@@ -729,15 +735,29 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   A Linux process without a user systemd manager uses a private folder and a watchdog process for the same deadline.
   Only a proven absence selects the watchdog: no user bus, a bus socket path that does not exist, or a bus where no process owns the systemd name.
   Any other failed manager check stops the test with status 1. The test starts only after the watchdog reports that it is ready; a watchdog that does not start also stops the test with status 1.
+  Before it reports that it is ready, the watchdog closes each descriptor above standard error that it inherits from the test.
+  Thus the watchdog holds no build folder lock of the test.
   At the deadline the watchdog stops the test first and then prints the limit line. The watchdog stops only the test process, not its children.
   Herdr adds the startup path to every agent pane because the server can launch it outside the client's test limit.
   The bootstrap gives a new direct test run a maker folder.
   A later `package_root.py` run inside an import selects the checkout only and starts no folder.
   `gate.py --affected` uses the same test-folder context for its outer run.
-  These folders use `<inherited TMPDIR>/test-runs/r*`.
+  A modeled checkout keeps each `r*` run folder in `test-runs` in its build output.
+  Worktree and main checkouts use their `target` link to the build output.
+  On natedev, a modeled `~/.claude` uses `/build/claude/main/test-runs`.
+  Numbered copies use their own `target` folder.
+  A checkout without a model output uses `$TMPDIR/test-runs`.
+  A nested legacy run uses the parent of the current run folder.
+  A gate job without `MERGE_GATE_MODULE_DIR` keeps the timed runner folders in its `TMPDIR`.
+  A direct timed runner selects the output from the checkout that contains `start_dir`.
+  It gives `config-reads-*` and `test-run-roots-*` unique names in that checkout's `test-runs` folder.
+  A new direct test run in that runner also puts its `TMPDIR` there.
   Child processes inherit TMPDIR, and each run holds its folder lock.
   Normal exit removes the folder, its lease, and its lock.
-  Before allocation, the next run sweeps free folders in that `test-runs` parent, including older `test-run-*` folders.
+  Before allocation, each run that prepares a `test-runs` parent sweeps its free folders, including older `test-run-*` folders.
+  This includes a direct run and the `gate.py --affected` outer run.
+  `test_run_folder()` uses the checkout output even when TMPDIR names a gate module folder.
+  The sweep does not wait for held folders.
   The sweep also removes free lease records, lock records, and unfinished temporary lease files.
   Held locks prevent removal.
   SIGTERM and SIGKILL leave recorded residue until the next sweep observes a free lock.
@@ -965,7 +985,10 @@ It also removes unpublished formatter commits.
 
 Shrink and as-built items use their commit subject's plan slug within the configured plan folder.
 Subjects without the closing-item format retain the configured plan.
-An ancestry hold names the first unmerged commit by its short hash and subject.
+Ancestry uses each pending commit's first parent as the test merge base.
+It skips the commit if a clean test merge leaves the fetched `origin/main` tree unchanged.
+Ancestry holds on a root commit, a tree change, a conflict, or a configured custom merge driver.
+The hold names the first such commit by its short hash and subject.
 A row that repeats a checkpoint in the batch receives instructions to resume it alone.
 
 `test_merge_checkpoint_batch.py` checks fresh and resumed red batches, formatter rollback, and the next queued item.
