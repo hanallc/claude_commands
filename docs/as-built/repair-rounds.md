@@ -196,6 +196,10 @@ nate decides step 3 of the push lock plan (one landing queue) from these times.
 The helper tracks active holds in the process.
 A nested call in the same process uses the existing hold for that path.
 A different repository takes its own lock.
+A caller can use `wait=False` to try the lock once without waiting.
+The Change Review readiness scan does this once per list, including after a merge.
+Each failed commit attempt gives one warning with the list path, the number of new rows, and the reason.
+The next scan tries again.
 The helper does not change `os.environ`.
 `held_environment(checkout)` gives a named child `MAIN_PUSH_LOCK_HELD` with the absolute lock path.
 It refuses when the process does not hold that lock.
