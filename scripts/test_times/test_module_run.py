@@ -492,22 +492,26 @@ except AssertionError:
 
     def test_private_run_roots_copies_the_test_owned_config(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        checkout = RUNNER.parents[2] / "config"
-        owned = root / "owned"
-        owned.mkdir()
+        checkout = root / "checkout"
+        config, owned = checkout / "config", checkout / "test_config"
+        for folder in (config, owned):
+            folder.mkdir(parents=True)
+        _ = (config / "console.conf").write_text("page.list.owner=live\n")
         _ = (owned / "console.conf").write_text("page.list.owner=test-owned\n")
-
-        def owned_path(stem: str) -> Path:
-            return owned / f"{stem}.conf"
+        _ = (config / "gate.conf").write_text("mode=fixture\n")
+        (config / "merge_gate.conf").symlink_to("gate.conf")
+        _ = (config / "limits.conf").write_text("# whole: 1..\ncount=8\n")
+        _ = (owned / "limits.conf").write_text("# whole: 1..\ncount=4\n")
 
         fixture = root / "fixture"
         fixture.mkdir()
         _ = (fixture / "console.conf").write_text("page.list.owner=inherited\n")
         sources = {path: path.read_bytes()
-                   for path in (checkout / "console.conf", owned / "console.conf", fixture / "console.conf")}
+                   for path in (config / "console.conf", owned / "console.conf", fixture / "console.conf",
+                                config / "limits.conf", owned / "limits.conf")}
         rows: tuple[tuple[str, dict[str, str]], ...] = (("no CONF_DIR", {}), ("set CONF_DIR", {"CONF_DIR": str(fixture)}))
         for index, (label, environment) in enumerate(rows):
-            with self.subTest(label), patch.object(conf, "test_config_path", side_effect=owned_path), patch.dict(os.environ):
+            with self.subTest(label), patch.object(module_run, "CHECKOUT", checkout), patch.dict(os.environ):
                 _ = os.environ.pop("CONF_DIR", None)
                 os.environ.update(environment)
                 module = root / f"module-{index}"
@@ -516,8 +520,11 @@ except AssertionError:
                     folder = Path(os.environ["CONF_DIR"])
                     self.assertEqual(folder, run_root / "config")
                     self.assertEqual((folder / "console.conf").read_text(), "page.list.owner=test-owned\n")
-                    self.assertEqual((folder / "gate.conf").read_bytes(), (checkout / "gate.conf").read_bytes())
+                    self.assertEqual((folder / "gate.conf").read_bytes(), (config / "gate.conf").read_bytes())
                     self.assertEqual(os.readlink(folder / "merge_gate.conf"), "gate.conf")
+                    shifted = folder / "limits.conf"
+                    self.assertEqual(conf.read(shifted).whole("count"), 5)
+                    self.assertIn("# test config shift: 4 5\n", shifted.read_text())
                     _ = (folder / "console.conf").write_text("changed\n")
                 if environment:
                     self.assertEqual(Path(os.environ["CONF_DIR"]), fixture)
@@ -1085,8 +1092,9 @@ shutil.rmtree(path)""", []),
             (root / "__pycache__").mkdir()
             _ = (root / "__pycache__/saved.bin").write_bytes(b"fixture")
             _ = (outside / "outside.txt").write_text("fixture\n")
-            environment = {**os.environ, "HOME": str(outside / "home"), "PYTHONPATH": str(library / "python_startup"),
-                           "PYTHONDONTWRITEBYTECODE": "1", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+            environment = {**os.environ, "HOME": str(outside / "home"), "CONF_DIR": str(root / "test_config"),
+                           "PYTHONPATH": str(library / "python_startup"), "PYTHONDONTWRITEBYTECODE": "1",
+                           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
             for arguments in (("init", "--quiet"), ("add", "listed", "commands", "docs")):
                 _ = subprocess.run(["git", *arguments], cwd=root, env=environment, check=True,
                                    capture_output=True, timeout=TEST_HANG_GUARD_SECS)

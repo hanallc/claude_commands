@@ -17,6 +17,7 @@ from unittest import mock
 
 
 from scripts.lib import conf, conf_reads
+from scripts.lib import checkout_test_support
 from scripts.lint.memory_test_support import commit_config_fixture, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -961,6 +962,26 @@ class TestOwnedConfigTests(unittest.TestCase):
     def test_each_config_file_has_a_test_owned_twin_with_the_same_keys(self) -> None:
         faults = twin_faults(Path(conf.__file__).resolve().parents[2] / "config", conf.test_config_path)
         self.assertEqual(faults, [], "\n".join(faults))
+
+    def test_runtime_copies_shift_the_test_owned_value_after_a_live_tune(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        source = root / "checkout"
+        live = source / "config/detached_runs.conf"
+        owned = source / "test_config/detached_runs.conf"
+        for path in (live, owned):
+            path.parent.mkdir(parents=True)
+            _ = path.write_text("# range: 1..30\nRESULT_PUSH_RETRY_SECONDS=5\n")
+        with (mock.patch.object(checkout_test_support, "SOURCE", source),
+              mock.patch.object(checkout_test_support, "runtime_files",
+                                return_value=(owned.relative_to(source),))):
+            checkout_test_support.copy_runtime(root / "before")
+            _ = live.write_text("# range: 1..30\nRESULT_PUSH_RETRY_SECONDS=8\n")
+            checkout_test_support.copy_runtime(root / "after")
+        before = root / "before/config/detached_runs.conf"
+        after = root / "after/config/detached_runs.conf"
+        self.assertEqual(after.read_bytes(), before.read_bytes())
+        self.assertEqual(conf.read(after).number("RESULT_PUSH_RETRY_SECONDS"), 6.25)
+        self.assertIn("# test config shift: 5 6.25\n", after.read_text())
 
     def test_twin_check_names_each_file_and_key(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))

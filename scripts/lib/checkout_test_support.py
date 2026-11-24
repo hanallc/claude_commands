@@ -46,21 +46,17 @@ def copy_with_bytecode(source: Path, destination: Path) -> None:
 
 def copy_runtime(checkout: Path, *, configuration: bool = True) -> None:
     """Copy missing runtime files and keep the fixture's existing tools."""
-    from scripts.lint.memory_test_support import copy_config_file_fixture
+    from scripts.lib.conf import copy_for_test
 
     for relative in runtime_files():
-        if not configuration and relative.parts[0] in {"config", "test_config"}:
+        if relative.parts[0] == "config" or not configuration and relative.parts[0] == "test_config":
             continue
         destination = checkout / relative
         if not os.path.lexists(destination):
             destination.parent.mkdir(parents=True, exist_ok=True)
-            source = SOURCE / relative
-            if relative.parts[0] == "config" and source.is_symlink():
-                destination.symlink_to(source.readlink(), target_is_directory=source.is_dir())
-            elif len(relative.parts) == 2 and relative.parts[0] == "config" and relative.suffix == ".conf":
-                _ = copy_config_file_fixture(source, destination)
-            else:
-                copy_with_bytecode(source, destination)
+            copy_with_bytecode(SOURCE / relative, destination)
+    if configuration:
+        _ = copy_for_test(SOURCE / "config", checkout / "config")
 
 
 def copy_startup(checkout: Path) -> None:
@@ -75,7 +71,7 @@ def copy_startup(checkout: Path) -> None:
 
 def copy_test_runner(checkout: Path) -> None:
     """Install the test runner and its dependencies in a temporary checkout."""
-    for relative in TEST_RUNNER_FILES:
+    for relative in (*TEST_RUNNER_FILES, "test_config/build_folders.conf", "test_config/test_times.conf"):
         destination = checkout / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.is_symlink():
