@@ -1011,6 +1011,7 @@ Review-list publication, style notification, checkout announcement, and Mac prom
 Each merge retains its own review ownership and completion record.
 
 A hold, failure, or cancellation ends a fresh batch and returns each row to its requester.
+When a row holds during its checks, each later notice names the held row and says that the later row did not run.
 Before each gate run, record the tested tip and each row's selected commands in memory.
 For attribution, compare a merged row with its merge's first parent.
 Compare an unmerged row with the destination tip before preparation.
