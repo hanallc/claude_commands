@@ -139,6 +139,97 @@ class UnitFolderMoveTests(FolderRenameFixture):
             f"roots.workspace={root}\nroots.build={build}\nroots.build.natedev={build}\n")
         return build_folders.worktree_path(build_folders.repo_word(self.source), self.old_name, "edit")
 
+    def test_managed_move_retries_publication_after_staff_records_the_destination(self) -> None:
+        import fcntl
+
+        destination = self.managed_destination()
+        output = build_folders.output_path(build_folders.repo_word(self.source), self.old_name, "edit")
+        output.parent.mkdir(parents=True)
+        target = self.source / "target"
+        target.mkdir()
+        _ = (target / "artifact").write_text("warm")
+        state = self.root / "worktree-state"
+        backend = FolderSessionFixture(self.owner, live=False)
+        with mock.patch.dict(os.environ, {"WORKTREES_STATE_DIR": str(state)}), backend.installed():
+            journal = worktrees.move_file(self.source)
+            with output.with_name(output.name + ".lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                for _attempt in range(2):
+                    result = self.move_folder(destination)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("the build folder lock is held", result.stderr)
+                    self.assertEqual(worktrees.read_move(journal).stage, worktrees.MoveStage.LINKED)
+                    row = staff.by_id(self.owner.id)
+                    assert row is not None
+                    self.assertEqual(row.worktree, staff.PresentWorktree(remote.local_machine(), destination))
+                    self.assertEqual((destination / "target/artifact").read_text(), "warm")
+
+            result = self.move_folder(destination)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "done\n", ""))
+            self.assertEqual(worktrees.read_move(journal).stage, worktrees.MoveStage.FINISHED)
+            self.assertEqual((destination / "target").readlink(), output)
+            self.assertEqual((output / "artifact").read_text(), "warm")
+            self.assertEqual(self.source.readlink(), destination)
+            result = self.move_folder(destination)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "unchanged\n", ""))
+        self.assertEqual((backend.starts, backend.stops), ([], []))
+
+    @unittest.skipUnless(sys.platform == "linux", "requires /proc")
+    def test_managed_move_leaves_the_local_target_in_use_on_retry(self) -> None:
+        import fcntl
+        import select
+
+        destination = self.managed_destination()
+        output = build_folders.output_path(build_folders.repo_word(self.source), self.old_name, "edit")
+        output.parent.mkdir(parents=True)
+        (self.source / "target").mkdir()
+        _ = (self.source / "target/artifact").write_text("warm")
+        backend = FolderSessionFixture(self.owner, live=True)
+        state = self.root / "worktree-state"
+        with mock.patch.dict(os.environ, {"WORKTREES_STATE_DIR": str(state)}), backend.installed():
+            with output.with_name(output.name + ".lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with mock.patch.object(restart, "start_row", side_effect=OSError("fixture launch failed")):
+                    result = self.move_folder(destination)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            recovery = unit_move.folder_resume_path(self.owner.id)
+            self.assertTrue(recovery.is_file())
+            journal = worktrees.move_file(self.source)
+            self.assertEqual(worktrees.read_move(journal).stage, worktrees.MoveStage.LINKED)
+
+            target = destination / "target"
+            inode = target.stat().st_ino
+            command = "import sys\nwith open('artifact'):\n print('ready', flush=True)\n sys.stdin.read()"
+            with ExitStack() as build:
+                process = build.enter_context(subprocess.Popen([sys.executable, "-c", command], cwd=target,
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE))
+                _ = build.callback(process.communicate, timeout=TEST_HANG_GUARD_SECS)
+                assert process.stdout is not None
+                ready, _, _ = select.select([process.stdout], [], [], TEST_HANG_GUARD_SECS)
+                self.assertTrue(ready)
+                self.assertEqual(process.stdout.readline(), b"ready\n")
+                entry = Path(self.env["HERDR_PROC"]) / str(process.pid)
+                entry.symlink_to(Path("/proc") / str(process.pid), target_is_directory=True)
+                _ = build.callback(entry.unlink)
+
+                before = file_versions(self.root)
+                result = self.move_folder(destination)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"process {process.pid}", result.stderr)
+                self.assertFalse(target.is_symlink())
+                self.assertEqual(target.stat().st_ino, inode)
+                self.assertFalse(output.exists())
+                self.assertEqual(file_versions(self.root), before)
+                self.assertEqual(backend.starts, [])
+
+            result = self.move_folder(destination)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(worktrees.read_move(journal).stage, worktrees.MoveStage.FINISHED)
+            self.assertEqual(target.readlink(), output)
+            self.assertEqual((output / "artifact").read_text(), "warm")
+            self.assertEqual(len(backend.starts), 1)
+            self.assertFalse(recovery.exists())
+
     def test_move_folder_records_the_destination_branch(self) -> None:
         destination = self.managed_destination()
         backend = FolderSessionFixture(self.owner, live=False)
@@ -414,6 +505,9 @@ class UnitFolderMoveTests(FolderRenameFixture):
                             self.assertTrue(backend.live)
                             if late_owners:
                                 self.assertEqual(lock.exists(), pending == "late run path with lock")
+                                recovery = unit_move.folder_resume_path(self.owner.id)
+                                self.assertFalse(recovery.exists())
+                                del refusal_files[str(recovery.relative_to(self.root))]
                                 self.assertEqual(file_versions(self.root), refusal_files)
                                 self.assertEqual(staff.by_id(late_owners[0].id), replace(late_owners[0], run=staff.OpenRun(run)))
                             else:
@@ -442,7 +536,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
                      "session_id": None},
                 ]
 
-                def start(row: staff.StaffRow, record: staff.StaffSnapshot, client: object) -> str:
+                def start(row: staff.StaffRow, record: staff.StaffSnapshot, client: object, **_options: object) -> str:
                     _ = backend.start(row, record, client)
                     panes[0]["session_id"] = None
                     return resumed_pane
@@ -607,14 +701,26 @@ class UnitFolderMoveTests(FolderRenameFixture):
             self.assert_finished_rerun(backend)
 
     def test_real_restart_resumes_each_family_in_the_destination_and_keeps_the_terminal(self) -> None:
+        self.check_real_folder_resume(("claude", "codex"))
+
+    def test_folder_move_reports_the_director_before_worker_restore(self) -> None:
+        for outcome in ("restored", "refused"):
+            with self.subTest(outcome=outcome):
+                self.check_real_folder_resume(("claude",), worker_outcome=outcome)
+
+    def check_real_folder_resume(self, kinds: tuple[Literal["claude", "codex"], ...], *,
+                                 worker_outcome: Literal["restored", "refused"] | None = None) -> None:
         from scripts.herdr import herdr
         from scripts.message import sessions
         from scripts.accounts import accounts
         from scripts.agents import stop_resume
+        from scripts.production import worker
 
-        kinds: tuple[Literal["claude", "codex"], ...] = ("claude", "codex")
         for kind in kinds:
             with self.subTest(kind=kind), saved_fixture(self.root) as restore:
+                member = fixture_worker("implementation", self.owner.id) if worker_outcome is not None else None
+                sibling = fixture_worker("review", self.owner.id) if worker_outcome == "refused" else None
+                restore_batches: list[frozenset[staff.StaffId]] = []
                 self.transcript(kind)
                 backend = FolderSessionFixture(self.owner, live=True)
                 real_start = restart.start_row
@@ -658,7 +764,27 @@ class UnitFolderMoveTests(FolderRenameFixture):
                     argv = [kind, "--resume" if kind == "claude" else "resume", self.owner.current_session] if backend.live else ["zsh"]
                     return {"process_info": {"shell_pid": 998040, "foreground_process_group_id": pid,
                         "foreground_processes": [{"pid": pid, "name": kind if backend.live else "zsh", "argv": argv}]}}
+                def restore_worker(parent: staff.StaffId, *, record: staff.StaffSnapshot,
+                                   report: worker.RestoreReport, only: frozenset[staff.StaffId],
+                                   **_options: object) -> worker.ExitCode:
+                    self.assertEqual(parent, self.owner.id)
+                    self.assertTrue(backend.live)
+                    assert member is not None
+                    current = record.by_id(member.id)
+                    assert current is not None
+                    self.assertEqual(current.current_session, member.current_session)
+                    self.assertEqual(shutdown_record.row_folder(current, record),
+                                     (remote.local_machine(), self.destination))
+                    restore_batches.append(only)
+                    if sibling is not None and len(restore_batches) == 1:
+                        report.restored.add(sibling.id)
+                        report.failures[member.id] = (member.name, "worker session is unavailable")
+                        return worker.ExitCode.UNCERTAIN
+                    report.restored.add(member.id)
+                    return worker.ExitCode.OK
+
                 with (backend.installed(), mock.patch.object(restart, "start_row", side_effect=real_start),
+                      mock.patch.object(worker, "restore", side_effect=restore_worker) as worker_restore,
                       mock.patch.object(restart, "stop_row", side_effect=stop),
                       mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude1", self.home / ".claude")),
                       mock.patch.object(accounts, "account_dir", return_value=self.home / ".claude"),
@@ -673,13 +799,33 @@ class UnitFolderMoveTests(FolderRenameFixture):
                       mock.patch.object(herdr.Herdr, "pane_activity", return_value=herdr.PaneAtShell()),
                       mock.patch.object(herdr.Herdr, "remember_row_tab")):
                     result = self.move_folder()
-                    self.assertEqual((result.returncode, result.stderr), (0, ""))
+                    self.assertIn(f"{self.owner.name}: director resumed", result.stdout)
+                    self.assertEqual(worker_restore.call_count, int(member is not None))
+                    if worker_outcome == "refused":
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn("worker session is unavailable", result.stderr)
+                        self.assertIn("session recovery is incomplete", result.stderr)
+                    else:
+                        self.assertEqual((result.returncode, result.stderr), (0, ""))
+                        if member is not None:
+                            self.assertIn(f"{self.owner.name}: worker {member.name} resumed", result.stdout)
                     self.assert_moved(backend)
                     self.assertEqual(len(resumed), 1)
                     arguments = resumed[0][1]
                     flag = "--resume" if kind == "claude" else "resume"
                     self.assertEqual(arguments[arguments.index(flag) + 1], self.owner.current_session)
                     self.assertEqual(list(self.records.iterdir()), [])
+                    recovery = unit_move.folder_resume_path(self.owner.id)
+                    if sibling is not None:
+                        assert member is not None
+                        self.assertTrue(recovery.is_file())
+                        rerun = self.move_folder()
+                        self.assertEqual((rerun.returncode, rerun.stderr), (0, ""))
+                        self.assertIn(f"{self.owner.name}: worker {member.name} resumed", rerun.stdout)
+                        self.assertTrue(rerun.stdout.endswith("done\n"))
+                        self.assertEqual(restore_batches, [frozenset({member.id, sibling.id}), frozenset({member.id})])
+                        self.assertEqual(backend.stops, [self.owner.current_session])
+                    self.assertFalse(recovery.exists())
                     before = file_versions(self.root)
                     rerun = self.move_folder()
                     self.assertEqual((rerun.returncode, rerun.stdout, rerun.stderr), (0, "unchanged\n", ""))
@@ -784,7 +930,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
                           mock.patch.object(restart, "start_row", return_value="") as start,
                           mock.patch.object(os, "kill") as kill):
                         result = command()
-                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.returncode, int(operation == "move"), result.stderr)
                     if operation == "move":
                         self.assertIn("stop is incomplete", result.stderr)
                         self.assertTrue(self.source.is_dir())
@@ -1058,17 +1204,53 @@ class UnitFolderMoveTests(FolderRenameFixture):
         self.test_stopped_unit_with_a_closed_pane_stays_stopped()
 
     def test_rerun_starts_a_director_that_is_down_after_staff_publication(self) -> None:
-        backend = FolderSessionFixture(self.owner, live=False)
-        _ = self.git("worktree", "move", "--force", "--force", str(self.source), str(self.destination))
-        _ = staff.set_worktree(self.owner.id, staff.PresentWorktree(remote.local_machine(), self.destination),
-                               expected=self.owner.worktree)
-        with backend.installed(), mock.patch.object(restart, "stop_row") as stop:
+        backend = FolderSessionFixture(self.owner, live=True)
+        recovery = unit_move.folder_resume_path(self.owner.id)
+        with backend.installed():
+            with mock.patch.object(restart, "start_row", side_effect=OSError("fixture launch failed")):
+                result = self.move_folder()
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("fixture launch failed", result.stderr)
+            self.assertTrue(recovery.is_file())
+            self.assertFalse(backend.live)
+            self.assert_moved(backend)
             result = self.move_folder()
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertTrue(result.stdout.endswith("unchanged\n"))
-            stop.assert_not_called()
-            self.assertEqual((backend.stops, backend.starts, backend.live), ([], [], False))
+            self.assertIn(f"{self.owner.name}: director resumed", result.stdout)
+            self.assertFalse(recovery.exists())
+            self.assertTrue(backend.live)
+            self.assertEqual(len(backend.starts), 1)
+            self.assertEqual(backend.stops, [self.owner.current_session])
             self.assert_finished_rerun(backend)
+
+    def test_expired_move_deadline_preserves_the_down_director_for_retry(self) -> None:
+        from scripts.agents import worker_lifecycle
+
+        backend = FolderSessionFixture(self.owner, live=True)
+        clock = [100.0]
+
+        def stop(row: staff.StaffRow, client: object) -> bool:
+            stopped = backend.stop(row, client)
+            clock[0] += 1
+            return stopped
+
+        recovery = unit_move.folder_resume_path(self.owner.id)
+        with backend.installed():
+            with (mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+                  mock.patch.object(restart, "stop_row", side_effect=stop),
+                  worker_lifecycle.operation_deadline(deadline=100.5)):
+                result = self.move_folder()
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("deadline", result.stderr)
+            self.assertFalse(backend.live)
+            self.assertEqual(backend.starts, [])
+            self.assertTrue(recovery.is_file())
+            self.assertFalse(self.destination.exists())
+            rerun = self.move_folder()
+            self.assertEqual(rerun.returncode, 0, rerun.stderr)
+            self.assertTrue(backend.live)
+            self.assertFalse(recovery.exists())
+            self.assert_moved(backend)
 
     def test_incomplete_stop_report_still_starts_a_director_that_has_exited(self) -> None:
         backend = FolderSessionFixture(self.owner, live=True)
@@ -1077,7 +1259,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
             return False
         with backend.installed(), mock.patch.object(restart, "stop_row", side_effect=incomplete):
             result = self.move_folder()
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("stop is incomplete", result.stderr)
         self.assertEqual(backend.stops, [self.owner.current_session])
         self.assertEqual(len(backend.starts), 1)
@@ -2166,6 +2348,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
                     self.assertIn("rename: error:", result.stderr)
                     self.assertEqual(len(result.stderr.splitlines()), 1)
                 else:
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                     self.assertIn("anomaly", result.stderr.lower())
                 self.assertNotIn("Traceback", result.stdout + result.stderr)
                 self.assertTrue(self.source.exists())
