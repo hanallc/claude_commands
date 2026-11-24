@@ -55,6 +55,7 @@ from scripts.build_queue.admission_wire import (
     VerifyRunSlotWaiting as VerifyRunSlotWaiting,
     LaunchRequest as LaunchRequest,
     ReleaseRequest as ReleaseRequest,
+    ReleaseEnding as ReleaseEnding,
     WidthRequest as WidthRequest,
     BuildHistoryRequest as BuildHistoryRequest,
     ViewRequest as ViewRequest,

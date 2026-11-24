@@ -400,9 +400,11 @@ class CargoWrapperTest(unittest.TestCase):
             ["nextest", "run", "--", "--help"],
         ))
         cases: list[tuple[list[str], dict[str, str]]] = [(args, {}) for args in calls]
+        # The value of the own scope starts cargo at once; a value from another scope is stale.
+        own_scope = "/sys/fs/cgroup" + self.cgroup.read_text().strip().removeprefix("0::")
         cases.extend((["build"], variables) for variables in (
             {"CARGO_FOLDER_CHECKED": "1"}, {"CARGO_FOLDER_CHECKED": "0"}, {"BUILDLOG_STEP_SCOPE": "/step.scope"},
-            {"BUILDLOG_STEP_SCOPE": ""}))
+            {"BUILDLOG_STEP_SCOPE": own_scope}, {"BUILDLOG_STEP_SCOPE": ""}))
         base = dict(self.env)
         for args, variables in cases:
             with self.subTest(args=args, variables=variables):
@@ -467,6 +469,8 @@ class CargoWrapperTest(unittest.TestCase):
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertEqual(done.stderr, "cargo stderr\n")
                 self.assertTrue(self.hold_log.exists())
+                # A stale value from another scope does not skip the folder step.
+                self.assertTrue(self.folder_log.exists())
                 self.assert_cargo(["test"])
                 self.assert_queue(["test"])
 

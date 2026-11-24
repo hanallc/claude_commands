@@ -2554,6 +2554,30 @@ class QueueLifetimeReaderTests(unittest.TestCase):
             self.assertIsInstance(step.end.end_kind, gate.StepEnd)
             self.assertEqual(step.end, step.intervals[-1].end)
 
+    def test_a_handoff_ends_the_grant_without_a_step_result_or_an_estimate_peak(self) -> None:
+        with AdmissionFixture() as fixture:
+            grants: dict[wire.ReleaseEnding, wire.Admitted] = {}
+            endings: tuple[wire.ReleaseEnding, ...] = ("result", "handed_off")
+            for ending in endings:
+                request = fixture.request(step="test-affected", since=fixture.clock.now() - 1)
+                request = replace(request, sidecar=str(fixture.scope(request.owner)))
+                fixture.allow_next_start()
+                grants[ending] = only_admitted(fixture.server.handle_request(request))
+                fixture.scoped_peak(grants[ending], GIB)
+            fixture.clock.advance(6)
+            for ending, grant in grants.items():
+                # copies.py gives the preparation grant back with status 0 before its command sends the step.
+                _ = fixture.server.handle_request(wire.ReleaseRequest(f"end-{ending}", grant.reservation, 0, ending))
+            ends = {step.intervals[0].reservation_id: step.end for step in gate.read_queue_lifetimes(fixture.state_dir)}
+            result, handoff = (ends[grants[ending].reservation] for ending in endings)
+            assert isinstance(result, gate.ReservationEnded) and isinstance(handoff, gate.ReservationEnded)
+            self.assertEqual((result.outcome, result.end_kind), ("completed", gate.StepEnd()))
+            self.assertEqual((handoff.outcome, handoff.end_kind, handoff.peak),
+                             ("handed_off", gate.HandOff(), gate.PeakSampled(GIB)))
+            self.assertEqual(gate.count_queue_sources(gate.read_queue_lifetimes(fixture.state_dir)).completed_steps, 1)
+            # The preparation peak is not a peak of the step, so the estimates never read it.
+            self.assertEqual([row["reservation_id"] for row in fixture.history()], [grants["result"].reservation])
+
     def test_source_counts_separate_admissions_logical_waits_and_missing_evidence(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request(since=fixture.clock.now() - 5)

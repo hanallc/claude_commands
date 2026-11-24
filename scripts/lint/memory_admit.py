@@ -186,6 +186,7 @@ from scripts.build_queue.step_estimator import (
     FILTERED_FLOOR,
     Failed,
     FinalOutcome,
+    HandedOff,
     HISTORY_DAYS,
     Killed,
     OutcomeNotRecorded,
@@ -201,7 +202,7 @@ def merge_gate_shape(argv: Sequence[str]) -> str:
 
 
 PROC = Path("/proc")
-# These cargo subcommands compile; arbitrary programs and merge gates run.
+# Classify these Cargo subcommands as compilation. Classify other programs and gate jobs as execution.
 
 
 HEADROOM_FACTOR_CLASSES: dict[str, type[ReleaseHeadroom | LegacyDevMultiplierHeadroom | DevSizeHeadroom]] = {
@@ -232,6 +233,11 @@ class StepEnd:
 @dataclass(frozen=True)
 class TokenReturn:
     pass
+
+
+@dataclass(frozen=True)
+class HandOff:
+    """The grant ended at a first-step handoff: the step goes on under the command's own admission."""
 
 
 @dataclass(frozen=True)
@@ -299,7 +305,7 @@ class EndedEvent(QueueLifeIdentity):
     reservation_id: str
     ended_at: float
     outcome: FinalOutcomeName
-    end_kind: StepEnd | TokenReturn
+    end_kind: StepEnd | TokenReturn | HandOff
     peak: PeakSampled | NoPositiveSample
 
 
@@ -1424,7 +1430,7 @@ def read_reservation(path: Path) -> Reservation:
         if (not all(isinstance(intent.get(key), str) for key in ("reservation_id", "ended_at"))
                 or not isinstance(intent.get("peak"), int) or isinstance(intent.get("peak"), bool)
                 or not isinstance(intent.get("scoped"), bool)
-                or intent.get("outcome") not in ("completed", "failed", "killed", "owner_gone")
+                or intent.get("outcome") not in ("completed", "failed", "killed", "owner_gone", "handed_off")
                 or "status" in intent and (not isinstance(intent["status"], int)
                                            or isinstance(intent["status"], bool))):
             raise ValueError("finalization intent has invalid fields")
@@ -1596,7 +1602,7 @@ class StepStillOpen:
 class ReservationEnded:
     ended_at: float
     outcome: FinalOutcomeName
-    end_kind: StepEnd | TokenReturn
+    end_kind: StepEnd | TokenReturn | HandOff
     peak: PeakSampled | NoPositiveSample
 
 
@@ -1682,7 +1688,8 @@ def read_queue_lifetimes(directory: Path) -> tuple[QueueStepLifetime, ...]:
                     ending = ReservationEnded(ended["ended_at"], ended["outcome"], ended["end_kind"], ended["peak"])
                     if reservation in intervals:
                         intervals[reservation] = replace(intervals[reservation], end=ending)
-                    end = ending if isinstance(ending.end_kind, StepEnd) else StepStillOpen()
+                    # A token return keeps the step open; a handoff ends this run's part of it.
+                    end = StepStillOpen() if isinstance(ending.end_kind, TokenReturn) else ending
                 elif kind == "left":
                     left = cast(LeftEvent, codec.parse_snapshot_value(row, LeftEvent))
                     end = LeftQueue(left["ended_at"], left["reason"])
@@ -2781,7 +2788,7 @@ class FinalizationIntents(Protocol):
 def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, now: datetime,
                          status: int | OutcomeNotRecorded = OUTCOME_NOT_RECORDED, *,
                          intents: FinalizationIntents,
-                         end_kind: StepEnd | TokenReturn) -> HistoryRecorded | NoHistoryRecorded:
+                         end_kind: StepEnd | TokenReturn | HandOff) -> HistoryRecorded | NoHistoryRecorded:
     """Save the peak before removing evidence; the service owns reservation state."""
     maximum = path.with_suffix(".max")
     history_path = path.parent / "anon_peaks.jsonl"
@@ -2802,9 +2809,11 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
             "peak": peak,
             "scoped": row.get("scoped", bool(row["sidecar"] and Path(row["sidecar"]).is_file())),
             "outcome": ("completed" if isinstance(outcome, Completed) else "failed" if isinstance(outcome, Failed)
-                        else "killed" if isinstance(outcome, Killed) else "owner_gone"),
+                        else "killed" if isinstance(outcome, Killed)
+                        else "handed_off" if isinstance(outcome, HandedOff) else "owner_gone"),
             "ended_at": store.utc_iso(now.timestamp()),
-            "end_kind": "token_return" if isinstance(end_kind, TokenReturn) else "step_end",
+            "end_kind": ("token_return" if isinstance(end_kind, TokenReturn)
+                         else "handoff" if isinstance(end_kind, HandOff) else "step_end"),
         }
         if "queue_waiter" in row:
             waiter = row["queue_waiter"]
@@ -2826,7 +2835,8 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
         intents.save(row, intent)
     intent = row["finalization"]
     result: HistoryRecorded | NoHistoryRecorded = NoHistoryRecorded()
-    if intent["peak"] > 0 and intent["scoped"]:
+    # A handoff peak is the preparation, not the step, so it never teaches the estimates.
+    if intent["peak"] > 0 and intent["scoped"] and intent["outcome"] != "handed_off":
         # The store repairs an unfinished tail before the identity lookup.
         with store.locked_append(history_path) as handle:
             recorded = recovering and any(previous.get("reservation_id") == intent["reservation_id"]
@@ -2857,7 +2867,8 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
         event: EndedEvent = {
             **lifecycle_event(intent["queue_identity"], "ended", intent["reservation_id"]),
             "reservation_id": intent["reservation_id"], "ended_at": ended_at, "outcome": intent["outcome"],
-            "end_kind": TokenReturn() if intent.get("end_kind") == "token_return" else StepEnd(),
+            "end_kind": (TokenReturn() if intent.get("end_kind") == "token_return"
+                         else HandOff() if intent.get("end_kind") == "handoff" else StepEnd()),
             "peak": PeakSampled(intent["peak"]) if intent["peak"] > 0 else NoPositiveSample(),
         }
         append_queue_time(path.parent, cast(dict[str, object], codec.snapshot_value(event)), ended_at)

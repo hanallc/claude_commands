@@ -11,6 +11,7 @@ html { overflow-anchor: none; }
   --used: var(--accent); --cap: var(--error); --block: var(--warning);
   --res-a: #427caf; --res-b: #6b91b7;
   --building: #007e78; --testing: #b00079;
+  --bump: #9c381d; --bump-bg: rgba(156, 56, 29, .09); --bump-ring: rgba(156, 56, 29, .30);
   --remote-memory: var(--remote-memory-light); --machine-natedev: var(--machine-natedev-light);
   --machine-mac: var(--machine-mac-light); --machine-aws: var(--machine-aws-light);
   --other: #a3a19b; --free: #e7e5df; --floor: #eda100;
@@ -21,6 +22,7 @@ html { overflow-anchor: none; }
   :root:not([data-theme="light"]) {
     --res-a: #719fd8; --res-b: #567ca8;
     --building: #27c6b8; --testing: #ca458f;
+    --bump: #f08a6b; --bump-bg: rgba(240, 138, 107, .12); --bump-ring: rgba(240, 138, 107, .35);
     --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
     --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
     --other: #5c5b57; --free: #2a2a28; --floor: #c98500;
@@ -31,6 +33,7 @@ html { overflow-anchor: none; }
 :root[data-theme="dark"] {
   --res-a: #719fd8; --res-b: #567ca8;
   --building: #27c6b8; --testing: #ca458f;
+  --bump: #f08a6b; --bump-bg: rgba(240, 138, 107, .12); --bump-ring: rgba(240, 138, 107, .35);
   --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
   --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
   --other: #5c5b57; --free: #2a2a28; --floor: #c98500;
@@ -108,11 +111,6 @@ __PAGE_FRAME_STYLE__
 .build-limit-cell .build-limit-mark:is(.free, .kept) { width: 9px; height: 9px; }
 .build-limit-wait { margin-top: 5px; }
 .build-limit-cell .build-limit-wait { margin-top: 0; }
-.build-limit-tip > .tip {
-  max-width: min(24rem, calc(100vw - 16px));
-  grid-template-columns: fit-content(44%) minmax(0, 1fr);
-}
-.build-limit-tip .tip dd { white-space: normal; overflow-wrap: anywhere; }
 .build-limit-legend { display: flex; flex-wrap: wrap; gap: 5px 16px; margin-top: 10px; color: var(--ink-2); font-size: .8rem; }
 .build-limit-legend > span { display: inline-flex; gap: 6px; align-items: center; }
 .bar > div:first-child { border-radius: 4px 2px 2px 4px; }
@@ -160,36 +158,37 @@ __PAGE_FRAME_STYLE__
 .legend .row .v { text-align: right; padding-left: 12px; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
 .legend .row[data-tip="room"] .name { white-space: nowrap; }
 /* shared:step-tip:start — the Disks page uses these rules too (disks_page.shared_step_tip). */
-#tip { position: fixed; z-index: 10; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; }
+#tip { position: fixed; z-index: 10; width: max-content; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; }
 #tip.on { opacity: 1; }
-.tip { display: grid; grid-template-columns: max-content 1fr; column-gap: 0; row-gap: 2px; margin: 0;
-  width: max-content; min-width: 15rem; max-width: 24rem; padding: 10px 12px; border-radius: 8px;
+.tip { display: grid; grid-template-columns: fit-content(44%) minmax(0, 1fr); column-gap: 0; row-gap: 2px; margin: 0;
+  width: max-content; min-width: min(15rem, var(--tip-width, 15rem)); max-width: min(24rem, var(--tip-width, 24rem));
+  padding: 10px 12px; border-radius: 8px;
   background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.45; }
-.tip dt { text-align: left; white-space: nowrap; }
-.tip dd { margin: 0; padding-left: 24px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tip :is(dt, dd) { overflow-wrap: anywhere; }
+.tip dt { text-align: left; }
+.tip dd { margin: 0; padding-left: 24px; text-align: right; font-variant-numeric: tabular-nums; }
 .tip .title { font-weight: 700; padding-bottom: 4px; }
 .tip .caption { grid-column: 1 / -1; margin-top: -4px; padding: 0 0 4px; text-align: left; white-space: normal; opacity: 0.7; }
 .tip .group { margin-top: 6px; padding-top: 6px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); }
 .tip .sum { font-weight: 700; }
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
-#tip > .tip { max-width: min(24rem, calc(100vw - 16px)); }
-.tip:has(dd.call) { grid-template-columns: fit-content(44%) minmax(0, 1fr); }
-.tip:has(dd.call) :is(dt, dd):not(.call) { white-space: normal; overflow-wrap: anywhere; }
 .tip dd.call > div { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
   overflow: hidden; white-space: normal; }
 .tip dd.call span { display: inline-block; width: max-content; max-width: 100%;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
 /* shared:step-tip:end */
+#tip > .tip { max-height: var(--tip-height); overflow: hidden; }
 .seg-remote { background: var(--remote-memory); }
 /* The one machine color map. Each name matches without case, so the hover words "Mac" and "AWS" match too.
    mac-linux is the Linux guest on the Mac, so it takes the mac color. hana-aws and hana-gpu are AWS boxes, so they take the aws color. */
 .machine[data-machine="natedev" i] { color: var(--machine-natedev); }
 .machine:is([data-machine="mac" i], [data-machine="mac-linux" i]) { color: var(--machine-mac); }
 .machine:is([data-machine="aws" i], [data-machine="hana-aws" i], [data-machine="hana-gpu" i]) { color: var(--machine-aws); }
-/* A machine icon keeps the 20px text line, so it never makes a row taller. Its badge is CSS text, not page text. */
+/* The icon fits the 20px text line. CSS draws its badge. */
 .machine-icon { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 24px;
   margin-block: -2px; vertical-align: top; border-radius: 6px; }
 .machine-icon svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.machine-icon .machine-emoji { font: 20px/1 "Apple Color Emoji", "Noto Color Emoji", emoji; }
 .machine-icon[data-badge]::after { content: attr(data-badge); position: absolute; right: -7px; bottom: -5px;
   font: 14px/1 "Apple Color Emoji", "Noto Color Emoji", emoji; }
 .machine-icon.run { background: color-mix(in srgb, var(--ink) 7%, transparent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--ink) 16%, transparent); }
@@ -246,6 +245,8 @@ td small { color: var(--ink-3); }
 .target-head .machine { font-weight: 600; }
 .target-state { padding: 0 8px; border-radius: 999px; border: 1px solid currentColor; font-size: 0.82rem; font-weight: 600; color: var(--block); }
 .target-state.unavailable { color: var(--cap); }
+/* A kept claim is a leftover, not a block, so it takes the kept mark gray. */
+.target-state.kept { color: var(--ink-3); }
 .target-reason { grid-area: reason; overflow-wrap: anywhere; }
 .target-owner { grid-area: owner; }
 .target-until { grid-area: until; }
@@ -282,6 +283,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .swaprows .row small { color: var(--ink-2); font-size: inherit; min-width: 0; overflow-wrap: anywhere; }
 .swaprows .row .v { font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
 .error { color: var(--cap); font-weight: 600; }
+.bump-notices { margin-bottom: 8px; line-height: 1.3; overflow-wrap: anywhere; }
 .walk-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
 .walk-sum { margin-left: auto; color: var(--ink-2); font-size: 0.86rem; }
 .walk-tokens { display: flex; align-items: baseline; gap: 6px; color: var(--ink-2); font-size: 0.86rem; }
@@ -305,7 +307,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
    and the row hover gives the full text. */
 .row-label :is(.owner, .wait-note) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* When the queue shows reorder handles, every waiting row keeps the handle space, so a fixed row lines up with the others. */
-#walk:has(.queue-grip) .wrow.wait .row-label { padding-inline-start: 30px; }
+#walk:has(.queue-grip) .wrow:is(.wait, .held) .row-label { padding-inline-start: 30px; }
 .queue-grip { position: absolute; inset-inline-start: 0; top: 4px; width: 28px; height: 34px;
   display: grid; place-items: center; border: 0; border-radius: 5px; background: transparent;
   color: var(--ink-3); cursor: grab; touch-action: none; }
@@ -325,7 +327,7 @@ body:has(.queue-lift) #tip { visibility: hidden; }
   background: none; border: 0; padding: 0; cursor: pointer; }
 .queue-feedback button[hidden] { display: none; }
 .row-label .owner, .cloud-status .amounts { font-size: 0.75rem; }
-.row-label .wait-note { font-size: 0.75rem; color: var(--ink-2); }
+.wait-note { font-size: 0.75rem; color: var(--ink-2); }
 .row-memory { min-width: 0; }
 .cloud-status .cap { color: var(--cap); }
 .amounts { position: relative; height: 16px; margin-top: 2px; color: var(--ink-2); font-size: 0.7rem; line-height: 14px; font-variant-numeric: tabular-nums; }
@@ -335,13 +337,15 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .wrow.room .name { flex: none; overflow: visible; text-overflow: clip; }
 .walk-table tr.wait-first > * { border-top: 1px solid var(--line); }
 .wrow.wait-first::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
+.wrow.held .row-label { grid-column: 1 / -1; }
+.walk.beside .wrow.held .row-label { max-width: calc(var(--table-left) - var(--gap)); }
 .wrow.room::after { content: ""; position: absolute; bottom: 0; left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .walk-chart .queue-head { display: flex; align-items: flex-end; padding-bottom: 3px; box-sizing: border-box; }
 .queue-title { display: flex; min-width: 0; white-space: nowrap; }
 .queue-title > :first-child { overflow: hidden; text-overflow: ellipsis; }
 .queue-title > :last-child { flex: none; white-space: pre; }
 .wrow.room::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
-.walk-table tr.wait { color: var(--ink-2); }
+.walk-table tr:is(.wait, .held) { color: var(--ink-2); }
 .walk-table { min-width: 0; width: max-content; max-width: 100%; }
 .walk-table table, :root.layout-measuring .walk-table table { width: max-content; max-width: 100%; margin: 0; table-layout: auto; font-size: 0.88rem; }
 .walk-table thead tr, .walk-table tbody tr.queue-head { height: 30px; }
@@ -356,6 +360,13 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .walk-table td.machine > * + * { margin-left: 10px; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .tokens { font-variant-numeric: tabular-nums; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .tokens { text-align: right; }
+.move-mark { display: inline-flex; align-items: center; gap: 5px; border-radius: 6px;
+  padding: 0 7px 0 5px; font-size: 12px; line-height: 18px; white-space: nowrap;
+  color: var(--bump); background: var(--bump-bg); box-shadow: 0 0 0 1px var(--bump-ring); }
+.move-mark svg { width: 15px; height: 15px; flex: none; fill: none; stroke: currentColor;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.move-mark[data-tip] { cursor: help; }
+.walk-table .move-mark { vertical-align: middle; }
 .walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
 .walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus, .walk-table th.tokens { text-align: left; }
 /* A waiting step sizes the Step column (fitWalkDetails). In a tight pane it wraps between words inside the column.
@@ -378,7 +389,9 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 /* The table is measured at its own width, not cut to the walk. */
 .walk.measuring .walk-table, .walk.measuring .walk-table table { max-width: none; }
 /* Narrow the column gaps to keep the chart beside the table. */
-.walk.tight .walk-table th:not(:last-child), .walk.tight .walk-table td:not(:last-child) { padding-right: 8px; }
+.walk.tight .walk-table th:not(:last-child), .walk.tight .walk-table td:not(:last-child) { padding-right: 6px; }
+/* The last machine badge extends 7 px past its icon. */
+.walk.tight .walk-table td.machine:has(> .machine-icon[data-badge]:last-child) { padding-right: 7px; }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }
 body.queue-unavailable .card { display: none; }
@@ -436,12 +449,93 @@ body.queue-unavailable .card { display: none; }
 .report-top-row { margin: 0; padding: 10px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .report-top-row:last-child { border-bottom: 0; }
 .report-top-row .action { display: block; margin-top: 3px; color: var(--ink-2); }
+.aws-title, .aws-history-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; }
+.aws-title .pill { font-size: 0.86rem; cursor: default; }
+.aws-title .pill[hidden] { display: none; }
+.aws-title .pill:hover { background: var(--card); }
+.aws-note { color: var(--ink-2); font-size: 0.86rem; margin: 6px 0 0; }
+.aws-rule { max-width: 130ch; }
+.aws-rule b { color: var(--ink); }
+.aws-totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: 12px; margin-top: 14px; }
+.aws-total { padding: 10px 12px 12px; border: 1px solid var(--line); border-radius: 8px; }
+.aws-total-label { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 8px; color: var(--ink-2); font-size: 0.86rem; }
+.aws-total-value { display: block; font-size: 1.5rem; line-height: 1.3; }
+.aws-total-value small { font-size: 0.95rem; font-weight: 600; color: var(--ink-2); }
+.aws-total-note, .aws-dim { color: var(--ink-3); font-size: 0.82rem; }
+.aws-total-note { margin-top: 4px; line-height: 1.4; }
+.aws-meter, .aws-bar { display: flex; height: 10px; border-radius: 3px; overflow: hidden; }
+.aws-meter { height: 6px; margin: 6px 0 8px; background: var(--hover); }
+.aws-meter i, .aws-bar i { background: var(--accent); }
+.aws-bar .estimate { background: repeating-linear-gradient(135deg, var(--accent) 0 2px, transparent 2px 5px);
+  box-shadow: inset 0 0 0 1px var(--accent); }
+.aws-state { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 0.82rem; font-weight: 600; }
+.aws-state::before { content: ""; flex: 0 0 10px; height: 10px; border-radius: 50%; border: 1px solid currentColor; }
+.aws-state.estimate::before { border-style: dashed; }
+.aws-state.billed::before { background: linear-gradient(90deg, currentColor 50%, transparent 50%); }
+.aws-state.final { color: var(--room); }
+.aws-state.final::before { background: currentColor; }
+.aws-state span { font-weight: 400; }
+.aws-key { display: flex; flex-wrap: wrap; gap: 4px 28px; margin: 10px 0 2px; }
+.aws-key-item { display: inline-flex; flex-wrap: wrap; gap: 2px 8px; }
+.aws-history { margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--line); }
+.aws-history h3 { margin: 0; font-size: 1rem; font-weight: 600; }
+#aws-costs .filter { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+#aws-costs .filter button { font: inherit; font-size: 0.86rem; color: var(--ink-2); background: transparent; border: 0; padding: 5px 12px; cursor: pointer; }
+#aws-costs .filter button + button { border-left: 1px solid var(--line); }
+#aws-costs .filter button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+#aws-costs .filter button:focus-visible { outline: 2px solid var(--ink); outline-offset: -2px; }
+.aws-scroll { overflow: auto; }
+.aws-table { width: 100%; border-collapse: collapse; font-size: 0.86rem; margin-top: 6px; }
+.aws-table th, .aws-table td { padding: 6px 0; text-align: left; border-bottom: 1px solid var(--line); }
+.aws-table th { color: var(--ink-2); font-weight: 600; }
+.aws-table .num { text-align: right; white-space: nowrap; padding-left: 16px; }
+.aws-history .aws-table .aws-bar-cell, .aws-history .aws-table .aws-states { padding-left: 28px; }
+.aws-history .aws-states > span { display: flex; }
+.aws-history-table { min-width: 32rem; }
+.aws-history-table thead .aws-period { width: 30%; }
+.aws-history-table thead .aws-bar-cell { width: 28%; }
+.aws-history-table thead .aws-states { width: 19%; }
+.aws-history:has([data-aws-view]:not([data-aws-view="day"])[aria-pressed="true"]) .aws-history-table thead .aws-states { width: 26%; }
+.aws-history-table tbody tr[data-period] { cursor: pointer; }
+.aws-history-table tbody tr[data-period]:hover { background: var(--hover); }
+.aws-toggle { background: transparent; color: var(--ink); border: 0; padding: 0; font: inherit; text-align: left; cursor: pointer; }
+.aws-toggle[aria-expanded="true"] { font-weight: 600; }
+.aws-point { text-decoration: underline dotted var(--ink-3); text-underline-offset: 4px; }
+small .aws-point { cursor: help; }
+.aws-chev { display: inline-block; margin: 0 9px 0 4px; border-left: 6px solid var(--ink-3); border-block: 4px solid transparent; }
+[aria-expanded="true"] > .aws-chev { transform: rotate(90deg); }
+.aws-period .aws-dim { margin-left: 8px; }
+.aws-history-table .aws-detail-cell { padding-top: 2px; padding-bottom: 14px; }
+.aws-day-detail { border: 1px solid var(--line); border-radius: 8px; background: var(--bg); padding: 10px 16px 12px; }
+.aws-day-detail > .aws-note { margin: 0 0 2px; }
+.aws-day-detail > .aws-unit-note { margin: 8px 0 0; }
+.aws-run-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0 2px; }
+.aws-run-controls .aws-more { margin: 0 0 0 auto; }
+.aws-run-scroll { overflow: auto; contain: inline-size; }
+.aws-run-scroll .aws-table { min-width: 47rem; }
+.aws-run-scroll .aws-table :is(th, td) { padding-right: 12px; }
+.aws-run-scroll .aws-table :is(th, td):last-child { padding-right: 0; }
+.aws-group-scroll { min-width: 0; overflow: auto; contain: inline-size; }
+.aws-group-scroll > .aws-table { min-width: 27rem; }
+.aws-group-scroll tr[data-aws-group] { cursor: pointer; }
+.aws-group-scroll tr[data-aws-group]:hover { background: var(--hover); }
+.aws-group-detail > td { padding: 0 0 8px 24px; }
+.aws-group-detail .aws-run-scroll { padding: 0 12px 0 8px; background: var(--hover); }
+.aws-table .aws-hint { display: block; }
+.aws-table .aws-total-row td { font-weight: 700; border-bottom: 0; }
+.aws-more { margin-top: 8px; font: inherit; font-size: 0.86rem; font-weight: 600; color: var(--ink-2); background: transparent;
+  border: 1px solid var(--line); border-radius: 8px; padding: 4px 12px; cursor: pointer; }
+.aws-kept { margin-top: 14px; }
+@media (max-width: 800px) {
+  .aws-history .aws-table .aws-bar-cell, .aws-history .aws-table .aws-states { padding-left: 12px; }
+}
 </style>
 </head>
 <body>
 <svg width="0" height="0" style="position: absolute" aria-hidden="true">
-  <symbol id="machine-server" viewBox="0 0 24 24"><rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/></symbol>
-  <symbol id="machine-laptop" viewBox="0 0 24 24"><path d="M18 5a2 2 0 0 1 2 2v8.526a2 2 0 0 0 .212.897l1.068 2.127a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45l1.068-2.127A2 2 0 0 0 4 15.526V7a2 2 0 0 1 2-2z"/><path d="M20.054 15.987H3.946"/></symbol>
+  <symbol id="machine-apple" viewBox="0 0 24 24">
+    <path fill="#fff" stroke="#000" stroke-width="1.2" stroke-linejoin="round" d="M12.1 6.2c-.2-2.9 2-5 4.5-5.4.1 2.8-1.9 5.2-4.5 5.4ZM12 7.7c1.2 0 2.4-1.4 4.6-1.4 1.7 0 3.2.8 4.1 2.1a4.8 4.8 0 0 0 .7 8.3c-1.3 3.3-3.2 6.2-5.2 6.2-1.5 0-2.1-1-4-1-1.8 0-2.6 1-4 1-2.7 0-5.8-5.4-5.8-10.1 0-4 2.4-6.5 5.6-6.5 1.9 0 3.1 1.4 4 1.4Z"/>
+  </symbol>
   <symbol id="machine-cloud" viewBox="0 0 24 24"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></symbol>
 </svg>
 <main class="page-wide">
@@ -534,6 +628,7 @@ body.queue-unavailable .card { display: none; }
 
   <section class="card">
     <div class="walk-head"><span class="section-head" id="walk-title" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span><div class="walk-tokens num" data-tip="tokens"><span>Tokens</span><dl id="walk-tokens"></dl></div></div>
+    <div class="bump-notices wait-note" id="bump-notices" role="status" hidden></div>
     <div class="walk-scroll"><div class="walk" id="walk"></div></div>
     <div class="queue-feedback" id="queue-feedback" hidden>
       <span id="queue-status" role="status"></span><button type="button" id="queue-action" hidden>Undo</button>
@@ -542,6 +637,7 @@ body.queue-unavailable .card { display: none; }
     <div class="walk-key">
       <span class="key" data-tip="waiting"><span class="sw waiting"></span>Waiting step, memory it needs</span>
       <span class="key" data-tip="progress">Progress: <span class="sw progress building"></span>building, <span class="sw progress testing"></span>testing</span>
+      <span class="key"><span id="bump-key"></span>someone moved the run to the top of the line</span>
     </div>
     <div class="machine-key" id="machine-key" aria-hidden="true"></div>
   </section>
@@ -567,6 +663,13 @@ body.queue-unavailable .card { display: none; }
     <p class="swap-reserve" id="swap-reserve" data-tip="swap"></p>
     <h3>Swap by group</h3>
     <div class="swaprows" id="swaprows"></div>
+  </section>
+  <section class="card" id="aws-costs" aria-label="AWS costs">
+    <div class="aws-title">
+      <div class="section-head">AWS costs</div>
+      <span class="pill" id="aws-cost-read" hidden></span>
+    </div>
+    <div id="aws-cost-content">no record</div>
   </section>
   <section class="card" id="report-charts">
     <div class="section-head">Top 3 costs</div>
@@ -608,18 +711,20 @@ function nameParts(parts) {
 function machineName(name) {
   return `<span class="machine" data-machine="${esc(name)}">${esc(name)}</span>`;
 }
-// The icon of each known machine: a lucide symbol, and a badge for the Mac Linux guest and the hana AWS boxes.
-const MACHINE_ICONS = new Map([["natedev", {symbol: "server"}], ["mac", {symbol: "laptop"}],
-  ["mac-linux", {symbol: "laptop", badge: "🐧"}], ["aws", {symbol: "cloud"}],
+const MACHINE_ICONS = new Map([["natedev", {emoji: "🐧"}], ["mac", {symbol: "apple"}],
+  ["mac-linux", {symbol: "apple", badge: "🐧"}], ["aws", {symbol: "cloud", badge: "🐧"}],
   ["hana-aws", {symbol: "cloud", badge: "🌸"}], ["hana-gpu", {symbol: "cloud", badge: "⚡"}]]);
 // A known machine shows as its icon in its machine color, with its name as the accessible name.
 // An unknown machine shows its name. The state is "run", "dim" or "".
 function machineIcon(name, state = "") {
   const icon = MACHINE_ICONS.get(name.toLowerCase());
   if (!icon) return machineName(name);
+  const mark = icon.emoji
+    ? `<span class="machine-emoji" aria-hidden="true">${icon.emoji}</span>`
+    : `<svg aria-hidden="true"><use href="#machine-${icon.symbol}"></use></svg>`;
   return `<span class="machine machine-icon${state && " " + state}" data-machine="${esc(name)}"` +
     `${icon.badge ? ` data-badge="${icon.badge}"` : ""} role="img" aria-label="${esc(name)}">` +
-    `<svg aria-hidden="true"><use href="#machine-${icon.symbol}"></use></svg></span>`;
+    `${mark}</span>`;
 }
 // "natedev or Mac" and "natedev only" give each machine name its color.
 function machineParts(text) {
@@ -715,6 +820,356 @@ function reserveTargetRows(covered, target) {
 function legendTip(name, bytes, caption, parts = []) {
   const title = field(name, ramAmount(bytes), 'title');
   return recorded(bytes) ? [title,field('',caption,'caption'),...groupRows(parts)] : [title];
+}
+const AWS_DAY_MS = 86400000;
+const AWS_HISTORY_DAYS = 14;
+const AWS_PERIODS = {
+  day: ["Day", "AWS day (UTC)"],
+  week: ["Week", "Week, Monday to Sunday (UTC)", "day"],
+  month: ["Month", "Month (UTC)", "week"],
+  year: ["Year", "Year (UTC)", "month"],
+};
+const AWS_STATES = {
+  final: ["Billed, final", "The amount from AWS. AWS does not change it."],
+  billed: ["Billed, not final", "The amount from AWS. AWS can change it."],
+  estimate: ["Estimate", "From our run records. AWS has no amount yet."],
+};
+const AWS_DAY_NAME = new Intl.DateTimeFormat("en-US", {timeZone:"UTC", weekday:"short", month:"short", day:"numeric"});
+const AWS_SHORT_DAY = new Intl.DateTimeFormat("en-US", {timeZone:"UTC", month:"short", day:"numeric"});
+const AWS_MONTH = new Intl.DateTimeFormat("en-US", {timeZone:"UTC", month:"long"});
+// The user zone from the feed. renderAwsCosts sets it before the pane shows a time.
+let awsZone = "UTC";
+const awsZoneFormats = new Map();
+function awsZoneParts(date, locale, options) {
+  const key = `${awsZone} ${locale} ${JSON.stringify(options)}`;
+  if (!awsZoneFormats.has(key)) awsZoneFormats.set(key, new Intl.DateTimeFormat(locale, {...options, timeZone:awsZone}));
+  return Object.fromEntries(awsZoneFormats.get(key).formatToParts(date).map(({type,value}) => [type,value]));
+}
+const AWS_LOCAL = {weekday:"short", month:"short", day:"numeric", hour:"numeric", minute:"2-digit", timeZoneName:"short"};
+const awsDate = day => new Date(day + "T00:00:00Z");
+const awsIso = time => time.toISOString().slice(0,10);
+const awsDayName = date => AWS_DAY_NAME.format(date).replace(",", "");
+const awsLocal = date => {
+  const parts = awsZoneParts(date, "en-US", AWS_LOCAL);
+  return {day:parts.weekday, clock:`${parts.hour}:${parts.minute} ${parts.dayPeriod}`, zone:parts.timeZoneName,
+    date:`${parts.weekday} ${parts.month} ${parts.day}`, shortDate:`${parts.month} ${parts.day}`,
+    dayNumber:Number(parts.day)};
+};
+// The zone as a word: "Pacific" for America/Los_Angeles. A zone with no such name keeps its IANA name.
+function awsZoneName() {
+  const name = awsZoneParts(new Date(), "en-US", {timeZoneName:"longGeneric"}).timeZoneName ?? "";
+  return name.endsWith(" Time") ? name.slice(0, -5) : awsZone;
+}
+function awsDateTime(date) {
+  const time = awsLocal(date);
+  return `${time.date}, ${time.clock} ${time.zone}`;
+}
+const awsCents = amount => Math.round(Number(amount) * 100);
+const awsMoney = (cents, estimate = false, digits = 2) => cents == null ? "no record" :
+  `${estimate ? "~" : ""}$${(cents / 100).toLocaleString("en-US", {minimumFractionDigits:digits, maximumFractionDigits:digits})}`;
+const awsCount = count => count.toLocaleString("en-US");
+const awsPercent = (amount, limit) => limit > 0 ? Math.max(0, Math.min(100, amount / limit * 100)) : 0;
+
+function awsPeriodStart(period, day) {
+  if (period === "year") return awsDate(day.slice(0,4) + "-01-01");
+  if (period === "month") return awsDate(day.slice(0,7) + "-01");
+  const start = awsDate(day);
+  if (period === "week") start.setUTCDate(start.getUTCDate() - (start.getUTCDay() + 6) % 7);
+  return start;
+}
+function awsPeriodEnd(period, start) {
+  const end = new Date(start);
+  if (period === "year") end.setUTCFullYear(end.getUTCFullYear() + 1);
+  else if (period === "month") end.setUTCMonth(end.getUTCMonth() + 1);
+  else end.setUTCDate(end.getUTCDate() + (period === "week" ? 7 : 1));
+  return end;
+}
+function awsSum(days) {
+  const states = new Map();
+  const runIds = new Set();
+  let cents = null, runs = 0;
+  for (const day of days) {
+    runs += day.runs;
+    for (const run of day.runs_list ?? []) {
+      if (run.id == null) continue;
+      if (runIds.has(run.id)) runs--;
+      runIds.add(run.id);
+    }
+    if (day.amount_usd == null) continue;
+    const amount = awsCents(day.amount_usd);
+    cents = (cents ?? 0) + amount;
+    const total = states.get(day.state) ?? {days:0, cents:0};
+    total.days++;
+    total.cents += amount;
+    states.set(day.state, total);
+  }
+  return {cents, runs, states};
+}
+function awsPeriods(period, days, parent) {
+  const groups = new Map();
+  for (const day of days) {
+    const start = awsPeriodStart(period, day.day);
+    const key = awsIso(start);
+    if (!groups.has(key)) groups.set(key, {start, days:[]});
+    groups.get(key).days.push(day);
+  }
+  return [...groups.values()].map(group => {
+    let {start} = group;
+    let end = awsPeriodEnd(period, start);
+    if (period === "week" && parent) {
+      if (parent.start > start) start = parent.start;
+      if (parent.end < end) end = parent.end;
+    }
+    return {period, start, end, id:`${period}-${awsIso(start)}`, days:group.days, ...awsSum(group.days)};
+  });
+}
+function awsPeriodName(row) {
+  if (row.period === "day") return awsDayName(row.start);
+  if (row.period === "year") return awsIso(row.start).slice(0,4);
+  if (row.period === "month") return `${AWS_MONTH.format(row.start)} ${awsIso(row.start).slice(0,4)}`;
+  const first = AWS_SHORT_DAY.format(row.start), last = AWS_SHORT_DAY.format(new Date(+row.end - AWS_DAY_MS));
+  return first === last ? first : `${first} to ${last}`;
+}
+function awsState(state, extra = "") {
+  return AWS_STATES[state] ? `<span class="aws-state ${state}">${AWS_STATES[state][0]}${extra}</span>` :
+    '<span class="aws-dim">no record</span>';
+}
+const awsJob = job => job ?? "Job not recorded";
+const awsUnit = unit => unit ?? "Unit not recorded";
+const awsEstimated = total => total.states.has("estimate");
+const awsAmount = total => awsMoney(total.cents, awsEstimated(total));
+const awsDateRange = (label, start, end) => [field(label + " (UTC)", "", "title"),
+  field("Starts", awsDateTime(start)), field("Ends", awsDateTime(end))];
+
+let awsCostView = "day", awsShowAll = false, awsCostReport, awsCostGroups, awsUnitStart = null;
+const awsCostOpen = new Map(Object.keys(AWS_PERIODS).map(period => [period, new Map()]));
+const awsRunViews = new Map();
+const awsLimitTips = new Map(), awsPeriodTips = new Map();
+function awsCostTip(id) {
+  return awsLimitTips.get(id) ?? awsPeriodTips.get(id) ?? [];
+}
+function awsLimitTip(title, limit, reserve, end) {
+  return [field(title, "", "title"), field("Limit", awsMoney(limit)),
+    field("New work stops at", awsMoney(limit - reserve)), field("Starts again", awsDateTime(end))];
+}
+function awsTile(label, amount, note, state, limit) {
+  return `<div class="aws-total"><div class="aws-total-label"><span>${label}</span>${state ? awsState(state) : ""}</div>
+    <strong class="aws-total-value num">${amount}${limit ? ` <small><span class="aws-point" tabindex="0"
+      data-tip="aws-cost:${limit.id}">of ${awsMoney(limit.cents)} limit</span></small>` : ""}</strong>
+    ${limit ? `<span class="aws-meter" aria-hidden="true"><i style="width:${awsPercent(limit.used, limit.cents)}%"></i></span>` : ""}
+    <div class="aws-total-note">${note}</div></div>`;
+}
+// The UTC bill day in the user zone. West of UTC it starts on the day before; east of UTC it ends on the next day.
+function awsDayRule(today) {
+  const start = awsDate(today), first = awsLocal(start), last = awsLocal(awsPeriodEnd("day", start));
+  const zoneChange = first.zone !== last.zone;
+  const [from, to] = [first, last].map(time => time.clock + (zoneChange ? " " + time.zone : ""));
+  const before = first.dayNumber !== start.getUTCDate();
+  return `In ${awsZoneName()} time, a day starts at <b>${from}${before ? " on the day before" : ""}</b> and ends at
+    ${to}${before ? "" : " on the next day"}.`;
+}
+// When the next read time is past, the read failed: name the last read day and the recorded AWS error.
+function awsNextRead(costs) {
+  if (costs.next_read_at * 1000 > Date.now()) {
+    return `The next AWS read is due ${awsDateTime(new Date(costs.next_read_at * 1000))}`;
+  }
+  const since = costs.read_at == null ? "" : ` since ${awsLocal(new Date(costs.read_at * 1000)).shortDate}`;
+  return `No AWS read${since}${costs.read_error ? ": " + esc(costs.read_error) : ""}`;
+}
+function awsCostTiles(costs, monthTotal, tips) {
+  const start = awsDate(costs.today), end = awsPeriodEnd("day", start);
+  const yesterday = new Date(+start - AWS_DAY_MS);
+  const current = costs.days.find(day => day.day === costs.today);
+  const previous = costs.days.find(day => day.day === awsIso(yesterday));
+  const month = awsPeriodStart("month", costs.today);
+  const [first, last, before] = [start, end, yesterday].map(awsLocal);
+  const change = before.zone === first.zone ? "" : " " + before.zone;
+  const nextRead = costs.next_read_at != null && previous?.state === "estimate" ? " · " + awsNextRead(costs) : "";
+  const tileAmount = row => awsMoney(row?.amount_usd == null ? null : awsCents(row.amount_usd), row?.state === "estimate");
+  const limit = (id, title, amount, used, reset) => {
+    const cents = awsCents(amount);
+    tips.set(id, awsLimitTip(title, cents, awsCents(costs.limits.reserve_usd), reset));
+    return {id, cents, used};
+  };
+  const monthNote = Object.keys(AWS_STATES).filter(state => monthTotal.states.has(state)).map(state =>
+    `${state === "estimate" ? "estimate" : AWS_STATES[state][0]} ${awsMoney(monthTotal.states.get(state).cents, state === "estimate")}`).join(" + ");
+  return `<div class="aws-totals">
+    ${awsTile("Today so far", tileAmount(current),
+      `${awsDayName(start)} · started ${first.day} ${first.clock} ${first.zone} · ends ${last.day} ${last.clock} ${last.zone}`,
+      current?.state, limit("day-limit", "Daily limit", costs.limits.day_usd, awsCents(current?.amount_usd ?? "0.00"), end))}
+    ${awsTile("Yesterday", tileAmount(previous),
+      `${awsDayName(yesterday)} · ${before.day} ${before.clock}${change} to ${first.day} ${first.clock} ${first.zone}${nextRead}`, previous?.state)}
+    ${awsTile(AWS_MONTH.format(month) + " to date", awsAmount(monthTotal), monthNote, "",
+      limit("month-limit", "Monthly limit", costs.limits.month_usd, monthTotal.cents, awsPeriodEnd("month", month)))}
+    </div>`;
+}
+
+const AWS_RUN_GROUPS = {job:"Job", unit:"Unit", region:"Region", machine:"Machine", none:"None"};
+const awsRunHeaders = () =>
+  [`Start (${awsZoneName()})`, "Job", "Unit", "Region", "Zone", "Machine type", "Mode", "Time on AWS", "Cost"];
+const AWS_CSV_TIME = {timeZoneName:"longOffset", year:"numeric", month:"2-digit", day:"2-digit",
+  hour:"2-digit", minute:"2-digit", second:"2-digit", hourCycle:"h23"};
+const AWS_HANA_LABEL = "Hana check and lint";
+const AWS_HANA_IDLE = "Hana machine with no run";
+const AWS_HANA_GROUP = JSON.stringify(["hana"]);
+const AWS_NO_RUN_COSTS = 'Costs with no run<span class="aws-dim aws-hint">Storage, addresses and data transfer</span>';
+const awsNewRunView = () => ({groupBy:"job", openGroups:new Set()});
+const awsRunJob = run => run.kind === "hana" ? AWS_HANA_LABEL : run.job;
+const awsRunFields = run => [awsRunJob(run), run.unit, run.region, run.zone, run.machine, run.mode];
+// The Unit column and the Unit group show only on a day where a run has a unit.
+const AWS_UNIT_COLUMN = 2;
+const awsDayHasUnits = day => day.runs_list.some(run => run.unit);
+// The first UTC bill day where a run has a unit, or null when no run has a unit.
+const awsFirstUnitDay = days => days.filter(awsDayHasUnits).map(day => day.day).sort()[0] ?? null;
+// The unit line shows only on a day with a gate run, before the first unit day or when no unit day exists.
+function awsUnitNote(day, unitStart) {
+  const gate = day.runs_list.some(run => run.kind === "gate");
+  if (!gate || awsDayHasUnits(day) || (unitStart != null && day.day >= unitStart)) return "";
+  const before = unitStart == null ? "" : ` before ${awsDayName(awsDate(unitStart))}`;
+  return `<p class="aws-note aws-unit-note">Runs${before} have no unit record.</p>`;
+}
+
+function awsRunTime(seconds) {
+  const hours = Math.floor(seconds / 3600), minutes = Math.floor(seconds / 60) % 60;
+  return [hours && `${hours} h`, minutes && `${minutes} min`, `${seconds % 60} s`].filter(Boolean).join(" ");
+}
+
+function awsTable(headers, rows, numeric) {
+  const cell = (tag, value, index) => `<${tag}${tag === "th" ? ' scope="col"' : ""}${numeric.includes(index) ? ' class="num"' : ""}>${value}</${tag}>`;
+  const body = rows.map(({values, total, group, detail}) => {
+    const attrs = total ? ' class="aws-total-row"' : group == null ? "" : ` data-aws-group="${esc(group)}"`;
+    return `<tr${attrs}>${values.map((value, index) => cell("td", value, index)).join("")}</tr>${detail ?
+      `<tr class="aws-group-detail"><td colspan="${headers.length}">${detail}</td></tr>` : ""}`;
+  }).join("");
+  return `<table class="aws-table"><thead><tr>${headers.map((value,index) => cell("th", value,index)).join("")}</tr></thead>
+    <tbody>${body}</tbody></table>`;
+}
+
+function awsRunTable(runs, estimated, extraRows, units) {
+  const columns = values => units ? values : values.filter((_, index) => index !== AWS_UNIT_COLUMN);
+  const rows = runs.map(run => {
+    const [job, unit, region, zone, machine, mode] = awsRunFields(run);
+    return {values:[awsDateTime(new Date(run.start * 1000)), esc(awsJob(job)), esc(awsUnit(unit)),
+      ...[region, zone, machine, mode].map(value => value ? esc(value) : "—"),
+      awsRunTime(run.seconds), awsMoney(awsCents(run.cost_usd), estimated)]};
+  });
+  const tableRows = [...rows, ...extraRows].map(row => ({...row, values:columns(row.values)}));
+  return `<div class="aws-scroll aws-run-scroll" tabindex="0" aria-label="Individual runs">
+    ${awsTable(columns(awsRunHeaders()), tableRows, units ? [7,8] : [6,7])}</div>`;
+}
+
+function awsRunGroups(runs, groupBy, hanaIdle) {
+  const groups = new Map();
+  if (groupBy === "job" && hanaIdle) {
+    groups.set(AWS_HANA_GROUP,
+      {key:AWS_HANA_GROUP, name:AWS_HANA_LABEL, unitUnknown:false, runs:[], seconds:0, cents:0, idle:hanaIdle});
+  }
+  for (const run of runs) {
+    const hana = groupBy === "job" && run.kind === "hana";
+    const value = run[groupBy] || null;
+    const key = hana ? AWS_HANA_GROUP : JSON.stringify([groupBy, value]);
+    if (!groups.has(key)) groups.set(key, {
+      key, name:hana ? AWS_HANA_LABEL : value ?? `${AWS_RUN_GROUPS[groupBy]} not recorded`,
+      unitUnknown:groupBy === "unit" && value == null, runs:[], seconds:0, cents:0, idle:0,
+    });
+    const group = groups.get(key);
+    group.runs.push(run);
+    group.seconds += run.seconds;
+    group.cents += awsCents(run.cost_usd);
+  }
+  return [...groups.values()].sort((a,b) => a.name.localeCompare(b.name));
+}
+
+function awsDayRuns(day, view) {
+  const estimated = day.state === "estimate";
+  const amount = usd => awsMoney(usd == null ? null : awsCents(usd), estimated);
+  const hanaIdle = awsCents(day.hana?.idle_usd ?? (day.hana?.runs === 0 ? day.hana.cost_usd : "0.00"));
+  const {groupBy, openGroups} = view;
+  const units = awsDayHasUnits(day);
+  const idleSeconds = day.hana?.idle_seconds;
+  const idleCharge = {name:AWS_HANA_IDLE, cents:hanaIdle, time:idleSeconds == null ? "—" : awsRunTime(idleSeconds)};
+  const charges = [
+    ...(groupBy === "job" ? [] : [idleCharge]),
+    {name:"Compute with no run record", cents:awsCents(day.unrecorded_compute_usd ?? "0.00"), time:"no record"},
+    {name:AWS_NO_RUN_COSTS, cents:awsCents(day.no_run_usd), time:"—"},
+  ].filter(charge => charge.cents !== 0);
+  const charge = (name, cost, {total = false, time = ""} = {}) =>
+    ({total, values:[name, "", "", "", "", "", "", time, cost]});
+  const runCharge = ({name, cents, time}) => charge(name, awsMoney(cents, estimated), {time});
+  if (groupBy === "none") {
+    const extraRows = [...charges.map(runCharge),
+      charge(`Total · ${awsCount(day.runs)} runs`, amount(day.amount_usd), {total:true})];
+    return awsRunTable(day.runs_list, estimated, extraRows, units);
+  }
+
+  const rows = awsRunGroups(day.runs_list, groupBy, hanaIdle).map(group => {
+    const open = openGroups.has(group.key), count = group.runs.length;
+    const name = `<button type="button" class="aws-toggle" aria-expanded="${open}"><span class="aws-chev"
+      aria-hidden="true"></span>${esc(group.name)}</button>`;
+    const note = group.unitUnknown ?
+      '<span class="aws-dim aws-hint">Run records before this release have no unit.</span>' : "";
+    const time = count ? awsRunTime(group.seconds) : "—";
+    const idleRows = group.idle ? [runCharge(idleCharge)] : [];
+    return {group:group.key, detail:open ? awsRunTable(group.runs, estimated, idleRows, units) : "",
+      values:[name + note, count ? awsCount(count) : "—", time,
+        awsMoney(group.cents + group.idle, estimated),
+        count && !group.idle ? awsMoney(group.cents / count, estimated, 3) : "—"]};
+  });
+  rows.push(...charges.map(({name, cents, time}) => ({values:[name, "—", time, awsMoney(cents, estimated), "—"]})));
+  const seconds = day.runs_list.reduce((total, run) => total + run.seconds, 0);
+  rows.push({total:true, values:["Total", day.runs ? awsCount(day.runs) : "—",
+    day.runs_list.length ? awsRunTime(seconds) : "—", amount(day.amount_usd), ""]});
+  return `<div class="aws-scroll aws-group-scroll" tabindex="0" aria-label="Run groups">
+    ${awsTable([AWS_RUN_GROUPS[groupBy], "Runs", "Run time", "Cost", "For one run"], rows, [1,2,3,4])}</div>`;
+}
+
+function awsDayDetail(day, priceDay, view = awsNewRunView(), unitStart = null) {
+  if (day.state === "none") return '<div class="aws-day-detail"><p class="aws-note">no record</p></div>';
+  const price = priceDay ? ` and the prices from the newest AWS amount (${AWS_SHORT_DAY.format(awsDate(priceDay))})` : "";
+  const estimate = day.state === "estimate" ? `<p class="aws-note">This amount is our estimate. It uses our run records${price}.
+    AWS has no amount for this day yet.</p>` : "";
+  const units = awsDayHasUnits(day);
+  const controls = Object.entries(AWS_RUN_GROUPS).filter(([group]) => units || group !== "unit").map(([group, label]) =>
+    `<button type="button" data-aws-group-by="${group}" aria-pressed="${group === view.groupBy}">${label}</button>`).join("");
+  return `<div class="aws-day-detail" data-aws-day="${day.day}">${estimate}
+    <div class="aws-run-controls"><span class="aws-dim">Group by</span>
+      <div class="filter" role="group" aria-label="Group by">${controls}</div>
+      <button type="button" class="aws-more" data-aws-csv>Download CSV</button></div>
+    <div class="aws-run-content">${awsDayRuns(day, view)}</div>${awsUnitNote(day, unitStart)}</div>`;
+}
+
+function awsRunsCsv(days) {
+  const quote = value => `"${String(value ?? "").replaceAll('"', '""')}"`;
+  const start = seconds => {
+    const time = awsZoneParts(new Date(seconds * 1000), "en-CA", AWS_CSV_TIME);
+    return `${time.year}-${time.month}-${time.day}T${time.hour}:${time.minute}:${time.second}${time.timeZoneName.slice(3)}`;
+  };
+  const header = ["UTC day", ...awsRunHeaders().slice(0,6), "Time on AWS (seconds)", "Cost (USD)", "Mode"].map(quote).join(",");
+  const runs = new Map();
+  for (const {day, runs_list} of days) {
+    for (const run of runs_list) {
+      const id = run.id ?? Symbol();
+      const previous = runs.get(id);
+      const first = !previous || day < previous.day || (day === previous.day && run.start < previous.run.start);
+      runs.set(id, {day:first ? day : previous.day, run:first ? run : previous.run,
+        seconds:(previous?.seconds ?? 0) + run.seconds, cents:(previous?.cents ?? 0) + awsCents(run.cost_usd)});
+    }
+  }
+  const rows = [...runs.values()].sort((a,b) => b.day.localeCompare(a.day)).map(({day, run, seconds, cents}) => {
+    const [job, unit, region, zone, machine, mode] = awsRunFields(run);
+    return [...[day, start(run.start), job, unit, region, zone, machine].map(quote),
+      seconds, (cents / 100).toFixed(2), quote(mode)].join(",");
+  });
+  return [header, ...rows, ""].join("\r\n");
+}
+
+function downloadAwsRuns(costs) {
+  const url = URL.createObjectURL(new Blob([awsRunsCsv(costs.days)], {type:"text/csv;charset=utf-8"}));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `aws-runs-${costs.today}.csv`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 const TIPS = {
   'g-builds': d => legendTip('Builds', queueCapMemory(d).builds, 'RAM that builds use now', memoryRows([
@@ -898,7 +1353,6 @@ function ciRow(row) { return row.ci || !!row.ci_label; }
 // A guest row is the queue row of a gate run on mac-linux. Its gate consumed the launch permission.
 // An unconfirmed row has no confirmed guest attempt yet.
 function guestRow(row) { return !!row.guest_run || !!row.guest_unconfirmed; }
-function guestState(row) { return row.guest_unconfirmed ? "not confirmed" : "running"; }
 const STEP_TABLE_HEADERS = {machine: "Machine", duration: "Dur", waiting: "Waiting"};
 function ownerText(text) {
   const shown = publicText(text || '');
@@ -968,11 +1422,11 @@ function stepTooltip(key, data) {
   const callFields = call ? [field('Call', call, 'call', true)] : [];
   const unavailable = row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used))
     || (waiting && row.kind !== 'cloud' && row.head_room?.unavailable);
-  const guestFields = guestRow(row) ? [machineField('Runs on', row.machine),
-    field('Guest attempt', row.guest_run?.attempt || guestState(row))] : [];
+  const guest = guestRow(row);
+  const guestFields = guest ? [machineField('Runs on', row.machine), ...progressRows(row)] : [];
   const namesGuest = row.targets?.includes('mac-linux');
-  const namedTargets = !waiting && namesGuest
-    ? [machineField('Named targets', row.runs_on), ...becauseRows(row.because || '')] : [];
+  const namedTargets = !waiting && (guest || namesGuest)
+    ? [machineField('Named targets', row.runs_on || row.targets?.join(' or ') || ''), ...becauseRows(row.because || '')] : [];
   const title = row.group ? field(row.name, ramAmount(row.used * GIB), 'title')
     : stepTitle(row, unavailable && !guestRow(row) ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
   const rows = [title];
@@ -1032,7 +1486,7 @@ function stepTooltip(key, data) {
     }
   } else {
     const machine = macRow(row) ? 'Mac' : row.kind === 'cloud' ? 'AWS' : row.machine || 'natedev';
-    rows.push(machineField('Runs on', machine), ...namedTargets);
+    rows.push(...(guest ? guestFields : [machineField('Runs on', machine)]), ...namedTargets);
     if (row.kind === 'cloud') {
       if (row.activity) rows.push(field('Status', row.activity));
       if (row.failed_modules) rows.push(field('Failed modules', row.failed_modules));
@@ -1048,7 +1502,7 @@ function stepTooltip(key, data) {
         : recorded(row.used) ? [field('Uses', ramAmount(row.used * GIB))] : [];
       rows.push(...groupRows(memory));
     }
-    rows.push(...progressRows(row));
+    if (!guest) rows.push(...progressRows(row));
   }
   rows.push(...callFields);
   return rows.filter(row => row.kind === 'title' || row.kind === 'long' || row.value || row.label === 'Because');
@@ -1065,7 +1519,30 @@ function tipDuration(key, row, data) {
 function tooltipRows(key, data) {
   data = shownReading(data);
   const [kind, index] = key.split(':');
+  if (kind === 'aws-cost') return awsCostTip(index);
   if (kind === 'row' || kind === 'wait') return stepTooltip(key, data);
+  if (kind === 'moved') {
+    const row = stepRow(key.slice("moved:".length), data);
+    const move = row?.last_move;
+    if (move?.kind !== "bump") return [];
+    const place = row.place ?? move.to_place;
+    return [field("Bump", `place ${place}`, "title"), field("Moved by", move.who),
+      field("From", move.from_place > 0 ? `place ${move.from_place}` : "place not recorded"),
+      field("To", "the top"), field("At", move.at)];
+  }
+  if (kind === 'held') {
+    const row = data.held_places?.find(place => place.key === index);
+    if (!row) return [];
+    const unit = ownerText(row.unit);
+    const match = row.match_rule ? ` (${row.match_rule})` : "";
+    return [field('Kept place', `place ${row.position}`, 'title'),
+      field('', `Kept for the next run of unit ${unit}`, 'caption'),
+      field('Unit', unit, 'field', true), field('Failed run', row.failed_run),
+      field('Failed step', row.failed_step || '—'), field(row.ended === 'no_result' ? 'Ended at' : 'Failed at', row.failed_at),
+      field('Kept until', row.kept_until),
+      field('', `If the next run of unit ${unit}${match} arrives before ${row.kept_until}, ` +
+        `it starts from place ${row.position}. Runs behind place ${row.position} do not wait for it.`, 'long')];
+  }
   if (kind === 'swap' && index !== undefined) return swapTip(data.swap_by[+index]);
   if (kind === 'swap-pool') return poolTip(index, data);
   const rows = TIPS[key](data);
@@ -1074,7 +1551,13 @@ function tooltipRows(key, data) {
   return rows;
 }
 function tooltipHtml(key, data) {
-  return tipRowsHtml(tooltipRows(key, data));
+  const rows = tooltipRows(key, data);
+  return rows.length ? tipRowsHtml(rows) : '';
+}
+function bumpMark(who, tip = "") {
+  return `<span class="move-mark"${tip ? ` data-tip="${esc(tip)}" tabindex="0"` : ""}>` +
+    '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 3h14M18 13l-6-6-6 6M12 7v14"/></svg>' +
+    `<span>${esc(who)}</span></span>`;
 }
 function tipRowsHtml(rows) {
   return '<dl class="tip">'+rows.map(row => {
@@ -1173,14 +1656,14 @@ function unitName(text) {
   return globalThis.staffNames?.unit(text) ?? esc(text);
 }
 // A row starts with its unit, or else with its owner in its staff color (plain ink when the owner has no staff entry).
-function rowLabel({name, unit = "", owner = "", starter = "", repository = ""}, note = "") {
-  return `<span class="row-label"><span class="row-heading"><span class="name">${unit ? unitName(unit) : staffName(starter || name)}</span></span>` +
+function rowLabel({name, unit = "", owner = "", starter = "", repository = "", nameSuffix = ""}, note = "") {
+  return `<span class="row-label"><span class="row-heading"><span class="name">${unit ? unitName(unit) : staffName(starter || name)}${esc(nameSuffix)}</span></span>` +
     `<span class="owner">${owner ? staffName(owner) : esc(repository)}</span>` +
     (note ? `<span class="wait-note">${esc(note)}</span>` : "") + '</span>';
 }
-function rowMemory(tip, bars = "") {
-  return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}">${bars}</div>` +
-    `<div class="amounts"></div></div>`;
+function rowMemory(tip, note = "") {
+  return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}"></div>` +
+    `<div class="amounts">${esc(note)}</div></div>`;
 }
 function cloudStatus(row, tip) {
   return `<div class="row-memory cloud-status" data-tip="${tip}"><div class="track" data-tip="${tip}"></div><div class="amounts">${esc(row.status)}` +
@@ -1201,47 +1684,84 @@ function ago(then, now) {
   return h < 24 ? `${h} h ${m % 60} min` : `${Math.floor(h / 24)} d ${h % 24} h`;
 }
 // Put the tooltip above the pointer, or below it near the top, and keep it inside the window.
-function placeTipAt(tip, x, y) {
+function placeTipAt(tip, x, y, fit, anchor) {
+  const {clientWidth, clientHeight} = document.documentElement;
+  const inset = 8;
+  const maxHeight = Math.max(0, clientHeight - 2 * inset);
+  tip.style.setProperty("--tip-width", `${Math.max(0, clientWidth - 2 * inset)}px`);
+  tip.style.setProperty("--tip-height", `${maxHeight}px`);
+  fit?.(tip, maxHeight);
   const w = tip.offsetWidth, h = tip.offsetHeight;
-  const left = Math.min(Math.max(8, x - w / 2), window.innerWidth - w - 8);
-  const top = y - h - 14 < 8 ? y + 18 : y - h - 14;
-  tip.style.left = `${left}px`;
-  tip.style.top = `${top}px`;
+  const rightEdge = clientWidth - w - inset;
+  const above = y - h - 14;
+  let left = x - w / 2;
+  let top = above < inset ? y + 18 : above;
+  if (anchor) {
+    const bounds = anchor.getBoundingClientRect();
+    left = bounds.right + inset <= rightEdge ? bounds.right + inset : bounds.left - inset - w;
+    top = bounds.top - 4;
+  }
+  tip.style.left = `${Math.max(inset, Math.min(left, rightEdge))}px`;
+  tip.style.top = `${Math.max(inset, Math.min(top, clientHeight - h - inset))}px`;
 }
 const f1 = (n) => recorded(n) ? n.toFixed(1) : "unavailable";
 const memoryAmount = (n) => recorded(n) ? `${f1(n)} GiB` : "use unavailable";
-// Show the tooltip of the [data-tip] element under the mouse, or of a clicked one; a second click hides it.
-// content(key) gives the tooltip HTML, or "" for no tooltip.
-function hoverTips(tip, content) {
+// Open a tooltip on hover or click. Click its trigger again or press Escape to close it.
+function hoverTips(tip, content, fit, getAnchor) {
   let shown = null;
-  const show = (key, x, y) => {
+  const refresh = (html, anchor = shown?.anchor) => {
+    if (!shown) return;
+    shown.anchor = anchor;
+    tip.innerHTML = html;
+    placeTipAt(tip, shown.x, shown.y, fit, anchor);
+  };
+  const show = (key, x, y, trigger) => {
     const html = content(key);
     if (!html) return;
-    shown = key;
-    tip.innerHTML = html;
+    shown = {key, x, y, anchor:getAnchor?.(trigger)};
+    refresh(html);
     tip.classList.add("on");
-    placeTipAt(tip, x, y);
   };
   const hide = () => { shown = null; tip.classList.remove("on"); };
+  window.addEventListener("resize", () => {
+    if (!shown) return;
+    // Let the resize handlers finish the layout before measuring the tooltip anchor.
+    requestAnimationFrame(() => {
+      if (!shown) return;
+      const html = content(shown.key);
+      if (html) refresh(html); else hide();
+    });
+  });
   document.addEventListener("pointermove", (e) => {
-    const el = e.target.closest("[data-tip]");
     if (e.pointerType !== "mouse") return;
-    if (el) show(el.dataset.tip, e.clientX, e.clientY); else if (shown) hide();
+    const el = e.target.closest("[data-tip]");
+    if (el) show(el.dataset.tip, e.clientX, e.clientY, el); else if (shown) hide();
   });
   document.addEventListener("click", (e) => {
     const el = e.target.closest("[data-tip]");
-    if (el && shown !== el.dataset.tip) show(el.dataset.tip, e.clientX, e.clientY); else hide();
+    if (el && shown?.key !== el.dataset.tip) show(el.dataset.tip, e.clientX, e.clientY, el); else hide();
   });
-  return {show, hide, key: () => shown};
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape") hide();
+  });
+  return {show, hide, refresh, key: () => shown?.key};
 }
 // shared:step-tip:end
 const tip = document.getElementById("tip");
-const tips = hoverTips(tip, key => latest ? pageTooltipHtml(key, latest) : "");
+const tips = hoverTips(tip, key => latest ? pageTooltipHtml(key, latest) : "", undefined,
+  trigger => trigger?.classList.contains("move-mark") ? trigger : undefined);
 const showTip = tips.show, hideTip = tips.hide;
 function placeTip(x, y) { placeTipAt(tip, x, y); }
 const SECONDS = __MEMORY_FEED_INTERVAL_SECONDS__;
 __PAGE_REFRESH_SCRIPT__
 const $ = (id) => document.getElementById(id);
+$("bump-key").innerHTML = bumpMark("bump");
+document.addEventListener("focusin", ({target}) => {
+  if (target.classList.contains("move-mark") && target.dataset.tip) showTip(target.dataset.tip, 0, 0, target);
+});
+document.addEventListener("focusout", ({target}) => {
+  if (target.dataset.tip?.startsWith("moved:") && tips.key() === target.dataset.tip) hideTip();
+});
 $("machine-key").innerHTML = "<span>Legend:</span>" + [...MACHINE_ICONS.keys()]
   .map(name => `<span class="key">${machineIcon(name)}${name}</span>`).join("");
 function setSeg(id, value, total) {
@@ -1289,7 +1809,10 @@ function restoreReportView(view) {
     if (!html) {
       hideTip();
       tip.replaceChildren();
-    } else tip.innerHTML = html;
+    } else if (tipKey.startsWith("moved:")) {
+      const mark = $("walk").querySelector(`.move-mark[data-tip="${CSS.escape(tipKey)}"]`);
+      if (mark) tips.refresh(html, mark); else hideTip();
+    } else tips.refresh(html);
   }
 }
 function render(d) {
@@ -1514,9 +2037,12 @@ function limitTooltipRows(key, limits) {
   return rows.length ? [field(identity, name, "title"), ...rows] : [];
 }
 function pageTooltipHtml(key, data) {
-  if (!key.startsWith("limit:")) return tooltipHtml(key, data);
+  if (!key.startsWith("limit:")) {
+    const queueTip = key.startsWith("held:") || key.startsWith("wait:");
+    return tooltipHtml(key, queueTip && displayedQueue ? displayedQueue : data);
+  }
   const rows = limitTooltipRows(key, data.build_limits);
-  return rows.length ? `<div class="build-limit-tip">${tipRowsHtml(rows)}</div>` : "";
+  return rows.length ? tipRowsHtml(rows) : "";
 }
 let lastBuildLimitsHtml = "";
 function renderBuildLimits(limits) {
@@ -1641,11 +2167,168 @@ let reportStamp = "";
 function reportDate(value, zone) {
   return new Date(value).toLocaleDateString("en-US", {timeZone: zone, month: "short", day: "numeric", year: "numeric"});
 }
+function awsCurrentNote(row, today, recordsStart) {
+  if (!row.days.some(day => day.day === today)) return "";
+  if (row.period === "day") return "today, so far";
+  if (row.period === "week") return "this week, so far";
+  const label = row.period === "month" ? "so far" : "year to date";
+  if (recordsStart == null || recordsStart <= awsIso(row.start)) return label;
+  return `${label}, from ${AWS_SHORT_DAY.format(awsDate(recordsStart))}`;
+}
+function awsHistoryRow(row, depth, costs, largest, openPeriods, tips) {
+  const name = awsPeriodName(row), note = awsCurrentNote(row, costs.today, costs.records_start);
+  const open = openPeriods.get(row.id) ?? (depth === 0 && note !== "");
+  const indent = depth * 26;
+  tips.set(row.id, awsDateRange(name, row.start, row.end));
+  const parts = Object.keys(AWS_STATES).filter(state => row.states.has(state));
+  const states = parts.map(state => {
+    const {days, cents} = row.states.get(state);
+    return awsState(state, row.period === "day" ? "" :
+      ` <span class="aws-dim">· ${days} ${days === 1 ? "day" : "days"} · ${awsMoney(cents, state === "estimate")}</span>`);
+  }).join("") || awsState("none");
+  const segments = parts.map(state =>
+    `<i class="${state}" style="width:${awsPercent(row.states.get(state).cents, largest[row.period])}%"></i>`).join("");
+  let children = "";
+  if (open) {
+    if (row.period === "day") {
+      const day = row.days[0];
+      children = `<tr><td class="aws-detail-cell" colspan="5" style="padding-left:${indent + 30}px">
+        ${awsDayDetail(day, costs.price_day, awsRunViews.get(day.day), awsUnitStart)}</td></tr>`;
+    } else {
+      const lower = AWS_PERIODS[row.period][2];
+      children = awsPeriods(lower, row.days, row).map(child =>
+        awsHistoryRow(child, depth + 1, costs, largest, openPeriods, tips)).join("");
+    }
+  }
+  return `<tr data-period="${row.id}">
+    <td class="aws-period" style="padding-left:${indent}px"><button type="button" class="aws-toggle" aria-expanded="${open}"
+      data-tip="aws-cost:${row.id}"><span class="aws-chev" aria-hidden="true"></span><span class="aws-point">${name}</span></button>${note ? `<small class="aws-dim">${note}</small>` : ""}</td>
+    <td class="num${row.runs ? "" : " aws-dim"}">${row.runs || row.cents != null ? awsCount(row.runs) : "no record"}</td>
+    <td class="num"><strong>${awsAmount(row)}</strong></td>
+    <td class="aws-bar-cell"><span class="aws-bar" aria-hidden="true">${segments}</span></td>
+    <td class="aws-states">${states}</td></tr>${children}`;
+}
+function awsHistoryRows(view, costs, periods, largest, openPeriods, tips, showAll) {
+  const shown = view === "day" && !showAll ? periods.slice(0, AWS_HISTORY_DAYS) : periods;
+  return shown.map(row => awsHistoryRow(row, 0, costs, largest, openPeriods, tips)).join("") ||
+    '<tr><td colspan="5">no record</td></tr>';
+}
+function renderAwsHistory() {
+  const {groups, largest} = awsCostGroups;
+  awsPeriodTips.clear();
+  $("aws-period-head").textContent = AWS_PERIODS[awsCostView][1];
+  $("aws-history-rows").innerHTML = awsHistoryRows(awsCostView, awsCostReport, groups[awsCostView], largest,
+    awsCostOpen.get(awsCostView), awsPeriodTips, awsShowAll);
+  const older = $("aws-older"), extra = groups.day.length - AWS_HISTORY_DAYS;
+  older.hidden = awsCostView !== "day" || extra <= 0;
+  older.textContent = awsShowAll ? "Show fewer days" : `Show ${extra} older ${extra === 1 ? "day" : "days"}`;
+}
+function renderAwsCosts(costs) {
+  awsCostReport = costs?.limits && costs?.today ? costs : null;
+  awsLimitTips.clear();
+  awsPeriodTips.clear();
+  const read = $("aws-cost-read"), content = $("aws-cost-content");
+  read.hidden = !awsCostReport;
+  if (!awsCostReport) {
+    content.textContent = "no record";
+    return;
+  }
+  awsZone = costs.zone;
+  awsUnitStart = awsFirstUnitDay(costs.days);
+  read.textContent = costs.read_at == null ? "AWS amounts not read yet" :
+    `AWS amounts read ${awsDateTime(new Date(costs.read_at * 1000))}`;
+  const groups = Object.fromEntries(Object.keys(AWS_PERIODS).map(period => [period, awsPeriods(period, costs.days)]));
+  const largest = Object.fromEntries(Object.entries(groups).map(([period, rows]) =>
+    [period, rows.reduce((max, row) => Math.max(max, row.cents ?? 0), 0)]));
+  awsCostGroups = {groups, largest};
+  const month = groups.month.find(row => row.id === "month-" + costs.today.slice(0,7) + "-01") ?? awsSum([]);
+  const key = Object.entries(AWS_STATES).reverse().map(([state, [,meaning]]) =>
+    `<span class="aws-key-item">${awsState(state)}<span>${meaning}</span></span>`).join("");
+  const controls = Object.entries(AWS_PERIODS).map(([period, [name]]) =>
+    `<button type="button" data-aws-view="${period}" aria-pressed="${period === awsCostView}">${name}</button>`).join("");
+  const records = costs.records_start == null ? "" :
+    `<p class="aws-note">Records start ${awsDayName(awsDate(costs.records_start))}, ${costs.records_start.slice(0,4)}.
+      The pane has no amounts before that day.</p>`;
+  const kept = costs.kept ? `<p class="aws-note aws-kept">Kept resources now cost ${awsMoney(awsCents(costs.kept.month_usd))} each month${costs.kept.items.length ?
+    ": " + costs.kept.items.map(item => `${esc(item.name)} ${awsMoney(awsCents(item.month_usd))}`).join(", ") : ""}.
+    These costs continue when no run is active.</p>` : "";
+  content.innerHTML = `<p class="aws-note aws-rule">Each day on this pane is <b>one AWS bill day</b>. AWS counts days in <b>UTC</b>.
+    ${awsDayRule(costs.today)} Weeks, months and the year are sums of these days.</p>
+    ${awsCostTiles(costs, month, awsLimitTips)}
+    <div class="aws-history"><div class="aws-history-head"><h3>History</h3>
+      <div class="filter" role="group" aria-label="Period of each row">${controls}</div></div>
+      <div class="aws-key aws-dim">${key}</div>
+      <div class="aws-scroll" tabindex="0" aria-label="AWS cost history">
+        <table class="aws-table aws-history-table"><thead><tr><th scope="col" class="aws-period" id="aws-period-head"></th>
+        <th scope="col" class="num">Runs</th><th scope="col" class="num">Amount</th>
+        <th scope="col" class="aws-bar-cell" aria-label="Relative amount"></th><th scope="col" class="aws-states">State</th></tr></thead>
+        <tbody id="aws-history-rows"></tbody></table>
+      </div><button type="button" class="aws-more" id="aws-older" hidden></button>${records}</div>${kept}`;
+  renderAwsHistory();
+}
+$("aws-costs").addEventListener("click", event => {
+  const dayDetail = event.target.closest("[data-aws-day]");
+  if (dayDetail) {
+    if (event.target.closest("[data-aws-csv]")) {
+      downloadAwsRuns(awsCostReport);
+      return;
+    }
+    const groupBy = event.target.closest("[data-aws-group-by]");
+    const group = event.target.closest("tr[data-aws-group]");
+    if (!groupBy && !group) return;
+    const date = dayDetail.dataset.awsDay;
+    const day = awsCostReport.days.find(row => row.day === date);
+    const view = awsRunViews.get(date) ?? awsNewRunView();
+    if (groupBy) {
+      if (view.groupBy === groupBy.dataset.awsGroupBy) return;
+      view.groupBy = groupBy.dataset.awsGroupBy;
+      view.openGroups.clear();
+      for (const control of groupBy.parentElement.children) {
+        control.setAttribute("aria-pressed", String(control === groupBy));
+      }
+    } else {
+      const key = group.dataset.awsGroup;
+      if (!view.openGroups.delete(key)) view.openGroups.add(key);
+    }
+    awsRunViews.set(date, view);
+    const content = dayDetail.querySelector(".aws-run-content");
+    const focused = group?.contains(document.activeElement);
+    content.innerHTML = awsDayRuns(day, view);
+    if (focused) {
+      content.querySelector(`[data-aws-group="${CSS.escape(group.dataset.awsGroup)}"] button`)?.focus({preventScroll:true});
+    }
+    return;
+  }
+  const button = event.target.closest("[data-aws-view]");
+  if (button) {
+    if (button.dataset.awsView === awsCostView) return;
+    awsCostView = button.dataset.awsView;
+    for (const control of button.parentElement.children) {
+      control.setAttribute("aria-pressed", String(control === button));
+    }
+  } else if (event.target.closest("#aws-older")) {
+    awsShowAll = !awsShowAll;
+  } else {
+    const row = event.target.closest("tr[data-period]");
+    if (!row) return;
+    const toggle = row.querySelector(".aws-toggle");
+    const open = toggle.getAttribute("aria-expanded") === "true";
+    awsCostOpen.get(awsCostView).set(row.dataset.period, !open);
+    const focused = document.activeElement === toggle;
+    hideTip();
+    renderAwsHistory();
+    if (focused) document.querySelector(`[data-tip="${toggle.dataset.tip}"]`)?.focus({preventScroll:true});
+    return;
+  }
+  hideTip();
+  renderAwsHistory();
+});
 function renderReport(report) {
   const stamp = JSON.stringify(report);
   if (stamp === reportStamp) return;
   const view = captureReportView();
   reportStamp = stamp;
+  renderAwsCosts(report?.aws_costs);
   if (!report || report.kind === "IndexUnavailable") {
     const reason = report?.reason || "Report data unavailable";
     $("top-costs").textContent = reason;
@@ -1693,6 +2376,7 @@ let queueAccess = null;
 let queueDrag = null;
 let queueSending = false;
 let queueReply = null;
+let displayedQueue = null;
 let queueHighlight = "";
 let queueHighlightTimer;
 let queueAction = null;
@@ -1713,14 +2397,7 @@ function queueReading(d) {
     return d;
   }
   if (queueReply.conflict) return {...d, queueReady:false};
-  const rows = new Map(d.waiters.filter(row => row.move).map(row => [row.move.row_id, row]));
-  const shown = queueReply.line.members.filter(member => rows.has(member.row_id));
-  if (shown.length !== rows.size) return {...d, queueReady:false};
-  const shownIds = new Set(shown.map(member => member.row_id));
-  const ordered = shown.map(member => ({...rows.get(member.row_id), move:member}));
-  let index = 0;
-  return {...d, move_revision:queueReply.line.revision,
-    waiters:d.waiters.map(row => shownIds.has(row.move?.row_id) ? ordered[index++] : row)};
+  return queueWithOrder(d, queueReply.line);
 }
 
 function showQueue(d) {
@@ -1733,6 +2410,7 @@ function showQueue(d) {
 }
 
 function showWalk(d) {
+  displayedQueue = d;
   const focusedMove = document.activeElement?.dataset.moveId;
   renderWalk({...d, queueControls:{
     canMove:Boolean(d.move_revision && d.queueReady !== false && queueAccess?.token),
@@ -1746,7 +2424,7 @@ function showWalk(d) {
 function beginQueueDrag(id, pointer) {
   if (!latest || queueSending || !queueAccess?.token) return false;
   const reading = queueReading(latest);
-  if (!reading.move_revision || reading.queueReady === false) return false;
+  if (!reading.move_line || reading.queueReady === false) return false;
   const row = reading.waiters.find(item => item.move?.row_id === id);
   if (!row || row.move.movable === false) return false;
   queueDrag = {reading, rows:reading.waiters, row, pointer, destination:null};
@@ -1766,9 +2444,18 @@ function previewQueueMove(neighbor) {
   drag.rows = drag.rows.map(row => row.move ? rows[index++] : row);
   drag.destination = to === 0 ? {kind:"QueueHeadDrop"}
     : {kind:"QueueDrop", neighbor:neighbor.move.row_id, side:to < from ? "before" : "after"};
-  const place = drag.rows.slice(0, drag.rows.indexOf(drag.row) + 1).filter(row => row.kind !== "cloud").length;
+  const line = drag.reading.move_line;
+  const members = [...line.members];
+  const moving = members.findIndex(member => member.row_id === drag.row.move.row_id);
+  const [member] = members.splice(moving, 1);
+  const drop = drag.destination;
+  const destination = drop.kind === "QueueHeadDrop" ? 0
+    : members.findIndex(item => item.row_id === drop.neighbor) + Number(drop.side === "after");
+  members.splice(destination, 0, member);
+  const preview = queueWithOrder(drag.reading, {...line, members});
+  const place = queuePlace(preview, drag.row.move.row_id, preview.move_revision);
   queueMessage(drag.pointer === null ? `Place ${place}` : "");
-  showWalk({...drag.reading, waiters:drag.rows});
+  showWalk(preview);
 }
 
 function finishQueueDrag(commit) {
@@ -1791,7 +2478,7 @@ function queueRequestId() {
 
 function queuePlace(reading, id, revision) {
   if (reading.queueReady === false || reading.move_revision !== revision) return 0;
-  return reading.waiters.filter(row => row.kind !== "cloud").findIndex(row => row.move?.row_id === id) + 1;
+  return reading.waiters.find(row => row.move?.row_id === id)?.place ?? 0;
 }
 
 async function sendQueueMove(row, reading, request, id = queueRequestId()) {
@@ -1894,6 +2581,7 @@ function renderWalk(d) {
   const scale = d.total;
   const pct = (v) => `${v / scale * 100}%`;
   const tableRows = [];
+  const held = d.held_places || [];
   const {canMove, lifted, highlighted} = d.queueControls ?? {};
   const grip = row => {
     if (!canMove || !row.move || row.move.movable === false) return "";
@@ -1903,22 +2591,26 @@ function renderWalk(d) {
       <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>`;
   };
   const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="duration">${duration}</th>` +
-    `<th scope="col" class="verify">Verify</th><th scope="col" class="step">Step</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.machine}</th><th scope="col" class="vcpus">vCPU</th>` +
-    (running ? '<th scope="col" class="tokens">Tokens</th>' : "");
+    `<th scope="col" class="verify">Verify</th><th scope="col" class="step">Step</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.machine}</th><th scope="col" class="vcpus"${running ? "" : ' colspan="2"'}>vCPU</th>` +
+    (running ? '<th scope="col" class="tokens">Tokens</th>' : "") + '<th scope="col" class="moved">Moved</th>';
   // A step that runs shows the bright icon of its machine; the row tooltip names the other targets.
   // A step that waits shows a dim icon for each machine that can take it.
-  const targetCell = (machine, named) => {
+  const targetCell = (machine, named, state) => {
     const icons = machine ? machineIcon(machine, "run") : (named || []).map(name => machineIcon(name, "dim")).join("");
-    return `<td class="machine">${icons || "—"}</td>`;
+    return `<td class="machine">${icons || "—"}${state ? ` ${esc(state)}` : ""}</td>`;
   };
   // A waiting step can wrap, but only between words: a word such as "cargo-style" never breaks at its hyphen.
   const stepText = (step, waiting) => waiting && step.includes(" ")
     ? step.split(" ").map(word => `<span class="word">${esc(word)}</span>`).join(" ") : esc(step);
-  const cells = (place, labels, duration, pid, target, vcpus, tip, className = "", done = "—", tokens = "—") => {
-    tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(labels.verify)}</td><th scope="row" class="step"><span class="cell-text">${stepText(labels.step, className.startsWith("wait"))}</span></th><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
-      target + `<td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td>` +
-      (className.startsWith("wait") ? "" : `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
+  const cells = (place, labels, duration, pid, target, vcpus, tip, className = "", done = "—", tokens = "—", move = null) => {
+    const kept = className.startsWith("held"), waiting = kept || className.startsWith("wait");
+    const moved = move?.kind === "bump" ? bumpMark(move.who, `moved:${tip}`) : "—";
+    const hint = tip ? ` data-tip="${esc(tip)}" tabindex="0"` : "";
+    tableRows.push(`<tr class="${className}"${hint}><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td>` +
+      `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(labels.verify)}</td><th scope="row" class="step"><span class="cell-text">${stepText(labels.step, waiting)}</span></th><td class="pid">${kept ? "" : typeof pid === "number" ? pid : "—"}</td>` +
+      target + `<td class="vcpus"${waiting ? ' colspan="2"' : ""}>${typeof vcpus === "number" ? vcpus : waiting ? "" : "—"}</td>` +
+      (waiting ? "" : `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) +
+      `<td class="moved">${moved}</td></tr>`);
   };
   const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || guestRow(row) || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
   const runningCount = ordered.filter(row => row.kind !== "mac-unavailable").length;
@@ -1932,35 +2624,55 @@ function renderWalk(d) {
   rows.push(...ordered.map(r => {
     const labels = queueRowLabels(r);
     const idleCI = r.ci && visibleDetail(r) === "idle";
+    const guest = guestRow(r);
+    const target = targetCell(r.machine, undefined, r.guest_unconfirmed === true ? "not confirmed" : r.guest_unconfirmed);
     cells(stageText(r), labels, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "",
-      r.pid, targetCell(r.machine, r.targets?.includes("mac-linux") ? r.targets : undefined), r.vcpus, `row:${r.key}`, "", doneText(r), r.tokens);
+      r.pid, target, r.vcpus, `row:${r.key}`, "", doneText(r), r.tokens, r.last_move);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(labels)}` +
-      (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`)) + `</div>`;
+      (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`, guest ? `on ${r.machine}` : "")) + `</div>`;
   }));
   // The table row only holds the place of the chart room row beside it; its value shows in the chart.
-  const columnClasses = ["place", "done", "duration", "verify", "step", "pid", "machine", "vcpus", "tokens"];
+  const columnClasses = ["place", "done", "duration", "verify", "step", "pid", "machine", "vcpus", "tokens", "moved"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
   rows.push(`<div class="wrow room">${rowLabel({name: "Free"})}` + rowMemory("room") + `</div>`);
-  const waitingCount = d.waiters.length;
-  if (waitingCount) tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
-  const units = waitingCount ? d.queued_priority_units || [] : [];
+  const notices = $("bump-notices");
+  const bumpLines = d.bump_notices || [];
+  notices.innerHTML = bumpLines.map(({unit, detail}) =>
+    `<div>${unit ? `Bump for ${unitName(unit)}` : "Bumps"} ${esc(detail)}</div>`).join("");
+  notices.hidden = !bumpLines.length;
+  const waitingCount = d.waiters.length, heldCount = held.length;
+  if (waitingCount || heldCount) tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
+  const units = waitingCount || heldCount ? d.queued_priority_units || [] : [];
   const title = d.move_revision ? "Waiting, in queue order"
     : !units.length ? "Queued, in order of submission"
     : units.length === 1 ? `Queued, ${units[0]} first, then in submission order`
     : `Queued, ${units.join(" followed by ")} and then in submission order`;
   const titleHtml = d.move_revision || !units.length ? esc(title) : units.length === 1 ? `Queued, ${roleName(units[0])} first, then in submission order`
     : `Queued, ${units.map(unit=>roleName(unit)).join(' followed by ')} and then in submission order`;
-  rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}"><span>${titleHtml}</span><span> (${waitingCount})</span></span></div>`);
+  rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}"><span>${titleHtml}</span><span> (${waitingCount + heldCount})</span></span></div>`);
   let localPosition = 0;
-  d.waiters.forEach((w, i) => {
-    const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
+  queueRows(d.waiters, held).forEach((w, i) => {
+    if (w.kind === "held") {
+      localPosition = w.position;
+      const unit = ownerText(w.unit);
+      const tip = `held:${w.key}`, rowClass = `held${i === 0 ? " wait-first" : ""}`;
+      const target = targetCell("", w.targets);
+      const deadline = w.kept_until.split(" ", 1)[0];
+      cells(String(w.position), {step:"", verify:""}, `until ${deadline}`, null, target, null, tip, rowClass);
+      const labels = {unit, name: "", nameSuffix: ": kept place",
+        repository: w.failed_step ? `last run failed in ${w.failed_step}` : ""};
+      rows.push(`<div class="wrow ${rowClass}" data-tip="${esc(tip)}">${rowLabel(labels)}</div>`);
+      return;
+    }
+    if (w.kind !== "cloud") localPosition = w.place ?? localPosition + 1;
+    const place = w.kind === "cloud" ? "cloud" : String(localPosition);
     const tip = `wait:${w.key}`;
     const state = w.move && (w.move.row_id === lifted ? " queue-lift"
       : w.move.row_id === highlighted ? " queue-highlight" : "") || "";
     const rowClass = `wait${i === 0 ? " wait-first" : ""}${state}`;
-    const target = targetCell("", w.machine ? [w.machine] : w.targets || []);
+    const target = targetCell("", w.targets?.length ? w.targets : w.machine ? [w.machine] : []);
     const labels = queueRowLabels(w);
-    cells(place, labels, ago(w.since, d.read_at), w.pid, target, null, tip, rowClass);
+    cells(place, labels, ago(w.since, d.read_at), w.pid, target, null, tip, rowClass, "—", "—", w.last_move);
     const reason = w.order_note
       || (["build hold", "build space", "the build in the same Cargo folder", "machine choice"].includes(w.why) ? w.reason : "");
     rows.push(`<div class="wrow ${rowClass}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${grip(w)}${rowLabel(labels, reason)}` +
@@ -1987,6 +2699,44 @@ function renderWalk(d) {
     : `${f1(claimedGib(shown))} of ${f1(shown.cap)} GiB taken${overCap > 0 ? ` · ${ramAmount(overCap)} over cap` : ""}`;
   $("walk-sum").classList.toggle("over-cap", overCap > 0);
   $("walk-tokens").innerHTML = tokenPoolRows(d.tokens).map(row => `<dt>${esc(row.label)}</dt><dd>${esc(row.value)}</dd>`).join('');
+}
+
+function queueWithOrder(reading, line) {
+  const kept = reading.held_places ?? [], keptRuns = line.kept_runs ?? [];
+  if (kept.length !== keptRuns.length || kept.some((row, index) => row.key !== keptRuns[index]))
+    return {...reading, queueReady:false};
+  const rows = new Map(reading.waiters.filter(row => row.move).map(row => [row.move.row_id, row]));
+  const ordered = [], held = [];
+  let position = 0;
+  const numberKept = count => {
+    while (held.length < count) held.push({...kept[held.length], position:++position});
+  };
+  for (const member of line.members) {
+    numberKept(member.kept_before ?? 0);
+    position++;
+    const row = rows.get(member.row_id);
+    if (row) ordered.push({...row, move:member, place:position});
+  }
+  if (ordered.length !== rows.size) return {...reading, queueReady:false};
+  numberKept(kept.length);
+  let index = 0;
+  return {...reading, move_revision:line.revision, move_line:line, held_places:held,
+    waiters:reading.waiters.map(row => row.move ? ordered[index++] : row)};
+}
+
+// Cloud waits have no numbered place.
+function queueRows(waiters, held) {
+  const rows = [];
+  let next = 0, position = 1;
+  for (const row of waiters) {
+    while (held[next] && held[next].position <= (row.place ?? position)) {
+      position = held[next].position + 1;
+      rows.push(held[next++]);
+    }
+    rows.push(row);
+    if (row.kind !== "cloud") position = (row.place ?? position) + 1;
+  }
+  return [...rows, ...held.slice(next)];
 }
 
 function fitAxisLabels() {
@@ -2076,7 +2826,7 @@ function fitWalkDetails() {
   const minimumTrackWidth = Math.max(MIN_TRACK_WIDTH, (Math.max(amountWidth + LABEL_GAP, statusWidth) + 1) / (capFraction || 1));
   // The widest row title or small line sets the label column, with the reorder handle space of its row.
   // A title never wraps; in a pane too narrow for it, it ends in an ellipsis and the row hover gives the full text.
-  const labels = [...walk.querySelectorAll(".row-label :is(.name, .owner, .wait-note)")].map(label =>
+  const labels = [...walk.querySelectorAll(".wrow:not(.held) .row-label :is(.name, .owner, .wait-note)")].map(label =>
     [label, label.textContent, parseFloat(getComputedStyle(label.closest(".row-label")).paddingInlineStart)]);
   const roomHeading = walk.querySelector(".wrow.room .row-heading");
   context.font = canvasFont(roomHeading);
@@ -2198,6 +2948,7 @@ function placeMemoryBars(d) {
   const reserveScale = r.build_target_bytes > 0 ? reserved / (r.build_target_bytes / GIB) : 0;
   for (const row of document.querySelectorAll(".wrow[data-run]")) {
     const run = d.walk.find(run => run.key === row.dataset.run);
+    if (guestRow(run)) continue;
     const amount = shown.walk.find(run => run.key === row.dataset.run);
     let bars = "";
     const amounts = [];
@@ -2273,7 +3024,9 @@ function placeMemoryBars(d) {
   placeDivider(roomRow, dividerTop);
   const dividerOffset = Math.floor(roomTrack.getBoundingClientRect().top) - dividerTop;
   for (const row of document.querySelectorAll(".wrow.wait-first")) {
-    placeDivider(row, Math.floor(row.querySelector(".track").getBoundingClientRect().top) - dividerOffset);
+    // A held place has no memory track, so its text sets the divider.
+    const anchor = row.querySelector(".track") || row.querySelector(".row-label");
+    placeDivider(row, Math.floor(anchor.getBoundingClientRect().top) - dividerOffset);
   }
 }
 
@@ -2369,7 +3122,8 @@ async function tick(supersede=false,current=()=>true) {
   $("pill").className=`pill ${lv}`;
   $("pill-t").textContent=({ok:"no memory pressure",warn:"memory pressure near limit",
     hold:"pressure: queue holds",neutral:"stall not recorded"})[lv];
-  return {readAt:d.read_at,renderSeconds:d.render_seconds,failure:d.read_error ? "The queue did not answer." : ""};
+  return {readAt:d.read_at,answeredAt:d.fresh_until,renderSeconds:d.render_seconds,
+    failure:d.read_error ? "The queue did not answer." : ""};
 }
 // Read the costs only when the feed names a new report version.
 let reportVersion = null;
@@ -2384,21 +3138,27 @@ async function loadReport(version,current) {
     reportVersion = version;
   } catch (e) { /* The next reading tries again. */ }
 }
-let pageStamp = null;
+const pageVersion = document.querySelector('meta[name="builds-page-version"]')?.content;
+let pageReloading = false;
 async function reloadWhenPageChanges() {
-  if (consoleHidden() || paused) return;
+  if (consoleHidden() || paused || pageReloading) return;
   try {
     const r = await fetch(location.pathname, { method: "HEAD", cache: "no-store" });
-    const stamp = r.headers.get("Last-Modified");
-    if (paused) return;
-    if (pageStamp && stamp && stamp !== pageStamp) location.reload();
-    pageStamp = stamp || pageStamp;
+    if (!r.ok || consoleHidden() || paused || pageReloading) return;
+    const version = r.headers.get("X-Builds-Page-Version");
+    if (pageVersion && version && version !== pageVersion) {
+      pageReloading = true;
+      location.reload();
+    }
   } catch (e) { /* The reading status already reports a lost server. */ }
 }
 const pageRefresh=createPageRefresh(tick,()=>paused ? 0 : SECONDS,()=>paused ? 'Press space to resume.' : '');
 void pageRefresh.refresh();
 reloadWhenPageChanges();
 setInterval(reloadWhenPageChanges, 30000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") void reloadWhenPageChanges();
+});
 addEventListener("message", event => {
   if (event.source === parent && event.origin === location.origin && event.data === "console-shown") {
     reloadWhenPageChanges();

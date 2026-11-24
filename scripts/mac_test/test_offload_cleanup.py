@@ -25,6 +25,7 @@ from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, UNREACHAB
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.lib.checkout_test_support import fixture_shim_source
 from scripts.lib import conf, removal_guard, test_hang_guard
+from scripts.lib.shell_test_support import fixture_zsh_environment
 
 
 MAC_TARGET_CONFIG = "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE
@@ -72,9 +73,7 @@ with StringIO() as output, conf_reads.record_reads(fixture / "trim-config-reads"
 def shell_environment(root: Path) -> dict[str, str]:
     """Give the test shells only the settings they need."""
     return {
-        # Keep the fixture PATH when the NixOS zsh startup file runs.
-        "__NIXOS_SET_ENVIRONMENT_DONE": "1",
-        "__ETC_ZSHENV_SOURCED": "1",
+        **fixture_zsh_environment(),
         "CONF_DIR": str(root / "config"),
         "HOME": str(root / "home with spaces"),
         "TMPDIR": str(root / "tmp"),
