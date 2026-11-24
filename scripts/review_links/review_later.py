@@ -164,5 +164,4 @@ def save(key: str, until: datetime, *, record_log: Callable[[Callable[[], None]]
 def deadline() -> str:
     zone = user_zone()
     now = datetime.now(zone)
-    future = [value for value in times(zone=zone).values() if value > now]
-    return str(int(min(future).timestamp())) if future else ''
+    return question_path.next_later_deadline(times(zone=zone).values(), now)
