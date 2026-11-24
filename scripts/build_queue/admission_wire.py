@@ -661,7 +661,7 @@ class ExecutionReport(CallerCode):
 
 @dataclass(frozen=True)
 class SettlementRequest:
-    """Ask the queue to confirm settlement for an exact scaler attempt."""
+    """Ask the queue to confirm settlement for an exact gate attempt."""
     assignment: placement.PlacementAssignment
 
 

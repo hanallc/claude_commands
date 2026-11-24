@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, replace
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, field, replace
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 from uuid import uuid4
 
@@ -63,6 +64,14 @@ class InheritedGatePlacement:
 GatePlacement = OwnedGatePlacement | InheritedGatePlacement
 
 
+def close_unsettled_gate(cleanup: Callable[[], None]) -> None:
+    """Log a cleanup error after an unsettled gate."""
+    try:
+        cleanup()
+    except Exception as error:
+        print(f'Gate cleanup failed. {error}', file=sys.stderr, flush=True)
+
+
 @dataclass
 class FirstStepAdmission:
     """Keep the preparation grant until the command can start."""
@@ -70,6 +79,7 @@ class FirstStepAdmission:
     queue_position: SlotQueuePosition
     grant: wire.Admitted | wire.LocalPlacementGranted | wire.Assignment | GatePlacement | HandedOff
     assignment_file: Path
+    unsettled: bool = field(default=False, init=False)
 
     def handoff(self, tree: Path) -> None:
         """End preparation or pass the assignment to the command."""
@@ -95,7 +105,7 @@ class FirstStepAdmission:
 
     def _hand_gate(self, grant: GatePlacement) -> None:
         # A local grant keeps its reservation, so the queue reads the assignment as current when the gate checks it.
-        # The gate ends that reservation after the check, before it takes its own (gate.gate_start_target).
+        # The gate ends that reservation after its assignment check, before it takes its own.
         # close() cancels the placement, and the cancel returns a reservation that the gate did not end.
         os.environ['BUILDLOG_PLACEMENT_FILE'] = str(self.assignment_file)
         os.environ['BUILDLOG_PLACEMENT_EPISODE'] = grant.grant.assignment.episode
@@ -114,9 +124,10 @@ class FirstStepAdmission:
     def run_gate(self, run: Callable[[], subprocess.CompletedProcess[str]]) -> subprocess.CompletedProcess[str]:
         """Run the gate and retry only when the queue permits a new attempt."""
         grant = self.grant
-        if not isinstance(grant, OwnedGatePlacement):
-            return run()
-        return run_gate_with_placement(run, self.assignment_file, grant.request, self.place_again)
+        result = (run_gate_with_placement(run, self.assignment_file, grant.request, self.place_again)
+                  if isinstance(grant, OwnedGatePlacement) else run())
+        self.unsettled = result.returncode == GATE_UNSETTLED_LAUNCH_STATUS
+        return result
 
     def close(self) -> None:
         """Release preparation after an error before command startup."""
@@ -250,24 +261,22 @@ def run_gate_with_placement(
                                 + 'Received a replacement assignment.')
             else:
                 client.request_settlement(wire.SettlementRequest(previous))
-            scaler_declined = (result.returncode == GATE_PRELAUNCH_REFUSED_STATUS
-                               and previous.destination.provider == 'scaler')
-            with (client.scaler_retry_window(request.since) if scaler_declined else nullcontext()):
-                place_again(request)
+            place_again(request)
             replacement = read_assignment(assignment_file).assignment
             if (not assignment_matches_request(replacement, request)
                     or replacement.attempt == previous.attempt):
                 raise wire.AdmissionUnavailable('the queue did not provide a replacement assignment')
             if retry_notice:
                 print(retry_notice, flush=True)
-        except (OSError, ValueError, wire.AdmissionUnavailable, FirstStepRefused) as error:
-            exhausted = isinstance(error, PlacementExhausted) or str(error) == client.LAUNCH_WAIT_LIMIT_REASON
-            if exhausted:
-                message = 'Gate placement blocked'
-            elif result.returncode == GATE_UNSETTLED_LAUNCH_STATUS:
-                message = f'Gate placement blocked during launch settlement. {error}'
-            else:
-                message = f'Gate placement blocked. {error}'
+        except Exception as error:
+            if result.returncode == GATE_UNSETTLED_LAUNCH_STATUS:
+                detail = f'Gate placement blocked during launch settlement. {error}\n'
+                stderr = f'{result.stderr.rstrip()}\n{detail}' if result.stderr else detail
+                return subprocess.CompletedProcess(request.constraints.command, result.returncode, result.stdout, stderr)
+            if not isinstance(error, (OSError, ValueError, wire.AdmissionUnavailable, FirstStepRefused)):
+                raise
+            message = ('Gate placement blocked' if isinstance(error, PlacementExhausted)
+                       else f'Gate placement blocked. {error}')
             return subprocess.CompletedProcess(request.constraints.command, GATE_PRELAUNCH_REFUSED_STATUS, '',
                                                message + '\n')
 
@@ -428,7 +437,8 @@ def admitted_run(command: Sequence[str], source: Path, *,
         _ = os.environ.pop('BUILDLOG_PLACEMENT_EPISODE', None)
         _ = os.environ.pop('BUILDLOG_PLACEMENT_SIDECAR', None)
     try:
-        with build_folders.tool_folder('copies-admission') as folder:
+        with ExitStack() as cleanup:
+            folder = cleanup.enter_context(build_folders.tool_folder('copies-admission'))
             assignment_file = folder / 'assignment.json'
             verify = verify_command(command)
             grant: wire.Admitted | wire.LocalPlacementGranted | wire.Assignment | GatePlacement
@@ -449,7 +459,11 @@ def admitted_run(command: Sequence[str], source: Path, *,
                     client.write_assignment(assignment_file, grant)
                 yield admitted
             finally:
-                admitted.close()
+                if admitted.unsettled:
+                    close_unsettled_gate(admitted.close)
+                    close_unsettled_gate(cleanup.close)
+                else:
+                    admitted.close()
     except wire.AdmissionUnavailable as error:
         raise FirstStepRefused(str(error)) from error
     finally:

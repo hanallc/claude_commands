@@ -1,8 +1,8 @@
 """Test how checkpoint gates enter placement and retry a silent Mac guest."""
 from __future__ import annotations
 
-from collections.abc import Callable
-from contextlib import nullcontext, redirect_stdout
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import io
 from dataclasses import replace
 from functools import partial
@@ -261,6 +261,48 @@ class CheckpointGatePlacementTests(unittest.TestCase):
         self.assertEqual(stopped.exception.state, "blocked")
         self.assertIn("settlement", stopped.exception.detail)
         run.assert_called_once_with(COMMAND, fixture.step.folder)
+
+    def test_queue_loss_after_guest_exit_80_preserves_checkpoint_settlement(self) -> None:
+        fixture = GatePlacementFixture(self)
+
+        @contextmanager
+        def tool_folder(_tool: str) -> Generator[Path]:
+            try:
+                yield fixture.step.folder
+            finally:
+                raise OSError("fixture folder cleanup failed")
+
+        def run(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
+            with redirect_stderr(io.StringIO()) as errors:
+                code = copies.main(["gate-step", "--repo", str(folder), "--", *command])
+            return subprocess.CompletedProcess(command, code, "", errors.getvalue())
+
+        child = subprocess.CompletedProcess(COMMAND, GATE_UNSETTLED_LAUNCH_STATUS, "", "guest end unproven\n")
+        with (PlacementFixture(),
+              mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": ""}, clear=False),
+              mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+              mock.patch.object(first_step, "_gate_request", return_value=fixture.request),
+              mock.patch.object(first_step, "_placement_grant", return_value=admission_wire.Assignment(fixture.guest)),
+              mock.patch.object(admission_records, "process_start_time", return_value="456"),
+              mock.patch.object(build_folders, "tool_folder", side_effect=tool_folder),
+              mock.patch.object(admission_client, "_connect", side_effect=FileNotFoundError("fixture socket is gone")) as connect,
+              mock.patch.object(subprocess, "run", return_value=child) as invoked,
+              mock.patch.object(checkpoint_gate, "run_test_command", side_effect=run) as runner):
+            del os.environ["BUILDLOG_PLACEMENT_FILE"]
+            with self.assertRaises(checkpoint_gate.Stop) as stopped:
+                _ = checkpoint_gate.run_test_steps(fixture.production, [fixture.step], frozenset(),
+                                                   frozenset(), fixture.log)
+        self.assertEqual(stopped.exception.state, "blocked")
+        self.assertIn("launch settlement", stopped.exception.detail)
+        self.assertEqual(connect.call_count, 2)
+        invoked.assert_called_once()
+        runner.assert_called_once_with(COMMAND, fixture.step.folder)
+        output = fixture.log.read_text()
+        self.assertIn("guest end unproven", output)
+        self.assertIn("Gate cleanup failed. no socket", output)
+        self.assertIn("Gate cleanup failed. fixture folder cleanup failed", output)
+        self.assertIn("merge_test_1_EXIT=80", output)
+        self.assertNotIn("RERUN", output)
 
     def test_unsettled_attempt_blocks_another_launch(self) -> None:
         fixture = GatePlacementFixture(self)

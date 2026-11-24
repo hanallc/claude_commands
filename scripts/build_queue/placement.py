@@ -559,8 +559,7 @@ def retry_decision(destination: PlacementDestination, reason: str | execution_id
         return DoNotRetry(reason)
     if reason in SETTINGS_REFUSAL_REASONS or reason in ("no_tests", "linux_only", "local_flag", "command"):
         return DoNotRetry(reason)
-    # A Mac Linux guest that took no run waits like a Mac decline, so the retry goes to another machine first.
-    remote_decline = destination.provider == "mac" or reason == MAC_LINUX_NO_ANSWER
+    remote_decline = destination.provider == "mac"
     delay = 180 if remote_decline and reason not in ("busy", "blocked", "disk") else 0
     return RetryAt(now + delay)
 
