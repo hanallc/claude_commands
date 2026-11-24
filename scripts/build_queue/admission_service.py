@@ -5946,6 +5946,7 @@ done
             return
         reading = published.view.reading
         if reading.view.move_line != previous:
+            published.placement_waits.clear()
             return
         by_id = {row[1].get("move_id", ""): (row, step)
                  for row, step in zip(reading.ordered, reading.view.waiting, strict=True)}
@@ -5958,8 +5959,8 @@ done
         wait_positions = {records.waiter_owner(row): position for position, (_, row) in enumerate(ordered, 1)
                           if records.waiter_owner(row) in published.wait_positions}
         view = wire.ViewReply(reading)
-        self._publish_replies(PublishedReplies(view, published.explain, wait_positions, published.placements,
-                                               wire.encode_reply(view).encode(), explain_bytes=published.explain_bytes))
+        self._publish_replies(replace(published, view=view, wait_positions=wait_positions, placement_waits={},
+                                      view_bytes=wire.encode_reply(view).encode(), mine_bytes=b""))
 
     def _move_destination(self, request: wire.QueueMoveRequest | wire.QueueUndoRequest, line: records.QueueMoveLine,
                           full_order: list[str]) -> tuple[wire.QueueMoved, QueueAnchor] | wire.QueueMoveConflict:
