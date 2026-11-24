@@ -7284,6 +7284,37 @@ window.fetch=async(path,options={})=>{
                 else:
                     self.assertEqual(saved_source["keeper"], keeper)
 
+    def test_restart_recovers_an_old_question_through_mortys_list_link(self) -> None:
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        folder = the_list.folder(MORTY.id)
+        linked = the_list.folder(OTHER.id)
+        linked.mkdir(parents=True)
+        folder.parent.mkdir(parents=True)
+        folder.symlink_to(linked, target_is_directory=True)
+        item = self.add("Check the linked List folder")
+        item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        with patch.object(session_pane, "session_place", return_value=HerdrPlace("native", "w1:p1")):
+            asked = list_page.submit(status.root, urlencode(self.fields(
+                item, "question", words="Which check passed?")), status)
+        assert isinstance(asked, list_page.ListQuestionDelivery)
+        delivery = asked.delivery
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        claimed = delivery.job.record
+        self.assertEqual(claimed.source.path, str(linked / f"{item.id}.md"))
+        self.assertIn(f" --keeper {MORTY.id} ", claimed.message)
+        path = status.path(delivery.page, delivery.row)
+        with status.locked():
+            change_page.advance_question_attempt(path, claimed, replace(
+                claimed, source=replace(claimed.source, keeper=delivery_state.NoSavedListKeeper()),
+                state=delivery_state.QuestionSendState.READY, owner=delivery_state.NoQuestionSendOwner()))
+        _ = delivery.job.release()
+
+        with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+            change_page.recover_review_messages(change_page.DeliveryStatus(status.root))
+        send.assert_called_once_with(DWIGHT.id, claimed.message, claimed.message_id)
+        self.assertIs(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
+
     def test_item_action_notices_go_to_the_keeper_when_the_producer_differs(self) -> None:
         root = self.root / "reviews"
         item = self.add("Check the notice recipient")

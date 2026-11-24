@@ -1568,7 +1568,10 @@ List, Images, and Review use the same send loop.
 The loop checks the saved source and recipient before each attempt.
 New List attempts save the keeper and the resolved item path.
 The sender checks that the keeper's item still resolves to that path.
-The sender can use the recipient, the source path, or Morty to locate the keeper on older attempts.
+An older attempt can name the keeper only in its saved answer command.
+The sender checks that this keeper's item resolves to the saved path.
+For a command without `--keeper`, the sender can use the recipient, the source path, or Morty to locate the keeper.
+Recovery sends the original command.
 A close preserves the delivery result of a send already in progress.
 The sender checks the item again before it sends a failure alert.
 A read error during retry authorization preserves the confirmed failure and reports the read error separately.

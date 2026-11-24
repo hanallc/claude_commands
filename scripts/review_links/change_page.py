@@ -381,6 +381,10 @@ class NoQuestionJob:
 
 NO_QUESTION_JOB = NoQuestionJob()
 
+_ANSWER_COMMAND_LINE = "\nAnswer with this command: "
+_LIST_ANSWER_PREFIX = "~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py answer "
+_LIST_ANSWER_SUFFIX = ' --question {question_id} --text "<answer>"'
+
 
 @dataclass(frozen=True)
 class SavedQuestionDelivery:
@@ -399,7 +403,7 @@ class SavedQuestionDelivery:
         return self._body(self.answer_command)
 
     def _body(self, command: str) -> str:
-        return f"{self.source.words}\nAnswer with this command: {command}"
+        return f"{self.source.words}{_ANSWER_COMMAND_LINE}{command}"
 
     @property
     def message(self) -> str:
@@ -449,8 +453,7 @@ def list_question_target(path: Path, item: str, number: int, title: str,
                          recipient: staff.StaffId, *, keeper: staff.StaffId,
                          alert_owner: staff.StaffId | None = None) -> QuestionDeliveryTarget:
     # The command names the record's folder, so a recipient never answers a same-number record in its own folder.
-    command = ('~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py '
-               + f'answer {{item}} --keeper {shlex.quote(keeper)} --question {{question_id}} --text "<answer>"')
+    command = _LIST_ANSWER_PREFIX + f"{{item}} --keeper {shlex.quote(keeper)}" + _LIST_ANSWER_SUFFIX
     return QuestionDeliveryTarget(path, item, recipient, f"List item {number}", title, command, alert_owner, keeper=keeper)
 
 
@@ -789,16 +792,33 @@ def _send_result(delivery: VerifiedQuestionAttempt) -> QuestionAttempt:
 def _list_question_store(record: QuestionAttempt) -> record_store.NumberedRecords:
     source = record.source
     path = Path(source.path)
-    keeper = source.keeper if not isinstance(source.keeper, NoSavedListKeeper) else record.recipient_id
-    listing = record_store.NumberedRecords(keeper, "list", "L", "list item", ValueError)
+    keeper = source.keeper
+    if isinstance(keeper, NoSavedListKeeper):
+        keeper = _legacy_list_command_keeper(source, record.message.rpartition(_ANSWER_COMMAND_LINE)[2])
+    owner = record.recipient_id if isinstance(keeper, NoSavedListKeeper) else keeper
+    listing = record_store.NumberedRecords(owner, "list", "L", "list item", ValueError)
     try:
         if listing.path(source.item_id).resolve() == path:
             return listing
-        if isinstance(source.keeper, NoSavedListKeeper):
+        if isinstance(keeper, NoSavedListKeeper):
             return _legacy_list_question_store(listing, source)
     except ValueError as error:
         raise StaleQuestionAttempt("The List question source is unavailable.") from error
     raise StaleQuestionAttempt("The List question source has moved.")
+
+
+def _legacy_list_command_keeper(source: QuestionSource, command: str) -> staff.StaffId | NoSavedListKeeper:
+    prefix = _LIST_ANSWER_PREFIX + shlex.quote(source.item_id)
+    suffix = _LIST_ANSWER_SUFFIX.format(question_id=source.question_id)
+    if not command.startswith(prefix) or not command.endswith(suffix):
+        raise ValueError("The saved List answer command does not match this question.")
+    option = command[len(prefix):-len(suffix)]
+    if not option:
+        return NoSavedListKeeper()
+    words = shlex.split(option)
+    if len(words) != 2 or option != " --keeper " + shlex.quote(words[1]):
+        raise ValueError("The saved List answer command has an invalid keeper.")
+    return staff.StaffId(words[1])
 
 
 def _legacy_list_question_store(listing: record_store.NumberedRecords,
@@ -1084,23 +1104,30 @@ def _claim_recovered_page_question(status: DeliveryStatus, record: QuestionAttem
         with status.locked():
             image = _read_image_question_source(status, record)
             questions = tuple(question_record.read(question) for question in image.get("questions", []))
-            target = image_question_target(source_path, image)
-            return _recover_saved_question(status, target, record, questions)
+            question = _verify_open_question(record, questions)
+            saved = image_question_target(source_path, image).saved(question)
+            return _recover_saved_question(status, saved, record)
     elif source.row == f"List item {source.item_id.removeprefix('L')}/{source.question_id}":
         listing = _list_question_store(record)
         with listing.locked(), status.locked():
             fields, question = _open_list_question(listing, record)
-            target = list_question_target(source_path, fields["id"], int(fields["number"]), fields["title"],
-                                          record.recipient_id, keeper=listing.owner,
-                                          alert_owner=staff.StaffId(fields["owner"]))
-            return _recover_saved_question(status, target, record, (question,))
+            number = int(fields["number"])
+            alert_owner = staff.StaffId(fields["owner"])
+            if isinstance(source.keeper, NoSavedListKeeper):
+                if source.row != f"List item {number}/{question.question_id}":
+                    raise ValueError("The saved List question has a different row.")
+                command = record.message.rpartition(_ANSWER_COMMAND_LINE)[2]
+                saved = SavedQuestionDelivery(source, record.recipient_id, fields["title"], command, alert_owner)
+            else:
+                target = list_question_target(source_path, fields["id"], number, fields["title"],
+                                              record.recipient_id, keeper=listing.owner, alert_owner=alert_owner)
+                saved = target.saved(question)
+            return _recover_saved_question(status, saved, record)
     return NoMessageDelivery()
 
 
-def _recover_saved_question(status: DeliveryStatus, target: QuestionDeliveryTarget, record: QuestionAttempt,
-                            questions: tuple[question_record.Question, ...]) -> MessageDelivery | NoMessageDelivery:
-    question = _verify_open_question(record, questions)
-    saved = target.saved(question)
+def _recover_saved_question(status: DeliveryStatus, saved: SavedQuestionDelivery,
+                            record: QuestionAttempt) -> MessageDelivery | NoMessageDelivery:
     if not saved.matches(record):
         raise ValueError("The saved question does not match this delivery.")
     view = question_delivery_view(status, saved)
