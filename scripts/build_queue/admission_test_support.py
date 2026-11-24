@@ -34,7 +34,7 @@ from typing import ClassVar, cast, override
 from scripts.lint import memory_admit as gate
 
 from scripts.lint.memory_test_support import (
-    admission_policy_fixture, config_environment, fake_memory_readings, gate_isolation_environment, write_pressure_reading,
+    admission_policy_fixture, fake_memory_readings, gate_isolation_environment, write_pressure_reading,
 )
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
@@ -433,8 +433,6 @@ class AdmissionFixture(ExitStack):
         super().__init__()
         if not hasattr(os, "pidfd_open") or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
-        if not private and (configuration := os.environ.get("CONF_DIR")):
-            _ = config_environment(Path(configuration))
         self.root: Path = root if root is not None else Path(self.enter_context(tempfile.TemporaryDirectory()))
         try:
             self.enter_context(mock.patch.dict(os.environ, gate_isolation_environment(self.root)))
