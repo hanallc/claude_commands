@@ -660,6 +660,42 @@ def _completion_notices() -> CompletionNotices:
     return cast(CompletionNotices, cast(object, import_module("scripts.herdr.turn_end")))
 
 
+def admit_dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, *,
+                   session_dir: Path, slot: str, phase: str, launcher_command: list[str],
+                   work: progress_history.DispatchWork, prompt_source: Path | bytes, record: staff.StaffSnapshot,
+                   lock: worker_panes.WorkerLockAtUse | worker_panes.WorkerLockHold | worker_panes.Kept = worker_panes.WorkerLockAtUse.ACQUIRE,
+                   ) -> pass_recorder.DispatchSelection | ExitCode:
+    """Check the proposed dispatch without changing files or sending a prompt."""
+    row = None if isinstance(lock, worker_panes.Kept) else worker_admission.find_worker(record, parent, name.value)
+    observed = (worker_panes.observe_worker(parent, row, record) if row is not None
+                else worker_panes.WorkerNotObserved.CURRENT)
+    pane = observed if isinstance(observed, worker_panes.OpenWorker) and not observed.status.idle else None
+    checked = (worker_panes.check_worker_lock(pane.row, include_name=True)
+               if isinstance(lock, worker_panes.WorkerLockAtUse) and pane is not None else lock)
+    if isinstance(checked, worker_panes.Kept):
+        print(checked.blocker, file=sys.stderr)
+        return ExitCode.BUSY
+    selection = progress_history.select_dispatch(session_dir, slot=slot, phase=phase, role=role,
+        prompt=prompt, launcher_command=launcher_command, work=work, target=name, prompt_source=prompt_source)
+    if isinstance(selection, pass_recorder.ActiveDispatchPromptConflict):
+        return _prompt_conflict(selection)
+    if pane is not None:
+        matched = selection.action
+        read_receipt: Callable[[staff.StaffRow], DispatchReceipt] | None = None
+        if isinstance(matched, pass_recorder.MatchedDispatch):
+            passed = worker_panes.worker_pass(pane.row, session_dir, record=record)
+            if passed.get("instance_id") == matched.instance_id:
+                if passed.get("status") == "completed":
+                    return selection
+                delivery = pass_recorder.dispatch_delivery(passed)
+                if delivery.line:
+                    read_receipt = partial(dispatch_receipt, line=delivery.line, dispatch_id=delivery.completion_id, run=session_dir)
+        ready = _dispatch_ready(parent, pane, _client(), read_receipt=read_receipt)
+        if isinstance(ready, ExitCode):
+            return ready
+    return selection
+
+
 def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, dispatch_id: str = "", *,
              session_dir: Path, slot: str, phase: str, kind: str, launcher_command: list[str],
              lens: str = "", reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, fix_cause: str = "",
@@ -677,17 +713,15 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
     with ExitStack() as after_dispatch, ExitStack() as operations, ExitStack() as cleanup:
         notice_delivery = notices if isinstance(notices, ExitStack) else after_dispatch
         hold = operations.enter_context(worker_panes.worker_lock(parent, name)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
-        if isinstance(hold, worker_panes.Kept):
-            print(hold.blocker, file=sys.stderr)
-            return ExitCode.BUSY
-        selection = progress_history.select_dispatch(session_dir, slot=slot, phase=phase, role=role,
-            prompt=prompt, launcher_command=launcher_command, work=progress_history.DispatchWork(kind, lens, fix_pass),
-            target=name)
-        if isinstance(selection, pass_recorder.ActiveDispatchPromptConflict):
-            return _prompt_conflict(selection)
+        record = staff.snapshot()
+        selection = admit_dispatch(parent, name, role, prompt, session_dir=session_dir, slot=slot, phase=phase,
+            launcher_command=launcher_command, work=progress_history.DispatchWork(kind, lens, fix_pass),
+            prompt_source=prompt, record=record, lock=hold)
+        if isinstance(selection, ExitCode):
+            return selection
+        assert isinstance(hold, worker_panes.WorkerLockHold)
         matched = selection.action
         completion_notices = _completion_notices()
-        record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
         recovered = CompletionRecovery.NO_PENDING_NOTICE
         if row is not None and (owner := record.parent_of(row)) is not None:
@@ -744,7 +778,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             return startup_result(name, current_start)
         started = current_start
         if not isinstance(matched, pass_recorder.MatchedDispatch):
-            ready = dispatch_pane_ready(parent, started, _client())
+            ready = _dispatch_ready(parent, started, _client())
             if not isinstance(ready, worker_panes.OpenWorker):
                 return ready
             started = ready
@@ -795,12 +829,20 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         return result
 
 
-def _dispatch_ready(parent: StaffId, current: worker_panes.OpenWorker,
-                    client: herdr.Herdr) -> worker_panes.OpenWorker | ExitCode:
-    """Use the existing bounded wait before replacing a submitted pass."""
+def _dispatch_ready(parent: StaffId, current: worker_panes.OpenWorker, client: herdr.Herdr, *,
+                    read_receipt: Callable[[staff.StaffRow], DispatchReceipt] | None = None,
+                    ) -> worker_panes.OpenWorker | DispatchSubmission | ExitCode:
+    """Check for a receipt or wait for the pane to accept a prompt."""
     codex = isinstance(staff.backend(current.row), staff.CodexBackend)
     if current.status == herdr.AgentStatus.BLOCKED and codex:
         return _blocked_question(client, current)
+    if read_receipt is not None:
+        found = read_receipt(current.row)
+        if isinstance(found, DispatchEvidenceUnknown):
+            print(f"anomaly: {current.row.name}: {found.reason}; no prompt sent", file=sys.stderr)
+            return ExitCode.UNCERTAIN
+        if not isinstance(found, DispatchNotSubmitted):
+            return DispatchSubmission.SUBMITTED
     if current.status == herdr.AgentStatus.WORKING:
         try:
             _ = client.wait_turn_end(current.pane, int(conf.read("direct").number("WORKER_SETTLE_SECONDS") * 1000))
@@ -821,45 +863,17 @@ def _dispatch_ready(parent: StaffId, current: worker_panes.OpenWorker,
         current = observed
         if current.status == herdr.AgentStatus.BLOCKED and codex:
             return _blocked_question(client, current)
-    return current
-
-
-def _idle_dispatch_pane(pane: worker_panes.OpenWorker | ExitCode) -> worker_panes.OpenWorker | ExitCode:
-    if isinstance(pane, worker_panes.OpenWorker) and pane.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
-        print(f"{pane.row.name}: agent is {pane.status.value}", file=sys.stderr)
+        if read_receipt is not None:
+            found = read_receipt(current.row)
+            if isinstance(found, DispatchEvidenceUnknown):
+                print(f"{current.row.name}: {found.reason}; no prompt sent", file=sys.stderr)
+                return ExitCode.UNCERTAIN
+            if not isinstance(found, DispatchNotSubmitted):
+                return DispatchSubmission.SUBMITTED
+    if not current.status.idle:
+        print(f"{current.row.name}: agent is {current.status.value}", file=sys.stderr)
         return ExitCode.BUSY
-    return pane
-
-
-def dispatch_pane_ready(parent: StaffId, started: worker_panes.OpenWorker,
-                        client: herdr.Herdr) -> worker_panes.OpenWorker | ExitCode:
-    """Wait for a pane to accept a new prompt."""
-    return _idle_dispatch_pane(_dispatch_ready(parent, started, client))
-
-
-def dispatch_turn_ready(parent: StaffId, started: worker_panes.OpenWorker, client: herdr.Herdr,
-                        line: str, dispatch_id: str, *, run: Path,
-                        ) -> worker_panes.OpenWorker | DispatchSubmission | ExitCode:
-    """Check the saved delivery receipt before and after the pane wait."""
-    if started.status == herdr.AgentStatus.BLOCKED and isinstance(staff.backend(started.row), staff.CodexBackend):
-        return _blocked_question(client, started)
-    receipt = dispatch_receipt(started.row, line, dispatch_id, run=run)
-    if isinstance(receipt, DispatchEvidenceUnknown):
-        print(f"anomaly: {started.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
-        return ExitCode.UNCERTAIN
-    if not isinstance(receipt, DispatchNotSubmitted):
-        return DispatchSubmission.SUBMITTED
-    ready = _dispatch_ready(parent, started, client)
-    if not isinstance(ready, worker_panes.OpenWorker):
-        return ready
-    if started.status == herdr.AgentStatus.WORKING:
-        receipt = dispatch_receipt(ready.row, line, dispatch_id, run=run)
-        if isinstance(receipt, DispatchEvidenceUnknown):
-            print(f"{ready.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
-            return ExitCode.UNCERTAIN
-        if not isinstance(receipt, DispatchNotSubmitted):
-            return DispatchSubmission.SUBMITTED
-    return _idle_dispatch_pane(ready)
+    return current
 
 
 def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: herdr.Herdr,
@@ -868,7 +882,8 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
                    defer_compaction: Callable[[], None] | AttachedCompaction = AttachedCompaction.RUN,
                    ) -> DispatchSubmission | ExitCode:
     """Submit the saved prompt after the bounded idle checks."""
-    current = dispatch_turn_ready(parent, started, client, line, dispatch_id, run=run)
+    read_receipt = partial(dispatch_receipt, line=line, dispatch_id=dispatch_id, run=run)
+    current = _dispatch_ready(parent, started, client, read_receipt=read_receipt)
     if not isinstance(current, worker_panes.OpenWorker):
         return current
     codex = isinstance(staff.backend(current.row), staff.CodexBackend)

@@ -509,49 +509,33 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     record = staff.snapshot()
     parent = unit_runs.run_owner(state, record)
     if isinstance(parent, staff.StaffRow):
-        saved_slot = slot if named else progress_history.launch_slot(run, slot, launcher)
-        passed = pass_recorder.pass_slots(state).get(saved_slot, {})
-        saved_prompt = Path(text(passed.get("prompt_file")))
-        match: pass_recorder.MatchedDispatch | pass_recorder.NoMatchedDispatch = pass_recorder.NoMatchedDispatch()
-        if (saved_prompt in (message, directory / f"{saved_slot}_prompt{suffix}.txt")
-                and saved_prompt.is_file() and saved_prompt.read_text() == content):
-            work = progress_history.DispatchWork("assign", args.lens, args.pass_number if role == "fix" else 0)
-            candidate = progress_history.dispatch_worker(run, slot=slot, phase=phase, role=role,
-                prompt=saved_prompt, launcher_command=launcher, work=work)
-            if (isinstance(candidate, pass_recorder.MatchedDispatch) and candidate.worker_name
-                    and candidate.instance_id == passed.get("instance_id")
-                    and (not named or candidate.worker_name == named)):
-                match = candidate
-        if isinstance(match, pass_recorder.MatchedDispatch):
-            chosen = staff.WorkerName.parse(match.worker_name)
-            message = saved_prompt
-        elif named:
+        work = progress_history.DispatchWork("assign", args.lens, args.pass_number if role == "fix" else 0)
+        prompt_source = content.encode("utf-8")
+        if named:
             chosen = staff.WorkerName.parse(named)
         else:
-            chosen = staff_worker.select_worker(parent.id, role, record, additional_runs=(run,))
+            saved_slot = progress_history.launch_slot(run, slot, launcher)
+            passed = pass_recorder.pass_slots(state).get(saved_slot, {})
+            saved_prompt = Path(text(passed.get("prompt_file")))
+            if (saved_prompt in (message, directory / f"{saved_slot}_prompt{suffix}.txt")
+                    and saved_prompt.is_file() and saved_prompt.read_bytes() == prompt_source
+                    and isinstance(retry := progress_history.dispatch_worker(run, slot=slot, phase=phase, role=role,
+                        prompt=saved_prompt, launcher_command=launcher, work=work), pass_recorder.MatchedDispatch)
+                    and retry.worker_name and retry.instance_id == passed.get("instance_id")):
+                chosen = staff.WorkerName.parse(retry.worker_name)
+                message = saved_prompt
+            else:
+                chosen = staff_worker.select_worker(parent.id, role, record, additional_runs=(run,))
+                if isinstance(chosen, staff.WorkerName):
+                    message = directory / f"{chosen.value}_prompt{suffix}.txt"
         if isinstance(chosen, worker_panes.StartRefused):
             return staff_worker.startup_result(staff.WorkerName.parse(role), chosen)
         if isinstance(chosen, staff.WorkerName):
-            row = worker_admission.find_worker(record, parent.id, chosen.value)
-            if row is not None:
-                observed = worker_panes.observe_worker(parent.id, row, record)
-                if isinstance(observed, worker_panes.OpenWorker) and worker_panes.worker_state(observed) == "busy":
-                    locked = worker_panes.check_worker_dispatch_locks(parent.id, row)
-                    if isinstance(locked, worker_panes.Kept):
-                        print(locked.blocker, file=sys.stderr)
-                        return staff_worker.ExitCode.BUSY
-                    client = herdr.Herdr(herdr.shared_session())
-                    if (isinstance(match, pass_recorder.MatchedDispatch)
-                            and (delivery := pass_recorder.dispatch_delivery(passed)).line):
-                        ready = staff_worker.dispatch_turn_ready(parent.id, observed, client,
-                            delivery.line, delivery.completion_id, run=run)
-                    else:
-                        ready = staff_worker.dispatch_pane_ready(parent.id, observed, client)
-                    if isinstance(ready, staff_worker.ExitCode):
-                        return ready
-                slot = chosen.value
-                if isinstance(match, pass_recorder.NoMatchedDispatch):
-                    message = directory / f"{slot}_prompt{suffix}.txt"
+            slot = chosen.value
+            admission = staff_worker.admit_dispatch(parent.id, chosen, role, message, session_dir=run, slot=slot,
+                phase=phase, launcher_command=launcher, work=work, prompt_source=prompt_source, record=record)
+            if isinstance(admission, staff_worker.ExitCode):
+                return admission
     summary = directory / f"{slot}_summary{suffix}.txt"
     status = directory / f"{slot}_status{suffix}"
     reply = directory / f"{slot}_reply{suffix}.txt"

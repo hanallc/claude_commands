@@ -1290,6 +1290,7 @@ class AssignLauncherTests(HookAssignmentFixture):
                                      ("missing receipt", "implement", worker.ExitCode.BUSY),
                                      ("held lock with receipt", "implement", worker.ExitCode.BUSY),
                                      ("held name lock with receipt", "implement", worker.ExitCode.BUSY),
+                                     ("done with an active pass", "implement", worker.ExitCode.BUSY),
                                      ("blocked", "test", worker.ExitCode.BLOCKED)):
             with self.subTest(state=case), ExitStack() as cleanup:
                 world.first_turn_timeout = case in ("working", "missing receipt")
@@ -1304,6 +1305,10 @@ class AssignLauncherTests(HookAssignmentFixture):
                 if case == "blocked":
                     locations[pane]["agent_status"] = "blocked"
                     self.native.agent.questions[pane] = question
+                if case == "done with an active pass":
+                    locations[pane]["agent_status"] = "done"
+                    self.write_phase_prompt("7", "Assignment core", "Change the active prompt.")
+                    self.assertEqual(worker_panes.worker_pass(row, self.session_dir).get("status"), "active")
                 if case == "held lock with receipt":
                     hold = cleanup.enter_context(worker_panes.worker_lock(self.native.fixture.parent.id,
                                                                           staff.WorkerName.parse("impl")))
@@ -1321,6 +1326,8 @@ class AssignLauncherTests(HookAssignmentFixture):
                 self.assertEqual(refused.returncode, expected, refused.stdout + refused.stderr)
                 if case in ("held lock with receipt", "held name lock with receipt"):
                     self.assertIn("dispatch lock is held", refused.stderr)
+                if case == "done with an active pass":
+                    self.assertIn("has different prompt content", refused.stderr)
                 if case == "blocked":
                     self.assertIn(question, refused.stderr)
                 self.assertEqual({path: path.read_bytes() for path in phase.iterdir() if path.is_file()}, files)

@@ -870,32 +870,28 @@ class ReleasedWorkerPass(Enum):
 WorkerDispatchState = DispatchHoldsWorker | CompletedWorkerPass | ReleasedWorkerPass
 
 
-def _check_worker_lock_path(path: Path) -> CloseAllowed | Kept:
-    try:
-        with path.open("r") as handle:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return Kept("dispatch lock is held")
-    except FileNotFoundError:
-        pass
-    return CloseAllowed()
+class DispatchLockAvailable(Enum):
+    AVAILABLE = "the dispatch lock does not block this operation"
 
 
 def check_worker_lock(row: staff.StaffRow,
-                      lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
-    """Check the fixed-ID lock without creating a file."""
-    if isinstance(lock, WorkerLockHold) and lock.owns(row):
-        return CloseAllowed()
-    return _check_worker_lock_path(_worker_lock_path(row.id))
-
-
-def check_worker_dispatch_locks(parent: StaffId, row: staff.StaffRow) -> CloseAllowed | Kept:
-    """Check the name and fixed-ID locks without creating files."""
-    name_lock = _check_worker_lock_path(_worker_name_lock_path(parent, row.name))
-    if isinstance(name_lock, Kept):
-        return name_lock
-    return check_worker_lock(row)
+                      lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE, *,
+                      include_name: bool = False) -> DispatchLockAvailable | Kept:
+    """Check the fixed-ID lock and optionally the name lock without creating files."""
+    if not isinstance(lock, WorkerLockHold) or not lock.owns(row):
+        paths = [_worker_lock_path(row.id)]
+        if include_name and isinstance(row.parent, staff.ReportsTo):
+            paths.insert(0, _worker_name_lock_path(row.parent.id, row.name))
+        for path in paths:
+            try:
+                with path.open("r") as handle:
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        return Kept("dispatch lock is held")
+            except FileNotFoundError:
+                continue
+    return DispatchLockAvailable.AVAILABLE
 
 
 class RunningDetachedWorkers(Protocol):
