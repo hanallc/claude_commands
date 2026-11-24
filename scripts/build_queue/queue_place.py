@@ -23,14 +23,12 @@ import time
 from typing import BinaryIO, TypedDict, Unpack
 
 from scripts.lib import build_folders, atomic_file, cancellation, conf
-from scripts.build_hold.shared_state_defaults import holder_directory, release_directory
 from scripts.buildlog import store
 from scripts.build_queue import admission_records
 from scripts.build_queue import program_start as startup
 from scripts.build_queue import step_estimator
 from scripts.lint import memory_admit
 from scripts.build_queue import admission_client, admission_protocol as wire
-from scripts.lib.release_waiter import local_release_waiter
 import uuid
 
 
@@ -508,12 +506,9 @@ def wait_for_placement(request: wire.PlacementRequest, cancel_reason: str) -> Pl
     gives no machine, and an error, cancel the episode with cancel_reason.
     """
     output = admission_client.WaitOutput()
-    directory = store.root() / "admission"
     try:
-        with admission_client.placement_acquisition(), local_release_waiter(holder_directory(), release_directory(),
-                wake_files=(directory / "queue.json",)) as events:
+        with admission_client.placement_acquisition():
             while True:
-                events.arm()
                 answer = admission_client.acquire_placement(request)
                 if isinstance(answer, admission_client.LeftQueue):
                     break
@@ -532,7 +527,7 @@ def wait_for_placement(request: wire.PlacementRequest, cancel_reason: str) -> Pl
                         request = refreshed_placement(request, request.local)
                 elif isinstance(answer.wait, wire.PlacementResourceWait):
                     output.resource_wait(answer.wait)
-                events.wait(admission_records.read_memory_config().waiting_pass_seconds)
+                time.sleep(admission_records.read_memory_config().waiting_pass_seconds)
     except BaseException:
         _ = admission_client.cancel_placement(wire.CancelPlacement(uuid.uuid4().hex, request.episode, request.owner,
                                                                    cancel_reason))

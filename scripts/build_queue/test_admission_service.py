@@ -65,8 +65,9 @@ from scripts.build_queue import admission_code, queue_snapshot, queue_view, head
 from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from zoneinfo import ZoneInfo
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
-from scripts.build_queue.admission_test_support import (AdmissionFixture, FixedSystemReader, GIB, InjectedCrash,
-                                                       SocketPeer, caller_admission, only_admitted)
+from scripts.build_queue.admission_test_support import (
+    AdmissionFixture, FixedSystemReader, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted,
+)
 
 
 def setUpModule() -> None:
@@ -74,6 +75,184 @@ def setUpModule() -> None:
 
 
 class PlacementStatusTests(unittest.TestCase):
+    def assert_unchanged_placement_poll(self, fixture: AdmissionFixture, request: wire.PlacementRequest | str,
+                                        initial: wire.PlacementWait) -> None:
+        with mock.patch.object(fixture.server, "run_pass", wraps=fixture.server.run_pass) as passed, \
+                mock.patch.object(fixture.server, "persist", wraps=fixture.server.persist) as persisted:
+            self.assertEqual(fixture.connect(request).replies(), [initial])
+            self.assertEqual((passed.call_count, persisted.call_count), (0, 0))
+
+    def test_identical_placement_poll_returns_the_published_position_without_writes(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
+
+        with PlacementFixture() as fixture:
+            peer = fixture.fixture_owner(os.getpid(), "fixture-peer")
+            fixture.free(0)
+            fixture.hold_starts()
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints,
+                candidates=(local_candidate(fixture),)))
+            initial, = fixture.connect(request).replies()
+            assert isinstance(initial, wire.PlacementWait)
+            self.assertEqual(initial.position, 1)
+            caller = records.run_owner(peer.pid, peer.start_time)
+            self.assertEqual(fixture.server.caller_versions[caller], request.code_version)
+            self.assert_unchanged_placement_poll(fixture, request, initial)
+
+    def test_identical_placement_poll_without_identity_uses_the_published_wait(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
+
+        with PlacementFixture() as fixture:
+            _ = fixture.fixture_owner(os.getpid(), "fixture-peer")
+            fixture.hold_starts()
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(local_candidate(fixture),)))
+            envelope = cast(dict[str, object], json.loads(wire.encode_request(request)))
+            del cast(dict[str, object], envelope["data"])["identity"]
+            encoded = json.dumps(envelope) + "\n"
+            initial, = fixture.connect(encoded).replies()
+            assert isinstance(initial, wire.PlacementWait)
+            self.assertEqual(fixture.server.placement_requests[request.episode].identity.step, request.profile.step)
+            self.assert_unchanged_placement_poll(fixture, encoded, initial)
+
+    def test_identical_placement_poll_with_a_canonicalized_cargo_folder_uses_the_published_wait(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
+
+        with PlacementFixture() as fixture:
+            _ = fixture.fixture_owner(os.getpid(), "fixture-peer")
+            fixture.hold_starts()
+            cargo = fixture.root / "cargo"
+            cargo.mkdir()
+            alias = fixture.root / "alias"
+            alias.symlink_to(cargo, target_is_directory=True)
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(local_candidate(fixture),),
+                cargo_folder=placement.CargoFolder(alias)))
+            initial, = fixture.connect(request).replies()
+            assert isinstance(initial, wire.PlacementWait)
+            self.assertEqual(fixture.server.placement_requests[request.episode].constraints.cargo_folder,
+                             placement.CargoFolder(cargo))
+            self.assert_unchanged_placement_poll(fixture, request, initial)
+
+    def test_placement_poll_with_an_ended_execution_reading_returns_closed(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
+
+        with PlacementFixture() as fixture:
+            _ = fixture.fixture_owner(os.getpid(), "fixture-peer")
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(local_candidate(fixture),)))
+            initial, = fixture.connect(request).replies()
+            assert isinstance(initial, wire.LocalPlacementGranted)
+            server = fixture.server
+            evidence = server.system_evidence
+            assert isinstance(evidence, service.SystemEvidence)
+            self.assertEqual(evidence.processes[request.owner.pid].start, request.owner.start_time)
+            self.assertIn(request.episode, server.reservations)
+            fixture.clock.advance(1)
+            peer = fixture.connect(request)
+            server.system_reader = FixedSystemReader(replace(evidence, lifetimes={request.episode: gate.EndedStep()},
+                read_at=fixture.clock.now(), started_monotonic=fixture.clock.monotonic()))
+            os.eventfd_write(server.reading_events, 1)
+            closed, = peer.replies()
+            assert isinstance(closed, wire.DispatchStatus), type(closed)
+            self.assertEqual(closed.state, placement.ClosedAssignment("local execution has ended"))
+
+    def test_placement_poll_with_a_dead_coordinator_reading_drops_the_published_wait(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
+
+        with PlacementFixture() as fixture:
+            fixture.hold_starts()
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(local_candidate(fixture),)))
+            initial, = fixture.connect(request).replies()
+            assert isinstance(initial, wire.PlacementWait)
+            self.assertEqual(initial.position, 1)
+            server = fixture.server
+            evidence = server.system_evidence
+            assert isinstance(evidence, service.SystemEvidence)
+            owner = wire.Owner(request.owner.pid, request.owner.start_time)
+            peer = fixture.connect(request)
+            fixture.proc.kill(owner)
+            server.system_reader = FixedSystemReader(replace(evidence,
+                processes={pid: state for pid, state in evidence.processes.items() if pid != owner.pid},
+                read_at=fixture.clock.now(), started_monotonic=fixture.clock.monotonic()))
+            os.eventfd_write(server.reading_events, 1)
+            waiting, = peer.replies()
+            assert isinstance(waiting, wire.PlacementWait)
+            self.assertEqual(waiting.position, 0)
+
+    def test_identical_placement_poll_returns_the_grant_after_the_timer_pass(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
+
+        with PlacementFixture() as fixture:
+            fixture.configure(waiting_pass_seconds=1)
+            fixture.free(0)
+            fixture.hold_starts()
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints,
+                candidates=(local_candidate(fixture),)))
+            initial, = fixture.connect(request).replies()
+            self.assertIsInstance(initial, wire.PlacementWait)
+            fixture.free(60 * GIB)
+            write_pressure_reading(fixture.root / "pressure")
+            fixture.clock.advance(1)
+            fixture.server.run_once(0)
+            self.assertIn(request.episode, fixture.server.reservations)
+            with mock.patch.object(fixture.server, "run_pass", wraps=fixture.server.run_pass) as passed, \
+                    mock.patch.object(fixture.server, "persist", wraps=fixture.server.persist) as persisted:
+                granted, = fixture.server.handle_request(request)
+                self.assertIsInstance(granted, wire.LocalPlacementGranted)
+                passed.assert_not_called()
+                persisted.assert_not_called()
+
+    def test_placement_poll_with_changed_constraints_runs_a_pass(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
+
+        with PlacementFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints,
+                candidates=(local_candidate(fixture),)))
+            self.assertIsInstance(fixture.connect(request).replies()[0], wire.PlacementWait)
+            evidence = fixture.server.system_evidence
+            assert isinstance(evidence, service.SystemEvidence)
+            fixture.server.system_reader = FixedSystemReader(evidence)
+            changed = replace(request, constraints=replace(request.constraints, package="another-package"))
+            with mock.patch.object(fixture.server, "run_pass", wraps=fixture.server.run_pass) as passed:
+                self.assertIsInstance(fixture.connect(changed).replies()[0], wire.PlacementWait)
+                passed.assert_called_once()
+            self.assertEqual(fixture.server.placement_requests[request.episode].constraints, request.constraints)
+
+    def test_identical_placement_poll_runs_a_pass_for_pending_configuration(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
+
+        with PlacementFixture() as fixture:
+            fixture.configure(waiting_pass_seconds=10, min_pass_gap_seconds=0.25)
+            fixture.clock.advance(0.25)
+            fixture.free(0)
+            fixture.hold_starts()
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints,
+                candidates=(local_candidate(fixture),)))
+            initial, = fixture.connect(request).replies()
+            assert isinstance(initial, wire.PlacementWait)
+            with mock.patch.object(fixture.server, "run_pass", wraps=fixture.server.run_pass) as passed:
+                with self.subTest(pending=False):
+                    self.assertEqual(fixture.server.handle_request(request), [initial])
+                    passed.assert_not_called()
+                passed.reset_mock()
+                fixture.configure(waiting_pass_seconds=2)
+                fixture.clock.advance(0.25)
+                with self.subTest(pending=True):
+                    waiting, = fixture.connect(request).replies()
+                    assert isinstance(waiting, wire.PlacementWait)
+                    self.assertEqual(waiting.position, initial.position)
+                    passed.assert_called_once()
+                    configuration = fixture.server.configuration
+                    assert isinstance(configuration, gate.UsableAdmissionConfiguration)
+                    self.assertEqual(configuration.config.waiting_pass_seconds, 2)
+
     def test_placement_control_distinguishes_missing_requests_from_owner_mismatches(self) -> None:
         from scripts.build_queue.test_placement import PlacementFixture, assignment_for, placement_request, publish_candidate
 
@@ -127,6 +306,7 @@ class PlacementStatusTests(unittest.TestCase):
                     pressure=records.NO_PRESSURE_HOLD, read_at=fixture.clock.now(),
                     started_monotonic=fixture.clock.monotonic())
                 os.eventfd_write(fixture.server.reading_events, 1)
+                fixture.server.run_once(0)
                 admitted, = fixture.connect(request).replies()
                 self.assertIsInstance(admitted, wire.LocalPlacementGranted)
                 self.assertIn(request.episode, fixture.server.reservations)
@@ -453,6 +633,7 @@ class PlacementStatusTests(unittest.TestCase):
         cases = (("settled command path", "The Hana attempt already has a settled command path"),
                  ("failed start", "The Hana start deadline expired"),
                  ("fenced start refusal", "The Hana start deadline expired"),
+                 ("cancelled fenced start", "The Hana start deadline expired"),
                  ("command published", ""),
                  ("restored startup refusal", "The Hana start deadline expired"),
                  ("restored claim failure", "The Hana attempt already has a settled command path"))
@@ -525,7 +706,7 @@ class PlacementStatusTests(unittest.TestCase):
                         self.assertEqual(fixture.server.assignments[key].state, placement.CurrentAssignment())
                         self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
                         continue
-                    if case == "fenced start refusal":
+                    if case in ("fenced start refusal", "cancelled fenced start"):
                         def release() -> hana_placement.HanaClaimRelease:
                             return hana_placement.release_assigned(assignment, coordinator_holder(assignment), controller)
 
@@ -538,6 +719,9 @@ class PlacementStatusTests(unittest.TestCase):
                         refusal, = fixture.server.handle_request(wire.ClaimFailure("refusal", assignment, "state"))
                         assert isinstance(refusal, wire.DispatchStatus)
                         self.assertEqual(refusal.state, placement.CurrentAssignment())
+                        if case == "cancelled fenced start":
+                            cancel = wire.CancelPlacement("cancel", request.episode, request.owner, "stopped")
+                            self.assertEqual(fixture.server.handle_request(cancel), [wire.Ok()])
                         controller.register(hana_box.DeploymentIdentity("deployment", "instance", "spot", "us-east-2"))
                         retry, = fixture.server.handle_request(request)
                         self.assertEqual(retry, wire.Assignment(assignment))
@@ -548,6 +732,13 @@ class PlacementStatusTests(unittest.TestCase):
                             release_claim=hana_placement.HanaClaimReleased, reason=reason)
                     self.assertIsInstance(settlement, hana_execution.HanaSettled)
                     self.assertFalse(hana_execution.claim_dispatch_pending(controller.directory, claim))
+                    if case == "cancelled fenced start":
+                        # Read the journal when a poll arrives in the same turn as the pass timer.
+                        fixture.clock.advance(1)
+                        closed, = fixture.connect(request).replies()
+                        self.assertIsInstance(closed, wire.DispatchStatus)
+                        self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("cancelled"))
+                        continue
                     if case == "fenced start refusal":
                         _ = fixture.run_pass()
                         self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("state"))
@@ -2033,8 +2224,12 @@ class ReplyPublicationTests(unittest.TestCase):
             self.assertEqual(guest.started_at, 0)
             self.assertGreater(server.next_pass, fixture.clock.monotonic() + gap)
             consumed_at = fixture.clock.now()
+            input_event_count = server.input_event_count
             granted, = consume_guest_permission(fixture, assignment, holder)
             self.assertIsInstance(granted, wire.FirstAuthorization)
+            self.assertGreater(server.input_event_count, input_event_count)
+            self.assertTrue(server.pass_stale)
+            self.assertEqual(queue_snapshot.read_view_snapshot(fixture.state_dir), before)
             fixture.clock.advance(gap)
             server.run_once()
             after = queue_snapshot.read_view_snapshot(fixture.state_dir)

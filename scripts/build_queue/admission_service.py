@@ -11,6 +11,7 @@ from concurrent.futures import Future
 from contextlib import contextmanager
 from contextvars import ContextVar
 import errno
+import hashlib
 import heapq
 import json
 from dataclasses import dataclass, field, fields, is_dataclass, replace
@@ -1389,11 +1390,19 @@ def durable_copy(value: object) -> object:
     return value
 
 
+@dataclass(frozen=True)
+class PublishedPlacement:
+    input_event_count: int
+    request_digest: bytes
+    reply: wire.PlacementWait | wire.Assignment | wire.LocalPlacementGranted
+
+
 @dataclass
 class PublishedReplies:
     view: wire.ViewReply
     explain: wire.ExplainReply
     wait_positions: dict[str, int]
+    placements: dict[str, PublishedPlacement]
     view_bytes: bytes
     explain_bytes: bytes = b""
     mine_bytes: bytes = b""
@@ -1454,6 +1463,7 @@ class Connection:
     request: wire.Request | NoRequest = NoRequest()
     finished: bool = False
     version: int = 1
+    placement_request_digest: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -1767,6 +1777,8 @@ class AdmissionServer:
         self.build_history_generation: int = 0
         self.ledger: ReplayLedger = ReplayLedger({})
         self.placement_requests: dict[str, wire.PlacementRequest] = {}
+        self.placement_request_digests: dict[str, bytes] = {}
+        self.input_event_count: int = 0
         self.pending_coordinators: dict[placement.SubmittingOwner, PendingCoordinatorEvidence] = {}
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
         self.current_assignments: dict[str, str] = {}
@@ -2859,6 +2871,11 @@ class AdmissionServer:
     def _pass_gap_open(self) -> bool:
         return self.clock.monotonic() >= self._pass_allowed_at()
 
+    def _schedule_pass(self) -> None:
+        """Invalidate placement replies and make a pass due."""
+        self.input_event_count += 1
+        self.next_pass = min(self.next_pass, self.clock.monotonic())
+
     def _pass_when_open(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
                         ) -> bool:
         """Run a pass now when the gap allows it. Otherwise keep the configuration and mark a pass due."""
@@ -2867,7 +2884,7 @@ class AdmissionServer:
             return True
         if isinstance(self.pending_configuration, NoPass):
             self.pending_configuration = configuration
-        self.next_pass = min(self.next_pass, self.clock.monotonic())
+        self._schedule_pass()
         return False
 
     def _run_pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
@@ -2978,10 +2995,10 @@ class AdmissionServer:
                         cargo_folder=cargo_folder, verify_slots=verify_slots)
         self.persist()
         visible_order = self._visible_queue_order(self._full_queue_order(captured.ranked_waiters))
-        self._publish_replies(visible_order)
-        assert isinstance(self.published, PublishedReplies)
-        waiting_steps = self.published.view.reading.view.waiting
-        positions = self.published.wait_positions
+        published = self._project_replies(visible_order)
+        assert isinstance(published, PublishedReplies)
+        waiting_steps = published.view.reading.view.waiting
+        positions = published.wait_positions
         decisions = {decision.owner: decision for decision in result.rows}
         for owner, position in positions.items():
             episode = by_owner.get(owner, "")
@@ -3007,6 +3024,7 @@ class AdmissionServer:
             if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                 self._deliver(waiting, reply)
                 waiting.last_reply, waiting.last_sent = reply, inputs.now
+        self._publish_replies(published, complete_pass=True)
         interval = (config.waiting_pass_seconds if self.waiters or any(self._placement_waiting(request)
                     for request in self.placement_requests.values()) else config.running_pass_seconds)
         self.next_pass = self.clock.monotonic() + interval
@@ -3310,12 +3328,12 @@ class AdmissionServer:
             reservations.append(row)
         return records.LocalAdmissionOccupancy(tuple(reservations), self._verify_run_owners())
 
-    def _publish_replies(self, ordered: list[tuple[Path, records.RankedWaiter]]) -> None:
+    def _project_replies(self, ordered: list[tuple[Path, records.RankedWaiter]]) -> PublishedReplies | NoPass:
         if (not isinstance(self.configuration, gate.UsableAdmissionConfiguration)
                 or not isinstance(self.last_inputs, records.QueueInputs)
                 or not isinstance(self.last_policy, records.AdmissionPolicy)
                 or not isinstance(self.last_result, gate.PassResult)):
-            return
+            return NoPass()
         ordered = self._published_queue_order(ordered)
         reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
                           diagnostics=self.last_diagnostics)
@@ -3358,15 +3376,36 @@ class AdmissionServer:
         occupancy = self._local_occupancy(self.last_inputs)
         view = wire.ViewReply(replace(reading, explanation=replace(reading.explanation, local_occupancy=occupancy)))
         view_bytes = wire.encode_reply(view).encode()
-        self.published = PublishedReplies(view, explain, positions, view_bytes)
+        placements = self.published.placements if isinstance(self.published, PublishedReplies) else {}
+        return PublishedReplies(view, explain, positions, placements, view_bytes)
+
+    def _publish_replies(self, published: PublishedReplies | NoPass, *, complete_pass: bool = False) -> None:
+        if isinstance(published, NoPass):
+            return
+        self.published = published
+        if complete_pass:
+            published.placements = self._placement_replies()
+        assert isinstance(self.configuration, gate.UsableAdmissionConfiguration)
         config = self.configuration.config
         written_at = self.clock.now()
         longest_interval = max(config.running_pass_seconds, config.waiting_pass_seconds, config.min_pass_gap_seconds)
         try:
-            queue_snapshot.write_view_snapshot(self.state_dir, written_at, written_at + longest_interval, view_bytes)
+            queue_snapshot.write_view_snapshot(self.state_dir, written_at, written_at + longest_interval, published.view_bytes)
         except OSError:
             # Keep the last complete file when publication fails.
             pass
+
+    def _placement_replies(self) -> dict[str, PublishedPlacement]:
+        input_event_count = self.input_event_count
+        replies: dict[str, PublishedPlacement] = {}
+        for episode, request in self.placement_requests.items():
+            request_digest = self.placement_request_digests.get(episode)
+            if request_digest is None or not self._placement_owner_live(request.owner):
+                continue
+            reply = self._placement_reply(request, self.local_hold_holders.get(episode, placement.ResourceHolderUnknown()))
+            if not isinstance(reply, wire.DispatchStatus):
+                replies[episode] = PublishedPlacement(input_event_count, request_digest, reply)
+        return replies
 
     def reply_bytes(self, reply: wire.Reply, *, version: int = wire.VERSION) -> bytes:
         if version != wire.VERSION:
@@ -3582,6 +3621,7 @@ class AdmissionServer:
 
     def _end(self, episode: str, ending: ReservationEnding) -> None:
         record = self.reservations[episode]
+        self.input_event_count += 1
         started = isinstance(ending, ReleaseStatus)
         if not started and "verify" in record.queue_waiter and record.sidecar:
             try:
@@ -3687,6 +3727,7 @@ class AdmissionServer:
             return configuration.read(file).number("probe_timeout_s")
 
     def publish_host_evidence(self, evidence: placement.HostEvidence) -> None:
+        self._schedule_pass()
         self.host_observations[evidence.key] = evidence
         self.pass_stale = True
         reader = self.host_readers.get(evidence.key)
@@ -4068,12 +4109,14 @@ done
                  and not self._placement_owner_live(owners[episode])}
         if not ended:
             return
+        self.input_event_count += 1
         self.assignments = {key: saved for key, saved in self.assignments.items()
                             if saved.assignment.episode not in ended}
         for episode in ended:
             if (request := self.placement_requests.get(episode)) is not None:
                 self._end_placement_rank(request)
             _ = self.placement_requests.pop(episode, None)
+            _ = self.placement_request_digests.pop(episode, None)
             _ = self.prerequisites.pop(episode, None)
             _ = self.placement_eligibility.pop(episode, None)
             self._remove_waiter(self.waiters.get(episode))
@@ -4626,7 +4669,7 @@ done
                 return self._placement_status(saved.assignment, state.reason)
             if isinstance(state, placement.ClosedAssignment):
                 # A released provider claim is final only after a pass settles the attempt and its retry.
-                self.next_pass = min(self.next_pass, self.clock.monotonic())
+                self._schedule_pass()
                 return wire.PlacementWait(request.episode, request.since, position,
                     self.placement_eligibility.get(request.episode, ()),
                     provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
@@ -4981,10 +5024,10 @@ done
         self._watch_owner(wire.Owner(request.holder.pid, request.holder.start_time))
         status = wire.DispatchStatus(assignment, saved.state, saved.permission)
         self.ledger["dispatch:" + key] = ReplayEntry(status, LiveGrant())
+        self._schedule_pass()
         self.persist()
         if destination.target == mac_linux.TARGET:
             self.pass_stale = True
-            self.next_pass = self.clock.monotonic()
         return wire.FirstAuthorization(assignment, reference)
 
     def _guest_took_no_run(self, saved: records.SavedPlacementAssignment, request: wire.ClaimFailure) -> bool:
@@ -5020,6 +5063,7 @@ done
 
     def _close_placement(self, saved: records.SavedPlacementAssignment, reason: str,
                          retry: placement.RetryDecision) -> None:
+        self._schedule_pass()
         assignment = saved.assignment
         key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         self._remove_waiter(self.waiters.get(assignment.episode))
@@ -5036,7 +5080,6 @@ done
             self._save_place(request, self._placement_row(request))
         self._prune_host_evidence()
         self.persist()
-        self.next_pass = self.clock.monotonic()
 
     def _settle_hana_prelaunch(self, saved: records.SavedPlacementAssignment,
                                report: placement.TerminalAttemptReport) -> bool:
@@ -5179,13 +5222,26 @@ done
                 elif saved is None:
                     self._end_placement_rank(submitted)
                     _ = self.placement_requests.pop(request.episode, None)
+                    _ = self.placement_request_digests.pop(request.episode, None)
                     self._remove_waiter(self.waiters.get(request.episode),
                                         claim_disposition=WaiterClaimDisposition.RETURN)
                 self._prune_host_evidence()
+            self._schedule_pass()
             self.persist()
-            self.next_pass = self.clock.monotonic()
             return [wire.Ok()]
         if isinstance(request, wire.PlacementRequest):
+            digest = connection.placement_request_digest if isinstance(connection, Connection) else None
+            if digest is None:
+                digest = hashlib.sha256(wire.encode_request(request).encode().removesuffix(b"\n")).digest()
+            if (isinstance(self.published, PublishedReplies)
+                    and (published := self.published.placements.get(request.episode)) is not None
+                    and published.input_event_count == self.input_event_count
+                    and published.request_digest == digest):
+                return [published.reply]
+            previous = self.placement_requests.get(request.episode)
+            identity = self._placement_identity(request)
+            members = records.queue_staff() if identity.session_id else records.NO_STAFF_LOOKUP
+            request = replace(request, identity=self._named_identity(identity, members=members))
             if not self._placement_owner_live(request.owner):
                 if request.owner.host == self.host and not isinstance(self.system_reader, NoSystemReader):
                     pending = self.pending_coordinators.get(request.owner)
@@ -5200,7 +5256,6 @@ done
                 return [wire.Refused("submitting owner is not live on the coordinator")]
             if request.owner in self.pending_coordinators:
                 del self.pending_coordinators[request.owner]
-            previous = self.placement_requests.get(request.episode)
             if previous is not None and (previous.owner != request.owner or previous.since != request.since
                     or previous.run != request.run or previous.purpose != request.purpose):
                 return [wire.Refused("placement episode changed its owner, start, run or purpose")]
@@ -5214,15 +5269,9 @@ done
                 except (OSError, ValueError) as error:
                     return [wire.Refused(f"cannot resolve the Cargo folder: {error}")]
                 request = replace(request, constraints=replace(request.constraints, cargo_folder=canonical))
-            if (isinstance(connection, Connection) and previous == request
-                    and not isinstance(self.system_reader, NoSystemReader)
-                    and self.system_reader.latest.started_monotonic <= self.last_pass_started
-                    and isinstance(self.pending_configuration, NoPass) and not self.pass_stale
-                    and isinstance(self.last_result, gate.PassResult)
-                    and self.clock.monotonic() < self.next_pass):
-                return [self._placement_reply(request,
-                    self.local_hold_holders.get(request.episode, placement.ResourceHolderUnknown()))]
+            self._schedule_pass()
             self.placement_requests[request.episode] = request
+            self.placement_request_digests[request.episode] = digest
             if previous is None:
                 self.prerequisites[request.episode] = request.prerequisite
             if self._placement_waiting(request):
@@ -5231,7 +5280,6 @@ done
             self.persist()
             if isinstance(connection, Connection) and not self._pass_gap_open():
                 self.parked_placements.append(ParkedPlacement(request, connection))
-                self.next_pass = min(self.next_pass, self.clock.monotonic())
                 return []
             _ = self.run_pass()
             return [self._placement_reply(request,
@@ -5265,8 +5313,8 @@ done
                     retry = placement.retry_decision(assignment.destination, request.reason, terminal.received_at)
                     if self._start_pending(saved):
                         self.assignments[key] = replace(refused, retry=retry)
+                        self._schedule_pass()
                         self.persist()
-                        self.next_pass = self.clock.monotonic()
                     else:
                         terminal = replace(terminal, path=placement.DispatchPathSettled())
                         self._close_placement(replace(refused, terminal_report=terminal), request.reason, retry)
@@ -5280,6 +5328,7 @@ done
                 and request.claim.episode == assignment.episode and request.claim.attempt == assignment.attempt
                 and request.claim.provider == assignment.destination.provider
                 and request.claim.target == assignment.destination.target and request.claim.scope == assignment.destination.scope):
+            self._schedule_pass()
             if (assignment.destination.target != "mac-linux" or isinstance(saved.permission, placement.PermissionConsumed)
                     or not isinstance(request.evidence, execution_identity.ObservedExecution)):
                 self.execution_evidence[key] = request.evidence
@@ -5309,9 +5358,8 @@ done
                 self._close_for_report(saved, report)
             else:
                 self.persist()
-                self.next_pass = self.clock.monotonic()
         if not self.pass_stale:
-            self._publish_replies(self._queue_order())
+            self._publish_replies(self._project_replies(self._queue_order()))
         return [self._placement_status(assignment, check_lifetime=False)]
 
     def _authorize(self, request: wire.Request, uid: int) -> str:
@@ -5443,10 +5491,6 @@ done
             return [wire.Ok()]
         if isinstance(connection, Connection):
             self._record_caller_version(request, connection, persist_change=not isinstance(request, wire.ConsumePermission))
-        if isinstance(request, wire.PlacementRequest):
-            identity = self._placement_identity(request)
-            members = records.queue_staff() if identity.session_id else records.NO_STAFF_LOOKUP
-            request = replace(request, identity=self._named_identity(identity, members=members))
         if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport,
                                 wire.PrerequisiteReport, wire.CancelPlacement)):
             replies = self._handle_placement(request, connection)
@@ -5463,6 +5507,7 @@ done
                 _ = self._run_pass(configuration)
                 return [wire.Refused(configuration.reason)]
             request = self._service_estimate(request, configuration)
+            self.input_event_count += 1
             self.pending_configuration = configuration
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)) and request.code_version:
             self.caller_versions[records.run_owner(request.owner.pid, request.owner.start_time)] = request.code_version
@@ -5479,7 +5524,7 @@ done
                         self.last_inputs = self._refresh_pass_slots(self.last_inputs, ordered)
                         self.last_result = gate.admission_pass(self.last_inputs, self.last_inputs.now, self.last_policy)
                     self.pass_stale = False
-                    self._publish_replies(ordered)
+                    self._publish_replies(self._project_replies(ordered))
             if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
                 return [wire.Refused(self.configuration.reason)]
             if (not isinstance(self.last_inputs, records.QueueInputs)
@@ -5567,7 +5612,7 @@ done
                 ordered = self._queue_order()
                 self.last_inputs = self._refresh_pass_slots(self.last_inputs, ordered)
                 self.pass_stale = True
-            self.next_pass = self.clock.monotonic()
+            self._schedule_pass()
             return [self.ledger[key].reply]
         if isinstance(connection, Connection):
             # The pass delivers admission replies on the connection, now or at the next pass.
@@ -5596,7 +5641,7 @@ done
         reply, undo_anchor = result
         self.ledger[key] = ReplayEntry(reply, self.clock.now(), undo_anchor=undo_anchor)
         self.pass_stale = True
-        self.next_pass = self.clock.monotonic()
+        self._schedule_pass()
         self.persist()
         return [reply]
 
@@ -5756,6 +5801,7 @@ done
         transition = records.PendingPriorityTransition(key,
             "set" if isinstance(request, wire.PrioritySetRequest) else "clear", at,
             month_row_end, unit, why, actor)
+        self.input_event_count += 1
         self.priority = records.QueuePriority(entries, transition)
         self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
         self.persist()
@@ -5888,6 +5934,7 @@ done
                 self._remove_waiter(waiting, reply, claim_disposition=WaiterClaimDisposition.RETURN)
                 changed = True
         if changed:
+            self._schedule_pass()
             self.persist()
         return changed
 
@@ -5911,7 +5958,10 @@ done
             process = self.system_reader.latest.processes.get(pid)
             identity = LiveOwnerIdentity(process.start) if process is not None else OwnerProcessGone()
         if isinstance(identity, LiveOwnerIdentity):
-            self.caller_versions[records.run_owner(pid, identity.start_time)] = request.code_version
+            caller = records.run_owner(pid, identity.start_time)
+            if isinstance(request, wire.PlacementRequest) and self.caller_versions.get(caller) == request.code_version:
+                return
+            self.caller_versions[caller] = request.code_version
             if persist_change:
                 self.persist()
 
@@ -5945,6 +5995,8 @@ done
                     if not (isinstance(connection.request, NoRequest) or _refreshes(connection.request, request)):
                         raise ValueError("one request for admission per connection")
                     connection.request = request
+                if isinstance(request, wire.PlacementRequest):
+                    connection.placement_request_digest = hashlib.sha256(line).digest()
                 connection.received = b""
                 if (not isinstance(self.system_reader, NoSystemReader)
                         and isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest))
@@ -6104,14 +6156,17 @@ done
                        if (connection := self.connections.get(descriptor)) is not None}
         watches = {descriptor: watch for descriptor, _events in ready
                    if (watch := self.watchers.get(descriptor)) is not None}
+        # A due pass can find journal changes and expired holds without a reader event.
+        if self.clock.monotonic() >= due:
+            self.input_event_count += 1
         if any(descriptor == self.priority_events for descriptor, _events in ready):
             _ = os.eventfd_read(self.priority_events)
         if any(descriptor == self.reading_events for descriptor, _events in ready):
             _ = os.eventfd_read(self.reading_events)
+            self._schedule_pass()
             self._refresh_host_observations()
             if not isinstance(self.system_reader, NoSystemReader):
                 self.system_reader.raise_failure()
-            self.next_pass = self.clock.monotonic()
             deferred, self.deferred_requests = self.deferred_requests, []
             for pending in deferred:
                 connection = pending.connection
@@ -6130,7 +6185,10 @@ done
             configuration_changed = True
         if configuration_changed:
             self.pending_configuration = self._read_configuration()
-            self.next_pass = self.clock.monotonic()
+            self._schedule_pass()
+        # These events can change placement after the loop reads ready requests.
+        if watches or (isinstance(self.pending_priority, PendingPriorityRoster) and self.pending_priority.result.done()):
+            self.input_event_count += 1
         # Drain ready requests before any expiry pass, including requests queued
         # on a connection accepted this turn. A silent peer cannot delay expiry.
         listener_ready = (not isinstance(self.listener, NoConnection)
@@ -6163,7 +6221,7 @@ done
                     if (owner_exit is not None and owner_exit.owner == owner) or not self._live(owner):
                         self._remove_waiter(waiting, claim_disposition=WaiterClaimDisposition.RETURN)
                 self._prune_watches()
-                self.next_pass = self.clock.monotonic()
+                self._schedule_pass()
         self._finish_priority_roster()
         if self.clock.monotonic() >= self.next_pass and self._pass_gap_open():
             _ = self.run_pass()

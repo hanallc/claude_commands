@@ -209,7 +209,16 @@ Saved disk exclusions remain diagnostic evidence.
 `SourceKeyUnavailable` preserves the existing copy path when neither source key is available.
 An unavailable key permits placement and sends no source key with the copy.
 `PlacementWait` carries the original queue time, position and candidate eligibility.
-`Assignment` carries a persisted destination and attempt; it grants no execution permission.
+`wait_for_placement` polls after each configured waiting interval, which is one second by default.
+The timer controls polling even when the queue, view, hold, or release files change.
+The service publishes placement waits and grants after each pass.
+The service hashes poll bytes with SHA-256 before it fills in the caller identity or resolves the Cargo folder.
+Each published placement reply carries its request digest and the current input event count.
+A poll uses the published reply when the request digest and input event count both match.
+Reuse needs no pass or state write if the caller version matches.
+Readings, process exits, configuration changes and queue changes advance the count.
+The pass timer also advances the count so the next pass can read the provider journal and check deadlines.
+`Assignment` carries a saved destination and attempt. Launch permission requires a separate request.
 `ClaimFailure` closes the exact assignment before another placement decision.
 `ConsumePermission` carries the exact assignment, adopted provider claim reference, and checked claim-holder identity.
 The coordinator remains separate from its offload child.
@@ -650,11 +659,12 @@ Importing `build_hold` or `build_targets` does not load the admission service.
 The service imports `argparse` inside `main()` and the reading alert message helpers inside `deliver_reading_alert()`.
 After each pass, the service publishes `admission/queue.json` atomically through `scripts/build_queue/queue_snapshot.py`.
 Each publication of the view also replaces `admission/view.json` atomically.
+The pass stores the current input event count with its placement replies before it replaces the view file.
 The file holds the publication time, `fresh_until`, and the encoded socket reply.
 `fresh_until` adds the longest configured pass interval or minimum pass gap to the publication time.
 A socket `ViewRequest` returns the last published view without starting a pass.
-Consuming a Mac Linux permission schedules a pass that publishes the guest row.
-Placement waiters watch the hold and release directories and accept `queue.json` changes from the admission directory.
+Consuming a Mac Linux permission advances the input event count and marks the pass stale.
+The next eligible pass publishes the guest row.
 
 The Builds feed reads `view.json` and uses its publication time as the data time.
 The page shows `Late` when the time since `fresh_until` exceeds `status.builds.age_limit_seconds` in `config/console.conf`.

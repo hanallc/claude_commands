@@ -80,7 +80,8 @@ class FakeClock:
 
 
 class FixedSystemReader:
-    """Publish private evidence without an operating-system reader."""
+    """Publish fixture evidence through the system reader interface."""
+
     def __init__(self, latest: service.SystemEvidence) -> None:
         self.latest: service.SystemEvidence = latest
         self.plans: list[service.SystemReadingPlan] = []

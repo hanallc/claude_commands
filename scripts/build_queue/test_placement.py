@@ -29,7 +29,9 @@ from scripts.build_queue import admission_protocol as wire, admission_records as
 from scripts.build_queue import admission_client as client, mac_run, queue_snapshot
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import limits_view, memory_feed
-from scripts.build_queue.admission_test_support import AdmissionFixture, FixedSystemReader, ObservedAdmissionServer, only_admitted, GIB
+from scripts.build_queue.admission_test_support import (
+    AdmissionFixture, FixedSystemReader, GIB, ObservedAdmissionServer, only_admitted,
+)
 from scripts.buildlog import store
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
@@ -753,11 +755,13 @@ class PlacementTests(unittest.TestCase):
                 self.assertEqual((row.pid, row.since, row.placement_candidates),
                                  (request.owner.pid, request.since, recorded))
                 fixture.clock.advance(2)
+                _ = fixture.run_pass()
                 waiting, = fixture.server.handle_request(request)
                 assert isinstance(waiting, wire.PlacementWait), waiting
                 self.assertEqual(waiting.eligibility[0].eligibility,
                                  placement.TemporaryExclusion("mac_linux_reading_required"))
                 _ = publish_candidate(fixture, request)
+                _ = fixture.run_pass()
                 assignment = assignment_for(fixture, request)
                 claim = adopt_assignment(fixture, request, assignment)
                 execution = execution_identity.ObservedExecution(execution_identity.ProcessExecution(
@@ -1301,6 +1305,7 @@ class PlacementTests(unittest.TestCase):
                     offload.report_placement_result(controller, adapter_request, result)
                 fixture.clock.advance(0.01)
                 _ = publish_candidate(fixture, request, placement.TemporaryExclusion("disk"))
+                fixture.server.run_once(0)
                 granted, = fixture.connect(request).replies()
                 self.assertIsInstance(granted, wire.LocalPlacementGranted)
                 if not isinstance(granted, wire.LocalPlacementGranted):
@@ -1473,7 +1478,6 @@ class PlacementTests(unittest.TestCase):
 
     def test_a_guest_gate_that_took_no_run_after_its_consume_closes_for_a_retry(self) -> None:
         # The gate ends before copies.py reports the claim failure. The last system reading can still show the gate.
-
         with PlacementFixture() as fixture:
             request = mac_linux_and_natedev_request(fixture)
             _ = publish_candidate(fixture, request)
@@ -1530,7 +1534,6 @@ class PlacementTests(unittest.TestCase):
 
     def test_a_gate_newer_than_the_system_reading_consumes_its_guest_permission(self) -> None:
         # copies.py starts the gate after the last system reading, so that reading does not show the holder.
-
         with PlacementFixture() as fixture:
             request = mac_linux_and_natedev_request(fixture)
             _ = publish_candidate(fixture, request)
@@ -1545,7 +1548,6 @@ class PlacementTests(unittest.TestCase):
 
     def test_a_gate_whose_pid_named_another_process_in_the_reading_consumes_its_guest_permission(self) -> None:
         # The last system reading shows the gate pid with the start time of an earlier process.
-
         with PlacementFixture() as fixture:
             request = mac_linux_and_natedev_request(fixture)
             _ = publish_candidate(fixture, request)
@@ -1564,7 +1566,6 @@ class PlacementTests(unittest.TestCase):
     def test_a_holder_the_fresh_read_does_not_confirm_keeps_the_guest_permission(self) -> None:
         # The last system reading shows the holder pid with the start time of an earlier process.
         # The fresh read then refuses a holder that is not a descendant or that states a start that is not live.
-
         cases = (("not a descendant", False, None), ("not the live start", True, "not-the-live-start"))
         for case, descendant, stated_start in cases:
             with self.subTest(case), PlacementFixture() as fixture:
