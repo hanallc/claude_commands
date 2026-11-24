@@ -1839,10 +1839,16 @@ If a save or delivery fails, the server answers 503 and names the step or recipi
 On reload, each pending answer for a removed picture shows its words, **Not sent yet**, and a **Retry** button.
 The page also shows Retry if the picture folder remains after its record is removed.
 The retry card leaves the page when delivery is confirmed.
-A refresh keeps the draft words in the form.
-Before a script update reloads the page, the browser saves each draft by picture id in the tab.
-The new page restores the drafts, including drafts for removed pictures.
-A confirmed send or retry clears its matching draft.
+The browser keeps editable drafts separate from saved answer attempts.
+Each edit saves the draft in the tab.
+Before each submit, the browser saves the draft and the action and round for an unchanged answer.
+A reload restores the drafts, including drafts for removed pictures.
+If draft storage fails, the page keeps the drafts in memory and blocks automatic reloads.
+While one request is active for a picture, its submit buttons are disabled.
+The buttons remain disabled until response handling and card removal finish.
+Other pictures can accept a request during this time.
+A confirmed send or Retry clears its matching draft if the draft has the same revision.
+A refresh keeps each Retry error with its saved attempt.
 The linked answer stays in the List log if delivery fails or the owner deletes the image.
 An agent deletes an image with this command:
 

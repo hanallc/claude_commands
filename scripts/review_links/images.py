@@ -594,7 +594,6 @@ const waiting = document.querySelector('[data-image-waiting]');
 const notice = document.querySelector('[data-image-notice]');
 let list = document.querySelector('[data-images]');
 const motion = createCardMotion(() => list);
-let sending = 0;
 let refreshRequest = 0;
 const refreshSeconds = () => list.dataset.refreshSeconds;
 const imageLink = () => new URLSearchParams(location.hash.slice(1));
@@ -635,163 +634,212 @@ function showGroups() {
   groups.hidden = rows.length === 0;
 }
 const draftStorageKey = 'images.answer-drafts:' + location.pathname;
-const draftForms = root => [...root.querySelectorAll('form[data-image-form]')]
-  .filter(form => form.elements.feedback);
-function readDrafts() {
-  try { return new Map(JSON.parse(sessionStorage.getItem(draftStorageKey) || '[]')); }
-  catch { return new Map(); }
+const pictureStates = new Map();
+const forms = root => [...root.querySelectorAll('form[data-image-form]')];
+const imageId = form => form.elements.image.value;
+const attemptKey = form => form.elements.retry_key?.value;
+const formStatus = form => form.querySelector('[data-image-status]');
+function pictureState(image) {
+  if (!pictureStates.has(image)) {
+    pictureStates.set(image, {draft: null, revision: 0, active: null, draftError: '', attempts: new Map()});
+  }
+  return pictureStates.get(image);
 }
-const savedDrafts = readDrafts();
-function storeDrafts() {
-  if (savedDrafts.size) sessionStorage.setItem(draftStorageKey, JSON.stringify([...savedDrafts]));
-  else sessionStorage.removeItem(draftStorageKey);
+try {
+  for (const [image, draft] of JSON.parse(sessionStorage.getItem(draftStorageKey) || '[]')) {
+    pictureState(image).draft = draft;
+  }
+} catch { /* The browser may block storage. */ }
+function preventDraftLoss(event) {
+  event.preventDefault();
+  event.returnValue = true;
 }
-function draftValue(form) {
+function saveDrafts() {
+  const drafts = [];
+  for (const [image, {draft}] of pictureStates) {
+    if (draft && (draft.words || draft.retryAction)) drafts.push([image, draft]);
+  }
+  try {
+    if (drafts.length) sessionStorage.setItem(draftStorageKey, JSON.stringify(drafts));
+    else sessionStorage.removeItem(draftStorageKey);
+    removeEventListener('beforeunload', preventDraftLoss);
+    return true;
+  } catch {
+    if (drafts.some(([, draft]) => draft.words)) {
+      addEventListener('beforeunload', preventDraftLoss);
+      return false;
+    }
+    removeEventListener('beforeunload', preventDraftLoss);
+    return true;
+  }
+}
+function readEdit(form, state, edited = false) {
   const {feedback, token, feedback_round: round} = form.elements;
-  const sameRetry = form.dataset.retryWords === feedback.value;
-  return {words: feedback.value, token: token.value, round: round.value,
-          retryAction: sameRetry ? form.dataset.retryAction : undefined,
-          retryRound: sameRetry ? form.dataset.retryRound : undefined};
+  const changed = feedback.value !== (state.draft?.words ?? '');
+  if (edited || changed) state.revision++;
+  state.draft = {...(changed ? null : state.draft), words: feedback.value, token: token.value, round: round.value};
 }
-function rememberDraft(form) {
-  const image = form.elements.image.value, draft = draftValue(form);
-  if (draft.words) savedDrafts.set(image, draft);
-  else savedDrafts.delete(image);
-}
-function saveDraftsForReload() {
-  const hadDrafts = savedDrafts.size > 0;
-  for (const form of draftForms(list)) rememberDraft(form);
-  if (hadDrafts || savedDrafts.size) storeDrafts();
-}
-function restoreDrafts() {
-  const forms = new Map(draftForms(list).map(form => [form.elements.image.value, form]));
-  for (const [image, draft] of savedDrafts) {
-    let form = forms.get(image);
-    if (!form) {
-      const card = document.querySelector('[data-image-draft-template]').content.firstElementChild.cloneNode(true);
+function restoreForms(root, previous = []) {
+  const editable = new Map(), attempts = new Set();
+  for (const form of forms(root)) {
+    const image = imageId(form), key = attemptKey(form), state = pictureState(image);
+    if (key) {
+      attempts.add(key);
+      const error = state.attempts.get(key) || '';
+      state.attempts.set(key, error);
+      if (error) formStatus(form).textContent = error;
+    } else {
+      editable.set(image, form);
+    }
+  }
+  const previousEdits = new Map(previous.filter(form => !attemptKey(form)).map(form => [imageId(form), form]));
+  for (const [image, state] of pictureStates) {
+    for (const [key, error] of state.attempts) {
+      // A missing card does not confirm delivery.
+      if (!attempts.has(key) && !error) state.attempts.delete(key);
+    }
+    const draft = state.draft;
+    let form = editable.get(image);
+    if (draft && !form && (draft.words || draft.retryAction || state.draftError)) {
+      const template = document.querySelector('[data-image-draft-template]').content;
+      const original = previousEdits.get(image)?.closest('article') ?? template.firstElementChild;
+      const card = original.cloneNode(true);
       card.id = 'image-' + image;
-      card.querySelector('h2').textContent = 'Picture ' + image;
+      if (original === template.firstElementChild) card.querySelector('h2').textContent = 'Picture ' + image;
       form = card.querySelector('form');
       form.elements.image.value = image;
       form.elements.token.value = draft.token;
       form.elements.feedback_round.value = draft.round;
       form.elements.feedback.id = 'feedback-' + image;
       form.querySelector('label').htmlFor = form.elements.feedback.id;
-      list.append(card);
+      root.append(card);
     }
-    form.elements.feedback.value = draft.words;
-    if (draft.retryAction) {
-      form.dataset.retryAction = draft.retryAction;
-      form.dataset.retryRound = draft.retryRound;
-      form.dataset.retryWords = draft.words;
+    if (form) {
+      if (draft) form.elements.feedback.value = draft.words;
+      formStatus(form).textContent = state.draftError;
+    } else if (!state.attempts.size) {
+      pictureStates.delete(image);
     }
   }
 }
-function updateStoredDraft(form) {
-  if (!savedDrafts.has(form.elements.image.value)) return;
-  rememberDraft(form);
-  try { storeDrafts(); } catch { /* Storage can become unavailable while the page is open. */ }
+function setPictureSubmitting(image, submitting) {
+  for (const form of forms(list)) {
+    if (imageId(form) === image) setCardSubmitting(form, submitting);
+  }
 }
-function clearDraft(form) {
-  form.elements.feedback.value = '';
-  updateStoredDraft(form);
+function clearDraft(state, form) {
+  state.draft = null;
+  state.draftError = '';
+  if (form) form.elements.feedback.value = '';
+  saveDrafts();
 }
 function bind(root) {
-  root.querySelectorAll('form[data-image-form]').forEach(form => form.addEventListener('submit', async event => {
-    event.preventDefault();
-    if (cardSubmitBlocked(form)) return;
-    const question = event.submitter?.value === 'question';
-    const retrying = event.submitter?.value === 'retry';
-    const feedback = event.submitter?.value === 'feedback', status = form.querySelector('[data-image-status]');
-    delete status.dataset.refreshFailed;
-    if (question && !form.elements.feedback.value.trim()) {
-      status.textContent = 'Enter a question first.';
-      return;
-    }
-    if (feedback && !form.elements.feedback.value.trim()) {
-      status.textContent = 'Enter feedback first.';
-      return;
-    }
-    const card = form.closest('article');
-    const body = new URLSearchParams(new FormData(form, event.submitter));
-    if (form.dataset.retryAction === body.get('action') && form.dataset.retryWords === body.get('feedback')) {
-      body.set('feedback_round', form.dataset.retryRound);
-    }
-    const answerForm = retrying && draftForms(list).find(other => other.elements.image.value === body.get('image'));
-    const answerDraft = answerForm && draftValue(answerForm);
-    if (answerDraft?.retryAction) {
-      body.set('draft_action', answerDraft.retryAction);
-      body.set('feedback', answerDraft.words);
-      if (answerDraft.retryRound !== undefined) body.set('feedback_round', answerDraft.retryRound);
-    }
-    status.textContent = '';
-    let postFailed = false, retry = !question && !retrying;
-    setCardSubmitting(form, true);
-    const draft = form.elements.feedback;
-    if (draft) draft.readOnly = true;
-    sending++;
-    try {
-      const response = await fetch(location.pathname, {method: 'POST', body});
-      if (!response.ok) {
-        retry = retry && response.status >= 500;
-        const reason = await response.json().then(body => body.reason, () => '');
-        throw new Error(reason || 'HTTP ' + response.status);
-      }
-      if (draft) clearDraft(form);
-      if (question) {
-        card.remove();
-        list.dataset.waitingImages += ' ' + card.dataset.image;
-        list.dataset.refreshSeconds = list.dataset.answerRefreshSeconds;
-        apply();
-        pageRefresh.restart();
-      } else {
-        const result = await response.json().catch(() => ({}));
-        if (answerForm && answerForm.isConnected) {
-          const currentDraft = draftValue(answerForm);
-          if (result.draft_confirmed && currentDraft.words === answerDraft.words
-              && currentDraft.retryAction === answerDraft.retryAction && currentDraft.retryRound === answerDraft.retryRound) {
-            clearDraft(answerForm);
-            answerForm.closest('article').remove();
-          } else {
-            // Keep edits made after the stored draft was restored.
-            updateStoredDraft(answerForm);
-          }
-        }
-        if (result.notice) {
-          notice.textContent = result.notice;
-          notice.hidden = false;
-        }
-        await motion.removeCard(card, apply);
-      }
-    } catch (error) {
-      postFailed = true;
-      if (!question) status.dataset.answerFailed = 'true';
-      if (retry) {
-        form.dataset.retryAction = body.get('action');
-        form.dataset.retryWords = body.get('feedback');
-        form.dataset.retryRound = body.get('feedback_round');
-      } else {
-        delete form.dataset.retryAction;
-      }
-      status.textContent = 'Not sent: ' + error.message;
-      apply();
-    } finally {
-      sending--;
-      setCardSubmitting(form, false);
-      if (draft) draft.readOnly = false;
-      if (question && !postFailed) void pageRefresh.refresh(true);
-      else if (!retrying || !postFailed) void refresh().catch(error => {
-        if (postFailed) return;
-        status.dataset.refreshFailed = 'true';
-        status.textContent = 'Update failed: ' + error.message;
-      });
-    }
-  }));
+  for (const form of forms(root)) {
+    form.elements.feedback?.addEventListener('input', () => {
+      readEdit(form, pictureState(imageId(form)), true);
+      saveDrafts();
+    });
+    form.addEventListener('submit', submit);
+  }
 }
+async function submit(event) {
+  event.preventDefault();
+  const form = event.currentTarget, image = imageId(form), state = pictureState(image);
+  if (state.active || cardSubmitBlocked(form)) return;
+  const action = event.submitter?.value, key = attemptKey(form), question = action === 'question';
+  const edit = key ? forms(list).find(other => imageId(other) === image && !attemptKey(other)) : form;
+  if (edit) readEdit(edit, state);
+  const status = formStatus(form), draft = state.draft;
+  if ((question || action === 'feedback') && !draft.words.trim()) {
+    state.draftError = question ? 'Enter a question first.' : 'Enter feedback first.';
+    status.textContent = state.draftError;
+    return;
+  }
+  const body = new URLSearchParams(new FormData(form, event.submitter));
+  if (key) {
+    if (draft?.retryAction) {
+      body.set('draft_action', draft.retryAction);
+      body.set('feedback', draft.words);
+      if (draft.retryRound !== undefined) body.set('feedback_round', draft.retryRound);
+    }
+  } else {
+    if (!question) {
+      if (draft.retryAction === action && draft.retryRound !== undefined) body.set('feedback_round', draft.retryRound);
+      draft.retryAction = action;
+      draft.retryRound = body.get('feedback_round') ?? undefined;
+    }
+    state.draftError = '';
+  }
+  const request = {revision: state.revision, key};
+  state.active = request;
+  ++refreshRequest;
+  setPictureSubmitting(image, true);
+  const field = form.elements.feedback;
+  if (field) field.readOnly = true;
+  if (!key) status.textContent = '';
+  saveDrafts();
+  const card = form.closest('article');
+  let postFailed = false, retryable = true;
+  try {
+    const response = await fetch(location.pathname, {method: 'POST', body});
+    if (!response.ok) {
+      retryable = response.status >= 500;
+      const reason = await response.json().then(body => body.reason, () => '');
+      throw new Error(reason || 'HTTP ' + response.status);
+    }
+    const result = question ? {} : await response.json().catch(() => ({}));
+    if (edit && edit.elements.feedback.value !== (state.draft?.words ?? '')) {
+      readEdit(edit, state);
+      saveDrafts();
+    }
+    if (state.active === request && state.revision === request.revision
+        && (!request.key || result.draft_confirmed === true)) {
+      clearDraft(state, edit);
+      if (request.key) edit?.closest('article').remove();
+    }
+    if (question) {
+      card.remove();
+      list.dataset.waitingImages += ' ' + card.dataset.image;
+      list.dataset.refreshSeconds = list.dataset.answerRefreshSeconds;
+      apply();
+      pageRefresh.restart();
+    } else {
+      if (result.notice) {
+        notice.textContent = result.notice;
+        notice.hidden = false;
+      }
+      if (request.key) state.attempts.delete(request.key);
+      await motion.removeCard(card, apply);
+    }
+  } catch (error) {
+    postFailed = true;
+    const message = 'Not sent: ' + error.message;
+    if (request.key) state.attempts.set(request.key, message);
+    else {
+      state.draftError = message;
+      if (!retryable && !question && state.revision === request.revision) {
+        delete state.draft.retryAction;
+        delete state.draft.retryRound;
+        saveDrafts();
+      }
+    }
+    status.textContent = message;
+    apply();
+  } finally {
+    state.active = null;
+    setPictureSubmitting(image, false);
+    if (field) field.readOnly = false;
+    if (question && !postFailed) void pageRefresh.refresh(true);
+    else void refresh().catch(error => {
+      if (!postFailed && !state.active && !state.draftError) status.textContent = 'Update failed: ' + error.message;
+    });
+  }
+}
+const sending = () => [...pictureStates.values()].some(state => state.active);
 async function refresh(_supersede=false,current=()=>true) {
-  if (sending) return;
+  if (sending()) return;
   const own = ++refreshRequest;
-  const isCurrent = () => own === refreshRequest && !sending && current();
+  const isCurrent = () => own === refreshRequest && !sending() && current();
   try {
     const response = await fetch(location.pathname, {cache: 'no-store'});
     if (!response.ok) throw new Error('HTTP ' + response.status);
@@ -799,40 +847,18 @@ async function refresh(_supersede=false,current=()=>true) {
     const fresh = page.querySelector('[data-images]');
     if (!isCurrent()) return;
     if (!fresh) throw new Error('The page has no image list.');
-    // A page from an older server script cannot bind the new cards, so it loads again.
+    const previous = forms(list);
+    for (const form of previous) {
+      if (form.elements.feedback) readEdit(form, pictureState(imageId(form)));
+    }
+    const saved = saveDrafts();
     if (fresh.dataset.script !== list.dataset.script) {
-      saveDraftsForReload();
+      if (!saved) throw new Error('Could not save the draft before reloading.');
       location.reload();
       return;
     }
     const facts = pageRefreshFacts(page);
-    // Keep drafts and action results on cards that the server still shows.
-    const forms = new Map(draftForms(list).map(form => [form.elements.image.value, form]));
-    draftForms(fresh).forEach(form => {
-      const image = form.elements.image.value;
-      const previous = forms.get(image);
-      if (!previous) return;
-      forms.delete(image);
-      form.elements.feedback.value = previous.elements.feedback.value;
-      const oldStatus = previous.querySelector('[data-image-status]');
-      const newStatus = form.querySelector('[data-image-status]');
-      if (!oldStatus.dataset.refreshFailed) newStatus.textContent = oldStatus.textContent;
-      if (oldStatus.dataset.answerFailed) newStatus.dataset.answerFailed = 'true';
-      if (previous.dataset.retryAction) {
-        form.dataset.retryAction = previous.dataset.retryAction;
-        form.dataset.retryWords = previous.dataset.retryWords;
-        form.dataset.retryRound = previous.dataset.retryRound;
-      }
-    });
-    // A removed picture can still accept the words from an open form.
-    for (const form of forms.values()) {
-      const status = form.querySelector('[data-image-status]');
-      if (status.dataset.answerFailed || form.elements.feedback.value.trim()) {
-        const card = form.closest('article').cloneNode(true);
-        card.querySelector('textarea').value = form.elements.feedback.value;
-        fresh.append(card);
-      }
-    }
+    restoreForms(fresh, previous);
     const top = scrollY;
     const wasWaiting = !waiting.hidden;
     const previousRate = refreshSeconds();
@@ -865,7 +891,7 @@ addEventListener('hashchange', () => {
   scrollToLinkedImage(true);
 });
 const pageRefresh = createPageRefresh(refresh, refreshSeconds);
-restoreDrafts();
+restoreForms(list);
 bind(list);
 // An image link opens its image at once.
 apply();

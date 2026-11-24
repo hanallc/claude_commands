@@ -843,6 +843,137 @@ if (sessionStorage.getItem('probe-phase')) document.querySelector('#image-SECOND
         markup = page.replace(f"<script>{images.SCRIPT}", remove_picture + f"<script>{images.SCRIPT}")
         self.assertEqual(firefox_probe_results(markup.replace("</body>", probe + "</body>").encode()), [[]])
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
+    def test_picture_guard_blocks_both_submit_orders_and_keeps_each_error(self) -> None:
+        removed, other = self.register("Removed shot"), self.register("Other shot")
+        identity = removed["id"]
+        round_id = images.feedback_round(set())
+        images.delete(self.root, identity)
+        with patch.object(change_page, "send_message", side_effect=RuntimeError("owner offline")):
+            for words in ("Keep the title.", "Keep the caption."):
+                with self.assertRaises(images.AnswerNotSent):
+                    self.submit(self.feedback_body(removed, words) + f"&feedback_round={round_id}")
+        page = images.render(self.status).decode()
+        fresh = json.dumps(page).replace("<", r"\u003c")
+        token = images.request_token(images.console_token(self.root), identity)
+        drafts = [[identity, {"words": "Keep the title.", "token": token, "round": round_id,
+                              "retryAction": "feedback", "retryRound": round_id}]]
+        seed = """<script>
+sessionStorage.setItem('images.answer-drafts:' + location.pathname, JSON.stringify(DRAFTS));
+</script>""".replace("DRAFTS", json.dumps(drafts))
+        probe = r"""<script>
+(async () => {
+ const failures = [], check = (ok, message) => { if (!ok) failures.push(message); };
+ const realFetch = window.fetch.bind(window), posts = [];
+ const draft = id => document.getElementById('feedback-' + id);
+ const edit = () => draft('REMOVED').form;
+ const retries = () => [...document.querySelectorAll('button[value=retry]')];
+ const retry = () => retries().find(button => button.closest('article').textContent.includes('Keep the title.'));
+ const status = form => form.querySelector('[data-image-status]').textContent;
+ const say = (ok, reason) => new Response(JSON.stringify(ok ? {draft_confirmed: true} : {reason}),
+                                            {status: ok ? 200 : 503});
+ const submit = button => button.form.dispatchEvent(new SubmitEvent('submit', {
+   bubbles:true, cancelable:true, submitter:button
+ }));
+ const until = async (message, ready) => {
+   for (let step = 0; step < 65; step++) {
+     if (ready()) return;
+     await new Promise(resolve => setTimeout(resolve, 30));
+   }
+   throw new Error(message);
+ };
+ const list = () => document.querySelector('[data-images]');
+ const refresh = async () => {
+   const previous = list();
+   document.dispatchEvent(new Event('visibilitychange'));
+   await until('The refresh replaces the list.', () => list() !== previous);
+ };
+ window.fetch = (url, options) => {
+   if (url !== location.pathname) return realFetch(url, options);
+   if (options?.method !== 'POST') return Promise.resolve(new Response(FRESH));
+   return new Promise(resolve => posts.push({body: options.body, resolve}));
+ };
+ const rejectAll = () => posts.forEach(post => post.resolve(say(false,
+   post.body.get('action') === 'retry' ? 'Retry failed.' : 'Approval failed.')));
+ const sameButtons = () => [...edit().querySelectorAll('button'), ...retries()];
+ const otherForm = () => draft('OTHER').form;
+ const approved = () => edit().querySelector('button[value=approved]');
+ try {
+   submit(retry());
+   check(sameButtons().every(button => button.disabled), 'Retry disables every submit for its picture.');
+   submit(approved());
+   check(posts.length === 1, 'Retry blocks a second submit in code.');
+   const other = otherForm().querySelector('button[value=question]');
+   check(!other.disabled, 'Another picture can still submit.');
+   draft('OTHER').value = 'Which check passed?';
+   submit(other);
+   check(posts.some(post => post.body.get('image') === 'OTHER'), 'Another picture starts a request.');
+   const before = list();
+   rejectAll();
+   await until('The other request refreshes the list.', () => before !== list());
+   check(status(retry().form) === 'Not sent: Retry failed.', 'The refresh keeps the Retry error.');
+   check(retries().some(button => status(button.form) === 'Not sent yet'), 'Another attempt keeps its own status.');
+   check(draft('REMOVED').value === 'Keep the title.', 'Retry failure keeps the draft.');
+   const count = posts.length, previous = list();
+   submit(approved());
+   check(sameButtons().every(button => button.disabled), 'Approval disables every submit for its picture.');
+   submit(retry());
+   check(posts.length === count + 1, 'Approval blocks Retry in code.');
+   rejectAll();
+   await until('Approval failure refreshes the list.', () => previous !== list());
+   check(status(edit()) === 'Not sent: Approval failed.', 'The refresh keeps the approval error.');
+   check(status(retry().form) === 'Not sent: Retry failed.', 'The refresh still shows the earlier Retry error.');
+   check(draft('REMOVED').value === 'Keep the title.', 'Approval failure keeps the draft.');
+   check(sameButtons().every(button => !button.disabled), 'The forms can submit again after failure.');
+   await refresh();
+   check(status(retry().form) === 'Not sent: Retry failed.', 'A later refresh keeps the Retry error.');
+   const beforeFeedback = list();
+   submit(edit().querySelector('button[value=feedback]'));
+   rejectAll();
+   await until('Feedback failure refreshes the list.', () => beforeFeedback !== list());
+   const beforeRetry = list();
+   submit(retry());
+   check(status(retry().form) === 'Not sent: Retry failed.', 'The error stays until the new Retry has a result.');
+   const post = posts.at(-1);
+   check(post.body.get('draft_action') === 'feedback', 'Retry submits the stored action.');
+   check(post.body.get('feedback_round') === ROUND, 'Retry submits the stored round.');
+   for (const words of ['A newer edit.', 'Keep the title.']) {
+     const field = draft('REMOVED');
+     field.value = words;
+     field.dispatchEvent(new Event('input', {bubbles:true}));
+   }
+   post.resolve(say(true));
+   await until('The confirmed Retry refreshes the list.', () => beforeRetry !== list());
+   check(draft('REMOVED')?.value === 'Keep the title.', 'Retry keeps the newer revision with the same words.');
+   const saved = new Map(JSON.parse(sessionStorage.getItem('images.answer-drafts:' + location.pathname)));
+   check(saved.get('REMOVED')?.words === 'Keep the title.', 'The newer revision remains in storage.');
+ } catch (error) { failures.push(String(error)); }
+ await realFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+})();</script>""".replace("REMOVED", identity).replace("OTHER", other["id"]).replace("FRESH", fresh).replace(
+            "ROUND", json.dumps(round_id))
+        markup = page.replace(f"<script>{images.SCRIPT}", seed + f"<script>{images.SCRIPT}")
+        self.assertEqual(firefox_probe_results(markup.replace("</body>", probe + "</body>").encode()), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
+    def test_ordinary_reload_restores_unsent_picture_words(self) -> None:
+        record = self.register()
+        probe = r"""<script>
+(async () => {
+ const feedback = document.getElementById('feedback-IMAGEID');
+ const words = 'Keep the title.\nUse a darker border.';
+ if (!sessionStorage.getItem('typed')) {
+   feedback.value = words;
+   feedback.dispatchEvent(new Event('input', {bubbles:true}));
+   sessionStorage.setItem('typed', 'yes');
+   location.reload();
+   return;
+ }
+ const failures = feedback.value === words ? [] : ['The ordinary reload must restore the unsent words.'];
+ await fetch('/results', {method:'POST', body:JSON.stringify(failures)});
+})();</script>""".replace("IMAGEID", record["id"])
+        page = images.render(self.status).replace(b"</body>", probe.encode() + b"</body>")
+        self.assertEqual(firefox_probe_results(page), [[]])
+
     def test_a_card_from_before_i21_that_posts_not_approved_gets_a_clear_refusal(self) -> None:
         record = self.register()
         with self.assertRaisesRegex(question_record.AnswerRefused, "^Not Approved was removed. Use Send Feedback.$"):
