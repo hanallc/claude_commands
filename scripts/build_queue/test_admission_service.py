@@ -9448,6 +9448,96 @@ class RunPlaceTests(unittest.TestCase):
             self.assertEqual(row["order_since"], second.since)
             self.assertFalse(fixture.server.reservations)
 
+    def test_doc_keeps_its_run_rank_without_a_memory_hold_or_repository_slot(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run)
+            grant = fixture.finish_step(first)
+            self.assertIsInstance(fixture.server.slots[grant.reservation], records.BetweenStepsSlot)
+            fixture.free(0)
+            fixture.hold_starts()
+            fixture.clock.advance(1)
+            peer = fixture.request()
+            _ = fixture.server.handle_request(peer)
+            fixture.clock.advance(1)
+            doc = fixture.request(step="doc", run=run)
+            doc = replace(doc, identity=replace(doc.identity, verify=records.VerifyCall("doc", "verify doc", 1, 2)))
+            self.assertIsInstance(fixture.server.handle_request(doc)[0], wire.Wait)
+            self.assertEqual(fixture.queue_pids(), [doc.owner.pid, peer.owner.pid])
+            self.assertIsInstance(fixture.server.slots[grant.reservation], records.BetweenStepsSlot)
+            self.assertIsInstance(fixture.server.waiters[doc.episode].continuation_claim, service.NoContinuationClaim)
+
+            fixture.free(60 * GIB)
+            write_pressure_reading(fixture.root / "pressure")
+            fixture.allow_next_start()
+            _ = fixture.run_pass()
+            doc_grant = fixture.server.reservations[doc.episode].reservation_id
+            self.assertFalse(fixture.server.verify_run_slots)
+            self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("doc", doc_grant, 0)), [wire.Ok()])
+            self.assertNotIn(doc_grant, fixture.server.slots)
+
+    def test_mac_busy_mend_keeps_its_rank_for_the_retry(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, adopt_assignment, assignment_for, consume_permission, local_candidate,
+            placement_request, publish_candidate,
+        )
+
+        with PlacementFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run)
+            _ = fixture.finish_step(first)
+            fixture.free(0)
+            fixture.hold_starts()
+            fixture.clock.advance(1)
+            peer = fixture.request()
+            _ = fixture.server.handle_request(peer)
+            fixture.clock.advance(1)
+            mend = placement_request(fixture)
+            assert isinstance(mend.profile, records.StepProfile)
+            mend = replace(mend, run=run, profile=replace(mend.profile, step="mend"),
+                identity=replace(mend.identity, step="mend"), constraints=replace(mend.constraints,
+                    command=("cargo", "mend"), candidates=(*mend.constraints.candidates, local_candidate(fixture))))
+            _ = publish_candidate(fixture, mend)
+            remote = assignment_for(fixture, mend)
+            self.assertEqual(remote.destination.provider, "mac")
+            saved_place = next(place for place in fixture.server.places.values() if place.episode == mend.episode)
+            self.assertTrue(saved_place.move_id)
+            claim = adopt_assignment(fixture, mend, remote)
+            self.assertEqual(fixture.server.handle_request(consume_permission("mend-start", remote, claim)),
+                             [wire.FirstAuthorization(remote, claim)])
+
+            key = fixture.server.host_evidence_key(mend, remote.destination)
+            evidence = fixture.provider_evidence[key]
+            assert isinstance(evidence, placement.FreshHostEvidence)
+            execution = execution_identity.ProcessExecution(remote.destination.host, evidence.generation, 700001, "start")
+            observed = replace(evidence, executions=((claim, execution_identity.ObservedExecution(execution)),))
+            fixture.provider_evidence[key] = observed
+            fixture.server.publish_host_evidence(observed)
+            _ = fixture.run_pass()
+            self.assertNotIn(mend.owner.pid, fixture.queue_pids())
+
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, mend, placement.TemporaryExclusion("busy"))
+            refused, = fixture.server.handle_request(wire.ExecutionReport("mend-busy", remote, claim,
+                execution_identity.ExecutionNotStarted(), placement.PrelaunchRefused("busy"),
+                placement.DispatchPathSettled()))
+            assert isinstance(refused, wire.DispatchStatus)
+            self.assertEqual(refused.state, placement.ClosedAssignment("busy"))
+            waiting, = fixture.server.handle_request(mend)
+            self.assertIsInstance(waiting, wire.PlacementWait)
+            self.assertEqual(fixture.queue_pids(), [mend.owner.pid, peer.owner.pid])
+            returned = next(place for place in fixture.server.places.values() if place.episode == mend.episode)
+            self.assertEqual(returned.move_id, saved_place.move_id)
+            row = next(row for _, row in self.reading(fixture).ordered if row["pid"] == mend.owner.pid)
+            self.assertEqual(row.get("order_since"), first.since)
+
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, mend)
+            retry = assignment_for(fixture, mend)
+            self.assertEqual(retry.destination, remote.destination)
+            self.assertNotEqual(retry.attempt, remote.attempt)
+            self.assertEqual(retry.episode, remote.episode)
+
     def test_restart_between_steps_keeps_the_run_watch_without_a_memory_charge(self) -> None:
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()

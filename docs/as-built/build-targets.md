@@ -637,8 +637,15 @@ Each step checks its package when it runs.
 The first failure ends either list with its status.
 A step list reports the command and exit status for each step it runs, including the package of a failed test step.
 On Linux, the parent initializes `BUILDLOG_RUN` once. Each step inherits it and uses its own call record.
-Both list forms keep the queue place during checkout for steps that share the slot.
-A `doc` step with its own slot uses `NO_RUN` in its placement request.
+Both list forms keep the queue place during checkout, including for `doc`.
+The `doc` step acquires its own checkout and uses ordinary memory admission.
+It takes no memory handoff or repository slot.
+A busy Mac leaves a mend step at its existing queue rank for the next placement.
+The `wait_s` field counts time waiting for admission, routing, holds, and the Cargo token.
+The `step_wait_s` field gives the wait for each step, including separate waits for mend and clippy.
+Verify adds the measured wait from each completed placement call.
+A canceled episode stops accruing wait before formatting starts.
+If a placement call stops before it reports a measurement, Verify records null for the step and call totals.
 A standalone step with its own checkout slot also uses `NO_RUN`.
 Steps with `NO_RUN` can leave their grants without a memory handoff.
 
