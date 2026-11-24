@@ -191,12 +191,6 @@ conf_reads.record('disabled')
             conf, "_git", side_effect=AssertionError("History must be read at use"),
         ):
             settings = conf.read(self.path)
-            with self.assertRaises(conf.Unusable) as caught:
-                _ = settings.text("count", recover_invalid=False)
-            with self.assertRaises(conf.Unusable):
-                _ = settings.value("count", int, default=4, recover_invalid=False)
-        self.assertEqual(str(caught.exception),
-                         f"{self.path}: count is missing; add it to {self.path}; the file does not exist")
         self.assertEqual(warning.getvalue(), "")
         self.commit("# whole: 1..10\ncount=8\n")
         self.commit("other=2\n")
@@ -207,10 +201,10 @@ conf_reads.record('disabled')
         self.assertIn(str(self.path), warning.getvalue())
         self.assertIn("count", warning.getvalue())
         with redirect_stderr(io.StringIO()):
-            self.assertEqual(settings.value("count", int, default=4), 8)
+            self.assertEqual(settings.value("count", int, default=4, recover_invalid=False), 8)
             self.path.unlink()
             self.directory.rmdir()
-            self.assertEqual(conf.read(self.path).whole("count"), 8)
+            self.assertEqual(conf.read(self.path).text("count", recover_invalid=False), "8")
 
     def test_values_and_origin_share_the_live_read_with_host_overrides(self) -> None:
         self.write("[settings]\nlabel=first\nlabel=duplicate\nlabel.testhost=local\noptional=\n"
@@ -659,9 +653,16 @@ conf_reads.record('disabled')
         self.write("other=0\n")
         with mock.patch("socket.gethostname", return_value="testhost.example"), redirect_stderr(io.StringIO()):
             self.assertEqual(conf.read("example").whole("amount"), 7)
-            with self.assertRaises(conf.Unusable) as caught:
-                _ = conf.read("example").text("amount", recover_invalid=False)
-            self.assertEqual(str(caught.exception), f"{self.path}: amount is missing; add it to {self.path}")
+
+    def test_disabling_invalid_value_recovery_still_recovers_a_missing_key(self) -> None:
+        self.history()
+        self.commit("count=3\n")
+        self.write("other=0\n")
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(conf.read("example").value("count", int, recover_invalid=False), 3)
+        self.write("count=broken\n")
+        with self.assertRaisesRegex(conf.Unusable, "count='broken'"):
+            _ = conf.read("example").value("count", int, recover_invalid=False)
 
     def test_no_good_revision_raises_instead_of_using_a_code_default(self) -> None:
         self.history()

@@ -257,8 +257,8 @@ class ConfigRead:
                 missing = _MissingValue(repair)
                 bad = "<missing>"
             reason = f"{self.source}: {key}={bad!r}: {error}"
-        if not recover_invalid:
-            return missing if missing is not None else UnavailableValue(reason)
+        if missing is None and not recover_invalid:
+            return UnavailableValue(reason)
         if warn and missing is None:
             _key_warning(self.source, key, reason, bad, self.stamp)
         current_limit = ""
@@ -297,7 +297,7 @@ class ConfigRead:
     def value(self, key: str, convert: Callable[[str], Result], *,
               default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
               recover_invalid: bool = True, host_override: HostOverride = HostOverride.APPLIES) -> Result:
-        """Read one key with an optional default. A caller can require a live value."""
+        """Read one key with an optional default. Recover missing settings from Git."""
         result = self._resolve(key, convert, warn=True, default=default, allow_blank=allow_blank,
                                recover_invalid=recover_invalid, host_override=host_override)
         if isinstance(result, UnavailableValue):

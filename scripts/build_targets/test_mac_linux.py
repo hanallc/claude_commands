@@ -2322,9 +2322,6 @@ fi
         _ = write_config_fixture(self.registry, 'enabled.mac-linux=on\n')
         commit_config_fixture(self.registry)
         _ = self.registry.write_text(self.registry.read_text().replace('enabled.mac-linux=on\n', ''))
-        with self.assertRaisesRegex(conf.Unusable, r'enabled\.mac-linux is missing'):
-            _ = mac_test.free_now(paths, configuration, self.repo)
-        _ = write_config_fixture(self.registry, 'enabled.mac-linux=on\n')
         self.assertEqual(mac_test.free_now(paths, configuration, self.repo), 'free')
 
     def test_free_now_reads_the_probe_backoff_for_a_registered_guest(self) -> None:
@@ -2393,7 +2390,7 @@ fi
         self.assertIn(f'{key} is missing; add it to {self.registry}', str(result))
         self.assert_guest_clean()
 
-    def test_unreachable_wait_refuses_a_missing_key_even_with_a_committed_value(self) -> None:
+    def test_unreachable_wait_uses_the_committed_value_when_the_key_is_missing(self) -> None:
         registry = self.repo / 'config/build_targets.conf'
         original = self.registry.read_text().replace(
             'settings.mac-linux=mac_linux.conf', f"settings.mac-linux={self.registry.with_name('mac_linux.conf')}")
@@ -2402,7 +2399,10 @@ fi
         _ = self.git('commit', '-qm', 'Add the target registry')
         key = target_config.UNREACHABLE_WAIT_KEY
         _ = registry.write_text(original.replace(f'{key}=20\n', ''))
-        with self.assertRaisesRegex(conf.Unusable, f'{key} is missing; add it to '):
+        settings = mac_linux.read_settings(conf.read(registry))
+        self.assertEqual(settings.unreachable_wait_seconds, 20)
+        _ = registry.write_text(original.replace(f'{key}=20\n', f'{key}=0\n'))
+        with self.assertRaisesRegex(conf.Unusable, 'expected a positive whole number'):
             _ = mac_linux.read_settings(conf.read(registry))
 
     def test_unreachable_wait_requires_whole_seconds_in_range(self) -> None:
