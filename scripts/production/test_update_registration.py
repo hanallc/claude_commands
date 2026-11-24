@@ -853,6 +853,12 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(item.timing, registration.DeferredUntil(datetime(2099, 1, 2, 8)))
         self.assertEqual(item.rank.follows, "Earlier choice")
 
+        path = self.outstanding()
+        for invalid in ("2099-02-29T08:00", "2099-01-02T24:00"):
+            with self.subTest(after=invalid):
+                with self.assertRaisesRegex(registration.InputError, r"\[0\]\.after: expected a valid YYYY-MM-DDTHH:MM"):
+                    _ = registration.parse_outstanding_entries([{**legacy, "after": invalid}], path)
+
 
 if __name__ == "__main__":
     _ = unittest.main()

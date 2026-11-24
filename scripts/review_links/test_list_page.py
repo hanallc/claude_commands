@@ -10,7 +10,6 @@ import re
 import shlex
 import select
 import shutil
-import signal
 import socket
 import subprocess
 import tempfile
@@ -19,7 +18,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout, suppress
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,7 +33,7 @@ from xml.etree import ElementTree
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
 from scripts.lib import conf, file_lock
-from scripts.lib.process_group import send_process_group
+from scripts.lib.process_group import run_process_group, stop_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import write_config_fixture
@@ -45,8 +44,9 @@ from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
 from scripts.review_links import review_items, review_page
+from scripts.review_links.server_test_support import started_review_server
 from scripts.review_links.test_change_page import BrowserForms
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.statusline import counts_row, rebuild_row
@@ -81,8 +81,11 @@ async function reviewCardPosition(card){
  const height=frame?.getBoundingClientRect().height ?? win.innerHeight;
  const requested=frame && Number.parseFloat(frame.style.getPropertyValue('--review-card-height'));
  const fullscreen=frame?.closest('dialog').hasAttribute('data-fullscreen');
- return {top,left,main,height,requested,
-  resized:!frame || Math.abs(height-(fullscreen ? win.parent.innerHeight : Math.min(requested,win.parent.innerHeight-98)))<1,
+ // The cap is the view height under the top of the List box, less 82 px for the box parts around the frame.
+ const start=frame ? frame.closest('dialog').getBoundingClientRect().top : 0;
+ const cap=win.parent.innerHeight-start-(fullscreen ? 0 : 82);
+ return {top,left,main,height,requested,cap,
+  resized:!frame || Math.abs(height-(fullscreen ? cap : Math.min(requested,cap)))<1,
   row:card.querySelector('[data-review-card-updates]').getBoundingClientRect().height,
   dark:win.matchMedia('(prefers-color-scheme:dark)').matches};
 }
@@ -123,8 +126,8 @@ async function checkReviewCardConflict(card,layout,check,advance){
   check(before.row===52 && after.row===52,'The status row keeps the same 52 pixel height.');
   check(Math.abs(after.top-before.top)<0.5 && Math.abs(after.left-before.left)<0.5 &&
    before.main===after.main && before.height===after.height && before.requested===after.requested,'A 409 keeps the text and card in place. '+JSON.stringify({before,after}));
-  if(layout==='short') check(before.requested<win.parent.innerHeight-98,'The short card fits below the iframe height cap.');
-  if(layout==='cap') check(before.requested>before.height && Math.abs(before.height-(win.parent.innerHeight-98))<1,
+  if(layout==='short') check(before.requested<before.cap,'The short card fits below the iframe height cap.');
+  if(layout==='cap') check(before.requested>before.height && Math.abs(before.height-before.cap)<1,
    'The tall card reaches the iframe height cap.');
   if(layout==='phone') check(win.top.innerWidth===390 && win.frameElement.closest('dialog').hasAttribute('data-fullscreen'),
    'The phone card fills the List dialog at 390 pixels.');
@@ -163,28 +166,12 @@ def _private_firefox_command(profile: Path, width: int, height: int, *, dark: bo
     return command, {**os.environ, "MOZ_HEADLESS_WIDTH": str(width), "MOZ_HEADLESS_HEIGHT": str(height)}
 
 
-def _stop_browser(process: subprocess.Popen[bytes]) -> None:
-    try:
-        with suppress(ProcessLookupError):
-            send_process_group(process.pid, signal.SIGTERM)
-        with suppress(subprocess.TimeoutExpired):
-            _ = process.wait(timeout=10)
-        # The browser can exit before its child processes.
-        with suppress(ProcessLookupError):
-            send_process_group(process.pid, signal.SIGKILL)
-        _ = process.wait(timeout=10)
-    finally:
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None:
-                stream.close()
-
-
 class _Browser:
     def __init__(self, process: subprocess.Popen[bytes]) -> None:
         self.process: subprocess.Popen[bytes] = process
         self.closed: bool = False
         self.resources: ExitStack = ExitStack()
-        _ = self.resources.callback(_stop_browser, process)
+        _ = self.resources.callback(stop_process_group, process)
 
     def close(self) -> None:
         if not self.closed:
@@ -455,6 +442,8 @@ class ListPageTests(unittest.TestCase):
             + "# range: 5..300\npage_refresh_seconds=15\n# whole: 1..80\nlist_log_max_height_rem=16\n"
             + "# whole: 1..300\npage_request_timeout_seconds=15\n"
             + "# whole: 1..5000\ncard_fade_out_ms=450\n# whole: 1..5000\ncard_fade_in_ms=600\n"
+            # Undo is off, so each send saves at once; test_send_hold and test_serve check the wait.
+            + "# whole: 0..60\nundo_seconds=0\n"
             + "# range: 0.5..60\nframe_retry_seconds=2\n"
             + "# range: 0.001..\ntailscale_check_seconds=60\n"
             + "# range: 0.001..\nsnapshot_sweep_seconds=3600\n"
@@ -504,8 +493,8 @@ class ListPageTests(unittest.TestCase):
                 root = Path(temporary)
                 command, environment = _private_firefox_command(root / "profile", width, height, dark=dark)
                 screenshot = path if path is not None else root / "page.png"
-                return subprocess.run([*command, "--screenshot", str(screenshot), destination],
-                                      capture_output=True, text=True, timeout=45, env=environment)
+                return run_process_group([*command, "--screenshot", str(screenshot), destination],
+                                         timeout=45, env=environment)
         try:
             browser = self.firefox()
             with browser.page(destination, width, height, dark=dark):
@@ -930,7 +919,8 @@ window.fetch=async (path,options={})=>{
   }) || bounds.height>heading.height || heading.height>button.offsetHeight+1){
    failures.push('The List controls fit beside the title at 320 px.');
   }
-  if(title.parentElement.querySelectorAll('button').length!==1 ||
+  if(title.parentElement.querySelector('button') ||
+     document.querySelector('[data-page-actions]').querySelectorAll('button').length!==1 ||
      button.getAttribute('aria-label')!=='New item for cargo-liner'){
    failures.push('The page owner button is the only action beside the title.');
   }
@@ -1080,6 +1070,56 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
 })();
 </script>'''
         self.browser_actions(markup, "", probe)
+
+    def test_new_item_opens_above_the_review_box_and_its_screenshot_shows_the_box(self) -> None:
+        from scripts.review_links.test_page_frame import WINDOW_BROWSERS, WINDOW_PROBE, window_probe_results
+
+        if not WINDOW_BROWSERS:
+            self.skipTest("Chrome or Firefox is required for the window rule.")
+        source = review_items.ChangeSource(self.root / "changes.md", {"#": "C1"},
+            change_routing.ChangeAssignment(change_routing.ShowrunnerOwnChange(OWNER.id, OWNER.name), self.root / "sdlc.md"),
+            delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery()))
+        change = review_items.ReviewItem("sdlc/C1", "C1", review_items.ReviewType.CHANGE, OWNER.id, OWNER.id,
+            "Check C1", review_items.ReviewState.OPEN, review_items.ReviewTimes(NOW, NOW), (), (), source)
+        item = self.add("Check the linked change", number=7)
+        _ = the_list.link(MORTY.id, item.id, (change.key,), source="morty")
+        with (patch.object(list_page, "read_linked_reviews", return_value=[change]),
+              patch.object(list_page, "counts_strip", return_value="")):
+            markup = list_page.render(self.root / "reviews")
+        page = page_frame.with_owner(markup, "list", MORTY, staff.StaffSnapshot((MORTY,)), new_item_dialog.render)
+        probe = r'''
+(async()=>{
+ if(nested) return;
+ try{
+  await painted();
+  const dialog=document.querySelector('[data-list-review-dialog]');
+  const link=document.querySelector('a[data-list-review-card]');
+  link.click();
+  await until(()=>dialog.open && dialog.querySelector('iframe'),'the review box');
+  await painted();
+  check(onTop(dialog.querySelector('.list-review-close')),'The action area does not cover the review box Close button.');
+  check(dialog.getBoundingClientRect().top>=actionsBottom(),'The review box starts below the action area.');
+  check(pressNewItem('over the review box')!==null,'The press reaches New item.');
+  const capture=await newItemOver(dialog,'the review box');
+  const address=location.pathname+location.search+location.hash;
+  check(capture.place===address+(location.hash ? '&' : '#')+'console-window='+encodeURIComponent(link.getAttribute('href')),
+   'The screenshot address names the open review box: '+capture.place);
+  await closeNewItem(dialog,'the review box');
+  await opensAgain(capture.place,doc=>doc.querySelector('[data-list-review-dialog]')?.open===true
+   && doc.querySelector('[data-list-review-dialog] iframe')!==null,'the review box');
+ }catch(error){failures.push(String(error));}
+ await report();
+})();'''
+        page = page.replace(b"</body>", b"<script>" + (WINDOW_PROBE + probe).encode() + b"</script></body>", 1)
+        card = b'<!doctype html><html data-theme="dark"><body><p>Review card fixture</p></body></html>'
+        # The probe starts a private browser. Close the idle shared browsers first.
+        for cached in (self._chrome, self._firefox):
+            if cached is not None:
+                cached.close()
+        for browser in WINDOW_BROWSERS:
+            with self.subTest(browser=browser):
+                self.assertEqual(window_probe_results({list_page.PAGE_PATH: page, review_page.PAGE_PATH: card},
+                                                      list_page.PAGE_PATH, browser), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_review_links_open_one_card_without_leaving_the_list(self) -> None:
@@ -1250,16 +1290,23 @@ async function inspect(){
  check(columns===(ready.defaultView.innerWidth<800 ? 1 : 2),'The card changes columns at 800 pixels.');
  const phone=direct || document.querySelector('.mobile-header').getClientRects().length>0;
  check(phone===(direct || new URLSearchParams(location.search).has('phone')),'The List uses the expected layout.');
+ // A top window starts at the bottom of the action area, or at the top of the view on a page without one.
+ const area=doc.querySelector('[data-page-actions]:not([data-page-window-actions])');
+ const clear=area ? Math.max(area.getBoundingClientRect().top,
+  ...[...area.children].map(control=>control.getBoundingClientRect().bottom)) : 0;
  if(phone){
   const box=dialog.getBoundingClientRect();
-  const top=listFrame?.getBoundingClientRect().top ?? box.top;
-  check(Math.abs(box.width-innerWidth)<=1 && Math.abs(box.height-innerHeight)<=1 && top===0,
-   'The phone dialog fills the screen. '+JSON.stringify({width:innerWidth,height:innerHeight,box,top}));
+  const top=listFrame?.getBoundingClientRect().top ?? 0;
+  check(Math.abs(box.width-innerWidth)<=1 && Math.abs(box.top-clear)<1 && Math.abs(box.bottom-innerHeight)<=1
+   && top===0,
+   'The phone dialog fills the screen below the action area. '
+   +JSON.stringify({width:innerWidth,height:innerHeight,box,top,clear}));
   check(ready.documentElement.scrollWidth<=ready.defaultView.innerWidth,'The card fits the phone width.');
  }else{
   const box=dialog.getBoundingClientRect();
-  check(box.width<=1060 && Math.abs(box.left+box.right-win.innerWidth)<=20 && box.top===16,
-   'The desktop dialog is centered horizontally and starts 16 pixels from the top.');
+  check(box.width<=1060 && Math.abs(box.left+box.right-win.innerWidth)<=20 && Math.abs(box.top-clear-16)<1,
+   'The desktop dialog is centered horizontally and starts 16 pixels below the action area. '
+   +JSON.stringify({box,clear}));
   check(ready.documentElement.scrollWidth<=ready.defaultView.innerWidth,'The card fits the desktop width.');
  }
  if(short && !direct){
@@ -1365,37 +1412,36 @@ async function inspect(){
  if(!phone){
   const timeout=win.AbortSignal.timeout,deadlines=[];
   win.AbortSignal.timeout=milliseconds=>{deadlines.push(milliseconds);return timeout(milliseconds);};
-  for(const dismiss of ['close','escape','outside']){
-   const saved=await readCard(link('sdlc/C1')),savedWindow=saved.defaultView;
-   const savedForm=saved.querySelector('[data-review-form]');
-   let finishRead,beginRead;
-   const reading=new Promise(resolve=>{beginRead=resolve;});
-   const heldRead=new Promise(resolve=>{finishRead=resolve;});
-   win.fetch=(url,options)=>{
-    if(url===win.location.pathname && options?.signal){
-     beginRead();return heldRead;
-    }
-    return fetchList(url,options);
-   };
-   savedWindow.fetch=()=>Promise.resolve(new savedWindow.Response(JSON.stringify({answer:'Works'})));
-   savedForm.requestSubmit(savedForm.querySelector('[value=works]'));
-   await reading;
-   check(dialog.open && !close.disabled,'A saved verdict enables Close before the List refresh ends.');
-   if(dismiss==='close') close.click();
-   if(dismiss==='escape') saved.body.dispatchEvent(new savedWindow.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
-   if(dismiss==='outside'){
-    dialog.dispatchEvent(new win.PointerEvent('pointerdown',{bubbles:true}));
-    dialog.dispatchEvent(new win.MouseEvent('click',{bubbles:true}));
+  const saved=await readCard(link('sdlc/C1')),savedWindow=saved.defaultView,savedFrame=savedWindow.frameElement;
+  const savedForm=saved.querySelector('[data-review-form]');
+  let finishRead,beginRead;
+  const reading=new Promise(resolve=>{beginRead=resolve;});
+  const heldRead=new Promise(resolve=>{finishRead=resolve;});
+  win.fetch=(url,options)=>{
+   if(url===win.location.pathname && options?.signal){
+    beginRead();return heldRead;
    }
-   check(!dialog.open && doc.activeElement===link('sdlc/C1'),'The pending List refresh allows '+dismiss+'.');
-   const pageStatus=doc.querySelector('[data-page-status]');
-   const readFailed=changed(pageStatus,()=>pageStatus.dataset.state==='Failed','the held refresh fails');
-   finishRead(new win.Response(null,{status:503}));
-   await readFailed;
-   await animationFrames(win);
-   if(dialog.open) close.click();
-  }
-  check(deadlines.length>=3 && deadlines.every(value=>value===7000),
+   return fetchList(url,options);
+  };
+  savedWindow.fetch=()=>Promise.resolve(new savedWindow.Response('Invalid JSON'));
+  savedForm.requestSubmit(savedForm.querySelector('[value=works]'));
+  await reading;
+  check(!dialog.open && doc.activeElement===link('sdlc/C1'),
+   'The card stays closed and returns focus during the List refresh.');
+  const notice=doc.querySelector('[data-review-refresh-error]');
+  check(!notice.hidden && notice.textContent==='Saved; the item could not refresh.',
+   'The List reports the unreadable response from a confirmed save.');
+  const currentSearch=doc.querySelector('#list-search');
+  currentSearch.focus();
+  check(doc.activeElement===currentSearch,'Search stays available during the List refresh.');
+  const pageStatus=doc.querySelector('[data-page-status]');
+  const readFailed=changed(pageStatus,()=>pageStatus.dataset.state==='Failed','the held refresh fails');
+  finishRead(new win.Response(null,{status:503}));
+  await readFailed;
+  await changed(dialog,()=>!savedFrame.isConnected,'the saved frame is removed');
+  check(!notice.hidden,'A failed refresh keeps the error visible.');
+  check(!dialog.open && doc.activeElement===currentSearch,'A failed refresh leaves the card closed and preserves focus.');
+  check(deadlines.length>0 && deadlines.every(value=>value===7000),
    'List refresh uses the configured seven-second request timeout.');
   win.AbortSignal.timeout=timeout;
   win.fetch=fetchList;
@@ -1418,7 +1464,7 @@ async function inspect(){
   listForm.querySelector('[value="tell"]').click();
   check(!!listForm.dataset.sending,'The List action starts before the Review save.');
  }
- const card=await readCard(readyLink),cardWin=card.defaultView;
+ const card=await readCard(readyLink),cardWin=card.defaultView,sendingFrame=cardWin.frameElement;
  const formInCard=()=>card.querySelector('[data-review-form]');
  const status=()=>card.querySelector('[data-review-card-notice]').textContent;
  const button=outcome=>formInCard().querySelector('[value="'+outcome+'"]');
@@ -1435,25 +1481,44 @@ async function inspect(){
    };
   }
   const fetchCard=cardWin.fetch.bind(cardWin);
-  let releaseFailure;
-  const failure=new Promise(resolve=>{releaseFailure=resolve;});
-  cardWin.fetch=(url,options)=>{
-   if(options?.method==='POST' && ++reviewPosts===1) return failure;
+  let undoRequests=0,sendReads=0;
+  const hold='/send-hold/'+'a'.repeat(24);
+  cardWin.fetch=async(url,options)=>{
+   if(url===hold+'/undo'){
+    undoRequests++;
+    return cardWin.Response.json({outcome:'undone'});
+   }
+   if(url===hold){
+    sendReads++;
+    return cardWin.Response.json({reason:'The test save failed.'},{status:503});
+   }
+   if(url===cardWin.location.pathname && options?.method==='POST' && ++reviewPosts<=2){
+    return cardWin.Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+   }
    return fetchCard(url,options);
   };
   const words='Keep these words through the failure and conflict.';
   formInCard().elements.feedback.value=words;
   submit('feedback');
+  check(!dialog.open && sendingFrame.isConnected,'Send closes the modal and keeps the card frame.');
+  const toast=()=>document.querySelector('[data-send-undo]');
+  await changed(document.body,()=>toast()?.querySelector('button'),'the Review Undo toast shows');
+  check(!dialog.open && toast().parentElement.parentElement===document.body,'The toast shows on the available page.');
+  check(toast().querySelector('span').textContent==='Sent to sdlc.','The toast names the linked card owner.');
+  const other=await readCard(link('sdlc/C2'));
+  check(dialog.open && other.querySelector('[data-state="Done"]') && sendingFrame.hidden,
+   'A second card opens while the send waits.');
   close.click();
-  dialog.dispatchEvent(new win.Event('cancel',{cancelable:true}));
-  card.body.dispatchEvent(new cardWin.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
-  dialog.dispatchEvent(new win.PointerEvent('pointerdown',{bubbles:true}));
-  dialog.dispatchEvent(new win.MouseEvent('click',{bubbles:true}));
-  check(dialog.open && close.disabled,'Close, Escape, and a click outside keep a saving card open.');
-  releaseFailure(new cardWin.Response(JSON.stringify({reason:'The test save failed.'}),{status:503}));
-  await changed(dialog,()=>!close.disabled,'the refusal enables Close');
+  toast().querySelector('button').click();
+  await changed(dialog,()=>dialog.open && !close.disabled,'Undo reopens the card');
+  check(undoRequests===1 && sendReads===0 && status()==='Undone. Edit and send again.' &&
+   formInCard().elements.feedback.value===words,'Undo restores the card and its words.');
+  submit('feedback');
+  await changed(document.body,()=>toast()?.querySelector('button'),'the next Review Undo toast shows');
+  toast().getAnimations()[0].finish();
+  await changed(dialog,()=>dialog.open && !close.disabled,'the refusal reopens the card');
   check(status()==='Not saved: The test save failed.','The failure remains visible.');
-  check(dialog.open && formInCard().elements.feedback.value===words,'The open card shows the failure and keeps the words.');
+  check(sendReads===1 && formInCard().elements.feedback.value===words,'Failure restores the card and its words.');
   await checkReviewCardConflict(card,'short',check,advance);
   delayRefresh=true;
  }
@@ -1466,28 +1531,31 @@ async function inspect(){
    }
   });
   const observer=new win.MutationObserver(()=>{
-   if(!dialog.open){saveObserver.disconnect();observer.disconnect();resolve();}
+   if(!sendingFrame.isConnected){saveObserver.disconnect();observer.disconnect();resolve();}
   });
   saveObserver.observe(notice,{childList:true});
   observer.observe(doc.body,{childList:true,subtree:true,attributes:true,attributeFilter:['open']});
  });
  submit('works');
+ check(!dialog.open,'The verdict closes the dialog at Send.');
  if(!phone){
   await changed(card.body,()=>status().startsWith('Saved:'),'the verdict is saved');
   await animationFrames(win);
-  check(dialog.open && listReads===0 && row()===before,'The Review save waits for the pending List action.');
+  check(!dialog.open && listReads===0 && row()===before,'The Review refresh waits for the pending List action.');
   releaseList(new win.Response(JSON.stringify({reason:'The test List action was refused.'}),{status:400}));
   await changed(doc.body,()=>!win.recordDetails(row()).querySelector('textarea[name="words"]').form.dataset.sending,
    'the refused List action ends');
-  check(listReads===1 && dialog.open && !close.disabled && button('works').disabled,
+  check(listReads===1 && !dialog.open && button('works').disabled,
    'A refused List action starts one refresh and keeps the saved form disabled.');
   submit('works');
-  check(reviewPosts===3,'The saving form sends no second POST during the refresh.');
+  check(reviewPosts===4,'The saving form sends no second POST during the refresh.');
   releaseRefresh();
  }
  await refreshed;
- if(!phone) check(JSON.stringify(fades)===JSON.stringify([['ARTICLE',180],['ARTICLE',260],['IFRAME',180]]),
-  'The overlay uses the configured card fade durations.');
+ if(!phone) check(doc.querySelector('[data-review-refresh-error]').hidden,
+  'A good refresh clears the previous error.');
+ if(!phone) check(JSON.stringify(fades)===JSON.stringify([['ARTICLE',180],['ARTICLE',260]]),
+  'Show updates uses the configured card fade durations.');
  check(doc.querySelector('[data-list]')!==listBefore && row()===before &&
   row().querySelector('[data-label="State"]').textContent.includes('Reviews done'),
   'The refresh displays the saved verdict.');
@@ -1542,10 +1610,10 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                 class Probe(serve.ReviewLinksHandler):
                     @override
                     def html_response(self, status: int, content: bytes, *,
-                                      delivery_pending: bool | None = None) -> None:
+                                      delivery_pending: bool | None = None, builds_version: str = "") -> None:
                         if self.path in (list_page.PAGE_PATH + "?direct=1", list_page.PAGE_PATH + "?direct=1&short=1"):
                             content = content.replace(b'</body>', probe.encode() + b'</body>')
-                        super().html_response(status, content, delivery_pending=delivery_pending)
+                        super().html_response(status, content, delivery_pending=delivery_pending, builds_version=builds_version)
 
                     @override
                     def review_response(self, content: bytes, content_type: str, prepared: bytes = b"", *,
@@ -1592,7 +1660,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                       patch.object(change_review, "lists_directory", return_value=self.root),
                       patch.object(staff, "snapshot", return_value=members),
                       patch.object(list_page, "counts_strip", return_value=""),
-                      serve.ReviewLinksServer(("127.0.0.1", 0), browser_root, initialize_review=True) as server):
+                      started_review_server(("127.0.0.1", 0), browser_root, initialize_review=True) as server):
                     thread = threading.Thread(target=server.serve_forever, daemon=True)
                     thread.start()
                     try:
@@ -2850,6 +2918,7 @@ document.body.append(result);
         check_counts(initial, 0, 2)
         answered = list_page.render(root, include_counts=False).decode()
         check_counts(answered, 2, 0)
+        self.assertEqual(answered.partition('<script>')[0].count('<small data-new-answer>New answer</small>'), 2)
         news = list_page.waiting_updates(console.NewsRequest(root))
         self.assertEqual({key.rsplit('/', 1)[0] for key in news}, {f'{MORTY.id}/{item.id}' for item in items})
         read_responses: list[list_page.SavedActionState] = []
@@ -2882,12 +2951,14 @@ document.body.append(result);
   if(!recordIsOpen(item(number))) item(number).querySelector('.list-toggle').click();
   const detail=recordDetails(item(number));
   check(detail.querySelector('.question-unread')?.textContent==='Unread','The answer is unread.');
+  check(item(number).querySelector('[data-new-answer]')?.textContent==='New answer','The row marks the new answer.');
   submit('read',detail.querySelector('form'));
   finishPost(receipts[number-1]);
   await flush();
   check(item(number).hidden && count('needs-me')===String(2-number) && count('parked')===String(number),
    'Mark read returns the item to the Parked count.');
   check(parkNote(number)===parks[number-1],'Mark read keeps the original parking condition.');
+  check(!item(number).querySelector('[data-new-answer]'),'Mark read removes the mark from the row.');
  }
  show('parked');
  check(!item(1).hidden && !item(2).hidden,'Both items appear in Parked after Mark read.');
@@ -2936,7 +3007,7 @@ document.body.append(result);
 let countRequests=[],sendCounts;
 window.fetch=async (url,options)=>{
  countRequests.push([url,options.cache]);
- return new Promise(resolve=>{sendCounts=()=>resolve({ok:true,text:async()=>MARKUP});});
+ return new Promise(resolve=>{sendCounts=()=>resolve({headers:new Headers(),ok:true,text:async()=>MARKUP});});
 };
 </script>""".replace("MARKUP", json.dumps(response))
                 probe = """
@@ -3061,7 +3132,7 @@ AbortSignal.timeout=milliseconds=>{
 window.fetch=(url,options)=>{
  if(!String(url).includes('?counts=')) return Promise.resolve(new Response(page));
  return new Promise((resolve,reject)=>{
-  const request={url,signal:options.signal,finish:markup=>resolve({ok:true,text:()=>Promise.resolve(markup)})};
+  const request={url,signal:options.signal,finish:markup=>resolve({headers:new Headers(),ok:true,text:()=>Promise.resolve(markup)})};
   requests.push(request);
   request.signal.addEventListener('abort',()=>reject(request.signal.reason));
  });
@@ -3411,7 +3482,9 @@ window.fetch=(url,options)=>{
         parked = the_list.load(MORTY.id, item.id)
         self.assertIs(parked.parked_until, the_list.ParkUntilDelivered.DELIVERED)
         self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "delivered")
-        self.assertEqual(the_list.feedback_requests(parked)[fields["request"]].parked_until, parked.parked_until)
+        notice = the_list.feedback_requests(parked)[fields["request"]]
+        self.assertEqual(notice.parked_until, parked.parked_until)
+        self.assertEqual(notice.words, f"List page: nate parked item {item.number} until delivered.")
         with self.assertRaisesRegex(the_list.ListError, "different parking"):
             _ = list_page.submit(root, urlencode({**fields, "until": "2026-12-03"}))
         delivered = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
@@ -3559,7 +3632,7 @@ const requests=[];let finishPost;
 window.fetch=async(_path,options={})=>{
  if(options.method!=='POST') throw new Error('Fixture refresh refused');
  requests.push(new URLSearchParams(options.body));
- return new Promise(resolve=>finishPost=result=>resolve({ok:result.ok!==false,status:result.ok===false ? 400 : 200,
+ return new Promise(resolve=>finishPost=result=>resolve({headers:new Headers(),ok:result.ok!==false,status:result.ok===false ? 400 : 200,
   json:async()=>({unread:'false',...result})}));
 };
 </script>'''
@@ -3593,7 +3666,7 @@ window.fetch=async(_path,options={})=>{
   check(row('106').querySelector('.list-state').textContent==='Closed','Remove updates the state text');
   await choose('working','105');row('105').querySelector('.list-toggle').click();
   const refused=submit('105','remove');check(row('105').hidden,'a refused Remove hides the row while pending');
-  finishPost({ok:false,reason:'The fixture refuses this close.'});await flush();await flush();
+  finishPost({headers:new Headers(),ok:false,reason:'The fixture refuses this close.'});await flush();await flush();
   check(!row('105').hidden && row('105').dataset.state==='Working','a refused Remove restores the row');
   check(row('105').dataset.unread==='true' && row('105').querySelector('.list-dot') &&
    refused.querySelector('[value="read"]'),'a refused Remove restores the unread controls');
@@ -3844,7 +3917,7 @@ window.fetch=async(_path,options={})=>{
  requests.push(new URLSearchParams(options.body));
  return new Promise((resolve,reject)=>{
   losePost=()=>reject(new Error('Fixture lost response'));
-  finishPost=result=>resolve({ok:!result.reason,status:result.reason ? 400 : 200,
+  finishPost=result=>resolve({headers:new Headers(),ok:!result.reason,status:result.reason ? 400 : 200,
    json:async()=>({unread:'true',...result})});
  });
 };
@@ -4878,7 +4951,7 @@ observer.observe(original.parentElement,{childList:true});
         def load(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             return self.firefox_view(arguments[-1], None, 1366, 768)
 
-        with patch("scripts.review_links.test_accounts_page.subprocess", SimpleNamespace(run=load)):
+        with patch("scripts.review_links.browser_test_support.subprocess", SimpleNamespace(run=load)):
             self.assertEqual(save_notice_failures(page, 'remove'), [[]])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -5080,6 +5153,12 @@ observer.observe(original.parentElement,{childList:true});
                 self.assertEqual(answered["waiting_for_answer"], "false")
                 self.assertEqual(answered["unread"], "true")
                 self.assertEqual(answered["parked"], "false" if unpark else "true")
+                if not unpark:
+                    current = the_list.load(MORTY.id, item.id)
+                    _, read = list_page.save_action(root, urlencode(self.fields(current, "read")), include_detail=True)
+                    assert read is not None
+                    self.assertEqual((read.get("unread_answer"), read["parked"]), ("false", "true"))
+                    self.assertEqual(the_list.load(MORTY.id, item.id).parked_until, until)
 
     def test_another_question_keeps_the_first_failure_visible(self) -> None:
         root = self.root / "reviews"
@@ -6137,6 +6216,40 @@ window.fetch=async(_url,options)=>{
 ''', reduced_motion=True)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_undo_keeps_the_words_and_leaves_the_row_unsent(self) -> None:
+        self.browser_action_sequence(r'''
+ const until=async(test,label)=>{
+  const end=performance.now()+8000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>setTimeout(resolve,20));
+  }
+ };
+ const before={state:row.dataset.state,unread:row.dataset.unread};
+ const listFetch=window.fetch;let undos=0;
+ window.fetch=async(path,options={})=>{
+  if(String(path).endsWith('/undo')){undos++;return Response.json({outcome:'undone'});}
+  if(options.method==='POST' && !requests.length){
+   requests.push(new URLSearchParams(options.body));
+   return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+  }
+  return listFetch(path,options);
+ };
+ const words=form.elements.words,notice=form.querySelector('[data-send-status]');
+ words.value='Tell morty after Undo.';words.dispatchEvent(new Event('input'));
+ submit('tell');
+ await until(()=>document.querySelector('[data-send-undo] button'),'The Undo toast did not show.');
+ check(document.querySelector('[data-send-undo] span').textContent==='Sent to morty.',
+  'The toast names the record keeper.');
+ document.querySelector('[data-send-undo] button').click();
+ await until(()=>notice.textContent==='Undone. Edit and send again.','The row did not say that the send was undone.');
+ check(words.value==='Tell morty after Undo.','After Undo the Tell keeps its words.');
+ check(row.dataset.state===before.state && row.dataset.unread===before.unread,
+  'After Undo the row keeps its state and its unread mark, so it is not marked sent.');
+ check(undos===1 && requests.length===1,'Undo posts once and nothing else is sent.');
+''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_shows_saved_actions_and_refreshes_until_delivery_ends(self) -> None:
         steps = r'''
  const view=document.querySelector('[data-record-inline-view]');
@@ -6209,7 +6322,7 @@ window.fetch=async(_url,options)=>{
  let countReads=0,lastPageQuery;
  window.fetch=(url,options)=>{
   const query=new URL(url,location.href).searchParams;
-  if(query.has('counts')){countReads++;return Promise.resolve({ok:true,text:async()=>DEFERRED_LINKS});}
+  if(query.has('counts')){countReads++;return Promise.resolve({headers:new Headers(),ok:true,text:async()=>DEFERRED_LINKS});}
   if(options?.method!=='POST') lastPageQuery=query;
   return fetchPage(url,options);
  };
@@ -6644,7 +6757,7 @@ requestAnimationFrame(()=>requestAnimationFrame(()=>{frame.src=frame.dataset.src
               patch.object(change_page, "recover_pending"),
               patch.object(list_page, "recover_pending"),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
-              serve.ReviewLinksServer(("127.0.0.1", 0), self.root / "reviews") as server):
+              started_review_server(("127.0.0.1", 0), self.root / "reviews") as server):
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
@@ -6853,7 +6966,7 @@ const change=async path=>{
               patch.object(list_page, "counts_strip", return_value=""),
               patch.object(staff, "caller_identity", return_value=MORTY.current_session),
               patch.object(change_page, "send_question", return_value=question_outcome()),
-              serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
+              started_review_server(("127.0.0.1", 0), root) as server):
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
@@ -6894,8 +7007,8 @@ window.fetch=async(path,options={})=>{
  requests.push(new URLSearchParams(options.body));
  return new Promise((resolve,reject)=>{
   losePost=()=>reject(new Error('Fixture lost response'));
-  failPostBody=()=>resolve({ok:true,status:200,json:async()=>{throw new Error('The response is unreadable.');}});
-  finishPost=result=>resolve({ok:!result.reason,status:result.status ?? (result.reason ? 400 : 200),
+  failPostBody=()=>resolve({headers:new Headers(),ok:true,status:200,json:async()=>{throw new Error('The response is unreadable.');}});
+  finishPost=result=>resolve({headers:new Headers(),ok:!result.reason,status:result.status ?? (result.reason ? 400 : 200),
    json:async()=>({unread:'true',...result})});
  });
 };
@@ -7063,6 +7176,8 @@ window.fetch=async(path,options={})=>{
                     item = the_list.load(MORTY.id, item.id)
                     feedback = the_list.feedback_requests(item)[fields["request"]]
                     self.assertEqual(feedback.words, words)
+                    if action == "park":
+                        self.assertEqual(item.parked_until, the_list.time_value("2026-12-03"))
                     if action == "tell":
                         self.assertEqual(item.log[-1].what, the_list.MarkedRead())
                     self.assertEqual(item.log[-2 if action == "tell" else -1].what, feedback)
@@ -7086,7 +7201,7 @@ window.fetch=async(path,options={})=>{
                     list_page.deliver(list_page.submit(root, urlencode(fields)))
                     self.assertEqual((send.call_count, the_list.load(MORTY.id, item.id).log), before)
             self.assertEqual(item.state, the_list.ItemState.CLOSED)
-            self.assertEqual(item.parked_until, the_list.time_value("2026-12-03"))
+            self.assertIs(item.parked_until, the_list.NoTimestamp.UNSET)
             self.assertEqual((item.title, item.owner, item.next_step), (initial.title, initial.owner, initial.next_step))
             _ = the_list.reopen(MORTY.id, item.id, source="morty")
             _ = the_list.update(MORTY.id, item.id, {"latest_status": "Morty acts."}, source="morty")
@@ -7111,6 +7226,33 @@ window.fetch=async(path,options={})=>{
         self.assertEqual([(entry.what, entry.source) for entry in saved.log if isinstance(entry.what, the_list.MarkedRead)],
                          [(the_list.MarkedRead(), the_list.PAGE_SOURCE)])
         self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].words, "Keep this result.")
+
+        root = self.root / "reviews"
+        for keeper, before, after in (
+            (MORTY.id, the_list.ItemState.WAITING_FOR_NATE, the_list.ItemState.WORKING),
+            (DWIGHT.id, the_list.ItemState.DELIVERED, the_list.ItemState.WORKING),
+            (MORTY.id, the_list.ItemState.BLOCKED, the_list.ItemState.BLOCKED),
+        ):
+            with self.subTest(keeper=keeper, state=before):
+                item = self.add("Check the Tell state", before)
+                if keeper != MORTY.id:
+                    legacy = the_list.folder(keeper)
+                    legacy.mkdir(parents=True)
+                    _ = (the_list.folder(MORTY.id) / f"{item.id}.md").rename(legacy / f"{item.id}.md")
+                request, token = list_page.signed_item_request(
+                    list_page.ListRecord(keeper, item), list_page.form_secret(root))
+                body = urlencode(dict(keeper=keeper, id=item.id, request=request, token=token,
+                                      action="tell", words="Keep this state change.", until=""))
+                delivery, state = list_page.save_action(root, body, include_detail=True)
+                assert state is not None
+                saved = the_list.load(keeper, item.id)
+                self.assertIs(saved.state, after)
+                self.assertEqual((state["item_state"], state["unread"]), (after.value, "false"))
+                self.assertEqual(saved.questions, ())
+                self.assertEqual(delivery, list_page.ListFeedbackDelivery(keeper, item.id, request))
+                self.assertEqual(the_list.feedback_requests(saved)[request].words, "Keep this state change.")
+                _ = list_page.submit(root, body)
+                self.assertEqual(the_list.load(keeper, item.id), saved)
 
     def test_tell_on_a_read_item_adds_no_read_log_entry(self) -> None:
         item = self.add("An update already read")
@@ -7223,7 +7365,7 @@ window.fetch=async(path,options={})=>{
         setup = '''<script>
 window.fetch=async(_path,options={})=>{
  if(options.method!=='POST') throw new Error('Fixture refresh refused');
- return {ok:true,json:async()=>({unread:'UNREAD'})};
+ return {headers:new Headers(),ok:true,json:async()=>({unread:'UNREAD'})};
 };
 </script>'''
         probe = '''<script>
@@ -7253,6 +7395,51 @@ window.fetch=async(_path,options={})=>{
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue('<p id="probe-result">PASS</p>' in result.stdout,
                                 f"The {action} action must show the saved unread state and apply the Unread filter.")
+
+        with self.subTest(action="tell", view="needs-me"):
+            item = self.add("Check the waiting result", the_list.ItemState.WAITING_FOR_NATE)
+            browser = self.chrome()
+            root = self.root / "reviews"
+            with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+                  patch.object(change_page, "send_to_staff", return_value=None),
+                  serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
+                thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+                thread.start()
+                try:
+                    browser.navigate(f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}#show=needs-me")
+                    result = browser.command("Runtime.evaluate", {
+                        "expression": r"""(async () => {
+ const row=document.querySelector('[data-number="ITEM_NUMBER"]');
+ const chip=document.getElementById('filter-show-needs-me');
+ const before=[row.hidden,Number(chip.dataset.filterCount)];
+ row.querySelector('.list-toggle').click();
+ const form=recordDetails(row).querySelector('form');
+ const words=form.elements.words;
+ words.value='Use the waiting result.';
+ words.dispatchEvent(new Event('input',{bubbles:true}));
+ const finished=new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   if(form.dataset.sending) return;
+   observer.disconnect();
+   resolve();
+  });
+  observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+ });
+ form.querySelector('[value="tell"]').click();
+ if(!form.dataset.sending) throw new Error('Tell did not submit.');
+ await finished;
+ return {before,after:[row.hidden,Number(chip.dataset.filterCount),row.dataset.state],
+  sameRow:row===document.querySelector('[data-number="ITEM_NUMBER"]')};
+})()""".replace("ITEM_NUMBER", str(item.number)),
+                        "awaitPromise": True, "returnByValue": True}, browser.session)
+                    self.assertNotIn("exceptionDetails", result)
+                    value = cast(dict[str, object], result["result"])
+                    self.assertEqual(value.get("value"), {
+                        "before": [False, 1], "after": [True, 0, "Working"], "sameRow": True})
+                    self.assertIs(the_list.load(MORTY.id, item.id).state, the_list.ItemState.WORKING)
+                finally:
+                    server.shutdown()
+                    thread.join()
 
     def test_feedback_recovers_after_restart_and_alerts_after_failed_tries(self) -> None:
         root = self.root / "reviews"
@@ -7388,7 +7575,7 @@ window.fetch=async(_path,options={})=>{
             width, _, height = arguments[arguments.index("--window-size") + 1].partition(",")
             return self.firefox_view(arguments[-1], path, int(width), int(height))
 
-        with patch("scripts.review_links.test_page_frame.subprocess", SimpleNamespace(run=screenshot)):
+        with patch("scripts.review_links.browser_test_support.subprocess", SimpleNamespace(run=screenshot)):
             assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
@@ -7536,7 +7723,7 @@ window.fetch=async(_path,options={})=>{
    row.dataset.unread='false';row.querySelector('.list-dot')?.remove();recordDetails(row).querySelector('[value="read"]')?.remove();
    original=page.documentElement.outerHTML;
   }
-  const result={ok:true,status:200,json:async()=>({state:'sent',unread:'false',
+  const result={headers:new Headers(),ok:true,status:200,json:async()=>({state:'sent',unread:'false',
    ...(fields.get('action')==='remove' ? {item_state:'Closed'} : {})})};
   if(holdPost) return await new Promise(resolve=>finishPost=(reply=result)=>resolve(reply));
   return result;
@@ -7812,7 +7999,7 @@ try{
  const refused=submitted(refusedForm,refusedForm.querySelector('[value="tell"]'));
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  check(reads.length===3,'The shared status event makes no List request during a row save.');
- finishPost({ok:false,status:409,json:async()=>({reason:'The row save was refused.'})});
+ finishPost({headers:new Headers(),ok:false,status:409,json:async()=>({reason:'The row save was refused.'})});
  holdPost=false;finishPost=undefined;
  await refused;
  check(reads.length===3 && refreshed.isConnected,'A refused row save makes no List request after the event.');

@@ -1044,7 +1044,7 @@ function showHiddenActionResults(items){
  if(status.textContent!==text) status.textContent=text;
  status.hidden=!text;
 }
-/** @param {{kind:'success' | 'failure', message:string, hiddenMessage?:string}} result */
+/** @param {{kind:'success' | 'failure' | 'undone', message:string, hiddenMessage?:string}} result */
 function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
  const key=item.dataset.key;
  actionNotices.set(key,{message,hiddenMessage});
@@ -1053,7 +1053,8 @@ function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
  if(status) status.textContent=message;
  apply(false,{animate:true});
  const restored=mounted.get(key);
- if(kind==='failure' && restored && rowMotion.has(item)){
+ // A refused or undone send brings its departing row back.
+ if(kind!=='success' && restored && rowMotion.has(item)){
   animateRow(content.querySelector('table'),restored,true,item);
  }
 }
@@ -1317,7 +1318,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  highlightedRow?.removeAttribute('data-record-highlight');
  clearTimeout(highlightTimer);
  const banner=document.querySelector('[data-page-status]');
- const inset=typeof stuckPageHeadingBottom==='function' ? stuckPageHeadingBottom() :
+ const inset=typeof stuckPageActionsBottom==='function' ? stuckPageActionsBottom() :
   banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
  row.style.scrollMarginTop=(inset+16)+'px';
  row.querySelector('.list-toggle').focus({preventScroll:true});

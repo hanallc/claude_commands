@@ -5,10 +5,12 @@ from scripts.lint.memory_test_support import write_config_fixture
 
 from scripts.lib.checkout_test_support import python_tool_source
 
+import contextlib
 import fcntl
 import base64
 import hashlib
 import importlib.util
+import io
 import json
 import gzip
 import os
@@ -39,6 +41,7 @@ from unittest.mock import ANY, Mock, call, patch
 from typing import TextIO, cast, override
 from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 
 from scripts.aws_target import aws_page, machines_page
@@ -48,6 +51,7 @@ from scripts.build_queue import memory_feed
 from scripts.for_you.action import ActionStore
 from scripts.message import send_result
 from scripts.review_links.test_page_question import question_outcome
+from scripts.review_links.server_test_support import started_review_server
 from scripts.production import (
     change_review, change_routing, delivery_state, investigation, next_item, proposal_issue,
     record_store, staff, the_list, tidy_wrapped, update_registration,
@@ -56,7 +60,7 @@ from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
 from scripts.review_links import console_tune, new_item_dialog, page_frame, page_question, question_record, reply_tokens, review_submissions
-from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, placement_disk, review_actions, review_later, review_page, review_items, serve, test_review_page
+from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item, placement_disk, review_actions, review_later, review_page, review_items, send_hold, serve, test_review_page
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -180,7 +184,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         with (patch.object(serve, "loaded_module_stamps", return_value={}),
               patch.object(change_page, "recover_pending"),
               patch.object(list_page, "recover_pending")):
-            server = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
+            server = self.enterContext(started_review_server(("127.0.0.1", 0), self.root))
         server.review_cache.synchronize()
         self._server = server
         review_posts = self.review_posts
@@ -199,7 +203,6 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         server.RequestHandlerClass = ReviewFixtureHandler
         self.port = server.server_port
-        self.addCleanup(server.server_close)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         self.addCleanup(thread.join, 5)
@@ -789,7 +792,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(response.status, 200, response.body)
                 self.assertNotIn("content-security-policy", response.headers)
                 self.assertIn(b'<main id="stage"></main>', response.body)
-                self.assertIn(b'<aside id="panel"><div class="page-heading"><h1>' + heading + b'</h1>', response.body)
+                self.assertIn(b'<aside id="panel"><div class="page-heading-actions" data-page-actions>', response.body)
+                self.assertIn(b'</div></div><div class="page-heading"><h1>' + heading + b'</h1>'
+                              + page_frame.HEADING_MEASURE.encode() + b'</div></aside>', response.body)
                 self.assertIn(b'data-page-owner="placement_disk"', response.body)
 
     def test_placement_disk_file_expands_the_home_folder(self) -> None:
@@ -844,6 +849,204 @@ class ReviewLinksServerTests(unittest.TestCase):
         filed, = investigation.records(other.id)
         self.assertEqual(filed.question, request.words)
         self.assertEqual(investigation.records(owner.id), [])
+
+    def held_http(self, method: str, path: str, body: bytes | None = None, *,
+                  headers: dict[str, str] | None = None) -> tuple[int, str, dict[str, object]]:
+        """Send one request from the console origin and return its status, hold header, and JSON fields."""
+        host = f"127.0.0.1:{self.port}"
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
+        try:
+            connection.request(method, path, body, {"Host": host, "Origin": f"http://{host}",
+                                                    "Content-Type": "application/json", **(headers or {})})
+            response = connection.getresponse()
+            body = response.read()
+            json_answer = (response.getheader("Content-Type") or "").startswith("application/json")
+            return (response.status, response.getheader("X-Send-Hold", ""),
+                    cast(dict[str, object], json.loads(body)) if json_answer and body else {})
+        finally:
+            connection.close()
+
+    def hold_states(self) -> list[str]:
+        """Return the state of each saved hold file."""
+        return [cast(send_hold.HoldFile, json.loads(path.read_text(encoding="utf-8")))["state"]
+                for path in sorted((self.root / send_hold.HOLD_FOLDER).glob("*.json"))]
+
+    def held_new_item(self) -> tuple[test_review_page.ReviewPageTests, staff.StaffRow, bytes]:
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        other = fixture_member("producer", name="another-recipient")
+        _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\n")
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, other.id),
+                          page="review", request_id="r6-" + uuid4().hex,
+                          page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        return case, other, self.new_item_body(request)
+
+    def test_a_held_new_item_waits_for_undo_time_then_files_once(self) -> None:
+        case, other, body = self.held_new_item()
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=1\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(send_hold, "RELEASE_GRACE_SECONDS", 0.0),
+              capture_sender("send_message") as send):
+            status, hold, fields = self.held_http("POST", review_page.NEW_ITEM_PATH, body,
+                                                  headers={send_hold.HOLD_HEADER: "1"})
+            self.assertEqual((status, hold, fields["seconds"]), (202, "held", 1), fields)
+            hold_id = cast(str, fields["hold"])
+            self.assertEqual(investigation.records(other.id), [])
+            send.assert_not_called()
+            status, hold, fields = self.held_http("GET", f"{send_hold.HOLD_PATH}/{hold_id}")
+            self.assertEqual((status, hold), (200, ""), fields)
+            send.assert_called_once_with(f"session:{other.current_session}", change_page.SENDER, ANY)
+        self.assertIn(cast(str, fields["key"]), cache.get().records)
+        self.assertEqual(len(investigation.records(other.id)), 1)
+        # A browser that lost the answer reads the same result again; an Undo is now too late.
+        self.assertEqual(self.held_http("GET", f"{send_hold.HOLD_PATH}/{hold_id}")[::2], (200, fields))
+        self.assertEqual(self.held_http("POST", f"{send_hold.HOLD_PATH}/{hold_id}/undo")[::2],
+                         (409, {"outcome": "already sent"}))
+        self.assertEqual(self.held_http("HEAD", f"{send_hold.HOLD_PATH}/{hold_id}")[0], 405)
+
+    def test_a_closed_page_sends_a_held_new_item_at_once(self) -> None:
+        case, other, body = self.held_new_item()
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              capture_sender("send_message") as send):
+            status, _, fields = self.held_http("POST", review_page.NEW_ITEM_PATH, body,
+                                               headers={send_hold.HOLD_HEADER: "1"})
+            self.assertEqual(status, 202, fields)
+            hold = f"{send_hold.HOLD_PATH}/{fields['hold']}"
+            self.assertEqual(self.held_http("POST", hold + "/send")[0], 200)
+            status, _, fields = self.held_http("GET", hold)
+            self.assertEqual(status, 200, fields)
+            self.assertEqual(self.held_http("POST", hold + "/send")[0], 409)
+            send.assert_called_once_with(f"session:{other.current_session}", change_page.SENDER, ANY)
+        self.assertEqual(len(investigation.records(other.id)), 1)
+
+    def test_an_undone_new_item_is_never_filed_or_sent(self) -> None:
+        case, other, body = self.held_new_item()
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              capture_sender("send_message") as send):
+            status, _, fields = self.held_http("POST", review_page.NEW_ITEM_PATH, body,
+                                               headers={send_hold.HOLD_HEADER: "1"})
+            self.assertEqual(status, 202, fields)
+            hold_id = cast(str, fields["hold"])
+            undo = f"{send_hold.HOLD_PATH}/{hold_id}/undo"
+            refused = self.held_http("POST", undo, headers={"Origin": "https://elsewhere.invalid"})
+            self.assertEqual(refused[0], 403)
+            with patch.object(send_hold, "write_text_atomic", side_effect=OSError("disk full")), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(self.held_http("POST", undo)[::2],
+                                 (503, {"reason": "The undo failed. The send can still leave."}))
+            self.assertEqual(self.hold_states(), ["pending"])
+            self.assertEqual(self.held_http("POST", undo)[::2], (200, {"outcome": "undone"}))
+            # A repeated Undo, after a lost answer, still says undone.
+            self.assertEqual(self.held_http("POST", undo)[::2], (200, {"outcome": "undone"}))
+            result = f"{send_hold.HOLD_PATH}/{hold_id}"
+            self.assertEqual(self.held_http("GET", result, headers={"Origin": "https://elsewhere.invalid"})[0], 403)
+            self.assertEqual(self.held_http("GET", result)[::2], (404, {"reason": "This send was undone."}))
+            send.assert_not_called()
+        self.assertEqual(investigation.records(other.id), [])
+        self.assertEqual(self.hold_states(), ["undone"])
+        self.assertEqual(self.request(f"/{send_hold.HOLD_FOLDER}/{hold_id}.json").status, 404)
+
+    def test_each_console_send_path_holds_a_marked_send_and_no_other_path_does(self) -> None:
+        marked = {send_hold.HOLD_HEADER: "1"}
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
+        _ = self.enterContext(patch.object(change_browser, "browser_manifest", return_value=("token", "")))
+        browser = f"/{change_page.CONSOLE_FOLDER}/changes.html"
+        for path in [*sorted(serve.HELD_SEND_PATHS), browser]:
+            with self.subTest(path=path), patch.object(serve.ReviewLinksHandler, "_write_post") as write:
+                status, hold, fields = self.held_http("POST", path, b"outcome=works", headers=marked)
+                self.assertEqual((status, hold), (202, "held"), fields)
+                write.assert_not_called()
+                undo = f"{send_hold.HOLD_PATH}/{fields['hold']}/undo"
+                self.assertEqual(self.held_http("POST", undo)[::2], (200, {"outcome": "undone"}))
+        status, hold, _ = self.held_http("POST", serve.QUEUE_MOVE_PATH, b"{}", headers=marked)
+        self.assertNotEqual((status, hold), (202, "held"))
+        status, hold, _ = self.held_http("POST", "/z12345/notes.html", b"{}", headers=marked)
+        self.assertNotEqual((status, hold), (202, "held"))
+        self.assertEqual(self.held_http("POST", review_page.PAGE_PATH + "?x=1", b"words", headers=marked)[0], 403)
+        self.assertEqual(self.held_http("POST", review_page.PAGE_PATH, b"", headers=marked)[0], 400)
+        self.assertEqual(self.held_http("POST", f"{send_hold.HOLD_PATH}/not-an-id/undo")[0], 404)
+        self.assertEqual(set(self.hold_states()), {"undone"})
+
+    def raw_held_post(self, headers: list[str], body: bytes) -> bytes:
+        """Send one marked Review POST with these extra header lines, end the send side, and return the answer."""
+        host = f"127.0.0.1:{self.port}"
+        lines = [f"POST {review_page.PAGE_PATH} HTTP/1.1", f"Host: {host}", f"Origin: http://{host}",
+                 f"{send_hold.HOLD_HEADER}: 1", "Content-Type: application/x-www-form-urlencoded", *headers]
+        answer = b""
+        with socket.create_connection(("127.0.0.1", self.port), timeout=TEST_HANG_GUARD_SECS) as connection:
+            connection.sendall(("\r\n".join(lines) + "\r\n\r\n").encode() + body)
+            connection.shutdown(socket.SHUT_WR)
+            while chunk := connection.recv(65536):
+                answer += chunk
+        return answer
+
+    def test_a_marked_send_without_one_exact_size_is_refused_and_not_held(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
+        # The first three are refused before the body is read, so they send no body.
+        for case, headers, body, reason in (
+            ("two sizes", ["Content-Length: 5", "Content-Length: 5"], b"", b"The send has no valid size."),
+            ("chunked", ["Content-Length: 5", "Transfer-Encoding: chunked"], b"", b"The send has no valid size."),
+            ("too large", [f"Content-Length: {serve.HELD_SEND_LIMIT + 1}"], b"", b"The send is empty or too large."),
+            ("short body", ["Content-Length: 100"], b"words", b"The send is incomplete."),
+        ):
+            with self.subTest(case=case):
+                answer = self.raw_held_post(headers, body)
+                self.assertEqual(answer.split(b" ", 2)[1], b"400", answer[:300])
+                self.assertIn(reason, answer)
+        self.assertEqual(list((self.root / send_hold.HOLD_FOLDER).glob("*.json")), [])
+
+    def test_a_held_review_answer_leaves_after_the_undo_time_with_its_normal_answer(self) -> None:
+        case = self.review_fixture(changes=1)
+        key = "page-owner/C1"
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=1\n")
+        form = case.card_body(cache.get(), key, "works", "The held answer.")
+        marked = {send_hold.HOLD_HEADER: "1", "Content-Type": "application/x-www-form-urlencoded"}
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(send_hold, "RELEASE_GRACE_SECONDS", 0.0),
+              patch.object(cache, "save", wraps=cache.save) as save):
+            status, hold, fields = self.held_http("POST", review_page.PAGE_PATH, form.encode(), headers=marked)
+            self.assertEqual((status, hold, fields["seconds"]), (202, "held", 1), fields)
+            save.assert_not_called()
+            self.assertEqual(cache.get().records[key].state, review_items.ReviewState.OPEN)
+            status, hold, answer = self.held_http("GET", f"{send_hold.HOLD_PATH}/{fields['hold']}")
+            self.assertEqual((status, hold), (200, ""), answer)
+            self.assertTrue({"answer", "version", "delivery_pending"} <= answer.keys(), answer)
+            self.assertTrue(self.review_posts.wait_until_none_run())
+            save.assert_called_once()
+        rows = {row["#"]: row for row in change_review.review_rows(case.fixture.review_list)}
+        self.assertEqual(rows["C1"]["Verdict"], "works: The held answer.")
+
+    def test_a_held_review_answer_reports_a_delivery_failure_after_saving(self) -> None:
+        case = self.review_fixture(changes=1)
+        key = "page-owner/C1"
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=1\n")
+        form = case.card_body(cache.get(), key, "not works", "The proof failed.")
+        marked = {send_hold.HOLD_HEADER: "1", "Content-Type": "application/x-www-form-urlencoded"}
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(send_hold, "RELEASE_GRACE_SECONDS", 0.0),
+              patch.object(change_page, "send_to_staff", side_effect=OSError("The owner is offline."))):
+            status, hold, fields = self.held_http("POST", review_page.PAGE_PATH, form.encode(), headers=marked)
+            self.assertEqual((status, hold), (202, "held"))
+            status, hold, answer = self.held_http("GET", f"{send_hold.HOLD_PATH}/{fields['hold']}")
+            self.assertEqual((status, hold, answer.get("answer")), (200, "", "not works: The proof failed."))
+            self.assertEqual(answer.get("send_failure"), "Delivery failed: The owner is offline.")
+            self.assertFalse(answer["delivery_pending"])
+        rows = {row["#"]: row for row in change_review.review_rows(case.fixture.review_list)}
+        self.assertEqual(rows["C1"]["Verdict"], "not works: The proof failed.")
 
     def test_list_owner_control_and_sends_use_the_configured_producer(self) -> None:
         case = self.review_fixture()
@@ -900,6 +1103,46 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(the_list.records(recipient.id, include_closed=True), [])
                     self.assertNotIn("list_key", saved)
                     send.assert_called_once_with(f"session:{recipient.current_session}", change_page.SENDER, ANY)
+
+    def test_new_item_command_files_through_the_handler_and_makes_its_list_item(self) -> None:
+        words = "The frame time graph has a gap."
+        self.check_new_item_list_filing("bug", review_items.ReviewType.BUG, words, words)
+
+    def test_enhancement_command_files_and_prefixes_the_list_title_at_the_word_limit(self) -> None:
+        first_line = "Show the next check in the row."
+        words = first_line + "\n" + "x" * (new_item_dialog.MAX_WORDS_LENGTH - len(first_line) - 1)
+        self.check_new_item_list_filing("enhancement", review_items.ReviewType.INVESTIGATION,
+                                        words, f"Enhancement: {words}")
+
+    def check_new_item_list_filing(self, kind: str, review_type: review_items.ReviewType, words: str,
+                                   filed_words: str) -> None:
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        unit = case.fixture.unit
+        morty = fixture_member("producer", name="morty")
+        producer = fixture_member("producer", name="bob")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
+        _ = conf.path("producer_map").write_text(f"{owner.id} = {producer.id}\n", encoding="utf-8")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        output, errors = StringIO(), StringIO()
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(for_you, "console_address", return_value=for_you.ConsoleAddress("127.0.0.1", self.port)),
+              patch("platform.system", return_value="Linux"),
+              capture_sender("send_message"), redirect_stdout(output), redirect_stderr(errors)):
+            code = new_item.main([kind, unit.name, words, "--session", "another-session"])
+            self.assertTrue(self.new_item_posts.wait_until_none_run())
+        self.assertEqual(code, new_item.Outcome.FILED, errors.getvalue())
+        self.assertNotIn("new_item:", errors.getvalue())
+        key, = [key for key, record in cache.get().records.items() if record.type == review_type]
+        item, = the_list.records(morty.id, include_closed=True)
+        title = filed_words.splitlines()[0]
+        self.assertEqual((cache.get().records[key].title, cache.get().records[key].owner), (title, owner.id))
+        self.assertEqual((item.title, item.owner, item.producer, item.unit, item.reviews),
+                         (title, owner.id, producer.id, unit.name, (key,)))
+        self.assertEqual(item.latest_status, filed_words)
+        self.assertEqual(output.getvalue(), f"{kind.capitalize()} \u2192 {unit.name}, a unit of {owner.name}. "
+                         + f"Producer: bob (from {owner.name}). List item {item.number}.\n")
 
     def test_list_draft_retries_after_failed_delivery_setup(self) -> None:
         from scripts.review_links.test_review_submissions import PNG
@@ -1679,6 +1922,40 @@ class ReviewLinksServerTests(unittest.TestCase):
                               f"http://127.0.0.1:{self.port}/console/review.html#owner=builds",
                               new_item_dialog.PageViewport(1280, 800, True), 1.5, (), (), "Owner builds", screenshot))
         return case.root / "page-states", cache, request
+
+    def test_published_builds_page_versions_each_write_in_one_second(self) -> None:
+        from scripts.build_queue import memory_files
+
+        output = self.root / "builds"
+        output.mkdir()
+        _ = conf.path("memory_feed").write_text(f"output_folder={output}\n", encoding="utf-8")
+        page = output / memory_files.PAGE_NAME
+        route = f"/builds/{memory_files.PAGE_NAME}"
+        source = memory_files.PAGE_SOURCE.read_bytes()
+        versions: list[str] = []
+        for offset in (100_000_000, 200_000_000):
+            with self.subTest(offset=offset):
+                _ = page.write_bytes(source)
+                mark = 1_700_000_000_000_000_000 + offset
+                os.utime(page, ns=(mark, mark))
+                reply = self.request(route)
+                self.assertEqual(reply.status, 200)
+                version = reply.headers.get("x-builds-page-version", "")
+                self.assertTrue(version)
+                self.assertIn(f'<meta name="builds-page-version" content="{version}">'.encode(), reply.body)
+                versions.append(version)
+                with (socket.create_connection(("127.0.0.1", self.port), TEST_HANG_GUARD_SECS) as client,
+                      client.makefile("rb") as head_reply):
+                    client.sendall((f"HEAD {route} HTTP/1.0\r\n"
+                                    "Host: 127.0.0.1\r\nConnection: close\r\n\r\n").encode())
+                    raw = head_reply.read()
+                head, delimiter, body = raw.partition(b"\r\n\r\n")
+                self.assertTrue(delimiter)
+                status_line, _, raw_headers = head.partition(b"\r\n")
+                self.assertEqual(status_line.split()[1:2], [b"200"])
+                self.assertEqual(parse_headers(BytesIO(raw_headers))["X-Builds-Page-Version"], version)
+                self.assertEqual(len(body), 0, "HEAD sent a response body")
+        self.assertEqual(len(set(versions)), 2)
 
     def test_only_the_published_aws_machines_path_matches_the_console_page(self) -> None:
         output = self.root / "AWS reports"
@@ -3112,9 +3389,6 @@ class ReviewLinksServerTests(unittest.TestCase):
         morty = fixture_member("producer", name="morty")
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\nowner.default={showrunner.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
-        # The dialog sends Feedback as an Investigation.
-        kinds = [new_item_dialog.SubmissionKind(kind if kind != "feedback" else "investigation")
-                 for kind, _, _ in new_item_dialog.KINDS]
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
               capture_sender("send_message")):
@@ -3128,14 +3402,17 @@ class ReviewLinksServerTests(unittest.TestCase):
                     continue
                 proposal_names = [row["name"] for row in recipients if row["proposal"]]
                 self.assertCountEqual(proposal_names, [showrunner.name, producer.name])
-                for kind in kinds:
+                for chip, _, _ in new_item_dialog.KINDS:
+                    kind = (chip if chip == "enhancement" else
+                            new_item_dialog.SubmissionKind("investigation" if chip == "feedback" else chip))
                     for row in recipients:
                         if kind == new_item_dialog.SubmissionKind.PROPOSAL and row["name"] not in proposal_names:
                             continue
-                        with self.subTest(page=page, kind=kind, name=row["name"]):
-                            request = replace(case.submission_request(kind, staff.StaffId(str(row["id"]))), page=page,
-                                              page_recipient=new_item_dialog.PageRecipient.SELECTED,
-                                              request_id="r6-" + uuid4().hex)
+                        with self.subTest(page=page, kind=chip, name=row["name"]):
+                            request = new_item_dialog.NewItemRequest(
+                                "r6-" + uuid4().hex, kind, staff.StaffId(str(row["id"])),
+                                f"Check the {kind} record.", new_item_dialog.NoEvidence(), page=page,
+                                page_recipient=new_item_dialog.PageRecipient.SELECTED)
                             response = self.new_item_http(self.new_item_body(request), finished=True)
                             self.assertEqual(response.status, 200, response.body)
 
@@ -3331,10 +3608,10 @@ class ReviewLinksServerTests(unittest.TestCase):
                 card = self.request(review_page.PAGE_PATH+'?'+urlencode({'body': key}))
             self.assertEqual(card.status, 200)
 
-    def request(self, path: str) -> HttpReply:
+    def request(self, path: str, *, method: str = "GET") -> HttpReply:
         connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
         try:
-            connection.request("GET", path)
+            connection.request(method, path)
             response = connection.getresponse()
             headers = {name.lower(): value for name, value in response.getheaders()}
             return HttpReply(response.status, headers.get("content-type", ""), response.read(), headers)
@@ -3467,7 +3744,7 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_server_initializes_review_on_a_fresh_root(self) -> None:
         with (patch.object(serve, "loaded_module_stamps", return_value={}),
               patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending")):
-            server = self.enterContext(serve.ReviewLinksServer(("127.0.0.1", 0), self.root, initialize_review=True))
+            server = self.enterContext(started_review_server(("127.0.0.1", 0), self.root, initialize_review=True))
         server.review_cache.synchronize()
         self.assertTrue((self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST).exists())
         self.port = server.server_port
@@ -3864,7 +4141,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
-        request = case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id)
+        kind = new_item_dialog.SubmissionKind.QUESTION
+        request = case.submission_request(kind, owner.id)
         with (patch.object(self.server, 'review_cache', cache),
               patch.object(self.server, 'delivery_status', case.status),
               capture_sender('send_to_staff') as send):
@@ -3878,7 +4156,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             path = review_items.source_path(waiting)
             initial = review_items.submission_origin(waiting)
             assert isinstance(initial, new_item_dialog.ReviewSubmission)
-            reply_key = new_item_dialog.submission_key(request.kind, owner.id, sent['id'], request.request_id)
+            reply_key = new_item_dialog.submission_key(kind, owner.id, sent['id'], request.request_id)
             self.assertTrue(change_page.answer_item(reply_key, 'Use the wide layout.', initial.reply_token, case.status))
             response, _ = cache.publish_record(cache.get(), key)
             self.assertEqual(response.records[key].type, review_items.ReviewType.RESPONSE)
@@ -4289,10 +4567,10 @@ class ReviewLinksServerTests(unittest.TestCase):
             native_write(before)
 
         def project_question(before: update_registration.QuestionRecord, members: staff.StaffSnapshot,
-                             *, unowned: bool = False) -> review_items.ReviewItem:
+                             *, unowned: bool = False, zone: ZoneInfo | None = None) -> review_items.ReviewItem:
             if before.path == path:
                 reply()
-            return project(before, members, unowned=unowned)
+            return project(before, members, unowned=unowned, zone=zone)
 
         with patch.object(update_registration, 'write_question_record', write), patch.object(
                 review_items, 'question_item', project_question):
@@ -5398,7 +5676,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = (other / "draft.txt").write_text("still served", encoding="utf-8")
         errors = StringIO()
         with patch.object(shutil, "rmtree", side_effect=PermissionError("cannot delete snapshot")), redirect_stderr(errors):
-            with serve.ReviewLinksServer(("127.0.0.1", 0), self.root) as server:
+            with started_review_server(("127.0.0.1", 0), self.root) as server:
                 # handle_request serves one disposable connection without a background service.
                 thread = threading.Thread(target=server.handle_request)
                 thread.start()
@@ -6617,7 +6895,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
                 errors = StringIO()
                 with patch.object(Path, "is_dir", new=checked_is_dir), redirect_stderr(errors):
-                    with serve.ReviewLinksServer(("127.0.0.1", 0), self.root) as server:
+                    with started_review_server(("127.0.0.1", 0), self.root) as server:
                         self.port = server.server_port
                         thread = threading.Thread(target=server.handle_request)
                         thread.start()
@@ -6880,17 +7158,17 @@ class SnapshotSweepTests(unittest.TestCase):
         with (patch.object(time, "time", return_value=now),
               patch.object(time, "monotonic", return_value=100.0) as elapsed,
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
-              serve.ReviewLinksServer(("127.0.0.1", 0), self.root) as server):
+              started_review_server(("127.0.0.1", 0), self.root) as server):
             self.assertFalse(expired_at_start.exists())
             self.assertFalse(flat_at_start.exists())
             expires_later = self.snapshot("session", "expires-later", now - 8 * 24 * 60 * 60)
             flat_later = self.snapshot("", "def456", now - 8 * 24 * 60 * 60)
             elapsed.return_value = 100.0 + 3599.0
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
             self.assertTrue(expires_later.exists())
             self.assertTrue(flat_later.exists())
             elapsed.return_value = 100.0 + 3600.0
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
             self.assertFalse(expires_later.exists())
             self.assertFalse(flat_later.exists())
 
@@ -7014,7 +7292,7 @@ class ServerCodeHealthTests(unittest.TestCase):
         self.load_module(self.module_file)
 
     def start_server(self) -> serve.ReviewLinksServer:
-        return self.enterContext(serve.ReviewLinksServer(("127.0.0.1", 0), self.checkout / "snapshots"))
+        return self.enterContext(started_review_server(("127.0.0.1", 0), self.checkout / "snapshots"))
 
     def load_module(self, path: Path) -> None:
         spec = importlib.util.spec_from_file_location(path.stem, path)
@@ -7038,17 +7316,17 @@ class ServerCodeHealthTests(unittest.TestCase):
 
         with patch.object(conf, "read", count_service_reads):
             self.elapsed = 104.0
-            server.service_actions()
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
+            serve.ReviewLinksServer.service_actions(server)
             read.assert_not_called()
             self.elapsed = 105.0
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
             read.assert_called_once_with("review_links")
             self.elapsed = 109.0
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
             read.assert_called_once_with("review_links")
             self.elapsed = 110.0
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
             self.assertEqual(read.call_count, 2)
 
     def test_a_module_imported_through_a_file_symlink_keeps_its_target_stamp(self) -> None:
@@ -7068,7 +7346,7 @@ class ServerCodeHealthTests(unittest.TestCase):
         self.module_file.unlink()
         self.elapsed = 105.0
         with self.assertRaises(serve.CodeChanged) as changed:
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
         self.assertIn(str(self.module_file), str(changed.exception))
 
     def test_a_module_loaded_after_start_joins_the_checks_without_a_restart(self) -> None:
@@ -7078,11 +7356,11 @@ class ServerCodeHealthTests(unittest.TestCase):
         os.utime(late_module, ns=(serve.STARTED_NS - 1_000_000_000, serve.STARTED_NS - 1_000_000_000))
         self.load_module(late_module)
         self.elapsed = 105.0
-        server.service_actions()
+        serve.ReviewLinksServer.service_actions(server)
         _ = late_module.write_text("VALUE = 'changed later'\n")
         self.elapsed = 110.0
         with self.assertRaises(serve.CodeChanged) as changed:
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
         self.assertIn(str(late_module), str(changed.exception))
 
     def test_a_newly_seen_module_modified_after_process_start_requires_a_restart(self) -> None:
@@ -7093,7 +7371,7 @@ class ServerCodeHealthTests(unittest.TestCase):
         self.load_module(late_module)
         self.elapsed = 105.0
         with self.assertRaises(serve.CodeChanged) as changed:
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
         self.assertIn(str(late_module), str(changed.exception))
 
     def test_an_active_verdict_defers_restart_and_keeps_the_recorded_stamps(self) -> None:
@@ -7105,9 +7383,24 @@ class ServerCodeHealthTests(unittest.TestCase):
         _ = self.module_file.write_text("VALUE = 'changed during the verdict'\n")
         os.utime(self.module_file, ns=(serve.STARTED_NS - 1_000_000_000, serve.STARTED_NS - 1_000_000_000))
         self.elapsed = 105.0
-        server.service_actions()
+        serve.ReviewLinksServer.service_actions(server)
         self.assertEqual(server.module_stamps, stamps)
         status.record(change_page.MessageDelivery(page, "C1", (), "", attempt))
+        self.elapsed = 110.0
+        with self.assertRaises(serve.CodeChanged) as changed:
+            serve.ReviewLinksServer.service_actions(server)
+        self.assertIn(str(self.module_file), str(changed.exception))
+
+    def test_a_running_send_replay_defers_restart_until_the_holds_stop(self) -> None:
+        server = self.start_server()
+        stamps = dict(server.module_stamps)
+        _ = self.module_file.write_text("VALUE = 'changed during a held send replay'\n")
+        os.utime(self.module_file, ns=(serve.STARTED_NS - 1_000_000_000, serve.STARTED_NS - 1_000_000_000))
+        self.elapsed = 105.0
+        with patch.object(server.send_holds, "stop_if_idle", return_value=False) as stop:
+            server.service_actions()
+        stop.assert_called_once_with()
+        self.assertEqual(server.module_stamps, stamps)
         self.elapsed = 110.0
         with self.assertRaises(serve.CodeChanged) as changed:
             server.service_actions()
@@ -7364,6 +7657,7 @@ class ReviewLinksConfigTests(unittest.TestCase):
         server.next_attachment_retry = 105.0
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         server.page_captures = serve.PageCaptures(root / "captures")
+        server.send_holds = send_hold.Holds(root / send_hold.HOLD_FOLDER, send_hold.replay_to("127.0.0.1", 1))
         server.next_tailscale_check = 200.0
         server.next_sweep = 300.0
         server.next_code_check = 400.0

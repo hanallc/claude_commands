@@ -37,6 +37,8 @@ class StaffNameTests(unittest.TestCase):
                 self.assertEqual(color.key, accounts.ROLE_COLOR_KEYS[group])
                 self.assertIn(f'data-color-text="{color.key}" style="color:{color.css}"', names.html(row.id, row.name))
             self.assertEqual(names.html("nate"), "nate")
+            # A unit with no staff entry gets the same span as a registered unit, from the one copy of the markup.
+            self.assertEqual(names.unit_open() + rows[1].name + "</span>", names.html(rows[1].id, rows[1].name))
             self.assertEqual(names.html("<unknown>"), "&lt;unknown&gt;")
             _ = path.write_text(path.read_text().replace("#123456", "#abcdef"))
             self.assertIn('color:#abcdef', staff_names.StaffNames(staff.StaffSnapshot(rows)).html(rows[0].id))

@@ -184,26 +184,72 @@ Cards and form controls keep their page styles.
 Every page uses the shared background and text colors.
 The status line has the same background as the page.
 The frame reserves scrollbar space, so short and long pages keep the same column position.
-The heading row holds the page title, the heading actions, the owner name and the New item button.
-On a page without a title, the actions wrapper holds the owner controls.
-The row is sticky near the top of the page, with an opaque page background, and content scrolls under it.
-A stuck row has an 8 px space (`--page-heading-space`) above it, so the title does not touch the top edge.
-An opaque band in the page background fills that space, and content does not show in it.
-While the row is stuck, a thin `--line` box shadow shows under it.
-The band and the line take no layout space, and neither shows at scroll zero.
-A Late or Failed status line sticks directly below the stuck row, so the page order never changes.
+Each page has one action area at the top right: `<div class="page-heading-actions" data-page-actions>`.
+The area holds the owner name and the New item button, which is last.
+The heading row (`.page-heading`) holds the page title and follows the area.
+On a page without a title, the heading row is empty.
+Only the action area is sticky. The title scrolls with the page.
+The area sticks 8 px (`--page-actions-space`) below the top edge.
+Without the script, the area takes its height above the title, so the title never goes under the controls.
+A script at the end of the heading row measures the row before the browser reads the content after it.
+When the full title and the controls fit on one line, the script puts the controls beside the title.
+Then the area has no height (`data-page-actions-beside`), and the heading row keeps space for the controls.
+The script sets `--page-actions-height` and `--page-actions-reserve` from the size of the controls.
+The owner group in the area has one opaque page background with a 4 px edge, and content scrolls under it.
+A page can add action buttons between the owner name and New item.
+`page_frame.page_action_button(action, icon, label, dialog_id)` makes one button, and pages pass it through `actions`.
+`owner_control()` and `with_owner()` take `actions`. The names `new-item` and `owner` are reserved.
+A press on a page action button opens its dialog with `showModal()` and binds it with `bindConsoleDialog`.
+`bindConsoleDialog` binds each dialog one time. A second call for the same dialog does nothing.
+When the dialog closes, focus goes back to the button that opened it, and the page does not scroll.
+A press on the copy of the button inside its own open dialog moves the focus to the first control of the dialog.
+A Late or Failed status line sticks directly below the stuck area, so the page order never changes.
 Nothing steps while the page scrolls: each part moves by at most the scroll distance.
-The status line never covers the owner name or button, and the row never covers the status line.
-Scrolling never changes the layout of the content, and at scroll zero the row stays in its normal place.
-On a narrow page the row can wrap to more lines.
-The AWS region filter sticks directly below the heading row and any sticky status line.
-The Images group index sticks 16 px below the heading row and any sticky status line.
+The status line never covers the owner name or button, and the area never covers the status line.
+Scrolling never changes the layout of the content, and at scroll zero the area stays in its normal place.
+The AWS region filter sticks directly below the action area and any sticky status line.
+The Images group index sticks 16 px below the action area and any sticky status line.
 The stacking order, from lowest to highest, is as follows:
 1. Page content, which includes a page's own sticky bars (z-index 3 or lower).
-2. The heading row (z-index 4).
+2. The action area (z-index 4).
 3. Overlays: tooltips, menus, popovers and the Builds paused badge (z-index 5 to 10).
 4. The sticky Late or Failed status line (z-index 20).
-An item jump places the focused row below the heading row and the status line.
+An item jump places the focused row below the action area and the status line.
+The window rule in `page_frame.py` keeps New item available while a page window is open.
+A page window is a `<dialog>` that a page opens with `showModal()`.
+These are the windows:
+1. The picture zoom window in `page_frame.py`.
+2. The New item window in `new_item_dialog.py`.
+3. The List review box in `list_page.py`.
+4. The Accounts color picker in `accounts_page.py`.
+A modal dialog makes the rest of the page inert, and a popover shown after it is also inert.
+Thus the frame adds a copy of the action area to each window when the window starts to open (`beforetoggle`).
+The copy is the last child of the window, at the same place as the area, and the window removes it when it closes.
+The copy has the same labels as the area. It has no `id` attributes.
+The controls in the copy have no plate and no edge, so each part of the copy that shows is a control.
+The copy itself takes no clicks: a click beside its controls goes to the window, as a click on the backdrop does.
+A window meets the action area when a part of the window and the controls of the area overlap from left to right.
+While a window meets the area, the frame sets `--page-window-top` on it to the bottom of the action area.
+The frame measures each open window at these times:
+- when the window opens, and when another window closes,
+- when the view or the action area changes size,
+- when a picture loads.
+It measures first with the current value. A window that meets with the value keeps it, so the measure keeps the scroll of the window.
+Only when the window does not meet with the value, the frame removes it and measures again.
+This second measure is necessary for the zoom image, because its width follows its height limit.
+A scroll does not change the left and right edges. On a scroll, the frame moves the copy and sets the value again only when it changes.
+A centered window stays centered on both axes.
+Its maximum height is `100dvh - 2 * max(16px, --page-window-top)`, so a tall window that meets the area clears the copy.
+New item, the other console dialogs and the picture zoom image use this limit.
+A window that does not meet the area has no value, so it keeps the place and the height limit of main.
+The Accounts color picker keeps its place next to its swatch, and the copy covers none of its controls.
+The List review box is placed at the top of the view, so it starts below the action area.
+The keyboard reaches the copy in the window: press Tab after the last control of the window.
+Escape, the backdrop and the focus return of each window do not change.
+New item opened over another window opens above it.
+When New item closes, the window under it stays open, and focus goes back to the New item button in that window.
+A press on the New item button in the copy inside the New item window moves focus to the words box.
+In the Saved state the words box is hidden, so the press moves focus to **Done**.
 The shared `.page-status` line follows the title.
 It shows the state, data time, round trip and server render time, in that order.
 Live uses `radio` and `--room`; Reading uses `loader-circle` and `--accent`.
@@ -534,7 +580,22 @@ The command prints one plain error line for a refused update.
 The states are **Open**, **Validating**, **Waiting** and **Done**.
 Changes use Validating while the showrunner checks the change.
 Records use Waiting while they await an answer or action.
-Later hides an item without changing its state.
+List and Review use the queue rule in `question_path.py`.
+An active Later value hides the item in Review and puts it in Parked on the List.
+An unread answer puts the item in Open on Review and Needs me on the List.
+The row shows **New answer** while the answer is unread.
+Review uses the saved answer time or the latest Answer event time.
+An answer is unread if its time is after the last Mark read or Later.
+During validation, a Change answer must also follow the current handoff and question.
+An answer without either time remains visible in the record.
+Saved positions and exchange IDs identify copies in the display.
+Review keeps the legacy history when it cannot identify a copy.
+Review, the question count and `/next` interpret legacy local times in the user's zone.
+Mark read removes the mark.
+Mark read also works when the Question owner is unavailable.
+An active Later value continues to apply after Mark read.
+A decision that still requires an action stays in Open after Mark read if Later does not hide it.
+The List and Review keep their existing Later storage formats.
 Validating changes remain visible in Validating and All.
 The count readers and `/next` use this shared reader.
 Open items count in the status line.
@@ -661,6 +722,12 @@ If a named local document cannot be read, Send reports the reason and leaves the
 Send checks native ID allocation and reads the folder registry before it saves a request binding or an image.
 The page owner dialog lists the evidence under **Sent with your words**.
 The server starts a screenshot when the dialog opens with **Include a screenshot** selected.
+The screenshot shows the page as the user sees it, with the window under New item open.
+`window.pageCapturePlace()` adds `console-window=NAME` to the address for the top open window.
+NAME is the `data-window-place` value or the `href` of the control that opened the window.
+When the page loads, the frame removes the parameter from the address and clicks that control again.
+A link that the frame clicks again does not move the page.
+A Review or List row that is open keeps its own place in the address (`item=`).
 The dialog keeps **Send** available while it takes the screenshot.
 Send uses page data if the preview is still pending.
 Send saves the capture intent with the native item and links the List draft to it.
@@ -711,10 +778,13 @@ A Bug also includes the page title, address, filters, and render time.
 The dialog shows Error lines and Script errors when the page has errors.
 Review reuses gzip bytes for an unchanged page shell with its current owner control.
 A Bug with a screenshot also includes the viewport.
-The dialog shows the saved item ID after Send on Review and the other pages outside The List.
-Select **Done** to close the confirmation.
-Review starts its refresh when Send succeeds.
-When the confirmation closes, Review opens the new item if it matches the current filters.
+**Send** closes the New item dialog at once.
+The user can work on the page while the fading **Undo** toast shows.
+**Undo** reopens the dialog with the same type, recipient, words, images and page capture.
+A failed send reopens the draft and shows the error.
+A retry after a lost response sends the original request again.
+If that retry confirms the original save, the dialog reopens with any edits made after the lost response.
+Review refreshes when Send succeeds and opens the new item if it matches the current filters.
 Review tells you when the current filters hide the new item.
 A save conflict shows its reason and preserves the current filters.
 The Type, Show and Owner chip rows wrap at phone width.
@@ -916,8 +986,16 @@ Each showrunner check uses its delivery attempt as the validation ID.
 Initial and recovered messages include `change_review.py verdict --validation <id>` with the complete answer command.
 The native verdict command refuses a missing, old or completed validation ID under the same rule.
 Every request message includes the complete answer command.
-Later keeps the state and hides the item from the page views, the counts and `/next` until its time.
-A change hand-off or return to Open clears the saved Later time.
+Later keeps the saved state.
+An unread answer takes priority over an active Later time in Review, the counts and `/next`.
+An answer keeps the saved Later time.
+Mark read returns the item to Later if the time is still active.
+Saving Later also marks the answer read.
+A legacy Question reply can lack an Answer event.
+Each new native reply saves its Answer event position with the exchange.
+A Change row with an empty Verdict can still show in Open after it moves to Reviewed.
+A validation answer stays in Open, the status counts and `/next` until Mark read.
+The change also stays in Validating until the handoff ends.
 The shared reader ignores any old Later time on a Validating change.
 `<SHOWRUNNER_STATE_DIR>/review-later.json` stores one ISO timestamp for each stable Review key across all five types.
 The shared reader applies that timestamp without copying the item or its state.
@@ -1154,6 +1232,20 @@ A retry can use a new screenshot if the first screenshot expires before filing.
 After Send, the List refreshes with the current filters.
 Select a row to open it.
 If a row save is in progress, the List refreshes when that save ends.
+
+The `/new_item` command (`scripts/review_links/new_item.py`) sends the dialog request to the same New item endpoint.
+The server reply holds the Review item ID and key, and no List item.
+The command then makes one List item for the filed Review item. A Send from the dialog makes no List item.
+The command writes the item in morty's List folder, because only that folder allocates List numbers.
+The title is the first line that has words, at most 120 characters. Latest status holds the words.
+Evidence links to the Review item, and the item links to the Review key.
+Owner is the recipient. Producer is the producer of the assignee. A unit assignee also fills Unit.
+Each run sends a new request ID, so each run files a new Review item and a new List item.
+The result line names the type, the assignee and the List item number. It also names the producer of an assignee that is not a producer.
+If the List write fails after the server files the item, the command still exits 0.
+If the List item write fails, the line names the Review item ID, says that no List item exists, and gives the error.
+If only the Review link fails, the line says that List item N exists without its Review link, and gives the error.
+
 The columns are #, Owner, Producer, Item, State, Next step, ETA, and Update.
 The Producer cell shows the name of the record's producer.
 On desktop, the ETA cell stays on one line and shows an ellipsis if the text is too long.
@@ -1207,6 +1299,9 @@ Back and Forward can open an item that the table filters hide.
 Select the row again to collapse it.
 Expanding or collapsing a row preserves the table filters and sort order.
 A linked Review card opens over the expanded row.
+An answer that supports **Undo** closes the card at once.
+**Undo** or a failed answer reopens the card with its draft and the result message.
+A successful answer refreshes the List.
 The List shows the item count above the table.
 
 A link under Links opens the target item in the console.
@@ -1282,8 +1377,10 @@ A Validating card lets the user ask the validator a question.
 If the record disappears, the dialog shows a message.
 Escape, Close, and a click outside the card close the dialog.
 Focus returns to the List link.
-The dialog fills the screen at the console's phone breakpoint, including on the direct List page.
-On a desktop, the List centers the dialog horizontally, 16 px from the top.
+The dialog reaches the right edge of the List column, so it meets the action area and starts below it (`--page-window-top`).
+At the console's phone breakpoint, the dialog fills the screen below the action area, including on the direct List page.
+On a desktop, the List centers the dialog horizontally, 16 px below the action area.
+On a page without an action area, the phone dialog fills the screen and the desktop dialog is 16 px from the top.
 The dialog dims the List with a 90 percent black backdrop and a 3 px blur.
 Switching browser tabs keeps the dialog and its draft.
 Changing console pages closes an idle dialog when it has no draft.
@@ -1474,8 +1571,7 @@ A newer update stays unread if it arrives before the read saves.
 After the item is read, the log shows “Question Q<n> — nate” and “Answer — <producer>” at their recorded times.
 Each of these rows has a left bar in the Review question color and a bold Question or Answer label.
 The List and Review use the same question color rule.
-An unread answer puts the item in Needs me even during an active park.
-Mark read returns the item to Parked if its park is still active.
+Mark read restores the List queue for the saved item state and its active parking condition.
 The panel clears the question when the log shows it.
 The List uses its local date and time format for questions and answers.
 A newer unread update leaves previously read answers in the log.
@@ -1508,6 +1604,7 @@ The picker aligns with the right edge of the text box.
 The page refresh waits while the picker is open.
 **Save** sends the chosen time in UTC.
 Park writes a date, a time, or `delivered` through `the_list.park` with the List page source.
+List and Review use the same Later code to read and write their saved values.
 The server reads a date as midnight in the user zone.
 The writer checks a new parking time against the current time under the List lock.
 The writer checks a Park retry against the parking condition in the receipt or the event with the same request ID.
@@ -1546,7 +1643,8 @@ The recipient is the item's producer for Mark read and the record keeper for eac
 The notice saves its recipient, so a later producer change does not move a saved Mark read notice.
 The existing sender delivers the notice with its retry and alert rules.
 A delivery failure does not reverse the completed item action.
-Feedback sends the user's words without changing the item state or parking time.
+Tell sends the user's words and keeps the parking time.
+Tell moves a Waiting for nate or Delivered item to Working in the same write that saves the feedback.
 Remove hides the item at once and closes it when the save succeeds.
 Park moves an item to the parked group at once.
 The item stays visible in All if it matches the other filters.
@@ -1673,6 +1771,7 @@ Each card shows, in this order:
 A plain click on a single image or either pair image opens the shared image zoom.
 The zoom centers the full image over a dark backdrop within the page view.
 It fits the view with a 16px margin and never exceeds the image's natural size.
+When the image meets the action area, its height also clears the copy, and the image stays centered.
 Escape or a click on the backdrop or image closes it.
 In a pair zoom, a badge above the image says Before or After.
 The left arrow key shows the before image and the right arrow key shows the after image.
@@ -2214,6 +2313,75 @@ The server returns 403 when the host or origin check fails.
 - Content types: `.html` and `.htm`, in any case, go out as `text/html; charset=utf-8`. A type that Python's `mimetypes` lists under `image/` keeps that type. All other files, `.md`, `.txt`, `.json` and `.pdf` included, go out as `text/plain; charset=utf-8`.
 - Each request writes the standard access line to stderr.
 
+### Undo after Send
+
+A send waits a short time before it leaves, so the user can undo it, as in an email client.
+These sends wait:
+
+1. Review items: each answer except Later and Validate.
+2. The List: Tell and Ask.
+3. Images: Approved, Send Feedback and Ask question.
+4. The New item dialog on each console page.
+5. The change browser: each answer except Skip.
+
+The browser marks the send with the `X-Undo-Hold: 1` header.
+The server saves the body, with the Content-Type, Origin, Host and Accept headers, in `<root>/.review-link-holds/<id>.json`.
+Only the owner can read the folder and its files. The server answers 202 with `X-Send-Hold: held`.
+The 202 body gives the hold id and `seconds`, the Undo time.
+Nothing is saved and nothing is sent before the time ends.
+When `undo_seconds` is zero, the server does not hold the send and handles it at once.
+
+The toast says `Sent to <name>.` and shows an **Undo** button and a bar.
+If the page has no receiver name, the toast says "Sending."
+For an action that saves without a message, the toast says "Saved."
+The toast uses the recipient name shown when the user presses **Send**.
+If a draft can recover an earlier filing, the toast says "Sending."
+The toast appears at the bottom center of the top page. Long names wrap.
+The toast uses the console colors.
+The toast moves to the top open modal dialog, or to the page, so no dialog covers it or makes it inert.
+The toast stays clear for the first half of the time and then fades out. The bar becomes shorter over the full time.
+**Undo** posts `/send-hold/<id>/undo`. The server replaces the saved request with an undone mark and answers 200.
+A repeated Undo, after a lost answer, also gets 200.
+The page then shows "Undone. Edit and send again." and keeps the draft.
+The New item dialog and the linked Review card reopen with the draft.
+You can open a new draft or another linked card while a send waits.
+The List keeps a separate recovery slot for each unresolved draft in the browser tab.
+If the server confirms a linked card save and its response is unreadable, the List shows the refresh error.
+A successful List refresh clears the error.
+A change browser answer goes back in the list with an **Open it** button.
+When the console page or the card frame of the send closes, the page removes the toast and posts
+`/send-hold/<id>/send`. The server then sends the request at once.
+
+One second after the time ends, the server sends the saved request to its own bound address.
+The normal handler then saves and sends, as for a send that does not wait.
+If delivery fails after a confirmed save, the toast shows the delivery failure. The action stays saved.
+An Undo after release gets 409.
+The toast waits for the result, then shows `Too late to undo. Sent to <name>.`, the save text, or the failure.
+An Undo that fails two times says "Undo failed. The send can still leave."
+The page reads `GET /send-hold/<id>`, with the same Tailscale and origin checks as the New item options.
+The server answers 202 with `X-Send-Hold: pending` until the send ends.
+It then gives the saved response, so each page shows its normal result.
+A read that loses its connection tries again each second. After 30 failed reads, the page shows the error.
+A failed connection to itself gives a 503 result.
+Before the replay, the server writes a 503 result: "The send may have left. Check before you send again."
+A server that stops during a replay keeps that result, so it never sends the request two times.
+A handler that runs longer than 5 minutes gives the same result, because it can still finish.
+
+Each saved request is a file, so a server restart sends each request it finds when its time ends.
+A code change restarts the server only when no replay runs and no hold request waits for its answer.
+After that check, no replay starts, and a new held send gets 503: "The console is restarting. Send again."
+A hold file that the server cannot read gets a stderr line, and the sweep deletes it.
+The sweep also deletes undone marks after 10 minutes, and other files in the folder after 10 minutes.
+If the server cannot write before a replay, it deletes the saved request and keeps a failed result in memory.
+If the server cannot write the result after a replay, the page reads that result from memory.
+After a restart, that page reads "may have left".
+If the server cannot write the undone mark, the Undo answers 503 and the send still leaves.
+A page can read a result again until the sweep deletes it, 10 minutes after the send.
+A New item that waited through a restart gets the stale token answer. The List page shows it.
+Other pages load a new token and send again, with a new Undo time.
+The `.review-link-` prefix keeps the folder private: a GET of a saved request gets 404.
+An undo needs the console host and origin, as other POST requests do.
+
 ### Sweep
 
 `sweep_snapshots(root: Path, now: float) -> int` deletes expired snapshot folders and returns the number deleted.
@@ -2343,6 +2511,7 @@ The scripts read `config/review_links.conf` through `scripts/lib/conf.py` when e
 `snapshot_allocation_tries` limits folder allocation attempts.
 `delivery_tries` and `delivery_pause_seconds` control message attempts.
 `feedback_rows` sets the textarea height from 1 to 20 rows and starts at 5.
+`undo_seconds` sets how long a send waits for Undo, from 0 to 60 seconds, and starts at 10. Zero turns Undo off. Each send reads it.
 `review_words_rows` sets the height of the Review page **Your words** box from 1 to 20 rows and starts at 4.
 The `later_*` keys set the Review page Later presets; each render reads them.
 `later_soon_minutes` is 1 to 1440 minutes and starts at 60.

@@ -260,7 +260,7 @@ class VaultSaveTests(unittest.TestCase):
     def test_vault_save_checks_first_push(self) -> None:
         origin = self.git("rev-parse", "origin/main")
         _ = self.git("config", "filter.fixture.clean", "sed '/^derived=/d'")
-        self.write(".gitattributes", "bob/note.md filter=fixture\n")
+        self.write(".gitattributes", "bob/*.md filter=fixture\n")
         self.write("older.md", "A local older commit.\n")
         _ = self.git("add", ".gitattributes", "older.md")
         _ = self.git("commit", "-m", "Fixture outgoing commit")
@@ -273,6 +273,8 @@ class VaultSaveTests(unittest.TestCase):
         _ = stale.write_text("An old copy.\n", encoding="utf-8")
         original = index.read_bytes()
         self.write("bob/note.md", "derived=old\nReviewed content.\n")
+        self.write("bob/second.md", "derived=2\nSecond\n\nnote.\n")
+        self.write("bob/empty.md", "derived=only\n")
         (self.vault / "remove.md").unlink()
         calls: list[tuple[Path, tuple[str, ...]]] = []
 
@@ -281,6 +283,8 @@ class VaultSaveTests(unittest.TestCase):
             if args[0] == "dir":
                 self.assertEqual((folder / "files/bob/note.md").read_bytes(), b"derived=old\nReviewed content.\n")
                 self.assertEqual((folder / "blobs/bob/note.md").read_bytes(), b"Reviewed content.\n")
+                self.assertEqual((folder / "blobs/bob/second.md").read_bytes(), b"Second\n\nnote.\n")
+                self.assertEqual((folder / "blobs/bob/empty.md").read_bytes(), b"")
                 self.assertEqual(folder.parent.parent, work)
                 self.assertFalse(stale.exists())
             self.assertEqual(index.read_bytes(), original)
@@ -295,7 +299,7 @@ class VaultSaveTests(unittest.TestCase):
         self.assertEqual(calls[1], (self.vault, ("git", f"--log-opts=--diff-merges=first-parent {origin}..{head}", ".")))
         self.assertEqual(index.read_bytes(), original)
         digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
-        self.assertIn("Scanned 3 paths.", output)
+        self.assertIn("Scanned 5 paths.", output)
         self.assertIn(f"Manifest {manifest}", output)
         self.assertIn(f"Manifest hash {digest}", output)
         self.assertEqual(self.command("first-save", "commit", "0" * 64)[0], 1)
@@ -304,7 +308,7 @@ class VaultSaveTests(unittest.TestCase):
         _ = self.git("config", "filter.fixture.clean", "cat")
         code, _, errors = self.command("first-save", "commit", digest)
         self.assertEqual(code, 1)
-        self.assertIn("filtered blob for 'bob/note.md' differs", errors)
+        self.assertIn("staged entry for 'bob/empty.md' differs", errors)
         self.assertEqual(index.read_bytes(), original)
         self.assertEqual(self.git(*list_objects), objects)
         self.assertFalse((self.vault / "remove.md").exists())
@@ -329,21 +333,15 @@ class VaultSaveTests(unittest.TestCase):
         self.assertEqual(code, 0, errors)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "main", repo=self.origin))
         self.assertEqual(self.git("show", "HEAD:bob/note.md"), "Reviewed content.")
+        self.assertEqual(self.git_output("show", "HEAD:bob/second.md"), b"Second\n\nnote.\n")
+        self.assertEqual(self.git_output("show", "HEAD:bob/empty.md"), b"")
         self.assertEqual(self.git("ls-tree", "HEAD", "remove.md"), "")
         self.assertEqual(self.git("diff", "--name-only", "HEAD"), "")
         self.assertEqual(self.git("ls-files", "--others", "--exclude-standard"), "")
         self.assertFalse(manifest.exists())
 
     def interrupt_before_index_sync(self, digest: str) -> tuple[int, str, str]:
-        update = vault_save.update_index
-
-        def stop_before_live_update(vault: Path, review: vault_save.Review, *,
-                                    env: dict[str, str] | None = None) -> None:
-            if env is None:
-                raise vault_save.SaveError("Stop before index sync.")
-            update(vault, review, env=env)
-
-        with patch.object(vault_save, "update_index", side_effect=stop_before_live_update):
+        with patch.object(vault_save, "update_index", side_effect=vault_save.SaveError("Stop before index sync.")):
             return self.command("first-save", "commit", digest)
 
     def test_vault_save_retries_after_moving_main(self) -> None:

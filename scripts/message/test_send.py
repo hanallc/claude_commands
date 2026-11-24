@@ -288,6 +288,56 @@ send._bound_relay(message, 2, [], {}, attempt)
         self.assertEqual(result.receiver, "session:recipient")
         relay.assert_called_once_with(message, 2)
 
+    def test_routing_refuses_two_live_generations_when_one_environment_is_unreadable(self) -> None:
+        from scripts.herdr import herdr
+
+        conversation = fixture_runtime_id("routing-recipient")
+        mailbox = send.ConversationRecipient("fixture", conversation)
+        message = send.Message(mailbox.address, "fixture", "Preview", "body", None)
+        place = HerdrPlace("agents", "w1:p1")
+        readable_pid, denied_pid = 998070, 998071
+        pids = (readable_pid, denied_pid)
+        info = {"process_info": {"foreground_processes": [{"pid": pid, "argv": ["claude"]} for pid in pids]}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry_dir = root / "sessions"
+            registry_dir.mkdir()
+            environment = {**fake_unit_host.environment(root), "NOTIFIER_SESSIONS_DIR": str(registry_dir)}
+            for pid in pids:
+                fake_unit_host.process(environment, pid, 1, ["claude"], {})
+            denied_path = root / "proc" / str(denied_pid) / "environ"
+            read_bytes = Path.read_bytes
+
+            def read_process_file(path: Path) -> bytes:
+                if path == denied_path:
+                    raise PermissionError(13, "Permission denied", str(path))
+                return read_bytes(path)
+
+            first = sessions.SessionRecord(pid=readable_pid, sessionId=conversation, procStart="1",
+                name="recipient", updatedAt=1, formerNames=[], tmux="", messagingSocketPath=str(root / "recipient.sock"))
+            second: sessions.SessionRecord = {**first, "pid": denied_pid, "messagingSocketPath": ""}
+            _ = (registry_dir / f"{readable_pid}.json").write_text(json.dumps(first))
+            with (mock.patch.dict(os.environ, environment), fake_unit_host.private_process_registry(),
+                  mock.patch.object(Path, "read_bytes", read_process_file),
+                  mock.patch.object(staff, "runtime_id", return_value=conversation),
+                  mock.patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
+                  mock.patch.object(herdr, "herdr_processes", return_value=[
+                      herdr.HerdrProcess(pid, place, {}, "claude", directory) for pid in pids]),
+                  mock.patch.object(herdr.Herdr, "listed", return_value=[{"pane_id": place.pane}]),
+                  mock.patch.object(herdr.Herdr, "result", return_value=info)):
+                for second_start, expected in (("2", send.RelayAttempt), ("1", send.ClaudeRoutingFailed)):
+                    with self.subTest(second_start=second_start):
+                        second["procStart"] = second_start
+                        _ = (registry_dir / f"{denied_pid}.json").write_text(json.dumps(second))
+                        registry = sessions.read_registry()
+                        running = sessions.running_records(registry)
+                        self.assertEqual({row["pid"] for row in running},
+                                         set(pids) if second_start == "1" else {readable_pid})
+                        plan = send.relay_plan(message, registry, running, staff.StaffSnapshot(()), mailbox)
+                        self.assertIsInstance(plan, expected)
+                        if isinstance(plan, send.ClaudeRoutingFailed):
+                            self.assertIn("Permission denied", plan.failure.reason)
+
     def test_delivery_refuses_an_unbound_socket_and_sends_over_the_checked_connection(self) -> None:
         from scripts.herdr import herdr
 
@@ -2315,41 +2365,83 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(result.outcome, "sent", result.detail)
         self.assertEqual([message.to for message in self.relayed], [f"uds:{self.root / 'second-recipient.sock'}"])
 
-    def test_expired_review_releases_the_list_and_stays_ended_until_a_new_review(self) -> None:
+    def test_each_prompt_restarts_the_idle_time_and_a_prompt_after_an_idle_end_starts_the_hold_again(self) -> None:
         self.session("recipient", "Recipient")
-        _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=4")
+        _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=10")
         at = send.now()
+        args = ["--to", "session:recipient", "--from", "test"]
+
+        def minutes(minute: int) -> datetime:
+            return at + timedelta(minutes=minute)
+
+        def send_at(minute: int, text: str) -> str:
+            with mock.patch.object(send, "now", return_value=minutes(minute)):
+                return send.send(local_options([*args, "--text", text])).outcome
+
+        def prompt_at(minute: int, emit: Callable[[str], None]) -> None:
+            review_hold.record_user_prompt("recipient", minutes(minute).timestamp(), emit,
+                record_keys=send.record_released_acceptances)
+
         review_hold.set_count("recipient", 5, at.timestamp(), self.fail,
             record_keys=send.record_released_acceptances)
-        args = ["--to", "session:recipient", "--from", "test"]
-        with mock.patch.object(send, "now", return_value=at):
-            self.assertEqual(send.send(local_options([*args, "--text", "First update."])).outcome, "kept")
-        recent_prompt = at + timedelta(minutes=3)
-        review_hold.record_user_prompt("recipient", recent_prompt.timestamp(), self.fail,
-            record_keys=send.record_released_acceptances)
-        with mock.patch.object(send, "now", return_value=at + timedelta(minutes=5)):
-            self.assertEqual(send.send(local_options([*args, "--text", "Second update."])).outcome, "kept")
-
-        after_idle = at + timedelta(minutes=8)
-        held: list[str] = []
-        review_hold.record_user_prompt("recipient", after_idle.timestamp(), held.append,
-            record_keys=send.record_released_acceptances)
-        self.assertEqual(len(held), 1)
+        prompt_at(0, self.fail)
+        self.assertEqual(send_at(1, "First update."), "kept")
+        prompt_at(8, self.fail)
+        self.assertEqual(send_at(15, "Second update."), "kept")
+        self.assertEqual(send_at(19, "Idle update."), "sent")
+        self.assertEqual(len(self.relayed), 1)
+        self.assertTrue(self.relayed[0].text.startswith(held_notice(2, "recipient")), self.relayed[0].text)
+        self.assertIn("Idle update.", self.relayed[0].text)
         self.assertLess(self.held_text().index("First update."), self.held_text().index("Second update."))
-        review_hold.set_count("recipient", 4, after_idle.timestamp(), self.fail,
+        review_hold.set_count("recipient", 4, minutes(19).timestamp(), self.fail,
             record_keys=send.record_released_acceptances)
-        with mock.patch.object(send, "now", return_value=after_idle):
-            self.assertEqual(send.send(local_options([*args, "--text", "Third update."])).outcome, "sent")
-            self.assertEqual(send.send(local_options([*args, "--text", "Fourth update."])).outcome, "sent")
+        self.assertEqual(send_at(19, "Count update."), "sent")
+        self.assertEqual(self.relayed[-1].text, "Count update.")
+
+        prompt_at(20, self.fail)
+        self.assertEqual(send_at(21, "Third update."), "kept")
+        held: list[str] = []
+        prompt_at(32, held.append)
+        self.assertEqual(held, [held_notice(1, "recipient")])
+        self.assertEqual(self.held_text().count("Third update."), 1)
+        self.assertEqual(send_at(33, "Fourth update."), "kept")
         self.assertEqual(len(self.relayed), 2)
-        self.assertEqual(self.relayed[0].text, "Third update.")
-        self.assertEqual(self.relayed[1].text, "Fourth update.")
-        review_hold.set_count("recipient", 0, after_idle.timestamp(), self.fail,
+        self.assertNotIn("Fourth update.", self.held_text())
+
+        released: list[str] = []
+        review_hold.set_count("recipient", 0, minutes(34).timestamp(), released.append,
             record_keys=send.record_released_acceptances)
-        review_hold.set_count("recipient", 5, after_idle.timestamp(), self.fail,
+        self.assertEqual(released, [held_notice(1, "recipient")])
+        self.assertEqual(self.held_text().count("Fourth update."), 1)
+        self.assertEqual(send_at(35, "After the review."), "sent")
+        self.assertEqual(self.relayed[-1].text, "After the review.")
+        review_hold.set_count("recipient", 5, minutes(35).timestamp(), self.fail,
             record_keys=send.record_released_acceptances)
-        with mock.patch.object(send, "now", return_value=after_idle):
-            self.assertEqual(send.send(local_options([*args, "--text", "New review."])).outcome, "kept")
+        self.assertEqual(send_at(35, "New review."), "kept")
+
+    def test_a_prompt_after_an_idle_end_starts_no_hold_when_off_or_without_open_items(self) -> None:
+        for case in ("off", "no-items"):
+            with self.subTest(case=case):
+                session = f"recipient-{case}"
+                after_idle = self.end_hold_with_one_message(session)
+                args = ["--to", f"session:{session}", "--from", "test"]
+                with mock.patch.object(send, "now", return_value=after_idle):
+                    self.assertEqual(send.send(local_options([*args, "--text", "Idle report."])).outcome, "sent")
+                if case == "off":
+                    _ = write_send_config(self.root / "config/send.conf", "review_hold=off\nreview_hold_idle_minutes=1")
+                else:
+                    review_hold.set_count(session, 0, after_idle.timestamp(), self.fail,
+                        record_keys=send.record_released_acceptances)
+                prompt = after_idle + timedelta(seconds=1)
+                review_hold.record_user_prompt(session, prompt.timestamp(), self.fail,
+                    record_keys=send.record_released_acceptances)
+                state = review_hold.held_file(session).with_name(f"{session}.json")
+                if case == "no-items":
+                    self.assertFalse(state.exists())
+                _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=1")
+                with mock.patch.object(send, "now", return_value=prompt + timedelta(seconds=1)):
+                    self.assertEqual(send.send(local_options([*args, "--text", "Later report."])).outcome, "sent")
+                self.assertEqual(self.relayed[-1].text, "Later report.")
 
     def test_the_first_send_after_idle_releases_the_list_without_a_prompt(self) -> None:
         self.session("recipient", "Recipient")

@@ -54,6 +54,11 @@ def is_draft_id(value: object) -> bool:
     return isinstance(value, str) and BROWSER_DRAFT_ID.fullmatch(value) is not None
 
 
+def submission_title(words: str) -> str:
+    """The title of a New item: its first line with words, at most 120 characters."""
+    return next(line.strip() for line in words.splitlines() if line.strip())[:120].rstrip()
+
+
 @dataclass(frozen=True)
 class CurrentBrowserDraftToken:
     digest: str = field(repr=False)
@@ -1469,8 +1474,9 @@ def _matches_list_capture_retry(send: ListDraftSend, intent: new_item_dialog.Sub
         if request.page != "list" or request.request_id != send.request_id:
             return False
         evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence))
+        words = read_words(request.words, "Your words", kind=request.kind)
         return item.destination.payload_hash == _browser_payload_hash(
-            request, read_words(request.words, "Your words"), evidence, _decode_images(request.images), filing.screenshot)
+            request, words, evidence, _decode_images(request.images), filing.screenshot)
     except SubmissionError:
         return False
 
@@ -1514,10 +1520,10 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
 
 
 def _legacy_list_draft(address: SubmissionAddress, words: str, uploads: tuple[_ImageUpload, ...],
-                      members: staff.StaffSnapshot | None) -> SavedSubmission | None:
+                      members: staff.StaffSnapshot | None, *, request_kind: str) -> SavedSubmission | None:
     """Recover old List filings when the original words, kind, images and recipient match."""
     legacy_id = "r2-" + address.request_id[3:]
-    fingerprint = _fingerprint([legacy_id, address.kind, words, _image_fingerprints(uploads)])
+    fingerprint = _fingerprint([legacy_id, request_kind, words, _image_fingerprints(uploads)])
     folder = _request_folder(f"r4-{fingerprint}")
     if not folder.is_dir():
         return None
@@ -1595,7 +1601,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     check_recipient_id(request.recipient_id)
     request_id = read_request_id(request.request_id)
     submitted_draft_id = request_id
-    kind = read_kind(request.kind)
+    kind = SubmissionKind.INVESTIGATION if request.kind == "enhancement" else read_kind(request.kind)
     if request.page and request.page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Open the New item dialog from a page owner.")
     if not request.page and request.page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
@@ -1610,11 +1616,11 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
         raise SubmissionError("Invalid draft request ID.")
     address = (SubmissionAddress(kind, request.recipient_id, request_id) if legacy_draft or browser_draft
                else _request_address(kind, request.recipient_id, request_id))
-    words = read_words(request.words, "Your words")
+    words = read_words(request.words, "Your words", kind=request.kind)
     evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence))
     uploads = _decode_images(request.images)
     if list_draft:
-        previous = _legacy_list_draft(address, words, uploads, members)
+        previous = _legacy_list_draft(address, words, uploads, members, request_kind=request.kind)
         if previous is not None:
             _check_capture_target(capture_target, previous)
             alias = _request_folder(request_id) / "list-receipt-key"
@@ -1633,9 +1639,9 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     if browser_draft:
         payload_hash = _browser_payload_hash(request, words, evidence, uploads, screenshot)
     elif legacy_draft:
-        payload_hash = _fingerprint([request_id, kind, words, _image_fingerprints(uploads)])
+        payload_hash = _fingerprint([request_id, request.kind, words, _image_fingerprints(uploads)])
     else:
-        payload_hash = _submission_fingerprint(replace(request, kind=kind, evidence=evidence), words, uploads)
+        payload_hash = _submission_fingerprint(replace(request, evidence=evidence), words, uploads)
     if isinstance(screenshot, new_item_dialog.PageScreenshot):
         total = len(screenshot.png) + sum(len(upload.data) for upload in uploads)
         if len(uploads) >= MAX_IMAGES or total > MAX_TOTAL_IMAGE_BYTES:
@@ -1734,7 +1740,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             details = ReviewSubmission(request_id, payload_hash, evidence, images, proof.sha256,
                                        page=request.page, page_state=request.page_state, capture_intent=capture_intent,
                                        reply_token_nonce=proof.nonce)
-            title = next(line.strip() for line in words.splitlines() if line.strip())[:120].rstrip()
+            title = submission_title(words)
             destinations: list[NativeSubmissionDestination] = []
             staging_started = False
 

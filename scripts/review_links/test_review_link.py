@@ -23,6 +23,7 @@ from unittest.mock import patch
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.review_links import review_link, serve
+from scripts.review_links.server_test_support import started_review_server
 
 
 from typing import cast, override
@@ -264,7 +265,7 @@ class ReviewLinkTests(unittest.TestCase):
         self.assertEqual(old_snapshot.parent, new_snapshot.parent)
         self.assertEqual(old_snapshot.read_text(encoding="utf-8"), "revised version")
         self.assertEqual(new_snapshot.read_text(encoding="utf-8"), "revised version")
-        with serve.ReviewLinksServer(("127.0.0.1", 0), self.snapshots) as server:
+        with started_review_server(("127.0.0.1", 0), self.snapshots) as server:
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             connection = HTTPConnection("127.0.0.1", server.server_port, timeout=TEST_HANG_GUARD_SECS)
@@ -342,7 +343,7 @@ class ReviewLinkTests(unittest.TestCase):
         self.assertNotEqual(original_copy.parent, alias_copy.parent)
         self.assertEqual(original_copy.name, "original.txt")
         self.assertEqual(alias_copy.name, "alias.txt")
-        with serve.ReviewLinksServer(("127.0.0.1", 0), self.snapshots) as server:
+        with started_review_server(("127.0.0.1", 0), self.snapshots) as server:
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
