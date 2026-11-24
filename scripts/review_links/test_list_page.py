@@ -6353,18 +6353,21 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
  show('all');
  check(!row.hidden,'All shows the waiting item with the newer park.');
 ''', reduced_motion=True, add_item=False)
-        self.browser_action_sequence('''
+        steps = '''
  show('parked');
  const chip=document.querySelector('[data-filter-row="show"] [data-filter-value="parked"]');
  const status=document.querySelector('[data-hidden-action-status]');
  const unpark=form.querySelector('[value="unpark"]');
  check(!row.hidden && chip.dataset.filterCount==='1','Parked includes the item before the question.');
  unpark.focus();
+ check(!document.hasFocus() && document.activeElement===unpark,
+  'The background List retains Unpark as its active element.');
  submit('unpark');
  finishPost({parked:'false',parked_until:'',waiting_for_answer:'true',open_question:'true',unpark_outcome:'cleared'});
  await flush();
  check(row.hidden && chip.dataset.filterCount==='0','The waiting item leaves Parked and its count.');
  check(document.activeElement===chip,'The Parked filter receives focus.');
+ check(!document.hasFocus(),'Unpark does not activate the List tab.');
  check(!status.hidden && status.textContent==='Item #1 unparked.','Parked shows the Unpark confirmation.');
  location.hash=new URLSearchParams({show:'parked',item:row.dataset.key}).toString();
  await flush();
@@ -6375,7 +6378,19 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
   'The direct link leaves the item out of the count and keeps the Unpark confirmation.');
  show('producer-answering');
  check(!row.hidden && !status.hidden,'Producer answering keeps the Unpark confirmation.');
-''', reduced_motion=True, add_item=False)
+'''
+        browser = self.chrome()
+        info = cast(dict[str, str], browser.command("Target.getTargetInfo", {}, browser.session)["targetInfo"])
+        other_tab = cast(str, browser.command("Target.createTarget", {
+            "url": "about:blank", "browserContextId": info["browserContextId"],
+        })["targetId"])
+        try:
+            _ = browser.command("Target.activateTarget", {"targetId": other_tab})
+            self.browser_action_sequence(steps, reduced_motion=True, add_item=False)
+        finally:
+            if not browser.closed:
+                _ = browser.command("Target.closeTarget", {"targetId": other_tab})
+                _ = browser.command("Page.bringToFront", {}, browser.session)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_restores_open_row_and_shows_the_refusal_after_a_lost_remove(self) -> None:
