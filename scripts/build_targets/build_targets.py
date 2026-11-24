@@ -34,6 +34,7 @@ from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
 from scripts.build_targets.execution_transport import HanaGpuNextestTransport
 from scripts.lib import conf
+from scripts.lib.display_text import display_field
 from scripts.build_queue.placement import (
     MAC_RUN_KINDS, CommandKind, ConfiguredProviderSettings, ExplicitProviderSettings, ProviderSettings,
 )
@@ -141,6 +142,7 @@ def parser() -> argparse.ArgumentParser:
     _ = backoff.add_argument("--no-probe", action="store_true")
     status = commands.add_parser("status")
     _ = status.add_argument("--probe", action="store_true")
+    _ = commands.add_parser("setup-mac-linux", help="Repair the state root for the Mac Linux gate on natedev")
     eligible = commands.add_parser("eligible", aliases=["constraints"])
     _ = eligible.add_argument("--repo-root", required=True)
     _ = eligible.add_argument("--package", default="")
@@ -227,12 +229,6 @@ def local_time(instant: datetime) -> str:
     from scripts.lib.user_zone import user_zone
 
     return instant.astimezone(user_zone()).strftime("%H:%M %Z")
-
-
-def display_field(value: str) -> str:
-    from scripts.buildlog.mac_idle_alert import display_field as clean_field
-
-    return clean_field(value)
 
 
 def unit_label_suffix(state: RunningJob | Held, labels: Mapping[RunningJob | Held | KeptClaim, roster.UnitLabels]) -> str:
@@ -1812,6 +1808,14 @@ def main() -> int:
         from scripts.build_targets import target_config
 
         args = parser().parse_args(namespace=CliArguments())
+        if args.command == "setup-mac-linux":
+            root = target_config.build_targets_state_root()
+            try:
+                target_config.provision_mac_linux_state_root(root)
+            except OSError as error:
+                print(f"setup-mac-linux: Cannot prepare {root}: {error}", file=sys.stderr)
+                return 1
+            return 0
         if args.command == "recover-probe":
             return command_recover_probe(args)
         if args.command == "probe-backoff":

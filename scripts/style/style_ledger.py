@@ -5096,7 +5096,7 @@ class Ledger:
         )
 
     def _record_build_checks(self, checks: tuple[tuple[str, BuiltEntryEvidence], ...]) -> tuple[FindingNotBuilt, ...]:
-        """Apply merge check outcomes inside the caller's transaction."""
+        """Record the build evidence inside the caller's transaction."""
         now = _now()
         not_built: list[FindingNotBuilt] = []
         for finding_id, evidence in checks:
@@ -5511,7 +5511,7 @@ class Ledger:
         return tuple(self._held(finding_id) for (finding_id,) in rows)
 
     def recheck_merged_findings(self) -> tuple[FindingNotBuilt, ...]:
-        """Apply current merge checks to filed findings with merged proposal tickets."""
+        """Check the build evidence for filed findings with merged proposal tickets."""
         with self.git_operation("held recheck-merged"), self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             rows = cast(list[tuple[str, str]], self._connection.execute(
@@ -6090,7 +6090,7 @@ class Ledger:
         return OuterBindingBlocked(f"rename blocked by outer binding {name!r} at line {line}", name, line, text)
 
     def judged_commit(self, finding: HeldFinding) -> JudgedCommit | NoJudgedCommit:
-        """Judging-ticket completion for merge checks; use finding_anchor to read source coordinates."""
+        """Read the judging result for build verification. Use finding_anchor to read source coordinates."""
         return self._judged_from(self._judging_ticket(finding.ticket))
 
     def _finding_history(self, finding: HeldFinding) -> FindingSourceHistory:

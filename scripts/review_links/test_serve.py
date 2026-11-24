@@ -1,7 +1,7 @@
 """HTTP behavior on localhost and retention in disposable snapshot folders."""
 from __future__ import annotations
 
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
 from scripts.lib.checkout_test_support import python_tool_source
 
@@ -7317,7 +7317,7 @@ class ServerStartupTests(unittest.TestCase):
         tailscale.chmod(0o755)
         other_store = temporary / "other-store"
         configuration = temporary / "config"
-        _ = shutil.copytree(checkout / "config", configuration)
+        _ = copy_config_fixture(checkout / "config", configuration)
         _ = write_config_fixture(configuration / "console.conf", f"page.list.owner={keeper}\n")
         rebuild_cache = temporary / "rebuild-cache"
         _ = (configuration / "statusline.conf").write_text(f"rebuild.cache={rebuild_cache}\n")

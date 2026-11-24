@@ -150,6 +150,15 @@ All main-path tests remain.
 `prepare_checkpoint` selects paths from the tip before the checkpoint merge through the prepared tip.
 `push_git` pushes without another merge.
 
+The checkpoint gate runs one Verify command from each Cargo workspace with changed packages.
+Packages in the same workspace share a step list, such as `verify.sh test alpha + test beta`, and one place in the build queue.
+A package outside a workspace gets its own command from its package folder.
+A package that reads `.cargo/config.toml` or `.cargo/config` below the workspace root runs separately from its package folder.
+Verify reports the exit status for each package it runs in a list.
+A red ends the list at the failed package. The gate uses that package for red attribution and retries.
+When the gate permits retries, it runs any packages that the list did not reach.
+Example checks and configured merge tests each keep their own step.
+
 `tested_main_push(production, tested_tip, retest, before_merge_tip, *, follow_main=True)` protects the final publication:
 
 1. Acquire `main_push_lock` and fetch main.
