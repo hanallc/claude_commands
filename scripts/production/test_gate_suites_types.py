@@ -1,4 +1,4 @@
-"""Merge gate suites contracts."""
+"""Test the gate suite runner."""
 
 from __future__ import annotations
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
@@ -93,7 +93,7 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assertEqual(arguments.args[:2], ("fixture-showrunner", f"merge-gate-nightly:{tree}"))
         message = cast(str, arguments.args[2])
         self.assertIn(failing_file, message)
-        self.assertNotIn("requires the full suite", message)
+        self.assertNotIn("full-required marker exists", message)
         self.assertFalse((self.state / "runner/full-required").exists())
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
 
@@ -257,18 +257,24 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assertIn("1980 other diagnostic lines omitted.", message)
         self.assertIn(summary, message)
 
-    def test_nightly_notice_without_a_failed_job_says_the_full_suite_is_required(self) -> None:
+    def test_nightly_runner_failure_names_the_jobs_that_run_the_full_suite_again(self) -> None:
         from scripts.production import showrunners
 
-        with (mock.patch.object(gate, "nightly_owner", return_value="fixture-showrunner"),
+        self.write(Path(self.environment["CONF_DIR"]) / "build_steps.conf",
+                   "names.integrate=fixture integrate\nnames.test-all=fixture test all\n"
+                   + "names.test-nightly=fixture test nightly\n")
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(gate, "nightly_owner", return_value="fixture-showrunner"),
               mock.patch.object(showrunners, "tell", return_value="sent to fixture-showrunner") as notice):
             _ = gate.tell_nightly_red(gate.GateArguments(merge_branch="integration"), "fixture-tree", [])
 
         arguments = notice.call_args
         assert arguments is not None
         message = cast(str, arguments.args[2])
+        self.assertIn("The fixture test nightly job failed", message)
         self.assertIn("(runner failure)", message)
-        self.assertIn("requires the full suite", message)
+        self.assertIn("The fixture integrate and fixture test all jobs run the full suite again"
+                      + " while the full-required marker exists.", message)
         self.assertNotIn("Tests passed", message)
 
     def test_type_check_requires_exit_zero_and_a_clean_summary(self) -> None:

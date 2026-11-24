@@ -49,6 +49,7 @@ from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.git_test_support import fixture_git_environment as shared_fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.unit_runs_test_support import bind_private_run_roots
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import session_records, sessions, session_send
 from scripts.message.sessions import SessionRecord
 from scripts.production import (
@@ -445,7 +446,7 @@ def shutdown_fixture_configuration(root: Path) -> dict[str, str]:
         if not destination.exists():
             if stem == "copies":
                 content = content.replace("~/remote-mirrors", str(root / "remote-mirrors"))
-            _ = destination.write_text(content, encoding="utf-8")
+            _ = write_config_fixture(destination, content)
     return {"CONF_DIR": str(root), "COPIES_CONFIG": str(root / "copies.conf"),
             "BUILD_TARGETS_CONFIG": str(root / "build_targets.conf")}
 

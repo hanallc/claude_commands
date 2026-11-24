@@ -17,7 +17,7 @@ from typing import TypedDict, cast, override
 
 from scripts.direct.recorder_fixture import LauncherFixture, communicate_launcher, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
 
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import copy_config_file_fixture, config_environment, write_config_fixture
 
 
 DIRECT_DIR = Path(__file__).parent
@@ -177,7 +177,7 @@ class ReviewLauncherFixture(LauncherFixture):
                          self.root / "scripts/production/fast_track.py")
         config = self.root / "config"
         config.mkdir(exist_ok=True)
-        _ = shutil.copy2(DIRECT_DIR.parents[1] / "config/fast_track.conf", config / "fast_track.conf")
+        _ = copy_config_file_fixture(DIRECT_DIR.parents[1] / "config/fast_track.conf", config / "fast_track.conf")
         for name in ("review.sh", "tag_inventory.py"):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
         configure_launcher_fixture(direct_dir / "review.sh")

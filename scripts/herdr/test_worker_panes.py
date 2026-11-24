@@ -26,6 +26,7 @@ from typing import Literal, cast, final, override
 from unittest.mock import ANY, patch
 from weakref import finalize
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import fake_unit_host, staff, worker_admission
 from scripts.production.production_doc import EnrolledPaths
 from scripts.herdr import herdr_types
@@ -147,9 +148,9 @@ class PaneWorld(herdr.Herdr):
                           + "# range: 0.01..600\nworker_publish_lock_seconds=15\n"
                           + "# range: 1..600\npane_agent_start_seconds=90\n")
         write_text_atomic(config / "shutdown.conf", "# whole: 1..300\nstop_grace_seconds=2\n# whole: 1..300\nkill_grace_seconds=2\n# whole: 1..300\nmove_stop_margin_seconds=2\n")
-        write_text_atomic(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
+        _ = write_config_fixture(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
                           + "agents_slice=app-agents.slice\n")
-        write_text_atomic(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
+        _ = write_config_fixture(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
         source = Path(__file__).resolve().parents[2] / "config"
         for name in ("detached_runs.conf", "postmaster.conf"):
             write_text_atomic(config / name, (source / name).read_text())

@@ -736,9 +736,9 @@ class NextestLogRetentionTests(TmpSweepCase):
     def test_mac_sweep_keeps_a_log_locked_after_the_process_scan(self) -> None:
         logs = Path.home() / nextest_log.DIRECTORY
         expired = write(logs / "nextest.00000001")
-        old = self.now - 8 * DAY
-        os.utime(expired, (old, old))
         _ = write_config_fixture(conf.path("mac_test"))
+        old = self.now - nextest_log.retention_days() * DAY - 1
+        os.utime(expired, (old, old))
         self.plan: removal_guard.RemovalList = removal_guard.RemovalList(removal_guard.Tool.TEMPORARY)
         result = tmp_sweep.Sweep()
         with ExitStack() as readers:
@@ -759,9 +759,9 @@ class NextestLogRetentionTests(TmpSweepCase):
     def test_incomplete_mac_process_scan_keeps_expired_logs(self) -> None:
         logs = Path.home() / nextest_log.DIRECTORY
         expired = write(logs / "nextest.00000001")
-        old = self.now - 8 * DAY
-        os.utime(expired, (old, old))
         _ = write_config_fixture(conf.path("mac_test"))
+        old = self.now - nextest_log.retention_days() * DAY - 1
+        os.utime(expired, (old, old))
         incomplete = subprocess.CompletedProcess(tmp_sweep.LSOF, 1, "p41\nf4\nn/other\n", "")
         result = tmp_sweep.Sweep()
         with mock.patch.object(subprocess, "run", return_value=incomplete):

@@ -40,7 +40,7 @@ class ModuleTimes(TypedDict):
     tests: list[TestTime]
 
 
-# The (suite, module) of the merge gate's type-check job, which runs no tests.
+# The (suite, module) of the gate job that only checks types.
 TYPE_CHECK_JOB: Final = ("types", "basedpyright")
 
 

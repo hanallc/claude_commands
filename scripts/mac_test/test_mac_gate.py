@@ -31,7 +31,7 @@ from scripts.lib.process_start import Started, Unreadable, process_start
 from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import mac_gate
-from scripts.mac_test.test_mac_queue_run import queue_fixture
+from scripts.mac_test.test_mac_queue_run import end_queue_fixture, queue_fixture, queue_with_ready_event
 from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
 from scripts.test_times import gate_record
@@ -814,19 +814,20 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
 
     def test_route_cancellation_reports_a_close_failure(self) -> None:
         self.install_held_module()
-        self.cancel_route(self.root, explicit=True, cleanup_refused=True)
+        self.cancel_route(self.root, explicit=True, cleanup_refused=True, wait_for_ready=True)
 
     def test_route_fixture_reports_a_failed_close_hook(self) -> None:
         self.install_held_module()
         (self.root / 'fail_close_hook').touch()
         with self.assertRaisesRegex(AssertionError, 'RuntimeError: fixture close hook failed'):
-            self.cancel_route(self.root, explicit=True)
+            self.cancel_route(self.root, explicit=True, wait_for_ready=True)
 
     def test_route_cancellation_stops_bundle_git_and_removes_refs(self) -> None:
         self.cancel_route(self.root, explicit=True, prepare_bundle=True)
 
     def cancel_route(self, root: Path, *, explicit: bool, cleanup_refused: bool = False,
-                     prepare_bundle: bool = False, force_signal_to_sender: bool = False) -> None:
+                     prepare_bundle: bool = False, force_signal_to_sender: bool = False,
+                     wait_for_ready: bool = False) -> None:
         environment = {**queue_fixture(root, LOCAL_MAC_SSH),
                        **fixture_zsh_environment(),
                        **copies_environment(root),
@@ -842,6 +843,8 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
             wrapper = root / 'queue-wrapper.py'
             _ = wrapper.write_text(QUEUE_SIGNAL_TO_SENDER)
             environment['MAC_GATE_QUEUE_WRAPPER'] = str(wrapper)
+        elif wait_for_ready:
+            environment['MAC_GATE_QUEUE_WRAPPER'] = str(queue_with_ready_event(root))
         if cleanup_refused:
             (root / 'close_refusal').touch()
         git = shutil.which('git')
@@ -860,9 +863,9 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
             caller = [sys.executable, '-c', CALL_ROUTE, str(self.repo), str(callback),
                       str(reader) if explicit else '']
             result = root / 'route.log'
-            with result.open('w+') as output, subprocess.Popen(
-                caller, env=environment, stdout=output, stderr=output, pass_fds=(reader,) if explicit else (),
-            ) as process:
+            with os.fdopen(writer, 'wb') as caller_end, result.open('w+') as output:
+                process = subprocess.Popen(caller, env=environment, stdout=output, stderr=output,
+                                           pass_fds=(reader,) if explicit else ())
                 try:
                     marker = root / ('bundle_pid' if prepare_bundle else 'module_pid')
                     wait_until(lambda: marker.exists() or process.poll() is not None, root, processes=(process,))
@@ -871,7 +874,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
                     if prepare_bundle:
                         self.assertTrue(gate.checked_git(self.repo, 'for-each-ref', 'refs/cloud-gates/'))
                     if explicit:
-                        self.assertEqual(os.write(writer, b'x'), 1)
+                        self.assertEqual(os.write(caller_end.fileno(), b'x'), 1)
                     else:
                         process.send_signal(signal.SIGTERM)
                     self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0 if explicit else -signal.SIGTERM,
@@ -893,11 +896,13 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
                     self.assertEqual(record['groups'], {})
                     self.assertEqual(record['folders'], [])
                 finally:
-                    if process.poll() is None:
+                    if wait_for_ready:
+                        end_queue_fixture(process, caller_end)
+                    elif process.poll() is None:
                         process.kill()
+                        _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
         finally:
             os.close(reader)
-            os.close(writer)
 
     def sleeping_process(self) -> subprocess.Popen[bytes]:
         process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],

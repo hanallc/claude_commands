@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from typing import override
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 HOOK = Path(__file__).with_name("stop-context-deferral.py")
@@ -78,7 +79,7 @@ class ContextDeferralTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = (self.root / "context_deferral.conf").write_bytes(CONFIG.read_bytes())
+        _ = copy_config_file_fixture(CONFIG, self.root / "context_deferral.conf")
         self.environment = {**os.environ, "CONF_DIR": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}
 
     def call(self, **payload: object) -> subprocess.CompletedProcess[str]:

@@ -144,7 +144,7 @@ def trend_tables(output: str) -> dict[str, list[list[str]]]:
     tables: dict[str, list[list[str]]] = {}
     heading = ""
     for line in output.splitlines():
-        if line.endswith((" merge gates", " targeted tests")):
+        if line.endswith((" full suite runs", " targeted tests")):
             heading = line
             tables[heading] = []
         elif not re.fullmatch(r"\d+ of \d+ runs have no cost record\.", line):
@@ -228,7 +228,7 @@ class TestTimesTests(unittest.TestCase):
 
     def write_run(self, modules: list[ModuleRun], *, epoch: float = EPOCH,
                   host: str = HOST, aborted: bool = False, status: int = 0,
-                  checkout: str = "") -> None:
+                  checkout: str = "", sha: str | None = None) -> None:
         self.next_id += 1
         suites: list[gate_record.SuiteRun] = [
             {"suite": suite, "wall_s": sum(row["wall_s"] for row in modules if row["suite"] == suite),
@@ -242,6 +242,8 @@ class TestTimesTests(unittest.TestCase):
             "checkout": checkout or str(self.repo),
             "slow_test_s": gate_record.slow_test_s(),
         }
+        if sha is not None:
+            run["sha"] = sha
         with mock.patch.object(record, "new_id", return_value=f"history-{self.next_id}"), \
                 mock.patch.object(socket, "gethostname", return_value=host):
             gate_record.write_gate_run(run, fixture_executions(run))
@@ -776,6 +778,159 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.assertEqual(self.cell(output, alpha, "runs counted"), "2", output)
         self.assertIn("no modules recorded yet", self.report("top", "--repo", str(self.repo)))
 
+    def test_top_uses_merge_base_time_then_start_before_the_run_limit(self) -> None:
+        old, shared, main, newer, older, missing = (digit * 40 for digit in "123456")
+        graph = (
+            f"900 {older} {old}\n"
+            + f"600 {newer} {shared}\n"
+            + f"400 {main} {old} {shared}\n"
+            + f"300 {shared} {old}\n"
+            + f"100 {old}\n"
+        )
+
+        def git(_repo: Path, *arguments: str, input_text: str | None = None,
+                missing_ok: bool = False) -> str:
+            match arguments:
+                case ("rev-parse", "--verify", "--quiet", "refs/remotes/origin/main^{commit}"):
+                    self.assertTrue(missing_ok)
+                    return main + "\n"
+                case ("cat-file", "--batch-check"):
+                    return "".join(f"{sha} missing\n" if sha == missing else f"{sha} commit 123\n"
+                                   for sha in (input_text or "").splitlines())
+                case ("rev-list", "--topo-order", "--timestamp", "--parents", "--stdin"):
+                    self.assertEqual(set((input_text or "").splitlines()), {main, newer, shared, older})
+                    return graph
+                case _:
+                    self.fail(f"unexpected Git command {arguments}")
+
+        _ = write_config_fixture(self.config / "test_times.conf", "top_runs=2")
+        self.write_run([module_run("test_alpha.py", 40.0)], sha=shared)
+        self.write_run([module_run("test_alpha.py", 6.0)], epoch=EPOCH + 60, sha=newer)
+        self.write_run([module_run("test_alpha.py", 8.0)], epoch=EPOCH + 120, sha=shared)
+        self.write_run([module_run("test_alpha.py", 50.0), module_run("test_beta.py", 8.0)],
+                       epoch=EPOCH + 180, sha=older)
+        self.write_run([module_run("test_alpha.py", 100.0), module_run("test_beta.py", 100.0),
+                        module_run("test_missing.py", 30.0)], epoch=EPOCH + 240, sha=missing)
+
+        with mock.patch.object(show, "ranking_git", side_effect=git) as commands, \
+                mock.patch.object(show, "top_cache_root", return_value=self.root / "cache"):
+            output = self.report("top")
+            for name, median, count in (("test_alpha.py", "7.000", "2"), ("test_beta.py", "54.000", "2"),
+                                        ("test_missing.py", "30.000", "1")):
+                row = self.line(output, f"tools/{name}")
+                self.assertEqual(self.cell(output, row, "median s"), median)
+                self.assertEqual(self.cell(output, row, "runs counted"), count)
+
+            commands.reset_mock()
+            self.assertEqual(self.report("top"), output)
+            self.assertEqual([call.args[1] for call in commands.call_args_list], ["rev-parse", "cat-file"])
+
+    def test_top_shows_the_latest_counted_run_code_date_in_the_user_zone(self) -> None:
+        older, newer, missing = (digit * 40 for digit in "123")
+        older_base = int(datetime(2026, 11, 2, 1, tzinfo=UTC).timestamp())
+        newer_base = int(datetime(2026, 11, 3, 1, tzinfo=UTC).timestamp())
+        self.write_run([module_run("test_alpha.py", 6.0), module_run("test_beta.py", 3.0)], sha=newer)
+        self.write_run([module_run("test_alpha.py", 8.0)], epoch=EPOCH + 60, sha=older)
+        self.write_run([module_run("test_beta.py", 4.0)], epoch=EPOCH + 120, sha=missing)
+
+        with mock.patch.object(show, "run_code_ages", return_value={older: older_base, newer: newer_base}):
+            output = self.report("top")
+
+        self.assertTrue(output.splitlines()[0].endswith("runs counted  code date"))
+        alpha = self.line(output, "tools/test_alpha.py")
+        self.assertEqual(self.cell(output, alpha, "last s"), "8.000")
+        self.assertEqual(self.cell(output, alpha, "code date"), "11-01")
+        beta = self.line(output, "tools/test_beta.py")
+        self.assertEqual(self.cell(output, beta, "runs counted"), "2")
+        self.assertEqual(self.cell(output, beta, "code date"), "unknown")
+
+    def test_top_code_age_cache_resolves_new_objects_and_tracks_main(self) -> None:
+        old, landed = "a" * 40, "b" * 40
+        main = old
+        available = False
+
+        def git(_repo: Path, *arguments: str, input_text: str | None = None,
+                missing_ok: bool = False) -> str:
+            match arguments:
+                case ("rev-parse", *_):
+                    self.assertTrue(missing_ok)
+                    return main + "\n"
+                case ("cat-file", "--batch-check"):
+                    return "".join(f"{sha} missing\n" if sha == landed and not available
+                                   else f"{sha} commit 123\n" for sha in (input_text or "").splitlines())
+                case ("rev-list", *_):
+                    if landed in (input_text or "").splitlines():
+                        return f"200 {landed} {old}\n100 {old}\n"
+                    return f"100 {old}\n"
+                case _:
+                    self.fail(f"unexpected Git command {arguments}")
+
+        with mock.patch.object(show, "ranking_git", side_effect=git), \
+                mock.patch.object(show, "top_cache_root", return_value=self.root / "cache"):
+            revisions = {old, landed}
+            self.assertEqual(show.run_code_ages(self.repo, revisions), {old: 100})
+            available = True
+            self.assertEqual(show.run_code_ages(self.repo, revisions), {old: 100, landed: 100})
+            main = landed
+            self.assertEqual(show.run_code_ages(self.repo, revisions), {old: 100, landed: 200})
+
+    def test_top_code_age_cache_recomputes_when_the_shallow_boundary_changes(self) -> None:
+        main, run_commit, boundary, deeper_boundary = (digit * 40 for digit in "1234")
+        shallow = self.repo / ".git" / "shallow"
+        _ = shallow.write_text(boundary + "\n", encoding="ascii")
+
+        with mock.patch.object(show, "ranking_git", return_value=main + "\n"), \
+                mock.patch.object(show, "resolve_run_commits", return_value={run_commit: run_commit}), \
+                mock.patch.object(show, "merge_base_times", side_effect=[{run_commit: 200}, {run_commit: 100}]) as times, \
+                mock.patch.object(show, "top_cache_root", return_value=self.root / "cache"):
+            self.assertEqual(show.run_code_ages(self.repo, {run_commit}), {run_commit: 200})
+            self.assertEqual(show.run_code_ages(self.repo, {run_commit}), {run_commit: 200})
+            times.assert_called_once_with(self.repo, main, {run_commit})
+
+            _ = shallow.write_text(deeper_boundary + "\n", encoding="ascii")
+            self.assertEqual(show.run_code_ages(self.repo, {run_commit}), {run_commit: 100})
+            self.assertEqual(times.call_count, 2)
+
+    def test_top_retries_an_unknown_merge_base_after_git_gains_history(self) -> None:
+        main, run_commit, base = (digit * 40 for digit in "123")
+        base_time = int(EPOCH)
+        history_available = False
+        cache = self.root / "cache"
+        self.write_run([module_run("test_alpha.py", 8.0)], sha=run_commit)
+        self.write_run([module_run("test_beta.py", 5.0)], sha=main)
+
+        def git(_repo: Path, *arguments: str, input_text: str | None = None,
+                missing_ok: bool = False) -> str:
+            match arguments:
+                case ("rev-parse", *_):
+                    self.assertTrue(missing_ok)
+                    return main + "\n"
+                case ("cat-file", "--batch-check"):
+                    return "".join(f"{sha} commit 123\n" for sha in (input_text or "").splitlines())
+                case ("rev-list", *_):
+                    self.assertEqual(set((input_text or "").splitlines()), {main, run_commit})
+                    if history_available:
+                        return (f"{base_time + 60} {main} {base}\n"
+                                + f"{base_time + 30} {run_commit} {base}\n{base_time} {base}\n")
+                    return f"{base_time + 60} {main}\n{base_time + 30} {run_commit}\n"
+                case _:
+                    self.fail(f"unexpected Git command {arguments}")
+
+        with mock.patch.object(show, "ranking_git", side_effect=git), \
+                mock.patch.object(show, "top_cache_root", return_value=cache):
+            before = self.report("top")
+            self.assertEqual(self.cell(before, self.line(before, "tools/test_alpha.py"), "code date"), "unknown")
+            saved = cache / "gate-top-code-age.json"
+            self.assertEqual(json.loads(saved.read_text()), {"main": main, "shallow": "", "times": {main: base_time + 60}})
+
+            # An older version could save a null time for the run commit.
+            _ = saved.write_text(json.dumps({"main": main, "shallow": "", "times": {main: base_time + 60, run_commit: None}}))
+            history_available = True
+            after = self.report("top")
+            self.assertEqual(self.cell(after, self.line(after, "tools/test_alpha.py"), "code date"), "11-03")
+            self.assertEqual(json.loads(saved.read_text()),
+                             {"main": main, "shallow": "", "times": {main: base_time + 60, run_commit: base_time}})
+
     def test_top_reads_history_when_the_configured_checkout_is_a_symlink(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)], checkout=str(self.repo.resolve()))
         alias = self.repo.with_name("checkout-alias")
@@ -1038,18 +1193,18 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         status, output, errors = report_without_update("trend")
         self.assertEqual(status, 0, errors)
         tables = trend_tables(output)
-        self.assertEqual(list(tables), ["builder merge gates", "natedev merge gates", "natedev targeted tests"])
-        self.assertEqual(tables["natedev merge gates"][1:], [
+        self.assertEqual(list(tables), ["builder full suite runs", "natedev full suite runs", "natedev targeted tests"])
+        self.assertEqual(tables["natedev full suite runs"][1:], [
             ["2026-11-02", "1", "6", "6", "30", "30", "—", "—", "—"],
             ["2026-11-03", "20", "15", "19", "34", "30", "—", "—", "—"],
         ])
-        self.assertEqual(tables["builder merge gates"][1:], [
+        self.assertEqual(tables["builder full suite runs"][1:], [
             ["2026-11-03", "1", "5", "5", "30", "30", "—", "—", "—"]])
         self.assertEqual(tables["natedev targeted tests"], [
             ["day", "runs", "CPU mean", "CPU p95", "wall mean", "wall p95",
              "cost mean", "cost p95", "cost total", "median modules run"],
             ["2026-11-03", "1", "10", "10", "40", "40", "—", "—", "—", "2"]])
-        self.assertEqual(tables["natedev merge gates"][0], tables["builder merge gates"][0])
+        self.assertEqual(tables["natedev full suite runs"][0], tables["builder full suite runs"][0])
 
     def test_trend_joins_cloud_cost_to_the_attempt_and_uses_the_applied_rate(self) -> None:
         from scripts.build_targets import target_config
@@ -1083,8 +1238,8 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         status, output, errors = report_without_update("trend")
         self.assertEqual(status, 0, errors)
         tables = trend_tables(output)
-        self.assertEqual(list(tables), ["aws merge gates", "aws targeted tests"])
-        self.assertEqual(tables["aws merge gates"][1:], [
+        self.assertEqual(list(tables), ["aws full suite runs", "aws targeted tests"])
+        self.assertEqual(tables["aws full suite runs"][1:], [
             ["2026-11-03", "2", "8", "10", "30", "30", "$0.655", "$1.000", "$1.310"]])
         self.assertEqual(tables["aws targeted tests"][1:], [
             ["2026-11-03", "1", "15", "15", "30", "30", "$0.120", "$0.120", "$0.120", "1"]])
@@ -1108,11 +1263,11 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         write_trend_ledger(state, reservations)
         status, output, errors = report_without_update("trend")
         self.assertEqual(status, 0, errors)
-        self.assertEqual(trend_tables(output)["aws merge gates"][1:], [
+        self.assertEqual(trend_tables(output)["aws full suite runs"][1:], [
             ["2026-11-03", "5", "5", "10", "30", "30", "$0.543", "$1.000", "$1.630"]])
         self.assertEqual(output.count("2 of 5 runs have no cost record."), 1)
-        self.assertNotIn("aws-build merge gates", output)
-        self.assertNotIn("aws-unpriced merge gates", output)
+        self.assertNotIn("aws-build full suite runs", output)
+        self.assertNotIn("aws-unpriced full suite runs", output)
 
     def test_trend_updates_missing_cost_on_an_open_day_and_caches_it_after_settling(self) -> None:
         from scripts.build_targets import target_config
@@ -1125,7 +1280,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             writer.commit()
         status, output, errors = report_without_update("trend", "--days", "1")
         self.assertEqual(status, 0, errors)
-        self.assertEqual(trend_tables(output)["aws merge gates"][1][-3:], ["—", "—", "—"])
+        self.assertEqual(trend_tables(output)["aws full suite runs"][1][-3:], ["—", "—", "—"])
         state = target_config.ssh_target_state_directory("aws")
         state.mkdir(parents=True)
         write_trend_ledger(state, [ledger.GateReservation(
@@ -1134,7 +1289,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             rate=ledger.BoxRate(Decimal("0.2"), "applied price"))])
         status, output, errors = report_without_update("trend", "--days", "1")
         self.assertEqual(status, 0, errors)
-        self.assertEqual(trend_tables(output)["aws merge gates"][1][-3:], ["$0.220", "$0.220", "$0.220"])
+        self.assertEqual(trend_tables(output)["aws full suite runs"][1][-3:], ["$0.220", "$0.220", "$0.220"])
 
         self.write_run([module_run("test_alpha.py", 8)], host="ip-10-1-1-2", epoch=EPOCH - 86400)
         _ = show.index.update()
@@ -1154,7 +1309,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             with redirect_stdout(output_buffer):
                 show.trend(reader, 2)
         output = output_buffer.getvalue()
-        self.assertEqual(trend_tables(output)["aws merge gates"][1],
+        self.assertEqual(trend_tables(output)["aws full suite runs"][1],
                          ["2026-11-02", "1", "4", "4", "30", "30", "—", "—", "—"])
         self.assertEqual(len([sql for sql in queries if "sum(m.cpu_s)" in sql]), 1)
         self.assertIn("1 of 2 runs have no cost record.", output)
@@ -1176,7 +1331,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         write_trend_ledger(state, reservations)
         status, output, errors = report_without_update("trend", "--days", "3")
         self.assertEqual(status, 0, errors)
-        self.assertEqual(trend_tables(output)["aws merge gates"][1][-3:], ["$0.120", "$0.120", "$0.120"])
+        self.assertEqual(trend_tables(output)["aws full suite runs"][1][-3:], ["$0.120", "$0.120", "$0.120"])
         self.assertIn("2 of 4 runs have no cost record.", output)
 
         reservations = reservations[:1]
@@ -1196,7 +1351,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             with redirect_stdout(output_buffer):
                 show.trend(reader, 3)
         output = output_buffer.getvalue()
-        self.assertEqual(trend_tables(output)["aws merge gates"][1],
+        self.assertEqual(trend_tables(output)["aws full suite runs"][1],
                          ["2026-11-01", "2", "4", "4", "30", "30", "$0.420", "$0.420", "$0.840"])
         self.assertEqual(len([sql for sql in queries if "sum(m.cpu_s)" in sql]), 1)
         self.assertNotIn("2026-11-01", "".join(queries))
@@ -1216,7 +1371,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             with redirect_stdout(output):
                 show.trend(reader, 2)
         tables = trend_tables(output.getvalue())
-        self.assertEqual(tables["natedev merge gates"][1:], [
+        self.assertEqual(tables["natedev full suite runs"][1:], [
             ["2026-11-02", "1", "4", "4", "30", "30", "—", "—", "—"],
             ["2026-11-03", "1", "99", "99", "30", "30", "—", "—", "—"]])
         self.assertEqual(len([sql for sql in queries if "sum(m.cpu_s)" in sql]), 1)
@@ -1229,7 +1384,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
                 _ = path.write_text(damaged)
                 status, output, errors = report_without_update("trend", "--days", "2")
                 self.assertEqual(status, 0, errors)
-                self.assertEqual(trend_tables(output)["natedev merge gates"][1][2:4], ["99", "99"])
+                self.assertEqual(trend_tables(output)["natedev full suite runs"][1][2:4], ["99", "99"])
 
     def test_trend_settles_only_after_a_complete_refresh_starts_beyond_the_delay(self) -> None:
         self.write_run([module_run("test_alpha.py", 8)], epoch=EPOCH - 86400, host="natedev")
@@ -1243,13 +1398,13 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             writer.commit()
         status, output, errors = report_without_update("trend", "--days", "2")
         self.assertEqual(status, 0, errors)
-        self.assertEqual(trend_tables(output)["natedev merge gates"][1][2:4], ["11", "11"])
+        self.assertEqual(trend_tables(output)["natedev full suite runs"][1][2:4], ["11", "11"])
         with closing(sqlite3.connect(index_path_in(self.log))) as writer:
             writer.execute("UPDATE gate_modules SET cpu_s=22").close()
             writer.commit()
         status, output, errors = report_without_update("trend", "--days", "2")
         self.assertEqual(status, 0, errors)
-        self.assertEqual(trend_tables(output)["natedev merge gates"][1][2:4], ["11", "11"])
+        self.assertEqual(trend_tables(output)["natedev full suite runs"][1][2:4], ["11", "11"])
 
     def test_trend_writers_preserve_days_and_a_newer_refresh_from_another_writer(self) -> None:
         self.write_run([module_run("test_alpha.py", 8)], epoch=EPOCH - 86400, host="natedev")
@@ -1327,7 +1482,7 @@ else:
                 self.assertEqual(show.read_trend_cache().completed_refresh_started_at, newer)
                 status, output, errors = report_without_update("trend", "--days", "2")
                 self.assertEqual(status, 0, errors)
-                self.assertEqual(trend_tables(output)["natedev merge gates"][1][2:4], ["77", "77"])
+                self.assertEqual(trend_tables(output)["natedev full suite runs"][1][2:4], ["77", "77"])
 
     def test_cli_imports_the_index_from_an_external_working_folder(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)])

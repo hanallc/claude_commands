@@ -83,11 +83,10 @@ The page keeps `agent_swap_demand` and `swap_covered_bytes` as its reserve field
 Each new host reading still reads `MemAvailable`.
 The pressure limits remain unchanged.
 
-The service measures each handled request's wall time and process CPU time.
-The measurements include configuration recovery for the logging threshold.
+The service measures each handled request's wall time and thread CPU time.
 `request_slow_seconds=0.25` sets the logging threshold in `config/build_admission.conf`.
 A request above that threshold logs its request kind, wall seconds, and CPU seconds to stderr.
-The service reads the threshold at use.
+The service reads the threshold when it loads the admission configuration.
 An unusable threshold logs once through the existing configuration diagnostics.
 Requests and cleanup continue when this logging setting is unusable.
 
@@ -209,7 +208,17 @@ Saved disk exclusions remain diagnostic evidence.
 `SourceKeyUnavailable` preserves the existing copy path when neither source key is available.
 An unavailable key permits placement and sends no source key with the copy.
 `PlacementWait` carries the original queue time, position and candidate eligibility.
-`Assignment` carries a persisted destination and attempt; it grants no execution permission.
+`wait_for_placement` polls after each configured waiting interval, which is one second by default.
+The timer controls polling even when the queue, view, hold, or release files change.
+The service caches placement waits after each pass.
+It hashes poll bytes with SHA-256 before it fills in the caller identity or resolves the Cargo folder.
+A poll can reuse a wait when the request digest and input event count match and no configuration change is pending.
+An episode with a current assignment or local grant takes the regular request path.
+An unchanged poll that reuses a wait needs no pass, state write, or configuration file read.
+A poll from another account still checks the owner's account in `/proc/<pid>/status`.
+The timer refreshes waits at the larger of `waiting_pass_seconds` and `min_pass_gap_seconds`.
+The next poll sees the new result after the pass.
+`Assignment` carries a saved destination and attempt. Launch permission requires a separate request.
 `ClaimFailure` closes the exact assignment before another placement decision.
 `ConsumePermission` carries the exact assignment, adopted provider claim reference, and checked claim-holder identity.
 The coordinator remains separate from its offload child.
@@ -291,13 +300,18 @@ Unavailable remote identity remains uncertain.
 Remote memory remains unavailable and contributes zero to local admission accounting.
 A Mac host run shows on the Builds page as its Mac build row; the page hides its queue row, so the run shows once.
 A `mac-linux` gate row has machine `mac-linux` after the gate consumes its launch permission.
-The service sets the remote `started_at` from the consume time, so `memory_feed.unconfirmed_guest_run` reads the consume from it.
-A confirmed guest attempt gives the row `guest_run`. A consumed attempt that the queue has not confirmed gives `guest_unconfirmed: true`.
+The service sets the remote `started_at` when the gate consumes its launch permission.
+The queue confirms the attempt when it receives matching execution evidence for that permission. The confirmed row has `guest_run`.
+The feed adds the guest setup allowance and `query_timeout_seconds` to `started_at` to set the deadline.
+Before the deadline, an unconfirmed row shows `starting`.
+At or after the deadline, it shows `not confirmed`.
 The Builds page shows both attempts in Running with the recorded job, unit, and caller.
-The Machine cell shows one bright icon for `mac-linux` and the guest state.
-The icon uses the Mac color in light and dark modes.
-The cell shows `not confirmed` until confirmation, then `running`.
-The tooltip lists the named targets. It shows the attempt ID after confirmation.
+The Machine cell shows one bright Apple icon with a 🐧 badge.
+The Apple icon has a white fill and a black outline in light and dark modes.
+The cell shows the unconfirmed state next to the icon. A confirmed row shows the icon alone.
+The tooltip shows `Runs on` and `Named targets`.
+The tooltip wraps long fields and fits the visible viewport when it opens, its content changes, or the window changes size.
+The tooltip clips content that exceeds the available height and lets clicks reach the rows beneath it.
 The memory column shows `on mac-linux`. The vCPU column shows `—`.
 The admission service reads the module counter from the current guest's placement request sidecar.
 It publishes the counter before and after the guest confirms the attempt.
@@ -342,7 +356,7 @@ The sweep also reads old six-character shell suffixes until 2026-12-03.
 `ExplicitBuildParent` retains an explicit parent.
 `SystemTemporaryParent` uses the short system parent for socket and index folders.
 `UnitRunParent` reads the current root from `unit_runs.run_roots()`.
-The merge gate checks `/dev/shm` before allocation and uses an explicit parent without a disk fallback.
+The gate checks `/dev/shm` before allocation and uses an explicit parent without a disk fallback.
 
 Shell callers use these forms:
 
@@ -376,7 +390,7 @@ An explicit private sweep root selects its own `copies` folder instead of the li
 Stable session folders retain their short paths and mode `0700`.
 The session hook defines the session temporary root.
 The admission fixture uses `short_socket_directory(prefix)` for its separate short socket parent.
-The service keeps `admission/state.json` and `admission/queue.json` outside temporary build folders.
+The service keeps `state.json`, `queue.json`, and `view.json` in the admission folder outside temporary build folders.
 `step_estimator.is_fresh_test()` and the disk sweep read `tmp_sweep.state_dir()` at use.
 `tmp_sweep.TARGET_DELETES_NAME` defines the shared deletion record name.
 
@@ -576,8 +590,12 @@ An expired estimate requires a client refresh through the service.
 | `view`, `explain`, `mine` | Read the stored pass |
 
 `/build:bump <position|session|folder>` selects a waiting step by position, session, or folder.
-It sets priority for that step's unit. An unmatched selector exits 3 without a priority change.
-The service refuses `priority_set` when no waiting step or current reservation belongs to the unit.
+The command resolves session names through the staff roster. It reads positions and folders from `queue.json`.
+Set and clear append to `admission/person_actions.jsonl` under a file lock and sync the file.
+Each record holds its id, actor, time and reason. A set also holds the selected step's queue key.
+The command prints `recorded` and the id after the write. It uses no service socket.
+An unmatched selector or unknown unit exits 3 and writes no record.
+The socket priority requests still serve existing clients.
 `/build:bump` works from any session or a plain shell.
 `queue_command_actor()` selects `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, then `"user"`.
 
@@ -646,7 +664,7 @@ An empty scope and ended owner permit finalization. A reused scope path gets a n
 `finalize_reservation` is the one finalizer. `StateIntents.save` persists its evidence before the history append.
 The finalizer matches `reservation_id` to prevent a duplicate history row after a crash.
 `StateIntents.clear` removes the reservation after the append. Startup completes any saved intent.
-The finalizer records completed measurements for history. Release creates the run slot without changing the accepted need.
+The finalizer records completed measurements for history. A first-step handoff records none: its peak is the preparation, not the step. Release creates the run slot without changing the accepted need.
 
 At the first start without `state.json`, the service imports the old admission files through their existing readers.
 It imports live reservations, saved intents, waiter places, token handoffs, priority, and start spacing.
@@ -658,6 +676,33 @@ Importing `build_hold` or `build_targets` does not load the admission service.
 `ServiceState` and `read_state` retain one definition in `admission_service.py` because the state uses several service types.
 The service imports `argparse` inside `main()` and the reading alert message helpers inside `deliver_reading_alert()`.
 After each pass, the service publishes `admission/queue.json` atomically through `scripts/build_queue/queue_snapshot.py`.
+Each publication of the view also replaces `admission/view.json` atomically.
+The pass stores the current input event count with its placement waits before it replaces the view file.
+The file holds the publication time, `fresh_until`, and the encoded socket reply.
+`fresh_until` adds the longest configured pass interval or minimum pass gap to the publication time.
+A socket `ViewRequest` returns the last published view without starting a pass.
+Consuming a Mac Linux permission advances the input event count and marks the pass stale.
+The next eligible pass publishes the guest row.
+
+The Builds feed reads `view.json` and uses its publication time as the data time.
+The page shows `Late` when the time since `fresh_until` exceeds `status.builds.age_limit_seconds` in `config/console.conf`.
+A missing or unreadable view file gives the queue read error.
+
+The service saves a `HeldPlace` when a failed run qualifies to keep its place.
+The record keeps the failed step, the run identity, its targets, and the expiry time.
+An older record can omit the failed step.
+The view uses the queue rank, including priority, to place each kept row in the waiting order.
+The service supplies the full waiting order for moves, including waiters without a display name.
+The Builds page uses that order to number the preview and the confirmed move.
+The Builds page shows the unit in its role color in the row label.
+The Machine cell uses the same dim target icons as a waiting row.
+The deadline cell shows `until HH:MM` in the user's time zone.
+The row has no reorder control or memory bar.
+The hover shows the failed run, step, failure time, and deadline.
+The hover includes the time zone in the failure time and deadline.
+The hover shows the match rule for the saved job.
+`build_queue.py` uses the same place numbers and reports a kept place when the user selects it.
+
 The snapshot contains the pass readings, its policy, and the remaining waiters.
 The AWS controller reads this snapshot without a live queue request.
 It refuses a start when the snapshot is missing, stale, or incomplete.
@@ -677,6 +722,7 @@ At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 Each event identifies the logical step by `pid`, `start_time`, and the original `since`.
 Each admission and end also identifies its reservation interval by `reservation_id`.
 A token wait ends an interval with `TokenReturn`. It does not complete the step.
+A first-step handoff ends its grant with `HandOff` and outcome `handed_off`. It ends this run's lifetime but does not count as a completed step; the command's own admission has its own lifetime.
 A normal end uses `StepEnd`. An exit before a positive sample records `NoPositiveSample`.
 The saved finalization intent retains the facts for the end event across retries.
 The event identity prevents a retry from publishing the same end twice.
@@ -740,7 +786,7 @@ The existing unreachable limit still applies until a valid reply arrives.
 
 A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `estimate_refresh_seconds`.
 A program uses its history estimate and refreshes it under the normal estimate policy.
-The merge gate reads `program_first_peak_gib.gate` at use; its first need is 4 GiB.
+The gate reads `program_first_peak_gib.gate` at use. Its first need is 4 GiB.
 Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the first pass's look-ahead window.
 The gate removes its progress counter before reruns, which keep the full need.
 The merge-gate progress profile key includes `shape` (`tests` or `types`).
@@ -1111,7 +1157,7 @@ so the session variable of the caller names the owner.
 The service form `systemd-run --user --wait --pipe ...` starts with the environment of the user manager, which has no owner variable.
 For raw cargo or `verify.sh` in a folder that has no owner record, add `-E CLAUDE_CODE_SESSION_ID` or `-E CLAUDE_SESSION_NAME`.
 These callers always give an owner, also under systemd or with no session:
-- The merge gate and the nightly gate: `default_owner(<unit>)` around the suites.
+- The gate and the nightly gate: `default_owner(<unit>)` around the suites.
 - `gate.py --tests-only` and `--affected` (targeted_test): `default_owner(copies.source_owner(repo))`.
   `run_tests_only` reads `copies.source_owner` only when `request_owner("")` gives `OwnerNotGiven`:
   the caller set no owner variable and its process family names no owner, so a run from a terminal keeps `terminal`.
@@ -1243,7 +1289,7 @@ It reads `queue.json` and the tail of `queue_times.jsonl`. It does not ask the s
 The watch uses `head_stall_alert_minutes` from `build_admission.conf` as the stall limit.
 The head must wait at least that long. At least one step must hold memory.
 The last admission or step start with a memory need above zero must also be at least that old.
-Merge gates and targeted tests start with a memory need of zero.
+Gate jobs start with a memory need of zero.
 The watch skips snapshots older than `silence_seconds`. `down-alert` covers a silent service.
 
 The watch sends one alert per stall to each of the `builds` and `bob` sessions.
@@ -1326,7 +1372,19 @@ Install on natedev from the repo root with `scripts/build_hold/install_cargo_wra
 `/build:bump` resolves the waiting step's recorded unit before it checks roster labels.
 The no-unit display placeholder supplies no unit.
 Unknown units keep the saved priority and return exit 3 with a refusal on stdout.
-The Builds page shows the saved priority order and reasons.
+Each pass applies bump records in file order before it ranks the waiters.
+The service persists the byte offset with the priority change in `admission/state.json`.
+A restart resumes at that offset. Complete records stay in the file.
+A set for a departed step saves a refusal with the offset.
+The Builds page shows the saved time of each waiting record in the user's zone.
+It shows the reason for each refusal. An applied record leaves the waiting list.
+A set record saves the selected step's queue place and the request time.
+When the service changes priority, it saves the applied bump with the admission episode and the journal offset.
+The applied record has the actor, source place, destination, and request time.
+The feed includes the bump on waiting and running rows for that episode.
+Moved is the last column. It shows the actor in an orange bump mark, or a dash when the row has no move.
+A kept place shows a dash.
+Hover on the mark to see the queue place, actor, source place, destination, and request time in the user's zone.
 
 Durable `Waiter` rows keep their join and token clocks. `RankedWaiter.order` holds `PriorityUnit` or `NormalOrder` only in the resolved queue. Priority transitions decode to `SettledPriority` or `PendingPriorityTransition`; a pending transition keeps its id and saved month-log offset through retries. One cleanup guard isolates both a failed token-wait intent and failed dead-owner reservation finalization. Each failure logs its record path and keeps the record for the next poll; other cleanup and admission continue.
 
@@ -1402,6 +1460,14 @@ Snapshot rows have priority on equal distances.
 **CI poll freshness** (`scripts/buildlog/ci.py`). Each poll that reached GitHub writes `<root>/ci/polled.json` `{repo: {polled_at, complete}}` atomically; a cold-credential skip or `GhError` writes nothing. `read_poll_state(repo) -> CompletedPoll(polled_at) | CappedPoll(polled_at) | NeverPolled()`; a malformed or zone-less stamp is `NeverPolled`.
 
 **BRP launches** (`scripts/buildlog/launches.py`). `collect() -> LaunchCounts` turns each `brp_launch` result in `~/.claude/projects/*/*.jsonl` (`BUILDLOG_TRANSCRIPTS` replaces the root) into a `build` step with caller `brp-launch`: `ended_at` = `metadata.launch_timestamp`, `started_at` = that minus the launch duration, argv `cargo build --workspace --bin|--example <target> [--release]` (`--bin` only when `metadata.launched_as` is `app`), no memory fields. It reads `mcpMeta.structuredContent`, list `tool_result` items and `<task-notification><result>JSON</result>` strings, and skips any line lacking `brp_launch` or one of those markers before parsing. `launch_record(line, transcript, *, backfill=False) -> RecordedLaunch | LaunchOutcome` takes the location from `parameters.path`, else `metadata.working_directory`, else `LaunchOutcome.NO_LOCATION`; repo and worktree come only from `record.git_facts(location)`. Each launch is `launch-<sha256(session:timestamp)>.jsonl`, written only when absent (temporary file, hard link). `launches_state.json` holds each transcript's offset and marks; an entry without `reread_complete` is re-read once from the start, launches before its saved offset recorded with `branch` and `sha` null. `LaunchCounts.summary()` prints on stdout for `buildlog launches` and on stderr for `buildlog report`. `day_report` collects before `index.update()`.
+
+### AWS costs on the Builds page
+
+The report feed reads saved AWS bills, the cost ledger, and launch records. It makes no AWS calls.
+The pane groups amounts by UTC bill day and uses the user time zone for times and CSV exports.
+A late read shows the last read date and the saved reason, when available.
+Days with fixed costs and no runs show the cost and zero runs.
+The job view shows Hana attempts and machine time outside those attempts.
 
 ### Build log: commands and report
 
@@ -1654,7 +1720,7 @@ With a call id, the record decides.
 Verify routes eligible steps to the Mac and waits for other steps.
 Their running natedev test and type-check children still stop.
 They write stopped rows with the PID and start time.
-The merge gate reads those rows and reruns the stopped modules after release.
+The gate reads those rows and reruns the stopped modules after release.
 No run pauses: cargo must release `/dev/steve` slots and locks, and wall-clock limits continue.
 
 `clear` starts the user unit `build-hold-enforcer` with absolute paths, or keeps an active unit.
@@ -1683,7 +1749,7 @@ Runs shorter than one pass can finish first, so call guards refuse those starts.
 The Bash front reads stdin once.
 It starts no Python when the hold directory has no entry.
 It also starts no Python when the input has none of `cargo`, `merge_gate`, or `targeted_test`.
- An unreadable hold path also starts the decision reader. Otherwise it passes the same input to `pre-tool-use-build-hold-guard.py` and relays its output and status. The guard refuses raw building `cargo` verbs (including short forms and `+toolchain`) while a non-holder natedev hold applies; removal ends that holder’s hold. All `verify.sh` calls pass, with or without a step record: verify routes eligible steps to the Mac during the hold and waits for other steps. Non-building calls pass. The Python guard checks the command through `tool_call_text.py`, checks for a hold entry, then imports `scripts/build_hold/hold_applies.py` in the same process. The helper uses `target_state(local_target())`, `natedev_holds` and `caller_holds_only_own()`. The sole in-force holder may build. Other sessions see `natedev builds are held by <holder>. Keep working, writes included. Use verify.sh: eligible steps go to the Mac; other steps wait. Raw cargo and merge gates must wait for the hold to end.` Only in-force holders are named, with `holder_text`. The helper exits 0 with that refusal on stdout, 1 silently when builds may run, or 2 with a read error on stderr. The guard denies hold read errors and any other exception in its decision path with a one-line reason that names the failed read. Only an explicit allow decision permits a build; no wait is registered.
+ An unreadable hold path also starts the decision reader. Otherwise it passes the same input to `pre-tool-use-build-hold-guard.py` and relays its output and status. The guard refuses raw building `cargo` verbs (including short forms and `+toolchain`) while a non-holder natedev hold applies; removal ends that holder’s hold. All `verify.sh` calls pass, with or without a step record: verify routes eligible steps to the Mac during the hold and waits for other steps. Non-building calls pass. The Python guard checks the command through `tool_call_text.py`, checks for a hold entry, then imports `scripts/build_hold/hold_applies.py` in the same process. The helper uses `target_state(local_target())`, `natedev_holds` and `caller_holds_only_own()`. The sole in-force holder may build. Other sessions see `natedev builds are held by <holder>. Keep working, writes included. Use verify.sh: eligible steps go to the Mac; other steps wait. Raw cargo and gate jobs must wait for the hold to end.` Only in-force holders are named, with `holder_text`. The helper exits 0 with that refusal on stdout, 1 silently when builds may run, or 2 with a read error on stderr. The guard denies hold read errors and any other exception in its decision path with a one-line reason that names the failed read. Only an explicit allow decision permits a build; no wait is registered.
 The cargo verbs include `mend` and `miri`; the guard does not match `verify.sh` step names or options.
 The guard also refuses `merge_gate.py` and `targeted_test.py` in every mode under the same hold decision.
 This applies to direct calls and calls through Python or `lib/py`.
@@ -1984,23 +2050,15 @@ The crossing record keeps the first above-line time under the record lock.
 A reading at or below that boundary restarts the interval.
 `config/lint.conf` sets the margin to 5 GiB and the interval to 60 minutes.
 With the 150 GiB alert line, free space must stay above 155 GiB for 60 minutes.
-Rearm sends one `sweep.disk_floor_recovered` phone push after an accepted fall push.
-The return receipt and its stable key prevent accepted return delivery from repeating.
-A failed return delivery retries above the rearm line.
-A later fall starts a new episode even when the previous return receipt stays pending.
-At recovery, `disk_floor` retires every open crossing's `phone:<identity>` fall key on natedev, which owns the silence queue.
-This includes a crossing whose fall phone receipt stays pending.
-The Mac reaches this retirement through ssh natedev.
-If retirement drops a kept fall push, the fall never reached the user and no return push sends.
-The reported dropped count determines this result even when the retire command exits with an error.
-A retire attempt without a dropped count suppresses the return push in the saved crossing state.
-The next pass retries retirement; a completed retry closes that crossing without a return push.
-Only an accepted fall and a first retire result of zero dropped pushes permit a return push.
-An episode with a pending fall phone receipt gets no return push.
-The same rule applies to natedev and the Mac.
+Recovery rearms the next fall without sending a phone push.
+At recovery, `disk_floor` retires the crossing's `phone:<identity>` fall key in the silence queue on natedev.
+This includes a crossing with a pending phone receipt.
+The Mac uses SSH to retire the key on natedev.
+A reported dropped count confirms retirement even when the command exits with an error.
+If the command gives no dropped count, the crossing stays in retirement and retries on a subsequent pass above the rearm line.
+A later fall starts a new episode if retirement is still pending.
 While text approval is stale, the natedev message still sends and the phone receipt stays pending.
 The phone channel can send that pending episode after the showrunner records the new approval.
-The return text needs its own approval before delivery.
 
 Natedev also records cache sizes, growth and removal accounting. These reports stay outside the Mac path:
 
@@ -2076,7 +2134,7 @@ It prints `verify.sh: example-test is removed: examples carry no tests (user, 20
 - The window report is host-scoped; the daily report aggregates hosts. A run's own peak comes from `ci_anon_bytes` / `builds_anon_bytes` samples, never from `memory.peak`.
 - Only a phone-floor crossing reaches the phone, with current text approval; diagnostics go to natedev.
 - Tests never read the real cgroup tree, `/proc/meminfo`, `/proc/pressure/memory`, journal or transcripts, and never write `~/.local/state/buildlog`, `build-hold`, `build-hold-release`, `notify` or the agent notes: they take `BUILDLOG_MEMINFO` and `BUILDLOG_MEMORY_PRESSURE` from `scripts/lint/memory_test_support.py`, set `BUILDLOG_*_CGROUP`, `BUILDLOG_TRANSCRIPTS`, `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR`, `HOME`, and stub `journalctl`, `zramctl`, cargo and git on `PATH`. Tests set the hold variables for a checkout's scripts; installed scripts refuse to run with them set.
-- When `BUILDLOG_LIVE_MEMORY_TRIPWIRE` names a record file, the shell gate and Python checker refuse a path that resolves to `/proc/meminfo` or `/proc/pressure/memory` before reading it, append a JSON record, and name the fake readings the test must set. The merge gate sets this variable for every test module and fails any module with a recorded live reading. The default-path test removes the tripwire but supplies fake pressure text. A failed record write still refuses the reading but leaves no record, so the gate detects only recorded readings.
+- When `BUILDLOG_LIVE_MEMORY_TRIPWIRE` names a record file, the shell gate and Python checker refuse a path that resolves to `/proc/meminfo` or `/proc/pressure/memory` before reading it, append a JSON record, and name the fake readings the test must set. The gate sets this variable for every test module and fails any module with a recorded live reading. The default-path test removes the tripwire but supplies fake pressure text. A failed record write still refuses the reading but leaves no record, so the gate detects only recorded readings.
 - A verify.sh routing test follows `scripts/direct/test_verify_untested_examples.py`: cargo passes `metadata` to real cargo and logs every other call, git is stubbed, and the environment drops `UNIT_RUN_DIR`/`UNIT_TEAM_ROLE` and sets `BUILDLOG_OFF=1`, `BUILDLOG_SCOPE=0`, `BUILDLOG_MEMINFO`, `BUILD_HOLD_DIR` and `CARGO_TARGET_DIR`. Tests set `BUILD_HOLD_DIR` for a checkout's scripts; installed scripts refuse to run with it set.
 - Times shown are in the user's zone through `user_zone()`; stored instants are UTC. An `HH:MM` release ETA names the zone in which it was supplied.
 
@@ -2358,12 +2416,20 @@ On 2026-11-23, Nate asked again for the Unit column to go because the row start 
 At 10:00 he asked why the Slot column still showed; natedev has no slots, so each of its rows showed `—`.
 On 2026-11-23, Nate said: “where it is running should be what shows in the running column”.
 On 2026-11-23, Nate approved the machine icons proposal of bob (List item 260): the `Machine` column shows icons, not names.
-`MACHINE_ICONS` in `memory_live.html` gives each known machine its icon: lucide `server` for `natedev`, lucide `laptop` for `mac`, and lucide `cloud` for `aws`.
-`mac-linux` is the laptop with a 🐧 badge. `hana-aws` is the cloud with a 🌸 badge. `hana-gpu` is the cloud with a ⚡ badge.
-One hidden `<svg>` at the top of the page defines each symbol once, and each icon uses it with `<use href>`.
-The badge is CSS text from the icon's `data-badge`, so it is not page text.
-Each icon has its machine name as its accessible name (`role="img"` and `aria-label`).
-A running row's `Machine` cell shows one bright icon in a faint box: the machine that runs the step.
+`MACHINE_ICONS` in `memory_live.html` gives each known machine its icon.
+
+- `natedev` uses the 🐧 emoji by itself.
+- `mac` uses the Apple silhouette.
+- `mac-linux` uses the Apple silhouette with a 🐧 badge.
+- `aws` uses the cloud with a 🐧 badge.
+- `hana-aws` uses the cloud with a 🌸 badge.
+- `hana-gpu` uses the cloud with a ⚡ badge.
+
+A hidden `<svg>` defines the Apple and cloud symbols once.
+Each SVG icon references its symbol with `<use href>`.
+CSS draws each badge from the icon's `data-badge` value.
+Each icon records its machine in `data-machine` and uses that name in `aria-label`.
+A running row shows one bright icon in a faint box for the machine that runs the step.
 The feed's `machine` field is the one source for that machine.
 The row hover names the running machine under `Runs on`.
 The `Folder` field follows `Runs on` and shows the full working path.
@@ -2379,7 +2445,7 @@ The page fits and positions the open hover again after a feed refresh.
 The AWS progress record has no working path.
 The CI summary and hand-made Mac Linux runs have no `Folder` field.
 The hover lists the other machines that the step named under `Named targets`.
-A waiting row's `Machine` cell shows one dim icon for each machine that can take the step, in the feed's order.
+A waiting row's `Machine` cell shows one icon at half opacity for each machine that can take the step, in the feed's order.
 A waiting CI step has one target: the host machine, where the CI runners run (`memory_feed.ci_target_notes`). The running CI row shows the same machine.
 Its hover names those machines in words under `Runs on`, after the `Waits for` reason.
 A machine with no icon shows its name as text in its machine color.
@@ -2388,7 +2454,8 @@ Waiting rows size the `Step` column, so each step shows on one line; a new waiti
 In a tight pane a waiting step breaks between words. There, the column takes the width of its widest word, so no word is cut.
 Each word of a waiting step with more than one word is in its own `.word` span with `white-space: nowrap`, so a word such as `cargo-style` never breaks at its hyphen.
 A legend under the table shows `Legend:`, then each of the six icons with its name.
-Each machine on the page shows in its machine color: the `Machine` icons, the legend, the hover's `Runs on` and `Named targets`, Target availability, the Build limits headings, and the top costs.
+The machine colors apply to SVG symbols and machine names throughout the page.
+Emoji use their own colors.
 The `.machine` rules in `memory_live.html` are the one machine color map. `config/memory_feed.conf` sets the colors for `natedev`, `mac`, and `aws`.
 `mac-linux` is the Linux guest on the Mac, so it uses the `mac` color. `hana-aws` and `hana-gpu` are AWS boxes, so they use the `aws` color.
 Every match in the map ignores case, so the hover words `Mac` and `AWS` match their machines.
@@ -2406,7 +2473,7 @@ The wait ends at the next line, which reports the tokens taken.
 `NoCounter.token_wait` is an optional field, so the counter wire union does not change for pinned clients.
 The admission reading stores it in the running step's `measured.counter`.
 A row without a counter shows `—`.
-Local builds, merge gates, and cloud rows use their recorded counters.
+Local builds, gate runs, and cloud rows use their recorded counters.
 hana CI currently has no admission counter.
 The Running table shows hana CI only when a recorded runner has a busy job.
 Idle or unreadable runners have no separate Running row.
@@ -2522,11 +2589,11 @@ No adaptive controller, fixed admission limit, order window, CI growth promise, 
 
 ### Progress memory profiles
 
-Merge gates start with a ranked peak from their host's recorded peaks from the last 14 days, as other programs do.
+Gate runs start with a ranked peak from their host's recorded peaks from the last 14 days, as other programs do.
 Without history, they use `program_first_peak_gib.gate` from `config/build_admission.conf`.
 Matching progress profiles still determine the running need.
 
-Cargo build, check, clippy, mend, nextest, and merge gates record attributed swap-backed use in five-percent phase bins.
+Cargo build, check, clippy, mend, nextest, and gate runs record attributed swap-backed use in five-percent phase bins.
 Progress bins and program peaks use one ranked selection rule.
 For count `n`, the rule selects the Nth-highest value, with `N = min(n, max(floor, n * share // 100 + 1))`.
 `peak_history_share_percent=10` sets the share in `config/build_admission.conf`; its whole-percent range is 0 through 50.
@@ -2538,7 +2605,7 @@ It rebuilds merged profiles when the rank or share changes.
 The service applies each step's recorded headroom rule to the highest selected bin within its look-ahead window.
 `progress_lookahead_percent` is read at use; its initial value is 20.
 The window crosses Cargo phase boundaries, including repeated build phases.
-The merge gate window stops at the end of `suites:1`, even when history contains rerun phases.
+The gate window stops at the end of `suites:1`, even when history contains rerun phases.
 Reruns without a measured window retain the full need. Each step has its own history key.
 Missing counters, profiles, or anonymous readings retain the full need.
 Each saved record names its peak reading source with `ScopeReading` or `ProcessTreeReading`.
@@ -2718,7 +2785,7 @@ It retains Cargo inputs and `NEXTEST_CARGO_PROFILE`.
 Rows without a key cannot prove a fresh build.
 The broader `BUILDLOG_TREE` field cannot replace this key.
 
-The merge gate and style lint own private folders through `build_folders.temporary_build_folder`.
+The gate and style lint own private folders through `build_folders.temporary_build_folder`.
 The contexts remove these folders after success or an exception.
 Style review keeps its input folder for the review worker and finish command.
 Session TMPDIRs and unit session folders remain for later session commands.

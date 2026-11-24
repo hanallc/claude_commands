@@ -19,7 +19,7 @@ from unittest import mock
 
 
 from scripts.herdr import fake_herdr
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import copy_config_file_fixture, config_environment
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase
@@ -396,7 +396,7 @@ class FolderRenameFixture(StaffTestCase):
             worktree=staff.PresentWorktree(remote.local_machine(), self.source))
         _ = staff.update_current_session(row.current_session,
             staff.native_id(fixture_runtime_id("folder-current-after-clear")))
-        _ = self.configuration.write_text((Path(__file__).resolve().parents[2] / "config/production.conf").read_text())
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/production.conf", self.configuration)
         self.transcript("claude")
 
     def git(self, *arguments: str, cwd: Path | None = None) -> str:

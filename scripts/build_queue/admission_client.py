@@ -31,6 +31,7 @@ import uuid
 from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_code, placement, snapshot_codec
 from scripts.build_queue import admission_wire as status_wire
+from scripts.build_queue.admission_wire import REPLACED_REASON
 from scripts.build_queue.admission_wire import assignment_what
 from scripts.build_queue.admission_wire import read_assignment as read_assignment
 from scripts.build_queue.admission_wire import write_assignment as write_assignment
@@ -388,7 +389,8 @@ class AdmissionResources:
 
 
 def _is_placement_control(request: wire.Request) -> bool:
-    return isinstance(request, (wire.ClaimFailure, wire.ConsumePermission, wire.ExecutionReport, wire.CancelPlacement))
+    return isinstance(request, (wire.ClaimFailure, wire.ConsumePermission, wire.ExecutionReport,
+                                wire.CancelPlacement, wire.SettlementRequest))
 
 
 def _waits_for_live_service(request: wire.Request) -> bool:
@@ -399,7 +401,7 @@ def _waits_for_live_service(request: wire.Request) -> bool:
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
-           | wire.CancelPlacement | status_wire.PlacementStatusRequest, *, wait_for_service: bool = True) -> wire.Reply:
+           | wire.CancelPlacement | wire.SettlementRequest | status_wire.PlacementStatusRequest, *, wait_for_service: bool = True) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
     if wait_for_service and _waits_for_live_service(request):
         reply = _call(request, lambda _wait: None, report_refusal=False)
@@ -408,6 +410,7 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | 
         if isinstance(reply, wire.Refused):
             raise wire.AdmissionUnavailable(reply.reason)
         return reply
+    assert isinstance(request, wire.CallerCode)
     request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
     timeout = records.read_memory_config().query_timeout_seconds
     deadline = CLOCK.monotonic() + timeout
@@ -490,6 +493,8 @@ def request_placement(request: wire.PlacementRequest, *, report_refusal: bool = 
     if isinstance(reply, LeftQueue):
         raise _QueueLeft()
     if isinstance(reply, wire.Refused):
+        if (line := replaced_line(reply.reason, request.identity.unit)) is not None:
+            raise RunReplaced(line)
         raise wire.AdmissionUnavailable(reply.reason)
     if isinstance(reply, (wire.Assignment, wire.LocalPlacementGranted, wire.PlacementWait, wire.DispatchStatus)):
         return reply
@@ -505,19 +510,27 @@ def acquire_placement(request: wire.PlacementRequest
         return LeftQueue()
 
 
-def report_prerequisite(request: wire.PrerequisiteReport, *, report_refusal: bool = True) -> wire.Ok:
+def report_prerequisite(request: wire.PrerequisiteReport, *, unit: str = "", report_refusal: bool = True) -> wire.Ok:
     reply = _call(request, lambda _wait: None, report_refusal=report_refusal)
     if isinstance(reply, LeftQueue):
         raise _QueueLeft()
     if isinstance(reply, wire.Ok):
         return reply
-    if not report_refusal and isinstance(reply, wire.Refused):
-        raise wire.AdmissionUnavailable(reply.reason)
+    if isinstance(reply, wire.Refused):
+        if (line := replaced_line(reply.reason, unit)) is not None:
+            raise RunReplaced(line)
+        if not report_refusal:
+            raise wire.AdmissionUnavailable(reply.reason)
     raise wire.AdmissionUnavailable("invalid prerequisite answer")
 
 
-def cancel_placement(request: wire.CancelPlacement) -> wire.Ok:
-    reply = _query(request)
+def cancel_placement(request: wire.CancelPlacement, *, unit: str = "") -> wire.Ok:
+    try:
+        reply = _query(request)
+    except wire.AdmissionUnavailable as error:
+        if (line := replaced_line(error.reason, unit)) is not None:
+            raise RunReplaced(line) from error
+        raise
     if isinstance(reply, wire.Ok):
         return reply
     raise wire.AdmissionUnavailable("invalid cancellation answer")
@@ -541,17 +554,17 @@ def token_prerequisite(choice: str) -> placement.TokenRequired | placement.Token
 
 
 def finish_step(path: Path, status: int, reason: str = "", *,
-                prerequisite: placement.LocalExecutionPrerequisite | KeepPlacementPrerequisite = KEEP_PLACEMENT_PREREQUISITE
-                ) -> wire.DispatchStatus:
+                prerequisite: placement.LocalExecutionPrerequisite | KeepPlacementPrerequisite = KEEP_PLACEMENT_PREREQUISITE,
+                ending: wire.ReleaseEnding = "result") -> wire.DispatchStatus:
     reply = read_assignment(path)
     if not isinstance(reply, wire.LocalPlacementGranted):
         raise wire.AdmissionUnavailable("finish-step requires a local grant")
-    return finish_local(reply, status, reason, prerequisite=prerequisite)
+    return finish_local(reply, status, reason, prerequisite=prerequisite, ending=ending)
 
 
 def finish_local(reply: wire.LocalPlacementGranted, status: int, reason: str = "", *,
-                 prerequisite: placement.LocalExecutionPrerequisite | KeepPlacementPrerequisite = KEEP_PLACEMENT_PREREQUISITE
-                 ) -> wire.DispatchStatus:
+                 prerequisite: placement.LocalExecutionPrerequisite | KeepPlacementPrerequisite = KEEP_PLACEMENT_PREREQUISITE,
+                 ending: wire.ReleaseEnding = "result") -> wire.DispatchStatus:
     """Release a local grant with its status, and close its attempt; a reason closes it as refused before launch."""
     from scripts.build_queue import placement
 
@@ -559,7 +572,7 @@ def finish_local(reply: wire.LocalPlacementGranted, status: int, reason: str = "
         _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex,
             reply.assignment.episode, reply.assignment.owner, prerequisite))
     if not reason:
-        _ = release(reply.grant.reservation, status, reply.grant.cleanup_timing)
+        _ = release(reply.grant.reservation, status, reply.grant.cleanup_timing, ending)
     result = report_execution(wire.ExecutionReport(uuid.uuid4().hex, reply.assignment, placement.NoProviderClaim(),
         execution_identity.ExecutionNotStarted() if reason else execution_identity.ExecutionEvidenceUnavailable("the local command has ended", CLOCK.now()),
         placement.PrelaunchRefused(reason) if reason else placement.AttemptCompleted(status),
@@ -592,6 +605,11 @@ def report_execution(request: wire.ExecutionReport, *, wait_for_service: bool = 
     if isinstance(reply, wire.DispatchStatus):
         return reply
     raise wire.AdmissionUnavailable("invalid execution report answer")
+
+
+def request_settlement(request: wire.SettlementRequest) -> None:
+    if not isinstance(_query(request), wire.Ok):
+        raise wire.AdmissionUnavailable("invalid settlement answer")
 
 
 class _HistoryNeeded(BaseException):
@@ -741,6 +759,10 @@ class AcquisitionRetry:
 _ACQUISITION_RETRY: ContextVar[AcquisitionRetry | None] = ContextVar("acquisition_retry", default=None)
 
 
+def launch_wait_limit_seconds() -> int:
+    return _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
+
+
 @contextmanager
 def placement_acquisition() -> Generator[None]:
     """Preserve one leave schedule across placement replies and estimate requests."""
@@ -783,9 +805,22 @@ def _leave_queue() -> bool:
         return False
 
 
+class RunReplaced(wire.AdmissionUnavailable):
+    """A newer run of the unit took the place of this run."""
+
+
+def replaced_line(reason: str, unit: str) -> str | None:
+    """Give the line for a refusal that ends a replaced run, or None for another refusal."""
+    if reason != REPLACED_REASON:
+        return None
+    return f"Replaced: a newer run of {unit or 'this unit'} took the place of this run."
+
+
 def _refused(reason: str, *, checker: bool = False) -> wire.Refused:
-    text = f"memory admission check failed ({reason}); step refused" if checker else reason
-    print(text, file=sys.stderr)
+    # The client of a replaced run knows its unit, so it shows the replaced line itself.
+    if reason != REPLACED_REASON:
+        text = f"memory admission check failed ({reason}); step refused" if checker else reason
+        print(text, file=sys.stderr)
     return wire.Refused(reason)
 
 
@@ -907,12 +942,11 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     retry = _ACQUISITION_RETRY.get() if acquisition else None
     owns_retry = retry is None
     if retry is None:
-        limit = _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
-        launch = isinstance(request, wire.LaunchRequest)
+        limit = launch_wait_limit_seconds() if isinstance(request, wire.LaunchRequest) else None
         deadline = (CLOCK.monotonic() + max(0.0, request.deadline - CLOCK.now())
                     if isinstance(request, wire.RepositorySlotRequest) else
-                    CLOCK.monotonic() + limit if launch and limit > 0 else float("inf"))
-        retry = AcquisitionRetry(deadline, launch_without_wait=launch and limit == 0)
+                    CLOCK.monotonic() + limit if limit is not None and limit > 0 else float("inf"))
+        retry = AcquisitionRetry(deadline, launch_without_wait=limit == 0)
     token = _ACQUISITION_RETRY.set(retry)
     try:
         from scripts.build_queue import admission_records as records
@@ -923,7 +957,8 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 return refuse(str(error), checker=True)
         else:
             resolved = configuration
-        request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
+        if isinstance(request, wire.CallerCode):
+            request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
         if report_refusal and isinstance(resolved, records.MemoryConfig):
             records.warn_configuration_diagnostics(resolved.diagnostics)
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest, wire.ServiceEstimateRequest)):
@@ -1545,9 +1580,9 @@ def launch(request: wire.LaunchRequest, on_wait: Callable[[wire.Wait], None],
 def _first_request_wait[Request, Reply](launching: bool, refresh: Callable[[], Request],
                                         wait: Callable[[Request], Reply]) -> Reply | wire.Refused | LeftQueue:
     """Build the first request inside the retry schedule that its refreshes use."""
-    limit = _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
-    token = _ACQUISITION_RETRY.set(AcquisitionRetry(CLOCK.monotonic() + limit if launching and limit > 0 else float("inf"),
-                                                    launch_without_wait=launching and limit == 0))
+    limit = launch_wait_limit_seconds() if launching else None
+    deadline = CLOCK.monotonic() + limit if limit is not None and limit > 0 else float("inf")
+    token = _ACQUISITION_RETRY.set(AcquisitionRetry(deadline, launch_without_wait=limit == 0))
     try:
         try:
             request = refresh()
@@ -1609,8 +1644,9 @@ def service_admit(request: wire.ServiceEstimateRequest, on_wait: Callable[[wire.
     return wire.Refused("invalid service estimate answer")
 
 
-def release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
-    return _mutation(wire.ReleaseRequest(request_id(), reservation, status), configuration)
+def release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+            ending: wire.ReleaseEnding = "result") -> wire.Ok | wire.Refused:
+    return _mutation(wire.ReleaseRequest(request_id(), reservation, status, ending), configuration)
 
 
 def width(reservation: str, width: int) -> wire.Ok | wire.Refused:
@@ -2222,20 +2258,20 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
         report_refusal = not args.pinned_refusals
         if already_queued:
             _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite),
-                                    report_refusal=report_refusal)
+                                    unit=identity.unit, report_refusal=report_refusal)
         while True:
             answer = request_placement(request, report_refusal=report_refusal)
             output.placement_notices(answer, placement_events=args.wait_events)
             if isinstance(answer, wire.PlacementWait) and isinstance(answer.wait, wire.Wait):
                 _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite),
-                                        report_refusal=report_refusal)
+                                        unit=identity.unit, report_refusal=report_refusal)
                 answer = request_placement(request, report_refusal=report_refusal)
                 output.placement_notices(answer, placement_events=args.wait_events)
             if not isinstance(answer, wire.PlacementWait):
                 break
             if _leave_queue():
                 _ = cancel_placement(wire.CancelPlacement(uuid.uuid4().hex, episode, owner,
-                    "the caller left before placement"))
+                    "the caller left before placement"), unit=identity.unit)
                 raise _QueueLeft()
             # The first pass only lets a free remote target take the step; it is no memory wait.
             token_check = (isinstance(prerequisite, placement.TokenRequired)
@@ -2427,7 +2463,9 @@ def main(argv: list[str] | None = None) -> int:
                 + str(output.elapsed_seconds()) + "\n")
         return 75
     except (_QueueUnreachable, wire.AdmissionUnavailable, ValueError, OSError) as error:
-        if isinstance(error, wire.AdmissionUnavailable):
+        if isinstance(error, RunReplaced):
+            reason = error.reason
+        elif isinstance(error, wire.AdmissionUnavailable):
             reason = f"admission service unavailable: {error.reason}"
             if args.command == "place-step" and not args.pinned_refusals:
                 reason += "; step refused"

@@ -12,13 +12,15 @@ from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
+from itertools import takewhile
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict, cast
 
 from scripts.build_queue.first_step import FirstStepRefused, gate_targets
 from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, command_program
+from scripts.lib.build_steps import GATE_PRELAUNCH_REFUSED_STATUS, GATE_SCRIPTS, GATE_UNSETTLED_LAUNCH_STATUS, command_program
+from scripts.lib.cargo_target_config import cargo_home_folder, cargo_workspace_manifest
 from scripts.lib.process_failure import failure_detail
 from scripts.message import session_send
 from scripts.production import showrunners, staff
@@ -199,9 +201,9 @@ def failed_tests(output: str) -> frozenset[str]:
     return frozenset(NEXTEST_FAIL.findall(output))
 
 
-# A red module in the merge gate output: `--- accounts/test_accounts.py exit=1 ---`.
+# A failed module in the gate output: `--- accounts/test_accounts.py exit=1 ---`.
 GATE_RED = re.compile(r"^--- (\S+) (?:rerun alone )?exit=(-?\d+) ---$", re.MULTILINE)
-# A module that the merge gate passed when it ran the module again alone.
+# A module that passed when the gate ran it again alone.
 GATE_GREEN_ALONE = re.compile(r"^--- (\S+) passed on rerun alone; first run exit=", re.MULTILINE)
 
 
@@ -210,7 +212,7 @@ def runs_merge_gate(command: Sequence[str]) -> bool:
 
 
 def red_names(command: Sequence[str], output: str) -> frozenset[str]:
-    """Return the red gate modules of a merge gate command, or the red nextest tests of another command."""
+    """Return the failed modules for a gate command or the failed nextest tests for another command."""
     if not runs_merge_gate(command):
         return failed_tests(output)
     green = frozenset(GATE_GREEN_ALONE.findall(output))
@@ -286,9 +288,12 @@ def stop_test_without_result(step: CheckpointTestStep, result: subprocess.Comple
     if result.returncode == TREE_CHANGED_STATUS:
         raise Stop("test", "cancelled", f"{step.label} cancelled because the tree changed; log {log}",
                    f"resubmit this checkpoint after your edits are done; test log: {log}")
-    if (result.returncode in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS)
-            and command_program(step.command) in GATE_SCRIPTS):
-        raise Stop("test", "blocked", f"{step.label} ended with gate status {result.returncode}. Log {log}",
+    gate = command_program(step.command) in GATE_SCRIPTS
+    if gate and result.returncode == GATE_UNSETTLED_LAUNCH_STATUS:
+        raise Stop("test", "blocked", f"{step.label} waits for launch settlement with gate status {result.returncode}. Log {log}",
+                   f"Check the launch settlement in {log}.")
+    if gate and result.returncode == GATE_PRELAUNCH_REFUSED_STATUS:
+        raise Stop("test", "blocked", f"{step.label} could not complete placement. Gate status {result.returncode}. Log {log}",
                    f"Check the gate placement in {log}.")
 
 
@@ -300,25 +305,85 @@ def run_checkpoint_test_steps(production: ProductionDocument, paths: tuple[str, 
     return run_test_steps(ledger or production, test_steps(production, paths, merge_tests), flakes, flaky_tests, log)
 
 
+def run_logged_step(step: CheckpointTestStep, log: Path) -> subprocess.CompletedProcess[str]:
+    with log.open("a", encoding="utf-8") as output:
+        result = run_test_command(step.command, step.folder)
+        _ = output.write(result.stdout + result.stderr)
+        _ = output.write(f"{step.label.replace(' ', '_')}_EXIT={result.returncode}\n")
+    stop_test_without_result(step, result, log)
+    return result
+
+
+def package_test_folder(folder: Path) -> Path:
+    """Use the workspace root when it preserves the package's Cargo config."""
+    try:
+        package = folder.resolve()
+        cwd = str(package)
+        manifest = cargo_workspace_manifest([], cwd, cargo_home_folder(cwd, os.environ))
+        workspace = manifest.parent.resolve()
+        for directory in (package, *package.parents):
+            if workspace.is_relative_to(directory):
+                break
+            config = directory / ".cargo"
+            if (config / "config.toml").is_file() or (config / "config").is_file():
+                return folder
+        return workspace
+    except (OSError, ValueError):
+        # Let Verify report discovery errors from the package folder.
+        return folder
+
+
+def package_test_results(packages: Sequence[CheckpointTestStep], folder: Path, log: Path
+                         ) -> Generator[tuple[CheckpointTestStep, subprocess.CompletedProcess[str]]]:
+    """Run packages from one folder. Report a red as its own package step."""
+    while len(packages) > 1:
+        first = packages[0]
+        names = [step.command[-1] for step in packages]
+        command = [*first.command, *(word for name in names[1:] for word in ("+", "test", name))]
+        joined = CheckpointTestStep(f"packages {', '.join(names)}", command, folder)
+        result = run_logged_step(joined, log)
+        lines = set(result.stderr.splitlines())
+        failed = next((index for index, name in enumerate(names)
+                       if f"verify.sh: step result: test {name} exit={result.returncode}" in lines), None)
+        if test_passed(result) or failed is None:
+            yield joined, result
+            return
+        yield packages[failed], result
+        # A Verify step list ends at the first red. Run any packages it did not reach.
+        packages = packages[failed + 1:]
+    for step in packages:
+        yield step, run_logged_step(step._replace(folder=folder), log)
+
+
+def initial_test_results(steps: Sequence[CheckpointTestStep], log: Path
+                         ) -> Generator[tuple[CheckpointTestStep, subprocess.CompletedProcess[str]]]:
+    """Group package tests that can run from the same Cargo workspace root."""
+    packages = tuple(takewhile(lambda step: step.label.startswith("package "), steps))
+    by_folder: dict[Path, list[CheckpointTestStep]] = {}
+    for step in packages:
+        by_folder.setdefault(package_test_folder(step.folder), []).append(step)
+    for folder, group in by_folder.items():
+        yield from package_test_results(group, folder, log)
+    for step in steps[len(packages):]:
+        yield step, run_logged_step(step, log)
+
+
 def run_test_steps(production: ProductionDocument, steps: Sequence[CheckpointTestStep], flakes: frozenset[str],
                    flaky_tests: frozenset[str], log: Path, *, retry_failed_steps: bool = True) -> str:
     """Run checkpoint tests with the caller's retry policy."""
     log.parent.mkdir(parents=True, exist_ok=True)
+    if not steps:
+        log.touch(exist_ok=True)
     failed: list[tuple[CheckpointTestStep, frozenset[str], frozenset[str]]] = []
-    with log.open("a", encoding="utf-8") as output:
-        for count, step in enumerate(steps, 1):
-            result = run_test_command(step.command, step.folder)
-            _ = output.write(result.stdout + result.stderr)
-            _ = output.write(f"{step.label.replace(' ', '_')}_EXIT={result.returncode}\n")
-            output.flush()
-            stop_test_without_result(step, result, log)
-            if not test_passed(result):
-                output_text = result.stdout + result.stderr
-                names = red_names(step.command, output_text)
-                if not retry_failed_steps:
-                    report("test", "ok", f"{count} commands ran; 1 red; log {log}")
-                    raise unit_red((RedStep(step, names),), log)
-                failed.append((step, failed_tests(output_text), names))
+    count = 0
+    for count, (step, result) in enumerate(initial_test_results(steps, log), 1):
+        if not test_passed(result):
+            output_text = result.stdout + result.stderr
+            names = red_names(step.command, output_text)
+            if not retry_failed_steps:
+                report("test", "ok", f"{count} commands ran; 1 red; log {log}")
+                raise unit_red((RedStep(step, names),), log)
+            failed.append((step, failed_tests(output_text), names))
     red_steps: list[RedStep] = []
     for step, tests, first_names in failed:
         name, command, folder = step
@@ -340,7 +405,7 @@ def run_test_steps(production: ProductionDocument, steps: Sequence[CheckpointTes
             # The rerun decides which names stay red; the first run names them when the rerun names none.
             names = red_names(command, result.stdout + result.stderr) or first_names
             red_steps.append(RedStep(step, names))
-    report("test", "ok", f"{len(steps)} commands ran; {len(failed)} red; log {log}")
+    report("test", "ok", f"{count} commands ran; {len(failed)} red; log {log}")
     if red_steps:
         raise unit_red(tuple(red_steps), log)
     report("red", "ok", "all commands green or known flakes green alone")

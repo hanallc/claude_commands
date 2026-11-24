@@ -12,6 +12,7 @@ from unittest import mock
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.test_verify_lint_judgment import VerifyLintJudgmentFixture
+from scripts.direct.test_verify_lint_scope import assert_clippy_calls
 from scripts.direct.verify_lint_scope_test_support import GIT_STUB
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -84,7 +85,7 @@ esac
             "TEST_CLIPPY_EXPECT_SOURCE": formatted,
         })
         result = self.verify("lint", "sample")
-        self.assert_fix_and_judgment_calls(fix_passes=2)
+        assert_clippy_calls(self, fix_passes=2)
         self.assertEqual((self.root / "src/lib.rs").read_text(encoding="utf-8"), formatted)
         self.assertNotIn("the tree changed while lint ran", result.stdout)
         self.assertEqual(len(list(cache.glob("*.pass"))), 1)

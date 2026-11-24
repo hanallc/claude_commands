@@ -64,7 +64,8 @@ def review_timeout_seconds() -> float:
         for line in contents.splitlines():
             key, separator, value = line.partition("#")[0].partition("=")
             if separator and key.strip() == "review_timeout_seconds":
-                seconds = float(value.strip())
+                values = conf_reads.trace_values(NOTIFY_CONFIG, contents, {"review_timeout_seconds": value.strip()})
+                seconds = float(values["review_timeout_seconds"])
                 if not math.isfinite(seconds) or seconds <= 0:
                     raise ValueError("review_timeout_seconds must be positive and finite")
                 return seconds

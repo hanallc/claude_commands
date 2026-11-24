@@ -2,7 +2,7 @@
 
 ## Current model
 
-AWS runs temporary Spot boxes for merge gates, paired AWS trials, and the GPU size trial.
+AWS runs temporary Spot boxes for gate jobs, paired AWS trials, and the GPU size trial.
 The configured build target order is `hana-aws,mac,natedev`.
 Hana placement has been enabled since 2026-11-17.
 The queue tries `hana-aws` first for eligible Hana check and clippy steps.
@@ -196,7 +196,7 @@ If the template has no policy or the plan cannot resolve it, the plan prints a n
 The plan then simulates S3 without a bucket policy.
 Bucket policies added outside the stack are out of scope.
 
-To plan a merge gate update, run this command in a terminal on natedev.
+To plan a gate infrastructure update, run this command in a terminal on natedev.
 
 ```sh
 deploy.py up --workload merge-gates --plan
@@ -361,7 +361,10 @@ An older observation cannot close a newer permit or replace a later running obse
 The fence survives controller restarts.
 Observations at the same time as the fence leave exposure unchanged.
 
-The existing `cost-ledger.json` version remains 1.
+The ledger reads versions 1 and 2 of `cost-ledger.json` and writes version 2.
+Drain old gate workers and upgrade ledger users before the first version 2 write.
+After that write, a code-only rollback to version 1 makes old reconcile code refuse the ledger.
+Keep version 2 support in all rollbacks.
 The optional `hana_compute` and `hana_storage` collections hold Hana exposure records.
 Older records have no Hana exposure when these collections are absent.
 A missing `hana_lifecycle_fence` remains absent until a fresh observation arrives.
@@ -805,8 +808,8 @@ The sweep preserves boxes with live owners, even when another owner in the same 
 The sweep preserves trial folders.
 Guest expiry and the AWS expiry function remain independent termination controls.
 AWS failures can delay termination beyond the configured expiry and confirmation timeout.
-Merge gate units also use `ExecStopPost` with `cloud_gate --cleanup`.
-Trials and merge gates use the same attempt cleanup code in `cloud_gate.py`.
+Gate units also use `ExecStopPost` with `cloud_gate --cleanup`.
+Trials and gate runs use the same attempt cleanup code in `cloud_gate.py`.
 The worker installs no signal handler.
 The ledger records each worker's PID, process start identity, and attempt folder.
 Reconciliation preserves live workers and workers whose identity cannot be read.
@@ -857,7 +860,7 @@ The bootstrap removes each known signed URL and its query from the result record
 Older paired candidates can send logs directly. The bootstrap cannot filter those uploads.
 The upload count and measured result fields remain unchanged.
 
-`cloud_gate.log_cloud_progress` reads stages for both paired trials and merge gates.
+`cloud_gate.log_cloud_progress` reads stages for both paired trials and gate runs.
 The progress record adds `stage`, `region`, and `zone` beside the existing fields.
 Before the first box log line, the state is `requesting` and the stage is `launch`.
 The last UTC `stage=` line supplies the stage text.
@@ -895,22 +898,43 @@ The gate ranks deployed types and public zones by the expected USD per run befor
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
 Direct gate placement uses natedev and `mac-linux`.
-A merge gate or targeted test with a prepared copy handoff from `copies.py run` can use the cloud route without a placement assignment.
-The cloud route reserves a queue slot before it requests a box.
-The route checks `enabled` in `cloud_gate.conf` before it reads deployment state and again before a new launch.
-With `enabled=off`, a gate without a placement assignment runs its tests on natedev.
+A gate in a prepared checkout can use AWS with a queue assignment.
+The queue offers AWS after `cloud_gate.availability()` confirms the switch, deployment, spend room and Spot quota room.
+This check reads local files and makes no AWS call.
+It checks the per-attempt booking against the daily and monthly caps and the safety reserve.
+It deducts live gate vCPUs from current Spot quotas and checks recent quota refusals.
+With `enabled=off` in `cloud_gate.conf`, the queue excludes AWS.
+The route checks this switch again before a launch.
+The AWS route consumes the assignment's launch permission once and reports the result to the queue.
+An AWS refusal ends the gate command and leaves any reassignment to the queue.
 A confirmed Spot interruption before a final result starts another cloud attempt.
 `spot_interruption_retries=2` permits two retries, which can reach another zone and then another region.
 The retry uses the next choice in the saved launch order.
 The route keeps its cloud slot across retries.
 The route saves the interruption count and the next choice in `current.json` before each retry.
-Resume restores both values, so a crash cannot reset the retry budget.
-Each retry gets a new attempt ID and passes the existing spend and attempt checks.
+An assigned AWS run starts from its claim and clears the saved retry state.
+Each retry gets a new attempt ID.
+The worker checks the current spending caps before each fresh assigned launch.
 The worker confirms cleanup of the interrupted box and reservation before the retry.
-The final fallback row includes the interruption count when retries or capacity choices end.
-A gate without a placement assignment runs the tests on natedev after a final cloud refusal.
+The final refusal row includes the interruption count when retries or capacity choices end.
 A complete gate failure keeps its failed result and gets no retry.
 An uncertain launch or termination keeps its cost reservation until reconciliation confirms the end.
+The route reports pending settlement to the queue while the launch remains uncertain.
+The stop cleanup looks up an unknown instance by client token.
+Cleanup accepts a saved termination for the same booking, region, and set of instances.
+An empty lookup proves absence only if the lookup starts at or after the booking expiry.
+If the reconciler cannot read a launch journal, it prints the file path and keeps that booking open.
+It continues cleanup for the other bookings.
+The queue reads settlement for the exact claim through `settlement()`.
+The queue calls `reconcile_expired()` when it checks pending settlement.
+A wrapper that owns the placement request asks the queue for settlement after status 80.
+It keeps the same episode for a permitted replacement.
+If the settlement request or replacement fails, the wrapper preserves status 80.
+`reconcile_expired()` requests the service when a booking for that claim has expired and cleanup is due.
+It reads the exact claim again before submitting the service.
+The call returns before reconciliation completes.
+If the service cannot start, the call prints one warning per attempt in the queue process.
+The reconciler records the confirmed end in the local ledger.
 The launch path uses Spot only; it has no on-demand choice.
 Paired trials use the same regional launch and cleanup path.
 
@@ -957,7 +981,7 @@ The module time limit and process groups stop the gate.
 The bootstrap names no `merge_gate` attribute and copies no host function source.
 A paired trial uses the changed candidate's entry point to supervise both verified trees.
 A candidate without the entry point publishes `candidate predates guest entry point` through the existing boot error link.
-If the cloud route returns a final refusal, a gate without a placement assignment uses the natedev fallback.
+The controller reports the failure to the queue.
 The result fields and transfer links keep their existing format.
 
 The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
@@ -1187,7 +1211,7 @@ The user asked for this layout on 2026-11-14 through builds. Each line has these
 The bill names the region by its usage type prefix, such as `USE2-SpotUsage:c7a.8xlarge`.
 `ledger.REGION_USAGE_PREFIXES` maps each prefix to a region.
 A launch row without a region ran in the home region, `region` in `aws_target.conf`.
-The next line names the cheapest merge gate by estimate.
+The next line names the cheapest gate by estimate.
 Below them, two tables show the refused requests and the launched boxes of each type and region.
 Refused requests are capacity and quota refusals.
 The last card asks “Did AWS bill more machine hours than we used?”
@@ -1383,8 +1407,11 @@ Equal costs keep configured order.
 Missing or stale prices follow fresh prices.
 Without applicable fresh prices, the gate preserves configured order except for capacity cooldowns.
 
-`capacity_cooldown_seconds=1800` moves recently refused capacity to the end without removing it.
+`capacity_cooldown_seconds=1800` moves recently refused capacity to the end of the launch order.
 `InsufficientInstanceCapacity`, `InsufficientSpotCapacity`, and `SpotMaxPriceTooLow` affect one region, type, and zone.
+Placement reports AWS unavailable while every deployed variant with current Spot quota room has a zone refusal in its cooldown window.
+The window includes the recorded refusal time through that time plus `capacity_cooldown_seconds`.
+Placement reads this evidence from `cloud-gate-launches.jsonl`.
 `MaxSpotInstanceCountExceeded` and `VcpuLimitExceeded` affect every variant of the region.
 Ranking reads the end of `cloud-gate-launches.jsonl` in 64 KiB blocks.
 It stops at the first row before the longer of the price-age and cooldown windows.

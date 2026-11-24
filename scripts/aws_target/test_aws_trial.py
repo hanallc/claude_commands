@@ -465,11 +465,11 @@ class Sample(unittest.TestCase):
         confirmed = ledger.GateTerminated(now - 2, 'i-race')
         costs: list[Decimal] = []
         def racing_resolve(attempt: str, outcome: ledger.GateRunning | ledger.GateAbsent | ledger.GateTerminated,
-                           *, instance_type: str = '') -> None:
+                           *, expected_owner: ledger.GateWorkerOwner | ledger.GateOwnerUnknown) -> None:
             self.assertIsInstance(outcome, ledger.GateAbsent)
             resolve(attempt, confirmed)
             costs.append(trial.trial_cost(book, {attempt}, self.settings, now)[0])
-            resolve(attempt, outcome, instance_type=instance_type)
+            resolve(attempt, outcome, expected_owner=expected_owner)
         with (mock.patch.object(book, 'resolve_gate', side_effect=racing_resolve),
               mock.patch.object(worker.api, 'call', side_effect=AssertionError('unexpected AWS call'))):
             trial.sweep_trial_resources(current, worker)
@@ -637,7 +637,7 @@ class Sample(unittest.TestCase):
         before = self.remote_branches()
         config = self.root / 'cloud_gate.conf'
         lifetime = 5
-        _ = config.write_text(config.read_text().replace('lifetime_minutes=20', f'lifetime_minutes={lifetime}'))
+        override_fixture_settings(config, f'lifetime_minutes={lifetime}\n')
 
         def first_service(_command: Sequence[str], _unit: str) -> int:
             live = self.remote_branches()
@@ -645,7 +645,7 @@ class Sample(unittest.TestCase):
             folder = next((self.state / 'paired-trials').iterdir())
             request = cloud_gate.read(next(folder.glob('*/request.json')))
             self.assertEqual(request['expires'], now + lifetime * 60)
-            _ = config.write_text(config.read_text().replace(f'lifetime_minutes={lifetime}', 'lifetime_minutes=1'))
+            override_fixture_settings(config, 'lifetime_minutes=1\n')
 
             def second_service(_command: Sequence[str], _unit: str) -> int:
                 remote = self.remote_branches()

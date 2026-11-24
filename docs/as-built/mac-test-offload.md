@@ -106,7 +106,7 @@ Tree repair steps remain local.
 
 Lint during a hold keeps local `cargo fmt` and `taplo fmt`. It then runs `mend-check` (`mend --fail-on-warn`) and clippy judgment (`--workspace --all-targets --all-features -- -D warnings`) on the Mac. A lint can use this sequence when its first `mend --fix` waits for memory and a Mac becomes free. A clean judgment ends the call without local repairs. A busy Mac keeps the lint on natedev. Local formatting uses the protected `local_noncompiling` record state, including when a hold starts during formatting.
 
-A `mend-check` finding starts the Mac fix pass in the same Mac run. The `mend-fix` verb runs `mend --fix --fail-on-warn` on the Mac copy. clippy then judges the fixed copy with `--all-targets --all-features`. On a pass, `return_fix` lists the mirror files that differ from the worktree in content, under the run's claim. It skips the mirror mark, `/.git`, `/target` and git-ignored paths. It writes the changed files and removes the deleted files only when the worktree tree key still equals the sent key. The return is all or nothing, with a roll-forward record in the worktree git folder (`mac-fix.json`, held under `mac-fix.lock`). `fix_return.py` writes each fixed file to a temporary sibling under a `staging` record. It then writes a `commit` record that lists the renames and removals, and fsyncs it. It runs the renames and removals and then deletes the record. At its start, `verify.sh` finishes a left record before any step reads the tree. A `staging` record is rolled back, so the tree is unchanged. A `commit` record is rolled forward. So a stop or SIGKILL at any point leaves the old tree or the fixed tree after the next run. natedev then runs `cargo fmt` and records the verdict key on the fixed tree. The result file adds `fix=applied|none|refused|failed|not_run`. A failed fix pass, a refused or failed return, or any decline other than busy or blocked returns the lint to the natedev queue for `mend --fix`, as before. Other writing steps always run on natedev, and their leave hooks remain disabled while the commands run. A Linux-only lint error can appear later at the merge gate. A local step stopped for a new hold is routed again after the stop, rather than counted as a completed failure.
+A `mend-check` finding starts the Mac fix pass in the same Mac run. The `mend-fix` verb runs `mend --fix --fail-on-warn` on the Mac copy. clippy then judges the fixed copy with `--all-targets --all-features`. On a pass, `return_fix` lists the mirror files that differ from the worktree in content, under the run's claim. It skips the mirror mark, `/.git`, `/target` and git-ignored paths. It writes the changed files and removes the deleted files only when the worktree tree key still equals the sent key. The return is all or nothing, with a roll-forward record in the worktree git folder (`mac-fix.json`, held under `mac-fix.lock`). `fix_return.py` writes each fixed file to a temporary sibling under a `staging` record. It then writes a `commit` record that lists the renames and removals, and fsyncs it. It runs the renames and removals and then deletes the record. At its start, `verify.sh` finishes a left record before any step reads the tree. A `staging` record is rolled back, so the tree is unchanged. A `commit` record is rolled forward. So a stop or SIGKILL at any point leaves the old tree or the fixed tree after the next run. natedev then runs `cargo fmt` and records the verdict key on the fixed tree. The result file adds `fix=applied|none|refused|failed|not_run`. A failed fix pass, a refused or failed return, or any decline other than busy or blocked returns the lint to the natedev queue for `mend --fix`, as before. Other writing steps always run on natedev, and their leave hooks remain disabled while the commands run. A Linux-only lint error can appear later at the gate. A local step stopped for a new hold is routed again after the stop, rather than counted as a completed failure.
 
 ## Mac Linux guest folders
 
@@ -116,6 +116,54 @@ The route returns `GuestNotStarted` with the refusal reason before any upload or
 The route releases the claim when the guest proves the run ended.
 The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
 The guest run lock still refuses another guest run until the first run ends.
+When the proof wait expires, the gate returns status 80 after it records the holder's release.
+The default root is `~/.local/state/build-targets`. The `BUILD_TARGETS_STATE_DIR` setting can supply a different root.
+The admission service creates each missing directory at startup and on reload.
+It syncs each directory entry from the state root up to the home directory, or to the filesystem root for paths outside home.
+The service logs the result before it accepts placement requests.
+If setup fails, the service retries on the next guest placement request.
+Until setup succeeds, the service refuses guest placement and launch permission. Other targets remain available.
+The gate refuses the launch before it consumes permission if the state root is missing or is a file.
+Run `./scripts/lib/py scripts/build_targets/build_targets.py setup-mac-linux` on natedev to perform the same setup manually.
+The route records the guest address, machine ID, checkout path, and gate process identity before it requests permission.
+The checkout probe accepts one identity line with an LF or CRLF ending.
+A malformed reply with exit code zero gets one immediate retry.
+For rejected replies, the probe reports the natedev checkout, each exit code, and bounded representations of stdout and stderr.
+The arm checks the saved guest identity before it writes any guest records.
+It appends records to `mac-linux/end-proofs.jsonl` under the build-targets state directory.
+It records `proven` when cleanup confirms the end of a run.
+It records `not started` if the gate consumed permission and sent no arm request.
+It records `unproven` and saves the armed guest identity when the proof wait expires.
+The route sends a completion report when it receives a start marker and a valid result.
+When the stream loses the result, end proof leaves the result unknown.
+For a proven no-run, it sends a refusal for the consumed claim and releases the holder in the journal.
+If the consume or arm reply is lost, the route releases the holder in the journal.
+The gate exits 80 if the guest can have run and the gate lacks a result.
+The gate also exits 80 if the journal cannot record the holder's release.
+The placement loop requests settlement for the exact attempt.
+The loop retries an exit 80 in the same episode only if the gate records a refusal for that attempt.
+The checkpoint stops when the placement loop returns exit 80.
+The queue can acknowledge the end report while it waits to read the proof.
+Each record contains the queue attempt key, the result, the detail, and the wall time.
+Each record includes the Mac claim ID.
+The writer locks the file during the append. It syncs the journal file, the journal directory, and the state root.
+A failed report send leaves the proof available on disk.
+`mac_linux.settlement()` reads the file without a lock and skips damaged rows.
+The reader uses `execution_identity.attempt_key()` with the episode and the attempt as 32 lowercase hexadecimal digits.
+A matching `proven` or `not started` row settles the attempt after the holder exits or gives up the attempt.
+The queue can call `reconcile_unproven()` while it holds the slot.
+If a launch remains unproven, recovery waits for the gate process to exit or give up the attempt.
+The adapter reads the journal again before it submits the service.
+When the route saved an armed guest identity, the service uses it to confirm the run ended.
+For a launch with an unknown arm result, the service requires the saved guest identity.
+A guest with a held run lock leaves the attempt pending.
+For a known launch, the guest checks both arm names and records refusal under the run lock.
+The refusal prevents later arms and runs for that queue attempt.
+The service records `proven` if the guest found an arm and `not started` if it found none.
+An unrecorded legacy attempt settles after the launch holder and the submitting owner both exit.
+The queue uses this rule even if it received a start report.
+The recovery path records at most one warning per attempt under `mac-linux/end-proof-warnings`.
+
 natedev holds the SSH input open for the whole run.
 When the natedev process ends by any signal, the guest sees its input end and kills the run group, which frees the run lock.
 Item 191 B3 will keep the Mac claim until proof and bind the claim identity to the guest attempt.
@@ -182,18 +230,42 @@ A PID alone cannot release another attempt.
   `/build:status [--probe]` reads coordination state and checks reach only when requested.
   `mac_test.py status` calls `full_settle`, which can lift expiry, restore CI, and send pending messages.
 
-### The idle claim — `mac_test.py watch-claim`
+### The claim watcher (`mac_test.py watch-claim`)
 
-A claim from any caller (offload, `mac_run.sh`, a session following `/build:mac`) is released once its Mac has had no Mac process for `claim_idle_minutes` (15) minutes.
+`claim` exit 0 and takeover exit 13 call `start_claim_watcher`.
+It starts the `systemd-run --user --collect` unit `mac-test-claim-watch-<pid>` if no watcher holds the lock.
+If the start fails, it prints `warning: the Mac claim watcher could not be started`.
+The watcher uses `claim_watch.lock` and runs `claim_watch_pass` every `claim_poll_seconds` (60).
+It releases the lock when no live claim remains.
 
-- `claim` exit 0 and takeover exit 13 call `start_claim_watcher`, which starts the `systemd-run --user --collect` unit `mac-test-claim-watch-<pid>` running `watch-claim`, unless `claim_watch.lock` is already held. A failed start prints `warning: the Mac claim watcher could not be started`. The watcher runs `claim_watch_pass` every `claim_poll_seconds` (60) and exits once no live claim remains in any claim file, releasing the lock first so the next claimant can start its own.
-- `claim_watch_pass` reads every claim file under `state.lock` and returns at once when no claim is live (a process-bound claim whose process is gone is left to the liveness rules). With no lock held it runs `check_mac_activity(config, host) -> MacActive(count) | MacIdle | ActivityCheckFailed(reason)` once per host, against `remote_host`, or `config.host` for a process-bound claim. The check counts all of the user's Mac work, since a build process cannot be traced to a repository, so a claim is idle only while the Mac runs nothing. `watch_claim` then applies that answer to each claim: it takes `state.lock` again and acts on that claim's file only when `pid`, `proc_start` and `since` are unchanged:
-  - `MacActive`: remove `idle_since`.
-  - `MacIdle` and no `idle_since`: write `idle_since` as now.
-  - `MacIdle` and `idle_since` at least `claim_idle_minutes` old: delete the claim's file, start the block watcher when a block is present (as `release` does), print the message to the watcher's journal, and send it to `session:<holder_session>` through `send_message` with key `mac-claim-idle-<pid>-<since>`. A claim with no `holder_session` sends nothing.
-  - `ActivityCheckFailed`: print `Mac claim activity check failed: <reason>` and change nothing. An unreachable Mac never releases a claim.
-- The message: `Your Mac claim "<what>" (since <HH:MM>) was released at <HH:MM>: nothing ran on the Mac for 15 minutes, so tests waiting for it can run. Claim it again before your next Mac command: ~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what '<what>' --worktree '<worktree>' [--remote '<host>'] (see /build:mac).` The `--worktree` is the claim's own, so the repeated claim keeps its scope; the `--remote` word appears for a remote claim.
-- `mac_activity_script()` runs over one ssh call (`BatchMode=yes`, `ConnectTimeout=connect_timeout_s`, 10 s total) and prints `active=<n>` and `rc=0`; any other answer is `ActivityCheckFailed`. A Mac process is one of the user's processes that `offload.mirror_selector_script(ALL_MIRRORS)` selects (a command line or working directory under `.local/state/mac-test/mirror/`), or whose executable is named `cargo`, `rustc` or `cargo-nextest`, or whose executable path contains `/target/` (test and app binaries). The check sends no signal. The text runs under the Mac's `sh` and `zsh -f`.
+- The watcher reads the claims under `state.lock` and releases the lock before SSH.
+  It checks activity once per host, using the recorded `remote_host` or the configured host for a process-bound claim.
+  It updates or releases only the exact claim it read.
+- The startup probe saves the mirror root and the Mac's `IOPlatformUUID` with the exact claim.
+  The offload uses the same mirror root for the lease and run.
+- For early release, the watcher confirms that the owner ended and takes the lease for the saved mirror root.
+  The remote check reads the Mac identity before it opens the fence.
+  The watcher requires that identity to match the saved identity.
+  The release path opens the exact start fence and takes its lock without waiting.
+  Under that lock, the read-only check counts processes by mirror command, working directory, and descriptor 8 on the fence.
+  When the count is zero, the release path removes the fence and releases the claim.
+  Work in another repository does not delay this release.
+  The SSH call, the read-only check, and the held-fence diagnostic use `leftover_timeout_s`.
+- A claim without a saved root or identity uses the Mac idle rule.
+  An identity mismatch also uses the idle rule.
+  A complete zero count with a missing fence uses the idle rule.
+  A held fence, a nonzero count, or a failed or partial check keeps the claim.
+- `MacActive` clears `idle_since`. The first `MacIdle` records `idle_since`.
+  The idle rule permits release after `claim_idle_minutes` (15) minutes with no Mac activity.
+  A failed activity check keeps the claim.
+- On release, the watcher prints the reason and tells the holder session if the claim names one.
+  It uses the message key `mac-claim-idle-<pid>-<since>`.
+  The notification includes a claim command with the saved worktree and, for a remote claim, the saved host.
+  The release path starts the block watcher when a block exists.
+- `mac_activity_script()` runs over SSH with `BatchMode=yes`, `ConnectTimeout=connect_timeout_s`, and a 10 s limit.
+  It reports `active=<n>`, `work=<n>`, and `rc=0`.
+  It counts mirror processes, `cargo`, `rustc`, `cargo-nextest`, and executables with `/target/` in the path.
+  The watcher sends no signals to those processes.
 
 ### The idle Mac watch — `scripts/buildlog/mac_idle.py`
 
@@ -492,16 +564,25 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   A signal during the claim lets that call answer before cleanup.
   A missing `mac_exit=<n>` becomes `LostMacRun`, unless `mirror-use` reports a busy refusal.
   A busy refusal becomes `BusyMacDecline` and writes the repository's mirror refusal time.
+  `mirror-use` forwards the start fence descriptor with its mirror lease descriptors.
+  A build child can keep the fence locked after the run wrapper exits.
   Other missing completions report the runner's exit status and exit 75 after cleanup.
   `check_leftovers` uses the two selectors from `mirror_selector_script(scope)`.
-  The claim watcher's activity check uses scope `ALL_MIRRORS`.
+  The claim watcher uses `ALL_MIRRORS` for the host activity check and the saved mirror for the read-only release check.
   The command selector uses `pgrep` for mirror command paths.
   The working-directory selector uses `lsof` and `awk`.
+  The stopped-work check includes processes with the exact start fence file open on descriptor 8 in the leftover count.
+  The fence check supplies PIDs only to the count.
+  The mirror command and working-directory selectors supply PIDs to TERM and KILL.
+  Release and the watcher keep the claim while the fence is held.
+  They report each holder's PID and command.
+  If the holder check gives no answer, they report that result.
   A `KnownRepository` scope stops both patterns at the repository boundary.
   `extended_regex_literal` escapes the repository name.
   Thus a lost hana run does not stop a cargo-liner run or a run under `mirror/hana_other`.
   Cleanup sends TERM, then KILL, then counts again.
-  Its SSH call uses `leftover_timeout_s` from `OffloadConfig`.
+  The cleanup SSH call uses `leftover_timeout_s` from `OffloadConfig`.
+  The runner closes descriptor 8 and settles the fence in the command's SSH session.
   Each routed Mac command uses that limit from the time it receives the verdict.
   A separate cleanup stream starts the limit before it starts SSH.
   It returns `LeftoversEnded`, `LeftoversRemain`, or `LeftoverCheckFailed`.
@@ -673,8 +754,10 @@ Both values use the existing configuration reader.
 - A printed `mac_exit=<n>` followed by nothing but `mac_cleanup=` markers is the result of a finished test even if ssh failed afterward. With no such line, a run is lost; reach and control checks require their own `rc=<n>` answer.
 - Tests run nothing on the Mac: stand-in `ssh`, `rsync`, `gh` on `PATH`, state under `MAC_TEST_STATE_DIR`, config under `MAC_TEST_CONFIG`. Tests set these variables for a checkout's scripts; installed scripts refuse to run with either set. A test reaching the footer sets `MAC_TEST_STATE_DIR` too.
 - On the Mac the feature writes and removes only under `~/.local/state/mac-test/`. The cleanup removes nothing but the mirror's `target` folder, and only below `free_floor_gib`; `/tmp` and the user's clones are never touched. Only step records are written there; call records are written on natedev only.
-- The claim files live on natedev. Only claims without `--remote` disappear when the claiming process dies; remote claims remain until their leftovers are confirmed gone, the claim watcher finds the Mac idle for `claim_idle_minutes`, or a hand release.
-- One claim per repository. Two live claims never share a repository, a whole-Mac claim (in `run.json`) excludes every other, and a block refuses claims from other sessions; the Mac's load is never read. The claim watcher removes only a claim that is idle and unchanged since it read it, and a failed activity check never releases one.
+- The claim files live on natedev. Process-bound claims expire when their owner ends. Remote claims require release.
+  The watcher releases a kept claim when its saved mirror is empty and its exact fence settles, or when the Mac idle rule permits release.
+- One live claim can hold a repository. A whole-Mac claim in `run.json` excludes all other claims.
+  A block refuses claims from other sessions.
 - A copy never replaces a copy, and a Mac-only (non-copy) run never gives way; only a live copy claim gives way, and only to a non-copy claim.
 - A copy win stops natedev only through a live group leader whose start time matches; a step that already ended keeps its result.
 

@@ -27,8 +27,9 @@ from scripts.build_queue import (admission_client, admission_protocol as wire, a
 from scripts.build_queue.queue_place import HeldReservation, PopenArguments, QueuePlaceRefused
 from scripts.build_targets import mac_linux
 from scripts.buildlog import record, treekey
-from scripts.lib import build_steps, conf, models_registry, nix_env
+from scripts.lib import build_steps, conf, conf_reads, models_registry, nix_env
 from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
+from scripts.lint.memory_test_support import shifted_config_lines
 from scripts.notify import review
 from scripts.mac_test.claim_state import WholeMacScope
 from scripts.production import hand_made, hand_made_limit
@@ -36,7 +37,15 @@ from scripts.production.hand_made_route import (PROGRAM_VARIABLES, Line, Machine
                                                 ProgramPlace, Refused)
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-REGISTRY_TEXT = (REPOSITORY / "config/models.conf").read_text()
+REGISTRY_TEXT = """\
+[cli.hand_made]
+claude.model=opus:high
+claude.role=units
+# range: 5e-324..
+check_time_limit_seconds=90
+# whole: 1..
+max_script_bytes=65536
+"""
 SCRIPT = 'print("hand made ran")\n'
 YES = {"verdict": "yes", "reason": "The script only prints a line."}
 NO = {"verdict": "no", "reason": "The script removes a folder outside the checkout."}
@@ -76,7 +85,7 @@ class FakeGuestRun:
         return 0
 
 
-# The variables of a caller, such as the merge gate, that change the output folder or the compiler of a run.
+# The variables of a caller, such as the gate, that change the output folder or the compiler of a run.
 BUILD_VARIABLES = ("CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC_WRAPPER", "SCCACHE_DIR")
 
 
@@ -415,16 +424,27 @@ class HandMadeTests(AttemptCase):
         self.assertEqual(gzip.decompress(log.read_bytes()), b"first\n" + (b"x" * 999 + b"\n") * 300)
 
     def test_the_program_gets_only_the_listed_variables_and_the_model_sees_the_shown_ones(self) -> None:
+        shift_log = conf_reads.CONF_SHIFT_READ_LOG
+        active_log = os.environ.get(shift_log)
         removed = {"RUSTC_WORKSPACE_WRAPPER": "/nonexistent/wrapper", "RUSTFLAGS": "-Zcode", "GIT_CONFIG_COUNT": "1",
                    "GIT_CONFIG_KEY_0": "hand.made", "GIT_CONFIG_VALUE_0": "x", "BASH_FUNC_x%%": "() {  echo x\n}",
                    "SCCACHE_DIR": "/nonexistent/cache", "SCCACHE_CACHE_SIZE": "77G",
-                   "SCCACHE_SERVER_UDS": "/nonexistent/cache.sock"}
+                   "SCCACHE_SERVER_UDS": "/nonexistent/cache.sock",
+                   shift_log: str(self.root / "excluded-shift.log")}
         wrappers = {"RUSTC_WRAPPER": "sccache", "CARGO_BUILD_RUSTC_WRAPPER": "sccache"}
         shown = {"PKG_CONFIG_PATH": "/nonexistent/pkgconfig"}
-        with mock.patch.dict(os.environ, removed | wrappers | shown):
+        with (mock.patch.dict(os.environ, removed | wrappers | shown),
+              mock.patch.object(self.line.place, "popen", wraps=self.line.place.popen) as launch):
             status, _ = self.attempt((sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"))
         self.assertEqual(status, 0)
+        launch.assert_called_once()
+        environment = cast(dict[str, str], launch.call_args.kwargs["env"])
+        self.assertFalse(removed.keys() & environment.keys())
         program = cast(dict[str, str], json.loads(self.output.getvalue()))
+        # The gate adds this log to the child environment after the program filter runs.
+        if shift_log in program:
+            self.assertEqual(program[shift_log], active_log)
+            del program[shift_log]
         self.assertLessEqual(set(program), PROGRAM_VARIABLES | hand_made.SHOWN_VARIABLES
                              | wrappers.keys() | {"CARGO_NET_OFFLINE", "PWD"})
         self.assertEqual((program["HOME"], program["PATH"], program["TMPDIR"]),
@@ -1135,8 +1155,28 @@ class ProgramFileTests(unittest.TestCase):
 @final
 class SettingsTests(unittest.TestCase):
     def test_repository_registry_section_has_the_four_keys(self) -> None:
+        text = models_registry.registry_text(REPOSITORY / "config/models.conf")
+        section = models_registry.parse_registry(text)[hand_made.SECTION]
+        self.assertEqual(set(section), {"claude.model", "claude.role", "check_time_limit_seconds", "max_script_bytes"})
+
+    def test_read_settings_uses_the_pinned_registry(self) -> None:
         self.assertEqual(hand_made.read_settings(REGISTRY_TEXT),
                          hand_made.CheckSettings("opus", "high", "units", 90.0, 65536))
+
+    def test_read_settings_records_both_shifted_values(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        registry = root / "models.conf"
+        _ = registry.write_text("\n".join(shifted_config_lines(REGISTRY_TEXT)) + "\n", encoding="utf-8")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)})))
+        log = root / "shifts.log"
+        self.addCleanup(conf_reads.set_shift_read_log, conf_reads.set_shift_read_log(str(log)))
+
+        self.assertEqual(hand_made.read_settings(models_registry.registry_text()),
+                         hand_made.CheckSettings("opus", "high", "units", 112.5, 65537))
+        self.assertEqual(log.read_text(encoding="utf-8").splitlines(), [
+            "models.conf:check_time_limit_seconds: 90 -> 112.50",
+            "models.conf:max_script_bytes: 65536 -> 65537",
+        ])
 
     def test_bad_settings_are_refusals(self) -> None:
         cases = {
@@ -1242,6 +1282,7 @@ class BuildsPageTests(unittest.TestCase):
             assert isinstance(waiting, wire.PlacementWait)
             self.assertIsInstance(waiting.wait, wire.PlacementResourceWait)
             fixture.allow_next_start()
+            _ = fixture.run_pass()
             granted, = fixture.server.handle_request(request)
             assert isinstance(granted, wire.LocalPlacementGranted)
             fixture.release(granted.grant)
