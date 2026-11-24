@@ -96,16 +96,22 @@ The route returns `GuestNotStarted` with the refusal reason before any upload or
 The route releases the claim when the guest proves the run ended.
 The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
 The guest run lock still refuses another guest run until the first run ends.
-When the proof wait expires, the gate returns status 80 to its placement retry loop.
+When the proof wait expires, the gate returns status 80 after it records the holder's release.
 The route records the guest address, machine ID, checkout path, and gate process identity before it requests permission.
 The arm checks the saved guest identity before it writes any guest records.
 It appends records to `mac-linux/end-proofs.jsonl` under the build-targets state directory.
 It records `proven` when cleanup confirms the end of a run.
-It records `not started` if the gate consumed permission and can prove that no run started.
+It records `not started` if the gate consumed permission and sent no arm request.
 It records `unproven` and saves the armed guest identity when the proof wait expires.
-The route sends a completion report for a run with a start marker.
+The route sends a completion report when it receives a start marker and a valid result.
+When the stream loses the result, end proof leaves the result unknown.
 For a proven no-run, it sends a refusal for the consumed claim and releases the holder in the journal.
-The gate requests settlement and keeps the same placement episode for the retry.
+If the consume or arm reply is lost, the route releases the holder in the journal.
+The gate exits 80 if the guest can have run and the gate lacks a result.
+The gate also exits 80 if the journal cannot record the holder's release.
+The placement loop requests settlement for the exact attempt.
+The loop retries an exit 80 in the same episode only if the gate records a refusal for that attempt.
+The checkpoint stops when the placement loop returns exit 80.
 The queue can acknowledge the end report while it waits to read the proof.
 Each record contains the queue attempt key, the result, the detail, and the wall time.
 Each record includes the Mac claim ID.
@@ -119,20 +125,31 @@ If a launch remains unproven, recovery waits for the gate process to exit or giv
 The adapter reads the journal again before it submits the service.
 When the route saved an armed guest identity, the service uses it to confirm the run ended.
 For a launch with an unknown arm result, the service requires the saved guest identity.
-An attempt without a journal record requires the queue to confirm that its legacy holder exited.
 A guest with a held run lock leaves the attempt pending.
-With the lock free, the guest checks both arm names and records refusal under the run lock.
+For a known launch, the guest checks both arm names and records refusal under the run lock.
 The refusal prevents later arms and runs for that queue attempt.
 The service records `proven` if the guest found an arm and `not started` if it found none.
+An unrecorded legacy attempt needs proof from the guest.
+The queue starts legacy recovery after it confirms the holder exited and verifies the assigned settings.
+The guest checks for active gate runs and arm records under the run lock.
+The service saves the guest machine ID with the proof.
 The recovery path records at most one warning per attempt under `mac-linux/end-proof-warnings`.
 
 natedev holds the SSH input open for the whole run.
 When the natedev process ends by any signal, the guest sees its input end and kills the run group, which frees the run lock.
 Item 191 B3 will keep the Mac claim until proof and bind the claim identity to the guest attempt.
 
-The Mac Linux route runs the suite in a numbered copy.
-The runner starts the copy's gate with a `scripts/lib/py -c` entry (`gate_entry_command`).
-Python gives a `-c` entry the argv `['-c', ...]`, so the entry removes `-c` before it runs the runner with `runner request --run-copy <reply descriptor>`.
+The Mac Linux route records the HEAD commit of the natedev runner's Git tree.
+It checks the index and worktree under `scripts/` against that commit.
+It refuses the run for changes, untracked files, or entries with the assume-unchanged or skip-worktree flag.
+The full and delta bundles include the runner commit.
+The bootstrap tar carries `request.json` with the runner commit.
+The guest extracts the runner's scripts and default configuration from that commit.
+Both guest entry points use the extracted Python shim and scripts.
+The guest main still resets to the candidate's `origin/main`.
+The gate runs the selected modules in the numbered copy of the candidate.
+The guest removes the bootstrap folder when the shell exits.
+After a forced stop, cleanup removes the folder under the run lock before it reports the end of the run.
 The reply descriptor is a copy of the stream standard output.
 The runner starts the sandbox, and `dbus-run-session` if the guest has it, for the gate run with standard output on standard error.
 Only the JSON reply line goes to the reply descriptor, so other output cannot come before it.
@@ -155,6 +172,7 @@ If `bwrap` is missing, the route declines before it sends the source.
 - Four locks: `state.lock` covers `claim`, `release` and each claim watcher read and write, and never waits on `gh`, ssh or a message; `control.lock` covers `block`, `unblock`, `status` and each block watcher pass; `watch.lock` keeps one block watcher (a `systemd-run --user --collect` unit named `mac-test-watch-<pid>`) at a time; `claim_watch.lock` keeps one claim watcher (`mac-test-claim-watch-<pid>`) at a time.
 - **Claim files and scopes.** `claims/<repo>.json` holds one repository's claim; `run.json` holds a claim whose worktree is in no repository. `claim_scope(worktree)` names the repository through `offload.repository_identity` (`sweep.repo_name`, the folder holding the shared repository directory), else `WHOLE_MAC`: `ClaimScope = RepositoryScope(name) | WholeMacScope`, and `claim_path(paths, scope)` maps it to its file. `scopes_overlap` is true when either side is the whole Mac or both name the same repository. `read_claims(paths) -> tuple[HeldClaim(scope, path, record), ...]` reads every file, oldest `since` first; a `claims/<repo>.json` scope comes from its file name, a `run.json` scope from its worktree, so a machine-wide `run.json` from an older install covers the repository its worktree is in, or every repository when that worktree is in none. A file it cannot read raises `ClaimStateUnreadable(path)`, a `StateReadError`. `live_claims` removes each claim whose owner ended and returns the rest. A cleanup releases a claim only through `claim_state.cleanup_scope_matches`: a `run.json` claim with a relative worktree and no `repo_name` keeps its whole-Mac scope for admission but matches no cleanup. When the owner of such a kept claim ends, no tool releases it; a person releases it with `mac_test.py release --pid <pid> --claim-id <id> --episode <episode> --attempt <attempt>`, with the values from `run.json`.
 Each claim records `claim_id`, `episode`, `attempt`, `submitting_session`, `pid`, `proc_start`, job details, worktree, and queue time.
+A mac-linux guest claim id starts with `MAC_LINUX_CLAIM_ID_PREFIX` (`mac-linux-`). `mac_test.claim_kind` reads the kind from this prefix, and the record has no other kind marker.
 A remote-bound claim also records `remote_host` and its applicable host generation.
 A process-bound claim ends when its checked owner ends.
 A remote-bound claim remains held until provider cleanup confirms departure.

@@ -19,13 +19,14 @@ import signal
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 from threading import Event, Timer
 import time
 from types import CodeType
 from typing import cast, override
 import unittest
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 from scripts.build_hold.owning_session import OwningSession
 from scripts.build_queue import admission_client, admission_protocol as wire, admission_records, execution_identity, first_step, mac_run, placement, progress_profile, queue_place
@@ -33,14 +34,15 @@ from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNot
 from scripts.build_targets import mac_linux, target_config
 from scripts.build_targets.mac_linux import send_guest_execution
 from scripts.buildlog import store, treekey
-from scripts.lib import conf, process_group, process_start
+from scripts.lib import conf, process_group, process_start, scratch
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test
-from scripts.production import gate
+from scripts.production import checkpoint_gate, gate
 from scripts.production.gate_modules import GateRefused
-from scripts.production.gate_routes import ALL_MODULES, AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
+from scripts.production.gate_routes import ALL_MODULES, AllModules, GateJobKind, GateRun, GuestGateBlocked, ModuleCoverage, SuiteMode, TreeSelection
+from scripts.production.test_checkpoint_gate import GatePlacementFixture
 
 
 SSH_FIXTURE = '''import os
@@ -66,7 +68,7 @@ scenario = os.environ['FIXTURE_GUEST_RESULT']
 identity = "printf 'checkout %s %s" in shell
 cleanup = 'prove_end()' in shell
 arm_records = 'full_suffix, window, lock_name, descriptor = sys.argv[1:]' in shell
-fence = arm_records and ' recover mac-linux-armed mac-linux-cancel ' in shell
+fence = arm_records and any(f' {mode} mac-linux-armed mac-linux-cancel ' in shell for mode in ('recover', 'recover-legacy'))
 probe = not cleanup and not arm_records and 'bundle unbundle -' not in shell
 trace_path = Path(os.environ['FIXTURE_SSH_TRACE'])
 if not identity or scenario == 'offline':
@@ -81,6 +83,8 @@ if 'FIXTURE_GUEST_PATH' in os.environ:
     environment['PATH'] = os.environ['FIXTURE_GUEST_PATH']
 if 'FIXTURE_GUEST_MACHINE' in os.environ:
     shell = shell.replace('cat /etc/machine-id', 'printf %s ' + shlex.quote(os.environ['FIXTURE_GUEST_MACHINE']))
+if 'FIXTURE_GUEST_ID_FILE' in os.environ:
+    shell = shell.replace('/etc/machine-id', os.environ['FIXTURE_GUEST_ID_FILE'])
 if identity:
     sys.exit(subprocess.call(['bash', '-c', shell], stdin=subprocess.DEVNULL, env=environment))
 if arm_records:
@@ -136,11 +140,12 @@ guest_input, link = os.pipe()
 forward = ['head', '-c', str(bootstrap_bytes + 16)] if scenario == 'disconnect' else ['tee', str(payload)]
 _ = subprocess.Popen(forward, stdout=link)
 before_copy = scenario in ('disconnect-before-copy', 'interrupted-before-copy')
+lost_reply = scenario == 'lost-run-reply'
 # A guest whose SSH server has not seen the end of the link keeps its input open.
 held = before_copy or 'FIXTURE_HELD_LINK' in os.environ
 guest = subprocess.Popen(['bash', '-c', shell], stdin=guest_input,
-                         stdout=subprocess.DEVNULL if before_copy else None,
-                         stderr=subprocess.PIPE if before_copy else None,
+                         stdout=subprocess.DEVNULL if before_copy or lost_reply else None,
+                         stderr=subprocess.PIPE if before_copy else subprocess.DEVNULL if lost_reply else None,
                          env=environment, start_new_session=True, pass_fds=(link,) if held else ())
 os.close(guest_input)
 os.close(link)
@@ -159,6 +164,9 @@ if before_copy:
     os._exit(255)
 status = guest.wait()
 record_bundle()
+if lost_reply:
+    assert status == 0, status
+    sys.exit(255)
 sys.exit(status)
 '''
 
@@ -278,6 +286,8 @@ def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_li
         signal.pause()
     if scenario == 'runner-failure':
         raise RuntimeError('fixture guest runner failed')
+    if scenario == 'lost-run-reply':
+        Path(os.environ['FIXTURE_RUN_GROUP']).write_text(str(os.getpgrp()))
     if scenario == 'time-limit':
         sleep(time_limit.seconds)
         report = f'time limit: limit {time_limit.seconds:g} s'
@@ -324,9 +334,9 @@ from pathlib import Path
 import runpy
 import signal
 import socket
-import socket
 import sys
 
+import scripts
 from scripts.aws_target import gate_box, ledger
 
 os.chdir(sys.argv[1])
@@ -334,33 +344,38 @@ socket.gethostname = lambda: 'nixos'
 if os.environ['FIXTURE_GUEST_RESULT'] in ('disconnect-before-copy', 'interrupted-before-copy'):
     print('fixture pause before take_copy', file=sys.stderr, flush=True)
     signal.pause()
+sys.argv = sys.argv[2:]
+runner_root = Path(sys.argv[0]).parents[2]
+scripts.__path__ = [str(runner_root / 'scripts'), *scripts.__path__]
 if '--run-copy' in sys.argv:
-    spec = spec_from_file_location('scripts.production.gate', Path('scripts/production/gate.py'))
+    spec = spec_from_file_location('scripts.production.gate', runner_root / 'scripts/production/gate.py')
     gate = module_from_spec(spec)
     sys.modules[spec.name] = gate
     spec.loader.exec_module(gate)
-entry = sys.argv[2:]
-if entry[0] == '-c':
-    # Python sets sys.argv to ['-c', *arguments] for a -c entry.
-    sys.argv = ['-c', *entry[2:]]
-    exec(entry[1], {'__name__': '__main__'})
-else:
-    sys.argv = entry
-    runpy.run_path(entry[0], run_name='__main__')
+runpy.run_path(sys.argv[0], run_name='__main__')
 '''
 
 
 class GuestEntryTests(unittest.TestCase):
     def test_gate_entry_gives_the_runner_the_request_and_the_run_copy_word(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        runner = root / 'runner.py'
-        _ = runner.write_text("import json, sys\nprint(json.dumps(sys.argv))\n"
-                              + "print(sys.argv[2:3] == ['--run-copy'])\n", encoding='utf-8')
+        runner = root / mac_linux.RUNNER_PATH
+        runner.parent.mkdir(parents=True)
+        candidate = Path(__file__).resolve().parents[2]
+        library = root / 'scripts/lib'
+        library.mkdir()
+        _ = shutil.copy2(candidate / 'scripts/lib/py', library / 'py')
+        _ = shutil.copytree(candidate / 'scripts/lib/python_startup', library / 'python_startup')
+        _ = runner.with_name('runner_fixture.py').write_text("marker = 'runner commit'\n", encoding='utf-8')
+        _ = runner.write_text('import json, os, sys\n'
+                              + 'from scripts.build_targets.runner_fixture import marker\n'
+                              + 'print(json.dumps(sys.argv))\nprint(marker)\nprint(os.getcwd())\n',
+                              encoding='utf-8')
         request = root / 'request.json'
         command = mac_linux.gate_entry_command(1, runner, request, 7)
-        output = subprocess.run(command, cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
-                                check=True, timeout=30).stdout.splitlines()
-        self.assertEqual(output, [f'["{runner}", "{request}", "--run-copy", "7"]', 'True'])
+        output = subprocess.run(command, cwd=candidate, capture_output=True, text=True, check=True, timeout=30,
+                                env={**os.environ, 'CLAUDE_PYTHON': sys.executable}).stdout.splitlines()
+        self.assertEqual(output, [f'["{runner}", "{request}", "--run-copy", "7"]', 'runner commit', str(candidate)])
 
 
 class MacLinuxSandboxTests(unittest.TestCase):
@@ -655,6 +670,7 @@ class MacLinuxRouteTests(unittest.TestCase):
     guest_home: Path = Path()
     trace: Path = Path()
     repo: Path = Path()
+    runner_repo: Path = Path()
     registry: Path = Path()
     placed: placement.PlacementAssignment = placement.PlacementAssignment(
         'gate-episode', 'gate-attempt', placement.PlacementDestination(
@@ -732,7 +748,7 @@ class MacLinuxRouteTests(unittest.TestCase):
         _ = self.git('add', '.')
         _ = self.git('commit', '-qm', 'base')
         _ = self.git('remote', 'add', 'origin', 'https://example.test/claude_commands.git')
-        for folder in ('config', 'scripts/lib', 'scripts/production', 'scripts/fixture'):
+        for folder in ('config', 'scripts/lib', 'scripts/production', 'scripts/fixture', 'scripts/build_targets'):
             (self.repo / folder).mkdir(parents=True)
         _ = shutil.copyfile(config / 'build_folders.conf', self.repo / 'config/build_folders.conf')
         _ = (self.repo / 'scripts/production/gate.py').write_text(GATE_FIXTURE, encoding='utf-8')
@@ -751,9 +767,13 @@ fi
                         + f'cd {package_root}\nexport PYTHONPATH={package_root}\n'
                         + f'exec {shlex.quote(sys.executable)} -B "${{options[@]}}"'
                         + f' -c {shlex.quote(GUEST_BOOTSTRAP)} "$candidate" "$@"\n')
+        _ = shutil.copyfile(Path(mac_linux.__file__), self.repo / mac_linux.RUNNER_PATH)
         _ = self.git('add', '.')
         _ = self.git('commit', '-qm', 'main checkout')
         _ = self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+        self.runner_repo = self.root / 'runner'
+        _ = self.git('clone', '-q', str(self.repo), str(self.runner_repo))
+        _ = self.enterContext(patch.object(mac_linux, '__file__', str(self.runner_repo / mac_linux.RUNNER_PATH)))
 
     @staticmethod
     def executable(path: Path, content: str) -> None:
@@ -769,7 +789,7 @@ fi
 
     def route(self, scenario: str = 'pass', selected: AllModules | TreeSelection = ALL_MODULES,
               gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED, *,
-              type_dirs: tuple[str, ...] = ()) -> GateRun | mac_linux.GuestNotStarted | str:
+              type_dirs: tuple[str, ...] = ()) -> GateRun | mac_linux.GuestNotStarted | GuestGateBlocked | str:
         mode = SuiteMode.GATE if isinstance(selected, AllModules) else SuiteMode.TARGETED
         temporary_directory = tempfile.TemporaryDirectory
 
@@ -787,9 +807,14 @@ fi
         self.assertEqual(self.git('for-each-ref', 'refs/mac-linux'), '')
         return result
 
-    def not_started(self, result: GateRun | mac_linux.GuestNotStarted | str) -> str:
+    def not_started(self, result: GateRun | mac_linux.GuestNotStarted | GuestGateBlocked | str) -> str:
         self.assertIsInstance(result, mac_linux.GuestNotStarted)
         assert isinstance(result, mac_linux.GuestNotStarted)
+        return result.reason
+
+    def blocked(self, result: GateRun | mac_linux.GuestNotStarted | GuestGateBlocked | str) -> str:
+        self.assertIsInstance(result, GuestGateBlocked)
+        assert isinstance(result, GuestGateBlocked)
         return result.reason
 
     def assert_guest_clean(self, *events: str) -> None:
@@ -849,7 +874,7 @@ fi
               patch.object(os, 'fsync', side_effect=sync),
               patch.object(mac_linux, 'send_guest_execution', side_effect=failed_send) as send,
               redirect_stderr(io.StringIO()) as errors):
-            mac_linux.settle_guest_dispatch(dispatch, 0)
+            mac_linux.settle_guest_dispatch(dispatch, placement.AttemptCompleted(0))
         send.assert_called_once()
         self.assertIn('fixture socket outage', errors.getvalue())
         self.assertEqual(mac_linux.settlement(assignment.episode, 16), placement.Settled())
@@ -862,7 +887,7 @@ fi
         for reason in ('', 'fixture refusal'):
             with (self.subTest(reason=reason), redirect_stderr(io.StringIO()) as errors,
                   patch.object(mac_linux, 'send_guest_execution', return_value=replace(pending, reason=reason)) as send):
-                mac_linux.settle_guest_dispatch(dispatch, 0)
+                mac_linux.settle_guest_dispatch(dispatch, placement.AttemptCompleted(0))
                 send.assert_called_once()
                 request = cast(wire.ExecutionReport, send.call_args.args[0])
                 self.assertEqual(request.assignment, dispatch.assignment)
@@ -944,18 +969,52 @@ fi
         with patch.object(process_start, 'process_start', return_value=process_start.Gone()):
             self.assertEqual(mac_linux.settlement(self.placed.episode, 16), placement.Settled())
 
-    def test_guest_without_a_start_line_saves_end_proof_and_reports_no_execution(self) -> None:
+    def test_guest_that_ran_without_a_received_start_line_reports_an_unknown_result(self) -> None:
         attempt = 16
         self.placed = replace(self.placed, attempt=f'{attempt:032x}')
         pending = wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
         with patch.object(mac_linux, 'send_guest_execution', return_value=pending) as report:
-            reason = self.not_started(self.route('disconnect-before-copy'))
+            reason = self.blocked(self.route('lost-run-reply'))
+        self.assertTrue((self.root / 'run.group').is_file())
         self.assertIn('Guest cleanup: ended', reason)
-        report.assert_called_once()
-        request = cast(wire.ExecutionReport, report.call_args.args[0])
-        self.assertIsInstance(request.evidence, execution_identity.ExecutionNotStarted)
-        self.assertEqual(request.outcome, placement.PrelaunchRefused(placement.MAC_LINUX_NO_ANSWER))
-        self.assertEqual(mac_linux.settlement(self.placed.episode, attempt), placement.Settled())
+        self.assertIn('did not confirm whether the run started', reason)
+        report.assert_not_called()
+        self.assertIsInstance(mac_linux.settlement(self.placed.episode, attempt), placement.Pending)
+        with patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+            self.assertEqual(mac_linux.settlement(self.placed.episode, attempt), placement.Settled())
+
+    def test_checkpoint_does_not_retry_an_unknown_guest_result(self) -> None:
+        fixture = GatePlacementFixture(self)
+        self.placed = fixture.guest
+        args = ('--tests-only', '--full', '--module-time-limit-s', '3', '--repo', str(self.repo))
+
+        def child(command: list[str], _folder: Path) -> subprocess.CompletedProcess[str]:
+            with redirect_stderr(io.StringIO()) as errors:
+                status = gate.main(args)
+            return subprocess.CompletedProcess(command, status, '', errors.getvalue())
+
+        pending = wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
+        run = Mock(side_effect=child)
+        with (patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': 'lost-run-reply',
+                                     'FIXTURE_EXPECTED_MAIN': self.git('rev-parse', 'origin/main'),
+                                     'BUILDLOG_PLACEMENT_FILE': str(fixture.assignment_file)}),
+              patch.object(gate, 'current_gate_placement', return_value=wire.Assignment(self.placed)),
+              patch.object(gate, 'gate_recovery', return_value=nullcontext()),
+              patch.object(scratch, 'copy_lock', return_value=nullcontext()),
+              patch.object(mac_linux, 'send_guest_execution', return_value=pending),
+              patch.object(admission_client, 'request_settlement') as settle,
+              self.assertRaises(checkpoint_gate.Stop) as stopped):
+            _ = fixture.run_step(run, retry_failed_steps=True)
+        self.assertEqual(stopped.exception.state, 'blocked')
+        self.assertIn('launch settlement', stopped.exception.detail)
+        output = fixture.log.read_text()
+        self.assertIn('Guest cleanup: ended', output)
+        self.assertIn('merge_test_1_EXIT=80', output)
+        self.assertNotIn('RERUN', output)
+        self.assertTrue((self.root / 'run.group').is_file())
+        settle.assert_called_once_with(wire.SettlementRequest(self.placed))
+        fixture.place_again.assert_not_called()
+        run.assert_called_once()
 
     def lose_guest_permission_reply(self, attempt: int) -> wire.ConsumePermission:
         self.placed = replace(self.placed, attempt=f'{attempt:032x}')
@@ -995,6 +1054,31 @@ fi
         self.assertEqual(record['attempt'], execution_identity.attempt_key(episode, self.placed.attempt))
         self.assertEqual(record['claim'], request.claim.claim_id)
         self.assertEqual(record['result'], 'not started')
+
+    def test_lost_launch_replies_request_settlement_after_releasing_the_holder(self) -> None:
+        for attempt, scenario in ((48, 'missing-arm-ack'), (49, 'lost-consume-reply'), (51, 'already-consumed')):
+            with self.subTest(scenario=scenario):
+                self.placed = replace(self.placed, attempt=f'{attempt:032x}')
+                if scenario == 'already-consumed':
+                    reply = wire.DispatchStatus(self.placed, placement.CurrentAssignment(),
+                        placement.PermissionConsumed(1.0), 'launch permission was already consumed')
+                    consume = patch.object(admission_client, 'consume_permission', return_value=reply)
+                elif scenario == 'lost-consume-reply':
+                    consume = patch.object(admission_client, 'consume_permission',
+                                           side_effect=wire.AdmissionUnavailable('fixture lost consume reply'))
+                else:
+                    consume = nullcontext()
+                with consume, patch.object(mac_linux, 'send_guest_execution') as report:
+                    outcome = self.route(scenario)
+                assert isinstance(outcome, mac_linux.GuestNotStarted), outcome
+                self.assertTrue(outcome.settlement_required)
+                report.assert_not_called()
+                with patch('scripts.aws_target.cloud_gate.start_reconcile_service') as submit:
+                    mac_linux.reconcile_unproven(self.placed.episode, attempt)
+                submit.assert_called_once()
+                mac_linux.reconcile_guest_end(self.placed.episode, attempt)
+                self.assertEqual(mac_linux.settlement(self.placed.episode, attempt), placement.Settled())
+        self.assert_guest_clean('probe', 'arm', 'fence', 'fence', 'fence')
 
     def test_guest_fence_refuses_a_gate_that_arms_after_reconciliation(self) -> None:
         request = self.lose_guest_permission_reply(29)
@@ -1117,6 +1201,29 @@ fi
         self.assert_guest_clean('probe')
         self.assertFalse(self.run_lock().exists())
 
+    def test_failed_launch_release_exits_with_a_settlement_error(self) -> None:
+        path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
+        armed = mac_linux.ArmedGuestAttempt('fixture-attempt', 'f' * 32, 'boot-id', 10, 'guest', '/fixture')
+        for attempt, reason in ((52, 'the guest end is unproven'), (50, 'the guest main probe failed')):
+            with self.subTest(reason=reason):
+                self.placed = replace(self.placed, attempt=f'{attempt:032x}')
+                transfer = (patch.object(mac_linux, 'transfer_source', side_effect=mac_linux.GuestEndUnproven(reason, armed))
+                            if attempt == 52 else nullcontext())
+                with (transfer, patch.object(mac_linux, '_end_proofs_path', side_effect=[path, path.parent, path.parent]),
+                      patch.object(mac_linux, 'send_guest_execution') as report, redirect_stderr(io.StringIO())):
+                    outcome = self.route('main-probe-failure')
+                blocked = self.blocked(outcome)
+                self.assertIn('Cannot release the Mac Linux launch holder', blocked)
+                self.assertIn(reason, blocked)
+                report.assert_not_called()
+                self.assertIsInstance(mac_linux.settlement(self.placed.episode, attempt), placement.Pending)
+                with patch('scripts.aws_target.cloud_gate.start_reconcile_service') as submit:
+                    mac_linux.reconcile_unproven(self.placed.episode, attempt)
+                    submit.assert_not_called()
+                    with patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+                        mac_linux.reconcile_unproven(self.placed.episode, attempt)
+                    submit.assert_called_once()
+
     def test_direct_affected_retries_after_a_consumed_guest_takes_no_run(self) -> None:
         key = treekey.tree_key(str(self.repo))
         assert key is not None
@@ -1208,10 +1315,10 @@ fi
                 mac_linux.reconcile_unproven(episode, 43)
                 submit.assert_called_once()
                 mac_linux.reconcile_guest_end(episode, 43)
-        self.assertEqual(mac_linux.settlement(episode, 43), placement.Settled())
+                self.assertEqual(mac_linux.settlement(episode, 43), placement.Settled())
         self.assert_guest_clean('fence')
 
-    def test_unrecorded_attempt_uses_holder_exit_without_guest_recovery(self) -> None:
+    def test_unrecorded_attempt_with_no_holder_identity_stays_pending(self) -> None:
         episode = self.placed.episode
         with (patch('scripts.aws_target.cloud_gate.start_reconcile_service') as submit,
               patch.object(mac_linux, 'recover_guest_launch') as fence):
@@ -1220,8 +1327,55 @@ fi
         submit.assert_not_called()
         fence.assert_not_called()
         self.assertIsInstance(mac_linux.settlement(episode, 44), placement.Pending)
-        self.assertEqual(mac_linux.settlement(episode, 44, legacy_holder_ended=True), placement.Settled())
         self.assert_guest_clean()
+
+    def test_unrecorded_attempt_needs_idle_guest_proof(self) -> None:
+        episode = self.placed.episode
+        attempt = 44
+        legacy = placement.LegacyGuestClaim(FIXTURE_CLAIM.claim_id,
+            placement.ClaimHolderIdentity(store.host_name(), os.getpid(), 'fixture-holder'))
+        machine = 'a' * 32
+        machine_id = self.root / 'machine-id'
+        _ = machine_id.write_text(machine + '\n')
+
+        with (patch('scripts.aws_target.cloud_gate.start_reconcile_service') as submit,
+              patch.object(process_start, 'process_start', return_value=process_start.Started('fixture-holder')) as holder,
+              patch.dict(os.environ, {'FIXTURE_GUEST_ID_FILE': str(machine_id)}),
+              redirect_stderr(io.StringIO())):
+            mac_linux.reconcile_unproven(episode, attempt, legacy=legacy)
+            mac_linux.reconcile_guest_end(episode, attempt, legacy=legacy)
+            submit.assert_not_called()
+            self.assertEqual(self.trace.read_text(), '')
+            holder.return_value = process_start.Gone()
+            self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
+            mac_linux.reconcile_unproven(episode, attempt, legacy=legacy)
+            submit.assert_called_once()
+
+            lock = self.run_lock()
+            lock.parent.mkdir(parents=True)
+            with lock.open('wb') as descriptor:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                mac_linux.reconcile_guest_end(episode, attempt, legacy=legacy)
+            self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
+
+            mac_linux.reconcile_guest_end(episode, attempt + 1, legacy=legacy)
+            self.assertEqual(mac_linux.settlement(episode, attempt + 1), placement.Settled())
+            settings = mac_linux.read_settings(conf.read(self.registry))
+            unrelated = mac_linux.arm_guest(settings, 'unrelated-legacy')
+            mac_linux.reconcile_guest_end(episode, attempt, legacy=legacy)
+            self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
+            (lock.parent / f'{mac_linux.CANCEL_RECORD_PREFIX}.{unrelated.boot_id}.{unrelated.deadline_ns}.{unrelated.attempt}').touch()
+            _ = lock.write_text(f'{os.getpgrp()} {unrelated.attempt}\n')
+            mac_linux.reconcile_guest_end(episode, attempt, legacy=legacy)
+            self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
+            _ = lock.write_text('')
+            mac_linux.reconcile_guest_end(episode, attempt, legacy=legacy)
+
+        self.assertEqual(mac_linux.settlement(episode, attempt), placement.Settled())
+        journal = self.root / 'target-state/mac-linux/end-proofs.jsonl'
+        rows = [cast(dict[str, object], json.loads(line)) for line in journal.read_bytes().splitlines()]
+        self.assertEqual([(row['result'], row['guest_machine_id']) for row in rows],
+                         [('not started', machine), ('proven', machine)])
 
     def test_reconcile_unproven_checks_for_proof_after_preparing_submission(self) -> None:
         request = self.lose_guest_permission_reply(40)
@@ -1745,11 +1899,10 @@ fi
         _ = configuration.write_text(configuration.read_text().replace('seconds=7', 'seconds=30'))
         with (patch.dict(os.environ, {'FIXTURE_RUN_SECONDS': '30', 'FIXTURE_HELD_LINK': '1'}),
               patch.object(mac_linux.GuestSettings, 'transfer_timeout_seconds', 6)):
-            result = self.route('hang')
-        self.assertIsInstance(result, str)
+            reason = self.blocked(self.route('hang'))
         group = (self.root / 'run.group').read_text()
-        self.assertIn('SSH or guest run exceeded 6 seconds', str(result))
-        self.assertIn('Guest cleanup: ended', str(result))
+        self.assertIn('SSH or guest run exceeded 6 seconds', reason)
+        self.assertIn('Guest cleanup: ended', reason)
         self.assertEqual(self.run_lock().read_text().split()[0], group)
         self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
@@ -1788,6 +1941,7 @@ fi
             'from scripts.build_targets import mac_linux',
             'from scripts.production.gate_routes import ALL_MODULES, SuiteMode',
             'from scripts.build_queue import admission_wire',
+            f'mac_linux.__file__ = {str(self.runner_repo / mac_linux.RUNNER_PATH)!r}',
             'mac_linux.consume_launch_permission = lambda claim, assignment: None',
             'mac_linux.report_guest_start = lambda armed, dispatch, **timing: None',
             'mac_linux.route(Path(sys.argv[1]), mode=SuiteMode.GATE, full=True, module_time_limit_s=3,',
@@ -1935,12 +2089,12 @@ fi
         self.assert_guest_clean('probe', 'arm', 'fence')
 
     def test_disconnect_before_take_copy_kills_the_run_and_proves_end(self) -> None:
-        reason = self.not_started(self.route('disconnect-before-copy'))
+        reason = self.blocked(self.route('disconnect-before-copy'))
         self.assertIn('SSH or source stream exited 255', reason)
         self.assertIn('Guest cleanup: ended', reason)
         self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
         self.assertFalse((self.guest_home / 'build').exists())
-        self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_unreachable_guest_releases_the_mac_claim_after_proof(self) -> None:
         events: list[str] = []
@@ -2132,6 +2286,24 @@ fi
             f'{mac_linux.CANCEL_RECORD_PREFIX}.{armed.boot_id}.{armed.deadline_ns}.{armed.attempt}')
         self.assertFalse(cancel.exists())
         self.assertIsInstance(mac_linux.prove_guest_end(settings, armed), mac_linux.GuestEndProven)
+
+    def test_cleanup_removes_the_bootstrap_under_the_run_lock(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        armed = mac_linux.arm_guest(settings, 'stopped-runner-fixture')
+        lock = self.run_lock()
+        runner = lock.parent / 'mac-linux' / mac_linux.RUNNER_PATH
+        runner.parent.mkdir(parents=True)
+        runner.touch()
+
+        with lock.open('w') as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            with patch.object(mac_linux, 'GUEST_KILL_GRACE_SECONDS', 0):
+                proof = mac_linux.prove_guest_end(settings, armed)
+            self.assertIsInstance(proof, mac_linux.GuestEndPending)
+            self.assertTrue(runner.is_file())
+
+        self.assertIsInstance(mac_linux.prove_guest_end(settings, armed), mac_linux.GuestEndProven)
+        self.assertFalse((lock.parent / 'mac-linux').exists())
 
     def test_cleanup_refuses_an_invalid_group_with_the_lock_held(self) -> None:
         lock = self.run_lock()
@@ -2455,10 +2627,9 @@ fi
         _ = configuration.write_text(configuration.read_text().replace('seconds=7', 'seconds=3'))
         with (patch.dict(os.environ, {'FIXTURE_RUN_SECONDS': '3', 'FIXTURE_TRANSFER_SECONDS': '4'}),
               patch.object(mac_linux, 'TRANSFER_ALLOWANCE_SECONDS', 4)):
-            result = self.route('hang')
-        self.assertIsInstance(result, str)
-        self.assertRegex(str(result), r'SSH or source stream exited (9|137):')
-        self.assertIn('Guest cleanup: ended', str(result))
+            reason = self.blocked(self.route('hang'))
+        self.assertRegex(reason, r'SSH or source stream exited (9|137):')
+        self.assertIn('Guest cleanup: ended', reason)
         self.assertTrue((self.root / 'run.group').is_file())
         self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
@@ -2517,13 +2688,12 @@ fi
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_guest_runner_failure_returns_reason_and_cleans(self) -> None:
-        result = self.route('runner-failure')
-        self.assertIsInstance(result, str)
-        self.assertIn('fixture guest runner failed', str(result))
-        self.assertIn('Guest cleanup: ended', str(result))
+        reason = self.blocked(self.route('runner-failure'))
+        self.assertIn('fixture guest runner failed', reason)
+        self.assertIn('Guest cleanup: ended', reason)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
-    def test_runner_failure_before_a_test_lets_natedev_take_the_gate(self) -> None:
+    def test_runner_failure_before_a_test_reports_an_unconfirmed_start(self) -> None:
         # Without Chromium on the guest PATH, the runner stops before a test starts.
         (self.root / 'bin/chromium').unlink()
         # A host can have Chromium, as the guest has: a PATH folder that holds it changes to a fixture folder of links
@@ -2539,14 +2709,16 @@ fi
                 folders[index] = str(links)
         os.environ['PATH'] = os.pathsep.join(folders)
         self.assertIsNone(shutil.which('chromium'))
-        reason = self.not_started(self.route())
+        reason = self.blocked(self.route())
         self.assertRegex(reason, r'^SSH or source stream exited 1: .*Chromium is absent from the guest PATH')
+        self.assertIn('did not confirm whether the run started', reason)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_unusable_reply_names_the_exit_status_and_the_stderr_tail(self) -> None:
         reply = mac_linux.GuestReply('', 1, mac_linux.BundleForm.FIRST, mac_linux.BundleReason.FIRST_RUN,
                                      'SSH or source stream exited 0: fixture stderr tail', False)
-        source = mac_linux.CandidateSource('head', 'commit', 'tree', 'main', 'origin', frozenset(), ModuleCoverage.COMPLETE)
+        source = mac_linux.CandidateSource('head', 'commit', 'tree', 'main', 'origin', 'runner',
+                                           frozenset(), ModuleCoverage.COMPLETE)
         request = cast(mac_linux.GuestRequest, cast(object, {}))
         with self.assertRaises(mac_linux.GuestTookNoRun) as before:
             _ = mac_linux.completed_run(reply, request, source)
@@ -2562,7 +2734,8 @@ fi
     def test_unusable_reply_shows_only_its_first_200_characters(self) -> None:
         reply = mac_linux.GuestReply('a' * 200 + 'b' * 100, 1, mac_linux.BundleForm.FIRST,
                                      mac_linux.BundleReason.FIRST_RUN, 'SSH or source stream exited 0: fixture', False)
-        source = mac_linux.CandidateSource('head', 'commit', 'tree', 'main', 'origin', frozenset(), ModuleCoverage.COMPLETE)
+        source = mac_linux.CandidateSource('head', 'commit', 'tree', 'main', 'origin', 'runner',
+                                           frozenset(), ModuleCoverage.COMPLETE)
         request = cast(mac_linux.GuestRequest, cast(object, {}))
         with self.assertRaises(mac_linux.GuestTookNoRun) as refusal:
             _ = mac_linux.completed_run(reply, request, source)
@@ -2588,7 +2761,7 @@ fi
         main = self.guest_home / '.claude'
         self.assertIsInstance(self.route(), GateRun)
         _ = (self.repo / 'scripts/fixture/test_added.py').touch()
-        reason = self.not_started(self.route('disconnect'))
+        reason = self.blocked(self.route('disconnect'))
         self.assertTrue(reason.startswith('SSH or source stream exited 1:'), reason)
         self.assertEqual((main / 'history.txt').read_text(encoding='utf-8'), 'old source\n')
         self.assertFalse((main / 'scripts/fixture/test_added.py').exists())
@@ -2604,6 +2777,96 @@ fi
         assert isinstance(result, GateRun), result
         self.assertTrue(result.passed)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_full_and_delta_bundles_run_the_committed_runner_with_its_modules(self) -> None:
+        main = self.guest_home / '.claude'
+        candidate_main = self.git('rev-parse', 'origin/main')
+        selected = TreeSelection(('scripts/fixture/test_first.py',), self.git('rev-parse', 'HEAD^{tree}'))
+        runner = self.runner_repo / mac_linux.RUNNER_PATH
+        runner_code = runner.read_text(encoding='utf-8')
+        for form, reason in ((mac_linux.BundleForm.FIRST, mac_linux.BundleReason.FIRST_RUN),
+                             (mac_linux.BundleForm.DELTA, mac_linux.BundleReason.DELTA)):
+            with self.subTest(form=form):
+                # Advance only the runner. Each transfer must send the new commit.
+                module = self.runner_repo / 'scripts/fixture/runner_only.py'
+                _ = module.write_text(f'REVISION = {form.value!r}\n', encoding='utf-8')
+                _ = runner.write_text(runner_code.replace(
+                    'from scripts.aws_target import gate_box, ledger',
+                    'from scripts.fixture.runner_only import REVISION\n'
+                    + f'assert REVISION == {form.value!r}\n'
+                    + 'from scripts.aws_target import gate_box, ledger', 1), encoding='utf-8')
+                _ = self.git_at(self.runner_repo, 'add', 'scripts')
+                _ = self.git_at(self.runner_repo, 'commit', '-qm', 'Advance the guest runner')
+                commit = self.git_at(self.runner_repo, 'rev-parse', 'HEAD')
+                result = self.route(selected=selected)
+                assert isinstance(result, mac_linux.MacLinuxGateRun), result
+                self.assertTrue(result.passed)
+                self.assertEqual([job.module for job in result.jobs], ['test_first.py'])
+                self.assertEqual((result.bundle_form, result.bundle_reason), (form, reason))
+                self.assertEqual(self.git_at(main, 'rev-parse', 'HEAD', 'origin/main').splitlines(),
+                                 [candidate_main, candidate_main])
+                self.assertEqual(self.git_at(main, 'cat-file', '-t', commit), 'commit')
+                self.assertFalse((main / 'scripts/fixture/runner_only.py').exists())
+                stream = (self.root / 'source.payload').read_bytes()
+                with tarfile.open(fileobj=io.BytesIO(stream)) as archive:
+                    self.assertEqual(archive.getnames(), ['request.json'])
+                    request = archive.extractfile('request.json')
+                    assert request is not None
+                    row = cast(mac_linux.GuestRequest, json.load(request))
+                    self.assertEqual(row['runner_commit'], commit)
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup', 'probe', 'arm', 'run', 'cleanup')
+
+    def test_dirty_runner_scripts_refuse_the_guest_before_claim_or_ssh(self) -> None:
+        runner = self.runner_repo / mac_linux.RUNNER_PATH
+        original = runner.read_text()
+        for changed in (runner, runner.with_name('untracked.py')):
+            with self.subTest(path=changed.name):
+                _ = changed.write_text('# Changed runner source.\n', encoding='utf-8')
+                with self.assertRaisesRegex(mac_linux.GuestUnavailable, 'runner scripts have uncommitted changes'):
+                    _ = mac_linux.checkout_source(self.repo)
+                self.assertIn('runner scripts have uncommitted changes', self.not_started(self.route()))
+                self.assert_guest_clean()
+                self.assertEqual(self.consumed, ())
+                if changed == runner:
+                    _ = runner.write_text(original, encoding='utf-8')
+
+    def test_runner_index_flags_refuse_even_a_clean_runner(self) -> None:
+        runner = self.runner_repo / mac_linux.RUNNER_PATH
+        for flag in ('assume-unchanged', 'skip-worktree'):
+            with self.subTest(flag=flag):
+                _ = self.git_at(self.runner_repo, 'update-index', f'--{flag}', '--', mac_linux.RUNNER_PATH)
+                try:
+                    with self.assertRaisesRegex(mac_linux.GuestTookNoRun, flag):
+                        _ = mac_linux.runner_commit(self.repo)
+                    _ = runner.write_text('# Hidden runner change.\n', encoding='utf-8')
+                    with self.assertRaisesRegex(mac_linux.GuestTookNoRun, flag):
+                        _ = mac_linux.runner_commit(self.repo)
+                finally:
+                    _ = self.git_at(self.runner_repo, 'update-index', f'--no-{flag}', '--', mac_linux.RUNNER_PATH)
+                    _ = self.git_at(self.runner_repo, 'restore', '--', mac_linux.RUNNER_PATH)
+        self.assert_guest_clean()
+
+    def test_runner_scripts_must_match_the_captured_commit(self) -> None:
+        initial = self.git_at(self.runner_repo, 'rev-parse', 'HEAD')
+        runner = self.runner_repo / mac_linux.RUNNER_PATH
+        with runner.open('a', encoding='utf-8') as script:
+            _ = script.write('\n# Change the runner.\n')
+        _ = self.git_at(self.runner_repo, 'commit', '-qam', 'Change the runner')
+        changed = self.git_at(self.runner_repo, 'rev-parse', 'HEAD')
+        _ = self.git_at(self.runner_repo, 'checkout', '-q', '--detach', initial)
+        checked_git = gate.checked_git
+
+        def advance_after_capture(folder: Path, *arguments: str) -> str:
+            result = checked_git(folder, *arguments)
+            if arguments[0] == 'rev-parse' and arguments[-1] == 'HEAD':
+                _ = self.git_at(self.runner_repo, 'checkout', '-q', '--detach', changed)
+            return result
+
+        with (patch.object(gate, 'checked_git', advance_after_capture),
+              self.assertRaisesRegex(mac_linux.GuestTookNoRun, 'runner scripts have uncommitted changes')):
+            _ = mac_linux.runner_commit(self.repo)
+        self.assertEqual(self.git_at(self.runner_repo, 'status', '--porcelain'), '')
+        self.assert_guest_clean()
 
     def test_delta_updates_main_and_reuses_the_numbered_copy(self) -> None:
         main = self.guest_home / '.claude'
@@ -2683,7 +2946,10 @@ fi
 
         with (patch.dict(os.environ, {'FIXTURE_PROBED_MAIN': self.git('rev-parse', 'origin/main')}),
               patch.object(mac_linux, 'arm_guest', lose_retry_reply)):
-            self.assertIn('did not acknowledge the armed deadline', self.not_started(self.route()))
+            outcome = self.route()
+        assert isinstance(outcome, mac_linux.GuestNotStarted), outcome
+        self.assertTrue(outcome.settlement_required)
+        self.assertIn('did not acknowledge the armed deadline', outcome.reason)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup', 'arm')
         self.assertFalse((self.guest_home / 'build').exists())
         self.assertIsInstance(mac_linux.settlement(episode, 45), placement.Pending)
@@ -2736,7 +3002,7 @@ fi
     def test_guest_refuses_when_the_type_check_tool_is_missing(self) -> None:
         missing = self.root / 'missing-basedpyright'
         with patch.dict(os.environ, {'GATE_BASEDPYRIGHT': str(missing)}):
-            reason = self.not_started(self.route(type_dirs=('scripts',)))
+            reason = self.blocked(self.route(type_dirs=('scripts',)))
         self.assertTrue(reason.startswith('SSH or source stream exited 1:'), reason)
         self.assertIn(f'The guest cannot find the type-check tool {missing}', reason)
         self.assertIn('Guest cleanup: ended', reason)

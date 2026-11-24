@@ -40,22 +40,24 @@ from uuid import uuid4
 
 from scripts.aws_target import gate_box, ledger
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
+from scripts.build_queue.placement import RECORDED_GUEST_RECOVERY_ONLY, ClaimHolderIdentity, LegacyGuestClaim, RecordedGuestRecoveryOnly
 from scripts.build_targets import target_config
 from scripts.lib import build_folders, conf, process_group, process_start
 from scripts.mac_test import claim_state, eligibility
 from scripts.production.gate_modules import GateRefused, discover_test_modules
-from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
+from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, GuestGateBlocked, ModuleCoverage, SuiteMode, TreeSelection
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 if TYPE_CHECKING:
     from scripts.build_queue.admission_protocol import DispatchStatus, ExecutionReport
-    from scripts.build_queue.placement import Pending, PlacementAssignment, ProviderClaimReference, Settled
+    from scripts.build_queue.placement import AttemptCompleted, NoTerminalReport, Pending, PlacementAssignment, ProviderClaimReference, Settled
 
 
 TARGET = eligibility.MAC_LINUX_TARGET
-# The guest route holds a repository claim on this Mac target while its run lasts.
-GUEST_CLAIM_TARGET = 'mac'
+GUEST_CLAIM_TARGET = eligibility.MAC_LINUX_CLAIM_TARGET
 ORIGIN_MAIN = 'refs/remotes/origin/main'
+RUNNER_PATH = 'scripts/build_targets/mac_linux.py'
+BOOTSTRAP_DIR = '.git/mac-linux'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
        '-o', f'ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}')
@@ -213,7 +215,7 @@ def consume_launch_permission(claim: claim_state.ClaimIdentity,
     """Consume the launch permission of the gate assignment before the guest run starts.
 
     The gate process is the holder, so the queue keeps the guest assignment current until the gate ends.
-    A refused consume, or a queue that does not answer, raises GuestTookNoRun: the guest starts nothing.
+    A lost consume reply leaves the permission unknown. The guest starts nothing.
     """
     from scripts.build_queue import admission_client, admission_protocol as wire, placement
     from scripts.buildlog import store
@@ -229,9 +231,12 @@ def consume_launch_permission(claim: claim_state.ClaimIdentity,
         permission = admission_client.consume_permission(
             wire.ConsumePermission(admission_client.request_id(), assignment, reference, holder))
     except wire.AdmissionUnavailable as error:
-        raise GuestTookNoRun(f'the launch permission is unavailable: {error}') from error
+        raise GuestPermissionUnknown(f'the launch permission is unavailable: {error}') from error
     if isinstance(permission, wire.DispatchStatus):
-        raise GuestTookNoRun(f'the queue refused the launch permission: {permission.reason}')
+        reason = f'the queue refused the launch permission: {permission.reason}'
+        if isinstance(permission.permission, placement.PermissionConsumed):
+            raise GuestPermissionUnknown(reason)
+        raise GuestTookNoRun(reason)
     return reference
 
 
@@ -252,6 +257,7 @@ class GuestRunRequest(TypedDict):
     commit: str
     tree: str
     origin_main: str
+    runner_commit: str
     unit: str
 
 
@@ -306,6 +312,10 @@ class CheckoutSource:
     tree: str
     origin_main: str
     origin_url: str
+    runner_commit: str
+
+    def bundle_tips(self) -> dict[str, str]:
+        return {'candidate': self.commit, 'main': self.origin_main, 'runner': self.runner_commit}
 
 
 @dataclass(frozen=True)
@@ -321,11 +331,35 @@ def check_repository(repo: Path) -> None:
         raise GuestRepositoryRefused(repository)
 
 
+def runner_commit(repo: Path) -> str:
+    """Find the clean runner commit and make its objects available to the bundle."""
+    from scripts.production.gate import checked_git, git
+
+    runner_folder = Path(__file__).resolve().parent
+    try:
+        top, _, commit = checked_git(runner_folder, 'rev-parse', '--show-toplevel', 'HEAD').rpartition('\n')
+        root = Path(top)
+        entries = checked_git(root, 'ls-files', '-v', '-z', '--cached', '--others', '--exclude-standard', '--', 'scripts/')
+        tags = {entry[0] for entry in entries.split('\0') if entry}
+        if any(tag == 'S' or tag.islower() for tag in tags):
+            raise GuestTookNoRun(f'the guest runner scripts have assume-unchanged or skip-worktree flags in {root}')
+        if ('?' in tags
+                or checked_git(root, 'diff', '--cached', '--name-only', commit, '--', 'scripts/')
+                or checked_git(root, 'diff', '--name-only', '--', 'scripts/')):
+            raise GuestTookNoRun(f'the guest runner scripts have uncommitted changes in {root}')
+        if git(repo, 'cat-file', '-e', f'{commit}^{{commit}}').returncode:
+            _ = checked_git(repo, 'fetch', '--no-tags', '--no-write-fetch-head', str(root), commit)
+    except (GateRefused, OSError, subprocess.SubprocessError) as error:
+        raise GuestTookNoRun(f'cannot prepare the guest runner commit: {error}') from error
+    return commit
+
+
 def checkout_source(repo: Path) -> CheckoutSource:
     from scripts.aws_target import cloud_gate
     from scripts.production.gate import checked_git
 
     check_repository(repo)
+    runner = runner_commit(repo)
     head = checked_git(repo, 'rev-parse', 'HEAD')
     origin_main = checked_git(repo, 'rev-parse', '--verify', f'{ORIGIN_MAIN}^{{commit}}')
     tree, dirty = cloud_gate.working_tree(repo)
@@ -334,7 +368,7 @@ def checkout_source(repo: Path) -> CheckoutSource:
     if origin.password or origin.query or ('://' in origin_url and origin.username):
         raise GuestUnavailable('the origin URL must contain no credential')
     commit = checked_git(repo, 'commit-tree', tree, '-p', head, '-m', 'Mac Linux gate snapshot') if dirty else head
-    return CheckoutSource(head, commit, tree, origin_main, origin_url)
+    return CheckoutSource(head, commit, tree, origin_main, origin_url, runner)
 
 
 def blob_id(data: bytes, object_id_length: int) -> str:
@@ -385,7 +419,7 @@ def candidate_source(repo: Path, selected: AllModules | TreeSelection) -> Candid
             raise GuestUnavailable('selected modules are absent from the checkout')
     coverage = ModuleCoverage.COMPLETE if modules == paths else ModuleCoverage.SUBSET
     return CandidateSource(source.head, source.commit, source.tree, source.origin_main, source.origin_url,
-                           modules, coverage)
+                           source.runner_commit, modules, coverage)
 
 
 def runner_bootstrap(request: GuestRequest | GuestCommandRequest) -> bytes:
@@ -395,7 +429,6 @@ def runner_bootstrap(request: GuestRequest | GuestCommandRequest) -> bytes:
     with BytesIO() as bootstrap:
         with tarfile.open(fileobj=bootstrap, mode='w') as archive:
             archive.addfile(record, BytesIO(manifest))
-            archive.add(Path(__file__).resolve(), arcname='runner.py')
         return bootstrap.getvalue()
 
 
@@ -526,12 +559,16 @@ class ArmedGuestAttempt:
 
 
 class GuestTookNoRun(GuestUnavailable):
-    """The guest did not arm a run, or the run stopped before a test started, so natedev can take the gate."""
+    """The gate saw a refusal or received no start marker before the stream failed."""
+
+
+class GuestPermissionUnknown(GuestTookNoRun):
+    """The queue may hold consumed permission without giving the gate launch authorization."""
 
 
 @dataclass(frozen=True)
 class GuestNotStarted:
-    """The guest took no run: the Mac refused the claim, the guest did not arm, or no test started.
+    """The gate can request a replacement after any required settlement.
 
     The reason names only the cause; the gate says that the guest took no run.
     """
@@ -568,7 +605,14 @@ def sync_checkout():
         os.fsync(parent)
         os.close(parent)
 
-if placed_attempt:
+def machine_id():
+    with open('/etc/machine-id', encoding='ascii') as identity:
+        machine = identity.read().rstrip('\\n')
+    if len(machine) != 32 or any(character not in '0123456789abcdef' for character in machine):
+        sys.exit('The guest machine ID is invalid.')
+    return machine
+
+if placed_attempt or mode == 'recover-legacy':
     lock = int(descriptor)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -577,6 +621,41 @@ if placed_attempt:
     path_stat = os.stat(lock_name, dir_fd=git, follow_symlinks=False)
     if not os.path.samestat(os.fstat(lock), path_stat):
         sys.exit('The guest run lock path changed.')
+if mode == 'recover-legacy':
+    history = os.pread(lock, 256, 0).split()
+    if history:
+        if len(history) != 2 or not history[0].isdigit() or not 1 < int(history[0]) <= 2147483647:
+            sys.exit('The guest run lock record is invalid.')
+        try:
+            os.killpg(int(history[0]), 0)
+        except ProcessLookupError:
+            pass
+        else:
+            sys.exit('A guest run group is still active.')
+    with open('/proc/sys/kernel/random/boot_id', encoding='ascii') as identity:
+        boot_id = identity.read().strip()
+    now = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+    armed = False
+    for name in os.listdir(git):
+        if not name.startswith(prefix + '.'):
+            continue
+        fields = name.removeprefix(prefix + '.').removeprefix('placed.').split('.')
+        if len(fields) != 3 or not fields[1].isascii() or not fields[1].isdecimal():
+            sys.exit('The guest armed record is invalid.')
+        armed = True
+        boot, deadline, run = fields
+        if boot != boot_id or int(deadline) <= now:
+            continue
+        try:
+            cancelled = os.stat(f'{cancel_prefix}.{boot}.{deadline}.{run}', dir_fd=git, follow_symlinks=False)
+        except FileNotFoundError:
+            sys.exit('A guest run can still start.')
+        if not stat.S_ISREG(cancelled.st_mode):
+            sys.exit('The guest cancel record must be a regular file.')
+    result = 'ended' if history or armed else 'not started'
+    print(f'{result} {machine_id()}', flush=True)
+    sys.exit(0)
+if placed_attempt:
     refusal = f'{cancel_prefix}.refused.{placed_attempt}'
     if mode == 'recover':
         attempts = (placed_attempt, placed_attempt + full_suffix)
@@ -600,10 +679,7 @@ if placed_attempt:
         pass
     else:
         sys.exit('The guest attempt was refused.')
-with open('/etc/machine-id', encoding='ascii') as identity:
-    machine = identity.read().rstrip('\\n')
-if len(machine) != 32 or any(character not in '0123456789abcdef' for character in machine):
-    sys.exit('The guest machine ID is invalid.')
+machine = machine_id()
 with open('/proc/sys/kernel/random/boot_id', encoding='ascii') as identity:
     boot = identity.read().strip()
 deadline = time.clock_gettime_ns(time.CLOCK_BOOTTIME) + int(window) * 10**9
@@ -628,13 +704,13 @@ def stop_ssh_process(process: subprocess.Popen[bytes]) -> None:
             continue
 
 
-def guest_arm_command(settings: GuestSettings, attempt: str, mode: Literal['arm', 'recover']) -> tuple[str, ...]:
+def guest_arm_command(settings: GuestSettings, attempt: str, mode: Literal['arm', 'recover', 'recover-legacy']) -> tuple[str, ...]:
     placed_attempt = (attempt.removesuffix(FULL_BUNDLE_RETRY_SUFFIX)
                       if attempt.startswith(PLACED_GUEST_ATTEMPT_PREFIX) else '')
     records = shlex.join(('python3', '-I', '-S', '-c', GUEST_ARM_RECORDS, mode, ARM_RECORD_PREFIX,
                           CANCEL_RECORD_PREFIX, attempt, placed_attempt, FULL_BUNDLE_RETRY_SUFFIX,
                           str(SSH_CONNECT_TIMEOUT_SECONDS), Path(RUN_LOCK_PATH).name, str(RUN_LOCK_FD)))
-    command = open_run_lock_command(RUN_LOCK_FD, f'exec {records}') if placed_attempt else records
+    command = open_run_lock_command(RUN_LOCK_FD, f'exec {records}') if placed_attempt or mode == 'recover-legacy' else records
     return settings.command(guest_checkout_guard(settings) + GUEST_CHECKOUT_SETUP + f'\nexec {command}')
 
 
@@ -823,7 +899,7 @@ unset CLAUDE_CONFIG_DIR CODEX_HOME CONF_DIR PYTHONPATH PYTHONHOME
 if [ ! -f .git/HEAD ]; then
     git init -q --initial-branch=main --object-format={object_format}
 fi
-bootstrap="$PWD/.git/mac-linux"
+bootstrap="$PWD/{BOOTSTRAP_DIR}"
 rm -rf -- "$bootstrap"
 mkdir -p -- "$bootstrap/tmp"
 trap 'rm -rf -- "$bootstrap"' EXIT
@@ -857,8 +933,9 @@ git symbolic-ref HEAD refs/heads/main
 git symbolic-ref refs/remotes/origin/HEAD {ORIGIN_MAIN}
 printf 'update refs/heads/main %s\\nupdate {ORIGIN_MAIN} %s\\n' "$origin_main" "$origin_main" | git update-ref --stdin
 git reset --hard -q "$origin_main"
+git archive {shlex.quote(source.runner_commit)} scripts config | tar -xf - -C "$bootstrap"
 umask 022
-./scripts/lib/py "$bootstrap/runner.py" "$bootstrap/request.json"'''
+"$bootstrap/scripts/lib/py" "$bootstrap/{RUNNER_PATH}" "$bootstrap/request.json"'''
     lock = guest_attempt_command('lock', armed, RUN_LOCK_FD)
     start = guest_attempt_command('start', armed, RUN_LOCK_FD)
     locked_run = f'''set -euo pipefail
@@ -875,7 +952,7 @@ def cleanup_shell(settings: GuestSettings, armed: ArmedGuestAttempt) -> str:
 lock="/proc/$$/fd/8"
 prove_end() {{
     flock -x -n 8 || return 1
-    if ! {cancel}; then
+    if ! {cancel} || ! rm -rf -- {BOOTSTRAP_DIR}; then
         exit {GUEST_END_PENDING_STATUS}
     fi
     printf 'ended\\n'
@@ -916,18 +993,44 @@ class GuestNotStartedProven:
     """The gate sent no arm, or the guest fenced an attempt with no arm record."""
 
 
-def recover_guest_launch(settings: GuestSettings, attempt: str) -> GuestEndProven | GuestNotStartedProven | GuestEndPending:
-    command = guest_arm_command(settings, attempt, 'recover')
+@dataclass(frozen=True)
+class LegacyGuestEndProof:
+    """The named guest had no active gate when it checked its run lock."""
+
+    machine_id: str
+    evidence: GuestEndProven | GuestNotStartedProven
+
+
+def guest_recovery_reply(command: tuple[str, ...]) -> subprocess.CompletedProcess[str] | GuestEndPending:
     try:
         reply = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace',
                                timeout=GUEST_CLEANUP_TIMEOUT_SECONDS, check=False, env=guest_ssh_environment())
     except (OSError, subprocess.TimeoutExpired) as error:
         return GuestEndPending(str(error) or type(error).__name__)
-    if reply.returncode == 0 and reply.stdout == 'not started\n':
+    if reply.returncode:
+        return GuestEndPending(reply.stderr.strip() or f'guest recovery exited {reply.returncode}')
+    return reply
+
+
+def recover_guest_launch(settings: GuestSettings, attempt: str) -> GuestEndProven | GuestNotStartedProven | GuestEndPending:
+    reply = guest_recovery_reply(guest_arm_command(settings, attempt, 'recover'))
+    if isinstance(reply, GuestEndPending):
+        return reply
+    if reply.stdout == 'not started\n':
         return GuestNotStartedProven()
-    if reply.returncode == 0 and reply.stdout == 'ended\n':
+    if reply.stdout == 'ended\n':
         return GuestEndProven()
-    return GuestEndPending(reply.stderr.strip() or f'guest recovery exited {reply.returncode}')
+    return GuestEndPending('The guest recovery reply is invalid.')
+
+
+def recover_legacy_guest(settings: GuestSettings) -> LegacyGuestEndProof | GuestEndPending:
+    reply = guest_recovery_reply(guest_arm_command(settings, 'legacy', 'recover-legacy'))
+    if isinstance(reply, GuestEndPending):
+        return reply
+    match = re.fullmatch(r'(ended|not started) ([0-9a-f]{32})\n', reply.stdout)
+    if match is None:
+        return GuestEndPending('The legacy guest recovery reply is invalid.')
+    return LegacyGuestEndProof(match[2], GuestEndProven() if match[1] == 'ended' else GuestNotStartedProven())
 
 
 def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt, *,
@@ -1024,7 +1127,7 @@ class BundleReason(StrEnum):
 
 @dataclass(frozen=True)
 class FullBundle:
-    """Send the complete Git history for the candidate and origin/main."""
+    """Send the complete Git history for the candidate, origin/main, and runner."""
 
     reason: BundleReason
 
@@ -1062,17 +1165,18 @@ def bundle_refs(repo: Path, source: CheckoutSource, attempt: str) -> Generator[s
     from scripts.production.gate import checked_git
 
     prefix = f'refs/mac-linux/{attempt}'
+    tips = source.bundle_tips()
     active_error: BaseException | None = None
     try:
-        _ = checked_git(repo, 'update-ref', f'{prefix}/candidate', source.commit)
-        _ = checked_git(repo, 'update-ref', f'{prefix}/main', source.origin_main)
+        for name, commit in tips.items():
+            _ = checked_git(repo, 'update-ref', f'{prefix}/{name}', commit)
         yield prefix
     except BaseException as error:
         active_error = error
         raise
     finally:
         failure = active_error
-        for tip in ('candidate', 'main'):
+        for tip in tips:
             ref = f'{prefix}/{tip}'
             try:
                 _ = checked_git(repo, 'update-ref', '-d', ref)
@@ -1093,12 +1197,13 @@ def bundle_refs(repo: Path, source: CheckoutSource, attempt: str) -> Generator[s
 def empty_delta_header(repo: Path, source: CheckoutSource, basis: DeltaBundle, prefix: str) -> str:
     from scripts.production.gate import checked_git
 
-    if checked_git(repo, 'rev-list', '--max-count=1', source.commit, source.origin_main, f'^{basis.base}'):
+    tips = source.bundle_tips()
+    if checked_git(repo, 'rev-list', '--max-count=1', *tips.values(), f'^{basis.base}'):
         return ''
     object_format = 'sha256' if len(source.commit) == 64 else 'sha1'
-    # Git refuses to create a bundle when both tips are already in the prerequisite.
-    return (f'# v3 git bundle\n@object-format={object_format}\n-{basis.base} guest main\n'
-            + f'{source.commit} {prefix}/candidate\n{source.origin_main} {prefix}/main\n\n')
+    # Git refuses to create a bundle when the prerequisite already has all the tips.
+    refs = ''.join(f'{commit} {prefix}/{name}\n' for name, commit in tips.items())
+    return f'# v3 git bundle\n@object-format={object_format}\n-{basis.base} guest main\n{refs}\n'
 
 
 # Without a count argument, the SSH output is the stream output. With one, send the SSH result to
@@ -1116,7 +1221,7 @@ bundle() {
     if [ -n "$header" ]; then
         printf '%s' "$header" && git pack-objects --stdout </dev/null
     else
-        local refs=("$prefix/candidate" "$prefix/main")
+        local refs=("--glob=$prefix/*")
         if [ -n "$base" ]; then
             refs+=("^$base")
         fi
@@ -1234,9 +1339,12 @@ def _append_guest_end(dispatch: GuestGateDispatch, evidence: GuestEndProven | Gu
 
 
 def _write_guest_end(key: str, claim: str,
-                     evidence: GuestEndProven | GuestNotStartedProven | ArmedGuestAttempt,
+                     evidence: GuestEndProven | GuestNotStartedProven | ArmedGuestAttempt | LegacyGuestEndProof,
                      detail: str) -> None:
     row: dict[str, object] = {'attempt': key, 'claim': claim, 'detail': detail, 'written_at': time()}
+    if isinstance(evidence, LegacyGuestEndProof):
+        row['guest_machine_id'] = evidence.machine_id
+        evidence = evidence.evidence
     if isinstance(evidence, ArmedGuestAttempt):
         row['result'] = 'unproven'
         row['armed'] = evidence.to_record()
@@ -1304,6 +1412,12 @@ def _placed_guest_attempt(key: str) -> str:
     return PLACED_GUEST_ATTEMPT_PREFIX + hashlib.sha256(key.encode()).hexdigest()
 
 
+def _guest_end_key(episode: str, attempt: int) -> str:
+    from scripts.build_queue.execution_identity import attempt_key
+
+    return attempt_key(episode, f'{attempt:032x}')
+
+
 def _record_guest_launch(assignment: PlacementAssignment, claim: claim_state.ClaimIdentity,
                          settings: GuestSettings) -> GuestLaunchRecovery:
     from scripts.build_queue.execution_identity import attempt_key
@@ -1333,10 +1447,9 @@ def _release_guest_launch(launch: GuestLaunchRecovery) -> None:
 
 
 def _read_guest_end(episode: str, attempt: int) -> Settled | Pending | GuestEndRecovery | GuestLaunchRecovery | GuestLaunchUnrecorded:
-    from scripts.build_queue.execution_identity import attempt_key
     from scripts.build_queue.placement import Pending, Settled
 
-    key = attempt_key(episode, f'{attempt:032x}')
+    key = _guest_end_key(episode, attempt)
     result: GuestEndRecovery | GuestLaunchUnrecorded = GuestLaunchUnrecorded()
     launch: GuestLaunchRecovery | None = None
     holders: dict[tuple[str, GuestLaunchHolder], None] = {}
@@ -1360,6 +1473,8 @@ def _read_guest_end(episode: str, attempt: int) -> Settled | Pending | GuestEndR
                         recorded = True
                     claim = ledger.text(row, 'claim')
                     if kind in ('proven', 'not started'):
+                        if 'guest_machine_id' in row and not re.fullmatch(r'[0-9a-f]{32}', ledger.text(row, 'guest_machine_id')):
+                            continue
                         proven = True
                     if kind == 'unproven' and 'armed' in row:
                         saved = ledger.mapping(row['armed'])
@@ -1406,13 +1521,13 @@ def _read_guest_end(episode: str, attempt: int) -> Settled | Pending | GuestEndR
     return replace(launch, holders=tuple(holder for _, holder in holders))
 
 
-def settlement(episode: str, attempt: int, *, legacy_holder_ended: bool = False) -> Settled | Pending:
-    """Read the proof or use the queue's holder check for a legacy attempt."""
-    from scripts.build_queue.placement import Pending, Settled
+def settlement(episode: str, attempt: int) -> Settled | Pending:
+    """Keep the assignment until the journal proves the guest end."""
+    from scripts.build_queue.placement import Pending
 
     result = _read_guest_end(episode, attempt)
     if isinstance(result, GuestLaunchUnrecorded):
-        return Settled() if legacy_holder_ended else Pending('The legacy Mac Linux launch holder can still be live.')
+        return Pending('The legacy Mac Linux attempt needs guest end proof.')
     if isinstance(result, (GuestEndRecovery, GuestLaunchRecovery)):
         return Pending('The Mac Linux guest end remains unproven')
     return result
@@ -1430,17 +1545,16 @@ def _warn_guest_reconcile(unit: str, detail: str) -> None:
 
 
 def _guest_reconcile_unit(episode: str, attempt: int) -> str:
-    from scripts.build_queue.execution_identity import attempt_key
-
-    key = attempt_key(episode, f'{attempt:032x}')
+    key = _guest_end_key(episode, attempt)
     return 'mac-linux-reconcile-' + hashlib.sha256(key.encode()).hexdigest()
 
 
-def reconcile_unproven(episode: str, attempt: int) -> None:
+def reconcile_unproven(episode: str, attempt: int, *,
+                       legacy: LegacyGuestClaim | RecordedGuestRecoveryOnly = RECORDED_GUEST_RECOVERY_ONLY) -> None:
     """Start recovery of an unsettled guest attempt without waiting for SSH."""
     unit = _guest_reconcile_unit(episode, attempt)
     try:
-        if not _guest_recovery_ready(_read_guest_end(episode, attempt)):
+        if not _guest_recovery_ready(_read_guest_end(episode, attempt), legacy):
             return
         from scripts.aws_target import cloud_gate
 
@@ -1450,29 +1564,39 @@ def reconcile_unproven(episode: str, attempt: int) -> None:
                    '--property=UMask=0077', '--working-directory=' + str(Path(__file__).resolve().parents[2]),
                    *overrides, sys.executable, '-m', 'scripts.build_targets.mac_linux',
                    '--reconcile-end', episode, str(attempt)]
-        if _guest_recovery_ready(_read_guest_end(episode, attempt)):
+        if isinstance(legacy, LegacyGuestClaim):
+            holder = legacy.holder
+            command.extend((legacy.claim_id, holder.host, str(holder.pid), holder.start_time))
+        if _guest_recovery_ready(_read_guest_end(episode, attempt), legacy):
             cloud_gate.start_reconcile_service(command, SSH_CONNECT_TIMEOUT_SECONDS, existing_unit=unit)
     except Exception as error:
         _warn_guest_reconcile(unit, str(error) or type(error).__name__)
 
 
-def _guest_recovery_ready(recovery: Settled | Pending | GuestEndRecovery | GuestLaunchRecovery | GuestLaunchUnrecorded) -> bool:
+def _guest_recovery_ready(recovery: Settled | Pending | GuestEndRecovery | GuestLaunchRecovery | GuestLaunchUnrecorded,
+                          legacy: LegacyGuestClaim | RecordedGuestRecoveryOnly) -> bool:
     if isinstance(recovery, GuestLaunchRecovery):
         return not any(holder.may_be_live() for holder in recovery.holders)
+    if isinstance(recovery, GuestLaunchUnrecorded) and isinstance(legacy, LegacyGuestClaim):
+        from scripts.buildlog import store
+
+        holder = legacy.holder
+        return holder.host == store.host_name() and not GuestLaunchHolder(holder.pid, holder.start_time).may_be_live()
     return isinstance(recovery, GuestEndRecovery)
 
 
-def reconcile_guest_end(episode: str, attempt: int) -> None:
-    """Use the saved guest identity to prove the attempt ended or never started."""
+def reconcile_guest_end(episode: str, attempt: int, *,
+                        legacy: LegacyGuestClaim | RecordedGuestRecoveryOnly = RECORDED_GUEST_RECOVERY_ONLY) -> None:
+    """Get guest proof for the exact assignment."""
     unit = _guest_reconcile_unit(episode, attempt)
     try:
         recovery = _read_guest_end(episode, attempt)
+        if not _guest_recovery_ready(recovery, legacy):
+            return
         if isinstance(recovery, GuestEndRecovery):
             proof = prove_kept_guest_end(recovery.armed)
             detail = 'The guest confirmed the run ended'
         elif isinstance(recovery, GuestLaunchRecovery):
-            if not _guest_recovery_ready(recovery):
-                return
             settings = read_settings(conf.read('build_targets'))
             if (settings.ssh_hops, settings.guest_user) != (recovery.ssh_hops, recovery.guest_user):
                 _warn_guest_reconcile(unit, 'The Mac Linux guest address changed for this attempt.')
@@ -1481,6 +1605,13 @@ def reconcile_guest_end(episode: str, attempt: int) -> None:
             proof = recover_guest_launch(settings, _placed_guest_attempt(recovery.key))
             detail = ('The guest refused the attempt before it armed' if isinstance(proof, GuestNotStartedProven)
                       else 'The guest ended the armed attempt')
+        elif isinstance(recovery, GuestLaunchUnrecorded) and isinstance(legacy, LegacyGuestClaim):
+            proof = recover_legacy_guest(read_settings(conf.read('build_targets')))
+            if isinstance(proof, GuestEndPending):
+                _warn_guest_reconcile(unit, proof.detail)
+            elif isinstance(_read_guest_end(episode, attempt), GuestLaunchUnrecorded):
+                _write_guest_end(_guest_end_key(episode, attempt), legacy.claim_id, proof, 'The guest had no active gate')
+            return
         else:
             return
         if isinstance(proof, GuestEndPending):
@@ -1491,19 +1622,19 @@ def reconcile_guest_end(episode: str, attempt: int) -> None:
         _warn_guest_reconcile(unit, str(error) or type(error).__name__)
 
 
-def settle_guest_dispatch(dispatch: GuestGateDispatch, status: int) -> None:
+def settle_guest_dispatch(dispatch: GuestGateDispatch, result: AttemptCompleted | NoTerminalReport) -> None:
     """Save the end proof and report any execution observed for this attempt."""
     from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
 
     assignment = dispatch.assignment
     try:
         _append_guest_end(dispatch, GuestEndProven(), 'The guest confirmed the run ended')
-        if dispatch.started is None:
+        if dispatch.started is None or isinstance(result, placement.NoTerminalReport):
             return
         execution = execution_identity.CloudExecution(
             TARGET, dispatch.started.boot_id, dispatch.started.machine_id, assignment.attempt)
         request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
-            execution_identity.ObservedExecution(execution), placement.AttemptCompleted(status),
+            execution_identity.ObservedExecution(execution), result,
             placement.DispatchPathSettled(), code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
         send_guest_end_report(request)
     except (wire.AdmissionUnavailable, OSError, ValueError) as error:
@@ -1524,12 +1655,11 @@ def send_guest_end_report(request: ExecutionReport) -> None:
 
 
 def settle_guest_no_run(dispatch: GuestGateDispatch) -> None:
-    """Save proof and report a refusal for the consumed permission."""
+    """Record that the gate consumed permission and sent no arm request."""
     from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
 
     try:
-        detail = 'The guest confirmed the run ended' if dispatch.settled else 'The gate sent no arm request'
-        _append_guest_end(dispatch, GuestNotStartedProven(), detail)
+        _append_guest_end(dispatch, GuestNotStartedProven(), 'The gate sent no arm request')
         request = wire.ExecutionReport(admission_client.request_id(), dispatch.assignment, dispatch.claim,
             execution_identity.ExecutionNotStarted(), placement.PrelaunchRefused(placement.MAC_LINUX_NO_ANSWER),
             placement.DispatchPathSettled(), code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
@@ -1823,7 +1953,7 @@ def stream_diagnostic(stderr: bytes) -> str:
 
 
 def guest_failure(tests_started: bool, reason: str) -> GuestUnavailable:
-    """A failure before the first test lets natedev take the gate; a failure after it refuses the gate."""
+    """Keep the diagnostic and mark when the stream gave no start evidence."""
     return (GuestUnavailable if tests_started else GuestTookNoRun)(reason)
 
 
@@ -1876,7 +2006,7 @@ class GuestCommand:
 
     def start(self, repo: Path, argv: Sequence[str], *, work: str, unit: str, bootstrap: Path,
               checked: Mapping[Path, bytes]) -> subprocess.Popen[bytes]:
-        """Start one run; the bootstrap file holds the request and the runner while the stream reads them.
+        """Start one run; the bootstrap file holds the request while the stream reads it.
 
         checked holds the bytes of each file of the checkout that the run must find in the commit. A
         failure before the guest starts the argv raises GuestUnavailable with the guest output, and closes
@@ -1892,7 +2022,8 @@ class GuestCommand:
             raise GuestUnavailable(f'the commit for the guest does not hold the checked text of {", ".join(mismatches)}: '
                                    + 'the file changed after the check, or git does not keep it')
         request = GuestCommandRequest(attempt=uuid4().hex, commit=source.commit, tree=source.tree,
-                                      origin_main=source.origin_main, unit=unit, work=work, argv=list(argv),
+                                      origin_main=source.origin_main, runner_commit=source.runner_commit, unit=unit,
+                                      work=work, argv=list(argv),
                                       checked=sorted(files))
         data = runner_bootstrap(request)
         _ = bootstrap.write_bytes(data)
@@ -2049,27 +2180,42 @@ def reply_run(reply: GuestReply, request: GuestRequest, source: CandidateSource)
 
 def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
           selected: AllModules | TreeSelection, gate_job: StepJob | GateJobNotRecorded,
-          assignment: PlacementAssignment, type_dirs: Sequence[str] = ()) -> GateRun | GuestNotStarted | str:
-    """Return the guest gate result, a run the guest did not take, or the reason the guest route failed.
+          assignment: PlacementAssignment, type_dirs: Sequence[str] = ()) -> GateRun | GuestNotStarted | GuestGateBlocked | str:
+    """Run a gate on the assigned guest.
 
     The assignment is the one the gate checked at its start. The route consumes its launch permission.
     """
     from scripts.aws_target import cloud_gate
-    from scripts.build_queue import mac_run
+    from scripts.build_queue import mac_run, placement
     from scripts.build_queue.admission_client import step_identity
     from scripts.build_queue.execution_identity import attempt_key
     from scripts.production import gate
 
     dispatch: GuestGateDispatch | None = None
     launch: GuestLaunchRecovery | None = None
-    no_run_proven = False
-    status = 1
+    completion: placement.AttemptCompleted | placement.NoTerminalReport = placement.NoTerminalReport()
 
-    def refused(reason: str) -> GuestNotStarted:
-        nonlocal no_run_proven
-        no_run_proven = (dispatch is not None and dispatch.started is None
-                         and (dispatch.settled or not dispatch.arm_requested))
-        return GuestNotStarted(reason, settlement_required=no_run_proven)
+    def release_launch() -> None:
+        nonlocal launch
+        assert launch is not None
+        saved, launch = launch, None
+        _release_guest_launch(saved)
+
+    def refused(reason: str, *, permission_unknown: bool = False) -> GuestNotStarted | GuestGateBlocked:
+        if dispatch is None and not permission_unknown:
+            return GuestNotStarted(reason)
+        if dispatch is not None:
+            if dispatch.settled and dispatch.arm_requested:
+                if dispatch.started is None:
+                    reason += '. The guest did not confirm whether the run started.'
+                return GuestGateBlocked(reason)
+            if not dispatch.arm_requested:
+                settle_guest_no_run(dispatch)
+        try:
+            release_launch()
+        except OSError as error:
+            return GuestGateBlocked(f'{reason}. Cannot release the Mac Linux launch holder: {error}')
+        return GuestNotStarted(reason, settlement_required=True)
 
     try:
         # natedev selects the modules of a targeted run once; the guest runs that list and selects none itself.
@@ -2091,7 +2237,8 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         relative_type_dirs = [(repo / name).resolve().relative_to(repo).as_posix() for name in type_dirs]
         guest_attempt = _placed_guest_attempt(attempt_key(assignment.episode, assignment.attempt))
         request = GuestRequest(attempt=guest_attempt, commit=source.commit, tree=source.tree,
-                               origin_main=source.origin_main, mode=mode.wire, full=full,
+                               origin_main=source.origin_main, runner_commit=source.runner_commit,
+                               mode=mode.wire, full=full,
                                selection=list(selected.paths) if isinstance(selected, TreeSelection) else 'all',
                                type_dirs=relative_type_dirs,
                                module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,
@@ -2119,13 +2266,13 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                 run = completed_run(reply, request, source)
         if gate.checked_git(repo, 'rev-parse', 'HEAD') != source.head or cloud_gate.working_tree(repo)[0] != source.tree:
             raise GuestUnavailable('the checkout changed during the guest run')
-        status = int(not run.passed)
+        completion = placement.AttemptCompleted(int(not run.passed))
         return run
     except mac_run.MacRunRefused as error:
         return refused(str(error))
     except GuestTookNoRun as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
-        return refused(' '.join((str(error), *notes)))
+        return refused(' '.join((str(error), *notes)), permission_unknown=isinstance(error, GuestPermissionUnknown))
     except GuestEndUnproven as error:
         if dispatch is not None:
             try:
@@ -2133,22 +2280,24 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                 launch = None
             except OSError as journal_error:
                 error.add_note(f'Cannot save the Mac Linux guest end: {journal_error}')
+                try:
+                    release_launch()
+                except OSError as release_error:
+                    detail = f'{error}. Cannot save the Mac Linux guest end: {journal_error}.'
+                    return GuestGateBlocked(f'{detail} Cannot release the Mac Linux launch holder: {release_error}')
         raise
     except route_errors() as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         detail = ' '.join((str(error), *notes))
-        if dispatch is not None and not dispatch.arm_requested:
-            return refused(detail)
+        if dispatch is not None:
+            return GuestGateBlocked(detail) if dispatch.arm_requested else refused(detail)
         return f'{TARGET}: {detail}'
     finally:
-        if no_run_proven:
-            assert dispatch is not None
-            settle_guest_no_run(dispatch)
-        elif dispatch is not None and dispatch.settled:
-            settle_guest_dispatch(dispatch, status)
-        if launch is not None and (no_run_proven or dispatch is None or not dispatch.settled):
+        if dispatch is not None and dispatch.settled:
+            settle_guest_dispatch(dispatch, completion)
+        if launch is not None and (dispatch is None or not dispatch.settled):
             try:
-                _release_guest_launch(launch)
+                release_launch()
             except OSError as error:
                 print(f'Cannot save the Mac Linux guest end: {error}', file=sys.stderr, flush=True)
 
@@ -2484,7 +2633,6 @@ def run_guest(request_path: Path) -> int:
                 environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
             reply = os.dup(1)
             try:
-                # The -c entry selects the numbered copy as the Python checkout.
                 return run_sandboxed_gate(tmp, gate_entry_command(request['jobs'], Path(__file__).resolve(),
                                                                   request_path, reply),
                                           copy.path, environment, reply)
@@ -2511,12 +2659,8 @@ def session_command(tmp: Path, command: Sequence[str]) -> list[str]:
 
 
 def gate_entry_command(jobs: int, runner: Path, request_path: Path, reply: int) -> list[str]:
-    """Run the runner in the numbered copy with the argv [runner, request, --run-copy, reply descriptor].
-
-    Python gives a -c entry the argv ['-c', *arguments], so the entry removes '-c' before it runs the runner.
-    """
-    return ['./scripts/lib/py', '-X', f'cpu_count={jobs}',
-            '-c', 'import runpy, sys; sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name="__main__")',
+    """Start the archived runner with the numbered copy as the working directory."""
+    return [str(runner.parents[1] / 'lib/py'), '-X', f'cpu_count={jobs}',
             str(runner), str(request_path), RUN_COPY, str(reply)]
 
 
@@ -2566,7 +2710,7 @@ def run_copy(request_path: Path, reply: int) -> None:
             def send_progress(line: str) -> None:
                 print(GUEST_PROGRESS + json.dumps(line), file=output, flush=True)
 
-            # Older gate code in a candidate checkout has no progress callback.
+            # Older gate code can omit the progress callback.
             machine = (gate.WholeMachine(module_progress=send_progress)
                        if hasattr(gate.WholeMachine, 'module_progress') else gate.WholeMachine())
             run = gate.run_suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],
@@ -2583,7 +2727,12 @@ def run_copy(request_path: Path, reply: int) -> None:
 
 if __name__ == '__main__':
     if sys.argv[1:2] == ['--reconcile-end']:
-        reconcile_guest_end(sys.argv[2], int(sys.argv[3]))
+        if sys.argv[4:]:
+            claim_id, host, pid, start = sys.argv[4:]
+            claim = LegacyGuestClaim(claim_id, ClaimHolderIdentity(host, int(pid), start))
+            reconcile_guest_end(sys.argv[2], int(sys.argv[3]), legacy=claim)
+        else:
+            reconcile_guest_end(sys.argv[2], int(sys.argv[3]))
     elif sys.argv[2:3] == [RUN_COPY]:
         run_copy(Path(sys.argv[1]), int(sys.argv[3]))
     else:

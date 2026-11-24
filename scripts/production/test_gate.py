@@ -13,6 +13,7 @@ import unittest
 import fcntl
 
 import io
+import json
 import os
 from pathlib import Path
 import re
@@ -181,6 +182,18 @@ class DirectGatePlacementTests(unittest.TestCase):
             settle.assert_called_once_with(admission_wire.SettlementRequest(assignment))
             self.assertIn(str(failure), errors.getvalue())
             self.assertIn("Gate placement blocked during launch settlement", errors.getvalue())
+
+    def test_direct_tests_only_keeps_exit_79_after_retry_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = self.checkout(folder)
+            arguments = ("--tests-only", "--repo", str(source))
+            admitted = self.admission(source, ("gate.py", *arguments), target="mac-linux")
+            with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
+                  mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)),
+                  mock.patch.object(gate, "run_tests_only", return_value=GATE_PRELAUNCH_REFUSED_STATUS) as run,
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(gate.main(arguments), GATE_PRELAUNCH_REFUSED_STATUS, errors.getvalue())
+            run.assert_called_once()
 
     def test_gate_recovery_keeps_placement_status_when_finish_fails(self) -> None:
         checkpoint = ["--merge-branch", "main", "--unit-branch", "fixture", "--checkpoint", "tip",
@@ -459,6 +472,48 @@ class MergeGateCheckpointTests(MergeGateFixture):
                         result = self.run_gate()
                     self.assertEqual(result.returncode == 0, outcome == "pass", result.stdout + result.stderr)
                     self.assertEqual(restored, [previous])
+
+    def test_unsettled_checkpoint_keeps_exit_80_and_the_baseline_when_rollback_fails(self) -> None:
+        pending = gate.AwsGateLaunchPending("fixture launch remains unproven")
+        with (mock.patch.object(gate, "current_gate_placement", return_value=placed("aws")),
+              mock.patch.object(gate, "run_gate_suites", side_effect=pending) as run,
+              mock.patch.object(gate, "rollback_merge", side_effect=OSError("fixture rollback failed")) as rollback):
+            result = self.run_gate()
+        run.assert_called_once()
+        rollback.assert_called_once_with(self.checkout, self.base)
+        self.assertEqual(result.returncode, GATE_UNSETTLED_LAUNCH_STATUS, result.stdout + result.stderr)
+        self.assertIn(str(pending), result.stderr)
+        self.assertIn("fixture rollback failed", result.stderr)
+        with mock.patch.dict(os.environ, self.environment):
+            records = list(gate.gate_run_directory(self.checkout).glob("*.json"))
+        self.assertEqual(len(records), 1)
+        saved = cast(dict[str, object], json.loads(records[0].read_text()))
+        self.assertEqual(saved["rollback"], self.base)
+        self.assert_not_pushed()
+
+    def test_unsettled_checkpoint_keeps_exit_80_when_admission_cleanup_fails(self) -> None:
+        assignment = placed("aws")
+        pending = gate.AwsGateLaunchPending("fixture launch remains unproven")
+
+        @contextmanager
+        def admit() -> Generator[first_step.FirstStepAdmission]:
+            try:
+                position = SlotQueuePosition(assignment.assignment.episode, assignment.assignment.since)
+                yield first_step.FirstStepAdmission(position, first_step.InheritedGatePlacement(assignment),
+                                                   self.root / "assignment.json")
+            finally:
+                raise OSError("fixture admission cleanup failed")
+
+        with (mock.patch.object(gate, "current_gate_placement", return_value=gate.NO_GATE_ASSIGNMENT),
+              mock.patch.object(first_step, "admitted_run", return_value=admit()),
+              mock.patch.object(gate, "run_gate_suites", side_effect=pending) as run):
+            result = self.run_gate()
+        self.assertEqual(result.returncode, GATE_UNSETTLED_LAUNCH_STATUS, result.stdout + result.stderr)
+        self.assertIn(str(pending), result.stderr)
+        self.assertIn("fixture admission cleanup failed", result.stderr)
+        run.assert_called_once()
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assert_not_pushed()
 
     def test_checkpoint_retries_its_merge_after_a_stop_before_push(self) -> None:
         checked = gate.checked_git

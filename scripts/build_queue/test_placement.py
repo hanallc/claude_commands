@@ -2500,7 +2500,9 @@ class PlacementTests(unittest.TestCase):
             _ = fixture.run_pass()
             self.assertEqual(worker.probe_next(), key)
             self.assertIsInstance(worker.dispatch_observations[attempt_key].result, placement.DispatchPathPending)
-            reconcile.assert_called_once_with(guest.episode, int(guest.attempt, 16))
+            legacy = placement.LegacyGuestClaim(authorized.claim.claim_id,
+                placement.ClaimHolderIdentity(guest.owner.host, holder.pid, holder.start_time))
+            reconcile.assert_called_once_with(guest.episode, int(guest.attempt, 16), legacy=legacy)
             _ = fixture.run_pass()
             self.assertEqual(fixture.server.current_assignments.get(guest.episode), attempt_key)
             reply, = fixture.server.handle_request(waiting)
@@ -2553,7 +2555,8 @@ class PlacementTests(unittest.TestCase):
 
     def test_guest_exit_80_waits_for_exact_settlement(self) -> None:
         settle = mock.Mock(return_value=placement.Pending("guest end unproven"))
-        provider = mock.Mock(spec=["settlement"], settlement=settle)
+        reconcile = mock.Mock()
+        provider = mock.Mock(spec=["settlement", "reconcile_unproven"], settlement=settle, reconcile_unproven=reconcile)
         with (PlacementFixture(private_child_starts=True) as fixture,
               mock.patch.object(service, "mac_linux_provider", create=True, return_value=provider),
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
@@ -2561,7 +2564,8 @@ class PlacementTests(unittest.TestCase):
             key = publish_candidate(fixture, request).key
             guest = assignment_for(fixture, request)
             holder = guest_gate(fixture, guest)
-            self.assertIsInstance(consume_guest_permission(fixture, guest, holder)[0], wire.FirstAuthorization)
+            authorization, = consume_guest_permission(fixture, guest, holder)
+            assert isinstance(authorization, wire.FirstAuthorization), authorization
             fixture.end_owner(holder)
             self.assertIsInstance(fixture.server.handle_request(wire.SettlementRequest(guest))[0], wire.Ok)
             self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
@@ -2569,6 +2573,9 @@ class PlacementTests(unittest.TestCase):
             assert isinstance(worker, ManualEvidenceWorker)
             self.assertEqual(worker.probe_next(), key)
             settle.assert_called_once_with(guest.episode, int(guest.attempt, 16))
+            legacy = placement.LegacyGuestClaim(authorization.claim.claim_id,
+                placement.ClaimHolderIdentity(fixture.server.host, holder.pid, holder.start_time))
+            reconcile.assert_called_once_with(guest.episode, int(guest.attempt, 16), legacy=legacy)
             self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
             settle.return_value = placement.Settled()
             self.assertEqual(worker.probe_next(), key)
