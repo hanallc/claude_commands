@@ -473,6 +473,18 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
 
+    def test_a_mac_linux_guest_that_took_no_run_keeps_its_status_when_rollback_fails(self) -> None:
+        refusal = "Mac Linux guest took no run: fixture SSH refused the connection"
+        with (mock.patch.object(gate, "run_gate_suites", side_effect=gate.MacLinuxTookNoRun(refusal)),
+              mock.patch.object(gate, "rollback_merge", side_effect=OSError("fixture rollback failed")) as rollback):
+            result = self.run_gate()
+        rollback.assert_called_once_with(self.checkout, self.base)
+        self.assertEqual(result.returncode, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, result.stdout + result.stderr)
+        self.assertIn(refusal, result.stderr)
+        self.assertIn("fixture rollback failed", result.stderr)
+        self.assertNotIn("merge undone", result.stderr)
+        self.assert_not_pushed()
+
     def test_merge_checkout_behind_origin_is_refused(self) -> None:
         _ = self.git(self.unit, "push", "origin", "HEAD:integration")
         result = self.run_gate()
