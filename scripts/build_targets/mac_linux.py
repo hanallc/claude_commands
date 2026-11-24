@@ -1285,7 +1285,7 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
 
 
 def ssh_connect_timeout(remaining: float) -> int:
-    # OpenSSH uses whole seconds. The local deadline also covers a fraction of a second.
+    # OpenSSH uses whole seconds. Use one second for the outer hop when the local deadline is shorter.
     return max(1, min(SSH_CONNECT_TIMEOUT_SECONDS, int(remaining)))
 
 
@@ -1373,6 +1373,8 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
                             remaining = deadline - monotonic()
                             if remaining <= 0:
                                 raise subprocess.TimeoutExpired(stream.args, timeout)
+                            if remaining < 1:
+                                raise GuestTookNoRun('Less than one second remains for the guest SSH connection.')
                             try:
                                 _ = os.write(input_fd, f'{ssh_connect_timeout(remaining)}\n'.encode())
                             except BrokenPipeError:
@@ -1407,7 +1409,7 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
         error.stderr = bytes(stderr)
         if not connected:
             detail = stream_diagnostic(bytes(stderr))
-            raise GuestUnavailable(f'The guest SSH connect deadline expired before command acceptance: {detail}') from error
+            raise GuestTookNoRun(f'The guest SSH connect deadline expired before command acceptance: {detail}') from error
         raise
     return bytes(stdout + reply_line), bytes(stderr)
 

@@ -2126,8 +2126,30 @@ fi
         guest_seconds = int(guest_timeout.removeprefix('ConnectTimeout='))
         self.assertLessEqual(guest_seconds, mac_seconds - 1)
         self.assertLess(elapsed - float(started), 4)
-        self.assertIn('guest SSH connect deadline expired before command acceptance', str(result))
+        reason = self.not_started(result)
+        self.assertIn('guest SSH connect deadline expired before command acceptance', reason)
+        self.assertIn('Guest cleanup: ended', reason)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_inner_ssh_does_not_start_with_less_than_one_second_left(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        now = 0.0
+        read = os.read
+        mac_ready = (mac_linux.INNER_CONNECT_READY + '\n').encode()
+
+        def read_after_outer_hop(fd: int, size: int) -> bytes:
+            nonlocal now
+            data = read(fd, size)
+            if data == mac_ready:
+                now = settings.unreachable_wait_seconds - 0.5
+            return data
+
+        with (patch.object(mac_linux, 'monotonic', lambda: now),
+              patch.object(os, 'read', read_after_outer_hop)):
+            reason = self.not_started(self.route())
+        self.assertIn('Less than one second remains for the guest SSH connection.', reason)
+        self.assertIn('Guest cleanup: ended', reason)
+        self.assert_guest_clean('probe', 'arm', 'cleanup')
 
     def test_mac_wrapper_runs_under_bash_and_zsh(self) -> None:
         for shell in ('bash', 'zsh'):
