@@ -22,7 +22,7 @@ Review records and closure replies do not change the counts.
 | --- | --- |
 | UX findings | Ledger entries whose lens names `ux`. |
 | Code findings | Ledger entries with no lens or any lens other than `ux`. |
-| Review-worker minutes | Finished review passes and UX review activities. |
+| Review-worker minutes | Finished review passes, `UX review` activities and `Subagent review` activities. |
 | UX check minutes | Finished `UX review` activities. |
 | UX repair minutes | Finished fix passes joined to ledger rounds that cover a UX finding. |
 
