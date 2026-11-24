@@ -3060,6 +3060,64 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(self.claims("race"), {})
         self.assertFalse((self.root / "queue").exists())
 
+    def test_once_relay_refuses_a_staff_move_during_lock_acquisition(self) -> None:
+        _, row = self.canonical_recipient()
+        path = Path(row["messagingSocketPath"])
+        path.unlink()
+        producer = staff.StaffRow(staff.StaffId("fixed-producer"), "producer", "planner", staff.StaffRoot(),
+                                  current_session=staff.StaffId(row["sessionId"]))
+        self.staff_rows[producer.id] = producer
+        replacement = replace(producer, current_session=staff.StaffId("replacement"))
+        key = "race"
+        locked = send.locked
+        move_on_lock = False
+
+        @contextmanager
+        def move_on_relay_lock() -> Generator[None]:
+            nonlocal move_on_lock
+            if move_on_lock:
+                move_on_lock = False
+                self.staff_rows[producer.id] = replacement
+            with locked():
+                yield
+
+        def launch(command: list[str], prompt: str, _timeout: float, _environment: dict[str, str],
+                   _cwd: Path) -> tuple[int, str, str]:
+            nonlocal move_on_lock
+            destination = cast(str, json.loads(next(line[6:] for line in prompt.splitlines()
+                                                   if line.startswith("- to: "))))
+            payload = guarded_payload(command, destination, "Private")
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(3)
+                client.connect(destination[4:])
+                move_on_lock = True
+                client.sendall(relay_wire(payload))
+                client.shutdown(socket.SHUT_WR)
+            return 0, stream(INIT, call(STAND_IN, target=destination), answer(OK)), ""
+
+        options = local_options(["--to", producer.id, "--recipient-kind", "producer", "--from", "test",
+                                 "--key", key, "--once-per-key", "--summary", "Private", "--text", "Private body."])
+        with (socket.socket(socket.AF_UNIX) as listener,
+              mock.patch.object(send, "relay", REAL_RELAY),
+              mock.patch.object(send, "claude_binary", return_value="/fixture/claude"),
+              mock.patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()),
+              mock.patch.object(models_registry, "claude_model", return_value="fixture"),
+              mock.patch.object(unit_lookup, "current_claude_record", REAL_CURRENT_CLAUDE_RECORD),
+              mock.patch.object(send, "locked", move_on_relay_lock),
+              mock.patch.object(send, "run", side_effect=launch)):
+            listener.bind(str(path))
+            listener.listen()
+            listener.settimeout(3)
+            result = send.send(options)
+            with listener.accept()[0] as old_peer:
+                old_peer.settimeout(3)
+                self.assertEqual(old_peer.recv(1), b"")
+        self.assertEqual(self.staff_rows[producer.id], replacement)
+        self.assertEqual(result, send.Result("failed", send.BEFORE_ACCEPTANCE
+                                             + "the session changed for staff ID fixed-producer"))
+        self.assertEqual(send.pending_deliveries(send.read_key_states().get(key, {"last": {}})), {})
+        self.assertEqual(self.claims(key), {})
+
     def test_raw_socket_queue_keeps_the_recipient_selected_before_replacement(self) -> None:
         canonical, row = self.canonical_recipient()
         address = f"uds:{row['messagingSocketPath']}"

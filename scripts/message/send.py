@@ -4257,6 +4257,8 @@ def _forward_relay_socket(listener: socket.socket, peer: socket.socket, stop: so
                         tool_id = approved.read_text(encoding="utf-8").strip()
                         if not tool_id:
                             return RefusedRelayRequest("failed", "the relay tool call has no approval")
+                        if isinstance(claim, DirectRelayClaim):
+                            mark_direct_relay_write(claim)
                         if isinstance(attempt.fallback_pane, HerdrPlace):
                             pane = _validate_fallback_pane(attempt, attempt.fallback_pane, peer.gettimeout() or 1.0)
                             if isinstance(pane, unit_lookup.SocketUnavailable):
@@ -4267,8 +4269,6 @@ def _forward_relay_socket(listener: socket.socket, peer: socket.socket, stop: so
                         owner = _validate_attempt_recipient(attempt)
                         if isinstance(owner, unit_lookup.SocketUnavailable):
                             return owner
-                        if isinstance(claim, DirectRelayClaim):
-                            mark_direct_relay_write(claim)
                         write.state = RelayRequestInterrupted("the proxy did not complete the request")
                         peer.sendall(request_bytes)
                         write.state = RelayRequestForwarded(tool_id, payload)
