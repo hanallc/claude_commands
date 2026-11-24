@@ -2811,6 +2811,13 @@ A local reservation keeps its saved place until the service sees processes in it
 The first reading clears the saved place for a direct reservation without a scope file.
 A placement retry before launch keeps its place.
 Both hosts use the visible order for normal steps.
+A request that waits only for the Mac can hold its place for one probe on a busy, blocked, backoff, or unreachable reading.
+This rule applies to the Mac-only route with configured order and to both forms of a Mac pin.
+The explicit `--mac-only` option can hold its place on a busy reading.
+Disk, off, and state readings give no hold.
+For an overlapping Mac scope, the first eligible older waiter decides the hold.
+When its probe answers or reaches its time limit, a second waiter cannot extend the hold.
+If the probe reports free before the hold check, the same pass considers that reading for the older waiter.
 When placement preparation sees a remote start, it ends the startup hold and removes the local waiter.
 The table includes remote-only waits in queue order.
 The table identifies waits that a build hold blocks.
