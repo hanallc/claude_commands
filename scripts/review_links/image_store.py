@@ -8,6 +8,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ RECORD = ".review-link-image.json"
 DRAFT_PREFIX = ".review-link-draft-"
 SUFFIXES = frozenset((".png", ".jpg", ".jpeg", ".gif", ".webp"))
 IDENTITY = re.compile(r"[0-9a-f]{12}")
+_ANSWERS_PREFIX = ".review-link-image-answers-"
 _LIST_ITEM_ID = re.compile(r"L[1-9][0-9]*")
 LOCK = ".review-link-images.lock"
 # Chrome clips a headless screenshot below about 150 pixels.
@@ -50,6 +52,7 @@ class ImageRecord(ImageReference):
 
 class ImageAnswer(TypedDict):
     message: str
+    words: NotRequired[str]
     answered: list[str]
     recipients: list[str]
     confirmed: list[str]
@@ -91,7 +94,15 @@ def new_answers(record: ImageReference) -> ImageAnswers:
 def _answers_path(directory: Path, identity: str) -> Path:
     if not IDENTITY.fullmatch(identity):
         raise ValueError("Invalid image ID.")
-    return directory / f".review-link-image-answers-{identity}.json"
+    return directory / f"{_ANSWERS_PREFIX}{identity}.json"
+
+
+def deleted_answer_ids(directory: Path) -> Iterator[str]:
+    """Find answer records for removed pictures."""
+    for path in sorted(directory.glob(f"{_ANSWERS_PREFIX}*.json")):
+        identity = path.stem.removeprefix(_ANSWERS_PREFIX)
+        if IDENTITY.fullmatch(identity) and not path.is_symlink() and not (directory / identity).exists():
+            yield identity
 
 
 def _texts(value: object) -> list[str]:
@@ -101,7 +112,7 @@ def _texts(value: object) -> list[str]:
 
 
 def read_answers(directory: Path, identity: str) -> ImageAnswers:
-    """Read a picture reference and its answer attempts under the image lock."""
+    """Read the saved picture reference and answer attempts."""
     fields = delivery_state.read_fields(_answers_path(directory, identity))
     attempts = fields.get("attempts")
     if not isinstance(attempts, dict):
@@ -113,9 +124,15 @@ def read_answers(directory: Path, identity: str) -> ImageAnswers:
         fields = cast(dict[str, object], attempt)
         if not isinstance(message := fields.get("message"), str):
             raise ValueError(f"{identity}: missing image answer message")
-        answers["attempts"][key] = {"message": message, "answered": _texts(fields.get("answered")),
-                                    "recipients": _texts(fields.get("recipients")),
-                                    "confirmed": _texts(fields.get("confirmed"))}
+        saved: ImageAnswer = {"message": message, "answered": _texts(fields.get("answered")),
+                              "recipients": _texts(fields.get("recipients")),
+                              "confirmed": _texts(fields.get("confirmed"))}
+        if "words" in fields:
+            words = fields["words"]
+            if not isinstance(words, str):
+                raise ValueError(f"{identity}: invalid image answer words")
+            saved["words"] = words
+        answers["attempts"][key] = saved
     return answers
 
 

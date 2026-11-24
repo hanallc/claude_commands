@@ -34,7 +34,8 @@ SENDER = Path(__file__).stem
 # Feedback always means the image is not approved.
 ANSWERS = {"approved": "your image is approved.", "feedback": "your image is not approved. The feedback follows."}
 # A page loaded before the answer buttons existed can still post delete.
-ACTIONS = frozenset(("delete", "question", *ANSWERS))
+ACTIONS = frozenset(("delete", "question", "retry", *ANSWERS))
+ANSWER_PREFIX = "From the user (via the Images page): "
 
 
 NO_OPEN_QUESTIONS: Mapping[str, QuestionSendState] = MappingProxyType({})
@@ -202,6 +203,20 @@ def question_html(question: question_record.Question, open_questions: Mapping[st
     return page_question.open_question_html(question, failed=open_questions.get(question.question_id) is QuestionSendState.FAILED)
 
 
+def _answer_form(identity: str, token: str, round_id: str, feedback_rows: int, *, question: bool = True) -> str:
+    closing_buttons = ('<button type="submit" name="action" value="approved">Approved</button>'
+                       '<button type="submit" name="action" value="feedback">Send Feedback</button>')
+    returning_buttons = '<button type="submit" name="action" value="question">Ask question</button>' if question else ""
+    return ('<form method="post" data-image-form>'
+            + f'<input type="hidden" name="image" value="{identity}">'
+            + f'<input type="hidden" name="token" value="{token}">'
+            + f'<input type="hidden" name="feedback_round" value="{round_id}">'
+            + f'<label for="feedback-{identity}">Feedback</label>'
+            + f'<textarea id="feedback-{identity}" name="feedback" rows="{feedback_rows}" autocomplete="off"></textarea>'
+            + page_frame.review_action_groups(closing_buttons, returning_buttons)
+            + '<span role="status" data-image-status></span></form>')
+
+
 def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapshot, feedback_rows: int,
          names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT, *,
          open_questions: Mapping[str, QuestionSendState] = NO_OPEN_QUESTIONS) -> str:
@@ -217,9 +232,6 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
     questions = sorted((question_record.read(saved) for saved in record.get('questions', [])),
                        key=lambda question: (question.answer is not None, int(question.question_id[1:])))
     round_id = feedback_round(answered_question_ids(record))
-    closing_buttons = ('<button type="submit" name="action" value="approved">Approved</button>'
-                       '<button type="submit" name="action" value="feedback">Send Feedback</button>')
-    returning_buttons = '<button type="submit" name="action" value="question">Ask question</button>'
     return (f'<article id="image-{record["id"]}"{' class="pair"' if pair else ''} data-image="{record["id"]}" '
             + f'data-owner="{html.escape(record["owner"], quote=True)}" data-owner-name="{html.escape(name, quote=True)}">'
             + f'<h2 class="caption">{html.escape(caption)}</h2><dl class="image-details">'
@@ -229,14 +241,33 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
             + f'{shown_time(added)}</time></dd></dl>'
             + (f'<div class="image-pair" data-image-zoom-group>{pictures}</div>' if pair else pictures)
             + ''.join(question_html(question, open_questions) for question in questions)
-            + '<form method="post" data-image-form>'
-            + f'<input type="hidden" name="image" value="{record["id"]}">'
-            + f'<input type="hidden" name="token" value="{request_token(token, record["id"])}">'
-            + f'<input type="hidden" name="feedback_round" value="{round_id}">'
-            + f'<label for="feedback-{record["id"]}">Feedback</label>'
-            + f'<textarea id="feedback-{record["id"]}" name="feedback" rows="{feedback_rows}"></textarea>'
-            + page_frame.review_action_groups(closing_buttons, returning_buttons)
-            + '<span role="status" data-image-status></span></form></article>')
+            + _answer_form(record["id"], request_token(token, record["id"]), round_id, feedback_rows)
+            + '</article>')
+
+
+def _pending_answer_cards(root: Path, token: str) -> list[str]:
+    directory = images_root(root)
+    cards: list[str] = []
+    for identity in image_store.deleted_answer_ids(directory):
+        try:
+            saved = image_store.read_answers(directory, identity)
+        except (OSError, ValueError) as error:
+            print(f"review-links images: {error}", file=sys.stderr)
+            continue
+        for key, answer in saved["attempts"].items():
+            if answer["recipients"] and set(answer["recipients"]) <= set(answer["confirmed"]):
+                continue
+            words = html.escape(answer.get("words", answer["message"]))
+            cards.append(f'<article><h2 class="caption">Removed picture {identity}</h2>'
+                         + f'<p class="image-answer-words">{words}</p>'
+                         + '<form method="post" data-image-form>'
+                         + f'<input type="hidden" name="image" value="{identity}">'
+                         + f'<input type="hidden" name="token" value="{request_token(token, identity)}">'
+                         + f'<input type="hidden" name="retry_key" value="{html.escape(key, quote=True)}">'
+                         + '<span role="status" data-image-status>Not sent yet</span>'
+                         + '<div><button type="submit" name="action" value="retry">Retry</button></div>'
+                         + '</form></article>')
+    return cards
 
 
 def render(status: change_page.DeliveryStatus) -> bytes:
@@ -258,6 +289,7 @@ def render(status: change_page.DeliveryStatus) -> bytes:
         elif review.open_questions:
             waiting.append(record['id'])
         refresh_needed |= review.refresh()
+    cards.extend(_pending_answer_cards(root, token))
     answer_refresh_seconds = settings.number("page_refresh_seconds")
     refresh_seconds = answer_refresh_seconds if refresh_needed else 0
     waiting_text = page_frame.QUESTION_WAITING.format(owner_role="owner")
@@ -269,6 +301,8 @@ def render(status: change_page.DeliveryStatus) -> bytes:
                + f' {card_motion.attributes()}'
                + f' data-answer-refresh-seconds="{answer_refresh_seconds}" data-waiting-images="{" ".join(waiting)}">'
                + f'{"".join(cards)}</div><p hidden data-empty></p></div></div>'
+               + '<template data-image-draft-template><article><h2 class="caption"></h2>'
+               + _answer_form("", "", "", rows, question=False) + '</article></template>'
                + '<noscript>Enable JavaScript to answer on an image.</noscript>'
                + f'<script>{SCRIPT}</script>')
     return page_frame.rendered(change_page.document(content, "Images"), started, read_at)
@@ -279,7 +313,8 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     """Save a question, send an answer, or delete the picture."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     # A page loaded before Send feedback existed posts only the image and its token, which means delete.
-    if not {"image", "token"} <= set(fields) <= {"image", "token", "feedback", "action", "feedback_round"} or any(
+    if not {"image", "token"} <= set(fields) <= {
+            "image", "token", "feedback", "action", "feedback_round", "retry_key"} or any(
             len(value) != 1 for value in fields.values()):
         raise question_record.AnswerRefused("use the form on this page")
     identity = fields["image"][0]
@@ -293,6 +328,12 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
         # A card loaded before I21 can still show the removed button.
         raise question_record.AnswerRefused("Not Approved was removed. Use Send Feedback.")
     if action not in ACTIONS:
+        raise question_record.AnswerRefused("use the form on this page")
+    if action == "retry":
+        if set(fields) != {"image", "token", "action", "retry_key"} or not fields["retry_key"][0]:
+            raise question_record.AnswerRefused("use the Retry button on this page")
+        return send_answer(root, identity, action, "", retry_key=fields["retry_key"][0])
+    if "retry_key" in fields:
         raise question_record.AnswerRefused("use the form on this page")
     if action == 'question':
         return ask_question(root, identity, fields.get('feedback', [''])[0], status)
@@ -325,7 +366,7 @@ def answer_message(record: image_store.ImageRecord, answer: str, feedback: str) 
     """Name the answer, then the feedback when the user wrote some, the image, and the delete command."""
     origin = f"http://{review_link.link_host()}:{conf.read('review_links').whole('server_port')}"
     return "\n".join((
-        f"From the user (via the Images page): {ANSWERS[answer]}",
+        ANSWER_PREFIX + ANSWERS[answer],
         *((f"Feedback: {feedback}",) if feedback else ()),
         *(f"{label or 'Image'}: {origin}{image_path(record, file)}" for label, file in shown_files(record)),
         f"Caption: {record['caption']}", f"For: {record['subject']}",
@@ -352,8 +393,8 @@ def _image_answers(directory: Path, record: image_store.ImageRecord) -> image_st
     return answers
 
 
-def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, round_id: str | None
-                    ) -> tuple[str, image_store.ImageAnswers]:
+def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, round_id: str | None,
+                    retry_key: str | None) -> tuple[str, image_store.ImageAnswers]:
     """Save the words and the List recipient before the first send."""
     folder = directory / identity
     try:
@@ -368,15 +409,24 @@ def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, 
     else:
         saved = _image_answers(directory, record)
 
-    parts = [saved["registered_at"], answer, feedback]
-    if round_id is not None:
-        parts.append(round_id)
-    key = change_page.review_delivery_key(folder / image_store.RECORD, identity, json.dumps(parts))
     attempts = saved["attempts"]
+    words = ""
+    if retry_key is not None:
+        if record is not None or retry_key not in attempts:
+            raise question_record.AnswerRefused("no saved answer for this removed picture")
+        key = retry_key
+    else:
+        parts = [saved["registered_at"], answer, feedback]
+        if round_id is not None:
+            parts.append(round_id)
+        key = change_page.review_delivery_key(folder / image_store.RECORD, identity, json.dumps(parts))
+        words = f"Image {identity}: {ANSWERS[answer]}"
+        if feedback:
+            words += "\n" + feedback
     if key not in attempts:
         previous: set[str] = set()
         if record is None:
-            message = ("From the user (via the Images page): " + ANSWERS[answer] + f"\nPicture {identity} was removed.")
+            message = ANSWER_PREFIX + ANSWERS[answer] + f"\nPicture {identity} was removed."
             if feedback:
                 message += "\nFeedback: " + feedback
             if "list_item" in saved:
@@ -391,7 +441,8 @@ def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, 
                 if round_id is not None and round_id != feedback_round(previous):
                     raise question_record.AnswerRefused("The image has a new answer. Review the answer and try again.") from None
             message = answer_message(record, answer, feedback)
-        attempts[key] = {"message": message, "answered": sorted(previous), "recipients": [], "confirmed": []}
+        attempts[key] = {"message": message, "words": words, "answered": sorted(previous),
+                         "recipients": [], "confirmed": []}
         image_store.write_answers(directory, saved)
     else:
         atomic_file.sync_folder(directory)
@@ -401,13 +452,13 @@ def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, 
         recipients = [saved["owner"]]
         if "list_item" in saved:
             item = saved["list_item"]
-            words = f"Image {identity}: {ANSWERS[answer]}"
-            if feedback:
-                words += "\n" + feedback
+            # Older attempts have the complete message in place of the List words.
+            words = attempt.get("words", words or attempt["message"])
+            approved = attempt["message"].partition("\n")[0] == ANSWER_PREFIX + ANSWERS["approved"]
             try:
                 keeper = staff.StaffId(saved["list_keeper"]) if "list_keeper" in saved else the_list.image_list_keeper(item)
                 producer = the_list.save_image_answer(keeper, item, key, words, image_id=identity,
-                                                      approved=answer == "approved")
+                                                      approved=approved)
             except (the_list.ListError, OSError) as error:
                 raise AnswerNotSent(f"Could not save the answer on {item}: {error}. Try again.") from error
             saved["list_keeper"] = keeper
@@ -423,8 +474,8 @@ def _recipient_name(members: staff.StaffSnapshot, identity: str) -> str:
     return row.name if row is not None else identity
 
 
-def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_id: str | None = None
-                ) -> ImageAnswerSent:
+def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_id: str | None = None,
+                retry_key: str | None = None) -> ImageAnswerSent:
     """Send to each recipient that has yet to confirm this answer."""
     if not image_store.IDENTITY.fullmatch(identity):
         raise question_record.AnswerRefused("not an image id")
@@ -437,7 +488,7 @@ def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_
         raise question_record.AnswerRefused(f"no image {identity}")
     with file_lock.exclusive(lock):
         try:
-            key, saved = _picture_answer(directory, identity, answer, feedback, round_id)
+            key, saved = _picture_answer(directory, identity, answer, feedback, round_id, retry_key)
         except OSError as error:
             raise AnswerNotSent(f"Could not save the picture answer: {error}. Try again.") from error
     attempt = saved["attempts"][key]
@@ -492,7 +543,7 @@ STYLE = """<style>[hidden]{display:none!important}
 [data-images] form{display:grid;gap:8px;margin-top:12px}
 [data-images] textarea{font:inherit;width:100%;box-sizing:border-box;color:CanvasText;background:Canvas}
 [data-image-form] .review-actions button{margin:0}
-.page-question p{white-space:pre-wrap;overflow-wrap:anywhere}
+.page-question p,.image-answer-words{white-space:pre-wrap;overflow-wrap:anywhere}
 @media (max-width:480px){[data-image-form] .review-actions button{font-size:15px;padding:6px 8px}}
 [data-image-layout]{display:grid;grid-template-columns:max-content minmax(0,680px);gap:32px;align-items:start}
 [data-image-groups]{position:sticky;
@@ -536,7 +587,7 @@ function apply() {
 // One row for each run of shown images from the same owner; the row opens the first image of the run.
 function showGroups() {
   const rows = [];
-  list.querySelectorAll('article:not([hidden])').forEach(card => {
+  list.querySelectorAll('article[data-owner]:not([hidden])').forEach(card => {
     const last = rows[rows.length - 1];
     if (last && last.owner === card.dataset.owner) { last.count++; return; }
     rows.push({owner: card.dataset.owner, card, count: 1});
@@ -562,11 +613,67 @@ function showGroups() {
   }));
   groups.hidden = rows.length === 0;
 }
+const draftStorageKey = 'images.answer-drafts:' + location.pathname;
+const draftForms = root => [...root.querySelectorAll('form[data-image-form]')]
+  .filter(form => form.elements.feedback);
+function readDrafts() {
+  try { return new Map(JSON.parse(sessionStorage.getItem(draftStorageKey) || '[]')); }
+  catch { return new Map(); }
+}
+const savedDrafts = readDrafts();
+function storeDrafts() {
+  if (savedDrafts.size) sessionStorage.setItem(draftStorageKey, JSON.stringify([...savedDrafts]));
+  else sessionStorage.removeItem(draftStorageKey);
+}
+function saveDraftsForReload() {
+  const hadDrafts = savedDrafts.size > 0;
+  for (const form of draftForms(list)) {
+    const {image, feedback, token, feedback_round: round} = form.elements;
+    if (!feedback.value) {
+      savedDrafts.delete(image.value);
+      continue;
+    }
+    const sameRetry = form.dataset.retryWords === feedback.value;
+    savedDrafts.set(image.value, {words: feedback.value, token: token.value, round: round.value,
+                                 retryAction: sameRetry ? form.dataset.retryAction : undefined,
+                                 retryRound: sameRetry ? form.dataset.retryRound : undefined});
+  }
+  if (hadDrafts || savedDrafts.size) storeDrafts();
+}
+function restoreDrafts() {
+  const forms = new Map(draftForms(list).map(form => [form.elements.image.value, form]));
+  for (const [image, draft] of savedDrafts) {
+    let form = forms.get(image);
+    if (!form) {
+      const card = document.querySelector('[data-image-draft-template]').content.firstElementChild.cloneNode(true);
+      card.id = 'image-' + image;
+      card.querySelector('h2').textContent = 'Picture ' + image;
+      form = card.querySelector('form');
+      form.elements.image.value = image;
+      form.elements.token.value = draft.token;
+      form.elements.feedback_round.value = draft.round;
+      form.elements.feedback.id = 'feedback-' + image;
+      form.querySelector('label').htmlFor = form.elements.feedback.id;
+      list.append(card);
+    }
+    form.elements.feedback.value = draft.words;
+    if (draft.retryAction) {
+      form.dataset.retryAction = draft.retryAction;
+      form.dataset.retryRound = draft.retryRound;
+      form.dataset.retryWords = draft.words;
+    }
+  }
+}
+function clearDraft(image) {
+  if (!savedDrafts.delete(image)) return;
+  try { storeDrafts(); } catch { /* Storage can become unavailable while the page is open. */ }
+}
 function bind(root) {
   root.querySelectorAll('form[data-image-form]').forEach(form => form.addEventListener('submit', async event => {
     event.preventDefault();
     if (cardSubmitBlocked(form)) return;
     const question = event.submitter?.value === 'question';
+    const retrying = event.submitter?.value === 'retry';
     const feedback = event.submitter?.value === 'feedback', status = form.querySelector('[data-image-status]');
     delete status.dataset.refreshFailed;
     if (question && !form.elements.feedback.value.trim()) {
@@ -583,8 +690,10 @@ function bind(root) {
       body.set('feedback_round', form.dataset.retryRound);
     }
     status.textContent = '';
-    let postFailed = false, retry = !question;
+    let postFailed = false, retry = !question && !retrying;
     setCardSubmitting(form, true);
+    const draft = form.elements.feedback;
+    if (draft) draft.readOnly = true;
     sending++;
     try {
       const response = await fetch(location.pathname, {method: 'POST', body});
@@ -592,6 +701,10 @@ function bind(root) {
         retry = retry && response.status >= 500;
         const reason = await response.json().then(body => body.reason, () => '');
         throw new Error(reason || 'HTTP ' + response.status);
+      }
+      if (draft) {
+        clearDraft(form.elements.image.value);
+        draft.value = '';
       }
       if (question) {
         card.remove();
@@ -622,8 +735,9 @@ function bind(root) {
     } finally {
       sending--;
       setCardSubmitting(form, false);
+      if (draft) draft.readOnly = false;
       if (question && !postFailed) void pageRefresh.refresh(true);
-      else void refresh().catch(error => {
+      else if (!retrying || !postFailed) void refresh().catch(error => {
         if (postFailed) return;
         status.dataset.refreshFailed = 'true';
         status.textContent = 'Update failed: ' + error.message;
@@ -644,14 +758,14 @@ async function refresh(_supersede=false,current=()=>true) {
     if (!fresh) throw new Error('The page has no image list.');
     // A page from an older server script cannot bind the new cards, so it loads again.
     if (fresh.dataset.script !== list.dataset.script) {
+      saveDraftsForReload();
       location.reload();
       return;
     }
     const facts = pageRefreshFacts(page);
     // Keep drafts and action results on cards that the server still shows.
-    const forms = new Map([...list.querySelectorAll('form[data-image-form]')]
-      .map(form => [form.elements.image.value, form]));
-    fresh.querySelectorAll('form[data-image-form]').forEach(form => {
+    const forms = new Map(draftForms(list).map(form => [form.elements.image.value, form]));
+    draftForms(fresh).forEach(form => {
       const image = form.elements.image.value;
       const previous = forms.get(image);
       if (!previous) return;
@@ -708,6 +822,7 @@ addEventListener('hashchange', () => {
   scrollToLinkedImage(true);
 });
 const pageRefresh = createPageRefresh(refresh, refreshSeconds);
+restoreDrafts();
 bind(list);
 // An image link opens its image at once.
 apply();

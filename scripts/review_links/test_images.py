@@ -300,7 +300,7 @@ class ImagesTests(ImagesFixture):
         self.assertNotIn('image-window', source)
         self.assertNotIn("start.get('show')", source)
         self.assertIn("card.remove();", source)
-        self.assertIn("home.insertBefore(card, next?.parentNode === home ? next : null);", source)
+        self.assertIn("await motion.removeCard(card, apply);", source)
         self.assertIn("status.textContent = 'Not sent: ' + error.message;", source)
         self.assertIn("new FormData(form, event.submitter)", source)
 
@@ -420,8 +420,13 @@ class ImagesTests(ImagesFixture):
  const departingForm = previous.querySelector('form');
  const feedbackButton = departingForm.querySelector('button[value="feedback"]');
  submitFeedback('Routine feedback.');
- const fade = departingForm.closest('article').getAnimations()[0];
- if (!fade) throw new Error('The card must fade after feedback.');
+ const departingCard = departingForm.closest('article');
+ let fade;
+ for (let step = 0; step < 100 && !fade; step++) {
+  fade = departingCard.getAnimations()[0];
+  if (!fade) await wait(5);
+ }
+ if (!fade) throw new Error('The card must fade after the server confirms feedback.');
  fade.pause();
  fade.currentTime = fade.effect.getTiming().duration / 2;
  check([...departingForm.querySelectorAll('button')].every(button => button.disabled),
@@ -544,7 +549,7 @@ class ImagesTests(ImagesFixture):
             + f'<input type="hidden" name="token" value="{token}">'
             + f'<input type="hidden" name="feedback_round" value="{images.feedback_round(set())}">'
             + f'<label for="feedback-{record['id']}">Feedback</label>'
-            + f'<textarea id="feedback-{record['id']}" name="feedback" rows="3"></textarea>'
+            + f'<textarea id="feedback-{record['id']}" name="feedback" rows="3" autocomplete="off"></textarea>'
             + '<div class="review-actions"><div class="review-action-group"><span>Closes the item</span><div>'
             + '<button type="submit" name="action" value="approved">Approved</button>'
             + '<button type="submit" name="action" value="feedback">Send Feedback</button>'
@@ -782,6 +787,61 @@ window.fetch = async (url, options) => {
 })();</script>"""
         markup = page.replace(b"<head>", b"<head>" + setup.encode()).replace(b"</body>", probe.encode() + b"</body>")
         self.assertEqual(firefox_probe_results(markup), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
+    def test_script_reload_restores_each_draft_and_clears_only_the_sent_draft(self) -> None:
+        first, second = self.register("First shot"), self.register("Second shot")
+        page = images.render(self.status).decode()
+        fresh = json.dumps(page).replace("<", r"\u003c")
+        probe = r"""<script>
+(async () => {
+ const phase = sessionStorage.getItem('probe-phase');
+ const first = document.querySelector('#feedback-FIRST'), second = document.querySelector('#feedback-SECOND');
+ const firstWords = 'Keep the title.\nUse a darker border.', secondWords = 'Keep the second draft.';
+ const failures = [], check = (ok, text) => { if (!ok) failures.push(text); };
+ const realFetch = window.fetch.bind(window);
+ const fresh = FRESH;
+ const update = () => document.dispatchEvent(new Event('visibilitychange'));
+ const version = document.querySelector('[data-images]').dataset.script;
+ window.fetch = async (url, options) => {
+   if (url !== location.pathname) return realFetch(url, options);
+   if (options?.method === 'POST') return new Response('{"state":"done"}');
+   return new Response(phase === 'sending' ? fresh : fresh.replace(
+     'data-script="' + version + '"', 'data-script="new-script"'));
+ };
+ if (!phase) {
+   first.value = firstWords;
+   second.value = secondWords;
+   sessionStorage.setItem('probe-phase', 'sending');
+   update();
+   return;
+ }
+ if (phase === 'sending') {
+   check(first.value === firstWords, 'The first draft survives the script reload.');
+   check(second?.value === secondWords, 'The second draft survives when its picture is gone.');
+   if (failures.length) {
+     await realFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+     return;
+   }
+   const form = first.form;
+   const before = document.querySelector('[data-images]');
+   form.requestSubmit(form.querySelector('button[value=feedback]'));
+   for (let count = 0; count < 60 && document.querySelector('[data-images]') === before; count++) {
+     await new Promise(resolve => setTimeout(resolve, 50));
+   }
+   sessionStorage.setItem('probe-phase', 'sent');
+   location.reload();
+   return;
+ }
+ check(first.value === '', 'The confirmed draft stays clear after reload.');
+ check(second?.value === secondWords, 'The second draft remains after the send.');
+ await realFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+})();</script>""".replace("FIRST", first["id"]).replace("SECOND", second["id"]).replace("FRESH", fresh)
+        remove_picture = ("""<script>
+if (sessionStorage.getItem('probe-phase')) document.querySelector('#image-SECOND').remove();
+</script>""").replace("SECOND", second["id"])
+        markup = page.replace(f"<script>{images.SCRIPT}", remove_picture + f"<script>{images.SCRIPT}")
+        self.assertEqual(firefox_probe_results(markup.replace("</body>", probe + "</body>").encode()), [[]])
 
     def test_a_card_from_before_i21_that_posts_not_approved_gets_a_clear_refusal(self) -> None:
         record = self.register()
@@ -2178,6 +2238,49 @@ class ImagesServerTests(ImagesFixture):
                          [f"session:{self.owner.current_session}" if self.owner is not None else "",
                           f"session:{producer.current_session}"])
         self.assertTrue(all(words in message for _, _, message in self.sent))
+
+    def test_reload_shows_the_saved_answer_and_retries_only_the_missing_recipient(self) -> None:
+        keeper, producer, item = self.list_item()
+        record = images.register(self.shot, "Check", self.owner_id(), "Phase check", list_item=item.id)
+        identity = record["id"]
+        token = images.request_token(images.console_token(self.root), identity)
+        images.delete(self.root, identity)
+        words = "Keep <this> & the title.\nUse a darker border."
+        body = urlencode({"image": identity, "token": token, "feedback": words, "action": "feedback"})
+        calls: list[tuple[str, str]] = []
+        online = False
+
+        def send(_recipient: str, _sender: str, message: str, *, key: str, recipient_key: str) -> None:
+            calls.append((recipient_key, key))
+            self.assertIn(words, message)
+            if recipient_key == producer.id and not online:
+                raise RuntimeError("producer offline")
+
+        with patch.object(change_page, "send_message", side_effect=send):
+            self.assertEqual(self.http("POST", images.PAGE_PATH, body)[0], 503)
+            saved = the_list.load(keeper.id, item.id)
+            key = calls[0][1]
+            page = self.http("GET", images.PAGE_PATH)[2].decode()
+            self.assertIn("Not sent yet", page)
+            self.assertIn("Keep &lt;this&gt; &amp; the title.\nUse a darker border.", page)
+            self.assertIn(f'name="retry_key" value="{key}"', page)
+            self.assertIn(">Retry</button>", page)
+
+            directory = images.images_root(self.root)
+            legacy = image_store.read_answers(directory, identity)
+            del legacy["attempts"][key]["words"]
+            image_store.write_answers(directory, legacy)
+            legacy_page = self.http("GET", images.PAGE_PATH)[2].decode()
+            self.assertIn("Keep &lt;this&gt; &amp; the title.", legacy_page)
+
+            online = True
+            retry = urlencode({"image": identity, "token": token, "action": "retry", "retry_key": key})
+            self.assertEqual(self.http("POST", images.PAGE_PATH, retry)[0], 200)
+            self.assertEqual(self.http("POST", images.PAGE_PATH, retry)[0], 200)
+
+        self.assertEqual(calls, [(self.owner_id(), key), *([(producer.id, key)] * 4)])
+        self.assertEqual(the_list.load(keeper.id, item.id), saved)
+        self.assertNotIn(key, self.http("GET", images.PAGE_PATH)[2].decode())
 
     def test_sweep_keeps_old_images(self) -> None:
         record = self.register()

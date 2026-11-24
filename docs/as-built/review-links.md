@@ -1836,7 +1836,12 @@ Delete saves the picture reference in the same private store before it removes t
 An open card can still send an answer after deletion.
 The page shows **This picture was removed; your words went to <owner name>.**
 If a save or delivery fails, the server answers 503 and names the step or recipient.
-A refresh keeps the draft words in the form while it can still send the answer.
+On reload, each pending answer for a removed picture shows its words, **Not sent yet**, and a **Retry** button.
+The retry card leaves the page when delivery is confirmed.
+A refresh keeps the draft words in the form.
+Before a script update reloads the page, the browser saves each draft by picture id in the tab.
+The new page restores the drafts, including drafts for removed pictures.
+A confirmed send clears its draft.
 The linked answer stays in the List log if delivery fails or the owner deletes the image.
 An agent deletes an image with this command:
 
