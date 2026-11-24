@@ -246,7 +246,8 @@ try {
   const headcountComparison = comparison === '--headcount';
   const comparisonImages = Boolean(comparison || beforePage || swapBeforePage || process.env.MEMORY_PAGE_SHOT);
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
-  const fixtureTime = readings.good.read_at;
+  const liveShot = queueRowsProof && !beforePage;
+  const fixtureTime = liveShot ? Math.floor(Date.now() / 1000) : readings.good.read_at;
   for (const reading of Object.values(readings)) {
     const shift = fixtureTime - reading.read_at;
     for (const row of reading.walk) {
@@ -255,6 +256,7 @@ try {
       for(const part of row.parts || []) if(part.started_at) part.started_at += shift;
     }
     for (const waiter of reading.waiters) waiter.since += shift;
+    if (liveShot) reading.fresh_until += shift;
     reading.read_at = fixtureTime;
   }
   const base = readings.good;
@@ -674,11 +676,35 @@ try {
             rust.started_at = runStart;
             rust.last_move = {kind:'bump', who:'nate', from_place:31, to_place:1, at:bumpTime};
             waiting.place = 2;
+            waiting.move = {row_id:'shot-admin-console', movable:true, kept_before:1};
             reading.held_places = [{kind:'held', key:'proof-kept', unit:'admin-console',
               position:1, failed_step:'test affected', kept_until:keptUntil, targets:['natedev','hana-aws']}];
+            reading.move_line = {revision:reading.move_revision, members:[waiting.move], kept_runs:['proof-kept']};
           }
           reading.queued_priority_units = [];
           servedReading = reading;
+          const navigateQueueRows = async width => {
+            const showHandle = !shootBefore && width === 1440;
+            // The narrow layout checks use the read-only view.
+            queueFixture = showHandle ? reading : null;
+            await navigate(shootBefore ? 'before.html' : 'memory_live.html');
+            if (showHandle) await evaluate(`new Promise((resolve, reject) => {
+              const walk = document.querySelector('#walk');
+              const ready = () => walk.querySelector('.queue-grip[data-move-id="shot-admin-console"]');
+              if (ready()) return resolve(true);
+              const observer = new MutationObserver(() => {
+                if (!ready()) return;
+                observer.disconnect();
+                clearTimeout(timeout);
+                resolve(true);
+              });
+              const timeout = setTimeout(() => {
+                observer.disconnect();
+                reject(new Error('The waiting row has no move handle.'));
+              }, 3000);
+              observer.observe(walk, {childList:true, subtree:true});
+            })`);
+          };
           const machineGraphics = {
             'natedev':['🐧', null],
             'mac':['#machine-apple', null],
@@ -695,7 +721,7 @@ try {
           let rows;
           for (const width of shootBefore ? [1440] : [1440, 900, 800]) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1100,deviceScaleFactor:1,mobile:false});
-            await navigate(shootBefore ? 'before.html' : 'memory_live.html');
+            await navigateQueueRows(width);
             rows = await evaluate(`(() => {
               const walk = document.querySelector('#walk');
               const name = row => row.querySelector('.name').textContent;
@@ -711,6 +737,7 @@ try {
               if (keptDeadline) deadlineRange.selectNodeContents(keptDeadline);
               const scroll = walk.closest('.walk-scroll');
               const waitingName = chart(keys[4]).querySelector('.name');
+              const handle = chart(keys[4]).querySelector('.queue-grip');
               const iconDetails = icon => [icon?.getAttribute('aria-label'), icon?.dataset.machine,
                 icon?.querySelector('svg use')?.getAttribute('href') ?? icon?.querySelector('.machine-emoji')?.textContent,
                 icon?.getAttribute('data-badge')];
@@ -738,6 +765,7 @@ try {
                   row.querySelector('.owner [data-color-text]')?.dataset.colorText]),
                 waitingNameLines:lines(waitingName),
                 waitingNameCut:waitingName.scrollWidth > waitingName.clientWidth,
+                handleFits:handle?.getBoundingClientRect().right <= waitingName.getBoundingClientRect().left,
                 headingCut:(() => {
                   const label = walk.querySelector('.walk-chart .queue-title').firstElementChild;
                   return label.scrollWidth > label.clientWidth;
@@ -762,7 +790,10 @@ try {
               assert.equal(rows.heading, 'Waiting, in queue order');
               assert.equal(rows.runAge, `${runAgeMinutes} min`);
               assert.equal(rows.keptDeadline, `until ${keptUntil.split(' ', 1)[0]}`);
-              if (width === 1440) assert.equal(rows.keptDeadlineLines, 1, 'The kept place deadline wraps at 1440 px.');
+              if (width === 1440) {
+                assert.equal(rows.keptDeadlineLines, 1, 'The kept place deadline wraps at 1440 px.');
+                assert.ok(rows.handleFits && !rows.waitingNameCut, 'The move handle or waiting name is cut at 1440 px.');
+              }
               if (width === 900) {
                 assert.deepEqual(rows.keptCut, [], 'A kept place value is cut at 900 px.');
                 assert.ok(rows.walkOverflow <= 1, `The walk overflows by ${rows.walkOverflow} px at 900 px.`);
@@ -801,7 +832,7 @@ try {
                 assert.ok(bump.text.includes(bumpTime), 'The bump tooltip shows the wrong time.');
                 assert.ok(bump.fits, 'The bump tooltip extends outside the card.');
                 const withBump = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:bump.clip});
-                await writeFile(join(folder, 'moved-dark-4.png'), Buffer.from(withBump.data,'base64'));
+                await writeFile(join(folder, 'moved-dark-5.png'), Buffer.from(withBump.data,'base64'));
               }
             }
           }
@@ -810,7 +841,7 @@ try {
           await call('Emulation.setScrollbarsHidden', {hidden:false});
           try {
             await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
-            await navigate(shootBefore ? 'before.html' : 'memory_live.html');
+            await navigateQueueRows(1440);
             const scroll = await evaluate(`(() => {
               const box = document.querySelector('.walk-scroll');
               const card = box.closest('.card').getBoundingClientRect();
@@ -826,6 +857,7 @@ try {
             if (!shootBefore) assert.deepEqual(scroll.bars, {right:0, bottom:0, down:0, sideways:0},
               'The Running/Queued scroll box shows a scrollbar.');
           } finally {
+            queueFixture = null;
             await call('Emulation.setScrollbarsHidden', {hidden:true});
           }
           if (queueRowsProof) {
