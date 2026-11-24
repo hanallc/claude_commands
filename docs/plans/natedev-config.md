@@ -17,7 +17,7 @@ Work: proposal P807, ~/rust/hanadocs/issues/one common way for config files.md (
 nate's words: "i approve - i want to make sure that config files have white space between comment/config sections so humans can read it".
 Add this rule to the plan: each config file has a blank line between its comment and config sections. The test of the common form checks it.
 
-Key rule: steps 1, 2, 4, 7 and 8 change no key and can start. Steps 3, 5 and 6 rename or move keys. Each of them waits for nate's go typed in this unit's session.
+Key rule: steps 1, 2, 4, 7 and 8 change no key and can start. Steps 3, 5 and 6 rename or move keys. Each of them waits for nate's go typed in this unit's session. nate gave the go for all four moves on 11-24 at 07:50 PST (Questions page).
 
 devtools of sdlc wrote P807. sdlc sends you the hand-over from devtools.
 Use Codex workers, not subagents (nate, 11-23 14:04 PST). A claude_commands `--affected` run gives no `--targets`; the default is natedev and mac-linux. A `gate.py --module` run names `--targets natedev` only (builds, 00:07 PST Nov 24).
@@ -54,6 +54,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - **Test lanes:** `scripts/lib/test_conf.py`, `scripts/lib/test_conf_sh.py`, `scripts/lib/test_models_registry.py`, `scripts/lib/test_tune.py`, and the `test_*.py` beside each changed module. The new form test is `scripts/lib/test_config_form.py`.
 - **Build:** none.
 - **Test:** a queued run: `~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --repo <worktree> --commit HEAD --apply-uncommitted <worktree> -- ./scripts/lib/py scripts/production/gate.py --affected`, with no `--targets` (the default is natedev and mac-linux). While iterating, add `--module <suite>/<test_module>.py` and name `--targets natedev`: the queue runs `--module` only on natedev. A direct run names single test functions only: `./scripts/lib/py -m unittest scripts.<suite>.<test_module>.<Class>.<test>`. The run target rule is from builds, 00:07 PST Nov 24. Never start `targeted_test.py` by hand (builds, 11-23).
+- **Status line check:** a phase that changes fixture or config path selection names `scripts.production.test_unit_phases` `test_unit_count_cache_filters_sources_and_retries_failed_reads` among its direct checks. It proves that the status line question count watches the configured zone file.
 - **Lint:** `basedpyright` on each changed Python file: zero errors, zero warnings. `bash -n` on each changed shell file.
 - **Invariants:**
   - Values do not change. A key that moves keeps its value byte for byte (P807 rule 8).
@@ -199,7 +200,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 0. **Wait.** Start only after devtools phases busywrite and rundone are on main (they change `scripts/direct/assign.py`). Merge main first.
 1. For each of `MODELS_CONFIG_FILE`, `COPIES_CONFIG`, `STAFF_CONFIG`, `AWS_TARGET_CONFIG`, `BUILD_TARGETS_CONFIG`, `SHOWRUNNERS_CONFIG` and `LINT_CONFIG_FILE`, first confirm that it names a file in `config/`.
-2. **Config file.** The reader takes the file from `CONF_DIR` when it is set, else from the repository `config/` folder: the same rule as `conf.read`. Remove the variable from code and tests. Tests write the fixture into `CONF_DIR` with `write_config_fixture`.
+2. **Config file.** The reader takes the file from `CONF_DIR` when it is set. When `CONF_DIR` is unset, each caller keeps its current source: the live folder, or its own checkout (`scripts/copies/copies.py` `config_settings` reads the checkout). Test both source selections, and keep the launch snapshot of item 4. Remove the variable from code and tests. Tests write the fixture into `CONF_DIR` with `write_config_fixture`.
 3. **Not a config file.** If a variable names a file outside `config/`, leave it. Move its allow list row to `permanent` with the reason "not a config file" and name it in the reply.
 4. **Runtime use.** If a variable carries a purpose beyond tests, keep that purpose and name it in the reply. Example to check first: `scripts/lib/models_registry.py` `_snapshot` (line 66) may pin a launched process to a registry snapshot through `MODELS_CONFIG_FILE`. A launched worker must read the same registry that it reads today. If the purpose needs the variable, keep the variable and move its row to `permanent` with the reason.
 5. `scripts/lib/models_registry.py` `registry_path` (line 262) is the one place that resolves the `models.conf` path. The other sources call it: `scripts/direct/assign.py`, `scripts/direct/pass_record.py`, `scripts/direct/assign_claude.py`, `scripts/direct/claude_worker.py`, `scripts/lib/waiting_rows.py`, `scripts/whoami/quota_alert.py`, `scripts/agents/models_config.sh`, `scripts/agents/sync_codex_catalog.sh`.
@@ -214,8 +215,8 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `scripts/lib/config_form_exceptions_test_support.py` — rows removed
 
 **Workers:** 2 writers — split by variable.
-- `impl` — `MODELS_CONFIG_FILE`: its sources, `scripts/direct/recorder_fixture.py` and its tests, and `scripts/direct/assign_launcher_test_support.py` with both of its fixture changes (`MODELS_CONFIG_FILE` and `LINT_CONFIG_FILE`); hub: `scripts/lib/config_form_exceptions_test_support.py` (this slot owns every edit to it; the other slot sends its row removals here)
-- `test` opens as impl — `COPIES_CONFIG`, `STAFF_CONFIG`, `AWS_TARGET_CONFIG`, `BUILD_TARGETS_CONFIG`, `SHOWRUNNERS_CONFIG`, `LINT_CONFIG_FILE`: their sources (with `scripts/lint/lint_config.sh` and `scripts/direct/verify.sh`) and tests, except `scripts/direct/assign_launcher_test_support.py`
+- `impl` — `MODELS_CONFIG_FILE`: its sources, `scripts/direct/recorder_fixture.py` and its tests, and `scripts/direct/assign_launcher_test_support.py` with all of its fixture changes (`MODELS_CONFIG_FILE`, `LINT_CONFIG_FILE`, `COPIES_CONFIG` and `STAFF_CONFIG`), and each other file that sets variables of both lanes (for example `scripts/production/test_stall_watch.py`); hub: `scripts/lib/config_form_exceptions_test_support.py` (this slot owns every edit to it; the other slot sends its row removals here)
+- `test` opens as impl — `COPIES_CONFIG`, `STAFF_CONFIG`, `AWS_TARGET_CONFIG`, `BUILD_TARGETS_CONFIG`, `SHOWRUNNERS_CONFIG`, `LINT_CONFIG_FILE`: their sources (with `scripts/lint/lint_config.sh` and `scripts/direct/verify.sh`) and tests, except `scripts/direct/assign_launcher_test_support.py` and the other files that set variables of both lanes (send those edits to `impl`)
 
 **State:** none
 
@@ -230,6 +231,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - The tests of each changed module pass on `CONF_DIR` fixtures.
 - `grep -rw` finds each removed variable nowhere under `scripts/`.
 - `test_config_form.py` passes with the rows removed.
+- This phase adds no `.conf` keys. The named fixture tests prove each path, format or runtime state change. The director reads each `CONF_DIR` fixture of each changed reader, shell and subprocess fixtures included.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file; `bash -n` passes on each changed shell file.
 
@@ -311,10 +313,11 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `scripts/production/hand_made.py`, `scripts/production/hand_made_limit.py`, `scripts/production/hand_made_guest.py`
 - `scripts/lib/config_form_exceptions_test_support.py` — the `TAIL_BYTES` row removed
 - `commands/default_models.md`, `commands/build/hand_made.md`, `config/README.md`
+- `scripts/agents/test_models_config.sh`, `scripts/agents/test_models_conf_publish.py` — the writer tests: the CLI rows in `/default_models` and the mixed model replacement
 - `scripts/whoami/quota_alert_test_support.py`, `scripts/agents/test_agent_exec.py`, `scripts/agents/test_agent_exec.sh`, `scripts/production/test_hand_made.py`, `scripts/production/test_hand_made_guest.py`, `scripts/production/test_hand_made_limit.py`, `scripts/production/test_hand_made_mac.py`, `scripts/lib/test_models_registry.py`, `scripts/lib/test_models_registry_fixture.py`
 
 **Workers:** 2 writers — the launcher side and the hand made side.
-- `impl` — `config/cli.conf`, `config/models.conf`, `scripts/lib/models_registry.py`, `scripts/agents/models_config.sh`, `scripts/agents/default_models.sh`, `scripts/cli_agent/cli_agent.sh`, `commands/default_models.md`, `config/README.md`, `scripts/lib/test_models_registry.py`, `scripts/lib/test_models_registry_fixture.py`, `scripts/agents/test_agent_exec.py`, `scripts/agents/test_agent_exec.sh`, `scripts/whoami/quota_alert_test_support.py`; hub: `config/cli.conf` (both sides read it)
+- `impl` — `config/cli.conf`, `config/models.conf`, `scripts/lib/models_registry.py`, `scripts/agents/models_config.sh`, `scripts/agents/default_models.sh`, `scripts/cli_agent/cli_agent.sh`, `commands/default_models.md`, `config/README.md`, `scripts/lib/test_models_registry.py`, `scripts/lib/test_models_registry_fixture.py`, `scripts/agents/test_agent_exec.py`, `scripts/agents/test_agent_exec.sh`, `scripts/whoami/quota_alert_test_support.py`, `scripts/agents/test_models_config.sh`, `scripts/agents/test_models_conf_publish.py`; hub: `config/cli.conf` (both sides read it)
 - `test` opens as impl — `scripts/production/hand_made.py`, `scripts/production/hand_made_limit.py`, `scripts/production/hand_made_guest.py`, `scripts/lib/config_form_exceptions_test_support.py`, `commands/build/hand_made.md`, `scripts/production/test_hand_made*.py`
 
 **State:** none
@@ -334,6 +337,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `/tune cli merge_branch.claude.model <value>` refuses an unknown agent (the `agent` limit).
 - The models registry, hand made, agent exec and quota alert tests pass.
 - `test_config_form.py` passes.
+- `scripts/production/fixture_conf_keys.py --repo <worktree> --base <phase start> --tip <candidate commit>` reports 0 missing keys. It does not check dotted keys, so the director also reads each `CONF_DIR` fixture of each changed reader, shell and subprocess fixtures included.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file; `bash -n` passes on each changed shell file.
 
@@ -350,14 +354,14 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 1. **Moves**, values byte for byte. A TOML table becomes a dotted prefix, so the full name `<stem>.<table>.<key>` stays the same:
    - `config/herdr_upkeep.toml` → `config/herdr_upkeep.conf`: `job.interval_seconds=120`, `job.timeout_seconds=60`.
    - `config/session_retries.toml` → `config/session_retries.conf`: `registry_reads=4`, `registry_delay_seconds=0.1`.
-   - `config/accounts.toml` `[trust] folders = ["~/worktrees"]` → `config/accounts.conf` row `trust.folders=~/worktrees` (a `words` value: space-separated). `config/accounts.conf` has no `trust.folders` key today.
+   - `config/accounts.toml` `[trust] folders = ["~/worktrees"]` → `config/accounts.conf` row `trust.folders=~/worktrees`: folder paths separated by `:`, as in `PATH`; an empty value means no folders (showrunner, 11-24 08:03 PST). `config/accounts.conf` has no `trust.folders` key today.
    - `config/agent_notes.toml` → `config/agent_notes.conf`: each `[table] key` becomes `table.key`. 30 keys: `job.interval_seconds`, `job.timeout_seconds`, `mac_usage.interval_seconds`, `mac_usage.codex_interval_seconds`, `parts.<part>.interval_seconds` and `parts.<part>.timeout_seconds` for `notes`, `quota`, `pacer`, `refusals`, `watchdog`, `logins`, `prune`, `folder_size`, `vault`, `vault_save`, then `vault.git_seconds`, `vault.named_paths`, `watchdog.dispatch_seconds`, `watchdog.recovery_seconds`, `watchdog.pass_dispatch_seconds`, `watchdog.result_seconds`.
 2. **Comments and limits.** Carry each TOML comment over. Replace prose limits ("Use a positive finite number") with a `# whole:` or `# range:` line that states the limit the reader checks today. One blank line between blocks.
 3. **Readers**, each read at use, no module-level copy:
    - `scripts/maintenance/herdr_upkeep.py` (line 28) → `conf.read("herdr_upkeep")`; remove `HERDR_UPKEEP_CONFIG`.
    - `scripts/maintenance/settings.py` (line 88) → `conf.read("agent_notes")`; remove `AGENT_NOTES_JOB_CONFIG`. The notes timer reads values on each pass; keep that.
    - `scripts/message/session_records.py` (line 100) → `conf.read("session_retries")`.
-   - `scripts/accounts/accounts.py` (line 874) → `conf.read("accounts").words("trust.folders")`.
+   - `scripts/accounts/accounts.py` (line 874) → `conf.read("accounts").text("trust.folders")`, split on `:`. Keep today's handling of a bad part: `_trusted_folders` (line 887) prints `accounts: anomaly: trust folder is not an absolute path` and skips a part that is empty or not absolute after `~` expansion; it refuses nothing. Add no new refusal (nate's rule of 11-05). Keep the tests of `~/other trees` (`test_accounts.py` line 3087) and the empty list (line 3244).
 4. **Tests** write `CONF_DIR` fixtures with `write_config_fixture`.
 5. Delete the four TOML files. Remove their rows from the format, reader and variable allow lists in `scripts/lib/config_form_exceptions_test_support.py`.
 6. **README.** Replace the TOML descriptions of these files with `.conf` sections.
@@ -369,12 +373,13 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `scripts/maintenance/herdr_upkeep.py`, `scripts/maintenance/test_herdr_upkeep.py`
 - `scripts/maintenance/settings.py`, `scripts/maintenance/test_agent_notes_job.py`, `scripts/maintenance/test_*.py` — the agent notes reader, and the tests that set `AGENT_NOTES_JOB_CONFIG`
 - `scripts/message/session_records.py`, `scripts/message/test_session_records.py`
+- `scripts/whoami/test_agent_notes.py`, `scripts/accounts/test_refusal_watch.py` — they set `AGENT_NOTES_JOB_CONFIG`
 - `scripts/accounts/accounts.py`, `scripts/accounts/home_test_support.py`, `scripts/production/unit_status_test_support.py`
 - `scripts/lib/config_form_exceptions_test_support.py`, `config/README.md`
 
 **Workers:** 2 writers — split by file pair.
-- `impl` — the `agent_notes` and `herdr_upkeep` files and their readers and tests; hub: `scripts/lib/config_form_exceptions_test_support.py` (this slot owns every edit to it; the other slot sends its row removals here)
-- `test` opens as impl — the `session_retries` and `accounts` files and their readers and tests, `config/README.md`
+- `impl` — the `agent_notes` and `herdr_upkeep` files and their readers and tests, with the agent notes fixtures in `scripts/whoami/test_agent_notes.py` and `scripts/accounts/test_refusal_watch.py`; hub: `scripts/lib/config_form_exceptions_test_support.py` (this slot owns every edit to it; the other slot sends its row removals here)
+- `test` opens as impl — the `session_retries` and `accounts` files and their readers and tests (`scripts/accounts/home_test_support.py` and the trust fixtures), `config/README.md`
 
 **State:** none
 
@@ -386,6 +391,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - Each changed module's tests pass on `CONF_DIR` fixtures.
 - The `/tune` key-and-limit check accepts `agent_notes job.interval_seconds 120` with no write.
 - `test_config_form.py` passes with the rows removed.
+- `scripts/production/fixture_conf_keys.py --repo <worktree> --base <phase start> --tip <candidate commit>` reports 0 missing keys. It does not check dotted keys, so the director also reads each `CONF_DIR` fixture of each changed reader, shell and subprocess fixtures included.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file.
 
@@ -402,7 +408,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 1. **Files:** `config/build_admission.conf` (`[disk]`, `[memory]`), `config/build_folders.conf` (9 sections), `config/build_steps.conf` (5), `config/gate_rename_deploy.conf` (1), `config/copies.conf` (`[copies]`, `[allow-list]`), `config/design_roles.conf` (`[ownership]`, `[roles]`), `config/lint.conf` (4). Replace each `[section]` line with a plain group comment line, `# <section>`, with a blank line above it.
 2. **Key names stay.** On the plan base no key repeats across sections in any of these files, so every key keeps its name. If a reader needs the section as part of the key, that is a rename: stop that file and report it to the director. No rename merges without nate's go.
 3. **Readers first.** Confirm how each reader reads its file. Candidates from a plan-base scan (confirm each): `scripts/build_queue/admission_service.py`, `scripts/build_queue/memory_feed.py`, `scripts/build_queue/limits_view.py`, `scripts/lint/memory_admit.py`, `scripts/worktree/worktrees.py`, `scripts/astra/design_roles.py`, `scripts/herdr/worker_panes.py`, `scripts/buildlog/rust_release.py`, `scripts/build_targets/build_targets.py`, `scripts/buildlog/report.py`, `scripts/mac_test/eligibility.py`, `scripts/history/rounds.py`, `scripts/style/style_plan.py`. A reader that reads by section changes to `conf.read` on the same key.
-4. **design_roles.** `scripts/astra/design_roles.py` uses `configparser`. It changes to `conf.read("design_roles")` keys `host` and `new_open`. `host` keeps both uses: routing and the local authority check. `new_open` gets the limit line `# one of: true, false`; the code reads `true` as open. Today `getboolean(..., fallback=True)` (line 825) also accepts `yes`, `on` and `1` and opens when the key is missing; after the change a missing or other value is a `conf.read` refusal, with Git recovery, like every key (rule 7: no default in code). The live value is `true`, so behavior stays the same. Remove `DESIGN_ROLES_CONFIG`; tests use `CONF_DIR`, and `scripts/astra/design_role_test_support.py` writes the fixture.
+4. **design_roles.** `scripts/astra/design_roles.py` uses `configparser`. It changes to `conf.read("design_roles")` keys `host` and `new_open`. `host` keeps both uses: routing and the local authority check. Read `host` with `HostOverride.IGNORED` at both uses, so a `host.<machine>` row cannot change the authority. Test that both uses give the same authority when the fixture has a host override row. `new_open` gets the limit line `# one of: true, false`; the code reads `true` as open. Today `getboolean(..., fallback=True)` (line 825) also accepts `yes`, `on` and `1` and opens when the key is missing; after the change a missing or other value is a `conf.read` refusal, with Git recovery, like every key (rule 7: no default in code). The live value is `true`, so behavior stays the same. Remove `DESIGN_ROLES_CONFIG`; tests use `CONF_DIR`, and `scripts/astra/design_role_test_support.py` writes the fixture.
 5. **Proof.** Before the change, a script reads every key of each file with `conf.read` and with each section-aware reader, and saves the values. After the change the same script gives the same values.
 6. Remove the seven files from the sections allow list. Replace the `design_roles.py` reader row with a `PERMANENT` row for `designer.md` only: line 710 still reads `config/design_roles/designer.md` as data. Remove `DESIGN_ROLES_CONFIG` from `VARIABLE_EXCEPTIONS`.
 7. **README.** Update the sections of `config/README.md` that show these files with `[section]` lines (for example `## lint.conf`).
@@ -429,6 +435,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - The proof script gives the same values before and after for each file.
 - Each changed reader's tests pass.
 - `test_config_form.py` passes with the rows removed.
+- This phase adds no `.conf` keys. The named fixture tests prove each path, format or runtime state change. The director reads each `CONF_DIR` fixture of each changed reader, shell and subprocess fixtures included.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file.
 
@@ -454,7 +461,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `scripts/lib/test_config_form.py` — the comment and limit rule with no exceptions
 - `scripts/lib/registry_rows.py`, `scripts/lib/models_registry.py`, `scripts/agents/sync_codex_catalog.sh`, `scripts/lib/test_models_registry.py`, `scripts/agents/test_sync_codex_catalog.sh` — only if a writer drops a comment
 
-**Workers:** 2 writers — split by file.
+**Workers:** 2 writers — split by file. At phase start, the director splits the files that are still in the live `COMMENT_LIMIT_FILES` list (after Phases 6 and 8 some listed files can pass already); the lists below are the plan-base split.
 - `impl` — `config/models.conf`, `config/build_folders.conf`, `config/copies.conf`, `config/design_roles.conf`, `config/lint.conf`, and any registry writer fix with its test row; hub: `scripts/lib/config_form_exceptions_test_support.py` and `scripts/lib/test_config_form.py` (`test` messages this slot for each row to remove)
 - `test` opens as impl — `config/build_steps.conf`, `config/console.conf`, `config/statusline.conf`, `config/build_targets.conf`, `config/stall_watch.conf`, `config/aws_target.conf`, `config/mac_linux.conf`, `config/memory_feed.conf`, `config/production.conf`
 
@@ -471,6 +478,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `test_config_form.py` passes, and `COMMENT_LIMIT_FILES` is gone.
 - `git diff -U0 -- config/` shows only added comment and blank lines.
 - A script checks each stored value of each changed stem against its limit line, host overrides included, with Git recovery off. (`check_comment_limits` checks only that a limit line exists, and a `conf.read` with recovery can return an older value.) `config/models.conf` is checked by section through the model registry reader. The proof also covers the four Phase 10 keys: `head_stall.times_tail_bytes`, `disk.min_outside_directory_bytes`, `report.edited_crate_max_crates`, `nextest.summary_scan_bytes`; and the five Phase 11 keys: `context_usage` `transcript.tail_bytes`, `notify` `pushover.max_source_chars`, `waste_watch` `alert.max_wait_share`, `codex_pacer` `sampling.max_step_percent`, `mac_linux` `ssh.connect_attempts`.
+- This phase adds no `.conf` keys. The named fixture tests prove each path, format or runtime state change. The director reads each `CONF_DIR` fixture of each changed reader, shell and subprocess fixtures included.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file; `bash -n` passes on each changed shell file.
 
@@ -585,10 +593,10 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 4. Values stay the same.
 5. Remove the moved rows from the allow list. `external` and `internal` rows stay.
 6. **the_list.conf.** Insert one blank line before each comment line that directly follows a key row in `config/the_list.conf`. Change nothing else. Before the row goes, run the item 229 writer (`listadd`, `scripts/production/the_list.py`) on a fixture copy and run `check_blank_lines` on its output. If the writer breaks the form, fix the writer and add a test row that runs it and then `check_blank_lines`. Remove its row from the blank-line allow list. Remove the absent-file case for `config/the_list.conf` from the stale-row loop of `test_repository_form` in `scripts/lib/test_config_form.py`.
-7. Tests that patched a constant now write the key in a `CONF_DIR` fixture. No test reads the live value of a moved key; each test writes its own fixture config.
+7. Tests that patched a constant now write the key in a `CONF_DIR` fixture. No test reads the live value of a moved key; each test writes its own fixture config. Before edits, list each `CONF_DIR` fixture that reaches a moved reader: the gate suite helper (`gate_suites_test_support.py`), the worker and shutdown CLI fixtures (`test_worker.py`), the direct progress fixtures (`test_progress_history.py`), and both guest route fixtures.
 8. **Unused reader.** Before the literal moves, after the main merge of item 0: confirm that `scripts/agents/inventory.py` `last_tool_call()` still has no caller. Then remove it, its `_LAST_STEP_BYTES` constant and its inventory row. Do not add `production.inventory.last_step_scan_bytes`.
 9. **Bounds.** Give the `scripts/production/gate.py` `RERUN_LIMIT` key the lower bound 0, and keep the shipped value 8: `test_gate_holds.py` sets it to zero to prove hold recovery with ordinary reruns off; keep that fixture. Bound `worker.history_bytes` (`scripts/production/worker.py` `WORKER_HISTORY_BYTES`) so that `read(limit + 1)` stays in range. Give the nightly diagnostic and board note slices explicit upper bounds.
-   - **Unusable limits.** `gate.py` uses the rerun limit after modules report results, and the nightly text is cut after the red result is saved. Read the rerun limit once when the gate starts, before any module runs. Ordinary reruns, memory retries and hold recovery use that one value. An unusable rerun limit stops the gate start with the diagnostic, and no module runs. An unusable nightly display limit never changes the saved red result or its assignment path; the note then shows the diagnostic in place of the cut text. Tests: an unusable rerun limit runs no module; an unusable nightly display limit keeps the red result and its assignment.
+   - **Unusable limits.** `gate.py` uses the rerun limit after modules report results, and the nightly text is cut after the red result is saved. Read the rerun limit once when the gate starts, before any module runs. Only ordinary reruns use the rerun limit. Memory retries keep their own `gate.conf` count, and hold recovery stays independent of both. Test each with the rerun limit set to 0. An unusable rerun limit stops the gate start with the diagnostic, and no module runs. An unusable nightly display limit never changes the saved red result or its assignment path; the note then shows the diagnostic in place of the cut text. Tests: an unusable rerun limit runs no module; an unusable nightly display limit keeps the red result and its assignment.
 10. **Guests.** Selected suites reach the rerun policy in the Mac Linux and AWS guest gates. Prove with a test that each guest gate route reads the candidate's `gate.conf`. The tests go in `scripts/build_targets/test_mac_linux.py` and `scripts/aws_target/test_cloud_gate.py`.
 11. **References.** Search `docs/` and `scripts/` for each moved name and each changed function. Update current docs, fixtures and test spies. Run every test module with a changed reference.
 
@@ -660,23 +668,25 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `scripts/accounts/accounts.py`, `scripts/accounts/worker_names.py` — the new paths; their tests also change
 - `scripts/accounts/role_map.py`, `scripts/accounts/test_role_map.py` — the path resolved inside the locks, and the race tests
 - `scripts/whoami/quota_alert_test_support.py`, `scripts/agents/codex_test_support.py`
+- `scripts/agents/test_agent_exec.py`, `scripts/agents/test_worker_lifecycle.py`, `scripts/direct/test_assign_claude.py` — account state fixtures; keep an old-path fixture for the migration test
 - `.gitignore`
 - `scripts/lib/test_config_form.py`, `scripts/lib/config_form_exceptions_test_support.py`
 - `docs/accounts.md`, `docs/as-built/accounts.md` — the new state paths
 
 **Workers:** 2 writers — the account state switch and the format rule.
-- `impl` — `accounts.json` and `accounts.lock`: `scripts/accounts/` files (with `role_map.py`), the test support files, `.gitignore`, `docs/accounts.md`, `docs/as-built/accounts.md`
+- `impl` — `accounts.json` and `accounts.lock`: `scripts/accounts/` files (with `role_map.py`), the test support files, the account state fixtures in `scripts/agents/test_agent_exec.py`, `scripts/agents/test_worker_lifecycle.py` and `scripts/direct/test_assign_claude.py`, `.gitignore`, `docs/accounts.md`, `docs/as-built/accounts.md`
 - `test` opens as impl — the untracked runtime file rule and its fixture checkout in `scripts/lib/test_config_form.py`; hub: `scripts/lib/config_form_exceptions_test_support.py` (`impl` messages this slot for a row)
 
 **State:** moves `accounts.json` and `accounts.lock` on natedev and the Mac; deletes a stale `config/showrunners.lock`.
 
 **Constraints from prior phases:**
-- Phase 7 moves `config/accounts.toml` `[trust] folders` to `config/accounts.conf` `trust.folders`. Phase 7 waits for nate's go, and this phase does not depend on it. If Phase 7 is not done when this phase starts, `trust.folders` is still in `config/accounts.toml`. If both phases run at the same time, they share `scripts/accounts/accounts.py`: the director gives that file to one phase at a time.
+- Phase 7 moves `config/accounts.toml` `[trust] folders` to `config/accounts.conf` `trust.folders`. Phase 7 has nate's go (11-24) and waits for Phases 1 and 2 and item 229 on main; this phase does not depend on it. If Phase 7 is not done when this phase starts, `trust.folders` is still in `config/accounts.toml`. If both phases run at the same time, they share `scripts/accounts/accounts.py`: the director gives that file to one phase at a time.
 - Phase 1 format check reads tracked files only; Spec item 5 adds the untracked runtime file case. `check_format(root, files)` judges only the paths it gets, and `test_repository_form` passes `git ls-files -z config/`. The untracked case needs its own file list from the `config/` folder on disk, and its own planted row in `test_planted_violations`.
 
 **Acceptance gate:**
 - The account tests pass, including the switch tests of Spec item 3.
 - `test_config_form.py` passes, and the fixture checkout with untracked `config/x.json` and `config/x.lock` fails the format check twice.
+- This phase adds no `.conf` keys. The named fixture tests prove each path, format or runtime state change. The director reads each `CONF_DIR` fixture of each changed reader, shell and subprocess fixtures included.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file.
 - The live check of Spec item 6 passes on both machines.
@@ -702,11 +712,12 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 **Files:**
 - `config/context_deferral.conf`, `config/context_deferral_patterns.txt` — new data file
 - `scripts/hooks/stop-context-deferral.py`, `scripts/hooks/test_stop_context_deferral.py`
+- `scripts/hooks/test_hook_dispatch.py` — writes `context_deferral.conf` and copies `context_deferral_patterns.txt` into `CONF_DIR`; keeps the exit 2 dispatch assertion and its diagnostic
 - `scripts/lib/config_form_exceptions_test_support.py`, `config/README.md`
 
 **Workers:** 1 writer + 1 tester — the hook and its data are one change.
 - `impl` — `config/context_deferral.conf`, `config/context_deferral_patterns.txt`, `scripts/hooks/stop-context-deferral.py`, `config/README.md`; hub: `scripts/lib/config_form_exceptions_test_support.py`
-- `test` — `scripts/hooks/test_stop_context_deferral.py`: the fixture form and the before-and-after decision rows
+- `test` — `scripts/hooks/test_stop_context_deferral.py`: the fixture form and the before-and-after decision rows; `scripts/hooks/test_hook_dispatch.py`: both files in `CONF_DIR`
 
 **State:** none
 
@@ -718,6 +729,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 **Acceptance gate:**
 - The hook tests pass, and the same transcripts give the same decisions.
 - `test_config_form.py` passes with the `FORMAT_FILES` row removed.
+- `scripts/production/fixture_conf_keys.py --repo <worktree> --base <phase start> --tip <candidate commit>` reports 0 missing keys. It does not check dotted keys, so the director also reads each `CONF_DIR` fixture of each changed reader, shell and subprocess fixtures included.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file.
 
@@ -806,53 +818,28 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 **Ruled out:** a home folder check for outside paths: every stem read already calls `directory()`, and no process without a home folder reads config by path.
 
 ### Phase 20 — Tests follow the config moves  · status: done
-**Depends on:** Phase 4, Phase 11, Phase 12, Phase 19
 
-#### Work Order
+#### As-built
 
-**Goal:** Every test that the config moves of this branch broke passes again, so the branch joined with main passes the queued `gate.py --affected` run on natedev and mac-linux.
-
-**Spec:**
-
-1. **The failure.** The queued run on `26c407572c` (main `823c4639bd`) ran on mac-linux and failed 226 tests in 26 modules. The same tests fail on natedev at this branch. The ones that run from the main checkout pass on main. No earlier run of this branch finished after Phase 4, so the reds collected over Phases 4, 11, 12 and 19. The failing test ids are in the run folder: `phases/20/impl_failing_tests.txt` and `phases/20/test_failing_tests.txt`. The log is `phases/20/gate_red_26c407572c.txt`.
-2. **Causes seen in the log.** Each worker confirms the cause of each test before it edits.
-   - A fixture sets `CONF_DIR` and does not write `user_zone.conf`. Since Phase 4, `user_zone` reads `conf.read("user_zone")` with no default, so the read raises `conf.Unusable`, or runs Git under a test that patches `subprocess.run` (`AssertionError: no real process`).
-   - A test patches `user_zone.CONF`, which Phase 4 removed (`lib/test_zone`, `review_links/test_review_page`, `production/test_unit_phases`).
-   - A fixture under `CONF_DIR` lacks a file or key that a moved literal now reads: `notify.conf` `REVIEW_TIMEOUT_SECONDS`, `stall_watch.conf` `sender_batch_seconds`, `review_links.conf` `new_item.max_total_image_bytes`.
-   - `accounts/test_refusal_watch` `test_whole_read_observer_keeps_the_actual_configuration_file` expects a path read to keep a `ConfigRead.file` that differs from the stem read. Since Phase 19 a path in the live folder reads as its stem.
-   - `notify/test_push_texts_sources` flags lines 284 and 288 of `scripts/lib/config_form_exceptions.py`: the source path `scripts/notify/pushover.py` of two `ExternalLiteral` rows ends in `notify/pushover.py`, and the scan reads that as a phone send. Only `scripts/lib/test_config_form.py` imports the module.
-   - Other reds may follow from the ones above: a missing read-trace `reads` file, a status line that shows its fallback line, a missing `Sent` header, a page without its owner. Fix the first cause, then run the test again.
-3. **The fix goes where the defect is.**
-   - A fixture that sets `CONF_DIR` writes each config file that the code under test reads, with `write_config_fixture` (`scripts/lint/memory_test_support.py`). It merges the repository template, so the values match the repository. Where a module has one shared fixture helper, change that helper once.
-   - A test that needs only a fixed zone can pin `USER_ZONE` in place of a `user_zone.conf` fixture. A test of the zone file reads a `user_zone.conf` fixture under `CONF_DIR`.
-   - A test that patched `user_zone.CONF` uses `CONF_DIR` with a `user_zone.conf` fixture.
-   - The observer test reads its path case from a `.conf` copy outside the live folder, so the path read keeps its own `ConfigRead.file`. Its assertions do not change.
-   - `scripts/lib/config_form_exceptions.py` is test-only data, so it takes the test-helper name `scripts/lib/config_form_exceptions_test_support.py`, and `is_test_code` skips it in production scans. Its rows do not change. Building the path to hide it from the scan is ruled out.
-   - Do not add a default value in code (P807 rule 7). Do not change a config value or key name. Do not change `conf.py` rules; a change to production code needs a defect in that code, stated in the summary.
-4. **Base reds.** A test that still fails after its cause is fixed, and that also fails on main, is a base red. Prove it on main in a numbered copy (`build_slots.py run --commit origin/main`), report it, and do not fix it.
+- Each test that sets `CONF_DIR` writes each config file and key that the code under test reads, with `write_config_fixture` (`scripts/lint/memory_test_support.py`). A test that needs only a fixed zone pins `USER_ZONE`. The 226 tests in 26 modules that the config moves broke pass again.
+- `review_items.question_counts` watches `conf.path('user_zone')` as the zone file source of the question count cache.
+- The typed allow lists of the config form test live in `scripts/lib/config_form_exceptions_test_support.py`, so `is_test_code` skips them in production scans. The rows are unchanged.
+- The observer test in `scripts/accounts/test_refusal_watch.py` reads its path case from a `.conf` copy outside the live folder, so the path read keeps its own `ConfigRead.file`.
+- The stall-watch grace tests remove only `prompt_grace_seconds` from the `stall_watch.conf` fixture. The sender keys stay in the fixture.
 
 **Files:**
-- `scripts/accounts/test_new_account.py`, `scripts/accounts/test_refusal_watch.py`, `scripts/agents/test_account_move.py`, `scripts/agents/test_reboot.py`, `scripts/agents/test_shutdown.py`, `scripts/build_queue/test_mac_run.py`, `scripts/disks/test_disks_page.py`, `scripts/lib/test_zone.py`, `scripts/production/test_change_routing.py`, `scripts/production/test_footer_counts.py`, `scripts/production/test_unit_phases.py`, `scripts/review_links/test_accounts_page.py`, `scripts/review_links/test_review_page.py`, `scripts/shot_report/test_transcripts.py`, `scripts/statusline/test_statusline.py`, `scripts/whoami/test_agent_notes.py` — the `impl` test modules
-- `scripts/message/test_send.py`, `scripts/message/test_repeat_guard.py`, `scripts/notify/test_push_texts_sources.py`, `scripts/production/test_stall_watch.py`, `scripts/production/test_update_registration_questions.py`, `scripts/review_links/test_page_frame.py`, `scripts/review_links/test_serve.py`, `scripts/mac_test/test_linux_runner.py`, `scripts/buildlog/test_machine_watch.py`, `scripts/buildlog/test_target_sync.py` — the `test` test modules
-- `scripts/lib/config_form_exceptions_test_support.py` — renamed from `scripts/lib/config_form_exceptions.py`; rows unchanged
-- `scripts/lib/test_config_form.py` — the import of the renamed module
-- `scripts/accounts/home_test_support.py`, `scripts/lint/memory_test_support.py` — shared fixture helpers, when a cause is in them; each worker names every other fixture helper it changes in its summary
+- `scripts/review_links/review_items.py` — the zone file source of the question count cache
+- `scripts/lib/config_form_exceptions_test_support.py` — the typed allow lists of the form test (test data)
+- `scripts/accounts/home_test_support.py`, `scripts/review_links/browser_test_support.py` — shared fixtures that write `user_zone.conf` and `review_links.conf`
+- `scripts/production/test_unit_phases.py` — `test_unit_count_cache_filters_sources_and_retries_failed_reads` checks that the cache watches the configured zone file
+- the other repaired test modules — fixtures and read-log checks
 
-**Workers:** 2 writers — split by failing test module.
-- `impl` — the `impl` test modules; hub: each fixture helper that modules of both lists use (for example `scripts/accounts/home_test_support.py`, `scripts/lint/memory_test_support.py`), and any production file
-- `test` opens as impl — the `test` test modules, `scripts/lib/config_form_exceptions_test_support.py` and the import line in `scripts/lib/test_config_form.py`
+**Binds later work:** Each config move adds the moved file or key to each `CONF_DIR` fixture that reads it. `fixture_conf_keys.py` skips dotted keys, so the director reads each `CONF_DIR` fixture of a dotted-key move.
 
-**State:** none
+**Gotchas:**
+- With `CONF_DIR` set, the repository is off. A missing fixture file or key raises `conf.Unusable`, or runs Git under a test that patches `subprocess.run`.
+- `conf.read` reads with `Path.read_text` and records the stem through `conf.path`. A read log uses `conf_reads.record_reads`, not a spy on `conf_reads.read_text`. `conf_reads.record_reads` takes priority over `CONF_READ_LOG`.
 
-**Constraints from prior phases:**
-- Phase 4: `user_zone.configured_zone_name(path="user_zone")` reads `conf.read(path).value("zone", ...)` at use; `USER_ZONE` in the environment wins. `USER_ZONE_CONF`, `STALL_WATCH_CONFIG` and `SEND_REPEAT_CONFIG` do not exist. Tests set `CONF_DIR`.
-- Phase 11: tests write `notify.conf` fixtures with `write_config_fixture` under `CONF_DIR`.
-- Phase 19: `conf.read` of a `.conf` path in the live folder recovers like a read of its stem, and `ConfigRead.file` is the stem. A path outside the live folder keeps its path.
-- With `CONF_DIR` set, the repository is off: a missing fixture file or key raises `conf.Unusable` after the Git recovery finds nothing.
-- Showrunner rule 13: the unit keeps one waiting queued run, and the director owns it. Workers start no queued run.
-
-**Acceptance gate:**
-- Each test id in both lists passes on natedev when run by name (`./scripts/lib/py -m unittest <id> [<id> ...]`), except a proved base red.
-- basedpyright reports zero errors and zero warnings on each changed Python file.
-- `fixture_conf_keys.py --repo <worktree> --base origin/main --tip <checkpoint>` reports 0 missing.
-- The queued `gate.py --affected` run on the checkpoint passes on natedev and mac-linux, except a red that also fails on the base commit.
+**Ruled out:**
+- A stall-watch fallback for absent sender limits: the packaged fallback on main read the same live file, so main sent no alert either.
+- A built path that hides the pushover rows from the phone-send scan: the module took the test-helper name.
