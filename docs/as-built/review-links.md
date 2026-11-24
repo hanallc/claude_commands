@@ -2288,7 +2288,8 @@ The server requires `completion_after_slice_cleanup` to offer or accept Kill.
 The supervisor sets that field when it publishes its process identity.
 A finished or missing record on that read gives **Run already ended**.
 The server saves accepted requests under `.review-link-build-kill` in its private state.
-If the supervisor exits before it records completion, the server recovers only the selected run after its slice is empty.
+If the saved supervisor process has ended and the slice is empty, the server can finish the selected record.
+The server leaves pane completion and run file cleanup to their normal handlers.
 The server saves **Stopped** when the record confirms the stop and the saved slice is empty.
 It then sends the keyed notice.
 A change in the detached record identity ends recovery with **Stop unconfirmed**.

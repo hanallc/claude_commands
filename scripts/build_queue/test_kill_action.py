@@ -3,19 +3,22 @@ from __future__ import annotations
 
 from argparse import Namespace
 from collections.abc import Callable
-from contextlib import nullcontext
-from dataclasses import replace
+from contextlib import nullcontext, redirect_stdout
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 import fcntl
+from io import StringIO
 import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 from typing import IO, cast, override
 import unittest
 from unittest.mock import ANY, patch
@@ -26,7 +29,9 @@ from scripts.build_queue import admission_client, admission_records as records, 
 from scripts.build_queue.admission_jobs import VerifyCall
 from scripts.build_queue.test_memory_feed import reservation_reading
 from scripts.buildlog import store
-from scripts.lib import atomic_file, process_start, process_stop
+from scripts.direct import progress_history
+from scripts.herdr import turn_end, worker_panes
+from scripts.lib import atomic_file, process_start, process_stop, scratch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import write_config_fixture
@@ -41,27 +46,51 @@ class KillActionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
 
+    def launch_record(self, caller: detached_runs.Caller, command: list[str],
+                      launch_supervisor: Callable[[list[str], IO[bytes]], object]) -> Path:
+        runs = self.root / detached_runs.DETACHED_RUNS_DIR
+        before = set(runs.glob("*.json"))
+        _ = (self.root / "detached_runs.conf").write_text("# whole: 1..10\nLIVE_RUN_LIMIT=2\n")
+        popen = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
+
+        def launch(argv: list[str], **options: object) -> object:
+            if len(argv) == 4 and Path(argv[1]).name == "detached_runs.py" and argv[2] == "supervise":
+                return launch_supervisor(argv, cast(IO[bytes], options["stdout"]))
+            return popen(argv, **options)
+
+        with (patch.object(detached_runs, "caller_from_environment", return_value=caller),
+              patch.object(subprocess, "Popen", side_effect=launch),
+              patch.dict(os.environ, {"CONF_DIR": str(self.root)}),
+              redirect_stdout(StringIO())):
+            self.assertEqual(detached_runs.command_start(Namespace(
+                session_dir=str(self.root), command=command, kind=detached_runs.DetachedRunKind.OTHER)), 0)
+        (path,) = set(runs.glob("*.json")) - before
+        return path
+
     def detached_target(self, *, name: str = "impl3", role: str = "worker",
-                        step: str = "check") -> kill_action.KillTarget:
-        record = self.root / "detached_runs" / "fixture.json"
-        record.parent.mkdir()
+                        step: str = "check", published: bool = True) -> kill_action.KillTarget:
+        recipient = staff.StaffId("fixture")
+        supervisor = os.getpid()
+        started = process_start.process_start(supervisor)
+        assert isinstance(started, process_start.Started)
+        with patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())):
+            record = self.launch_record(detached_runs.DirectorCaller(name, recipient), ["cargo", step],
+                                        lambda _argv, _log: SimpleNamespace(pid=supervisor))
         run_slice: process_stop.RunSliceIdentity = {"unit": "builds-detached-fixture.slice", "device": 1, "inode": 2,
             "path": "/user.slice/builds.slice/builds-detached.slice/builds-detached-fixture.slice"}
-        route = kill_action.DetachedCommand(record, 17, "123", 16, "122", run_slice)
+        route = kill_action.DetachedCommand(record, 17, "123", supervisor, started.start, run_slice)
         run = kill_action.KillCandidate(17, "123", 17, "123", "session", step, "at")
-        target = kill_action.KillTarget(run, route, staff.StaffId("fixture"), f"{name}, {role}", name, role)
-        self.write_run(target)
+        target = kill_action.KillTarget(run, route, recipient, f"{name}, {role}", name, role)
+        if published:
+            self.write_run(target)
         return target
 
     def write_run(self, target: kill_action.KillTarget, **fields: object) -> None:
         route = target.route
-        _ = route.record.write_text(json.dumps({
-            "run_id": route.record.stem, "status": "running", "staff_id": target.recipient,
-            "command_slice": route.run_slice, "completion_after_slice_cleanup": True,
-            "session_dir": str(self.root), "worker": target.recipient_name,
-            "label": "fixture", "command": ["cargo", "check"], "log": str(route.record.with_suffix(".log")),
-            "started_at": 10, "pid": route.supervisor, "director_dir": "", "done_message_file": "", **fields,
-        }))
+        record = worker_lifecycle.read_json_object(route.record)
+        record.update({"command_slice": route.run_slice, "completion_after_slice_cleanup": True,
+                       "supervisor_started": route.supervisor_start, **fields})
+        _ = route.record.write_text(json.dumps(record))
 
     def finish_run(self, target: kill_action.KillTarget, **fields: object) -> None:
         path = target.route.record
@@ -170,9 +199,10 @@ class KillActionTests(unittest.TestCase):
             self.assertIsInstance(kill_action.stop_route(target.candidate, target.recipient, {}), kill_action.NoStopRoute)
         detached.assert_not_called()
 
-    def scoped_target(self) -> tuple[kill_action.KillTarget, dict[int, memory_admit.ProcessIdentity], Path]:
+    def scoped_target(self, *, published: bool = True,
+                      ) -> tuple[kill_action.KillTarget, dict[int, memory_admit.ProcessIdentity], Path]:
         """Match a verified detached command to a step scope in its run slice."""
-        target = self.detached_target()
+        target = self.detached_target(published=False)
         proc = self.root / "proc"
         cgroups = self.root / "cgroups"
         route = target.route
@@ -193,8 +223,8 @@ class KillActionTests(unittest.TestCase):
         run_slice: process_stop.RunSliceIdentity = {**route.run_slice, "device": identity.st_dev, "inode": identity.st_ino}
         route = replace(route, run_slice=run_slice)
         target = replace(target, candidate=run, route=route)
-        self.write_run(target, command_pid=route.group, command_group=route.group, command_started=route.started,
-                       pid=route.supervisor, supervisor_started=route.supervisor_start, command=["cargo", "check"])
+        if published:
+            self.write_run(target, command_pid=route.group, command_group=route.group, command_started=route.started)
         table = {route.group: memory_admit.ProcessIdentity(route.supervisor, route.started),
                  holder: memory_admit.ProcessIdentity(route.group, run.holder_start)}
         caller = staff.StaffRow(target.recipient, "worker", target.recipient_name, staff.StaffRoot(),
@@ -245,14 +275,10 @@ class KillActionTests(unittest.TestCase):
         send.assert_not_called()
 
     def test_launcher_record_without_a_published_supervisor_has_no_kill_offer(self) -> None:
-        target, _, _ = self.scoped_target()
-        path = target.route.record
-        record = worker_lifecycle.read_json_object(path)
-        for field in ("completion_after_slice_cleanup", "supervisor_started", "command_pid",
-                      "command_group", "command_started", "command_slice"):
-            del record[field]
-        record["pid"] = 0
-        _ = path.write_text(json.dumps(record))
+        target, _, _ = self.scoped_target(published=False)
+        record = worker_lifecycle.read_json_object(target.route.record)
+        self.assertNotIn("supervisor_started", record)
+        self.assertNotIn("completion_after_slice_cleanup", record)
 
         with patch.object(detached_runs, "command_group") as group:
             self.assertEqual(kill_action.KillActions(self.root).options(15), ({}, []))
@@ -285,71 +311,178 @@ class KillActionTests(unittest.TestCase):
         stop.assert_called_once()
         send.assert_called_once()
 
-    def test_recovery_finishes_the_stop_after_supervisor_exit_and_leaves_the_other_run(self) -> None:
-        target, _, member_scope = self.scoped_target()
-        path = target.route.record
-        events = process_stop.CGROUP_ROOT / member_scope.parent.relative_to("/") / "cgroup.events"
+    def launch_live_run(self, caller: detached_runs.Caller) -> tuple[Path, subprocess.Popen[bytes], socket.socket]:
+        listener = self.enterContext(socket.socket())
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(TEST_HANG_GUARD_SECS)
+        port = cast(tuple[str, int], listener.getsockname())[1]
+        command = [sys.executable, "-c", """
+import socket, sys
+with socket.create_connection(("127.0.0.1", int(sys.argv[1]))) as peer:
+    peer.sendall(b"r")
+    peer.recv(1)
+""", str(port)]
+        popen = subprocess.Popen
+        supervisors: list[subprocess.Popen[bytes]] = []
+
+        def supervise(argv: list[str], log: IO[bytes]) -> subprocess.Popen[bytes]:
+            # Keep delivery and the independent pipe watcher outside this fixture.
+            process = popen([sys.executable, "-c", """
+import sys
+from contextlib import nullcontext
+from unittest.mock import patch
+from scripts.agents import detached_runs
+
+with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; shift 2; exec "$@"'),
+      patch.object(detached_runs, "_completion_sources", return_value=nullcontext()),
+      patch.object(detached_runs, "deliver_in_fresh_process", return_value=0),
+      patch.object(detached_runs, "_complete_worker_dispatch", return_value=detached_runs.CompletionReplay.HANDLED)):
+    sys.exit(detached_runs.main(sys.argv[2:]))
+""", *argv[-3:]], stdin=subprocess.DEVNULL, stdout=log,
+                stderr=subprocess.STDOUT, start_new_session=True)
+            supervisors.append(process)
+            self.addCleanup(process.wait, TEST_HANG_GUARD_SECS)
+            self.addCleanup(process.kill)
+            return process
+
+        with patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}):
+            path = self.launch_record(caller, command, supervise)
+        (supervisor,) = supervisors
+        connection = listener.accept()[0]
+        _ = self.enterContext(connection)
+        connection.settimeout(TEST_HANG_GUARD_SECS)
+        self.assertEqual(connection.recv(1), b"r", path.with_suffix(".log").read_text())
+        return path, supervisor, connection
+
+    def live_target(self, path: Path) -> tuple[kill_action.KillTarget, Path]:
+        raw = worker_lifecycle.read_json_object(path)
+        supervisor, started = raw["pid"], raw["supervisor_started"]
+        group, command_started = raw["command_group"], raw["command_started"]
+        assert isinstance(supervisor, int) and isinstance(started, str)
+        assert isinstance(group, int) and isinstance(command_started, str)
+        self.assertEqual(process_start.process_start(supervisor), process_start.Started(started))
+        self.assertIs(raw.get("completion_after_slice_cleanup"), True)
+        unit = "builds-detached-fixture.slice"
+        location = Path("/user.slice/builds.slice/builds-detached.slice") / unit
+        folder = self.root / "cgroups" / location.relative_to("/")
+        folder.mkdir(parents=True)
+        identity = folder.stat()
+        run_slice: process_stop.RunSliceIdentity = {"unit": unit, "device": identity.st_dev, "inode": identity.st_ino,
+                                                    "path": str(location)}
+        with patch.object(process_stop, "command_slice", return_value=run_slice):
+            process_stop.publish_run_slice(path, process_stop.ScopeUnit(unit, "fixture.scope"))
+        events = folder / "cgroup.events"
         _ = events.write_text("populated 1\n")
         _ = write_config_fixture(self.root / "shutdown.conf", "STOP_GRACE_SECONDS=2\nKILL_GRACE_SECONDS=5")
+        route = kill_action.DetachedCommand(path, group, command_started, supervisor, started, run_slice)
+        run = kill_action.KillCandidate(group, command_started, group, command_started, "session", "check", "at")
+        target = kill_action.KillTarget(run, route, staff.StaffId(str(raw["staff_id"])), "impl3, worker", "impl3", "worker")
+        _ = self.enterContext(patch.object(process_stop, "CGROUP_ROOT", self.root / "cgroups"))
+        return target, events
+
+    def unfinished_pass(self, row: staff.StaffRow, parent: staff.StaffRow, instance: str) -> None:
+        reply = self.root / "reply.txt"
+        _ = reply.write_text(f"DONE {instance}\n")
+        completion = progress_history.HookCompletion(turn_end.TurnOutcome.DONE, str(reply), actions_done=True,
+            pane_closed=True, role_released=True, recording_done=True, sender_native_id="codex:fixture")
+        passed = {"status": "completed", "instance_id": instance, "hook_completion": asdict(completion)}
+        snapshot = staff.StaffSnapshot((parent, row))
+        for context in (
+            patch.object(staff, "snapshot", return_value=snapshot),
+            patch.object(staff, "local_snapshot", return_value=snapshot),
+            patch.object(staff, "record_path", return_value=self.root / "staff.json"),
+            patch.object(progress_history, "active_dispatch", return_value=progress_history.ActiveDispatch(instance, ())),
+            patch.object(progress_history, "save_hook_completion"),
+            patch.object(worker_panes, "worker_pass", return_value=passed),
+            patch.object(worker_panes, "worker_run", return_value=self.root),
+            patch.object(worker_panes, "observe_worker", return_value=worker_panes.WorkerNotObserved.CURRENT),
+            patch.object(scratch, "end", return_value=()),
+            patch.object(turn_end, "_prepare_notice", return_value=turn_end.TurnDecision(turn_end.TurnOutcome.DONE,
+                                                                                       lambda: None)),
+            patch.object(turn_end, "_remove_completed_restart"),
+        ):
+            _ = self.enterContext(context)
+
+    def test_recovery_finishes_only_the_selected_record(self) -> None:
+        parent = staff.StaffRow(staff.StaffId("director"), "unit", "director", staff.StaffRoot(),
+                               current_session=staff.StaffId("director-session"))
+        row = staff.StaffRow(staff.StaffId("fixture"), "worker", "impl3", staff.ReportsTo(parent.id),
+                            current_session=staff.StaffId("session"))
+        self.unfinished_pass(row, parent, "fixture-pass")
+        peer, peer_supervisor, peer_connection = self.launch_live_run(
+            detached_runs.DirectorCaller("peer", staff.StaffId("unregistered-peer")))
+        path, supervisor, connection = self.launch_live_run(detached_runs.PaneCaller(str(self.root), row.name, row.id))
+        target, events = self.live_target(path)
+        self.assertEqual(worker_lifecycle.read_json_object(path)["pane_dispatch_id"], "fixture-pass")
+        peer_connection.shutdown(socket.SHUT_WR)
+        self.assertEqual(peer_supervisor.wait(TEST_HANG_GUARD_SECS), 0, peer.with_suffix(".log").read_text())
+        self.assertEqual(worker_lifecycle.read_json_object(peer)["status"], "finished")
+
         actions = kill_action.KillActions(self.root)
         reference = target.candidate.reference
-
-        with (subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE) as peer,
-              patch.object(process_stop, "stop_slice", side_effect=process_stop.SliceStopFailed("fixture slice busy"))
+        with (patch.object(process_stop, "stop_slice", side_effect=process_stop.SliceStopFailed("fixture slice busy"))
                   as stop,
-              patch.object(detached_runs, "_complete_stopped_run", return_value="finished: fixture") as complete,
+              patch.object(kill_action, "live_targets", return_value={reference: target}),
+              patch.object(kill_action, "stop_route", return_value=target.route),
+              patch.object(memory_admit, "process_table", return_value={}),
               patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.SENT) as send):
-            peer_start = process_start.process_start(peer.pid)
-            self.assertIsInstance(peer_start, process_start.Started)
-            other_unit = "builds-detached-other.slice"
-            other_slice = member_scope.parent.with_name(other_unit)
-            other_folder = process_stop.CGROUP_ROOT / other_slice.relative_to("/")
-            other_folder.mkdir()
-            identity = other_folder.stat()
-            _ = (other_folder / "cgroup.events").write_text("populated 1\n")
-            _ = (other_folder / "cgroup.procs").write_text(f"{peer.pid}\n")
-            other_path = path.with_name("other.json")
-            other = replace(target, route=replace(target.route, record=other_path, supervisor=peer.pid,
-                run_slice={"unit": other_unit, "path": str(other_slice), "device": identity.st_dev,
-                           "inode": identity.st_ino}))
-            self.write_run(other, stop_pass_requested=True, stop_reason="fixture peer stop")
-            other_record = other_path.read_bytes()
-            other_log = other_path.with_suffix(".log")
-            _ = other_log.write_text("other run log\n")
-
             offers, _ = actions.options(15)
             _ = actions.stop(reference, offers[reference]["handle"], "")
             self.assertEqual(self.saved_action(target).result["stop"], kill_action.StopState.STOPPING)
             send.assert_not_called()
 
+            supervisor.kill()
+            self.assertEqual(supervisor.wait(TEST_HANG_GUARD_SECS), -signal.SIGKILL)
+            connection.shutdown(socket.SHUT_WR)
+            self.assertEqual(connection.recv(1), b"")
             _ = events.write_text("populated 0\n")
-            with (patch.object(detached_runs, "_run", return_value=143),
-                  patch.object(detached_runs, "_completion_sources", return_value=nullcontext()),
-                  patch.object(detached_runs, "deliver_in_fresh_process", side_effect=InterruptedError("fixture exit")),
-                  self.assertRaises(InterruptedError)):
-                _ = detached_runs.command_supervise(Namespace(record=str(path)))
             record = worker_lifecycle.read_json_object(path)
-            self.assertEqual((record["status"], record["exit_code"]), ("running", 143))
+            self.assertEqual(record["status"], "running")
+            self.assertNotIn("exit_code", record)
             self.assertNotIn("finished_at", record)
-
-            def supervises(pid: int, record: Path) -> bool:
-                return (pid, record) == (peer.pid, other_path)
-
-            with patch.object(detached_run_process, "supervises", side_effect=supervises):
-                result = self.resume()
-            record = worker_lifecycle.read_json_object(path)
-            self.assertEqual((record["status"], record["ended"]), ("finished", "supervisor gone"))
-            self.assertIn("finished_at", record)
+            before = {file.name: file.read_bytes() for file in path.parent.iterdir() if file != path}
+            result = self.resume()
             self.assertEqual((result["stop"], result["delivery"]),
                              (kill_action.StopState.STOPPED, kill_action.DeliveryState.SENT))
-            self.assertEqual(other_path.read_bytes(), other_record)
-            self.assertEqual(other_log.read_text(), "other run log\n")
-            self.assertEqual(process_start.process_start(peer.pid), peer_start)
-            self.assertEqual(set(other_path.parent.glob("other.*")), {other_path, other_log})
+            after = {file.name: file.read_bytes() for file in path.parent.iterdir() if file != path}
+            self.assertIn(peer.name, after, "Kill recovery pruned the other finished record")
+            self.assertEqual(after, before)
+            record = worker_lifecycle.read_json_object(path)
+            self.assertEqual((record["status"], record["exit_code"]), ("finished", 128 + signal.SIGTERM))
+            self.assertIn("finished_at", record)
 
         stop.assert_called_once_with(target.route.run_slice, 2, 5)
-        complete.assert_called_once_with(path, ANY)
         send.assert_called_once()
+        with detached_runs.record_lock(path):
+            record = worker_lifecycle.read_json_object(path)
+            self.assertIs(record.get("completion_pending"), True)
+        self.assertEqual(detached_runs.prune_finished(path.parent), [peer.stem])
+
+    def test_recovery_checks_the_supervisor_start_time_for_the_saved_pid(self) -> None:
+        path, supervisor, connection = self.launch_live_run(
+            detached_runs.DirectorCaller("impl3", staff.StaffId("fixture")))
+        target, events = self.live_target(path)
+        self.save_unfinished_request(target, committed=True)
+        action = self.saved_action(target)
+        _ = events.write_text("populated 0\n")
+        original = path.read_bytes()
+        route = target.route
+
+        detached_runs.finish_stopped_record(path, notice_id=action.id, owner=target.recipient,
+                                            run_slice=route.run_slice)
+        self.assertEqual(path.read_bytes(), original)
+        self.write_run(target, supervisor_started=str(int(route.supervisor_start) - 1))
+        self.assertEqual(process_start.process_start(supervisor.pid), process_start.Started(route.supervisor_start))
+        detached_runs.finish_stopped_record(path, notice_id=action.id, owner=target.recipient,
+                                            run_slice=route.run_slice)
+        record = worker_lifecycle.read_json_object(path)
+        self.assertEqual((record["status"], record["exit_code"]), ("finished", 128 + signal.SIGTERM))
+        self.assertEqual(process_start.process_start(supervisor.pid), process_start.Started(route.supervisor_start))
+        supervisor.kill()
+        self.assertEqual(supervisor.wait(TEST_HANG_GUARD_SECS), -signal.SIGKILL)
+        connection.shutdown(socket.SHUT_WR)
+        self.assertEqual(connection.recv(1), b"")
 
     def test_legacy_verify_rows_do_not_offer_a_step_scope(self) -> None:
         run = kill_action.KillCandidate(17, "123", 16, "122", "session", "check", "at")

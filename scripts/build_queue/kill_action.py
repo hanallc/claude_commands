@@ -527,11 +527,9 @@ class KillActions:
                     retry = True
                 state = detached_run_state(action.route, action.recipient, notice_id=action.id)
                 route = action.route
-                if (isinstance(state, RunningDetachedRun) and state.stop_committed
-                        and not detached_run_process.supervises(route.supervisor, route.record)
-                        and process_stop.slice_has_ended(route.run_slice)):
-                    detached_runs.reap_stopped_orphan(route.record, notice_id=action.id, owner=action.recipient,
-                                                       run_slice=route.run_slice)
+                if isinstance(state, RunningDetachedRun) and state.stop_committed:
+                    detached_runs.finish_stopped_record(route.record, notice_id=action.id, owner=action.recipient,
+                                                        run_slice=route.run_slice)
                     state = detached_run_state(route, action.recipient, notice_id=action.id)
                 if isinstance(state, RunningDetachedRun):
                     if not state.stop_committed and not retry:

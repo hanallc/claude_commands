@@ -2128,8 +2128,9 @@ The helper checks `cgroup.events` for `populated 0` to confirm that the slice is
 The supervisor sets `completion_after_slice_cleanup` when it publishes its process identity.
 It writes the completion stamp after the run slice is empty.
 Without the field, the page shows **Kill is not available for this run yet**.
-If the supervisor exits before it records completion, the server reaps the committed stop after the slice is empty.
-This recovery changes only the selected run.
+After a committed stop, the server can finish the record if the saved supervisor process and run slice have ended.
+The server checks the supervisor PID and start time under the record lock.
+The server writes only the selected record and leaves pane completion to its normal handlers.
 The server confirms the saved slice is empty before it sends the notice.
 If the detached record changes identity, the server saves **Stop unconfirmed**.
 The detached helper keeps the original run record until the server acknowledges its stop notice.

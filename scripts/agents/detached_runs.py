@@ -906,23 +906,38 @@ def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
     return run_ids
 
 
-def reap_stopped_orphan(path: Path, *, notice_id: str, owner: staff.StaffId,
-                        run_slice: process_stop.RunSliceIdentity) -> None:
-    """Finish only the saved stop after its supervisor and slice end."""
-    def matches(record: RunRecord) -> bool:
-        return (bool(notice_id) and record.get("stop_notice_id") == notice_id
-                and record.get("completion_after_slice_cleanup") is True
-                and record.get("stop_pass_requested") is True
-                and record.get("command_slice") == run_slice and record["staff_id"] == owner)
+def finish_stopped_record(path: Path, *, notice_id: str, owner: staff.StaffId,
+                          run_slice: process_stop.RunSliceIdentity) -> None:
+    """Record the stop after the saved supervisor and its run slice end."""
+    try:
+        lock = path.with_suffix(".record.lock").open("r")
+    except FileNotFoundError:
+        return
+    with lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        record = worker_lifecycle.read_json_object(path)
+        if (not _is_run_record(record) or path.stem != record["run_id"] or record["status"] != "running"
+                or not notice_id or record.get("stop_notice_id") != notice_id
+                or record.get("completion_after_slice_cleanup") is not True
+                or record.get("stop_pass_requested") is not True
+                or record.get("command_slice") != run_slice or record["staff_id"] != owner):
+            return
+        started = record.get("supervisor_started")
+        if not started or record["pid"] <= 0:
+            return
+        supervisor = _saved_process(record["pid"], started)
+        if not isinstance(supervisor, (process_start.Gone, process_start.Zombie, SavedProcessIdReused)):
+            return
+        if not process_stop.slice_has_ended(run_slice):
+            return
+        record.update(status="finished", exit_code=128 + signal.SIGTERM,
+                      finished_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                      completion_pending=True)
+        _ = record.pop("slice_cleanup_pending", None)
+        write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
 
-    with (path.parent / ".start.lock").open("a") as admission:
-        fcntl.flock(admission, fcntl.LOCK_EX)
-        result = _reap_orphans_locked(path.parent, only=path, check=matches)
-    result.complete()
 
-
-def _reap_orphans_locked(runs: Path, worker: str = "", *, only: Path | None = None,
-                         check: Callable[[RunRecord], bool] = lambda _record: True) -> OrphanReapResult:
+def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
     """Reap orphan records while the caller holds the runs-folder admission lock."""
     now = time.time()
     records: list[tuple[Path, RunRecord]] = []
@@ -933,9 +948,6 @@ def _reap_orphans_locked(runs: Path, worker: str = "", *, only: Path | None = No
             print(" ".join(str(error).splitlines()), file=sys.stderr)
     result = OrphanReapResult()
     for path, raw in records:
-        # The other records can show a newer run. This request changes only its selected record.
-        if only is not None and (path != only or raw["status"] != "running"):
-            continue
         if worker and raw.get("worker") != worker:
             continue
         if raw["status"] == "finished" and (_needs_completion(raw) or _needs_push_retry(raw)):
@@ -945,7 +957,7 @@ def _reap_orphans_locked(runs: Path, worker: str = "", *, only: Path | None = No
         if raw["status"] != "running":
             continue
         supervisor_alive = raw["pid"] > 0 and detached_run_process.supervises(raw["pid"], path)
-        if only is None and (run_slice := raw.get("command_slice")) and (
+        if (run_slice := raw.get("command_slice")) and (
                 raw.get("stop_pass_requested") or (raw.get("slice_cleanup_pending") and not supervisor_alive)):
             try:
                 _resume_slice_stop(path, run_slice, allow_cleanup=not supervisor_alive)
@@ -959,8 +971,7 @@ def _reap_orphans_locked(runs: Path, worker: str = "", *, only: Path | None = No
                 record = _read_record(path)
                 if _has_saved_cgroup(record) and not scope_lock.enter_context(_scope_stop_lock(path, blocking=False)):
                     continue
-                if (not check(record) or record.get("pending_hold_stop_requests")
-                        or not _orphaned(path, record, now)):
+                if record.get("pending_hold_stop_requests") or not _orphaned(path, record, now):
                     continue
                 record = _recover_staged_pane_stop(path, record)
                 newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
