@@ -647,6 +647,8 @@ placement_once
             gate_copy = Path(self.next_step(gate_process)["cwd"])
             self.assertEqual(gate_copy, self.slot_root / "verify/slot-order/1")
             self.queue.hold_starts()
+            _ = self.queue.run_pass()
+            first_request = len(self.requests)
             first_reply = len(self.replies)
             step = self.start(("bash", verify, "check", "sample", "--local", "fixture"))
             wait_until(lambda: step.poll() is not None or any(memory_pressure_wait(reply)
@@ -657,7 +659,7 @@ placement_once
                 replies = ", ".join(type(reply).__name__ for reply in self.replies[first_reply:])
                 self.fail(f"verify did not wait for memory pressure; replies: {replies}; output: "
                           + "".join(step.communicate(timeout=TEST_HANG_GUARD_SECS)))
-            request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
+            request = next(request for request in self.requests[first_request:] if isinstance(request, wire.PlacementRequest))
             self.assertEqual(list(gate_copy.parent.glob("*.lease.json")), [build_folders.lease_path(gate_copy)])
             self.assertEqual(build_folders.build_folder_state(gate_copy), "held")
             with self.queue.loop_turn():
