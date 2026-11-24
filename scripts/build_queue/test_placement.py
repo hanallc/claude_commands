@@ -2275,6 +2275,26 @@ class PlacementTests(unittest.TestCase):
                 saved = fixture.server.assignments[attempt_key]
                 self.assertEqual(saved.state, placement.ClosedAssignment(MAC_LINUX_NO_ANSWER))
 
+    def test_legacy_guest_no_run_stays_pending_when_registration_is_missing(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            holder = guest_gate(fixture, assignment)
+            granted, = consume_guest_permission(fixture, assignment, holder)
+            assert isinstance(granted, wire.FirstAuthorization), granted
+            fixture.end_owner(holder)
+            _ = (fixture.root / "build_targets.conf").write_text(
+                "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
+            status, = fixture.server.handle_request(wire.ClaimFailure("gate-ended", assignment, MAC_LINUX_NO_ANSWER))
+            assert isinstance(status, wire.DispatchStatus), status
+            self.assertEqual(status.state, placement.CurrentAssignment())
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            report = fixture.server.assignments[key].terminal_report
+            assert isinstance(report, placement.TerminalAttemptReport)
+            self.assertIsInstance(report.path, placement.DispatchPathPending)
+
     def test_guest_execution_outlives_holder_and_arbitrary_refusal_keeps_assignment(self) -> None:
         with PlacementFixture(private_child_starts=True) as fixture:
             request = mac_linux_and_natedev_request(fixture)
@@ -2656,49 +2676,97 @@ class PlacementTests(unittest.TestCase):
             self.assertEqual(reply.state, placement.ClosedAssignment("cancelled"))
             self.assertNotIn(guest.episode, fixture.server.current_assignments)
 
+    def cancel_unindexed_guest_owner(
+        self, fixture: PlacementFixture,
+    ) -> tuple[placement.PlacementAssignment, placement.ProviderClaimReference, placement.HostEvidenceKey]:
+        request = mac_linux_and_natedev_request(fixture, natedev=False)
+        key = publish_candidate(fixture, request).key
+        guest = assignment_for(fixture, request)
+        holder = guest_gate(fixture, guest)
+        authorized, = consume_guest_permission(fixture, guest, holder)
+        assert isinstance(authorized, wire.FirstAuthorization)
+        attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+        state = service.read_state(fixture.state_dir)
+        del state.current_assignments[guest.episode]
+        _ = (fixture.state_dir / "state.json").write_text(wire.encode_record(state))
+        fixture.restart()
+        self.assertIn(attempt, fixture.server.manual_guest_settlement)
+        fixture.end_owner(holder)
+
+        self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+        fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+        timed_out, = fixture.server.handle_request(request)
+        assert isinstance(timed_out, wire.DispatchStatus), timed_out
+        self.assertEqual(timed_out.assignment, guest)
+        self.assertIsInstance(timed_out.retry, placement.DoNotRetry)
+        cancel = wire.CancelPlacement("cancel", request.episode, request.owner, timed_out.reason)
+        self.assertEqual(fixture.server.handle_request(cancel), [wire.Ok()])
+
+        return guest, authorized.claim, key
+
     def test_reused_episode_waits_for_another_coordinators_guest_settlement(self) -> None:
+        for proof_late in (False, True):
+            with (self.subTest(proof_late=proof_late), PlacementFixture(private_child_starts=True) as fixture,
+                  mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+                  mock.patch.object(service, "send_admission_alert", return_value=True)):
+                guest, claim, key = self.cancel_unindexed_guest_owner(fixture)
+                attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+                new_request = replace(mac_linux_and_natedev_request(fixture, natedev=False), episode=guest.episode)
+                wait, = fixture.server.handle_request(new_request)
+                assert isinstance(wait, wire.PlacementWait), wait
+                self.assertEqual(wait.since, new_request.since)
+                self.assertEqual(fixture.server.assignments[attempt].state, placement.CurrentAssignment())
+
+                if proof_late:
+                    fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+                write_guest_no_start_proof(fixture, claim)
+                worker = fixture.server.host_readers[key].worker
+                assert isinstance(worker, ManualEvidenceWorker)
+                self.assertEqual(worker.probe_next(), key)
+                _ = fixture.run_pass()
+                _ = publish_candidate(fixture, new_request)
+                self.assertEqual(fixture.server.assignments[attempt].state, placement.ClosedAssignment("cancelled"))
+                if proof_late:
+                    reply, = fixture.server.handle_request(new_request)
+                    assert isinstance(reply, wire.DispatchStatus), reply
+                    self.assertEqual(reply.retry, placement.DoNotRetry(reply.reason))
+                    self.assertNotIn(new_request.episode, fixture.server.current_assignments)
+                else:
+                    replacement = assignment_for(fixture, new_request)
+                    self.assertEqual(replacement.owner, new_request.owner)
+                    self.assertNotEqual(replacement.attempt, guest.attempt)
+
+    def test_reused_episode_expires_at_its_own_deadline_after_restart(self) -> None:
         with (PlacementFixture(private_child_starts=True) as fixture,
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
               mock.patch.object(service, "send_admission_alert", return_value=True)):
-            request = mac_linux_and_natedev_request(fixture, natedev=False)
-            key = publish_candidate(fixture, request).key
-            guest = assignment_for(fixture, request)
-            holder = guest_gate(fixture, guest)
-            authorized, = consume_guest_permission(fixture, guest, holder)
-            assert isinstance(authorized, wire.FirstAuthorization)
+            guest, _, _ = self.cancel_unindexed_guest_owner(fixture)
             attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+            new_request = replace(mac_linux_and_natedev_request(fixture, natedev=False), episode=guest.episode)
+            limit = memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS
+            fixture.clock.advance(5)
+            self.assertIsInstance(fixture.server.handle_request(new_request)[0], wire.PlacementWait)
             state = service.read_state(fixture.state_dir)
-            del state.current_assignments[guest.episode]
-            _ = (fixture.state_dir / "state.json").write_text(wire.encode_record(state))
+            self.assertEqual(state.guest_settlement_waits[guest.episode].deadline, new_request.since + limit)
             fixture.restart()
-            self.assertIn(attempt, fixture.server.manual_guest_settlement)
-            fixture.end_owner(holder)
-
-            self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
-            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
-            timed_out, = fixture.server.handle_request(request)
+            fixture.clock.advance(limit - 6)
+            self.assertIsInstance(fixture.server.handle_request(new_request)[0], wire.PlacementWait)
+            original = fixture.server.assignments[attempt]
+            fixture.clock.advance(1)
+            timed_out, = fixture.server.handle_request(new_request)
             assert isinstance(timed_out, wire.DispatchStatus), timed_out
-            self.assertEqual(timed_out.assignment, guest)
-            self.assertIsInstance(timed_out.retry, placement.DoNotRetry)
-            cancel = wire.CancelPlacement("cancel", request.episode, request.owner, timed_out.reason)
+            self.assertEqual(timed_out.assignment, placement.UnknownAssignment(guest.episode, ""))
+            self.assertEqual(timed_out.retry, placement.DoNotRetry(timed_out.reason))
+            self.assertIn(guest.attempt, timed_out.reason)
+            self.assertIn(f"within {limit} seconds", timed_out.reason)
+            self.assertEqual(fixture.server.assignments[attempt], original)
+            self.assertEqual(original.state, placement.CurrentAssignment())
+
+            cancel = wire.CancelPlacement("cancel-new", new_request.episode, new_request.owner, timed_out.reason)
             self.assertEqual(fixture.server.handle_request(cancel), [wire.Ok()])
-
-            new_request = replace(mac_linux_and_natedev_request(fixture, natedev=False), episode=request.episode)
-            wait, = fixture.server.handle_request(new_request)
-            assert isinstance(wait, wire.PlacementWait), wait
-            self.assertEqual(wait.since, new_request.since)
-            self.assertEqual(fixture.server.assignments[attempt].state, placement.CurrentAssignment())
-
-            write_guest_no_start_proof(fixture, authorized.claim)
-            worker = fixture.server.host_readers[key].worker
-            assert isinstance(worker, ManualEvidenceWorker)
-            self.assertEqual(worker.probe_next(), key)
-            _ = fixture.run_pass()
-            _ = publish_candidate(fixture, new_request)
-            replacement = assignment_for(fixture, new_request)
-            self.assertEqual(replacement.owner, new_request.owner)
-            self.assertNotEqual(replacement.attempt, guest.attempt)
-            self.assertEqual(fixture.server.assignments[attempt].state, placement.ClosedAssignment("cancelled"))
+            next_request = replace(mac_linux_and_natedev_request(fixture, natedev=False), episode=guest.episode)
+            self.assertIsInstance(fixture.server.handle_request(next_request)[0], wire.PlacementWait)
+            self.assertEqual(fixture.server.assignments[attempt], original)
 
     def test_guest_in_a_different_state_dir_waits_for_proof_after_both_holders_exit(self) -> None:
         with (PlacementFixture(private_child_starts=True) as fixture,

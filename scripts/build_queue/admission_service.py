@@ -860,6 +860,14 @@ class VerifyRunSlot:
 
 
 @dataclass(frozen=True)
+class GuestSettlementWait:
+    """Keep the submission's deadline and the attempt that holds its slot."""
+    attempt: str
+    deadline: float
+    limit: int | None
+
+
+@dataclass(frozen=True)
 class ServiceState:
     reservations: dict[str, ReservationRecord]
     places: dict[str, WaiterPlace]
@@ -877,6 +885,7 @@ class ServiceState:
     pending_cloud_groups: dict[str, PendingCloudGroup] = field(default_factory=dict)
     queue_pins: QueuePins = ()
     verify_run_slots: dict[str, VerifyRunSlot] = field(default_factory=dict, kw_only=True)
+    guest_settlement_waits: dict[str, GuestSettlementWait] = field(default_factory=dict, kw_only=True)
 
 
 def saved_verify_run_slots(state: ServiceState) -> dict[str, VerifyRunSlot]:
@@ -1632,6 +1641,20 @@ def _placement_history_applies(saved: records.SavedPlacementAssignment, request:
                  or assignment.owner == request.owner and assignment.since == request.since))
 
 
+def _guest_wait_limit() -> int | None:
+    try:
+        with conf.report_key_changes():
+            return target_config.unreachable_wait_seconds(_provider_configuration().read("build_targets"))
+    except (OSError, conf.Unusable):
+        return None
+
+
+def _guest_wait_timeout(attempt: str, limit: int | None) -> str:
+    if limit is None:
+        return f"The Mac Linux wait limit is unavailable for attempt {attempt}."
+    return f"Mac Linux did not confirm the end of attempt {attempt} within {limit} seconds."
+
+
 def _holds_consumed_guest_slot(saved: records.SavedPlacementAssignment) -> bool:
     # A consumed guest holds the slot until the service records closure.
     return (isinstance(saved.state, placement.CurrentAssignment)
@@ -1874,6 +1897,7 @@ class AdmissionServer:
         self.build_history_generation: int = 0
         self.ledger: ReplayLedger = ReplayLedger({})
         self.placement_requests: dict[str, wire.PlacementRequest] = {}
+        self.guest_settlement_waits: dict[str, GuestSettlementWait] = {}
         self.pending_coordinators: dict[placement.SubmittingOwner, PendingCoordinatorEvidence] = {}
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
         self.current_assignments: dict[str, str] = {}
@@ -2022,6 +2046,8 @@ class AdmissionServer:
             self.placement_requests = {
                 key: replace(request, identity=self._named_identity(self._placement_identity(request), members=members))
                 for key, request in state.placement_requests.items()}
+            self.guest_settlement_waits = {episode: wait for episode, wait in state.guest_settlement_waits.items()
+                                           if episode in self.placement_requests}
             self.assignments = state.assignments
             self.current_assignments = state.current_assignments
             self.pending_cloud_groups = state.pending_cloud_groups
@@ -2137,7 +2163,8 @@ class AdmissionServer:
         state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.priority,
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
             self.placement_requests, self.assignments, self.current_assignments, self.pending_cloud_groups,
-            queue_pins=self.queue_pins, verify_run_slots=self.verify_run_slots)
+            queue_pins=self.queue_pins, verify_run_slots=self.verify_run_slots,
+            guest_settlement_waits=self.guest_settlement_waits)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         changed = False
 
@@ -4242,6 +4269,7 @@ done
             if (request := self.placement_requests.get(episode)) is not None:
                 self._end_placement_rank(request)
             _ = self.placement_requests.pop(episode, None)
+            _ = self.guest_settlement_waits.pop(episode, None)
             _ = self.prerequisites.pop(episode, None)
             _ = self.placement_eligibility.pop(episode, None)
             self._remove_waiter(self.waiters.get(episode))
@@ -4406,8 +4434,8 @@ done
         destination = saved.assignment.destination
         if destination.provider == "scaler":
             return True
-        guest = is_mac_linux_guest(destination)
-        if destination.provider == 'ssh' and not guest:
+        marked_guest = is_mac_linux_guest(destination) and saved.guest_proof_required
+        if destination.provider == 'ssh' and not marked_guest:
             try:
                 submitted = self.placement_requests.get(saved.assignment.episode)
                 transport = self._ssh_transport(saved)
@@ -4462,7 +4490,7 @@ done
         with conf.report_key_changes():
             try:
                 paths = (claim_state.StatePaths(target_config.ssh_target_state_directory(destination.target),
-                                              destination.target, platform="linux") if guest
+                                              destination.target, platform="linux") if marked_guest
                          else claim_state.state_paths(destination.target))
                 return claim_state.pending_start_exists(paths, identity)
             except (OSError, conf.Unusable):
@@ -4493,8 +4521,31 @@ done
         state = self._assignment_state(saved) if check_lifetime else saved.state
         return wire.DispatchStatus(saved.assignment, state, saved.permission, reason, saved.retry)
 
+    def _save_guest_settlement_wait(self, request: wire.PlacementRequest) -> bool:
+        if request.episode in self.guest_settlement_waits:
+            return False
+        attempt = next((saved.assignment.attempt for saved in self.assignments.values()
+            if saved.assignment.episode == request.episode and _holds_consumed_guest_slot(saved)
+            and (saved.assignment.owner != request.owner or saved.assignment.since != request.since)), None)
+        if attempt is None:
+            return False
+        limit = _guest_wait_limit()
+        deadline = request.since + limit if limit is not None else self.clock.now()
+        self.guest_settlement_waits[request.episode] = GuestSettlementWait(attempt, deadline, limit)
+        return True
+
+    def _expired_guest_settlement_wait(self, request: wire.PlacementRequest) -> GuestSettlementWait | None:
+        wait = self.guest_settlement_waits.get(request.episode)
+        if wait is None or self.clock.now() < wait.deadline:
+            return None
+        submitted = self.placement_requests.get(request.episode)
+        if submitted is not None and submitted.owner == request.owner and submitted.since == request.since:
+            return wait
+        return None
+
     def _placement_waiting(self, request: wire.PlacementRequest) -> bool:
-        if not self._placement_owner_live(request.owner) or request.episode in self.current_assignments:
+        if (not self._placement_owner_live(request.owner) or request.episode in self.current_assignments
+                or self._expired_guest_settlement_wait(request) is not None):
             return False
         return not any(saved.assignment.episode == request.episode
             and (_holds_consumed_guest_slot(saved) or _holds_scaler_slot(saved)
@@ -4768,6 +4819,10 @@ done
 
     def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder
                          ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
+        if (wait := self._expired_guest_settlement_wait(request)) is not None:
+            reason = _guest_wait_timeout(wait.attempt, wait.limit)
+            return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
+                placement.ClosedAssignment(reason), placement.NoLaunchPermission(reason), reason, placement.DoNotRetry(reason))
         diagnostics = tuple(evidence.provider_diagnostic
             for candidate in self.placement_eligibility.get(request.episode, ())
             if candidate.destination.provider != "local" and isinstance(candidate.eligibility, placement.TemporaryExclusion)
@@ -5262,6 +5317,14 @@ done
                     self._end_placement_rank(request)
             del self.current_assignments[assignment.episode]
         self.assignments[key] = replace(saved, state=placement.ClosedAssignment(reason), retry=retry)
+        wait = self.guest_settlement_waits.get(assignment.episode)
+        if wait is not None and wait.attempt == assignment.attempt:
+            remaining = next((other.assignment.attempt for other in self.assignments.values()
+                if other.assignment.episode == assignment.episode and _holds_consumed_guest_slot(other)), None)
+            if remaining is not None:
+                self.guest_settlement_waits[assignment.episode] = replace(wait, attempt=remaining)
+            elif self.clock.now() < wait.deadline:
+                del self.guest_settlement_waits[assignment.episode]
         self.manual_guest_settlement.discard(key)
         _ = self.settlement_host_keys.pop(key, None)
         destination = assignment.destination
@@ -5460,16 +5523,10 @@ done
         if (not isinstance(report, placement.TerminalAttemptReport)
                 or not isinstance(report.outcome, placement.AttemptDeclined | placement.PrelaunchRefused)):
             return saved
-        attempt = saved.assignment.attempt
-        try:
-            with conf.report_key_changes():
-                limit = target_config.unreachable_wait_seconds(_provider_configuration().read("build_targets"))
-        except (OSError, conf.Unusable):
-            reason = f"The Mac Linux wait limit is unavailable for attempt {attempt}."
-        else:
-            if self.clock.now() < report.received_at + limit:
-                return saved
-            reason = f"Mac Linux did not confirm the end of attempt {attempt} within {limit} seconds."
+        limit = _guest_wait_limit()
+        if limit is not None and self.clock.now() < report.received_at + limit:
+            return saved
+        reason = _guest_wait_timeout(saved.assignment.attempt, limit)
         return replace(saved, terminal_report=replace(report, outcome=placement.AttemptCancelled(reason)),
                        retry=placement.DoNotRetry(reason))
 
@@ -5559,6 +5616,7 @@ done
                 elif saved is None:
                     self._end_placement_rank(submitted)
                     _ = self.placement_requests.pop(request.episode, None)
+                    _ = self.guest_settlement_waits.pop(request.episode, None)
                     self._remove_waiter(self.waiters.get(request.episode),
                                         claim_disposition=WaiterClaimDisposition.RETURN)
                 self._prune_host_evidence()
@@ -5594,7 +5652,8 @@ done
                     return [wire.Refused(f"cannot resolve the Cargo folder: {error}")]
                 request = replace(request, constraints=replace(request.constraints, cargo_folder=canonical))
             self._recover_abandoned_attempt(request)
-            if (isinstance(connection, Connection) and previous == request
+            wait_saved = self._save_guest_settlement_wait(request)
+            if (isinstance(connection, Connection) and previous == request and not wait_saved
                     and not isinstance(self.system_reader, NoSystemReader)
                     and self.system_reader.latest.started_monotonic <= self.last_pass_started
                     and isinstance(self.pending_configuration, NoPass) and not self.pass_stale
