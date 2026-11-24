@@ -1909,6 +1909,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         status = job.process.returncode
                     if status is None:
                         continue
+                    if rerunning and not time_limit_report:
+                        hold_seconds_now = hold.waited_s() - initial_hold_seconds if hold is not None else 0.0
+                        if time.monotonic() >= deadline + hold_seconds_now:
+                            # Keep the job for the time limit report below.
+                            break
                     try:
                         result = finish_gate_job(job, status)
                         executions.append(result)
