@@ -8,7 +8,7 @@ lib=${0:A:h}/../lib
 if [[ $1 == cleanup-copy ]]; then
   checkout=$2
   launch=$3
-  if confirmation=$(rm -f -- "$launch" 2>&1 &&
+  if confirmation=$(rm -f -- "${MAC_SMOKE_LAUNCH_TOKEN:?}" "$launch" 2>&1 &&
       "$lib/py" "$lib/../hana_instances/hana_instances.py" stop-checkout "$checkout" 2>&1) &&
      [[ ${confirmation##*$'\n'} == 'hana-instances: checkout clear' ]]; then
     rm -f -- "${COPIES_KEEP_FILE:?}" || exit 4
@@ -27,6 +27,10 @@ if [[ $1 == prepare || $1 == cleanup ]]; then
   shift 2
 fi
 if [[ $callback_mode == cleanup ]]; then
+  if [[ -e $argv_file.state || -h $argv_file.state ]]; then
+    print -u2 -r -- "mac_run: legacy scratch cleanup required for $argv_file.state"
+    exit 4
+  fi
   if [[ -r $argv_file.bundle ]]; then
     bundle=$(< "$argv_file.bundle")
     rm -f -- "$bundle"
@@ -104,9 +108,11 @@ print "HEAD=\$head"
 [[ \$head == $sha ]] || { print "wrong tree: wanted $sha"; exit 5 }
 MACOSX_DEPLOYMENT_TARGET=$deployment_target cargo build -q -p hana || { print 'build failed'; exit 6; }
 # Terminal holds the camera grant. The launch file records the child status.
+# Enter the copy before checking the token so cleanup sees a launcher that passed the check.
 rm -f $status_arg
 printf '#!/bin/zsh\nexport MAC_PLACEMENT=%q\n' "\$MAC_PLACEMENT" > $launch_arg
-printf 'export checkout=%q; cd %q\\n' "\$checkout" "\$checkout" >> $launch_arg
+printf 'export checkout=%q\\ncd -- "\$checkout" || exit 4\\n[[ -f %q ]] || exit 4\\n' \
+  "\$checkout" "\${MAC_SMOKE_LAUNCH_TOKEN:?}" >> $launch_arg
 cat >> $launch_arg <<'HANA_LAUNCH'
 HANA_TEST_PURPOSE=$purpose_arg HANA_TEST_OWNER=$owner_arg BEVY_ASSET_ROOT="\$checkout/crates/hana" BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $hold "\$checkout/target/debug/hana" > $log_arg 2>&1
 echo \$? > $status_arg

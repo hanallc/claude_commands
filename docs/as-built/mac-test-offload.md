@@ -684,7 +684,10 @@ The queue removes its run record and receipt after the callback confirms cleanup
 
 ### The showrunner's Mac build — `scripts/production/mac_run.sh`
 
-It claims the Mac after its reach probe (`mac_test.py claim --pid $$ --what "mac run <sha9>" --worktree $repo --wait 600`), so the claim is the repository's; claim exit 10, 11 or 12 prints the claim's line and exits 9. When the clone already holds the commit, nothing is sent and the clone checks it out. `INT`, `TERM` and `HUP` run `stop_mac_run` (one ssh call that ends the clone's builds and test processes and removes its temp files), release, and exit 128 plus the signal.
+After its reach probe, `mac_run.sh` requests a Mac placement for the repository.
+It sends a bundle if the Mac source lacks the requested commit.
+`copies.py run` holds a numbered copy for the smoke test.
+If SSH input closes during the test, the Mac helper stops the smoke process group and checks the copy.
 
 ### Which packages belong on the Mac — `scripts/mac_test/audit.py`
 
@@ -814,10 +817,11 @@ An empty configured capacity raises `ConfigError`.
 The policy supplies a fallback only when both capacity keys are absent.
 The Mac retains its single slot per repository.
 
-`mac_run.sh` creates its task-owned clone through `copies.py`.
-It preserves both registrations until process exit and scratch cleanup succeed.
-It then removes the Mac registration before the natedev registration.
-Failed clone cleanup retains both registrations.
+The Terminal launcher enters the numbered copy before it checks its per-run token.
+Cleanup removes the token before `stop-checkout` scans the copy.
+The copy stays kept if `stop-checkout` cannot confirm it is clear.
+The queue reads the smoke exit status from SSH.
+Cleanup keeps old scratch recovery records that contain `argv.json.state`.
 
 [Gate checkouts](gate-checkouts.md#remote-mirrors) defines the mirror metadata, lock order, recovery, process scans, registry commands, and probe behavior.
 Candidate leases precede the shared scan, so a process that starts before lease acquisition protects its mirror.

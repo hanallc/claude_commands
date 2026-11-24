@@ -16,6 +16,7 @@ from unittest import mock
 from pathlib import Path
 from typing import ClassVar, TypedDict, cast, final, override
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, FIXTURE_OWNER, copy_helpers
+from scripts.lib import build_folders
 from scripts.lib.git_test_support import fixture_git_environment
 
 from scripts.direct.wait_for_test_state import wait_until
@@ -69,11 +70,10 @@ remote=${@[-1]}
 placed_run=0
 if [[ $command == ssh && $remote == *smoke-work* ]]; then
     outer=("${(@Q)${(z)remote}}")
-    wrapper=${outer[3]}
-    work=${wrapper%'; printf '*}
+    work=${outer[3]}
     printf '%s\0' "$work" >> "$state/placed-commands"
     words=("${(@Q)${(z)work}}")
-    lease=${words[4]}
+    lease=${words[-1]}
     print -r -- "$lease" > "$state/lease-command"
     inner=("${(@Q)${(z)lease}}")
     worker_index=${inner[(Ie)smoke-work]}
@@ -127,24 +127,29 @@ if [[ ${@[-1]} == true ]] && (( ${@[(Ie)-o]} )); then
 fi
 
 if (( placed_run )); then
+    export MAC_SMOKE_COOKIE=${words[2]#MAC_SMOKE_COOKIE=}
     exec "$MAC_RUN_PYTHON" -c '
 import os, sys
 from pathlib import Path
 state = Path(os.environ["MAC_RUN_STUB_STATE"])
 os.setsid()
 print("HEAD=" + os.environ["MAC_RUN_SHA"], flush=True)
+if os.environ.get("MAC_RUN_CHECKOUT_CLEANUP"):
+    os.chdir(os.environ["MAC_RUN_CHECKOUT"])
+    os.execv(sys.executable, [sys.executable, os.environ["MAC_RUN_WORKER"], "smoke-work",
+        "touch \"$MAC_RUN_STUB_STATE/build-started\"; cat \"$MAC_RUN_STUB_STATE/hold-build\"",
+        "exec \"$MAC_RUN_CHECKOUT_CLEANUP\" cleanup-copy \"$1\" \"$MAC_RUN_LAUNCH\""])
 if os.environ.get("MAC_RUN_HOLD_BUILD") == "1":
     (state / "build-started").touch()
     _ = sys.stdin.read()
     (state / "input-closed").touch()
     (state / "cleanup-called").touch()
-    print("mac_exit=1", flush=True)
+    sys.exit(1)
 else:
     (state / "cleanup-called").touch()
-    print("mac_smoke_complete=0", flush=True)
+    print("mac_smoke_complete=" + os.environ["MAC_SMOKE_COOKIE"], flush=True)
     _ = sys.stdin.read()
     (state / "input-closed").touch()
-    print("mac_exit=0", flush=True)
 '
 fi
 if [[ $remote == *'rev-parse --verify HEAD'* ]]; then
@@ -823,33 +828,101 @@ class MacRunTests(unittest.TestCase):
                 self.assertTrue((self.stub_state / "cleanup-called").exists())
                 self.assert_claim_released()
 
-    def test_cleanup_keeps_the_copy_when_checkout_clear_is_unconfirmed(self) -> None:
+    def install_checkout_cleanup(self, stop_command: str) -> Path:
         installed = self.root / "installed"
         library = installed / "lib"
         library.mkdir(parents=True)
-        for name in ("conf.sh", "conf_record.sh"):
-            _ = shutil.copy2(SCRIPT.parents[1] / "lib" / name, library / name)
-        self.write_executable(library / "py", """
+        self.write_executable(library / "py", """\
 if [[ ${1:t} != hana_instances.py || $2 != stop-checkout ]]; then
     print -u2 "expected stop-checkout, got $*"
     exit 92
 fi
-print "hana-instances: a process still uses the checkout"
-""")
+""" + stop_command)
         script = installed / "production/mac_run.sh"
         script.parent.mkdir()
         _ = shutil.copy2(SCRIPT, script)
+        return script
+
+    def test_cleanup_keeps_the_copy_when_checkout_clear_is_unconfirmed(self) -> None:
+        script = self.install_checkout_cleanup('print "hana-instances: a process still uses the checkout"\n')
         keep = self.root / "copy.keep"
         launch = self.root / "launch.command"
+        token = self.repository / "launch-token"
+        token.touch()
         launch.touch()
         result = subprocess.run(
             ["zsh", str(script), "cleanup-copy", str(self.repository), str(launch)],
-            env={**self.environment, "COPIES_KEEP_FILE": str(keep)},
+            env={**self.environment, "COPIES_KEEP_FILE": str(keep), "MAC_SMOKE_LAUNCH_TOKEN": str(token)},
             cwd=self.root, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
         self.assertIn("a process still uses the checkout", keep.read_text())
         self.assertFalse(launch.exists())
+
+    def test_a_launcher_opened_before_cleanup_cannot_start_hana_afterward(self) -> None:
+        launch = self.root / "launch.command"
+        status = self.root / "status"
+        token = self.repository / "launch-token"
+        keep = self.root / "copy.keep"
+        keep.touch()
+        token.touch()
+        self.write_production_config(mac_run_launch=str(launch), mac_run_status=str(status))
+        result = self.mac_run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        remote = next(event["args"][-1] for event in self.events() if event["input"])
+        launch_work = remote.partition("open -a Terminal")[0]
+        self.assertNotEqual(launch_work, remote)
+        self.write_executable(self.bin_directory / "cargo", "exit 0\n")
+        self.write_executable(self.bin_directory / "perl", 'print started > "$HANA_STARTED"\n')
+        started = self.root / "hana-started"
+        environment = {**self.environment, "MAC_SMOKE_LAUNCH_TOKEN": str(token),
+                       "COPIES_KEEP_FILE": str(keep), "HANA_STARTED": str(started)}
+        generated = subprocess.run(["zsh", "-c", launch_work], env=environment, cwd=self.repository,
+                                   capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(generated.returncode, 0, generated.stdout + generated.stderr)
+        opened = launch.read_text()
+        self.assertTrue(opened.startswith("#!/bin/zsh\n"))
+        active = subprocess.run(["zsh", "-c", opened], env=environment, cwd=self.root,
+                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(active.returncode, 0, active.stdout + active.stderr)
+        started.unlink()
+        script = self.install_checkout_cleanup('print "hana-instances: checkout clear"\n')
+        cleared = subprocess.run(["zsh", str(script), "cleanup-copy", str(self.repository), str(launch)],
+                                 env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(cleared.returncode, 0, cleared.stdout + cleared.stderr)
+        resumed = subprocess.run(["zsh", "-c", opened], env=environment, cwd=self.root,
+                                 capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertFalse(started.exists(), resumed.stdout + resumed.stderr)
+        self.assertFalse(launch.exists())
+        self.assertFalse(keep.exists())
+
+    def test_hup_keeps_the_numbered_copy_when_stop_checkout_fails(self) -> None:
+        script = self.install_checkout_cleanup('print "hana-instances: stop failed"\nexit 1\n')
+        build_root = self.root / "build"
+        checkout = build_root / "hana/verify/1"
+        checkout.mkdir(parents=True)
+        keep = build_folders.copy_keep_file(checkout)
+        os.mkfifo(self.stub_state / "hold-build")
+        process = self.start_mac_run(extra={
+            "MAC_RUN_CHECKOUT_CLEANUP": str(script),
+            "MAC_RUN_CHECKOUT": str(checkout),
+            "MAC_RUN_WORKER": str(SCRIPT.parents[1] / "mac_test/mac_queue_run.py"),
+            "MAC_RUN_LAUNCH": str(self.root / "launch.command"),
+            "COPIES_KEEP_FILE": str(keep),
+        })
+        try:
+            self.wait_for_path(self.stub_state / "build-started", process)
+            send_process_group(process.pid, signal.SIGHUP)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        except BaseException:
+            send_process_group(process.pid, signal.SIGKILL)
+            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            raise
+        self.assertEqual(process.returncode, -signal.SIGHUP, output + errors)
+        self.assertIn("stop failed", keep.read_text())
+        with mock.patch.object(build_folders, "build_root", return_value=build_root):
+            self.assertEqual(build_folders.build_folder_state(checkout), "kept")
+        self.assertEqual(list(checkout.glob(".mac-smoke-launch-*")), [])
 
     def test_build_marker_wait_reports_a_failed_child(self) -> None:
         with subprocess.Popen([sys.executable, "-c", "import sys; sys.exit('fixture start failed')"],
