@@ -8,3 +8,4 @@ scripts/aws_target/hana_result.py
 scripts/build_queue/execution_identity.py
 scripts/lib/build_folder_lock.py
 scripts/lib/process_stat.py
+scripts/mac_test/mirror_root.py

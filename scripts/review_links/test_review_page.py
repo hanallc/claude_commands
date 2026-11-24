@@ -2371,12 +2371,26 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   words.value='Keep these words.';words.dispatchEvent(new Event('input',{bubbles:true}));
   words.focus({preventScroll:true});words.setSelectionRange(2,5);
   const currentTop=()=>summary(15).getBoundingClientRect().top;
+  const nextWindowRedraw=()=>new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{observer.disconnect();resolve();});
+   observer.observe(document.querySelector('[data-window-before]'),{childList:true});
+  });
+  const windowRedrawn=nextWindowRedraw();
   scrollBy({top:currentTop()-180,behavior:'instant'});
-  await frame();
+  await windowRedrawn;
   const top=currentTop(),scrolled=scrollY,heightAbove=summary(14).getBoundingClientRect().height;
   const heightOpen=row(15).getBoundingClientRect().height;
   check(scrolled>0 && summary(14).getBoundingClientRect().top<top && top>0 && top<innerHeight,
    'The open row is below the top and below the changed row.');
+  // Delay the version response until the next virtual table redraw.
+  const redrawBeforeVersion=nextWindowRedraw(),snapshotFetch=window.fetch;
+  window.fetch=async(url,options)=>{
+   if(new URL(url,location.href).searchParams.get('version')==='1'){
+    window.fetch=snapshotFetch;
+    await redrawBeforeVersion;
+   }
+   return snapshotFetch(url,options);
+  };
   refresh();
   await until(()=>recordDetails(row(15))?.textContent.includes('The refreshed proof.'),'the refreshed open row');
   await frame();

@@ -141,6 +141,6 @@ class KeyRefusalTests(CostFixture):
         with mock.patch.object(subprocess, 'run', side_effect=record), redirect_stderr(StringIO()):
             outcome = cloud_gate.run(self.root, mode=gate.SuiteMode.GATE, full=False,
                                      module_time_limit_s=1800, service=service)
-        self.assertEqual(outcome, cloud_gate.LocalFallback(key_refusal.REFUSED_REASON))
+        self.assertEqual(outcome, cloud_gate.CloudDeclined(key_refusal.REFUSED_REASON))
         service.assert_not_called()
         self.assertEqual(commands, [])

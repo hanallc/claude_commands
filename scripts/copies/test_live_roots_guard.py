@@ -12,7 +12,7 @@ from typing import cast
 from unittest.mock import patch
 
 from scripts.copies import copies
-from scripts.lib import build_folders, conf, session_folder
+from scripts.lib import build_folders, conf, conf_reads, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.cli_fixture import ImmutableGitSeed
@@ -65,7 +65,7 @@ class LiveRootsGuardTests(unittest.TestCase):
             home = root / "home"
             home.mkdir()
             environment = {"PATH": os.environ.get("PATH", os.defpath), **private.environment,
-                           "TMPDIR": str(temporary), "HOME": str(home),
+                           **conf_reads.shift_child_environment(), "TMPDIR": str(temporary), "HOME": str(home),
                            "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
             with patch.dict(os.environ, environment, clear=True):
                 source = ImmutableGitSeed.create(root, "main", "Copy Tests", "copy@example.invalid",
@@ -73,9 +73,11 @@ class LiveRootsGuardTests(unittest.TestCase):
             program = '''import json, os, pathlib, subprocess, sys
 from scripts.copies import copies
 from scripts.copies.workspace_test_support import registered_workspace
-from scripts.lib import build_folders, copy_record, scratch
+from scripts.lib import build_folders, conf_reads, copy_record, scratch
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 root, source = map(pathlib.Path, sys.argv[1:3])
+if conf_reads.shift_reads_enabled():
+    conf_reads.set_shift_read_log(str(root / 'shift-reads'))
 forbidden = tuple(pathlib.Path(value) for value in json.loads(sys.argv[3]))
 def checked(value, descriptor=None, *, writing=False):
     if not isinstance(value, (str, bytes, os.PathLike)):
