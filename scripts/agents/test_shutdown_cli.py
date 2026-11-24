@@ -4110,7 +4110,8 @@ class UnitRenameTests(UnitRenameFixture):
                     self.assertFalse(destination.exists())
                     self.assertIsNone(unit_move.pending_rename(row.id))
                     moved = self.rust / "moved-omega"
-                    arguments = ["move-folder", "--unit", str(row.id), "--to", str(moved)]
+                    arguments = ["move-folder", "--unit", str(row.id), "--to", str(moved),
+                                 "--user-words", "Move this unit.", "--why", "Test folder recovery."]
                     result = invoke_cli(unit_move, lambda: unit_move.main(arguments), arguments, self.env, self.checkout)
                     self.assert_ok(result)
                     self.assertEqual(staff.by_id(row.id), replace(renamed,

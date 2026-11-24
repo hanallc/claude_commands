@@ -28,7 +28,7 @@ class RequestedValueChange(argparse.Namespace):
     user_words: str = ""
 
 
-def _one_line(name: str, value: str) -> None:
+def require_one_line(name: str, value: str) -> None:
     if not value.strip() or "\n" in value or "\r" in value:
         raise main_publish.Refusal(f"{name} must be one nonempty line")
 
@@ -79,10 +79,10 @@ def main(arguments: list[str] | None = None) -> int:
     _ = parser.add_argument("--user-words", required=True)
     try:
         args = parser.parse_args(argv, namespace=RequestedValueChange())
-        _one_line("--why", args.why)
-        _one_line("--user-words", args.user_words)
-        _one_line("file", args.file)
-        _one_line("key", args.key)
+        require_one_line("--why", args.why)
+        require_one_line("--user-words", args.user_words)
+        require_one_line("file", args.file)
+        require_one_line("key", args.key)
         if "\n" in args.value or "\r" in args.value:
             raise main_publish.Refusal("value must fit on one line")
         if re.search(r"\s#", args.value) or args.value != args.value.strip():

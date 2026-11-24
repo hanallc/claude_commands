@@ -20,6 +20,7 @@ import time
 from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from enum import Enum
 from importlib import import_module
 from pathlib import Path
@@ -34,7 +35,7 @@ from scripts.herdr import herdr  # noqa: E402
 from scripts.agents import pane_record, detached_run_process  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import build_folders, conf, copy_record, git_files, unit_runs  # noqa: E402
+from scripts.lib import build_folders, conf, copy_record, file_lock, git_files, unit_runs, user_zone  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.production import staff  # noqa: E402
@@ -1125,6 +1126,31 @@ def _push_moved_branch(checkout: Path, branch: str) -> None:
         _ = git(checkout, "push", "--set-upstream", "origin", f"{branch}:refs/heads/{branch}")
 
 
+@dataclass(frozen=True)
+class MoveAuthority:
+    user_words: str
+    why: str
+    at: datetime
+
+    def fields(self) -> dict[str, str]:
+        return {"user_words": self.user_words, "why": self.why, "at": self.at.isoformat()}
+
+    def record(self, unit: staff.StaffId, destination: Path) -> None:
+        """Save one authority record before the move starts."""
+        path = rename_move_path(unit).with_suffix(".jsonl")
+        row = staff.by_id(unit)
+        source = (str(row.worktree.path.expanduser().resolve())
+                  if row is not None and not isinstance(row.worktree, staff.WorktreeUnfilled) else None)
+        entry = {**self.fields(), "source": source, "destination": str(destination.expanduser().resolve())}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with file_lock.exclusive(path.with_suffix(".jsonl.lock")):
+            try:
+                previous = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                previous = ""
+            write_text_atomic(path, previous + json.dumps(entry, ensure_ascii=False) + "\n", new_file_mode=0o600)
+
+
 def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBranch = KeepBranch.CURRENT) -> bool:
     """Defer running work, then move the idle worktree and resume the director."""
     destination = destination.expanduser().resolve()
@@ -1321,21 +1347,39 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         return changed
 
 
+class MoveArguments(argparse.Namespace):
+    unit: str = ""
+    to: Path = Path()
+    user_words: str = ""
+    why: str = ""
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    from scripts.lib import main_publish, tune
+
     parser = argparse.ArgumentParser(description="Move a unit folder without a rename.")
     commands = parser.add_subparsers(dest="command", required=True)
     command = commands.add_parser("move-folder")
     _ = command.add_argument("--unit", required=True)
     _ = command.add_argument("--to", required=True, type=Path)
-    arguments = parser.parse_args(argv)
+    _ = command.add_argument("--user-words", required=True)
+    _ = command.add_argument("--why", required=True)
+    arguments = parser.parse_args(argv, namespace=MoveArguments())
     try:
-        changed = _move_folder(staff.native_id(cast(str, arguments.unit)), cast(Path, arguments.to))
+        tune.require_one_line("--user-words", arguments.user_words)
+        tune.require_one_line("--why", arguments.why)
+        unit = staff.native_id(arguments.unit)
+        authority = MoveAuthority(arguments.user_words, arguments.why, datetime.now(timezone.utc))
+        authority.record(unit, arguments.to)
+        shown = {**authority.fields(), "at": user_zone.shown_time(authority.at, labeled=True)}
+        print(json.dumps(shown, ensure_ascii=False), flush=True)
+        changed = _move_folder(unit, arguments.to)
         print("done" if changed else "unchanged")
         return 0
     except (subprocess.TimeoutExpired, worker_lifecycle.OperationDeadlineExpired) as error:
         print(f"unit_move: anomaly: {error}", file=sys.stderr)
         return 0
-    except (RenameRefused, staff.StaffRefused, staff.StaffNotFound, OSError, ValueError, herdr_types.HerdrFailure) as error:
+    except (main_publish.Refusal, staff.StaffRefused, staff.StaffNotFound, OSError, ValueError, herdr_types.HerdrFailure) as error:
         print(f"unit_move: {error}", file=sys.stderr)
         return 1
 
