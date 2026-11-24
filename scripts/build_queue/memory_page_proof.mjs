@@ -13,6 +13,7 @@
 // Use --verify-call as the third argument for the Verify column proof.
 // Use --headcount to compare the Running and Queued headers.
 // Use --build-tools as the third argument for the Build tools proof.
+// Use --outside-queue as the third argument for the CPU time proof.
 // Use --queue-rows to capture the dark queue card, its tooltips, and its right edge.
 // Use the fourth argument to select the older page.
 // Use --guest-tip after the output folder for the guest row tooltip screenshot.
@@ -63,11 +64,13 @@ const [previousPage, comparison] = awsCostShots ? [] : comparisonArgs;
 const requestedShot = gateMode ? undefined : process.env.MEMORY_PAGE_SHOT;
 const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
+const outsideQueueProof = previousPage === '--outside-queue';
 const queueDragProof = previousPage === '--queue-drag';
 const queueRowsProof = previousPage === '--queue-rows';
 const guestTipProof = previousPage === '--guest-tip';
 const standingProof = previousPage === '--standing-orders';
-const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || guestTipProof || standingProof;
+const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || guestTipProof
+  || standingProof || outsideQueueProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Machine','vCPU','Tokens','Moved'];
@@ -554,7 +557,8 @@ try {
           source:'window.proofSetInterval = window.setInterval; window.setInterval = () => 0;'
             + 'Date.now = () => ' + clockTime + ';'});
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-        await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
+        const desktopWidth = gateMode ? 1400 : 1600;
+        await call('Emulation.setDeviceMetricsOverride', {width:desktopWidth,height:1200,deviceScaleFactor:1,mobile:false});
         const navigate = async path => {
           currentFixture = servedReading;
           const loaded = new Promise((resolve, reject) => events.set(`${sessionId}:Page.loadEventFired`, {resolve,reject}));
@@ -584,6 +588,52 @@ try {
             : await captureAwsCosts(evaluate, call, base.report.aws_costs.today);
           console.log(JSON.stringify({shots,output:folder}));
           break browserProof;
+        }
+        if (outsideQueueProof || !focusedProof) {
+          servedReading = readings.outside_queue;
+          await navigate('memory_live.html');
+          const result = await evaluate(`(() => {
+            const section = document.querySelector('#outside-queue');
+            section.scrollIntoView({block:'center'});
+            const bounds = section.getBoundingClientRect();
+            const rows = Array.from(section.querySelectorAll('.outside-queue-row'), row => ({
+              cells:Array.from(row.children, cell => cell.textContent),
+              color:row.querySelector('.detail [data-color-text]')?.getAttribute('data-color-text'),
+            }));
+            return {heading:section.querySelector('.section-head').textContent,
+              previousCard:section.previousElementSibling?.id,
+              nextCard:section.nextElementSibling?.id,
+              rows, visible:!section.hidden, clip:{x:bounds.left+scrollX,y:bounds.top+scrollY,
+              width:bounds.width,height:bounds.height,scale:1}};
+          })()`);
+          assert.equal(result.visible, true);
+          assert.equal(result.heading, 'Tests outside the queue');
+          assert.equal(result.previousCard, 'build-limits', 'Tests outside the queue must follow Build limits.');
+          assert.equal(result.nextCard, 'leftovers', 'Leftover processes must follow Tests outside the queue.');
+          assert.deepEqual(result.rows, [{cells:['queue · test · targeted_test.py', '136.0 s CPU'],
+            color:'role.unit-director'}]);
+          const output = join(folder, 'cpumark-dark.png');
+          const pageOutput = join(folder, 'cpumark-page-dark.png');
+          if (outsideQueueProof) {
+            const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:result.clip});
+            await writeFile(output, Buffer.from(shot.data, 'base64'));
+            await evaluate(`(() => {
+              document.querySelector('.legend-box').open = false;
+              scrollTo(0, 0);
+            })()`);
+            const {cssContentSize: {height}} = await call('Page.getLayoutMetrics');
+            const pageShot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,
+              clip:{x:0,y:0,width:desktopWidth,height,scale:1}});
+            await writeFile(pageOutput, Buffer.from(pageShot.data, 'base64'));
+          }
+          assert.equal(await evaluate(`(() => {
+            renderReading({...proofData, outside_queue:[]});
+            return document.querySelector('#outside-queue').hidden;
+          })()`), true);
+          if (outsideQueueProof) {
+            console.log(JSON.stringify({pass:true, views:2, output, pageOutput}));
+            break browserProof;
+          }
         }
         if (buildToolsProof) {
           const ram = JSON.parse(await readFile(join(folder, 'legend_ram.json'), 'utf8'));

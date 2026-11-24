@@ -445,6 +445,8 @@ body.queue-unavailable .card { display: none; }
 .leftover-row { display: grid; grid-template-columns: minmax(0, 1fr) max-content max-content; gap: 4px 16px; padding: 5px 0; }
 .leftover-row .age { white-space: nowrap; }
 .leftover-row .detail { color: var(--ink-2); overflow-wrap: anywhere; }
+.outside-queue-row { grid-template-columns: minmax(0, 1fr) max-content; }
+.outside-queue-row + .outside-queue-row { border-top: 1px solid var(--line); }
 .report-window { color: var(--ink-2); font-size: 0.85rem; }
 .report-top-row { margin: 0; padding: 10px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .report-top-row:last-child { border-bottom: 0; }
@@ -646,6 +648,11 @@ small .aws-point { cursor: help; }
     <summary><span class="chev" aria-hidden="true">▶</span><span class="name"></span></summary>
     <div id="build-limits-content"></div>
   </details>
+
+  <section class="card" id="outside-queue" hidden>
+    <div class="section-head">Tests outside the queue</div>
+    <div id="outside-queue-rows"></div>
+  </section>
 
   <section class="card" id="leftovers" hidden>
     <div class="section-head">Leftover processes</div>
@@ -1908,6 +1915,7 @@ function render(d) {
   renderBuildLimits(d.build_limits);
   renderSwap(d);
   renderLeftovers(d);
+  renderOutsideQueue(d);
   restoreReportView(view);
 }
 
@@ -2146,6 +2154,17 @@ function renderLeftovers(d) {
     `<div class="leftover-row"><span class="detail">${roleName(scope.owner)} · ${esc(member.program)}${typeof member.pid === "number" ? ` · pid ${member.pid}` : ""}</span><span class="age">${index === 0 ? esc(scope.age) : ""}</span><span class="num">${index === 0 ? memoryAmount(scope.used) : ""}</span></div>`));
   $("leftovers").hidden = rows.length === 0;
   $("leftover-rows").innerHTML = rows.join("");
+}
+
+function renderOutsideQueue(d) {
+  const rows = d.outside_queue || [];
+  $("outside-queue").hidden = rows.length === 0;
+  $("outside-queue-rows").innerHTML = rows.map(row => {
+    const owner = row.owner || "Owner unknown";
+    const names = row.unit && row.unit !== owner
+      ? `${staffName(row.unit)} · ${staffName(owner)}` : staffName(owner);
+    return `<div class="leftover-row outside-queue-row"><span class="detail">${names} · ${esc(row.command)}</span><span class="num">${row.cpu_seconds.toFixed(1)} s CPU</span></div>`;
+  }).join("");
 }
 
 function reportCost(value, unit = "h/day") {

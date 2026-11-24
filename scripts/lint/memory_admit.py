@@ -1369,10 +1369,15 @@ def read_meminfo(path: Path) -> HostMemory:
 NO_HOST_SWAP = HostMemory(0, UnknownHostTotal())
 
 
-def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy) -> Pressure:
-    """Read PSI once and retain missing evidence for scheduling and display."""
+def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy,
+                  pressure_path: Path | None = None) -> Pressure:
+    """Read PSI once and retain missing evidence for scheduling and display.
+
+    Without pressure_path, BUILDLOG_MEMORY_PRESSURE or the live PSI file supplies the path.
+    """
     readings: dict[str, float] = {}
-    path = Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
+    path = (pressure_path if pressure_path is not None
+            else Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory")))
     check_memory_reading(path)
     try:
         for line in _read_proc_text(path).splitlines():

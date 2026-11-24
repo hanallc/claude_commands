@@ -13,7 +13,7 @@ import os
 import re
 from collections import Counter
 from collections.abc import Iterator
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -46,7 +46,7 @@ from scripts.build_queue.queue_view import refresh_mac_builds
 from scripts.build_queue.admission_test_support import (
     AdmissionFixture, FixedSystemReader, NOW as ADMISSION_NOW, only_admitted, publish_fixture_view,
 )
-from scripts.build_queue.queue_fixture import write_process, write_scope
+from scripts.build_queue.queue_fixture import fixture_reservation, write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
@@ -219,10 +219,237 @@ def fixture_published_view(reading: admission_records.QueueRead) -> queue_snapsh
     return queue_snapshot.PublishedView(reading.explanation.now, reading.explanation.now, reading)
 
 
+def write_outside_queue_fixture(root: Path, *, siblings: tuple[int, ...] = ()) -> staff.StaffSnapshot:
+    """Write process trees and staff for a private CPU time reading."""
+    _ = write_config_fixture(root / "test_times.conf",
+        "[direct_test]\n# whole: 1..\ndirect_test.time_limit_seconds=120\n")
+    runner = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
+                            current_session=staff.StaffId("runner-session"))
+    director = staff.StaffRow(staff.StaffId("queue"), "unit", "queue", staff.ReportsTo(runner.id),
+                              current_session=staff.StaffId("director-session"))
+    worker = staff.StaffRow(staff.StaffId("test-worker"), "worker", "test", staff.ReportsTo(director.id),
+                            current_session=staff.StaffId("worker-session"))
+    scope = Path("user/app.slice/app-agents.slice/run-p8100.scope")
+    ticks = os.sysconf("SC_CLK_TCK")
+    for pid, state, parent, argv, cpu in (
+        (8100, "S", 1, "/bin/bash\0--login\0--norc", (200, 0, 0, 0)),
+        (8101, "S", 8100, "/bin/codex", (200, 0, 0, 0)),
+        (8102, "S", 1, "/bin/python3\0/fixture/scripts/production/targeted_test.py", (41, 17, 23, 7)),
+        (8103, "Z", 8105, "", (35, 13, 0, 0)),
+        (8104, "S", 8101, "/bin/rustc", (80, 40, 0, 0)),
+        (8105, "S", 8102, "/bin/python3", (0, 0, 0, 0)),
+        (8107, "S", 8101, "/bin/pytest", (19, 0, 0, 0)),
+        *((pid, "S", 8101, "/bin/pytest", (121, 0, 0, 0)) for pid in siblings),
+    ):
+        process = root / "proc" / str(pid)
+        write_process(process.parent, pid, parent=parent)
+        fields = [state, str(parent), *(["0"] * 9), *(str(value * ticks) for value in cpu), *(["0"] * 4), str(pid)]
+        _ = (process / "stat").write_text(f"{pid} (fixture ) command) {' '.join(fields)}\n")
+        _ = (process / "cmdline").write_text(argv + "\0")
+        _ = (process / "cgroup").write_text(f"0::/{scope}\n")
+    _ = (root / "proc/8101/environ").write_text("CODEX_THREAD_ID=worker-session\0")
+    _ = (root / "proc/8102/environ").write_text("BUILDLOG_OWNER_STAFF_ID=builds\0")
+    write_scope(root / "cgroup" / scope, members=(8100, 8101, 8102, 8104, 8105, 8107, *siblings))
+    write_scope(root / "cgroup/user/builds.slice")
+    return staff.StaffSnapshot((runner, director, worker))
+
+
+def outside_queue_fixture_groups(root: Path) -> dict[str, str]:
+    return {"BUILDLOG_USER_CGROUP": str(root / "cgroup/user"),
+            "BUILDLOG_BUILDS_CGROUP": str(root / "cgroup/user/builds.slice")}
+
+
 class MemoryFeedTests(unittest.TestCase):
     root: Path = Path()
     output: Path = Path()
     configuration: Path = Path()
+
+    def test_outside_queue_reads_each_shared_ancestor_environment_once(self) -> None:
+        siblings = tuple(range(8200, 8212))
+        owners = memory_feed.FeedStaff(write_outside_queue_fixture(self.root, siblings=siblings))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root))))
+        shell_env = self.root / "proc/8100/environ"
+        agent_env = self.root / "proc/8101/environ"
+        _ = shell_env.write_text("BUILDLOG_OWNER_STAFF_ID=test-worker\0")
+        _ = agent_env.write_text("CODEX_THREAD_ID=unknown-session\0")
+        reads: Counter[Path] = Counter()
+        read_bytes = Path.read_bytes
+
+        def count_bytes(path: Path) -> bytes:
+            if path.name == "environ":
+                reads[path] += 1
+            return read_bytes(path)
+
+        inputs = captured_reading().explanation.decided_from
+        with mock.patch.object(Path, "read_bytes", new=count_bytes):
+            rows = memory_feed.outside_queue_processes(inputs, owners)
+
+        self.assertEqual([(row["pid"], row["owner"]) for row in rows if row["pid"] in siblings],
+                         [(pid, "test") for pid in siblings])
+        self.assertEqual(reads[agent_env], 1)
+        self.assertEqual(reads[shell_env], 1)
+        self.assertEqual(max(reads.values()), 1)
+
+    def test_outside_queue_scans_a_child_after_its_parent_leaves_the_scope(self) -> None:
+        owners = memory_feed.FeedStaff(write_outside_queue_fixture(self.root, siblings=(8200,)))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root))))
+        # The membership file still lists the parent, but the parent's cgroup has changed.
+        _ = (self.root / "proc/8101/cgroup").write_text("0::/user/app.slice/other.scope\n")
+
+        rows = memory_feed.outside_queue_processes(captured_reading().explanation.decided_from, owners)
+
+        self.assertEqual([(row["pid"], row["command"], row["cpu_seconds"]) for row in rows],
+                         [(8102, "targeted_test.py", 136.0), (8200, "pytest", 121.0)])
+
+    def test_outside_queue_marks_a_login_shell_that_execs_a_script(self) -> None:
+        owners = memory_feed.FeedStaff(write_outside_queue_fixture(self.root))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root))))
+        inputs = captured_reading().explanation.decided_from
+        process = self.root / "proc/8102"
+        stat = process / "stat"
+        _ = stat.write_bytes(stat.read_bytes().replace(b"(fixture ) command)", b"(bash)", 1))
+        cmdline = process / "cmdline"
+        _ = cmdline.write_text("/bin/bash\0--login\0--norc\0")
+        self.assertEqual(memory_feed.outside_queue_processes(inputs, owners), [])
+
+        _ = cmdline.write_text("/bin/bash\0/fixture/long-build.sh\0")
+        rows = memory_feed.outside_queue_processes(inputs, owners)
+        self.assertEqual(rows, [
+            {"pid": 8102, "unit": "queue", "owner": "test", "command": "long-build.sh", "cpu_seconds": 136.0},
+        ])
+
+    def test_cpu_time_marks_only_unadmitted_command_trees_over_the_limit(self) -> None:
+        staff_members = write_outside_queue_fixture(self.root)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root))))
+        reading = captured_reading()
+        with (mock.patch.object(staff, "snapshot", return_value=staff_members),
+              mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading))):
+            page = memory_feed.reading()
+        self.assertEqual(page["outside_queue"], [
+            {"pid": 8102, "unit": "queue", "owner": "test", "command": "targeted_test.py", "cpu_seconds": 136.0},
+        ])
+        inputs = reading.explanation.decided_from
+        owners = memory_feed.FeedStaff(staff_members)
+        cmdline = self.root / "proc/8102/cmdline"
+        original_command = cmdline.read_text()
+        _ = cmdline.write_text("/bin/python3\0/fixture/agent_exec.py\0")
+        self.assertEqual([(row["command"], row["owner"]) for row in memory_feed.outside_queue_processes(inputs, owners)],
+                         [("agent_exec.py", "test")])
+        _ = cmdline.write_text(original_command)
+
+        user = self.root / "cgroup/user"
+        scope = user / "builds.slice/build-fixture.scope"
+        write_scope(scope)
+        child_group = self.root / "proc/8105/cgroup"
+        agent_path = child_group.read_text()
+        _ = child_group.write_text(f"0::/{scope.relative_to(self.root / 'cgroup')}\n")
+        self.assertEqual(memory_feed.outside_queue_processes(inputs, owners), [])
+        config = self.root / "test_times.conf"
+        _ = config.write_text("# whole: 1..\ndirect_test.time_limit_seconds=80\n")
+        rows = memory_feed.outside_queue_processes(inputs, owners)
+        self.assertEqual([(row["pid"], row["cpu_seconds"]) for row in rows], [(8104, 120.0), (8102, 88.0)])
+        _ = child_group.write_text(agent_path)
+        _ = config.write_text("# whole: 1..\ndirect_test.time_limit_seconds=120\n")
+
+        write_scope(user / "app.slice/app-agents.slice/run-p8100.scope", members=(8100, 8101, 8104, 8107))
+        run_slice = user / "builds.slice/builds-detached.slice/builds-detached-20261117T19250434733015b4c.slice"
+        detached = run_slice / "detached-python-tests-20261117T192504-3473301-5b4c.scope"
+        write_scope(detached, members=(8102, 8105))
+        for pid in (8102, 8103, 8105):
+            _ = (self.root / f"proc/{pid}/cgroup").write_text(f"0::/{detached.relative_to(self.root / 'cgroup')}\n")
+        cpu_stat = detached / "cpu.stat"
+        _ = cpu_stat.write_text("user_usec 90000000\nusage_usec 151500000\n")
+        byte_reads: Counter[Path] = Counter()
+        read_bytes = Path.read_bytes
+        text_reads: Counter[Path] = Counter()
+        read_text = Path.read_text
+
+        def count_bytes(path: Path) -> bytes:
+            byte_reads[path] += 1
+            return read_bytes(path)
+
+        def count_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            text_reads[path] += 1
+            return read_text(path, encoding=encoding, errors=errors)
+
+        with (mock.patch.object(Path, "read_bytes", new=count_bytes),
+              mock.patch.object(Path, "read_text", new=count_text)):
+            outside = memory_feed.outside_queue_processes(inputs, owners)
+            self.assertEqual(text_reads[cpu_stat], 1)
+            self.assertEqual(memory_feed.outside_queue_processes(inputs, owners), outside)
+            self.assertEqual(text_reads[cpu_stat], 2)
+        self.assertEqual([(row["pid"], row["owner"], row["cpu_seconds"]) for row in outside], [(8102, "builds", 151.5)])
+        self.assertEqual(byte_reads[self.root / "proc/8102/environ"], 2)
+        self.assertEqual(byte_reads[cmdline], 2)
+        self.assertEqual(byte_reads[self.root / "proc/8105/cmdline"], 2)
+        self.assertEqual(byte_reads[self.root / "proc/8107/cmdline"], 2)
+        self.assertEqual(byte_reads[self.root / "proc/8107/environ"], 0)
+        self.assertEqual(byte_reads[self.root / "proc/8101/environ"], 0)
+        self.assertEqual(byte_reads[self.root / "proc/8102/stat"], 2)
+
+        reservation = fixture_reservation(8105, admission_records.GIB)
+        self.assertEqual(memory_feed.outside_queue_processes(replace(inputs, reservations=(reservation,)), owners), [])
+        reservation["start_time"] = "old-start"
+        self.assertEqual(memory_feed.outside_queue_processes(replace(inputs, reservations=(reservation,)), owners), outside)
+
+        use = admission_records.AnonymousRunUse(0)
+        for old_source in (admission_records.ScopeSource(scope, frozenset({8102})),
+                           admission_records.ProcessSource((admission_records.ProcessAnonymousUse(8102, use),))):
+            with self.subTest(source=old_source):
+                memory = admission_records.MeasuredMemory(0, anonymous_source=old_source)
+                step = admission_records.RunningStep("", "", "check", "/fixture", 0, memory, pid=8106)
+                self.assertEqual(memory_feed.outside_queue_processes(replace(inputs, running=(step,)), owners), outside)
+
+        write_scope(detached, members=(8102,))
+        write_scope(scope, members=(8105,))
+        _ = (self.root / "proc/8105/cgroup").write_text(f"0::/{scope.relative_to(self.root / 'cgroup')}\n")
+        self.assertEqual(memory_feed.outside_queue_processes(inputs, owners), outside)
+
+        with mock.patch.object(conf, "read", wraps=conf.read) as read:
+            self.assertEqual(memory_feed.direct_test_time_limit_seconds(), 120.0)
+            read.assert_not_called()
+            _ = config.write_text("[direct_test]\n")
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                self.assertEqual(memory_feed.outside_queue_processes(inputs, owners), [])
+                self.assertEqual(memory_feed.outside_queue_processes(inputs, owners), [])
+            read.assert_called_once_with(config)
+            self.assertEqual(len(errors.getvalue().splitlines()), 1)
+            self.assertIn("direct_test.time_limit_seconds missing", errors.getvalue())
+        _ = config.write_text("# whole: 1..\ndirect_test.time_limit_seconds=130\n")
+        self.assertEqual(memory_feed.outside_queue_processes(inputs, owners), outside)
+
+        environ = self.root / "proc/8102/environ"
+        _ = environ.write_text("BUILDLOG_OWNER_STAFF_ID=test-worker\0")
+        byte_reads.clear()
+        with mock.patch.object(Path, "read_bytes", new=count_bytes):
+            rows = memory_feed.outside_queue_processes(inputs, owners)
+            self.assertEqual(memory_feed.outside_queue_processes(inputs, owners), rows)
+        self.assertEqual([(row["pid"], row["command"], row["owner"]) for row in rows],
+                         [(8102, "targeted_test.py", "test")])
+        self.assertEqual(byte_reads[cmdline], 2)
+        self.assertEqual(byte_reads[environ], 2)
+
+        queued = run_slice / "cargo.scope"
+        write_scope(queued, members=(8105,))
+        _ = (queued / "cpu.stat").write_text(cpu_stat.read_text())
+        _ = child_group.write_text(f"0::/{queued.relative_to(self.root / 'cgroup')}\n")
+        source = admission_records.ScopeSource(queued, frozenset({8105}))
+        memory = admission_records.MeasuredMemory(0, anonymous_source=source)
+        step = admission_records.RunningStep("", "", "check", "/fixture", 0, memory, pid=8105)
+        self.assertEqual(memory_feed.outside_queue_processes(replace(inputs, running=(step,)), owners), rows)
+
+        dust_pid = 8108
+        proc = self.root / "proc"
+        write_process(proc, dust_pid, name="dust")
+        _ = (proc / str(dust_pid) / "cmdline").write_text("/bin/dust\0")
+        for name in ("run-r0001.scope", "detached-other-20261117T192504-3473301-5b4d.scope"):
+            with self.subTest(sibling=name):
+                sibling = run_slice / name
+                write_scope(sibling, members=(dust_pid,))
+                _ = (sibling / "cpu.stat").write_text(cpu_stat.read_text())
+                _ = (proc / str(dust_pid) / "cgroup").write_text(f"0::/{sibling.relative_to(self.root / 'cgroup')}\n")
+                self.assertEqual(memory_feed.outside_queue_processes(replace(inputs, running=(step,)), owners), rows)
 
     def test_each_reading_shares_current_staff_role_names_with_the_page(self) -> None:
         runner = staff.StaffRow(staff.StaffId("fixture-runner"), "showrunner", "fixture-runner", staff.StaffRoot(),
@@ -485,6 +712,7 @@ class MemoryFeedTests(unittest.TestCase):
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
             "MACHINE_FACTS_FILE": str(self.root / "machine-facts.json"),
             "BUILDLOG_USER_CGROUP": str(self.root / "user"),
+            "BUILDLOG_BUILDS_CGROUP": str(self.root / "user/builds.slice"),
         })))
         _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={}))
         _ = self.enterContext(mock.patch.object(memory_feed, "host_name", return_value=FIXTURE_MACHINE))
@@ -5478,6 +5706,11 @@ def write_browser_fixture(folder: Path) -> None:
               mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(
                   base.explanation.now, (placed,)))):
             pages["macroute_running"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+        staff_members = write_outside_queue_fixture(fixture.root)
+        with (mock.patch.dict(os.environ, outside_queue_fixture_groups(fixture.root)),
+              mock.patch.object(staff, "snapshot", return_value=staff_members),
+              mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(base))):
+            pages["outside_queue"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         # The proof serves each reading's report as report.json and shows it with its reading.
         default_report = memory_feed.report_file(memory_feed.report_reading(configuration.history_days))
         for name, page in pages.items():
