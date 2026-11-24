@@ -20,6 +20,37 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.review_links import console
 
 NO_DATA_FILE: dict[str, object] = {}
+UNDO_ACTION_SCRIPT = r"""
+function fixtureUndo(){
+ const realFetch=window.fetch.bind(window),posts=[];
+ window.fetch=async(url,options={})=>{
+  if(options.method!=='POST') return realFetch(url,options);
+  if(String(url).endsWith('/undo')) return Response.json({outcome:'undone'});
+  if(new Headers(options.headers).get('X-Undo-Hold')!=='1') throw new Error('The action sent no hold header.');
+  posts.push(new URLSearchParams(options.body));
+  return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+ };
+ const until=async(test,label)=>{
+  const end=performance.now()+8000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ const toast=()=>window.top.document.querySelector('[data-send-undo]');
+ async function undo(){
+  await until(()=>toast()?.querySelector('button'),'The Undo toast did not show.');
+  const current=toast();
+  const button=current.querySelector('button');
+  if(current.querySelector('span').textContent!=='Saved.' || button.textContent!=='Undo')
+   throw new Error('The toast must say Saved and offer Undo.');
+  button.click();
+  await until(()=>!current.isConnected,'The Undo toast did not close.');
+ }
+ return {realFetch,posts,until,undo};
+}
+"""
+
 STATUS_PAGES = (
     ("accounts", "Accounts", "users", "Accounts", 45),
     ("aws", "AWS", "cloud", "AWS", 3900),

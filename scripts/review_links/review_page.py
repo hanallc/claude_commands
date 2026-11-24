@@ -215,6 +215,7 @@ class ReviewSnapshot:
     action_notices: tuple[str, ...] = ()
     unavailable_cards: frozenset[str] = frozenset()
     title_limit: int = 100
+    undo_enabled: bool = False
     delivery_window_seconds: int = record_table.DELIVERY_WINDOW_SECONDS
     submission_keys: dict[str, str] = field(default_factory=dict)
 
@@ -508,6 +509,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     request_timeout = settings.whole('page_request_timeout_seconds')
     delivery_window = record_table.delivery_window_seconds(settings)
     card_motion = page_frame.CardMotion.read(settings)
+    undo_enabled = settings.whole('undo_seconds') > 0
     later = later_settings(settings)
     title_limit = conf.read_or_repository('production').whole('question_title_max_chars')
     log_max_height = record_table.log_max_height_rem(settings)
@@ -516,12 +518,13 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     action_notices = tuple(review_items.utf8_display(f'{failure.source}: {failure.reason}') for failure in actions.unavailable)
     retained = repr((records, assets, members.rows, browser, words_rows, refresh_seconds, request_timeout,
                      card_motion, zone.key, notices, action_notices, unavailable_cards, later, title_limit, delivery_window, names.colors,
-                     log_max_height))
+                     log_max_height, undo_enabled))
     version = hashlib.sha256((index+retained).encode()).hexdigest()[:20]
     snapshot = ReviewSnapshot(version,records,entries,members,
         browser,words_rows,refresh_seconds,request_timeout,card_motion,assets,zone,sources.before_read,later,names,log_max_height,read_at=read_at,
         notices=notices, action_notices=action_notices, unavailable_cards=frozenset(unavailable_cards),
-        title_limit=title_limit, delivery_window_seconds=delivery_window, submission_keys=submission_keys)
+        title_limit=title_limit, undo_enabled=undo_enabled, delivery_window_seconds=delivery_window,
+        submission_keys=submission_keys)
     return pack_snapshot(snapshot, index, started)
 
 
@@ -1193,6 +1196,7 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         +f'<div data-review data-version="{snapshot.version}" data-show="{show}" data-refresh-seconds="{snapshot.refresh_seconds}" '
         +f'data-request-timeout-seconds="{snapshot.request_timeout_seconds}" '
         +f'data-delivery-window-seconds="{snapshot.delivery_window_seconds}" '
+        +f'data-undo-enabled="{str(snapshot.undo_enabled).lower()}" '
         +snapshot.card_motion.attributes()+' '
         +f'data-title-limit="{snapshot.title_limit}" data-zone="{html.escape(snapshot.zone.key, quote=True)}" '
         +f'data-later="{html.escape(json.dumps(dict(snapshot.later)), quote=True)}" '
@@ -1766,12 +1770,9 @@ async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true
 async function saveReviewAction(data,{receiver,sending,confirmedSave,saved,failed,undone=failed,displayFailed,recover,finished}){
  let conflict=false,confirmed=false;
  try{
-  // An answer to its owner waits on the server for Undo. Later only hides the item and Validate starts a check,
-  // so both act at once.
-  const hold=!['later','validate'].includes(data.get('outcome'));
-  if(hold) sending?.();
-  const options={method:'POST',body:data};
-  const response=await (hold ? heldFetch(location.pathname,options,receiver) : fetch(location.pathname,options));
+  const saveAction=['later','validate'].includes(data.get('outcome'));
+  sending?.();
+  const response=await heldFetch(location.pathname,{method:'POST',body:data},saveAction ? null : receiver);
   conflict=response.status===409;
   confirmed=response.ok;
   if(confirmed) confirmedSave?.();
@@ -2185,7 +2186,7 @@ async function afterRowAnimations(run,current=()=>true){
 addEventListener('scroll',()=>{
  const waiting=scrollDepartures.size>0;
  for(const save of pendingSaves.values()){
-  if(save.departing && !save.saved && Math.abs(scrollY-save.top)>=innerHeight) scrollDepartures.add(save);
+  if(save.departing && !save.saved && !save.held && Math.abs(scrollY-save.top)>=innerHeight) scrollDepartures.add(save);
  }
  if(waiting || !scrollDepartures.size) return;
  void afterRowAnimations(()=>{
@@ -2326,7 +2327,8 @@ function bindForm(row){
    const handed=row.dataset.type==='change' && ['validate','question','feedback'].includes(outcome);
    // A question or feedback on a change or a proposal shows its own result, so its row stays open through the save.
    const keepOpen=['question','feedback'].includes(outcome) && ['change','proposal'].includes(row.dataset.type);
-   const pending={notice:'Saving…',saved:false,departing:!validationQuestion,keepOpen,top:scrollY};
+   const held=content.dataset.undoEnabled==='true' && ['later','validate'].includes(outcome);
+   const pending={notice:'Saving…',saved:false,departing:!validationQuestion,held,keepOpen,top:scrollY};
    pendingSaves.set(key,pending);pageRefresh.abandon();drawSaveState(key);
    const request=view.startItemRequest(key),session=view.openSession;
    const closes=outcome==='later' || !['question','feedback','validate'].includes(outcome);

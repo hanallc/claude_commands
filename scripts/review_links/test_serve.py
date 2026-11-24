@@ -924,6 +924,49 @@ class ReviewLinksServerTests(unittest.TestCase):
             send.assert_called_once_with(f"session:{other.current_session}", change_page.SENDER, ANY)
         self.assertEqual(len(investigation.records(other.id)), 1)
 
+    def test_a_retried_post_reuses_the_hold(self) -> None:
+        case, other, body = self.held_new_item()
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        request_id = send_hold.new_hold_id()
+        result = f"{send_hold.HOLD_PATH}/{request_id}"
+        headers = {send_hold.HOLD_HEADER: "1", send_hold.REQUEST_HEADER: request_id}
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              capture_sender("send_message") as send):
+            first = self.held_http("POST", review_page.NEW_ITEM_PATH, body, headers=headers)
+            self.assertEqual(first, (202, "held", {"hold": request_id, "seconds": 60}))
+            repeated = self.held_http("POST", review_page.NEW_ITEM_PATH, body, headers=headers)
+            self.assertEqual((repeated[0], repeated[1], repeated[2]["hold"]), (202, "held", request_id))
+            self.assertEqual(self.hold_states(), ["pending"])
+            self.assertEqual(self.held_http("POST", result + "/send")[0], 200)
+            self.assertEqual(self.held_http("GET", result)[0], 200)
+            _ = write_config_fixture(conf.path("review_links"), "undo_seconds=0\n")
+            repeated = self.held_http("POST", review_page.NEW_ITEM_PATH, body, headers=headers)
+            self.assertEqual((repeated[0], repeated[1], repeated[2]["hold"]), (202, "held", request_id))
+            self.assertEqual(self.hold_states(), ["released"])
+            send.assert_called_once()
+        self.assertEqual(len(investigation.records(other.id)), 1)
+
+    def test_a_retried_hold_reports_the_remaining_undo_time(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
+        request_id = send_hold.new_hold_id()
+        headers = {send_hold.HOLD_HEADER: "1", send_hold.REQUEST_HEADER: request_id}
+        body = b"outcome=works"
+        started = now = time.time()
+        with patch.object(send_hold, "time", Mock(wraps=time, time=lambda: now)):
+            first = self.held_http("POST", review_page.PAGE_PATH, body, headers=headers)
+            self.assertEqual(first, (202, "held", {"hold": request_id, "seconds": 60}))
+            now = started + 42.5
+            repeated = self.held_http("POST", review_page.PAGE_PATH, body, headers=headers)
+            self.assertEqual(repeated, (202, "held", {"hold": request_id, "seconds": 17.5}))
+            now = started + 60
+            repeated = self.held_http("POST", review_page.PAGE_PATH, body, headers=headers)
+            self.assertEqual(repeated, (202, "held", {"hold": request_id, "seconds": 0}))
+            undo = f"{send_hold.HOLD_PATH}/{request_id}/undo"
+            self.assertEqual(self.held_http("POST", undo)[0], 200)
+
     def test_an_undone_new_item_is_never_filed_or_sent(self) -> None:
         case, other, body = self.held_new_item()
         _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")

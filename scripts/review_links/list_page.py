@@ -1066,6 +1066,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     settings = conf.read("review_links")
     seconds = settings.number("page_refresh_seconds")
     request_timeout = settings.whole("page_request_timeout_seconds")
+    undo_enabled = settings.whole("undo_seconds") > 0
     delivery_window = record_table.delivery_window_seconds(settings)
     card_motion = page_frame.CardMotion.read(settings)
     morning = record_table.clock_minutes(settings, "later_morning")
@@ -1081,6 +1082,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<p data-review-refresh-error role="status" hidden></p>'
                + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
+               + f' data-undo-enabled="{str(undo_enabled).lower()}"'
                + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
@@ -1226,7 +1228,7 @@ const chipsByState=Object.fromEntries(Object.entries(queuesByState).map(([state,
 const deliveryParking=''' + json.dumps(the_list.ParkUntilDelivered.DELIVERED) + r''';
 const isParked=data=>data.parked==='true' || data.parked===deliveryParking;
 const chipFor=data=>{
- if(data.state==='Closed') return;
+ if(data.state==='Closed' || data.undoPending==='true') return;
  const parked=isParked(data);
  return chipsByQueue[questionQueue(queuesByState[data.state],data.unread==='true' && data.unreadAnswer==='true',
   parked,data.unreadDelivery==='true',data.openQuestion==='true')];
@@ -1560,6 +1562,8 @@ function bindFeedbackForm(form){
    const changesParking=parks || action==='unpark';
    const focusUnpark=action==='unpark' && document.activeElement===unpark;
    const usesWords=action==='tell' || action==='question';
+   const saveAction=changesParking || action==='read' || action==='remove';
+   const heldSave=saveAction && content.dataset.undoEnabled==='true';
    const asksQuestion=action==='question';
    if(usesWords && !words.value.trim()) return;
    const retry=matching(action);
@@ -1588,7 +1592,7 @@ function bindFeedbackForm(form){
    if(hadFocus) document.addEventListener('focusin',trackFocus);
    let saved=false,refused=false,stale=false,focusParkedAfterClose=false,nextForm;
    const clearsUnread=action==='read' || usesWords,unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
-   const releasesLink=action==='read' || parks || action==='remove';
+   const releasesLink=action==='read' || parks || action==='remove' || (action==='unpark' && heldSave);
    let restoreLink;
    const submission=tableView.preserveRecordRowTop(()=>{
     setCardSubmitting(form,true,recordDetails(item));
@@ -1600,6 +1604,7 @@ function bindFeedbackForm(form){
     }
     if(parks) item.dataset.parked=parkForDelivery ? deliveryParking : 'true';
     if(clearsUnread) item.dataset.unread='false';
+    if(heldSave) item.dataset.undoPending='true';
     if(releasesLink) restoreLink=tableView.releaseLink(key);
     return tableView.startAction(item);
    });
@@ -1612,10 +1617,10 @@ function bindFeedbackForm(form){
     tableView.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
    };
    try{
-    // Words wait on the server for Undo; read, park and remove act at once.
     const options={method:'POST',body:data};
-    const response=await (usesWords ? heldFetch(location.pathname,options,current.dataset.sendReceiver)
-                                   : fetch(location.pathname,options));
+    const response=await (usesWords || saveAction
+     ? heldFetch(location.pathname,options,saveAction ? null : current.dataset.sendReceiver)
+     : fetch(location.pathname,options));
     saved=response.ok;
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parks && action!=='remove'));
     if(saved && tableView.currentItemRequest(request) && usesWords &&
@@ -1623,6 +1628,7 @@ function bindFeedbackForm(form){
     const result=await response.json();
     stale=!tableView.currentItemRequest(request);
     if(item.listRequest!==request) return;
+    delete item.dataset.undoPending;
     if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
     if(stale){
      if(tableView.openItem?.dataset.key===key) return;
@@ -1681,6 +1687,7 @@ function bindFeedbackForm(form){
    }catch(error){
     stale=!tableView.currentItemRequest(request);
     if(item.listRequest!==request) return;
+    delete item.dataset.undoPending;
     // An undone send saved nothing, so the item returns to its state before Send and keeps the words.
     const undone=error instanceof SendUndone;
     if(undone) refused=true;

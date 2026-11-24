@@ -46,7 +46,7 @@ from scripts.review_links import change_browser, change_page, new_item_dialog, p
 from scripts.review_links import review_items, review_page
 from scripts.review_links.server_test_support import started_review_server
 from scripts.review_links.test_change_page import BrowserForms
-from scripts.review_links.browser_test_support import assert_status_states
+from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.statusline import counts_row, rebuild_row
@@ -3809,11 +3809,12 @@ window.fetch=async(_path,options={})=>{
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_retries_the_same_parking_time_after_it_passes(self) -> None:
         self.browser_action_sequence(r"""
- let now=Date.parse('2026-12-02T13:00:00Z');
+ let now=Date.parse('2026-12-04T00:29:30Z');
  Date.now=()=>now;
  show('all');
  const toggle=form.querySelector('[data-later-toggle]');
  toggle.click();
+ form.querySelector('[data-date="2026-12-03"]').click();
  const time=form.querySelector('[data-later-time]'),save=form.querySelector('[value="park"]');
  time.value='1930';time.dispatchEvent(new Event('input',{bubbles:true}));
  save.click();
@@ -3821,7 +3822,7 @@ window.fetch=async(_path,options={})=>{
  check(first?.get('until')==='2026-12-04T00:30:00.000Z','The first save sends the chosen instant');
  losePost();await flush();
  await finishRowMotion();
- now=Date.parse('2026-12-05T13:00:00Z');
+ now=Date.parse('2026-12-04T00:30:10Z');
  toggle.click();
  check(time.value==='19:30' && !save.disabled,'The picker retains and enables the expired retry');
  save.click();
@@ -3911,12 +3912,20 @@ window.fetch=async(_path,options={})=>{
         with patch.object(list_page, "counts_strip", return_value=""):
             markup = list_page.render(self.root / "reviews").decode()
         setup = '''<script>
-const requests=[];let finishPost,losePost;
+const requests=[];let finishPost,losePost,lostHold;
 window.fetch=async(_path,options={})=>{
  if(options.method!=='POST') throw new Error('Fixture refresh refused');
+ const hold=new Headers(options.headers).get('X-Undo-Request');
+ if(lostHold && hold===lostHold && !options.keepalive){
+  lostHold=null;
+  throw new Error('Fixture lost response');
+ }
  requests.push(new URLSearchParams(options.body));
  return new Promise((resolve,reject)=>{
-  losePost=()=>reject(new Error('Fixture lost response'));
+  losePost=()=>{
+   if(options.keepalive) lostHold=hold;
+   reject(new Error('Fixture lost response'));
+  };
   finishPost=result=>resolve({headers:new Headers(),ok:!result.reason,status:result.reason ? 400 : 200,
    json:async()=>({unread:'true',...result})});
  });
@@ -5922,6 +5931,105 @@ observer.observe(original.parentElement,{childList:true});
  check(row.hidden,'Tell morty keeps the row outside Unread after confirmation');
 """, add_item=False)
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_undo_restores_park_mark_read_and_remove(self) -> None:
+        item = self.add("Restore the original item", number=1)
+        _ = self.add("Keep the next item in place", number=2)
+        _ = the_list.update(MORTY.id, item.id, {"latest_status": "An update is ready."}, source="morty")
+        _ = write_config_fixture(self.root / "config/review_links.conf", "undo_seconds=30\n")
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,posts,until,undo}=fixtureUndo();
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='820px';
+  const row=document.querySelector('[data-list-item][data-number="1"]');
+  row.querySelector('.list-toggle').click();
+  const form=recordDetails(row).querySelector('form');
+  const order=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')].map(item=>item.dataset.key).join(',');
+  const state=()=>JSON.stringify([row.dataset.state,row.dataset.parked,row.dataset.unread,JSON.parse(row.dataset.sortValues)]);
+  const before=order(),original=state();
+  form.elements.words.value='Keep this draft.';
+  for(const action of ['park','park-until-delivered','read','remove']){
+   if(action.startsWith('park')){
+    form.querySelector('[data-later-toggle]').click();
+    form.elements.until.value='2026-12-03';
+   }
+   form.querySelector('[value="'+action+'"]').click();
+   check(row.hidden,action+' hides the row at once.');
+   await undo();
+   await until(()=>!row.hidden && recordIsOpen(row) &&
+    form.querySelector('[value="read"]:enabled'),action+' did not restore the open row.');
+   check(order()===before,action+' restores the row order.');
+   check(state()===original,action+' restores the row state.');
+   check(form.elements.words.value==='Keep this draft.',action+' keeps the draft.');
+   await until(()=>!document.querySelector('[data-record-motion]'),'The return animation did not finish.');
+  }
+  check(posts.map(post=>post.get('action')).join(',')==='park,park,read,remove','Each action creates one hold.');
+  check(posts[1]?.get('until')==='delivered','Until delivered keeps its parking value.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe+'</body>').encode()), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_undo_unpark_restores_the_parked_row(self) -> None:
+        item = self.add("Keep the parking time", number=1)
+        _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
+        _ = write_config_fixture(self.root / "config/review_links.conf", "undo_seconds=30\n")
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,posts,until,undo}=fixtureUndo(),failures=[];
+ try{
+  document.querySelector('#filter-show-parked').click();
+  const row=document.querySelector('[data-list-item][data-number="1"]'),parking=row.dataset.parked;
+  row.querySelector('.list-toggle').click();
+  const button=recordDetails(row).querySelector('[value=unpark]');
+  button.click();
+  if(!row.hidden) failures.push('Unpark hides the row at once.');
+  await undo();
+  await until(()=>!row.hidden && recordIsOpen(row) && !button.disabled,'Undo did not restore the parked row.');
+  if(!parking || row.dataset.parked!==parking || button.hidden) failures.push('Undo keeps the original parking time.');
+  if(posts.map(post=>post.get('action')).join()!=='unpark') failures.push('Unpark creates one hold.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe+'</body>').encode()), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_undo_unpark_restores_the_linked_row(self) -> None:
+        item = self.add("Keep the parking time", number=1)
+        _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
+        _ = write_config_fixture(self.root / "config/review_links.conf", "undo_seconds=30\n")
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,posts,until,undo}=fixtureUndo(),failures=[];
+ try{
+  const row=document.querySelector('[data-list-item][data-number="1"]'),parking=row.dataset.parked;
+  const key=row.dataset.key,linked=document.querySelector('[data-linked-item]');
+  location.hash=new URLSearchParams({show:'working',item:key,reveal:'1'});
+  await until(()=>!linked.hidden && linked.contains(row) && recordIsOpen(row),'The link did not open the parked row.');
+  const button=recordDetails(row).querySelector('[value=unpark]');
+  button.click();
+  if(!row.hidden || history.state.recordTable.linkedItem) failures.push('Held Unpark hides the row and releases the link.');
+  await until(()=>linked.hidden,'The linked section did not hide.');
+  await undo();
+  await until(()=>!linked.hidden && linked.contains(row) && !row.hidden && recordIsOpen(row),
+   'Undo did not restore the linked row.');
+  if(history.state.recordTable.linkedItem!==key || row.dataset.parked!==parking)
+   failures.push('Undo keeps the link and the original parking time.');
+  if(posts.length!==1 || posts[0].get('action')!=='unpark') failures.push('Unpark creates one hold.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe+'</body>').encode()), [[]])
+
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_explicit_actions_release_open_rows_from_unread_only(self) -> None:
         _ = self.add("Check the current result", number=1)
@@ -6989,7 +7097,8 @@ const change=async path=>{
                 markup = list_page.render(self.root / "reviews").decode()
         markup = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', markup, count=1)
         setup = '''<script>
-const requests=[],itemSnapshots=new Map();let finishPost,losePost,failPostBody,refreshMarkup,readback,deliveryPending,pageReads=0;
+const requests=[],itemSnapshots=new Map();
+let finishPost,losePost,lostHold,failPostBody,refreshMarkup,readback,deliveryPending,pageReads=0;
 window.fetch=async(path,options={})=>{
  if(options.method!=='POST'){
   const query=new URL(path,location.href).searchParams;
@@ -7004,9 +7113,17 @@ window.fetch=async(path,options={})=>{
   if(typeof deliveryPending==='boolean') headers.set('X-Item-Delivery-Pending',String(deliveryPending));
   return {ok:true,headers,text:async()=>refreshMarkup};
  }
+ const hold=new Headers(options.headers).get('X-Undo-Request');
+ if(lostHold && hold===lostHold && !options.keepalive){
+  lostHold=null;
+  throw new Error('Fixture lost response');
+ }
  requests.push(new URLSearchParams(options.body));
  return new Promise((resolve,reject)=>{
-  losePost=()=>reject(new Error('Fixture lost response'));
+  losePost=()=>{
+   if(options.keepalive) lostHold=hold;
+   reject(new Error('Fixture lost response'));
+  };
   failPostBody=()=>resolve({headers:new Headers(),ok:true,status:200,json:async()=>{throw new Error('The response is unreadable.');}});
   finishPost=result=>resolve({headers:new Headers(),ok:!result.reason,status:result.status ?? (result.reason ? 400 : 200),
    json:async()=>({unread:'true',...result})});

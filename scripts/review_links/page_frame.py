@@ -879,6 +879,7 @@ transform-origin:left}
 '''
 
 HELD_SEND_SCRIPT = (f'window.heldFetch || (() => {{\nconst SEND_HOLD_PATH={json.dumps(send_hold.HOLD_PATH)},'
+                    f'SEND_REQUEST_HEADER={json.dumps(send_hold.REQUEST_HEADER)},'
                     f'SEND_UNDO_STYLE={json.dumps(HELD_SEND_STYLE)};\n') + r'''class SendUndone extends Error{
  constructor(){super('Undone. Edit and send again.');this.name='SendUndone';}
 }
@@ -886,8 +887,33 @@ function sendUndoHost(){
  try{ return window.top.document; }catch{ return document; }
 }
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-function showSendUndo(hold,seconds,receiver){
- const host=sendUndoHost(),view=host.defaultView || window;
+const RETRY_LIMIT_MS=120_000,KEEPALIVE_LIMIT=64*1024;
+const heldRequests=new Map();
+function trackHeldRequest(key){
+ const view=sendUndoHost().defaultView || window;
+ const id=Array.from(crypto.getRandomValues(new Uint8Array(12)),byte=>byte.toString(16).padStart(2,'0')).join('');
+ const started=Date.now(),elapsed=performance.now();
+ const expired=()=>Date.now()-started>=RETRY_LIMIT_MS || performance.now()-elapsed>=RETRY_LIMIT_MS;
+ const request={id,hold:id,expired,closed:false,closeToast:null,finish};
+ function finish(){
+  view.removeEventListener('pagehide',close);
+  if(view!==window) removeEventListener('pagehide',close);
+  if(heldRequests.get(key)===request) heldRequests.delete(key);
+ }
+ function close(){
+  if(request.closed) return;
+  request.closed=true;
+  request.closeToast?.();
+  fetch(SEND_HOLD_PATH+'/'+request.hold+'/send',
+   {method:'POST',headers:{[SEND_REQUEST_HEADER]:id},keepalive:true}).catch(()=>{});
+ }
+ view.addEventListener('pagehide',close);
+ if(view!==window) addEventListener('pagehide',close);
+ heldRequests.set(key,request);
+ return request;
+}
+function showSendUndo(request,seconds,receiver){
+ const {hold}=request,host=sendUndoHost();
  if(!host.querySelector('style[data-send-undo-style]')){
   const style=host.createElement('style');style.dataset.sendUndoStyle='';style.textContent=SEND_UNDO_STYLE;
   host.head.append(style);
@@ -918,16 +944,21 @@ function showSendUndo(hold,seconds,receiver){
  return new Promise(resolve=>{
   let done=false;
   const remove=()=>{
-   toast.remove();watch.disconnect();view.removeEventListener('pagehide',closed);removeEventListener('pagehide',closed);
+   toast.remove();watch.disconnect();
    if(!stack.children.length) stack.remove();
   };
   const finish=undone=>{
    if(done) return;
    done=true;remove();resolve(undone);
   };
-  const reportResult=async(response,late=false)=>{
+  const reportResult=async(response,late=false,warning)=>{
+   if(request.closed) return;
    const result=await response?.clone().json().catch(()=>null);
-   if(!late && !result?.send_failure){remove();return;}
+   if(!late && !result?.send_failure && (!warning || response?.ok)){
+    if(warning) warning.then(remove);
+    else remove();
+    return;
+   }
    const summary=response?.ok && result && !result.send_failure
     ? (result.no_message ? 'Saved.' : sent)
     : result?.send_failure || result?.reason || result?.error || 'The send result is unavailable.';
@@ -935,17 +966,10 @@ function showSendUndo(hold,seconds,receiver){
    fade.cancel();toast.style.display='';
    pause(3000).then(remove);
   };
-  // A closed console or card frame sends at once.
-  const closed=()=>{
-   if(done) return;
-   done=true;remove();
-   fetch(SEND_HOLD_PATH+'/'+hold+'/send',{method:'POST',keepalive:true}).catch(()=>{});
-   // A page that comes back from the browser cache reads the result.
-   resolve(false);
+  request.closeToast=()=>{
+   remove();
+   if(!done){done=true;resolve(false);}
   };
-  view.addEventListener('pagehide',closed);
-  // A card frame that goes away takes its toast with it, so it sends at once too.
-  if(view!==window) addEventListener('pagehide',closed);
   fade.finished.then(()=>{
    if(done) return;
    done=true;
@@ -959,6 +983,7 @@ function showSendUndo(hold,seconds,receiver){
     try{ answer=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST'}); }catch{ await pause(500); }
    }
    if(answer?.ok){finish(true);return;}
+   if(request.closed) return;
    done=true;
    button.remove();bar.remove();fade.cancel();
    if(answer?.status===409){
@@ -966,24 +991,42 @@ function showSendUndo(hold,seconds,receiver){
     resolve(response=>reportResult(response,true));
     return;
    }
-   text.textContent='Undo failed. The send can still leave.';
-   resolve(false);
-   pause(3000).then(remove);
+   const failed='Undo failed. The send can still leave.';
+   text.textContent=failed;
+   const warning=pause(3000).then(()=>{if(text.textContent===failed) toast.style.display='none';});
+   resolve(response=>reportResult(response,false,warning));
   });
  });
 }
 async function heldFetch(url,init={},receiver){
  const headers=new Headers(init.headers);headers.set('X-Undo-Hold','1');
- const first=await fetch(url,{...init,headers});
- if(first.headers.get('X-Send-Hold')!=='held') return first;
+ const body=String(init.body ?? '');
+ const key=JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
+ const request=heldRequests.get(key) || trackHeldRequest(key);
+ headers.set(SEND_REQUEST_HEADER,request.id);
+ const keepalive=body.length<=KEEPALIVE_LIMIT && new TextEncoder().encode(body).length<=KEEPALIVE_LIMIT;
+ const post=async keepalive=>{
+  if(request.expired()) throw new Error('The retry time ended. The send may have left.');
+  return fetch(url,{...init,headers,keepalive});
+ };
+ const first=await post(keepalive).catch(error=>{
+  if(!keepalive) throw error;
+  return post(false);
+ });
+ if(first.headers.get('X-Send-Hold')!=='held'){
+  if(!(first.status>=500)) request.finish();
+  return first;
+ }
  const {hold,seconds}=await first.json();
- const undo=await showSendUndo(hold,seconds,receiver);
- if(undo===true) throw new SendUndone();
+ request.hold=hold;
+ const undo=!request.closed && seconds>0 && await showSendUndo(request,seconds,receiver);
+ if(undo===true){request.finish();throw new SendUndone();}
  // A server restart drops the connection; the held send waits in its file, so read its result again.
  for(let failures=0;;){
   try{
    const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store'});
    if(response.headers.get('X-Send-Hold')!=='pending'){
+    if(response.status!==404 || !request.expired()) request.finish();
     if(typeof undo==='function') await undo(response);
     return response;
    }

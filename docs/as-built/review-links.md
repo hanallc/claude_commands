@@ -2308,25 +2308,30 @@ The server returns 403 when the host or origin check fails.
 
 ### Undo after Send
 
-A send waits a short time before it leaves, so the user can undo it, as in an email client.
-These sends wait:
+The following actions wait so the user can undo them.
 
-1. Review items: each answer except Later and Validate.
-2. The List: Tell and Ask.
-3. Images: Approved, Send Feedback and Ask question.
-4. The New item dialog on each console page.
-5. The change browser: each answer except Skip.
+1. Review items include all answers, Later, and Validate.
+2. The List includes Tell, Ask, both Park choices, Unpark, Mark read, and Remove.
+3. Images includes Approved, Send Feedback, and Ask question.
+4. The New item dialog waits on each console page.
+5. The change browser includes each answer and the question Skip action.
 
-The browser marks the send with the `X-Undo-Hold: 1` header.
+The browser marks the send with `X-Undo-Hold: 1` and sets `X-Undo-Request` to a new request ID.
+If the browser loses the response, a retry of the same action uses the same request ID.
+The browser allows POST retries for two minutes after the first POST. After two minutes, it shows a failure.
+The server uses this ID for the hold. A repeated POST returns the same hold and the remaining Undo time.
 The server saves the body, with the Content-Type, Origin, Host and Accept headers, in `<root>/.review-link-holds/<id>.json`.
 Only the owner can read the folder and its files. The server answers 202 with `X-Send-Hold: held`.
-The 202 body gives the hold id and `seconds`, the Undo time.
+The 202 body gives the hold ID and the remaining Undo time in `seconds`.
+If no time remains, the page reads the result without an Undo toast.
 Nothing is saved and nothing is sent before the time ends.
 When `undo_seconds` is zero, the server does not hold the send and handles it at once.
 
 The toast says `Sent to <name>.` and shows an **Undo** button and a bar.
 If the page has no receiver name, the toast says "Sending."
 For an action that saves without a message, the toast says "Saved."
+Later, Validate, Park, Unpark, Mark read, Remove, and Skip also use "Saved."
+The existing sender delivers any notice after the hold ends.
 The toast uses the recipient name shown when the user presses **Send**.
 If a draft can recover an earlier filing, the toast says "Sending."
 The toast appears at the bottom center of the top page. Long names wrap.
@@ -2342,15 +2347,25 @@ The List keeps a separate recovery slot for each unresolved draft in the browser
 If the server confirms a linked card save and its response is unreadable, the List shows the refresh error.
 A successful List refresh clears the error.
 A change browser answer goes back in the list with an **Open it** button.
-When the console page or the card frame of the send closes, the page removes the toast and posts
-`/send-hold/<id>/send`. The server then sends the request at once.
+Undo restores the Review or List row in the current sort order and keeps its draft.
+Undo after Unpark restores the row to Parked.
+Held Unpark hides a linked parked row during the hold. Undo restores the row and its link.
+Undo returns to a skipped question if the user stays at the next question.
+The page tracks the request from the first POST until the server confirms the result or Undo.
+The action POST uses `keepalive` for bodies of 64 KiB or less. Larger bodies use a regular POST.
+If the keepalive POST rejects before a response, the page retries once without `keepalive` and uses the same request ID.
+When the console page or the card frame closes, the page removes the toast and posts `/send-hold/<id>/send`.
+The server sends the request at once. If the release arrives first, the server records it until the POST arrives.
+A failed Undo leaves release on close active.
 
 One second after the time ends, the server sends the saved request to its own bound address.
 The normal handler then saves and sends, as for a send that does not wait.
 If delivery fails after a confirmed save, the toast shows the delivery failure. The action stays saved.
 An Undo after release gets 409.
 The toast waits for the result, then shows `Too late to undo. Sent to <name>.`, the save text, or the failure.
-An Undo that fails two times says "Undo failed. The send can still leave."
+The browser retries an Undo once if it loses the connection.
+A failed Undo says "Undo failed. The send can still leave."
+The toast still reads the result and shows any delivery failure.
 The page reads `GET /send-hold/<id>`, with the same Tailscale and origin checks as the New item options.
 The server answers 202 with `X-Send-Hold: pending` until the send ends.
 It then gives the saved response, so each page shows its normal result.

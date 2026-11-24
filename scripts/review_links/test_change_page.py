@@ -34,7 +34,7 @@ from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from uuid import uuid4
 
-from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
+from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, scratch, urgency
@@ -3885,7 +3885,9 @@ class ChangePageTests(unittest.TestCase):
     const posted=stubSave('');
     await save(row,rowForm,outcome);
     check(posted().get('outcome')===outcome,outcome+' sends its outcome');
-    check(current!==row && row.dataset.pending==='false' && saveNotice.textContent===notice,outcome+' advances with its notice');
+    check(current!==row && row.dataset.pending===String(outcome==='skip') &&
+     saveNotice.textContent===notice,outcome+' advances with its notice');
+    if(outcome==='skip') check(waiting().at(-1)===row,'Skip moves the question to the end.');
    }
    for(const row of rows) row.dataset.pending='false';
    navigate('');check(!empty.hidden && empty.textContent==='No questions to answer.','questions empty page');
@@ -4055,7 +4057,7 @@ class ChangePageTests(unittest.TestCase):
                 thread.join(TEST_HANG_GUARD_SECS)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
-    def test_undo_puts_an_early_answer_back_in_the_list_and_skip_sends_no_hold(self) -> None:
+    def test_undo_puts_an_early_answer_back_in_the_list(self) -> None:
         probe = r'''<script>
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
@@ -4094,14 +4096,84 @@ class ChangePageTests(unittest.TestCase):
   check(open?.textContent==='Open it','The notice has an Open it button.');
   open?.click();
   check(current===row,'Open it shows the change again.');
-  await save(row,form,'skip');
-  check(JSON.stringify(posts)===JSON.stringify([['not works','1'],['skip',null]]),'Skip sends no hold header.');
+  check(JSON.stringify(posts)===JSON.stringify([['not works','1']]),'The verdict creates one hold.');
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>'''
         page = self.browser("changes")[2].replace('</body>', probe + '</body>')
         self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_browser_undo_restores_the_skipped_question(self) -> None:
+        _ = self.file_user_question("Pick the first choice")
+        _ = self.file_user_question("Pick the second choice")
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,posts,until,undo}=fixtureUndo();
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ try{
+  const row=current,form=row.querySelector('form'),words=form.querySelector('textarea');
+  const order=()=>waiting().map(item=>item.dataset.key).join(',');
+  const previous=order(),place=location.hash;
+  words.value='Keep this answer.';
+  form.querySelector('[value="skip"]').click();
+  check(current!==row && !waiting().includes(row),'Skip advances at once.');
+  await undo();
+  await until(()=>current===row && !row.hidden && !form.hidden,'Undo did not restore the open question.');
+  check(location.hash===place && order()===previous,'Undo restores the question order and location.');
+  check(words.value==='Keep this answer.','Undo keeps the draft.');
+  check(posts.length===1 && posts[0].get('outcome')==='skip','Skip creates one hold.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        markup = self.browser("questions")[2].replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_browser_skip_restores_the_last_question(self) -> None:
+        _ = self.file_user_question("The last question")
+        probe = r"""<script>
+(async()=>{
+ const failures=[],realFetch=window.fetch.bind(window),row=current,form=row.querySelector('form');
+ let reply,release;
+ const response=new Promise(resolve=>{release=resolve;});
+ window.fetch=async(url,options={})=>options.method==='POST' ? (reply=options.body,response) : realFetch(url,options);
+ const skipping=save(row,form,'skip');
+ if(current!==null || waiting().length) failures.push('Skip hides the last question while it saves.');
+ release(Response.json({answer:''}));
+ await skipping;
+ if(reply.get('outcome')!=='skip' || waiting().at(-1)!==row || current!==row || row.hidden || form.hidden)
+  failures.push('Skip restores the last question and its form in the local queue.');
+ if(saveNotice.hidden || saveNotice.textContent!=='Skipped.') failures.push('Skip shows its notice.');
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})().catch(error=>fetch('/results',{method:'POST',body:JSON.stringify([String(error)])}));
+</script>"""
+        self.assertEqual(firefox_probe_results(self.browser("questions")[2].replace('</body>', probe+'</body>').encode()), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_browser_undo_skip_names_the_question_after_navigation(self) -> None:
+        for title in ("First question", "Second question", "Third question"):
+            _ = self.file_user_question(title)
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,undo}=fixtureUndo(),failures=[];
+ try{
+  const [row,next,last]=waiting(),heading=row.querySelector('h1').textContent;
+  const skipping=save(row,row.querySelector('form'),'skip');
+  if(current!==next) failures.push('Skip advances to the next question.');
+  go(last.dataset.key);
+  await undo();await skipping;
+  if(current!==last || saveNotice.textContent!=='Undone: '+heading+'. It is back in the list. Open it')
+   failures.push('Undo names the question and keeps the current question.');
+  saveNotice.querySelector('button')?.click();
+  if(current!==row) failures.push('Open it returns to the restored question.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        self.assertEqual(firefox_probe_results(self.browser("questions")[2].replace('</body>', probe+'</body>').encode()), [[]])
 
     def test_submit_writes_through_verdict_and_a_fresh_get_reads_the_saved_record(self) -> None:
         reply = self.request(self.page_path, self.answer())

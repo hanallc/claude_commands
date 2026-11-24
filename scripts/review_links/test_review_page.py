@@ -46,7 +46,7 @@ from scripts.review_links import change_browser, change_page, console, for_you, 
 from scripts.review_links import question_path, question_record
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, new_item_dialog, reply_tokens, review_actions, review_events, review_later, review_submissions
-from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
+from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.statusline import counts_row
 
@@ -6731,6 +6731,81 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
   document.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip===filters.owner &&
   document.querySelector('#list-search').value===filters.q,'The card submit keeps each selected control.');
 """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_undo_restores_later_and_validate_cards(self) -> None:
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,posts,until,undo}=fixtureUndo();
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='820px';
+  const visible=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')];
+  const key=visible().find(item=>item.dataset.type==='change').dataset.key;
+  const row=()=>visible().find(item=>item.dataset.key===key);
+  row().querySelector('.list-toggle').click();
+  const initial=()=>visible().map(item=>item.dataset.key).join(',');
+  const order=initial(),state=row().dataset.state;
+  for(const action of ['later','validate']){
+   const form=await readyReviewCard(row());
+   form.elements.feedback.value='Keep these words.';
+   if(action==='later'){
+    form.querySelector('[data-later-toggle]').click();
+    form.querySelector('[data-later-preset="soon"]').click();
+   }else form.querySelector('[value="validate"]').click();
+   check(!row(),action+' hides the card at once.');
+   await undo();
+   await until(()=>row() && recordIsOpen(row()) &&
+    recordDetails(row()).querySelector('[value="validate"]:enabled'),action+' did not restore the open card.');
+   check(initial()===order && row().dataset.state===state,action+' restores the card order and state.');
+   check((await readyReviewCard(row())).elements.feedback.value==='Keep these words.',action+' restores the words.');
+   await until(()=>!document.querySelector('[data-record-motion]'),'The return animation did not finish.');
+  }
+  check(posts.map(post=>post.get('outcome')).join(',')==='later,validate','Each action creates one hold.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        markup = browser_markup(self.root).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_scroll_keeps_held_later_and_validate_cards_hidden(self) -> None:
+        _ = write_config_fixture(self.fixture.temporary / "config/review_links.conf", "undo_seconds=30\n")
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,posts,until,undo}=fixtureUndo(),failures=[];
+ const frame=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='820px';
+  const spacer=document.createElement('div');spacer.style.height='400vh';document.body.append(spacer);
+  const key=document.querySelector('[data-list-item][data-type="change"]').dataset.key;
+  const row=()=>document.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]:not([hidden])');
+  row().querySelector('.list-toggle').click();
+  for(const action of ['later','validate']){
+   const form=await readyReviewCard(row());
+   if(action==='later'){
+    form.querySelector('[data-later-toggle]').click();
+    form.querySelector('[data-later-preset="soon"]').click();
+   }else form.querySelector('[value=validate]').click();
+   const top=scrollY;
+   await until(()=>window.top.document.querySelector('[data-send-undo] button'),'Undo did not show.');
+   scrollTo(0,top+innerHeight*2);await frame();
+   if(scrollY-top<innerHeight) failures.push('The page did not scroll far enough.');
+   await until(()=>!document.querySelector('[data-record-motion]'),'The departure animation did not finish.');
+   scrollTo(0,top);await frame();
+   if(row()) failures.push(action+' must stay hidden while held.');
+   await undo();
+   await until(()=>row() && recordIsOpen(row()),'Undo did not restore the card.');
+   await until(()=>!document.querySelector('[data-record-motion]'),'The return animation did not finish.');
+  }
+  if(posts.map(post=>post.get('outcome')).join()!=='later,validate') failures.push('Each action creates one hold.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        markup = browser_markup(self.root).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_undo_keeps_the_card_words_and_a_second_send_posts_again(self) -> None:
