@@ -57,6 +57,7 @@ class ScriptRepositoryTestCase(unittest.TestCase):
         }
         self.environment.update(
             HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / ".config"),
+            XDG_CACHE_HOME=str(self.home / ".cache"),
             GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
             GIT_AUTHOR_NAME="rerun test", GIT_AUTHOR_EMAIL="rerun@example.invalid",
             GIT_COMMITTER_NAME="rerun test", GIT_COMMITTER_EMAIL="rerun@example.invalid",
