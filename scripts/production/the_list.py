@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed
 from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
-from scripts.production import delivery_state, record_store, staff
+from scripts.production import delivery_state, goal, record_store, staff
 from scripts.review_links import change_page, page_question, question_path, question_record
 
 
@@ -1076,7 +1076,12 @@ def _require_active_open_producers(items: Sequence[ListItem]) -> None:
             raise ListError(f"{producer.name}: retired producer. Choose an active producer.")
 
 
-def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
+def _goal_status(item: ListItem) -> goal.ItemStatus:
+    eta = "none recorded" if item.eta is EtaStatus.NOT_ASKED else eta_text(item.eta)
+    return goal.ItemStatus(item.title, item.state.value, eta)
+
+
+def _save(store: record_store.NumberedRecords, item: ListItem, *, previous_producer: staff.StaffId | None = None) -> None:
     _validate(item)
     fields = {"id": item.id, "number": str(item.number), "title": item.title,
               "owner": item.owner, "producer": item.producer, "unit": item.unit, "state": item.state.value,
@@ -1100,7 +1105,8 @@ def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
                                           ("done_when", item.done_when, "Log", log)):
         fields[key + "_length"] = str(len(text))
         body += record_store.section(heading) + following
-    store.write(item.id, fields, body)
+    with goal.list_item_change(store.owner, item.id, item.producer, _goal_status(item), previous_producer):
+        store.write(item.id, fields, body)
 
 
 def records(keeper: staff.StaffId, *, include_closed: bool = False,
@@ -1336,7 +1342,7 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
         if isinstance(request, PageRequest):
             changed = _save_page_request(store, keeper, changed, request)
         else:
-            _save(store, changed)
+            _save(store, changed, previous_producer=item.producer)
         return SavedEdit(item, changed)
 
 
@@ -2117,6 +2123,69 @@ def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId
             print(f"the_list: {item.id} was saved. The {role} notice to {reference} failed. {details}", file=sys.stderr)
             status = 1
     return status
+
+
+class _GoalArguments(argparse.Namespace):
+    action: str = ""
+    item: str = ""
+    blocked: str = ""
+    faster: str = ""
+
+
+def _change_goal(args: _GoalArguments, keeper: staff.StaffId, producer: staff.StaffId) -> str:
+    with _store(keeper).locked():
+        saved = goal.load(producer)
+        if args.action == "set":
+            item = load(keeper, args.item)
+            if item.producer != producer:
+                raise ListError(f"{item.id} is assigned to another producer.")
+            if saved is goal.NoGoal.UNSET or (saved["keeper"], saved["item"]) != (keeper, item.id):
+                saved = goal.GoalRecord(keeper=keeper, item=item.id, blocked="", faster="", noted_at="")
+        elif saved is goal.NoGoal.UNSET:
+            if args.action == "note":
+                raise ListError(saved.value)
+            goal.clear_card(producer)
+            return saved.value
+        else:
+            if saved["keeper"] != keeper:
+                raise ListError("The List keeper changed. Set the main goal again.")
+            item = load(keeper, saved["item"])
+            if item.producer != producer:
+                if args.action == "note":
+                    raise ListError(f"{item.id} is assigned to another producer.")
+                return goal.save(producer, saved, goal.ItemAvailability.UNAVAILABLE)
+        if args.action == "note":
+            _line(args.blocked, "Blocked by")
+            _line(args.faster, "Faster if")
+            saved["blocked"] = args.blocked.strip()
+            saved["faster"] = args.faster.strip()
+            saved["noted_at"] = now().isoformat(timespec="seconds")
+        if args.action != "card":
+            goal.write_goal(producer, saved)
+        return goal.save(producer, saved, _goal_status(item))
+
+
+def goal_main(argv: list[str] | None = None) -> int:
+    """Run the producer's main goal command."""
+    parser = argparse.ArgumentParser(description=goal.__doc__)
+    actions = parser.add_subparsers(dest="action", required=True)
+    mark = actions.add_parser("set", help="mark one List item as your main goal")
+    _ = mark.add_argument("item", help="the List item ID, such as L1")
+    _ = actions.add_parser("card", help="refresh and print your main goal card")
+    note = actions.add_parser("note", help="write the blocker and what can make work faster")
+    _ = note.add_argument("--blocked", required=True, help="what blocks the main goal")
+    _ = note.add_argument("--faster", required=True, help="what can make work faster")
+    args = parser.parse_args(argv, namespace=_GoalArguments())
+    try:
+        members = staff.snapshot()
+        producer = members.by_current_session(staff.caller_identity())
+        if producer is None or producer not in staff.active(members, "producer"):
+            raise ListError("Run this command in a producer session.")
+        print(_change_goal(args, producer_id(members, "morty"), producer.id))
+    except (OSError, ValueError, staff.StaffRefused) as error:
+        print(f"goal: {error}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
