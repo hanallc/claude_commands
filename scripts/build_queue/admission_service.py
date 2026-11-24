@@ -1929,6 +1929,7 @@ class AdmissionServer:
         self.host_requests: dict[placement.HostEvidenceKey, wire.PlacementRequest] = {}
         self.placement_host_keys: dict[tuple[str, placement.PlacementDestination], placement.HostEvidenceKey] = {}
         self.settlement_host_keys: dict[str, placement.HostEvidenceKey] = {}
+        self.guest_starts_pending_after_proof: set[str] = set()
         # Start time of each hold that keeps a remote destination for an older waiting request.
         self.placement_holds: dict[tuple[str, placement.PlacementDestination], float] = {}
         # The reading that answered each ended hold. That reading never starts another hold.
@@ -4507,6 +4508,16 @@ done
             except (OSError, conf.Unusable):
                 return True
 
+    def _guest_settlement_ready_at(self, saved: records.SavedPlacementAssignment, attempt: str,
+                                   proved_at: float | None) -> float | None:
+        if proved_at is None:
+            return None
+        if self._pending_start_path_exists(saved, guest_state_path=True):
+            self.guest_starts_pending_after_proof.add(attempt)
+            return None
+        # If the start was pending after proof, use the time the service sees it clear.
+        return self.clock.now() if attempt in self.guest_starts_pending_after_proof else proved_at
+
     def _recovered_hana_dispatch(self, saved: records.SavedPlacementAssignment) -> wire.ExecutionReport | placement.NoTerminalReport:
         if self._ended_claim_holder(saved):
             _ = self._start_pending(saved)
@@ -4551,10 +4562,14 @@ done
         for key, saved in blocking:
             report = saved.terminal_report
             if isinstance(saved.state, placement.CurrentAssignment):
+                now = self.clock.now()
+                if now < deadline:
+                    continue
                 evidence_key = self.settlement_host_keys.get(key)
                 reader = None if evidence_key is None else self.host_readers.get(evidence_key)
-                settled_at = None if reader is None else reader.worker.observed_settlement_time(saved, key)
-                until = self.clock.now() if settled_at is None else settled_at
+                proved_at = None if reader is None else reader.worker.observed_settlement_time(saved, key)
+                ready_at = self._guest_settlement_ready_at(saved, key, proved_at)
+                until = now if ready_at is None else ready_at
             elif (isinstance(report, placement.TerminalAttemptReport)
                   and isinstance(report.path, placement.DispatchPathSettled) and report.received_at >= request.since):
                 until = report.received_at
@@ -5338,6 +5353,7 @@ done
             del self.current_assignments[assignment.episode]
         self.assignments[key] = replace(saved, state=placement.ClosedAssignment(reason), retry=retry)
         self.manual_guest_settlement.discard(key)
+        self.guest_starts_pending_after_proof.discard(key)
         _ = self.settlement_host_keys.pop(key, None)
         destination = assignment.destination
         worker = self.host_targets.get((destination.provider, destination.target))
@@ -5522,15 +5538,16 @@ done
                 legacy_holder_ended=legacy_holder_ended)
 
         probe = self._dispatch_settlement_probe(saved, read_dispatch)
-        settled_at = None if probe is None else probe[0].dispatch_settled_at(probe[1])
-        if settled_at is None or self._pending_start_path_exists(saved, guest_state_path=True):
+        proved_at = None if probe is None else probe[0].dispatch_settled_at(probe[1])
+        settled_at = self._guest_settlement_ready_at(saved, attempt_key, proved_at)
+        if settled_at is None:
             self.assignments[attempt_key] = self._expire_guest_replacement(saved)
             return
         expired = self._expire_guest_replacement(saved, checked_at=settled_at)
         report = expired.terminal_report
         terminal = (replace(report, path=placement.DispatchPathSettled())
                     if isinstance(report, placement.TerminalAttemptReport) else self._lost_report())
-        # Keep the proof time for a reused submission after the worker forgets the attempt.
+        # Keep the settlement time for a reused submission after the worker forgets the attempt.
         submitted = self.placement_requests.get(episode)
         saved_terminal = (replace(terminal, received_at=settled_at) if submitted is not None
                           and (assignment.owner != submitted.owner or assignment.since != submitted.since) else terminal)
