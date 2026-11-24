@@ -16,6 +16,7 @@ from enum import Enum, auto
 import json
 import fcntl
 import hashlib
+from importlib import import_module
 import shlex
 import math
 import os
@@ -30,7 +31,7 @@ import sys
 import tempfile
 import time
 from types import MappingProxyType
-from typing import TYPE_CHECKING, NoReturn, TextIO, cast, override
+from typing import TYPE_CHECKING, NoReturn, Protocol, TextIO, cast, override
 from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
@@ -47,7 +48,7 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.lib.build_steps import (
-    GATE_SCRIPTS, MERGE_GATE_PROGRAMS,
+    GATE_SCRIPTS,
     OtherCommand, StepJob, VerifyCommand, build_call_arguments, command_job, command_program,
     parse_command_program, read_step_names, verify_command,
 )
@@ -1465,10 +1466,32 @@ class DirectCommandCopy:
     tree: Path
 
 
+class GateCommandParser(argparse.ArgumentParser):
+    @override
+    def error(self, message: str) -> NoReturn:
+        raise CopyError(message)
+
+
+class GateSourceCheck(Protocol):
+    def gate_source_check(self, arguments: Sequence[str], parser: argparse.ArgumentParser) -> Callable[[Path], None] | None: ...
+
+
+def gate_command_source_check(command: Sequence[str]) -> Callable[[Path], None] | None:
+    program = parse_command_program(command)
+    if isinstance(program, OtherCommand) or program[0] not in GATE_SCRIPTS:
+        return None
+    name, arguments = program
+    if name == "targeted_test.py":
+        arguments = ("--affected", *arguments)
+    gate = cast(GateSourceCheck, cast(object, import_module("scripts.production.gate")))
+    return gate.gate_source_check(arguments, GateCommandParser(prog=name, allow_abbrev=False))
+
+
 @contextmanager
 def _command_copy(
     owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
     merge: MergePolicy, step: str = "", gate_targets: tuple[str, ...] = (), place_unnamed_gate: bool = True,
+    check_source: Callable[[Path], None] | None = None,
 ) -> Generator[AdmittedCommandCopy | DirectCommandCopy]:
     """Hold the copy and any first-step admission through the caller scope."""
     from scripts.build_targets.gate_targets import uses_parent_reservation
@@ -1479,9 +1502,12 @@ def _command_copy(
         with ExitStack() as scope:
             if isinstance(job, StepJob) and (gate_targets or not uses_parent_reservation(tuple(command))):
                 source = Path(repo).expanduser().resolve()
-                if (gate_targets or place_unnamed_gate and command_program(command) in GATE_SCRIPTS
+                if (check_source is not None or gate_targets
+                        or place_unnamed_gate and command_program(command) in GATE_SCRIPTS
                         or isinstance(verify_command(command), VerifyCommand)):
                     source = scope.enter_context(requested_source(source, policy, merge))
+                    if check_source is not None:
+                        check_source(source)
                     policy = CommittedSource(commit_at(source, "HEAD"))
                     merge = NO_MERGE
                 admission = first_step.admitted_run(command, source, targets=gate_targets,
@@ -1492,6 +1518,8 @@ def _command_copy(
                 yield AdmittedCommandCopy(tree, admitted)
             else:
                 tree = scope.enter_context(standing(owner, repo, policy, merge=merge, step=label, command=command))
+                if check_source is not None:
+                    check_source(tree)
                 yield DirectCommandCopy(tree)
     except first_step.FirstStepRefused as error:
         failure = CopyError(str(error))
@@ -2650,15 +2678,7 @@ def run_prepared_gate(command: Sequence[str], *, cwd: Path, descriptors: tuple[i
 
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
     """Run verify from a snapshot and other commands under a numbered copy lease."""
-    program = parse_command_program(command)
-    if not isinstance(program, OtherCommand) and program[0] in MERGE_GATE_PROGRAMS:
-        arguments = program[1]
-        if "-h" not in arguments and "--help" not in arguments:
-            error = first_step.gate_module_mode_error(
-                has_modules=any(word == "--module" or word.startswith("--module=") for word in arguments),
-                tests_only="--tests-only" in arguments, affected="--affected" in arguments)
-            if error:
-                raise CopyError(error)
+    check_source = gate_command_source_check(command)
     owner = caller_owner()
     source = Path(args.repo or "").expanduser().resolve()
     verification = verify_command(command)
@@ -2684,7 +2704,7 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
             source_arguments = [part.replace("{tree}", str(source)) for part in command]
             targets = first_step.gate_targets(source_arguments, source, args.targets)
             prepared = scope.enter_context(_command_copy(owner, source, policy, command, merge=merge,
-                                                         gate_targets=targets))
+                                                         gate_targets=targets, check_source=check_source))
             tree = prepared.tree
             environment = {"PYTHONDONTWRITEBYTECODE": "1", "COPIES_STEP_OWNER": owner,
                            "BUILDLOG_PREPARED_COPY": str(tree)}
@@ -2731,6 +2751,8 @@ def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
 
     if command_program(command) not in GATE_SCRIPTS:
         raise CopyError("gate-step requires a gate command")
+    if check := gate_command_source_check(command):
+        check(source)
     targets = first_step.gate_targets(command, source, args.targets)
 
     def run() -> subprocess.CompletedProcess[str]:

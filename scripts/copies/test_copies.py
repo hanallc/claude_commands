@@ -2427,6 +2427,45 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertEqual(result.stderr, "copies: --module needs --tests-only or --affected\n")
         admit.assert_not_called()
 
+    def test_run_refuses_a_module_with_the_scripts_prefix_before_admission(self) -> None:
+        with mock.patch.object(first_step, "admitted_run") as admit:
+            result = self.run_cli(command=("./scripts/lib/py", "scripts/production/gate.py",
+                                           "--tests-only", "--module", "scripts/lib/test_fixture.py"))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--module 'scripts/lib/test_fixture.py' needs a path under scripts/", result.stderr)
+        self.assertIn("lib/test_x.py", result.stderr)
+        admit.assert_not_called()
+
+    def test_run_refuses_a_module_absent_from_the_requested_commit_before_admission(self) -> None:
+        test = self.source / "scripts/lib/test_fixture.py"
+        test.parent.mkdir(parents=True)
+        test.touch()
+        _ = self.git(self.source, "add", str(test))
+        _ = self.git(self.source, "commit", "-qm", "Add the test module")
+        with mock.patch.object(first_step, "admitted_run") as admit:
+            result = self.run_cli("--commit", self.head, command=(
+                "./scripts/lib/py", "scripts/production/gate.py", "--tests-only", "--module", "lib/test_fixture.py"))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--module 'lib/test_fixture.py' does not name a test module", result.stderr)
+        admit.assert_not_called()
+
+    def test_run_admits_a_module_from_the_requested_commit_once(self) -> None:
+        test = self.source / "scripts/lib/test_fixture.py"
+        test.parent.mkdir(parents=True)
+        test.touch()
+        _ = self.git(self.source, "add", str(test))
+        _ = self.git(self.source, "commit", "-qm", "Add the test module")
+        revision = self.git(self.source, "rev-parse", "HEAD")
+        _ = self.git(self.source, "rm", str(test))
+        _ = self.git(self.source, "commit", "-qm", "Remove the test module")
+        with mock.patch.object(first_step, "admitted_run",
+                               side_effect=first_step.FirstStepRefused("Fixture reached admission")) as admit:
+            result = self.run_cli("--commit", revision, command=("./scripts/lib/py", "scripts/production/gate.py",
+                "--affected", "--module", "lib/test_fixture.py", "--repo", "{tree}"))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, "copies: Fixture reached admission\n")
+        admit.assert_called_once()
+
     def test_run_uses_tree_cwd_substitution_and_command_exit_status(self) -> None:
         output = self.base / "command-result.json"
         evidence = self.base / "build-evidence.json"

@@ -330,6 +330,9 @@ class GateDefaultPlacementTests(unittest.TestCase):
             script = Path("scripts/production/gate.py")
             arguments = ["--affected", "--module", module, "--repo", str(source)]
             command = [sys.executable, "-B", str(script), *arguments]
+            test = source / "scripts" / module
+            test.parent.mkdir(parents=True)
+            test.touch()
             assignment = placed("natedev")
             (source / script).parent.mkdir(parents=True)
             _ = (source / script).write_text(dedent(f"""\
@@ -772,7 +775,11 @@ class GateDefaultPlacementTests(unittest.TestCase):
         local.assert_not_called()
 
     def test_a_standalone_named_module_uses_placement_and_a_nested_module_keeps_its_parent(self) -> None:
-        arguments = ['--tests-only', '--module', 'fixture/test_ok.py']
+        repo = Path(self.enterContext(TemporaryDirectory())).resolve()
+        test = repo / 'scripts/fixture/test_ok.py'
+        test.parent.mkdir(parents=True)
+        test.touch()
+        arguments = ['--tests-only', '--module', 'fixture/test_ok.py', '--repo', str(repo)]
         parent = mock.Mock(spec=OuterReservation)
         assignment = placed('mac-linux')
         for nested in (True, False):
@@ -808,7 +815,10 @@ class GateDefaultPlacementTests(unittest.TestCase):
                 return wire.PlacementStatusReply(wire.KnownPlacementStatus(
                     assignment, placement.CurrentAssignment(), placement.NoProviderClaim()))
 
-            arguments = ['--tests-only', '--module', 'fixture/test_ok.py']
+            test = repo / 'scripts/fixture/test_ok.py'
+            test.parent.mkdir(parents=True)
+            test.touch()
+            arguments = ['--tests-only', '--module', 'fixture/test_ok.py', '--repo', str(repo)]
             with (mock.patch.dict(os.environ, {'PATH': os.environ['PATH'], 'CONF_DIR': directory, 'HOME': directory,
                                                'CLAUDE_SESSION_NAME': 'gate-fixture', 'BUILDLOG_GATE_TARGETS': 'natedev'}, clear=True),
                   mock.patch.object(build_folders, 'repo_word', return_value='claude'),

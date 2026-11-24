@@ -357,6 +357,9 @@ class DirectGatePlacementTests(unittest.TestCase):
     def test_named_gate_refuses_an_inherited_assignment_for_a_different_source(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             source = self.checkout(folder)
+            test = source / "scripts/lib/test_fixture.py"
+            test.parent.mkdir(parents=True)
+            test.touch()
             path = source / ".git" / "assignment.json"
             key = treekey.tree_key(str(source))
             assert key is not None
@@ -390,6 +393,18 @@ class DirectGatePlacementTests(unittest.TestCase):
                         self.assertEqual(result, 1)
                     self.assertIn("source does not match", errors.getvalue())
                     run.assert_not_called()
+
+    def test_direct_gate_refuses_a_missing_module_before_admission(self) -> None:
+        with (tempfile.TemporaryDirectory() as folder,
+              mock.patch.dict(os.environ, {}, clear=True),
+              mock.patch.object(first_step, "admitted_run") as admit,
+              mock.patch.object(gate, "run_tests_only") as run,
+              redirect_stderr(io.StringIO()) as errors):
+            status = gate.main(["--tests-only", "--repo", folder, "--module", "lib/test_missing.py"])
+        self.assertEqual(status, 1)
+        self.assertIn("--module 'lib/test_missing.py' does not name a test module", errors.getvalue())
+        admit.assert_not_called()
+        run.assert_not_called()
 
     def test_direct_gate_refuses_an_assignment_for_a_different_source(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
