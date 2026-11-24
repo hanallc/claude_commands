@@ -30,7 +30,8 @@
     "sweep_build_floor_gib.natedev": 6
   },
   "mac_test": {
-    "offload": 21
+    "offload": 21,
+    "probe_timeout_s": 26
   },
   "merge_gate": {
     "GATE_TIME_LIMIT_FACTOR": 5
