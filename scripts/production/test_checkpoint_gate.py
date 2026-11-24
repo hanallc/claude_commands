@@ -178,7 +178,7 @@ class BatchProbeAdmissionTests(GateSuitesFixture):
 
 @final
 class CheckpointGatePlacementTests(unittest.TestCase):
-    def run_step(self, status: int, *, retry_failed_steps: bool) -> None:
+    def run_step(self, status: int, *, retry_failed_steps: bool, output: str = RED_OUTPUT) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         production = ProductionDocument(root / "production.md", "fixture", "merge", root,
                                         root / "production.log", ZoneInfo("UTC"))
@@ -189,7 +189,7 @@ class CheckpointGatePlacementTests(unittest.TestCase):
         def run(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
             args = copies.CopyArguments(repo=str(folder), targets="mac-linux,natedev")
             result = copies.run_gate_step(args, command)
-            return subprocess.CompletedProcess(command, result, RED_OUTPUT, "")
+            return subprocess.CompletedProcess(command, result, output, "")
 
         with (mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)) as place,
               mock.patch.object(subprocess, "run",
@@ -200,7 +200,7 @@ class CheckpointGatePlacementTests(unittest.TestCase):
                                                retry_failed_steps=retry_failed_steps)
         place.assert_called_once_with(COMMAND, root, targets=("mac-linux", "natedev"))
         child.assert_called_once()
-        if status == 1:
+        if status in (0, 1):
             assert isinstance(stopped.exception, checkpoint_gate.RedCheckpointTests)
             self.assertEqual(stopped.exception.red, (checkpoint_gate.RedStep(step, frozenset({"lib/test_infrastructure.py"})),))
         else:
@@ -217,3 +217,5 @@ class CheckpointGatePlacementTests(unittest.TestCase):
 
     def test_red_gate_remains_a_test_failure(self) -> None:
         self.run_step(1, retry_failed_steps=False)
+        self.run_step(0, retry_failed_steps=False,
+                      output="--- lib/test_infrastructure.py passed on rerun alone; first run exit=1 ---\n")

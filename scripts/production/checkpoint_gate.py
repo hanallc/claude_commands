@@ -172,6 +172,11 @@ def red_names(command: Sequence[str], output: str) -> frozenset[str]:
     return frozenset(match[1] for match in GATE_RED.finditer(output) if match[2] != "0") - green
 
 
+def gate_rerun_red(command: Sequence[str], output: str) -> frozenset[str]:
+    """Read modules that failed before passing a rerun."""
+    return frozenset(GATE_GREEN_ALONE.findall(output)) if runs_merge_gate(command) else frozenset()
+
+
 def gate_command_words(command: Sequence[str]) -> Sequence[str]:
     """Read the gate command after a leading env with assignments."""
     if not command or Path(command[0]).name != "env":
@@ -312,12 +317,13 @@ def run_test_steps(production: ProductionDocument, steps: Sequence[CheckpointTes
             _ = output.write(f"{step.label.replace(' ', '_')}_EXIT={result.returncode}\n")
             output.flush()
             stop_test_without_result(step, result, log)
-            if not test_passed(result):
-                output_text = result.stdout + result.stderr
+            output_text = result.stdout + result.stderr
+            rerun_red: frozenset[str] = frozenset() if retry_failed_steps else gate_rerun_red(step.command, output_text)
+            if not test_passed(result) or rerun_red:
                 names = red_names(step.command, output_text)
                 if not retry_failed_steps:
                     report("test", "ok", f"{count} commands ran; 1 red; log {log}")
-                    raise unit_red((RedStep(step, names),), log)
+                    raise unit_red((RedStep(step, names | rerun_red),), log)
                 failed.append((step, failed_tests(output_text), names))
     red_steps: list[RedStep] = []
     for step, tests, first_names in failed:

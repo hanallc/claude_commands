@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
 from scripts.lib import file_lock
-from scripts.lib.atomic_file import sync_folder, write_text_atomic
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_start import Started, Unreadable, process_start
 
 
@@ -147,20 +147,6 @@ def record_result(*, commit: str, production: str, unit: str, phase: str,
             lines = path.read_text(encoding="utf-8").splitlines()
         except FileNotFoundError:
             lines = []
-        if state == "dropped":
-            for line in reversed(lines):
-                try:
-                    previous = cast(object, json.loads(line))
-                except ValueError:
-                    continue
-                if not isinstance(previous, dict):
-                    continue
-                saved = cast(dict[str, object], previous)
-                if saved.get("commit") == commit and saved.get("production") == production:
-                    if saved == {**row, "time": saved.get("time")}:
-                        sync_folder(path.parent)
-                        return
-                    break
         lines = [*lines, json.dumps(row)][-KEPT_RESULTS:]
         write_text_atomic(path, "\n".join(lines) + "\n")
 

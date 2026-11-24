@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import gzip
 from collections.abc import Callable
-import os
 from pathlib import Path
 import shlex
 import shutil
@@ -1029,26 +1028,17 @@ raise SystemExit(1)
         return run
 
     def test_persistent_red_drops_only_its_owner_and_full_gates_survivors(self) -> None:
-        for resumed in (False, True):
-            with self.subTest(resumed=resumed):
-                shutil.rmtree(self.root)
-                _ = shutil.copytree(self.fixture_snapshot, self.root)
-                self.bind_fixture(self.root)
-                start, _, beta, rows = self.prepare_row_drop()
-                if resumed:
-                    with (patch.object(merge_checkpoint, "prepare_checkpoint", side_effect=KeyboardInterrupt),
-                          self.assertRaises(KeyboardInterrupt)):
-                        _ = self.land_batch(rows)
-                runs: list[RowDropRun] = []
-                with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs)):
-                    result = self.land_batch(rows)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                _ = self.assert_landed(start, [beta])
-                self.assertEqual(runs[0], RowDropRun(False, True, True, False))
-                self.assertEqual(runs[1], RowDropRun(True, False, False, False))
-                self.assertCountEqual(runs[2:4], [RowDropRun(True, True, False, False), RowDropRun(True, False, True, False)])
-                self.assertEqual(runs[4:], [RowDropRun(False, False, True, False)])
-                self.assertEqual(self.events("checkpoint-test"), [[]])
+        start, _, beta, rows = self.prepare_row_drop()
+        runs: list[RowDropRun] = []
+        with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs)):
+            result = self.land_batch(rows)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        _ = self.assert_landed(start, [beta])
+        self.assertEqual(runs[0], RowDropRun(False, True, True, False))
+        self.assertEqual(runs[1], RowDropRun(True, False, False, False))
+        self.assertCountEqual(runs[2:4], [RowDropRun(True, True, False, False), RowDropRun(True, False, True, False)])
+        self.assertEqual(runs[4:], [RowDropRun(False, False, True, False)])
+        self.assertEqual(self.events("checkpoint-test"), [[]])
 
     def test_red_base_or_two_red_rows_keeps_todays_stop(self) -> None:
         for red_base in (True, False):
@@ -1094,37 +1084,56 @@ raise SystemExit(1)
         self.assertEqual(result.stdout.count("send alpha:"), 1)
         self.assertEqual(result.stdout.count("send beta:"), 1)
 
-    def test_restart_after_drop_does_not_restore_the_dropped_row(self) -> None:
-        for after_rollback in (False, True):
-            with self.subTest(after_rollback=after_rollback):
+    def test_interrupted_red_batch_stops_and_retries_all_rows(self) -> None:
+        for survivors, beta_first in ((False, False), (True, False), (True, True)):
+            with self.subTest(survivors=survivors, beta_first=beta_first):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
                 self.bind_fixture(self.root)
                 start, alpha, beta, rows = self.prepare_row_drop()
+                if beta_first:
+                    rows.reverse()
                 runs: list[RowDropRun] = []
-                reset_batch = merge_checkpoint.reset_batch
+                gate = self.row_drop_gate(runs)
 
-                def interrupt(rollback: merge_checkpoint.ResetBatchCheckout, warnings: list[str]) -> None:
-                    if after_rollback:
-                        reset_batch(rollback, warnings)
-                    raise KeyboardInterrupt
+                def interrupt(command: list[str], folder: Path, **options: bool) -> subprocess.CompletedProcess[str]:
+                    if (checkpoint_gate.runs_merge_gate(command) and "--module" not in command
+                            and (not survivors or not (folder / "src/drop-alpha.txt").exists())):
+                        raise KeyboardInterrupt
+                    return gate(command, folder, **options)
 
-                with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs)):
-                    with patch.object(merge_checkpoint, "reset_batch", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+                with patch.object(checkpoint_gate, "run_test_command", side_effect=gate):
+                    with (patch.object(checkpoint_gate, "run_test_command", side_effect=interrupt),
+                          self.assertRaises(KeyboardInterrupt)):
                         _ = self.land_batch(rows)
-                    saved = self.batch_record().read_text()
-                    self.assertIn(RED_MODULE, saved)
-                    self.assertIn(alpha, saved)
+                    record = self.batch_record()
+                    if survivors:
+                        self.assertEqual(self.git("rev-parse", "HEAD^2"), beta)
+                        recorded = record.read_text().splitlines()
+                        expected = [beta, alpha] if beta_first else [alpha, beta]
+                        self.assertEqual([line.split("\t", 1)[0] for line in recorded], [*expected, "in-flight"])
+                    self.assertNotIn("\ndrop\t", record.read_text())
                     self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
-                    if after_rollback:
-                        self.assertEqual(self.git("rev-parse", "HEAD"), start)
                     runs.clear()
-                    result = self.land_batch(rows)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(runs, [RowDropRun(False, False, True, False)])
+                    retry = self.land_batch(rows)
+                    if survivors:
+                        self.assertIn("batch: resume — beta phase 2 is already merged", retry.stdout)
+                        self.assertIn(f"batch: dropped — alpha phase 2 ({alpha[:12]})", retry.stdout)
+                    else:
+                        self.assertEqual(retry.returncode, 1, retry.stdout + retry.stderr)
+                        self.assertNotIn("batch: dropped", retry.stdout)
+                        self.assertIn("send alpha:", retry.stdout)
+                        self.assertIn("send beta:", retry.stdout)
+                        self.assertEqual(runs, [RowDropRun(False, True, True, False)])
+                        self.assert_rolled_back(start)
+                        runs.clear()
+                        retry = self.land_batch(rows)
+                self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+                self.assertEqual(runs[0], RowDropRun(False, True, True, False))
+                self.assertEqual(runs[-1], RowDropRun(False, False, True, False))
+                self.assertEqual(sum(run.probe for run in runs), 3)
                 _ = self.assert_landed(start, [beta])
-                with patch.dict("os.environ", self.env):
-                    self.assertEqual(land_runs.results_path().read_text().count('"state": "dropped"'), 1)
+                self.assertFalse(record.exists())
 
     def test_dropped_row_gets_result_send_line_and_kept_log(self) -> None:
         _, alpha, beta, rows = self.prepare_row_drop()
@@ -1150,105 +1159,8 @@ raise SystemExit(1)
               patch.object(build_record, "keep_log", side_effect=OSError("log write refused"))):
             result = self.land_batch(rows)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("could not save the batch drop: log write refused", result.stdout)
+        self.assertIn("could not keep the batch test log: log write refused", result.stdout)
         self.assert_rolled_back(start)
-
-    def test_failed_drop_replacement_rolls_back_the_batch(self) -> None:
-        start, _, _, rows = self.prepare_row_drop()
-        record = self.batch_record()
-        replace = os.replace
-
-        def refuse_drop(source: str | Path, target: str | Path, *,
-                        src_dir_fd: int | None = None, dst_dir_fd: int | None = None) -> None:
-            if target == record and "\ndrop\t" in Path(source).read_text():
-                self.assertNotIn("\ndrop\t", record.read_text())
-                raise OSError("fixture refused drop replacement")
-            replace(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
-
-        with (patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate([])),
-              patch.object(os, "replace", side_effect=refuse_drop)):
-            result = self.land_batch(rows)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("not replaced; previous content retained", result.stdout)
-        self.assertIn("send alpha:", result.stdout)
-        self.assertIn("send beta:", result.stdout)
-        self.assert_rolled_back(start)
-
-    def test_resumed_drop_requires_a_confirmed_directory_sync(self) -> None:
-        start, alpha, beta, rows = self.prepare_row_drop()
-        record = self.batch_record()
-        sync_folder = atomic_file.sync_folder
-        allow_sync = False
-        drop_syncs: list[bool] = []
-        runs: list[RowDropRun] = []
-
-        def sync(folder: Path) -> None:
-            if folder == record.parent and "\ndrop\t" in record.read_text():
-                drop_syncs.append(allow_sync)
-                if not allow_sync:
-                    raise OSError("fixture refused drop directory sync")
-            sync_folder(folder)
-
-        with (patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs)),
-              patch.object(atomic_file, "sync_folder", side_effect=sync)):
-            first = self.land_batch(rows)
-            self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
-            self.assertIn("new content visible; durability unconfirmed", first.stdout)
-            saved = record.read_text()
-            self.assertIn("\ndrop\t", saved)
-            head = self.git("rev-parse", "HEAD")
-            status = self.git("status", "--porcelain")
-            self.assertNotEqual(head, start)
-            runs.clear()
-
-            held = self.land_batch(rows)
-            self.assertEqual(held.returncode, 1, held.stdout + held.stderr)
-            stop_line, = (line for line in held.stdout.splitlines() if line.startswith("batch: held"))
-            self.assertIn("could not confirm the saved batch drop", stop_line)
-            self.assertIn(str(record), stop_line)
-            self.assertIn("Resolve the filesystem error, then resume with the same batch.", stop_line)
-            self.assertIn("send alpha:", held.stdout)
-            self.assertIn("send beta:", held.stdout)
-            self.assertEqual(self.git("rev-parse", "HEAD"), head)
-            self.assertEqual(self.git("status", "--porcelain"), status)
-            self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
-            self.assertEqual(record.read_text(), saved)
-            self.assertEqual(runs, [])
-            with patch.dict("os.environ", self.env):
-                self.assertNotEqual(land_runs.last_results()[alpha]["state"], "dropped")
-
-            allow_sync = True
-            result = self.land_batch(rows)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(drop_syncs[:3], [False, False, True])
-        self.assertEqual(runs, [RowDropRun(False, False, True, False)])
-        _ = self.assert_landed(start, [beta])
-        self.assertFalse(record.exists())
-
-    def test_drop_stays_saved_until_the_result_is_written(self) -> None:
-        start, alpha, beta, rows = self.prepare_row_drop()
-        runs: list[RowDropRun] = []
-        with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs)):
-            with patch.object(land_runs, "record_result", side_effect=OSError("result write refused")):
-                first = self.land_batch(rows)
-                self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
-                self.assertIn("could not record the drop of alpha phase 2", first.stdout)
-                saved = self.batch_record().read_text()
-                self.assertIn(RED_MODULE, saved)
-                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
-                _ = self.git("reset", "--keep", start)
-                runs.clear()
-                held = self.land_batch(rows)
-                self.assertEqual(held.returncode, 1, held.stdout + held.stderr)
-                self.assertEqual(self.batch_record().read_text(), saved)
-                self.assertEqual(runs, [])
-            result = self.land_batch(rows)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(self.batch_record().exists())
-        self.assertEqual(runs, [RowDropRun(False, False, True, False)])
-        _ = self.assert_landed(start, [beta])
-        with patch.dict("os.environ", self.env):
-            self.assertEqual(land_runs.last_results()[alpha]["state"], "dropped")
 
     def test_main_move_requires_survivor_retest(self) -> None:
         _, _, beta, rows = self.prepare_row_drop()

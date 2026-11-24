@@ -950,7 +950,6 @@ A batch can contain one item.
    Identify checkpoint merges by their subjects and second parents.
    If the record is missing or differs, refuse the batch and tell the requester how to start again.
    Remove the record after publication or when the batch ends without unpushed merges.
-   Keep a saved drop across an interruption, including an interruption after rollback or publication.
    If record removal fails, report a warning and continue.
    Resume each item that the merge branch already contains through the single command's route, in file order.
 3. Retain the starting tip and whether a merge is unfinished.
@@ -981,15 +980,22 @@ A red report names the failed test step and says whether the row selects it.
 If command selection failed for a row, report unknown changed paths and include the error.
 The batch stops at the first failed test command.
 
-If a gate names red modules, the batch runs those modules on pinned main in a private checkout.
+If a fresh batch gate names red modules, the batch runs those modules on pinned main in a private checkout.
 It probes unpublished checkpoints separately on the same base and tests the rows with the most changed module paths first.
 The probes use the gate admission path.
 The batch drops a row only if the base passes and that row alone reproduces every red module.
-The batch keeps the stop if the base, a survivor, or the starting tip contains the dropped checkpoint.
-It keeps the test log in buildlog and saves the drop decision before rollback.
+The batch stops if the base, a survivor, or the starting tip contains the dropped checkpoint.
+A batch gate or probe treats a module that passes on rerun alone as red.
+The batch keeps the test log in buildlog and rolls back the original batch.
+It keeps the full batch resume record while it rebuilds the survivors.
 It records the dropped row's result and removes that row from the running land.
+It keeps the drop decision in memory for this run.
 It rebuilds survivors in order and runs every configured merge command.
 A red survivor gate stops the batch. The existing main advance policy also applies to survivors.
+If a survivor rebuild stops before publication, resend the same full batch.
+When a gate batch has only some rows merged locally, a matching resend merges the remaining rows before the gate.
+If that gate is red, the batch can identify and drop one row again.
+If all rows are already merged locally, a red gate uses the normal stop.
 Exit 0 includes a batch that publishes its survivors. Read its `send <unit>:` lines for each row's result.
 Exit 1 reports a failed batch. Exit 77 reports a tree change.
 

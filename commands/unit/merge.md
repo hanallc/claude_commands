@@ -198,6 +198,7 @@ Apply <RestartTakeover/> before new merge dispatches.
 Compare each operation's evidence with its authorized order under <MergeResults/>.
 Use the saved launcher receipt before resubmitting a prompt.
 Resume pending publication only within the order's destination authorization.
+If a survivor rebuild stops before publication, resend the same full batch.
 </MergeRecovery>
 
 ## Reporting
