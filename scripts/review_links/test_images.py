@@ -32,6 +32,7 @@ from scripts.review_links.test_page_question import FakeQuestionTransport, quest
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import change_page, console, image_store, images, list_page, page_frame, serve
 from scripts.review_links import question_record
+from scripts.review_links.server_test_support import started_review_server
 
 SEND_MESSAGE = change_page.send_message
 PNG = bytes.fromhex('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c63606060f80f00010401005fe5c34b0000000049454e44ae426082')
@@ -1840,9 +1841,8 @@ class ImagesServerTests(ImagesFixture):
         super().setUp()
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
         with patch.object(change_page, "recover_pending"):
-            server = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
+            server = self.enterContext(started_review_server(("127.0.0.1", 0), self.root))
         self.port = server.server_port
-        self.addCleanup(server.server_close)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         self.addCleanup(thread.join, TEST_HANG_GUARD_SECS)

@@ -45,6 +45,7 @@ from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
 from scripts.review_links import review_items, review_page
+from scripts.review_links.server_test_support import started_review_server
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
@@ -1592,7 +1593,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                       patch.object(change_review, "lists_directory", return_value=self.root),
                       patch.object(staff, "snapshot", return_value=members),
                       patch.object(list_page, "counts_strip", return_value=""),
-                      serve.ReviewLinksServer(("127.0.0.1", 0), browser_root, initialize_review=True) as server):
+                      started_review_server(("127.0.0.1", 0), browser_root, initialize_review=True) as server):
                     thread = threading.Thread(target=server.serve_forever, daemon=True)
                     thread.start()
                     try:
@@ -6644,7 +6645,7 @@ requestAnimationFrame(()=>requestAnimationFrame(()=>{frame.src=frame.dataset.src
               patch.object(change_page, "recover_pending"),
               patch.object(list_page, "recover_pending"),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
-              serve.ReviewLinksServer(("127.0.0.1", 0), self.root / "reviews") as server):
+              started_review_server(("127.0.0.1", 0), self.root / "reviews") as server):
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
@@ -6853,7 +6854,7 @@ const change=async path=>{
               patch.object(list_page, "counts_strip", return_value=""),
               patch.object(staff, "caller_identity", return_value=MORTY.current_session),
               patch.object(change_page, "send_question", return_value=question_outcome()),
-              serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
+              started_review_server(("127.0.0.1", 0), root) as server):
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
