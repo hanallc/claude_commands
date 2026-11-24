@@ -46,7 +46,7 @@ else:
     from scripts.buildlog import health as buildlog_health
     from scripts.buildlog import record as buildlog_record
     from scripts.buildlog import store as buildlog_store
-from scripts.lib import conf, session_folder
+from scripts.lib import conf, conf_reads, session_folder
 from scripts.production.cli_fixture import invoke_cli
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
@@ -713,16 +713,23 @@ class OffloadSettingsTests(unittest.TestCase):
     def test_explicit_mac_settings_cannot_bypass_the_nextest_summary_limit(self) -> None:
         request = offload.OffloadRequest(self.root, "hana", "log-limit", offload.NO_RESULT_FILE, (),
                                         owner="verify", holder_session="fixture-session")
-        for limit in ("", "# whole: 1..2048\n"):
+        ceiling = conf.read(nextest_log.DEFAULT_SETTINGS).whole(nextest_log.SUMMARY_BYTES)
+        larger = ceiling + 1
+        source = self.settings.read_text()
+        summary = (rf"^(?:{re.escape(conf_reads.SHIFT_MARK)}[^\n]*\n)?"
+                   + rf"# whole: [^\n]*\n{nextest_log.SUMMARY_BYTES}=[^\n]*$")
+        for limit in ("", f"# whole: 1..{larger}\n"):
             with self.subTest(limit=limit):
                 settings = self.root / "summary-limit.conf"
-                _ = settings.write_text(self.settings.read_text().replace(
-                    f"# whole: 1..1024\n{nextest_log.SUMMARY_BYTES}=1024",
-                    f"{limit}{nextest_log.SUMMARY_BYTES}=2048"))
+                contents, replacements = re.subn(summary, f"{limit}{nextest_log.SUMMARY_BYTES}={larger}",
+                                                 source, flags=re.MULTILINE)
+                self.assertEqual(replacements, 1)
+                _ = settings.write_text(contents)
                 config = eligibility.read_config(settings)
+                error = f"Summary limit must be at most {ceiling}" if limit else nextest_log.SUMMARY_BYTES
                 with (mock.patch.object(subprocess, "run", RUN_SUBPROCESS),
                       mock.patch.object(subprocess, "Popen", START_SUBPROCESS),
-                      self.assertRaisesRegex(conf.Unusable, nextest_log.SUMMARY_BYTES + "|Summary limit")):
+                      self.assertRaisesRegex(conf.Unusable, error)):
                     _ = offload.remote_test_command(config, request, HANA)
 
     def test_explicit_mac_settings_use_host_only_nextest_limits(self) -> None:

@@ -424,16 +424,27 @@ class HandMadeTests(AttemptCase):
         self.assertEqual(gzip.decompress(log.read_bytes()), b"first\n" + (b"x" * 999 + b"\n") * 300)
 
     def test_the_program_gets_only_the_listed_variables_and_the_model_sees_the_shown_ones(self) -> None:
+        shift_log = conf_reads.CONF_SHIFT_READ_LOG
+        active_log = os.environ.get(shift_log)
         removed = {"RUSTC_WORKSPACE_WRAPPER": "/nonexistent/wrapper", "RUSTFLAGS": "-Zcode", "GIT_CONFIG_COUNT": "1",
                    "GIT_CONFIG_KEY_0": "hand.made", "GIT_CONFIG_VALUE_0": "x", "BASH_FUNC_x%%": "() {  echo x\n}",
                    "SCCACHE_DIR": "/nonexistent/cache", "SCCACHE_CACHE_SIZE": "77G",
-                   "SCCACHE_SERVER_UDS": "/nonexistent/cache.sock"}
+                   "SCCACHE_SERVER_UDS": "/nonexistent/cache.sock",
+                   shift_log: str(self.root / "excluded-shift.log")}
         wrappers = {"RUSTC_WRAPPER": "sccache", "CARGO_BUILD_RUSTC_WRAPPER": "sccache"}
         shown = {"PKG_CONFIG_PATH": "/nonexistent/pkgconfig"}
-        with mock.patch.dict(os.environ, removed | wrappers | shown):
+        with (mock.patch.dict(os.environ, removed | wrappers | shown),
+              mock.patch.object(self.line.place, "popen", wraps=self.line.place.popen) as launch):
             status, _ = self.attempt((sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"))
         self.assertEqual(status, 0)
+        launch.assert_called_once()
+        environment = cast(dict[str, str], launch.call_args.kwargs["env"])
+        self.assertFalse(removed.keys() & environment.keys())
         program = cast(dict[str, str], json.loads(self.output.getvalue()))
+        # The gate adds this log to the child environment after the program filter runs.
+        if shift_log in program:
+            self.assertEqual(program[shift_log], active_log)
+            del program[shift_log]
         self.assertLessEqual(set(program), PROGRAM_VARIABLES | hand_made.SHOWN_VARIABLES
                              | wrappers.keys() | {"CARGO_NET_OFFLINE", "PWD"})
         self.assertEqual((program["HOME"], program["PATH"], program["TMPDIR"]),
