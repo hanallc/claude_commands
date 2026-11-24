@@ -391,8 +391,11 @@ class QueuePlaceFixture(ExitStack):
             return read_text(path, *args, **kwargs)  # pyright: ignore[reportArgumentType]
 
         def membership_or_private_sample(path: Path) -> None:
-            if path.is_relative_to("/sys/fs/cgroup") and (path.name in readings or path.name == "cgroup.procs"):
-                return
+            if path.is_relative_to("/sys/fs/cgroup"):
+                if path.name in readings or path.name == "cgroup.procs":
+                    return
+                if path.name == "cgroup.events" and self.private_slice in path.parent.parts and ".." not in path.parts:
+                    return
             guard(path)
 
         _ = self.enter_context(mock.patch.object(Path, "read_text", autospec=True, side_effect=supplied_text))
@@ -1321,6 +1324,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             scope = fixture.root / "scope"
             scope.mkdir()
             for name, value in {"cgroup.procs": "123\n", "memory.current": str(GIB),
+                                "cgroup.events": "populated 1\n",
                                 "memory.swap.current": "0", "memory.stat": f"anon {GIB}\nshmem 0\ninactive_file 0\n"}.items():
                 _ = (scope / name).write_text(value)
             read_fd, write_fd = os.pipe()
@@ -1359,6 +1363,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 os.kill(program_pid, 0)  # The program still lives after its holder died.
                 send_process_group(program_pid, signal.SIGKILL)
                 _ = (scope / "cgroup.procs").write_text("")
+                _ = (scope / "cgroup.events").write_text("populated 0\n")
                 check()
                 check()
                 fixture.assert_released(self, str(row.get("reservation_id", "")), outcome="owner_gone")

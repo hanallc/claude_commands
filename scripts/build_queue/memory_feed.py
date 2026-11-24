@@ -831,6 +831,7 @@ class RunRow(RowQueueNotes, SlotPlace, NamedQueueRow):
     ci_cgroup: NotRequired[str]
     need: NotRequired[float]
     need_part: NotRequired[bool]
+    need_reason: NotRequired[str]
 
 
 GATE_STEPS = frozenset(GATE_PROGRAMS)
@@ -1641,6 +1642,22 @@ def need_in_next_part(steps: Sequence[admission_records.RunningStep]) -> bool:
     """Tell whether the run's need is the peak of the next part of the build, from its progress profile."""
     return any(isinstance(step.measured, admission_records.ProgressAdjustedMemory)
                and isinstance(step.measured.window, progress.WindowPeak) for step in steps)
+
+
+class NeedNotes(TypedDict):
+    need_part: bool
+    need_reason: NotRequired[str]
+
+
+def need_notes(steps: Sequence[admission_records.RunningStep]) -> NeedNotes:
+    """Include the reasons that set the memory need for this run."""
+    notes: NeedNotes = {"need_part": need_in_next_part(steps)}
+    reasons = dict.fromkeys(gate.test_need_text(step.measured.test_need_override) for step in steps
+        if isinstance(step.measured, admission_records.ProgressAdjustedMemory)
+        and isinstance(step.measured.test_need_override, admission_records.TestNeedOverride))
+    if reasons:
+        notes["need_reason"] = ". ".join(reasons)
+    return notes
 
 
 def wait_why(reason: admission_records.WaitingStepReason) -> str:
@@ -2969,7 +2986,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "started_at": step.started_at if step is not None else 0,
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ()), token_stage),
                      "queued": True, "keep_text": "", "group": "", "ci": False, "parts": [],
-                     "need": gib(hold.memory.need), "need_part": need_in_next_part(steps_by_owner.get(hold.memory.owner, ())),
+                     "need": gib(hold.memory.need), **need_notes(steps_by_owner.get(hold.memory.owner, ())),
                      **(step_target_notes(step, routes)
                         if step is not None and not ci_label else NO_TARGET_NOTES),
                      **(local_call_notes(step) if step is not None else CallNotes()),

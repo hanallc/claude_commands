@@ -2475,6 +2475,31 @@ class ReplyPublicationTests(unittest.TestCase):
                 gate.reservation_memory(Path(record.path), service.reservation_row(record),
                     datetime.fromtimestamp(fixture.clock.now()), fixture.proc.processes(), fixture.proc.path, config.policy))
 
+    def test_only_decayed_tests_take_compiler_snapshots(self) -> None:
+        for step, decayed, scans, snapshots in (
+            ("build", True, 1, 0),
+            ("merge-gate", False, 1, 0),
+            ("merge-gate", True, 3, 2),
+        ):
+            with self.subTest(step=step, decayed=decayed), AdmissionFixture() as fixture:
+                request = fixture.request(step=step)
+                grant = only_admitted(fixture.server.handle_request(request))
+                fixture.scoped_peak(grant, grant.need)
+                _ = Path(grant.wave_path).write_text(f"{grant.need} {int(fixture.clock.now())}\n")
+                record = fixture.server.reservations[request.episode]
+                config = fixture.server.last_usable_configuration
+                assert isinstance(config, records.MemoryConfig)
+                if decayed:
+                    fixture.clock.advance(config.policy.peak_hold.seconds_for(step) + 1)
+                plan = service.SystemReadingPlan(config, (record,), (), False)
+                with mock.patch.object(fixture.readings, "compilers", return_value=[]), mock.patch.object(
+                        gate, "process_table", wraps=gate.process_table) as tables, mock.patch.object(
+                        gate, "compiler_members", wraps=gate.compiler_members) as compilers:
+                    evidence = service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
+                self.assertIsInstance(evidence.reservations[request.episode].memory, records.MeasuredMemory)
+                self.assertEqual(tables.call_count, scans)
+                self.assertEqual(compilers.call_count, snapshots)
+
     def test_persist_matches_full_encoding_after_each_durable_change(self) -> None:
         with AdmissionFixture() as fixture:
             server = fixture.server
@@ -5843,6 +5868,7 @@ class ServiceTests(unittest.TestCase):
                         if isinstance(captured, gate.PopulatedStepScope):
                             captures += 1
                             _ = (scope / "cgroup.procs").write_text("")
+                            _ = (scope / "cgroup.events").write_text("populated 0\n")
                         return captured
                     with mock.patch.object(fixture.proc, "lifetime", side_effect=empty_after_capture):
                         if stage == "restore":
@@ -6751,8 +6777,8 @@ class ServiceTests(unittest.TestCase):
             request = replace(fixture.request(owner=owner), sidecar=str(sidecar))
             guard = gate.check_memory_reading
             def membership_only(path: Path) -> None:
-                # cgroup.procs is lifecycle evidence; no live memory file is allowed.
-                if path != scope / "cgroup.procs":
+                # Allow lifecycle reads only for the fixture scope.
+                if path not in (scope / "cgroup.procs", scope / "cgroup.events"):
                     guard(path)
             def supplied_scope_memory(_path: Path, row: records.Reservation, _now: object,
                                       _processes: object, _proc: Path, policy: records.AdmissionPolicy) -> records.StepMemory:

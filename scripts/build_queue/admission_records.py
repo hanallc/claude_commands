@@ -481,6 +481,8 @@ class NoPromise:
 
 MemoryPromise = RampPromise | LifetimePromise | NoPromise
 
+TEST_PHASE_MARGIN_FALLBACK = 1.2
+
 
 @dataclass(frozen=True)
 class PeakSoFar:
@@ -489,16 +491,19 @@ class PeakSoFar:
     peak_at: float | PeakTimeUnknown = PeakTimeUnknown()
     last_near_peak_at: float | PeakTimeUnknown = PeakTimeUnknown()
     old_sampler: bool = False
+    near_peak_is_fresh: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)
 class PeakDecayed:
-    """The reduced memory charge retains the original peak and decay times."""
+    """The record holds the peak after decay, the original peak, and the decay times."""
     bytes: int
     peak_bytes: int
     last_near_peak_at: float
     decayed_at: float
     old_sampler: bool
+    margin: float = field(default=TEST_PHASE_MARGIN_FALLBACK, kw_only=True)
+    sampled: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -530,21 +535,65 @@ class ProcessAnonymousUse:
 
 
 @dataclass(frozen=True)
+class NoCompilerSeen:
+    """Both snapshots agree that no compiler is active."""
+
+
+@dataclass(frozen=True)
+class CompilerSeen:
+    """Both snapshots identify an active compiler."""
+
+
+@dataclass(frozen=True)
+class CompilerEvidenceIncomplete:
+    """The compiler evidence cannot support a reduction in need."""
+    reason: str
+
+
+CompilerEvidence = NoCompilerSeen | CompilerSeen | CompilerEvidenceIncomplete
+
+
+@dataclass(frozen=True)
+class CompilerEvidenceNotRecorded:
+    """This memory record has no compiler evidence."""
+
+
+@dataclass(frozen=True)
 class ScopeSource:
     """The memory reading comes from this scope and its process members."""
     directory: Path
     members: frozenset[int]
+    compiler_evidence: CompilerEvidence | CompilerEvidenceNotRecorded = field(
+        default_factory=CompilerEvidenceNotRecorded, kw_only=True, compare=False)
 
 
 @dataclass(frozen=True)
 class ProcessSource:
     """The memory reading comes from these individual processes."""
     processes: tuple[ProcessAnonymousUse, ...]
+    memory_read_incomplete: bool = field(default=False, kw_only=True)
+    compiler_evidence: CompilerEvidence | CompilerEvidenceNotRecorded = field(
+        default_factory=CompilerEvidenceNotRecorded, kw_only=True, compare=False)
 
 
 @dataclass(frozen=True)
 class NoSource:
     """The memory reading has no recorded source."""
+
+TestNeedReason = Literal["compiler", "compiler evidence unavailable", "near-peak sample",
+                         "peak evidence unavailable", "post-decay sample unavailable", "peak after decay"]
+
+
+@dataclass(frozen=True)
+class TestNeedOverride:
+    """The test evidence selects this need over the progress window."""
+    bytes: int
+    reason: TestNeedReason
+
+
+@dataclass(frozen=True)
+class NoTestNeedOverride:
+    """Test evidence leaves the existing calculation in effect."""
 
 
 @dataclass(frozen=True)
@@ -560,6 +609,8 @@ class MeasuredMemory:
     # An existing peak file could not be read; its promise remains a floor.
     unknown_peak_promise: int = 0
     peak_history: PeakHistory = NoPeakRecorded()
+    compiler_evidence: CompilerEvidence | CompilerEvidenceNotRecorded = field(
+        default_factory=CompilerEvidenceNotRecorded, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -568,6 +619,7 @@ class ProgressAdjustedMemory(MeasuredMemory):
     counter: progress.ProgressCounter | progress.NoCounter = field(kw_only=True)
     window: progress.WindowPeak | progress.NoMatchingProfile = field(kw_only=True)
     remaining_need: int = field(kw_only=True)
+    test_need_override: TestNeedOverride | NoTestNeedOverride = field(default_factory=NoTestNeedOverride, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1561,9 +1613,6 @@ def warn_configuration_diagnostics(diagnostics: tuple[ConfigurationDiagnostic, .
             _warned_configuration_diagnostics.add(diagnostic)
             print(diagnostic.diagnostic, file=sys.stderr)
 
-TEST_PHASE_MARGIN_FALLBACK = 1.2
-
-
 @dataclass(frozen=True)
 class MemoryConfig:
     """The configuration holds admission policy, service timings, and memory estimate settings."""
@@ -1719,9 +1768,10 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
 test_threads = parse.test_threads
 
 
-def process_start_time(pid: int) -> str | None:
+def process_start_time(pid: int, proc: str | Path = "/proc") -> str | None:
+    root = Path(proc) if isinstance(proc, str) else proc
     try:
-        stat = read_proc_text(Path("/proc") / str(pid) / "stat")
+        stat = read_proc_text(root / str(pid) / "stat")
         fields = stat.rsplit(") ", 1)[1].split()
         return fields[19] if fields[0] not in ("Z", "X") else None
     except (OSError, IndexError):
