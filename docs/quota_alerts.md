@@ -82,6 +82,8 @@ Workers entries have no hold in minutes.
 A move to Claude holds until the source account's weekly reset, even if Codex has room earlier.
 Entries run once in log order and leave the log after a recorded move.
 A refused move keeps its entry.
+The workers queue uses the Codex target report from the current pass.
+It treats a weekly reset at or before the check time as an unavailable reading.
 
 Above 0% and at or below 2%, Codex can send one phone reminder per episode.
 The first pending workers entry suppresses this reminder, even when it targets the current account.
@@ -161,6 +163,13 @@ Failures, waits, wait completion, no room, and renewed room have separate entrie
 Readers skip malformed lines, including during duplicate confirmation checks.
 Requests omit an unknown `reset`; waits carry a known reset.
 Refusal state stays in `refusals.json`, with one all-model record and one record for each model family for each account.
+The watcher records “Fable limit” as `weekly_fable`, even when the provider reports a generic weekly rate type.
+A Fable account pick or automatic group destination requires room in both weekly windows.
+The existing Claude usage response supplies the Fable window in `limits.weekly_scoped`.
+The usage store saves it beside the all-model weekly and five-hour readings.
+The picker skips the account when that window is unavailable or expired.
+The watcher claims a fresh read for an automatic Fable move if either weekly window has reset.
+Later groups can use that reading if it is fresh and the required windows are current at their decision time.
 A usage store failure writes a log line without preventing alerts.
 Advice reads the saved store.
 

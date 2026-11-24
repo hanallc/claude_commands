@@ -342,11 +342,16 @@ class RefusalWatchTests(unittest.TestCase):
         return path
 
     def reading(self, login: str, weekly: float, *, five: float = 50, at: datetime = NOW,
-                reset: datetime = WEEKLY_RESET, five_reset: datetime = FIVE_HOUR_RESET) -> None:
+                reset: datetime = WEEKLY_RESET, five_reset: datetime = FIVE_HOUR_RESET,
+                fable_left: float | None = None, fable_reset: datetime | None = None) -> None:
         saved = usage_store.load()
-        saved[usage_store.key("Claude", login)] = usage_store.StoredUsage(
+        reading = usage_store.StoredUsage(
             weekly=usage_store.StoredWindow(left=weekly, resets=reset.isoformat(), at=at.isoformat()),
             five_hour=usage_store.StoredWindow(left=five, resets=five_reset.isoformat(), at=at.isoformat()))
+        if fable_left is not None:
+            reading["weekly_fable"] = usage_store.StoredWindow(left=fable_left, resets=(fable_reset or reset).isoformat(),
+                                                               at=at.isoformat())
+        saved[usage_store.key("Claude", login)] = reading
         usage_store.write(saved)
 
     def cli(self, *arguments: str) -> tuple[int | None, str, str]:
@@ -2748,17 +2753,39 @@ class RefusalWatchTests(unittest.TestCase):
         refusal = refusal_watch.transcript_refusal("fable")
         assert isinstance(refusal, refusal_watch.TranscriptRefusal)
         self.assertEqual(refusal.family, refusals.ModelFamily("fable"))
-        self.assertEqual(refusal.window, refusals.KnownWindow("weekly"))
+        self.assertEqual(refusal.window, refusals.FableWeeklyWindow())
         self.assertEqual(refusal.reset, refusals.KnownReset(datetime(2026, 11, 24, 17, tzinfo=timezone.utc)))
+
+    def test_fable_refusal_without_rate_fields_or_with_a_fable_rate_type(self) -> None:
+        for entry in (
+            self.family_refusal_entry(limit="", resets_at=None),
+            self.family_refusal_entry(limit="weekly_scoped", text="You've hit your usage limit.", field="quotaLimits"),
+        ):
+            with self.subTest(entry_type=entry.get("quotaLimits", "text")):
+                if "quotaLimits" not in entry:
+                    del entry["apiErrorParams"]
+                refusal = refusal_watch.claude_entry_refusal(entry, lambda: refusals.UNKNOWN_FAMILY, CLAUDE_FAMILIES)
+                assert isinstance(refusal, refusal_watch.TranscriptRefusal)
+                self.assertEqual(refusal.family, refusals.ModelFamily("fable"))
+                self.assertEqual(refusal.window, refusals.FableWeeklyWindow())
+
+    def test_fable_limit_text_takes_precedence_over_a_generic_weekly_rate_type(self) -> None:
+        for limit in ("weekly", "seven_day"):
+            with self.subTest(limit=limit):
+                entry = self.family_refusal_entry(limit=limit)
+                refusal = refusal_watch.claude_entry_refusal(entry, lambda: refusals.ModelFamily("opus"), CLAUDE_FAMILIES)
+                assert isinstance(refusal, refusal_watch.TranscriptRefusal)
+                self.assertEqual((refusal.window, refusal.family), (refusals.FableWeeklyWindow(), refusals.FABLE_FAMILY))
+                self.assertEqual(refusal.reset, refusals.KnownReset(datetime.fromtimestamp(FABLE_RESETS_AT, timezone.utc)))
 
     def test_family_limit_text_names_the_family_without_a_prior_model_and_all_models_otherwise(self) -> None:
         unknown: Callable[[], refusals.ModelFamily | refusals.UnknownFamily] = lambda: refusals.UNKNOWN_FAMILY
-        for text, expected in ((FABLE_LIMIT_TEXT, refusals.ModelFamily("fable")),
-                               ("You've hit your usage limit.", refusals.ALL_MODELS)):
+        for text, expected, window in ((FABLE_LIMIT_TEXT, refusals.ModelFamily("fable"), refusals.FableWeeklyWindow()),
+                                       ("You've hit your usage limit.", refusals.ALL_MODELS, refusals.KnownWindow("weekly"))):
             with self.subTest(text=text):
                 refusal = refusal_watch.claude_entry_refusal(self.family_refusal_entry(text=text), unknown, CLAUDE_FAMILIES)
                 assert isinstance(refusal, refusal_watch.TranscriptRefusal)
-                self.assertEqual((refusal.family, refusal.window), (expected, refusals.KnownWindow("weekly")))
+                self.assertEqual((refusal.family, refusal.window), (expected, window))
 
     def test_refusal_text_family_wins_over_the_prior_model(self) -> None:
         # A Fable session switched with /model opus; its next request was refused for Opus.
@@ -2829,13 +2856,15 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("solo")
         _ = self.family_transcript("solo", assistant_entry("claude-fable-5-2"), self.family_refusal_entry())
         # claude2 resets first, so only its Fable refusal keeps the Fable session off it.
-        self.reading("main@example.invalid", 80, reset=NOW + timedelta(days=1))
-        self.reading(TARGET_LOGIN, 50, reset=NOW + timedelta(days=5))
+        self.reading("main@example.invalid", 80, reset=NOW + timedelta(days=1), fable_left=50)
+        self.reading(TARGET_LOGIN, 50, reset=NOW + timedelta(days=5), fable_left=50)
         for login, family in (("main@example.invalid", "fable"), (TARGET_LOGIN, "opus")):
             refusals.write_refusal(refusals.AccountRefusal("claude", login, refusals.KnownWindow("weekly"),
                 refusals.KnownReset(NOW + timedelta(days=2)), REFUSAL_AT - timedelta(hours=1), refusals.ModelFamily(family)))
         _ = self.cli()
         self.assertEqual([(move.session_id, move.target) for move in self.moves.calls], [("solo", "claude3")])
+        stored = refusals.load()[f"claude:{SOURCE_LOGIN}:fable"]
+        self.assertEqual(stored.window, refusals.FableWeeklyWindow())
 
     def test_group_member_on_another_family_places_the_group_with_an_unknown_family(self) -> None:
         self.write_models()
@@ -2937,6 +2966,132 @@ class RefusalWatchTests(unittest.TestCase):
                 self.assertIn(expected, text)
                 _ = self.cli()
                 self.assertEqual(len(self.head_deliveries), count)
+
+    def test_fable_next_move_uses_the_next_target_with_fable_room(self) -> None:
+        self.write_models()
+        self.reading(TARGET_LOGIN, 50, fable_left=50)
+        rule = refusal_watch.AutoMoveRule("fable-move", "producers", "claude2",
+                                        refusal_watch.LeftAtMost(1), ("claude3",))
+        for first in (0, None):
+            self.reading("main@example.invalid", 25, fable_left=first)
+            with (self.subTest(first=first),
+                  patch.object(agent_accounts, "claude_live", side_effect=AssertionError("unexpected live usage read"))):
+                chosen = refusal_watch._choose_auto_move_target(  # pyright: ignore[reportPrivateUsage]
+                    rule, "claude1", NOW, conf.read("accounts"), dry_run=True)
+            self.assertEqual(chosen, replace(rule, to="claude3"))
+
+    @staticmethod
+    def save_reset_target_reading(target: agent_accounts.NumberedAccount, *, fable: bool = False,
+                                  weekly_reset: datetime = WEEKLY_RESET) -> agent_accounts.Report:
+        WatchTime.at = NOW + timedelta(seconds=1, microseconds=25)
+        claim = usage_store.claim_read(target.login, WatchTime.at)
+        assert isinstance(claim, agent_accounts.UsageReadClaim)
+        report = agent_accounts.Report("Claude", email=target.login,
+            quotas=[agent_accounts.Quota("Weekly", used_percent=0, resets_at=weekly_reset)],
+            source=agent_accounts.ClaudeDirectorySource(target.home),
+            usage_read_outcome=agent_accounts.UsageReadOutcome.OK, usage_read_claim=claim)
+        if fable:
+            report.weekly_fable = agent_accounts.Quota(agent_accounts.FABLE_WEEKLY_QUOTA_LABEL, 0, WEEKLY_RESET)
+        usage_store.finish_read(target.login, claim, report)
+        return report
+
+    def test_due_move_reads_the_reset_target_and_starts_in_the_same_pass(self) -> None:
+        path = self.groups()
+        _ = self.owner("unit", host="unit")
+        self.next_entries(self.low_rule())
+        self.reading("main@example.invalid", 0, at=NOW - timedelta(minutes=2), reset=NOW - timedelta(seconds=4))
+        target = accounts.account_identity(accounts.account_dir("claude2"))
+        with patch.object(agent_accounts, "claude_live", side_effect=self.save_reset_target_reading) as read:
+            lines = refusal_watch.run_auto_moves(NOW)
+        read.assert_called_once_with(target)
+        self.assertTrue(any("move from claude1 to claude2" in line for line in lines), lines)
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual([move.target for move in self.moves.calls], ["claude2"])
+        self.assertEqual(next_moves.read_next_moves(), ())
+
+    def test_due_groups_share_one_read_after_the_pass_starts(self) -> None:
+        path = self.groups(showrunners="claude1")
+        _ = self.owner("unit", host="unit")
+        _ = self.owner("runner", host="herdr")
+        self.next_entries(self.low_rule(), self.low_rule("showrunners-low", group="showrunners"))
+        self.reading("main@example.invalid", 0, at=NOW - timedelta(minutes=2), reset=NOW - timedelta(seconds=4))
+        target = accounts.account_identity(accounts.account_dir("claude2"))
+        with patch.object(agent_accounts, "claude_live", side_effect=self.save_reset_target_reading) as read:
+            _ = refusal_watch.run_auto_moves(NOW)
+        read.assert_called_once_with(target)
+        self.assertEqual(stored_group_labels(path), {"units": "claude2", "showrunners": "claude2"})
+        self.assertEqual(next_moves.read_next_moves(), ())
+
+    def test_later_group_checks_the_shared_target_read_at_its_decision_time(self) -> None:
+        settings = conf.read("accounts")
+        first = refusal_watch.AutoMoveRule("first", "units", "claude2", refusal_watch.LeftAtMost(1))
+        second = refusal_watch.AutoMoveRule("second", "showrunners", "claude2", refusal_watch.LeftAtMost(1))
+        choose = refusal_watch._choose_auto_move_target  # pyright: ignore[reportPrivateUsage]
+        cases = (("age", WEEKLY_RESET, timedelta(minutes=settings.whole("usage_stale_minutes") + 1)),
+                 ("reset", NOW + timedelta(seconds=5), timedelta(seconds=5)))
+        for cause, next_reset, delay in cases:
+            with self.subTest(cause=cause):
+                WatchTime.at = NOW
+                self.reading("main@example.invalid", 0, at=NOW - timedelta(minutes=2), reset=NOW)
+                read_target = partial(self.save_reset_target_reading, weekly_reset=next_reset)
+                with patch.object(agent_accounts, "claude_live", side_effect=read_target) as read:
+                    self.assertEqual(choose(first, "claude1", NOW, settings), first)
+                    WatchTime.at = NOW + delay
+                    blocked = choose(second, "claude1", NOW, settings)
+                read.assert_called_once()
+                self.assertEqual(blocked, refusal_watch.BlockedAutoMoveTargets((
+                    (second, quota_alert.TargetReadingUnavailable(NOW + timedelta(seconds=1))),
+                )))
+
+    def test_due_fable_move_reads_the_target_after_only_the_fable_reset(self) -> None:
+        self.write_models()
+        path = self.groups()
+        _ = path.write_text(json.dumps({"units": "claude1", "showrunners": "claude3", "producers": "claude1"}))
+        self.next_entries(self.low_rule("producers-low", group="producers"))
+        self.reading("main@example.invalid", 50, fable_left=0, fable_reset=NOW - timedelta(seconds=1))
+        target = accounts.account_identity(accounts.account_dir("claude2"))
+        with patch.object(agent_accounts, "claude_live", side_effect=partial(self.save_reset_target_reading, fable=True)) as read:
+            _ = refusal_watch.run_auto_moves(NOW, dry_run=True)
+            read.assert_not_called()
+            _ = refusal_watch.run_auto_moves(NOW)
+        read.assert_called_once_with(target)
+        self.assertEqual(stored_group_labels(path)["producers"], "claude2")
+        self.assertEqual(next_moves.read_next_moves(), ())
+
+    def test_due_move_holds_when_the_reset_target_read_is_held_or_fails(self) -> None:
+        path = self.groups()
+        _ = self.owner("unit", host="unit")
+        entry = self.low_rule()
+        self.next_entries(entry)
+        login = "main@example.invalid"
+        last_read = NOW - timedelta(minutes=2)
+        self.reading(login, 0, at=last_read, reset=NOW - timedelta(seconds=4))
+        target = accounts.account_identity(accounts.account_dir("claude2"))
+        expected = quota_alert.blocked_next_move_line("units", "claude2", entry.id,
+            quota_alert.TargetReadingUnavailable(last_read))
+        for outcome in (agent_accounts.UsageReadOutcome.HELD, agent_accounts.UsageReadOutcome.ERROR):
+            with self.subTest(outcome=outcome):
+                report = agent_accounts.Report("Claude", email=login, usage_read_outcome=outcome)
+                with patch.object(agent_accounts, "claude_live", return_value=report) as read:
+                    self.assertIn(expected, refusal_watch.run_auto_moves(NOW))
+                read.assert_called_once_with(target)
+                self.assertEqual(stored_group_labels(path)["units"], "claude1")
+                self.assertEqual(self.moves.calls, [])
+                self.assertEqual(next_moves.read_next_moves(), (entry,))
+
+    def test_due_move_dry_run_does_not_read_the_reset_target(self) -> None:
+        _ = self.groups()
+        entry = self.low_rule()
+        self.next_entries(entry)
+        last_read = NOW - timedelta(minutes=2)
+        self.reading("main@example.invalid", 0, at=last_read, reset=NOW)
+        expected = quota_alert.blocked_next_move_line("units", "claude2", entry.id,
+            quota_alert.TargetReadingUnavailable(last_read))
+        before = self.snapshot()
+        with patch.object(agent_accounts, "claude_live") as read:
+            self.assertIn(expected, refusal_watch.run_auto_moves(NOW, dry_run=True))
+        read.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
 
     def test_automatic_rule_consumes_the_current_account_without_a_move(self) -> None:
         path = self.groups(units="claude2")

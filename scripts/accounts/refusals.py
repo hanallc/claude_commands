@@ -43,12 +43,14 @@ class FreshReading:
     weekly: ReadingWindow
     five_hour: ReadingWindow | NoWindow
     credits: str
+    weekly_fable: ReadingWindow | NoWindow = field(default_factory=NoWindow, kw_only=True)
 
 
 @dataclass(frozen=True)
 class StaleReading:
     weekly: ReadingWindow | NoWindow = field(default_factory=NoWindow)
     five_hour: ReadingWindow | NoWindow = field(default_factory=NoWindow)
+    weekly_fable: ReadingWindow | NoWindow = field(default_factory=NoWindow, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -75,18 +77,33 @@ def stored_reading(tool: Literal["claude", "codex"], login: str, now: datetime) 
 def stored_reading_with_age(tool: Literal["claude", "codex"], login: str, now: datetime,
                             stale_after: timedelta) -> FreshReading | StaleReading | NoReading:
     """Read saved usage with the caller's age limit."""
-    held = usage_store.load().get(usage_store.key(tool.capitalize(), login))
-    if held is None or "weekly" not in held:
+    held = usage_store.load().get(usage_store.key(tool.capitalize(), login), {})
+    return usage_reading_with_age(tool, held, now, stale_after)
+
+
+def usage_reading_with_age(tool: Literal["claude", "codex"], held: usage_store.StoredUsage, now: datetime,
+                           stale_after: timedelta) -> FreshReading | StaleReading | NoReading:
+    """Check the age of one account's saved usage."""
+    if "weekly" not in held:
         return NoReading()
     try:
         weekly = _reading_window(held["weekly"])
         five = _reading_window(held["five_hour"]) if "five_hour" in held else NoWindow()
-        if now - weekly.at > stale_after or weekly.at > now:
-            return StaleReading(weekly, five)
-        credits = held["credits"]["balance"] if "credits" in held else ""
-        return FreshReading(weekly, five, credits)
     except (ValueError, TypeError):
         return NoReading()
+    fable: ReadingWindow | NoWindow = NoWindow()
+    if tool == "claude" and "weekly_fable" in held:
+        try:
+            fable = _reading_window(held["weekly_fable"])
+        except (ValueError, TypeError):
+            pass
+    if not timedelta(0) <= now - weekly.at <= stale_after:
+        return StaleReading(weekly, five, weekly_fable=fable)
+    credits = held["credits"]["balance"] if "credits" in held else ""
+    return FreshReading(weekly, five, credits, weekly_fable=fable)
+
+
+RefusalWindowName = Literal["weekly", "five_hour", "weekly_fable", "unknown"]
 
 
 @dataclass(frozen=True)
@@ -95,8 +112,35 @@ class KnownWindow:
 
 
 @dataclass(frozen=True)
+class FableWeeklyWindow:
+    name: Literal["weekly_fable"] = field(default="weekly_fable", init=False)
+
+
+@dataclass(frozen=True)
 class UnknownWindow:
     pass
+
+
+RefusalWindow = KnownWindow | FableWeeklyWindow | UnknownWindow
+
+
+def refusal_window(name: RefusalWindowName) -> RefusalWindow:
+    if name == "unknown":
+        return UnknownWindow()
+    if name == "weekly_fable":
+        return FableWeeklyWindow()
+    return KnownWindow(name)
+
+
+def window_name(window: RefusalWindow) -> RefusalWindowName:
+    return "unknown" if isinstance(window, UnknownWindow) else window.name
+
+
+def move_window(window: RefusalWindow) -> Literal["weekly", "five_hour", "unknown"]:
+    """Use the weekly category in the existing move record format."""
+    if isinstance(window, UnknownWindow):
+        return "unknown"
+    return "weekly" if isinstance(window, FableWeeklyWindow) else window.name
 
 
 @dataclass(frozen=True)
@@ -118,6 +162,7 @@ class UnknownFamily:
 
 UNKNOWN_FAMILY = UnknownFamily()
 ALL_MODELS = AllModels()
+FABLE_FAMILY = ModelFamily("fable")
 # The provider resets a model family's allowance at most one week after a refusal.
 FAMILY_WINDOW = timedelta(days=7)
 
@@ -150,7 +195,7 @@ def model_family(model: str, families: frozenset[str]) -> ModelFamily | UnknownF
 class AccountRefusal:
     tool: Literal["claude", "codex"]
     login: str
-    window: KnownWindow | UnknownWindow
+    window: RefusalWindow
     reset: KnownReset | NoResetKnown
     at: datetime
     family: ModelFamily | AllModels = ALL_MODELS
@@ -212,9 +257,11 @@ def load() -> dict[str, AccountRefusal]:
         if not all(isinstance(held.get(name), str) for name in ("tool", "login", "window", "reset", "at")):
             raise RefusalsError("invalid account refusal fields")
         wire = cast(RefusalWire, cast(object, held))
-        if wire["tool"] not in {"claude", "codex"} or not wire["login"] or wire["window"] not in {"weekly", "five_hour", "unknown"}:
+        if wire["tool"] not in {"claude", "codex"} or not wire["login"] or wire["window"] not in {
+            "weekly", "five_hour", "weekly_fable", "unknown",
+        }:
             raise RefusalsError("invalid account refusal identity or window")
-        window = (UnknownWindow() if wire["window"] == "unknown" else KnownWindow(cast(Literal["weekly", "five_hour"], wire["window"])))
+        window = refusal_window(cast(RefusalWindowName, wire["window"]))
         reset = KnownReset(_time(wire["reset"])) if wire["reset"] else NoResetKnown()
         family = held.get("family", "")
         if not isinstance(family, str) or family and not family.isalpha():
@@ -227,7 +274,7 @@ def load() -> dict[str, AccountRefusal]:
 
 def _wire(refusal: AccountRefusal) -> RefusalWire:
     wire = RefusalWire(tool=refusal.tool, login=refusal.login,
-        window=refusal.window.name if isinstance(refusal.window, KnownWindow) else "unknown",
+        window=window_name(refusal.window),
         reset=refusal.reset.at.isoformat() if isinstance(refusal.reset, KnownReset) else "", at=refusal.at.isoformat())
     if isinstance(refusal.family, ModelFamily):
         wire["family"] = refusal.family.name
@@ -257,8 +304,8 @@ def write_refusal(refusal: AccountRefusal) -> None:
 
 
 def resolved(refusal: AccountRefusal, reading: FreshReading | StaleReading | NoReading, now: datetime) -> bool:
-    if isinstance(refusal.family, ModelFamily):
-        # Saved readings hold no family window, so only time resolves a family refusal.
+    if isinstance(refusal.family, ModelFamily) or isinstance(refusal.window, FableWeeklyWindow):
+        # A family refusal resolves at its reset.
         return now >= (refusal.reset.at if isinstance(refusal.reset, KnownReset) else refusal.at + FAMILY_WINDOW)
     if isinstance(refusal.window, KnownWindow) and isinstance(refusal.reset, KnownReset) and refusal.reset.at <= now:
         return True

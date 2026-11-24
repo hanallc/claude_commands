@@ -102,7 +102,7 @@ class TranscriptRefusal:
 
     entry_id: str
     refused_at: RefusedAt
-    window: refusals.KnownWindow | refusals.UnknownWindow
+    window: refusals.RefusalWindow
     text: str
     reset: refusals.KnownReset | refusals.NoResetKnown = field(default_factory=refusals.NoResetKnown)
     family: refusals.ModelFamily | refusals.AllModels = refusals.ALL_MODELS
@@ -124,7 +124,7 @@ _assumed_refusals: ContextVar[Mapping[str, ProofRefusal]] = ContextVar("assumed_
 
 class FirstRefusalObservation(TypedDict):
     login: str
-    window: Literal["weekly", "five_hour", "unknown"]
+    window: refusals.RefusalWindowName
     reset: NotRequired[str]
     at: str
     family: NotRequired[str]
@@ -610,17 +610,20 @@ def claude_entry_refusal(entry: Mapping[str, object],
                          for block in cast(list[object], content) if isinstance(block, dict))
     else:
         text = ""
-    window = _text_window(text, False)
+    window: refusals.RefusalWindow = _text_window(text, False)
     rate_type, raw_reset = _rate_limit_fields(entry)
     # The text describes the refused request; the prior model describes an earlier one.
     family = _text_family(text, families)
     if isinstance(family, refusals.UnknownFamily):
         family = session_family()
     scope: refusals.ModelFamily | refusals.AllModels = refusals.ALL_MODELS
-    if rate_type in ("seven_day", "weekly"):
-        window = refusals.KnownWindow("weekly")
-    elif rate_type == "five_hour":
+    if rate_type == "five_hour":
         window = refusals.KnownWindow("five_hour")
+    elif rate_type in ("weekly_scoped", "seven_day_fable") or re.search(r"\bfable limit\b", text, re.IGNORECASE):
+        window = refusals.FableWeeklyWindow()
+        scope = family = refusals.FABLE_FAMILY
+    elif rate_type in ("seven_day", "weekly"):
+        window = refusals.KnownWindow("weekly")
     elif rate_type == OVERAGE_LIMIT:
         window = refusals.KnownWindow("weekly")
         scope = family if isinstance(family, refusals.ModelFamily) else refusals.ALL_MODELS
@@ -838,7 +841,7 @@ def _record_blocked_head(state: WatchState, rule: AutoMoveRule, reason: BlockedH
 
 
 def _first_refusal(held: FirstRefusalObservation) -> refusals.AccountRefusal:
-    window = refusals.UnknownWindow() if held["window"] == "unknown" else refusals.KnownWindow(held["window"])
+    window = refusals.refusal_window(held["window"])
     reset = refusals.KnownReset(datetime.fromisoformat(held["reset"])) if "reset" in held else refusals.NoResetKnown()
     family = refusals.ModelFamily(held["family"]) if "family" in held else refusals.ALL_MODELS
     return refusals.AccountRefusal("claude", held["login"], window, reset, datetime.fromisoformat(held["at"]), family)
@@ -880,7 +883,8 @@ def _reading_values_fingerprint() -> str:
     values: dict[str, dict[str, object]] = {}
     for identity, reading in usage_store.load().items():
         values[identity] = {}
-        for name, window in (("weekly", reading.get("weekly")), ("five_hour", reading.get("five_hour"))):
+        for name, window in (("weekly", reading.get("weekly")), ("five_hour", reading.get("five_hour")),
+                             ("weekly_fable", reading.get("weekly_fable"))):
             if window is not None:
                 values[identity][name] = {"left": window["left"], "resets": window["resets"]}
         if "credits" in reading:
@@ -1045,7 +1049,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             reading = refusals.stored_reading_with_age("claude", login, now, stale_after)
             window = _refusal_window(refusal.window, reading, refusal.refused_at.at)
             reset: refusals.KnownReset | refusals.NoResetKnown = refusals.NoResetKnown()
-            # A reading holds no family window, so a family refusal keeps only its own reset.
+            # A family refusal uses only its own reset.
             if (isinstance(window, refusals.KnownWindow) and isinstance(refusal.family, refusals.AllModels)
                     and isinstance(reading, (refusals.FreshReading, refusals.StaleReading))):
                 value = reading.weekly if window.name == "weekly" else reading.five_hour
@@ -1056,7 +1060,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             account_refusal = refusals.AccountRefusal("claude", login, window, reset, refusal.refused_at.at, refusal.family)
             if not dry_run:
                 observation = FirstRefusalObservation(login=login,
-                    window=account_refusal.window.name if isinstance(account_refusal.window, refusals.KnownWindow) else "unknown",
+                    window=refusals.window_name(account_refusal.window),
                     at=account_refusal.at.isoformat())
                 if isinstance(account_refusal.reset, refusals.KnownReset):
                     observation["reset"] = account_refusal.reset.at.isoformat()
@@ -1088,7 +1092,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                 move_id = uuid4().hex
                 moves.append_move(moves.WaitedMove(kind="waited", at=now.isoformat(), tool="claude",
                     subject=subject, move_id=move_id,
-                    window=window.name if isinstance(window, refusals.KnownWindow) else "unknown",
+                    window=refusals.move_window(window),
                     reset=wait_reset.at.isoformat()))
                 _set_transition(state, session_id, refusal.entry_id, "waited", move_id)
             continue
@@ -1182,10 +1186,10 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                 moved_groups.add(group_name)
             continue
         first_refusal = group[0][2]
-        window_name = first_refusal.window.name if isinstance(first_refusal.window, refusals.KnownWindow) else "unknown"
+        window_name = refusals.window_name(first_refusal.window)
         reset_text = first_refusal.reset.at.astimezone(agent_accounts.user_zone()).isoformat() if isinstance(first_refusal.reset, refusals.KnownReset) else "unknown reset"
         why = f"{source} refused: {window_name} limit until {reset_text}"
-        move_origin = accounts.RefusalOrigin(window_name, first_refusal.reset)
+        move_origin = accounts.RefusalOrigin(refusals.move_window(first_refusal.window), first_refusal.reset)
         refusal_ids = sorted((session["session_id"], refusal.entry_id) for session, refusal, _ in group)
         transition = accounts.GroupTransition(uuid5(NAMESPACE_URL, json.dumps(refusal_ids)).hex,
                                               move_origin, accounts.RecordedTransitionReason(why))
@@ -1478,10 +1482,58 @@ class BlockedAutoMoveTargets:
     reasons: tuple[tuple[AutoMoveRule, BlockedHeadReason], ...]
 
 
+@dataclass(frozen=True)
+class RefreshedTargetReading:
+    reading: refusals.FreshReading
+    checked_at: datetime
+
+
+def _usage_matches_claim(usage: usage_store.StoredUsage, claimed_at: datetime) -> bool:
+    return (usage.get("attempt_outcome") == agent_accounts.UsageReadOutcome.OK
+            and usage.get("attempted_at") == claimed_at.isoformat()
+            and "weekly" in usage and usage["weekly"]["at"] == claimed_at.isoformat(timespec="seconds"))
+
+
+def _target_read_completed_in_pass(usage: usage_store.StoredUsage, pass_started_at: datetime, checked_at: datetime) -> bool:
+    try:
+        claimed_at = datetime.fromisoformat(usage.get("attempted_at", ""))
+    except ValueError:
+        return False
+    return (claimed_at.tzinfo is not None and pass_started_at <= claimed_at <= checked_at
+            and _usage_matches_claim(usage, claimed_at))
+
+
+def _read_reset_target(destination: agent_accounts.NumberedAccount, reset: datetime,
+                       now: datetime, stale_after: timedelta) -> RefreshedTargetReading | refusals.NoReading:
+    try:
+        report = agent_accounts.claude_live(destination)
+    except (OSError, ValueError, RuntimeError):
+        return refusals.NoReading()
+    claim = report.usage_read_claim
+    if (report.usage_read_outcome != agent_accounts.UsageReadOutcome.OK
+            or not isinstance(claim, agent_accounts.UsageReadClaim) or claim.at < reset):
+        return refusals.NoReading()
+    usage = usage_store.load().get(usage_store.key("Claude", destination.login), {})
+    if not _usage_matches_claim(usage, claim.at):
+        return refusals.NoReading()
+    checked_at = max(now, datetime.now(timezone.utc))
+    if claim.at > checked_at:
+        return refusals.NoReading()
+    reading = refusals.usage_reading_with_age("claude", usage, checked_at, stale_after)
+    if not isinstance(reading, refusals.FreshReading):
+        return refusals.NoReading()
+    next_reset = reading.weekly.reset
+    if isinstance(next_reset, refusals.KnownReset) and next_reset.at <= checked_at:
+        return refusals.NoReading()
+    return RefreshedTargetReading(reading, checked_at)
+
+
 def _choose_auto_move_target(rule: AutoMoveRule, current_account: str, now: datetime,
-                             account_config: conf.ConfigRead) -> AutoMoveRule | BlockedAutoMoveTargets:
+                             account_config: conf.ConfigRead, *, dry_run: bool = False) -> AutoMoveRule | BlockedAutoMoveTargets:
     held_refusals = refusals.load()
-    family = accounts.group_family(rule.group)
+    families = accounts.group_model_families(rule.group)
+    family = next(iter(families)) if len(families) == 1 else refusals.UNKNOWN_FAMILY
+    needs_fable = refusals.FABLE_FAMILY in families
     stale_after = timedelta(minutes=account_config.whole("usage_stale_minutes"))
     blocked: list[tuple[AutoMoveRule, BlockedHeadReason]] = []
     for label in (rule.to, *rule.fallback_targets):
@@ -1493,17 +1545,32 @@ def _choose_auto_move_target(rule: AutoMoveRule, current_account: str, now: date
         except accounts.AccountsError as error:
             blocked.append((candidate, TargetAccountUnavailable(str(error).splitlines()[0])))
             continue
-        sign_in = accounts.move_target_sign_in(destination, now)
+        checked_at = max(now, datetime.now(timezone.utc))
+        sign_in = accounts.move_target_sign_in(destination, checked_at)
         if isinstance(sign_in, accounts.MoveRefused):
             blocked.append((candidate, TargetPreparationRefused(sign_in.reason)))
             continue
-        target_login = sign_in.login
-        target = refusals.stored_reading_with_age("claude", target_login, now, stale_after)
-        last_read = (target.weekly.at if isinstance(target, (refusals.FreshReading, refusals.StaleReading))
-                     and isinstance(target.weekly, refusals.ReadingWindow) else NoTargetReading())
-        target_usage = usage_store.load().get(usage_store.key("Claude", target_login), {})
+        target_usage = usage_store.load().get(usage_store.key("Claude", sign_in.login), {})
+        checked_at = max(checked_at, datetime.now(timezone.utc))
+        target = refusals.usage_reading_with_age("claude", target_usage, checked_at, stale_after)
+        weekly = target.weekly if not isinstance(target, refusals.NoReading) else refusals.NoWindow()
+        last_read = weekly.at if isinstance(weekly, refusals.ReadingWindow) else NoTargetReading()
+        fable = (target.weekly_fable if needs_fable and not isinstance(target, refusals.NoReading)
+                 else refusals.NoWindow())
+        passed_resets = [window.reset.at for window in (weekly, fable)
+                         if isinstance(window, refusals.ReadingWindow)
+                         and isinstance(window.reset, refusals.KnownReset) and window.reset.at <= checked_at]
+        if passed_resets:
+            if dry_run or _target_read_completed_in_pass(target_usage, now, checked_at):
+                blocked.append((candidate, TargetReadingUnavailable(last_read)))
+                continue
+            refreshed = _read_reset_target(sign_in, max(passed_resets), checked_at, stale_after)
+            if isinstance(refreshed, refusals.NoReading):
+                blocked.append((candidate, TargetReadingUnavailable(last_read)))
+                continue
+            target, checked_at = refreshed.reading, refreshed.checked_at
         reason: BlockedHeadReason
-        if usage_store.latest_read_outcome(target_usage) in (agent_accounts.UsageReadOutcome.STALE_TOKEN,
+        if not passed_resets and usage_store.latest_read_outcome(target_usage) in (agent_accounts.UsageReadOutcome.STALE_TOKEN,
                                                           agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN):
             attempt = accounts.login_renewal_attempts().get(label)
             reason = (TargetLoginRenewalFailed(attempt.result.detail)
@@ -1513,10 +1580,18 @@ def _choose_auto_move_target(rule: AutoMoveRule, current_account: str, now: date
             reason = TargetReadingUnavailable(last_read)
         elif target.weekly.left <= rule.when.percent:
             reason = TargetAtOrBelowThreshold(target.weekly.left, rule.when.percent)
-        else:
-            if refusals.blocking(held_refusals, "claude", target_login, family, target, now) is None:
-                return candidate
+        elif refusals.blocking(held_refusals, "claude", sign_in.login, family, target, checked_at) is not None:
             reason = TargetUnresolvedRefusal()
+        elif needs_fable:
+            fable = accounts.fable_weekly_reading(target, checked_at, stale_after)
+            if isinstance(fable, refusals.NoWindow):
+                reason = TargetAccountUnavailable("no readable Fable weekly window")
+            elif fable.left <= 0 or isinstance(target.five_hour, refusals.ReadingWindow) and target.five_hour.left <= 0:
+                reason = TargetAtOrBelowThreshold(0, 0)
+            else:
+                return candidate
+        else:
+            return candidate
         blocked.append((candidate, reason))
     return BlockedAutoMoveTargets(tuple(blocked))
 
@@ -1641,7 +1716,10 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
             if (isinstance(started.duration, next_moves.ResolvedHold)
                     and (now - started.at).total_seconds() / 60 < started.duration.minutes):
                 continue
-        chosen = _choose_auto_move_target(rule, selection.account, now, account_config)
+        if dry_run:
+            chosen = _choose_auto_move_target(rule, selection.account, now, account_config, dry_run=True)
+        else:
+            chosen = _choose_auto_move_target(rule, selection.account, now, account_config)
         if isinstance(chosen, BlockedAutoMoveTargets):
             blocked_rule, reason = chosen.reasons[0]
             if not rule.fallback_targets and isinstance(reason, TargetAccountUnavailable):

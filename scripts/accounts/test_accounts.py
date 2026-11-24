@@ -9709,6 +9709,7 @@ class PickerTests(unittest.TestCase):
 
     def test_pick_and_placement_skip_a_family_refusal_only_for_its_family_or_an_unknown_family(self) -> None:
         self.assert_picked("claude3")
+        self.store_fable("claude1", 60)
         refusals.write_refusal(refusals.AccountRefusal("claude", "third@example.invalid",
             refusals.KnownWindow("weekly"), refusals.KnownReset(self.now + timedelta(days=2)), self.now,
             refusals.ModelFamily("fable")))
@@ -9721,6 +9722,74 @@ class PickerTests(unittest.TestCase):
                 self.assertEqual(accounts.placement("units", self.now, exclude=frozenset(), family=family).label, label)
                 explained = [accounts._pick_explanation(reason) for reason in chosen.reasons]  # pyright: ignore[reportPrivateUsage]
                 self.assertEqual(any("refused at" in line for line in explained), label == "claude1")
+
+    def store_fable(self, label: str, left: float) -> None:
+        directory = accounts.account_dir(label)
+        identity = accounts.account_identity(directory)
+        assert isinstance(identity, agent_accounts.NumberedAccount)
+        general = usage_store.load()[usage_store.key("Claude", identity.login)].get("weekly")
+        assert general is not None
+        usage: dict[str, object] = {
+            "seven_day": {"utilization": 100 - general["left"], "resets_at": general["resets"]},
+            "limits": {"weekly_scoped": {"percent": 100 - left, "is_active": True,
+                                        "resets_at": (self.now + timedelta(days=2)).isoformat()}},
+        }
+        report = agent_accounts.Report("Claude", email=identity.login,
+            quotas=agent_accounts.claude_usage_quotas(usage), weekly_fable=agent_accounts.claude_fable_weekly(usage))
+        usage_store.save([report], self.now)
+
+    def test_fable_usage_survives_store_and_timer_round_trips(self) -> None:
+        payload: dict[str, object] = {
+            "seven_day": {"utilization": 75, "resets_at": (self.now + timedelta(days=3)).isoformat()},
+            "limits": {"weekly_scoped": {"percent": 100, "is_active": True,
+                                        "resets_at": (self.now + timedelta(days=1)).isoformat()}},
+        }
+        look_up = usage_store.key("Claude", "first@example.invalid")
+        report = agent_accounts.Report("Claude", email="first@example.invalid",
+            quotas=agent_accounts.claude_usage_quotas(payload), weekly_fable=agent_accounts.claude_fable_weekly(payload))
+        usage_store.save([report], self.now)
+        saved = usage_store.load()[look_up]
+        weekly = saved.get("weekly")
+        assert weekly is not None
+        self.assertEqual(weekly["left"], 25)
+        self.assertEqual(saved.get("weekly_fable"), usage_store.StoredWindow(left=0, at=self.now.isoformat(),
+            resets=(self.now + timedelta(days=1)).isoformat()))
+        usage_store.save_timer_usage("fixture", [report], self.now)
+        cached = usage_store.recent_timer_usage("fixture", self.now)
+        assert isinstance(cached, usage_store.RecentTimerUsage)
+        self.assertEqual(cached.reports[0].weekly_fable, report.weekly_fable)
+        usage_store.save([replace(report, weekly_fable=agent_accounts.NoFableQuota())], self.now)
+        self.assertNotIn("weekly_fable", usage_store.load()[look_up])
+
+    def test_fable_pick_and_group_placement_require_both_weekly_windows(self) -> None:
+        self.reading("Claude", "third@example.invalid", 25, 2)
+        self.store_fable("claude3", 0)
+        self.store_fable("claude1", 60)
+        registry = self.home / ".claude/config/models.conf"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        _ = registry.write_text("[claude.families]\nfable=fable\n[production.claude]\ndirector=fable:high\n")
+        with patch.object(agent_accounts, "claude_live", side_effect=AssertionError("unexpected live usage read")):
+            picked = accounts.pick("claude", self.now, family=refusals.FABLE_FAMILY)
+            assert isinstance(picked, accounts.PickedAccount)
+            self.assertEqual(picked.label, "claude1")
+            self.assertEqual({reason.label: reason.status for reason in picked.reasons}["claude3"], "no room")
+            self.assertEqual(accounts.placement("units", self.now).label, "claude1")
+            self.reading("Claude", "third@example.invalid", 0, 2)
+            self.store_fable("claude3", 60)
+            self.assertEqual(accounts.placement("units", self.now).label, "claude1")
+
+    def test_fable_pick_explains_a_missing_saved_window(self) -> None:
+        with patch.object(agent_accounts, "claude_live", side_effect=AssertionError("unexpected live usage read")):
+            refused = accounts.pick("claude", self.now, family=refusals.FABLE_FAMILY)
+        assert isinstance(refused, accounts.NoAccountWithRoom)
+        self.assertTrue(refused.reasons)
+        self.assertEqual({reason.status for reason in refused.reasons}, {"cannot read the Fable weekly window"})
+
+    def test_non_fable_pick_ignores_the_saved_fable_window(self) -> None:
+        self.store_fable("claude3", 0)
+        picked = accounts.pick("claude", self.now, family=refusals.ModelFamily("opus"))
+        assert isinstance(picked, accounts.PickedAccount)
+        self.assertEqual(picked.label, "claude3")
 
     def test_group_family_reads_the_staff_model_setting(self) -> None:
         registry = self.home / ".claude/config/models.conf"

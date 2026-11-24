@@ -2096,13 +2096,29 @@ def _codex_reading_can_work(reading: FreshReading, now: datetime, credits: agent
     return isinstance(agent_accounts.codex_can_work(report, now, credits), agent_accounts.CodexWorkAvailable)
 
 
+FABLE_WEEKLY_UNREADABLE = "cannot read the Fable weekly window"
+
+
+def fable_weekly_reading(reading: FreshReading | StaleReading | refusals.NoReading, now: datetime,
+                         stale_after: timedelta) -> ReadingWindow | NoWindow:
+    """Use the saved Fable window while the reading and reset are current."""
+    if not isinstance(reading, FreshReading) or not isinstance(window := reading.weekly_fable, ReadingWindow):
+        return NoWindow()
+    if (not 0 <= window.left <= 100 or not timedelta(0) <= now - window.at <= stale_after
+            or isinstance(window.reset, KnownReset) and window.reset.at <= now):
+        return NoWindow()
+    return window
+
+
 def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[str] = _NO_EXCLUSIONS, keep: KeepAccount | NoKeep = _NO_KEEP, prefer_weekly_room: bool = False,
          reading_age_minutes: int | ConfiguredReadingAge = _CONFIGURED_READING_AGE, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS,
-         family: refusals.ModelFamily | refusals.UnknownFamily = refusals.UNKNOWN_FAMILY) -> PickedAccount | NoAccountWithRoom:
+         family: refusals.ModelFamily | refusals.UnknownFamily = refusals.UNKNOWN_FAMILY,
+         require_fable_weekly: bool = False) -> PickedAccount | NoAccountWithRoom:
     """Keep a working account, otherwise spend the weekly allowance resetting soonest.
 
     A refusal for another model family leaves the account a candidate; an unknown family honors every refusal.
     """
+    needs_fable = tool == "claude" and (require_fable_weekly or family == refusals.FABLE_FAMILY)
     exclude = frozenset(numbered_account_label(label, tool).label for label in exclude)
     keep = KeepAccount(numbered_account_label(keep.label, tool).label) if isinstance(keep, KeepAccount) else keep
     candidates: list[tuple[str, Path, str]] = []
@@ -2158,7 +2174,8 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
         any_fresh = any_fresh or isinstance(reading, FreshReading)
         weekly: ReadingWindow | NoWindow = reading.weekly if isinstance(reading, (FreshReading, StaleReading)) else NoWindow()
         five: ReadingWindow | NoWindow = reading.five_hour if isinstance(reading, (FreshReading, StaleReading)) else NoWindow()
-        for window in (weekly, five):
+        fable = fable_weekly_reading(reading, now, stale_after) if needs_fable else NoWindow()
+        for window in (weekly, five, fable):
             if isinstance(window, ReadingWindow) and isinstance(window.reset, KnownReset) and window.reset.at > now:
                 resets.append(window.reset.at)
         resets.extend(held.reset.at for held in refusals.applicable(held_refusals, tool, login, family)
@@ -2168,8 +2185,12 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
             reason = refusal_problem
         elif refusal is not None:
             reason = "refused at " + refusal.at.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z")
+        elif needs_fable and isinstance(fable, NoWindow):
+            reason = FABLE_WEEKLY_UNREADABLE
+        elif needs_fable and isinstance(weekly, ReadingWindow) and isinstance(weekly.reset, KnownReset) and weekly.reset.at <= now:
+            reason = "no room"
         elif tool == "claude" and isinstance(reading, FreshReading) and any(
-            isinstance(window, ReadingWindow) and window.left <= 0 for window in (weekly, five)
+            isinstance(window, ReadingWindow) and window.left <= 0 for window in (weekly, five, fable)
         ):
             reason = "no room"
         elif tool == "claude":
@@ -2518,7 +2539,7 @@ def placement(group: ClaudeGroup, now: datetime, *, exclude: frozenset[str] = _N
                      if isinstance(reading_age_minutes, ConfiguredReadingAge) else reading_age_minutes)
     stale_after = timedelta(minutes=stale_minutes)
     chosen = pick("claude", now, exclude=exclude, keep=NoKeep(), reading_age_minutes=stale_minutes, account_config=account_config,
-                  family=family)
+                  family=family, require_fable_weekly=refusals.FABLE_FAMILY in group_model_families(group))
     if isinstance(chosen, NoAccountWithRoom):
         label = group_label(group_accounts(), group)
         directory = claude_account_dir(label) if isinstance(label, str) and _label_is(label, "claude") else GROUP_NOT_CONFIGURED
@@ -2551,25 +2572,32 @@ def group_family(group: ClaudeGroup) -> refusals.ModelFamily | refusals.UnknownF
     Producers use their [producers] rows; showrunners and unit directors use [production.claude].
     Producers on two families, or an unreadable setting, give an unknown family.
     """
+    families = group_model_families(group)
+    return next(iter(families)) if len(families) == 1 else refusals.UNKNOWN_FAMILY
+
+
+def group_model_families(group: ClaudeGroup) -> frozenset[refusals.ModelFamily | refusals.UnknownFamily]:
+    """Read every Claude model family the group launches."""
     try:
         # Resolve the registry from this call's HOME, as a launch does.
         sections = registry_rows.parse_registry(models_registry.registry_text(models_registry.registry_path(os.environ)))
     except (OSError, ValueError):
-        return refusals.UNKNOWN_FAMILY
-    if group == "producers":
-        models: list[str] = []
-        for value in sections.get("producers", {}).values():
-            try:
-                profile = models_registry.parse_producer_profile(value)
-            except ValueError:
-                return refusals.UNKNOWN_FAMILY
-            if profile.family == "claude":
-                models.append(profile.model)
-    else:
-        models = [sections.get("production.claude", {}).get("director" if group == "units" else "showrunner", "").partition(":")[0]]
+        return frozenset()
     known = refusals.registry_families(sections)
-    families = {refusals.model_family(model, known) for model in models}
-    return families.pop() if len(families) == 1 else refusals.UNKNOWN_FAMILY
+    if group != "producers":
+        role = "director" if group == "units" else "showrunner"
+        model = sections.get("production.claude", {}).get(role, "").partition(":")[0]
+        return frozenset({refusals.model_family(model, known)})
+    families: set[refusals.ModelFamily | refusals.UnknownFamily] = set()
+    for value in sections.get("producers", {}).values():
+        try:
+            profile = models_registry.parse_producer_profile(value)
+        except ValueError:
+            families.add(refusals.UNKNOWN_FAMILY)
+            continue
+        if profile.family == "claude":
+            families.add(refusals.model_family(profile.model, known))
+    return frozenset(families)
 
 
 def group_label(groups: GroupAccounts, group: ClaudeGroup) -> str | GroupNotConfigured:

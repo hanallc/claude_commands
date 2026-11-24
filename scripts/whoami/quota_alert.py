@@ -213,17 +213,18 @@ def _refusal_blocks_return(readings: CodexAlertPassReadings, selected: agent_acc
             and not _credits_pay_after(refusal, readings, selected))
 
 
-def _refusal_window(window: refusals.KnownWindow | refusals.UnknownWindow,
+def _refusal_window(window: refusals.RefusalWindow,
                     reading: refusals.FreshReading | refusals.StaleReading | refusals.NoReading,
-                    at: datetime) -> refusals.KnownWindow | refusals.UnknownWindow:
-    if isinstance(window, refusals.KnownWindow):
+                    at: datetime) -> refusals.RefusalWindow:
+    if not isinstance(window, refusals.UnknownWindow):
         return window
     if isinstance(reading, refusals.FreshReading):
-        exhausted = [name for name, value in (("weekly", reading.weekly), ("five_hour", reading.five_hour))
+        exhausted = [known for known, value in ((refusals.KnownWindow("weekly"), reading.weekly),
+                                               (refusals.KnownWindow("five_hour"), reading.five_hour))
                      if isinstance(value, refusals.ReadingWindow) and value.at > at and value.left == 0]
         if len(exhausted) == 1:
-            return refusals.KnownWindow(cast(Literal["weekly", "five_hour"], exhausted[0]))
-    return refusals.UnknownWindow()
+            return exhausted[0]
+    return window
 
 
 def _finish_workers_transitions(
@@ -2599,7 +2600,7 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
             now: datetime | None = None, *,
             selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
             codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS,
-            window: refusals.KnownWindow | refusals.UnknownWindow = UNKNOWN_REFUSAL_WINDOW,
+            window: refusals.RefusalWindow = UNKNOWN_REFUSAL_WINDOW,
             refused_at: RefusedAt | RefusalTimeUnknown = REFUSAL_TIME_UNKNOWN,
             stopped: StoppedWorker | StoppedWorkerUnknown = STOPPED_WORKER_UNKNOWN) -> list[str]:
     routed = _route_refusal(notes, refusing_account, now, selection=selection,
@@ -2615,7 +2616,7 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
             now: datetime | None = None, *,
             selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
             codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS,
-            window: refusals.KnownWindow | refusals.UnknownWindow = UNKNOWN_REFUSAL_WINDOW,
+            window: refusals.RefusalWindow = UNKNOWN_REFUSAL_WINDOW,
             refused_at: RefusedAt | RefusalTimeUnknown = REFUSAL_TIME_UNKNOWN) -> RoutedRefusal:
     """A provider refusal waits briefly, moves workers, or opens the Claude fallback."""
     from scripts.accounts import accounts
@@ -2641,9 +2642,19 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
     name = refusing_account.label
     reading = refusals.stored_reading("codex", refusing_account.login, now)
     window = _refusal_window(window, _reading_for_account(readings, refusing_account, now), refusal_time)
+    window_name = refusals.window_name(window)
+    journal_window = refusals.move_window(window)
     reset: refusals.KnownReset | refusals.NoResetKnown = refusals.NoResetKnown()
-    if isinstance(window, refusals.KnownWindow) and isinstance(reading, (refusals.FreshReading, refusals.StaleReading)):
-        held_window = reading.weekly if window.name == "weekly" else reading.five_hour
+    if isinstance(reading, (refusals.FreshReading, refusals.StaleReading)):
+        match window_name:
+            case "weekly":
+                held_window = reading.weekly
+            case "five_hour":
+                held_window = reading.five_hour
+            case "weekly_fable" if isinstance(reading, refusals.FreshReading):
+                held_window = reading.weekly_fable
+            case _:
+                held_window = refusals.NoWindow()
         if isinstance(held_window, refusals.ReadingWindow):
             reset = held_window.reset
     refusals.write_refusal(refusals.AccountRefusal("codex", refusing_account.login, window, reset, refusal_time))
@@ -2671,9 +2682,8 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                                        agent_accounts.codex_credits_setting(readings.workers.label))
             entries = moves.read_moves()
             if (isinstance(reset, refusals.KnownReset) and (pending_head
-                    or isinstance(window, refusals.KnownWindow) and window.name == "five_hour"
+                    or window_name == "five_hour"
                     and timedelta(0) < reset.at - now < timedelta(minutes=20))):
-                window_name = window.name if isinstance(window, refusals.KnownWindow) else "unknown"
                 window_text = "5-hour" if window_name == "five_hour" else window_name
                 if any(entry["tool"] == "codex" and entry["subject"] == "workers" and entry["kind"] == "waited"
                        and entry["reset"] == reset.at.isoformat() for entry in entries):
@@ -2681,7 +2691,7 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                                          WorkersWaitForReset(reset_display(reset)))
                 move_id = uuid.uuid4().hex
                 moves.append_move(moves.WaitedMove(kind="waited", at=stamp, tool="codex", subject="workers",
-                    move_id=move_id, window=window_name, reset=reset.at.isoformat()))
+                    move_id=move_id, window=journal_window, reset=reset.at.isoformat()))
                 transition_line = f"workers wait for {name}'s {window_text} reset at {reset_display(reset)}"
                 outcome = WorkersWaitForReset(reset_display(reset))
             elif pending_head:
@@ -2692,11 +2702,10 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                 chosen = accounts.pick("codex", now, exclude=frozenset({readings.workers.label}), keep=accounts.NoKeep())
                 if isinstance(chosen, accounts.PickedAccount):
                     move_id = uuid.uuid4().hex
-                    window_name: Literal["weekly", "five_hour", "unknown"] = window.name if isinstance(window, refusals.KnownWindow) else "unknown"
                     reason = f"{name} refused ({window_name} limit until {reset_display(reset)})"
                     request: moves.RequestedMove = {"kind": "requested", "scope": "group", "at": stamp, "tool": "codex",
                         "subject": "workers", "move_id": move_id, "from": readings.workers.label, "to": chosen.label,
-                        "why": reason, "window": window_name}
+                        "why": reason, "window": journal_window}
                     if isinstance(reset, refusals.KnownReset):
                         request["reset"] = reset.at.isoformat()
                     moves.append_move(request)

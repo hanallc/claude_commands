@@ -244,6 +244,12 @@ When the family is not known, any unresolved family refusal blocks the destinati
 The producers use their `[producers]` rows.
 Unit directors and showrunners use `director` and `showrunner` in `[production.claude]`.
 Producers on two families, or an unreadable setting, give an unknown family.
+Fable work needs room in the all-model weekly window and the Fable weekly window.
+This rule also applies to a group that launches Fable and other models.
+The existing Claude usage reader saves `limits.weekly_scoped` as `weekly_fable`.
+The picker checks the saved Fable window for the signed-in account.
+The reading must meet the usage age limit.
+An expired or unreadable Fable window blocks the candidate.
 Automatic group moves, their next-move target checks and group completion use the group's family.
 Codex selection also checks allowance and whether `codex_credit_accounts` lets the account spend credits.
 
@@ -418,9 +424,12 @@ A Claude refusal entry gives its limit type and reset in `apiErrorParams.rate_li
 `refusal_watch.claude_entry_refusal(entry, session_family, families)` reads one entry.
 The caller supplies the family of the session's prior model and `families`, the key set of `[claude.families]`.
 The prior model is the newest real assistant entry, even when its model is not a known family.
-`seven_day` and `weekly` give an all-model weekly refusal; `five_hour` gives an all-model five-hour refusal.
+`five_hour` gives an all-model five-hour refusal.
 A family name is a key of `[claude.families]` in `config/models.conf`; any other name is not a family.
-`seven_day_<family>` gives a weekly refusal for that model family.
+`weekly_scoped`, `seven_day_fable`, or the text “Fable limit” gives a `weekly_fable` refusal for Fable.
+“Fable limit” takes precedence over the generic `seven_day` and `weekly` types.
+Those generic types otherwise give an all-model weekly refusal.
+Other `seven_day_<family>` types give a weekly refusal for that model family.
 Another `seven_day_` type gives an all-model weekly refusal.
 `seven_day_overage_included` gives a weekly refusal for the family of the refused work.
 The text "reached your <Name> limit" names that family.
@@ -433,12 +442,22 @@ When a refused group member's own family differs from the group's family, the wa
 A family record has the key `tool:login:family` and a `family` field.
 A newer refusal replaces only the record with the same key.
 A family refusal resolves at its reset.
-A fresh reading never resolves it, because saved readings do not hold the family window.
 Without a known reset, it resolves 7 days after the refusal.
 
 Queued moves use group-local positions and stable internal identities.
 Only the head of each group can run.
 An unavailable target remains queued and blocks later entries.
+An automatic target for a group that launches Fable also needs room in the saved Fable window.
+If a required weekly reset has passed, the watcher claims a usage read for the checked target account.
+Fable groups check both the all-model weekly reset and the Fable weekly reset.
+The reader checks the sign-in before it claims usage.
+It ignores optional fields that do not describe usage windows.
+Each non-null reset in a usage window must parse as a timestamp with an offset.
+A failed read keeps the last valid usage and resets.
+Later groups can use the same claimed reading while it is valid at their decision time.
+If that reading becomes stale or its required reset passes, the target waits for the next pass.
+A held or failed read makes that target unavailable.
+A dry run treats the expired reading as unavailable and makes no live read.
 A changed head loses its old hold and notice state.
 `FixedHold` carries a duration; `HalfPointHold` requests a pace-based duration.
 `ResolvedHold` keeps the duration and its source.
