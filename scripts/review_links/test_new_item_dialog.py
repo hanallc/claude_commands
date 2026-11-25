@@ -78,25 +78,31 @@ SHELL = '''
 PROBE = r'''
 const failures = [];
 const check = (ok, description) => { if (!ok) failures.push(description); };
-const dialog = document.querySelector('dialog'), body = dialog.querySelector('.new-item-body');
-const textarea = dialog.querySelector('textarea'), error = dialog.querySelector('[role="alert"]');
-const send = dialog.querySelector('[type="submit"]'), recipient = () => dialog.querySelector('[name="recipient_id"]');
+let dialog, body, textarea, error, send;
+const recipient = () => dialog.querySelector('[name="recipient_id"]');
 const launch = document.querySelector('[data-owner-new]'), png = '__PNG__';
 const to = () => [...dialog.querySelectorAll('[name="recipient_id"]')];
 const morty = () => to().find(input => input.nextElementSibling.textContent === 'morty');
 const selectType = kind => dialog.querySelector('[name="kind"][value="'+kind+'"]').click();
-const open = ({kind, page = 'builds'} = {}) => new Promise(resolve => {
- const loading = dialog.querySelector('[data-recipients-loading]');
- const observer = new MutationObserver(() => {
-  if (!loading.hidden) return;
-  observer.disconnect();
-  if (kind) selectType(kind);
-  resolve();
- });
- observer.observe(loading, {attributes:true, attributeFilter:['hidden']});
+async function open({kind, page = 'builds'} = {}) {
  launch.closest('[data-page-owner]').dataset.pageOwner = page;
  launch.click();
-});
+ dialog = document.querySelector('dialog:modal');
+ body = dialog.querySelector('.new-item-body');
+ textarea = dialog.querySelector('textarea');
+ error = dialog.querySelector('[role="alert"]');
+ send = dialog.querySelector('[type="submit"]');
+ const loading = dialog.querySelector('[data-recipients-loading]');
+ if (!loading.hidden) await new Promise(resolve => {
+  const observer = new MutationObserver(() => {
+   if (!loading.hidden) return;
+   observer.disconnect();
+   resolve();
+  });
+  observer.observe(loading, {attributes:true, attributeFilter:['hidden']});
+ });
+ if (kind) selectType(kind);
+}
 const closeToLauncher = () => !dialog.open && document.activeElement === launch;
 function type(text) {
  textarea.value = text;
@@ -636,12 +642,14 @@ async function sendSaved() {
    type('A practice item.');
    check(!notice.hidden && notice.textContent === 'Sending is off on a practice List.',
          'The practice dialog shows one reason.');
-   check(send.disabled && checkbox.closest('label').hidden, 'The practice dialog disables Send and hides capture.');
+   check(send.disabled && dialog.querySelector('[name="include_page"]').closest('label').hidden,
+         'The practice dialog disables Send and hides capture.');
    send.click();
    check(ownerPosts.length === beforePractice, 'The practice dialog makes no POST.');
    dialog.querySelector('[data-cancel]').click();
    await open({page:'accounts',kind:'question'});
-   check(notice.hidden && !notice.textContent, 'The next dialog clears the previous refusal.');
+   const nextNotice = dialog.querySelector('[data-send-disabled]');
+   check(nextNotice.hidden && !nextNotice.textContent, 'The next dialog clears the previous refusal.');
    const recipientFailure = dialog.querySelector('[data-recipients-status]');
    check(!recipientFailure.hidden && recipientFailure.textContent === 'The recipient service is unavailable.',
          'The recipient request failure shows its reason.');

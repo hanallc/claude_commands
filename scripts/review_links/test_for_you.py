@@ -160,7 +160,7 @@ class ForYouTests(unittest.TestCase):
         _ = source.write_text(json.dumps(value))
         row, = self.read().rows
         members = staff.snapshot()
-        inputs = review_page.ReviewBodyInputs(change_page.ReviewBrowser("fixture"), members, 4, "",
+        inputs = review_page.ReviewBodyInputs(change_page.ReviewBrowser("fixture"), members, 4,
                                               {}, ZoneInfo("America/Los_Angeles"), staff_names.StaffNames(members))
         markup = review_page.details(review_items.for_you_item(row, members), inputs)
         self.assertIn("<h3>Why</h3>", markup)
@@ -362,7 +362,7 @@ class ForYouTests(unittest.TestCase):
         self.assertEqual([request.reason for request in row.requests], ["Show the build result."])
         self.assertEqual(need.read_completed_needs(), ())
         names = staff.snapshot()
-        inputs = review_page.ReviewBodyInputs(change_page.ReviewBrowser("fixture"), names, 4, "",
+        inputs = review_page.ReviewBodyInputs(change_page.ReviewBrowser("fixture"), names, 4,
                                               {}, ZoneInfo("America/Los_Angeles"), staff_names.StaffNames(names))
         markup = review_page.details(review_items.for_you_item(row, names), inputs)
         self.assertIn("The running revision is unknown.", markup)

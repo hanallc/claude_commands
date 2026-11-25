@@ -16,6 +16,7 @@ def save_notice_failures(page: bytes, action: Literal['works', 'remove']) -> lis
     """Check the status region during sequential and overlapping saves."""
     setup = b'''<script>
 const realFetch=fetch;
+const lostReplies=new Map();
 let finishPost;
 window.setInterval=()=>0;
 window.fetch=(path,options={})=>{
@@ -25,10 +26,21 @@ window.fetch=(path,options={})=>{
   }
   return new Promise(()=>{});
  }
+ const request=new Headers(options.headers).get('X-Undo-Request');
+ if(!options.keepalive && lostReplies.has(request)){
+  const reason=lostReplies.get(request);
+  lostReplies.delete(request);
+  return Promise.reject(new Error(reason));
+ }
  return new Promise((resolve,reject)=>{
-  finishPost=reason=>reason ? reject(new Error(reason)) : resolve({headers:new Headers(),ok:true,json:async()=>({
-   answer:'works',request:'a'.repeat(32),token:'b'.repeat(64),item_state:'Closed'
-  })});
+  finishPost=reason=>{
+   if(reason){
+    if(options.keepalive) lostReplies.set(request,reason);
+    reject(new Error(reason));
+   }else resolve({headers:new Headers(),ok:true,json:async()=>({
+    answer:'works',request:'a'.repeat(32),token:'b'.repeat(64),item_state:'Closed'
+   })});
+  };
  });
 };
 </script>'''

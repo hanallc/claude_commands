@@ -2768,7 +2768,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   for(let count=0;count<30;count++) await frame();
   stays('a second refresh of the same snapshot');
   // The All chip keeps the Waiting row listed; a chip that hides the row closes it by the filter rule.
-  document.getElementById('review-show-all').click();
+  document.querySelector('[data-filter-row="show"] [data-filter-value="all"]').click();
   for(let count=0;count<10;count++) await frame();
   stays('a chip click');
 """

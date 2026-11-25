@@ -821,13 +821,12 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     sent = the_list.feedback_notice_time(item)
     if isinstance(sent, datetime):
         feedback = tuple(the_list.feedback_requests(item).values())[-1]
-        recipient_id = feedback.recipient_id(entry.keeper)
-        recipient = names.html(recipient_id, owner_name(names.members, recipient_id))
-        notice = "sent to " + recipient
         if feedback.state == "alerted":
+            recipient_id = feedback.recipient_id(entry.keeper)
+            recipient = names.html(recipient_id, owner_name(names.members, recipient_id))
             alert = names.html(feedback.alerted_to) + " told" if feedback.alerted_to else "no showrunner for alert"
             notice = f"not sent to {recipient}; {alert}"
-        update += '<small>' + notice + ", " + html.escape(list_time(sent, today)) + '</small>'
+            update += '<small>' + notice + ", " + html.escape(list_time(sent, today)) + '</small>'
     overdue = due is not None and due < today and item.state != the_list.ItemState.CLOSED
     eta_class = "list-eta warning" if overdue else "list-eta"
     full_eta = field_html("eta", item.eta, today, names)

@@ -736,7 +736,7 @@ document.body.append(result);
                               hold: send_hold.HoldHeader | None = None) -> None:
                 if self.command == "POST" and self.path == review_page.NEW_ITEM_PATH and "id" in fields:
                     saved.append((status, fields))
-                    if lose_reply and len(saved) == 1 and status == 200:
+                    if lose_reply and len(saved) <= 2 and status == 200:
                         self.close_connection = True
                         return
                 super().json_response(status, fields, hold=hold)
@@ -769,9 +769,10 @@ document.body.append(result);
             self.assertEqual(first_status, 200)
             self.assertEqual((first["id"], first["list_number"], row.reviews), (record.id, row.number, (first["key"],)))
             if lose_reply:
-                _, (status, receipt) = saved
-                self.assertEqual(status, 200)
-                self.assertEqual(receipt, {**first, "version": receipt["version"]})
+                _, fallback, retry = saved
+                for status, receipt in (fallback, retry):
+                    self.assertEqual(status, 200)
+                    self.assertEqual(receipt, {**first, "version": receipt["version"]})
             else:
                 self.assertEqual(len(saved), 1)
 
@@ -833,8 +834,9 @@ window.fetch=async (path,options={})=>{
  const words=dialog.querySelector('textarea');
  words.value='A new List item';
  words.dispatchEvent(new Event('input',{bubbles:true}));
+ const filed=new Promise(resolve=>document.addEventListener('review-item-created',resolve,{once:true}));
  dialog.querySelector('[type="submit"]').click();
- await until(dialog,()=>!dialog.open);
+ await filed;
  check(reads===0,'The List waits for the row save before it refreshes.');
  const reply=__ROW_REPLY__;
  finishRowSave(Response.json(reply.body,{status:reply.status}));
@@ -965,7 +967,7 @@ window.fetch=async (path,options={})=>{
   return new Promise(()=>{});
  }
  sends.push(payload);
- if(sends.length===1) throw new TypeError('The response was lost.');
+ if(sends.length<=2) throw new TypeError('The response was lost.');
  return Response.json({id:'Q1',key:'fixture-review-key'});
 };
 </script>""".replace("__KEY__", json.dumps(list_page.ListRecord(MORTY.id, item).key)).replace(
@@ -1002,8 +1004,8 @@ window.fetch=async (path,options={})=>{
   const row=()=>document.querySelector('[data-list-item][data-key="'+CSS.escape(savedKey)+'"]');
   await until(document.body,()=>row() && !row().hidden);
   await frame();
-  check(sends.length===2 && JSON.stringify(sends[0])===JSON.stringify(sends[1]),
-        'Send retries the original draft and capture key.');
+  check(sends.length===3 && sends.every(send=>JSON.stringify(send)===JSON.stringify(sends[0])),
+        'Both retries use the original draft and capture key.');
   check(location.href===address && scrollY===top,'The refresh keeps the List address and scroll position.');
   check(dialog.open && words.value==='The words for a new Send' && document.activeElement===send,
         'The dialog keeps the edited words and focus.');
@@ -9469,14 +9471,14 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
     def browser(self, markup: str) -> None:
         setup = r'''<script>
 const nativeFetch=fetch, nativeTimeout=setTimeout, errors=[], reads=[],posts=[];
-let original=MARKUP,holdPost=false,finishPost,failRefresh=false,realFeedback=false,loseResponse=false;
+let original=MARKUP,holdPost=false,finishPost,failRefresh=false,realFeedback=false,lostReplies=0;
 window.setInterval=()=>0;window.clearInterval=()=>{};
 window.fetch=async(_path,options={})=>{
  if(options.method==='POST'){
   const fields=new URLSearchParams(options.body);posts.push(fields);
   if(realFeedback){
    const result=await nativeFetch('/feedback',options);
-   if(loseResponse){loseResponse=false;throw new Error('fixture lost response');}
+   if(lostReplies>0){lostReplies--;throw new Error('fixture lost response');}
    return result;
   }
   if(fields.get('action')==='read'){
@@ -9768,7 +9770,7 @@ try{
  check(refreshed.dataset.unread==='true' && refusedForm.elements.words.value==='Keep my draft' &&
        refusedForm.querySelector('[data-send-status]').textContent==='Not saved: The row save was refused.',
        'A refusal restores the unread state and shows the reason beside the draft.');
- realFeedback=true;loseResponse=true;
+ realFeedback=true;lostReplies=2;
  const tellRow=rows().find(row=>row.dataset.number==='105');tellRow.querySelector('.list-toggle').click();
  check(visible().length===2 && !recordIsOpen(refreshed) &&
   recordIsOpen(tellRow),'Opening the second List row closes the first row.');
@@ -9784,8 +9786,9 @@ try{
  retryForm=recordDetails(rows().find(row=>row.dataset.number==='105')).querySelector('form');
  check(retryForm.elements.request.value===retryId && retryForm.elements.token.value===retryToken,'refresh keeps the failed request identity');
  await submitted(retryForm,retryForm.querySelector('[value="tell"]'));
- check(posts.length===startPosts+2,'the lost response has one retry');
- check(posts.at(-1).get('request')===retryId && posts.at(-1).get('token')===retryToken,'the retry uses its original signature');
+ check(posts.length===startPosts+3,'the lost response has one transport retry and one manual retry');
+ check(posts.slice(startPosts).every(post=>post.get('request')===retryId && post.get('token')===retryToken),
+       'each attempt uses the original signature');
  retryForm=recordDetails(rows().find(row=>row.dataset.number==='105')).querySelector('form');
  check(retryForm.elements.request.value!==retryId,'success clears the saved retry identity');
  check(retryForm.elements.words.value==='' && retryForm.querySelector('[value="tell"]').disabled,'a successful send clears the box and disables Tell morty');
