@@ -7,6 +7,7 @@ import io
 import json
 import os
 import platform
+import shlex
 import subprocess
 import tempfile
 import time
@@ -26,6 +27,7 @@ from scripts.notify import pushover
 from scripts.notify import review
 from scripts.notify import push_texts
 from scripts.notify import push_reference
+from scripts.production import staff, the_list
 from scripts.notify import silence
 from scripts.notify.test_review import FakeReviewer, verdict, with_footer
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,
@@ -147,6 +149,23 @@ class MacDeliveryTests(unittest.TestCase):
                 forwarded = cast(dict[str, str], json.loads(asked[0][1]))
                 self.assertEqual(forwarded["silence_policy"], "send_through_silence")
                 self.assertEqual(forwarded["priority"], priority)
+        argv = ["--text-id", "session.needs_go", "--source", "Mac unit", "--value", "sender=Mac unit",
+                "--value", "session=trunk", "--value", "item=412", "--value", "ask=A2", "--through-silence"]
+        response = subprocess.CompletedProcess(argv, 0, stdout="pushover: sent\n", stderr="")
+        with (self.subTest(template="session.needs_go"),
+              mock.patch.object(the_list, "load", side_effect=AssertionError("Mac read the List")),
+              mock.patch.object(pushover, "ask_natedev", return_value=response) as ask,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(pushover.send(argv), 0)
+            self.assertEqual(output.getvalue(), "pushover: sent\n")
+            ask.assert_called_once_with([*silence.SSH, pushover.REMOTE + " " + shlex.join(argv)], "")
+        payload = {"source": "Mac unit", "priority": "0", "title": "trunk waits for your go",
+                   "message": "Action: Press Go on List item 412: archive the logs",
+                   "detail": "", "key": "", "text_id": "session.needs_go"}
+        with (self.subTest(template="session.needs_go", legacy=True),
+              mock.patch("sys.stdin", io.StringIO(json.dumps(payload))), redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(pushover.main(["deliver"]), 2)
+            self.assertIn("Send session.needs_go with the List item number.", errors.getvalue())
 
     def test_cancel_asks_natedev_and_preserves_its_reply(self) -> None:
         for status, out, error in ((0, "pushover: cancelled 1\n", ""), (2, "", "pushover: fixture refusal\n")):
@@ -226,6 +245,20 @@ class PushoverTests(unittest.TestCase):
 
         code = registered_send(argv, self.keys, post)
         return code, urllib.parse.parse_qs(sent[0].decode()) if sent else {}
+
+    def go_item(self) -> the_list.ListItem:
+        keeper = staff.StaffId("morty-fixture")
+        member = staff.StaffRow(keeper, "producer", "morty", staff.StaffRoot(), current_session=keeper)
+        members = staff.StaffSnapshot((member,))
+        for reader in ("snapshot", "authority_snapshot"):
+            _ = self.enterContext(mock.patch.object(staff, reader, return_value=members))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.keys.parent / "list-state")})))
+        return the_list.add(keeper, "Check the phase files", owner=the_list.UnassignedOwner.NATE, source="morty",
+                            changes={}, number=412)
+
+    def add_go_ask(self, item: the_list.ListItem, what: str) -> the_list.Ask:
+        return the_list.add_ask(item.producer, item.id, kind=the_list.AskKind.GO, target=item.producer,
+                                what=what, why="The phases share a folder.", config=False, requester=item.producer, source="morty")
 
     def test_direct_free_text_is_refused_before_review_credentials_or_posting(self) -> None:
         for priority in ("0", "1", "2"):
@@ -410,11 +443,32 @@ class PushoverTests(unittest.TestCase):
         entry = push_texts.PushText("test", "shutdown", "decision", "Owner is blocked",
             push_texts.ActionTemplate("stop Owner"), "Reason: waiting.",
             (push_texts.PushExample("typical", {}),), purpose="Test.", session=push_texts.SessionTemplate("Owner"))
-        with mock.patch.object(push_texts, "catalog", return_value=(entry,)), redirect_stdout(io.StringIO()) as output:
-            code, form = self.run_send(["--text-id", "test"])
-        self.assertEqual(code, 0)
-        self.assertEqual(form["message"], [footed("Session: Owner\nAction: stop Owner\nReason: waiting.", "shutdown", "test")])
-        self.assertIn('"session": "Owner"', output.getvalue())
+        needs_go = next(text for text in push_texts.catalog() if text.id == "session.needs_go")
+        item = self.go_item()
+        _ = self.add_go_ask(item, "remove arrange_jacks/  from\tphases/130/files; 140 owns it  ")
+        for template, extra, session, sender, title, message in (
+            (entry, [], "Owner", "shutdown", "Owner is blocked", "Session: Owner\nAction: stop Owner\nReason: waiting."),
+            (needs_go, [], "trunk", "natedev", "trunk waits for your go", "Session: trunk\n"
+             + "Action: Press Go on List item 412: remove arrange_jacks/ from phases/130/files; 140 owns it"),
+            (needs_go, ["--value", "ask=A2"], "trunk", "natedev", "trunk waits for your go", "Session: trunk\n"
+             + "Action: Press Go on List item 412: archive the logs"),
+        ):
+            argv = ["--text-id", template.id,
+                    *(arg for key, value in template.examples[0].values.items() if key != "what"
+                      for arg in ("--value", f"{key}={value}"))]
+            if extra:
+                _ = self.add_go_ask(item, "archive the logs")
+                with (redirect_stderr(io.StringIO()) as errors,
+                      mock.patch.object(pushover, "read_keys", side_effect=AssertionError("read keys"))):
+                    self.assertEqual(self.run_send(argv), (2, {}))
+                    self.assertIn("--value ask=<ask id>. Available IDs: A1, A2", errors.getvalue())
+            with (self.subTest(template=template.id, extra=extra), mock.patch.object(push_texts, "catalog", return_value=(template,)),
+                  redirect_stdout(io.StringIO()) as output):
+                code, form = self.run_send([*argv, *extra])
+                self.assertEqual(code, 0)
+                self.assertEqual(form["title"], [title])
+                self.assertEqual(form["message"], [footed(message, sender, template.id)])
+                self.assertIn(f'"session": "{session}"', output.getvalue())
 
     def test_unit_suffix_leaves_per_unit_and_other_free_text_as_written(self) -> None:
         body = "Session: style\nCounts are per-unit now. Read the trunk plan first."
@@ -1343,28 +1397,47 @@ class PushoverTests(unittest.TestCase):
 
 
     def test_silence_release_discards_saved_repeat_flood_pushes_and_posts_other_pushes(self) -> None:
-        self.silence_on()
-        with redirect_stdout(io.StringIO()):
-            kept = silence.keep_here({"source": "send-repeat-guard", "priority": "0",
-                "title": "Repeated messages held", "message": "No action needed.",
-                "detail": "", "key": "old-flood", "text_id": "message.repeat_flood"})
-            self.assertIsInstance(kept, silence.Kept)
-            code, form = self.run_send(["--no-action", "Build done", "The build passed."])
-        self.assertEqual((code, form), (0, {}))
-        posted: list[str] = []
+        for template, reason in (("message.repeat_flood", "retired template message.repeat_flood"),
+                                 ("session.needs_go", "Go ask L412/A1 closed or unavailable")):
+            with self.subTest(template=template):
+                self.silence_on()
+                with redirect_stdout(io.StringIO()):
+                    if template == "message.repeat_flood":
+                        kept = silence.keep_here({"source": "send-repeat-guard", "priority": "0",
+                            "title": "Repeated messages held", "message": "No action needed.",
+                            "detail": "", "key": "old-flood", "text_id": template})
+                        self.assertIsInstance(kept, silence.Kept)
+                    else:
+                        item = self.go_item()
+                        ask = self.add_go_ask(item, "Check the phase files")
+                        open_ask = self.add_go_ask(item, ask.what)
+                        self.assertEqual(self.run_send(["--text-id", template, "--value", "sender=trunk",
+                            "--value", "session=trunk", "--value", "item=412", "--value", f"ask={ask.ask_id}"]), (0, {}))
+                        _ = the_list.give_go(item.producer, item.id, ask.ask_id, "go-fixture", source="test")
+                        self.assertEqual(self.run_send(["--text-id", template, "--value", "sender=herdr",
+                            "--value", "session=herdr", "--value", "item=412", "--value", f"ask={open_ask.ask_id}"]), (0, {}))
+                    code, form = self.run_send(["--no-action", "Build done", "The build passed."])
+                self.assertEqual((code, form), (0, {}))
+                posted: list[str] = []
 
-        def post(_url: str, data: bytes) -> tuple[int, bytes]:
-            posted.append(urllib.parse.parse_qs(data.decode())["title"][0])
-            return 200, b'{"status":1}'
+                def post(_url: str, data: bytes) -> tuple[int, bytes]:
+                    posted.append(urllib.parse.parse_qs(data.decode())["title"][0])
+                    return 200, b'{"status":1}'
 
-        with redirect_stdout(io.StringIO()):
-            self.assertEqual(silence.off(lambda _argv: 0,
-                lambda push: pushover.post_kept(push, self.keys, post)), 0)
-        self.assertEqual(posted, ["Build done"])
-        self.assertEqual(silence.read_kept(), [])
-        self.assertEqual([line["outcome"] for line in self.log_lines()
-                          if line["source"] == "send-repeat-guard"],
-                         ["dropped: retired template message.repeat_flood"])
+                with redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(silence.off(lambda _argv: 0, lambda push: pushover.post_kept(push, self.keys, post)), 0)
+                self.assertEqual(posted, ["Build done"] if template == "message.repeat_flood"
+                                 else ["herdr waits for your go", "Build done"])
+                self.assertEqual(silence.read_kept(), [])
+                self.assertIn("1 kept push delivered; 1 dropped" if template == "message.repeat_flood"
+                              else "2 kept pushes delivered; 1 dropped", output.getvalue())
+                drops = [line for line in self.log_lines() if line["outcome"] == "dropped: " + reason]
+                self.assertEqual(len(drops), 1)
+                self.assertEqual(drops[0]["template"], template)
+                if template == "message.repeat_flood":
+                    self.assertEqual([line["outcome"] for line in self.log_lines()
+                                      if line["source"] == "send-repeat-guard"],
+                                     ["dropped: retired template message.repeat_flood"])
 
     def test_a_push_after_a_missed_end_posts_the_kept_pushes_first(self) -> None:
         self.silence_on()

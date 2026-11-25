@@ -229,6 +229,9 @@ def silence_auto_off_values(given: dict[str, str]) -> TemplateValues:
 
 
 NATE_ADHOC_TEXT_ID = "nate.adhoc"
+NEEDS_GO_TEXT = "session.needs_go"
+NEEDS_GO_ASK = ('~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py ask "L{item}"'
+                + ' --kind go --target "<staff id>" --what "<change>" --why "<reason>"')
 ENTRIES = (
     PushText("accounts.login_sitting", "accounts", "note", "Claude logins will expire", NoActionNeeded(),
         "You asked for early login reminders.\nWithout renewal, Claude work stops at these login end dates:\n{accounts}\nFor each account:\n"
@@ -640,22 +643,14 @@ ENTRIES = (
             "credits": "25,345", "refill": "Tue 10-27 02:33 AST", "credit_accounts": "none"}),),
         purpose="An account now spends paid credits, and you queued a workers move.",
         expand_values=partial(paid_credits_text_values, queued=True)),
-    # A session waits for a go (user approved 2026-10-21): sent with send.py --text-id session.needs_go.
-    # send.py fills sender from the session's own name. Examples: the trunk push the user approved, and the
-    # herdr-panes worktree left after herdr-unit took over herdr work (2026-10-18).
-    PushText("session.needs_go", "{sender}", "decision", "{sender}: {session} waits for your go",
-        ActionTemplate("On {machine}, in the {session} pane, type: {go}"),
-        "{why}.\nYour go {does}.",
-        (PushExample("typical", {"sender": "natedev", "session": "trunk", "machine": "natedev",
-            "go": "Go: remove arrange_jacks/ from phases/130/files; 140 owns it",
-            "why": "Steps 130 and 140 both claim the arrange_jacks folder, and your permission check refused the fix",
-            "does": "removes it from step 130, and trunk goes on"}),
-         PushExample("delete_worktree", {"sender": "build-followups", "session": "herdr", "machine": "natedev",
-            "go": "Go: delete the herdr-panes worktree and its branch",
-            "why": "The herdr session tried to delete the old herdr-panes worktree, and your permission check refused it. "
-            + "The main branch has all its work",
-            "does": "deletes them, and herdr starts its next phase"})),
-        purpose="A session waits for your go before it does one step.",
+    # The user approved this layout on 2026-11-24. send.py supplies the sender for the footer.
+    PushText(NEEDS_GO_TEXT, "{sender}", "decision", "{session} waits for your go",
+        ActionTemplate("Press Go on List item {item}: {what}"), "",
+        (PushExample("typical", {"sender": "natedev", "session": "trunk", "item": "412",
+            "what": "remove arrange_jacks/ from phases/130/files; 140 owns it"}),
+         PushExample("delete_worktree", {"sender": "build-followups", "session": "herdr", "item": "413",
+            "what": "delete the herdr-panes worktree and its branch"})),
+        purpose="A session waits for your Go on a List item.",
         session=SessionTemplate("{session}")),
     # Auto silence (user spec, 2026-10-20: "a very compact format"): auto_silence.py sends one when the
     # user goes idle, before silence starts, and one when their next prompt ends it.

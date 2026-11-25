@@ -1349,32 +1349,56 @@
     "delete_worktree": {
       "objections": [
         {
-          "quote": "build-followups: herdr waits for your go",
+          "quote": "herdr waits for your go",
           "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "the herdr-panes worktree",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Press Go on List item 413",
+          "rule": "say-where-to-act"
+        },
+        {
+          "quote": "herdr waits for your go",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Press Go on List item 413: delete the herdr-panes worktree and its branch",
+          "rule": "every-choice-says-what-it-does"
         }
       ],
-      "reviewer": "user-spec: user pre-approved 2026-10-21 via showrunner: session stopped until the user types a go; reviewer: opus",
-      "sha256": "e38afe35cfa793954e97990345a4fd1c89a5d148d276b7265dbbe8596ab4afcd",
-      "time": "2026-10-21T08:05:00.760833-04:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (image b09de2d3d949), 11:23 PST Nov 24: Press Go on List item N; reviewer: claude-opus-5-5",
+      "sha256": "4f924b03c60fc2fa6e41657502a4d0c191673e7b276db337a26e60e3aa5bdf23",
+      "time": "2026-11-24T14:32:02.802611-05:00"
     },
     "typical": {
       "objections": [
         {
-          "quote": "natedev: trunk waits for your go",
-          "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "Steps 130 and 140 both claim the arrange_jacks folder",
+          "quote": "remove arrange_jacks/ from phases/130/files; 140 owns it",
           "rule": "reader-starts-cold"
         },
         {
-          "quote": "Your go removes it from step 130, and trunk goes on.",
+          "quote": "Press Go on List item 412",
+          "rule": "say-where-to-act"
+        },
+        {
+          "quote": "trunk waits for your go",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "Press Go on List item 412: remove arrange_jacks/ from phases/130/files; 140 owns it",
           "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Press Go on List item 412: remove arrange_jacks/ from phases/130/files; 140 owns it",
+          "rule": "first-150-stand-alone"
         }
       ],
-      "reviewer": "user-spec: user pre-approved 2026-10-21 via showrunner: session stopped until the user types a go; reviewer: opus",
-      "sha256": "e38afe35cfa793954e97990345a4fd1c89a5d148d276b7265dbbe8596ab4afcd",
-      "time": "2026-10-21T08:04:49.559420-04:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (image b09de2d3d949), 11:23 PST Nov 24: Press Go on List item N; reviewer: claude-opus-5-5",
+      "sha256": "4f924b03c60fc2fa6e41657502a4d0c191673e7b276db337a26e60e3aa5bdf23",
+      "time": "2026-11-24T14:31:53.337608-05:00"
     }
   },
   "shutdown.move_untrusted": {

@@ -288,7 +288,9 @@ The gate permits only an exact match. A missing template id or failed gate check
 | `HELD: <pushover message>` | 4 | pushover 4 (no marker) |
 | `HELD: not sent: this push reports an auto-mode refusal. Send it with the auto_mode.refused template: <call>` | 4 | `send()`, before the claim and pushover (no marker) |
 | `HELD: not sent: this push reports paid credit use. Send it with the quota.paid_credits template: <call>` | 4 | `send()`, before the claim and pushover (no marker) |
-| `HELD: not sent: this push asks the user to type a go. Send it with the session.needs_go template: <call>` | 4 | `send()`, before the claim and pushover (no marker) |
+| `HELD: not sent: this push asks for a Go.` followed by the ask and send commands | 4 | Before the claim and pushover |
+| `REFUSED: <reason>. Open the ask first with <command>` | 2 | `pushover.py` finds no Go box on the List item |
+| `REFUSED: ... Cannot read List record <path>: <error>` | 2 | `pushover.py` cannot read the List item |
 | `REPLACED: a newer version replaced this push; nothing was sent` | 0 | pushover 5 (no marker) |
 | `REFUSED: <why>` | 2 | pushover 2 with `refused before sending:` (no marker) |
 | `FAILED: the user was not reached: <why>` | 3 | A channel error, missing keys, or a timeout; report the failure. |
@@ -311,7 +313,20 @@ Legacy failure records remain readable by the existing tools.
 - `--text-id auto_mode.refused`: the session gives `session`, `machine`, one `command` for each refused command (in order), `waits` and an optional `rule`. `command` is the only key that can repeat, and only for this template; `parse()` collects the items in a list. `auto_mode_values()` fills `sender` from the session's own record (`own_session_name()`), `action` from the commands' first words (`rca.action_of()`: `a file change`, `a shell command`, `an action`, `2 shell commands`, or `2 actions` for mixed kinds), `refused` from the commands (one per line), `waits_line` from `waits` (`rca.waits_line()`), `noun` and `this` from the number of commands, and `rule_line` from `rule`. It drops the final periods from `waits` and cuts a command longer than 90 characters to its first 89 and `…`. A send with no `--key` gets the key `auto-mode:<session>:<first 12 hex of the sha256 of the sorted one-line commands>` (`auto_mode_key()`), so `rca.py fixed` can retire the alert. The waits sentence is a value the session writes, so `send()` keeps it only when the cold-read review approves the whole alert within `WAITS_REVIEW_SECONDS` (30 s, `review.review(…, limit=30)`; `reviewed_waits()`). A timeout or a `Failed`, `Rewritten`, `Withheld` or `Unreviewed` verdict sends the alert without it and prints why to stderr. With the review off the alert goes as given. It refuses no command, an empty command, a `waits` that has a thing to type or names a pane or session (`waits` says only what waits; the Action line says what the user does), `--value sender`, `--from`, `--machine` and a run with no session record. `send.py --help` lists the registered pushes (`SESSION_TEMPLATES`): the templates a session sends, and the three rca.py pushes with the rca.py call that sends them. `Options.commands` keeps each `command` value as given, before the cut, for the rca.py case.
   The send rule lives beside `auto_mode.refused` in `send.py --help`. The session applies it before sending; no program checks it.
 - After `parse()` renders a registered text, it refuses the run when `action_conflicts()` gives a reason: `<id> gives a second action: <reasons>`. A template value cannot add a second action. Registered texts other than agent-written ids are sent as rendered and skip live review when approved (2026-10-23: a `waits` value told the user to type `! kill …` in a second session).
-- `--text-id session.needs_go`: the session gives `session`, `machine`, `go`, `why` and `does`. `needs_go_values()` fills `sender` from the session's own record and drops a final period from `why` and `does`. It refuses the same things as `auto_mode.refused`. A free-text or agent-written push (`nate.adhoc`) whose title, text or action has `type: Go:`, `until you allow`, `until you type` or `waits for your go` is held (`wrong_template()`).
+- For a Go request, the item's producer first runs
+  `the_list.py ask LN --kind go --target "<staff id>" --what "<change>" --why "<reason>"`.
+  Then the session sends `send.py --to user --text-id session.needs_go
+  --value "session=<session>" --value "item=N"`.
+  Use the number in place of `N`.
+  If the item has several Go boxes, add `--value "ask=<ask id>"`.
+  `needs_go_values()` takes the sender from the session's record for the footer.
+  `pushover.py` forwards Mac requests to natedev before it reads the List or renders the push.
+  On natedev, it finds the box with `the_list.answerable_asks` and uses the box's What text on one line.
+  It saves the selected ask ID in the kept push detail.
+  Silence release drops the push if that Go box has closed and logs one line.
+  Silence release also drops older Go pushes without an ask ID.
+  A List read failure shows the record path and leaves a kept push available for retry.
+  `wrong_template()` holds free-text Go requests and gives both commands.
 - `user()` passes the message's `--key` to `pushover.py`, in the free-text and the `--text-id` forms, so a kept push with the same key from the same sender replaces the older kept one, and a `--need blocked` push carries the key's tag. `remote()` forwards `--key` to the far `send.py`. `push_texts.user_send_argv(…, key=)` adds `--key`.
 - `send.py retire --to user --from SENDER --key KEY` stops the emergency push sent with KEY, once its reason has ended. It prints `retired N queued messages`, then `dropped N kept pushes` (`silence.drop()`: the pushes kept during silence with KEY from SENDER). Then it runs `pushover.py cancel --source SENDER KEY` (`cancel_user_push()`, through `run()` like `user()`, 30 s limit) and prints one line: `cancelled: the emergency push for KEY stopped` (exit 0), `nothing to cancel: no emergency push for KEY is repeating` (exit 0), or `FAILED: the emergency push for KEY may still repeat: <why>` (exit 3). The cancel is by tag with the app token, so it reaches a push sent from either machine that uses the same token. `escalate.py close KEY` calls it for a sent `--need blocked` hold; its pushes carry `--key escalate-KEY`.
 - One event sends one emergency push (2026-10-27: two `--key github-cold` sends 23 s apart reached the phone twice). A `--need blocked` send with no `--key` gets `user-emergency:<sender>:<first 12 hex of the title's sha256>` (`user_emergency_key()`). With no `--repeat-minutes`, its window is `pushover.EXPIRE_S` (`emergency_lifetime()`), and `claim(…, live=True)` skips a repeat: `SKIPPED: an emergency push with key K went to the user at T and is still live until E; to send a new one, retire it first: send.py retire --to user --from S --key K`, exit 0. A push that is not `sent` releases its claim (`forget_sent()`), and `retire --to user` forgets the key's last send to the user. An emergency claim saves the owner pid and process start. Only a gone or replaced owner releases an unfinished claim, and a live owner or an unknown result keeps it, so only delivery starts the live window. `remote()` forwards `--repeat-minutes 0`, so only the sending host holds the window. An explicit `--repeat-minutes` wins; note and decision have no window without it.
@@ -397,7 +412,9 @@ New escalate holds retain their registered template and values.
   Each refused command has its own line. Two paragraphs follow:
   `Go: the session runs {this} {noun} now, and auto mode can refuse {this} {noun} again.`
   `Allow rule: auto mode lets {this} {noun} run from then on.{rule_line}`.
-- `session.needs_go` (user approved 2026-10-21, need `decision`): title `{sender}: {session} waits for your go`, `Session: {session}`, Action `On {machine}, in the {session} pane, type: {go}`, then `{why}.` and `Your go {does}.`
+- The user approved `session.needs_go` on 2026-11-24. Its need is `decision`.
+  The title is `{session} waits for your go`.
+  The text shows `Session: {session}` and `Action: Press Go on List item {item}: {what}` above the standard footer.
 - `quota.codex_workers_moved` has only a title. It names the exhausted account and the account that takes the work.
   The title says when the target spends paid credits.
 - `quota.paid_credits` shows `<account> now spends paid credits: <balance> left` for a known balance.

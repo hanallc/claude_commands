@@ -976,10 +976,14 @@ Use `cargo-berth sequence` for merge order.
       to add, and why the check refused it, in a few words. Put it in
       `needed:` and send it as a <Notify/> `blocked` alert. An auto-mode refusal
       goes as `send.py --to user --need blocked --clears-when "<check>" --text-id auto_mode.refused` with its
-      `--value`s (read the send rule in `send.py --help`); free text about it is held. A session that waits
-      for the user to type a go goes as `send.py --to user --need blocked --clears-when "<check>" --text-id
-      session.needs_go` with its `--value`s; free text about it is held. `<check>` is a
-      command that exits 0 once the unit no longer waits; with none, drop `--need blocked`.
+      `--value`s. Read the send rule in `send.py --help`.
+      For a Go request, have the item's producer open the ask with
+      `the_list.py ask LN --kind go --target "<staff id>" --what "<change>" --why "<reason>"`.
+      Then send `send.py --to user --text-id session.needs_go
+      --value "session=<session>" --value "item=N"`.
+      Use the number in place of `N`.
+      If the item has several Go boxes, add `--value "ask=<ask id>"`.
+      Use `--need blocked --clears-when "<check>"` if a command can exit 0 when the unit stops waiting.
    4. **Rule 4's limit holds.** Each hour, run
       `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <showrunner name> <unit>`
       and repeat 1–3.
