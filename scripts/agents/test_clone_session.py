@@ -1,7 +1,7 @@
 """Fixture checks for the agents clone command."""
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from functools import cached_property
 import json
 import os
@@ -11,6 +11,7 @@ from unittest.mock import ANY, Mock, patch
 
 from scripts.agents import shutdown
 from scripts.herdr import herdr
+from scripts.lib import copy_record, scratch, session_folder
 from scripts.message import roster, sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase
@@ -24,6 +25,7 @@ FORK_PANE = "w1:p2"
 
 @final
 class CloneCommandTests(StaffTestCase):
+    clone_scratch: Path = Path()
     folder: Path = Path()
     prepare: Mock = Mock()
     launch: Mock = Mock()
@@ -44,7 +46,13 @@ class CloneCommandTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.folder = self.root / "worktree"
+        _ = self.enterContext(cast(AbstractContextManager[object], patch.dict(os.environ, {
+            "CONF_DIR": str(Path(scratch.__file__).resolve().parents[2] / "config"),
+            copy_record.ROOT_ENV: str(self.root / "scratch"),
+            session_folder.ROOT_ENV: str(self.root / "session"),
+        })))
+        self.clone_scratch = self.enterContext(scratch.temporary_folder("clone-fixture"))
+        self.folder = self.clone_scratch / "worktree"
         self.folder.mkdir()
         _ = self.owner
         _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.client))
@@ -84,7 +92,7 @@ class CloneCommandTests(StaffTestCase):
         cast(Mock, self.remember).assert_called_once_with(FORK, FORK_PANE)
 
     def test_claude_clone_uses_the_source_account_and_turn_settings_and_admits_a_new_row(self) -> None:
-        home = self.root / ".claude4"
+        home = self.clone_scratch / ".claude4"
         self.source("claude", home, ["claude", "--model", "sonnet", "--effort", "low"])
         transcript = home / "projects" / "worktree" / f"{SOURCE}.jsonl"
         transcript.parent.mkdir(parents=True)
@@ -107,7 +115,7 @@ class CloneCommandTests(StaffTestCase):
         self.assert_new_row(home)
 
     def test_codex_clone_forks_the_native_id_with_current_settings_and_a_separate_row(self) -> None:
-        home = self.root / ".codex4"
+        home = self.clone_scratch / ".codex4"
         self.source("codex", home, ["codex", "--model", "gpt-5", "-c", 'model_reasoning_effort="low"'])
         transcript = home / "sessions" / f"rollout-{SOURCE}.jsonl"
         transcript.parent.mkdir(parents=True)
@@ -132,11 +140,36 @@ class CloneCommandTests(StaffTestCase):
         self.assertEqual(staff.initial_snapshot().rows, (self.owner,))
 
     def test_clone_refuses_to_attach_its_staff_row_to_the_source_id(self) -> None:
-        self.source("claude", self.root / ".claude4", ["claude"])
+        self.source("claude", self.clone_scratch / ".claude4", ["claude"])
         cast(Mock, self.native).return_value = SOURCE
         self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
         self.assertEqual(staff.initial_snapshot().rows, (self.owner,))
         cast(Mock, self.remember).assert_not_called()
+
+    def test_probe_cleanup_removes_only_the_scratch_folder_after_failure(self) -> None:
+        projects = self.clone_scratch / ".claude" / "projects"
+        project = projects / "worktree"
+        project.mkdir(parents=True)
+        transcript = project / f"{SOURCE}.jsonl"
+        _ = transcript.write_text("source transcript\n")
+
+        with (patch.object(scratch, "remove", wraps=scratch.remove) as remove,
+              self.assertRaisesRegex(ValueError, "probe failed"),
+              scratch.temporary_folder("clone-probe") as probe):
+            self.assertEqual(probe.parent, self.root / "scratch")
+            fixture_projects = probe / ".claude" / "projects"
+            fixture_projects.mkdir(parents=True)
+            _ = (fixture_projects / f"{FORK}.jsonl").write_text("fork transcript\n")
+            alias = probe / ".claude6"
+            alias.mkdir()
+            (alias / "projects").symlink_to(projects, target_is_directory=True)
+            raise ValueError("probe failed")
+
+        remove.assert_called_once_with(probe)
+        self.assertFalse(probe.exists())
+        self.assertEqual(list(projects.iterdir()), [project])
+        self.assertEqual(list(project.iterdir()), [transcript])
+        self.assertEqual(transcript.read_text(), "source transcript\n")
 
 
 def prepare_fixture_environment(cwd: str, environment: dict[str, str]) -> herdr.PreparedAgentEnvironment:

@@ -48,6 +48,12 @@ The command checks the new native id before it creates a root producer row.
 The row stores the clone's launch folder and account home.
 The source keeps its own transcript, staff row, and message address.
 
+Use `scripts.lib.scratch.temporary_folder("clone-probe")` for a clone probe.
+Create the test checkout and fixture config directory inside that scratch folder.
+Set `CLAUDE_CONFIG_DIR` to the fixture config directory for a Claude probe.
+Create its `projects` directory inside the fixture.
+Stop the probe before the Python scope removes its scratch folder.
+
 `agents pause NAME [--keep-workers] --why TEXT` pauses a director.
 The director finishes its current turn and holds at the prompt.
 By default, pause stops the workers.
