@@ -183,37 +183,33 @@ class ReviewStore:
             handle["closing"] = True
         return handle
 
-    def session_state(self, review: ActiveReview, identity: str) -> SessionLiveness:
+    def remember_process(self, review: ActiveReview, identity: str) -> bool:
         observed = self.liveness(identity)
         saved = review["participants"].get(identity)
-        if saved is None:
-            return (sessions.SessionLivenessUnknown("No saved process identity.")
-                    if isinstance(observed, sessions.SessionNotLive) else observed)
-        if isinstance(observed, sessions.LiveSessionProcess) and (
-            isinstance(observed.started, str) or observed.pid != saved["pid"]
+        if saved is not None and (
+            not isinstance(observed, sessions.LiveSessionProcess)
+            or (observed.pid == saved["pid"] and not isinstance(observed.started, str))
         ):
-            return observed
-        process = sessions.process_liveness(saved["pid"], saved["started"])
-        if isinstance(process, sessions.LiveSessionProcess) or isinstance(observed, sessions.SessionNotLive):
-            return process
-        return observed
-
-    def remember_process(self, review: ActiveReview, identity: str) -> bool:
-        observed = self.session_state(review, identity)
+            observed = sessions.process_liveness(saved["pid"], saved["started"])
         if not isinstance(observed, sessions.LiveSessionProcess) or not isinstance(observed.started, str):
             raise ReviewError("Cannot confirm your process. Try again when your session is live.")
         process = ReviewProcess(pid=observed.pid, started=observed.started)
-        if review["participants"].get(identity) == process:
+        if saved == process:
             return False
         review["participants"][identity] = process
         return True
 
-    def prune_claims(self, path: Path, review: ActiveReview, actor: str, owner: str) -> None:
-        ended = [index for index, holder in review["claims"].items()
-                 if holder not in (actor, owner) and isinstance(self.session_state(review, holder), sessions.SessionNotLive)]
-        if ended:
-            for index in ended:
-                del review["claims"][index]
+    def prune_claims(self, path: Path, review: ActiveReview, owner: str) -> None:
+        claims = review["claims"]
+        count = len(claims)
+        for index, holder in tuple(claims.items()):
+            if holder == owner:
+                continue
+            saved = review["participants"].get(holder)
+            if saved is None or not isinstance(sessions.process_liveness(saved["pid"], saved["started"]),
+                                               sessions.LiveSessionProcess):
+                del claims[index]
+        if len(claims) != count:
             _save(path, review)
 
     def join(self, actor: str, owner: str) -> ReviewHandle:
@@ -223,9 +219,9 @@ class ReviewStore:
                 if actor != owner:
                     raise ReviewError("This review has ended.")
                 return self.handle(owner, path, review)
-            if actor != owner and self.remember_process(review, actor):
+            self.prune_claims(path, review, owner)
+            if actor != owner and actor not in review["claims"].values() and self.remember_process(review, actor):
                 _save(path, review)
-            self.prune_claims(path, review, actor, owner)
             return self.handle(owner, path, review)
 
     @contextmanager
@@ -245,7 +241,7 @@ class ReviewStore:
                 return
             if actor != owner and actor not in review["participants"]:
                 raise ReviewError("Join this review before you use its items.")
-            self.prune_claims(path, review, actor, owner)
+            self.prune_claims(path, review, owner)
             yield path, review
 
     def claim(self, actor: str, owner: str, review_id: str, requested: int | NextItem) -> ClaimedItem | NoAvailableItem:
@@ -268,7 +264,7 @@ class ReviewStore:
         if not index:
             count = remaining(review)
             return NoAvailableItem(state="busy" if count else "complete", remaining=count, items=review_tasks(review))
-        if actor != owner:
+        if actor != owner and current != index:
             _ = self.remember_process(review, actor)
         if current and current != index:
             del claims[current]

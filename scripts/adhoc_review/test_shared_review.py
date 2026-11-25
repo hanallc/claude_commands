@@ -142,6 +142,21 @@ class SharedReviewTests(unittest.TestCase):
         self.assertEqual(json.loads(self.cli(OWNER, "claim", *handle))["item"], 1)
         self.assertIn("current claim", self.cli(CLONE, "record", *handle, "1", "Late decision", expected=2))
 
+    def test_reused_pid_releases_a_claim_without_reading_the_registry(self) -> None:
+        review = self.start("first")
+        handle = (review["owner"], review["review"])
+        _ = self.cli(CLONE, "join", "bob")
+        self.assertEqual(json.loads(self.cli(CLONE, "next", *handle))["item"], 1)
+        pid = PIDS[CLONE]
+        self.liveness[CLONE] = sessions.LiveSessionProcess(pid)
+        with (patch.object(sessions, "process_liveness", new=session_records.process_liveness),
+              patch.object(session_records, "process_start", return_value="reused-pid") as start,
+              patch.object(os, "kill"),
+              patch.object(sessions, "read_registry", return_value=sessions.RegistryRead((), ())) as registry):
+            self.assertEqual(json.loads(self.cli(OWNER, "claim", *handle))["item"], 1)
+        start.assert_called_once_with(pid)
+        registry.assert_not_called()
+
     def test_leave_releases_the_item_and_owner_end_invalidates_the_review_handle(self) -> None:
         review = self.start("first")
         handle = (review["owner"], review["review"])

@@ -53,8 +53,8 @@ Both claim commands return items in review order with stable IDs and saved decis
 Without `--item`, `next` returns the current item or claims the first available item.
 `leave` releases a joined session's claim.
 The helper requires a verified process start to save a joined session's PID and start.
-The helper checks the saved identity when the registry has no record or omits the start for the saved PID.
-The helper releases a joined session's claim when it confirms that the process ended.
+A joined session keeps its claim while the saved PID runs with the saved start time.
+The helper checks existing claims without reading the registry or a socket.
 Joined sessions can claim items, save decisions, and release claims while the owner is absent.
 The owner's claim stays with the owner.
 The owner's `end` freezes the shared record and returns the final decisions.
