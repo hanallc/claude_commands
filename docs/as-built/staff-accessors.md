@@ -166,6 +166,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
 | `scripts/agents/codex_test_support.py` | read | CodexBackend (fixture) |
 | `scripts/agents/detached_runs.py` | read | local_snapshot |
+| `scripts/agents/restart_support.py` | read | Kind (type only); the continuation send names the recipient kind |
 | `scripts/agents/test_agent_exec.sh` | read | staff.json (shell) |
 | `scripts/astra/astra_review.py` | read | runtime_id |
 | `scripts/astra/astra_roles.py` | write | local_snapshot, set_worker_role |
@@ -207,7 +208,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/direct/verify_token_wait_test_support.py` | read | caller_identity; fixture child runs keep the runner's session |
 | `scripts/direct/worker_state.py` | read | StaffRow |
 | `scripts/direct/workers.py` | read | initial_snapshot, local_snapshot |
-| `scripts/disks/slots.py` | read | local_snapshot, by_id, StaffId, StaffUnreadable; `staff_names` names slot lease owners for the Disks page |
+| `scripts/disks/slots.py` | read | local_snapshot, by_id, StaffId, StaffUnreadable; `staff_names` names numbered copy lease owners for the Disks page |
 | `scripts/hana_shot/hana_shot.py` | read | local_snapshot, runtime_id |
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
 | `scripts/herdr/herdr_sessions.py` | read | initial_snapshot |

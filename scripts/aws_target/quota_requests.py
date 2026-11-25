@@ -1,16 +1,24 @@
 """Read and store the state of regional Spot quota requests."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from contextlib import AbstractContextManager
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
+import json
+from pathlib import Path
+from typing import cast
 
 from scripts.aws_target import ledger
 from scripts.aws_target.aws_cli import AwsCli
-from scripts.lib import conf
+from scripts.aws_target.controller_lock import control_lock
+from scripts.lib import conf, user_zone
+from scripts.lib.atomic_file import write_text_atomic
 
 
+RECORD_PATH = Path('quota-requests') / 'requests.json'
 STANDARD_SPOT_QUOTA = 'L-34B43A08'
 GPU_SPOT_QUOTA = 'L-3819A6DF'
 # Match both Spot quota request limits in cloud_gate.conf.
@@ -23,6 +31,7 @@ class QuotaRequestStatus(StrEnum):
     IN_PROGRESS = 'IN_PROGRESS'
     APPROVED = 'APPROVED'
     DENIED = 'DENIED'
+    CLOSED = 'CLOSED'
     CASE_CLOSED = 'CASE_CLOSED'
     NOT_APPROVED = 'NOT_APPROVED'
     INVALID_REQUEST = 'INVALID_REQUEST'
@@ -30,7 +39,7 @@ class QuotaRequestStatus(StrEnum):
 
 
 CLOSED_QUOTA_REQUEST_STATUSES: frozenset[str] = frozenset((
-    QuotaRequestStatus.APPROVED, QuotaRequestStatus.DENIED, QuotaRequestStatus.CASE_CLOSED,
+    QuotaRequestStatus.APPROVED, QuotaRequestStatus.DENIED, QuotaRequestStatus.CLOSED, QuotaRequestStatus.CASE_CLOSED,
     QuotaRequestStatus.NOT_APPROVED, QuotaRequestStatus.INVALID_REQUEST,
 ))
 
@@ -63,6 +72,7 @@ class QuotaRequest:
         """Use the update time if AWS omits the creation time."""
         stamp = self.created_at if isinstance(self.created_at, datetime) else self.updated_at
         return stamp.timestamp() if isinstance(stamp, datetime) else float('-inf')
+
 
 @dataclass(frozen=True)
 class NoQuotaRequest:
@@ -159,3 +169,98 @@ def snapshot_quota_requests(document: dict[str, object], regions: tuple[str, ...
                                        request_reading(ledger.mapping(row['gpu'])))
                  if (row := by_region.get(region)) is not None else RegionalQuotaRequests(region, missing, missing)
                  for region in regions)
+
+
+type RegionalQuota = tuple[str, str]
+
+
+@dataclass(frozen=True)
+class OpenQuotaRequest:
+    region: str
+    quota_code: str
+    quota_name: str
+    asked_vcpus: str
+    status: str
+    # An empty value means AWS did not supply the case ID or time.
+    case_id: str
+    updated_at: str
+
+    @property
+    def quota(self) -> RegionalQuota:
+        return self.region, self.quota_code
+
+    @classmethod
+    def from_reply(cls, region: str, code: str, name: str, status: str,
+                   reply: Mapping[str, object]) -> OpenQuotaRequest:
+        asked = format_asked_vcpus(reply['DesiredValue'])
+        date = reply.get('LastUpdated') or reply.get('Created')
+        moment = request_time(date)
+        updated_at = moment.isoformat() if isinstance(moment, datetime) else ''
+        return cls(region, code, str(reply.get('QuotaName') or name), asked, status,
+                   str(reply.get('CaseId') or ''), updated_at)
+
+
+@dataclass(frozen=True)
+class QuotaRequestSnapshot:
+    read_at: int
+    requests: tuple[OpenQuotaRequest, ...]
+
+
+def format_asked_vcpus(value: object) -> str:
+    return f'{conf.decimal(str(value)).normalize():f}'
+
+
+def timestamp(value: object) -> float:
+    """Convert an AWS timestamp to seconds. Sort missing dates last."""
+    moment = request_time(value)
+    return moment.timestamp() if isinstance(moment, datetime) else float('-inf')
+
+
+def shown_time(value: object) -> str:
+    """Format a quota timestamp in the user's zone."""
+    if value is None or value == '':
+        return '-'
+    moment = request_time(value)
+    assert isinstance(moment, datetime)
+    return moment.astimezone(user_zone.user_zone()).strftime('%Y-%m-%d %H:%M:%S %Z')
+
+
+def read(directory: Path) -> QuotaRequestSnapshot:
+    """Read the saved requests. Raise FileNotFoundError if no snapshot exists."""
+    document = ledger.mapping(cast(object, json.loads((directory / RECORD_PATH).read_text(encoding='utf-8'))))
+    requests: list[OpenQuotaRequest] = []
+    for row in ledger.rows(document, 'requests'):
+        status = ledger.text(row, 'status')
+        if status in CLOSED_QUOTA_REQUEST_STATUSES:
+            continue
+        asked = format_asked_vcpus(ledger.text(row, 'asked_vcpus'))
+        requests.append(OpenQuotaRequest(
+            ledger.text(row, 'region'), ledger.text(row, 'quota_code'), ledger.text(row, 'quota_name'),
+            asked, status, str(row.get('case_id') or ''), str(row.get('updated_at') or '')))
+    return QuotaRequestSnapshot(ledger.instant(document, 'read_at'), tuple(requests))
+
+
+def save(directory: Path, histories: Mapping[RegionalQuota, tuple[OpenQuotaRequest, ...]], read_at: int,
+         *, complete: bool) -> None:
+    """Replace the record atomically. Call with the quota command lock held."""
+    if not histories and not complete:
+        return
+    path = directory / RECORD_PATH
+    requests: list[OpenQuotaRequest] = []
+    if not complete:
+        try:
+            previous = read(directory)
+        except FileNotFoundError:
+            pass
+        else:
+            requests.extend(row for row in previous.requests if row.quota not in histories)
+            if requests:
+                read_at = previous.read_at
+    requests.extend(row for rows in histories.values() for row in rows if row.status not in CLOSED_QUOTA_REQUEST_STATUSES)
+    document = {'read_at': read_at, 'requests': [asdict(row) for row in requests]}
+    write_text_atomic(path, json.dumps(document) + '\n', new_file_mode=0o600)
+
+
+def command_lock(directory: Path) -> AbstractContextManager[None]:
+    """Serialize quota commands from the first AWS read through the save."""
+    return control_lock(directory / RECORD_PATH.parent)

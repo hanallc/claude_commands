@@ -4,7 +4,6 @@
 Envrc files below ~/rust, ~/worktrees or ~/.claude* are allowed automatically.
 Linked worktrees registered by repositories below those roots also qualify.
 Numbered copies require a regular envrc that matches their recorded source commit.
-Legacy AWS slots require a regular envrc that matches their Git HEAD.
 Registered scratch copies qualify when their envrc matches their recorded source commit in a trusted repository.
 A `copies.py run` snapshot qualifies the same way, by the source commit its binding names.
 Other folders require explicit direnv approval.
@@ -17,7 +16,6 @@ except FileNotFoundError:
     pass
 
 import os
-from enum import Enum, auto
 import stat
 import sys
 from pathlib import Path
@@ -121,37 +119,6 @@ def _envrc_matches_commit(envrc: Path, git_directory: Path, commit: str) -> bool
     return bool(expected.stdout.strip()) and expected.stdout.strip() == actual.stdout.strip()
 
 
-class SlotEnvrcTrust(Enum):
-    """A slot requires byte proof before any broader trust rule."""
-
-    NOT_A_SLOT = auto()
-    TRUSTED = auto()
-    NEEDS_APPROVAL = auto()
-
-
-def slot_envrc_trust(envrc: Path) -> SlotEnvrcTrust:
-    """Prove a slot's envrc against its checked-out source commit."""
-    import subprocess
-    from scripts.lib import git_files, slot_root
-
-    try:
-        root = slot_root.configured_slot_root()
-    except slot_root.SlotsNotConfigured:
-        return SlotEnvrcTrust.NOT_A_SLOT
-    try:
-        folder = envrc.parent.resolve(strict=True)
-        if not folder.is_relative_to(root):
-            return SlotEnvrcTrust.NOT_A_SLOT
-        if (folder.parent != root or envrc.name != ".envrc"
-                or not stat.S_ISREG(envrc.lstat().st_mode) or not registered_worktree(folder)):
-            return SlotEnvrcTrust.NEEDS_APPROVAL
-        checkout = git_files.at(folder)
-        return (SlotEnvrcTrust.TRUSTED if _envrc_matches_commit(envrc.absolute(), checkout.git_dir, "HEAD")
-                else SlotEnvrcTrust.NEEDS_APPROVAL)
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
-        return SlotEnvrcTrust.NEEDS_APPROVAL
-
-
 def _legacy_copy_envrc(envrc: Path) -> bool:
     """Compare a legacy copy's or a run snapshot's envrc with its recorded source commit."""
     import subprocess
@@ -180,9 +147,6 @@ def registered_copy(envrc: Path) -> bool:
         numbered = build_folders.numbered_copy_envrc(envrc, trusted_source=trusted_root)
         if numbered is not build_folders.NumberedCopyEnvrc.OUTSIDE_COPY:
             return numbered is build_folders.NumberedCopyEnvrc.TRUSTED
-        slot = slot_envrc_trust(envrc)
-        if slot is not SlotEnvrcTrust.NOT_A_SLOT:
-            return slot is SlotEnvrcTrust.TRUSTED
         return _legacy_copy_envrc(envrc)
     except (OSError, ValueError, RuntimeError):
         return False
@@ -217,9 +181,6 @@ def trusted_envrc(envrc: Path) -> bool:
         if resolved != envrc.absolute() and build_folders.numbered_copy_envrc(
                 resolved, trusted_source=trusted_root) is not build_folders.NumberedCopyEnvrc.OUTSIDE_COPY:
             return False
-        slot = slot_envrc_trust(envrc)
-        if slot is not SlotEnvrcTrust.NOT_A_SLOT:
-            return slot is SlotEnvrcTrust.TRUSTED
         return trusted_root(resolved) or registered_worktree(resolved.parent) or _legacy_copy_envrc(envrc)
     except (OSError, ValueError, RuntimeError):
         return False

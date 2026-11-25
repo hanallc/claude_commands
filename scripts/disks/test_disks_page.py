@@ -655,8 +655,8 @@ const localStorage={getItem:()=>null};
         assert start is not None
         scenario = scenario.replace("START", start[0])
         node = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
-        done = subprocess.run([node, "--unhandled-rejections=strict", "-e",
-                               environment + functions + page_frame.REFRESH_SCRIPT + page_frame.ACTION_STATUS_SCRIPT + scenario],
+        script = environment + functions + page_frame.REFRESH_SCRIPT + page_frame.ACTION_STATUS_SCRIPT + scenario
+        done = subprocess.run([node, "--unhandled-rejections=strict", "-"], input=script,
                               capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual((done.returncode, done.stdout.strip()), (0, "PASS"), done.stderr)
 
