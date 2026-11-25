@@ -6379,17 +6379,20 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
             else:
                 shared_groups.setdefault((hierarchy, path), set()).add(session)
     children: dict[int, list[Path]] = {}
+    present: set[int] = set()
     read_parent = linux_process_parent if scan is None else scan.read_parent
     for process in candidates:
+        pid = int(process.name)
         try:
-            parent = read_parent(int(process.name))
+            parent = read_parent(pid)
             children.setdefault(parent, []).append(process)
         except FileNotFoundError:
             continue
         except (OSError, ValueError, IndexError) as error:
             if failures is not None:
                 failures.append(f"cannot read the parent of process {process.name}: {error}")
-            continue
+        if pids is not None and pid in pids:
+            present.add(pid)
     descendants = [(process, session) for pid, session in servers.items() for process in children.get(pid, [])]
     sessions = dict(servers)
     while descendants:
@@ -6399,7 +6402,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
             continue
         sessions[pid] = session
         descendants.extend((child, session) for child in children.get(pid, []))
-    if (unit_groups or shared_groups) and (pids is None or not pids <= sessions.keys()):
+    if (unit_groups or shared_groups) and (pids is None or not present <= sessions.keys()):
         # Handoff transfers PTYs without reparenting their processes to the
         # replacement. setsid leaves their dedicated service cgroup unchanged.
         shared_sessions: set[str] = set()
@@ -6413,6 +6416,9 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
             try:
                 if process.stat().st_uid != os.getuid():
                     continue
+            except FileNotFoundError:
+                present.discard(pid)
+                continue
             except OSError:
                 continue
             groups = _systemd_cgroups(process)
@@ -6427,8 +6433,8 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
                     break
             if pid not in sessions and (scopes := pane_scopes(groups, read_slice())):
                 loose[pid] = scopes
-        if pids is not None and pids <= sessions.keys():
-            return {pid: sessions[pid] for pid in pids if pid not in servers}
+        if pids is not None and present <= sessions.keys():
+            return {pid: sessions[pid] for pid in present if pid not in servers}
         # A pane scope holds one pane's processes, as the unit's cgroup held
         # them before. Only a scope that no matched process explains needs the
         # unit servers' pane shells.
@@ -6652,8 +6658,9 @@ def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_B
         add_descendants(pending, session)
     if pids is not None:
         # A live handoff preserves pane shell PIDs after reparenting.
+        present = pids & by_pid.keys()
         for session in servers.values():
-            if pids <= sessions.keys():
+            if present <= sessions.keys():
                 break
             add_descendants(_pane_shell_pids(session), session)
     return sessions

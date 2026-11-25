@@ -627,6 +627,21 @@ class MemoryFeedTests(unittest.TestCase):
             target, = memory_feed.live_outside_kill_targets().values()
             self.assertEqual(target.recipient, worker.id)
 
+    def test_outside_kill_caches_an_unreadable_codex_environment(self) -> None:
+        members = write_outside_queue_fixture(self.root)
+        inputs = captured_reading().explanation.decided_from
+        with (mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root)),
+              mock.patch.object(herdr, "process_environment", side_effect=PermissionError) as read,
+              mock.patch.object(herdr, "herdr_places", wraps=herdr.herdr_places) as places):
+            scan = memory_feed.OutsideQueueScan(inputs, memory_feed.outside_process_table(),
+                memory_feed.FeedStaff(members), self.root / "cgroup/user/builds.slice", for_table=True)
+            scan.herdr_pids.add(8101)
+            self.assertIsInstance(scan.codex_environment(8101), memory_feed.OutsideEnvironmentUnreadable)
+            self.assertEqual(scan.herdr_places.placements, {})
+            self.assertIsInstance(scan.codex_session(8101), memory_feed.OutsideIdentityUnreadable)
+            read.assert_called_once_with(8101)
+            places.assert_called_once_with(set())
+
     def test_outside_kill_checks_the_agent_above_a_codex_thread_host(self) -> None:
         members = write_outside_queue_fixture(self.root, siblings=(8200,))
         host = self.root / "proc/8104/cmdline"

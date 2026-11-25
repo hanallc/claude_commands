@@ -2837,6 +2837,11 @@ class OutsideIdentityUnreadable:
     """The scan could not verify the agent's session."""
 
 
+@dataclass(frozen=True)
+class OutsideEnvironmentUnreadable:
+    """The scan could not read the process environment."""
+
+
 @final
 class OutsideQueueScan:
     """Read current placement for one feed refresh."""
@@ -2853,7 +2858,7 @@ class OutsideQueueScan:
         self.commands: dict[int, tuple[str, ...]] = {}
         self.native_sessions: dict[int, str | OutsideThreadHost | OutsideIdentityUnreadable] = {}
         self.herdr_pids: set[int] = set()
-        self.codex_environments: dict[int, dict[str, str] | None] = {}
+        self.codex_environments: dict[int, dict[str, str] | OutsideEnvironmentUnreadable] = {}
         self.children: dict[int, list[int]] = {}
         for pid, process in processes.items():
             self.children.setdefault(process.parent, []).append(pid)
@@ -2898,21 +2903,21 @@ class OutsideQueueScan:
     @cached_property
     def herdr_places(self) -> herdr.HerdrProcessPlacements:
         return herdr.herdr_places({pid for pid in self.herdr_pids
-                                  if (environment := self.codex_environment(pid)) is not None
+                                  if isinstance(environment := self.codex_environment(pid), dict)
                                   and environment.get("HERDR_PANE_ID") and not environment.get("TMUX_PANE")})
 
-    def codex_environment(self, pid: int) -> dict[str, str] | None:
+    def codex_environment(self, pid: int) -> dict[str, str] | OutsideEnvironmentUnreadable:
         if pid not in self.codex_environments:
             try:
                 self.codex_environments[pid] = herdr.process_environment(pid)
             except (OSError, ValueError, HerdrFailure, subprocess.SubprocessError):
-                self.codex_environments[pid] = None
+                self.codex_environments[pid] = OutsideEnvironmentUnreadable()
         return self.codex_environments[pid]
 
     def codex_session(self, pid: int) -> str | OutsideIdentityUnreadable:
         try:
             environment = self.codex_environment(pid)
-            if environment is None:
+            if isinstance(environment, OutsideEnvironmentUnreadable):
                 return OutsideIdentityUnreadable()
             if environment.get("HERDR_PANE_ID") and not environment.get("TMUX_PANE"):
                 place = self.herdr_places.get(pid)

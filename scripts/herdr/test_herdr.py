@@ -5578,7 +5578,7 @@ class HerdrTests(unittest.TestCase):
                        json.dumps({"result": {"panes": [{"pane_id": "w1:p1"}]}}))
         self.darwin_environment(71, "codex", "HERDR_PANE_ID=w1:p1")
 
-        self.assertEqual(herdr.herdr_places({71}).placements, {71: herdr.HerdrPlace("default", "w1:p1")})
+        self.assertEqual(herdr.herdr_places({71, 99}).placements, {71: herdr.HerdrPlace("default", "w1:p1")})
         pane_lists = [command for command in self.commands() if command[2:4] == ["pane", "list"]]
         self.assertEqual(pane_lists, [["--session", "default", "pane", "list"]])
 
@@ -6270,6 +6270,26 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual([(row.pid, row.place) for row in rows], [(12, herdr.HerdrPlace("fixture", "p1"))])
         self.assertIn(self.proc / "12/environ", opened)
         self.assertNotIn(server / "environ", opened)
+
+    def test_placement_filter_ignores_pids_that_exit_before_handoff(self) -> None:
+        server = self.process(30, 1, ["herdr", "server"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/writing/herdr.sock", 100)
+        self.socket_fd(server, 100)
+        _ = self.process(11, 30, ["codex"], {"HERDR_PANE_ID": "w1:p1"})
+        self.configure(["--session", "writing", "pane", "list"],
+                       json.dumps({"result": {"panes": [{"pane_id": "w1:p1"}]}}))
+
+        other_server = self.process(40, 1, ["herdr", "server"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/other/herdr.sock", 101)
+        self.socket_fd(other_server, 101)
+        orphan = self.process(41, 1, ["sh"], {})
+        for process in (other_server, orphan):
+            _ = (process / "cgroup").write_text("0::/user.slice/session-7.scope\n")
+        (self.proc / "12").mkdir()
+
+        self.assertEqual(herdr.herdr_places({11, 12, 99}).placements, {11: herdr.HerdrPlace("writing", "w1:p1")})
+        pane_lists = [command for command in self.commands() if command[2:4] == ["pane", "list"]]
+        self.assertEqual(pane_lists, [["--session", "writing", "pane", "list"]])
 
     def test_handoff_survivors_keep_their_unit_after_reparenting(self) -> None:
         self.configure(["--session", "writing", "pane", "list"],
