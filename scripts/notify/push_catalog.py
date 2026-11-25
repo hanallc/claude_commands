@@ -4,12 +4,15 @@ from functools import partial
 
 from scripts.notify.gpu_xid import XID_MEANINGS
 from scripts.notify.push_texts import (ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate,
-                                       TemplateValues, decision_values)
+                                       TemplateValues, decision_values, display_values)
+from scripts.production import nightly_schedule
 
 # Codex usage destination: https://learn.chatgpt.com/docs/pricing (read 2026-10-14).
 # Real quota case: notify/review.jsonl, 2026-10-13T22:30:22.569264-04:00.
 # Other script senders have no live record in the two supplied logs. Their
 # typical cases use existing test facts or the Nix thresholds, never invented log citations.
+
+PAID_CREDIT_ACTION_PREFIX = "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts "
 
 
 def waiting_tests(count: int) -> str:
@@ -42,6 +45,170 @@ def hide_sender_values(given: dict[str, str], *, hidden: tuple[str, ...]) -> Tem
         raise ValueError(f"missing values {missing}")
     displayed = {field: value for field, value in given.items() if field not in hidden}
     return TemplateValues(displayed, dict(given))
+
+
+def codex_workers_moved_title(account: str, target: str, *, uses_credits: bool) -> str:
+    """Name the account that now pays for work."""
+    if uses_credits:
+        title = f"{account} is out; Codex now uses {target} credits"
+        short_title = f"{account} out; uses {target} credits"
+    else:
+        title = f"{account} is out; Codex work now uses {target}"
+        short_title = f"{account} out; work uses {target}"
+    if len(title) <= 44:
+        return title
+    if len(short_title) <= 44:
+        return short_title
+    return "Codex work moves to paid credits" if uses_credits else "Codex work moves to another account"
+
+
+def workers_moved_values(given: dict[str, str]) -> TemplateValues:
+    """Use the new title for a saved move notice."""
+    values = hide_sender_values(given, hidden=("account", "reset", "target", "funding"))
+    transition = values.displayed.get("transition", "")
+    if transition.startswith("Codex work now "):
+        values.displayed["transition"] = codex_workers_moved_title(
+            given["account"], given["target"], uses_credits=given["funding"] == "its own paid credits")
+    return values
+
+
+def remaining_credit_accounts(account: str, accounts: frozenset[str]) -> str:
+    """Format the credit accounts without this account."""
+    return " ".join(sorted(accounts - {account})) or "none"
+
+
+def paid_credits_text_values(given: dict[str, str], *, queued: bool) -> TemplateValues:
+    """Show the balance and the command to stop spending."""
+    hidden = ("machine", "refill") if queued else ("machine", "refill", "next_reset")
+    values = hide_sender_values(given, hidden=hidden)
+    if missing := sorted({"account", "credits"} - values.displayed.keys()):
+        raise ValueError(f"missing values {missing}")
+    if "title" in values.displayed:
+        raise ValueError("extra values ['title']")
+    account = values.displayed.pop("account")
+    credits = values.displayed.pop("credits")
+    if "credit_accounts" not in values.displayed:
+        from scripts.whoami.agent_accounts import codex_credit_accounts
+
+        values.displayed["credit_accounts"] = remaining_credit_accounts(account, codex_credit_accounts())
+    if credits == "unlimited":
+        balance = "no limit"
+    elif re.fullmatch(r"[0-9][0-9,]*", credits):
+        balance = f"{credits} left"
+    else:
+        balance = "balance unknown"
+    if queued:
+        title = f"{account} uses credits until move"
+        with_balance = f"{title}: {balance}"
+        if balance != "balance unknown" and len(with_balance) <= 44:
+            title = with_balance
+        if len(title) > 44:
+            title = "Codex uses credits until move"
+        values.displayed["title"] = title
+        return values
+
+    status = "now spends paid credits"
+    for title in (f"{account} {status}: {balance}", f"{account} uses credits: {balance}", f"{account} {status}"):
+        if len(title) <= 44:
+            values.displayed["title"] = title
+            return values
+    values.displayed["title"] = f"Codex {status}"
+    return values
+
+
+def permission_prompt_values(given: dict[str, str]) -> TemplateValues:
+    """Shorten the title and keep the full session name."""
+    values = hide_sender_values(given, hidden=("since",))
+    if "unit" not in values.displayed:
+        raise ValueError("missing value unit")
+    if "title" in values.displayed:
+        raise ValueError("extra values ['title']")
+    unit = values.displayed["unit"]
+    suffix = " stuck at a permission prompt"
+    title = f"{unit} is{suffix}"
+    if len(title) > 44:
+        available = 44 - len(suffix)
+        short_unit = unit if len(unit) <= available else unit[:available - 1] + "…"
+        title = short_unit + suffix
+    values.displayed["title"] = title
+    return values
+
+
+def credits_forecast_values(given: dict[str, str]) -> TemplateValues:
+    """Render saved forecasts with the current text."""
+    values = hide_sender_values(given, hidden=("horizon", "destination"))
+    forecast = values.displayed.get("forecast", "")
+    horizon = given["horizon"]
+    if forecast.startswith("Codex account "):
+        if horizon == "have no limit":
+            forecast = "Paid credits have no limit."
+        elif horizon == "run-out unknown":
+            forecast = "No credit balance; the run-out time is unknown."
+    elif old_run_out := re.fullmatch(
+        r"Workers on Codex account .*; its ([0-9,]+) credits last until about (\S+) \d+-\d+-\d+ (\d+:\d+) .*\.",
+        forecast,
+    ):
+        balance, day, time = old_run_out.groups()
+        forecast = f"{balance} credits left; they run out about {day} {time}."
+    elif old_balance := re.fullmatch(r"(?:Workers|Coding workers) on Codex account .*; ([0-9,]+) (?:paid )?credits left\.",
+                                     forecast):
+        balance = old_balance[1]
+        if horizon == "use is zero":
+            forecast = f"{balance} credits left; none used in the last hour."
+        elif horizon == "run-out unknown":
+            forecast = f"{balance} credits left; the run-out time is unknown."
+    if "forecast" in values.displayed:
+        values.displayed["forecast"] = forecast
+    return values
+
+
+def rust_result_values(given: dict[str, str], *, hidden: tuple[str, ...], title: str,
+                       short_title: str = "", count_field: str = "") -> TemplateValues:
+    """Fit the result in the phone title."""
+    values = hide_sender_values(given, hidden=hidden)
+    expected = {"version", count_field} if count_field else {"version"}
+    if values.displayed.keys() != expected:
+        raise ValueError(f"missing values {sorted(expected - values.displayed.keys())}; "
+                         + f"extra values {sorted(values.displayed.keys() - expected)}")
+    if count_field:
+        count = values.displayed[count_field]
+        word = count_field.removesuffix("s") if count == "1" else count_field
+        values.displayed[count_field] = f"{count} {word}"
+    short_title = short_title or title
+    versionless_title = short_title.replace(" {version}", "")
+    for form in (title, short_title, versionless_title):
+        display_title = form.format_map(values.displayed)
+        if len(display_title) <= 44:
+            return TemplateValues({"result": display_title}, values.supplied)
+    values.displayed[count_field] = count_field
+    return TemplateValues({"result": versionless_title.format_map(values.displayed)}, values.supplied)
+
+
+def nightly_not_run_values(given: dict[str, str]) -> TemplateValues:
+    """Accept the legacy values that the installed timer sends."""
+    if given.keys() != {"branch", "time", "reason", "action"}:
+        return display_values(given)
+    action = given["action"]
+    if action == "None. The next nightly run tries again.":
+        action = ""
+    return TemplateValues({"reason": given["reason"], "action": action,
+                           "next_run": nightly_schedule.nightly_next_run()}, dict(given))
+
+
+AUTO_MODE_REFUSED_TITLE = "{session}: {count} {noun} refused"
+
+
+def auto_mode_refused_values(given: dict[str, str]) -> TemplateValues:
+    """Add the waits clause when it fits in the title."""
+    values = hide_sender_values(given, hidden=tuple(field for field in ("waits", "rule") if field in given))
+    waits = given.get("waits", "")
+    clause = ""
+    if waits and {"session", "count", "noun"} <= values.displayed.keys():
+        suffix = f"; {waits}"
+        title = AUTO_MODE_REFUSED_TITLE.format(**values.displayed)
+        if len(title + suffix) <= 44:
+            clause = suffix
+    return TemplateValues(values.displayed | {"waits_clause": clause}, values.supplied)
 
 
 def silence_auto_off_values(given: dict[str, str]) -> TemplateValues:
@@ -86,15 +253,15 @@ ENTRIES = (
             "failures": "AWS refused the us-east-2 price read.\nAWS refused the us-west-2 Standard quota read."})),
         purpose="AWS denied a regional read that the gate deployment can repair."),
     PushText("nightly.assigned", "sdlc", "note", "Nightly check {outcome}", NoActionNeeded(),
-        "sdlc received it at {received}.\nAssigned to {unit} at {assigned}.\n"
-        + "The nightly check of {branch} {outcome} at {time}.\nType check: {types}.\nFull tests: {tests}.",
+        "Fix assigned to: {unit}.",
         (PushExample("tests_failed", {"branch": "main", "time": "03:00 EST", "outcome": "failed",
             "types": "passed", "tests": "failed in production/test_staff.py", "received": "03:00 EST",
             "unit": "staff", "assigned": "03:05 EST"}),
          PushExample("types_failed", {"branch": "main", "time": "03:00 EST", "outcome": "failed",
             "types": "failed with 3 errors, 0 warnings, 0 notes", "tests": "passed", "received": "03:00 EST",
             "unit": "types", "assigned": "03:05 EST"})),
-        purpose="sdlc assigned the failed nightly check to a unit director."),
+        purpose="sdlc assigned the failed nightly check to a unit director.", header=False,
+        expand_values=partial(hide_sender_values, hidden=("branch", "time", "types", "tests", "received", "assigned"))),
     PushText("nightly.result", "nightly", "note", "Nightly check {outcome}", NoActionNeeded(),
         "",
         (PushExample("passed", {"branch": "main", "time": "03:53 EST", "outcome": "passed",
@@ -111,15 +278,16 @@ ENTRIES = (
                                        "types": "did not run", "tests": "did not finish"})),
         purpose="The nightly check finished. The title gives the result.",
         header=False, expand_values=nightly_result_values),
-    PushText("nightly.not_run", "nightly", "note", "Nightly check did not run", ActionTemplate("{action}"),
-        "The nightly check of {branch} did not run at {time}.\nWhy: {reason}.",
-        (PushExample("fetch_failed", {"branch": "main", "time": "03:53 EST",
+    PushText("nightly.not_run", "nightly", "note", "Nightly check did not run", ActionTemplate("{action}", omit_when_empty=True),
+        "Why: {reason}.\nNext run: {next_run}.",
+        (PushExample("fetch_failed", {"next_run": "Tue 11-24 00:53 PST",
              "reason": "git fetch of main failed: ssh connection timed out",
-             "action": "None. The next nightly run tries again."}),
-         PushExample("cold_credentials", {"branch": "main", "time": "03:53 EST",
+             "action": ""}),
+         PushExample("cold_credentials", {"next_run": "Tue 11-24 00:53 PST",
              "reason": "GitHub credentials are cold",
              "action": "In a terminal on natedev, run github-warmup"})),
-        purpose="The nightly check did not run. It says why."),
+        purpose="The nightly check did not run. The push gives the reason and next run.",
+        expand_values=nightly_not_run_values),
     PushText("decision.choices", "{sender}", "decision", "{title}",
         ActionTemplate("On {machine}, reply in the {session} terminal: {choice_labels}."),
         "Situation: {situation}\n\nChoices:\n{choices}\n\n"
@@ -132,14 +300,6 @@ ENTRIES = (
             "recommendation_reason": "The small fix removes the stall without resuming the rest of the held cable work."}),),
         purpose="A decision with structured choices and a recommendation.", session=SessionTemplate("{session}"),
         agent_written=True, expand_values=decision_values),
-    PushText("review_watch.acknowledge", "{session}", "decision", "Review report needs your acknowledgment",
-        ActionTemplate("In the {session} terminal on {machine}, acknowledge the review report."),
-        "Situation: {report}\n\nChoices:\n"
-        + "Acknowledge: You confirm that you read the report. Later build reports stop showing this reminder.\n"
-        + "Wait: The reminder remains in later build reports.\n\n"
-        + "Recommendation: Acknowledge after you read the report.",
-        (PushExample("report", {"session": "natedev", "machine": "natedev", "report": "12 of 12 phases that change the screen merged without the extra code reviewer: report ready, waiting for your acknowledgment"}),),
-        purpose="A build report reminds you to acknowledge its review report.", session=SessionTemplate("{session}"), agent_written=True),
     PushText("mac_idle.unreachable", "Mac idle watch", "blocked", "Mac does not answer; {tests}",
         ActionTemplate("Wake the Mac or check its network."),
         "",
@@ -166,17 +326,15 @@ ENTRIES = (
         session=SessionTemplate("{session}")),
     # Stall-watch examples are the real prompts of 2026-10-23: a Bash call reads "run <command>" (cut to 89
     # characters and "…"), an edit "edit <file>", as stall_watch.prompt_request words them from the pending call.
-    PushText("stall_watch.permission_prompt", "stall-watch", "blocked", "{unit} needs your answer",
+    PushText("stall_watch.permission_prompt", "stall-watch", "blocked", "{title}",
         ActionTemplate("On {machine}, open the {unit} herdr tab and answer its prompt"),
-        "{unit} asks to {request}. It has waited since {since}.\n\n"
-        + "Yes: it does that and goes on.\n\n"
-        + "No: it does not, and asks you what to do instead.",
+        "It asks to {request}.",
         (PushExample("typical", {"unit": "handler", "machine": "natedev", "since": "09:01 AST",
             "request": "run cargo build -p cargo-handler"}),
          PushExample("edit", {"unit": "messaging", "machine": "natedev", "since": "06:05 AST",
             "request": "edit send.py"})),
         purpose="A session waits for you to answer its permission prompt.",
-        session=SessionTemplate("{unit}")),
+        session=SessionTemplate("{unit}"), expand_values=permission_prompt_values),
     PushText("shutdown.restart_failed", "shutdown", "decision", "Claude coding work remains stopped",
         ActionTemplate('In the Claude session named natedev on the natedev computer, run /agents restart {account}.'),
         "After your restart request, {stopped} on Claude account {account} did not restart on {machine}. "
@@ -189,46 +347,8 @@ ENTRIES = (
              "stopped": "1 session",
              "cause": "restart prompt not submitted"})),
         purpose="One restart problem sends one push with the failed session count."),
-    PushText("shutdown.restart_untrusted", "shutdown", "decision", "Stopped Claude work needs folder trust",
-        ActionTemplate("In a terminal on {machine}, run ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py trust. "
-                       + "Then run /agents restart {account} in the natedev session."),
-        "After your restart request, {stopped} on Claude account {account} could not start on {machine}. Coding work stays stopped. "
-        + "The first command trusts the configured folders. The second retries stopped sessions.",
-        (PushExample("typical", {"stopped": "3 sessions", "machine": "natedev", "account": "claude2"}),),
-        purpose="One push counts sessions that need folder trust on one machine."),
-    PushText("shutdown.restart_untrusted_unlisted", "shutdown", "decision", "Stopped Claude work needs folder trust",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, send: "Trust the folders of the stopped Claude sessions on {machine} from their shutdown records."'),
-        "After your restart request, {stopped} on Claude account {account} could not start on {machine}. "
-        + "Claude does not trust the folders. "
-        + "Coding work stays stopped until the folders are trusted and the sessions restart.",
-        (PushExample("one_session", {"stopped": "1 session", "machine": "Mac", "account": "claude3"}),
-         PushExample("several_sessions", {"stopped": "4 sessions", "machine": "natedev", "account": "claude2"})),
-        purpose="Stopped sessions need trust for folders outside the configured list."),
-    PushText("shutdown.move_failed", "shutdown", "decision", "A Claude session did not finish its move",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, send: "Finish moving the Claude session named {session} to {target} from its shutdown record."'),
-        "The Claude session {session} on {machine} stopped on account {source} to move to account {target}. "
-        + "It did not start on {target}, so its work stays paused. "
-        + "Its shutdown record starts it on {target}, not on {source}.",
-        (PushExample("typical", {"session": "ups", "machine": "natedev", "source": "claude1", "target": "claude3"}),
-         PushExample("long_session", {"session": "build-followups-message-clarity-unit-director-session-12",
-             "machine": "Mac", "source": "claude2", "target": "claude4"})),
-        purpose="A session stopped for an account move did not start on its new account."),
-    PushText("shutdown.restart_incomplete", "shutdown", "decision", "Claude restart could not be confirmed",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, run /agents restart {account}.'),
-        "The restart of Claude account {account} could not be confirmed on {machine}. "
-        + "Its stopped sessions may still be unable to work. Retrying asks any sessions that are still stopped to start again.",
-        (PushExample("typical", {"account": 'claude2', "machine": "Mac"}),
-         PushExample("long_account", {"account": '"claude-team-build-followups-12"', "machine": "natedev"})),
-        purpose="A restart ended, but its result could not be confirmed."),
-    PushText("shutdown.manual_restart", "shutdown", "decision", "Stopped Claude coding work needs you",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, send: "Resume the stopped Claude sessions on {machine} from their shutdown records."'),
-        "After your shutdown, {stopped} on {machine} cannot restart without help. "
-        + "Coding work stays stopped. The shutdown records hold the commands to resume the stopped sessions.",
-        (PushExample("typical", {"machine": "natedev", "stopped": "3 sessions"}),
-         PushExample("one_session", {"machine": "Mac", "stopped": "1 session"})),
-        purpose="Stopped Claude sessions need their saved commands to resume."),
     PushText("quota.claude_next_move", "quota_alert", "note", "{account} has {remaining} left with no move",
-        ActionTemplate("Set a move on the Accounts page"),
+        ActionTemplate("In the natedev session, type /agents move <group> <account>."),
         "",
         (PushExample("uncovered_low", {"account": "claude3", "remaining": "2%"}),
          PushExample("uncovered_empty", {"account": "claude4", "remaining": "0%"})),
@@ -255,12 +375,15 @@ ENTRIES = (
          PushExample("credits_off_codex", {"account": "codex2", "remaining": "2%", "outcome_title": "codex1 next"}),
          PushExample("credits_off_alone", {"account": "codex1", "remaining": "1%", "outcome_title": "units work alone next"})),
         purpose="A Codex account runs low. Its workers move or spend credits soon.", one_line=True),
-    PushText('quota.codex_workers_moved', "quota_alert", "note", '{transition}',
+    PushText("quota.codex_workers_moved", "quota_alert", "note", "{transition}",
         NoActionNeeded(),
-        'Codex account {account} has exhausted its included weekly usage until {reset}. Credits are off, so new work moves to the other Codex account, {target}, using {funding}. Jobs already running finish their current turn first.',
-        (PushExample('codex_one', {'account': 'codex1', 'reset': 'Tue 2026-10-20 00:58 AST', 'target': 'codex2', 'funding': '97% weekly usage left', 'transition': 'Codex work now uses codex2'}),
-         PushExample('codex_two', {'account': 'codex2', 'reset': 'Thu 2026-10-22 07:00 AST', 'target': 'codex1', 'funding': 'its own paid credits', 'transition': 'Codex work now spends paid credits'})),
-        purpose="A Codex account ran out, and its work moved to another account."),
+        "",
+        (PushExample("codex_one", {"account": "codex1", "reset": "Tue 2026-10-20 00:58 AST", "target": "codex2",
+            "funding": "97% weekly usage left", "transition": "codex1 is out; Codex work now uses codex2"}),
+         PushExample("codex_two", {"account": "codex2", "reset": "Thu 2026-10-22 07:00 AST", "target": "codex1",
+            "funding": "its own paid credits", "transition": "codex2 is out; Codex now uses codex1 credits"})),
+        purpose="A Codex account ran out, and its work moved to another account.",
+        header=False, expand_values=workers_moved_values),
     PushText("quota.codex_workers_stay", "quota_alert", "note", "{account} is empty; {outcome}",
         NoActionNeeded(),
         "",
@@ -268,17 +391,37 @@ ENTRIES = (
          PushExample("failed_move", {"account": "codex2", "outcome": "we're in self-actualize mode; worker work moves to claude3"}),
          PushExample("queued", {"account": "codex1", "outcome": "workers wait for their queued move"})),
         purpose="A Codex account ran out; its workers wait or their work moves.", one_line=True),
-    PushText('quota.codex_credits_forecast', "quota_alert", "note", '{account}: paid credits {horizon}',
+    PushText("quota.codex_credits_forecast", "quota_alert", "note", "{account} is running on paid credits",
         NoActionNeeded(),
-        '{forecast} {destination}',
-        (PushExample('codex_one', {'account': 'codex1', 'forecast': 'Workers on Codex account codex1 used 120 paid credits in the last hour; its 6,370 credits last until about Fri 2026-10-16 13:05 AST.', 'destination': 'When credits run out, workers move to codex2 (97% weekly usage left).', 'horizon': 'until Fri 13:05 AST'}),
-         PushExample('codex_two', {'account': 'codex2', 'forecast': 'Workers on Codex account codex2 used 40 paid credits in the last hour; its 2,114 credits last until about Fri 2026-10-16 12:51 AST.', 'destination': 'When credits run out, workers move to codex1 and spend its own paid credits.', 'horizon': 'until Fri 12:51 AST'}),
-         PushExample('zero_use', {'account': 'codex1', 'forecast': 'Workers on Codex account codex1 used no credits in the last hour; 6,370 paid credits left.', 'destination': 'When credits run out, workers move to codex2 (97% weekly usage left).', 'horizon': 'use is zero'}),
-         PushExample('unlimited', {'account': 'codex1', 'forecast': 'Codex account codex1 has unlimited paid credits; its coding workers remain on paid usage with no credit limit.', 'destination': '', 'horizon': 'have no limit'}),
-         PushExample('unknown_balance', {'account': 'codex1', 'forecast': 'Codex account codex1 reports no credit balance; its coding workers remain on paid usage, but the run-out time is unknown.', 'destination': 'When credits run out, workers move to codex2 (97% weekly usage left).', 'horizon': 'run-out unknown'}),
-         PushExample('unknown_use', {'account': 'codex2', 'forecast': 'Coding workers on Codex account codex2 remain on paid usage. Their hourly use is unknown because credit observations cover less than 30 minutes of the hour; 2,114 credits left.', 'destination': 'When they run out, Codex work moves to Claude, the other coding assistant, until Tue 2026-10-20 00:58 AST.', 'horizon': 'run-out unknown'}),
-         PushExample('queued', {'account': 'codex1', 'forecast': 'Workers on Codex account codex1 used 120 paid credits in the last hour; its 6,370 credits last until about Fri 2026-10-16 13:05 AST.', 'destination': 'When credits run out, workers wait for the account move you queued.', 'horizon': 'until Fri 13:05 AST'})),
-        purpose="Tells when the paid credits of a Codex account run out."),
+        "{forecast}",
+        (PushExample("codex_one", {"account": "codex1",
+            "forecast": "6,370 credits left; they run out about Fri 13:05.",
+            "destination": "When credits run out, workers move to codex2 (97% weekly usage left).",
+            "horizon": "until Fri 13:05 AST"}),
+         PushExample("codex_two", {"account": "codex2",
+            "forecast": "2,114 credits left; they run out about Fri 12:51.",
+            "destination": "When credits run out, workers move to codex1 and spend its own paid credits.",
+            "horizon": "until Fri 12:51 AST"}),
+         PushExample("zero_use", {"account": "codex1",
+            "forecast": "6,370 credits left; none used in the last hour.",
+            "destination": "When credits run out, workers move to codex2 (97% weekly usage left).",
+            "horizon": "use is zero"}),
+         PushExample("unlimited", {"account": "codex1", "forecast": "Paid credits have no limit.",
+            "destination": "", "horizon": "have no limit"}),
+         PushExample("unknown_balance", {"account": "codex1",
+            "forecast": "No credit balance; the run-out time is unknown.",
+            "destination": "When credits run out, workers move to codex2 (97% weekly usage left).",
+            "horizon": "run-out unknown"}),
+         PushExample("unknown_use", {"account": "codex2",
+            "forecast": "2,114 credits left; the run-out time is unknown.",
+            "destination": "When they run out, Codex work moves to Claude, the other coding assistant, until Tue 2026-10-20 00:58 AST.",
+            "horizon": "run-out unknown"}),
+         PushExample("queued", {"account": "codex1",
+            "forecast": "6,370 credits left; they run out about Fri 13:05.",
+            "destination": "When credits run out, workers wait for the account move you queued.",
+            "horizon": "until Fri 13:05 AST"})),
+        purpose="Tells when the paid credits of a Codex account run out.",
+        header=False, expand_values=credits_forecast_values),
     PushText("quota.codex_refused", "quota_alert", "decision", "Codex work stopped for lack of usage",
         ActionTemplate("At chatgpt.com/codex/settings/usage, add credits for account {account}."),
         "Codex hit its usage limit on account {account} and stopped accepting coding jobs. "
@@ -287,41 +430,38 @@ ENTRIES = (
         (PushExample("typical", {"account": "codex1"}),
          PushExample("long_account", {"account": "codex999"})),
         purpose="Codex stopped work for lack of usage, and Claude could not take it."),
-    PushText("rust.passed", "rust_release", "decision", "Hana can use the new Rust compiler",
-        ActionTemplate("In the Claude session named natedev, reply upgrade or wait."),
-        "Hana, the editor project, passed its compiler check on Rust {version}: no errors. "
-        + "It currently uses Rust {pin}.\n\n"
-        + "Upgrade (recommended because the check passed): use Rust {version} for Hana's builds.\n\n"
-        + "Wait: keep building Hana with Rust {pin}.",
+    PushText("rust.passed", "rust_release", "decision", "{result}",
+        ActionTemplate("In the hana session, reply upgrade (recommended) or wait."),
+        "",
         (PushExample("typical", {"version": "1.100.0", "pin": "1.99.0"}),
          PushExample("long_versions", {"version": "100.100.100", "pin": "99.99.99"})),
-        purpose="A new Rust compiler passed its check on Hana. Upgrade or wait."),
-    PushText("rust.warnings", "rust_release", "decision", "New compiler adds warnings to Hana",
-        ActionTemplate("In the Claude session named natedev, reply wait or upgrade."),
-        "Hana, the editor project, passed its code check on Rust {version}, but gained {warnings} warnings. "
-        + "Warnings do not prevent builds. It still uses Rust {pin}.\n\n"
-        + "Wait (recommended to avoid new warnings): keep Rust {pin}.\n\n"
-        + "Upgrade: use Rust {version} with those warnings.",
+        purpose="A new Rust compiler passed its check on Hana. Upgrade or wait.",
+        expand_values=partial(rust_result_values, hidden=("pin",),
+            title="Hana passes on Rust {version}")),
+    PushText("rust.warnings", "rust_release", "decision", "{result}",
+        ActionTemplate("In the hana session, reply wait (recommended) or upgrade."),
+        "",
         (PushExample("typical", {"version": "1.100.0", "pin": "1.99.0", "warnings": "2"}),
          PushExample("many_warnings", {"version": "1.100.0", "pin": "1.99.0", "warnings": "14"})),
-        purpose="A new Rust compiler adds warnings to Hana. Upgrade or wait."),
-    PushText("rust.errors", "rust_release", "decision", "Rust upgrade failed a code check",
-        ActionTemplate("In the Claude session named natedev, reply wait or upgrade."),
-        "Rust {version} failed its code check on Hana, the editor project. Errors: {errors}; new warnings: {warnings}. "
-        + "Hana still uses Rust {pin}.\n\n"
-        + "Wait (recommended to keep builds working): keep Rust {pin}.\n\n"
-        + "Upgrade: use Rust {version} despite the errors; Hana's builds may fail.",
+        purpose="A new Rust compiler adds warnings to Hana. Upgrade or wait.",
+        expand_values=partial(rust_result_values, hidden=("pin",), count_field="warnings",
+            title="Rust {version} adds {warnings} to Hana")),
+    PushText("rust.errors", "rust_release", "decision", "{result}",
+        ActionTemplate("In the hana session, reply wait (recommended) or upgrade."),
+        "",
         (PushExample("typical", {"version": "1.100.0", "pin": "1.99.0", "errors": "1", "warnings": "2"}),
          PushExample("many_errors", {"version": "1.100.0", "pin": "1.99.0", "errors": "14", "warnings": "14"})),
-        purpose="A new Rust compiler failed its check on Hana. Upgrade or wait."),
-    PushText("rust.repair_failed", "rust_release", "decision", "Rust upgrade breaks the build repair tool",
-        ActionTemplate("In the Claude session named natedev, reply wait or upgrade."),
-        "Rust {version} is out. The tool that repairs Rust build errors fails to compile with it. Hana, the editor project, uses Rust {pin}.\n\n"
-        + "Wait (recommended): Hana stays on {pin} and keeps build repair. No fix is scheduled.\n\n"
-        + "Upgrade: Hana moves to {version}. It may lose build repair. No benefit for Hana is confirmed.",
+        purpose="A new Rust compiler failed its check on Hana. Upgrade or wait.",
+        expand_values=partial(rust_result_values, hidden=("pin", "warnings"), count_field="errors",
+            title="Rust {version} fails Hana's check: {errors}", short_title="Rust {version}: {errors} in Hana")),
+    PushText("rust.repair_failed", "rust_release", "decision", "{result}",
+        ActionTemplate("In the hana session, reply wait (recommended) or upgrade."),
+        "",
         (PushExample("typical", {"version": "1.100.0", "pin": "1.99.0"}),
          PushExample("long_versions", {"version": "100.100.100", "pin": "99.99.99"})),
-        purpose="A new Rust compiler breaks the build repair tool. Upgrade or wait."),
+        purpose="A new Rust compiler breaks the build repair tool. Upgrade or wait.",
+        expand_values=partial(rust_result_values, hidden=("pin",),
+            title="Rust {version} breaks the build repair tool", short_title="Rust {version} breaks build repair")),
     PushText("codex.reset_ready", "codex-winddown", "decision", "Codex is ready for your reset",
         ActionTemplate("At chatgpt.com/codex/settings/usage, redeem your limit reset."),
         "All Codex coding agents on {machine}, your computer, have stopped. Redeeming your usage reset now will not interrupt any work. "
@@ -370,14 +510,13 @@ ENTRIES = (
         purpose="natedev's GPU stopped, and both displays are dark.",
         expand_values=partial(hide_sender_values, hidden=("xid", "meaning", "time"))),
     # Current ups.nix: low-runtime shutdown at five minutes or 30% charge.
-    PushText("nixos.ups_battery", "ups", "blocked", "Power outage threatens open work",
-        ActionTemplate("Save your open work on the natedev computer now."),
-        "Mains power is out. The natedev computer is on backup battery and could shut down soon. "
-        + "Charge: {charge}%. Time left: about {minutes} minutes. It shuts down at 30% charge. "
-        + "It also shuts down at 5 minutes left. This prevents the battery dying while a file is being saved.",
+    PushText("nixos.ups_battery", "ups", "blocked", "Power out: natedev on battery, {minutes} min left",
+        ActionTemplate("Save your open work on natedev now."),
+        "",
         (PushExample("typical", {"charge": "80", "minutes": "20"}),
          PushExample("shutdown_threshold", {"charge": "30", "minutes": "5"})),
-        purpose="Power is out, and natedev runs on battery. Save your work."),
+        purpose="Power is out, and natedev runs on battery. Save your work.",
+        expand_values=partial(hide_sender_values, hidden=("charge",))),
     PushText("nixos.ups_replace_battery", "ups", "note", "natedev UPS battery is worn out",
         ActionTemplate("Replace the battery in the natedev UPS."),
         "",
@@ -437,26 +576,18 @@ ENTRIES = (
                                      + "Both are done, and both units run under their new names."})),
         purpose="An update that an agent writes for you with /nate adhoc.",
         header=False, agent_written=True),
-    # Auto-mode refusal (texts from 2026-11-06, on the user's question via natedev): a session sends it with send.py --text-id auto_mode.refused.
-    # send.py fills sender from the session's own name, action from the commands' first words (rca.action_of),
-    # refused from the command values (one per line), waits_line from waits when the 30 s push review passes it
-    # (else ""), noun and this from the number of commands, and rule_line from rule.
-    PushText("auto_mode.refused", "{sender}", "decision", "{sender}: {session} {noun} refused",
+    # send.py counts the refused commands and reviews the waits clause.
+    PushText("auto_mode.refused", "{sender}", "decision", AUTO_MODE_REFUSED_TITLE + "{waits_clause}",
         ActionTemplate("On {machine}, in the {session} pane, type: Go: run the refused {noun}"),
-        "Auto mode refused {action} in the {session} session.{waits_line}\n{refused}\n\n"
-        + "Go: the session runs {this} {noun} now, and auto mode can refuse {this} {noun} again.\n\n"
-        + "Allow rule: auto mode lets {this} {noun} run from then on.{rule_line}",
+        "",
         (PushExample("typical", {"sender": "cargo-liner-style", "session": "modules", "machine": "natedev",
-            "action": "2 shell commands", "refused": "implement.sh --to modules-impl\nreview.sh --to modules-test",
-            "noun": "commands", "this": "these", "waits_line": " The modules build waits for them.", "rule_line": ""}),
+            "count": "2", "noun": "commands", "waits": "its build waits"}),
          PushExample("one_with_rule", {"sender": "build-followups", "session": "messaging", "machine": "natedev",
-            "action": "a shell command", "refused": "git push origin build-followups-messaging", "noun": "command",
-            "this": "this", "waits_line": " The merge of the messaging work waits for it.", "rule_line": " The rule: Bash(git push:*)"}),
+            "count": "1", "noun": "command", "waits": "its work waits", "rule": "Bash(git push:*)"}),
          PushExample("file_change_no_waits", {"sender": "hana", "session": "demo", "machine": "natedev",
-            "action": "a file change", "refused": "write phases/34h/delegated_phase_reservation_state.json",
-            "noun": "command", "this": "this", "waits_line": "", "rule_line": ""})),
+            "count": "1", "noun": "command"})),
         purpose="Auto mode refused a session's commands. The commands wait for you.",
-        session=SessionTemplate("{session}")),
+        session=SessionTemplate("{session}"), expand_values=auto_mode_refused_values),
     # Permission root cause (user ask, 2026-10-23): rca.py sends these when the owner of a case starts it
     # (`rca.py start`) and when its fix merges (`rca.py fixed`), with --key rca-<case id>. sender is the
     # session's production, or messaging when it has none. rca.py fills time (silence.shown) and stop from the case.
@@ -490,30 +621,25 @@ ENTRIES = (
             "body": "At 14:23 AST in the demo session, auto mode refused a file change.\n"
             + "Why: its steps told it to write a progress file by hand.\nNow: a script writes that file."}),),
         purpose="The fix merged; the push review wrote this text after two refusals."),
-    # Paid credits (user approved 2026-10-21): sent with send.py --text-id quota.paid_credits. send.py fills
-    # sender from the session's own name; a script with no session record names itself with --from.
-    # Examples: the codex2 values the user approved, and codex1 sent from the natedev session.
-    PushText("quota.paid_credits", "{sender}", "decision", "{sender}: {account} now uses paid credits",
-        ActionTemplate("To stop it, remove {account} from codex_credit_accounts in ~/.claude/config/accounts.conf on {machine}"),
-        "{account} has {credits} paid credits left. Its plan refills {refill}.\n\n"
-        + "Leave on (recommended): work spends these credits, then moves to Claude.\n\n"
-        + "Turn off: work moves to Claude until {next_reset}.",
+    # send.py fills the sender from the session or the script name.
+    PushText("quota.paid_credits", "{sender}", "decision", "{title}",
+        ActionTemplate(PAID_CREDIT_ACTION_PREFIX + "{credit_accounts}"),
+        "",
         (PushExample("typical", {"sender": "quota_alert", "account": "codex2", "machine": "natedev",
-            "credits": "25,345", "refill": "Tue 10-27 02:33 AST", "next_reset": "Sat 10-24 16:40 AST"}),
+            "credits": "25,345", "refill": "Tue 10-27 02:33 AST", "next_reset": "Sat 10-24 16:40 AST",
+            "credit_accounts": "none"}),
          PushExample("from_session", {"sender": "natedev", "account": "codex1", "machine": "natedev",
-            "credits": "6,370", "refill": "Thu 10-29 07:00 AST", "next_reset": "Sat 10-24 16:40 AST"})),
-        purpose="An account now spends paid credits. You can turn this off."),
-    # Paid credits with a queued workers move (agreed with accounts-unit 2026-10-21): workers never go to
-    # Claude; they wait for the queued move. Same title, action, need and sender rule as quota.paid_credits.
-    PushText("quota.paid_credits_queued", "{sender}", "decision", "{sender}: {account} now uses paid credits",
-        ActionTemplate("To stop it, remove {account} from codex_credit_accounts in ~/.claude/config/accounts.conf on {machine}"),
-        "{account} has {credits} paid credits left. Its plan refills {refill}.\n\n"
-        + "Leave on (recommended): workers spend these credits until your queued move runs. "
-        + "If the credits run out first, workers wait.\n\n"
-        + "Turn off: workers stop and wait for your queued move.",
+            "credits": "6,370", "refill": "Thu 10-29 07:00 AST", "next_reset": "Sat 10-24 16:40 AST",
+            "credit_accounts": "codex2 codex3"})),
+        purpose="An account now spends paid credits. You can turn this off.",
+        expand_values=partial(paid_credits_text_values, queued=False)),
+    PushText("quota.paid_credits_queued", "{sender}", "decision", "{title}",
+        ActionTemplate(PAID_CREDIT_ACTION_PREFIX + "{credit_accounts}"),
+        "",
         (PushExample("typical", {"sender": "quota_alert", "account": "codex2", "machine": "natedev",
-            "credits": "25,345", "refill": "Tue 10-27 02:33 AST"}),),
-        purpose="An account now spends paid credits, and you queued a workers move."),
+            "credits": "25,345", "refill": "Tue 10-27 02:33 AST", "credit_accounts": "none"}),),
+        purpose="An account now spends paid credits, and you queued a workers move.",
+        expand_values=partial(paid_credits_text_values, queued=True)),
     # A session waits for a go (user approved 2026-10-21): sent with send.py --text-id session.needs_go.
     # send.py fills sender from the session's own name. Examples: the trunk push the user approved, and the
     # herdr-panes worktree left after herdr-unit took over herdr work (2026-10-18).

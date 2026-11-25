@@ -1,4 +1,4 @@
-"""Hold first-step admission while a caller prepares its repository slot."""
+"""Hold first-step admission while a caller prepares its numbered copy."""
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence
@@ -21,6 +21,7 @@ from scripts.lib import build_folders, conf
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.build_queue.admission_wire import KnownPlacementStatus, read_assignment
+from scripts.build_queue.placement import MAC_LINUX_START_UNCONFIRMED
 from scripts.lib.build_steps import (
     CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS, GATE_SCRIPTS, GATE_UNSETTLED_LAUNCH_STATUS,
     OtherCommand, VerifyCommand, command_job, command_program, gate_job_from_process, parse_command_program,
@@ -259,27 +260,28 @@ def run_gate_with_placement(
             if result.returncode == GATE_PRELAUNCH_REFUSED_STATUS:
                 refusal = read_gate_claim_failure(assignment_file, request)
                 settled = client.claim_failure(refusal)
+                unconfirmed_start = refusal.reason == MAC_LINUX_START_UNCONFIRMED
                 waiting_for_settlement = isinstance(settled.state, placement.CurrentAssignment) and (
                     destination.provider == 'scaler' or
                     (mac_linux and isinstance(settled.permission, placement.PermissionConsumed)))
                 if (settled.assignment != refusal.assignment
                         or not isinstance(settled.permission, (placement.PermissionAvailable, placement.PermissionConsumed))
                         or not isinstance(settled.retry, placement.RetryAt)
+                        or unconfirmed_start and (not mac_linux or settled.reason
+                            or not isinstance(settled.permission, placement.PermissionConsumed))
                         or (settled.state != placement.ClosedAssignment(refusal.reason) and not waiting_for_settlement)):
                     raise wire.AdmissionUnavailable('the queue did not permit a retry for the gate attempt')
+                if unconfirmed_start:
+                    waiting_for_settlement = False
                 reason = 'did not answer' if refusal.reason == placement.MAC_LINUX_NO_ANSWER else refusal.reason
+                if unconfirmed_start:
+                    reason = 'did not confirm a start'
                 retry_notice = (f'placement: retry — {destination.host} ({destination.target}) {reason}. '
                                 + 'Received a replacement assignment.')
             else:
                 client.request_settlement(wire.SettlementRequest(previous))
                 if mac_linux:
-                    # A retry also requires a report that the guest took no run.
-                    try:
-                        refusal = read_gate_claim_failure(assignment_file, request)
-                    except FileNotFoundError:
-                        return result
-                    if refusal.reason != placement.MAC_LINUX_NO_ANSWER:
-                        return result
+                    return result
                 waiting_for_settlement = True
             if mac_linux and waiting_for_settlement:
                 print(f'waiting for Mac Linux to confirm the end of attempt {previous.attempt}', flush=True)
@@ -333,6 +335,13 @@ def canonical_gate_command(command: Sequence[str], source: Path) -> bool:
     path = root / program[0]
     canonical = root / "scripts/production/gate.py"
     return path == canonical and path.resolve() == canonical
+
+
+def gate_module_mode_error(*, has_modules: bool, tests_only: bool, affected: bool) -> str:
+    """Return the error for named modules in an incompatible gate mode."""
+    if has_modules and not (tests_only or affected):
+        return "--module needs --tests-only or --affected"
+    return ""
 
 
 def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> tuple[str, ...]:

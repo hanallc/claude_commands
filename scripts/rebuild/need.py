@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from shlex import quote
-from typing import Literal, TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
 
 Machine = Literal["natedev", "mac"]
 REVISION = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
@@ -24,6 +24,14 @@ FULL_NEED_COMMIT = re.compile(r"[0-9a-f]{40}")
 SHORT_COMMIT = re.compile(r"[0-9a-f]{4,39}")
 GENERATION = re.compile(r"system-[0-9]+-link")
 NO_REASON = "No reason given"
+
+
+class SourceWatch(Protocol):
+    """Record file observations that determine whether a result can be saved."""
+
+    def watch(self, path: Path) -> None: ...
+    def verified_absence(self, path: Path) -> bool: ...
+    def mark_incomplete(self) -> None: ...
 
 
 class NeedRecord(TypedDict):
@@ -88,17 +96,32 @@ def request_time(value: str) -> datetime:
     return created if created.tzinfo is not None else created.replace(tzinfo=timezone.utc)
 
 
-def _open_needs(errors: list[str] | None = None) -> list[NeedRecord]:
+def _open_needs(errors: list[str] | None = None, *, watch: SourceWatch | None = None) -> list[NeedRecord]:
+    folder = needs_folder()
+    if watch is not None:
+        watch.watch(folder)
+    try:
+        paths = sorted(path for path in folder.iterdir() if path.suffix == ".json")
+    except FileNotFoundError:
+        if watch is not None and not watch.verified_absence(folder):
+            raise
+        return []
     records: list[NeedRecord] = []
-    for path in sorted(needs_folder().glob("*.json")):
+    for path in paths:
+        if watch is not None:
+            watch.watch(path)
         try:
             fields = _read_fields(path)
             if path.stem != fields["id"]:
                 raise ValueError("The file name and request ID differ.")
             records.append(cast(NeedRecord, cast(object, fields)))
         except FileNotFoundError:
+            if watch is not None:
+                watch.mark_incomplete()
             continue
         except (OSError, ValueError, RecursionError) as error:
+            if watch is not None:
+                watch.mark_incomplete()
             message = f"Rebuild request {path.name}: {error}"
             if errors is None:
                 print(message, file=sys.stderr)
@@ -161,10 +184,10 @@ def add_need(machine: Machine, commit: str, reason: str, concerns: str,
         _write_record(folder / filename, record, create_only=True)
 
 
-def read_needs(errors: list[str] | None = None) -> list[MachineNeeds]:
+def read_needs(errors: list[str] | None = None, *, watch: SourceWatch | None = None) -> list[MachineNeeds]:
     """Read the needs folder and return one summary per machine without subprocesses."""
     groups: dict[Machine, list[NeedRecord]] = {}
-    for record in _open_needs(errors):
+    for record in _open_needs(errors, watch=watch):
         groups.setdefault(record["machine"], []).append(record)
     summaries: list[MachineNeeds] = []
     for machine in sorted(groups):

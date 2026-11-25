@@ -86,7 +86,8 @@ The contract reviewer retains the style assignment.
 
 - With a root `Cargo.toml`, `<FinalGate/>` runs `verify.sh final` for the workspace check and tests without example linking.
 - Without that manifest, it runs the repository's unit gate.
-  For `~/.claude`, this is `scripts/lib/py scripts/production/targeted_test.py --checkout <tree>`.
+  For `claude_commands`, run `gate.py --affected` through `copies.py run` from the unit worktree root.
+  Use the command in `<FinalGate/>` in `docs/direct/final_gate_commit.md`.
 - Neither gate repeats formatting, lint, or style review.
 - On failure, a synthetic `final` phase opens the failures in the ledger and repairs them through `<FixDispatch/>`, then the gate reruns.
 - `<FinalGateCommit/>` commits only synthetic-phase repairs and source-comment edits from the last plan review. After staging in a Cargo repository, it runs `verify.sh doc` as its own command. On failure, it repairs through `<FixDispatch/>`, stages, and runs `doc` again. It does not reformat; the repair workers' `lint` covers formatting.
