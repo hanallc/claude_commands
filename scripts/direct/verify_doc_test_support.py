@@ -9,7 +9,7 @@ from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.copies import copies
 from scripts.lib import conf
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from unittest import mock
 
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture
@@ -195,12 +195,12 @@ class VerifyDocFixture(unittest.TestCase):
             "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })
-        private = private_slot_config(self.root)
-        slot_settings = private.settings.read_text().splitlines(keepends=True)
+        private = private_copy_config(self.root)
+        copy_settings = private.settings.read_text().splitlines(keepends=True)
         for key, value in (("locks.probe_wait_seconds", "0.25"), ("locks.probe_retry_seconds", "1")):
             line, _ = conf.editable_line(private.settings, key)
-            slot_settings[line] = f"{key}={value}\n"
-        _ = private.settings.write_text("".join(slot_settings))
+            copy_settings[line] = f"{key}={value}\n"
+        _ = private.settings.write_text("".join(copy_settings))
         _ = write_config_fixture(Path(private.environment["COPIES_CONFIG"]), "git_timeout_seconds=600\n")
         configuration = Path(self.environment["CONF_DIR"])
         _ = shutil.copy2(private.settings, configuration / "build_folders.conf")

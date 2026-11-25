@@ -1268,7 +1268,7 @@ subprocess.Popen = launch_keeper_fixture
         self.assertFalse(group_running(group))
         self.assert_lint_slot_and_folder_released()
 
-    def test_stopping_lint_during_slot_checkout_or_final_status_stops_git_and_releases_resources(self) -> None:
+    def test_stopping_lint_during_copy_checkout_or_final_status_stops_git_and_releases_resources(self) -> None:
         slot = self.standing_target().parent
         for step, command in (("checkout", "checkout --force --detach"), ("status", "status --porcelain --")):
             with self.subTest(step=step):
