@@ -696,7 +696,7 @@ def refresh_gate_source(settings_path: Path, directory: Path) -> int:
     if not manifest.is_file():
         return 0
     with account_stack_lock(directory) as access:
-        if access is LockResult.BUSY or not manifest.is_file():
+        if access is LockResult.BUSY or (directory / 'down.json').exists() or not manifest.is_file():
             return 0
         deployment = ledger.mapping(cast(object, json.loads(manifest.read_text())))
         if isinstance(gate_source.deployment_source(deployment), gate_source.PublicCloneSource):

@@ -1608,8 +1608,91 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
         regional = ledger.rows(self.deployment, 'regions')[0]
         self.deployment['regions'] = [{**regional, 'region': region, 'source_bucket': 'source-' + region}
                                       for region in ('us-east-2', 'us-west-2')]
+        cloud_gate.save(self.state / 'gate-deployment.json', self.deployment)
         self.fake.result = self.result(commit=commit, tree=tree)
         return SourceS3(self.now), repo, base
+
+    def test_private_source_upload_and_launch_exclude_teardown(self) -> None:
+        from scripts.aws_target.controller_lock import account_stack_lock
+        from scripts.lib.file_lock import LockResult
+
+        s3, repo, _ = self.private_source_fixture(changed=True)
+        api = AwsCli('fixture', 'us-east-2', 1, execute=s3)
+        regions = ledger.rows(self.deployment, 'regions')
+        self.assertEqual(gate_source.refresh_bases(api, repo, regions=regions, clock=lambda: self.now), ())
+        protected: set[str] = set()
+
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if 'put-object' in arguments or 'run-instances' in arguments:
+                with account_stack_lock(self.state) as access:
+                    self.assertIs(access, LockResult.BUSY)
+                protected.add('launch' if 'run-instances' in arguments else 'upload')
+            if any(argument in ('source-us-east-2', 'source-us-west-2') for argument in arguments):
+                return s3(arguments, **options)
+            return self.fake(arguments, **options)
+
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-2', 1, execute=transport), self.book,
+            self.settings, self.folder / 'reservation', clock=lambda: self.now, pause=self.advance)
+
+        def check_refusal(attempt: str, reason: str) -> None:
+            folder = self.root / attempt
+            folder.mkdir()
+            request = {**self.request, 'attempt': attempt}
+            cloud_gate.save(folder / 'request.json', request)
+            result = worker.execute(folder, request, self.deployment)
+            self.assertEqual(result['status'], 'fallback')
+            self.assertIn(reason, ledger.text(result, 'reason'))
+
+        with account_stack_lock(self.state) as access:
+            self.assertIs(access, LockResult.ACQUIRED)
+            check_refusal('busy', 'account stack is busy')
+        removal = self.state / 'down.json'
+        removal.touch()
+        check_refusal('removing', 'deployment is no longer available')
+        removal.unlink()
+        self.assertEqual(protected, set())
+        self.assertEqual(worker.execute(self.folder, self.request, self.deployment)['status'], 'complete')
+        self.assertEqual(protected, {'upload', 'launch'})
+        self.assertTrue(any(operation == 'put-object' and key.startswith(gate_source.DELTA_PREFIX)
+                            for _, operation, key in s3.operations))
+
+    def test_a_newer_regional_base_contains_the_entire_captured_source(self) -> None:
+        s3, repo, old_base = self.private_source_fixture()
+        _ = gate_source.git(repo, 'commit', '--allow-empty', '-qm', 'New regional base')
+        _ = gate_source.git(repo, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+        new_base = gate_source.git(repo, 'rev-parse', 'HEAD')
+        self.assertNotEqual(new_base, old_base)
+        region = ledger.rows(self.deployment, 'regions')[0]
+        bucket = gate_source.source_bucket(region)
+        api = AwsCli('fixture', bucket.region, 1, execute=s3)
+        self.assertEqual(gate_source.refresh_bases(api, repo, regions=(region,), clock=lambda: self.now), ())
+        pin = gate_source.pin_source(api, bucket, self.folder, self.request, self.now)
+        assert isinstance(pin, gate_source.BaseOnly)
+        self.assertEqual(pin.base.commit, new_base)
+        self.assertIn((bucket.region, 'get-object', pin.base.bundle.key), s3.operations)
+        self.assertFalse(any(key.startswith(gate_source.DELTA_PREFIX) for _, _, key in s3.operations))
+
+    def test_private_source_archive_remains_for_recovery_and_is_removed_after_settlement(self) -> None:
+        s3, repo, _ = self.private_source_fixture()
+        regions = ledger.rows(self.deployment, 'regions')
+        api = AwsCli('fixture', 'us-east-2', 1, execute=s3)
+        self.assertEqual(gate_source.refresh_bases(api, repo, regions=regions, clock=lambda: self.now), ())
+        self.fake.launch_timeouts = 1
+
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if any(argument in ('source-us-east-2', 'source-us-west-2') for argument in arguments):
+                return s3(arguments, **options)
+            return self.fake(arguments, **options)
+
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-2', 1, execute=transport), self.book,
+            self.settings, self.folder / 'reservation', clock=lambda: self.now, pause=self.advance)
+        archive = self.folder / gate_source.SOURCE_ARCHIVE
+        self.assertEqual(worker.execute(self.folder, self.request, self.deployment)['status'], 'fallback')
+        self.assertTrue(archive.is_file())
+        self.assertTrue(ledger.gate_is_open(self.book.read_snapshot().gate_reservations[0]))
+        self.assertEqual(worker.execute(self.folder, self.request, self.deployment)['status'], 'complete')
+        self.assertFalse(ledger.gate_is_open(self.book.read_snapshot().gate_reservations[0]))
+        self.assertFalse(archive.exists())
 
     def test_a_failed_base_publish_preserves_the_manifest_and_other_regions_advance(self) -> None:
         s3, repo, _ = self.private_source_fixture()

@@ -231,9 +231,14 @@ def signed_urls(links: Mapping[str, object]) -> tuple[str, ...]:
                  and link.startswith(('http://', 'https://')) and link.partition('?')[2].partition('#')[0])
 
 
+class GuestTransferFailed(RuntimeError):
+    pass
+
+
 GUEST_TRANSFERS = f'''import json, os, subprocess, tempfile, time
 from collections.abc import Mapping
 {inspect.getsource(signed_urls)}
+{inspect.getsource(GuestTransferFailed)}
 gate_record_filter = {GATE_RECORD_FILTER!r}
 # The controller validates the suite mode before it sends the request.
 transfer_retries = {BOX_CURL_RETRY!r} if gate_request.get('task') != 'paired' and 'mode' in gate_request else ()
@@ -264,11 +269,11 @@ def transfer(stage, name, arguments, *, content=None):
                                      '--write-out', '%{http_code}', *transfer_retries, *arguments],
                                     input=content, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except OSError:
-        raise RuntimeError(f'{stage} {name} failed (curl could not run)') from None
+        raise GuestTransferFailed(f'{stage} {name} failed (curl could not run)') from None
     if answer.returncode:
         status = answer.stdout
         http = status.decode() if len(status) == 3 and status.isdigit() else '000'
-        raise RuntimeError(f'{stage} {name} failed (curl exit {answer.returncode}, HTTP {http})')
+        raise GuestTransferFailed(f'{stage} {name} failed (curl exit {answer.returncode}, HTTP {http})')
 def get(name, destination):
     transfer('GET', name, ['--max-time', '60', '-o', str(destination)])
 def put(name, content):
@@ -445,6 +450,8 @@ def restore_private_source(root: Path, links: Mapping[str, str], request: dict[s
         _ = git(repo, 'checkout', '--detach', links['commit'])
         verify(repo, links['commit'], links['tree'])
         return repo
+    except GuestTransferFailed as error:
+        raise GuestSourceRejected(f'GuestSourceRejected: {error}') from error
     except (OSError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
         raise GuestSourceRejected('GuestSourceRejected: the requested source could not be restored') from error
 

@@ -20,6 +20,9 @@ from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 from scripts.mac_test import mac_test
 
 
+SOURCE_DELETE_BATCH_SIZE = 500
+
+
 DRY_RUN = '''down would disable AWS routing and aws-target.service.
 down refuses while an AWS job still runs. Kept claims do not delay down.
 down would delete the aws-build Tailscale device and keep tag:build-aws policy rules.
@@ -239,6 +242,7 @@ class TargetRemoval:
         self.identity = RemovalIdentity(self.identity.stack, self.identity.region, account, stack_id, deployment_id,
                                         str(outputs.get('InstanceId', '')), str(saved.get('data_volume_id', '')),
                                         str(saved.get('budget_name', '')))
+        _ = verified_gate_deployment(self.directory, self.api.region, deployment_id)
         path = self.directory / 'down.json'
         if path.exists():
             journal = remote.read_record(path)
@@ -374,12 +378,13 @@ class TargetRemoval:
                 for request in book.pending_compute_requests():
                     book.resolve_compute_request(request, ledger.ComputeResourcesAbsent(now))
         write_text_atomic(self.directory / 'down-complete.json', json.dumps(self.saved, sort_keys=True) + '\n')
+        (self.directory / 'gate-deployment.json').unlink(missing_ok=True)
         (self.directory / 'down.json').unlink(missing_ok=True)
         (self.directory / 'deployment.json').unlink(missing_ok=True)
         return changed
 
     def regional_gates(self) -> bool:
-        return remove_regional_gates(self.api, self.directory, include_home=True)
+        return remove_regional_gates(self.api, self.directory, self.identity.deployment_id, include_home=True)
 
     def gate_image(self) -> bool:
         outcome = remove_gate_images(self.api, self.directory, self.clock)
@@ -438,39 +443,50 @@ def empty_gate_source_bucket(api: AwsCli, stack: dict[str, object], deployment: 
         return
     while True:
         try:
-            objects = api.call('list-objects-v2', '--bucket', bucket, '--no-paginate', service='s3api')
+            objects = api.call('list-objects-v2', '--bucket', bucket, '--no-paginate',
+                               '--max-keys', str(SOURCE_DELETE_BATCH_SIZE), service='s3api')
         except AwsUnavailable as error:
             if 'NoSuchBucket' in str(error):
                 return
             raise
-        if 'Contents' not in objects or not ledger.rows(objects, 'Contents'):
+        batch = ledger.rows(objects, 'Contents')[:SOURCE_DELETE_BATCH_SIZE] if 'Contents' in objects else ()
+        if not batch:
             return
-        keys = [{'Key': ledger.text(row, 'Key')} for row in ledger.rows(objects, 'Contents')]
+        keys = [{'Key': ledger.text(row, 'Key')} for row in batch]
         removed = api.call('delete-objects', '--bucket', bucket, '--delete',
                            json.dumps({'Objects': keys, 'Quiet': True}), service='s3api')
         if removed.get('Errors'):
             raise AwsUnavailable('The source bucket still contains objects')
 
 
-def remove_regional_gates(api: AwsCli, directory: Path, *, include_home: bool = False) -> bool:
-    """Remove regional stacks before deleting their copied images."""
+def verified_gate_deployment(directory: Path, region: str, deployment: str) -> dict[str, object]:
     from scripts.aws_target.config import gate_deployment
-    manifest_path = directory / 'gate-deployment.json'
-    manifest = gate_deployment(manifest_path, api.region) if manifest_path.exists() else {}
+
+    path = directory / 'gate-deployment.json'
+    if not path.exists():
+        return {}
+    manifest = gate_deployment(path, region)
+    if manifest.get('deployment_id') != deployment:
+        raise ValueError('The gate record differs from the verified deployment')
+    return manifest
+
+
+def remove_regional_gates(api: AwsCli, directory: Path, deployment: str, *, include_home: bool = False) -> bool:
+    """Remove regional stacks before deleting their copied images."""
+    manifest = verified_gate_deployment(directory, api.region, deployment)
     stack_path = directory / 'regional-stacks.json'
     stacks = remote.read_record(stack_path) if stack_path.exists() else {}
     regions = ledger.rows(manifest, 'regions') if manifest else ()
-    source_regions = {ledger.text(row, 'region') for row in regions if row.get('source_bucket')}
     for row in regions:
         if row.get('stack'):
             stacks[ledger.text(row, 'region')] = row['stack']
     changed = bool(stacks)
     sweep_regions = dict.fromkeys([*conf.read_or_repository('cloud_gate').words('regions'), *stacks,
-        *(ledger.text(row, 'region') for row in ledger.rows(manifest, 'regions'))]) if stacks or include_home and manifest else {}
+        *(ledger.text(row, 'region') for row in regions)]) if stacks or include_home and manifest else {}
     for region in sweep_regions:
         target = api.in_region(region)
         reply = target.call('describe-instances', '--filters',
-            'Name=tag:GateDeployment,Values=' + ledger.text(manifest, 'deployment_id'),
+            'Name=tag:GateDeployment,Values=' + deployment,
             'Name=tag:Workload,Values=cloud-claude-gate',
             'Name=instance-state-name,Values=pending,running,stopping,stopped')
         instances = [ledger.text(instance, 'InstanceId') for group in ledger.rows(reply, 'Reservations')
@@ -481,13 +497,14 @@ def remove_regional_gates(api: AwsCli, directory: Path, *, include_home: bool = 
     for region, name in list(stacks.items()):
         target = api.in_region(region)
         try:
-            if region in source_regions:
-                reply = target.call('describe-stacks', '--stack-name', str(name), service='cloudformation')
-                saved_stacks = ledger.rows(reply, 'Stacks')
-                if len(saved_stacks) != 1 or saved_stacks[0].get('StackName') != name:
-                    raise ValueError('The regional stack differs from the saved deployment')
-                empty_gate_source_bucket(target, saved_stacks[0], ledger.text(manifest, 'deployment_id'))
-            _ = target.call('delete-stack', '--stack-name', str(name), service='cloudformation')
+            reply = target.call('describe-stacks', '--stack-name', str(name), service='cloudformation')
+            saved_stacks = ledger.rows(reply, 'Stacks')
+            if len(saved_stacks) != 1 or saved_stacks[0].get('StackName') != name:
+                raise ValueError('The regional stack differs from the saved deployment')
+            stack = saved_stacks[0]
+            if stack.get('StackStatus') != 'DELETE_IN_PROGRESS':
+                empty_gate_source_bucket(target, stack, deployment)
+                _ = target.call('delete-stack', '--stack-name', str(name), service='cloudformation')
             _ = target.call('wait', 'stack-delete-complete', '--stack-name', str(name), service='cloudformation')
         except AwsUnavailable as error:
             if 'does not exist' not in str(error):
@@ -496,7 +513,7 @@ def remove_regional_gates(api: AwsCli, directory: Path, *, include_home: bool = 
         write_text_atomic(stack_path, json.dumps(stacks) + '\n')
     if manifest and len(ledger.rows(manifest, 'regions')) > 1:
         manifest['regions'] = ledger.rows(manifest, 'regions')[:1]
-        write_text_atomic(manifest_path, json.dumps(manifest, sort_keys=True) + '\n')
+        write_text_atomic(directory / 'gate-deployment.json', json.dumps(manifest, sort_keys=True) + '\n')
     image_path = directory / 'regional-images.json'
     images = remote.read_record(image_path) if image_path.exists() else {}
     for identity, value in list(images.items()):

@@ -33,6 +33,7 @@ from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
 from scripts.aws_target.config import (AwsOn, account_settings_path, aws_switch, cloud_gate_off_reason, gate_deployment,
     gate_regions, read_settings)
+from scripts.aws_target.controller_lock import account_stack_lock
 from scripts.aws_target.run_cost import GateLaunchVariant as GateLaunchVariant
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, execution_identity, placement, progress_profile, queue_place, snapshot_codec
 from scripts.build_queue.admission_wire import CloudGroup, NoCloudGroup, NO_CLOUD_GROUP
@@ -421,7 +422,26 @@ def instance_not_found(error: AwsUnavailable) -> bool:
 def cleanup_folder(folder: Path, worker: GateWorker) -> bool:
     """Clean one gate folder or all module folders in a trial."""
     paths = [folder / 'request.json'] if (folder / 'request.json').exists() else sorted(folder.glob('*/request.json'))
-    return cleanup_requests(paths, worker)
+    complete = cleanup_requests(paths, worker)
+    if complete and paths:
+        discard_source_archive(folder)
+    return complete
+
+
+def discard_source_archive(folder: Path) -> None:
+    try:
+        (folder / gate_source.SOURCE_ARCHIVE).unlink(missing_ok=True)
+    except OSError as error:
+        print(f'Gate source archive cleanup failed. {error}', file=sys.stderr)
+
+
+def discard_settled_source_archive(folder: Path, book: ledger.CostLedger, attempt: str) -> None:
+    try:
+        if (folder / gate_source.SOURCE_ARCHIVE).is_file() and any(
+                row.attempt == attempt and not ledger.gate_is_open(row) for row in book.read_snapshot().gate_reservations):
+            discard_source_archive(folder)
+    except (OSError, ledger.LedgerUnavailable) as error:
+        print(f'Gate source archive cleanup failed. {error}', file=sys.stderr)
 
 
 def cleanup_requests(paths: Sequence[Path], worker: GateWorker) -> bool:
@@ -513,7 +533,12 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
         except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
             print('gate cleanup: ' + str(error), file=sys.stderr)
             complete = False
-    return worker.confirm_terminations(boxes, deadline) and complete
+    confirmed = worker.confirm_terminations(boxes, deadline)
+    for item in attempts:
+        reservation = item.reservation
+        if isinstance(reservation.owner, ledger.GateWorkerOwner):
+            discard_settled_source_archive(Path(reservation.owner.folder), worker.book, reservation.attempt)
+    return confirmed and complete
 
 
 @dataclass
@@ -1135,6 +1160,30 @@ class GateWorker:
             self.book.resolve_gate(attempt, ledger.GateAbsent(now))
         return reason
 
+    def _start(self, folder: Path, request: dict[str, object], deployment: dict[str, object], *,
+               new_launch: bool) -> str | CloudDeclined:
+        private_source = request.get('source_form') == 'regional-bundle'
+        directory = self.book.directory
+        lock = account_stack_lock(directory, shared=True) if private_source else nullcontext(LockResult.ACQUIRED)
+        with lock as access:
+            if access is LockResult.BUSY:
+                raise ValueError('The AWS account stack is busy. The gate cannot launch')
+            if private_source:
+                manifest = directory / 'gate-deployment.json'
+                if ((directory / 'down.json').exists() or not manifest.is_file()
+                        or read(manifest).get('deployment_id') != ledger.text(deployment, 'deployment_id')):
+                    raise ValueError('The AWS gate deployment is no longer available')
+            if new_launch:
+                bucket = ledger.text(deployment, 'bucket')
+                if request['source_key']:
+                    self.upload(bucket, ledger.text(request, 'source_key'), folder / 'source.bundle')
+                attempt = ledger.text(request, 'attempt')
+                self.upload(bucket, 'requests/' + attempt + '.json', folder / 'request.json')
+                guest = folder / 'guest.py'
+                _ = guest.write_text(gate_box.GUEST)
+                self.upload(bucket, 'requests/' + attempt + '.guest.py', guest)
+            return self.launch(folder, request, deployment)
+
     def execute(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> dict[str, object]:
         attempt = ledger.text(request, 'attempt')
         row: dict[str, object] = {}
@@ -1170,20 +1219,12 @@ class GateWorker:
                 raise ValueError('The worker has no readable process identity')
             owner = ledger.GateWorkerOwner(os.getpid(), identity.start, str(folder.resolve()))
             self.book.gate_owner(attempt, owner, now=self.clock())
-            if new_launch:
-                if claim is not None:
-                    if previous is not None:
-                        self.charges()
-                    if reason := self._check_launch_booking(attempt):
-                        return {'status': 'fallback', 'reason': reason}
-                bucket = ledger.text(deployment, 'bucket')
-                if request['source_key']:
-                    self.upload(bucket, ledger.text(request, 'source_key'), folder / 'source.bundle')
-                self.upload(bucket, 'requests/' + attempt + '.json', folder / 'request.json')
-                guest = folder / 'guest.py'
-                _ = guest.write_text(gate_box.GUEST)
-                self.upload(bucket, 'requests/' + attempt + '.guest.py', guest)
-            launched = self.launch(folder, request, deployment)
+            if new_launch and claim is not None:
+                if previous is not None:
+                    self.charges()
+                if reason := self._check_launch_booking(attempt):
+                    return {'status': 'fallback', 'reason': reason}
+            launched = self._start(folder, request, deployment, new_launch=new_launch)
             if isinstance(launched, CloudDeclined):
                 return {'status': 'fallback', 'reason': launched.reason}
             instance = launched
@@ -1327,6 +1368,9 @@ class GateWorker:
             if interruption_confirmed:
                 return {'status': 'interrupted', 'reason': str(error), 'interruption_code': interruption_code}
             return {'status': 'fallback', 'reason': str(error)}
+        finally:
+            if request.get('source_form') == 'regional-bundle' and request.get('task') != 'paired':
+                discard_settled_source_archive(folder, self.book, attempt)
 
 
 def time_limit_result(request: dict[str, object], text: str, elapsed: float,

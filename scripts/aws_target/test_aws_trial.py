@@ -931,7 +931,7 @@ else:
         with self.assertRaises(ValueError):
             trial.validate_paired_result(row, request, 'i-other')
 
-    def guest(self, *, limit: float | None = None, private: bool = False
+    def guest(self, *, limit: float | None = None, private: bool = False, missing_delta: bool = False
               ) -> tuple[dict[str, object], list[dict[str, object]]]:
         from scripts.aws_target import gate_box, cloud_gate
         box = self.root / 'box'
@@ -950,6 +950,9 @@ else:
             links.update(source_base='base-object', source_base_commit=self.base,
                          source_base_sha256=gate_source.bundle_sha256(base_bundle), source_delta='delta-object',
                          source_delta_sha256=gate_source.bundle_sha256(delta))
+            if missing_delta:
+                delta.unlink()
+                links['boot_error'] = 'boot-error'
         cloud_gate.save(box / 'request.json', request)
         cloud_gate.save(box / 'links.json', links)
         tools = self.root / 'tools'
@@ -963,7 +966,11 @@ root = pathlib.Path({str(box)!r})
 if '--data-binary' in sys.argv:
     (root / ('uploaded-' + name)).write_bytes(sys.stdin.buffer.read())
 else:
-    pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes((root / name).read_bytes())
+    source = root / name
+    if not source.is_file():
+        print('404', end='')
+        raise SystemExit(22)
+    pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(source.read_bytes())
 print('200', end='')
 ''')
         curl.chmod(0o755)
@@ -996,6 +1003,14 @@ os.execv({git_path!r}, [{git_path!r}, *sys.argv[1:]])
         self.assertEqual(len(traces), 8)
         self.assertEqual(trial.checked_git(self.root / 'box/base', 'rev-parse', 'HEAD'), self.base)
         self.assertEqual(trial.checked_git(self.root / 'box/changed', 'rev-parse', 'HEAD'), self.changed)
+
+    def test_private_guest_boot_error_names_the_missing_delta_and_http_status(self) -> None:
+        reply, traces = self.guest(private=True, missing_delta=True)
+        boot = cloud_gate.read(self.root / 'box/uploaded-boot-error')
+        self.assertEqual(boot['verdict'], 'error')
+        self.assertEqual(boot['error'], 'GuestSourceRejected: GET source_delta failed (curl exit 22, HTTP 404)')
+        self.assertEqual(reply['error'], boot['error'])
+        self.assertEqual(traces, [])
 
     def test_private_paired_trial_sends_a_bundle_without_remote_branch_commands(self) -> None:
         _ = trial.checked_git(self.repo, 'update-ref', 'refs/remotes/origin/main', self.base)

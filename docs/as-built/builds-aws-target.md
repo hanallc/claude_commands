@@ -1027,7 +1027,11 @@ The result fields and transfer links keep their existing format.
 Each gate stack owns an encrypted, private source bucket with the existing cost tags.
 The bucket policy requires TLS and limits the scaler to the manifest and bundle keys.
 The gate plan checks the source bucket policy in each proposed region.
-Teardown empties each source bucket before it deletes the stack.
+Teardown checks the gate record against the verified deployment.
+It reads the source bucket from each saved stack, including stacks absent from the gate manifest.
+It empties each verified bucket in batches of up to 500 objects before it deletes the stack.
+Private gate uploads and launches hold the shared account stack lock.
+Teardown holds the exclusive lock and keeps private launches and refreshes disabled until removal ends.
 
 The deployment captures one `origin/main` commit and publishes a full Git bundle to each source bucket.
 The hourly job checks for a refresh when cloud gates are enabled.
@@ -1038,9 +1042,12 @@ A failed regional publication keeps the previous manifest and leaves the other r
 
 The controller pins the selected region's base in the saved launch record.
 It uses `BaseOnly` when the base contains all requested commits.
+It downloads and verifies the base if the captured archive lacks the base commit.
 Otherwise, it uploads a delta for the selected base in the same region.
 Paired modules that select the same base share one regional delta.
 Recovery reuses the saved source keys and launch arguments for an uncertain launch.
+The controller keeps the full source archive while recovery can use it.
+It removes the archive when the gate or paired trial settles.
 
 The controller selects bases for 14 days.
 The bucket expires base objects after 15 days and deltas after one day.
@@ -1051,6 +1058,7 @@ An unavailable base, a base mismatch, or a failed delta upload prevents the regi
 The guest downloads the exact signed objects and verifies their SHA-256 hashes.
 It verifies bundle prerequisites, detached commits, and trees before it runs tests.
 It publishes `GuestSourceRejected` through the boot error link when source verification fails.
+A failed download names the bundle and reports the curl exit code and HTTP status.
 The deployment verifies pinned Linux tool paths in the Nix binary cache.
 The private boot uses those paths and reports `GateToolsUnavailable` if tool preparation fails.
 

@@ -4338,11 +4338,11 @@ sys.exit(7)
             write(destination, text)
         with mock.patch.object(teardown, 'write_text_atomic', side_effect=fail_record):
             with self.assertRaisesRegex(OSError, 'fixture record failure'):
-                _ = teardown.remove_regional_gates(api, self.state)
+                _ = teardown.remove_regional_gates(api, self.state, 'fixture')
         self.assertTrue(deleted)
-        self.assertTrue(teardown.remove_regional_gates(api, self.state))
+        self.assertTrue(teardown.remove_regional_gates(api, self.state, 'fixture'))
         self.assertEqual(snapshots, ['snap-west'])
-        self.assertFalse(teardown.remove_regional_gates(api, self.state))
+        self.assertFalse(teardown.remove_regional_gates(api, self.state, 'fixture'))
 
     def test_down_removes_regional_stack_and_copied_image_before_snapshot(self) -> None:
         from scripts.aws_target import teardown
@@ -4358,11 +4358,13 @@ sys.exit(7)
             reply: dict[str, object] = {'Reservations': []}
             if 'describe-instances' in args and args[args.index('--region') + 1] == 'us-west-2':
                 reply = {'Reservations': [{'Instances': [{'InstanceId': 'i-fixture-west'}]}]}
+            if 'describe-stacks' in args:
+                reply = {'Stacks': [{'StackName': 'fixture-gates-us-west-2'}]}
             if 'describe-images' in args:
                 reply = {'Images': [{'BlockDeviceMappings': [{'Ebs': {'SnapshotId': 'snap-west'}}]}]}
             return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
         api = aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)
-        self.assertTrue(teardown.remove_regional_gates(api, self.state))
+        self.assertTrue(teardown.remove_regional_gates(api, self.state, 'fixture'))
         operations = [command[command.index('--region') + 3] for command in calls]
         self.assertLess(operations.index('terminate-instances'), operations.index('wait'))
         self.assertLess(operations.index('wait'), operations.index('delete-stack'))
@@ -4371,7 +4373,7 @@ sys.exit(7)
         sweeps = [command for command in calls if 'describe-instances' in command]
         self.assertEqual([command[command.index('--region') + 1] for command in sweeps], ['us-east-2', 'us-west-2'])
         self.assertTrue(all(command[command.index('--region') + 1] == 'us-west-2' for command in calls if command not in sweeps))
-        self.assertFalse(teardown.remove_regional_gates(api, self.state))
+        self.assertFalse(teardown.remove_regional_gates(api, self.state, 'fixture'))
 
 
     def test_gate_stack_updates_print_named_start_and_done_lines(self) -> None:

@@ -350,7 +350,19 @@ def pin_source(api: AwsCli, target: SourceBucket, folder: Path, request: dict[st
             _ = git(repo, 'init', '--bare')
             _ = git(repo, 'fetch', '--no-tags', str((shared / SOURCE_ARCHIVE).resolve()),
                     'refs/cloud-gates/*:refs/cloud-gates/*')
-            _ = git(repo, 'cat-file', '-e', base.commit + '^{commit}')
+            present = subprocess.run(['git', '-C', str(repo), 'cat-file', '-e', base.commit + '^{commit}'],
+                                     capture_output=True, check=False)
+            if present.returncode:
+                base_bundle = scratch / 'base.bundle'
+                try:
+                    _ = api.call('get-object', '--bucket', target.name, '--key', base.bundle.key,
+                                 str(base_bundle), service='s3api')
+                    digest = bundle_sha256(base_bundle)
+                except (AwsUnavailable, OSError, ValueError, subprocess.SubprocessError) as error:
+                    raise RegionalSourceBaseUnavailable(f'RegionalSourceBaseUnavailable in {target.region}') from error
+                if digest != base.bundle.sha256:
+                    raise SourceBaseMismatch('SourceBaseMismatch: the downloaded base checksum differs')
+                _ = git(repo, 'fetch', '--no-tags', str(base_bundle), base.commit)
             if git(repo, 'rev-list', '--count', *commits, '--not', base.commit) == '0':
                 write_text_atomic(receipt, json.dumps({'base_only': True}))
                 return BaseOnly(base)
