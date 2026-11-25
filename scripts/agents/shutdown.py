@@ -24,6 +24,7 @@ def _usage() -> str:
   agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]
   agents resume PRODUCER --resend-opening-prompt
   agents resume --production SHOWRUNNER
+  agents clone NAME --as NEW
   agents retire NAME [--to PRODUCER]
   agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
   agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
@@ -705,6 +706,9 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--dry-run", action="store_true")
     _ = command.add_argument("--only", default="")
     _ = command.add_argument("--account", dest="account")
+    command = commands.add_parser("clone")
+    _ = command.add_argument("session", metavar="NAME")
+    _ = command.add_argument("--as", dest="new", required=True, metavar="NEW")
     command = commands.add_parser("remove-stray")
     _ = command.add_argument("producer", metavar="NAME")
     _ = command.add_argument("session", metavar="SESSION")
@@ -781,8 +785,12 @@ def main(argv: list[str] | None = None) -> int:
             return set_model.report_error(error)
     locks = ExitStack()
     try:
-        if options.command in ("resume", "restart", "add-producer", "transfer", "move") and not options.dry_run:
+        if options.command in ("resume", "restart", "add-producer", "transfer", "move", "clone") and not options.dry_run:
             locks.enter_context(herdr.reboot_lock())
+        if options.command == "clone":
+            from scripts.agents import clone_session
+
+            return clone_session.run(options.session, options.new)
         if options.command == "resume" and options.resend_opening_prompt:
             if options.production or options.retired:
                 raise ValueError("--resend-opening-prompt needs one producer name and an active pane")

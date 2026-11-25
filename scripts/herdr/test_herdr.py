@@ -871,6 +871,7 @@ class NativePaneSessionTests(StaffTestCase):
             ("new-foreign-rollout", ["codex"], launch, current, herdr.PaneSessionReport(current)),
             ("new-no-rollout", ["codex"], "", current, herdr.PaneSessionReport(current)),
             ("resume", ["codex", "resume", launch], "", "", herdr.LaunchArgument(launch)),
+            ("fork", ["codex", "fork", launch], launch, current, herdr.PaneSessionReport(current)),
         )
         for case, arguments, rollout_id, report, expected in rows:
             with self.subTest(case=case):
@@ -906,6 +907,7 @@ class NativePaneSessionTests(StaffTestCase):
             (["codex", "Explain this repository"], True, ""),
             (["codex", "--", "Explain this repository"], True, ""),
             (["codex", "--model", "test-model", "--no-alt-screen"], True, ""),
+            (["codex", "fork", launch], True, ""),
             (["codex", "--config=resume"], False, "invalid configuration value"),
             (["codex", "-cresume"], False, "invalid configuration value"),
             (["codex", '-cmodel="test-model"'], True, ""),
@@ -3402,6 +3404,26 @@ class LaunchDestinationTests(StaffTestCase):
         assert isinstance(result.outcome, herdr.PromptNotSubmitted)
         self.assertIn("resume prompt was not sent", result.outcome.reason)
         self.assertIn("Check the retained pane and send the resume prompt by hand.", result.outcome.reason)
+
+    def test_fork_launch_uses_a_new_tab_while_the_source_session_runs(self) -> None:
+        source = fixture_runtime_id("fork-source")
+        _ = staff.ensure("showrunner", name="source", runtime_id=source)
+        client = Mock(spec=herdr.Herdr)
+        opened = cast(Mock, client.open_tab)
+        opened.return_value = "w1:p2"
+        prepared = herdr.PreparedAgentEnvironment(self.root, {})
+        arguments = ["--resume", source, "--fork-session", "-n", "clone"]
+        with (patch.object(herdr, "trust_claude_launch"),
+              patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (1,))) as live,
+              patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired()) as start):
+            launched = herdr.launch_prepared_agent("agents", herdr.ForkTab("w1:p1", "clone"),
+                prepared, "claude", arguments, herdr.NoOpeningPrompt(), 5000, agent="clone", client=client)
+        self.assertEqual(launched.pane, "w1:p2")
+        live.assert_not_called()
+        opened.assert_called_once()
+        self.assertEqual(cast(str, opened.call_args.kwargs["after_pane"]), "w1:p1")
+        start.assert_called_once_with("agents", "w1:p2", "claude", arguments, herdr.NoOpeningPrompt(), 5000,
+                                      agent="clone")
 
     def test_every_launch_keeps_the_shell_after_the_agent_returns(self) -> None:
         for kind in ("claude", "codex"):
@@ -5906,6 +5928,26 @@ class HerdrTests(unittest.TestCase):
         self.share()
         self.assertEqual(herdr.attach_hint("solo", "solo"),
                          "herdr session attach fixture, workspace solo, tab solo")
+
+    def test_open_tab_places_a_clone_after_its_source_without_moving_other_tabs(self) -> None:
+        client = self.herdr
+        source: herdr.PaneIdentity = {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1",
+            "terminal_id": "fixture-terminal", "label": "alpha", "session_id": None}
+        tabs = [{"tab_id": "w1:t1"}, {"tab_id": "w1:t2"}]
+        result = {"root_pane": {"pane_id": "w1:p3"}, "tab": {"tab_id": "w1:t3"}}
+        with (patch.object(client, "pane_row", return_value=source),
+              patch.object(client, "listed", return_value=tabs) as listed,
+              patch.object(client, "result", return_value=result) as create,
+              patch.object(client, "run", return_value=""),
+              patch.object(client, "socket_request") as move,
+              patch.object(client, "save_layout"),
+              patch.object(client, "order_tabs") as order):
+            self.assertEqual(client.open_tab("", "alpha-copy", "/repo", {}, after_pane="w1:p1"), "w1:p3")
+        listed.assert_called_once_with("tab", "--workspace", "w1")
+        create.assert_called_once_with("tab", "create", "--workspace", "w1", "--label", "alpha-copy",
+                                      "--cwd", "/repo", "--env", "HERDR_AGENT_PANE=1", "--no-focus")
+        move.assert_called_once_with("tab.move", tab_id="w1:t3", insert_index=1)
+        order.assert_not_called()
 
     def test_open_tab_creates_the_production_workspace_once_then_adds_tabs(self) -> None:
         boss = fixture_member("showrunner", name="boss")

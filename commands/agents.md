@@ -18,6 +18,7 @@ Use the `agents` program.
   A production pause reports each refusal and pauses the other selected directors.
 - Use `agents resume --production SHOWRUNNER` to resume its units.
 - `agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]`: resume a staff name, staff id, launch reference, or native session id.
+- `agents clone NAME --as NEW`: fork a live Claude or Codex session beside its source tab.
 - Use `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]` to rename a staff member.
 - `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]`: move Claude sessions to a numbered account.
 - `agents retire NAME`: remove the unit worktree and branch. Keep its retired staff row and conversations.
@@ -32,6 +33,14 @@ Use the `agents` program.
 - `agents stop --all [--dry-run]`: save the live local staff rows, then stop them without a restart.
 - `agents remove-stray NAME SESSION`: remove a stray producer conversation on this machine.
 - `agents transfer NAME [--model MODEL --effort EFFORT]`: give the producer role NAME to the session that runs the command.
+
+## Clone a session
+
+Run the command on the source session's machine.
+Use its staff name, staff id, or native session id.
+The clone uses the source folder, account, model, and effort.
+Its opening prompt names both sessions.
+Its new staff row gives messages a separate address.
 
 ## Create a producer
 

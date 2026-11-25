@@ -1409,11 +1409,11 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
         raise
 
 
-def _prompt_identity(client: herdr.Herdr, pane: str, deadline: float) -> str:
+def wait_for_native_session(client: herdr.Herdr, pane: str, deadline: float, *, kind: Literal["claude", "codex"]) -> str:
     """Wait for the pane to expose its native identity within the start deadline."""
     while True:
         try:
-            return client.native_session(pane, "claude", operation_deadline.remaining(max(0.001, deadline - monotonic())))
+            return client.native_session(pane, kind, operation_deadline.remaining(max(0.001, deadline - monotonic())))
         except (OSError, ValueError, subprocess.SubprocessError, herdr_types.HerdrFailure):
             remaining = deadline - monotonic()
             if remaining <= 0:
@@ -1452,7 +1452,7 @@ def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, a
     if not message:
         return live
     try:
-        identity = _prompt_identity(client, tab.pane_id, deadline)
+        identity = wait_for_native_session(client, tab.pane_id, deadline, kind="claude")
     except (OSError, ValueError, subprocess.SubprocessError, herdr_types.HerdrFailure) as error:
         print(f"{entry['session_id']}: prompt identity anomaly: {error}", file=sys.stderr)
         return live

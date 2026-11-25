@@ -251,13 +251,22 @@ def _resume_arguments(entry: pane_launch.NativePaneLaunch, *,
             arguments.extend(("--model", entry["model"]))
         arguments.extend(entry.get("codex_policy", []))
         return arguments
-    arguments = ["--resume", entry["session_id"]]
-    if entry["name"]:
-        arguments.extend(("-n", entry["name"]))
-    if entry["remote_control"]:
-        arguments.extend(("--remote-control", entry["name"]) if entry["name"] else ("--remote-control",))
-    arguments.extend(claude_settings.arguments())
-    for directory in entry.get("plugin_directories", []):
+    return claude_conversation_arguments(entry["session_id"], entry["name"], claude_settings,
+        entry.get("plugin_directories", []), remote_control=entry["remote_control"])
+
+
+def claude_conversation_arguments(session: str, name: str, settings: ClaudeResumeSettings,
+                                  plugins: Sequence[str], *, remote_control: bool, fork: bool = False) -> list[str]:
+    """Build the common Claude arguments for resume and fork."""
+    arguments = ["--resume", session]
+    if fork:
+        arguments.append("--fork-session")
+    if name:
+        arguments.extend(("-n", name))
+    if remote_control:
+        arguments.extend(("--remote-control", name) if name else ("--remote-control",))
+    arguments.extend(settings.arguments())
+    for directory in plugins:
         arguments.extend(("--plugin-dir", directory))
     arguments.extend(("--settings", '{"disableAgentView": true}'))
     return arguments

@@ -25,7 +25,7 @@ A browser leaves helper processes after its own exit or a timeout, and a plain `
 
 The `/agents` skill uses the `agents` program.
 `agents` and `agents help` print the same usage and return status 0.
-The public commands are `help`, `status`, `pause`, `exit`, `resume`, `restart`, and `stop`.
+The public commands include `help`, `status`, `pause`, `exit`, `resume`, `clone`, `restart`, and `stop`.
 `agents status [ACCOUNT] [--json] [--here]` reports live sessions.
 `agents stop SESSION` stops the selected session and its workers.
 SESSION is a staff id, a session id, a unique name, or a staff path.
@@ -36,6 +36,17 @@ A path that matches more than one staff row stops nothing and returns status 2 w
 Add `--dry-run` to print their names without stopping them.
 `agents` runs `scripts/agents/shutdown.py`.
 All lifecycle scripts use `scripts/agents/`.
+
+`agents clone NAME --as NEW` forks a live conversation on the source machine.
+The command accepts a staff name, staff id, or native session id.
+It refuses a name another staff row or live session uses.
+It opens a new Herdr tab after the source tab.
+The fork uses the source folder, account, model, and effort.
+Claude uses `--resume --fork-session`. Codex uses `codex fork`.
+The first prompt names the clone and directs it to wait for a request to its own name.
+The command checks the new native id before it creates a root producer row.
+The row stores the clone's launch folder and account home.
+The source keeps its own transcript, staff row, and message address.
 
 `agents pause NAME [--keep-workers] --why TEXT` pauses a director.
 The director finishes its current turn and holds at the prompt.

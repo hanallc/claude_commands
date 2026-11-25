@@ -2008,16 +2008,31 @@ class Herdr:
         return matches[0]
 
     @pane_evidence_run()
-    def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str], *, member: str = "") -> str:
+    def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str], *,
+                 member: str = "", after_pane: str = "") -> str:
         """Open a named tab and pane in an existing or new workspace."""
         options = ["--label", title, "--cwd", cwd]
         for key, value in _pane_environment(environment).items():
             options.extend(["--env", f"{key}={value}"])
         with _LayoutLock(self.session):
             saved = saved_layout(self.session)
-            workspace = self._workspace_named(space)
-            if workspace is None and self._place_saved_workspaces(saved, frozenset({space})):
+            position = 0
+            move_new_tab = False
+            if after_pane:
+                source = self.pane_row(after_pane)
+                if isinstance(source, NoPane):
+                    raise HerdrFailure(f"{after_pane}: source pane is unavailable")
+                workspace = source["workspace_id"]
+                tabs = self.listed("tab", "--workspace", workspace)
+                position = next((index for index, tab in enumerate(tabs, 1)
+                                 if tab.get("tab_id") == source.get("tab_id")), 0)
+                if not position:
+                    raise HerdrFailure(f"{after_pane}: source tab is unavailable")
+                move_new_tab = position < len(tabs)
+            else:
                 workspace = self._workspace_named(space)
+                if workspace is None and self._place_saved_workspaces(saved, frozenset({space})):
+                    workspace = self._workspace_named(space)
             if workspace is not None:
                 result = self.result("tab", "create", "--workspace", workspace, *options, "--no-focus")
             else:
@@ -2030,7 +2045,10 @@ class Herdr:
             root_pane = json_object(result.get("root_pane"), "herdr tab root pane")
             pane = json_text(root_pane.get("pane_id"), "herdr tab root pane id")
             _ = self.run("pane", "rename", pane, title)
-            if workspace is not None:
+            if move_new_tab:
+                tab = json_text(json_object(result.get("tab"), "created tab").get("tab_id"), "tab id")
+                _ = self.socket_request("tab.move", tab_id=tab, insert_index=position)
+            elif workspace is not None and not after_pane:
                 _ = self._close_placeholders(workspace)
                 try:
                     pane = self.order_tabs(workspace, saved, opening_members=((pane, member),) if member else ()).get(pane, pane)
@@ -2806,8 +2824,8 @@ class Herdr:
                 except HerdrFailure as error:
                     print(f"herdr {self.session}: workspace {candidate.workspace_id} retained: {error}", file=sys.stderr)
 
-    def producer_admission_launch(self, pane: str, kind: Literal["claude", "codex"]) -> pane_launch.CurrentLaunch:
-        """Read the native identity and launch evidence before producer admission."""
+    def foreground_launch(self, pane: str, kind: Literal["claude", "codex"]) -> ForegroundLaunch:
+        """Read the command and environment of the current native session."""
         info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"),
                            "producer process info")
         row = self.pane_row(pane)
@@ -2819,14 +2837,20 @@ class Herdr:
         if (not Path(folder).is_absolute() or observed.environment.get("HERDR_PANE_ID") != pane
                 or observed.environment.get("HERDR_SESSION", "default") != self.session):
             raise HerdrFailure("producer process does not match its pane")
-        entry = pane_launch.launch(pane, observed.current_identity, folder, observed.environment,
-                                   owner.arguments, kind=kind)
-        entry["config_dir"] = observed.environment.get("CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR") or str(
-            Path.home() / (".codex" if kind == "codex" else ".claude"))
-        entry.update(pid=owner.pid, proc_start=observed.started)
         current = self.native_pane_process(pane, kind, PROGRAM_TIMEOUT_SECONDS, pane_row=row)
         if current != observed:
             raise HerdrFailure("producer process changed before admission")
+        return ForegroundLaunch(observed, owner.pid, folder, owner.arguments)
+
+    def producer_admission_launch(self, pane: str, kind: Literal["claude", "codex"]) -> pane_launch.CurrentLaunch:
+        """Read the native identity and launch evidence before producer admission."""
+        observed = self.foreground_launch(pane, kind)
+        environment = observed.process.environment
+        entry = pane_launch.launch(pane, observed.process.current_identity, observed.cwd, environment,
+                                   observed.arguments, kind=kind)
+        entry["config_dir"] = environment.get("CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR") or str(
+            Path.home() / (".codex" if kind == "codex" else ".claude"))
+        entry.update(pid=observed.pid, proc_start=observed.process.started)
         return entry
 
     def codex_launch(self, pane: str,
@@ -3662,6 +3686,14 @@ class ProvedClaudeForeground:
 
 
 type ForegroundPaneAgent = ProvedCodexForeground | ProvedClaudeForeground
+
+
+@dataclass(frozen=True)
+class ForegroundLaunch:
+    process: NativeAgentProcess
+    pid: int
+    cwd: str
+    arguments: list[str]
 
 
 @dataclass(frozen=True)
@@ -5064,7 +5096,9 @@ def _codex_launch_argument(pid: int) -> LaunchArgument | StartingCodexPane | Cod
                         return LaunchArgument(staff.native_id(next(options, "")))
                     except staff.StaffRefused:
                         return CodexLaunchIdentityUnknown(f"{unavailable}: bad resume id")
-                if option in {"exec", "e", "review", "fork", "login", "logout", "mcp", "mcp-server",
+                if option == "fork":
+                    return StartingCodexPane(pid)
+                if option in {"exec", "e", "review", "login", "logout", "mcp", "mcp-server",
                               "app-server", "app", "completion", "sandbox", "debug", "apply", "a",
                               "cloud", "features", "help"}:
                     return CodexLaunchIdentityUnknown(f"{unavailable}: unsupported subcommand")
@@ -6898,6 +6932,12 @@ class NewTab:
 
 
 @dataclass(frozen=True)
+class ForkTab:
+    source_pane: str
+    title: str
+
+
+@dataclass(frozen=True)
 class SplitPane:
     of_pane: str
     direction: Literal["right", "down"]
@@ -7010,7 +7050,7 @@ def _resume_prompt_failure(outcome: PromptNotSubmitted, pane: str) -> PromptNotS
     return replace(outcome, reason=f"{outcome.reason}; {advice} Pane: {pane}.")
 
 
-def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
+def launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
                           kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
                           timeout_ms: int, *, agent: str, reported_unknown: str = "",
                           agent_name: str | AgentNameSource = AgentNameSource.MEMBER_REFERENCE,
@@ -7025,7 +7065,7 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                                       codex=codex, client=client)
 
 
-def _launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
+def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
                            kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
                            timeout_ms: int, *, agent: str, reported_unknown: str,
                            agent_name: str | AgentNameSource, codex: CodexConversations | CodexLaunchRead,
@@ -7039,8 +7079,9 @@ def _launch_prepared_agent(name: str, destination: NewTab | SplitPane | Existing
         except HerdrFailure as error:
             print(str(error), file=sys.stderr)
             return AgentLaunched("", _without_prompt_transport(opening, launched_at, ClaudeTrustNotWritten(str(error))))
-    session_id = next((agent_arguments[index + 1] for index, argument in enumerate(agent_arguments[:-1])
-                       if argument in {"--resume", "--session-id", "resume"}), "")
+    session_id = ("" if isinstance(destination, ForkTab) else
+                  next((agent_arguments[index + 1] for index, argument in enumerate(agent_arguments[:-1])
+                        if argument in {"--resume", "--session-id", "resume"}), ""))
     resuming_with_prompt = isinstance(opening, OpeningPrompt) and (
         "--resume" in agent_arguments or kind == "codex" and "resume" in agent_arguments)
     reuse_client = not isinstance(client, LaunchClientSource)
@@ -7049,7 +7090,8 @@ def _launch_prepared_agent(name: str, destination: NewTab | SplitPane | Existing
     folder_member: session_folder.Member | None = None
     try:
         membership = _tab_staff()
-        owner = membership.by_member_reference(session_id or agent) or membership.by_path(agent)
+        owner = (None if isinstance(destination, ForkTab) else
+                 membership.by_member_reference(session_id or agent) or membership.by_path(agent))
         if owner is not None:
             session_id = owner.current_session
             member = owner.id
@@ -7066,7 +7108,10 @@ def _launch_prepared_agent(name: str, destination: NewTab | SplitPane | Existing
             conversation_note(observed)
     if kind == "claude" and folder_member is not None:
         prepared = in_session_folder(prepared, folder_member, session_id)
-    if isinstance(destination, NewTab):
+    if isinstance(destination, ForkTab):
+        pane = client.open_tab("", destination.title, str(prepared.directory), prepared.env,
+                               after_pane=destination.source_pane)
+    elif isinstance(destination, NewTab):
         pane = (client.open_tab(destination.space, destination.title, str(prepared.directory), prepared.env,
                                **({"member": member} if member else {})) if reuse_client else
                 open_tab(name, destination.space, destination.title, str(prepared.directory), prepared.env,
@@ -7119,7 +7164,7 @@ def _launch_prepared_agent(name: str, destination: NewTab | SplitPane | Existing
         outcome = _without_prompt_transport(opening, launched_at, failure)
     if (isinstance(outcome, AgentNotStarted) and outcome.state == "not_sent"
             and not isinstance(destination, ExistingPane)):
-        if isinstance(destination, NewTab):
+        if isinstance(destination, (NewTab, ForkTab)):
             close_agent(name, pane)
         else:
             _ = client.close_retained_pane(pane)
