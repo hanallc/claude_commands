@@ -461,7 +461,15 @@ window.fetch=(url,options)=>{
         self.assertIn(b'Open &lt;1&gt;', card)
         answered = change_page.answer_item(created.saved.key, 'The display is correct.', created.saved.reply_token, self.status)
         self.assertTrue(answered)
-        self.assertIn(created.key, {item.key for item in review_items.read_open(self.root)})
+        self.assertNotIn(created.key, {item.key for item in review_items.read_open(self.root)})
+        record = investigation.load(created.saved.owner, created.saved.id)
+        destination = record.list_destination
+        assert isinstance(destination, investigation.ListDestination)
+        row = the_list.load(destination.keeper, f"L{destination.number}")
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual((row.report.kind, row.report.evidence_key, row.report.words),
+                         (the_list.ReportKind.INVESTIGATION, created.key, request.words))
+        self.assertEqual(record.answer, 'The display is correct.')
 
     def test_bug_card_shows_captured_page_state_and_screenshot(self) -> None:
         import base64
@@ -7164,11 +7172,23 @@ window.fetch=async(url,options={})=>{
             request = replace(request, words='Keep this question too.')
         created = cache.create_submission(request)
         fresh = cache.get()
-        values = {
+        values: dict[str, object] = {
             'owner': owner.id, 'key': created.key, 'id': created.saved.id, 'kind': kind,
             'words': request.words, 'matches': matches_filters,
             'body': fresh.body(created.key).decode(), 'snapshot': cast(object, json.loads(fresh.index_response())),
         }
+        receipt: dict[str, object] = {'id': created.saved.id, 'key': created.key, 'version': fresh.version}
+        if kind in (new_item_dialog.SubmissionKind.INVESTIGATION, new_item_dialog.SubmissionKind.BUG):
+            row = review_actions.submission_report_row(created.saved)
+            assert isinstance(row, the_list.ListItem)
+            assert isinstance(row.report, the_list.ListReport)
+            self.assertEqual((row.report.kind, row.report.evidence_key, row.report.words), (
+                the_list.ReportKind.BUG if kind == new_item_dialog.SubmissionKind.BUG
+                else the_list.ReportKind.INVESTIGATION, created.key, request.words))
+            assert not isinstance(row.owner, the_list.UnassignedOwner)
+            receipt.update(list_number=row.number, list_owner=review_items.name(row.owner, created.members),
+                           list_producer=review_items.name(row.producer, created.members))
+        values['receipt'] = receipt
         setup = r'''<script>
 const fixture=FIXTURE, nativeFetch=fetch;
 let sent=false;
@@ -7181,7 +7201,7 @@ window.fetch=async(url,options={})=>{
   if(options.method==='POST'){
    if(JSON.parse(options.body).page_capture) return Response.json({});
    sent=true;
-   return Response.json({id:fixture.id,key:fixture.key,version:fixture.snapshot.version});
+   return Response.json(fixture.receipt);
   }
   return Response.json({token:'fixture',page_owner:fixture.owner,
    recipients:[{id:fixture.owner,name:'page-owner',proposal:true}]});
@@ -7222,6 +7242,12 @@ window.fetch=async(url,options={})=>{
   dialog.querySelector('[type="submit"]').click();
   const event=await created;
   check(!dialog.open && event.detail.id===fixture.id,'Send closes the dialog and reports the saved ID.');
+  const receipt=fixture.receipt;
+  if(receipt.list_number){
+   const text='List item '+receipt.list_number+'. Owner '+receipt.list_owner+'. Producer '+receipt.list_producer+'.';
+   check(window.top.document.querySelector('[data-report-receipt]')?.textContent===text,
+         'Send shows the saved List number, owner, and producer.');
+  }
   await refreshed;
   const row=review.querySelector('[data-key="'+CSS.escape(fixture.key)+'"]');
   check(Object.entries(selection).every(([key,value])=>params().get(key)===value),
@@ -7243,8 +7269,12 @@ window.fetch=async(url,options={})=>{
    }
   }else{
    check(!row && history.length===previous,'Send keeps a hidden item outside the view.');
-   check(review.querySelector('[data-review-notice]').textContent==='The current filters hide '+fixture.id+'.',
-         'Review explains why the saved item is hidden.');
+   const notice=review.querySelector('[data-review-notice]');
+   if(receipt.list_number)
+    check(notice.hidden,'Review leaves the List report outside its filters.');
+   else
+    check(notice.textContent==='The current filters hide '+fixture.id+'.',
+          'Review explains why the saved item is hidden.');
   }
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});

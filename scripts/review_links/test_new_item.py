@@ -184,6 +184,7 @@ class NewItemTests(ServerFixture):
         _ = staff_file.write_text(json.dumps({"schema": 1, "rows": [
             row.to_json() for row in staff.active(members, "producer")
         ]}))
+        _ = write_config_fixture(folder / "console.conf", f"page.list.owner={MORTY.id}\n")
         _ = (folder / "the_list.conf").write_text("# whole: 1..\nseries_run_limit=730\n")
         _ = (folder / "review_links.conf").write_text("review_attachments_root=review-attachments\n")
         self.map_row(NATEDEV, DWIGHT)

@@ -1267,9 +1267,9 @@ def _list_filing_producer(member: staff.StaffRow, members: staff.StaffSnapshot
 
 def _plan_list_filing(assignee: ListCommandAssignee | ListWindowAssignee, recipient: staff.StaffRow,
                       members: staff.StaffSnapshot) -> ListFilingRoute | ListFilingUnavailable:
-    keeper = producer_map.find_member("morty", members, ("producer",))
-    if isinstance(keeper, producer_map.UnknownMember) or keeper.name != "morty":
-        return ListFilingUnavailable("The List needs one active producer named morty.", assignee)
+    keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
+    if keeper is None:
+        return ListFilingUnavailable("The List has no active producer.", assignee)
     member = recipient
     source = "nate via New item"
     if isinstance(assignee, ListCommandAssignee):
@@ -1583,28 +1583,16 @@ def _available_page_owner(identity: staff.StaffId, members: staff.StaffSnapshot,
     return PageOwnerUnavailable()
 
 
-def _configured_list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
-    configured = settings.origin("page.list.owner", str)
-    if isinstance(configured, conf.UnavailableValue):
-        return PageOwnerUnavailable()
-    row = members.by_id(staff.StaffId(configured.value))
-    return row if row is not None and row.kind == "producer" else PageOwnerUnavailable()
-
-
 def list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
     """Find the active producer that owns the List."""
-    row = _configured_list_producer(settings, members)
-    if (isinstance(row, PageOwnerUnavailable) or row.id not in members.rows_by_id
-            or not _page_owner_is_active(row, members)):
-        return PageOwnerUnavailable()
-    return row
+    return record_store.list_keeper(settings, members) or PageOwnerUnavailable()
 
 
 def _send_recipient(address: SubmissionAddress, page: str, members: staff.StaffSnapshot,
                     choice: new_item_dialog.PageRecipient) -> staff.StaffRow:
     identity = address.recipient_id
     if choice == new_item_dialog.PageRecipient.LIST_OWNER:
-        configured = _configured_list_producer(conf.read_or_repository("console"), members)
+        configured = record_store.configured_list_producer(conf.read_or_repository("console"), members)
         if not isinstance(configured, staff.StaffRow) or configured.id != identity:
             raise SubmissionConflict("The List owner is unavailable. Open New item again.")
     elif choice in (new_item_dialog.PageRecipient.SELECTED, new_item_dialog.PageRecipient.PRODUCER):

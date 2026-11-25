@@ -11,6 +11,7 @@ from io import StringIO
 from typing import cast, final, override
 from unittest.mock import patch
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import goal, record_store, staff, the_list
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
 from scripts.production.test_the_list import copy_list_item
@@ -21,7 +22,10 @@ class GoalTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = self.enterContext(cast(AbstractContextManager[object], patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "state")})))
+        configuration = self.root / "config"
+        _ = self.enterContext(cast(AbstractContextManager[object], patch.dict(os.environ, {
+            "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "CONF_DIR": str(configuration)})))
+        _ = write_config_fixture(configuration / "console.conf", f"page.list.owner={self.keeper.id}\n")
 
     @cached_property
     def keeper(self) -> staff.StaffRow:
