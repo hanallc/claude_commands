@@ -74,7 +74,7 @@ class SshReservationTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         _ = set_up_fixture(self.addCleanup, self.fixture)
-        _ = write_config_fixture(self.fixture.root / "linux.conf", "offload=on\nslots=1\nslots.hana=1\n")
+        _ = write_config_fixture(self.fixture.root / "linux.conf", "offload=on\n")
 
     def reserve(self, pid: int) -> tuple[int, Path]:
         path = self.fixture.root / f"reservation-{pid}"

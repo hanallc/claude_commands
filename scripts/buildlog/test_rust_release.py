@@ -95,7 +95,7 @@ class RustReleaseTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         temporary = self.enterContext(tempfile.TemporaryDirectory())
-        private = private_slot_config(Path(temporary), repository="hana")
+        private = private_slot_config(Path(temporary))
         self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.root = Path(temporary) / "buildlog"
         self.scratch = Path(temporary) / "scratch"

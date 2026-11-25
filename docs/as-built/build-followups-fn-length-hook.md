@@ -182,7 +182,7 @@ Files: `scripts/hooks/pre-tool-use-tool-output-read.py`, `scripts/hooks/test_too
   Without either launcher, the notifier logs `run launcher unavailable: <name>; waiting after tick` and runs the job after it releases the tick lock.
   The job claims its slot and replaces `<instance>/run.log` with its command output.
   A `zselect` watchdog sends TERM at the timeout.
-  The job appends `run timeout` or `run exit <rc>` to `fire.log`.
+  The job appends `run result timeout` or `run result exit <rc>` to `fire.log`. Exit `0` records success.
   Other jobs run inside the tick.
 
 ### Production launch and wrap records
