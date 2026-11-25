@@ -5489,13 +5489,13 @@ class ReviewLinksServerTests(unittest.TestCase):
                 reply = self.request('/console/review.html'+query)
                 self.assertEqual(reply.status, 200)
                 self.assertEqual(reply.body, b'Review')
-                render.assert_called_once_with(show=show, kind='')
+                render.assert_called_once_with(show=show)
 
     def test_review_initial_html_falls_back_to_open_for_unavailable_show(self) -> None:
         snapshot = review_page.build_snapshot(self.review_fixture().root)
         with patch.object(review_page.ReviewSnapshotCache, 'get', return_value=snapshot):
-            for kind in ('', 'investigations', *review_page.TYPES):
-                show = 'Validating' if kind in review_page.SHOWS_BY_TYPE else 'Closed'
+            for kind, show in (('', 'Closed'), ('', 'Waiting'), ('change', 'Validating'),
+                               ('investigations', 'Waiting'), ('response', 'Validating'), ('for-you', 'Validating')):
                 with self.subTest(kind=kind, show=show):
                     query = urlencode({'state': show, 'type': kind})
                     reply = self.request(review_page.PAGE_PATH+'?'+query)
@@ -5516,8 +5516,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                 staff,'snapshot',side_effect=AssertionError('A GET read staff.')):
             waiting = self.request(review_page.PAGE_PATH+'?state=Waiting')
             self.assertEqual(waiting.status, 200)
-            self.assertIn(b'data-show="Waiting"', waiting.body)
-            self.assertIn(b'data-filter-value="Waiting" aria-pressed="true"', waiting.body)
+            self.assertIn(b'data-show="open"', waiting.body)
+            self.assertIn(b'data-filter-value="open" aria-pressed="true"', waiting.body)
             version=self.request(review_page.PAGE_PATH+'?version=1')
             self.assertEqual(version.status,200)
             self.assertEqual(json.loads(version.body)['version'],snapshot.version)
