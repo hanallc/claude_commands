@@ -1,6 +1,7 @@
 """Test image registration, the Images page, deletes and feedback in private folders."""
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -9,16 +10,15 @@ import subprocess
 import tempfile
 import threading
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
-from itertools import permutations
 from pathlib import Path
-from typing import ClassVar, cast, override
+from typing import ClassVar, Literal, cast, override
 from unittest.mock import call, patch
 from urllib.parse import parse_qs, urlencode
 
@@ -29,11 +29,11 @@ from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
-from scripts.production import delivery_state, staff, unrouted_alert
+from scripts.production import delivery_state, staff, the_list, unrouted_alert
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import change_page, console, image_store, images, list_page, page_frame, serve
-from scripts.review_links import question_record
+from scripts.review_links import question_record, send_hold
 from scripts.review_links.server_test_support import started_review_server
 
 SEND_MESSAGE = change_page.send_message
@@ -58,7 +58,8 @@ class ImagesFixture(unittest.TestCase):
             "page.images.url=python:scripts.review_links.images:page_url\n"
             + "page.images.items=python:scripts.review_links.images:waiting_images\n")
         settings = configuration / "review_links.conf"
-        _ = write_config_fixture(settings, "delivery_pause_seconds=0\ndelivery_tries=3\nserver_port=8765\n")
+        _ = write_config_fixture(
+            settings, "delivery_pause_seconds=0\ndelivery_tries=3\nserver_port=8765\nmax_chars.image_title=80\n")
         self.root = self.temporary / "snapshots"
         self.status = change_page.DeliveryStatus(self.root)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
@@ -74,7 +75,8 @@ class ImagesFixture(unittest.TestCase):
 
     def submit(self, body: str) -> None:
         delivery = images.submit(self.root, body, self.status)
-        change_page.deliver(delivery, self.status)
+        if not isinstance(delivery, images.ImageAnswerSent):
+            change_page.deliver(delivery, self.status)
 
     def capture(self, recipient: str, sender: str, message: str, **_delivery: str) -> None:
         self.sent.append((recipient, sender, message))
@@ -90,8 +92,17 @@ class ImagesFixture(unittest.TestCase):
         assert self.owner is not None
         return self.owner.id
 
-    def register(self, caption: str = "The nav shows Images. Look at the left column.") -> image_store.ImageRecord:
-        return images.register(self.shot, caption, self.owner_id(), "Phase console-images")
+    def register(self, title: str = "The Images navigation",
+                 *, look_for: tuple[str, ...] = ()) -> image_store.ImageRecord:
+        return images.register(self.shot, title, self.owner_id(), "Phase console-images", look_for=look_for)
+
+    def list_item(self) -> tuple[staff.StaffRow, staff.StaffRow, the_list.ListItem]:
+        self.enterContext(patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.temporary / "state")}))
+        keeper = fixture_member("producer", name="morty")
+        producer = fixture_member("producer", name="shot-producer")
+        item = the_list.add(keeper.id, "Check the picture", owner=keeper.id, source="nate",
+                            changes={"producer": producer.id, "state": the_list.ItemState.WAITING_FOR_NATE})
+        return keeper, producer, item
 
     def run_firefox(self, handler: type[BaseHTTPRequestHandler], name: str, *, timeout: int = 45,
                     release: Callable[[], None] = lambda: None) -> None:
@@ -207,10 +218,51 @@ class ChangeImageTests(ImagesFixture):
 
 
 class ImagesTests(ImagesFixture):
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_selecting_an_image_at_viewport_top_clears_the_frozen_header(self) -> None:
+        _ = self.register()
+        owner = self.owner
+        assert owner is not None
+        page = page_frame.with_owner(images.render(self.status), "images", owner,
+                                     staff.StaffSnapshot((owner,)), lambda: "")
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ try{
+  frameElement.style.width='1024px';
+  frameElement.style.height='800px';
+  const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  document.querySelector('[data-image-layout]').style.minHeight='2400px';
+  const target=document.querySelector('[data-images] article');
+  const header=document.querySelector('.page-top');
+  await painted();
+  scrollTo({top:target.getBoundingClientRect().top+scrollY,behavior:'instant'});
+  await painted();
+  if(Math.abs(target.getBoundingClientRect().top)>=1 || header.getBoundingClientRect().bottom<30 ||
+     matchMedia('(prefers-reduced-motion: reduce)').matches){
+   throw new Error('The image must start at viewport y=0 under the header with motion enabled.');
+  }
+  const moved=new Promise(resolve=>{
+   const done=()=>{clearTimeout(timer);removeEventListener('scrollend',done);resolve();};
+   const timer=setTimeout(done,1500);
+   addEventListener('scrollend',done,{once:true});
+  });
+  document.querySelector('[data-image-groups] a').click();
+  await moved;
+  await painted();
+  const gap=target.getBoundingClientRect().top-header.getBoundingClientRect().bottom;
+  if(gap< -1 || gap>5) failures.push('The selected image must clear the header. Gap: '+gap+' px.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+
     def test_staff_image_owners_have_role_colors_and_unknown_owners_stay_plain(self) -> None:
+        _ = (self.temporary / "config/statusline.conf").write_text("role.unit-director=#ffaf02\n")
         record = self.register()
         body = images.render(self.status).decode()
         self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>shot-owner</span>')
+        self.assertRegex(body, r'\(<span[^>]*data-color-text="role.unit-director" style="color:#ffaf02">unit</span>\)</dd>')
         unknown = record.copy()
         unknown["owner"] = "missing-owner"
         self.assertIn('Unknown session: missing-owner</dd>', images.card(unknown, "private", staff.snapshot(), 2))
@@ -231,22 +283,41 @@ class ImagesTests(ImagesFixture):
     def test_register_refuses_bad_input_and_leaves_no_folder(self) -> None:
         text = self.temporary / "notes.txt"
         _ = text.write_text("not an image")
-        cases = ((text, "caption", self.owner_id(), "use one of"),
-                 (self.temporary / "absent.png", "caption", self.owner_id(), "no such image file"),
-                 (self.shot, "  ", self.owner_id(), "the caption is empty"),
-                 (self.shot, "caption", staff.StaffId("absent-owner"), "no staff record"))
-        for image, caption, owner, reason in cases:
+        cases = ((text, "Cards", self.owner_id(), "use one of"),
+                 (self.temporary / "absent.png", "Cards", self.owner_id(), "no such image file"),
+                 (self.shot, "  ", self.owner_id(), "one nonempty line"),
+                 (self.shot, "Cards\nPanel", self.owner_id(), "one nonempty line"),
+                 (self.shot, "Cards", staff.StaffId("absent-owner"), "no staff record"))
+        for image, title, owner, reason in cases:
             with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
-                _ = images.register(image, caption, owner, "Change sdlc/C1")
+                _ = images.register(image, title, owner, "Change sdlc/C1")
+        with self.assertRaisesRegex(ValueError, "Each --look-for value must be one nonempty line."):
+            _ = self.register(look_for=("First line\nSecond line",))
         self.assertEqual(list((self.root / image_store.IMAGES_FOLDER).glob("*")) if (self.root / image_store.IMAGES_FOLDER).exists() else [], [])
 
-    def test_command_prints_the_image_and_console_links_and_deletes(self) -> None:
+    def test_register_reports_the_limit_and_length_of_a_long_title(self) -> None:
+        errors = StringIO()
+        with redirect_stderr(errors):
+            code = images.main(["register", "--image", str(self.shot), "--title", "A" * 81,
+                                "--owner", self.owner_id(), "--phase", "image-card"])
+        self.assertEqual(code, 1)
+        self.assertEqual(errors.getvalue(),
+                         "images: --title has 81 characters. The limit is 80. Put the details in --look-for lines.\n")
+        self.assertFalse(images.images_root(self.root).exists())
+
+    def test_command_stores_the_title_and_look_for_lines_prints_links_and_deletes(self) -> None:
         output = StringIO()
         with redirect_stdout(output):
-            code = images.main(["register", "--image", str(self.shot), "--caption", "Look at the cards",
+            code = images.main(["register", "--image", str(self.shot), "--title", "List cards",
+                                "--look-for", "The count above the table", "--look-for", " The owner label ",
                                 "--owner", self.owner_id(), "--change", "sdlc/C9"])
         self.assertEqual(code, 0)
         record = images.records(self.root)[0]
+        stored = cast(dict[str, object], json.loads(
+            (images.images_root(self.root) / record["id"] / image_store.RECORD).read_text()))
+        self.assertEqual(stored["title"], "List cards")
+        self.assertEqual(stored["look_for"], ["The count above the table", "The owner label"])
+        self.assertEqual(stored["caption"], "List cards\nLook for:\n- The count above the table\n- The owner label")
         self.assertEqual(record["subject"], "Change sdlc/C9")
         self.assertEqual(output.getvalue().splitlines(), [
             f"registered {record['id']}: http://127.0.0.1:8765/images/{record['id']}/image.png",
@@ -294,8 +365,9 @@ class ImagesTests(ImagesFixture):
         self.assertNotIn('image-window', source)
         self.assertNotIn("start.get('show')", source)
         self.assertIn("card.remove();", source)
-        self.assertIn("home.insertBefore(card, next?.parentNode === home ? next : null);", source)
-        self.assertIn("status.textContent = undone ? error.message : 'Not sent: ' + error.message;", source)
+        self.assertIn("await motion.removeCard(card, apply);", source)
+        self.assertIn("const undone = error instanceof SendUndone;", source)
+        self.assertIn("showActionFailure(status, message);", source)
         self.assertIn("new FormData(form, event.submitter)", source)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
@@ -373,6 +445,10 @@ class ImagesTests(ImagesFixture):
   check(list() !== previous, action + ' refreshes the cards after the POST');
   check(!form.isConnected, action + ' replaces the old form');
   check(list().querySelector('article')?.id === card.id, action + ' shows the card that the server kept');
+  if (words !== 'Please retry.') {
+   const status = list().querySelector('[data-image-status]');
+   check(status.hidden && !status.textContent, action + ' leaves no action status.');
+  }
  }
  const restored = list().querySelector('form');
  check(restored.elements.feedback.value === 'Please retry.', 'failed feedback keeps its draft');
@@ -414,8 +490,13 @@ class ImagesTests(ImagesFixture):
  const departingForm = previous.querySelector('form');
  const feedbackButton = departingForm.querySelector('button[value="feedback"]');
  submitFeedback('Routine feedback.');
- const fade = departingForm.closest('article').getAnimations()[0];
- if (!fade) throw new Error('The card must fade after feedback.');
+ const departingCard = departingForm.closest('article');
+ let fade;
+ for (let step = 0; step < 100 && !fade; step++) {
+  fade = departingCard.getAnimations()[0];
+  if (!fade) await wait(5);
+ }
+ if (!fade) throw new Error('The card must fade after the server confirms feedback.');
  fade.pause();
  fade.currentTime = fade.effect.getTiming().duration / 2;
  check([...departingForm.querySelectorAll('button')].every(button => button.disabled),
@@ -540,6 +621,8 @@ class ImagesTests(ImagesFixture):
  };
  window.fetch = async (path, options = {}) => {
   if (String(path).endsWith('/undo')) return Response.json({outcome: 'undone'});
+  if (String(path).startsWith('/send-hold/'))
+   return Response.json({reason: 'The image send failed.'}, {status: 503});
   if (options.method !== 'POST') return new Promise(() => {});
   posts.push(new URLSearchParams(options.body));
   return Response.json({hold: 'a'.repeat(24), seconds: 30}, {status: 202, headers: {'X-Send-Hold': 'held'}});
@@ -547,14 +630,16 @@ class ImagesTests(ImagesFixture):
  try {
   const card = document.querySelector('[data-images] article'), form = card.querySelector('form');
   const status = form.querySelector('[data-image-status]');
+  const group = () => document.querySelector('[data-image-groups] a[href="#' + card.id + '"]');
   form.elements.feedback.value = 'Too dark.';
   const view = host.defaultView;
   check(view.innerWidth === 390 && view.matchMedia('(prefers-color-scheme: dark)').matches,
         'The browser uses the phone width and dark theme.');
-  for (const action of ['feedback', 'approved']) {
+  for (const action of ['feedback', 'approved', 'question']) {
    form.requestSubmit(form.querySelector('button[value="' + action + '"]'));
    await until(() => host.querySelector('[data-send-undo] button'), 'The Undo toast did not show.');
    const toast = host.querySelector('[data-send-undo]'), text = toast.querySelector('span');
+   check(!card.getClientRects().length && !group(), 'The card and its group leave when the toast appears.');
    const button = toast.querySelector('button'), box = toast.getBoundingClientRect();
    check(text.textContent === 'Sent to ' + __RECEIVER__ + '.' && button.textContent === 'Undo',
          'The toast names the image owner and offers Undo.');
@@ -568,8 +653,16 @@ class ImagesTests(ImagesFixture):
    button.click();
    await until(() => status.textContent === 'Undone. Edit and send again.', 'The card did not say Undone.');
    check(card.isConnected && form.elements.feedback.value === 'Too dark.', 'After Undo the card returns with its words.');
+   check(card.getClientRects().length && group() && document.activeElement === form.elements.feedback,
+         'Undo shows the card and focuses its feedback field.');
   }
-  check(posts.map(post => post.get('action')).join(',') === 'feedback,approved', 'Undo sends nothing more.');
+  check(posts.map(post => post.get('action')).join(',') === 'feedback,approved,question', 'Undo sends nothing more.');
+  form.requestSubmit(form.querySelector('[value="question"]'));
+  await until(() => host.querySelector('[data-send-undo] button'), 'The next Undo toast did not show.');
+  host.querySelector('[data-send-undo]').getAnimations()[0].finish();
+  await until(() => status.textContent === 'Not sent: The image send failed.', 'The card did not show the failure.');
+  check(card.getClientRects().length && group() && form.elements.feedback.value === 'Too dark.',
+        'A failed send restores the card, its group and its words.');
  } catch (error) {
   failures.push(String(error));
  }
@@ -581,8 +674,8 @@ class ImagesTests(ImagesFixture):
         page = page.replace("</body>", probe.replace("__RECEIVER__", json.dumps(name)) + "</body>")
         self.assertEqual(firefox_probe_results(page.encode(), window_size=(390, 860), dark=True), [[]])
 
-    def test_card_shows_the_caption_details_image_feedback_field_and_the_answer_buttons(self) -> None:
-        record = self.register("Look at <the> cards")
+    def test_card_shows_the_title_look_for_details_image_and_actions(self) -> None:
+        record = self.register("Look at <the> cards", look_for=("Check <the> count.", "Look for a gap."))
         record["registered_at"] = "2026-11-15T03:09:00+00:00"
         image_store.write_record(self.root / image_store.IMAGES_FOLDER / record["id"], record)
         card = images.card(record, "token", staff.snapshot(), 3)
@@ -591,7 +684,9 @@ class ImagesTests(ImagesFixture):
         self.assertEqual(without_role_colors(card), (
             f'<article id="image-{record['id']}" data-image="{record['id']}"'
             + f' data-owner="{record['owner']}" data-owner-name="shot-owner" data-send-receiver="shot-owner">'
-            + '<h2 class="caption">Look at &lt;the&gt; cards</h2><dl class="image-details">'
+            + '<h2 class="image-title">Look at &lt;the&gt; cards</h2>'
+            + '<ul class="image-look-for"><li>Check &lt;the&gt; count.</li><li>Look for a gap.</li></ul>'
+            + '<dl class="image-details">'
             + '<dt>Owner:</dt><dd>shot-owner (unit)</dd><dt>For  :</dt><dd>Phase console-images</dd>'
             + '<dt>Added:</dt><dd><time datetime="2026-11-15T03:09:00+00:00">Nov 14, 2026, 22:09</time></dd></dl>'
             + f'<a data-image-zoom href="{path}" target="_blank" rel="noopener"><img src="{path}" alt="Look at &lt;the&gt; cards" loading="lazy"></a>'
@@ -599,13 +694,13 @@ class ImagesTests(ImagesFixture):
             + f'<input type="hidden" name="token" value="{token}">'
             + f'<input type="hidden" name="feedback_round" value="{images.feedback_round(set())}">'
             + f'<label for="feedback-{record['id']}">Feedback</label>'
-            + f'<textarea id="feedback-{record['id']}" name="feedback" rows="3"></textarea>'
+            + f'<textarea id="feedback-{record['id']}" name="feedback" rows="3" autocomplete="off"></textarea>'
             + '<div class="review-actions"><div class="review-action-group"><span>Closes the item</span><div>'
             + '<button type="submit" name="action" value="approved">Approved</button>'
             + '<button type="submit" name="action" value="feedback">Send Feedback</button>'
             + '</div></div><div class="review-action-group"><span>The item returns to you</span><div>'
             + '<button type="submit" name="action" value="question">Ask question</button></div></div></div>'
-            + '<span role="status" data-image-status></span></form></article>'))
+            + '<span role="status" data-image-status hidden></span></form></article>'))
         with patch.dict(os.environ, {"USER_ZONE": "Europe/Berlin"}):
             self.assertIn(">Nov 15, 2026, 04:09<", images.card(record, "token", staff.snapshot(), 3))
 
@@ -643,6 +738,63 @@ class ImagesTests(ImagesFixture):
         self.assertIn('<button type="submit" name="action" value="approved">Approved</button>', page)
         self.assertNotIn('value="delete"', page)
 
+    def add_legacy_caption(self) -> str:
+        record = self.register()
+        path = images.images_root(self.root) / record["id"] / image_store.RECORD
+        stored = cast(dict[str, object], json.loads(path.read_text()))
+        _ = stored.pop("title")
+        _ = stored.pop("look_for")
+        caption = "Check <the> cards. " * 12 + "\nThe last line stays visible."
+        stored["caption"] = caption
+        _ = path.write_text(json.dumps(stored))
+        return caption
+
+    def test_an_old_caption_only_record_shows_the_full_title(self) -> None:
+        caption = self.add_legacy_caption()
+        page = images.render(self.status).decode()
+        self.assertIn('<h2 class="image-title">' + html.escape(caption) + '</h2>', page)
+        self.assertNotIn('<ul class="image-look-for">', page)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_shows_the_title_at_the_limit_and_wraps_long_text_in_dark_mode(self) -> None:
+        title = "W" * 80
+        _ = self.register(title, look_for=("Check the spacing above each button.",))
+        _ = self.add_legacy_caption()
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ try{
+  document.documentElement.dataset.theme='dark';
+  frameElement.style.width='1382px';
+  await painted();
+  const points=document.querySelector('.image-look-for');
+  const title=points.closest('article').querySelector('.image-title');
+  const legacy=[...document.querySelectorAll('.image-title')].find(heading=>heading!==title);
+  const style=getComputedStyle(title);
+  check(innerWidth===1382 && title.textContent==='W'.repeat(80) &&
+        title.scrollWidth===title.clientWidth && title.scrollHeight===title.clientHeight &&
+        title.getBoundingClientRect().height>1.5*parseFloat(style.lineHeight),
+        'The full title wraps at 1382 px.');
+  check(style.fontWeight==='400' && getComputedStyle(legacy).fontWeight==='400' && style.fontSize==='17px',
+        'Both titles use normal weight and the List font size.');
+  check(style.color==='rgb(240, 239, 236)' && getComputedStyle(points).color==='rgb(195, 194, 183)',
+        'The dark theme uses secondary text for the bullet list.');
+  check(legacy.getBoundingClientRect().height>2*parseFloat(style.lineHeight),
+        'The legacy title wraps in the card.');
+  frameElement.style.width='390px';
+  await painted();
+  const root=document.documentElement;
+  check(innerWidth===390 && root.scrollWidth===root.clientWidth &&
+        title.getBoundingClientRect().height>1.5*parseFloat(style.lineHeight) && title.scrollWidth===title.clientWidth,
+        'The phone title wraps without horizontal overflow.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        page = images.render(self.status)
+        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+
     def feedback_body(self, record: image_store.ImageRecord, feedback: str, action: str = "feedback") -> str:
         token = images.request_token(images.console_token(self.root), record["id"])
         return urlencode({"image": record["id"], "token": token, "feedback": feedback, "action": action})
@@ -660,11 +812,373 @@ class ImagesTests(ImagesFixture):
                 self.assertEqual([message for _, _, message in self.sent], ["\n".join((
                     f"From the user (via the Images page): {first}", *lines,
                     f"Image: http://127.0.0.1:8765/images/{record['id']}/image.png",
-                    "Caption: After: the panel.", "For: Phase console-images",
+                    "Title: After: the panel.", "For: Phase console-images",
                     "After you act on it, delete the image: "
                     + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))])
                 self.assertIn("feedback_at", image_store.read_record(self.root / image_store.IMAGES_FOLDER / record["id"]))
                 self.assertNotIn(record["id"], images.render(self.status).decode())
+
+    def test_linked_answers_save_before_delivery_and_survive_owner_delete(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.temporary / "state")}))
+        morty = fixture_member("producer", name="morty")
+        producer = fixture_member("producer", name="shot-producer")
+        owner = self.owner
+        assert owner is not None
+        for action, subject in (("approved", "--phase"), ("feedback", "--change")):
+            with self.subTest(action=action):
+                item = the_list.add(morty.id, "Check the picture", owner=morty.id, source="nate",
+                                    changes={"producer": producer.id, "state": the_list.ItemState.DELIVERED})
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    self.assertEqual(images.main(["register", "--image", str(self.shot), "--title", "Check the rows",
+                        "--look-for", "Keep the second row.", "--owner", self.owner_id(), subject, "test/C1", "--list-item", item.id]), 0)
+                record, = images.records(self.root)
+                self.assertEqual(record.get("list_item"), item.id)
+                page = images.render(self.status).decode()
+                self.assertIn('<h2 class="image-title">Check the rows</h2>'
+                              + '<ul class="image-look-for"><li>Keep the second row.</li></ul>', page)
+                words = "Check the two rows.\nKeep this text."
+                received: list[tuple[str, str]] = []
+                producer_online = action == "approved"
+
+                def receive(recipient: str, _sender: str, message: str, *, key: str,
+                            recipient_key: str) -> Literal["skipped"] | None:
+                    saved = the_list.load(morty.id, item.id)
+                    self.assertIs(saved.state, the_list.ItemState.DELIVERED if action == "approved"
+                                  else the_list.ItemState.WORKING)
+                    self.assertTrue(any(isinstance(entry.what, str) and words in entry.what for entry in saved.log))
+                    self.assertIn(words, message)
+                    self.assertIn(f"List item: {item.id}", message)
+                    self.assertIn("Title: Check the rows\nLook for:\n- Keep the second row.", message)
+                    if recipient_key == producer.id and not producer_online:
+                        raise RuntimeError("producer offline")
+                    if (recipient_key, key) in received:
+                        return "skipped"
+                    received.append((recipient_key, key))
+                    if action == "approved" and recipient == f"session:{owner.current_session}":
+                        images.delete(self.root, record["id"])
+                    return None
+
+                body = self.feedback_body(record, words, action)
+                with patch.object(change_page, "send_message", side_effect=receive):
+                    if action == "feedback":
+                        with self.assertRaisesRegex(images.AnswerNotSent, "producer offline"):
+                            self.submit(body)
+                        saved = the_list.load(morty.id, item.id)
+                        producer_online = True
+                        self.submit(body)
+                        self.assertEqual(the_list.load(morty.id, item.id), saved)
+                        images.delete(self.root, record["id"])
+                    else:
+                        self.submit(body)
+                self.assertEqual([target for target, _ in received], [owner.id, producer.id])
+                self.assertEqual(len({key for _, key in received}), 1)
+                self.assertEqual(images.records(self.root), [])
+                saved = the_list.load(morty.id, item.id)
+                self.assertTrue(any(isinstance(entry.what, str) and words in entry.what for entry in saved.log))
+
+    def test_registration_saves_the_legacy_list_keeper(self) -> None:
+        keeper, producer, item = self.list_item()
+        legacy = staff.StaffId("legacy-list")
+        the_list.folder(legacy).parent.mkdir()
+        _ = the_list.folder(keeper.id).rename(the_list.folder(legacy))
+        record = images.register(self.shot, "Check", self.owner_id(), "Phase check", list_item=item.id)
+        self.assertEqual(record.get("list_keeper"), legacy)
+        self.submit(self.feedback_body(record, "Check the width."))
+        self.assertIs(the_list.load(legacy, item.id).state, the_list.ItemState.WORKING)
+        self.assertEqual(self.sent[-1][0], f"session:{producer.current_session}")
+
+    def test_deleted_picture_keeps_the_pending_producer_send(self) -> None:
+        keeper, producer, item = self.list_item()
+        record = images.register(self.shot, "Check", self.owner_id(), "Phase check", list_item=item.id)
+        calls: list[tuple[str, str]] = []
+        online = False
+
+        def send(_recipient: str, _sender: str, message: str, *, key: str, recipient_key: str) -> None:
+            calls.append((recipient_key, key))
+            self.assertIn("Keep these words.", message)
+            if recipient_key == self.owner_id():
+                images.delete(self.root, record["id"])
+            elif not online:
+                raise RuntimeError("producer offline")
+
+        body = self.feedback_body(record, "Keep these words.")
+        with patch.object(change_page, "send_message", side_effect=send):
+            with self.assertRaisesRegex(images.AnswerNotSent, "producer offline"):
+                self.submit(body)
+            online = True
+            self.submit(body)
+            self.submit(body)
+        self.assertEqual([recipient for recipient, _ in calls], [self.owner_id(), *([producer.id] * 4)])
+        self.assertEqual(len({key for _, key in calls}), 1)
+        saved = the_list.load(keeper.id, item.id)
+        self.assertEqual(sum(isinstance(entry.what, str) and "Keep these words." in entry.what
+                             for entry in saved.log), 1)
+
+    def test_unconfirmed_producer_leaves_the_card_and_retry_sends_only_to_the_producer(self) -> None:
+        _, producer, item = self.list_item()
+        record = images.register(self.shot, "Check", self.owner_id(), "Phase check", list_item=item.id)
+        online = False
+        calls: list[tuple[str, str]] = []
+
+        def send(_recipient: str, _sender: str, _message: str, *, key: str,
+                 recipient_key: str) -> Literal["pending"] | None:
+            calls.append((recipient_key, key))
+            return "pending" if recipient_key == producer.id and not online else None
+
+        body = self.feedback_body(record, "Keep it visible until delivery.")
+        with patch.object(change_page, "send_message", side_effect=send):
+            with self.assertRaisesRegex(images.AnswerNotSent, "has not confirmed"):
+                self.submit(body)
+            self.assertIn(record["id"], images.render(self.status).decode())
+            online = True
+            self.submit(body)
+        self.assertEqual([recipient for recipient, _ in calls], [self.owner_id(), *([producer.id] * 4)])
+        self.assertEqual(len({key for _, key in calls}), 1)
+        self.assertNotIn(record["id"], images.render(self.status).decode())
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
+    def test_browser_keeps_words_for_a_removed_picture_until_send_succeeds(self) -> None:
+        record = self.register()
+        page = images.render(self.status)
+        images.delete(self.root, record["id"])
+        fresh = json.dumps(images.render(self.status).decode()).replace("<", r"\u003c")
+        setup = r"""<script>
+const realFetch = window.fetch.bind(window), posts = [];
+let release;
+window.fetch = async (url, options) => {
+  if (url === location.pathname) {
+    if (options.method === 'POST') {
+      posts.push(options.body.toString());
+      if (posts.length === 1) {
+        await new Promise(resolve => { release = resolve; });
+        return new Response(JSON.stringify({reason:'The producer is offline.'}), {status:503});
+      }
+      return new Response(JSON.stringify({notice:'This picture was removed; your words went to shot-owner.'}));
+    }
+    return new Response(FRESH);
+  }
+  return realFetch(url, options);
+};
+</script>""".replace("FRESH", fresh)
+        probe = r"""<script>
+(async () => {
+ const failures = [], check = (result, text) => { if (!result) failures.push(text); };
+ const form = () => document.querySelector('[data-image-form]');
+ const find = selector => document.querySelector(selector);
+ const until = async (label, condition) => {
+   for (let count = 0; count < 50; count++){
+     if (condition()) return;
+     await new Promise(resolve => setTimeout(resolve, 50));
+   }
+   throw Error(label);
+ };
+ const words = 'Keep the width.\nUse a darker border.';
+ try {
+   form().elements.feedback.value = words;
+   form().querySelector('[value=feedback]').click();
+   await until('The first send starts.', () => release);
+   check(!!form()?.getClientRects().length, 'The card stays visible until the send is confirmed.');
+   release();
+   const original = form();
+   await until('The refresh keeps the removed picture form.',
+     () => form() && form() !== original && find('[data-image-status]').textContent.includes('offline'));
+   check(form().elements.feedback.value === words, 'The refresh keeps the words.');
+   form().querySelector('[value=feedback]').click();
+   await until('The confirmed send removes the form.', () => !form());
+   check(posts.length === 2 && posts[0] === posts[1], 'The retry submits the same request.');
+   check(find('[data-image-notice]').textContent === 'This picture was removed; your words went to shot-owner.'
+     && !find('[data-image-notice]').hidden, 'The page names the recipient after success.');
+ } catch(error) { failures.push(String(error)); }
+ await realFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+})();</script>"""
+        markup = page.replace(b"<head>", b"<head>" + setup.encode()).replace(b"</body>", probe.encode() + b"</body>")
+        self.assertEqual(firefox_probe_results(markup), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
+    def test_script_reload_restores_each_draft_and_clears_only_the_sent_draft(self) -> None:
+        first, second = self.register("First shot"), self.register("Second shot")
+        page = images.render(self.status).decode()
+        fresh = json.dumps(page).replace("<", r"\u003c")
+        probe = r"""<script>
+(async () => {
+ const phase = sessionStorage.getItem('probe-phase');
+ const first = document.querySelector('#feedback-FIRST'), second = document.querySelector('#feedback-SECOND');
+ const firstWords = 'Keep the title.\nUse a darker border.', secondWords = 'Keep the second draft.';
+ const failures = [], check = (ok, text) => { if (!ok) failures.push(text); };
+ const realFetch = window.fetch.bind(window);
+ const fresh = FRESH;
+ const update = () => document.dispatchEvent(new Event('visibilitychange'));
+ const version = document.querySelector('[data-images]').dataset.script;
+ window.fetch = async (url, options) => {
+   if (url !== location.pathname) return realFetch(url, options);
+   if (options?.method === 'POST') return new Response('{"state":"done"}');
+   return new Response(phase === 'sending' ? fresh : fresh.replace(
+     'data-script="' + version + '"', 'data-script="new-script"'));
+ };
+ if (!phase) {
+   first.value = firstWords;
+   second.value = secondWords;
+   sessionStorage.setItem('probe-phase', 'sending');
+   update();
+   return;
+ }
+ if (phase === 'sending') {
+   check(first.value === firstWords, 'The first draft survives the script reload.');
+   check(second?.value === secondWords, 'The second draft survives when its picture is gone.');
+   if (failures.length) {
+     await realFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+     return;
+   }
+   const form = first.form;
+   const before = document.querySelector('[data-images]');
+   form.requestSubmit(form.querySelector('button[value=feedback]'));
+   for (let count = 0; count < 60 && document.querySelector('[data-images]') === before; count++) {
+     await new Promise(resolve => setTimeout(resolve, 50));
+   }
+   sessionStorage.setItem('probe-phase', 'sent');
+   location.reload();
+   return;
+ }
+ check(first.value === '', 'The confirmed draft stays clear after reload.');
+ check(second?.value === secondWords, 'The second draft remains after the send.');
+ await realFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+})();</script>""".replace("FIRST", first["id"]).replace("SECOND", second["id"]).replace("FRESH", fresh)
+        remove_picture = ("""<script>
+if (sessionStorage.getItem('probe-phase')) document.querySelector('#image-SECOND').remove();
+</script>""").replace("SECOND", second["id"])
+        markup = page.replace(f"<script>{images.SCRIPT}", remove_picture + f"<script>{images.SCRIPT}")
+        self.assertEqual(firefox_probe_results(markup.replace("</body>", probe + "</body>").encode()), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
+    def test_picture_guard_blocks_both_submit_orders_and_keeps_each_error(self) -> None:
+        removed, other = self.register("Removed shot"), self.register("Other shot")
+        identity = removed["id"]
+        round_id = images.feedback_round(set())
+        images.delete(self.root, identity)
+        with patch.object(change_page, "send_message", side_effect=RuntimeError("owner offline")):
+            for words in ("Keep the title.", "Keep the caption."):
+                with self.assertRaises(images.AnswerNotSent):
+                    self.submit(self.feedback_body(removed, words) + f"&feedback_round={round_id}")
+        page = images.render(self.status).decode()
+        fresh = json.dumps(page).replace("<", r"\u003c")
+        token = images.request_token(images.console_token(self.root), identity)
+        drafts = [[identity, {"words": "Keep the title.", "token": token, "round": round_id,
+                              "retryAction": "feedback", "retryRound": round_id}]]
+        seed = """<script>
+sessionStorage.setItem('images.answer-drafts:' + location.pathname, JSON.stringify(DRAFTS));
+</script>""".replace("DRAFTS", json.dumps(drafts))
+        probe = r"""<script>
+(async () => {
+ const failures = [], check = (ok, message) => { if (!ok) failures.push(message); };
+ const realFetch = window.fetch.bind(window), posts = [];
+ const draft = id => document.getElementById('feedback-' + id);
+ const edit = () => draft('REMOVED').form;
+ const retries = () => [...document.querySelectorAll('button[value=retry]')];
+ const retry = () => retries().find(button => button.closest('article').textContent.includes('Keep the title.'));
+ const status = form => form.querySelector('[data-image-status]').textContent;
+ const say = (ok, reason) => new Response(JSON.stringify(ok ? {draft_confirmed: true} : {reason}),
+                                            {status: ok ? 200 : 503});
+ const submit = button => button.form.dispatchEvent(new SubmitEvent('submit', {
+   bubbles:true, cancelable:true, submitter:button
+ }));
+ const until = async (message, ready) => {
+   for (let step = 0; step < 65; step++) {
+     if (ready()) return;
+     await new Promise(resolve => setTimeout(resolve, 30));
+   }
+   throw new Error(message);
+ };
+ const list = () => document.querySelector('[data-images]');
+ const refresh = async () => {
+   const previous = list();
+   document.dispatchEvent(new Event('visibilitychange'));
+   await until('The refresh replaces the list.', () => list() !== previous);
+ };
+ window.fetch = (url, options) => {
+   if (url !== location.pathname) return realFetch(url, options);
+   if (options?.method !== 'POST') return Promise.resolve(new Response(FRESH));
+   return new Promise(resolve => posts.push({body: options.body, resolve}));
+ };
+ const rejectAll = () => posts.forEach(post => post.resolve(say(false,
+   post.body.get('action') === 'retry' ? 'Retry failed.' : 'Approval failed.')));
+ const sameButtons = () => [...edit().querySelectorAll('button'), ...retries()];
+ const otherForm = () => draft('OTHER').form;
+ const approved = () => edit().querySelector('button[value=approved]');
+ try {
+   submit(retry());
+   check(sameButtons().every(button => button.disabled), 'Retry disables every submit for its picture.');
+   submit(approved());
+   check(posts.length === 1, 'Retry blocks a second submit in code.');
+   const other = otherForm().querySelector('button[value=question]');
+   check(!other.disabled, 'Another picture can still submit.');
+   draft('OTHER').value = 'Which check passed?';
+   submit(other);
+   check(posts.some(post => post.body.get('image') === 'OTHER'), 'Another picture starts a request.');
+   const before = list();
+   rejectAll();
+   await until('The other request refreshes the list.', () => before !== list());
+   check(status(retry().form) === 'Not sent: Retry failed.', 'The refresh keeps the Retry error.');
+   check(retries().some(button => status(button.form) === 'Not sent yet'), 'Another attempt keeps its own status.');
+   check(draft('REMOVED').value === 'Keep the title.', 'Retry failure keeps the draft.');
+   const count = posts.length, previous = list();
+   submit(approved());
+   check(sameButtons().every(button => button.disabled), 'Approval disables every submit for its picture.');
+   submit(retry());
+   check(posts.length === count + 1, 'Approval blocks Retry in code.');
+   rejectAll();
+   await until('Approval failure refreshes the list.', () => previous !== list());
+   check(status(edit()) === 'Not sent: Approval failed.', 'The refresh keeps the approval error.');
+   check(status(retry().form) === 'Not sent: Retry failed.', 'The refresh still shows the earlier Retry error.');
+   check(draft('REMOVED').value === 'Keep the title.', 'Approval failure keeps the draft.');
+   check(sameButtons().every(button => !button.disabled), 'The forms can submit again after failure.');
+   await refresh();
+   check(status(retry().form) === 'Not sent: Retry failed.', 'A later refresh keeps the Retry error.');
+   const beforeFeedback = list();
+   submit(edit().querySelector('button[value=feedback]'));
+   rejectAll();
+   await until('Feedback failure refreshes the list.', () => beforeFeedback !== list());
+   const beforeRetry = list();
+   submit(retry());
+   check(status(retry().form) === 'Not sent: Retry failed.', 'The error stays until the new Retry has a result.');
+   const post = posts.at(-1);
+   check(post.body.get('draft_action') === 'feedback', 'Retry submits the stored action.');
+   check(post.body.get('feedback_round') === ROUND, 'Retry submits the stored round.');
+   for (const words of ['A newer edit.', 'Keep the title.']) {
+     const field = draft('REMOVED');
+     field.value = words;
+     field.dispatchEvent(new Event('input', {bubbles:true}));
+   }
+   post.resolve(say(true));
+   await until('The confirmed Retry refreshes the list.', () => beforeRetry !== list());
+   check(draft('REMOVED')?.value === 'Keep the title.', 'Retry keeps the newer revision with the same words.');
+   const saved = new Map(JSON.parse(sessionStorage.getItem('images.answer-drafts:' + location.pathname)));
+   check(saved.get('REMOVED')?.words === 'Keep the title.', 'The newer revision remains in storage.');
+ } catch (error) { failures.push(String(error)); }
+ await realFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+})();</script>""".replace("REMOVED", identity).replace("OTHER", other["id"]).replace("FRESH", fresh).replace(
+            "ROUND", json.dumps(round_id))
+        markup = page.replace(f"<script>{images.SCRIPT}", seed + f"<script>{images.SCRIPT}")
+        self.assertEqual(firefox_probe_results(markup.replace("</body>", probe + "</body>").encode()), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
+    def test_ordinary_reload_restores_unsent_picture_words(self) -> None:
+        record = self.register()
+        probe = r"""<script>
+(async () => {
+ const feedback = document.getElementById('feedback-IMAGEID');
+ const words = 'Keep the title.\nUse a darker border.';
+ if (!sessionStorage.getItem('typed')) {
+   feedback.value = words;
+   feedback.dispatchEvent(new Event('input', {bubbles:true}));
+   sessionStorage.setItem('typed', 'yes');
+   location.reload();
+   return;
+ }
+ const failures = feedback.value === words ? [] : ['The ordinary reload must restore the unsent words.'];
+ await fetch('/results', {method:'POST', body:JSON.stringify(failures)});
+})();</script>""".replace("IMAGEID", record["id"])
+        page = images.render(self.status).replace(b"</body>", probe.encode() + b"</body>")
+        self.assertEqual(firefox_probe_results(page), [[]])
 
     def test_a_card_from_before_i21_that_posts_not_approved_gets_a_clear_refusal(self) -> None:
         record = self.register()
@@ -674,7 +1188,7 @@ class ImagesTests(ImagesFixture):
         self.assertIn(record["id"], images.render(self.status).decode())
 
     def test_feedback_goes_to_the_owner_session_and_hides_the_image_but_keeps_it(self) -> None:
-        record = self.register("After: the panel. Look at the counts.")
+        record = self.register("Panel counts", look_for=("Check the counts.", "Check their order."))
         self.submit(self.feedback_body(record, "  The counts are wrong.  "))
         assert self.owner is not None
         self.assertEqual(len(self.sent), 1)
@@ -684,7 +1198,7 @@ class ImagesTests(ImagesFixture):
             "From the user (via the Images page): your image is not approved. The feedback follows.",
             "Feedback: The counts are wrong.",
             f"Image: http://127.0.0.1:8765/images/{record['id']}/image.png",
-            "Caption: After: the panel. Look at the counts.",
+            "Title: Panel counts", "Look for:", "- Check the counts.", "- Check their order.",
             "For: Phase console-images",
             "After you act on it, delete the image: "
             + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}")))
@@ -737,7 +1251,7 @@ class ImageQuestionTests(ImagesFixture):
                     self.capture(recipient, sender, message)
 
                 with patch.object(change_page, 'send_message', side_effect=answer_during_delivery):
-                    images.send_answer(self.root, record['id'], action, 'Check the gate.')
+                    _ = images.send_answer(self.root, record['id'], action, 'Check the gate.')
                 stored = image_store.read_record(images.images_root(self.root) / record['id'])
                 self.assertNotIn('feedback_at', stored)
                 content = images.render(self.status).decode()
@@ -747,7 +1261,7 @@ class ImageQuestionTests(ImagesFixture):
                 self.assertEqual(console.news(self.root, pages, 'changes'), ('images',))
                 self.assertEqual(console.news(self.root, pages, 'images'), ())
 
-    def test_repeated_feedback_uses_the_same_key_when_a_question_receives_an_answer(self) -> None:
+    def test_repeated_feedback_preserves_a_new_answer_without_resending(self) -> None:
         record = self.register()
         self.ask(record)
         self.sent.clear()
@@ -770,32 +1284,37 @@ class ImageQuestionTests(ImagesFixture):
             self.submit(body)
             images.answer_question(self.root, record["id"], "Q1", "The gate passed.")
             self.submit(body)
-        self.assertEqual(len(keys), 2)
-        self.assertEqual(keys[0], keys[1])
+        self.assertEqual(len(keys), 1)
         self.assertEqual(len(self.sent), 1)
         saved = image_store.read_record(images.images_root(self.root) / record["id"])
         self.assertNotIn("feedback_at", saved)
         self.assertIn("The gate passed.", images.render(self.status).decode())
 
-    def test_repeated_feedback_keeps_a_new_answer_for_each_send_order(self) -> None:
-        outcomes: tuple[send_result.Outcome, ...] = ("pending", "sent", "skipped")
-        for order in permutations(outcomes):
-            with self.subTest(order=order):
-                record = self.register()
-                self.ask(record)
-                body = urlencode({"image": record["id"], "action": "feedback", "feedback": "Check the gate.",
-                                  "token": images.request_token(images.console_token(self.root), record["id"])})
-                with (patch.object(change_page, "send_message", new=SEND_MESSAGE),
-                      patch.object(unrouted_alert, "message_outcome",
-                                   side_effect=[question_outcome(outcome) for outcome in order]) as send):
-                    self.submit(body)
-                    images.answer_question(self.root, record["id"], "Q1", "The gate passed.")
-                    for _ in order[1:]:
-                        self.submit(body)
-                        saved = image_store.read_record(images.images_root(self.root) / record["id"])
-                        self.assertNotIn("feedback_at", saved)
-                        self.assertIn(f'data-image="{record["id"]}"', images.render(self.status).decode())
-                self.assertEqual(send.call_count, len(order))
+    def test_feedback_retry_keeps_an_answer_received_after_an_unconfirmed_send(self) -> None:
+        record = self.register()
+        self.ask(record)
+        body = urlencode({"image": record["id"], "action": "feedback", "feedback": "Check the gate.",
+                          "token": images.request_token(images.console_token(self.root), record["id"])})
+        attempts: list[str] = []
+        outcomes: Iterator[Literal["pending", "skipped"]] = iter(("pending", "pending", "pending", "skipped"))
+
+        def send(_recipient: str, _sender: str, _message: str, *, key: str,
+                 recipient_key: str) -> Literal["pending", "skipped"]:
+            self.assertEqual(recipient_key, self.owner_id())
+            attempts.append(key)
+            return next(outcomes)
+
+        with patch.object(change_page, "send_message", side_effect=send):
+            with self.assertRaisesRegex(images.AnswerNotSent, "has not confirmed"):
+                self.submit(body)
+            images.answer_question(self.root, record["id"], "Q1", "The gate passed.")
+            self.submit(body)
+            self.submit(body)
+        self.assertEqual(len(attempts), 4)
+        self.assertEqual(len(set(attempts)), 1)
+        saved = image_store.read_record(images.images_root(self.root) / record["id"])
+        self.assertNotIn("feedback_at", saved)
+        self.assertIn(f'data-image="{record["id"]}"', images.render(self.status).decode())
 
     def test_new_approval_sends_once_after_an_answer_reopens_the_image(self) -> None:
         record = self.register()
@@ -836,13 +1355,11 @@ class ImageQuestionTests(ImagesFixture):
             self.assertNotIn(identity, images.render(self.status).decode())
             self.submit(fresh_post)
 
-        self.assertEqual(len(keys), 4)
-        self.assertEqual(keys[0], keys[1])
-        self.assertEqual(keys[2], keys[3])
-        self.assertNotEqual(keys[0], keys[2])
+        self.assertEqual(len(keys), 2)
+        self.assertNotEqual(keys[0], keys[1])
         self.assertEqual(len(self.sent), 2)
 
-    def test_skipped_feedback_retry_hides_the_image_after_a_failed_write(self) -> None:
+    def test_confirmed_feedback_retry_hides_the_image_after_a_failed_write(self) -> None:
         record = self.register()
         self.ask(record)
         images.answer_question(self.root, record["id"], "Q1", "The gate passed.")
@@ -851,14 +1368,14 @@ class ImageQuestionTests(ImagesFixture):
         folder = images.images_root(self.root) / record["id"]
         with (patch.object(change_page, "send_message", new=SEND_MESSAGE),
               patch.object(unrouted_alert, "message_outcome",
-                           side_effect=[question_outcome("sent"), question_outcome("skipped")]) as send):
+                           return_value=question_outcome("sent")) as send):
             with (patch.object(image_store, "write_record", side_effect=OSError("The feedback write failed.")),
                   self.assertRaisesRegex(OSError, "The feedback write failed.")):
                 self.submit(body)
             self.assertNotIn("feedback_at", image_store.read_record(folder))
             self.assertIn("The gate passed.", images.render(self.status).decode())
             self.submit(body)
-        self.assertEqual(send.call_count, 2)
+        self.assertEqual(send.call_count, 1)
         self.assertIn("feedback_at", image_store.read_record(folder))
         self.assertNotIn(record["id"], images.render(self.status).decode())
 
@@ -884,14 +1401,14 @@ class ImageQuestionTests(ImagesFixture):
         record = self.register()
         self.ask(record)
         images.answer_question(self.root, record['id'], 'Q1', 'The gate passed.')
-        images.send_answer(self.root, record['id'], 'feedback', 'Use a larger caption.')
+        _ = images.send_answer(self.root, record['id'], 'feedback', 'Use a larger title.')
         stored = image_store.read_record(images.images_root(self.root) / record['id'])
         self.assertIn('feedback_at', stored)
         self.assertNotIn(record['id'], images.render(self.status).decode())
         self.assertEqual(images.waiting_images(console.NewsRequest(self.root)), frozenset())
 
     def test_an_asked_image_leaves_the_page_and_its_answer_returns_as_new(self) -> None:
-        record = self.register('Check <the> gate')
+        record = self.register('Check <the> gate', look_for=('Check the first row.',))
         pages = tuple(page for page in console.read_pages() if page.identity == 'images')
         self.assertEqual(console.news(self.root, pages, 'images'), ())
         self.ask(record)
@@ -909,6 +1426,7 @@ class ImageQuestionTests(ImagesFixture):
         assert self.owner is not None
         self.assertEqual(self.sent[0][0], 'session:'+self.owner.current_session)
         self.assertIn(f"Images {record['id']}: Ask question", self.sent[0][2])
+        self.assertIn("Check <the> gate\nLook for:\n- Check the first row.\n", self.sent[0][2])
         self.assertIn(f"--id {record['id']} --question Q1 --text", self.sent[0][2])
         # An unrelated feedback mark must not prevent the answer from returning.
         stored['feedback_at'] = datetime.now(UTC).isoformat()
@@ -973,7 +1491,7 @@ class ImageQuestionTests(ImagesFixture):
             self.ask(record)
         self.assertEqual(send.call_count, 3)
         content = images.render(self.status).decode()
-        self.assertIn('Question not delivered.', content)
+        self.assertEqual(content.count(change_page.question_failure_html(True)), 1)
         self.assertIn(f'data-image="{record["id"]}"', content)
         self.assertEqual(images.waiting_images(console.NewsRequest(self.root)), frozenset((record['id'],)))
         paths = list(self.root.glob(change_page.DELIVERY_PREFIX+'*'))
@@ -1136,7 +1654,9 @@ class ImageQuestionTests(ImagesFixture):
         with patch.object(process_start, "process_start", return_value=process_start.Unreadable("Cannot read the sender.")):
             content = images.render(self.status).decode()
             self.assertIn(words, content)
-            self.assertNotIn("Question not delivered.", content)
+            self.assertNotIn('Question not delivered.', content)
+            self.assertNotIn('Resend is unavailable until the sender can be checked.', content)
+            self.assertNotIn('Enter the same words and press Ask question to send it again.', content)
             self.ask(record, words)
             self.assertEqual(self.sent, [])
         _ = delivery.job.release()
@@ -1410,14 +1930,33 @@ async (find, whenPageShows, check, controlRefresh) => {
 }'''
         _ = self.run_question_browser(self.question_probe(probe), fail_first_refresh=True)
 
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser actions')
+    def test_successful_delete_shows_refresh_failure_outside_the_removed_card(self) -> None:
+        probe = r'''
+async (find, whenPageShows, check) => {
+ const card = find('Question fixture'), form = card.querySelector('form');
+ const notice = document.getElementById('image-action-failure');
+ // A post without an action is the legacy delete.
+ form.requestSubmit();
+ await whenPageShows('the refresh failure', () => !notice.hidden);
+ check(notice.textContent === 'Update failed: HTTP 503', 'The page notice shows the refresh error.');
+ check(!card.isConnected, 'The deleted card stays out of the list.');
+ check(form.querySelector('[data-image-status]').hidden, 'The removed card has no failure notice.');
+ document.dispatchEvent(new Event('visibilitychange'));
+ await whenPageShows('the cleared notice', () => notice.hidden);
+ check(!find('Question fixture'), 'The refreshed list also leaves the deleted card out.');
+}'''
+        requests = self.run_question_browser(self.question_probe(probe), fail_first_refresh=True)
+        self.assertEqual([request.get('action') for request in requests], [None])
+
     @staticmethod
     def question_probe(check_page: str) -> str:
         return r'''
 (async () => {
  const failures = [];
  const check = (ok, message) => {if (!ok) failures.push(message);};
- const find = caption => [...document.querySelectorAll('[data-image]')]
-  .find(card => card.querySelector('.caption').textContent === caption);
+ const find = title => [...document.querySelectorAll('[data-image]')]
+  .find(card => card.querySelector('.image-title').textContent === title);
  const browserNow = performance.now.bind(performance);
  const waitLimit = 12000;
  const whenPageShows = (name, predicate) => new Promise((resolve, reject) => {
@@ -1571,8 +2110,9 @@ async (find, whenPageShows, check, controlRefresh) => {
                         return
                 else:
                     requests.append(parse_qs(payload))
-                    delivery = images.submit(root, payload, delivery_status)
-                    if isinstance(delivery, change_page.MessageDelivery):
+                    result = images.submit(root, payload, delivery_status)
+                    if isinstance(result, change_page.MessageDelivery):
+                        delivery = result
                         body = response_body
                         is_first_delivery = len(requests) == 1
                 self.send_response(200)
@@ -1614,10 +2154,10 @@ async (find, whenPageShows, check, controlRefresh) => {
 
 
 class ImagePairTests(ImagesFixture):
-    def register_pair(self, caption: str = "The panel. Look at the counts.") -> image_store.ImageRecord:
+    def register_pair(self, title: str = "Panel counts") -> image_store.ImageRecord:
         after = self.temporary / "after.webp"
         _ = after.write_bytes(PNG[::-1])
-        return images.register(after, caption, self.owner_id(), "Phase image-pairs", before=self.shot)
+        return images.register(after, title, self.owner_id(), "Phase image-pairs", before=self.shot)
 
     def test_a_pair_is_one_record_in_one_folder_and_one_delete_removes_both(self) -> None:
         record = self.register_pair()
@@ -1641,7 +2181,7 @@ class ImagePairTests(ImagesFixture):
 
         with patch("scripts.review_links.image_store.shutil.copyfile", side_effect=copy_image), \
                 self.assertRaisesRegex(OSError, "the after image cannot be copied"):
-            _ = images.register(after, "caption", self.owner_id(), "Phase image-pairs", before=self.shot)
+            _ = images.register(after, "Cards", self.owner_id(), "Phase image-pairs", before=self.shot)
         self.assertEqual(list((self.root / image_store.IMAGES_FOLDER).iterdir()), [])
         self.assertEqual(images.records(self.root), [])
 
@@ -1650,7 +2190,7 @@ class ImagePairTests(ImagesFixture):
         _ = text.write_text("not an image")
         for before, reason in ((text, "use one of"), (self.temporary / "absent.png", "no such image file")):
             with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
-                _ = images.register(self.shot, "caption", self.owner_id(), "Phase image-pairs", before=before)
+                _ = images.register(self.shot, "Cards", self.owner_id(), "Phase image-pairs", before=before)
         self.assertFalse((self.root / image_store.IMAGES_FOLDER).exists())
 
     def test_a_record_whose_before_is_not_text_stays_off_the_page(self) -> None:
@@ -1668,10 +2208,12 @@ class ImagePairTests(ImagesFixture):
         _ = after.write_bytes(PNG)
         output = StringIO()
         with redirect_stdout(output):
-            code = images.main(["register", "--before", str(self.shot), "--after", str(after), "--caption", "Cards",
+            code = images.main(["register", "--before", str(self.shot), "--after", str(after), "--title", "Cards",
+                                "--look-for", "Check the row count.",
                                 "--owner", self.owner_id(), "--phase", "image-pairs"])
         self.assertEqual(code, 0)
         record = images.records(self.root)[0]
+        self.assertEqual((record["title"], record["look_for"]), ("Cards", ["Check the row count."]))
         origin = f"http://127.0.0.1:8765/images/{record['id']}"
         self.assertEqual(output.getvalue().splitlines(), [
             f"registered {record['id']}: {origin}/before.png {origin}/after.png",
@@ -1680,7 +2222,7 @@ class ImagePairTests(ImagesFixture):
         for options in (["--before", str(self.shot)], ["--image", str(self.shot), "--after", str(after)], []):
             with self.subTest(options=options), redirect_stderr(StringIO()) as errors, \
                     self.assertRaises(SystemExit):
-                _ = images.main(["register", *options, "--caption", "Cards", "--owner", self.owner_id(),
+                _ = images.main(["register", *options, "--title", "Cards", "--owner", self.owner_id(),
                                  "--phase", "image-pairs"])
             self.assertIn("give --image, or --before and --after", errors.getvalue())
         self.assertEqual(images.records(self.root), [record])
@@ -1848,7 +2390,7 @@ class ImagePairTests(ImagesFixture):
   frameElement.style.height='800px';
   document.querySelector('[data-image-layout]').style.minHeight='300vh';
   const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
-  const actions=document.querySelector('[data-page-actions]'), groups=document.querySelector('[data-image-groups]');
+  const frozen=document.querySelector('.page-top'), groups=document.querySelector('[data-image-groups]');
   for(const top of [0,64,800]){
    scrollTo({top,behavior:'instant'});
    await painted();
@@ -1858,13 +2400,16 @@ class ImagePairTests(ImagesFixture):
     failures.push('The Images pair must fit side by side at 1024 px and scroll position '+top+'.');
    }
   }
-  const space=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-actions-space'));
-  const controls=Math.max(...[...actions.children].map(control=>control.getBoundingClientRect().bottom));
-  if(Math.abs(actions.getBoundingClientRect().top-space)>=1 || document.querySelector('.page-heading').getBoundingClientRect().bottom>0){
-   failures.push('At scroll position 800 the action area must stick at the top and the title must scroll away.');
+  const top=frozen.getBoundingClientRect();
+  const parts=[...frozen.querySelectorAll('h1,.page-owner,[data-page-status]')];
+  if(Math.abs(top.top)>=1 || parts.length!==3 || parts.some(element=>{
+   const box=element.getBoundingClientRect();
+   return box.height===0 || box.top<top.top || box.bottom>top.bottom;
+  })){
+   failures.push('At scroll position 800 the title, actions, and status stay in the frozen top.');
   }
-  if(groups.getBoundingClientRect().top<controls+16){
-   failures.push('The image group index must stick below the action area.');
+  if(groups.getBoundingClientRect().top<top.bottom+15.5){
+   failures.push('The image group index stays 16 px or more below the frozen top.');
   }
   frameElement.style.width='1382px';
   groups.querySelector('a span').textContent='admin-console-reviewer';
@@ -1910,11 +2455,17 @@ class ImagesServerTests(ImagesFixture):
         self.addCleanup(thread.join, TEST_HANG_GUARD_SECS)
         self.addCleanup(server.shutdown)
 
-    def http(self, method: str, path: str, body: str = "") -> tuple[int, str, bytes]:
+    def http(self, method: str, path: str, body: str = "", *,
+             held: bool = False) -> tuple[int, str, bytes]:
         connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
         try:
             if method == "POST":
-                connection.request("POST", path, body, {"Content-Type": "application/x-www-form-urlencoded"})
+                headers = {"Content-Type": "application/x-www-form-urlencoded"}
+                if held:
+                    headers.update({send_hold.HOLD_HEADER: "1", "Origin": f"http://127.0.0.1:{self.port}"})
+                elif path.startswith(send_hold.HOLD_PATH + "/"):
+                    headers["Origin"] = f"http://127.0.0.1:{self.port}"
+                connection.request("POST", path, body, headers)
             else:
                 connection.request(method, path)
             response = connection.getresponse()
@@ -2012,11 +2563,250 @@ class ImagesServerTests(ImagesFixture):
         with patch.object(change_page, "send_message", side_effect=RuntimeError("session gone")):
             status, _, answer = self.http("POST", images.PAGE_PATH, body)
         self.assertEqual((status, cast(dict[str, str], json.loads(answer))),
-                         (503, {"reason": "the owner did not get the message (session gone). Try again."}))
+                         (503, {"reason": "shot-owner did not get the message (session gone). Try again."}))
         status, _, answer = self.http("POST", images.PAGE_PATH, body)
         self.assertEqual((status, cast(dict[str, str], json.loads(answer))), (200, {"state": "done"}))
         self.assertEqual(len(self.sent), 1)
         self.assertNotIn(record["id"], self.http("GET", images.PAGE_PATH)[2].decode())
+
+    def test_image_answer_reports_the_failed_producer_or_list_save(self) -> None:
+        _, producer, item = self.list_item()
+        record = images.register(self.shot, "Check", self.owner_id(), "Phase check", list_item=item.id)
+        token = images.request_token(images.console_token(self.root), record["id"])
+        body = urlencode({"image": record["id"], "token": token, "feedback": "Too dark.", "action": "feedback"})
+        with patch.object(the_list, "save_image_answer", side_effect=OSError("disk unavailable")):
+            status, _, answer = self.http("POST", images.PAGE_PATH, body)
+        self.assertEqual(status, 503)
+        self.assertIn(f"Could not save the answer on {item.id}", answer.decode())
+        self.assertNotIn("the owner did not get", answer.decode())
+        self.assertEqual(self.sent, [])
+
+        def send(_recipient: str, _sender: str, _message: str, *, key: str, recipient_key: str) -> None:
+            self.assertTrue(key)
+            if recipient_key == producer.id:
+                raise RuntimeError("producer offline")
+
+        with patch.object(change_page, "send_message", side_effect=send):
+            status, _, answer = self.http("POST", images.PAGE_PATH, body)
+        self.assertEqual(status, 503)
+        self.assertIn(producer.name, answer.decode())
+        self.assertNotIn("the owner did not get", answer.decode())
+
+    def test_answer_to_an_already_deleted_picture_reaches_its_owner_and_list(self) -> None:
+        keeper, producer, item = self.list_item()
+        record = images.register(self.shot, "Check", self.owner_id(), "Phase check", list_item=item.id)
+        token = images.request_token(images.console_token(self.root), record["id"])
+        images.delete(self.root, record["id"])
+        words = "Keep the title.\nUse a darker border."
+        body = urlencode({"image": record["id"], "token": token, "feedback": words, "action": "feedback",
+                          "feedback_round": images.feedback_round(set())})
+        status, _, answer = self.http("POST", images.PAGE_PATH, body)
+        self.assertEqual(status, 200)
+        self.assertIn("This picture was removed; your words went to shot-owner.", answer.decode())
+        saved = the_list.load(keeper.id, item.id)
+        self.assertIs(saved.state, the_list.ItemState.WORKING)
+        self.assertIsInstance(saved.log[-1].what, str)
+        self.assertIn(words, cast(str, saved.log[-1].what))
+        self.assertEqual([recipient for recipient, _, _ in self.sent],
+                         [f"session:{self.owner.current_session}" if self.owner is not None else "",
+                          f"session:{producer.current_session}"])
+        self.assertTrue(all(words in message for _, _, message in self.sent))
+
+    def test_held_linked_picture_answer_can_be_undone_or_released_once(self) -> None:
+        keeper, _, item = self.list_item()
+        record = images.register(self.shot, "Check", self.owner_id(), "Phase check", list_item=item.id)
+        identity = record["id"]
+        images.delete(self.root, identity)
+        token = images.request_token(images.console_token(self.root), identity)
+        body = urlencode({"image": identity, "token": token, "action": "feedback", "feedback": "Keep the title."})
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+
+        def hold() -> str:
+            status, _, answer = self.http("POST", images.PAGE_PATH, body, held=True)
+            self.assertEqual(status, 202, answer)
+            saved = cast(dict[str, str], json.loads(answer))
+            self.assertEqual(the_list.load(keeper.id, item.id), item)
+            self.assertEqual(self.sent, [])
+            return f"{send_hold.HOLD_PATH}/{saved['hold']}"
+
+        undone = hold()
+        self.assertEqual(self.http("POST", undone + "/undo")[0], 200)
+        self.assertEqual(self.http("GET", undone)[0], 404)
+        released = hold()
+        self.assertEqual(self.http("POST", released + "/send")[0], 200)
+        status, _, answer = self.http("GET", released)
+        self.assertEqual(status, 200, answer)
+        self.assertIn(b"This picture was removed; your words went to shot-owner.", answer)
+        self.assertEqual(self.http("GET", released)[2], answer)
+        saved = the_list.load(keeper.id, item.id)
+        self.assertIs(saved.state, the_list.ItemState.WORKING)
+        self.assertEqual(sum(isinstance(entry.what, str) and "Keep the title." in entry.what
+                             for entry in saved.log), 1)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_reload_shows_the_saved_answer_and_retries_only_the_missing_recipient(self) -> None:
+        keeper, producer, item = self.list_item()
+        record = images.register(self.shot, "Check <the> rows", self.owner_id(), "Phase check",
+                                 look_for=("Check <the> count.",), list_item=item.id)
+        identity = record["id"]
+        token = images.request_token(images.console_token(self.root), identity)
+        images.delete(self.root, identity)
+        words = "Keep <this> & the title.\nUse a darker border."
+        body = urlencode({"image": identity, "token": token, "feedback": words, "action": "feedback"})
+        calls: list[tuple[str, str]] = []
+        online = False
+
+        def send(_recipient: str, _sender: str, message: str, *, key: str, recipient_key: str) -> None:
+            calls.append((recipient_key, key))
+            self.assertIn(words, message)
+            if recipient_key == producer.id and not online:
+                raise RuntimeError("producer offline")
+
+        with patch.object(change_page, "send_message", side_effect=send):
+            self.assertEqual(self.http("POST", images.PAGE_PATH, body)[0], 503)
+            saved = the_list.load(keeper.id, item.id)
+            key = calls[0][1]
+            page = self.http("GET", images.PAGE_PATH)[2].decode()
+            self.assertIn('<h2 class="image-title">Check &lt;the&gt; rows</h2>'
+                          + '<ul class="image-look-for"><li>Check &lt;the&gt; count.</li></ul>', page)
+            self.assertIn("Not sent yet", page)
+            self.assertIn("Keep &lt;this&gt; &amp; the title.\nUse a darker border.", page)
+            self.assertIn(f'name="retry_key" value="{key}"', page)
+            self.assertIn(">Retry</button>", page)
+
+            directory = images.images_root(self.root)
+            legacy = image_store.read_answers(directory, identity)
+            del legacy["attempts"][key]["words"]
+            _ = legacy.pop("heading")
+            image_store.write_answers(directory, legacy)
+            legacy_page = self.http("GET", images.PAGE_PATH)[2].decode()
+            self.assertIn("Keep &lt;this&gt; &amp; the title.", legacy_page)
+            self.assertIn(f'<h2 class="image-title">Removed picture {identity}</h2>', legacy_page)
+
+            online = True
+            retry = urlencode({"image": identity, "token": token, "action": "retry", "retry_key": key})
+            self.assertEqual(self.http("POST", images.PAGE_PATH, retry)[0], 200)
+            self.assertEqual(self.http("POST", images.PAGE_PATH, retry)[0], 200)
+
+        self.assertEqual(calls, [(self.owner_id(), key), *([(producer.id, key)] * 4)])
+        self.assertEqual(the_list.load(keeper.id, item.id), saved)
+        self.assertNotIn(key, self.http("GET", images.PAGE_PATH)[2].decode())
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
+    def test_retry_clears_only_the_matching_draft_after_reload(self) -> None:
+        first, second = self.register("First shot"), self.register("Second shot")
+        words = "Keep the title."
+        round_id = images.feedback_round(set())
+        picture_ids = [first["id"], second["id"]]
+        drafts: list[tuple[str, dict[str, str]]] = []
+        with patch.object(change_page, "send_message", side_effect=RuntimeError("owner offline")):
+            for record, draft_action in ((first, "feedback"), (second, "approved")):
+                identity = record["id"]
+                token = images.request_token(images.console_token(self.root), identity)
+                body = urlencode({"image": identity, "token": token, "action": "feedback",
+                                  "feedback": words, "feedback_round": round_id})
+                self.assertEqual(self.http("POST", images.PAGE_PATH, body)[0], 503)
+                images.delete(self.root, identity)
+                drafts.append((identity, {"words": words, "token": token, "round": round_id,
+                                          "retryAction": draft_action, "retryRound": round_id}))
+        seed = """<script>
+if (!sessionStorage.getItem('probe-phase')) {
+  sessionStorage.setItem('images.answer-drafts:' + location.pathname, JSON.stringify(DRAFTS));
+}
+</script>""".replace("DRAFTS", json.dumps(drafts))
+        probe = r"""<script>
+(async () => {
+ const ids = IDS, failures = [];
+ const draft = id => document.getElementById('feedback-' + id);
+ const retry = id => [...document.querySelectorAll('button[value=retry]')]
+   .find(button => button.form.elements.image.value === id);
+ const check = (ok, text) => { if (!ok) failures.push(text); };
+ const phase = sessionStorage.getItem('probe-phase');
+ if (!phase) {
+   check(ids.every(id => draft(id)?.value === 'Keep the title.'), 'Both drafts start with their saved words.');
+   for (const id of ids) {
+     retry(id).click();
+     for (let step = 0; step < 80 && retry(id); step++) {
+       await new Promise(resolve => setTimeout(resolve, 50));
+     }
+     check(!retry(id), 'The confirmed retry leaves the page.');
+   }
+   check(!draft(ids[0]), 'Retry removes the matching editable draft.');
+   check(draft(ids[1])?.value === 'Keep the title.', 'Retry keeps the draft for another verdict.');
+   sessionStorage.setItem('probe-phase', JSON.stringify(failures));
+   location.reload();
+   return;
+ }
+ failures.push(...JSON.parse(phase));
+ check(!draft(ids[0]), 'The confirmed draft stays clear after reload.');
+ check(draft(ids[1])?.value === 'Keep the title.', 'The other draft survives reload.');
+ await fetch('/results', {method:'POST', body:JSON.stringify(failures)});
+})().catch(error => fetch('/results', {method:'POST', body:JSON.stringify([String(error)])}));
+</script>""".replace("IDS", json.dumps(picture_ids))
+        results: list[list[str]] = []
+        complete = threading.Event()
+        fixture = self
+
+        class Probe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/complete":
+                    _ = complete.wait(TEST_HANG_GUARD_SECS)
+                    self.send_payload(204, "", b"")
+                elif self.path == "/":
+                    self.send_payload(200, "text/html", f'<iframe src="{images.PAGE_PATH}"></iframe>'
+                                      .encode() + b'<img hidden src="/complete">')
+                elif self.path == images.PAGE_PATH:
+                    _, kind, page = fixture.http("GET", self.path)
+                    page = page.replace(b"<head>", b"<head>" + seed.encode(), 1)
+                    self.send_payload(200, kind, page.replace(b"</body>", probe.encode() + b"</body>"))
+                else:
+                    self.send_error(404)
+
+            def do_POST(self) -> None:
+                body = self.rfile.read(int(self.headers["Content-Length"])).decode()
+                if self.path == "/results":
+                    results.append(cast(list[str], json.loads(body)))
+                    self.send_payload(204, "", b"")
+                    complete.set()
+                else:
+                    self.send_payload(*fixture.http("POST", self.path, body))
+
+            def send_payload(self, status: int, kind: str, payload: bytes) -> None:
+                self.send_response(status)
+                self.send_header("Content-Type", kind)
+                self.end_headers()
+                _ = self.wfile.write(payload)
+
+        self.run_firefox(Probe, "retry-draft", release=complete.set)
+        self.assertEqual(results, [[]])
+        self.assertEqual(len(self.sent), 2)
+
+    def test_retry_recovers_an_answer_after_an_interrupted_delete(self) -> None:
+        record = self.register()
+        identity = record["id"]
+        token = images.request_token(images.console_token(self.root), identity)
+        body = urlencode({"image": identity, "token": token, "action": "feedback", "feedback": "Keep the title."})
+        with patch.object(change_page, "send_message", side_effect=RuntimeError("owner offline")):
+            self.assertEqual(self.http("POST", images.PAGE_PATH, body)[0], 503)
+
+        def stop_delete(folder: Path) -> None:
+            (folder / image_store.RECORD).unlink()
+            raise OSError("Delete stopped.")
+
+        with patch.object(shutil, "rmtree", side_effect=stop_delete):
+            with self.assertRaisesRegex(OSError, "Delete stopped"):
+                images.delete(self.root, identity)
+        directory = images.images_root(self.root)
+        self.assertTrue((directory / identity).is_dir())
+        key, = image_store.read_answers(directory, identity)["attempts"]
+        page = self.http("GET", images.PAGE_PATH)[2].decode()
+        self.assertIn(f"Removed picture {identity}", page)
+        self.assertIn(f'name="retry_key" value="{key}"', page)
+        self.assertIn("Keep the title.", page)
+        retry = urlencode({"image": identity, "token": token, "action": "retry", "retry_key": key})
+        self.assertEqual(self.http("POST", images.PAGE_PATH, retry)[0], 200)
+        self.assertEqual(len(self.sent), 1)
+        self.assertNotIn(key, self.http("GET", images.PAGE_PATH)[2].decode())
 
     def test_sweep_keeps_old_images(self) -> None:
         record = self.register()

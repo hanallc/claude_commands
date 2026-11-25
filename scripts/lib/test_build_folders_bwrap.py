@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import ExitStack, redirect_stdout
-from dataclasses import replace
 from enum import Enum
 import fcntl
 from io import StringIO
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -19,14 +21,16 @@ from typing import cast
 import unittest
 from unittest import mock
 
-from scripts.lib import build_folder_lock, build_folders
+from scripts.lib import build_folders, removal_guard
 from scripts.lib.process_start import Gone, Started, Unreadable, proc_table_start
-from scripts.lib.removal_bwrap_test_support import BuildMount, LINUX_CHECKOUT, RemovalSandbox
-from scripts.lint.test_removal_bwrap import CANARY, PROBE_MOUNT, PROBE_OUTSIDE
+from scripts.lib.removal_bwrap_test_support import BuildMount, LINUX_CHECKOUT, RemovalSandbox, mac_profile
+from scripts.lint.test_removal_bwrap import CANARY, PROBE_OUTSIDE
 
 
 class ClaimCase(Enum):
     LEFTOVER = "leftover"
+    SYMLINK = "symlink"
+    NESTED_MOUNT = "nested-mount"
     UNREADABLE_LEASE = "unreadable-lease"
     LIVE_OWNER = "live-owner"
     FOREIGN_OWNER = "foreign-owner"
@@ -46,24 +50,37 @@ run_claim(Path(sys.argv[2]), ClaimCase(sys.argv[3]), *map(int, sys.argv[4:]))
 """
 
 
-RUN_MOVED_PARENT = """
-from pathlib import Path
-import sys
-
-sys.path.insert(0, sys.argv[1])
-from scripts.lib.test_build_folders_bwrap import remove_after_parent_moves
-
-remove_after_parent_moves(Path(sys.argv[2]))
-"""
+def read_guard(candidate: Path) -> removal_guard.RemovalGuard:
+    names = removal_guard.KnownNames(frozenset(("proof",)), frozenset(("unit", "moved")))
+    return removal_guard.read(build_top=candidate.parents[2], names=names)
 
 
-def remove_after_parent_moves(candidate: Path) -> None:
-    """Keep the original parent open when its path changes."""
-    parent = candidate.parent
-    with build_folder_lock.folder_parent(candidate, parent, create=False) as directory:
-        _ = parent.rename(parent.with_name("moved"))
-        parent.mkdir()
-        assert not build_folders.remove_build_folder(candidate, dir_fd=directory, repair_access=True)
+def check_refusal(guard: removal_guard.RemovalGuard, path: Path,
+                  reason: removal_guard.RefusalReason) -> None:
+    try:
+        with guard.check(path):
+            raise AssertionError(f"the guard approved {path}")
+    except removal_guard.Refused as error:
+        assert error.reason is reason, error
+
+
+def check_guard(candidate: Path, case: ClaimCase) -> None:
+    guard = read_guard(candidate)
+    if case is ClaimCase.SYMLINK:
+        check_refusal(guard, candidate, removal_guard.RefusalReason.UNVERIFIED_PATH)
+        return
+    if case is ClaimCase.NESTED_MOUNT:
+        check_refusal(guard, candidate, removal_guard.RefusalReason.MOUNT)
+        return
+    with guard.check(candidate) as checked:
+        checked.recheck()
+    if case is ClaimCase.LEFTOVER:
+        # Keep the original tree for the tool claim.
+        peer = candidate.with_name("guard-proof")
+        _ = shutil.copytree(candidate, peer, symlinks=True)
+        with guard.check(peer) as checked:
+            removal_guard.remove(checked)
+        assert not peer.exists()
 
 
 def _check_missing_pid(pid: int) -> None:
@@ -79,7 +96,8 @@ def _lease_owner(case: ClaimCase, foreign_pid: int) -> int:
         return os.getpid()
     if case is ClaimCase.FOREIGN_OWNER:
         assert foreign_pid > 0
-        assert (Path("/proc") / str(foreign_pid)).stat().st_uid != os.geteuid()
+        if sys.platform == "linux":
+            assert (Path("/proc") / str(foreign_pid)).stat().st_uid != os.geteuid()
         try:
             os.kill(foreign_pid, 0)
         except PermissionError:
@@ -132,6 +150,9 @@ def _claim_after_other_owner(candidate: Path) -> None:
 
 def run_claim(candidate: Path, case: ClaimCase, foreign_pid: int = 0) -> None:
     """Run the real claim with the selected fixture state."""
+    if case is ClaimCase.NESTED_MOUNT:
+        assert not build_folders.may_remove_folder_tree(candidate), f"the mount table allowed removal of {candidate}"
+    check_guard(candidate, case)
     lease = build_folders.lease_path(candidate)
     _ = lease.write_text(json.dumps({"pid": _lease_owner(case, foreign_pid)}))
     if case is ClaimCase.OWNER_REPLACEMENT:
@@ -181,8 +202,7 @@ def run_claim(candidate: Path, case: ClaimCase, foreign_pid: int = 0) -> None:
         )
 
 
-@unittest.skipUnless(sys.platform == "linux", "requires Linux bubblewrap")
-class ToolFolderRemovalTests(unittest.TestCase):
+class ToolFolderRemovalFixture(unittest.TestCase):
     def sandbox(self) -> RemovalSandbox:
         root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="tool-removal-"))).resolve()
         sandbox = RemovalSandbox(root / "fixture")
@@ -198,7 +218,7 @@ class ToolFolderRemovalTests(unittest.TestCase):
         self.assertEqual(path.read_text(), CANARY)
 
     def candidate(self, sandbox: RemovalSandbox) -> Path:
-        candidate = sandbox.build / "proof"
+        candidate = sandbox.build / "proof" / "unit" / "proof"
         local = sandbox.host_path(candidate)
         self.canary(local / "old" / "output")
         _ = local.with_suffix(".lock").touch()
@@ -206,17 +226,42 @@ class ToolFolderRemovalTests(unittest.TestCase):
 
     def claim(self, sandbox: RemovalSandbox, candidate: Path,
               case: ClaimCase = ClaimCase.LEFTOVER) -> subprocess.CompletedProcess[str]:
-        return sandbox.python("-c", RUN_CLAIM, str(LINUX_CHECKOUT), str(candidate), case.value)
+        checkout = sandbox.checkout if sys.platform == "darwin" else LINUX_CHECKOUT
+        return self.run_python(sandbox, candidate, RUN_CLAIM, str(checkout), str(candidate), case.value)
+
+    def run_python(self, sandbox: RemovalSandbox, candidate: Path,
+                   *arguments: str) -> subprocess.CompletedProcess[str]:
+        if sys.platform == "linux" and sandbox.mount is BuildMount.BIND_UNIT:
+            with mock.patch.object(RemovalSandbox, "build", candidate.parent):
+                return sandbox.python("-c", *arguments)
+        return sandbox.python("-c", *arguments)
+
+    def assert_child_ok(self, result: subprocess.CompletedProcess[str]) -> None:
+        if result.returncode == 0:
+            return
+        if result.returncode < 0:
+            number = -result.returncode
+            try:
+                reason = signal.Signals(number).name
+            except ValueError:
+                reason = f"signal {number}"
+        else:
+            reason = f"exit {result.returncode}"
+        command = shlex.join(cast(list[str], result.args))
+        self.fail(f"{reason}: {command}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
 
     def assert_claim(self, result: subprocess.CompletedProcess[str], name: str) -> None:
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_child_ok(result)
         self.assertEqual(result.stdout.strip(), name)
 
+
+@unittest.skipUnless(sys.platform in ("linux", "darwin"), "requires Linux or macOS")
+class ToolFolderRemovalTests(ToolFolderRemovalFixture):
     def test_removes_only_the_leftover(self) -> None:
         sandbox = self.sandbox()
         outside = sandbox.outside.read_bytes()
         probe = sandbox.python("-c", PROBE_OUTSIDE, str(sandbox.outside))
-        self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+        self.assert_child_ok(probe)
         candidate = self.candidate(sandbox)
         local = sandbox.host_path(candidate)
         keep = local.parent / "keep"
@@ -236,15 +281,27 @@ class ToolFolderRemovalTests(unittest.TestCase):
         self.assertTrue(sibling_lock.is_file())
         self.assertEqual(sandbox.outside.read_bytes(), outside)
 
+    def test_mac_profile_limits_writes_and_protects_the_test_root(self) -> None:
+        self.assertEqual(mac_profile(Path("/private/tmp/tool removal/fixture")), (
+            "(version 1)\n"
+            "(allow default)\n"
+            "(deny network*)\n"
+            "(deny file-write*)\n"
+            '(allow file-write* (subpath "/private/tmp/tool removal/fixture") (literal "/dev/null"))\n'
+            '(deny file-read-data (subpath "/private/tmp/tool removal"))\n'
+            '(allow file-read-data (subpath "/private/tmp/tool removal/fixture"))\n'
+        ))
+
     def test_keeps_a_symlink_at_the_tool_name(self) -> None:
         sandbox = self.sandbox()
-        candidate = sandbox.build / "proof"
+        candidate = sandbox.build / "proof" / "unit" / "proof"
         local = sandbox.host_path(candidate)
+        local.parent.mkdir(parents=True)
         target = sandbox.build / "other-tool"
         keep = sandbox.host_path(target / "output")
         self.canary(keep)
         local.symlink_to(target, target_is_directory=True)
-        self.assert_claim(self.claim(sandbox, candidate), "proof-2")
+        self.assert_claim(self.claim(sandbox, candidate, ClaimCase.SYMLINK), "proof-2")
         self.assertEqual(local.readlink(), target)
         self.assert_canary(keep)
 
@@ -260,58 +317,31 @@ class ToolFolderRemovalTests(unittest.TestCase):
         self.assertFalse(local.exists())
         self.assert_canary(keep)
 
-    def test_does_not_follow_a_bind_mount_inside_the_leftover(self) -> None:
-        sandbox = replace(self.sandbox(), mount=BuildMount.BIND_UNIT)
-        candidate = self.candidate(sandbox)
-        mount = candidate / "unit"
-        sandbox.host_path(mount).mkdir()
-        keep = sandbox.bind_source / "output"
-        self.canary(keep)
-        probe = sandbox.python("-c", PROBE_MOUNT, str(mount))
-        self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
-        result = self.claim(sandbox, candidate)
-        self.assert_canary(keep)
-        self.assert_canary(sandbox.host_path(candidate / "old" / "output"))
-        self.assert_claim(result, "proof-2")
-
-    def test_keeps_a_bind_mount_after_the_removal_parent_moves(self) -> None:
-        with mock.patch.object(RemovalSandbox, "build", Path("/build/removal-parent")):
-            sandbox = replace(self.sandbox(), mount=BuildMount.BIND_UNIT)
-            candidate = self.candidate(sandbox)
-            sandbox.host_path(candidate / "unit").mkdir()
-            keep = sandbox.bind_source / "output"
-            self.canary(keep)
-            result = sandbox.python("-c", RUN_MOVED_PARENT, str(LINUX_CHECKOUT), str(candidate))
-        self.assert_canary(keep)
-        moved = candidate.parent.with_name("moved") / candidate.name
-        self.assert_canary(sandbox.host_path(moved / "old" / "output"))
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
     def test_second_claim_keeps_the_first_claim_live_owner(self) -> None:
         sandbox = self.sandbox()
         candidate = self.candidate(sandbox)
         result = self.claim(sandbox, candidate, ClaimCase.OWNER_REPLACEMENT)
-        self.assert_canary(sandbox.host_path(candidate / "live"))
         self.assert_claim(result, "proof-2")
+        self.assert_canary(sandbox.host_path(candidate / "live"))
 
     def test_keeps_a_replacement_at_the_checked_staging_name(self) -> None:
         sandbox = self.sandbox()
         candidate = self.candidate(sandbox)
         result = self.claim(sandbox, candidate, ClaimCase.STAGED_REPLACEMENT)
+        self.assert_claim(result, "replacement refused")
         parent = sandbox.host_path(candidate.parent)
         self.assert_canary(parent / "original-tree" / "old" / "output")
         staged = [path for path in parent.glob(".removing-*") if path.is_dir()]
         self.assertEqual(len(staged), 1, result.stdout + result.stderr)
         [replacement] = staged
         self.assert_canary(replacement / "replacement")
-        self.assert_claim(result, "replacement refused")
 
     def assert_kept(self, case: ClaimCase) -> None:
         sandbox = self.sandbox()
         candidate = self.candidate(sandbox)
         result = self.claim(sandbox, candidate, case)
-        self.assert_canary(sandbox.host_path(candidate / "old" / "output"))
         self.assert_claim(result, "proof-2")
+        self.assert_canary(sandbox.host_path(candidate / "old" / "output"))
 
     def test_keeps_a_folder_with_an_unreadable_lease(self) -> None:
         self.assert_kept(ClaimCase.UNREADABLE_LEASE)
@@ -335,6 +365,17 @@ class ToolFolderRemovalTests(unittest.TestCase):
         return identity.start, owner
 
     def test_keeps_a_folder_with_a_foreign_lease_owner(self) -> None:
+        if sys.platform == "darwin":
+            sandbox = self.sandbox()
+            candidate = self.candidate(sandbox)
+            with self.assertRaises(PermissionError):
+                os.kill(1, 0)
+            result = self.run_python(sandbox, candidate, RUN_CLAIM, str(sandbox.checkout), str(candidate),
+                                     ClaimCase.FOREIGN_OWNER.value, "1")
+            self.assert_claim(result, "proof-2")
+            self.assert_canary(sandbox.host_path(candidate / "old" / "output"))
+            return
+
         uid = os.geteuid()
         for process in Path("/proc").iterdir():
             if not process.name.isdecimal():
@@ -360,6 +401,7 @@ class ToolFolderRemovalTests(unittest.TestCase):
         self.assert_canary(candidate / "old" / "output")
         self.assert_claim(result, "proof-2")
 
+    @unittest.skipIf(sys.platform == "darwin", "requires the Linux process table")
     def test_foreign_lease_owner_case_skips_when_no_foreign_process_is_visible(self) -> None:
         processes = [Path("/proc/self"), Path("/proc") / str(os.getpid())]
         with (mock.patch.object(Path, "iterdir", return_value=iter(processes)),
@@ -373,6 +415,12 @@ class ToolFolderRemovalTests(unittest.TestCase):
         bubblewrap = shutil.which("bwrap")
         self.assertIsNotNone(bubblewrap)
         assert bubblewrap is not None
+        templates = " ".join(str(candidate.parents[2].joinpath(*form.value)) for form in removal_guard.Form)
+        config = sandbox.host_path(sandbox.home / "config" / "build_folders.conf")
+        key = "removal.path_templates.natedev"
+        source, replaced = re.subn(rf"(?m)^{re.escape(key)}=.*$", f"{key}={templates}", config.read_text())
+        self.assertEqual(replaced, 1)
+        _ = config.write_text(source)
         # Keep host PIDs visible. Only the fixture has a writable bind.
         return subprocess.run([
             bubblewrap, "--unshare-user", "--unshare-net", "--unshare-ipc", "--unshare-uts", "--die-with-parent",
@@ -387,3 +435,7 @@ class ToolFolderRemovalTests(unittest.TestCase):
 
     def test_keeps_a_folder_with_a_held_lock(self) -> None:
         self.assert_kept(ClaimCase.HELD_LOCK)
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

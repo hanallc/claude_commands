@@ -142,8 +142,8 @@ class SidePaneTests(StaffTestCase):
         arguments = self.world.requests[-1][1]
         self.assertFalse(any("model_auto_compact_token_limit" in argument for argument in arguments))
         config = self.root / "conf/direct.conf"
-        write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
-                                                             "UNIT_COMPACT_ABOVE_TOKENS=71000"))
+        write_text_atomic(config, config.read_text().replace("unit_compact_above_tokens=43000",
+                                                             "unit_compact_above_tokens=71000"))
         del self.world.foreground[first.pane]
         self.assertEqual(self.start(), first)
         arguments = self.world.requests[-1][1]
@@ -262,8 +262,8 @@ class SidePaneTests(StaffTestCase):
 
     def test_claude_side_pane_ignores_the_codex_compaction_limit(self) -> None:
         config = self.root / "conf/direct.conf"
-        write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
-                                                             "UNIT_COMPACT_ABOVE_TOKENS=invalid"))
+        write_text_atomic(config, config.read_text().replace("unit_compact_above_tokens=43000",
+                                                             "unit_compact_above_tokens=invalid"))
         _ = self.start()
         family, arguments, _ = self.world.requests[-1]
         self.assertEqual(family, "claude")
@@ -276,8 +276,8 @@ class SidePaneTests(StaffTestCase):
         before = staff.snapshot().rows
         for index, value in enumerate(("", "invalid", "0", "-1", "1.5")):
             with self.subTest(value=value):
-                write_text_atomic(config, original.replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
-                                                           "UNIT_COMPACT_ABOVE_TOKENS=" + value))
+                write_text_atomic(config, original.replace("unit_compact_above_tokens=43000",
+                                                           "unit_compact_above_tokens=" + value))
                 _ = self.start(f"consultation-{index}")
                 family, arguments, _ = self.world.requests[-1]
                 self.assertEqual(family, "codex")
@@ -584,7 +584,7 @@ class SidePaneTests(StaffTestCase):
             send_signal(agent_pid, number)
             self.world.activate(fixture_runtime_id("other-work"), result.pane, "claude")
 
-        write_text_atomic(self.root / "conf/shutdown.conf", "# range: 0..300\nSTOP_GRACE_SECONDS=0\n")
+        write_text_atomic(self.root / "conf/shutdown.conf", "# range: 0..300\nstop_grace_seconds=0\n")
         with patch.object(os, "kill", side_effect=busy):
             code, _, errors = self.command("close", "consultation")
         self.assertEqual(code, 8)
@@ -606,7 +606,7 @@ class SidePaneTests(StaffTestCase):
         self.assertIn("w1:p0", self.world.locations)
 
     def test_private_configuration_sets_the_split_and_a_dev_shell_environment(self) -> None:
-        write_text_atomic(self.root / "conf/direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.4\n# range: 1..600\nPANE_AGENT_START_SECONDS=125\n")
+        write_text_atomic(self.root / "conf/direct.conf", "# range: 0.1..0.9\nworker_split_ratio=0.4\n# range: 1..600\npane_agent_start_seconds=125\n")
         environment = {"PRIVATE_DEV_SHELL": "loaded"}
         from scripts.lib import nix_env
 
@@ -687,7 +687,7 @@ class SidePaneTests(StaffTestCase):
         def retained(agent_pid: int, number: int) -> None:
             self.signals.append((agent_pid, number))
 
-        write_text_atomic(self.root / "conf/shutdown.conf", "# range: 0..300\nSTOP_GRACE_SECONDS=0\n")
+        write_text_atomic(self.root / "conf/shutdown.conf", "# range: 0..300\nstop_grace_seconds=0\n")
         with patch.object(os, "kill", side_effect=retained):
             code, _, errors = self.command("close", "consultation")
         self.assertEqual(code, 8)
@@ -753,7 +753,7 @@ class SidePaneTests(StaffTestCase):
 
     def test_open_uses_the_configured_ratio_range_and_reads_configuration_once(self) -> None:
         write_text_atomic(self.root / "conf/direct.conf",
-            "# range: 0..1\nWORKER_SPLIT_RATIO=0.95\n# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
+            "# range: 0..1\nworker_split_ratio=0.95\n# range: 1..600\npane_agent_start_seconds=90\n")
         read = conf.read
         with patch.object(conf, "read", wraps=read) as readings:
             consultation = self.start()

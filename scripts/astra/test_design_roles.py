@@ -27,12 +27,12 @@ from unittest.mock import patch
 
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.accounts import role_map  # noqa: E402
-from scripts.agents import worker_lifecycle  # noqa: E402
+from scripts.agents import remote, worker_lifecycle  # noqa: E402
 from scripts.astra import astra_review, astra_work, design_roles  # noqa: E402
 from scripts.direct import progress_history, recorder_state
 from scripts.astra.design_role_test_support import HeldRolePaneCase, write_empty_binding_record
 from scripts.herdr import worker_panes
-from scripts.herdr.test_worker_panes import PaneWorld, idle_transcript
+from scripts.herdr.test_worker_panes import PaneWorld, idle_transcript, prepare_recorder_history
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
@@ -234,6 +234,9 @@ class HeldRolePaneTests(HeldRolePaneCase):
         parent = staff.snapshot().parent_of(self.panes.command_case.fixture.parent)
         if parent is None:
             self.fail("fixture has no showrunner")
+        doc = self.panes.root / "showrunner-production.md"
+        write_text_atomic(doc, "# Production\n")
+        parent = staff.set_doc(parent.id, staff.LiveDoc(remote.local_machine(), doc))
         transcript = Path.home() / ".claude/projects/fixture" / f"{parent.current_session}.jsonl"
         write_text_atomic(transcript, json.dumps({"type": "assistant", "message": {"model": "fixture"},
                                                  "effort": "high"}) + "\n")
@@ -661,8 +664,9 @@ class DurableRolesTests(HeldRolePaneCase):
         _ = (phase / "delegated_phase_reservation_state.json").write_text(json.dumps({
             "kind": "enrolled_awaiting_first_touch", "phase": "1"}))
         _ = (phase / "files").write_text("design.md\n")
+        history = prepare_recorder_history(self.root / (name + ".jsonl"))
         _ = (directory / "progress_history_state.json").write_text(json.dumps({
-            "run_id": name, "owner_staff_id": owner.id, "history_file": str(self.root / (name + ".jsonl")),
+            "run_id": name, "owner_staff_id": owner.id, "history_file": str(history),
             "phase": {"id": "1", "instance_id": instance, "status": "open"},
             "open_phases": [{"id": "1", "instance_id": instance, "status": "open"}],
         }))

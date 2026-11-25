@@ -240,6 +240,8 @@ def _source(instance: Path, *, dependencies: Callable[[Path], None] | None = Non
     owner = owner_for_timer(instance, record)
     if not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
         raise ValueError(f"{owner.name}: no production document")
+    if owner.doc.machine != remote.local_machine():
+        raise ValueError(f"{owner.name}: production document is on {owner.doc.machine}")
     path = owner.doc.path
     if dependencies is not None:
         dependencies(path)
@@ -350,10 +352,11 @@ def registered_showrunners(
     return ShowrunnerDiscovery(found, tuple(failures))
 
 
-def production_of(session_id: str, state_dir: Path | None = None) -> Path | None:
+def production_of(session_id: str, state_dir: Path | None = None, *,
+                  record: staff.StaffSnapshot | None = None) -> Path | None:
     """Read the current session's production document from staff."""
     del state_dir
-    owner = staff.snapshot().by_current_session(session_id)
+    owner = (staff.snapshot() if record is None else record).by_current_session(session_id)
     if (owner is not None and owner.kind == "showrunner"
             and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
             and owner.doc.machine == remote.local_machine()):
