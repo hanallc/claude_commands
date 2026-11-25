@@ -866,3 +866,89 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 **State:** none.
 
 **Acceptance gate:** green `copies.py run --affected` of 6f7fe87082 (done, 780 modules); `fixture_conf_keys` 0 missing; `git merge-tree` against main clean.
+
+### Phase 22 — Report removed config keys that code still reads  · status: done
+
+**Depends on:** Phase 21
+
+#### Work Order
+
+**Goal:** The join check names each config key that the tip removes or renames while non-test code on the tip still reads the old key. It refuses nothing (List item 424, nate's words via morty 02:24 PST Nov 25: "build the report form only").
+
+**Spec:**
+1. Case: `85caf8d5aa` removed `slots.aws-hana.hana.max` and `slots.aws-hana.hana.max_bytes` from `config/build_folders.conf`. `scripts/aws_target/hana_source.py:104-105` still reads them with `configuration.whole('slots.aws-hana.hana.max')`. Tests did not see it, because they write their own copies of the keys.
+2. Extend `scripts/production/fixture_conf_keys.py`, so that the join step in `docs/production_format.md` (step 3 at line 285) stays one command.
+3. A removed key is a key of `config/<name>.conf` on the base that the same file on the tip does not hold. A deleted file removes all its keys. A rename is a removal of the old key. All keys count, dotted per-name keys too.
+4. A read is a string literal on the tip whose text equals a removed key:
+   - in a Python source under `scripts/` that is not a fixture source (`is_fixture_source` false), found with `ast` (`ast.Constant` strings only);
+   - in a shell source under `scripts/` (`.sh`, `.zsh`, `.bash`), found as a whole token: the key with no `[A-Za-z0-9_.-]` character directly before or after it.
+5. When the key is still in another config file on the tip, a read counts only if the same source also names the removed file: the stem or `<stem>.conf` as a string literal (Python) or as a whole token (shell). This keeps short shared key names out of the report.
+6. Output, after the current fixture lines and before the summary:
+   - `removed keys in config/<name>.conf: <key>, <key>` (one line per file, keys sorted).
+   - `<source>:<line>: reads <key>, which the tip removes from config/<name>.conf` (sorted by source, then line).
+   - The summary line gains a second line: `removed config keys: <N> reads on the tip`.
+7. The removed-key report never changes the exit code. Exit 1 still means only missing fixture keys; exit 2 still means an unreadable tree.
+8. The same report also names each fixed-name read on the tip of a key that no config file on the tip holds (round 2, 02:55 PST). The item case key `slots.aws-hana.hana.max` was never in a config file, so a base-to-tip diff misses it. A read is `<ConfigRead>.<accessor>(<literal key>)` in Python (accessors `effective_key, number, origin, text, value, values, whole, words`; the receiver is a `conf.read`/`conf.read_or_repository` result or a `ConfigRead` parameter) or `conf_value`/`conf_get`/`conf.py get` in shell. A key is held when a tip config file has it or a key that starts with `<key>.`. Output: `<source>:<line>: reads <key>, which no config file on the tip holds`; the second summary line reads `config key reads: <N> of a removed key, <M> of a key no config file holds`.
+9. `docs/production_format.md` step 3: one sentence says the step also lists removed keys that code still reads, and that the list does not block the join. The plan lines that say the check skips dotted keys stay true for added keys; do not edit the plan.
+
+**Files:** `scripts/production/fixture_conf_keys.py`, `scripts/production/test_fixture_conf_keys.py`, `docs/production_format.md`.
+
+**Workers:** 1 writer + 1 tester — `impl` holds the check and the doc; `test` holds the test module.
+- `impl`: `scripts/production/fixture_conf_keys.py`, `docs/production_format.md`.
+- `test`: `scripts/production/test_fixture_conf_keys.py`, written from this Spec.
+
+**Invariants:**
+1. No config value or key changes. No code default. No new refusal: the report never fails a run.
+2. The current added-key check and its output stay unchanged.
+
+**State:** none.
+
+**Acceptance gate:** `basedpyright` 0 errors, 0 warnings on the two Python files; the test module ids pass by name; a run of the check on `--base origin/main --tip origin/main` names `hana_source.py` 106 and 107; green `copies.py run --affected` with the item 224 tip.
+
+### Phase 23 — Join with combo2 before its merge  · status: todo
+
+**Depends on:** Phase 21
+
+#### Work Order
+
+**Goal:** Resolve the item 224 tip against sdlc combo2 (`3c2a11eb68`, ahead in the merge line) in a scratch join, so the real join after combo2 reaches main is fast (showrunner order, 02:58 PST Nov 25).
+
+**Spec:**
+1. The scratch join is in `/home/natepiano/worktrees/claude/config/join224` (branch `config-join224`), base `4f57485534`. 31 files conflict.
+2. Keep combo2's behavior. Reapply the branch's config moves: reads through `conf.read`/`conf.path`, no code defaults; where combo2 changed a moved literal, the key takes combo2's value.
+3. A new literal from combo2 stays a literal. No key is added, renamed or deleted. No refusal is added.
+
+**Workers:** 2 writers — `impl` holds the config files, `conf.py`, `live_settings.py` and the review page files; `test` holds the other conflict files.
+
+**Invariants:** as Phase 21.
+
+**State:** none.
+
+**Acceptance gate:** no conflict markers; `basedpyright` 0/0/0 on each resolved Python file; the conflict test ids pass by name; `fixture_conf_keys` 0 missing; after combo2 reaches main, a green `copies.py run --affected` of the real join.
+
+### Phase 24 — Read scan recall follow-ups  · status: todo
+
+**Depends on:** Phase 22
+
+#### Work Order
+
+**Goal:** The Phase 22 read scan finds reads behind branch and closure bindings, relative imports and shell command prefixes, with one shared Git batch helper.
+
+**Spec:**
+1. F008 (from Phase 22): a name is a reader in a scope when any binding of the name in that scope is a reader. When the scope does not bind the name, use the nearest enclosing function scope that binds it, then the module. This replaces the statement-order rule. A rare false report is acceptable; a missed read is not.
+2. F009: resolve relative imports against the source path's package. `from ..lib import conf` in `scripts/production/probe.py` is `scripts.lib.conf`.
+3. F010: at shell command position, skip leading `NAME=value` words. Accept `conf.py get` after an interpreter word (last path part `py`, or starts with `python`).
+4. F011: use the batch helper in `scripts/style/git_process.py` for the scan's `git cat-file --batch` work; remove the duplicate code.
+5. Documented limit: a line inside a shell here-document can give a false report. One sentence in `docs/production_format.md` step 3 says so.
+
+**Files:** `scripts/production/fixture_conf_keys.py`, `scripts/production/test_fixture_conf_keys.py`, `docs/production_format.md`.
+
+**Workers:** 1 writer + 1 tester — `impl` holds the check and the doc; `test` holds the test module.
+- `impl`: `scripts/production/fixture_conf_keys.py`, `docs/production_format.md`.
+- `test`: `scripts/production/test_fixture_conf_keys.py`, written from this Spec.
+
+**Invariants:** as Phase 22.
+
+**State:** none.
+
+**Acceptance gate:** `basedpyright` 0 errors, 0 warnings on the two Python files; the test module ids pass by name; a run on `--base origin/main --tip origin/main` still names `hana_source.py` 106 and 107.
