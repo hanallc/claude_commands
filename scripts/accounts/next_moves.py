@@ -13,6 +13,7 @@ from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from enum import StrEnum
 from importlib import import_module
 from pathlib import Path
 from typing import Literal, Protocol, cast
@@ -29,6 +30,8 @@ class NextMoveError(ValueError):
 
 class NextMoveCommit(Protocol):
     def commit(self, entries: tuple[NextMove, ...]) -> None: ...
+
+    def commit_rule_replacement(self, entries: tuple[NextMove, ...], previous_id: str) -> None: ...
 
 
 class NextMoveEdit(Protocol):
@@ -171,9 +174,27 @@ def parse_hold_mode(text: str) -> HoldMode:
         raise NextMoveError("next: hold must be half-point or nonnegative minutes") from error
 
 
-def _check_move_input(percent: float, added_at: datetime) -> None:
+class QuotaMeasure(StrEnum):
+    """The Claude quota window that triggers a next move."""
+    ALL_MODELS = "all-models"
+    FABLE = "fable"
+
+
+def parse_quota_measure(value: object) -> QuotaMeasure:
+    if value == QuotaMeasure.ALL_MODELS.value:
+        return QuotaMeasure.ALL_MODELS
+    if value == QuotaMeasure.FABLE.value:
+        return QuotaMeasure.FABLE
+    raise NextMoveError("next: measure must be all-models or fable")
+
+
+def check_next_move_percent(percent: float) -> None:
     if isinstance(percent, bool) or not 0 <= percent <= 100 or not math.isfinite(percent):
         raise NextMoveError("next: percent must be from 0 to 100")
+
+
+def _check_move_input(percent: float, added_at: datetime) -> None:
+    check_next_move_percent(percent)
     if added_at.utcoffset() is None:
         raise NextMoveError("next: added_at needs a zone")
 
@@ -187,10 +208,11 @@ class ClaudeGroupMove:
     to: str
     added_at: datetime
     fallback_targets: tuple[str, ...]
+    measure: QuotaMeasure
 
     def __init__(self, id: str, group: role_map.ClaudeGroup, at_percent: float,
                  hold_mode: HoldMode | float, to: str, added_at: datetime,
-                 fallback_targets: tuple[str, ...] = ()) -> None:
+                 fallback_targets: tuple[str, ...] = (), *, measure: QuotaMeasure = QuotaMeasure.ALL_MODELS) -> None:
         object.__setattr__(self, "id", id)
         object.__setattr__(self, "group", group)
         object.__setattr__(self, "at_percent", at_percent)
@@ -198,6 +220,7 @@ class ClaudeGroupMove:
         object.__setattr__(self, "to", to)
         object.__setattr__(self, "added_at", added_at)
         object.__setattr__(self, "fallback_targets", fallback_targets)
+        object.__setattr__(self, "measure", measure)
         self.__post_init__()
 
     @property
@@ -279,7 +302,8 @@ def next_moves_file() -> Path:
 
 def encode_next_moves(entries: tuple[NextMove, ...]) -> str:
     return json.dumps([dict(id=entry.id, group=entry.group, at_percent=entry.at_percent,
-                            **(encode_hold_mode(entry.hold_mode) if isinstance(entry, ClaudeGroupMove) else {}),
+                            **(encode_hold_mode(entry.hold_mode) | {"measure": entry.measure.value}
+                               if isinstance(entry, ClaudeGroupMove) else {}),
                             **({"else": entry.fallback_targets} if isinstance(entry, ClaudeGroupMove) and entry.fallback_targets else {}),
                             to=target_label(entry), added_at=entry.added_at.isoformat()) for entry in entries])
 
@@ -326,7 +350,10 @@ def _decode_next_moves(text: str) -> DecodedNextMoves:
                 raise NextMoveError("next: else must be a list of Claude accounts")
             fallback_targets = tuple(cast(list[str], fallbacks))
             entry: NextMove
+            measure = parse_quota_measure(fields.get("measure", QuotaMeasure.ALL_MODELS.value))
             if group == "workers":
+                if measure is QuotaMeasure.FABLE:
+                    raise NextMoveError("next: workers entries cannot use a Fable measure")
                 if fallback_targets:
                     raise NextMoveError("next: workers entries cannot use --else")
                 if hold != 0 or mode != "fixed":
@@ -338,7 +365,7 @@ def _decode_next_moves(text: str) -> DecodedNextMoves:
             else:
                 entry = ClaudeGroupMove(name, group, float(percent),
                                         HalfPointHold() if mode == "half-point" else FixedHold(float(hold)),
-                                        target, datetime.fromisoformat(added), fallback_targets)
+                                        target, datetime.fromisoformat(added), fallback_targets, measure=measure)
             if entry.id in ids:
                 raise NextMoveError("next: duplicate entry id")
             ids.add(entry.id)
@@ -437,27 +464,30 @@ def insert_next_move(entry: NextMove, insertion: AppendToGroup | InsertAt = APPE
         raise NextMoveError(f"next: cannot add entry: {error}") from error
 
 
-def _new_next_move(group: NextMoveGroup, at_percent: float, to: str, hold_minutes: float | HoldMode = 0, *,
-                   fallback_targets: tuple[str, ...] = ()) -> NextMove:
+def new_next_move(group: NextMoveGroup, at_percent: float, to: str, hold_minutes: float | HoldMode = 0, *,
+                  fallback_targets: tuple[str, ...] = (), measure: QuotaMeasure = QuotaMeasure.ALL_MODELS) -> NextMove:
     # All text-to-domain conversions use the same boundary as file and remote reads.
     return decode_next_moves(json.dumps([dict(id=uuid4().hex, group=group, at_percent=at_percent,
         **encode_hold_mode(hold_minutes if isinstance(hold_minutes, (FixedHold, HalfPointHold)) else FixedHold(hold_minutes)),
-        to=to, **{"else": fallback_targets}, added_at=datetime.now(timezone.utc).isoformat())]))[0]
+        to=to, measure=measure.value, **{"else": fallback_targets}, added_at=datetime.now(timezone.utc).isoformat())]))[0]
+
+
+def _write_remote_next_move(entry: NextMove, *options: str) -> NextMove:
+    received = decode_next_moves(role_map.ssh_role_map(("next-write", encode_next_moves((entry,)), *options)))
+    if len(received) != 1:
+        raise NextMoveError("next: remote write returned no entry")
+    return received[0]
 
 
 def add_next_move(group: NextMoveGroup, at_percent: float, to: str,
                   hold_minutes: float | HoldMode = 0, *, fallback_targets: tuple[str, ...] = (),
-                  insertion: AppendToGroup | InsertAt = APPEND_TO_GROUP) -> NextMove:
-    entry = _new_next_move(group, at_percent, to, hold_minutes, fallback_targets=fallback_targets)
+                  insertion: AppendToGroup | InsertAt = APPEND_TO_GROUP,
+                  measure: QuotaMeasure = QuotaMeasure.ALL_MODELS) -> NextMove:
+    entry = new_next_move(group, at_percent, to, hold_minutes, fallback_targets=fallback_targets, measure=measure)
     if not role_map.is_role_map_host():
         try:
-            arguments = ("next-write", encode_next_moves((entry,)))
-            if isinstance(insertion, InsertAt):
-                arguments += ("--at", str(insertion.position.value))
-            received = decode_next_moves(role_map.ssh_role_map(arguments))
-            if len(received) != 1:
-                raise NextMoveError("next: remote add returned no entry")
-            return received[0]
+            options = ("--at", str(insertion.position.value)) if isinstance(insertion, InsertAt) else ()
+            return _write_remote_next_move(entry, *options)
         except role_map.RemoteCommandRefused as error:
             raise NextMoveError(str(error)) from error
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -467,26 +497,34 @@ def add_next_move(group: NextMoveGroup, at_percent: float, to: str,
 
 
 def console_next_move_percent() -> float:
-    """The weekly percent left at which a next move chosen on the console Accounts page runs."""
+    """Read the default percent for an empty next-move form."""
     return conf.read("accounts").number("next_move_percent")
 
 
-def set_first_next_move(group: role_map.ClaudeGroup, at_percent: float, to: str) -> NextMove:
-    """Make `to` the group's first next move; the new entry replaces the group's current first entry."""
+def set_first_next_move(group: role_map.ClaudeGroup, at_percent: float, to: str, *,
+                        measure: QuotaMeasure = QuotaMeasure.ALL_MODELS) -> NextMove:
+    """Set the target, threshold, and measure of the group's first entry."""
+    entry = ClaudeGroupMove(uuid4().hex, group, at_percent, 0, to, datetime.now(timezone.utc), measure=measure)
     if not role_map.is_role_map_host():
-        if any(entry.group == group for entry in read_next_moves()):
-            remove_next_move(group, FIRST_GROUP_POSITION)
-        return add_next_move(group, at_percent, to, insertion=InsertAt(FIRST_GROUP_POSITION))
-    entry = _new_next_move(group, at_percent, to)
+        try:
+            return _write_remote_next_move(entry, "--replace-first")
+        except role_map.RemoteCommandRefused as error:
+            raise NextMoveError(str(error)) from error
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise NextMoveError(f"next: remote save failed: {error}") from error
     watcher = cast(NextMoveEdit, cast(object, import_module("scripts.accounts.refusal_watch")))
     try:
         with watcher.editing_next_moves() as edit:
             entries = list(read_next_moves())
-            first = next((index for index, saved in enumerate(entries) if saved.group == group), None)
-            if first is None:
-                entries.append(entry)
-            else:
-                entries[first] = entry
+            for index, saved in enumerate(entries):
+                if isinstance(saved, ClaudeGroupMove) and saved.group == group:
+                    if (saved.to, saved.at_percent, saved.measure) == (to, at_percent, measure):
+                        return saved
+                    entry = replace(saved, id=entry.id, to=to, at_percent=at_percent, measure=measure)
+                    entries[index] = entry
+                    edit.commit_rule_replacement(tuple(entries), saved.id)
+                    return entry
+            entries.append(entry)
             edit.commit(tuple(entries))
     except OSError as error:
         raise NextMoveError(f"next: cannot set entry: {error}") from error
@@ -541,7 +579,12 @@ def move_next_move(group: NextMoveGroup, source: GroupPosition, destination: Gro
 
 
 def format_next_move_percent(percent: float) -> str:
-    return repr(float(percent)).removesuffix(".0")
+    return "0" if percent == 0 else repr(float(percent)).removesuffix(".0")
+
+
+def format_next_move_threshold(percent: float, measure: QuotaMeasure) -> str:
+    suffix = " Fable" if measure is QuotaMeasure.FABLE else ""
+    return f"{format_next_move_percent(percent)}%{suffix}"
 
 
 def render_time() -> datetime:
@@ -577,7 +620,8 @@ def _render_next_move(entry: NextMove, position: GroupPosition,
                         else f"≈{duration.minutes:g} min")
             hold = f", hold half a point ({estimate})"
     fallback = "".join(f", else {target}" for target in entry.fallback_targets) if isinstance(entry, ClaudeGroupMove) else ""
-    return f"{entry.group} {position.value}: at {format_next_move_percent(entry.at_percent)}% → {target_label(entry)}{fallback}{hold}"
+    threshold = format_next_move_threshold(entry.at_percent, entry.measure if isinstance(entry, ClaudeGroupMove) else QuotaMeasure.ALL_MODELS)
+    return f"{entry.group} {position.value}: at {threshold} → {target_label(entry)}{fallback}{hold}"
 
 
 def render_next_moves(entries: tuple[NextMove, ...]) -> str:

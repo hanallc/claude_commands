@@ -1367,6 +1367,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path == console_tune.PAGE_PATH:
             self.tune_post(route.query)
             return
+        if route.path == accounts_page.PAGE_PATH:
+            self.accounts_post(route.query)
+            return
         if not self.same_origin():
             self.send_error(403)
             return
@@ -1375,9 +1378,6 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         if route.path == review_page.PAGE_PATH:
             self._write_post(self.review_post)
-            return
-        if route.path == accounts_page.PAGE_PATH:
-            self.accounts_post()
             return
         if route.path == images.PAGE_PATH:
             self._write_post(self.image_post)
@@ -2193,41 +2193,67 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         else:
             self.json_response(200, {**response, "state": "saved"})
 
-    def accounts_post(self) -> None:
+    def accounts_post_failure(self, status: int, reason: str, response: dict[str, str]) -> None:
+        print(f"review-links accounts POST: {reason}", file=sys.stderr)
+        self.json_response(status, response)
+
+    def accounts_post(self, query: str) -> None:
         """Apply one Accounts page action."""
+        color_fields = {"key", "value"}
         quota_fields = {"quota_account", "quota_level", "quota_reset"}
         retry_fields = {"retry_move", "member"}
+        save_fields = {"group", "to", "percent", "measure"}
+        clear_fields = {"group", "clear"}
+        move_fields = {"group", "move_now"}
         try:
+            if query or self.headers.get_content_type() != "application/x-www-form-urlencoded":
+                raise ValueError("Use the Accounts form without a query.")
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 4096:
                 raise ValueError("Invalid accounts request size.")
             fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
-        except (ValueError, UnicodeError) as error:
-            self.json_response(400, {"reason": str(error)})
+        except ValueError as error:
+            self.accounts_post_failure(400, str(error), {"reason": str(error)})
             return
-        keys = fields.keys()
-        if (keys not in ({"key", "value"}, {"group", "to"}, {"group", "clear"}, quota_fields, retry_fields)
+        action = set(fields)
+        if (action not in (color_fields, quota_fields, retry_fields, save_fields, clear_fields, move_fields)
                 or any(len(values) != 1 for values in fields.values())
-                or ("clear" in fields and fields["clear"] != ["first"])):
+                or (action == clear_fields and fields["clear"] != ["first"])):
             reason = "Send one Accounts action with its required fields."
-            self.json_response(400, {"reason": _retry_failure_text(reason) if retry_fields & keys else reason})
+            if retry_fields & action:
+                self.json_response(400, {"reason": _retry_failure_text(reason)})
+            else:
+                self.accounts_post_failure(400, reason, {"reason": reason})
+            return
+        if not self.same_origin(required=action in (retry_fields, move_fields)):
+            if action == retry_fields:
+                self.json_response(403, {"reason": _retry_failure_text("Open the retry button on this console.")})
+            else:
+                self.accounts_post_failure(403, "Invalid Accounts form origin.", {})
             return
         server = cast(ReviewLinksServer, self.server)
-        if keys == retry_fields:
-            if not self.same_origin(required=True):
-                self.json_response(403, {"reason": _retry_failure_text("Open the retry button on this console.")})
-                return
+        if action == retry_fields:
             result = retry_account_move(fields["retry_move"][0], fields["member"][0])
+        elif action == quota_fields:
+            result = accounts_page.clear_quota(server.root, fields["quota_account"][0], fields["quota_level"][0],
+                                               fields["quota_reset"][0])
+        elif action == color_fields:
+            result = accounts_page.save_color(fields["key"][0], fields["value"][0])
+        elif action == move_fields:
+            result = accounts_page.move_group_now(fields["group"][0], fields["move_now"][0])
+        elif action == clear_fields:
+            result = accounts_page.clear_next_move(fields["group"][0])
         else:
-            result = (accounts_page.clear_quota(server.root, fields["quota_account"][0], fields["quota_level"][0],
-                                                fields["quota_reset"][0]) if set(fields) == quota_fields
-                      else accounts_page.save_color(fields["key"][0], fields["value"][0]) if "key" in fields
-                      else accounts_page.clear_next_move(fields["group"][0]) if "clear" in fields
-                      else accounts_page.save_next_move(fields["group"][0], fields["to"][0]))
-        if isinstance(result, accounts_page.Refused):
-            self.json_response(400, {"reason": result.reason})
-        elif isinstance(result, accounts_page.SaveFailed):
-            self.json_response(503, {"reason": result.reason})
+            result = accounts_page.save_next_move_settings(fields["group"][0], fields["to"][0],
+                                                           fields["percent"][0], fields["measure"][0])
+        if isinstance(result, accounts_page.MoveInProgress):
+            self.accounts_post_failure(409, "An account move is in progress.", {"state": "move-in-progress"})
+        elif isinstance(result, (accounts_page.Refused, accounts_page.SaveFailed)):
+            status = 400 if isinstance(result, accounts_page.Refused) else 503
+            if action in (save_fields, clear_fields, move_fields):
+                self.accounts_post_failure(status, result.reason, {})
+            else:
+                self.json_response(status, {"reason": result.reason})
         else:
             server.accounts_cache = AccountsPageCache()
             self.json_response(200, {"state": "saved"})
