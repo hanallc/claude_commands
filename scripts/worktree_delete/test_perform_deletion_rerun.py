@@ -132,6 +132,34 @@ class DeletionRerunTests(unittest.TestCase):
         _ = self.script("record_confirmation.sh", self.repo, self.worktree, check=True)
         self.assert_retained(self.script("perform_deletion.sh", self.repo, self.worktree), tip, origin=False)
 
+    def test_confirmed_removal_reaches_the_report_after_the_checkout_is_gone(self) -> None:
+        tip = self.git("rev-parse", f"refs/heads/{BRANCH}", directory=self.repo)
+        _ = self.script("record_confirmation.sh", self.repo, self.worktree, check=True)
+        _ = self.git("worktree", "remove", str(self.worktree), directory=self.repo)
+
+        result = self.script("perform_deletion.sh", self.repo, self.worktree)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [f"Reviewing worktree: {self.worktree}"])
+        self.assertEqual(result.stderr.splitlines(), [
+            f"kept for a manual removal list: {self.output} (worktrees, the checkout is selected for removal)",
+        ])
+        self.assertEqual((self.output / "artifact").read_text(), "keep\n")
+        self.assertEqual(self.git("rev-parse", f"refs/heads/{BRANCH}", directory=self.repo), tip)
+
+    def test_confirmation_does_not_allow_removal_from_another_repository(self) -> None:
+        other = self.root / "other"
+        _ = self.git("clone", "-q", str(self.repo), str(other))
+        _ = self.git("branch", BRANCH, directory=other)
+        _ = self.script("record_confirmation.sh", other, self.worktree, check=True)
+
+        result = self.script("perform_deletion.sh", other, self.worktree)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Error: the worktree belongs to a different repository.", result.stdout)
+        self.assertNotIn("kept for a manual removal list", result.stderr)
+        self.assertTrue(self.worktree.is_dir())
+
     def test_branch_lookup_error_stops_before_reporting_folders(self) -> None:
         tip = self.git("rev-parse", "HEAD", directory=self.worktree)
         _ = self.script("record_confirmation.sh", self.repo, self.worktree, check=True)

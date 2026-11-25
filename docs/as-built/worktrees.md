@@ -21,6 +21,11 @@ If worktree setup fails, the checkout stays for review.
 Worktree creation releases its source lease before it prepares the target link and calls `write_record()`.
 
 `worktrees.py remove <path>` reports the checkout and its assigned output.
+Use `--repo WORD` to select the repository. The command uses the checkout at `<path>` by default.
+Give the checkout root. The command refuses main checkouts, including submodule main checkouts.
+If the checkout is missing, the command uses its recorded repository by default.
+If the checkout and its record are missing, use `--repo WORD` to name the repository where Git registered it.
+The command keeps the record while Git registers the worktree, including a detached worktree.
 Agent shutdown uses the same review helper for a unit checkout.
 
 A change review row's try folder is the worktree `worktrees.py make <repo> <team> try-C<n>`.
