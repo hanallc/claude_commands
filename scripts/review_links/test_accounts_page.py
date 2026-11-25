@@ -639,9 +639,9 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
         weekly = usage_store.StoredWindow(left=0, at=AT.isoformat(), resets=reset)
         for weekly_left, five, balance, credits, expected in (
             (0, None, "10", agent_accounts.CreditsOn(), "ready"),
-            (0, None, "10", agent_accounts.CreditsOff(), "far"),
+            (0, None, "10", agent_accounts.CreditsOff(), "exhausted"),
             (20, None, "0", agent_accounts.CreditsOff(), "ready"),
-            (20, 0, "0", agent_accounts.CreditsOff(), "far"),
+            (20, 0, "0", agent_accounts.CreditsOff(), "exhausted"),
             (20, 0, "unlimited", agent_accounts.CreditsOn(), "ready"),
         ):
             with self.subTest(weekly=weekly_left, five=five, credits=credits, expected=expected):
@@ -652,7 +652,10 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 with patch.object(agent_accounts, "codex_credits_setting", return_value=credits):
                     row = make_row(status, held, AT, ())
                 reading = accounts.StatusReading((row,), (), (), timezone.utc, AT)
-                self.assertIn(f'class="weekly-reset-{expected}"', accounts_page.board(reading))
+                markup = accounts_page.board(reading)
+                self.assertIn(f'class="weekly-reset-{expected}"', markup)
+                if expected == "exhausted":
+                    self.assertIn('style="--reset-orange-weight:33%"', markup)
 
     def test_weekly_reset_colors_reject_future_codex_readings(self) -> None:
         make_row = cast(Callable[..., accounts.StatusRow], getattr(accounts, "_status_row"))
@@ -710,12 +713,13 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
             replace(exhausted, weekly_left_percent=1),
             replace(exhausted, label="claude2", roles=("units",), role_counts=(accounts.RoleSessionCounts(0, 1, 0, 0),)),
             replace(exhausted, label="claude3", resets_at=AT + timedelta(days=4)),
-            replace(exhausted, label="claude4", resets_at=AT + timedelta(days=5)),
-            replace(exhausted, label="claude5", resets_at=AT + timedelta(days=6)),
+            replace(exhausted, label="claude4", resets_at=AT + timedelta(days=4, hours=6)),
+            replace(exhausted, label="claude5", resets_at=AT + timedelta(days=4, hours=18)),
             replace(exhausted, label="codex1", tool="codex", roles=("workers",), selected_roles=("workers",),
                     weekly_left_percent=1, codex_work_readiness=agent_accounts.CodexWorkAvailable()),
-            replace(exhausted, label="codex2", tool="codex", roles=("spare",),
-                    weekly_left_percent=accounts.StatusUnavailable()),
+            replace(exhausted, label="codex2", tool="codex", roles=("spare",), resets_at=AT + timedelta(days=5),
+                    codex_work_readiness=agent_accounts.CodexWorkExhausted()),
+            replace(exhausted, label="codex3", tool="codex", weekly_left_percent=accounts.StatusUnavailable()),
         )
         reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets())
         probe = """<script>
@@ -735,32 +739,43 @@ const background=node=>getComputedStyle(node).backgroundColor;
 const fill=cell=>pixel(background(cell.closest('.card')),background(cell.closest('tr')),background(cell.parentElement));
 try{
  const cells=[...document.querySelectorAll('.accounts-table td > [class^=weekly-reset-]')];
- check(cells.map(cell=>cell.className).join(',')===
-  'weekly-reset-ready,weekly-reset-ready,weekly-reset-near,weekly-reset-middle,weekly-reset-far,'+
-  'weekly-reset-ready,weekly-reset-unknown',
-  'Room and a running session use green. Exhausted accounts use their reset times.');
- const paired=cells[5];
- check(paired.closest('tr').matches('.auto-pair'),'The green Codex reset is in a paired row.');
+ const ready=cells.filter(cell=>cell.matches('.weekly-reset-ready'));
+ const exhausted=cells.filter(cell=>cell.matches('.weekly-reset-exhausted'));
+ const labels=spans=>spans.map(cell=>cell.closest('tr').dataset.accountRow).join(',');
+ check(labels(ready)==='claude1,claude2,codex1','Accounts with room or a running session use green.');
+ check(labels(exhausted)==='claude3,claude4,claude5,codex2','Exhausted accounts use the gradient.');
+ check(labels(cells.filter(cell=>cell.matches('.weekly-reset-unknown')))==='codex3','Unknown keeps the default color.');
+ check(exhausted.map(cell=>cell.style.getPropertyValue('--reset-orange-weight')).join(',')==='33%,49.75%,83.25%,100%',
+  'The orange weight follows the time between the nearest and furthest resets.');
+ const paired=cells.filter(cell=>cell.closest('tr').matches('.auto-pair'));
+ check(labels(paired)==='codex1,codex2','The pair includes an available account and an exhausted account.');
  for(const theme of ['light','dark']){
   document.documentElement.dataset.theme=theme;
   const inks=cells.map(cell=>getComputedStyle(cell.firstElementChild || cell).color);
-  check(inks[0]===inks[1] && inks[0]===inks[5] && new Set(inks).size===5,theme+' has distinct steps.');
-  check(fill(paired).join(',')!==fill(cells[0]).join(','),theme+' has a tinted pair background.');
-  for(const hover of [false,true]){
-   for(const [index,cell] of cells.slice(0,6).entries()){
-    if(hover) cell.parentElement.style.backgroundColor='var(--hover)';
+  const readyInks=ready.map(cell=>inks[cells.indexOf(cell)]);
+  check(new Set(readyInks).size===1 && new Set(inks).size===6,theme+' has green and four distinct gradient colors.');
+  check(fill(paired[0]).join(',')!==fill(cells[0]).join(','),theme+' has a tinted pair background.');
+  for(const state of ['default','hover','limit']){
+   for(const [index,cell] of cells.entries()){
+    const row=cell.closest('tr');
+    const tint=row.style.backgroundColor;
+    if(state==='hover') cell.parentElement.style.backgroundColor='var(--hover)';
+    if(state==='limit' && paired.includes(cell)){
+     const color=theme==='dark' ? 'white' : 'black';
+     row.style.backgroundColor='color-mix(in srgb,'+color+' TINT_PERCENT%,transparent)';
+    }
     const base=luminance(fill(cell));
     const ink=luminance(pixel(inks[index]));
     const contrast=(Math.max(base,ink)+0.05)/(Math.min(base,ink)+0.05);
-    const label=cell.closest('tr').dataset.accountRow;
-    check(contrast>=4.5,theme+' '+label+(hover ? ' hover ' : ' ')+contrast.toFixed(2));
+    check(contrast>=4.5,[theme,row.dataset.accountRow,state,contrast.toFixed(2)].join(' '));
     cell.parentElement.style.removeProperty('background-color');
+    row.style.backgroundColor=tint;
    }
   }
  }
 }catch(error){failures.push(String(error));}
 fetch('/results',{method:'POST',body:JSON.stringify(failures)});
-</script>"""
+</script>""".replace("TINT_PERCENT", str(accounts_page.PAIR_TINT_PERCENT))
         page = ('<!doctype html><html><head>' + accounts_page.STYLE + '</head><body>'
                 + accounts_page.board(reading) + probe + '</body></html>').encode()
         self.assertEqual(firefox_probe_results(page), [[]])

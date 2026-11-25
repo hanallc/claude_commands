@@ -512,12 +512,12 @@ def _weekly_reset_ready(row: accounts.StatusRow) -> bool:
     return isinstance(row.weekly_left_percent, (int, float)) and row.weekly_left_percent > 0
 
 
-def _weekly_reset_classes(reading: accounts.StatusReading) -> dict[str, str]:
-    classes: dict[str, str] = {}
+def _weekly_reset_attributes(reading: accounts.StatusReading) -> dict[str, str]:
+    attributes: dict[str, str] = {}
     no_room: dict[str, datetime] = {}
     for row in reading.rows:
         if _weekly_reset_ready(row):
-            classes[row.label] = "weekly-reset-ready"
+            attributes[row.label] = ' class="weekly-reset-ready"'
         elif isinstance(row.resets_at, datetime) and row.resets_at > reading.checked_at:
             exhausted = (isinstance(row.codex_work_readiness, agent_accounts.CodexWorkExhausted) if row.tool == "codex"
                          else isinstance(row.weekly_left_percent, (int, float)) and row.weekly_left_percent <= 0)
@@ -527,10 +527,11 @@ def _weekly_reset_classes(reading: accounts.StatusReading) -> dict[str, str]:
         nearest, furthest = min(no_room.values()), max(no_room.values())
         span = furthest - nearest
         for label, reset in no_room.items():
-            distance = (reset - nearest) * 3
-            classes[label] = ("weekly-reset-far" if reset == furthest or distance > span * 2 else
-                              "weekly-reset-middle" if distance > span else "weekly-reset-near")
-    return classes
+            fraction = (reset - nearest) / span if span else 0
+            orange_weight = 33 + 67 * fraction
+            attributes[label] = (f' class="weekly-reset-exhausted"'
+                                 f' style="--reset-orange-weight:{orange_weight:.8g}%"')
+    return attributes
 
 
 def _account_login_title(login: str) -> str:
@@ -550,7 +551,7 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
     values: list[SortValues] = []
     labels_in_row_order: list[str] = []
     facts = {row.label: row for row in reading.rows}
-    reset_classes = _weekly_reset_classes(reading)
+    reset_attributes = _weekly_reset_attributes(reading)
     moves = _shown_moves(reading, rows_by_account, facts)
     pair = [facts[label] for label, row_moves in moves.items() if facts[label].tool == "codex" and "auto" in row_moves]
     # One Codex account has nothing to take turns with, so it keeps the plain auto text.
@@ -608,8 +609,8 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
             + _cell(_swatch(cells["label"])) + _cell(left, "right") + _cell(fable_text, "right")
             + _cell(f"{rate:.1f}%" if rate is not None else no_rate, "right") + _cell(empty_text)
         )
-        reset_class = reset_classes.get(label, "weekly-reset-unknown")
-        reset_text = f'<span class="{reset_class}">{_spans(cells["resets"])}</span>'
+        reset_span_attributes = reset_attributes.get(label, ' class="weekly-reset-unknown"')
+        reset_text = f'<span{reset_span_attributes}>{_spans(cells["resets"])}</span>'
         account_end = (_cell(reset_text, "right")
                        + _cell(reset_count_text, "right") + _cell(_spans(cells["credits"]), "right")
                        + _cell(_spans(cells["enabled"])))
@@ -1036,11 +1037,10 @@ tbody tr td{border-top:1px solid var(--line)}
 tbody tr:hover td{background:var(--hover)}
 .bold{font-weight:600}.success{color:var(--room)}.error{color:var(--error)}.warning{color:var(--warning)}
 .accounts-table{--reset-green:light-dark(color-mix(in srgb,var(--room) 60%,var(--ink)),
-color-mix(in srgb,var(--room) 75%,var(--ink)))}
+color-mix(in srgb,var(--room) 75%,var(--ink)));
+--reset-orange:light-dark(color-mix(in srgb,var(--warning) 94%,var(--ink)),var(--warning))}
 .weekly-reset-ready{color:var(--reset-green)}
-.weekly-reset-near{color:color-mix(in srgb,var(--reset-green),var(--warning) 33%)}
-.weekly-reset-middle{color:color-mix(in srgb,var(--reset-green),var(--warning) 67%)}
-.weekly-reset-far{color:var(--warning)}
+.weekly-reset-exhausted{color:color-mix(in srgb,var(--reset-green),var(--reset-orange) var(--reset-orange-weight))}
 .inactive{color:var(--ink-3)}
 .color-swatch{width:18px;height:18px;vertical-align:middle;background:var(--ink);border:1px solid var(--ink-3);border-radius:4px;cursor:pointer}
 .color-picker{position:fixed;inset:auto;margin:0;padding:16px;width:280px;box-sizing:border-box;max-width:calc(100vw - 16px);
