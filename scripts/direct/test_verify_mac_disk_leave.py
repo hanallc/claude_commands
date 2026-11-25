@@ -185,10 +185,10 @@ class StepRetryPermissionTests(unittest.TestCase):
     def test_retry_permission_uses_all_target_rows_in_every_order(self) -> None:
         cases = (
             (("mac", "disk"),),
-            (("linux", "disk"),),
-            (("mac", "disk"), ("linux", "off")),
-            (("mac", "off"), ("linux", "disk")),
-            (("mac", "off"), ("linux", "repo")),
+            (("mac2", "disk"),),
+            (("mac", "disk"), ("mac2", "off")),
+            (("mac", "off"), ("mac2", "disk")),
+            (("mac", "off"), ("mac2", "repo")),
         )
         contexts: tuple[tuple[str, build_targets.StepKind, str], ...] = (
             ("0", "test", "0"), ("1", "test", "0"), ("0", "build", "0"), ("0", "final", "0"),
@@ -206,7 +206,7 @@ class StepRetryPermissionTests(unittest.TestCase):
                             capture_output=True, timeout=TEST_HANG_GUARD_SECS)
                         configuration = "targets=" + ",".join(name for name, _ in ordered) + ",natedev\n"
                         for name in dict(ordered):
-                            configuration += f"kind.{name}=ssh\nplatform.{name}={'macos' if name == 'mac' else 'linux'}\n"
+                            configuration += f"kind.{name}=ssh\nplatform.{name}=macos\n"
                             configuration += f"settings.{name}={name}.conf\n"
                             _ = write_config_fixture(fixture.root / f"{name}.conf",
                                 "offload=on\nlinux_only.hana=\nkinds=test,check,lint,doc,build,example\n",
@@ -241,6 +241,8 @@ class StepRetryPermissionTests(unittest.TestCase):
                         expected = (local_only == "0" and writes_tree == "0" and kind != "final"
                                     and any(reason == "disk" for _, reason in rows))
                         self.assertEqual(isinstance(reply, wire.Assignment), expected, repr(reply))
+                        if isinstance(reply, wire.Assignment):
+                            self.assertEqual(reasons[reply.assignment.destination.target], "disk")
 
 
 if __name__ == "__main__":

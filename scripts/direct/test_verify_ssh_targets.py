@@ -61,6 +61,8 @@ class VerifySshTargetsTests(VerifySshTargetsFixture):
         attempts = self.attempts()
         self.assertEqual([attempt["target"] for attempt in attempts], ["mac", "mac2"])
         self.assertEqual((attempts[0]["outcome"], attempts[0]["reason"]), ("declined", "unreachable"))
+        self.assertEqual((attempts[0]["completion"], attempts[0]["cleanup"], attempts[0]["unresolved_count"]),
+                         ("missing", "confirmed", 0))
         self.assertEqual(self.routing_record()["target"], "mac2")
 
 

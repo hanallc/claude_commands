@@ -1589,6 +1589,53 @@ placement_once
                         self.assertIsInstance(saved, wire.Assignment)
                         self.assertEqual(saved.assignment.source_key, execution_identity.SourceKeyKnown(executed_key))
 
+    def test_hana_checkout_refuses_a_source_record_in_the_admitted_tree(self) -> None:
+        tools = self.verify_source()
+        environment = self.verify_run_environment(tools)
+        (self.root / ".claude").symlink_to(tools.home / ".claude", target_is_directory=True)
+        _ = copies.git(tools.root, "remote", "set-url", "origin", "https://example.com/team/hana.git")
+        config = Path(environment["CONF_DIR"])
+        registry = config / "build_targets.conf"
+        _ = registry.write_text(registry.read_text().replace("targets=mac,natedev", "targets=mac,hana,natedev")
+            + "kind.hana=ssh\nplatform.hana=linux\nsettings.hana=hana_aws.conf\n")
+        _ = write_config_fixture(config / "hana_aws.conf",
+            "enabled=on\nexecution_transport=hana-control\nhost=fake-hana\n"
+            + "repository_identity=https://example.com/team/hana\nkinds=check\n")
+
+        admitted = self.root / "admitted-source"
+        invoked = self.root / "hana-runner-invoked"
+        tools.write_executable(tools.runner, f"#!/bin/sh\ntouch {shlex.quote(str(invoked))}\nexit 1\n")
+        verify = CHECKOUT / "scripts/direct/verify.sh"
+        startup = self.root / "stage-source-record.sh"
+        _ = startup.write_text(
+            f'if [[ "$0" == {shlex.quote(str(verify))} && "$PWD" == "${{COPIES_STEP_SOURCE:-}}" ]]; then\n'
+            + "unset BASH_ENV\n"
+            + "printf '{}' > .scratch.json && git add -f .scratch.json && "
+            + f"(git rev-parse --show-toplevel && git write-tree) > {shlex.quote(str(admitted))}\nfi\n")
+        environment["BASH_ENV"] = str(startup)
+
+        def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+            return private_caller_provider(self.queue, environment, key)
+
+        with (mock.patch.object(self.queue.server, "host_probe", new=provider),
+              mock.patch.dict(os.environ, environment)):
+            process = self.start(("bash", str(verify), "check", "sample", "--target", "hana"),
+                                 "--apply-uncommitted", str(tools.root))
+            stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(process.returncode, 2, stdout + stderr)
+        self.assertIn("the admitted tree contains .scratch.json", stderr)
+        self.assertFalse(invoked.exists())
+        self.assertFalse(self.copy_root.exists())
+        caller, tree = admitted.read_text().splitlines()
+        self.assertFalse(Path(caller).exists())
+        request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
+        self.assertEqual(request.constraints.repository, caller)
+        expected = execution_identity.SourceKeyKnown(treekey.committed_tree_key(tree.encode("ascii")))
+        self.assertEqual(request.constraints.source_key, expected)
+        grant = next(reply for reply in self.replies if isinstance(reply, wire.Assignment))
+        self.assertEqual((grant.assignment.destination.provider, grant.assignment.destination.target), ("ssh", "hana"))
+        self.assertEqual(grant.assignment.source_key, expected)
+
     def test_verify_request_only_keeps_the_first_step_routing_and_creates_no_copy(self) -> None:
         tools = self.verify_source()
         source_key = treekey.committed_tree_key(copies.git(tools.root, "rev-parse", "HEAD^{tree}").strip())
