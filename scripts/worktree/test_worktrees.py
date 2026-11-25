@@ -13,6 +13,7 @@ import json
 import os
 import re
 from pathlib import Path
+from select import select
 import shlex
 import shutil
 import signal
@@ -311,6 +312,20 @@ class WorktreeLifecycleTests(unittest.TestCase):
 
     def register_process(self, pid: int) -> None:
         (self.proc / str(pid)).symlink_to(Path("/proc") / str(pid), target_is_directory=True)
+
+    @contextmanager
+    def process_in(self, cwd: Path) -> Generator[int]:
+        source = "import sys; print('ready', flush=True); sys.stdin.read()"
+        with subprocess.Popen([sys.executable, "-c", source], cwd=cwd, env=self.environment,
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+            assert child.stdout is not None
+            self.assertTrue(select([child.stdout], [], [], 20)[0], "The fixture process did not start")
+            self.assertEqual(cast(str, child.stdout.readline()), "ready\n")
+            self.register_process(child.pid)
+            try:
+                yield child.pid
+            finally:
+                (self.proc / str(child.pid)).unlink()
 
     def finish_landed(self, *, reviewed: tuple[Path, ...] = ()) -> list[EndResult]:
         python = self.home / ".claude/scripts/lib/py"
@@ -728,10 +743,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
                         with self.assertRaisesRegex(worktree_records.Refused, f"{re.escape(str(lock))} held"):
                             _ = worktrees.move_worktree(old, "origin", "fixture-unit", "demo")
 
-                with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
-                                      cwd=nested, stdin=subprocess.PIPE, env=self.environment) as child:
-                    self.register_process(child.pid)
-                    with self.assertRaisesRegex(worktree_records.Refused, f"pids {child.pid}"):
+                with self.process_in(nested) as pid:
+                    with self.assertRaisesRegex(worktree_records.Refused, f"pids {pid}"):
                         _ = worktrees.move_worktree(old, "origin", "fixture-unit", "demo")
                 copy_source.assert_not_called()
                 self.assertTrue(old.is_dir() and not old.is_symlink())
@@ -1763,10 +1776,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
         _ = list_file.write_text(f"{busy} fixture-unit busy\n{idle} fixture-unit idle\n")
         command = self.migration_command("--all", "--list", list_file)
 
-        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
-                              cwd=nested, stdin=subprocess.PIPE, env=self.environment) as child:
-            self.register_process(child.pid)
-            reason = f"keep {busy}: in use (pids {child.pid})"
+        with self.process_in(nested) as pid:
+            reason = f"keep {busy}: in use (pids {pid})"
             dry = self.command(self.root, [*command, "--dry-run"])
             self.assertEqual(dry.returncode, 0, dry.stderr)
             self.assertIn(reason, dry.stdout)
@@ -2029,10 +2040,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             def open_then_start_process(move: worktrees.WorktreeMove, *,
                                         clone_members: tuple[Path, ...] = ()) -> worktrees.MoveJournal:
                 journal = open_move(move, clone_members=clone_members)
-                child = children.enter_context(subprocess.Popen(
-                    [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"], cwd=old, stdin=subprocess.PIPE))
-                self.register_process(child.pid)
-                pids.append(child.pid)
+                pids.append(children.enter_context(self.process_in(old)))
                 return journal
 
             with patch.object(worktrees, "_open_move", open_then_start_process), redirect_stdout(first := StringIO()):
@@ -2109,6 +2117,11 @@ class WorktreeLifecycleTests(unittest.TestCase):
             _ = (parent / "status").write_text(f"State:\tS\nUid:\t{os.geteuid()}\t{os.geteuid()}\nThreads:\t1\n")
             _ = (parent / "stat").write_text(f"{pid} (fixture) S {ppid}\n")
             _ = (parent / "cmdline").write_bytes(argv)
+            (parent / "cwd").symlink_to(self.root)
+            (parent / "root").symlink_to("/")
+            (parent / "exe").symlink_to(sys.executable)
+            (parent / "fd").mkdir()
+            _ = (parent / "maps").write_text("")
         responses: dict[str, dict[str, object]] = {}
         for pid, (name, old) in enumerate(trees.items(), 200):
             pane = f"w1:p{pid}"
@@ -2188,9 +2201,22 @@ class WorktreeLifecycleTests(unittest.TestCase):
             self.assertIn(f"keep {trees['reused-pid']}: in use (pids {reused})", report.getvalue())
             return
 
+        command = self.migration_command("--list", list_file)
+        if "missing-fd" in cases:
+            pid = 200 + cases.index("missing-fd")
+            for flags in (["--dry-run"], []):
+                result = self.command(self.root, [*command, *flags])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for old in trees.values():
+                    self.assertIn(f"keep {old}: in use: unreadable process {pid}", result.stdout)
+                    self.assertFalse(old.is_symlink())
+            descriptors = self.proc / str(pid) / "fd"
+            descriptors.mkdir()
+            (descriptors / "7").symlink_to(trees["missing-fd"] / "code.txt")
+
         new = self.trees / "origin/fixture-unit/stopped"
         for flags in (["--dry-run"], []):
-            result = self.command(self.root, self.migration_command("--list", list_file, *flags))
+            result = self.command(self.root, [*command, *flags])
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(f"move {trees['stopped']} -> {new}", result.stdout)
             for pid, name in enumerate(cases[1:], 201):
@@ -3190,6 +3216,93 @@ class WorktreeLifecycleTests(unittest.TestCase):
         for path in (tree, output):
             self.assertIn(f"kept for a manual removal list: {path}", gone.stderr)
 
+    def test_remove_uses_the_repository_of_the_worktree_path(self) -> None:
+        self.layout_fixture()
+        tree = self.make_layout("demo", "probe")
+        other = self.other_main()
+        result = self.command(other, [sys.executable, str(WORKTREES), "remove", str(tree)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"kept for a manual removal list: {tree} (worktrees, the checkout is selected for removal)",
+                      result.stderr)
+        self.assertTrue(tree.is_dir())
+
+    def test_remove_refuses_a_worktree_from_a_different_named_repository(self) -> None:
+        self.layout_fixture()
+        tree = self.make_layout("demo", "probe")
+        _ = self.other_main()
+        result = self.command(self.home / "rust/origin",
+                              [sys.executable, str(WORKTREES), "remove", str(tree), "--repo", "other"])
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stderr.splitlines(), [f"{tree}: worktree belongs to another repository"])
+        self.assertTrue(tree.is_dir())
+
+    def test_remove_refuses_a_missing_checkout_recorded_for_another_repository(self) -> None:
+        self.layout_fixture()
+        tree = self.make_layout("demo", "probe")
+        output = (tree / "target").readlink()
+        _ = self.other_main()
+        record = self.record_path(tree)
+        saved = record.read_bytes()
+        _ = self.git(self.home / "rust/origin", "worktree", "remove", "--force", str(tree))
+
+        command = [sys.executable, str(WORKTREES), "remove", str(tree), "--repo"]
+        refused = self.command(self.root, [*command, "other"])
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertEqual(refused.stderr.splitlines(), [f"{tree}: worktree belongs to another repository"])
+        self.assertEqual(record.read_bytes(), saved)
+
+        reported = self.command(self.root, [*command, "origin"])
+        self.assertEqual(reported.returncode, 0, reported.stdout + reported.stderr)
+        self.assertIn(f"kept for a manual removal list: {output}", reported.stderr)
+        self.assertFalse(record.exists())
+
+    def test_remove_checks_git_registration_for_a_missing_checkout_without_a_record(self) -> None:
+        self.layout_fixture()
+        main = self.migration_main()
+        tree = self.add_linked_tree(main, self.trees / "registered", "registered")
+        _ = tree.rename(self.trees / "renamed")
+        command = [sys.executable, str(WORKTREES), "remove", "--repo", "origin"]
+
+        reported = self.command(self.root, [*command, str(tree)])
+        self.assertEqual(reported.returncode, 0, reported.stdout + reported.stderr)
+        self.assertIn(f"kept for a manual removal list: {tree}", reported.stderr)
+
+        missing = self.trees / "unregistered"
+        refused = self.command(self.root, [*command, str(missing)])
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertEqual(refused.stderr.splitlines(), [f"{missing}: worktree is not registered in {main}"])
+
+    def test_remove_keeps_the_record_of_a_missing_detached_worktree(self) -> None:
+        self.layout_fixture()
+        tree = self.make_layout("demo", "probe")
+        record = self.record_path(tree)
+        saved = record.read_bytes()
+        _ = self.git(tree, "switch", "--detach")
+        _ = tree.rename(tree.with_name("unavailable"))
+
+        result = self.command(self.root, [sys.executable, str(WORKTREES), "remove", "--repo", "origin", str(tree)])
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"kept for a manual removal list: {tree}", result.stderr)
+        self.assertEqual(record.read_bytes(), saved)
+
+    def test_remove_refuses_an_absorbed_submodule_main_checkout(self) -> None:
+        submodule = self.repository / "modules/sample"
+        _ = self.git(self.repository, "submodule", "add", str(self.origin), str(submodule))
+        self.assertTrue((submodule / ".git").is_file())
+        result = self.command(self.root, [sys.executable, str(WORKTREES), "remove", str(submodule)])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.splitlines(), [f"{submodule}: cannot remove the main checkout"])
+
+    def test_remove_requests_the_checkout_root_for_other_paths(self) -> None:
+        for path in (self.repository / "missing", self.trees, self.merge_tree / "docs"):
+            with self.subTest(path=path):
+                result = self.command(self.repository, [sys.executable, str(WORKTREES), "remove", str(path)])
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stderr.splitlines(), [
+                    f"{path}: not a Git checkout root. Give the checkout root, or use --repo WORD.",
+                ])
+
     def test_a_try_folder_is_a_named_worktree_and_removal_keeps_unsaved_work(self) -> None:
         self.layout_fixture()
         tree = self.make_layout("demo", "try-C12")
@@ -3208,9 +3321,13 @@ class WorktreeLifecycleTests(unittest.TestCase):
         code = "from scripts.worktree.worktrees import remove_named; print(*remove_named('other', 'try-C12'))"
         kept = self.command(self.repository, [str(python), "-c", code])
         self.assertEqual(kept.returncode, 0, kept.stderr)
-        self.assertTrue(kept.stdout.startswith(f"{other} kept: dirty worktree: ?? notes.txt. Save the work, then run: "))
-        self.assertTrue(kept.stdout.endswith(f"worktrees.py remove {other}\n"))
+        command = shlex.join([str(python), str(self.home / ".claude/scripts/worktree/worktrees.py"), "remove", str(other)])
+        self.assertEqual(kept.stdout, f"{other} kept: dirty worktree: ?? notes.txt. Save the work, then run: {command}\n")
         self.assertNotIn("kept for a manual removal list", kept.stderr)
+        printed = shlex.split(kept.stdout.split("then run: ", 1)[1])
+        reported = self.command(self.root, printed)
+        self.assertEqual(reported.returncode, 0, reported.stdout + reported.stderr)
+        self.assertIn(f"kept for a manual removal list: {other}", reported.stderr)
 
     def test_make_carries_direnv_permission_only_for_the_allowed_source_file(self) -> None:
         self.layout_fixture()
@@ -3430,7 +3547,7 @@ raise SystemExit(2)
         _ = tree.rename(tree.with_name("unavailable"))
         notices = StringIO()
         with (patch.dict(os.environ, self.environment, clear=True),
-              patch.object(worktrees, "worktree_branches", side_effect=worktree_records.Refused(1, "Git listing failed")),
+              patch.object(worktrees, "linked_trees", side_effect=worktree_records.Refused(1, "Git listing failed")),
               redirect_stderr(notices),
               self.assertRaisesRegex(worktree_records.Refused, "Git listing failed")):
             worktrees.remove_git_checkout(tree, self.home / "rust/origin")
