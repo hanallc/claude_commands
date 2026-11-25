@@ -1159,8 +1159,8 @@ class LockHeld:
 
 
 @dataclass(frozen=True)
-class SlotBuildOutput:
-    """Build output that shares a repository slot's maker lease."""
+class CopyBuildOutput:
+    """Build output that shares a numbered copy's maker lease."""
 
     checkout: Path
 
@@ -1169,10 +1169,10 @@ class SlotBuildOutput:
         return str(self.checkout.with_name(self.checkout.name + ".lock"))
 
 
-def output_slot_leases(
+def output_copy_leases(
     path: str, *, outputs: CargoOutputIndex | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> tuple[SlotBuildOutput, ...]:
-    """Locate slot leases for direct output and recorded external output."""
+) -> tuple[CopyBuildOutput, ...]:
+    """Locate copy leases for direct output and recorded external output."""
     if isinstance(outputs, UseConfiguredValue):
         outputs = OUTPUT_ROOTS.get()
     resolved = Path(path).resolve()
@@ -1190,41 +1190,41 @@ def output_slot_leases(
                 raise form.error
             if isinstance(form, build_folders.BuildCopy):
                 checkouts.add(candidate)
-    return tuple(SlotBuildOutput(checkout) for checkout in sorted(checkouts))
+    return tuple(CopyBuildOutput(checkout) for checkout in sorted(checkouts))
 
 
 @dataclass(frozen=True)
-class UnverifiedSlotLease:
-    """The target stays because the sweep cannot verify its slot lease."""
+class UnverifiedCopyLease:
+    """The target stays because the sweep cannot verify its copy lease."""
 
     reason: str
 
 
-def report_unverified_slot(path: str, error: Exception) -> UnverifiedSlotLease:
-    reason = f"cannot verify the slot lease: {error}"
+def report_unverified_copy(path: str, error: Exception) -> UnverifiedCopyLease:
+    reason = f"cannot verify the copy lease: {error}"
     print(f"lint sweep: {path} kept: {reason}", file=sys.stderr)
-    return UnverifiedSlotLease(reason)
+    return UnverifiedCopyLease(reason)
 
 
-def hold_trim_recovery_slots(roots: Sequence[str], guards: ExitStack,
-                             held_slots: Collection[SlotBuildOutput]) -> bool:
-    """Hold each slot lease before a paired trim retries deletion."""
+def hold_trim_recovery_copies(roots: Sequence[str], guards: ExitStack,
+                             held_copies: Collection[CopyBuildOutput]) -> bool:
+    """Hold each copy lease before a paired trim retries deletion."""
     current = OUTPUT_ROOTS.get()
     saved = saved_cargo_output_roots()
     outputs = CargoOutputIndex((*current.workspaces, *saved.workspaces, *saved.history))
-    held = set(held_slots)
+    held = set(held_copies)
     for root in roots:
         try:
             if not outputs.mappings_for(Path(root).resolve()):
                 raise ValueError("no recorded Cargo output mapping for the saved trim")
-            for slot in output_slot_leases(root, outputs=outputs):
-                if slot not in held:
-                    if not guards.enter_context(build_folders.collector_lease(slot.checkout, wait=False)):
-                        print(f"lint sweep: busy slot lease; {root} left alone")
+            for copy in output_copy_leases(root, outputs=outputs):
+                if copy not in held:
+                    if not guards.enter_context(build_folders.collector_lease(copy.checkout, wait=False)):
+                        print(f"lint sweep: busy copy lease; {root} left alone")
                         return False
-                    held.add(slot)
+                    held.add(copy)
         except (OSError, RuntimeError, ValueError) as error:
-            _ = report_unverified_slot(root, error)
+            _ = report_unverified_copy(root, error)
             return False
     return True
 
@@ -1604,7 +1604,7 @@ def floor_holders(busy: Mapping[str, FloorProtection], sizes: dict[str, int],
         use = direct_use(protection)
         if isinstance(use, (BuildHoldTarget, NoRecordedEvidence)):
             continue
-        if isinstance(use, UnverifiedSlotLease):
+        if isinstance(use, UnverifiedCopyLease):
             holders.append(FloorHolder(root, sizes.get(root, 0), None, use.reason, None))
             continue
         if isinstance(use, LockHeld):
@@ -2013,12 +2013,12 @@ class TrimTake:
         self.save()
 
     def recover(
-        self, *, held_slots: Collection[SlotBuildOutput] = (),
+        self, *, held_copies: Collection[CopyBuildOutput] = (),
     ) -> ConfirmedDeletion | UnconfirmedReclaim | PairedTrimDeferred:
         """A missing or replaced name proves removal, never reclaimed blocks."""
         with ExitStack() as guards:
             if (len(self.output_roots) > 1 and self.stage == "deleting" and self.pending
-                    and not hold_trim_recovery_slots(self.output_roots, guards, held_slots)):
+                    and not hold_trim_recovery_copies(self.output_roots, guards, held_copies)):
                 return PairedTrimDeferred(self.output_roots)
             return self._recover()
 
@@ -2470,7 +2470,7 @@ def assess_form_folders(guard: removal_guard.RemovalGuard, plan: removal_guard.R
             print(f"review {legacy}: legacy build folder")
             if isinstance(plan, removal_guard.RemovalList):
                 _ = plan.add_manual(removal_guard.Tool.BUILD, legacy, guard.root, 0, "legacy build folder")
-    for repo in sorted(guard.names.repositories - removal_guard.LEGACY_TOP):
+    for repo in sorted(guard.names.repositories - removal_guard.PROTECTED_TOP):
         repo_path = guard.root / repo
         collect(repo_path)
         if not removal_guard.is_real_directory(repo_path):
@@ -3079,22 +3079,22 @@ def shrink_floor(
         with ExitStack() as guards:
             lock = scratch.judgment_lock
             blocked_pair = False
-            held_slots: set[SlotBuildOutput] = set()
+            held_copies: set[CopyBuildOutput] = set()
             for paired in paired_roots:
                 try:
-                    slots = output_slot_leases(paired)
+                    copies = output_copy_leases(paired)
                 except (OSError, RuntimeError) as error:
-                    busy[paired] = report_unverified_slot(paired, error)
+                    busy[paired] = report_unverified_copy(paired, error)
                     blocked_pair = True
                     break
-                for slot in slots:
-                    if slot in held_slots:
+                for copy in copies:
+                    if copy in held_copies:
                         continue
-                    if not guards.enter_context(build_folders.collector_lease(slot.checkout, wait=False)):
-                        busy[paired] = LockHeld(slot.lock)
+                    if not guards.enter_context(build_folders.collector_lease(copy.checkout, wait=False)):
+                        busy[paired] = LockHeld(copy.lock)
                         blocked_pair = True
                         break
-                    held_slots.add(slot)
+                    held_copies.add(copy)
                 if blocked_pair:
                     break
                 if not guards.enter_context(lock(Path(paired))):
@@ -4052,7 +4052,7 @@ class BuildHoldTarget:
     holder: str
 
 
-RootProtection = TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence | UnverifiedSlotLease
+RootProtection = TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence | UnverifiedCopyLease
 
 
 @dataclass(frozen=True)
@@ -4796,18 +4796,18 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         no_evidence = {item.path for item in OUTPUT_ROOTS.get().no_recorded_evidence}
         for root in targets:
             try:
-                held_slots = [slot for slot in output_slot_leases(root)
-                              if build_folders.build_folder_state(slot.checkout) == "held"]
+                held_copies = [copy for copy in output_copy_leases(root)
+                              if build_folders.build_folder_state(copy.checkout) == "held"]
             except (OSError, RuntimeError) as error:
-                busy[root] = report_unverified_slot(root, error)
+                busy[root] = report_unverified_copy(root, error)
                 held_targets.add(root)
                 _ = known_trees.setdefault(root, [])
                 continue
-            if held_slots:
-                busy[root] = LockHeld(held_slots[0].lock)
+            if held_copies:
+                busy[root] = LockHeld(held_copies[0].lock)
                 held_targets.add(root)
                 _ = known_trees.setdefault(root, [])
-                print(f"lint sweep: busy slot lease; {root} left alone")
+                print(f"lint sweep: busy copy lease; {root} left alone")
                 continue
             with scratch.judgment_lock(Path(root)) as idle_copy:
                 if root in no_evidence and not idle_copy:
@@ -5383,7 +5383,7 @@ def sweep_unused_folders(dry_run: bool, *, now: float, lint_settings: conf.Confi
             if isinstance(plan, removal_guard.RemovalList):
                 _ = plan.add_manual(removal_guard.Tool.BUILD, path, root, 0, "saved numbered copy removal")
     for repo in sorted(root.iterdir()):
-        if (repo.name in build_folders.BUILD_ROOT_EXCEPTIONS or repo.name in removal_guard.LEGACY_TOP
+        if (repo.name in build_folders.BUILD_ROOT_EXCEPTIONS or repo.name in removal_guard.PROTECTED_TOP
                 or repo.name.startswith("old-") or not removal_guard.is_real_directory(repo)):
             continue
         for path, form in _unused_form_paths(repo):
@@ -5402,7 +5402,7 @@ def switch_removal_list() -> int:
     root = build_folders.build_root()
     plan = removal_guard.RemovalList(removal_guard.Tool.BUILD)
     if removal_guard.is_real_directory(root):
-        for name in ("cargo", "paths", "slot", "hana-ci", "old-claude"):
+        for name in ("cargo", "paths", "hana-ci", "old-claude"):
             path = root / name
             if removal_guard.is_real_directory(path):
                 _ = plan.add_manual(removal_guard.Tool.BUILD, path, root, 0, "legacy build folder at the switch")

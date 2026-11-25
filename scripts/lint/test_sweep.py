@@ -2075,16 +2075,16 @@ class FloorTests(SweepCase):
         self.assertEqual(saved.workspaces, (pairs[1],))
         self.assertEqual(set(saved.history), {pairs[0], pairs[2]})
 
-    def test_floor_sweep_keeps_an_unverified_slot_and_continues(self) -> None:
+    def test_floor_sweep_keeps_an_unverified_copy_and_continues(self) -> None:
         base = self.base()
         unverified, _ = cargo_target(base, "unverified", APP, time.time() - DAY)
         independent, _ = cargo_target(base, "independent", DEMO, time.time() - DAY)
-        leases = sweep.output_slot_leases
+        leases = sweep.output_copy_leases
         verified: set[str] = set()
 
-        def read_leases(path: str) -> tuple[sweep.SlotBuildOutput, ...]:
+        def read_leases(path: str) -> tuple[sweep.CopyBuildOutput, ...]:
             if path == str(unverified.parent):
-                raise PermissionError("fixture slot verification failed")
+                raise PermissionError("fixture copy verification failed")
             verified.add(path)
             return leases(path)
 
@@ -2092,13 +2092,13 @@ class FloorTests(SweepCase):
         build_root = base / "build"
         _ = write_config_fixture(conf.path("build_folders"),
                                  f"roots.build={build_root}\nroots.build.natedev={build_root}\n")
-        with (mock.patch.object(sweep, "output_slot_leases", side_effect=read_leases),
+        with (mock.patch.object(sweep, "output_copy_leases", side_effect=read_leases),
               redirect_stderr(errors)):
             status, _ = self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB], dry_run=True, recorded=True)
         self.assertEqual(status, 0, errors.getvalue())
         self.assertTrue(unverified.is_dir())
         self.assertIn(str(unverified.parent), errors.getvalue())
-        self.assertIn("cannot verify the slot lease", errors.getvalue())
+        self.assertIn("cannot verify the copy lease", errors.getvalue())
         self.assertIn(str(independent.parent), verified)
 
     def test_a_target_removed_during_shrink_does_not_fail_the_floor_pass(self) -> None:

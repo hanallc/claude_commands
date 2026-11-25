@@ -128,6 +128,15 @@ class RemovalGuardTests(unittest.TestCase):
             self.assert_refused(path, removal_guard.RefusalReason.OUTSIDE_ROOT)
             self.assertTrue(path.is_dir())
 
+    def test_user_removal_root_is_refused_before_resolution(self) -> None:
+        guard = self.guard()
+        path = self.root / "slot" / "unit" / "1"
+        with (mock.patch.object(Path, "resolve") as resolve,
+              self.assertRaises(removal_guard.Refused) as result):
+            _ = guard.checked_location(path)
+        self.assertEqual(result.exception.reason, removal_guard.RefusalReason.OUTSIDE_ROOT)
+        resolve.assert_not_called()
+
     def test_unknown_repo_unit_and_extra_depth_refuse(self) -> None:
         for path in (self.root / "unknown" / "unit" / "short",
                      self.root / "sample" / "unknown" / "short", self.target / "debug"):
