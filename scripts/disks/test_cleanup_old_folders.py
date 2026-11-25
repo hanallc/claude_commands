@@ -63,7 +63,8 @@ class CleanupTests(unittest.TestCase):
             f"[cleanup]\ncleanup.dead.natedev={dead}\ncleanup.dead.mac={dead}\n"
             + f"cleanup.list_only.natedev={self.build / 'sccache'}\n"
             + "cleanup.list_only.mac=~/build/slot\ncleanup.list_only_reason.natedev=shared tool cache\n"
-            + "cleanup.list_only_reason.mac=bob's hand step\n# whole: 1..\ncleanup.ssh_seconds=17\n")
+            + "cleanup.list_only_reason.mac=bob's hand step\n")
+        _ = (self.configuration.parent / "mac_test.conf").write_text("# range: 5e-324..\nfloor_sweep_timeout_s=17\n")
 
     def candidate(self, name: str = "old", *, home: Path | None = None) -> Path:
         path = (self.home if home is None else home) / name
