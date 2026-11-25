@@ -224,16 +224,16 @@ def _journal_attempt(row: dict[str, object]) -> tuple[str, str]:
 
 
 def _journal_request(row: dict[str, object]) -> hana_protocol.HanaExecutionRequest:
-    return hana_protocol.decode_request(_saved_copy_document(row['request']))
+    return hana_protocol.decode_request(hana_protocol.encode_document(_saved_copy_fields(row['request'])))
 
 
-def _saved_copy_document(value: object) -> bytes:
+def _saved_copy_fields(value: object) -> dict[str, object]:
     """Read the copy number from a saved document that uses the ABI 2 field."""
     fields = hana_result.object_fields(value)
     if 'copy_number' not in fields and 'slot' in fields:
         fields = fields.copy()
         fields['copy_number'] = fields.pop('slot')
-    return hana_protocol.encode_document(fields)
+    return fields
 
 
 def settle_unpublished_claim(directory: Path, reference: placement.ProviderClaimReference, *,
@@ -309,7 +309,7 @@ def dispatch_publication_attempted(directory: Path, request: hana_protocol.HanaE
 def _checked_observation(row: dict[str, object], request: hana_protocol.HanaExecutionRequest
                          ) -> hana_protocol.HanaExecutionObservation | HanaObservationUnavailable:
     try:
-        observation = hana_protocol.decode_observation(_saved_copy_document(row['observation']))
+        observation = hana_protocol.decode_observation(hana_protocol.encode_document(_saved_copy_fields(row['observation'])))
         if observation.key != request.key or observation.copy_number != request.copy_number:
             raise ValueError('The Hana observation belongs to another dispatch')
         return observation
@@ -588,7 +588,18 @@ def _accepted_result(row: dict[str, object]) -> hana_result.HanaResultDecision:
     encoded = row.get('accepted_result')
     if not isinstance(encoded, str):
         return hana_result.RejectedHanaResult('The Hana dispatch has no accepted terminal result')
-    return hana_result.AcceptedHanaResult(hana_result.decode_result(base64.b64decode(encoded, validate=True)))
+    content = base64.b64decode(encoded, validate=True)
+    try:
+        result = hana_result.decode_result(content)
+    except ValueError:
+        if len(content) > hana_result.RESULT_MAX_BYTES:
+            raise
+        saved = cast(object, json.loads(content))
+        fields = _saved_copy_fields(saved)
+        if fields is saved:
+            raise
+        result = hana_result.decode_result(json.dumps(fields, separators=(',', ':'), allow_nan=False).encode())
+    return hana_result.AcceptedHanaResult(result)
 
 
 def _terminal(row: dict[str, object]) -> placement.TerminalAttemptOutcome:

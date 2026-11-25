@@ -1,6 +1,7 @@
 """Check assigned Hana dispatch, fencing, and recovery without provider calls."""
 from __future__ import annotations
 
+import base64
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
@@ -460,6 +461,43 @@ class HanaExecutionTests(unittest.TestCase):
             retained_generation=hana.generation_text(self.key.generation), release_claim=self.release)
         self.assertEqual(settled, execution.HanaSettled(
             placement.AttemptDeclined('The Hana command has no accepted result'), observation.evidence))
+        self.assertEqual(self.releases, 1)
+        self.assertFalse(execution.claim_dispatch_pending(self.root, self.reference))
+
+    def test_replay_releases_the_claim_for_a_saved_abi_2_accepted_result(self) -> None:
+        self.assertIsInstance(self.dispatch(), execution.DispatchSent)
+        observation = replace(self.objects.observe_execution(self.key), fenced=True, terminated=True, lease_free=True)
+        with mock.patch.object(self.objects, 'observe_execution', return_value=observation):
+            self.assertEqual(execution.observe_execution(self.root, self.request, self.objects), observation.evidence)
+        command = replace(self.command_result(1), stdout=b'x' * hana_protocol.CONTROL_MAX_BYTES)
+        accepted = result.AcceptedHanaResult(command)
+        self.assertEqual(execution.accept_result(self.root, self.request, result.encode_result(command),
+            'fixture-host', lambda: self.source_key), accepted)
+
+        with mock.patch.object(self, 'release', return_value=hana.HanaClaimReleaseRefused('The Hana claim is busy')):
+            self.assertIsInstance(self.settle(), execution.HanaCleanupPending)
+        self.assertTrue(execution.execution_command_settled(self.root, self.key.claim_id))
+        self.assertTrue(execution.claim_dispatch_pending(self.root, self.reference))
+
+        path = execution.execution_path(self.root, self.key.claim_id)
+        row = result.object_fields(cast(object, json.loads(path.read_text())))
+        result.object_fields(result.object_fields(row['request'])['manifest'])['runtime_abi'] = 2
+        for name in ('request', 'observation'):
+            document = result.object_fields(row[name])
+            document['slot'] = document.pop('copy_number')
+        saved_result = result.object_fields(cast(object, json.loads(result.encode_result(command))))
+        saved_result['slot'] = saved_result.pop('copy_number')
+        legacy_result = json.dumps(saved_result, separators=(',', ':')).encode()
+        row['accepted_result'] = base64.b64encode(legacy_result).decode('ascii')
+        _ = path.write_text(json.dumps(row))
+
+        with self.assertRaisesRegex(ValueError, 'copy_number'):
+            _ = result.decode_result(legacy_result)
+        settled = execution.replay_execution_settlement(self.root, self.assignment,
+            retained_generation=hana.generation_text(self.key.generation), release_claim=self.release)
+        self.assertEqual(settled, execution.HanaSettled(placement.AttemptCompleted(1), observation.evidence))
+        legacy_request = replace(self.request, manifest=replace(self.manifest, runtime_abi=2))
+        self.assertEqual(execution.replay_accepted_result(self.root, legacy_request), accepted)
         self.assertEqual(self.releases, 1)
         self.assertFalse(execution.claim_dispatch_pending(self.root, self.reference))
 
