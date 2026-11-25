@@ -29,6 +29,8 @@ Release the hold when nate is back and gives approval.
 Read The List records and morty's other `checkins.json` state at startup and after compaction.
 Use `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all` to read every item in morty's folder.
 Save substantive item changes through `the_list.py add`, `update`, `park`, `unpark`, `close`, `reopen`, `mark-read`, `link`, or `unlink`.
+Set Scheduled with `--state Scheduled --start <zoned ISO time> --do <words>`. Add `--repeat <RRULE>` for a series.
+Say the repeat rule in plain words before saving it. Use `--scope this|following|all` to change or remove a repeat.
 Use `--review <shown id>` or `--review-key <key>` with `link` and `unlink`; both options can repeat and mix.
 Use `--producer <name or staff ID>` with `add` or `update` to assign an item in morty's folder.
 When a producer gets an item in a Rust project, tell it to load `~/.claude/docs/producer/rust_design.md`. Ask it to confirm.

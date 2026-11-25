@@ -1,12 +1,16 @@
 """Test The List against private staff records and state folders."""
 from __future__ import annotations
 
+import errno
+import fcntl
 import io
 import json
 import os
 import shlex
 import shutil
+import socket
 import subprocess
+import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -18,19 +22,21 @@ from typing import Literal, Protocol, cast, final, override
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
+from scripts.agents import remote
 from scripts.agents.remote import local_machine
 from scripts.herdr.place import HerdrPlace
-from scripts.lib import atomic_file, conf
-from scripts.message import send_result
-from scripts.production import change_review, delivery_state, investigation, record_store, session_pane, staff, the_list, update_registration
+from scripts.lib import atomic_file, conf, main_publish
+from scripts.message import send_result, session_send
+from scripts.production import change_review, delivery_state, investigation, record_store, repeat_rule, session_pane, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
-from scripts.review_links import change_page, list_page, question_record, review_items
+from scripts.review_links import change_page, list_page, new_item_dialog, question_record, review_items, review_submissions
 
 MORTY = staff.StaffRow(staff.StaffId("536997b5-4415-4cb1-b683-d777e02e9a22"), "producer", "morty", staff.StaffRoot(),
                        current_session=staff.StaffId("20fa30c6-3cad-493a-b74a-0e408a93f865"))
 BOB = staff.StaffRow(staff.StaffId("a02a55c8-a2c4-47d9-bf99-fd30ffe75247"), "producer", "bob", staff.StaffRoot(),
                      current_session=staff.StaffId("32c954ea-25b3-44e7-9eed-3218ce9df1d6"))
 START = datetime(2026, 11, 16, 18, tzinfo=UTC)
+UPKEEP_INTERVAL = timedelta(minutes=2)
 LIST_TEXT_LIMITS = {
     "max_chars.latest_status": 80,
     "max_chars.next_step": 72,
@@ -40,7 +46,7 @@ LIST_TEXT_LIMITS = {
 
 class ProducerScopedUpdate(Protocol):
     def __call__(self, keeper: staff.StaffId, identity: str, changes: the_list.ItemChanges, *,
-                 source: str, assigned_to: staff.StaffRow) -> the_list.ListEdit: ...
+                 source: str, assigned_to: staff.StaffRow, schedule_edits: the_list.ScheduleChanges) -> the_list.ListEdit: ...
 
 
 scoped_update = cast(ProducerScopedUpdate, getattr(the_list, "_update"))
@@ -70,7 +76,8 @@ class TheListTests(unittest.TestCase):
         _ = os.environ.pop("CONF_DIR", None)
         self.list_config = self.root / ".claude/config/the_list.conf"
         self.list_config.parent.mkdir(parents=True)
-        _ = self.list_config.write_text("".join(f"# whole: 1..\n{key}={limit}\n" for key, limit in LIST_TEXT_LIMITS.items()))
+        settings = {**LIST_TEXT_LIMITS, "series_run_limit": 730, "confirm_wait_minutes": 15}
+        _ = self.list_config.write_text("".join(f"# whole: 1..\n{key}={limit}\n" for key, limit in settings.items()))
         _ = self.enterContext(patch.object(the_list, "now", return_value=START))
         _ = self.send_patch.start()
         self.addCleanup(self.send_patch.stop)
@@ -208,6 +215,1156 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(item.log[1], the_list.ItemChange(START, the_list.MarkedRead(), "nate"))
         self.assertIn("| # | Owner | Producer | Item | State | Next step | ETA | Update |", self.command("list")[1])
         self.assertIn('| 106 | show | morty | The page: "List" | Delivered;', self.command("list")[1])
+
+    def add_scheduled(self, start: str, *options: str) -> tuple[int, str, str]:
+        return self.command("add", "--title", "Check the predictions", "--owner", RUNNER.id,
+                            "--state", "scheduled", "--start", start, "--do", "Read the figures.\nSend the total.",
+                            "--source", "nate", *options)
+
+    def save_series_progress(self, identity: str, *, finished: range | frozenset[int]) -> None:
+        store = record_store.NumberedRecords(MORTY.id, "list", "L", "list item", the_list.ListError)
+        fields, body = store.read(identity)
+        schedule = cast(dict[str, object], json.loads(fields["schedule"]))
+        schedule["runs_used"] = len(finished)
+        schedule["finished_runs"] = sorted(finished)
+        fields["schedule"] = json.dumps(schedule)
+        store.write(identity, fields, body)
+
+    def test_scheduled_items_round_trip_and_list_their_next_run(self) -> None:
+        start = "2026-11-30T09:00[America/Los_Angeles]"
+        stamp = "2026-11-30T09:00:00-08:00[America/Los_Angeles]"
+        draft = review_submissions.NewItemDraft(new_item_dialog.ScheduledDraftId("s1-" + "a" * 32), review_submissions.ListDraftClaim(
+            "b" * 64, MORTY.id, "Assign to the runner.", ("Starts on Monday.", "Does not repeat"),
+            (review_submissions.ListAssignmentNotice(RUNNER.id, "showrunner", "Read the figures.", "morty"),)))
+        for options, detail, origin in (
+            ((), "Does not repeat", review_submissions.NoNewItemDraft.ABSENT),
+            (("--repeat", "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TH"), "Repeats: Every 2 weeks on Monday and Thursday",
+             review_submissions.NoNewItemDraft.ABSENT),
+            ((), "Does not repeat", draft),
+        ):
+            with self.subTest(detail=detail, origin=origin):
+                if isinstance(origin, review_submissions.NewItemDraft):
+                    start_time = datetime(2026, 11, 30, 9, tzinfo=ZoneInfo("America/Los_Angeles"))
+                    chosen: list[int] = []
+                    saved = the_list.add(MORTY.id, "Check the predictions", owner=RUNNER.id, source="nate",
+                                         changes={"state": the_list.ItemState.SCHEDULED,
+                                                  "schedule": the_list.ScheduledRun(start_time, "Read the figures.\nSend the total."),
+                                                  "evidence": "Read the source report."},
+                                         new_item_draft_id=origin, before_save=chosen.append)
+                    self.assertEqual(chosen, [saved.number])
+                    identity = saved.id
+                else:
+                    code, output, errors = self.add_scheduled(start, *options)
+                    self.assertEqual((code, errors), (0, ""))
+                    description, identity = output.splitlines()
+                    self.assertEqual(description, detail)
+                item = the_list.load(MORTY.id, identity)
+                self.assertEqual(item.new_item_draft_id, origin)
+                schedule = item.schedule
+                self.assertIs(item.state, the_list.ItemState.SCHEDULED)
+                self.assertIs(item.parked_until, the_list.NoTimestamp.UNSET)
+                if isinstance(schedule, the_list.ScheduledSeries):
+                    run = schedule.first
+                    self.assertEqual(schedule.rule.rrule, "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TH")
+                else:
+                    assert isinstance(schedule, the_list.ScheduledRun)
+                    run = schedule
+                self.assertEqual(run.start.tzinfo, ZoneInfo("America/Los_Angeles"))
+                self.assertEqual(run.words, "Read the figures.\nSend the total.")
+                shown = self.command("list")[1]
+                self.assertIn(f"Scheduled · Starts {stamp}", shown)
+                if options:
+                    self.assertIn(f"Every 2 weeks on Monday and Thursday · next {stamp}", shown)
+                event = item.log[-1].what
+                assert isinstance(event, the_list.FieldChange)
+                self.assertEqual(event.fields.get("schedule"), schedule)
+                page = list_page.render(self.root, include_counts=False).decode()
+                self.assertIn("Check the predictions", page)
+                if isinstance(origin, review_submissions.NewItemDraft):
+                    self.assertEqual(item.evidence, "Read the source report.")
+                    self.assertNotIn(origin.id.value, shown)
+                    self.assertNotIn(origin.id.value, page)
+
+        second = datetime(2026, 11, 30, 17, tzinfo=UTC) + timedelta(days=1)
+        moved = second + timedelta(hours=1)
+        third = second + timedelta(days=1)
+        for label, finished, expected in (
+            ("run 2 comes before a delayed run 1", frozenset[int](), ((2, second), (1, moved), (3, third))),
+            ("finished run 2 leaves run 1 pending", frozenset({2}), ((1, moved), (3, third))),
+            ("finishing both runs leaves run 3 pending", frozenset({1, 2}), ((3, third),)),
+        ):
+            with self.subTest(label=label):
+                code, output, errors = self.add_scheduled((second - timedelta(days=1)).isoformat(), "--repeat", "FREQ=DAILY;COUNT=3")
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                self.assertEqual(self.command("update", "--id", identity, "--scope", "this", "--source", "nate",
+                                              "--start", moved.isoformat()), (0, "Repeats: Daily for 3 runs\n", ""))
+                series = the_list.load(MORTY.id, identity).schedule
+                assert isinstance(series, the_list.ScheduledSeries)
+                progress = series.finish_runs(finished)
+                self.assertEqual(progress.runs_used, len(finished))
+                self.assertEqual(progress.finished_runs, finished)
+                self.save_series_progress(identity, finished=progress.finished_runs)
+                saved = the_list.load(MORTY.id, identity).schedule
+                self.assertEqual(saved, progress)
+                assert isinstance(saved, the_list.ScheduledSeries)
+                self.assertEqual(tuple((run.number, run.run.start) for run in saved.runs()),
+                                 expected)
+                rows = self.command("list")[1].splitlines()
+                row = next(line for line in rows if line.startswith(f"| {identity.removeprefix('L')} |"))
+                self.assertIn(f"· next {expected[0][1].isoformat()}", row)
+
+        settings = self.list_config.read_text()
+        for label, offset, old_cursor, expected_finished in (
+            ("6de0503120 split", 1, {}, frozenset({1})),
+            ("9eb8ed1201 cursor", 0, {"runs_used": 2}, frozenset({1})),
+        ):
+            with self.subTest(label=label):
+                _ = self.list_config.write_text(settings.replace("series_run_limit=730", "series_run_limit=4"))
+                code, output, errors = self.add_scheduled(start, "--repeat", "FREQ=DAILY;COUNT=4")
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                store = record_store.NumberedRecords(MORTY.id, "list", "L", "list item", the_list.ListError)
+                fields, body = store.read(identity)
+                legacy = {"start": stamp, "do": "Check the figures.", "repeat": "FREQ=DAILY;COUNT=4",
+                          "runs_before": offset, "exceptions": [{"number": 2, "removed": True}], **old_cursor}
+                current = fields["schedule"]
+                fields["schedule"] = json.dumps(legacy)
+                body = body.replace('"schedule": ' + current, '"schedule": ' + fields["schedule"])
+                store.write(identity, fields, body)
+                saved = the_list.load(MORTY.id, identity)
+                series = saved.schedule
+                assert isinstance(series, the_list.ScheduledSeries)
+                self.assertEqual((series.finished_runs, series.skipped_runs, series.runs_used),
+                                 (expected_finished, frozenset({2}), 2))
+                self.assertEqual(series.run_number_offset, offset)
+                event = saved.log[-1].what
+                assert isinstance(event, the_list.FieldChange)
+                self.assertEqual(event.fields.get("schedule"), series)
+                self.assertEqual(series.run_allowance, 4)
+                _ = the_list.update(MORTY.id, identity, {"title": "Check the totals"}, source="nate")
+                _ = self.list_config.write_text(settings.replace("series_run_limit=730", "series_run_limit=2"))
+                migrated = the_list.load(MORTY.id, identity)
+                self.assertEqual(migrated.schedule, series)
+                self.assertEqual(migrated.log[-2], saved.log[-1])
+
+        parked = self.add("A parked item")
+        _ = the_list.park(MORTY.id, parked.id, START + timedelta(days=1), source="nate")
+        self.assertEqual(self.command("update", "--id", parked.id, "--state", "Scheduled", "--start", start,
+                                     "--do", "Check the total.", "--source", "nate"), (0, "Does not repeat\n", ""))
+        saved = the_list.load(MORTY.id, parked.id)
+        self.assertEqual(saved.parked_until, the_list.NoTimestamp.UNSET)
+        self.assertEqual(saved.schedule, the_list.ScheduledRun(
+            datetime(2026, 11, 30, 9, tzinfo=ZoneInfo("America/Los_Angeles")), "Check the total."))
+
+    def test_scheduled_run_cycle(self) -> None:
+        sender = self.root / "send.py"
+        sent = self.root / "sent.jsonl"
+        attempted = self.root / "attempted.jsonl"
+        _ = sender.write_text(r"""from pathlib import Path
+import json
+import os
+import subprocess
+import sys
+import time
+
+args = sys.argv[1:]
+log = Path(__file__).with_name("sent.jsonl")
+attempted = log.with_name("attempted.jsonl")
+key = args[args.index("--key") + 1]
+to = args[args.index("--to") + 1]
+with attempted.open("a") as stream:
+    stream.write(json.dumps(args) + "\n")
+if ("Slow notice" in args[-1] or "Accepted notice" in args[-1]) and key.endswith(":owner_start"):
+    lock = log.with_name("sender-child.lock")
+    program = (
+        "import fcntl, sys, time\n"
+        "with open(sys.argv[1], 'w') as lock:\n"
+        "    fcntl.flock(lock, fcntl.LOCK_EX)\n"
+        "    print('ready', flush=True)\n"
+        "    time.sleep(10)\n"
+    )
+    command = [sys.executable, "-c", program, str(lock)]
+    child = subprocess.Popen(command, stdout=subprocess.PIPE,
+                             start_new_session=os.environ.get("SEND_REPEAT_NOTICE_JOB") != "1")
+    assert child.stdout.readline() == b"ready\n"
+    child.stdout.close()
+    if "Slow notice" in args[-1]:
+        child.wait()
+if ("Orphan sender" in args[-1] or "Exited sender" in args[-1]) and key.endswith(":owner_start"):
+    program = (
+        "import os, signal, socket, sys\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "with socket.create_connection(('127.0.0.1', int(sys.argv[1])), timeout=8) as connection:\n"
+        "    connection.sendall(b'R')\n"
+        "    if connection.recv(1) == b'X':\n"
+        "        print('release', flush=True)\n"
+        "        os.close(1)\n"
+        "        connection.recv(1)\n"
+    )
+    command = [sys.executable, "-c", program, os.environ["SCHEDFIRE_TEST_READY_PORT"]]
+    if "Exited sender" in args[-1]:
+        child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        assert child.stdout.readline() == b"release\n"
+        child.stdout.close()
+    else:
+        with subprocess.Popen(command, stdout=subprocess.DEVNULL) as child:
+            child.wait()
+if "Scan resume" in args[-1] and key.endswith("_start"):
+    time.sleep(30)
+rows = log.read_text().splitlines() if log.exists() else []
+if any(key in json.loads(row) for row in rows):
+    print("SKIPPED: key already accepted")
+    sys.exit(0)
+with log.open("a") as stream:
+    stream.write(json.dumps(args) + "\n")
+if "Lose receipt" in args[-1] and key.endswith(":producer_start"):
+    sys.exit(3)
+if to == "user":
+    print("KEPT: held during silence")
+elif key.endswith(":owner_start") and "Accepted notice" not in args[-1]:
+    print("QUEUED: owner is offline")
+    sys.exit(1)
+else:
+    print("SENT: delivered")
+""")
+        cases = (
+            ("confirmed", "", 730, 0, RUNNER),
+            ("timeout", "", 730, 0, MORTY),
+            ("count", "FREQ=DAILY;COUNT=2", 730, 0, MORTY),
+            ("until", "FREQ=DAILY;UNTIL=20261117T180000Z", 730, 0, RUNNER),
+            ("cap", "FREQ=DAILY", 2, 0, RUNNER),
+            ("missed", "FREQ=DAILY;COUNT=4", 730, 2, RUNNER),
+            ("Lose receipt", "", 730, 0, RUNNER),
+            ("owner changed", "", 730, 0, RUNNER),
+        )
+        config = self.list_config.read_text().replace("confirm_wait_minutes=15", "confirm_wait_minutes=2")
+        with (patch.object(session_send, "SEND_SCRIPT", sender),
+              patch.object(remote, "local_machine", return_value="natedev"),
+              patch.object(sys, "platform", "linux")):
+            for case, rule, limit, missed_days, caller in cases:
+                with self.subTest(case=case):
+                    _ = self.list_config.write_text(config.replace("series_run_limit=730", f"series_run_limit={limit}"))
+                    for path in (sent, attempted):
+                        _ = path.write_text("")
+                    scheduled = the_list.ScheduledRun(START, "Compare the account predictions.")
+                    schedule = the_list.ScheduledSeries(scheduled, repeat_rule.parse(rule), limit) if rule else scheduled
+                    item = self.add(case, changes={"state": the_list.ItemState.SCHEDULED,
+                                                   "schedule": schedule, "producer": BOB.id})
+                    if case == "cap":
+                        _ = self.list_config.write_text(config.replace("series_run_limit=730", "series_run_limit=1"))
+                    due = START + timedelta(days=missed_days)
+                    tick = due + timedelta(minutes=1) if missed_days else due
+                    if case in {"confirmed", "cap"}:
+                        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+                        _ = path.write_text("".join(line for line in path.read_text().splitlines(keepends=True)
+                                                    if not line.startswith("scheduled_check:")))
+                    with (patch.object(the_list, "now", return_value=START - timedelta(seconds=1)),
+                          patch.object(the_list, "load", side_effect=AssertionError("the future record was loaded"))):
+                        the_list.fire_scheduled(UPKEEP_INTERVAL)
+                    self.assertEqual(sent.read_text(), "")
+                    extra_logs = missed_days + int(case == "Lose receipt")
+                    with patch.object(the_list, "now", return_value=tick), redirect_stderr(io.StringIO()):
+                        the_list.fire_scheduled(UPKEEP_INTERVAL)
+                        working = the_list.load(MORTY.id, item.id)
+                        self.assertIs(working.state, the_list.ItemState.WORKING)
+                        self.assertEqual(len(working.log), len(item.log) + 1 + extra_logs)
+                        self.assertIn("Instruction sent", str(working.log[len(item.log) + missed_days].what))
+                        if missed_days:
+                            expected = [f"Scheduled run due {(START + timedelta(days=day)).isoformat()}. Missed."
+                                        for day in range(missed_days)]
+                            self.assertEqual([entry.what for entry in working.log[len(item.log):-1]], expected)
+                        starts = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
+                        self.assertEqual([args[args.index("--to") + 1] for args in starts],
+                                         [f"staff:{RUNNER.id}", f"staff:{BOB.id}"])
+                        for args in starts:
+                            message = args[args.index("--text") + 1]
+                            self.assertIn(f"Scheduled List item {item.number} starts now: {case}", message)
+                            self.assertIn(scheduled.words, message)
+                            self.assertIn(due.isoformat(), message)
+                        self.assertEqual(len(working.run_deliveries), 1)
+                        run_key = working.run_deliveries[0].key
+                        if case == "Lose receipt":
+                            the_list.fire_scheduled(UPKEEP_INTERVAL)
+                            sends = [cast(list[str], json.loads(row)) for row in attempted.read_text().splitlines()]
+                            self.assertEqual(sends, starts)
+                            self.assertIn("Delivery uncertain for producer start", str(working.log[-1].what))
+                            self.assertEqual(the_list.load(MORTY.id, item.id).log, working.log)
+                        if case == "owner changed":
+                            _ = the_list.update(MORTY.id, item.id, {"owner": OTHER.id}, source="nate")
+                            extra_logs += 1
+                            with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": OTHER.current_session}):
+                                code, _, error = self.command("confirm", "--id", item.id, "--run", run_key)
+                            self.assertEqual(code, 1)
+                            self.assertIn("only the owner or morty", error)
+                        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": BOB.current_session}):
+                            code, _, error = self.command("confirm", "--id", item.id)
+                        self.assertEqual(code, 1)
+                        self.assertIn("only the owner or morty", error)
+                        if case != "timeout":
+                            with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": caller.current_session}):
+                                result = self.command("confirm", "--id", item.id, "--run", run_key)
+                            self.assertEqual(result, (0, f"confirmed {item.id}\n", ""))
+                    with patch.object(the_list, "now", return_value=tick + timedelta(minutes=2, seconds=-1)):
+                        the_list.fire_scheduled(UPKEEP_INTERVAL)
+                    self.assertEqual(len(sent.read_text().splitlines()), 2)
+                    with patch.object(the_list, "now", return_value=tick + timedelta(minutes=2)):
+                        if case == "timeout":
+                            code, _, error = self.command("confirm", "--id", item.id)
+                            self.assertEqual(code, 1)
+                            self.assertIn("the confirmation time has passed", error)
+                        the_list.fire_scheduled(UPKEEP_INTERVAL)
+                        the_list.fire_scheduled(UPKEEP_INTERVAL)
+                    changed = the_list.load(MORTY.id, item.id)
+                    self.assertEqual(len(changed.log), len(item.log) + 1 + extra_logs)
+                    result_entry = changed.log[len(item.log) + missed_days]
+                    rows = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
+                    if case == "timeout":
+                        self.assertIn("No confirmation", str(result_entry.what))
+                        self.assertEqual([args[args.index("--to") + 1] for args in rows],
+                                         [f"staff:{RUNNER.id}", f"staff:{BOB.id}", "user", f"staff:{BOB.id}"])
+                        self.assertEqual(rows[2][rows[2].index("--text-id") + 1], "nate.adhoc")
+                        self.assertIn("has no confirmation", rows[3][-1])
+                    else:
+                        self.assertIn("Confirmed", str(result_entry.what))
+                        self.assertEqual(rows, starts)
+                    if rule:
+                        self.assertIs(changed.state, the_list.ItemState.SCHEDULED)
+                        next_time = due + timedelta(days=1)
+                        self.assertIn(f"next {next_time.isoformat()}", the_list.table(MORTY.id))
+                        with patch.object(the_list, "now", return_value=next_time):
+                            the_list.fire_scheduled(UPKEEP_INTERVAL)
+                            code, _, error = self.command("confirm", "--id", item.id, "--run", run_key)
+                            self.assertEqual(code, 1)
+                            self.assertIn("no matching scheduled run", error)
+                            self.assertEqual(self.command("confirm", "--id", item.id),
+                                             (0, f"confirmed {item.id}\n", ""))
+                        changed = the_list.load(MORTY.id, item.id)
+                        self.assertEqual(len(changed.log), len(item.log) + 2 + extra_logs)
+                        self.assertIn(next_time.isoformat(), str(changed.log[-1].what))
+                        self.assertEqual(len(sent.read_text().splitlines()), 4)
+                        with patch.object(the_list, "now", return_value=next_time + timedelta(days=1)):
+                            the_list.fire_scheduled(UPKEEP_INTERVAL)
+                        self.assertEqual(len(sent.read_text().splitlines()), 4)
+                    self.assertIs(changed.state, the_list.ItemState.WORKING)
+                    self.assertIs(changed.schedule, the_list.NoSchedule.UNSET)
+
+            for case in ("interrupted owner", "slow notice", "accepted notice", "scan resume", "overlapping runs",
+                         "same check", "state changed", "all confirmations", "pending instruction",
+                         "reopened", "capture allocation fails", "Mac", "orphan sender", "exited sender"):
+                with self.subTest(case=case):
+                    for path in (sent, attempted):
+                        _ = path.write_text("")
+                    _ = self.list_config.write_text(config)
+                    match case:
+                        case "interrupted owner":
+                            self.check_scheduled_instruction_interrupt(attempted)
+                        case "slow notice" | "accepted notice":
+                            self.check_slow_scheduled_notice(sent, attempted, accepted=case == "accepted notice")
+                        case "scan resume":
+                            self.check_scheduled_scan_resumes(sent)
+                        case "overlapping runs" | "same check" | "state changed":
+                            self.check_overlapping_scheduled_runs(sent, attempted, case)
+                        case "all confirmations" | "pending instruction":
+                            self.check_manual_run_settlement(attempted, pending_instruction=case == "pending instruction")
+                        case "reopened":
+                            self.check_reopened_run_settlement(attempted)
+                        case "capture allocation fails":
+                            self.check_scheduled_capture_failure(sent, attempted)
+                        case "Mac":
+                            self.check_mac_scheduled_run(attempted)
+                        case "orphan sender" | "exited sender":
+                            self.check_scheduled_sender_stops_after_upkeep_dies(sender, sender_exits=case == "exited sender")
+
+    def check_scheduled_instruction_interrupt(self, attempted: Path) -> None:
+        schedule = the_list.ScheduledRun(START, "Check the figures.")
+        item = self.add("Interrupted", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+        with (patch.object(the_list, "_send_scheduled_notice", side_effect=KeyboardInterrupt),
+              self.assertRaises(KeyboardInterrupt)):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+        interrupted = the_list.load(MORTY.id, item.id)
+        active = interrupted.run_deliveries[0]
+        self.assertEqual(active.notices[0], the_list.ScheduledNotice(the_list.RunNotice.OWNER_START,
+                                                                    the_list.NoticeState.SENDING))
+        code, _, error = self.command("confirm", "--id", item.id, "--run", active.key)
+        self.assertEqual(code, 1)
+        self.assertIn("waiting for its owner instruction", error)
+        recovered_at = START + timedelta(minutes=3)
+        with patch.object(the_list, "now", return_value=recovered_at):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+        recovered = the_list.load(MORTY.id, item.id)
+        self.assertEqual(recovered.run_deliveries[0].confirmation,
+                         the_list.AwaitingConfirmation(recovered_at + timedelta(minutes=2)))
+        self.assertEqual([entry.what for entry in recovered.log[len(item.log):]],
+                         [f"Scheduled run due {START.isoformat()}. Instruction uncertain. Waiting for confirmation.",
+                          f"Scheduled run due {START.isoformat()}. Delivery uncertain for owner start."])
+        rows = [cast(list[str], json.loads(row)) for row in attempted.read_text().splitlines()]
+        self.assertEqual([args[args.index("--key") + 1].split(":")[-1] for args in rows], ["producer_start"])
+        with patch.object(the_list, "now", return_value=recovered_at + timedelta(minutes=2)):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+        rows = [cast(list[str], json.loads(row)) for row in attempted.read_text().splitlines()]
+        self.assertEqual([args[args.index("--key") + 1].split(":")[-1] for args in rows],
+                         ["producer_start", "user_timeout", "producer_timeout"])
+
+    def check_slow_scheduled_notice(self, sent: Path, attempted: Path, *, accepted: bool) -> None:
+        schedule = the_list.ScheduledRun(START, "Check the figures.")
+        changes: the_list.ItemChanges = {"state": the_list.ItemState.SCHEDULED, "schedule": schedule}
+        slow = self.add("Accepted notice" if accepted else "Slow notice", changes=changes)
+        later = self.add("Later item", changes=changes)
+        with redirect_stderr(io.StringIO()) as errors:
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+        self.assertIn("timed out", errors.getvalue())
+        with (self.root / "sender-child.lock").open("r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        rows = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
+        self.assertEqual(sum(later.title in args[-1] for args in rows), 2)
+        done = the_list.load(MORTY.id, slow.id)
+        if accepted:
+            self.assertIn("sender group timed out after the sender exited", errors.getvalue())
+            run = done.run_deliveries[0]
+            self.assertEqual(run.notices[0], the_list.ScheduledNotice(the_list.RunNotice.OWNER_START,
+                                                                     the_list.NoticeState.ACCEPTED))
+            self.assertEqual(done.log[run.log_index].what,
+                             f"Scheduled run due {START.isoformat()}. Instruction sent. Waiting for confirmation.")
+            self.assertNotIn("Delivery uncertain", "\n".join(str(entry.what) for entry in done.log))
+        else:
+            self.assertIn("Delivery uncertain for owner start", str(done.log[-1].what))
+        for item in (slow, later):
+            self.assertEqual(self.command("confirm", "--id", item.id), (0, f"confirmed {item.id}\n", ""))
+        the_list.fire_scheduled(UPKEEP_INTERVAL)
+        rows = [cast(list[str], json.loads(row)) for row in attempted.read_text().splitlines()]
+        self.assertEqual(sum(slow.title in args[-1] and args[args.index("--key") + 1].endswith(":owner_start")
+                             for args in rows), 1)
+
+    def check_scheduled_sender_stops_after_upkeep_dies(self, sender: Path, *, sender_exits: bool) -> None:
+        schedule = the_list.ScheduledRun(START, "Check the figures.")
+        title = "Exited sender" if sender_exits else "Orphan sender"
+        _ = self.add(title, changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+        program = """import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+from scripts.agents import remote
+from scripts.message import session_send
+from scripts.production import the_list
+
+session_send.SEND_SCRIPT = Path(sys.argv[1])
+the_list.now = lambda: datetime.fromisoformat(sys.argv[2])
+remote.local_machine = lambda: "natedev"
+the_list.fire_scheduled(timedelta(minutes=2))
+"""
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(5)
+            address = cast(tuple[str, int], listener.getsockname())
+            env = {**os.environ, "SCHEDFIRE_TEST_READY_PORT": str(address[1])}
+            with subprocess.Popen([sys.executable, "-c", program, str(sender), START.isoformat()],
+                                  env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as upkeep:
+                try:
+                    connection = listener.accept()[0]
+                    with connection:
+                        connection.settimeout(5)
+                        self.assertEqual(connection.recv(1), b"R")
+                        upkeep.kill()
+                        if sender_exits:
+                            _ = upkeep.wait(timeout=5)
+                            connection.sendall(b"X")
+                        self.assertEqual(connection.recv(1), b"")
+                finally:
+                    upkeep.kill()
+
+    def check_scheduled_scan_resumes(self, sent: Path) -> None:
+        schedule = the_list.ScheduledRun(START, "Read the figures.")
+        changes: the_list.ItemChanges = {"state": the_list.ItemState.SCHEDULED, "schedule": schedule}
+        slow = self.add("Scan resume", changes=changes)
+        later = self.add("Later scan item", changes=changes)
+        with patch.object(the_list, "_SCHEDULED_CHECK_SECONDS", 1.5), redirect_stderr(io.StringIO()):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+            first_check = the_list.load(MORTY.id, slow.id)
+            self.assertIn("Delivery uncertain for owner start", str(first_check.log[-1].what))
+            self.assertEqual(the_list.load(MORTY.id, later.id), later)
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+        rows = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
+        self.assertEqual(sum(later.title in args[-1] for args in rows), 2)
+        for item in (slow, later):
+            self.assertEqual(self.command("confirm", "--id", item.id), (0, f"confirmed {item.id}\n", ""))
+
+    def check_overlapping_scheduled_runs(self, sent: Path, attempted: Path, case: str) -> None:
+        first = the_list.ScheduledRun(START.replace(hour=17), "First words.")
+        schedule = the_list.ScheduledSeries(first, repeat_rule.parse("FREQ=DAILY;COUNT=2"), 730)
+        item = self.add("Lose receipt in moved run", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+        second = first.start + timedelta(days=1)
+        moved = second + timedelta(minutes=1)
+        self.assertEqual(self.command("update", "--id", item.id, "--scope", "this", "--start", moved.isoformat(),
+                                      "--source", "nate"), (0, "Repeats: Daily for 2 runs\n", ""))
+        if case != "same check":
+            with patch.object(the_list, "now", return_value=second), redirect_stderr(io.StringIO()):
+                the_list.fire_scheduled(UPKEEP_INTERVAL)
+                after_second = the_list.load(MORTY.id, item.id)
+                active = after_second.run_deliveries[0]
+                self.assertEqual(active.run.start, second)
+                self.assertIn("Delivery uncertain for producer start", str(after_second.log[-1].what))
+                remaining = after_second.schedule
+                assert isinstance(remaining, the_list.ScheduledSeries)
+                self.assertEqual(remaining.finished_runs, frozenset({2}))
+                self.assertEqual(remaining.runs_used, 1)
+                self.assertEqual([(run.number, run.run.start) for run in remaining.runs()], [(1, moved)])
+                if case == "state changed":
+                    self.assertEqual(self.command("update", "--id", item.id, "--state", "Delivered",
+                                                  "--source", "nate"), (0, "", ""))
+                    delivered = the_list.load(MORTY.id, item.id)
+                    self.assertIs(delivered.state, the_list.ItemState.DELIVERED)
+                    self.assertEqual(delivered.schedule, remaining)
+                    self.assertEqual(delivered.run_deliveries, ())
+                    self.assertEqual(delivered.log[active.log_index].what,
+                                     f"Scheduled run due {second.isoformat()}. Settled by a manual state change.")
+        tick = moved + timedelta(seconds=30) if case == "same check" else moved
+        with patch.object(the_list, "now", return_value=tick), redirect_stderr(io.StringIO()):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+            if case == "same check":
+                first_check = the_list.load(MORTY.id, item.id)
+                self.assertEqual([run.run.start for run in first_check.run_deliveries], [second, moved])
+                self.assertNotIn("Missed.", "\n".join(str(entry.what) for entry in first_check.log))
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+            started = the_list.load(MORTY.id, item.id)
+            expected = [moved] if case == "state changed" else [second, moved]
+            self.assertEqual([run.run.start for run in started.run_deliveries], expected)
+            if case == "state changed":
+                sends = attempted.read_text()
+                with patch.object(the_list, "now", return_value=second + timedelta(minutes=2)):
+                    the_list.fire_scheduled(UPKEEP_INTERVAL)
+                self.assertEqual(attempted.read_text(), sends)
+            for run in started.run_deliveries:
+                self.assertEqual(self.command("confirm", "--id", item.id, "--run", run.key),
+                                 (0, f"confirmed {item.id}\n", ""))
+        rows = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
+        self.assertEqual(len(rows), 4)
+        for args, due in zip(rows, (second, second, moved, moved), strict=True):
+            self.assertIn(due.isoformat(), args[-1])
+        self.assertIs(the_list.load(MORTY.id, item.id).schedule, the_list.NoSchedule.UNSET)
+
+    def check_manual_run_settlement(self, attempted: Path, *, pending_instruction: bool) -> None:
+        wait = timedelta(days=3)
+        settings = self.list_config.read_text().replace("confirm_wait_minutes=2", "confirm_wait_minutes=4320")
+        _ = self.list_config.write_text(settings)
+        first = the_list.ScheduledRun(START, "Read the figures.")
+        days = "MO,TU,WE" if pending_instruction else "MO,TU"
+        rule = repeat_rule.parse(f"FREQ=WEEKLY;BYDAY={days};COUNT={4 if pending_instruction else 3}")
+        item = self.add("Manual settlement", changes={"state": the_list.ItemState.SCHEDULED,
+                                                     "schedule": the_list.ScheduledSeries(first, rule, 730)})
+        due = (START, START + timedelta(days=1), START + timedelta(days=2))
+        for tick in due[:2]:
+            with patch.object(the_list, "now", return_value=tick):
+                the_list.fire_scheduled(UPKEEP_INTERVAL)
+        if pending_instruction:
+            with (patch.object(the_list, "now", return_value=due[2]),
+                  patch.object(the_list, "_deliver_scheduled_notice", side_effect=KeyboardInterrupt),
+                  self.assertRaises(KeyboardInterrupt)):
+                the_list.fire_scheduled(UPKEEP_INTERVAL)
+
+        active = the_list.load(MORTY.id, item.id)
+        first_run, second_run, *pending = active.run_deliveries
+        for run, tick in zip((first_run, second_run), due[:2], strict=True):
+            self.assertEqual(run.confirmation, the_list.AwaitingConfirmation(tick + wait))
+        if pending_instruction:
+            self.assertEqual([(run.run.start, run.confirmation) for run in pending],
+                             [(due[2], the_list.AwaitingInstruction.OWNER)])
+
+        with patch.object(the_list, "now", return_value=due[2]):
+            self.assertEqual(self.command("update", "--id", item.id, "--state", "Delivered", "--source", "nate"),
+                             (0, "", ""))
+            delivered = the_list.load(MORTY.id, item.id)
+            self.assertIs(delivered.state, the_list.ItemState.DELIVERED)
+            self.assertEqual(delivered.schedule, active.schedule)
+            self.assertEqual(delivered.run_deliveries, tuple(pending))
+            for run in (first_run, second_run):
+                self.assertEqual(delivered.log[run.log_index].what,
+                                 f"Scheduled run due {run.run.start.isoformat()}. Settled by a manual state change.")
+            if pending_instruction:
+                the_list.fire_scheduled(UPKEEP_INTERVAL)
+                resumed = the_list.load(MORTY.id, item.id)
+                self.assertEqual([(run.key, run.confirmation) for run in resumed.run_deliveries],
+                                 [(pending[0].key, the_list.AwaitingConfirmation(due[2] + wait))])
+
+        sends = attempted.read_text()
+        for tick in due[:2]:
+            with patch.object(the_list, "now", return_value=tick + wait):
+                the_list.fire_scheduled(UPKEEP_INTERVAL)
+        self.assertEqual(attempted.read_text(), sends)
+
+    def check_reopened_run_settlement(self, attempted: Path) -> None:
+        schedule = the_list.ScheduledRun(START, "Read the figures.")
+        item = self.add("Reopened run", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+        with (patch.object(the_list, "_deliver_scheduled_notice", side_effect=KeyboardInterrupt),
+              self.assertRaises(KeyboardInterrupt)):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+        self.assertEqual(self.command("close", "--id", item.id, "--words", "Close this item.", "--source", "nate"),
+                         (0, "", ""))
+        closed = the_list.load(MORTY.id, item.id)
+        self.assertIs(closed.state, the_list.ItemState.CLOSED)
+        self.assertIs(closed.run_deliveries[0].confirmation, the_list.AwaitingInstruction.OWNER)
+
+        the_list.fire_scheduled(UPKEEP_INTERVAL)
+        instructed = the_list.load(MORTY.id, item.id)
+        run = instructed.run_deliveries[0]
+        deadline = START + timedelta(minutes=2)
+        self.assertEqual(run.confirmation, the_list.AwaitingConfirmation(deadline))
+        self.assertEqual(self.command("reopen", "--id", item.id, "--source", "nate"), (0, "", ""))
+        reopened = the_list.load(MORTY.id, item.id)
+        self.assertIs(reopened.state, the_list.ItemState.NEW)
+        self.assertEqual(reopened.run_deliveries, ())
+        self.assertEqual(reopened.log[run.log_index].what,
+                         f"Scheduled run due {START.isoformat()}. Settled by a manual state change.")
+        self.assertEqual(reopened.log[-1].what, the_list.Reopened())
+
+        sends = attempted.read_text()
+        with patch.object(the_list, "now", return_value=deadline):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+        self.assertEqual(attempted.read_text(), sends)
+        self.assertEqual(the_list.load(MORTY.id, item.id), reopened)
+
+    def check_scheduled_capture_failure(self, sent: Path, attempted: Path) -> None:
+        schedule = the_list.ScheduledRun(START, "Read the figures.")
+        item = self.add("Capture allocation", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+        with (tempfile.TemporaryFile() as report, redirect_stderr(io.StringIO()) as errors,
+              patch.object(the_list, "TemporaryFile", side_effect=(report, OSError(errno.ENOSPC, "No space left")))):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+            self.assertTrue(report.closed)
+        self.assertIn("No space left", errors.getvalue())
+        self.assertEqual(attempted.read_text(), "")
+
+        pending = the_list.load(MORTY.id, item.id)
+        run = pending.run_deliveries[0]
+        self.assertIs(run.confirmation, the_list.AwaitingInstruction.OWNER)
+        self.assertEqual(run.notices, (the_list.ScheduledNotice(the_list.RunNotice.OWNER_START),
+                                       the_list.ScheduledNotice(the_list.RunNotice.PRODUCER_START)))
+        self.assertEqual([entry.what for entry in pending.log[len(item.log):]],
+                         [f"Scheduled run due {START.isoformat()}. Sending the instruction."])
+
+        the_list.fire_scheduled(UPKEEP_INTERVAL)
+        the_list.fire_scheduled(UPKEEP_INTERVAL)
+        self.assertEqual(attempted.read_text(), sent.read_text())
+        rows = [cast(list[str], json.loads(row)) for row in sent.read_text().splitlines()]
+        self.assertEqual([args[args.index("--key") + 1] for args in rows],
+                         [f"list-run:{item.id}:{run.key}:owner_start", f"list-run:{item.id}:{run.key}:producer_start"])
+        delivered = the_list.load(MORTY.id, item.id).run_deliveries[0]
+        self.assertEqual(delivered.confirmation, the_list.AwaitingConfirmation(START + timedelta(minutes=2)))
+        self.assertEqual([notice.state for notice in delivered.notices], [the_list.NoticeState.ACCEPTED] * 2)
+
+    def check_mac_scheduled_run(self, attempted: Path) -> None:
+        schedule = the_list.ScheduledRun(START, "Check the figures.")
+        item = self.add("Mac check", changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        before = path.read_bytes()
+        settings = self.list_config.with_name("live_settings.conf")
+        _ = settings.write_text("# whole: 1..\nnatedev_forward_seconds=45\n")
+        run_key = "fixture run"
+        receipt = subprocess.CompletedProcess(["ssh"], 0, f"confirmed {item.id}\n", "")
+        with (patch.object(remote, "local_machine", return_value="mac"),
+              patch.object(sys, "platform", "darwin"),
+              patch.object(main_publish, "ssh", return_value=receipt) as ssh):
+            the_list.fire_scheduled(UPKEEP_INTERVAL)
+            self.assertEqual(attempted.read_text(), "")
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(self.command("confirm", "--id", item.id, "--run", run_key),
+                             (0, f"confirmed {item.id}\n", ""))
+            args = cast(tuple[str, ...], ssh.call_args.args)
+            self.assertEqual(shlex.split(args[0]), ["CODEX_THREAD_ID=", f"CLAUDE_CODE_SESSION_ID={MORTY.current_session}",
+                             "$HOME/.claude/scripts/lib/py", "$HOME/.claude/scripts/production/the_list.py",
+                             "confirm", "--id", item.id, "--run", run_key])
+            ssh.assert_called_once_with(args[0], ssh_program=os.environ.get("ZONE_SSH") or "ssh", host="natedev",
+                                        time_limit=main_publish.CommandTimeLimit(45))
+
+    def test_repeat_series_limit_uses_the_live_setting(self) -> None:
+        start = "2026-11-30T17:00:00Z"
+        original_settings = self.list_config.read_text()
+        for limit in (730, 2):
+            with self.subTest(limit=limit):
+                _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", f"series_run_limit={limit}"))
+                code, output, errors = self.add_scheduled(start, "--repeat", "FREQ=DAILY")
+                self.assertEqual((code, errors), (0, ""))
+                saved = the_list.load(MORTY.id, output.splitlines()[-1])
+                series = saved.schedule
+                assert isinstance(series, the_list.ScheduledSeries)
+                last = series.first.start + timedelta(days=limit - 1)
+                self.assertEqual(series.rule.next_after(series.first.start, last - timedelta(days=1),
+                                                       the_list.series_run_limit()), last)
+                self.assertIs(series.rule.next_after(series.first.start, last, the_list.series_run_limit()),
+                              repeat_rule.NoNextRun.REMAINING)
+                refused, message, errors = self.add_scheduled(start, "--repeat", f"FREQ=DAILY;COUNT={limit + 1}")
+                self.assertEqual((refused, message), (1, ""))
+                self.assertIn(f"COUNT exceeds the series limit of {limit} runs", errors)
+
+                for numbers, unissued in (((1, 999), 999), ((1,), 0)):
+                    with self.subTest(finish=numbers):
+                        if unissued:
+                            with self.assertRaisesRegex(the_list.ListError, f"the series did not issue run {unissued}"):
+                                _ = series.finish_runs(numbers)
+                        else:
+                            completed = series.finish_runs(numbers)
+                            self.assertEqual((completed.finished_runs, completed.runs_used), (frozenset({1}), 1))
+                            self.assertIs(completed.finish_runs(numbers), completed)
+
+                if limit == 2:
+                    with self.subTest(finish="the live limit changes after selection"):
+                        selected = tuple(series.runs())[-1]
+                        settings = self.list_config.read_text()
+                        _ = self.list_config.write_text(settings.replace("series_run_limit=2", "series_run_limit=1"))
+                        try:
+                            self.assertEqual(the_list.series_run_limit(), 1)
+                            completed = series.finish_runs((selected.number,))
+                            self.assertEqual((completed.finished_runs, completed.runs_used), (frozenset({2}), 1))
+                        finally:
+                            _ = self.list_config.write_text(settings)
+
+                for progress in ("exhausted", "skipped"):
+                    with self.subTest(progress=progress):
+                        if progress == "skipped":
+                            self.save_series_progress(saved.id, finished=range(1, limit - 1))
+                            moment = last - timedelta(days=1)
+                            with patch.object(the_list, "now", return_value=moment):
+                                self.assertEqual(self.command("close", "--id", saved.id, "--scope", "this",
+                                                              "--source", "nate", "--words", "Skip once."), (0, "", ""))
+                        else:
+                            self.save_series_progress(saved.id, finished=range(1, limit + 1))
+                            moment = last + timedelta(microseconds=1)
+                        path = the_list.folder(MORTY.id) / f"{saved.id}.md"
+                        before = path.read_bytes()
+                        new_start = last + timedelta(days=1)
+                        with patch.object(the_list, "now", return_value=moment):
+                            code, output, errors = self.command("update", "--id", saved.id, "--scope", "all",
+                                                                "--start", new_start.isoformat(), "--source", "nate")
+                        if progress == "exhausted":
+                            self.assertEqual((code, output), (1, ""))
+                            self.assertIn("no runs left under the limit", errors)
+                            self.assertEqual(path.read_bytes(), before)
+                        else:
+                            self.assertEqual((code, errors), (0, ""))
+                            updated = the_list.load(MORTY.id, saved.id).schedule
+                            assert isinstance(updated, the_list.ScheduledSeries)
+                            self.assertEqual([(run.number, run.run.start) for run in updated.runs()],
+                                             [(limit, new_start + timedelta(days=limit - 1))])
+
+        for end, next_start, expected in (
+            ("", "2026-12-01T09:00:00+00:00", (2, 3, 4)),
+            (";UNTIL=20261201T090000Z", "2026-12-04T10:00:00+00:00", (2, 6, 7)),
+        ):
+            with self.subTest(end=end):
+                initial_limit = 2 if end else 4
+                _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", f"series_run_limit={initial_limit}"))
+                code, output, errors = self.add_scheduled("2026-11-30T09:00+00:00", "--repeat", f"FREQ=DAILY{end}")
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                self.save_series_progress(identity, finished=frozenset({1}))
+                if end:
+                    self.assertEqual(self.command("update", "--id", identity, "--scope", "this", "--source", "nate",
+                                                  "--start", next_start), (0, "Repeats: Daily until 2026-12-01 09:00:00 UTC\n", ""))
+                    _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", "series_run_limit=4"))
+                    self.assertEqual(self.command("update", "--id", identity, "--scope", "following", "--source", "nate",
+                                                  "--repeat", "FREQ=DAILY"), (0, "Repeats: Daily\n", ""))
+                for live_limit in (4, 2, 1, 9):
+                    with self.subTest(live_limit=live_limit):
+                        _ = self.list_config.write_text(original_settings.replace("series_run_limit=730",
+                                                                                f"series_run_limit={live_limit}"))
+                        reloaded = the_list.load(MORTY.id, identity).schedule
+                        assert isinstance(reloaded, the_list.ScheduledSeries)
+                        self.assertEqual(tuple(run.number for run in reloaded.runs()), expected)
+                        self.assertEqual(reloaded.finish_runs(expected).finished_runs, frozenset((1, *expected)))
+                        code, output, errors = self.command("list")
+                        self.assertEqual((code, errors), (0, ""))
+                        row = next(line for line in output.splitlines() if line.startswith(f"| {identity.removeprefix('L')} |"))
+                        self.assertIn(f"· next {next_start}", row)
+                        if live_limit == 1 and end:
+                            code, _, errors = self.command("update", "--id", identity, "--scope", "following",
+                                                           "--source", "nate", "--repeat", "FREQ=DAILY")
+                            self.assertEqual((code, errors), (0, ""))
+                            self.assertEqual(the_list.load(MORTY.id, identity).schedule, reloaded)
+                            code, output, errors = self.command("update", "--id", identity, "--scope", "following",
+                                                                "--source", "nate", "--repeat", "FREQ=DAILY;COUNT=1")
+                            self.assertEqual((code, output), (1, ""))
+                            self.assertIn("no runs left under the limit of 1", errors)
+                            self.assertEqual(the_list.load(MORTY.id, identity).schedule, reloaded)
+
+        moved_start = "2026-12-01T18:00:00+00:00"
+        moved_words = "Read the figures at the new time."
+        for rule, words, start_flags, expected_exceptions in (
+            ("FREQ=DAILY", "Read the figures.\nSend the total.", (), ()),
+            ("FREQ=DAILY;UNTIL=20261203T170000Z", "Read the December figures.", (), ()),
+            ("FREQ=DAILY;COUNT=4", "Send the December total.", (), ()),
+            ("FREQ=DAILY", moved_words, ("--start", moved_start),
+             (the_list.RunException(2, the_list.ScheduledRun(datetime.fromisoformat(moved_start), moved_words)),)),
+        ):
+            with self.subTest(words_only=rule, start_flags=start_flags):
+                _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", "series_run_limit=4"))
+                code, output, errors = self.add_scheduled(start, "--repeat", rule)
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                self.save_series_progress(identity, finished=frozenset({1}))
+                if start_flags:
+                    code, _, errors = self.command("update", "--id", identity, "--scope", "this", "--source", "nate",
+                                                   *start_flags)
+                    self.assertEqual((code, errors), (0, ""))
+                before = the_list.load(MORTY.id, identity).schedule
+                assert isinstance(before, the_list.ScheduledSeries)
+                _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", "series_run_limit=2"))
+                code, _, errors = self.command("update", "--id", identity, "--scope", "following", "--source", "nate",
+                                               "--do", words, *start_flags)
+                self.assertEqual((code, errors), (0, ""))
+                after = the_list.load(MORTY.id, identity).schedule
+                assert isinstance(after, the_list.ScheduledSeries)
+                self.assertEqual(after, replace(before, first=replace(before.first, words=words),
+                                                exceptions=expected_exceptions))
+                self.assertEqual(tuple((run.number, run.run.start) for run in after.runs()),
+                                 tuple((run.number, run.run.start) for run in before.runs()))
+                self.assertEqual(tuple(run.run.words for run in after.runs()), (words, words, words))
+
+        with self.subTest(allowance="above sys.maxsize"):
+            allowance = sys.maxsize + 1
+            _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", f"series_run_limit={allowance}"))
+            code, output, errors = self.add_scheduled(start, "--repeat", "FREQ=DAILY")
+            self.assertEqual((code, errors), (0, ""))
+            identity = output.splitlines()[-1]
+            _ = self.list_config.write_text(original_settings.replace("series_run_limit=730", "series_run_limit=4"))
+            code, output, errors = self.command("list")
+            self.assertEqual((code, errors), (0, ""))
+            row = next(line for line in output.splitlines() if line.startswith(f"| {identity.removeprefix('L')} |"))
+            self.assertIn("· next 2026-11-30T17:00:00+00:00", row)
+            after = the_list.load(MORTY.id, identity).schedule
+            assert isinstance(after, the_list.ScheduledSeries)
+            self.assertEqual(after.run_allowance, allowance)
+
+    def test_repeated_item_updates_use_the_selected_scope(self) -> None:
+        start = datetime(2026, 11, 30, 17, tzinfo=UTC)
+        second = start + timedelta(days=1)
+        moved = second + timedelta(hours=1)
+        for scope, now_at, first, run_number_offset, next_words in (
+            ("this", second, start, 0, "Read the figures.\nSend the total."),
+            ("following", second, moved, 1, "Read new figures."),
+            ("all", START, moved, 0, "Read new figures."),
+        ):
+            with self.subTest(scope=scope):
+                code, output, errors = self.add_scheduled(start.isoformat(), "--repeat", "FREQ=DAILY;COUNT=4")
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                if now_at == second:
+                    self.save_series_progress(identity, finished=frozenset({1}))
+                before = the_list.load(MORTY.id, identity)
+                with patch.object(the_list, "now", return_value=now_at):
+                    code, output, errors = self.command("update", "--id", identity, "--source", "nate",
+                        "--scope", scope, "--start", moved.isoformat(), "--do", "Read new figures.")
+                self.assertEqual((code, errors), (0, ""))
+                self.assertIn("Repeats: Daily", output)
+                item = the_list.load(MORTY.id, identity)
+                series = item.schedule
+                assert isinstance(series, the_list.ScheduledSeries)
+                self.assertEqual((series.first.start, series.run_number_offset), (first, run_number_offset))
+                next_run = series.next_run()
+                assert isinstance(next_run, the_list.SeriesRun)
+                self.assertEqual(next_run.run, the_list.ScheduledRun(moved, "Read new figures."))
+                after = series.finish_runs((next_run.number,)).next_run()
+                assert isinstance(after, the_list.SeriesRun)
+                self.assertEqual(after.run.words, next_words)
+                self.assertEqual(len(tuple(series.rule.runs(series.first.start, the_list.series_run_limit()))),
+                                 3 if scope == "following" else 4)
+                self.assertEqual(item.log[:-1], before.log)
+                self.assertEqual(item.log[-1].what, the_list.FieldChange("Updated", {"schedule": series}))
+
+        original_words = "Read the figures.\nSend the total."
+        moved_first = start + timedelta(hours=1)
+        reanchored_start = moved + timedelta(hours=1)
+        for label, now_at, finished, prepare, scope, change, number, expected in (
+            ("following keeps the pending move", second, frozenset({1}), ("update", "--start", moved.isoformat()),
+             "following", ("--repeat", "FREQ=DAILY;INTERVAL=2"), 2, the_list.ScheduledRun(moved, original_words)),
+            ("all keeps a skip after a time edit", second, frozenset({1}), ("close", "--words", "Skip this check."),
+             "all", ("--start", moved_first.isoformat()), 3, the_list.ScheduledRun(moved + timedelta(days=1), original_words)),
+            ("all keeps the pending run when repeat ends", second, frozenset({1}), (), "all",
+             ("--repeat", ""), 2, the_list.ScheduledRun(second, original_words)),
+            ("this edits run 2 before a delayed run 1", second, frozenset[int](), ("update", "--start", moved.isoformat()),
+             "this", ("--do", "Read new figures."), 2, the_list.ScheduledRun(second, "Read new figures.")),
+            ("repeat removal keeps run 2 before a delayed run 1", second, frozenset[int](),
+             ("update", "--start", moved.isoformat()), "all", ("--repeat", ""), 2,
+             the_list.ScheduledRun(second, original_words)),
+            ("following uses the moved Monday for a new weekday rule", start, frozenset({1}),
+             ("update", "--start", moved_first.isoformat()), "following", ("--repeat", "FREQ=WEEKLY;BYDAY=MO"), 2,
+             the_list.ScheduledRun(moved_first, original_words)),
+            ("following changes the start of a delayed run after run 2 finishes", second, frozenset({2}),
+             ("update", "--start", moved.isoformat()), "following", ("--start", reanchored_start.isoformat()), 3,
+             the_list.ScheduledRun(reanchored_start, original_words)),
+        ):
+            with self.subTest(label=label):
+                code, output, errors = self.add_scheduled(start.isoformat(), "--repeat", "FREQ=DAILY;COUNT=4")
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                self.save_series_progress(identity, finished=finished)
+                with patch.object(the_list, "now", return_value=now_at):
+                    if prepare:
+                        verb, *flags = prepare
+                        code, _, errors = self.command(verb, "--id", identity, "--source", "nate",
+                                                       "--scope", "this", *flags)
+                        self.assertEqual((code, errors), (0, ""))
+                    log = the_list.load(MORTY.id, identity).log
+                    code, _, errors = self.command("update", "--id", identity, "--source", "nate",
+                                                   "--scope", scope, *change)
+                self.assertEqual((code, errors), (0, ""))
+                item = the_list.load(MORTY.id, identity)
+                self.assertEqual(item.log[:-1], log)
+                if change == ("--repeat", ""):
+                    self.assertEqual(item.schedule, expected)
+                else:
+                    assert isinstance(item.schedule, the_list.ScheduledSeries)
+                    pending = item.schedule.next_run()
+                    assert isinstance(pending, the_list.SeriesRun)
+                    self.assertEqual((pending.number, pending.run), (number, expected))
+
+        settings = self.list_config.read_text()
+        for rule, old_end, moves, end, limits, description, expected in (
+            ("FREQ=DAILY", "", ("2026-12-01T10:00+00:00",), "COUNT=3", (730, 730), "Daily for 3 runs",
+             ((2, "2026-12-01T10:00+00:00"), (3, "2026-12-02T09:00+00:00"), (4, "2026-12-03T09:00+00:00"))),
+            ("FREQ=WEEKLY;BYDAY=MO", "", ("2026-12-08T09:00+00:00",), "COUNT=3", (730, 730), "Weekly on Monday for 3 runs",
+             ((2, "2026-12-08T09:00+00:00"), (3, "2026-12-14T09:00+00:00"), (4, "2026-12-21T09:00+00:00"))),
+            ("FREQ=DAILY", "", ("2026-12-01T10:00+00:00",), "UNTIL=20261203T090000Z", (730, 730),
+             "Daily until 2026-12-03 09:00:00 UTC",
+             ((2, "2026-12-01T10:00+00:00"), (3, "2026-12-02T09:00+00:00"), (4, "2026-12-03T09:00+00:00"))),
+            ("FREQ=DAILY", "", ("2026-12-04T10:00+00:00",), "COUNT=1", (730, 730), "Daily for 1 run",
+             ((3, "2026-12-02T09:00+00:00"),)),
+            ("FREQ=DAILY", "", ("2026-12-04T10:00+00:00", "2026-12-01T08:00+00:00"),
+             "UNTIL=20261201T120000Z", (730, 730), "Daily until 2026-12-01 12:00:00 UTC",
+             ((3, "2026-12-01T08:00+00:00"),)),
+            ("FREQ=DAILY", "COUNT=3", ("2026-12-10T10:00+00:00",), "COUNT=2", (730, 730), "Daily for 2 runs",
+             ((3, "2026-12-02T09:00+00:00"), (2, "2026-12-10T10:00+00:00"))),
+            ("FREQ=DAILY", "COUNT=3", ("2026-12-10T10:00+00:00",), "COUNT=3", (730, 730), "Daily for 3 runs",
+             ((3, "2026-12-02T09:00+00:00"), (4, "2026-12-03T09:00+00:00"), (2, "2026-12-10T10:00+00:00"))),
+            ("FREQ=DAILY", "COUNT=2", ("2026-12-10T10:00+00:00",), "COUNT=2", (3, 3), "Daily for 2 runs",
+             ((2, "2026-12-10T10:00+00:00"), (12, "2026-12-11T09:00+00:00"))),
+            ("FREQ=DAILY", "COUNT=2", ("2026-12-10T10:00+00:00",), "UNTIL=20261211T090000Z", (3, 3),
+             "Daily until 2026-12-11 09:00:00 UTC",
+             ((2, "2026-12-10T10:00+00:00"), (12, "2026-12-11T09:00+00:00"))),
+            ("FREQ=DAILY", "UNTIL=20261201T090000Z", ("2026-12-04T10:00+00:00",), "", (4, 4), "Daily",
+             ((2, "2026-12-04T10:00+00:00"), (6, "2026-12-05T09:00+00:00"), (7, "2026-12-06T09:00+00:00"))),
+            ("FREQ=DAILY", "UNTIL=20261202T090000Z", ("2026-12-04T10:00+00:00",),
+             "UNTIL=20261202T090000Z", (4, 2), "Daily until 2026-12-02 09:00:00 UTC",
+             ((3, "2026-12-02T09:00+00:00"),)),
+        ):
+            saved_limit, live_limit = limits
+            with self.subTest(rule=rule, old_end=old_end, moves=moves, end=end, limits=limits):
+                _ = self.list_config.write_text(settings.replace("series_run_limit=730", f"series_run_limit={saved_limit}"))
+                anchor = "2026-11-30T09:00+00:00"
+                code, output, errors = self.add_scheduled(anchor, "--repeat", f"{rule};{old_end}" if old_end else rule)
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                self.save_series_progress(identity, finished=frozenset({1}))
+                for moved_at in moves:
+                    code, _, errors = self.command("update", "--id", identity, "--source", "nate",
+                                                   "--scope", "this", "--start", moved_at)
+                    self.assertEqual((code, errors), (0, ""))
+                before = the_list.load(MORTY.id, identity).schedule
+                assert isinstance(before, the_list.ScheduledSeries)
+                _ = self.list_config.write_text(settings.replace("series_run_limit=730", f"series_run_limit={live_limit}"))
+                now_at = START if end else datetime(2026, 12, 3, 9, tzinfo=UTC)
+                with patch.object(the_list, "now", return_value=now_at):
+                    code, output, errors = self.command("update", "--id", identity, "--source", "nate",
+                                                          "--scope", "following", "--repeat", f"{rule};{end}" if end else rule)
+                self.assertEqual((code, errors), (0, ""))
+                self.assertEqual(output, f"Repeats: {description}\n")
+                item = the_list.load(MORTY.id, identity)
+                changed = item.schedule
+                assert isinstance(changed, the_list.ScheduledSeries)
+                self.assertEqual(changed.first.start, datetime.fromisoformat(anchor))
+                self.assertEqual(changed.run_allowance, saved_limit)
+                self.assertEqual(changed.exceptions, before.exceptions)
+                self.assertEqual(item.log[-1].what, the_list.FieldChange("Updated", {"schedule": changed}))
+                self.assertEqual(tuple((run.number, run.run.start.isoformat(timespec="minutes"))
+                                       for run in changed.runs()), expected)
+                rows = self.command("list")[1].splitlines()
+                row = next(line for line in rows if line.startswith(f"| {identity.removeprefix('L')} |"))
+                self.assertIn(f"· {description} · next ", row)
+        _ = self.list_config.write_text(settings)
+
+        old_words, new_words = "Read the figures.", "Read new figures."
+        fourth = start + timedelta(days=3, hours=2)
+        early = second - timedelta(hours=1)
+        daily = the_list.ScheduledSeries(the_list.ScheduledRun(start, old_words),
+                                        repeat_rule.parse("FREQ=DAILY;COUNT=5"), the_list.series_run_limit(),
+                                         runs_used=1, finished_runs=frozenset({1}))
+        tokyo_first = datetime(2026, 11, 24, 0, 30, tzinfo=ZoneInfo("Asia/Tokyo"))
+        tokyo_second = tokyo_first + timedelta(days=7)
+        later_in_tokyo = tokyo_second.replace(hour=1, minute=0)
+        ny_start = "2026-11-30T11:00:00-05:00[America/New_York]"
+        between_runs = tokyo_first + timedelta(days=1)
+        new_repeat = ("--repeat", "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU")
+        weekly = the_list.ScheduledSeries(the_list.ScheduledRun(tokyo_first, old_words),
+                                         repeat_rule.parse("FREQ=WEEKLY;BYDAY=TU"), the_list.series_run_limit(),
+                                          runs_used=1, finished_runs=frozenset({1}))
+        moved_run = the_list.RunException(2, the_list.ScheduledRun(moved, old_words))
+        for schedule, now_at, repeat_options, expected, repeat_label in (
+            (replace(daily, runs_used=2, exceptions=(moved_run, the_list.RunException(3, the_list.SkippedRun("")),
+                                        the_list.RunException(4, the_list.ScheduledRun(fourth, old_words)))),
+             second, (), ((2, moved, new_words), (4, fourth, new_words), (5, start + timedelta(days=4), new_words)),
+             "Repeats: Daily"),
+            (replace(daily, exceptions=(the_list.RunException(3, the_list.ScheduledRun(early, old_words)),)),
+             early, (), ((3, early, new_words), (2, second, old_words), (4, start + timedelta(days=3), new_words)),
+             "Repeats: Daily"),
+            (replace(daily, exceptions=(moved_run,)), second + timedelta(minutes=30),
+             ("--repeat", ""), the_list.ScheduledRun(moved, new_words), "Does not repeat"),
+            (weekly, between_runs, new_repeat,
+             ((2, tokyo_second, new_words), (3, tokyo_second + timedelta(days=14), new_words)),
+             "Repeats: Every 2 weeks on Tuesday"),
+            (weekly, between_runs, (*new_repeat, "--start", ny_start),
+             ((2, later_in_tokyo, new_words), (3, later_in_tokyo + timedelta(days=14), new_words)),
+             "Repeats: Every 2 weeks on Tuesday"),
+            (weekly, between_runs, (),
+             ((2, tokyo_second, new_words), (3, tokyo_second + timedelta(days=7), new_words)),
+             "Repeats: Weekly on Tuesday"),
+            (weekly, between_runs, ("--start", ny_start),
+             ((2, later_in_tokyo, new_words), (3, later_in_tokyo + timedelta(days=7), new_words)),
+             "Repeats: Weekly on Tuesday"),
+        ):
+            with self.subTest(scope="following", exceptions=schedule.exceptions, repeat_options=repeat_options):
+                item = self.add(changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+                with patch.object(the_list, "now", return_value=now_at):
+                    code, output, errors = self.command("update", "--id", item.id, "--source", "nate",
+                                                        "--scope", "following", "--do", new_words, *repeat_options)
+                self.assertEqual((code, errors), (0, ""))
+                self.assertIn(repeat_label, output)
+                saved = the_list.load(MORTY.id, item.id).schedule
+                if isinstance(expected, the_list.ScheduledRun):
+                    self.assertEqual(saved, expected)
+                    continue
+                assert isinstance(saved, the_list.ScheduledSeries)
+                pending = saved.runs()
+                for number, date, words in expected:
+                    next_run = next(pending)
+                    self.assertEqual((next_run.number, next_run.run), (number, the_list.ScheduledRun(date, words)))
+                    self.assertEqual(next_run.run.start.tzinfo, date.tzinfo)
+
+    def test_repeated_item_removals_use_the_selected_scope(self) -> None:
+        start = datetime(2026, 11, 30, 17, tzinfo=UTC)
+        second = start + timedelta(days=1)
+        third = start + timedelta(days=2)
+        delayed = second + timedelta(hours=1)
+        for scope, now_at, operation, options, state, reorder in (
+            ("this", second, "close", ("--words", "Skip this check"), the_list.ItemState.SCHEDULED, False),
+            ("this", second, "close", ("--words", "Skip this check"), the_list.ItemState.SCHEDULED, True),
+            ("following", second, "park", ("--until", third.isoformat()), the_list.ItemState.WORKING, False),
+            ("all", START, "close", ("--words", "Stop these checks"), the_list.ItemState.CLOSED, False),
+            ("all", START, "update", ("--state", "Working"), the_list.ItemState.WORKING, False),
+        ):
+            with self.subTest(scope=scope, operation=operation, reorder=reorder):
+                code, output, errors = self.add_scheduled(start.isoformat(), "--repeat", "FREQ=DAILY")
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                if reorder:
+                    self.assertEqual(self.command("update", "--id", identity, "--scope", "this", "--source", "nate",
+                                                  "--start", delayed.isoformat()), (0, "Repeats: Daily\n", ""))
+                elif now_at == second:
+                    self.save_series_progress(identity, finished=frozenset({1}))
+                before = the_list.load(MORTY.id, identity)
+                with patch.object(the_list, "now", return_value=now_at):
+                    self.assertEqual(self.command(operation, "--id", identity, "--source", "nate",
+                                                  "--scope", scope, *options), (0, "", ""))
+                item = the_list.load(MORTY.id, identity)
+                self.assertIs(item.state, state)
+                if scope == "this":
+                    series = item.schedule
+                    assert isinstance(series, the_list.ScheduledSeries)
+                    next_run = series.next_run()
+                    assert isinstance(next_run, the_list.SeriesRun)
+                    self.assertEqual((next_run.number, next_run.run.start), (1, delayed) if reorder else (3, third))
+                    skip = the_list.RunException(2, the_list.SkippedRun("Skip this check"))
+                    if reorder:
+                        self.assertEqual(series.skipped_runs, frozenset({2}))
+                        self.assertIn(skip, series.exceptions)
+                    else:
+                        self.assertEqual(series.exceptions, (skip,))
+                else:
+                    self.assertIs(item.schedule, the_list.NoSchedule.UNSET)
+                if operation == "park":
+                    self.assertEqual(item.parked_until, third)
+                self.assertEqual(item.log[:-1], before.log)
+                event = item.log[-1].what
+                assert isinstance(event, the_list.FieldChange)
+                self.assertEqual(event.fields.get("schedule"), item.schedule)
+
+    def test_repeated_item_refuses_an_invalid_scope_without_writing(self) -> None:
+        start = datetime(2026, 11, 30, 17, tzinfo=UTC)
+        second = start + timedelta(days=1)
+        moved = second + timedelta(hours=1)
+        for options, moment, runs_used, prepare, reason, rule in (
+            (("update", "--do", "Read new figures."), START, 0, (), "use --scope", "FREQ=DAILY"),
+            (("update", "--do", "Read new figures.", "--scope", "following"), START, 0, (), "from the second run", "FREQ=DAILY"),
+            (("update", "--repeat", "FREQ=WEEKLY", "--scope", "this"), START, 0, (), "change a repeat rule", "FREQ=DAILY"),
+            (("close", "--words", "Stop"), START, 0, (), "use --scope", "FREQ=DAILY"),
+            (("close", "--words", "Stop", "--scope", "following"), START, 0, (), "from the second run", "FREQ=DAILY"),
+            (("update", "--scope", "this", "--start", "2026-12-01T09:00-08:00"),
+             START, 0, (), "another run already uses this time", "FREQ=DAILY"),
+            (("update", "--scope", "following", "--do", "Read new figures."),
+             START, 0, ("update", "--start", moved.isoformat()), "from the second run", "FREQ=DAILY"),
+            (("update", "--scope", "following", "--do", "Read new figures."),
+             second, 0, ("close", "--words", "Skip the first run."), "from the second run", "FREQ=DAILY"),
+            (("update", "--scope", "following", "--start", start.isoformat()),
+             second, 1, (), "choose a time on or after now", "FREQ=DAILY"),
+            (("update", "--scope", "all", "--repeat", ""),
+             second, 0, (), "choose a time on or after now", "FREQ=DAILY"),
+            (("update", "--scope", "all", "--repeat", "FREQ=DAILY;COUNT=3"),
+             START, 0, ("update", "--start", (second + timedelta(days=1)).isoformat()),
+             "another run already uses this time", "FREQ=DAILY;COUNT=2"),
+            (("update", "--scope", "following", "--repeat", "FREQ=DAILY;UNTIL=20261130T170000Z"),
+             START, 1, (), "UNTIL must be on or after the selected run", "FREQ=DAILY"),
+            (("update", "--scope", "following", "--repeat", "FREQ=DAILY;UNTIL=20261201T170000Z"),
+             START, 1, ("update", "--start", "2026-12-04T17:00:00+00:00"), "UNTIL must be on or after the selected run",
+             "FREQ=DAILY;UNTIL=20261201T170000Z"),
+            (("update", "--scope", "all", "--start", "9999-12-30T23:00-05:00"),
+             START, 0, (), "COUNT crosses the supported date limit", "FREQ=DAILY;COUNT=2"),
+        ):
+            with self.subTest(options=options, moment=moment, prepare=prepare):
+                code, output, errors = self.add_scheduled(start.isoformat(), "--repeat", rule)
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                if runs_used:
+                    self.save_series_progress(identity, finished=range(1, runs_used + 1))
+                if prepare:
+                    verb, *flags = prepare
+                    code, _, errors = self.command(verb, "--id", identity, "--source", "nate", "--scope", "this", *flags)
+                    self.assertEqual((code, errors), (0, ""))
+                path = the_list.folder(MORTY.id) / f"{identity}.md"
+                before = path.read_bytes()
+                verb, *flags = options
+                with patch.object(the_list, "now", return_value=moment):
+                    code, output, errors = self.command(verb, "--id", identity, "--source", "nate", *flags)
+                self.assertEqual((code, output), (1, ""))
+                self.assertIn(reason, errors)
+                self.assertEqual(path.read_bytes(), before)
+
+        for scope, moment, finished, run_number in (
+            (the_list.ScheduleScope.THIS, start + timedelta(days=2), frozenset({1, 2}), 2),
+            (the_list.ScheduleScope.FOLLOWING, start + timedelta(days=3), frozenset({1, 2, 3}), 2),
+            (the_list.ScheduleScope.ALL, start + timedelta(days=2), frozenset({1, 2}), 2),
+            (the_list.ScheduleScope.ALL, start, frozenset[int](), repeat_rule.NoNextRun.REMAINING),
+        ):
+            with self.subTest(scope=scope, moment=moment, run_number=run_number):
+                code, output, errors = self.add_scheduled(start.isoformat(), "--repeat", "FREQ=DAILY;COUNT=3")
+                self.assertEqual((code, errors), (0, ""))
+                identity = output.splitlines()[-1]
+                self.save_series_progress(identity, finished=finished)
+                path = the_list.folder(MORTY.id) / f"{identity}.md"
+                before = path.read_bytes()
+                saved = the_list.load(MORTY.id, identity)
+                expected = the_list.ScheduleExpectation(the_list.schedule_revision(saved.schedule), run_number)
+                with (patch.object(the_list, "now", return_value=moment),
+                      self.assertRaisesRegex(the_list.ScheduleSelectionChanged, "The next run changed")):
+                    if scope is the_list.ScheduleScope.ALL:
+                        _ = the_list.save_page_schedule(
+                            MORTY.id, identity, the_list.ScheduleOperation.EDIT,
+                            {"words": "Read new figures.", "repeat": repeat_rule.parse("FREQ=DAILY;INTERVAL=2")},
+                            scope=scope, expected=expected, repeat_zone=ZoneInfo("America/New_York"),
+                            receipt=the_list.PageRequest("repeat", "park", "Repeat"),
+                        )
+                    else:
+                        _ = the_list.close(MORTY.id, identity, "Stop", source="nate", schedule_scope=scope,
+                                           expected_schedule=expected)
+                self.assertEqual(path.read_bytes(), before)
 
     def test_text_limits_on_add_and_update(self) -> None:
         cases = (
@@ -476,6 +1633,16 @@ class TheListTests(unittest.TestCase):
         self.assertIn("| Latest status |", output)
         self.assertIn("| 1 | show | dwight | Build plan | New; parked until", output)
         self.assertIn("| The build is complete. · 13:00 EST |", output)
+        with self.subTest(owner="producer"):
+            owned = the_list.add(MORTY.id, "Producer's plan", owner=BOB.id, source="nate",
+                                 changes={"producer": OTHER.id})
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                result = the_list.notify_producer_assignment(owned, MORTY.id, MORTY.id, caller=MORTY.id)
+            self.assertEqual((result, errors.getvalue()), (0, ""))
+            (notice,) = self.notices[4:]
+            self.assertEqual(notice[0], OTHER.id)
+            self.assertIn("You are the producer of item 3: Producer's plan.", notice[1])
 
     def test_assignment_sends_no_notice_for_same_producer_or_morty(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
@@ -662,7 +1829,7 @@ class TheListTests(unittest.TestCase):
             _ = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.CLOSED}, source=OTHER.name)
         with self.assertRaisesRegex(the_list.ListError, "use close"):
             _ = scoped_update(MORTY.id, item.id, {"state": the_list.ItemState.CLOSED},
-                              source=OTHER.name, assigned_to=OTHER)
+                              source=OTHER.name, assigned_to=OTHER, schedule_edits={})
         self.assertEqual(the_list.load(MORTY.id, item.id), saved)
 
     def test_producer_sets_next_check_with_its_name_as_source(self) -> None:
@@ -688,6 +1855,17 @@ class TheListTests(unittest.TestCase):
                         f"the_list: {item.id} is assigned to another producer. "
                         + "A producer can change only its own items.\n")))
                     self.assertEqual(the_list.load(MORTY.id, item.id), item)
+
+        code, output, errors = self.add_scheduled("2026-11-30T17:00Z", "--producer", BOB.name,
+                                                   "--repeat", "FREQ=DAILY")
+        self.assertEqual((code, errors), (0, ""))
+        identity = output.splitlines()[-1]
+        saved = the_list.load(MORTY.id, identity)
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            self.assertEqual(self.command("update", "--id", identity, "--do", "Change the check.", "--scope", "all"),
+                             (1, "", f"the_list: {identity} is assigned to another producer. "
+                              + "A producer can change only its own items.\n"))
+        self.assertEqual(the_list.load(MORTY.id, identity), saved)
 
     def test_producer_updates_and_appends_its_evidence(self) -> None:
         cases = (
@@ -734,13 +1912,13 @@ class TheListTests(unittest.TestCase):
     def test_producer_scoped_update_cannot_reassign_an_item(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
         with self.assertRaisesRegex(the_list.ListError, "Refused options: --producer"):
-            _ = scoped_update(MORTY.id, item.id, {"producer": BOB.id}, source=OTHER.name, assigned_to=OTHER)
+            _ = scoped_update(MORTY.id, item.id, {"producer": BOB.id}, source=OTHER.name, assigned_to=OTHER, schedule_edits={})
         self.assertEqual(the_list.load(MORTY.id, item.id), item)
 
     def test_producer_scoped_update_logs_its_own_name(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
         _ = scoped_update(MORTY.id, item.id, {"latest_status": "The plan is ready."},
-                          source=MORTY.name, assigned_to=OTHER)
+                          source=MORTY.name, assigned_to=OTHER, schedule_edits={})
         saved = the_list.load(MORTY.id, item.id)
         self.assertEqual(saved.latest_status, "The plan is ready.")
         self.assertEqual(saved.log[-1].source, OTHER.name)
@@ -750,7 +1928,7 @@ class TheListTests(unittest.TestCase):
         retired = staff.set_producer_retirement(OTHER.id, staff.RetiredProducer("claude:sonnet:high"))
         with self.assertRaisesRegex(the_list.ListError, "dwight: retired producer"):
             _ = scoped_update(MORTY.id, item.id, {"state": the_list.ItemState.WORKING},
-                              source=retired.name, assigned_to=retired)
+                              source=retired.name, assigned_to=retired, schedule_edits={})
         self.assertEqual(the_list.load(MORTY.id, item.id), item)
 
     def test_producer_cli_update_reads_staff_once(self) -> None:
@@ -1216,6 +2394,7 @@ class TheListTests(unittest.TestCase):
         before = path.read_bytes(), path.stat().st_mtime_ns
         self.assertEqual(the_list.load(MORTY.id, item.id), item)
         self.assertEqual((item.reviews, item.producer), ((), MORTY.id))
+        self.assertIs(the_list.load(MORTY.id, item.id).schedule, the_list.NoSchedule.UNSET)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
     def test_ask_cli_opens_an_ask_and_makes_the_item_unread(self) -> None:
@@ -1852,6 +3031,7 @@ class TheListTests(unittest.TestCase):
         item = self.add()
         path = the_list.folder(MORTY.id) / f"{item.id}.md"
         before = path.read_text()
+        gap = datetime(2026, 3, 8, 2, 30, tzinfo=ZoneInfo("America/Los_Angeles"))
         cases: tuple[tuple[str, object, object], ...] = (
             ("title", "", ""),
             ("owner", "../owner", "../owner"),
@@ -1871,6 +3051,9 @@ class TheListTests(unittest.TestCase):
             ("latest_status", 1, 1),
             ("evidence", 1, 1),
             ("done_when", 1, 1),
+            ("schedule", "Invalid", {"start": START.isoformat(), "do": ""}),
+            ("schedule", the_list.ScheduledRun(gap, "Check the figures."),
+             {"start": "2026-03-08T02:30:00-08:00[America/Los_Angeles]", "do": "Check the figures."}),
             ("parked_until", START.replace(tzinfo=None), START.replace(tzinfo=None).isoformat()),
             ("closing_words", " ", " "),
         )
@@ -1886,6 +3069,10 @@ class TheListTests(unittest.TestCase):
                     assert isinstance(native, str)
                     with self.assertRaises(the_list.ListError):
                         _ = the_list.close(MORTY.id, item.id, native, source="nate")
+                elif isinstance(native, the_list.ScheduledRun):
+                    with self.assertRaisesRegex(the_list.ListError, "start does not exist"):
+                        _ = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.SCHEDULED, "schedule": native},
+                                            source="morty")
                 else:
                     changes = cast(the_list.ItemChanges, cast(object, {field: native}))
                     with self.assertRaises(the_list.ListError):

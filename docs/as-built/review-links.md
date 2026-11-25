@@ -106,7 +106,7 @@ If the configured owner is unavailable, the corner shows the default recipient.
 An item for a unit goes to its showrunner.
 Showrunner and producer owners receive their items directly.
 The page owner button names the default recipient and opens one shared dialog.
-The dialog offers Bug, Question, Feedback, Proposal, and Investigation.
+The dialog offers Bug, Question, Feedback, Proposal, Investigation, Enhancement, and Scheduled.
 The **To** row offers chips for all eligible producers and showrunners in the staff record.
 For a new draft, **To** selects the page owner or the showrunner who receives items for that unit.
 On an unavailable AWS Machines page owned by the AWS unit, **To** selects its showrunner, builds.
@@ -124,6 +124,16 @@ Proposal limits the row to recipients with a native proposal folder.
 When the selected recipient becomes unavailable, the dialog clears the selection and disables Send until you choose a recipient.
 Changing the type or reopening a kept draft preserves this empty selection.
 Feedback uses the native Investigation record.
+
+Select **Scheduled** to create a List item directly.
+Select the owner in **To**.
+Enter the instruction, a `Start` time, and an optional `Repeat` in the words box.
+The dialog shows an example for the start and repeat.
+The dialog hides page details and attachment controls for Scheduled.
+The saved confirmation shows the List number, start, repeat, and any assignment notice warning.
+If the dialog cannot confirm the save, **Retry** sends the original submitted fields.
+A retry of a filed Scheduled draft returns the same List number.
+
 The List colors Owner, Producer, supporting unit names, staff names in log sources, and showrunner names in the count strip.
 List delivery notices and feedback log entries use role colors for the notice recipient.
 Delivery notices also color the showrunner who received an alert.
@@ -1241,12 +1251,15 @@ The navigation label is List, and the page title is The List.
 The page uses the shared status line in `page_frame.py`.
 The page owner button opens the shared New item dialog.
 For a new draft, **To** selects the owner configured in `page.list.owner`.
-**Send** saves and delivers a Review item for the selected recipient.
-The List assigns numbers only when its own record writer creates an item.
+For a Review kind, **Send** files and delivers the Review item to the selected recipient.
+The List assigns numbers when its own record writer creates an item.
 The browser stores the recipient selection with the draft ID and restores both after a reload.
-The user can edit the draft before a retry.
-Each draft ID can file one Review item and one linked List row.
-An exact retry returns the saved item ID and closes the window.
+Retry uses the submitted fields when the browser saved them.
+Select **Edit a separate draft** to keep new edits while you confirm the earlier Send.
+If the browser stored only a draft ID and recipient, enter the original fields and select **Send**.
+Each Review draft ID can file one Review item and one linked List row.
+An exact retry returns the saved item ID.
+The dialog closes after the retry unless it holds a separate draft or shows an attachment warning.
 The reply includes the List number if the row exists.
 If a retry changes the saved draft, the window shows the saved item ID and preserves the new text.
 A retry can use a new screenshot if the first screenshot expires before filing.
@@ -1279,6 +1292,9 @@ For a new filing to a showrunner or unit, it also names the producer.
 
 The columns are #, Owner, Producer, Item, State, Next step, ETA, and Update.
 The Producer cell shows the name of the record's producer.
+A one-time Scheduled row shows its start below the state.
+A repeated row shows the rule and the next start, or **No next run**.
+For a pending run, Next step shows the instruction and ETA shows the start.
 On desktop, the ETA cell stays on one line and shows an ellipsis if the text is too long.
 Hover or focus on the ETA to see the full text.
 On a phone, the ETA wraps to show the full text in the row.
@@ -1306,7 +1322,7 @@ The other filters stay selected.
 The address stores the words as `q`.
 The List restores these words on reload.
 The List ignores form text that the browser restores without an input event.
-The chip order is All, Needs me, Producer answering, Working, Blocked, and Parked.
+The chip order is All, Needs me, Producer answering, Working, Blocked, Parked, and Scheduled.
 The List excludes Closed records from rows, filters, and counts.
 Parked includes non-Closed items with an active park and no unread answer.
 An unread delivery release belongs to Needs me even if the question remains open.
@@ -1317,6 +1333,7 @@ Saved links with `waiting-answer` or `morty-answering` select Producer answering
 Needs me also includes unparked items in Waiting for nate or Delivered with no open question.
 Working includes other unparked items in New or Working.
 Blocked includes other unparked items in Blocked or Paused.
+Scheduled includes items in the Scheduled state.
 All includes every open item, including parked items and Done items.
 The State cell shows the parking end time or delivery condition under the saved state.
 The Unread only switch shows and counts unread items.
@@ -1378,6 +1395,26 @@ Old records without the field use their record keeper.
 The terminal list shows a Producer column after Owner.
 The CLI shows producers only their assigned items. Morty can see every item.
 Producers can park and close their assigned items. See `showrunner-automation.md` for CLI permissions and assignment notices.
+
+See the [List store](showrunner-automation.md#the-list-the_listpy) for the dispatcher, confirmation, and CLI rules.
+The `schedule` field uses `start` and `do` for the first start and instruction.
+The `repeat` and `run_allowance` fields hold the series rule and allowance.
+The `runs_before` field gives the run number offset.
+The `runs_used` field counts runs that have used the allowance.
+The `finished_runs` field names the runs that finished.
+The optional `following_runs` field names the run numbers kept by a scoped rule edit.
+The `exceptions` field stores changes and skips by run number.
+Active deliveries and confirmations use the `run_deliveries` field.
+The page and the dispatcher use `ScheduledSeries.next_run()` to select the pending run from saved progress.
+Herdr upkeep calls `the_list.fire_scheduled`.
+The dispatcher reads `scheduled_check` to decide when to load the full record.
+
+For a browser filing, `new_item_draft_id` holds the Scheduled draft ID and its filing claim.
+The claim includes the request fingerprint, keeper, filing readback, and assignment notices.
+`list_draft.py` defines the claim and parses the saved field.
+It also constructs the List store used by the writer and recovery.
+The draft index records the reserved List number before the writer saves the item.
+If a claim has no receipt, recovery validates the complete List record and checks the claim before it recreates the receipt.
 
 When List records have review links, the page reads review items once per render and indexes them by key.
 It stores no review states on the List record.
@@ -1655,10 +1692,52 @@ Remove sits at the left edge of the dialog above the four-line text box.
 Park and Remove close the dialog after the save.
 The table applies the saved state before the next refresh.
 Park, Remove, Tell, Ask question, and Mark read show a message if the page cannot confirm the save.
+
+#### Schedule controls
+
+Open **Park until** to use the calendar and time picker on an ordinary row.
+Leave **At that time, do this** empty to park the item.
+Enter an instruction and choose a future start to schedule the item.
+The picker names the owner who receives the instruction and the producer who receives a copy.
+**Edit schedule** opens the picker for a Scheduled item.
+**Start now** moves the pending run to the current time.
+For a series, **Start now** applies to **This run**.
+**Unpark** on a Scheduled item removes the schedule for the selected scope.
+Clear the instruction to replace the schedule with a parking time or **Until delivered**.
+
+The **Repeat** menu appears when the picker has an instruction and a start.
+The menu offers **Does not repeat**, **Daily**, weekly, monthly, and annual presets, **Every weekday**, and **Custom…**.
+The date-based presets follow the selected start date.
+**Custom recurrence** sets an interval in days, weeks, months, or years.
+For a weekly rule, select the weekdays.
+For a monthly rule, select a calendar day or a weekday pattern.
+The rule can end on a date or after a count.
+**Never** uses the saved run allowance.
+Select **Done** to return the rule to the picker.
+Select **Save** in the picker to apply the rule.
+
+The scope dialog offers **This run**, **This and following runs**, and **All runs** when they apply.
+**This run** changes or skips the next run. A repeat rule change needs a broader scope.
+**This and following runs** is available after a run finishes and a pending run remains.
+An instruction-only edit with this scope preserves run dates, moved runs, and skipped runs.
+Park disables **This run** and explains that parking applies to the item.
+The dialog selects the first available scope.
+If a repeat edit omits a start, the List uses the selected run's displayed start, including a moved start.
+The writer checks the schedule and selected run under the write lock before it saves a scoped edit.
+This check applies when **All runs** uses the displayed run as the new start.
+If the schedule or run changed, the writer refuses the edit and keeps the saved schedule.
+
+A new rule uses the page's display time zone.
+A new CLI rule uses the selected run's time zone.
+A retained rule keeps the saved series time zone when the start changes.
+A retained Custom rule also keeps its saved text.
+The picker shows a validation message if the new start falls outside the retained rule.
+
+#### Ordinary parking and feedback
+
 **Unpark** and **Park until** sit at the right edge of the row.
-The dialog shows a parked item's parking condition above the buttons.
-**Unpark** appears in the form when the item has active parking and its state is outside Closed.
-**Park until** opens the picker.
+The dialog shows the parking condition above the buttons.
+**Unpark** appears when an open item has active parking.
 **Until delivered** sits above the shared calendar and 24-hour time field.
 Click Until delivered to save this choice and move the item to Parked.
 The picker aligns with the right edge of the text box.

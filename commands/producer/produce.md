@@ -87,6 +87,8 @@ Use `the_list.py update --id L<n>` to update your items in morty's folder.
 For a legacy item, use `the_list.py update --keeper <keeper> --id L<n> --next-step "<step>"`.
 Run an `update` command from a List message as it is.
 Use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
+Set Scheduled with `--state Scheduled --start <zoned ISO time> --do <words>`. Add `--repeat <RRULE>` for a series.
+Say the repeat rule in plain words before saving it. Use `--scope this|following|all` to change or remove a repeat.
 Write no time in `--source`.
 
 Add your own item with `the_list.py add --owner <showrunner staff ID> --title <text> --source <source> --done-when <result>`.

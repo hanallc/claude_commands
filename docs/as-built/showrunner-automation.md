@@ -574,7 +574,7 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
 
 The List keeps one Markdown record at `<SHOWRUNNER_STATE_DIR>/<morty staff id>/list/L<n>.md`.
 The default root is `~/.local/state/showrunner`.
-The CLI requires a producer staff row for the current session.
+The CLI requires a producer staff row for commands other than confirmation.
 Morty's fixed staff ID selects the folder for each new item.
 The item's `owner` field names its showrunner.
 `nate` and `Not recorded` identify items without an assigned showrunner.
@@ -593,7 +593,7 @@ The log keeps dated changes in file order, newest last, with the source on each 
 The Added line preserves initial field values, including state, ETA, next step, and latest status.
 Quoted log values preserve line endings as JSON escapes.
 
-States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
+States are `New`, `Working`, `Scheduled`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
 Parking stores a time or a delivery condition and keeps the current item state.
 The List ends a delivery park automatically when the producer sets the item state to Delivered.
 Linked changes supply review information on the List.
@@ -650,6 +650,65 @@ A Go that leaves no ask with a box on a Waiting for nate item also sets Working 
 A Go message that does not reach a recipient adds a “Go not delivered” log line.
 nate's Go counts as his go for the one named change only after `go_check.py` prints `go ok` for the target session.
 
+Add or update a Scheduled item with `--state Scheduled --start <time> --do <words>`.
+Use an ISO time with an offset or an IANA zone in brackets.
+For example, use `--start '2026-11-30T09:00[America/Los_Angeles]'` to keep 09:00 across daylight-saving changes.
+Use `--repeat 'FREQ=WEEKLY;BYDAY=MO'` to repeat on Mondays.
+The CLI prints the rule in words before it saves the schedule.
+The schedule stores its start and instruction in the `schedule` field.
+A series also stores its RRULE, run allowance, and run progress.
+It stores changes and skips by run number.
+Delivery uses the saved allowance.
+Old records without the field have no schedule.
+The `list` command shows the start, repeat rule in words, and next run.
+
+Use `--scope this|following|all` to change or remove a repeat with `update`, `park`, or `close`.
+Use `this` to change the next run's start or words, or to skip the next run.
+The run limit counts skipped runs.
+If you skip a run with `close`, the skip record keeps the closing words.
+Use `following` after a run occurs to apply the change from the next run.
+Use `all` to change or remove the series.
+Use `--repeat ''` to remove the repeat and keep the pending run.
+Supply a new start if the pending start is in the past.
+Use scoped `update --state Working`, `park`, or `close` to remove a repeat schedule.
+A manual state change, including reopening, settles all runs awaiting confirmation in one save.
+The same save clears their deadlines.
+Runs awaiting the owner instruction keep their delivery state.
+The next run stays scheduled.
+The record keeps its earlier log entries when the schedule changes or ends.
+A producer can change its own schedules. Morty can change all schedules.
+Herdr upkeep checks the List on natedev after it restores the shared server.
+The job uses its existing lock and interval.
+It reads the next check time from each item header.
+It loads the item when a run, notice, or confirmation deadline is due.
+If the scan reaches its time limit, the next check starts after the last item it inspected.
+Delivery has separate time limits for a notice, an item, and the whole check.
+The watchdog keeps the sender group's deadline after upkeep or the sender exits.
+It stays active until the sender group exits or the deadline expires.
+The List reports a group timeout separately from the sender's result.
+
+On the first check at or after the start, the List saves the run and sets the item to Working.
+The owner receives the instruction. The producer receives a copy.
+The List opens the capture files before it saves the notice as sending.
+If a file cannot open, the notice stays ready for the next check.
+The List calls the sender after it saves the notice as sending.
+If the List cannot confirm acceptance, it records one uncertainty entry.
+The List calls `send.py` at most once per notice.
+The List starts runs due within two upkeep intervals in order of their saved start times.
+It keeps the latest due run even after an outage.
+The same save records the other runs older than two intervals as missed.
+
+Use `the_list.py confirm --id L<n>` to confirm the latest active run.
+The start message includes `--run` to select that exact run.
+The owner saved for that run or morty can confirm.
+On the Mac, the command forwards the confirmation to natedev.
+The confirmation time starts when the sender accepts the owner's instruction or the List marks its delivery uncertain.
+If the confirmation time passes, the List sends one phone text to nate and a second message to the producer.
+The List stores the result on the run's start line.
+Each future run can start while an earlier run awaits confirmation.
+After the active runs finish, an item still in Working returns to Scheduled if runs remain.
+The item stays open when the series ends.
+
 Use `--include-parked` to include parked items or `--all` to include parked and closed items.
 Use `--latest-status` to show the latest status column.
 The List page and the command show the saved update time beside the latest status in the user's time zone.
@@ -702,8 +761,10 @@ The CLI reads character limits in `config/the_list.conf` when add or update sets
 | `max_chars.latest_status` | 200 characters for the latest status |
 | `max_chars.next_step` | 160 characters for the next step |
 | `max_chars.evidence_line` | 300 characters for each replacement or appended evidence line |
+| `series_run_limit` | 730 runs per series, including the start |
+| `confirm_wait_minutes` | 15 minutes for the owner to confirm a scheduled run |
 
-The CLI refuses a write if the applicable setting is missing, invalid, or too small for the supplied text.
+The CLI refuses a write if the applicable text setting is missing, invalid, or too small for the supplied text.
 The limit applies when the CLI next sets that text. Existing text stays readable at any length.
 `--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
 Either option with no values clears its field.

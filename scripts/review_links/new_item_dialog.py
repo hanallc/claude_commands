@@ -330,6 +330,7 @@ class ReviewSubmission:
     capture_intent: SubmissionCaptureIntent = NoDeferredCapture.ABSENT
     reply_token_nonce: str = ""
     legacy_reply_token: str = field(default="", repr=False, compare=False)
+    image_digests: tuple[tuple[str, str], ...] = field(default=(), kw_only=True)
 
     def __post_init__(self) -> None:
         if reply_tokens.valid(self.reply_token_sha256):
@@ -681,6 +682,10 @@ def stored_submission(details: ReviewSubmission) -> dict[str, object]:
     fields = cast(dict[str, object], asdict(details))
     fields["evidence"] = evidence_fields(details.evidence)
     _ = fields.pop("legacy_reply_token")
+    if details.image_digests:
+        fields["image_digests"] = dict(details.image_digests)
+    else:
+        _ = fields.pop("image_digests")
     if not details.reply_token_nonce:
         _ = fields.pop("reply_token_nonce")
     if details.page_state is None:
@@ -712,7 +717,13 @@ def _read_capture_intent(value: object) -> DeferredCaptureIntent:
 
 def read_submission(value: object) -> ReviewSubmission:
     row = _mapping(value, "Review submission")
-    images = _entries(row.get("images"), "Image references", MAX_IMAGES)
+    images = tuple(read_image_reference(image) for image in _entries(row.get("images"), "Image references", MAX_IMAGES))
+    image_ids = {image.id for image in images}
+    image_digests: list[tuple[str, str]] = []
+    for identity, digest in _mapping(row.get("image_digests", {}), "Image digests").items():
+        if identity not in image_ids or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise SubmissionError("Invalid saved image digest.")
+        image_digests.append((identity, digest))
     page = _text(row.get("page", ""), "Console page", 32, allow_empty=True)
     if page and page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Invalid page in Review submission.")
@@ -730,10 +741,11 @@ def read_submission(value: object) -> ReviewSubmission:
         raise SubmissionError("Invalid reply token nonce.")
     return ReviewSubmission(
         read_request_id(row.get("request_id")), _text(row.get("request_digest"), "Request digest", 64),
-        read_evidence(row.get("evidence")), tuple(read_image_reference(image) for image in images),
+        read_evidence(row.get("evidence")), images,
         digest, page, read_bug_page_state(row.get("page_state")), data,
         capture_intent=_read_capture_intent(row["capture_intent"]) if "capture_intent" in row else NoDeferredCapture.ABSENT,
         reply_token_nonce=nonce,
+        image_digests=tuple(image_digests),
         legacy_reply_token=legacy if isinstance(legacy, str) and reply_tokens.matches(digest, legacy) else "")
 
 
@@ -783,6 +795,52 @@ def read_words(value: object, label: str, *, kind: SubmissionKind | Literal["enh
     return f"Enhancement: {words.lstrip()}" if kind == "enhancement" else words
 
 
+SCHEDULED_KIND = "scheduled"
+SCHEDULED_DRAFT_ID = re.compile(r"s1-[0-9a-f]{32}")
+
+
+class ScheduledDraftRequired(SubmissionConflict):
+    def __init__(self) -> None:
+        super().__init__("This draft ID is invalid for Scheduled. Start a new Scheduled draft.")
+
+
+@dataclass(frozen=True)
+class ScheduledDraftId:
+    """A draft ID reserved for a Scheduled Send."""
+
+    value: str
+
+    def __post_init__(self) -> None:
+        if not SCHEDULED_DRAFT_ID.fullmatch(self.value):
+            raise ScheduledDraftRequired()
+
+
+def read_scheduled_draft_id(value: object) -> ScheduledDraftId:
+    if not isinstance(value, str):
+        raise ScheduledDraftRequired()
+    return ScheduledDraftId(value)
+
+
+@dataclass(frozen=True)
+class ScheduledSubmission:
+    request_id: ScheduledDraftId
+    recipient_id: staff.StaffId
+    words: str
+    page: str
+
+
+def read_scheduled_request(fields: dict[str, object]) -> ScheduledSubmission:
+    """Read the Scheduled Send fields."""
+    page = fields.get("page")
+    if not isinstance(page, str) or page not in page_frame.OWNER_PAGES or fields.get("page_recipient") != PageRecipient.SELECTED:
+        raise SubmissionError("Select a recipient from the New item dialog.")
+    if set(fields) - {"kind", "page", "page_recipient", "request_id", "recipient_id", "token", "words"}:
+        raise SubmissionError("Send the instruction, start, and repeat for a Scheduled item.")
+    recipient = staff.StaffId(_text(fields.get("recipient_id"), "Recipient ID", 128))
+    check_recipient_id(recipient)
+    return ScheduledSubmission(read_scheduled_draft_id(fields.get("request_id")), recipient,
+                               read_words(fields.get("words"), "Your words"), page)
+
 
 _SPARKLES = """<!-- @license lucide-static v0.468.0 - ISC -->
 <svg aria-hidden="true" focusable="false" class="lucide lucide-sparkles"
@@ -800,7 +858,8 @@ KINDS = ((SubmissionKind.BUG, "Bug", "bug"),
          ("feedback", "Feedback", "message-circle-question"),
          (SubmissionKind.PROPOSAL, "Proposal", "lamp"),
          (SubmissionKind.INVESTIGATION, "Investigation", "microscope"),
-         ("enhancement", "Enhancement", "sparkles"))
+         ("enhancement", "Enhancement", "sparkles"),
+         (SCHEDULED_KIND, "Scheduled", "clock-alert"))
 
 
 def render() -> str:
@@ -825,6 +884,8 @@ def render() -> str:
    </fieldset>
    <textarea name="words" rows="4" maxlength="{MAX_WORDS_LENGTH}" aria-label="Your words"
     placeholder="Type your words. You can paste an image." required></textarea>
+   <p data-scheduled-help hidden>Enter the instruction. Then add <code>Start Mon Nov 30 09:00.</code>
+    You can add <code>Repeat every 2 weeks on Monday and Thursday.</code></p>
    <section class="page-state-box sent-details" data-sent-details aria-labelledby="sent-details-title">
     <h4 id="sent-details-title">Sent with your words</h4>
     <div class="new-item-evidence" data-evidence hidden></div>
@@ -843,6 +904,10 @@ def render() -> str:
      <div data-taking role="status"><span class="capture-spinner" aria-hidden="true"></span>Taking a screenshot. You can send now. The screenshot joins the saved item when ready.</div>
     </div>
     <p data-capture-expired role="status" hidden>The screenshot expired.</p>
+    <div data-replace-capture hidden>
+     <button type="button" data-renew-capture>Renew screenshot</button>
+     <button type="button" data-omit-capture>Omit screenshot</button>
+    </div>
     <p data-fallback role="status" hidden>Screenshot unavailable. Page data and visible text go instead.</p>
     <div class="new-item-previews" data-previews hidden></div>
    </section>
@@ -851,7 +916,12 @@ def render() -> str:
   <footer>
    <p data-send-disabled role="status" hidden></p>
    <p class="new-item-error" role="alert" hidden></p>
-   <div><button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button></div>
+   <p id="new-item-saved" data-saved-confirmation role="status" hidden></p>
+   <div data-send-controls>
+    <button type="button" data-later-draft hidden>Edit a separate draft</button>
+    <button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button>
+   </div>
+   <div data-saved-controls hidden><button type="button" data-done aria-describedby="new-item-saved">Done</button></div>
   </footer>
 '''
     dialog = page_frame.console_dialog('review-new-item', 'new-item-title', 'New item', body,
@@ -912,6 +982,9 @@ STYLE = '''
 :is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="investigation"] { --item-icon: #1cc1b5; }
 :is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
 :is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="enhancement"] { --item-icon: #efbd63; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="scheduled"] { --item-icon: #4fd1d9; }
+:is(#review-new-item,[data-new-item-draft]) [data-scheduled-help] { margin: 0; color: var(--ink-2); }
+:is(#review-new-item,[data-new-item-draft]).scheduled-locked .new-item-chip:has(input:disabled:not(:checked)) > span { opacity: .55; cursor: default; }
 :is(#review-new-item,[data-new-item-draft]) .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
 :is(#review-new-item,[data-new-item-draft]) [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
 :is(#review-new-item,[data-new-item-draft]) [data-recipient-group] { display: flow-root; }
@@ -1006,16 +1079,19 @@ STYLE = '''
  border: 1px solid #6c6b66; border-radius: 5px; background: #1a1a19; color: #f0efec;
 }
 :is(#review-new-item,[data-new-item-draft]) footer { padding-block: 0 20px; }
-:is(#review-new-item,[data-new-item-draft]) footer > div {
+:is(#review-new-item,[data-new-item-draft]) footer > div:not([hidden]) {
  display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--line, #34332f);
  padding-top: 14px;
 }
-:is(#review-new-item,[data-new-item-draft]) footer button {
+:is(#review-new-item,[data-new-item-draft]) [data-replace-capture]:not([hidden]) { display: flex; gap: 8px; flex-wrap: wrap; }
+:is(#review-new-item,[data-new-item-draft]) [data-send-controls] { flex-wrap: wrap; }
+:is(#review-new-item,[data-new-item-draft]) footer button, :is(#review-new-item,[data-new-item-draft]) [data-replace-capture] button {
  min-height: 38px; padding: 6px 14px; border: 1px solid var(--ink-3, #9a988f); border-radius: 8px;
  background: transparent; color: inherit;
 }
 :is(#review-new-item,[data-new-item-draft]) [data-send-disabled] { margin: 0 0 8px; color: var(--ink-2); }
 :is(#review-new-item,[data-new-item-draft]) .new-item-error { color: var(--error, #ef7372); margin: 0 0 8px; overflow-wrap: anywhere; }
+:is(#review-new-item,[data-new-item-draft]) [data-saved-confirmation] { margin: 0 0 12px; white-space: pre-line; }
 @media (max-width: 480px) {
  :is(#review-new-item,[data-new-item-draft]) footer { padding-bottom: 14px; }
  :is(#review-new-item,[data-new-item-draft]) .new-item-body { gap: 14px; }
@@ -1031,7 +1107,10 @@ SCRIPT = r'''(() => {
  const drafts = [];
  const listSendKey = 'console.list.pending-send';
  const listDraftPrefix = listSendKey + '.';
- const listDraftId = /^r6-[0-9a-f]{32}$/;
+ const listStatePrefix = listDraftPrefix + 'state.';
+ const browserDraftId = /^(?:r6|s1)-[0-9a-f]{32}$/;
+ const submittedKey = 'console.new-item.submitted';
+ const submittedPrefix = submittedKey + '.';
  let nextDraft = 0;
 
  function storedListDraft() {
@@ -1039,11 +1118,14 @@ SCRIPT = r'''(() => {
    const legacy = sessionStorage.getItem(listSendKey);
    if (legacy !== null) {
     try {
-     const draft = listDraftId.test(legacy) ? {id: legacy, recipient: null} : JSON.parse(legacy);
-     if (typeof draft?.id === 'string' && listDraftId.test(draft.id)) {
+     const draft = browserDraftId.test(legacy) ? {id: legacy, recipient: null} : JSON.parse(legacy);
+     if (typeof draft?.id === 'string' && browserDraftId.test(draft.id)) {
       const key = listDraftPrefix + draft.id;
-      if (sessionStorage.getItem(key) === null)
-       sessionStorage.setItem(key, typeof draft.recipient === 'string' ? draft.recipient : '');
+      if (sessionStorage.getItem(key) === null) {
+       sessionStorage.setItem(key, draft.recipient || '');
+       if (typeof draft.awaitingSend === 'boolean')
+        sessionStorage.setItem(listStatePrefix + draft.id, String(draft.awaitingSend));
+      }
      }
     } catch (_) {}
     sessionStorage.removeItem(listSendKey);
@@ -1052,8 +1134,9 @@ SCRIPT = r'''(() => {
     const key = sessionStorage.key(index);
     if (!key.startsWith(listDraftPrefix)) continue;
     const id = key.slice(listDraftPrefix.length);
-    if (!listDraftId.test(id) || drafts.some(draft => draft.id === id)) continue;
-    return {id, recipient: sessionStorage.getItem(key) || null};
+    if (!browserDraftId.test(id) || drafts.some(draft => draft.id === id)) continue;
+    const state = sessionStorage.getItem(listStatePrefix + id);
+    return {id, recipient: sessionStorage.getItem(key) || null, awaitingSend: state === null ? undefined : state === 'true'};
    }
   } catch (_) {}
   return null;
@@ -1069,6 +1152,7 @@ function bindDraft(dialog, fresh = false) {
  const ownerReason = dialog.querySelector('[data-owner-reason]');
  const ownerReasonText = ownerReason.querySelector('span');
  const words = form.elements.words, previews = dialog.querySelector('[data-previews]');
+ const wordsPlaceholder = words.placeholder;
  const includePage = form.elements.include_page, sentDetails = dialog.querySelector('[data-sent-details]');
  const bugStateBox = dialog.querySelector('[data-bug-page-state]');
  const evidenceBox = sentDetails.querySelector('[data-evidence]');
@@ -1077,16 +1161,28 @@ function bindDraft(dialog, fresh = false) {
  const fallback = sentDetails.querySelector('[data-fallback]');
  const fallbackText = fallback.textContent;
  const expired = sentDetails.querySelector('[data-capture-expired]');
+ const replaceCapture = sentDetails.querySelector('[data-replace-capture]');
+ const renewButton = replaceCapture.querySelector('[data-renew-capture]');
+ const omitButton = replaceCapture.querySelector('[data-omit-capture]');
+ const laterButton = dialog.querySelector('[data-later-draft]');
  const send = dialog.querySelector('[type="submit"]'), error = dialog.querySelector('.new-item-error');
+ const scheduledHelp = dialog.querySelector('[data-scheduled-help]');
+ const kindInputs = [...form.querySelectorAll('input[name="kind"]')];
  const sendNotice = dialog.querySelector('[data-send-disabled]');
- const fields = [...form.querySelectorAll('fieldset'), words, includePage, dialog.querySelector('[data-close]'),
+ const confirmation = dialog.querySelector('[data-saved-confirmation]'), done = dialog.querySelector('[data-done]');
+ const closeButton = dialog.querySelector('[data-close]');
+ const sendControls = dialog.querySelector('[data-send-controls]'), savedControls = done.parentElement;
+ const fields = [...form.querySelectorAll('fieldset'), words, includePage, closeButton,
                  dialog.querySelector('[data-cancel]')];
  let launcher, opening, token, recipients, images = [], sending = false;
- let draftId, keepDraft = false, canRecoverFiling = false, ownerPage = '';
+ let draftId, keepDraft = false, ownerPage = '';
  // Null means the user must choose again. An empty string means the page has no default.
  let selectedRecipient = '';
  let pageOwner = '';
- let captureSession, pageContext, deferredCapture, pendingItem, pendingEdited = false;
+ let captureSession, pageContext, savedItem, laterDraft, laterBase;
+ let awaitingEarlierSend = false, awaitingNativeRecovery = false, submittedDraft;
+ let separateFromNativeDraft = false, nativeListEdit, separateListEdit;
+ let draftDatabase, submittedStorageKey;
 
  let source = '', evidence = {kind: 'none'}, tipPreview = null;
 
@@ -1155,9 +1251,54 @@ function bindDraft(dialog, fresh = false) {
   error.hidden = !reason;
  }
 
+ function isScheduled() {
+  return form.elements.kind.value === 'scheduled';
+ }
+
+ function isRecovering() {
+  return submittedDraft?.mode === 'retry' || submittedDraft?.mode === 'screenshot-expired';
+ }
+
+ function isEditingLater() {
+  return submittedDraft?.mode === 'edit-later';
+ }
+
+ function pendingPayload() {
+  if (isRecovering()) return submittedDraft.payload;
+ }
+
+ function canEditSeparateListDraft() {
+  const canResume = separateListEdit && !words.value && !images.length;
+  return ownerPage === 'list' && token && !savedItem && !submittedDraft &&
+    !separateFromNativeDraft && (awaitingNativeRecovery || canResume);
+ }
+
  function updateSend() {
-  send.disabled = sending || !token || (!pendingItem &&
-    (!recipientChips.querySelector('input:checked') || !words.value.trim() || words.value.length > words.maxLength));
+  const recipient = recipientChips.querySelector('input:checked');
+  const scheduled = isScheduled();
+  const recovering = isRecovering();
+  const locked = recovering || (scheduled && !!savedItem);
+  dialog.classList.toggle('scheduled-locked', scheduled && locked);
+  words.readOnly = locked;
+  includePage.disabled = sending || locked;
+  for (const button of previews.querySelectorAll('button')) button.disabled = sending || locked;
+  for (const fieldset of form.querySelectorAll('fieldset')) fieldset.disabled = sending || locked;
+  send.textContent = sending ? 'Sending…' : recovering ? 'Retry' : 'Send';
+  laterButton.hidden = !canEditSeparateListDraft() && !['retry', 'edit-later'].includes(submittedDraft?.mode);
+  laterButton.disabled = sending;
+  laterButton.textContent = isEditingLater() ? 'Return to Retry' : 'Edit a separate draft';
+  sentDetails.hidden = scheduled;
+  scheduledHelp.hidden = !scheduled || !!savedItem;
+  words.placeholder = scheduled ? 'Enter the instruction, start time, and repeat.' : wordsPlaceholder;
+  for (const input of kindInputs) {
+   input.disabled = sending || locked || !!savedItem ||
+     (input.value === 'scheduled' && awaitingEarlierSend && !isEditingLater());
+  }
+  send.disabled = !!savedItem || sending || !token || isEditingLater() || submittedDraft?.mode === 'screenshot-expired' ||
+    (scheduled && awaitingEarlierSend && !recovering) ||
+    (!pendingPayload() && (!recipient || !words.value.trim() || words.value.length > words.maxLength));
+  renewButton.disabled = sending || !token || !pageContext?.place;
+  omitButton.disabled = sending || !token;
  }
 
  function showRecipients() {
@@ -1165,8 +1306,12 @@ function bindDraft(dialog, fresh = false) {
   const proposal = form.elements.kind.value === 'proposal';
   const available = recipients.filter(recipient => !proposal || recipient.proposal);
   if (selectedRecipient && !available.some(recipient => recipient.id === selectedRecipient)) {
-   selectedRecipient = null;
-   storeListDraft();
+   if (isRecovering() && selectedRecipient === submittedDraft.payload.recipient_id) {
+    available.push({id: selectedRecipient, name: submittedDraft?.recipientName || selectedRecipient});
+   } else {
+    selectedRecipient = null;
+    storeListDraft();
+   }
   }
   recipientChips.replaceChildren();
   for (const recipient of available) {
@@ -1196,12 +1341,15 @@ function bindDraft(dialog, fresh = false) {
  }
 
  function editDraft(event) {
-  if (sending) return;
-  // A retry can confirm the original request after the user edits the draft from a lost response.
-  if (pendingItem) pendingEdited = true;
+  if (sending || isRecovering()) return;
   if (event?.target.name === 'kind') {
+   discardCapture();
+   if (!awaitingNativeRecovery || isEditingLater()) draftId = undefined;
+   ensureDraftId();
    showRecipients();
    showBugPage();
+   storeListDraft();
+   startCapture();
   }
   if (event?.target.name === 'recipient_id') {
    selectedRecipient = event.target.value;
@@ -1209,7 +1357,7 @@ function bindDraft(dialog, fresh = false) {
    recipientStatus.hidden = true;
    showOwnerReason();
   }
-  if (event?.target === includePage && !pendingItem) startCapture();
+  if (event?.target === includePage && !pendingPayload()) startCapture();
   showSentDetails();
   setError('');
   updateSend();
@@ -1226,7 +1374,7 @@ function bindDraft(dialog, fresh = false) {
  }
 
  words.addEventListener('paste', event => {
-  if (sending) return;
+  if (sending || isScheduled() || isRecovering()) return;
   const files = [...(event.clipboardData?.files || [])].filter(file => file.type.startsWith('image/'));
   if (!files.length) return;
   event.preventDefault();
@@ -1275,11 +1423,11 @@ function bindDraft(dialog, fresh = false) {
   const data = await response.json().catch(() => null);
   if (!response.ok || !data) {
    const failure = new Error(data?.error || data?.reason || fallback);
-   failure.definiteRefusal = response.status >= 400 && response.status < 500;
+   failure.definiteRefusal = response.status >= 400 && response.status < 500 && data?.code !== 'draft_pending';
    failure.staleToken = response.status === 403 && data?.code === 'stale_token';
    failure.screenshotExpired = response.status === 409 && data?.code === 'screenshot_expired';
    if (response.status === 409 && data?.code === 'already_filed' &&
-       typeof data.id === 'string' && /^[QPI][1-9][0-9]*$/.test(data.id)) {
+       typeof data.id === 'string' && /^[QPIL][1-9][0-9]*$/.test(data.id)) {
     failure.filedId = data.id;
    }
    throw failure;
@@ -1453,7 +1601,10 @@ function bindDraft(dialog, fresh = false) {
   words.rows = bug ? 3 : 4;
   bugStateBox.hidden = !bug || !pageContext;
   fallback.textContent = bug ? 'Screenshot unavailable.' : fallbackText;
-  if (!bug || !pageContext) return;
+  if (!bug || !pageContext?.state) {
+   bugStateBox.querySelector('dl').replaceChildren();
+   return;
+  }
   const {state} = pageContext;
   const rows = [
    ['Page', state.title],
@@ -1473,6 +1624,20 @@ function bindDraft(dialog, fresh = false) {
  }
 
  function showSentDetails() {
+  const choosing = submittedDraft?.mode === 'screenshot-expired';
+  replaceCapture.hidden = !choosing;
+  const key = submittedDraft?.payload.capture_key;
+  const hasOriginalPreview = key && (captureSession?.capture.key === key || captureSession?.image?.key === key);
+  if (isRecovering() && (choosing || !hasOriginalPreview || captureSession?.image === null)) {
+   slot.hidden = true;
+   expired.hidden = !choosing;
+   fallback.hidden = choosing || !includePage.checked;
+   fallback.textContent = submittedDraft.payload.defer_capture
+    ? 'The screenshot joins the saved item when ready.'
+    : key ? 'Retry includes the screenshot.' : 'Retry sends the page data without a screenshot.';
+   updateSend();
+   return;
+  }
   const image = captureSession?.image;
   const include = Boolean(pageContext) && includePage.checked && sendNotice.hidden;
   const unavailable = include && (image === null || !hasCaptureSpace(image));
@@ -1488,10 +1653,13 @@ function bindDraft(dialog, fresh = false) {
  }
 
  function startCapture(renewed = false) {
-  if (!pageContext || !includePage.checked || !token || captureSession) return;
+  if (isScheduled() || isRecovering() || isEditingLater() || (savedItem && !renewed) || !pageContext || !includePage.checked || !token || captureSession) return;
   const {place, viewport} = pageContext;
-  const capture = deferredCapture || {key: ensureDraftId() + randomNonce(), request: {place, ...viewport}};
-  const session = {token, renewed, capture, sent: Boolean(deferredCapture), page: ownerPage,
+  const item = pendingPayload();
+  const capturing = item?.defer_capture;
+  const capture = capturing ? {key: item.capture_key, request: capturing}
+   : {key: ensureDraftId() + randomNonce(), request: {place, ...viewport}};
+  const session = {token, renewed, capture, sent: Boolean(capturing), page: ownerPage,
                    controller: new AbortController()};
   captureSession = session;
   showSentDetails();
@@ -1531,7 +1699,9 @@ function bindDraft(dialog, fresh = false) {
  }
 
  function ensureDraftId() {
-  return draftId ||= 'r6-' + randomNonce();
+  const prefix = isScheduled() ? 's1-' : 'r6-';
+  if (!draftId?.startsWith(prefix)) draftId = prefix + randomNonce();
+  return draftId;
  }
 
  async function renewCapture() {
@@ -1563,38 +1733,295 @@ function bindDraft(dialog, fresh = false) {
   session.image = null;
  }
 
+ function isShippedListDraft(draft) {
+  return draft?.id.startsWith('r6-') && draft.awaitingSend === undefined;
+ }
+
  function storeListDraft() {
-  if (ownerPage !== 'list' || !draftId || !canRecoverFiling) return;
+  if (ownerPage !== 'list' || !draftId || isEditingLater() ||
+      separateFromNativeDraft || !sendNotice.hidden) return;
   try {
    sessionStorage.setItem(listDraftPrefix + draftId, selectedRecipient || '');
+   if (!awaitingNativeRecovery) sessionStorage.setItem(listStatePrefix + draftId, String(awaitingEarlierSend));
   } catch (_) {}
  }
 
- function removeListDraft() {
-  if (ownerPage === 'list') {
-   try { sessionStorage.removeItem(listDraftPrefix + draftId); } catch (_) {}
+ function draftTransaction(mode, action) {
+  draftDatabase ||= new Promise((resolve, reject) => {
+   const request = indexedDB.open('console.new-item', 1);
+   request.onupgradeneeded = () => request.result.createObjectStore('submitted');
+   request.onsuccess = () => resolve(request.result);
+   request.onerror = () => reject(request.error);
+  });
+  return draftDatabase.then(database => new Promise((resolve, reject) => {
+   const transaction = database.transaction('submitted', mode);
+   const request = action(transaction.objectStore('submitted'));
+   transaction.oncomplete = () => resolve(request.result);
+   transaction.onabort = () => reject(transaction.error);
+  }));
+ }
+
+ async function storeSubmittedDraft(draft) {
+  const id = draft.payload.request_id;
+  const key = submittedStorageKey || (sessionStorage.getItem(submittedKey) ? submittedPrefix + id : submittedKey);
+  const earlier = sessionStorage.getItem(key);
+  let pointer;
+  try {
+   sessionStorage.setItem(key, JSON.stringify(draft));
+  } catch (failure) {
+   if (failure?.name !== 'QuotaExceededError') throw failure;
+   await draftTransaction('readwrite', store => store.put(draft, id));
+   pointer = id;
+   sessionStorage.setItem(key, pointer);
+  }
+  if (earlier && browserDraftId.test(earlier) && earlier !== pointer) {
+   void draftTransaction('readwrite', store => store.delete(earlier)).catch(() => {});
+  }
+  submittedStorageKey = key;
+  submittedDraft = draft;
+ }
+
+ async function restoreSubmittedDraft() {
+  if (submittedDraft) return submittedDraft;
+  const keys = draftId ? [submittedPrefix + draftId, submittedKey] :
+   [...Object.keys(sessionStorage).filter(key => key.startsWith(submittedPrefix)), submittedKey];
+  for (const key of keys) {
+   const stored = sessionStorage.getItem(key);
+   if (!stored) continue;
+   const saved = browserDraftId.test(stored)
+    ? await draftTransaction('readonly', store => store.get(stored)) : JSON.parse(stored);
+   const id = saved?.payload?.request_id || '';
+   const prefix = saved?.payload?.kind === 'scheduled' ? 's1-' : 'r6-';
+   if (!browserDraftId.test(id) || !id.startsWith(prefix)) throw new Error('Could not restore the submitted New item.');
+   if (drafts.some(other => other !== draft && other.id === id)) continue;
+   submittedDraft = {...saved, mode: saved.mode || 'retry'};
+   submittedStorageKey = key;
+   break;
+  }
+  return submittedDraft;
+ }
+
+ function clearSubmittedDraft() {
+  if (!submittedDraft) return;
+  const key = submittedStorageKey;
+  const stored = sessionStorage.getItem(key);
+  sessionStorage.removeItem(key);
+  submittedDraft = undefined;
+  submittedStorageKey = undefined;
+  if (stored && browserDraftId.test(stored)) {
+   void draftTransaction('readwrite', store => store.delete(stored)).catch(() => {});
   }
  }
 
  function finishDraft() {
-  removeListDraft();
-  draftId = deferredCapture = pendingItem = undefined;
-  canRecoverFiling = pendingEdited = false;
+  clearSubmittedDraft();
+  if (ownerPage === 'list' && draftId && !separateFromNativeDraft) {
+   try {
+    sessionStorage.removeItem(listDraftPrefix + draftId);
+    sessionStorage.removeItem(listStatePrefix + draftId);
+   } catch (_) {}
+  }
+  draftId = undefined;
+  awaitingEarlierSend = awaitingNativeRecovery = false;
  }
 
- function hideDialog() {
-  dialog.close();
-  if (launcher?.isConnected) launcher.focus({preventScroll: true});
+ function replaceImages(files) {
+  for (const image of images) URL.revokeObjectURL(image.url);
+  images = [];
+  previews.replaceChildren();
+  addImagePreviews(files);
  }
 
- function close({sent = false} = {}) {
+ function editSnapshot() {
+  return {kind: form.elements.kind.value, recipient: selectedRecipient, words: words.value,
+          include: includePage.checked, files: images.map(image => image.file), pageContext, ownerPage, id: draftId};
+ }
+
+ function showLaterDraft() {
+  const draft = laterDraft;
+  laterDraft = undefined;
+  if (draft) showEdit(draft);
+ }
+
+ function showEdit(draft) {
+  ownerPage = draft.ownerPage;
+  pageContext = draft.pageContext;
+  form.elements.kind.value = draft.kind;
+  draftId = draft.id;
+  selectedRecipient = draft.recipient;
+  words.value = draft.words;
+  includePage.checked = draft.include;
+  replaceImages(draft.files);
+  showRecipients();
+  showBugPage();
+ }
+
+ function decodePastedFiles(uploads) {
+  return uploads.map(image => new File([
+   Uint8Array.from(atob(image.base64_data), character => character.charCodeAt(0))
+  ], 'Pasted image', {type: image.media_type}));
+ }
+
+ function showSubmittedDraft(draft) {
+  const original = draft.payload;
+  const editingLater = isEditingLater();
+  if (editingLater) {
+   const draft = editSnapshot();
+   const sameFiles = draft.files.length === laterBase.files.length &&
+    draft.files.every((file, index) => file === laterBase.files[index]);
+   if (draft.words !== laterBase.words || draft.kind !== laterBase.kind || draft.recipient !== laterBase.recipient ||
+       draft.include !== laterBase.include || !sameFiles) laterDraft = draft;
+   laterBase = undefined;
+  }
+  draft.mode = draft.mode === 'screenshot-expired' ? 'screenshot-expired' : 'retry';
+  draftId = original.request_id;
+  ownerPage = original.page ?? '';
+  if (ownerPage === 'list') {
+   const stored = storedListDraft();
+   separateFromNativeDraft = isShippedListDraft(stored) && stored.id !== draftId;
+   if (separateFromNativeDraft) {
+    awaitingNativeRecovery = false;
+    if (!nativeListEdit && draft.nativeListEdit) {
+     nativeListEdit = {...draft.nativeListEdit, files: decodePastedFiles(draft.nativeListEdit.files)};
+    }
+   }
+  }
+  awaitingEarlierSend = true;
+  form.elements.kind.value = draft.selectedKind || original.kind;
+  selectedRecipient = original.recipient_id;
+  words.value = original.words;
+  includePage.checked = draft.includeScreenshot ?? Boolean(original.capture_key);
+  const url = original.page_state?.url ? new URL(original.page_state.url) : null;
+  pageContext = draft.pageContext || {
+   state: original.page_state, data: original.evidence,
+   place: original.defer_capture?.place || (url ? url.pathname + url.search + url.hash : ''),
+   viewport: original.defer_capture || original.page_state?.viewport || viewport()
+  };
+  if (editingLater || images.length !== (original.images?.length || 0)) {
+   replaceImages(decodePastedFiles(original.images || []));
+  }
+  if (!keepDraft || error.hidden || draft.mode === 'screenshot-expired') {
+   setError(draft.mode === 'retry' ? 'Retry to confirm the save.' : '');
+  }
+  showRecipients();
+  showBugPage();
+  showSentDetails();
+ }
+
+ laterButton.addEventListener('click', () => {
+  if (canEditSeparateListDraft()) {
+   discardCapture();
+   if (awaitingNativeRecovery) {
+    nativeListEdit = editSnapshot();
+    separateFromNativeDraft = true;
+    awaitingEarlierSend = awaitingNativeRecovery = false;
+   }
+   showEdit(separateListEdit || {...nativeListEdit, kind: 'scheduled', id: undefined, words: '', files: []});
+   separateListEdit = undefined;
+   ensureDraftId();
+   setError('');
+   showSentDetails();
+   startCapture();
+   words.focus();
+   return;
+  }
+  if (isEditingLater()) {
+   showSubmittedDraft(submittedDraft);
+   setError('Retry to confirm the save.');
+   send.focus();
+   return;
+  }
+  if (!isRecovering()) return;
+  laterBase = editSnapshot();
+  submittedDraft.mode = 'edit-later';
+  discardCapture();
+  draftId = undefined;
+  showLaterDraft();
+  ensureDraftId();
+  setError('Confirm the earlier Send before you send these edits.');
+  showSentDetails();
+  words.focus();
+ });
+
+ async function chooseScreenshot(renew) {
+  if (submittedDraft?.mode !== 'screenshot-expired' || sending) return;
+  const payload = {...submittedDraft.payload};
+  delete payload.capture_key;
+  delete payload.defer_capture;
+  if (payload.page_state) {
+   payload.page_state = {...payload.page_state, include_screenshot: false};
+  }
+  if (renew) {
+   payload.capture_key = draftId + randomNonce();
+   payload.defer_capture = {place: pageContext.place, ...pageContext.viewport};
+  }
+  setSending(true);
+  try {
+   await storeSubmittedDraft({...submittedDraft, payload, mode: 'retry', includeScreenshot: renew});
+   includePage.checked = renew;
+   setError('');
+  } catch (failure) {
+   setError(failure.message);
+  } finally {
+   setSending(false);
+   showSentDetails();
+  }
+  send.focus();
+ }
+
+ renewButton.addEventListener('click', () => void chooseScreenshot(true));
+ omitButton.addEventListener('click', () => void chooseScreenshot(false));
+
+ function showConfirmation(item) {
+  savedItem = item;
+  const saved = Boolean(item);
+  const scheduled = saved && item.id.startsWith('L');
+  confirmation.textContent = scheduled
+   ? ['Saved List item ' + item.id.slice(1) + '.', item.receipt?.replace(/ List item [1-9][0-9]*\.$/, ''),
+      ...(item.readback || []), item.notice_warning].filter(Boolean).join('\n')
+   : saved ? ['Saved ' + item.id + '.', item.attachment_warning].filter(Boolean).join('\n') : '';
+  confirmation.hidden = savedControls.hidden = !saved;
+  body.hidden = saved && !scheduled;
+  sendControls.hidden = saved;
+  closeButton.hidden = Boolean(item?.attachment_warning);
+  updateSend();
+  if (saved) done.focus();
+ }
+
+ function close({sent = false, acknowledged = false} = {}) {
   if (sending || (!sent && !dialog.open)) return;
+  const result = savedItem;
+  if (result?.attachment_warning) {
+   if (!acknowledged) return;
+   discardCapture();
+   finishDraft();
+   if (laterDraft) {
+    showConfirmation();
+    showLaterDraft();
+    showSentDetails();
+    startCapture();
+    updateSend();
+    words.focus();
+    dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: result}));
+    return;
+   }
+  }
+  if (isEditingLater()) showSubmittedDraft(submittedDraft);
+  const returnToNative = separateFromNativeDraft && !submittedDraft;
+  if (returnToNative) {
+   if (!sent && !result) separateListEdit = editSnapshot();
+   separateFromNativeDraft = false;
+   draftId = undefined;
+   awaitingEarlierSend = false;
+  }
   discardCapture();
   opening.abort();
   if (dialog.open) hideDialog();
-  keepDraft = !sent && Boolean(pendingItem || words.value || images.length);
+  keepDraft = !returnToNative && !sent && !result &&
+    Boolean(submittedDraft || awaitingEarlierSend || words.value || images.length);
   if (!keepDraft) {
-   if (ownerPage !== 'list' || !canRecoverFiling) finishDraft();
+   if (!returnToNative) finishDraft();
+   if (result) showConfirmation();
    for (const image of images) URL.revokeObjectURL(image.url);
    images = [];
    previews.replaceChildren();
@@ -1608,10 +2035,14 @@ function bindDraft(dialog, fresh = false) {
   }
  }
 
+ function hideDialog() {
+  dialog.close();
+  if (launcher?.isConnected) launcher.focus({preventScroll: true});
+ }
+
  function setSending(value) {
   sending = value;
   for (const control of [...fields, ...previews.querySelectorAll('button')]) control.disabled = value;
-  send.textContent = value ? 'Sending…' : 'Send';
   form.setAttribute('aria-busy', String(value));
   updateSend();
  }
@@ -1619,7 +2050,7 @@ function bindDraft(dialog, fresh = false) {
  async function open(trigger, page, key, {kind = 'bug', recipientName = '',
                                         capture = {kind: 'none'}, shownTip = null} = {}) {
   if (dialog.open) {
-   words.focus({preventScroll: true});
+   (savedItem ? done : words).focus({preventScroll: true});
    return;
   }
   if (sending) return;
@@ -1628,9 +2059,8 @@ function bindDraft(dialog, fresh = false) {
    evidence = structuredClone(capture);
    tipPreview = shownTip;
   }
-  if (pendingItem) page = pendingItem.page;
-  ownerPage = page;
-  pageContext = page ? collectPageContext() : null;
+  ownerPage = submittedDraft ? submittedDraft.payload.page ?? '' : page;
+  if (!keepDraft || !submittedDraft) pageContext = ownerPage ? collectPageContext() : null;
   launcher = trigger;
   token = '';
   if (ownerPage === 'list' && !draftId && !keepDraft) {
@@ -1638,7 +2068,9 @@ function bindDraft(dialog, fresh = false) {
    if (stored) {
     draftId = stored.id;
     selectedRecipient = stored.recipient;
-    canRecoverFiling = true;
+    // The shipped List dialog stores no Send state.
+    awaitingNativeRecovery = isShippedListDraft(stored);
+    awaitingEarlierSend = awaitingNativeRecovery || stored.awaitingSend === true;
    }
   }
   const newDraft = !keepDraft && !draftId;
@@ -1653,6 +2085,10 @@ function bindDraft(dialog, fresh = false) {
    form.reset();
    setError('');
    form.elements.kind.value = kind;
+   if (nativeListEdit && awaitingNativeRecovery && nativeListEdit.id === draftId) {
+    showEdit(nativeListEdit);
+    nativeListEdit = undefined;
+   }
   }
   recipientStatus.textContent = 'Loading recipients…';
   recipientStatus.hidden = false;
@@ -1667,9 +2103,13 @@ function bindDraft(dialog, fresh = false) {
   focus.focus({preventScroll: true});
   body.scrollTop = 0;
   try {
+   const restored = await restoreSubmittedDraft();
+   if (controller.signal.aborted) return;
+   const original = restored?.payload;
+   if (original) showSubmittedDraft(restored);
    const data = await loadOptions(controller.signal);
    if (controller.signal.aborted) return;
-   if (newDraft) {
+   if (newDraft && !original) {
     selectedRecipient = (ownerPage ? data.page_owner
      : data.recipients.find(recipient => recipient.name === recipientName)?.id) || '';
    }
@@ -1684,15 +2124,19 @@ function bindDraft(dialog, fresh = false) {
  form.addEventListener('input', editDraft);
  bindConsoleDialog(dialog, close);
  dialog.querySelector('[data-cancel]').addEventListener('click', () => close());
+ done.addEventListener('click', () => close({acknowledged: true}));
  async function submissionPayload() {
-  if (pendingItem) return pendingItem;
+  const pending = pendingPayload();
+  if (pending) return pending;
   const type = form.elements.kind.value, recipient = recipientChips.querySelector('input:checked');
   if (!recipient) throw new Error('Select a recipient.');
   const kind = type === 'feedback' ? 'investigation' : type;
   const payload = {request_id: ensureDraftId(), kind, recipient_id: recipient.value, words: words.value,
                    ...(ownerPage && {page: ownerPage, page_recipient: 'selected'})};
+  storeListDraft();
+  if (kind === 'scheduled') return payload;
   let key = '';
-  if (!deferredCapture && !slot.hidden && !taking.hidden) deferredCapture = captureSession?.capture;
+  const deferredCapture = !slot.hidden && !taking.hidden ? captureSession?.capture : undefined;
   if (!deferredCapture && !slot.hidden && !shot.hidden) {
    key = captureSession?.image?.key;
    if (!key) throw new Error('The screenshot is unavailable.');
@@ -1706,7 +2150,6 @@ function bindDraft(dialog, fresh = false) {
   const item = {...payload, evidence: data, images: files,
                 ...(deferredCapture && {capture_key: deferredCapture.key, defer_capture: deferredCapture.request}),
                 ...(key && {capture_key: key}), ...(state && {page_state: state})};
-  if (deferredCapture) pendingItem = item;
   return item;
  }
 
@@ -1714,47 +2157,82 @@ function bindDraft(dialog, fresh = false) {
   event.preventDefault();
   if (send.disabled) return;
   const onList = ownerPage === 'list';
-  const couldRecoverFiling = canRecoverFiling;
-  let saved, submittedKind, usedPreview = false;
+  const hadEarlierSend = awaitingEarlierSend;
+  let saved, usedPreview = false, posted = false;
   setError('');
   setSending(true);
-  hideDialog();
+  if (!isScheduled()) hideDialog();
   try {
    const item = await submissionPayload();
-   submittedKind = item.kind;
+   if (submittedDraft?.payload !== item) {
+    const recipientName = recipientChips.querySelector('input:checked')?.nextElementSibling.textContent;
+    const draft = {payload: item, mode: 'live', recipientName, pageContext, selectedKind: form.elements.kind.value,
+                   includeScreenshot: includePage.checked};
+    if (separateFromNativeDraft && nativeListEdit) {
+     const files = await Promise.all(nativeListEdit.files.map(pastedData));
+     draft.nativeListEdit = {...nativeListEdit, files};
+    }
+    await storeSubmittedDraft(draft);
+   }
+   awaitingEarlierSend = true;
+   storeListDraft();
    usedPreview = Boolean(item.capture_key && !item.defer_capture);
    const sendItem = () => {
-    const receiver = canRecoverFiling ? undefined : recipients?.find(recipient => recipient.id === item.recipient_id)?.name;
-    canRecoverFiling = true;
-    storeListDraft();
-    return post({...item, kind: submittedKind, token}, {hold: true, receiver});
+    posted = true;
+    if (usedPreview && captureSession?.image?.key === item.capture_key) captureSession.sent = true;
+    const receiver = !hadEarlierSend && recipients?.find(recipient => recipient.id === item.recipient_id)?.name;
+    return post({...item, token}, {hold: item.kind !== 'scheduled', receiver: receiver || undefined});
    };
    let result;
    try {
     result = await sendItem();
    } catch (failure) {
-    if (onList || !failure?.staleToken) throw failure;
+    if ((onList && item.kind !== 'scheduled') || !failure?.staleToken) throw failure;
     const fresh = await loadOptions(opening.signal);
     setOptions(fresh);
-    if (!pendingItem && selectedRecipient !== item.recipient_id) throw failure;
+    if (!pendingPayload() && selectedRecipient !== item.recipient_id) throw failure;
     result = await sendItem();
    }
-   if (typeof result.id !== 'string' || !/^[QPI][1-9][0-9]*$/.test(result.id)) {
+   const expectedId = item.kind === 'scheduled' ? /^L[1-9][0-9]*$/ : /^[QPI][1-9][0-9]*$/;
+   if (typeof result.id !== 'string' || !expectedId.test(result.id)) {
     throw new Error('The server did not return a saved item ID.');
    }
    saved = result;
   } catch (failure) {
-   dialog.showModal();
-   if (failure?.definiteRefusal && !failure.staleToken) {
-    pendingItem = deferredCapture = undefined;
-    pendingEdited = false;
-   }
-   // After an Undo, the next Send builds the item again from the edited words.
+   if (!dialog.open) dialog.showModal();
    if (failure instanceof SendUndone) {
-    pendingItem = undefined;
-    pendingEdited = false;
-    canRecoverFiling = couldRecoverFiling;
-    if (!canRecoverFiling) removeListDraft();
+    if (!hadEarlierSend) {
+     clearSubmittedDraft();
+     awaitingEarlierSend = false;
+     if (captureSession) captureSession.sent = false;
+     storeListDraft();
+    }
+    setError(failure.message);
+    return;
+   }
+   if (posted && !failure?.definiteRefusal && submittedDraft && !isRecovering()) {
+    showSubmittedDraft(submittedDraft);
+    try { await storeSubmittedDraft(submittedDraft); } catch (_) {}
+   }
+   const chooseCapture = failure?.screenshotExpired && isRecovering();
+   if (chooseCapture) {
+    submittedDraft.mode = 'screenshot-expired';
+    try { await storeSubmittedDraft(submittedDraft); } catch (_) {}
+    discardCapture(!onList);
+    showSentDetails();
+   } else if (failure?.definiteRefusal) {
+    if (!failure.staleToken || !hadEarlierSend) {
+     const recovering = isRecovering();
+     clearSubmittedDraft();
+     if (recovering) {
+      showLaterDraft();
+      showRecipients();
+      showBugPage();
+      showSentDetails();
+     }
+    }
+    awaitingEarlierSend = awaitingNativeRecovery || (failure.staleToken && hadEarlierSend);
+    storeListDraft();
    }
    if (failure?.filedId) {
     discardCapture();
@@ -1762,12 +2240,12 @@ function bindDraft(dialog, fresh = false) {
     setError('This item was already filed as ' + failure.filedId + '. Any change after that Send was not sent.');
     void renewCapture();
    } else {
-    setError(failure?.message || 'Could not send this item.');
-    if (failure?.screenshotExpired && includePage.checked) {
+    setError(chooseCapture ? '' : failure?.message || 'Could not send this item.');
+    if (failure?.screenshotExpired && !chooseCapture && includePage.checked) {
      discardCapture(!onList);
      void renewCapture();
     } else if (onList && (failure?.staleToken || failure instanceof TypeError)) {
-     if (!pendingItem && (failure?.staleToken || !captureSession?.image)) discardCapture();
+     if (!pendingPayload() && (failure?.staleToken || !captureSession?.image)) discardCapture();
      const signal = opening.signal;
      const fresh = await loadOptions(signal).catch(() => null);
      if (!signal.aborted && fresh) {
@@ -1780,26 +2258,36 @@ function bindDraft(dialog, fresh = false) {
   } finally {
    setSending(false);
   }
-  if (!saved) {
-   send.focus();
-   return;
-  }
-  const keepEdits = pendingEdited;
-  discardCapture(usedPreview);
-  finishDraft();
-  if (keepEdits) {
-   dialog.showModal();
-   setError('Saved ' + saved.id + '. Your edits are still in the dialog.');
+  if (saved?.attachment_warning) {
+   if (!dialog.open) dialog.showModal();
+   showConfirmation(saved);
    dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
-   startCapture();
-   updateSend();
+  } else if (saved) {
+   const keepEdits = Boolean(laterDraft);
+   discardCapture(usedPreview);
+   finishDraft();
+   showLaterDraft();
+   showSentDetails();
+   if (keepEdits) {
+    if (!dialog.open) dialog.showModal();
+    setError('Saved ' + saved.id + '. Your edits are still in the dialog.');
+    dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
+    startCapture();
+    updateSend();
+    send.focus();
+   } else if (!saved.id.startsWith('L')) {
+    close({sent: true});
+    const target = dialog.isConnected ? dialog : document;
+    if (!onList) target.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
+    target.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
+   } else {
+    showConfirmation(saved);
+    dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
+   }
+  } else {
    send.focus();
    return;
   }
-  close({sent: true});
-  const target = dialog.isConnected ? dialog : document;
-  if (!onList) target.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
-  target.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
  });
 
  const draft = {
@@ -1819,8 +2307,11 @@ function bindDraft(dialog, fresh = false) {
   dialog.dataset.newItemDraft = '';
   dialog.id += suffix;
   for (const element of dialog.querySelectorAll('[id]')) element.id += suffix;
-  for (const element of [dialog, ...dialog.querySelectorAll('[aria-labelledby]')])
-   element.setAttribute('aria-labelledby', element.getAttribute('aria-labelledby') + suffix);
+  for (const attr of ['aria-labelledby', 'aria-describedby', 'for'])
+   for (const element of [dialog, ...dialog.querySelectorAll('[' + attr + ']')]) {
+    if (element.hasAttribute(attr))
+     element.setAttribute(attr, element.getAttribute(attr).split(' ').map(id => id + suffix).join(' '));
+   }
   original.after(dialog);
   const draft = bindDraft(dialog, true);
   drafts.push(draft);
