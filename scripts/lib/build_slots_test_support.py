@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.buildlog.store import host_name
+from scripts.lib import conf
 from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 

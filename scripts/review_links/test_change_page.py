@@ -556,6 +556,8 @@ class ChangePageTests(unittest.TestCase):
         key = self.file_user_question("Read this result?", asker=self.unit)
         body = self.browser("questions")[2]
         self.assertIn(key, body)
+        self.assertIn('<label for="review-showrunner"><span class="staff-name" data-color-text="role.showrunner"'
+                      + ' style="color:#a379fd">Showrunner:</span></label>', body)
         self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>page-owner</span>')
         self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>builder-unit</span>')
         self.assertNotRegex(body, r'class="staff-name"[^>]*>nate</span>')
@@ -632,7 +634,8 @@ class ChangePageTests(unittest.TestCase):
                         self.assertEqual(body.count(page_frame.COPY_BUTTON), len(blocks))
                         self.assertEqual(body.count('<pre>'), len(blocks))
                         if answer != fenced:
-                            prefix = 'Showrunner: ' if feedback else ''
+                            prefix = ('<span class="staff-name" data-color-text="role.showrunner" style="color:#a379fd">'
+                                      'Showrunner:</span> ') if feedback else ''
                             self.assertIn('<p>' + prefix + answer + '</p>', body)
                     status.write_slots(self.page, row_id, change_page.DeliverySlots(change_page.NoDelivery(), change_page.NoDelivery()))
 
@@ -758,6 +761,7 @@ class ChangePageTests(unittest.TestCase):
         configuration.mkdir()
         for stem in ("change_review", "nix_env"):
             _ = write_config_fixture(configuration / f'{stem}.conf')
+        _ = write_config_fixture(configuration / "statusline.conf", "role.showrunner=#a379fd\n")
         self.write_delivery_config()
         _ = self.enterContext(patch.object(unrouted_alert, "send_message"))
         _ = self.enterContext(patch.object(reply_tokens, "platform", "linux"))
@@ -3114,7 +3118,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(refreshed.counts["page-owner"], 3)
         self.assertEqual(footer_counts.changes(self.production), 3)
         self.assertEqual(refreshed.outcomes["page-owner/C1"], ["works", "not works", "validate", "question", "feedback"])
-        self.assertIn("Showrunner: The &lt;proof&gt; now has three steps.", content)
+        self.assertIn("Showrunner: The &lt;proof&gt; now has three steps.", without_role_colors(content))
         self.assertIsInstance(status.slots(self.page, "C1").question, change_page.CompletedFeedback)
         self.assertEqual(self.http_request(path, self.browser_fields(refreshed, "page-owner/C1", "works")).status, 200)
         self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
@@ -3803,7 +3807,8 @@ class ChangePageTests(unittest.TestCase):
             self.assertIn("tab==='' || r.dataset.tab===tab", body)
             self.assertIn("runnerMenu.value=tab", body)
         with self.subTest(controls="labels and action groups"):
-            self.assertIn('<label for="review-showrunner">Showrunner:</label>', body)
+            self.assertIn('<label for="review-showrunner"><span class="staff-name" data-color-text="role.showrunner"'
+                          + ' style="color:#a379fd">Showrunner:</span></label>', body)
             self.assertIn('>Comment, question or feedback</label>', body)
             self.assertIn('value="validate">Ask showrunner to check</button>', body)
             self.assertIn('<div class="answer-actions"><button name="outcome" value="works">Works</button>'

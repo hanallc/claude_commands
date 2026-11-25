@@ -22,6 +22,7 @@ from unittest.mock import patch
 from urllib.parse import urlencode, urlsplit
 from uuid import NAMESPACE_URL, uuid5
 
+from scripts.accounts import accounts
 from scripts.agents import remote
 from scripts.lib import file_lock
 from scripts.lib.git_test_support import fixture_git_environment
@@ -206,11 +207,14 @@ class BranchPageTests(unittest.TestCase):
         row = branch_page.MergedUnitBranch("merged", member.name, "abc", "2026-11-16T12:00:00+00:00",
             "def", "2026-11-16T13:00:00+00:00", branch_page.InactiveUnit())
         page = branch_page.BranchPage(Path(), (row, replace(row, unit="nate")), "private", member.id, Path())
-        with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))):
+        with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))),
+              patch.object(accounts, "role_colors", return_value={"role.unit-director": "#ffaf02"})):
             body = branch_page.render(page).decode()
         self.assertEqual(body.count(page_frame.BUTTON_STATES), 1)
         self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>Builder</span>')
-        self.assertIn('Unit: nate — not active', body)
+        prefix = '<span class="staff-name" data-color-text="role.unit-director" style="color:#ffaf02">Unit:</span>'
+        self.assertEqual(body.count(prefix), 2)
+        self.assertIn(prefix + ' nate — not active', body)
 
     def test_lists_only_merged_recorded_natedev_unit_branches_and_checks_each_row(self) -> None:
         for live_directory in ("present", "missing", "pruned", "newest-run", "unrecorded", "remote-main", "enrolled"):

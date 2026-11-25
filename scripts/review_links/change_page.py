@@ -53,7 +53,7 @@ from scripts.production.production_doc import Refusal as Refusal, production_fie
 from scripts.feature_log import feature_log
 from scripts.review_links.question_path import AnswerTime, NO_ANSWER_TIME, answer_log_id
 from scripts.review_links import (console_theme, image_store, new_item_dialog, page_frame, question_record, review_events,
-                                  reply_tokens, review_link)
+                                  reply_tokens, review_link, staff_names)
 from scripts.review_links.question_record import AnswerRefused as AnswerRefused
 from scripts.review_links.review_items import (
     CompletedFeedback as CompletedFeedback, OpenFeedback as OpenFeedback,
@@ -1989,13 +1989,23 @@ def review_question_failed(status: DeliveryStatus, page: ReviewPage, row: str,
     return re.fullmatch(r"C\d+", row) is not None
 
 
-def question_html(question: NoQuestion | OpenQuestion | AnsweredQuestion, *, failed: bool = False) -> str:
+def question_html(question: NoQuestion | OpenQuestion | AnsweredQuestion, *, failed: bool = False,
+                  names: staff_names.StaffNames | None = None) -> str:
     if isinstance(question, NoQuestion):
         return ""
     feedback = isinstance(question, (OpenFeedback, CompletedFeedback))
     content = ('<h2>Feedback</h2>' if feedback else '<h2>Question</h2>') + review_html(question.text)
     if isinstance(question, AnsweredQuestion):
-        content += review_html('Showrunner: ' + question.answer) if feedback else '<h2>Answer</h2>' + review_html(question.answer)
+        if feedback:
+            names = names if names is not None else staff_names.StaffNames(staff.StaffSnapshot(()))
+            label = 'Showrunner:'
+            answer = review_html(label + ' ' + question.answer)
+            prefix = '<p>' + label
+            if answer.startswith(prefix):
+                answer = '<p>' + names.role_label('showrunner', label) + answer[len(prefix):]
+            content += answer
+        else:
+            content += '<h2>Answer</h2>' + review_html(question.answer)
     elif not failed:
         content += '<p>The showrunner will act on this</p>' if feedback else '<p>The showrunner will answer this</p>'
     return content + question_failure_html(failed)
@@ -2064,6 +2074,7 @@ def list_routing(snapshots: dict[Path, change_review.ReviewListSnapshot]) -> cha
 
 def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO_ANSWER_NOTICE) -> bytes:
     feedback_rows = conf.read("review_links").whole("feedback_rows")
+    names = staff_names.StaffNames(staff.StaffSnapshot(()))
     sections: list[str] = []
     saved = False
     for row in shown_rows(page):
@@ -2085,7 +2096,7 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         content = f'''{alert}
 <h1>{html.escape(row["Change"])}</h1>
 <h2>{proof_title}</h2>{review_html(row[change_review.CHECK])}
-{question_html(question, failed=failed)}{answer}
+{question_html(question, failed=failed, names=names)}{answer}
 {change_details(row, change_review.display_id(row, route_owner(page, row).tab))}'''
         sections.append(f'<section id="{row_id}" data-change-card>' + change_content(row, content) + '</section>')
     if notice.reason and not notice.row:

@@ -937,11 +937,13 @@ def assign_menu(item: ReviewItem, names: staff_names.StaffNames) -> str:
                       + f'data-send-receiver="{html.escape(member.name, quote=True)}"{names.style(member.id)}>'
                       +f'{html.escape(member.name)}</option>'
                       for member in review_actions.approval_assignees(names.members))
-    return page_frame.action_select('assignee', 'Assign', f'<option value="">{html.escape(shown)} decides</option>'+options)
+    return page_frame.action_select('assignee', 'Assign',
+        f'<option value=""{names.style(item.owner)}>{html.escape(shown)} decides</option>'+options)
 
 
 def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *,
-         soon: str = "In 1 hour", owner: str = '', validator: str = '', assignment: str = '', routes: str = '') -> str:
+         soon: str = "In 1 hour", owner: str = '', validator: str = '', assignment: str = '', routes: str = '',
+         names: staff_names.StaffNames | None = None) -> str:
     if item.state == ReviewState.DONE or (item.type == ReviewType.FOR_YOU and not item.actions):
         return ''
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key), 'revision': revision}
@@ -965,8 +967,6 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
          else closes).append(button)
         if action == 'approve':
             closes.append(assignment)
-    heading = (page_frame.ReturningActionHeading.SENDS_TO_SHOWRUNNER if item.type == ReviewType.CHANGE
-               else page_frame.ReturningActionHeading.ITEM_RETURNS)
     later = ''
     if (item.state not in (ReviewState.DONE, ReviewState.VALIDATING)
             and item.type not in (ReviewType.RESPONSE, ReviewType.FOR_YOU) and not waiting_change(item)):
@@ -990,14 +990,20 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
         words = (f'<label for="{field}">Your words</label><textarea id="{field}" name="feedback" rows="{words_rows}" '
                  + f'placeholder="{placeholder}"></textarea>')
     if item.type == ReviewType.RESPONSE:
+        shown_owner = names.html(item.owner, owner) if names is not None else html.escape(owner)
         groups = ('<div class="review-actions"><div class="review-action-group"><span>Closes the item</span><div>'
                   +''.join(closes)+'</div></div><div class="review-action-group"><span>Sends to '
-                  +html.escape(owner)+'</span><div>'+''.join(returns)+'</div></div></div>')
+                  +shown_owner+'</span><div>'+''.join(returns)+'</div></div></div>')
     elif validator:
+        shown_validator = names.html(item.owner, validator) if names is not None else html.escape(validator)
         groups = ('<div class="review-actions"><div class="review-action-group"><span>Sends to '
-                  +html.escape(validator)+'</span><div>'+''.join(returns)+'</div></div></div>')
+                  +shown_validator+'</span><div>'+''.join(returns)+'</div></div></div>')
     else:
-        groups = page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading=heading)
+        heading = ''
+        if item.type == ReviewType.CHANGE and returns:
+            names = names if names is not None else staff_names.StaffNames(staff.StaffSnapshot(()))
+            heading = 'Sends to ' + names.role_label('showrunner', 'showrunner')
+        groups = page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading_html=heading)
     return (f'<form method="post" data-review-form {routes}>'+hidden+words+groups+acknowledge
             +'<span role="status" data-send-status></span></form>')
 
@@ -1123,13 +1129,13 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
         if validator:
             duration = (' · Validating for <time data-validating-age datetime="'
                         +source.handed_at.isoformat()+'"></time>') if source.handed_at is not None else ''
-            handoff = '<p class="review-handoff">With '+names.html(item.owner, validator)+duration+'</p>'
+            shown_validator = names.html(item.owner, validator)
+            handoff = '<p class="review-handoff">With '+shown_validator+duration+'</p>'
             if isinstance(question, (change_page.OpenQuestion, change_page.AnsweredQuestion)) and not isinstance(
                     question, (change_page.OpenFeedback, change_page.CompletedFeedback)):
-                escaped = html.escape(validator)
-                exchange = section('Question for '+escaped, question.text)
+                exchange = section('Question for '+shown_validator, question.text)
                 if isinstance(question, change_page.AnsweredQuestion):
-                    exchange += ('<section><h3>Answer from '+escaped+'</h3>'
+                    exchange += ('<section><h3>Answer from '+shown_validator+'</h3>'
                                  +change_browser.answer_html(question.answer)+'</section>')
         else:
             if isinstance(question, change_page.OpenQuestion) and not isinstance(question, change_page.OpenFeedback):
@@ -1161,7 +1167,7 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+handoff+'<div data-review-body>'+body+'</div></div>'
             +'<div class="review-log-column">'+record_table.log_panel(log_id, log_html(item, inputs, owner))+exchange+'</div>'
             +form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets), soon=inputs.soon_label,
-                  owner=owner, validator=validator, routes=review_toast_routes(item, inputs.members),
+                  owner=owner, validator=validator, routes=review_toast_routes(item, inputs.members), names=names,
                   assignment=assign_menu(item, names) if 'approve' in item.actions else '')+footer+'</div>')
 
 

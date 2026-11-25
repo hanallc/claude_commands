@@ -398,6 +398,8 @@ window.fetch=(url,options)=>{
  check([...form.querySelectorAll('.review-action-group')].map(group=>group.textContent.trim()).join('|')===
   'Closes the itemGot it|Sends to page-ownerAsk a follow-up' && form.elements.feedback.labels[0].textContent==='Your words',
   'The Response shows both labeled actions and Your words.');
+ check(form.querySelector('.review-action-group:last-child [data-color-text="role.showrunner"]')?.textContent==='page-owner',
+  'The Response action heading shows the showrunner color.');
  check(form.elements.feedback.placeholder==='Type your words for Ask a follow-up.',
   'The placeholder says which action sends the words.');
  const id=recordFromDetail(form).dataset.key;
@@ -3260,9 +3262,10 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
         self.assertEqual(entry['ownerName'], 'page-owner')
         self.assertEqual(entry.get('handoff', ('', ''))[1], 'Nov 17 03:00 EST')
         card = snapshot.body(key).decode()
-        for text in ('How to check', 'Proof', 'Log · newest first', 'Your words', 'Sends to page-owner',
+        for text in ('How to check', 'Proof', 'Log · newest first', 'Your words',
                      'Ask a question', 'data-validating-age datetime="2026-11-17T03:00:00-05:00"'):
             self.assertIn(text, card)
+        self.assertRegex(card, r'Sends to <span[^>]*data-color-text="role.showrunner"[^>]*>page-owner</span>')
         self.assertNotIn('data-later-toggle', card)
         path = self.status.path(self.fixture.page, 'C1')
         fields = cast(dict[str, object], json.loads(path.read_text()))
@@ -3294,7 +3297,7 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
         question = 'What is holding up validation?'
         current = cache.get()
         self.assertEqual(next(entry['ownerName'] for entry in current.entries if entry['key'] == key), 'page-owner')
-        self.assertIn('Sends to page-owner', current.body(key).decode())
+        self.assertRegex(current.body(key).decode(), r'Sends to <span[^>]*data-color-text="role.showrunner"[^>]*>page-owner</span>')
         fields = self.card_body(current, key, 'question', question)
         sent = cache.save(fields, self.status)
         self.assertEqual(sent.answer, 'question saved')
@@ -3330,9 +3333,10 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
         pending, _ = cache.publish_record(cache.get(), key)
         self.assertEqual(pending.records[key].state, review_items.ReviewState.VALIDATING)
         pending_card = pending.body(key).decode()
-        self.assertIn('Question for page-owner', pending_card)
+        validator = r'<span[^>]*data-color-text="role.showrunner"[^>]*>page-owner</span>'
+        self.assertRegex(pending_card, 'Question for ' + validator)
         self.assertIn(question, pending_card)
-        self.assertNotIn('Answer from page-owner', pending_card)
+        self.assertNotRegex(pending_card, 'Answer from ' + validator)
         self.assertEqual([event.words for event in pending.records[key].log][-2:],
                          ['Asked page-owner to validate', 'Asked a question about validation'])
         retry = cache.save(self.card_body(pending, key, 'question', question), self.status)
@@ -3351,7 +3355,9 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
             with self.subTest(version=snapshot.version):
                 self.assertEqual(snapshot.records[key].state, review_items.ReviewState.VALIDATING)
                 card = snapshot.body(key).decode()
-                for text in ('Question for page-owner', 'Answer from page-owner', question, words):
+                for label in ('Question for ', 'Answer from '):
+                    self.assertEqual(len(re.findall(label + validator, card)), 1)
+                for text in (question, words):
                     self.assertIn(text, card)
                     self.assertEqual(card.count(text), 1)
                 self.assertEqual([event.words for event in snapshot.records[key].log][-3:],
@@ -3410,7 +3416,7 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
 
         snapshot = review_page.build_snapshot(self.root)
         self.assertEqual(snapshot.records[key].owner, validator.id)
-        self.assertIn('Sends to page-owner', snapshot.body(key).decode())
+        self.assertRegex(snapshot.body(key).decode(), r'Sends to <span[^>]*data-color-text="role.showrunner"[^>]*>page-owner</span>')
         body = self.card_body(snapshot, key, 'question', 'Which check is still running?')
         question, _ = review_page.submit(self.root, body, self.status, snapshot=snapshot)
         assert isinstance(question, change_page.MessageDelivery)
@@ -4823,8 +4829,12 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 self.assertEqual(item.actions,expected[item.key])
                 form = review_page.form(item,change_page.ReviewBrowser(token,initial),4,'fixture-revision')
                 self.assertIn('Closes the item',form)
-                heading = 'Sends to showrunner' if item.type == review_items.ReviewType.CHANGE else 'The item returns to you'
-                self.assertIn(heading,form)
+                if item.type == review_items.ReviewType.CHANGE:
+                    self.assertIn('<span>Sends to <span class="staff-name" data-color-text="role.showrunner"'
+                                  + ' style="color:#a379fd">showrunner</span></span>', form)
+                    self.assertIn('value="validate">Ask showrunner to check</button>', form)
+                else:
+                    self.assertIn('The item returns to you', form)
                 self.assertIn('aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later',form)
                 for label in ('In 1 hour','This evening','Tomorrow morning','Next week','Choose a time…'):
                     self.assertIn('<span>'+label+'</span>',form)
@@ -5955,9 +5965,21 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
                 self.assertEqual(body.count('name="assignee"'), 1)
                 options = body.partition('<select name="assignee">')[2].partition('</select>')[0]
                 self.assertEqual(re.findall(r'<option value="([^"]*)"([^>]*)>([^<]+)</option>', options),
-                                 [('', '', 'page-owner decides'), *expected])
+                                 [('', ' style="color:#a379fd"', 'page-owner decides'), *expected])
                 for member in (worker, wrapped):
                     self.assertNotIn(member.id, options)
+
+    def test_response_action_heading_colors_the_producer_name(self) -> None:
+        doc = self.fixture.temporary / 'producer.md'
+        _ = doc.write_text('# Producer\n')
+        producer = fixture_member('producer', name='fixture-producer', doc=staff.LiveDoc(local_machine(), doc))
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        self.addCleanup(cache.close)
+        created = cache.create_submission(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, producer.id))
+        self.assertTrue(review_submissions.answer(created.saved.key, 'The test passed.', created.saved.reply_token))
+        card = review_page.build_snapshot(self.root).body(created.key).decode()
+        self.assertRegex(card, r'Sends to <span[^>]*data-color-text="role.producer"'
+                         + r' style="color:#90fe42">fixture-producer</span>')
 
     def test_explicit_approval_delivers_and_records_the_assignee(self) -> None:
         proposal, efficiency = self.decisions()

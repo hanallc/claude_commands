@@ -2115,11 +2115,14 @@ frame.addEventListener('load',async()=>{
         self.assertIn('<td data-label="Owner"><span class="list-owner-name"><span>nate</span></span></td>', body)
 
     def test_added_log_shows_staff_colors_local_eta_and_field_labels(self) -> None:
-        _ = self.add("Log labels")
+        item = self.add("Log labels")
+        _ = the_list.update(MORTY.id, item.id, {"unit": "fixture-unit"}, source="morty")
         body = list_page.render(self.root / "reviews").decode()
         log = body.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
         self.assertRegex(log, r'Owner</dt><dd><span[^>]*data-color-text="role.showrunner"[^>]*>sdlc</span>')
-        self.assertRegex(log, r'Producer</dt><dd><span[^>]*data-color-text="role.producer"[^>]*>morty</span>')
+        self.assertRegex(log, r'<dt><span[^>]*data-color-text="role.producer" style="color:#90fe42">Producer</span></dt>'
+                         + r'<dd><span[^>]*data-color-text="role.producer"[^>]*>morty</span>')
+        self.assertRegex(log, r'<dt><span[^>]*data-color-text="role.unit-director" style="color:#ffaf02">Unit</span></dt>')
         self.assertIn("ETA</dt><dd>14:00 EST – 15:00 EST</dd>", log)
         self.assertIn("State</dt><dd>Working</dd>", log)
         self.assertIn("Next step</dt><dd>", log)
@@ -2127,6 +2130,19 @@ frame.addEventListener('load',async()=>{
         shown = re.sub(r"<[^>]+>", "", log)
         for text in (OWNER.id, MORTY.id, "EtaRange(", "next_step", "latest_status"):
             self.assertNotIn(text, shown)
+
+    def test_producer_filter_and_both_tables_show_the_producer_label_color(self) -> None:
+        _ = self.add("Producer labels")
+        body = list_page.render(self.root / "reviews", include_counts=False).decode()
+        label = '<span class="staff-name" data-color-text="role.producer" style="color:#90fe42">Producer</span>'
+        self.assertIn(f'aria-label="Producer" data-filter-row="producer"><span aria-hidden="true">{label}</span>', body)
+        self.assertIn('<th scope="col" aria-sort="none" data-list-producer>'
+                      + '<button type="button" id="list-sort-2" data-sort="2">Producer', body)
+        self.assertIn('th[data-list-producer] button{color:var(--producer-label-color,inherit)}', body)
+        self.assertIn(f'<th scope="col">{label}</th>', body.split('<section data-linked-item', 1)[1])
+        self.assertIn('--producer-label-color:#90fe42', body)
+        self.assertIn('td[data-label="Producer"]::before{color:var(--producer-label-color,var(--ink-3))}', body)
+        self.assertIn('<td data-label="Producer">', body)
 
     def test_updated_log_shows_full_eta_and_shares_the_next_step_renderer(self) -> None:
         item = self.add("Log an update")
@@ -2289,7 +2305,8 @@ frame.addEventListener('load',async()=>{
         note = "; ".join(f"{key}: {json.dumps(value)}" for key, value in fields.items())
         log = self.legacy_log("- 2026-11-16 18:00:00+00:00 Added; " + note + " — nate")
         self.assertRegex(log, r'Owner</dt><dd><span[^>]*data-color-text="role.showrunner"[^>]*>sdlc</span>')
-        self.assertRegex(log, r'Producer</dt><dd><span[^>]*data-color-text="role.producer"[^>]*>morty</span>')
+        self.assertRegex(log, r'data-color-text="role.producer"[^>]*>Producer</span></dt>'
+                         + r'<dd><span[^>]*data-color-text="role.producer"[^>]*>morty</span>')
         self.assertIn("State</dt><dd>Working</dd>", log)
         self.assertIn("ETA</dt><dd>14:00 EST – 15:00 EST</dd>", log)
         self.assertIn("Next step</dt><dd>", log)
@@ -2378,7 +2395,7 @@ frame.addEventListener('load',async()=>{
         _ = self.long_log_item()
         self.set_log_max_height(9)
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
-        self.assertIn('style="--list-log-max-height:9rem"', markup)
+        self.assertRegex(markup, r'\bstyle="(?:[^"]*;)?--list-log-max-height:9rem[;"]')
         probe = r'''<script>
 document.querySelector('.list-toggle').click();
 const panel=document.querySelector('.list-panel'),[left,right]=panel.children;
@@ -5250,7 +5267,10 @@ observer.observe(original.parentElement,{childList:true});
             delivery = list_page.submit(root, urlencode(fields), status)
             opened = list_page.render(root, status=status).decode().split('<script>', 1)[0]
             self.assertIn('data-waiting-for-answer="true"', opened)
-            self.assertIn('<p data-waiting-note>morty will answer.</p>', opened)
+            self.assertRegex(opened, r'<p data-waiting-note><span[^>]*data-color-text="role.producer"[^>]*>morty</span> will answer.</p>')
+            status_cell = opened.split('<td data-label="State">', 1)[1].split('</td>', 1)[0]
+            self.assertRegex(status_cell, r'<small data-open-question-note><span[^>]*data-color-text="role.producer"'
+                             + r' style="color:#90fe42">Producer</span> answering</small>')
             self.assertIn('Question Q1 — waiting for an answer</h3>' + asked_time, opened)
             self.assertIn("What changed in &lt;List&gt;?", opened)
             self.assertNotIn('name="action" value="question"', opened)
@@ -5482,7 +5502,12 @@ observer.observe(original.parentElement,{childList:true});
         self.assertEqual(saved.recipient, question_record.KeeperForUnavailableProducer(MORTY.id, DWIGHT.id))
         markup = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
         self.assertIn(words, markup)
-        self.assertIn("dwight is not live, so morty will answer.", markup)
+        note_match = re.search(r'<p data-waiting-note(?: hidden)?>(.*?)</p>', markup)
+        assert note_match is not None
+        note = ElementTree.fromstring(f"<p>{note_match[1]}</p>")
+        self.assertEqual("".join(note.itertext()), "dwight is not live, so morty will answer.")
+        self.assertEqual([(name.text, name.get("data-color-text"), name.get("style")) for name in note],
+                         [("dwight", "role.producer", "color:#90fe42"), ("morty", "role.producer", "color:#90fe42")])
         for text in ("Resend question", "ready to send", "may not have reached", "Question not delivered."):
             self.assertNotIn(text, markup)
         assert isinstance(submission, list_page.ListQuestionDelivery)
@@ -5669,7 +5694,9 @@ observer.observe(original.parentElement,{childList:true});
                     self.assertEqual(edited.questions[0].recipient,
                                      question_record.KeeperForUnavailableProducer(MORTY.id, DWIGHT.id))
                     note = '<p data-waiting-note>dwight is not live, so morty will answer.</p>'
-                    self.assertIn(note, saved.get("waiting_details_html", ""))
+                    waiting_html = saved.get("waiting_details_html", "")
+                    self.assertIn(note, without_role_colors(waiting_html))
+                    self.assertRegex(waiting_html, r'data-color-text="role.producer"[^>]*>morty</span> will answer.')
                 body = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
                 self.assertNotIn('value="resend-Q1"', body)
 
@@ -5807,6 +5834,9 @@ observer.observe(original.parentElement,{childList:true});
  check(!row.hidden,'The saved row stays in All.');
  const note=row.querySelector('[data-open-question-note]');
  check(note?.getClientRects().length && note.textContent==='Producer answering' &&
+  note.firstElementChild?.textContent==='Producer' &&
+  note.firstElementChild?.dataset.colorText==='role.producer' &&
+  note.firstElementChild?.style.color==='rgb(144, 254, 66)' &&
   row.querySelector('.list-state').textContent==='Waiting for nate','The note appears below the saved state.');
  check(changes.join()==='POST','The chip changes without a refresh.');
  check(count.textContent==='2 of 2 items shown · 0 need you · 1 unread','All counts the saved row.');
@@ -7321,6 +7351,10 @@ const change=async path=>{
             return " ".join(re.sub(r"<[^>]+>", " ", markup).split()).replace(" :", ":")
         self.assertEqual(text(list_page.staff_role_html(merge, names)), "the merge director of sdlc")
         self.assertEqual(text(list_page.staff_role_html(MORTY, names)), "the List producer")
+        self.assertRegex(list_page.staff_role_html(merge, names),
+                         r'data-color-text="role.unit-director" style="color:#ffaf02">merge director</span>')
+        self.assertRegex(list_page.staff_role_html(MORTY, names),
+                         r'data-color-text="role.producer" style="color:#90fe42">List producer</span>')
         item = self.add("Merge the needsme unit", number=1)
         ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=merge.id, what="Merge needsme to main.",
                                why="The merge needs nate's go.", config=False, requester=MORTY.id, source="morty")
@@ -7333,6 +7367,7 @@ const change=async path=>{
             markup = list_page.render(self.root / "reviews").decode()
         self.assertEqual(markup.count("data-ask="), 1)
         self.assertIn("natemerge, the merge director of sdlc", text(without_role_colors(markup)))
+        self.assertRegex(markup, r'Pressing Go sends your go to <span[^>]*data-color-text="role.unit-director"[^>]*>natemerge</span>\.')
         _ = the_list.give_go(MORTY.id, item.id, ask.ask_id, "0" * 32, source="nate")
         with patch.object(list_page, "counts_strip", return_value=""):
             markup = list_page.render(self.root / "reviews").decode()

@@ -196,7 +196,8 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
     owner, name = owner_names(members, record["owner"])
     names = staff_names.for_page(names, members)
     member = members.by_id(staff.StaffId(record["owner"]))
-    shown_owner = names.html(record["owner"], name) + f" ({member.kind})" if member is not None else html.escape(owner)
+    shown_owner = (names.html(record["owner"], name) + f" ({names.role_label(member.kind, member.kind)})"
+                   if member is not None else html.escape(owner))
     receiver = f' data-send-receiver="{html.escape(name, quote=True)}"' if member is not None else ""
     questions = sorted((question_record.read(saved) for saved in record.get('questions', [])),
                        key=lambda question: (question.answer is not None, int(question.question_id[1:])))

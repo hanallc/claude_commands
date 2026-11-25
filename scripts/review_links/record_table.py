@@ -49,7 +49,7 @@ class Chip:
     count: int | None = None
 
 
-def chip_row(name: str, chips: Iterable[Chip], selected: str) -> str:
+def chip_row(name: str, chips: Iterable[Chip], selected: str, *, label_html: str = '') -> str:
     """Render a named filter with All as its first choice."""
     key = name.lower().replace(' ', '-')
     choices = {chip.value: chip for chip in chips}
@@ -63,10 +63,11 @@ def chip_row(name: str, chips: Iterable[Chip], selected: str) -> str:
         buttons.append(f'<button type="button" id="filter-{html.escape(key, quote=True)}-{quote(chip.value, safe="")}"'
                        + f' data-filter-value="{value}" aria-pressed="{pressed}" data-filter-count="{count}">'
                        + f'{chip.label_html}<b>{count}</b></button>')
-    return labelled_chip_row(name, ''.join(buttons), filter_key=key)
+    return labelled_chip_row(name, ''.join(buttons), filter_key=key, label_html=label_html)
 
 
-def labelled_chip_row(name: str, buttons: str, *, filter_key: str = '', chip_classes: str = '', chip_id: str = '') -> str:
+def labelled_chip_row(name: str, buttons: str, *, filter_key: str = '', chip_classes: str = '', chip_id: str = '',
+                      label_html: str = '') -> str:
     """Render a visible label and a group of filter buttons."""
     label = html.escape(name, quote=True)
     group = f' role="group" aria-label="{label}"'
@@ -74,7 +75,7 @@ def labelled_chip_row(name: str, buttons: str, *, filter_key: str = '', chip_cla
     classes = f' class="{html.escape(chip_classes, quote=True)}"' if chip_classes else ''
     identity = f' id="{html.escape(chip_id, quote=True)}"' if chip_id else ''
     return (f'<div class="record-filter-row"{group + key if filter_key else ""}>'
-            + f'<span aria-hidden="true">{label}</span>'
+            + f'<span aria-hidden="true">{label_html or label}</span>'
             + f'<div{classes}{identity}{"" if filter_key else group}>{buttons}</div></div>')
 
 

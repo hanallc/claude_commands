@@ -16,6 +16,7 @@ import ipaddress
 import json
 import gzip
 import os
+import re
 import secrets
 import select
 import shlex
@@ -45,6 +46,7 @@ from typing import IO, Literal, TextIO, TypedDict, cast, override
 from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
+from xml.etree import ElementTree
 
 
 from scripts.aws_target import aws_page, machines_page
@@ -5018,7 +5020,13 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertIn(b'<template data-card-body><div class="list-panel review-panel change">', card.body)
         for body in (table.body, card.body):
             self.assertIn(b'<h3>How to check</h3>', body)
-            self.assertIn(b'Sends to page-owner', body)
+            heading_match = re.search(rb'<div class="review-action-group">(<span>.*?</span>)<div>', body)
+            assert heading_match is not None
+            heading = ElementTree.fromstring(heading_match[1])
+            self.assertEqual(''.join(heading.itertext()), 'Sends to page-owner')
+            name = heading.find('span')
+            assert name is not None
+            self.assertEqual((name.get('data-color-text'), name.get('style')), ('role.showrunner', 'color:#a379fd'))
             self.assertIn(b'value="question">Ask a question</button>', body)
             self.assertNotIn(b'value="works"', body)
             self.assertNotIn(b'data-later-toggle', body.split(b'</template>', 1)[0])
