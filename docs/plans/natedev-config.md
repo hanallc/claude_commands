@@ -846,64 +846,32 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 ### Phase 21 — Review of the commits outside any phase  · status: done
 
-**Depends on:** Phase 20
+#### As-built
 
-#### Work Order
+- Review of the parts of tip 6f7fe87082 that no phase review covered, checkpoint e82392c2ed.
+- bob's names for two new keys: `report.max_edited_crates` and `module_cost.max_output_replay_bytes`. Values did not change. nate approved the 26 key names (item 224).
+- `rebuild_row._read_cache` calls `cache_path(config)` again, as main does. Test fixtures write `user_zone.conf` and `review_links.conf`.
+- Each main join conflict keeps main's behavior and reapplies the config moves: reads through `conf.read`/`conf.path`, no code defaults.
 
-**Goal:** Review the four parts of tip 6f7fe87082 that no phase review covered, so the tip can merge with a recorder trial line.
-
-**Spec:**
-1. `3005f4c88c`: the route test for the connect attempt limit expects the result main gave at that time for a run-stage connect failure. The `bddc0d6195` join reverted this expectation, because main changed the result again (GuestNotStarted with settlement).
-2. `df4d3ed225`: bob's names for two new keys. `report.edited_crate_max_crates` becomes `report.max_edited_crates`, and `module_cost.output_replay_limit_bytes` becomes `module_cost.max_output_replay_bytes`. The config, README, docs, readers and tests change together. Values do not change. nate approved the 26 key names (item 224).
-3. `805a9d4e6b`: test fixtures write each config file that the code under test reads (`user_zone.conf`, `review_links.conf`). `rebuild_row._read_cache` calls `cache_path(config)` again, as main does, so tests that patch `cache_path` take effect. The config name resolves through `conf.path`.
-4. The conflict resolutions of the main join merges `87cf9564c8`, `8cea319225`, `aa972aee9e`, `bddc0d6195` and `6f7fe87082`. Each keeps main's behavior and reapplies the branch's config moves: config reads through `conf.read`/`conf.path`, no code defaults, and the configured limits.
-
-**Invariants:**
-1. Each new key's value equals the literal it replaces.
-2. No key that exists on main changes, is renamed or is deleted.
-3. No code default is added, and no new refusal is added.
-
-**State:** none.
-
-**Acceptance gate:** green `copies.py run --affected` of 6f7fe87082 (done, 780 modules); `fixture_conf_keys` 0 missing; `git merge-tree` against main clean.
+**Binds later work:** Each new key's value equals the literal it replaces. No key on main changes, is renamed or is deleted. No code default and no new refusal.
 
 ### Phase 22 — Report removed config keys that code still reads  · status: done
 
-**Depends on:** Phase 21
+#### As-built
 
-#### Work Order
+- `scripts/production/fixture_conf_keys.py` also lists config key reads on the tip, after the fixture lines (List item 424, report form only). The list never changes the exit code and refuses nothing.
+- Two kinds: a key that the tip removes or renames in `config/<name>.conf` (a literal in a non-fixture Python source, or a whole shell token), and a fixed-name read of a key that no tip config file holds (`<ConfigRead>.<accessor>("<key>")` in Python; `conf_value`, `conf_get`, `conf.py get` in shell).
+- A key is held when a tip config file has it or a key that starts with `<key>.`. A key still held by another file counts only when the source names the removed file.
+- Output lines: `removed keys in config/<name>.conf: ...`, `<source>:<line>: reads <key>, which the tip removes from config/<name>.conf`, `<source>:<line>: reads <key>, which no config file on the tip holds`, and the summary `config key reads: <N> of a removed key, <M> of a key no config file holds`. A source that cannot be read or parsed is counted as not scanned.
+- `docs/production_format.md` step 3 documents the list.
 
-**Goal:** The join check names each config key that the tip removes or renames while non-test code on the tip still reads the old key. It refuses nothing (List item 424, nate's words via morty 02:24 PST Nov 25: "build the report form only").
+**Files:**
+- `scripts/production/fixture_conf_keys.py` — the read scan
+- `scripts/production/test_fixture_conf_keys.py` — its tests
 
-**Spec:**
-1. Case: `85caf8d5aa` removed `slots.aws-hana.hana.max` and `slots.aws-hana.hana.max_bytes` from `config/build_folders.conf`. `scripts/aws_target/hana_source.py:104-105` still reads them with `configuration.whole('slots.aws-hana.hana.max')`. Tests did not see it, because they write their own copies of the keys.
-2. Extend `scripts/production/fixture_conf_keys.py`, so that the join step in `docs/production_format.md` (step 3 at line 285) stays one command.
-3. A removed key is a key of `config/<name>.conf` on the base that the same file on the tip does not hold. A deleted file removes all its keys. A rename is a removal of the old key. All keys count, dotted per-name keys too.
-4. A read is a string literal on the tip whose text equals a removed key:
-   - in a Python source under `scripts/` that is not a fixture source (`is_fixture_source` false), found with `ast` (`ast.Constant` strings only);
-   - in a shell source under `scripts/` (`.sh`, `.zsh`, `.bash`), found as a whole token: the key with no `[A-Za-z0-9_.-]` character directly before or after it.
-5. When the key is still in another config file on the tip, a read counts only if the same source also names the removed file: the stem or `<stem>.conf` as a string literal (Python) or as a whole token (shell). This keeps short shared key names out of the report.
-6. Output, after the current fixture lines and before the summary:
-   - `removed keys in config/<name>.conf: <key>, <key>` (one line per file, keys sorted).
-   - `<source>:<line>: reads <key>, which the tip removes from config/<name>.conf` (sorted by source, then line).
-   - The summary line gains a second line: `removed config keys: <N> reads on the tip`.
-7. The removed-key report never changes the exit code. Exit 1 still means only missing fixture keys; exit 2 still means an unreadable tree.
-8. The same report also names each fixed-name read on the tip of a key that no config file on the tip holds (round 2, 02:55 PST). The item case key `slots.aws-hana.hana.max` was never in a config file, so a base-to-tip diff misses it. A read is `<ConfigRead>.<accessor>(<literal key>)` in Python (accessors `effective_key, number, origin, text, value, values, whole, words`; the receiver is a `conf.read`/`conf.read_or_repository` result or a `ConfigRead` parameter) or `conf_value`/`conf_get`/`conf.py get` in shell. A key is held when a tip config file has it or a key that starts with `<key>.`. Output: `<source>:<line>: reads <key>, which no config file on the tip holds`; the second summary line reads `config key reads: <N> of a removed key, <M> of a key no config file holds`.
-9. `docs/production_format.md` step 3: one sentence says the step also lists removed keys that code still reads, and that the list does not block the join. The plan lines that say the check skips dotted keys stay true for added keys; do not edit the plan.
+**Binds later work:** Phase 24 owns the routed recall gaps F008-F011.
 
-**Files:** `scripts/production/fixture_conf_keys.py`, `scripts/production/test_fixture_conf_keys.py`, `docs/production_format.md`.
-
-**Workers:** 1 writer + 1 tester — `impl` holds the check and the doc; `test` holds the test module.
-- `impl`: `scripts/production/fixture_conf_keys.py`, `docs/production_format.md`.
-- `test`: `scripts/production/test_fixture_conf_keys.py`, written from this Spec.
-
-**Invariants:**
-1. No config value or key changes. No code default. No new refusal: the report never fails a run.
-2. The current added-key check and its output stay unchanged.
-
-**State:** none.
-
-**Acceptance gate:** `basedpyright` 0 errors, 0 warnings on the two Python files; the test module ids pass by name; a run of the check on `--base origin/main --tip origin/main` names `hana_source.py` 106 and 107; green `copies.py run --affected` with the item 224 tip.
+**Gotchas:** The scan takes about 10 s on the full tree. It reports `scripts/aws_target/hana_source.py` 106 and 107 on main (List 357 owns that repair).
 
 ### Phase 23 — Join with combo2 before its merge  · status: todo
 
