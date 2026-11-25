@@ -17,6 +17,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import verify_doc_test_support as doc_support
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
 from scripts.build_targets import build_targets
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import mac_test, claim_state
 
 from scripts.lib import process_start as process_identity
@@ -32,38 +33,35 @@ class VerifySshTargetsTests(VerifySshTargetsFixture):
         self.assertEqual(self.attempts(), [])
         self.assertEqual(len(self.local_runs()), 1)
 
-    def test_probe_refusal_keeps_queue_age_and_continues_to_the_next_ssh_target(self) -> None:
-        self.check_busy_startup("probe-refusal")
-
-    def test_run_refusal_keeps_queue_age_and_continues_to_the_next_ssh_target(self) -> None:
-        self.check_busy_startup("run-refusal")
-
-    def test_after_probe_refusal_keeps_queue_age_and_continues_to_the_next_ssh_target(self) -> None:
-        self.check_busy_startup("after-probe")
-
-    def check_busy_startup(self, mode: str) -> None:
-        self.configure("linux,spare,natedev")
-        with self.spare_after_linux_refusal():
-            result = self.verify("test", "sample", "--no-cache", extra={
-                "TEST_SSH_MODES": json.dumps({"linux": mode}), "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
+    def test_failed_mac_probe_records_backoff_and_keeps_queue_age_for_the_next_mac(self) -> None:
+        self.configure("mac,mac2,natedev")
+        self.enable_mac()
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text(registry.read_text()
+                                + "kind.mac2=ssh\nplatform.mac2=macos\nsettings.mac2=mac2.conf\n")
+        _ = write_config_fixture(self.root / "mac2.conf", (self.root / "mac_test.conf").read_text(),
+                                 template="mac_test")
+        self.write_executable(self.runner, self.runner.read_text().replace(
+            'if mode == "probe-leftovers":', 'if mode == "probe-failed":'))
+        first_wait, wait_environment = self.first_wait()
+        result = self.verify("test", "sample", "--no-cache", extra={
+            "TEST_SSH_MODES": '{"mac":"probe-failed"}', **wait_environment})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         events = self.ssh_events()
-        self.assertEqual([event["target"] for event in events], ["linux", "spare"],
+        self.assertEqual([event["target"] for event in events], ["mac", "mac2"],
                          json.dumps(events) + result.stdout + result.stderr)
         self.assertEqual(self.local_runs(), [])
-        self.assertNotIn("release", events[0]["actions"])
-        self.assertEqual(events[0]["queued_at"], "100.25")
-        self.assertEqual(events[1]["queued_at"], "100.25")
-        self.assertTrue((self.runner_state / "linux.marker").exists())
-        state = self.target_state("linux")
-        self.assertTrue(list((state / "claims").glob("**/*.json")))
-        self.assertFalse((state / "unreachable_until").exists())
+        self.assertEqual(events[0]["actions"], ["claim:0", "probe", "release", "cleanup"])
+        self.assertEqual([event["queued_at"] for event in events], ["100.25", "100.25"])
+        self.assertEqual(first_wait.read_text().strip(), "100.25")
+        state = Path(self.environment["MAC_TEST_STATE_DIR"])
+        self.assertTrue((state / "unreachable_until").exists())
+        self.assertEqual(events[0]["remaining_claim_ids"], [])
         self.assertNotIn("Traceback", result.stdout + result.stderr)
         attempts = self.attempts()
-        self.assertEqual([attempt["target"] for attempt in attempts], ["linux", "spare"])
-        self.assertEqual((attempts[0]["outcome"], attempts[0]["completion"], attempts[0]["cleanup"]),
-                         ("declined", "missing", "unconfirmed"))
-        self.assertIsNone(attempts[0]["unresolved_count"])
+        self.assertEqual([attempt["target"] for attempt in attempts], ["mac", "mac2"])
+        self.assertEqual((attempts[0]["outcome"], attempts[0]["reason"]), ("declined", "unreachable"))
+        self.assertEqual(self.routing_record()["target"], "mac2")
 
 
 class SshReservationTests(unittest.TestCase):

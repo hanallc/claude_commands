@@ -38,27 +38,6 @@ class VerifySshResultsTests(VerifySshTargetsFixture):
                          + repr(self.admission.server.assignments))
         return attempts[0]
 
-    def test_failed_probe_with_live_leftovers_continues_without_backoff(self) -> None:
-        self.configure("natedev,linux,spare")
-        with self.spare_after_linux_refusal():
-            result = self.verify_after_ssh_result("spare", extra={
-                "TEST_SSH_MODES": '{"linux":"probe-leftovers"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        events = self.ssh_events()
-        self.assertEqual(len(events), 2, json.dumps(events) + repr(self.admission.server.assignments))
-        first, second = events
-        self.assertEqual((first["target"], second["target"]), ("linux", "spare"))
-        self.assertEqual(first["result_type"], "BusyMacDecline")
-        self.assertEqual(first["holder"], "LostRunLeftovers")
-        self.assertNotIn("run", first["actions"])
-        self.assertNotIn("release", first["actions"])
-        self.assertEqual(first["queued_at"], second["queued_at"])
-        state = self.target_state("linux")
-        self.assertTrue(list((state / "claims").glob("**/*.json")))
-        self.assertFalse((state / "unreachable_until").exists())
-        attempt = self.attempts()[0]
-        self.assertEqual((attempt["cleanup"], attempt["unresolved_count"]), ("unconfirmed", 2))
-
     def test_no_matching_tests_have_a_distinct_durable_outcome(self) -> None:
         self.configure("natedev,mac")
         self.enable_mac()

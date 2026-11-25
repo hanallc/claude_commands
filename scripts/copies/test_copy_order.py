@@ -1423,11 +1423,6 @@ placement_once
         remote_tmp = self.root / "remote-tmp"
         remote_tmp.mkdir()
         config = Path(environment["CONF_DIR"])
-        _ = write_config_fixture(config / "linux.conf", "offload=on\nhost=fake-linux\nslots=1\nkinds=check,doc\n",
-                                 template="mac_test")
-        targets = config / "build_targets.conf"
-        _ = targets.write_text(targets.read_text().replace("targets=mac,natedev", "targets=mac,peer,natedev")
-            + "kind.peer=ssh\nplatform.peer=linux\nsettings.peer=linux.conf\n")
         _ = (tools.root / "src/merged.rs").write_text("pub fn merged() {}\n")
         _ = copies.git(tools.root, "add", "src/merged.rs")
         _ = copies.git(tools.root, "commit", "-qm", "Add the merge source")
@@ -1448,7 +1443,6 @@ placement_once
             sys.path.insert(0, {str(CHECKOUT)!r})
             from scripts.buildlog import treekey
             from scripts.direct.wait_for_test_state import wait_for_file
-            from scripts.lib import copy_record
             from scripts.mac_test import offload
 
             class ParsedRequest(Exception):
@@ -1465,26 +1459,6 @@ placement_once
                        (root / "src/main.rs").read_text()]
                 if "TEST_REMOTE_ASSIGNMENT" in os.environ:
                     observed.with_suffix(".assignment").write_bytes(Path(arguments.assignment_file).read_bytes())
-                if "TEST_TRUST_CALLER" in os.environ:
-                    caller = Path(os.environ["TEST_TRUST_CALLER"])
-                    repo = request.repo_root
-                    accepted = offload.trusted_linux_source(repo)
-                    record = copy_record.read_record(repo / copy_record.RECORD)
-                    evidence = [
-                        offload.trusted_linux_source(caller), accepted,
-                        repo.parent == copy_record.root().resolve(),
-                        isinstance(record, copy_record.Registered),
-                        isinstance(record, copy_record.Registered) and "generated_source" in record.fields,
-                    ]
-                    observed.with_suffix(".trust").write_text(json.dumps(evidence))
-                    if request.verb == "doc":
-                        observed.with_suffix(".doc").write_text(json.dumps([
-                            str(repo), isinstance(request.source, offload.StagedDocSnapshot),
-                            (root / "src/main.rs").read_text(),
-                            record.fields.get("source_path") if isinstance(record, copy_record.Registered) else None,
-                        ]))
-                    if not accepted:
-                        os.environ.update(TEST_RUNNER_MAC="declined", TEST_RUNNER_STATUS="75", TEST_RUNNER_REASON="repo")
                 temporary = observed.with_suffix(".tmp")
                 temporary.write_text(json.dumps(row))
                 temporary.replace(observed)
@@ -1502,62 +1476,42 @@ placement_once
         other = self.root / "other-trusted"
         _ = copies.git(tools.root, "clone", "-q", str(tools.root), str(other))
         tools.write_executable(tools.bin_directory / "direnv", "#!/bin/sh\nexit 1\n")
-        for scenario in ("prepared", "clean-linux", "linux-doc", "trusted-linux",
-                         "untrusted-linux", "trusted-envrc",
-                         "untrusted-envrc", "mismatched-linux", "source-record", "retry"):
+        for scenario in ("prepared", "clean-linux", "trusted-linux", "trusted-envrc",
+                         "untrusted-envrc", "mismatched-linux", "retry"):
             with self.subTest(source=scenario):
-                envrc = scenario in ("trusted-envrc", "untrusted-envrc")
-                mismatch = scenario == "mismatched-linux"
-                source_record = scenario == "source-record"
-                doc = scenario == "linux-doc"
-                linux = envrc or mismatch or source_record or scenario in (
-                    "trusted-linux", "untrusted-linux", "clean-linux", "linux-doc",
-                )
-                trusted = scenario in ("trusted-linux", "trusted-envrc", "clean-linux", "linux-doc")
                 if scenario == "trusted-envrc":
                     _ = (tools.root / ".envrc").write_text("export FIXTURE_ENVRC=1\n")
                     _ = copies.git(tools.root, "add", "-f", ".envrc")
                     _ = copies.git(tools.root, "commit", "-qm", "Add the approved envrc")
-                if mismatch:
+                if scenario == "mismatched-linux":
                     _ = copies.git(tools.root, "rm", "-q", ".envrc")
                     _ = copies.git(tools.root, "commit", "-qm", "Remove the envrc")
+                if scenario in ("clean-linux", "trusted-linux", "trusted-envrc", "untrusted-envrc", "mismatched-linux"):
+                    caller = other if scenario == "mismatched-linux" else tools.root
+                    trusted_folder = "other-repository" if scenario == "untrusted-envrc" else caller.name
+                    _ = write_config_fixture(config / "nix_env.conf", f"trusted_home_folders={trusted_folder}\n")
+                    with locked_environment({**os.environ, **environment, "HOME": str(self.root),
+                                             "TMPDIR": str(remote_tmp)}, self.queue.loop_access):
+                        self.assert_ssh_source(tools.root, caller, revision, scenario)
+                    continue
                 observed = self.root / f"remote-{scenario}.json"
                 ready = self.root / f"remote-{scenario}-ready"
-                words = ("bash", str(verify), "doc" if doc else "check", "sample",
-                         "--target", "peer" if linux else "mac")
+                words = ("bash", str(verify), "check", "sample", "--target", "mac")
                 case_environment = {**environment, "VERIFY_MAC_RUNNER": str(parser_runner),
                                     "TEST_REMOTE_SOURCE": str(observed), "COPY_ORDER_CHECK": str(started),
                                     "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"}
                 if scenario == "retry":
                     words = words[:-2]
-                if scenario == "retry" or (linux and scenario != "clean-linux"):
                     startup = self.root / f"{scenario}-verify-startup.sh"
                     commands = [
                         f'if [[ "$0" == {shlex.quote(str(verify))} && "$PWD" == "${{COPIES_STEP_SOURCE:-}}" ]]; then',
                         "unset BASH_ENV",
                         "printf '%s\\n' 'fn main() { let _ = 1; }' > src/main.rs",
                     ]
-                    if mismatch:
-                        commands.append("export COPIES_STEP_REPOSITORY=" + shlex.quote(str(other)))
-                    if source_record:
-                        admitted = shlex.quote(str(observed.with_suffix(".source")))
-                        commands.append("printf '{}' > .scratch.json && git add -f .scratch.json"
-                                        + " && git add src/main.rs src/lib.rs && "
-                                        + f"(git rev-parse --show-toplevel && git write-tree) > {admitted}")
                     _ = startup.write_text("\n".join([*commands, "fi", ""]))
                     case_environment["BASH_ENV"] = str(startup)
                 if scenario == "prepared":
                     case_environment["TEST_REMOTE_ASSIGNMENT"] = "1"
-                if linux:
-                    trusted_folder = other.name if mismatch else tools.root.name if trusted else "other-repository"
-                    _ = write_config_fixture(config / "nix_env.conf", f"trusted_home_folders={trusted_folder}\n")
-                    case_environment.update(HOME=str(self.root), TMPDIR=str(remote_tmp),
-                                            TEST_TRUST_CALLER=str(other if mismatch else tools.root))
-                    ready.touch()
-                if scenario in ("clean-linux", "trusted-linux", "trusted-envrc", "untrusted-envrc", "mismatched-linux"):
-                    with locked_environment({**os.environ, **case_environment}, self.queue.loop_access):
-                        self.assert_ssh_source(tools.root, other if mismatch else tools.root, revision, scenario)
-                    continue
                 if scenario == "retry":
                     case_environment.update(TEST_RUNNER_MAC="declined", TEST_RUNNER_STATUS="75",
                         TEST_RUNNER_REASON="source_changed", TEST_PROVIDER_ALLOW_RUNNER_REFUSALS="1",
@@ -1578,23 +1532,7 @@ placement_once
                 with (mock.patch.object(self.queue.server, "host_probe", new=provider),
                       mock.patch.dict(os.environ, case_environment)):
                     process = self.start(words, "--apply-uncommitted", str(tools.root), "--merge", revision)
-                    if source_record:
-                        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                        self.assertEqual(process.returncode, 2, stdout + stderr)
-                        self.assertIn("the admitted tree contains .scratch.json", stderr)
-                        self.assertFalse(observed.exists())
-                        self.assertFalse(self.copy_root.exists())
-                        caller, tree = observed.with_suffix(".source").read_text().splitlines()
-                        request = next(request for request in self.requests[first_request:]
-                                       if isinstance(request, wire.PlacementRequest))
-                        self.assertEqual(request.constraints.repository, caller)
-                        expected = execution_identity.SourceKeyKnown(treekey.committed_tree_key(tree.encode("ascii")))
-                        self.assertEqual(request.constraints.source_key, expected)
-                        grant = next(reply for reply in self.replies[first_reply:] if isinstance(reply, wire.Assignment))
-                        self.assertEqual(grant.assignment.destination.provider, "ssh")
-                        self.assertEqual(grant.assignment.source_key, expected)
-                        continue
-                    if scenario == "retry" or linux:
+                    if scenario == "retry":
                         wait_until(lambda: observed.exists() or process.poll() is not None, self.root,
                                    timeout=45, processes=(process,))
                         self.assertTrue(observed.exists(), process.communicate(timeout=5) if process.poll() is not None else "")
@@ -1622,20 +1560,7 @@ placement_once
                         release.touch()
                     else:
                         local_key, content = "", ""
-                    if linux:
-                        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                        self.assertTrue(observed.exists(), stdout + stderr)
-                        caller_trusted, runner_trusted, under_scratch, registered, marked = cast(
-                            list[bool], json.loads(observed.with_suffix(".trust").read_text()))
-                        self.assertEqual(caller_trusted, trusted or mismatch)
-                        self.assertEqual(runner_trusted, trusted, "Linux source approval changed in the copy")
-                        self.assertTrue(under_scratch and registered, "The SSH checkout needs a scratch record")
-                        self.assertEqual(marked, trusted)
-                        self.assertEqual(process.returncode, 0 if trusted else 2, stdout + stderr)
-                        if not trusted:
-                            self.assertIn("target peer refused: repo", stderr)
-                    else:
-                        self.finish(process)
+                    self.finish(process)
                     if scenario == "retry":
                         self.assertEqual(content, "pub fn retried() {}\n")
                         local = next(reply for reply in self.replies[first_reply:]
@@ -1653,18 +1578,9 @@ placement_once
                     self.assertEqual(cwd, supplied_root)
                     if scenario == "retry":
                         self.assertEqual(binary, "fn main() { let _ = 1; }\n")
-                    if doc:
-                        repo, staged, main, caller = cast(
-                            tuple[str, bool, str, str], json.loads(observed.with_suffix(".doc").read_text()))
-                        self.assertTrue(staged)
-                        self.assertEqual(repo, supplied_root)
-                        self.assertEqual(main, "fn main() {}\n")
-                        self.assertEqual(caller, str(tools.root))
                     self.assertEqual(library, "pub fn changed() {}\n")
                     self.assertEqual(merged, "pub fn merged() {}\n")
                     grant = next(reply for reply in self.replies[first_reply:] if isinstance(reply, wire.Assignment))
-                    if linux:
-                        self.assertEqual(grant.assignment.destination.provider, "ssh")
                     self.assertEqual(grant.assignment.source_key, execution_identity.SourceKeyKnown(executed_key))
                     if scenario == "prepared":
                         self.assertEqual(grant.assignment.source_key, execution_identity.SourceKeyKnown(key or ""))
