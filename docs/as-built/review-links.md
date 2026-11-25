@@ -122,8 +122,9 @@ Select a recipient to enable Send.
 Select any other chip to change the recipient.
 Proposal limits the row to recipients with a native proposal folder.
 The proposal writer checks the title and body before it creates the record.
-`/issue` runs `console_text/check.py --kind proposal --file <draft>` before it writes the proposal.
-`proposal_issue.py number` checks the title and body before it assigns a number.
+`/issue` passes a private draft to `proposal_issue.py number --draft-file`.
+Numbering checks the title and body before it takes the locks.
+It verifies the draft under the locks and publishes the new proposal with its number.
 Generated style decisions use their own filing path.
 When the selected recipient becomes unavailable, the dialog clears the selection and disables Send until you choose a recipient.
 Changing the type or reopening a kept draft preserves this empty selection.

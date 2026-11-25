@@ -762,6 +762,53 @@ class ChangePageTests(unittest.TestCase):
                 self.assertEqual(status.slots(page, row).question,
                                  change_page.AnsweredQuestion(original.question_id, original.text, words))
 
+    def test_native_decision_replies_refuse_a_record_closed_during_review(self) -> None:
+        from scripts.lib.user_zone import user_zone
+        from scripts.production import proposal_issue
+        from scripts.production.issues import Issue, frontmatter
+        from scripts.review_links import efficiency_reviews
+
+        members = staff.snapshot()
+        owner = self.showrunner_id
+        filed = datetime.now(user_zone())
+        path = self.temporary / "proposal.md"
+        _ = path.write_text("---\nstatus: open\nstage: backlog\nreview_state: waiting\n---\nThe layout.\n")
+        proposal = review_items.proposal_item("proposal", Issue(path, frontmatter(path)), owner, owner,
+                                              "The layout", filed, members)
+        ledger = self.temporary / "efficiency.md"
+        line = "- 2026-11-25 The layout — proposed"
+        _ = ledger.write_text(line + "\n")
+        efficiency = review_items.efficiency_item(ledger, 0, line, efficiency_reviews.EfficiencyReview(
+            mark=review_events.ReviewMark.WAITING), owner, members, user_zone())
+        marks = efficiency_reviews.path(ledger)
+        _ = marks.write_text('{"E1":{"log":[],"mark":"waiting"}}')
+        status = change_page.DeliveryStatus(self.root)
+        answer = "Use the new layout."
+        for item, target, row in ((proposal, path, path.stem), (efficiency, marks, "E1")):
+            with self.subTest(kind=item.type):
+                page = change_page.ReviewPage(target, target.parent, (row,), "")
+                slots = change_page.DeliverySlots(change_page.NoDelivery(), change_page.NoDelivery(),
+                                                  change_page.OpenQuestion("Q1", "Which layout?", change_page.NoDelivery()))
+                with status.locked():
+                    status.write_slots(page, row, slots)
+
+                def read_draft(*_args: object, **_options: object) -> review.QuestionAccepted:
+                    if item == proposal:
+                        with proposal_issue.issue_lock(path):
+                            _ = path.write_text(path.read_text().replace("status: open", "status: closed"))
+                    else:
+                        with efficiency_reviews.ledger_lock(ledger):
+                            _ = ledger.write_text(line.replace("proposed", "accepted") + "\n")
+                    return review.QuestionAccepted(answer)
+
+                with (patch.object(review_items, "read", return_value=[item]),
+                      patch.object(review, "review_question", side_effect=read_draft) as reader,
+                      self.assertRaisesRegex(question_record.AnswerRefused, "The item is not Waiting")):
+                    _ = change_page.answer_item(item.key, answer, "Q1", status)
+                reader.assert_called_once()
+                self.assertNotIn(answer, target.read_text())
+                self.assertEqual(status.slots(page, row), slots)
+
     def test_answer_question_keeps_internal_line_breaks_and_an_identical_rerun_changes_nothing(self) -> None:
         status = change_page.DeliveryStatus(self.root)
         question = status.ask(self.page, 'C1', 'Which steps?')

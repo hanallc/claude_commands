@@ -765,9 +765,9 @@ def validate(value: object, draft: Draft, revision: bool,
                 raise ValueError("ask needs questions")
             return Questions(version, questions, failed, metadata, tuple(failures))
         return Rewritten(version, failed, metadata, tuple(failures))
-    except UnmatchedConsoleQuote as error:
-        return Failed(draft, [str(error)], metadata)
     except ValueError as error:
+        if console:
+            return Failed(draft, [str(error)], metadata, tuple(failures))
         if not failures:
             try:
                 failures = supported_failures(_object(value).get("failed_rules"), draft, reply=content_only)
@@ -816,6 +816,7 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
             context: PushReview | ReplyContext | QuestionReview = PUSH_REVIEW, *, timeout_seconds: float,
             check_template_fit: bool = True) -> ReviewOutcome:
     started = time.monotonic()
+    console = isinstance(context, QuestionReview) and bool(context.console_kind)
     account, model = "not selected", "opus"
     timeout = timeout_seconds
     binary: ResolvedReviewerBinary | MissingReviewerBinary | ReviewerNotResolved = ReviewerNotResolved()
@@ -892,7 +893,7 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
             case StructuredAnswer(value=value):
                 return validate(value, draft, revision, details(), reply=isinstance(context, ReplyContext),
                                 question=isinstance(context, QuestionReview),
-                                console=isinstance(context, QuestionReview) and bool(context.console_kind))
+                                console=console)
             case ModelTimeout():
                 return Unreviewed("timeout", details())
             case ModelExit(code=code):
@@ -900,7 +901,7 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
             case ModelError():
                 return Unreviewed("reviewer error", details())
             case BadJson():
-                return Unreviewed("bad JSON", details())
+                return Failed(draft, ["bad JSON"], details()) if console else Unreviewed("bad JSON", details())
             case ShellRefused(reason=reason):
                 return Unreviewed(reason, details())
             case ModelUnavailable(reason=reason):
@@ -908,7 +909,7 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
     except subprocess.TimeoutExpired:
         return Unreviewed("timeout", details())
     except json.JSONDecodeError:
-        return Unreviewed("bad JSON", details())
+        return Failed(draft, ["bad JSON"], details()) if console else Unreviewed("bad JSON", details())
     except (OSError, ValueError) as error:
         return Unreviewed(f"review unavailable: {error}", details())
     except Exception as error:
@@ -1008,7 +1009,8 @@ def review_question(key: QuestionKey, question: str, revision: bool = False, *,
         else:
             result = QuestionReviewUnavailable(question, outcome.why)
     else:
-        details = () if console_kind and outcome.failures else tuple(outcome.failed_rules)
+        quoted_rules: set[str] = {failure.rule for failure in outcome.failures} if console_kind else set()
+        details = tuple(rule for rule in outcome.failed_rules if rule not in quoted_rules)
         result = QuestionReviewFailed(question, details, outcome.failures)
     save_question_review(key, result)
     return result

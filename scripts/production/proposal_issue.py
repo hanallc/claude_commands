@@ -33,7 +33,7 @@ from scripts.console_text import check as console_text
 
 from scripts.lib import atomic_file, urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
-from scripts.production.issues import ALL_FIELDS, PROPOSAL_TAG, Issue, frontmatter, header_fields
+from scripts.production.issues import PROPOSAL_TAG, Issue, frontmatter, header_fields
 from scripts.production import record_store, staff, unit_names
 from scripts.review_links import new_item_dialog, reply_tokens, review_events
 from scripts.review_links.review_events import MarkChange, NoMark, ReviewLog, ReviewMark, StoredReviewLog
@@ -52,7 +52,7 @@ CLOSE_FIELDS = ("as_built", "reason", "date_closed")
 PROPOSED_RANKING = re.compile(r"^Proposed ranking:[^\r\n]*", re.MULTILINE)
 EMPTY_RANKING = re.compile(r"^Proposed ranking:[ \t]*(?=\r?$)", re.MULTILINE)
 NUMBER_FIELD = "proposal_id"
-NUMBER = re.compile(r'^proposal_id:\s*"?P(\d+)"?\s*$', re.MULTILINE)
+NUMBER = re.compile(r"P(\d+)")
 # The vault keeps closed issues under archive/ beside the issues folder; their numbers stay taken.
 ARCHIVE = "archive"
 STYLE_AREA = "style"
@@ -193,10 +193,18 @@ class ProposalSubmissionReply:
     selected: Issue
 
 
+@dataclass(frozen=True)
+class NoProposalSubmissionReply:
+    """The action uses the native Review record."""
+
+
+_NO_SUBMISSION_REPLY = NoProposalSubmissionReply()
+
+
 def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, today: date, who: str = "nate", *,
                   check: Callable[[], object] | None = None, waiting_why: str = "", check_state: Callable[[], None] = lambda: None,
                   new_reply_proof: reply_tokens.ReplyTokenProof | reply_tokens.MintReplyProof = reply_tokens.MINT_REPLY_PROOF,
-                  submission_reply: ProposalSubmissionReply | None = None) -> bool:
+                  submission_reply: ProposalSubmissionReply | NoProposalSubmissionReply = _NO_SUBMISSION_REPLY) -> bool:
     """Append one Review page log line and change its mark. Returns False for an exact repeat."""
     reason = review_events.require_waiting_why(waiting_why) if change == ReviewMark.WAITING or waiting_why else ""
     with issue_lock(path):
@@ -205,7 +213,7 @@ def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, 
         issue = Issue(path, frontmatter(path))
         check_state()
         before = review_log(issue)
-        if submission_reply is not None:
+        if isinstance(submission_reply, ProposalSubmissionReply):
             assert isinstance(words, str)
             if _submission_reply_is_repeat(issue, submission_reply.key, words,
                                            submission_reply.token, submission_reply.owner, before):
@@ -213,7 +221,7 @@ def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, 
             if issue != submission_reply.selected:
                 raise new_item_dialog.SubmissionError("The selected Proposal changed.")
         lines_to_append = (words,) if isinstance(words, str) else words
-        if submission_reply is None and issue.value("review_submission") and any(
+        if not isinstance(submission_reply, ProposalSubmissionReply) and issue.value("review_submission") and any(
                 line.startswith("Answer: ") for line in lines_to_append):
             raise new_item_dialog.SubmissionError("Use the scoped reply from the Review item.")
         events = before
@@ -387,49 +395,82 @@ class ProposalNumbering:
     text: str
 
 
-def number(paths: list[Path], today: date) -> list[str]:
-    """Check all proposals before writing their numbers, oldest first."""
-    paths = sorted({path.resolve() for path in paths})
+def _numbering_input(path: Path, source: Path) -> tuple[Issue, str, str]:
+    try:
+        text = read_issue(source)
+    except (Refusal, OSError, UnicodeError) as error:
+        raise OSError(f"Cannot read record {source}: {error}") from error
+    lines = record_store.lines_with_endings(text)
+    if not lines or lines[0].strip() != FENCE:
+        return Issue(path, {}), text, ""
+    for end, line in enumerate(lines[1:], 1):
+        if line.strip() == FENCE:
+            return Issue(path, header_fields(lines[1:end])), text, "".join(lines[end + 1:])
+    return Issue(path, {}), text, ""
+
+
+def number(paths: list[Path], today: date, *, draft_file: Path | None = None) -> list[str]:
+    """Review proposal drafts before taking the locks that assign numbers."""
+    if draft_file is not None and len(paths) != 1:
+        raise Refusal("--draft-file needs one destination.")
+    paths = sorted({path.resolve() for path in paths}) if draft_file is None else [
+        paths[0].parent.resolve() / paths[0].name]
+    sources = {path: path if draft_file is None else draft_file for path in paths}
+    reviewed: dict[Path, str] = {}
+    for path, source in sources.items():
+        issue, text, body = _numbering_input(path, source)
+        proposal = PROPOSAL_TAG in issue.fields.get("tags", [])
+        taken = NUMBER.fullmatch(issue.value(NUMBER_FIELD))
+        if draft_file is not None and (not proposal or issue.value(NUMBER_FIELD)):
+            raise Refusal("The draft must be an unnumbered proposal.")
+        if proposal and not taken:
+            title = path.stem
+            console_text.require(f"## {title}\n\n{body}", "proposal", identity=str(path),
+                                 title=title, refusal=Refusal)
+            reviewed[path] = body if draft_file is None else text
+
+    folders = sorted({path.parent for path in paths})
     with ExitStack() as locks:
-        for folder in sorted({path.parent.resolve() for path in paths}):
+        for folder in folders:
             _ = locks.enter_context(_folder_lock(folder))
         for path in paths:
             _ = locks.enter_context(issue_lock(path))
+            if draft_file is not None and (path.exists() or path.is_symlink()):
+                raise FileExistsError(f"The proposal already exists: {path}")
         numbers = locks.enter_context(proposal_numbers())
-        issues = sorted((record_store.number_fields(path, ALL_FIELDS) for path in paths),
-                        key=lambda issue: (issue.value("date_created"), issue.path.name))
+        inputs = (_numbering_input(path, source) for path, source in sources.items())
+        issues = sorted(inputs, key=lambda item: (item[0].value("date_created"), item[0].path.name))
         writes: list[ProposalNumbering] = []
         lines: list[str] = []
-        folders = sorted({path.parent for path in paths})
         ceiling = numbers.floor(*folders)
-        for issue in issues:
+        for issue, text, body in issues:
+            if draft_file is not None and text != reviewed.get(issue.path):
+                raise Refusal(f"{issue.path}: the reviewed proposal draft changed.")
             if PROPOSAL_TAG not in issue.fields.get("tags", []):
                 lines.append(f"number {issue.path.name}: not a proposal")
                 continue
-            text = read_issue(issue.path)
-            taken = NUMBER.search(text.split(f"\n{FENCE}", 1)[0])
+            taken = NUMBER.fullmatch(issue.value(NUMBER_FIELD))
             if taken:
                 lines.append(f"number {issue.path.name}: P{taken[1]}")
                 continue
-            folder = issue.path.parent.resolve()
-            content = record_store.lines_with_endings(text)
-            end = _closing_fence(content, issue.path)
-            header = Issue(issue.path, header_fields(content[1:end]))
-            body = "".join(content[end + 1:]).strip()
-            title = issue.path.stem
-            console_text.require(f"## {title}\n\n{body}", "proposal", identity=str(issue.path),
-                                 title=title, refusal=Refusal)
-            owner = proposal_owner(header, "") or _proposal_owner(folder, header.value("proposed_by"))
+            if draft_file is None and body != reviewed.get(issue.path):
+                raise Refusal(f"{issue.path}: the reviewed proposal draft changed.")
+            owner = proposal_owner(issue, "") or _proposal_owner(issue.path.parent, issue.value("proposed_by"))
             ceiling += 1
             identity = f"P{ceiling}"
-            numbered, _ = set_fields(text, {NUMBER_FIELD: identity, "production_id": owner, "date_modified": _vault_date(today)}, issue.path)
+            numbered, _ = set_fields(text, {NUMBER_FIELD: identity, "production_id": owner,
+                                            "date_modified": _vault_date(today)}, issue.path)
             writes.append(ProposalNumbering(issue.path, owner, identity, numbered))
             lines.append(f"number {issue.path.name}: {identity}")
         with ExitStack() as rollback:
             for write in writes:
-                _ = rollback.enter_context(record_store.keep_file_on_error(write.path))
-                with numbers.write(write.path, write.identity, write.owner):
-                    _replace_issue(write.path, write.text)
+                if draft_file is None:
+                    _ = rollback.enter_context(record_store.keep_file_on_error(write.path))
+                    with numbers.write(write.path, write.identity, write.owner):
+                        _replace_issue(write.path, write.text)
+                else:
+                    with numbers.write(write.path, write.identity, write.owner, new_record=True):
+                        record_store.create_record_text(write.path, _hash_legacy_reply(write.path, write.text))
         return lines
 
 
@@ -1262,6 +1303,7 @@ def main(argv: list[str]) -> int:
     stars = verbs.add_parser("stars", help="set the five ranking values")
     numbering = verbs.add_parser("number", help="give each proposal without one its P number")
     _ = numbering.add_argument("issues", type=Path, nargs="+")
+    _ = numbering.add_argument("--draft-file", type=Path, help="review and publish this draft at the given issue path")
     _ = stars.add_argument("--goal", required=True, help="e.g. '1 - Ship Hana'")
     for name in ("alignment", "impact", "urgency", "effort"):
         _ = stars.add_argument(f"--{name}", required=True, help="1 to 5")
@@ -1272,7 +1314,9 @@ def main(argv: list[str]) -> int:
     today = datetime.now(user_zone()).date()
     if verb == "number":
         try:
-            print("\n".join(number([path.expanduser() for path in cast(list[Path], args.issues)], today)))
+            paths = [path.expanduser() for path in cast(list[Path], args.issues)]
+            draft = cast(Path | None, args.draft_file)
+            print("\n".join(number(paths, today, draft_file=draft.expanduser() if draft is not None else None)))
         except (ValueError, OSError, UnicodeError) as error:
             print(f"proposal_issue: {error}", file=sys.stderr)
             return 2

@@ -6,7 +6,7 @@ from datetime import datetime
 from scripts.lib.user_zone import user_zone
 from scripts.production import proposal_issue
 from scripts.production.issues import Issue, frontmatter
-from scripts.review_links import efficiency_reviews, review_events, review_items
+from scripts.review_links import efficiency_reviews, review_items
 from scripts.review_links.review_events import MarkChange, NoMark, ReviewMark
 
 
@@ -47,7 +47,8 @@ def require_current_waiting(item: review_items.ReviewItem) -> None:
         result = lines[index].partition(' — ')[2] if 0 <= index < len(lines) else ''
         review = efficiency_reviews.read(source.path).get(identity, efficiency_reviews.EfficiencyReview())
         state = review_items.efficiency_state(result, review)
-    review_events.require_waiting(state == review_items.ReviewState.WAITING)
+    if state != review_items.ReviewState.WAITING:
+        raise NoOpenQuestion('The item is not Waiting.')
 
 
 def stored_mark(item: review_items.ReviewItem) -> ReviewMark | NoMark:
@@ -65,4 +66,4 @@ def answer(item: review_items.ReviewItem, words: str, who: str) -> bool:
         if item.log and item.log[-1].words == line:
             return False
         raise NoOpenQuestion('this item has no open question')
-    return record(item,line,NoMark(),who)
+    return record(item, line, NoMark(), who, waiting_only=True)

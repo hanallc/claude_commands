@@ -320,6 +320,31 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual(review.review_question(key, draft.body, runner=approved, console_kind="reply"),
                          review.QuestionAccepted(draft.body))
 
+    def test_console_filing_holds_invalid_verdicts_and_allows_a_reviewer_outage(self) -> None:
+        from scripts.console_text import check as console_text
+
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Use the new layout.", False)
+        real_review = review.review_question
+        for runner, reason in (
+            (FakeReviewer(verdict(draft, body="Use the old layout.")), "send changed draft"),
+            (FakeReviewer(verdict(draft), failure="json"), "bad JSON"),
+            (FakeReviewer(verdict(draft), failure="timeout"), ""),
+        ):
+            with self.subTest(reason=reason):
+                def run(key: review.QuestionKey, text: str, *, console_kind: str) -> review.QuestionOutcome:
+                    return real_review(key, text, runner=runner, console_kind=console_kind)
+
+                with mock.patch.object(review, "review_question", side_effect=run):
+                    if reason:
+                        with self.assertRaisesRegex(ValueError, reason):
+                            console_text.require(draft.body, "reply", identity="layout")
+                        key = review.QuestionKey("reply/layout", "")
+                        hold = review.state_path() / "questions" / f"{key.digest}.json"
+                        self.assertIn(draft.body, hold.read_text())
+                    else:
+                        console_text.require(draft.body, "reply", identity="layout")
+                        self.assertEqual(self.entries()[-1]["verdict"], "unreviewed: timeout")
+
     def test_unavailable_question_review_preserves_original_and_logs_reason(self) -> None:
         draft = review.Draft("demo", "0", "", NoActionRequired(), "Retry build 42?", False)
         runner = FakeReviewer(verdict(draft), failure="timeout")

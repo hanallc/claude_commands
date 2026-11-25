@@ -16,7 +16,7 @@ from collections.abc import Generator
 from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
-from typing import final, override
+from typing import cast, final, override
 from unittest import mock
 
 from scripts.agents.remote import local_machine
@@ -27,7 +27,7 @@ from scripts.production import proposals_folder, record_store, staff, unit_names
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.lib.user_zone import user_zone
 from scripts.review_links import new_item_dialog, reply_tokens
-from scripts.review_links.review_events import ReviewMark
+from scripts.review_links.review_events import NoMark, ReviewMark
 from scripts.style import rules
 
 ISSUE = """---
@@ -323,6 +323,61 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertNotIn("review_due", text)
         _ = self.run_cli("urgency", str(self.issue), "--level", "normal")
         self.assertNotIn("review_", self.issue.read_text())
+
+    def test_number_reviews_a_private_draft_once_and_refuses_changes_before_publication(self) -> None:
+        draft = self.root / "draft.md"
+        destination = self.root / "new proposal.md"
+        initial = VAULT_ISSUE + "\nUse the new layout.\n"
+        _ = draft.write_text(initial)
+        arguments = ("number", "--draft-file", str(draft), str(destination))
+
+        with (mock.patch.object(proposal_issue, "issue_lock", wraps=proposal_issue.issue_lock) as issue_lock,
+              mock.patch.object(proposal_issue, "proposal_numbers", wraps=proposal_issue.proposal_numbers) as numbers):
+            def approve(_key: review.QuestionKey, text: str, **_options: object) -> review.QuestionAccepted:
+                issue_lock.assert_not_called()
+                numbers.assert_not_called()
+                self.assertFalse(destination.exists())
+                return review.QuestionAccepted(text)
+
+            def change_draft(key: review.QuestionKey, text: str, **options: object) -> review.QuestionAccepted:
+                accepted = approve(key, text, **options)
+                _ = draft.write_text(initial.replace("layout", "menu"))
+                return accepted
+
+            with mock.patch.object(review, "review_question", side_effect=change_draft) as reader:
+                code, _, errors = self.run_cli(*arguments)
+                self.assertEqual(code, 2)
+                self.assertIn("the reviewed proposal draft changed", errors)
+                self.assertFalse(destination.exists())
+                reader.assert_called_once()
+            self.assertFalse((record_store.state_root() / "record-ids/proposal.water").exists())
+
+            _ = draft.write_text(initial)
+            issue_lock.reset_mock()
+            numbers.reset_mock()
+            with mock.patch.object(review, "review_question", side_effect=approve) as reader:
+                self.assertEqual(self.run_cli(*arguments), (0, "number new proposal.md: P1\n", ""))
+                reader.assert_called_once()
+                reviewed = cast(str, reader.call_args.args[1])
+            saved_body = destination.read_text().split("\n---\n", 1)[1]
+            self.assertEqual(reviewed, "## new proposal\n\n" + saved_body)
+            self.assertEqual(draft.read_text(), initial)
+
+    def test_native_proposal_reply_uses_the_named_state(self) -> None:
+        today = date(2026, 11, 25)
+        native = proposal_issue.NoProposalSubmissionReply()
+        _ = self.issue.write_text(VAULT_ISSUE)
+        self.assertTrue(proposal_issue.record_review(self.issue, "Answer: Use the new layout.", NoMark(), today,
+                                                    submission_reply=native))
+        issue = Issue(self.issue, frontmatter(self.issue))
+        self.assertEqual(proposal_issue.review_log(issue)[-1].words, "Answer: Use the new layout.")
+
+        scoped, _ = proposal_issue.set_fields(VAULT_ISSUE, {"review_submission": "{}"}, self.issue)
+        _ = self.issue.write_text(scoped)
+        with self.assertRaisesRegex(new_item_dialog.SubmissionError, "Use the scoped reply"):
+            _ = proposal_issue.record_review(self.issue, "Answer: Use the new layout.", NoMark(), today,
+                                             submission_reply=native)
+        self.assertEqual(self.issue.read_text(), scoped)
 
     def test_number_refuses_a_draft_then_numbers_the_revision(self) -> None:
         draft = VAULT_ISSUE + "\nRead /tmp/proof.txt.\n"
