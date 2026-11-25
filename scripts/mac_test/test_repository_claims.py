@@ -120,7 +120,7 @@ class RepositoryKeyTests(unittest.TestCase):
         self.assertNotIn("memory_admit.py", {Path(file).name for file in files})
 
 
-class RepositorySlotTests(unittest.TestCase):
+class RepositoryClaimTests(unittest.TestCase):
     root: Path = Path()
     origins: dict[str, str] = {}
     common: dict[str, Path] = {}
@@ -445,7 +445,7 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertEqual(offload.remote_mirror(eligibility.KnownRepository("other-copy", cases[0][0].key), "linux", 2),
                          offload.remote_mirror(cases[0][0], "linux", 2))
 
-    def test_linux_mirrors_isolate_origins_slots_and_build_folders(self) -> None:
+    def test_linux_mirrors_use_distinct_paths_for_each_origin_and_number(self) -> None:
         first = self.repository("one/project", "ssh://git@example.com/a/project.git")
         second = self.repository("two/project", "https://example.com/b/project.git")
         first_id = eligibility.repository_identity(first)
@@ -475,7 +475,7 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertEqual(words[words.index("--mirror") + 1], mirrors[1])
         self.assertNotIn(mirrors[0], words)
 
-    def test_invalid_slot_answers_never_confirm_a_claim(self) -> None:
+    def test_invalid_legacy_numbers_never_confirm_a_claim(self) -> None:
         for output in ("claimed\nslot: 0\n", "claimed\nslot: -1\n", "claimed\nslot: x\n",
                        "claimed\nslot: 1\nslot: 2\n"):
             with self.subTest(output=output):

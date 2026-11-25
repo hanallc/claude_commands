@@ -41,7 +41,7 @@ from scripts.mac_test.abandoned_sessions import removal_script
 
 if TYPE_CHECKING:
     from scripts.copies import copies
-    from scripts.lib import build_folders, build_slots
+    from scripts.lib import build_copies, build_folders
     from scripts.lib.boot_identity import boot_identity as boot_identity
     from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
 else:
@@ -76,7 +76,7 @@ def slot_boot(lease: SlotRun, current_boot: str, *, require_boot_identity: bool 
 class LeasedSlotExecution:
     """Execute with the maker's held slot and its Cargo environment."""
 
-    slot: build_slots.LeasedCopy
+    slot: build_copies.LeasedCopy
     descriptors: tuple[int, ...]
 
 

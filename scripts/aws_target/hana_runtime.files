@@ -24,7 +24,7 @@ scripts/build_queue/program_start.py
 scripts/build_queue/progress_profile.py
 scripts/build_queue/queue_place.py
 scripts/build_queue/scope_activity.py
-scripts/build_queue/slot_wait.py
+scripts/build_queue/queue_wait.py
 scripts/build_queue/snapshot_codec.py
 scripts/build_queue/step_estimator.py
 scripts/build_queue/system_clock.py
@@ -49,7 +49,7 @@ scripts/lib/atomic_file.py
 scripts/lib/boot_identity.py
 scripts/lib/build_folder_lock.py
 scripts/lib/build_folders.py
-scripts/lib/build_slots.py
+scripts/lib/build_copies.py
 scripts/lib/build_steps.py
 scripts/lib/cancellation.py
 scripts/lib/cargo_output.py
