@@ -1425,7 +1425,9 @@ class PlacementTests(unittest.TestCase):
                 persist.assert_called_once()
 
     def test_scaler_execution_report_persists_one_transition(self) -> None:
-        self.check_execution_report_persist_count(guest=False)
+        # Let the report handler settle the journal without a concurrent probe.
+        with mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
+            self.check_execution_report_persist_count(guest=False)
 
     def test_mac_linux_execution_report_persists_one_transition(self) -> None:
         self.check_execution_report_persist_count(guest=True)
