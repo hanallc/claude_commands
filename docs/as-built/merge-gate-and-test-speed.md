@@ -424,6 +424,7 @@ Gate startup checks recovery records for dead gate processes across checkouts.
 Every gate mode runs its cleanup before it exits on SIGTERM when the default handler is active.
 Guests that call `run_suites` directly also clean up their suites before they exit on SIGTERM.
 The gate preserves an existing SIGTERM handler.
+The gate defers SIGTERM until suite folder cleanup and the recovery record update finish.
 After cleanup, the gate exits with SIGTERM.
 The nightly skips its build folder sweep when SIGTERM stops the gate.
 Successful recovery removes a record if it names no retained folders.

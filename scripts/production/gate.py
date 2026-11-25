@@ -988,23 +988,27 @@ def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator
                 recovery.save()
             yield folder
         finally:
+            previous_signals = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
             try:
-                cleanup.close()
-            finally:
-                if folder is not None:
-                    try:
-                        remaining = build_folders.temporary_allocation_entries(folder)
-                    except OSError:
-                        report_retained_gate_folder(str(folder), "the gate could not confirm removal")
-                    else:
-                        if folder in remaining:
-                            report_retained_gate_folder(str(folder), "the gate could not remove its folder")
-                        elif remaining:
-                            paths = ", ".join(map(str, remaining))
-                            report_retained_gate_folder(paths, "the gate could not remove its lease files")
+                try:
+                    cleanup.close()
+                finally:
+                    if folder is not None:
+                        try:
+                            remaining = build_folders.temporary_allocation_entries(folder)
+                        except OSError:
+                            report_retained_gate_folder(str(folder), "the gate could not confirm removal")
                         else:
-                            recovery.folders.remove(str(folder))
-                            recovery.save()
+                            if folder in remaining:
+                                report_retained_gate_folder(str(folder), "the gate could not remove its folder")
+                            elif remaining:
+                                paths = ", ".join(map(str, remaining))
+                                report_retained_gate_folder(paths, "the gate could not remove its lease files")
+                            else:
+                                recovery.folders.remove(str(folder))
+                                recovery.save()
+            finally:
+                _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous_signals)
 
 
 def typecheck_venv_path() -> Path:

@@ -541,6 +541,35 @@ with gate.unwind_gate_on_sigterm(), gate.gate_recovery(Path({str(self.checkout)!
         self.assertEqual(record["folders"], [])
         self.assertEqual(build_folders.temporary_allocation_entries(folder), ())
 
+    def test_sigterm_after_lease_release_finishes_suite_cleanup(self) -> None:
+        marker = self.state / "suite-cleanup"
+        parent = self.root / "gate-cleanup"
+        parent.mkdir()
+        preamble = f"""from scripts.lib import build_folders
+release = build_folders._release_build_folder
+
+with gate.unwind_gate_on_sigterm(), gate.gate_recovery(Path({str(self.checkout)!r})) as recovery:
+    recovery.rollback = {self.base!r}
+    with gate.gate_temporary(recovery, "merge-gate", Path({str(parent)!r})) as folder:
+        Path({str(marker)!r}).write_text(str(recovery.path) + '\\n' + str(folder))
+
+        def release_then_signal(path, *, descriptor=None):
+            release(path, descriptor=descriptor)
+            if path == folder:
+                assert folder.is_dir()
+                signal.raise_signal(signal.SIGTERM)
+
+        build_folders._release_build_folder = release_then_signal
+"""
+        result = subprocess.run(self.gate_command(preamble=preamble), cwd=self.root, env=self.environment,
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
+        record_path, folder = map(Path, marker.read_text().splitlines())
+        record = cast(dict[str, object], json.loads(record_path.read_text()))
+        self.assertEqual(record["rollback"], self.base)
+        self.assertEqual(record["folders"], [])
+        self.assertEqual(build_folders.temporary_allocation_entries(folder), ())
+
     def test_nightly_skips_the_sweep_on_sigterm(self) -> None:
         sweep_started = self.state / "nightly-sweep"
         preamble = f"""from contextlib import nullcontext

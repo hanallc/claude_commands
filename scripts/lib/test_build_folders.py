@@ -1318,21 +1318,35 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
         self.assertEqual(folders.build_folder_state(path), "held")
 
     def test_gate_suite_lease_records_the_owner_and_directory_identity(self) -> None:
-        request = folders.GateSuiteFolder("g-", folders.ExplicitBuildParent(self.root))
-        with folders.temporary_build_folder(request) as path:
-            status = path.stat()
-            start = process_start(os.getpid())
-            assert isinstance(start, Started)
-            lease = folders.lease_path(path)
-            fields = cast(dict[str, object], json.loads(lease.read_text()))
-            self.assertEqual(fields["pid"], os.getpid())
-            self.assertEqual(fields["process_start"], start.start)
-            if sys.platform == "darwin":
-                self.assertNotIn("boot_id", fields)
-            else:
-                self.assertEqual(fields["boot_id"], boot_identity())
-            self.assertEqual(fields["device"], status.st_dev)
-            self.assertEqual(fields["inode"], status.st_ino)
+        samestat = os.path.samestat
+        checked: list[Path] = []
+
+        def check_order(created: os.stat_result, current: os.stat_result) -> bool:
+            if stat.S_ISDIR(current.st_mode):
+                for entry in self.root.glob("g-*"):
+                    if samestat(current, entry.stat()):
+                        read_owner.assert_any_call(os.getpid())
+                        checked.append(entry)
+            return samestat(created, current)
+
+        with (mock.patch("scripts.lib.process_start.process_start", wraps=process_start) as read_owner,
+              mock.patch.object(os.path, "samestat", side_effect=check_order)):
+            request = folders.GateSuiteFolder("g-", folders.ExplicitBuildParent(self.root))
+            with folders.temporary_build_folder(request) as path:
+                self.assertIn(path, checked)
+                status = path.stat()
+                start = process_start(os.getpid())
+                assert isinstance(start, Started)
+                lease = folders.lease_path(path)
+                fields = cast(dict[str, object], json.loads(lease.read_text()))
+                self.assertEqual(fields["pid"], os.getpid())
+                self.assertEqual(fields["process_start"], start.start)
+                if sys.platform == "darwin":
+                    self.assertNotIn("boot_id", fields)
+                else:
+                    self.assertEqual(fields["boot_id"], boot_identity())
+                self.assertEqual(fields["device"], status.st_dev)
+                self.assertEqual(fields["inode"], status.st_ino)
         self.assertFalse(path.exists())
         self.assertFalse(lease.exists())
 
