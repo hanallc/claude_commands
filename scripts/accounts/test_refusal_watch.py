@@ -2176,7 +2176,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(output.getvalue().splitlines(), ["Removed next move units 1 at 1% to claude2."])
         self.assertEqual(output.flush_count, 1)
         self.assertIn("unit: Claude is up on claude2 in w1:p1 (0.0 s)", lines)
-        self.assertEqual(self.moves.calls, [MoveCall("unit", "claude2", "auto: " + entry.id)])
+        self.assertEqual(self.moves.calls, [MoveCall("unit", "claude2", "claude1 at 1%")])
         self.assertEqual(stored_group_labels(path)["units"], "claude2")
         self.assertEqual(next_moves.read_next_moves(), ())
         saved = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
@@ -2508,7 +2508,7 @@ class RefusalWatchTests(unittest.TestCase):
                     else:
                         _ = refusal_watch.run_auto_moves(at)
 
-                self.assertEqual(self.moves.calls, [MoveCall("unit", "claude2", "auto: " + first.id)])
+                self.assertEqual(self.moves.calls, [MoveCall("unit", "claude2", "claude1 at 1%")])
                 self.assertEqual(stored_group_labels(path), {"units": "claude2", "showrunners": "claude3"})
                 self.assertEqual(next_moves.read_next_moves(), (later,))
                 returned = accounts.group_transition("showrunners")
@@ -2698,7 +2698,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(len(history), 1)
         self.assertEqual((history[0]["cause"], history[0]["why"], history[0]["label"]),
                          ("auto", "auto: units-low", "claude2"))
-        self.assertEqual(self.moves.calls, [MoveCall("unit", "claude2", "auto: units-low")])
+        self.assertEqual(self.moves.calls, [MoveCall("unit", "claude2", "claude1 at 1%")])
         self.assertEqual(self.notifications, [])
         _ = self.cli()
         self.assertEqual(len(self.moves.calls), 1)
@@ -2713,7 +2713,7 @@ class RefusalWatchTests(unittest.TestCase):
             _ = self.cli()
         self.assertEqual(stored_group_labels(path),
                          {"units": "claude1", "showrunners": "claude1", "producers": "claude2"})
-        self.assertEqual(self.moves.calls, [MoveCall("producer", "claude2", "auto: producers-low")])
+        self.assertEqual(self.moves.calls, [MoveCall("producer", "claude2", "claude1 at 1%")])
         self.assertEqual(next_moves.read_next_moves(), ())
         self.assertEqual(role_map.recorded_auto_moves(accounts.roles_history_file()),
                          role_map.RecordedAutoMoves(frozenset({"producers-low"})))
@@ -2906,7 +2906,7 @@ class RefusalWatchTests(unittest.TestCase):
         with patch.object(accounts, "live_group_members", return_value=members):
             _ = self.cli()
         self.assertEqual(stored_group_labels(path), {"units": "claude1", "showrunners": "claude2", "producers": "claude1"})
-        self.assertEqual(self.moves.calls, [MoveCall("runner", "claude2", "auto: showrunners-low")])
+        self.assertEqual(self.moves.calls, [MoveCall("runner", "claude2", "claude1 at 1%")])
         self.assertEqual(next_moves.read_next_moves(), (self.low_rule("producers-low", group="producers"),))
         self.assertIn("unresolved refusal", self.head_deliveries[-1][0].text)
 

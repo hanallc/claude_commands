@@ -1896,11 +1896,13 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 return SessionNotFound(session)
             from scripts.agents import restart
 
+            start_row = (restart.start_row if configuration is None
+                         else partial(restart.start_row, configuration=configuration))
             if keep_workers:
-                pane = restart.start_row(row, names.tab_record, client, target_account=to or "",
-                                         worker_scope=restart.WorkerRestartScope.SELECTED_ROWS, configuration=configuration)
+                pane = start_row(row, names.tab_record, client, target_account=to or "",
+                                 worker_scope=restart.WorkerRestartScope.SELECTED_ROWS)
             else:
-                pane = restart.start_row(row, names.tab_record, client, target_account=to or "", configuration=configuration)
+                pane = start_row(row, names.tab_record, client, target_account=to or "")
             result = running_on_account(identity, pane, kind=kind)
             if isinstance(result, ClaudeUp):
                 return replace(result, elapsed_seconds=monotonic() - began, start_state=ClaudeStartState.STARTED)

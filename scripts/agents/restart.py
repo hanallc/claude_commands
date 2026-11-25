@@ -844,7 +844,7 @@ def _error_reason(error: object) -> str:
 
 
 def _launch_failure_reason(error: Exception) -> str:
-    if isinstance(error, subprocess.TimeoutExpired):
+    if isinstance(error, subprocess.TimeoutExpired) or isinstance(error.__cause__, subprocess.TimeoutExpired):
         return "The launcher timed out before the detached process claimed the log"
     if isinstance(error, FileNotFoundError) and cast(object, error.filename) == "systemd-run":
         return "The systemd-run command is missing"
