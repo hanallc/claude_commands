@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 import fcntl
 import json
-import math
 import os
 import re
 from pathlib import Path
@@ -183,10 +182,10 @@ def release_gate_folder_lease(path: Path, retained: os.stat_result, owner_pid: i
                 del sidecars[name]
 
 
-def run_hdiutil(*arguments: str, timeout: float = HDIUTIL_TIMEOUT_S) -> subprocess.CompletedProcess[bytes]:
+def run_hdiutil(*arguments: str) -> subprocess.CompletedProcess[bytes]:
     try:
         return subprocess.run(['/usr/bin/hdiutil', *arguments], stdin=subprocess.DEVNULL,
-                              capture_output=True, timeout=timeout, check=False)
+                              capture_output=True, timeout=HDIUTIL_TIMEOUT_S, check=False)
     except subprocess.TimeoutExpired as error:
         stdout = (error.stdout or b'').decode(errors='replace')
         stderr = (error.stderr or b'').decode(errors='replace')
@@ -199,8 +198,8 @@ def hdiutil_detail(result: subprocess.CompletedProcess[bytes]) -> str:
     return f'hdiutil exit status: {result.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}'
 
 
-def attached_gate_images(folder: Path, *, timeout: float = HDIUTIL_TIMEOUT_S) -> list[dict[str, object]]:
-    result = run_hdiutil('info', '-plist', timeout=timeout)
+def attached_gate_images(folder: Path) -> list[dict[str, object]]:
+    result = run_hdiutil('info', '-plist')
     if result.returncode:
         raise GateRefused(f'Cannot read attached disk images. {hdiutil_detail(result)}')
     reply = ledger.mapping(cast(object, plistlib.loads(result.stdout)))
@@ -244,64 +243,31 @@ def gate_image_target(folder: Path, image: dict[str, object]) -> tuple[str, Path
     return devices.pop(), mounts[0]
 
 
-def detach_gate_image(path: Path, folder: Path, retained: os.stat_result, image: dict[str, object],
-                      deadline: float, interval: float) -> list[dict[str, object]]:
-    device, mount = gate_image_target(folder, image)
+def detach_gate_image(path: Path, folder: Path, retained: os.stat_result,
+                      image: dict[str, object]) -> list[dict[str, object]]:
+    device, _ = gate_image_target(folder, image)
     source = image['image-path']
-    busy = ''
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise GateRefused(busy or f'The image detach time expired for {device} at {mount}')
-        try:
-            attached = attached_gate_images(folder, timeout=remaining)
-        except GateRefused as error:
-            if not busy:
-                raise
-            raise GateRefused(f'{busy}\n{error}') from error
-        current = next((entry for entry in attached if entry['image-path'] == source
-                        and any(entity.get('dev-entry') == device for entity in gate_image_entities(entry))), None)
-        if current is None:
-            break
-        _, mount = gate_image_target(folder, current)
-        if not os.path.samestat(retained, path.lstat()) or path.resolve() != folder:
-            raise GateRefused('The gate folder changed before image detach')
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise GateRefused(busy or f'The image detach time expired for {device} at {mount}')
-        try:
-            result = run_hdiutil('detach', device, timeout=remaining)
-        except GateRefused as error:
-            raise GateRefused(f'{busy or f"Cannot detach disk image {device} at {mount}."}\n{error}') from error
-        if result.returncode == 0:
-            attached = attached_gate_images(folder)
-            if any(entry['image-path'] == source for entry in attached):
-                raise GateRefused(f'Disk image {device} remains attached at {mount}. {hdiutil_detail(result)}')
-            return attached
-        detail = hdiutil_detail(result)
-        if result.returncode != 16 or 'resource busy' not in detail.lower():
-            raise GateRefused(f'Cannot detach disk image {device} at {mount}. {detail}')
-        busy = f'Disk image {device} is busy at {mount}. {detail}'
-        remaining = deadline - time.monotonic()
-        if remaining > 0:
-            time.sleep(min(interval, remaining))
-    return attached_gate_images(folder)
-
-
-def detach_attached_gate_images(path: Path, folder: Path, retained: os.stat_result) -> None:
-    images = attached_gate_images(folder)
-    if not images:
-        return
+    attached = attached_gate_images(folder)
+    current = next((entry for entry in attached if entry['image-path'] == source
+                    and any(entity.get('dev-entry') == device for entity in gate_image_entities(entry))), None)
+    if current is None:
+        return attached_gate_images(folder)
+    _, mount = gate_image_target(folder, current)
+    if not os.path.samestat(retained, path.lstat()) or path.resolve() != folder:
+        raise GateRefused('The gate folder changed before image detach')
     try:
-        seconds = float(os.environ['MAC_GATE_DETACH_SECONDS'])
-        interval = float(os.environ['MAC_GATE_DETACH_INTERVAL_SECONDS'])
-    except (KeyError, ValueError) as error:
-        raise GateRefused('The Mac gate cleanup has no valid detach timing') from error
-    if not all(math.isfinite(value) and value > 0 for value in (seconds, interval)):
-        raise GateRefused('The Mac gate cleanup has no valid detach timing')
-    deadline = time.monotonic() + seconds
-    while images:
-        images = detach_gate_image(path, folder, retained, images[0], deadline, interval)
+        result = run_hdiutil('detach', device)
+    except GateRefused as error:
+        raise GateRefused(f'Cannot detach disk image {device} at {mount}.\n{error}') from error
+    detail = hdiutil_detail(result)
+    if result.returncode:
+        if result.returncode == 16 and 'resource busy' in detail.lower():
+            raise GateRefused(f'Disk image {device} is busy at {mount}. {detail}')
+        raise GateRefused(f'Cannot detach disk image {device} at {mount}. {detail}')
+    attached = attached_gate_images(folder)
+    if any(entry['image-path'] == source for entry in attached):
+        raise GateRefused(f'Disk image {device} remains attached at {mount}. {detail}')
+    return attached
 
 
 def detach_gate_images(path: Path, retained: os.stat_result) -> None:
@@ -315,7 +281,14 @@ def detach_gate_images(path: Path, retained: os.stat_result) -> None:
             folder = path.resolve(strict=True)
             if not os.path.samestat(retained, folder.lstat()):
                 raise GateRefused('The gate folder changed before image detach')
-            detach_attached_gate_images(path, folder, retained)
+            images = attached_gate_images(folder)
+            remaining = images
+            for image in images:
+                current = next((entry for entry in remaining if entry['image-path'] == image['image-path']), None)
+                if current is not None:
+                    remaining = detach_gate_image(path, folder, retained, current)
+            if remaining:
+                raise GateRefused('A disk image remains attached to the gate folder')
     except (GateRefused, OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         raise GateRefused(f'The Mac kept its gate folder {path}. {error}') from error
 
@@ -526,13 +499,6 @@ def checkout_bundle(ssh: list[str], checkout: str, repo: Path, folder: Path,
     return [bundle]
 
 
-def checkout_stop_command(root: str, runner: str) -> str:
-    settings = conf.read('mac_gate')
-    seconds = settings.number('cleanup.detach_seconds')
-    interval = settings.number('cleanup.detach_interval_seconds')
-    return f'MAC_GATE_DETACH_SECONDS={seconds} MAC_GATE_DETACH_INTERVAL_SECONDS={interval} {runner} stop {root}'
-
-
 def checkout_cleanup_command(root: str, stop: str, checkout: str) -> str:
     fallback = f'printf "{CheckoutCleanup.RETAINED}\\n"'
     if Path(checkout).is_absolute():
@@ -557,6 +523,7 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     root = '"$HOME"/' + shlex.quote(remote)
     python = '/usr/bin/env PYTHONPATH="$HOME/.claude" "$HOME/.claude/scripts/lib/py"'
     runner = f'{python} {root}/mac_gate.py'
+    stop = f'{runner} stop {root}'
     host = os.environ['MAC_QUEUE_HOST']
     ssh = ['ssh', '-n', '-o', 'BatchMode=yes', host]
     checkout_file = argv_file.with_suffix('.json.checkout')
@@ -568,11 +535,11 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
         if phase == 'cleanup-ended':
             from scripts.mac_test.mac_queue_run import MAC_GATE_SCRIPT
 
-            cleanup = checkout_stop_command(root, f'{python} "$HOME/.claude"/{MAC_GATE_SCRIPT}')
+            cleanup = f'{python} "$HOME/.claude"/{MAC_GATE_SCRIPT} stop {root}'
             if Path(checkout).is_absolute():
                 cleanup += ' ' + shlex.join(['--checkout', checkout])
         else:
-            cleanup = checkout_cleanup_command(root, checkout_stop_command(root, runner), checkout)
+            cleanup = checkout_cleanup_command(root, stop, checkout)
         result = subprocess.run([*ssh, cleanup], capture_output=True, text=True, check=False)
         outcome = result.stdout.strip()
         if result.returncode or outcome not in (CheckoutCleanup.REMOVED, CheckoutCleanup.RETAINED):
@@ -585,7 +552,6 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
             copies.unregister_remote(host, checkout)
         return 0
 
-    stop = checkout_stop_command(root, runner)
     request = cloud_gate.read(folder / 'request.json')
     local_repo = Path((folder / 'local-repo').read_text())
     owner = copies.source_owner(local_repo)
