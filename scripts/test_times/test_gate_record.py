@@ -22,7 +22,7 @@ from unittest import mock
 from scripts.test_times import gate_record
 from scripts.buildlog import index, record, store
 from scripts.lib import build_folders
-from scripts.lib.process_start import Started
+from scripts.lib.process_start import Gone, Started
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.test_times.gate_record import ModuleTimes, TestTime
 from scripts.test_times.gate_record_test_support import fixture_executions, gate_run, module_times
@@ -409,6 +409,40 @@ class GateRecordTests(unittest.TestCase):
         self.assertEqual(status["end"], "killed")
         self.assertEqual(len(lines), 1)
 
+    def test_folder_report_refuses_a_log_that_shrinks_or_changes_identity(self) -> None:
+        owner: gate_record.GateFolderOwner = {"pid": 12, "process_start": "100", "boot_id": "boot-a"}
+        for change in ("shrink", "regrow", "replace"):
+            with self.subTest(change=change), mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.buildlog / change)}):
+                folder = self.root.resolve() / "gate" / change / "g-one"
+                self.write_leased_folder(folder, owner)
+                [path] = list((self.buildlog / change).glob("*/*.jsonl"))
+                with path.open("ab") as output:
+                    _ = output.write(b'{"kind":"gate_folder_end","end":"red","unfinished":"' + b"x" * 16384)
+                lines: list[str] = []
+
+                def decode(line: str) -> object:
+                    lines.append(line)
+                    if len(lines) == 1:
+                        if change == "replace":
+                            replacement = path.with_suffix(".replacement")
+                            _ = replacement.write_bytes(path.read_bytes())
+                            _ = replacement.replace(path)
+                        else:
+                            store.append_line(path, {
+                                **owner, "kind": "gate_folder_end", "suite_folders": [str(folder)],
+                                "end": "normal", "extra": "y" * 32768 if change == "regrow" else "",
+                            })
+                    return cast(object, json.loads(line))
+
+                with (redirect_stdout(io.StringIO()) as stdout, redirect_stderr(io.StringIO()) as stderr,
+                      mock.patch.object(gate_record, "json", SimpleNamespace(loads=decode, dumps=json.dumps))):
+                    self.assertEqual(gate_record.main([str(folder.parent)]), 1)
+                self.assertEqual(stdout.getvalue(), "")
+                [message] = stderr.getvalue().splitlines()
+                self.assertIn("log changed during the read", message)
+                self.assertIn(str(path), message)
+                self.assertEqual(len(lines), 1)
+
     def test_folder_report_marks_only_the_matching_live_owner_as_running(self) -> None:
         folder = self.root.resolve() / "gate/g-live"
         owner: gate_record.GateFolderOwner = {"pid": 12, "process_start": "100", "boot_id": "boot-a"}
@@ -424,6 +458,21 @@ class GateRecordTests(unittest.TestCase):
                     lookup.assert_called_once_with(12)
                 else:
                     lookup.assert_not_called()
+
+    def test_folder_report_includes_an_end_written_before_the_owner_check_finishes(self) -> None:
+        folder = self.root.resolve() / "gate/g-exiting"
+        owner: gate_record.GateFolderOwner = {"pid": 12, "process_start": "100", "boot_id": "boot-a"}
+        self.write_leased_folder(folder, owner)
+
+        def exit_gate(pid: int) -> Gone:
+            self.assertEqual(pid, owner["pid"])
+            gate_record.write_gate_folder_event({**owner, "suite_folders": [str(folder)], "end": "normal"})
+            return Gone()
+
+        with (mock.patch.object(gate_record, "boot_identity", return_value="boot-a"),
+              mock.patch.object(gate_record, "process_start", side_effect=exit_gate)):
+            [status] = gate_record.gate_folder_status(folder.parent)
+        self.assertEqual(status["end"], "normal")
 
     def test_folder_report_refuses_a_lease_for_a_replaced_directory(self) -> None:
         folder = self.root.resolve() / "gate/g-replaced"

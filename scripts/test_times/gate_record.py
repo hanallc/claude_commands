@@ -6,6 +6,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 import hashlib
+import io
 import json
 import math
 import os
@@ -485,18 +486,36 @@ class GateFolderStatus(TypedDict):
     end: GateFolderOutcome
 
 
+class _FolderLogChanged(OSError):
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"log changed during the read ({str(path)!r})")
+
+
 def _folder_log_rows(path: Path) -> Iterator[dict[str, object]]:
-    """Read only complete rows within the file size at open, without a log lock."""
+    """Read the complete prefix of a log without holding a lock."""
     try:
         handle = path.open("rb")
     except FileNotFoundError:
         return
     with handle:
-        remaining = os.fstat(handle.fileno()).st_size
+        descriptor = handle.fileno()
+        before = os.fstat(descriptor)
+        remaining = before.st_size
+        # Log writers can cut the unfinished tail. Each observed newline protects its prefix.
+        while remaining:
+            offset = max(0, remaining - io.DEFAULT_BUFFER_SIZE)
+            block = os.pread(descriptor, remaining - offset, offset)
+            if len(block) != remaining - offset:
+                raise _FolderLogChanged(path)
+            if (newline := block.rfind(b"\n")) >= 0:
+                remaining = offset + newline + 1
+                break
+            remaining = offset
+        had_unfinished_tail = remaining < before.st_size
         while remaining:
             line = handle.readline(remaining)
             if not line.endswith(b"\n"):
-                break
+                raise _FolderLogChanged(path)
             remaining -= len(line)
             try:
                 row = cast(object, json.loads(line.decode("utf-8")))
@@ -504,6 +523,15 @@ def _folder_log_rows(path: Path) -> Iterator[dict[str, object]]:
                 continue
             if isinstance(row, dict):
                 yield cast(dict[str, object], row)
+        try:
+            named = path.stat()
+        except FileNotFoundError as error:
+            raise _FolderLogChanged(path) from error
+        after = os.fstat(descriptor)
+        if ((named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)
+                or min(named.st_size, after.st_size) < before.st_size
+                or (had_unfinished_tail and after.st_mtime_ns != before.st_mtime_ns)):
+            raise _FolderLogChanged(path)
 
 
 def _matches_leased_folder(folder: Path, fields: Mapping[str, object]) -> bool:
@@ -544,6 +572,16 @@ def gate_folder_status(root: Path) -> list[GateFolderStatus]:
     if not candidates:
         return statuses
 
+    current_boot = ""
+    with suppress(OSError, ValueError):
+        current_boot = boot_identity()
+    live: set[_GateLeaseOwner] = set()
+    for owner in {owner for _, owner in candidates}:
+        if owner.boot_id == current_boot:
+            start = process_start(owner.pid)
+            if isinstance(start, Started) and start.start == owner.process_start:
+                live.add(owner)
+
     ends: dict[tuple[str, _GateLeaseOwner], GateEnd] = {}
     host_logs = store.root() / store.host_name()
     for path in sorted(host_logs.glob("[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl")):
@@ -565,18 +603,13 @@ def gate_folder_status(root: Path) -> list[GateFolderStatus]:
                     for folder in cast(list[object], folders):
                         if isinstance(folder, str) and (folder, owner) in candidates:
                             ends[folder, owner] = end
-    current_boot = ""
-    with suppress(OSError, ValueError):
-        current_boot = boot_identity()
     for key, candidate in candidates.items():
         if "sha" not in candidate:
             continue
         if (end := ends.get(key)) is not None:
             candidate["end"] = end
             continue
-        _, owner = key
-        start = process_start(owner.pid) if owner.boot_id == current_boot else None
-        candidate["end"] = "running" if isinstance(start, Started) and start.start == owner.process_start else "killed"
+        candidate["end"] = "running" if key[1] in live else "killed"
     return statuses
 
 

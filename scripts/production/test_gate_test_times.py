@@ -119,14 +119,19 @@ gate.gate_temporary = observe_folder
 
     def test_sigterm_during_the_timing_append_writes_one_end(self) -> None:
         preamble = """from scripts.buildlog import store
-append = store.append_line
+write_all = store._write_all
 
-def stop_after_timing_append(path, row):
-    append(path, row)
-    if row["kind"] == "gate_run":
+def stop_during_timing_append(descriptor, data):
+    if data.startswith(b'{"kind":"gate_run",'):
+        middle = len(data) // 2
+        write_all(descriptor, data[:middle])
         signal.raise_signal(signal.SIGTERM)
+        assert signal.SIGTERM in signal.sigpending()
+        write_all(descriptor, data[middle:])
+    else:
+        write_all(descriptor, data)
 
-store.append_line = stop_after_timing_append
+store._write_all = stop_during_timing_append
 """
         result = self.run_gate("--tests-only", "--full", own_process=True, preamble=preamble)
         self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
