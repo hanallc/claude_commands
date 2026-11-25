@@ -2896,21 +2896,18 @@ class OutsideQueueScan:
     def read_native_session(self, pid: int, command: tuple[str, ...]) -> str | OutsideThreadHost | OutsideIdentityUnreadable:
         if is_claude_process(command):
             native = self.claude_sessions.get((pid, self.processes[pid].start), "")
+        elif staff_sources.codex_thread_host(list(command)):
+            process = self.current_process(pid)
+            return OutsideThreadHost() if process is not None and not process.zombie else OutsideIdentityUnreadable()
         else:
-            if staff_sources.codex_thread_host(list(command)):
-                process = self.current_process(pid)
-                return OutsideThreadHost() if process is not None and not process.zombie else OutsideIdentityUnreadable()
             try:
-                native = herdr.codex_resume_thread(pid)
+                environment = herdr.process_environment(pid)
+                # A child can inherit this value from an agent that has exited.
+                _ = environment.pop("CODEX_THREAD_ID", None)
+                result = self.codex_threads.thread(pid, environment)
             except (OSError, ValueError):
-                try:
-                    environment = herdr.process_environment(pid)
-                    # A child can inherit this value from an agent that has exited.
-                    _ = environment.pop("CODEX_THREAD_ID", None)
-                    result = self.codex_threads.thread(pid, environment)
-                except (OSError, ValueError):
-                    return OutsideIdentityUnreadable()
-                native = result.owner if isinstance(result, herdr.ProvedMatch) else ""
+                return OutsideIdentityUnreadable()
+            native = result.owner if isinstance(result, herdr.ProvedMatch) else ""
         process = self.current_process(pid)
         return native if native and process is not None and not process.zombie else OutsideIdentityUnreadable()
 

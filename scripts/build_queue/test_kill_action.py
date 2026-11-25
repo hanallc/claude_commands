@@ -195,6 +195,43 @@ class KillActionTests(unittest.TestCase):
                              kill_action.OutsideIdentityUnconfirmed("Cannot verify the process tree at pid 812."))
         sent.assert_not_called()
 
+    def test_outside_tree_checks_a_reparented_child_under_a_reused_pid(self) -> None:
+        proc = self.outside_stop_fixture()
+        run = kill_action.OutsideKillCandidate(810, "200", "test.py")
+        before = {810: memory_admit.ProcessIdentity(1, "200"), 811: memory_admit.ProcessIdentity(810, "201")}
+        after = {811: memory_admit.ProcessIdentity(1, "203"), 812: memory_admit.ProcessIdentity(811, "202")}
+
+        for child_live in (False, True):
+            with self.subTest(child_live=child_live):
+                write_process(proc, 811, parent=810, start="201")
+                reused = False
+
+                def read_table(_proc: Path) -> dict[int, memory_admit.ProcessIdentity]:
+                    if not reused:
+                        return before
+                    # The snapshot retains the child's old parent after it reparents.
+                    if child_live:
+                        write_process(proc, 812, parent=1, start="202")
+                    write_process(proc, 811, parent=1, start="203")
+                    return after
+
+                def pidfd_live(pid: int) -> bool:
+                    return not reused and pid in before
+
+                def send(descriptor: int, _number: int) -> None:
+                    nonlocal reused
+                    if descriptor == run.row_pid:
+                        reused = True
+
+                with (patch.object(memory_admit, "process_table", side_effect=read_table),
+                      patch.object(process_stop, "pin_process", side_effect=self.pin_fixture_process),
+                      patch.object(kill_action, "pidfd_live", side_effect=pidfd_live),
+                      patch.object(signal, "pidfd_send_signal", side_effect=send) as sent):
+                    expected = (kill_action.OutsideIdentityUnconfirmed("Cannot verify the process tree at pid 812.")
+                                if child_live else kill_action.OutsideTreeEmpty())
+                    self.assertEqual(kill_action.stop_outside_tree(run), expected)
+                self.assertEqual(sent.call_args_list, [call(811, signal.SIGTERM), call(810, signal.SIGTERM)])
+
     def test_outside_tree_reports_a_live_child_when_its_parent_exits_during_the_scan(self) -> None:
         proc = self.outside_stop_fixture()
         write_process(proc, 811, parent=810, start="201")

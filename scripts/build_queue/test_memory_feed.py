@@ -52,6 +52,7 @@ from scripts.build_queue.admission_test_support import (
 from scripts.build_queue.queue_fixture import fixture_reservation, write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
+from scripts.herdr import herdr
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lint.memory_test_support import write_pressure_reading
 from scripts.lib import atomic_file, build_folders, conf, test_hang_guard
@@ -60,7 +61,7 @@ from scripts.lib.process_group import run_process_group
 from scripts.review_links import console_theme, page_frame, review_link, test_page_frame, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, HAND_MADE, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, StepNames, command_job, read_step_names
-from scripts.message import unit_labels
+from scripts.message import sessions, unit_labels
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.production.gate import SuiteMode
@@ -252,6 +253,7 @@ def write_outside_queue_fixture(root: Path, *, siblings: tuple[int, ...] = ()) -
         _ = (process / "stat").write_text(f"{pid} (fixture ) command) {' '.join(fields)}\n")
         _ = (process / "cmdline").write_text(argv + "\0")
         _ = (process / "cgroup").write_text(f"0::/{scope}\n")
+        _ = (process / "environ").write_text("")
     _ = (root / "proc/8102/environ").write_text("BUILDLOG_OWNER_STAFF_ID=builds\0")
     write_scope(root / "cgroup" / scope, members=(8100, 8101, 8102, 8104, 8105, 8107, *siblings))
     write_scope(root / "cgroup/user/builds.slice")
@@ -281,6 +283,7 @@ def write_outside_detached_fixture(root: Path) -> Path:
     pid = 8112
     write_process(proc, 8111)
     _ = (proc / "8111/cmdline").write_text(f"/bin/codex\0resume\0{fixture_runtime_id('runner-session')}\0")
+    _ = (proc / "8111/environ").write_text("")
     write_process(proc, pid, parent=8111)
     _ = (proc / str(pid) / "cmdline").write_text("/bin/python3\0/fixture/verify_cache_test.py\0")
     _ = (proc / str(pid) / "cgroup").write_text(f"0::/{scope.relative_to(root / 'cgroup')}\n")
@@ -509,6 +512,31 @@ class MemoryFeedTests(unittest.TestCase):
             (self.root / "proc/8100/stat").unlink()
             self.assertEqual(memory_feed.live_outside_kill_targets(), {})
 
+    def test_outside_kill_refuses_a_codex_launch_that_disagrees_with_the_pane(self) -> None:
+        members = write_outside_queue_fixture(self.root)
+        runner, _, worker = members.rows
+        reading = captured_reading()
+        pane = {"session_id": runner.current_session}
+        evidence = {"pane": pane, "process_info": {"foreground_processes": [
+            {"pid": 8101, "argv": ["/bin/codex", "resume", worker.current_session]}]}}
+        with (mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root)),
+              mock.patch.object(sessions, "process_start", return_value="8101"),
+              mock.patch.object(herdr, "process_placement", return_value=herdr.HerdrPlace("agents", "w1:p1")),
+              mock.patch.object(herdr.Herdr, "result", return_value=evidence),
+              mock.patch.object(staff, "snapshot", return_value=members),
+              mock.patch.object(memory_feed, "host_name", return_value="natedev"),
+              mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(kill_action, "outside_stop_route", return_value=kill_action.OutsideCommandTree())):
+            self.assertEqual(memory_feed.live_outside_kill_targets(), {})
+            rows = memory_feed.outside_queue_processes(reading.explanation.decided_from,
+                                                       memory_feed.FeedStaff(members), for_table=True)
+            row, = rows
+            self.assertEqual(row["pid"], 8102)
+            self.assertNotIn("kill_ref", row)
+            pane["session_id"] = worker.current_session
+            target, = memory_feed.live_outside_kill_targets().values()
+            self.assertEqual(target.recipient, worker.id)
+
     def test_outside_kill_checks_the_agent_above_a_codex_thread_host(self) -> None:
         members = write_outside_queue_fixture(self.root, siblings=(8200,))
         host = self.root / "proc/8104/cmdline"
@@ -640,7 +668,7 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual(byte_reads[self.root / "proc/8105/cmdline"], 2)
         self.assertEqual(byte_reads[self.root / "proc/8107/cmdline"], 2)
         self.assertEqual(byte_reads[self.root / "proc/8107/environ"], 0)
-        self.assertEqual(byte_reads[self.root / "proc/8101/environ"], 0)
+        self.assertEqual(byte_reads[self.root / "proc/8101/environ"], 2)
         self.assertEqual(byte_reads[self.root / "proc/8102/stat"], 4)
 
         reservation = fixture_reservation(8105, admission_records.GIB)

@@ -270,12 +270,11 @@ class OutsideTree:
         while pending:
             parent = pending.pop()
             current = observed.get(parent.pid)
-            if current is not None and current.start != parent.start:
-                continue
+            reused = current is not None and current.start != parent.start
             for child in children.get(parent.pid, ()):
                 if child in self.known:
                     continue
-                if self.pin_child(parent, child):
+                if not reused and self.pin_child(parent, child):
                     pending.append(child)
                 else:
                     self.require_branch_gone(child, observed)
