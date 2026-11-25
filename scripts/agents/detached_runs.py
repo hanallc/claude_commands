@@ -1208,7 +1208,10 @@ def _prune_finished_locked(runs: Path) -> list[str]:
     from scripts.direct import progress_history
     from scripts.herdr import worker_panes
 
-    membership = staff.local_snapshot()
+    try:
+        membership = staff.local_snapshot()
+    except staff.StaffAbsent:
+        membership = None
     records = [(path, raw) for path in sorted(runs.glob("*.json"))
                if (raw := worker_lifecycle.read_json_object(path)).get("run_id")]
     newest: dict[str, float] = {}
@@ -1226,7 +1229,9 @@ def _prune_finished_locked(runs: Path) -> list[str]:
             continue
         started = _number(raw.get("started_at"), 0.0)
         staff_id = str(raw.get("staff_id", ""))
-        member = membership.by_id(staff.StaffId(staff_id)) if staff_id else None
+        if staff_id and membership is None:
+            continue
+        member = membership.by_id(staff.StaffId(staff_id)) if staff_id and membership is not None else None
         if member is not None and member.kind == "worker":
             if member.id not in passes:
                 passes[member.id] = worker_panes.worker_pass(member, runs.parent, record=membership)
@@ -2111,9 +2116,12 @@ def command_start(args: argparse.Namespace) -> int:
             _ = _write_record(record_path, record)
     finally:
         reaped.complete()
-    _ = prune_finished(runs)
     print(f"run {run_id} started detached for {name} (pid {supervisor.pid}, log {log_path}); "
-          + "its result arrives as your next message")
+          + "its result arrives as your next message", flush=True)
+    try:
+        _ = prune_finished(runs)
+    except (OSError, ValueError) as error:
+        print(f"detached_runs: could not prune finished runs in {runs}: {error}", file=sys.stderr)
     return 0
 
 

@@ -481,6 +481,28 @@ class DetachedRunsTests(unittest.TestCase):
                     self.assertIn(f"{original}: a matching run has no owner staff ID", errors.getvalue())
                     self.assertEqual(original.read_bytes(), legacy_before)
 
+    def test_start_reports_the_run_when_prune_fails(self) -> None:
+        def fail_prune(runs: Path) -> list[str]:
+            spawn.assert_called_once()
+            record, = runs.glob("*.json")
+            saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))
+            self.assertEqual((saved["status"], saved["pid"]), ("running", 4321))
+            raise PermissionError("fixture cannot delete a run log")
+
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD_ONE}),
+              patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)) as spawn,
+              patch.object(detached_runs, "prune_finished", side_effect=fail_prune) as prune,
+              contextlib.redirect_stdout(io.StringIO()) as output,
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            code = detached_runs.main(["start", "--", "fixture-command"])
+
+        self.assertEqual(code, 0)
+        runs = self.session / detached_runs.DETACHED_RUNS_DIR
+        record, = runs.glob("*.json")
+        prune.assert_called_once_with(runs)
+        self.assertIn(f"run {record.stem} started detached for {WORKER} (pid 4321,", output.getvalue())
+        self.assertIn("fixture cannot delete a run log", errors.getvalue())
+
     def test_start_refuses_systemd_run_without_an_exact_scope_prefix(self) -> None:
         for command in (
             ["systemd-run", "--user", "--quiet", "--pipe", "--wait", "-p", "MemoryMax=4G", "true"],
@@ -880,6 +902,19 @@ class DetachedRunsTests(unittest.TestCase):
                 self.assertEqual(guard.result(worker), [path.stem])
             self.assertFalse(path.exists())
             self.assertFalse(pending_stop.exists())
+
+    def test_prune_without_staff_keeps_records_with_staff_owners(self) -> None:
+        runs = self.session / detached_runs.DETACHED_RUNS_DIR
+        worker = self.finished_run("worker")
+        older = self.finished_run("director-old", worker="director", staff_id="", started_at=1.0)
+        newest = self.finished_run("director-new", worker="director", staff_id="", started_at=2.0)
+
+        with patch.dict(os.environ, {"STAFF_FILE": str(self.root / "absent-staff.json")}):
+            self.assertEqual(detached_runs.prune_finished(runs), [older.stem])
+
+        self.assertEqual(self.run_files(older.stem), [])
+        self.assertTrue(worker.exists())
+        self.assertTrue(newest.exists())
 
     def test_prune_waits_for_the_matching_stop_notice_acknowledgment(self) -> None:
         path = self.finished_run("stop-notice", staff_id="retired-worker", stop_notice_id="notice",
