@@ -141,12 +141,13 @@ def _copy_commit(repository: Path, source: Path, commit: str) -> Generator[None]
 
 def _rescue(path: Path, output: Sequence[str] = ()) -> None:
     """Save the source work, but not target, the use stamp or the `output` folders."""
+    descriptor = build_folders.build_folder_lock_fd(path)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     name = f"{path.name}-{stamp}"
     generated = [path / "target", path / build_folders.COPY_USE_STAMP, *(path / folder for folder in output)]
     try:
         _ = git_rescue.rescue(path, name, generated=generated,
-                             pass_fds=build_folders.held_build_folder_descriptors())
+                             pass_fds=(descriptor,))
     except git_rescue.RescueError as error:
         if "status" not in error.command or "index" not in error.stderr:
             raise
@@ -155,10 +156,9 @@ def _rescue(path: Path, output: Sequence[str] = ()) -> None:
             saved_index = Path(backup.name)
         _ = index.replace(saved_index)
         try:
-            descriptor = build_folders.build_folder_lock_fd(path)
             _ = _git(path, "read-tree", "HEAD", pass_fds=(descriptor,))
             _ = git_rescue.rescue(path, name, generated=generated,
-                                 pass_fds=build_folders.held_build_folder_descriptors())
+                                 pass_fds=(descriptor,))
         except BaseException:
             _ = saved_index.replace(index)
             raise
