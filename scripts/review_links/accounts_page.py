@@ -980,7 +980,6 @@ def main() -> int:
 
 
 STYLE = "<style>\n" + console_theme.CSS + page_frame.STYLE + """
-main:has(>.page-status,>.page-heading>h1):not(.page-wide){max-width:1172px}
 h2{margin:16px 0 4px}
 [data-accounts] .card>h2:first-child{margin-top:0}
 .card{--column-gap:1.125rem;--table-font-size:.86rem;width:fit-content;max-width:100%;padding-right:var(--column-gap)}

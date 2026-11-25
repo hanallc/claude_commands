@@ -2231,6 +2231,10 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   const narrow=popup.getBoundingClientRect();
   check(narrow.left>=0 && narrow.right<=innerWidth && popup.scrollWidth<=popup.clientWidth,
    'the picker fits a narrow phone without horizontal scrolling');
+  const accountScroll=cell.closest('.scroll'), accountCard=accountScroll.closest('.card');
+  check(accountScroll.scrollWidth>accountScroll.clientWidth && getComputedStyle(accountScroll).overflowX==='auto' &&
+   accountScroll.getBoundingClientRect().right<=accountCard.getBoundingClientRect().right &&
+   document.documentElement.scrollWidth<=innerWidth,'the wide Accounts table scrolls inside its card');
   frameElement.style.width='420px';dispatchEvent(new Event('resize'));
   swatch.scrollIntoView({block:'nearest',inline:'nearest'});dispatchEvent(new Event('scroll'));
   const aligned=popup.getBoundingClientRect();
@@ -2387,10 +2391,10 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   check(!popup.open && calls===1,'a successful save closes the popup and refreshes');
   const roles=[...document.querySelectorAll('[data-color-key="role.unit-director"]')];
   const roleWords=[...document.querySelectorAll('[data-color-text="role.unit-director"]')];
-  check(roles.length===3 && roleWords.length===3 &&
-   roleWords.every(word=>word.textContent==='units' && word.style.color==='rgb(215, 175, 0)') &&
-   new Set(roleWords.map(word=>word.closest('table'))).size===2,
-   'both tables show the units swatch and label');
+  const tables=nodes=>nodes.map(node=>node.closest('table').getAttribute('aria-label')).sort().join(',');
+  check(tables(roles)==='Accounts,Accounts,Roles' && tables(roleWords)==='Accounts,Accounts,Models,Roles' &&
+   roleWords.every(word=>word.textContent==='units' && word.style.color==='rgb(215, 175, 0)'),
+   'Accounts and Roles show the units swatch and all three tables show the units label');
   roles[0].click();
   check(popup.open && picker.value==='#d7af00' && popup.querySelector('#color-title').textContent==='Change units color',
    'a role swatch opens the picker with the role color');
