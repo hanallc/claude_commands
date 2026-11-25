@@ -809,33 +809,60 @@ def report_state_time(item: the_list.ListItem, today: datetime) -> str:
     return ""
 
 
-def shows_next_step(item: the_list.ListItem) -> bool:
-    return not (isinstance(item.report, the_list.ListReport) and item.state is the_list.ItemState.DELIVERED)
+class ListProgress(NamedTuple):
+    eta: the_list.Eta
+    latest_status: str
+    status_time: the_list.Timestamp
+    next_step_html: str
+    next_step_sort: str
 
 
-def next_step_html(item: the_list.ListItem, next_step: str) -> str:
-    return change_browser.question_paragraphs(next_step or "Not recorded") if shows_next_step(item) else ""
+def item_progress(item: the_list.ListItem, names: staff_names.StaffNames, schedule: DisplayedSchedule) -> ListProgress:
+    latest_status, status_time = item.latest_status, item.latest_status_time
+    eta, next_step = displayed_work(item, schedule)
+    step_html = change_browser.question_paragraphs(next_step or "Not recorded")
+    if isinstance(item.report, the_list.ListReport):
+        use_repair_status = True
+        use_repair_step = item.state is the_list.ItemState.WORKING and not next_step
+        for entry in reversed(item.log):
+            event = entry.what
+            if isinstance(event, the_list.PageFeedback) and event.action is the_list.ReportVerdict.NOT_FIXED:
+                if use_repair_status:
+                    latest_status, status_time = "Not fixed: " + event.words, entry.time
+                if use_repair_step:
+                    producer = owner_name(names.members, item.producer)
+                    next_step = producer + " repairs it again"
+                    step_html = '<p>' + names.html(item.producer, producer) + ' repairs it again</p>'
+                break
+            if isinstance(event, the_list.FieldChange):
+                use_repair_status = use_repair_status and "latest_status" not in event.fields
+                use_repair_step = use_repair_step and "state" not in event.fields and "next_step" not in event.fields
+            if not (use_repair_status or use_repair_step):
+                break
+        if item.state is the_list.ItemState.DELIVERED:
+            next_step = step_html = ""
+    return ListProgress(eta, latest_status, status_time, step_html, next_step.casefold())
 
 
 def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff_names.StaffNames,
-                 unread_answers: frozenset[str], asks: str = "",
-                 schedule: DisplayedSchedule = the_list.NoSchedule.UNSET) -> str:
+                 unread_answers: frozenset[str], progress: ListProgress, asks: str = "") -> str:
     log = item_log_html(entry, today, names, unread_answers)
     log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
     item = entry.item
-    status_time = item.latest_status_time
-    status_stamp = " · " + time_html(status_time, today) if item.latest_status and isinstance(status_time, datetime) else ""
-    eta, next_step = displayed_work(item, schedule)
+    status_time = progress.status_time
+    status_stamp = " · " + time_html(status_time, today) if progress.latest_status and isinstance(status_time, datetime) else ""
+    duplicate_status = (isinstance(item.report, the_list.ListReport)
+                        and progress.latest_status.strip() == item.report.words.strip())
     state_stamp = report_state_time(item, today)
     fields = ''.join(
         f'<section class="list-field-{field}"><h3>'
         + ('How to try' if field == "next_step" and item.state == the_list.ItemState.REPAIRED else FIELD_LABELS[field])
         + (status_stamp if field == "latest_status" else "") + '</h3>'
-        + field_html(field, value, today, names)
+        + (progress.next_step_html if field == "next_step" else field_html(field, value, today, names))
         + (' · ' + state_stamp if field == "state" and state_stamp else '') + '</section>'
-        for field, value in (("state", item.state), ("eta", eta), ("latest_status", item.latest_status),
-                             ("next_step", next_step), ("done_when", item.done_when))
-        if field != "next_step" or shows_next_step(item))
+        for field, value in (("state", item.state), ("eta", progress.eta), ("latest_status", progress.latest_status),
+                             ("next_step", ""), ("done_when", item.done_when))
+        if (field != "latest_status" or not duplicate_status) and (field != "next_step" or progress.next_step_html))
     report = review_page.list_report_details(item.report) if isinstance(item.report, the_list.ListReport) else ''
     return ('<div class="list-panel"><div>' + report + asks + '<div class="list-item-fields">' + fields
             + '</div><div data-list-item-content>' + sections + '</div>'
@@ -918,22 +945,22 @@ def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *,
 
 def waiting_details(entry: ListRecord, today: datetime, names: staff_names.StaffNames,
                     unread_answers: frozenset[str], secret: str,
-                    reviews: ReviewDisplay, parking_label: str, mark: TopPriorityMark) -> str:
+                    reviews: ReviewDisplay, parking_label: str, mark: TopPriorityMark, progress: ListProgress) -> str:
     sections = (waiting_note(entry, names) + '<div data-waiting-questions>'
                 + panel_questions(entry.item, today, unread_answers) + '</div>'
                 + review_links(entry.item, reviews, today) + waiting_feedback_form(
                     entry, secret, parking_label, unread=bool(unread_answers) or the_list.unread_delivery(entry.item),
                     mark=mark))
-    return detail_panel(entry, sections, today, names, unread_answers, ask_boxes(entry, secret, names))
+    return detail_panel(entry, sections, today, names, unread_answers, progress, ask_boxes(entry, secret, names))
 
 
 def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisplay,
             names: staff_names.StaffNames, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
             unread_answers: frozenset[str], *, parking_label: str,
-            schedule: DisplayedSchedule, mark: TopPriorityMark) -> str:
+            schedule: DisplayedSchedule, mark: TopPriorityMark, progress: ListProgress) -> str:
     item = entry.item
     if isinstance(visibility, the_list.WaitingForAnswer) and item.state != the_list.ItemState.REPAIRED:
-        return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label, mark)
+        return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label, mark, progress)
     links = [f'<li><a data-record-jump href="{html.escape(item_link(entry.keeper, link.number), quote=True)}">#{link.number}</a>'
              + ' — ' + html.escape(link.condition) + '</li>' for link in item.blocked_by]
     links.extend(f'<li>Related: <a data-record-jump href="{html.escape(item_link(entry.keeper, number), quote=True)}">#{number}</a></li>'
@@ -945,7 +972,7 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
     form = feedback_form(entry, secret, members=names.members, parking_label=parking_label,
                          schedule=schedule, today=today, mark=mark)
     return waiting_note(entry, names, hidden=True) + detail_panel(
-        entry, sections + questions + form, today, names, unread_answers, ask_boxes(entry, secret, names), schedule)
+        entry, sections + questions + form, today, names, unread_answers, progress, ask_boxes(entry, secret, names))
 
 
 def original_request_words(item: the_list.ListItem) -> str:
@@ -966,11 +993,11 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     unread = isinstance(item.unread_since, datetime)
     waiting = isinstance(visibility, the_list.WaitingForAnswer)
     scheduled = not isinstance(schedule, the_list.NoSchedule)
-    eta, next_step = displayed_work(item, schedule)
-    due = the_list.eta_due(eta)
-    eta_sort: tuple[int, float | str] = (0, due.timestamp()) if due is not None else (1, eta_text(eta, today).casefold())
+    progress = item_progress(item, names, schedule)
+    due = the_list.eta_due(progress.eta)
+    eta_sort: tuple[int, float | str] = (0, due.timestamp()) if due is not None else (1, eta_text(progress.eta, today).casefold())
     values = (item.number, owner_sort, producer.casefold(), item.title.casefold(), item.state.value.casefold(),
-              next_step.casefold() if shows_next_step(item) else "", eta_sort, item.unread_since.timestamp() if isinstance(item.unread_since, datetime) else 0)
+              progress.next_step_sort, eta_sort, item.unread_since.timestamp() if isinstance(item.unread_since, datetime) else 0)
     parking = (the_list.ParkUntilDelivered.DELIVERED.value
                if item.parked_until is the_list.ParkUntilDelivered.DELIVERED else str(parked).lower())
     key = entry.key
@@ -1036,18 +1063,18 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
             update += '<small>' + notice + ", " + html.escape(list_time(sent, today)) + '</small>'
     overdue = not scheduled and due is not None and due < today and item.state != the_list.ItemState.CLOSED
     eta_class = "list-eta warning" if overdue else "list-eta"
-    full_eta = field_html("eta", eta, today, names)
-    short_eta = html.escape(eta_cell_text(eta, today))
+    full_eta = field_html("eta", progress.eta, today, names)
+    short_eta = html.escape(eta_cell_text(progress.eta, today))
     eta_cell = (f'<span class="{eta_class}" id="list-eta-{row_id}" tabindex="0" title="{full_eta}">'
                 + f'<span class="list-eta-text">{short_eta}</span>'
                 + f'<span class="list-eta-full" aria-hidden="true">{full_eta}</span></span>')
     cells = (number, owner_cell, field_html("producer", item.producer, today, names),
-             title, state, next_step_html(item, next_step), eta_cell, update)
+             title, state, progress.next_step_html, eta_cell, update)
     row = ''.join(f'<td' + (' class="record-id"' if label == '#' else '')
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden_attr = ' hidden' if hidden else ''
     body = details(entry, today, secret, reviews, names, visibility, unread_answers, parking_label=parking_label,
-                   schedule=schedule, mark=mark)
+                   schedule=schedule, mark=mark, progress=progress)
     revision = detail_revision(item, body)
     return (f'<tbody data-list-item{attrs} data-detail-revision="{revision}"{hidden_attr}><tr class="list-row">' + row
             + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">'
@@ -1170,7 +1197,8 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
     open_question = not scheduled and item.state != the_list.ItemState.CLOSED and the_list.has_open_question(item)
     visibility = the_list.QuestionAttention() if scheduled else the_list.question_visibility(owner, item, reading)
     waiting = open_question and isinstance(visibility, the_list.WaitingForAnswer)
-    open_ask = bool(the_list.answerable_asks(item, staff.snapshot()))
+    members = staff.snapshot()
+    open_ask = bool(the_list.answerable_asks(item, members))
     saved: SavedActionState = {"unread": str(isinstance(unread, datetime)).lower(),
                                "unread_sort": unread.timestamp() if isinstance(unread, datetime) else 0,
                                "item_state": item.state.value,
@@ -1183,17 +1211,6 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
                                "unread_answer": str(bool(unread_answers)).lower()}
     if scheduled:
         saved["scheduled_note"] = schedule_label(schedule, local_today)
-    if include_detail:
-        eta, next_step = displayed_work(item, schedule)
-        due = the_list.eta_due(eta)
-        saved.update(next_step_html=next_step_html(item, next_step),
-                     next_step_sort=next_step.casefold() if shows_next_step(item) else "", eta_short=eta_cell_text(eta, local_today),
-                     eta_full=eta_text(eta, local_today),
-                     eta_sort=(0, due.timestamp()) if due is not None else (1, eta_text(eta, local_today).casefold()))
-    if isinstance(item.report, the_list.ListReport):
-        saved["state_time_html"] = report_state_time(item, local_today)
-        saved["next_step_html"] = next_step_html(item, item.next_step)
-        saved["next_step_sort"] = item.next_step.casefold() if shows_next_step(item) else ""
     if park_request:
         try:
             prefix, retry = ListFormRequestPrefix.parse(park_request)
@@ -1213,9 +1230,24 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
         if feedback is not None and feedback.action is the_list.ReportVerdict.NOT_FIXED:
             state = (NotFixedReceiptState.DELIVERED if feedback.state == "sent" else NotFixedReceiptState.ACCEPTED)
         saved["not_fixed_receipt"] = NotFixedReceipt(request=request, state=state)
-    if waiting or include_detail and item.state != the_list.ItemState.CLOSED:
-        members = staff.snapshot()
-        names = staff_names.StaffNames(members)
+    has_detail = waiting or include_detail and item.state != the_list.ItemState.CLOSED
+    report = isinstance(item.report, the_list.ListReport)
+    if include_detail and item.state == the_list.ItemState.CLOSED:
+        saved["detail_closed"] = True
+    if not (report or has_detail or include_detail):
+        return saved
+    names = staff_names.StaffNames(members)
+    progress = item_progress(item, names, schedule)
+    if report:
+        saved["state_time_html"] = report_state_time(item, local_today)
+    if report or include_detail:
+        saved.update(next_step_html=progress.next_step_html, next_step_sort=progress.next_step_sort)
+    if include_detail:
+        eta = progress.eta
+        due = the_list.eta_due(eta)
+        saved.update(eta_short=eta_cell_text(eta, local_today), eta_full=eta_text(eta, local_today),
+                     eta_sort=(0, due.timestamp()) if due is not None else (1, eta_text(eta, local_today).casefold()))
+    if has_detail:
         reviews: ReviewRecords = {}
         if item.reviews:
             try:
@@ -1228,14 +1260,12 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
         secret = form_secret(reading.root)
         body = details(ListRecord(owner, item), local_today, secret, reviews, names,
                        visibility, unread_answers, parking_label=parked_until,
-                       schedule=schedule, mark=top_priority_mark(top_priority, members, item))
+                       schedule=schedule, mark=top_priority_mark(top_priority, members, item), progress=progress)
         if waiting:
             saved["waiting_details_html"] = body
         if include_detail:
             revision = detail_revision(item, body)
             saved.update(detail_html=body, detail_revision=revision)
-    if include_detail and item.state == the_list.ItemState.CLOSED:
-        saved["detail_closed"] = True
     return saved
 
 
