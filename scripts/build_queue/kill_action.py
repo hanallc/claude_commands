@@ -30,7 +30,7 @@ from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.buildlog import store
 from scripts.buildlog.parse import CARGO_BUILD_VERBS
 from scripts.lib import atomic_file, conf, process_start, process_stop
-from scripts.lib.build_steps import GATE_PROGRAMS, command_program, live_process_arguments
+from scripts.lib.build_steps import GATE_STEPS, command_program, live_process_arguments
 from scripts.lib.user_zone import user_zone
 from scripts.lint import memory_admit
 from scripts.message import send_budget, session_send
@@ -90,7 +90,7 @@ def candidate(step: admission_records.RunningStep, reservation: admission_record
             or not step.step.isprintable()
             or step.pid != reservation["pid"] or reservation["pid"] <= 1
             or not reservation["start_time"].isdecimal()
-            or step.step in GATE_PROGRAMS or isinstance(step.job, StepJob)
+            or step.step in GATE_STEPS or isinstance(step.job, StepJob)
             or isinstance(step.verify, admission_records.VerifyCall) or step.step not in BUILD_STEPS):
         return NoKillCandidate()
     run = step.run
