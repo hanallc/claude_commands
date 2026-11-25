@@ -280,7 +280,7 @@ class RustReleaseTests(unittest.TestCase):
                 self.assertEqual(push.body, "")
 
     def test_release_send_wait_includes_the_configured_review_limit(self) -> None:
-        _ = write_config_fixture(self.config.with_name("notify.conf"), "REVIEW_TIMEOUT_SECONDS=90\n")
+        _ = write_config_fixture(self.config.with_name("notify.conf"), "review_timeout_seconds=90\n")
         done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user", "")
         with mock.patch.object(subprocess, "run", return_value=done) as run:
             self.assertTrue(rust_release.send_release_text(render("rust.passed", version="1.100.0", pin="1.99.0")))

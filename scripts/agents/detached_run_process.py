@@ -28,7 +28,7 @@ def process_args(pid: int) -> list[str] | ProcessCommandText | ProcessArgumentsU
     """Read the process arguments or report absence or failure."""
     if Path("/proc/self").exists():
         return _proc_args(Path(f"/proc/{pid}"))
-    timeout = conf.read("detached_runs").whole("PROCESS_CHECK_SECONDS")
+    timeout = conf.read("detached_runs").whole("process_check_seconds")
     try:
         shown = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
                                capture_output=True, text=True, check=False, timeout=timeout)

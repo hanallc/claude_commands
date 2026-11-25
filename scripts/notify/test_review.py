@@ -175,7 +175,7 @@ class LocalReviewTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(review, "schedule"))
         _ = self.enterContext(mock.patch.object(pushover, "http_post", side_effect=AssertionError("real post")))
         _ = self.enterContext(mock.patch.object(pushover, "LOG_FILE", self.root / "pushes.jsonl"))
-        _ = write_config_fixture(self.notify_config, "REVIEW_TIMEOUT_SECONDS=60\n")
+        _ = write_config_fixture(self.notify_config, "review_timeout_seconds=60\n")
         binary = self.root / "bin/claude"
         binary.parent.mkdir()
         _ = binary.write_text("#!/bin/sh\nprintf '2.1.319 (Claude Code)\\n'\n")
@@ -293,6 +293,83 @@ class LocalReviewTests(unittest.TestCase):
                 else:
                     self.assertIsInstance(outcome, (review.QuestionAwaitingFacts, review.QuestionReviewFailed))
                     self.assertTrue((review.state_path() / "questions" / (key.digest + ".json")).exists())
+
+    def test_console_rewrite_with_an_unmatched_quote_holds_the_draft(self) -> None:
+        key = review.QuestionKey("demo", "Open the page")
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Step B opens the page.", False)
+        reason = "The reviewer gave a quote that does not match the draft."
+        runner = FakeReviewer(verdict(draft, "rewrite", body="The page opens.",
+                                      failed_rules=[{"rule": "omit-team-words", "quote": "Step C"}]))
+
+        result = review.review_question(key, draft.body, runner=runner, console_kind="reply")
+
+        self.assertEqual(result, review.QuestionReviewFailed(draft.body, (reason,)))
+        hold = review.state_path() / "questions" / f"{key.digest}.json"
+        self.assertEqual(json.loads(hold.read_text(encoding="utf-8")), {
+            "slug": key.name, "text": key.text, "question": draft.body, "details": [reason],
+        })
+
+    def test_console_rewrite_without_failed_rules_holds_the_draft(self) -> None:
+        key = review.QuestionKey("demo", "Open the page")
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Open the page.", False)
+        held = review.QuestionReviewFailed(draft.body, ("The reviewer requested a rewrite without a failed rule.",))
+        for body in ("Open the window.", ""):
+            with self.subTest(body=body):
+                runner = FakeReviewer(verdict(draft, "rewrite", body=body, failed_rules=[]))
+                self.assertEqual(review.review_question(key, draft.body, runner=runner, console_kind="reply"), held)
+                self.assertTrue((review.state_path() / "questions" / f"{key.digest}.json").is_file())
+        approved = FakeReviewer(verdict(draft))
+        self.assertEqual(review.review_question(key, draft.body, runner=approved, console_kind="reply"),
+                         review.QuestionAccepted(draft.body))
+
+    def test_console_filing_holds_invalid_verdicts_and_allows_a_reviewer_outage(self) -> None:
+        from scripts.console_text import check as console_text
+
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Use the new layout.", False)
+        real_review = review.review_question
+        for runner, reason in (
+            (FakeReviewer(verdict(draft, body="Use the old layout.")), "send changed draft"),
+            (FakeReviewer(verdict(draft), failure="json"), "bad JSON"),
+            (FakeReviewer(verdict(draft), failure="timeout"), ""),
+        ):
+            with self.subTest(reason=reason):
+                def run(key: review.QuestionKey, text: str, *, console_kind: str) -> review.QuestionOutcome:
+                    return real_review(key, text, runner=runner, console_kind=console_kind)
+
+                with mock.patch.object(review, "review_question", side_effect=run):
+                    if reason:
+                        with self.assertRaisesRegex(ValueError, reason):
+                            console_text.require(draft.body, "reply", identity="layout")
+                        key = review.QuestionKey("reply/layout", "")
+                        hold = review.state_path() / "questions" / f"{key.digest}.json"
+                        self.assertIn(draft.body, hold.read_text())
+                    else:
+                        console_text.require(draft.body, "reply", identity="layout")
+                        self.assertEqual(self.entries()[-1]["verdict"], "unreviewed: timeout")
+
+    def test_console_filing_holds_send_with_extra_fields_or_blank_rule_names(self) -> None:
+        from scripts.console_text import check as console_text
+
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Use the new layout.", False)
+        real_review = review.review_question
+        for value, reason in (
+            (verdict(draft, extra=True), "verdict fields"),
+            (verdict(draft, failed_rules=[{"rule": "reader", "quote": draft.body, "extra": True}]), "failed rule fields"),
+            (verdict(draft, failed_rules=[{"rule": "", "quote": draft.body}]), "failed rule needs a name"),
+            (verdict(draft, failed_rules=[{"rule": " \t", "quote": draft.body}]), "failed rule needs a name"),
+        ):
+            with self.subTest(value=value):
+                runner = FakeReviewer(value)
+
+                def run(key: review.QuestionKey, text: str, *, console_kind: str) -> review.QuestionOutcome:
+                    return real_review(key, text, runner=runner, console_kind=console_kind)
+
+                with (mock.patch.object(review, "review_question", side_effect=run),
+                      self.assertRaisesRegex(ValueError, reason)):
+                    console_text.require(draft.body, "reply", identity="layout")
+                key = review.QuestionKey("reply/layout", "")
+                hold = review.state_path() / "questions" / f"{key.digest}.json"
+                self.assertIn(draft.body, hold.read_text())
 
     def test_unavailable_question_review_preserves_original_and_logs_reason(self) -> None:
         draft = review.Draft("demo", "0", "", NoActionRequired(), "Retry build 42?", False)
@@ -424,25 +501,25 @@ class LocalReviewTests(unittest.TestCase):
                 self.assertEqual(review.reviewer_binary(), review.ResolvedReviewerBinary(expected))
                 self.assertEqual([call.args[0] for call in access.call_args_list], list(candidates[:index + 1]))
 
-    def test_review_config_accepts_positive_finite_seconds_and_recovers_from_git(self) -> None:
+    def test_review_config_accepts_positive_finite_seconds_and_logs_fallbacks(self) -> None:
         with (mock.patch.object(subprocess, "run", REAL_PROCESS_RUN),
               mock.patch.dict(os.environ, fixture_git_environment(self.root), clear=True)):
             _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True)
-            _ = write_config_fixture(self.notify_config, "REVIEW_TIMEOUT_SECONDS=75\n")
+            _ = write_config_fixture(self.notify_config, "review_timeout_seconds=75\n")
             _ = commit_repository(self.root, "Set the reviewer timeout", "config/notify.conf")
             for value, expected in (("90 # seconds", 90), ("0.5", 0.5)):
                 with self.subTest(value=value), redirect_stderr(io.StringIO()) as errors:
-                    _ = write_config_fixture(self.notify_config, f"REVIEW_TIMEOUT_SECONDS={value}\n")
+                    _ = write_config_fixture(self.notify_config, f"review_timeout_seconds={value}\n")
                     self.assertEqual(review.review_timeout_seconds(), expected)
                     self.assertEqual(errors.getvalue(), "")
             for value, reason in (("oops", "expected a finite number"), ("0", "outside range"),
                                   ("-1", "outside range"), ("nan", "expected a finite number"),
                                   ("inf", "expected a finite number"), ("1e999", "expected a finite number")):
                 with self.subTest(value=value), redirect_stderr(io.StringIO()) as errors:
-                    _ = write_config_fixture(self.notify_config, f"REVIEW_TIMEOUT_SECONDS={value}\n")
+                    _ = write_config_fixture(self.notify_config, f"review_timeout_seconds={value}\n")
                     self.assertEqual(review.review_timeout_seconds(), 75)
                     self.assertIn(reason, errors.getvalue())
-            _ = self.notify_config.write_text("# range: 1..60\nTEXT_ASK_MINUTES=5\n", encoding="utf-8")
+            _ = self.notify_config.write_text("# range: 1..60\ntext_ask_minutes=5\n", encoding="utf-8")
             with redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(review.review_timeout_seconds(), 75)
             self.assertIn("key is missing", errors.getvalue())
@@ -452,7 +529,7 @@ class LocalReviewTests(unittest.TestCase):
             self.assertIn("No such file", errors.getvalue())
 
     def test_all_delivery_waits_derive_from_the_configured_review_and_post_limits(self) -> None:
-        _ = write_config_fixture(self.notify_config, "REVIEW_TIMEOUT_SECONDS=90\n")
+        _ = write_config_fixture(self.notify_config, "review_timeout_seconds=90\n")
         self.assertEqual(review.revision_seconds(), 195)
         self.assertEqual(review.user_send_seconds(), 205)
         self.assertEqual(review.claim_stale_seconds(), 205)
@@ -462,12 +539,12 @@ class LocalReviewTests(unittest.TestCase):
             self.assertEqual(review.user_send_seconds(), 220)
             self.assertEqual(review.claim_stale_seconds(), 220)
             self.assertEqual(review.posting_wait_seconds(), 110)
-        _ = write_config_fixture(self.notify_config, "REVIEW_TIMEOUT_SECONDS=60\n")
+        _ = write_config_fixture(self.notify_config, "review_timeout_seconds=60\n")
         self.assertEqual(review.user_send_seconds(), 145)
         self.assertEqual(review.posting_wait_seconds(), 110)
 
     def test_stale_claim_recovery_respects_a_longer_configured_revision_budget(self) -> None:
-        _ = write_config_fixture(self.notify_config, "REVIEW_TIMEOUT_SECONDS=150\n")
+        _ = write_config_fixture(self.notify_config, "review_timeout_seconds=150\n")
         held = self.held()
         review.hold(held)
         with mock.patch.object(time, "time", return_value=1301):
@@ -1147,7 +1224,7 @@ class LocalReviewTests(unittest.TestCase):
         digest = push_texts.fingerprint(entry)
         config = self.root / "ask-config"
         config.mkdir()
-        _ = (config / "notify.conf").write_text("# range: 1..60\nTEXT_ASK_MINUTES=7\n", encoding="utf-8")
+        _ = (config / "notify.conf").write_text("# range: 1..60\ntext_ask_minutes=7\n", encoding="utf-8")
         with (mock.patch.dict(os.environ, {"CONF_DIR": str(config),
                                          "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "pause")}),
               mock.patch.object(text_asks, "read_pane",

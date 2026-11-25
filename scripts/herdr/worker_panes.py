@@ -22,7 +22,7 @@ import subprocess
 import sys
 import time
 from threading import Event
-from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
+from collections.abc import Callable, Generator, Hashable, Iterable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stderr
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -36,7 +36,9 @@ from scripts.herdr import herdr_types
 from scripts.lib import conf, models_registry, nix_env, unit_runs
 from scripts.lib.transcripts import uncompressed_path
 from scripts.whoami import quota_state
-from scripts.production import staff, worker_admission
+from scripts.production import session_staff, staff, worker_admission
+from scripts.production.production_doc import EnrolledPaths, ProductionPathsError, resolve_production_paths
+from scripts.production.staff import serving_merge_unit
 from scripts.agents import detached_run_process, pane_record, shutdown_record, worker_lifecycle
 from scripts.direct import progress_history, recorder_state
 
@@ -49,6 +51,62 @@ WorkerRole = staff.WorkerRole
 
 WORKER_SANDBOX = "danger-full-access"
 READ_ONLY_SANDBOX = "read-only"
+REVIEW_ROLES: frozenset[WorkerRole] = frozenset({"review", "astra-reviewer"})
+CLAUDE_REVIEW_TOOLS = "Read,Grep,Glob"
+CLAUDE_REVIEW_MCP = '{"mcpServers":{}}'
+CLAUDE_REVIEW_ARGUMENTS = ("--tools", CLAUDE_REVIEW_TOOLS, "--mcp-config", CLAUDE_REVIEW_MCP, "--strict-mcp-config")
+
+
+class OrdinaryWorkerOwner(Enum):
+    LEGACY_OR_UNIT = "the worker uses the existing unit or legacy policy"
+
+
+def enrolled_worker_owner(owner: staff.StaffRow) -> EnrolledPaths | OrdinaryWorkerOwner:
+    if owner.kind == "showrunner" and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        paths = resolve_production_paths(owner.doc.path)
+        if isinstance(paths, EnrolledPaths):
+            return paths
+    return OrdinaryWorkerOwner.LEGACY_OR_UNIT
+
+
+def worker_directory(record: staff.StaffSnapshot, reference: StaffId) -> Path:
+    row = record.by_id(reference)
+    owner = record.parent_of(row) if row is not None and row.kind == "worker" else row
+    if owner is not None:
+        paths = enrolled_worker_owner(owner)
+        if isinstance(paths, EnrolledPaths):
+            return paths.main
+    return session_staff.worker_directory(record, reference)
+
+
+def review_role_refusal(owner: staff.StaffRow, role: WorkerRole | WorkerRoleUnavailable) -> AdmissionRefused | None:
+    if isinstance(role, str) and role in REVIEW_ROLES:
+        return None
+    merge = serving_merge_unit(owner.id)
+    route = f"unit {merge.name}" if merge is not None else "a unit with the assigned work"
+    return AdmissionRefused(f"{owner.name}: only review and astra-reviewer can run here. Send write work to {route}.")
+
+
+def review_run_refusal(owner: staff.StaffRow, run: Path, paths: EnrolledPaths, *artifacts: Path) -> AdmissionRefused | None:
+    root = run.absolute()
+    if not isinstance(owner.run, staff.OpenRun) or root != owner.run.path.absolute():
+        return AdmissionRefused("showrunner reviews require the owner's recorded run directory")
+    return review_artifact_refusal(root, paths, *artifacts)
+
+
+def review_artifact_refusal(run: Path, paths: EnrolledPaths, *artifacts: Path) -> AdmissionRefused | None:
+    root = run.absolute()
+    if ".." in root.parts or root.resolve() != root or not root.is_dir():
+        return AdmissionRefused("showrunner reviews require the owner's recorded run directory")
+    if any(root.is_relative_to(tree) or tree.is_relative_to(root) for tree in (paths.main, paths.integration)):
+        return AdmissionRefused("the showrunner run directory overlaps a checkout")
+    for artifact in artifacts:
+        path = artifact.absolute()
+        if ".." in path.parts or not path.is_relative_to(root):
+            return AdmissionRefused("showrunner review orders and replies must stay in the run directory")
+        if path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
+            return AdmissionRefused(f"{path}: showrunner review paths cannot contain symbolic links")
+    return None
 
 
 @dataclass(frozen=True)
@@ -87,6 +145,8 @@ class DurableDesignRole:
 
 
 PaneTarget = StaffWorker | ConsultationPane | DurableDesignRole
+
+CLAIMED_WORKING_DIR_ENV = "UNIT_CLAIMED_WORKING_DIR"
 
 
 @dataclass(frozen=True)
@@ -287,10 +347,13 @@ def worker_id_lock(identity: StaffId, *, blocking: bool = False,
 class WorkerLockHold:
     """Hold the worker's fixed-id lock through startup and dispatch."""
 
-    def __init__(self, parent: StaffId, name: WorkerName, operations: ExitStack, *, blocking: bool) -> None:
+    def __init__(self, parent: StaffId, name: WorkerName, operations: ExitStack, after_unlock: ExitStack, *,
+                 blocking: bool) -> None:
         self.parent = parent
         self.name = name
         self._operations = operations
+        self._after_unlock = after_unlock
+        self._deferred: set[Hashable] = set()
         self._held: set[StaffId] = set()
         self._blocking = blocking
         self.active = True
@@ -312,6 +375,16 @@ class WorkerLockHold:
     def owns(self, row: staff.StaffRow) -> bool:
         return self.active and row.id in self._held and row.kind == "worker" and row.reports_to(self.parent)
 
+
+    def defer_until_unlock(self, key: Hashable, action: Callable[[], None]) -> None:
+        """Run one action per key after this context releases both locks."""
+        if not self.active:
+            raise ValueError("the worker lock is no longer active")
+        if key not in self._deferred:
+            self._deferred.add(key)
+            _ = self._after_unlock.callback(action)
+
+
 @contextmanager
 def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False,
                 deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> Generator[WorkerLockHold | Kept]:
@@ -319,7 +392,7 @@ def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False,
 
     A deadline limits the wait for both locks.
     """
-    with ExitStack() as operations:
+    with ExitStack() as after_unlock, ExitStack() as operations:
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
         path = _worker_name_lock_path(parent, name.value)
@@ -335,7 +408,7 @@ def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False,
             return
         if row is None:
             row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
-        hold = WorkerLockHold(parent, name, operations, blocking=blocking)
+        hold = WorkerLockHold(parent, name, operations, after_unlock, blocking=blocking)
         try:
             if row is not None:
                 hold.bind(row, deadline=deadline)
@@ -352,14 +425,20 @@ class UseRolePolicy(Enum):
     CURRENT = "resolve the role policy"
 
 
+class ToolAccess(Enum):
+    ROLE_DEFAULT = "use the role's tools"
+    SHOWRUNNER_REVIEW = "permit Claude read tools only"
+
+
 @dataclass(frozen=True)
 class LaunchPolicy:
     settings: models_registry.LaunchSettings
     sandbox: str
     permission: str
-    compact_window: tuple[str, ...]
+    compact_window: tuple[str, ...] = ()
     configuration: models_registry.LaunchModelConfiguration | models_registry.FreshLaunchConfiguration = (
         models_registry.FreshLaunchConfiguration())
+    tools: ToolAccess = ToolAccess.ROLE_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -615,6 +694,36 @@ def observe_worker(parent: StaffId, row: staff.StaffRow, record: staff.StaffSnap
 
 def observe(parent: StaffId, record: staff.StaffSnapshot) -> list[WorkerPane]:
     return _evidence(parent, record, _client()).states
+
+
+def run_execution_blocker(run: Path, record: staff.StaffSnapshot, owner: StaffId,
+                          identities: frozenset[StaffId]) -> unit_runs.RunExecutionState:
+    """Check execution and launch locks without using reply evidence."""
+    for path in _worker_lock_path("").parent.glob(f"{owner}-*.lock"):
+        try:
+            with path.open("r") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return unit_runs.RunExecutionBlocker(f"{path.stem}: a worker operation is in progress")
+        except FileNotFoundError:
+            continue
+    for identity in sorted(identities):
+        row = record.by_id(identity)
+        if row is None or row.kind != "worker":
+            continue
+        parent = record.parent_of(row)
+        if parent is None:
+            return unit_runs.RunExecutionBlocker(f"{row.name}: the worker owner is unavailable")
+        if worker_run(row, record=record).resolve() != run.resolve():
+            continue
+        state = observe_worker(parent.id, row, record)
+        if isinstance(state, (ClosedWorker, StoppedWorker)):
+            continue
+        if not isinstance(state, OpenWorker) or not state.status.idle:
+            return unit_runs.RunExecutionBlocker(f"{row.name}: the worker can still be running")
+        if isinstance(locked := check_worker_lock(row), Kept):
+            return unit_runs.RunExecutionBlocker(f"{row.name}: {locked.blocker}")
+    return unit_runs.NoRunExecutionBlocker.IDLE
 
 
 def observe_parents(parents: Sequence[staff.StaffRow], record: staff.StaffSnapshot, *,
@@ -929,10 +1038,21 @@ class CompletedWorkerPass:
     dispatch_id: str
 
 
+class StoppedPassCleanup(Enum):
+    COMPLETE = "no stop cleanup needs a retry"
+    RETRY = "retry the stop cleanup"
+
+
+class StoppedDiagnosticRecovery(Enum):
+    SETTLED = "all diagnostics were delivered"
+    PENDING = "diagnostic delivery remains pending"
+    UNREADABLE = "diagnostic evidence is unreadable"
+
+
 @dataclass(frozen=True)
 class StoppedRunPassCompletion:
     outcome: str
-    send_notice: Callable[[], object]
+    send_notice: Callable[[], StoppedPassCleanup]
 
 
 class NoOwningPanePass(Enum):
@@ -1019,6 +1139,8 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
                   for item in _worker_passes_in(row, _run_state(directory, read), record)]
     if not passes:
         latest = progress_history.last_dispatch(row.id)
+        if isinstance(latest, progress_history.DispatchHistoryUnknown):
+            return DispatchHoldsWorker(latest.reason)
         if (not isinstance(latest, progress_history.RecordedDispatch)
                 or latest.status is progress_history.DispatchDetailNotRecorded.UNRECORDED):
             return ReleasedWorkerPass.NO_PROMPT_DELIVERED
@@ -1047,7 +1169,9 @@ def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, objec
     completion = progress_history.hook_completion(passed)
     active = status == "active" and bool(delivery.line)
     finished = isinstance(completion, progress_history.HookCompletion) and completion.finished
-    if active or (delivery.line and delivery.completion_id and not finished):
+    reply_ended = (isinstance(completion, progress_history.HookCompletion) and completion.outcome == "stopped"
+                   and completion.stopped_reply is progress_history.StoppedReplyDisposition.ENDED_WITHOUT_DONE)
+    if active or (delivery.line and delivery.completion_id and not (finished or reply_ended)):
         evidence = cast(RecordedCompletionEvidence, cast(object, import_module("scripts.production.worker")))
         reply_file = completion.reply_file if isinstance(completion, progress_history.HookCompletion) else delivery.reply_file
         started_at = _pass_started_at(passed)
@@ -1142,10 +1266,12 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
                 return Kept(f"agent state is {worker.status.value}")
             return CloseAllowed()
         hook = progress_history.hook_completion(passed)
-        if (isinstance(hook, progress_history.HookCompletion) and hook.outcome == "stopped"
-                and isinstance(worker, OpenWorker) and not worker.status.idle):
-            return Kept(f"agent state is {worker.status.value}")
-        delivery = pass_recorder.dispatch_delivery(passed)
+        if isinstance(hook, progress_history.HookCompletion) and hook.outcome == "stopped":
+            if isinstance(worker, OpenWorker) and not worker.status.idle:
+                return Kept(f"agent state is {worker.status.value}")
+            if hook.stopped_reply is progress_history.StoppedReplyDisposition.ENDED_WITHOUT_DONE:
+                return CloseAllowed()
+        delivery = progress_history.dispatch_delivery(passed)
         if delivery.line:
             completion = recorded_completion_close(worker.row, directory, passed, worker_is_working=working)
         elif isinstance(worker, StoppedWorker):
@@ -1176,7 +1302,7 @@ def launch_policy(role: WorkerRole, family: Literal["claude", "codex", "assigned
     from scripts.astra import design_roles
     configuration = models_registry.launch_snapshot()
     settings = role_launch_settings(role, family, configuration)
-    sandbox = READ_ONLY_SANDBOX if role in ("review", "astra-reviewer") else WORKER_SANDBOX
+    sandbox = READ_ONLY_SANDBOX if role in REVIEW_ROLES else WORKER_SANDBOX
     if role == "astra-designer":
         sandbox = design_roles.DESIGNER_SANDBOX
     return _launch_policy(settings, sandbox, configuration)
@@ -1257,6 +1383,8 @@ def _policy_arguments(policy: LaunchPolicy) -> list[str]:
         if settings.effort and settings.effort != "unset":
             arguments += ["--effort", settings.effort]
         arguments += policy.compact_window
+        if policy.tools is ToolAccess.SHOWRUNNER_REVIEW:
+            arguments += CLAUDE_REVIEW_ARGUMENTS
     return arguments + _turn_end_arguments(settings.kind)
 
 
@@ -1327,6 +1455,50 @@ def launch_environment(policy: LaunchPolicy, account: ConfiguredWorkerAccount | 
                 if isinstance(selected_claude_account, accounts.NamedAccount) else {})
     except (OSError, ValueError) as error:
         return StartRefused(StartRefusal.ACCOUNT_UNAVAILABLE, str(error))
+
+
+def _argument_values(arguments: Sequence[str], flags: frozenset[str]) -> list[str]:
+    values: list[str] = []
+    for index, argument in enumerate(arguments):
+        flag, equals, value = argument.partition("=")
+        if flag in flags:
+            values.append(value if equals else arguments[index + 1] if index + 1 < len(arguments) else "")
+    return values
+
+
+def _codex_read_only(arguments: Sequence[str]) -> bool:
+    if any(arg.partition("=")[0] in ("--yolo", "--dangerously-bypass-approvals-and-sandbox", "--full-auto")
+           for arg in arguments):
+        return False
+    if _argument_values(arguments, frozenset({"--sandbox", "-s"})) != [READ_ONLY_SANDBOX]:
+        return False
+    if _argument_values(arguments, frozenset({"--ask-for-approval", "-a"})) != ["never"]:
+        return False
+    return all(setting.partition("=")[0].strip() in
+               ("model_reasoning_effort", "notice.hide_rate_limit_model_nudge", "service_tier")
+               for setting in _argument_values(arguments, frozenset({"-c", "--config"})))
+
+
+def require_review_process(client: herdr.Herdr, pane: str, paths: EnrolledPaths) -> None:
+    """Prove the running worker uses the review tools in main."""
+    info = herdr.json_object(client.result("pane", "process-info", "--pane", pane).get("process_info"), "review launch")
+    owner = herdr.foreground_pane_owner(info)
+    if not isinstance(owner, (herdr.ProvedCodexForeground, herdr.ProvedClaudeForeground)):
+        raise ValueError("the running showrunner review process is unproved")
+    if not isinstance(owner.cwd, str) or Path(owner.cwd).resolve() != paths.main:
+        raise ValueError("the retained showrunner worker does not run in main")
+    actual = owner.arguments
+    if isinstance(owner, herdr.ProvedCodexForeground):
+        if _codex_read_only(actual):
+            return
+    elif (not any(arg.partition("=")[0] in ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+                                           "--allowedTools", "--allowed-tools", "--plugin-dir", "--add-dir") for arg in actual)
+          and _argument_values(actual, frozenset({"--permission-mode"})) == ["plan"]
+          and _argument_values(actual, frozenset({"--tools"})) == [CLAUDE_REVIEW_TOOLS]
+          and _argument_values(actual, frozenset({"--mcp-config"})) == [CLAUDE_REVIEW_MCP]
+          and "--strict-mcp-config" in actual):
+        return
+    raise ValueError("the retained showrunner worker does not have the read-only review policy")
 
 
 def _live_policy(worker: OpenWorker, policy: LaunchPolicy, client: herdr.Herdr, *, same_role: bool) -> bool | UncertainWorker:
@@ -1423,7 +1595,7 @@ def _destination(parent: staff.StaffRow, name: str, evidence: PaneEvidence,
         if not isinstance(client.pane_activity(identity), herdr.PaneAtShell):
             return StartRefused(StartRefusal.PANE_NOT_AT_SHELL, "interrupted recovery pane is live")
         return herdr.ExistingPane(identity, terminal)
-    ratio = conf.read("direct").number("WORKER_SPLIT_RATIO")
+    ratio = conf.read("direct").number("worker_split_ratio")
     workers = {item.pane for item in evidence.states if isinstance(item, (OpenWorker, StoppedWorker))
                and any(_text(pane, "pane_id") == item.pane and _text(pane, "tab_id") == tab for pane in evidence.panes)}
     workers.update(_text(pane, "pane_id") for pane in evidence.panes
@@ -1466,6 +1638,12 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     owner = record.by_id(parent)
     if owner is None or owner.kind not in ("unit", "showrunner"):
         return AdmissionRefused("only a unit or showrunner can admit a worker")
+    try:
+        paths = enrolled_worker_owner(owner)
+        if isinstance(paths, EnrolledPaths) and (refusal := review_role_refusal(owner, role)):
+            return refusal
+    except (OSError, ValueError, ProductionPathsError, staff.StaffRefused, staff.StaffUnreadable) as error:
+        return AdmissionRefused(str(error))
     expected = worker_admission.find_worker(record, parent, name.value)
     keep_model = isinstance(policy, UseRolePolicy)
     try:
@@ -1490,11 +1668,19 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
             run = worker_run(existing if existing is not None else owner, record=record, scanned=runs)
             if existing is not None and not isinstance(worker_dispatch_state(existing, run, held), DispatchHoldsWorker):
                 run = worker_run(owner, record=record, scanned=runs)
+            if isinstance(paths, EnrolledPaths):
+                if refusal := review_run_refusal(owner, run, paths):
+                    return refusal
+                if policy.sandbox != READ_ONLY_SANDBOX or policy.permission != "plan":
+                    return AdmissionRefused("showrunner review requires a read-only launch policy")
+                policy = replace(policy, tools=ToolAccess.SHOWRUNNER_REVIEW)
+            if unit_runs.terminal_run(unit_runs.read_run_fields(run)):
+                return AdmissionRefused(f"{run}: the run has ended dispatch admission")
             allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
                 worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
             target = SelectedWorkers(frozenset({name.value})) if selection == "by_name" else selection
             with worker_admission.worker_operation(allowed):
-                result = _start_locked(owner, name, role, policy, account, allowed, held, codex,
+                result = _start_locked(owner, name, role, policy, account, allowed, held, codex, paths,
                                        keep_model=keep_model, selection=target)
                 if isinstance(result, OpenWorker) and result.row.role != staff.KnownWorkerRole(role):
                     return replace(result, row=staff.set_worker_role(result.row.id, staff.KnownWorkerRole(role)))
@@ -1506,8 +1692,8 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
 def first_turn_session(client: herdr.Herdr, pane: str, terminal: str) -> str:
     """Read the session report, then wait for the first Codex turn to end."""
     settings = conf.read("direct")
-    text = settings.text("WORKER_FIRST_TURN_TEXT")
-    seconds = settings.number("WORKER_FIRST_TURN_SECONDS")
+    text = settings.text("worker_first_turn_text")
+    seconds = settings.number("worker_first_turn_seconds")
     deadline = time.monotonic() + seconds
     client.prompt_terminal(pane, terminal, text)
     failure = "first turn timed out"
@@ -1543,13 +1729,14 @@ def unpublished_cleanup_text(result: UnpublishedWorker) -> str:
 def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, policy: LaunchPolicy,
                   account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection,
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
-                  codex: herdr.CodexConversations | herdr.CodexLaunchRead, *, keep_model: bool,
+                  codex: herdr.CodexConversations | herdr.CodexLaunchRead,
+                  paths: EnrolledPaths | OrdinaryWorkerOwner, *, keep_model: bool,
                   selection: SelectedWorkers | SelectedWorkerRows) -> WorkerStart:
     started = time.monotonic()
     try:
         settings = conf.read("direct")
-        start_seconds = settings.number("PANE_AGENT_START_SECONDS")
-        publish_lock_seconds = settings.number("WORKER_PUBLISH_LOCK_SECONDS")
+        start_seconds = settings.number("pane_agent_start_seconds")
+        publish_lock_seconds = settings.number("worker_publish_lock_seconds")
     except conf.Unusable as error:
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
     deadline = started + start_seconds
@@ -1577,6 +1764,16 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the worker changed before startup")
     if isinstance(current, (ProcessUnknownWorker, UncertainWorker)):
         return current
+    if isinstance(paths, EnrolledPaths):
+        try:
+            if isinstance(current, OpenWorker):
+                require_review_process(client, current.pane, paths)
+            elif row is not None and isinstance(backend, staff.CodexBackend):
+                retained = pane_record.publication_for_session(row.current_session, record=record)
+                if retained is not None and not _codex_read_only(retained.entry.get("codex_policy", [])):
+                    return AdmissionRefused("the retained Codex worker launch does not prove read-only access")
+        except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            return AdmissionRefused(str(error))
     if current is None:
         pane = _interrupted_pane(owner, name.value, evidence, client)
         if isinstance(pane, (StartRefused, UncertainWorker, ProcessUnknownWorker)):
@@ -1595,6 +1792,11 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 return ProcessUnknownWorker(owner, identity, _text(pane, "terminal_id"), str(error))
             if not isinstance(activity, herdr.PaneAtShell):
+                if isinstance(paths, EnrolledPaths):
+                    try:
+                        require_review_process(client, identity, paths)
+                    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                        return AdmissionRefused(str(error))
                 try:
                     native = (_codex_start_session(client, identity, pane_row=pane) if policy.settings.kind == "codex" else
                               client.native_session(identity, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane))
@@ -1669,11 +1871,16 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     launch_home = (staff.SessionHome(Path(environment["CODEX_HOME"]))
                    if policy.settings.kind == "codex" else staff.HomeUnknown())
     environment["UNIT_TEAM_ROLE"] = name.value
-    if owner.kind == "unit":
+    if owner.kind == "unit" or isinstance(paths, EnrolledPaths):
         environment["UNIT_RUN_DIR"] = str(allowed.run)
     if temporary := os.environ.get("TMPDIR"):
         environment["TMPDIR"] = temporary
-    directory = owner.worktree.path if isinstance(owner.worktree, staff.PresentWorktree) else Path.cwd()
+    if isinstance(paths, EnrolledPaths):
+        directory = paths.main
+    elif claimed := os.environ.get(CLAIMED_WORKING_DIR_ENV):
+        directory = Path(claimed).resolve()
+    else:
+        directory = owner.worktree.path if isinstance(owner.worktree, staff.PresentWorktree) else Path.cwd()
     prepared = herdr.prepare_session_environment(str(row.current_session) if row is not None and not switching else "", str(directory), environment,
                                                frozenset({"STAFF_ID"}))
     if isinstance(prepared, nix_env.Refused):
@@ -1764,6 +1971,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         if isinstance(process.start_ticks, herdr.ProcessGenerationUnavailable):
             raise herdr_types.HerdrFailure(process.start_ticks.reason)
         launch_processes[launched.pane] = process
+        if isinstance(paths, EnrolledPaths):
+            require_review_process(client, launched.pane, paths)
         if not identity and policy.settings.kind == "codex":
             if isinstance(launched.outcome, herdr.PromptNotSubmitted):
                 raise herdr_types.HerdrFailure(launched.outcome.reason)

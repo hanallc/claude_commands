@@ -373,8 +373,8 @@ def snapshot() -> MeasuredDiskSnapshot:
     previous_snapshot = read_snapshot()
     floor = read_floor()
     settings = conf.read("buildlog")
-    walk_minutes = settings.whole("DISK_WALK_MINUTES")
-    walk_hour = settings.whole("DISK_WALK_HOUR")
+    walk_minutes = settings.whole("disk_walk_minutes")
+    walk_hour = settings.whole("disk_walk_hour")
     if (previous_snapshot is not None and "filesystems" in previous_snapshot
             and "outside_build_caches" in previous_snapshot and "outside_build_cache_totals" in previous_snapshot
             and "previous_measured_at" in previous_snapshot):

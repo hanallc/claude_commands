@@ -311,13 +311,13 @@ def read_actions(*, remote: bool) -> RenderRead[ActionFields]:
             actions = for_you.console_status_line_actions()
             sources.complete = isinstance(actions.other_count, int)
         else:
-            snapshot = for_you.read_for_status_line(config, watch=sources)
+            snapshot = for_you.read_for_status_line(config, include_reasons=True, watch=sources)
             actions = snapshot.status_line_actions()
             deadline = snapshot.comparison_deadline
             sources.complete &= not snapshot.unavailable and deadline > 0
             sources.deadline = deadline
             refresh_due = snapshot.comparison_refresh_due or 0 < deadline <= time.time()
-        waiting_rebuilds = rebuild_row.rebuild_names(actions.rebuild_machines)
+        waiting_rebuilds = actions.rebuild_text()
         actions_count = f"{actions.other_count}+" if actions.partial else str(actions.other_count)
     except Exception:
         sources.complete = False

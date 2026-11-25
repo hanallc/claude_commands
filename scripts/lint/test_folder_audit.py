@@ -62,6 +62,18 @@ def folder(path: Path, age_days: float = 2) -> Path:
     return path
 
 
+def process_working_in(proc: Path, pid: int, cwd: Path) -> Path:
+    process = proc / str(pid)
+    (process / "fd").mkdir(parents=True)
+    (process / "cwd").symlink_to(cwd)
+    (process / "root").symlink_to("/")
+    (process / "exe").symlink_to(sys.executable)
+    _ = (process / "maps").write_text("")
+    uid = os.geteuid()
+    _ = (process / "status").write_text(f"State:\tS\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nThreads:\t1\n")
+    return process
+
+
 def git(repo: Path, *arguments: str) -> None:
     environment = {key: value for key, value in os.environ.items() if key not in GIT_CHECKOUT_ENV}
     _ = subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *arguments],
@@ -736,9 +748,7 @@ class FolderAuditTests(unittest.TestCase):
         held = self.clone_folder("held-clone", 3)
         listening = self.clone_folder("socket-clone", 3)
         busy = self.clone_folder("busy-clone", 3)
-        pid = self.root / "proc" / "12"
-        pid.mkdir(parents=True)
-        (pid / "cwd").symlink_to(used)
+        _ = process_working_in(self.root / "proc", 12, used)
         _ = scratch.hold(held, "gate:keep-clone", "test")
         server = socket.socket(socket.AF_UNIX)
         self.addCleanup(server.close)
@@ -891,13 +901,11 @@ class FolderAuditTests(unittest.TestCase):
         self.assertEqual(outcomes[clone], folder_audit.HELD)
         self.assertTrue(clone.exists())
         _ = scratch.release(clone)
-        pid = self.root / "proc" / "42"
-        pid.mkdir()
-        (pid / "cwd").symlink_to(checkout)
+        process = process_working_in(self.root / "proc", 42, checkout)
         outcomes = self.judge_clones([clone], mac=True, free_space=0)
         self.assertEqual(outcomes[clone], "pid 42 works in it")
         self.assertTrue(clone.exists())
-        (pid / "cwd").unlink()
+        _ = process.rename(process.with_name("exited"))
         found = folder_audit.audit(
             self.rust, [], frozenset[str](), time.time(), files=[], removing=True,
             proc=str(self.root / "proc"), sockets=str(self.root / "unix"),
@@ -1060,8 +1068,7 @@ class FolderAuditTests(unittest.TestCase):
         _ = scratch.hold(held / "sub", "until:2099-01-01T0000Z", "test", time.time())
         used = folder(self.rust / "used", 8)
         proc = self.root / "proc"
-        (proc / "12").mkdir(parents=True)
-        (proc / "12" / "cwd").symlink_to(used)
+        _ = process_working_in(proc, 12, used)
         listening = folder(self.rust / "listening", 8)
         server = socket.socket(socket.AF_UNIX)
         self.addCleanup(server.close)

@@ -24,12 +24,15 @@ from typing import IO, cast
 from scripts.lib import conf, lock_holder
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, session_staff
+from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX
 from scripts.agents import worker_lifecycle
 from scripts.agents.stop_results import shutdown_state_root
 
 
 def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot, *,
                resolver: session_staff.RowResolver | None = None) -> tuple[str, Path]:
+    if isinstance(row.launch_folder, staff.SessionLaunchFolder):
+        return row.launch_folder.machine, row.launch_folder.path
     facts = session_staff.RowResolver(record) if resolver is None else resolver
     # A recorded worker folder remains valid for older stopped worker rows.
     tree = row.worktree if isinstance(row.worktree, (staff.PresentWorktree, staff.RemovedWorktree)) else facts.unit_worktree(row)
@@ -38,6 +41,13 @@ def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot, *,
     if row.kind == "unit":
         raise ValueError(f"{row.name}: the staff worktree is unavailable")
     if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        if row.kind == "showrunner" and isinstance(row.doc, staff.LiveDoc):
+            document = facts.production_doc(row)
+            if isinstance(document, session_staff.ProductionDoc):
+                return document.machine, session_staff.enrolled_launch_directory(
+                    document.text.splitlines(), document.path.parent)
+            if row.doc.path.name.endswith(LIVE_DOCUMENT_SUFFIX):
+                raise ValueError(f"{row.name}: {document.reason}")
         return row.doc.machine, row.doc.path.parent
     if row.kind == "producer":
         from scripts.agents import remote
@@ -45,7 +55,7 @@ def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot, *,
         return remote.local_machine(), Path.home()
     document = facts.production_doc(row)
     if isinstance(document, session_staff.ProductionDoc):
-        return document.machine, document.path.parent
+        return document.machine, session_staff.enrolled_launch_directory(document.text.splitlines(), document.path.parent)
     raise ValueError(f"{row.name}: {document.reason}")
 
 
@@ -69,7 +79,7 @@ class RecordBusy(TimeoutError):
 
 
 def record_lock_seconds() -> float:
-    key = "RESTART_RECORD_LOCK_SECONDS"
+    key = "restart_record_lock_seconds"
     config = conf.read_or_repository("shutdown")
     if isinstance(config.settings, dict) and config.effective_key(key) not in config.settings:
         config = conf.read(Path(__file__).resolve().parents[2] / "config" / "shutdown.conf")

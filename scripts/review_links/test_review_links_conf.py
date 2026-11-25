@@ -166,7 +166,8 @@ class ReviewLinksConfTest(unittest.TestCase):
         # The scan must find the keys of the known read forms, or an empty result passes in silence.
         # Each scan branch loses at least one of these keys when it stops working.
         for key in ("server_port", "accounts_page_seconds", "tailscale_timeout_seconds", "card_fade_in_ms",
-                    "later_morning", "later_week_time", "page_delivery_window_seconds", "operator_login"):
+                    "later_morning", "later_week_time", "page_delivery_window_seconds", "operator_login",
+                    "kill.request_bytes"):
             self.assertIn(key, found)
         missing = {key: sorted(places) for key, places in found.items() if key not in rows}
         self.assertEqual(missing, {}, f"{REPOSITORY_FILE} has no row for these keys")

@@ -58,7 +58,7 @@ class RebootTests(unittest.TestCase):
         config = self.root / "config"
         config.mkdir()
         _ = (config / "shutdown.conf").write_text(
-            "REBOOT_LOG_FOLDER=reboot\n# range: 0.001..10\nREBOOT_SPINNER_SECONDS=0.1\n")
+            "reboot_log_folder=reboot\n# range: 0.001..10\nreboot_spinner_seconds=0.1\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(config),
             "USER_ZONE": "UTC",
@@ -284,7 +284,7 @@ else:
         config = self.root / "config" / "shutdown.conf"
         old_logs = self.directory.with_name("old-logs")
         new_logs = self.directory.with_name("new-logs")
-        _ = config.write_text("REBOOT_LOG_FOLDER=old-logs\n# range: 0.001..10\nREBOOT_SPINNER_SECONDS=0.1\n")
+        _ = config.write_text("reboot_log_folder=old-logs\n# range: 0.001..10\nreboot_spinner_seconds=0.1\n")
         old_logs.mkdir(parents=True)
         reboot.Checkpoint(reboot.Step.SERVER).save(old_logs / "reboot.json")
         shutdown_record.save(["alpha"])
@@ -293,7 +293,7 @@ else:
         def server(log: reboot.RunLog) -> None:
             self.assertTrue((self.directory / "reboot.json").is_file())
             self.assertFalse((old_logs / "reboot.json").exists())
-            _ = config.write_text("REBOOT_LOG_FOLDER=new-logs\n# range: 0.001..10\nREBOOT_SPINNER_SECONDS=0.1\n")
+            _ = config.write_text("reboot_log_folder=new-logs\n# range: 0.001..10\nreboot_spinner_seconds=0.1\n")
             with patch.object(os, "getpid", return_value=os.getpid() + 1), redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(shutdown.main(["resume", "alpha"]), 1)
             self.assertEqual(errors.getvalue(), "A reboot is running; wait for it to end.\n")

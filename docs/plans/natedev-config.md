@@ -869,7 +869,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `scripts/production/fixture_conf_keys.py` — the read scan
 - `scripts/production/test_fixture_conf_keys.py` — its tests
 
-**Binds later work:** Phase 24 owns the routed recall gaps F008-F011.
+**Binds later work:** Phase 24 closed the routed recall gaps F008-F011.
 
 **Gotchas:** The scan takes about 10 s on the full tree. It reports `scripts/aws_target/hana_source.py` 106 and 107 on main (List 357 owns that repair).
 
@@ -894,29 +894,41 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Acceptance gate:** no conflict markers; `basedpyright` 0/0/0 on each resolved Python file; the conflict test ids pass by name; `fixture_conf_keys` 0 missing; after combo2 reaches main, a green `copies.py run --affected` of the real join.
 
-### Phase 24 — Read scan recall follow-ups  · status: todo
+### Phase 24 — Read scan recall follow-ups  · status: done
 
-**Depends on:** Phase 22
+#### As-built
+
+- Reader names: a name is a reader when any binding of it in its scope, an enclosing function scope or the module is a reader. `global`, `nonlocal` and comprehension walrus bindings go to the scope Python uses. A rare false report is accepted; a missed read is not.
+- Key-string variables take the last assignment before the call. A loop over a literal adds its strings and keeps the earlier values.
+- Relative imports resolve against the source path's package.
+- Shell: `NAME=value` and redirect words before the command are skipped; the next word is the command, even a shell keyword. An interpreter word (`py`, `python*`) before `conf.py get` is accepted.
+- The scan uses the shared batch helper in `scripts/style/git_process.py`. The helper reads in memory and can report a missing object without stopping the batch; its default mode still refuses a missing object.
+- `docs/production_format.md` step 3 names the shell here-document limit.
+
+**Files:**
+- `scripts/production/fixture_conf_keys.py`, `scripts/production/test_fixture_conf_keys.py`
+- `scripts/style/git_process.py`, `scripts/style/test_git_process.py`
+
+**Gotchas:** The module is about 890 lines. The full scan takes 6-12 s with load.
+
+### Phase 25 — Refuse a removed config key that main still reads  · status: done
+
+**Depends on:** Phase 24
 
 #### Work Order
 
-**Goal:** The Phase 22 read scan finds reads behind branch and closure bindings, relative imports and shell command prefixes, with one shared Git batch helper.
+**Goal:** The main join check exits 1 when the tip removes or renames a config key and a source on main still reads that key. It names the key, the config file and the reading file and line.
 
 **Spec:**
-1. F008 (from Phase 22): a name is a reader in a scope when any binding of the name in that scope is a reader. When the scope does not bind the name, use the nearest enclosing function scope that binds it, then the module. This replaces the statement-order rule. A rare false report is acceptable; a missed read is not.
-2. F009: resolve relative imports against the source path's package. `from ..lib import conf` in `scripts/production/probe.py` is `scripts.lib.conf`.
-3. F010: at shell command position, skip leading `NAME=value` words. Accept `conf.py get` after an interpreter word (last path part `py`, or starts with `python`).
-4. F011: use the batch helper in `scripts/style/git_process.py` for the scan's `git cat-file --batch` work; remove the duplicate code.
-5. Documented limit: a line inside a shell here-document can give a false report. One sentence in `docs/production_format.md` step 3 says so.
+- User words (nate, 12:27 PST via morty): "the item 424 check may refuse a change that removes a config key that code on main still reads, and it names the key and the file." This yes covers this check only. Make no other refusal. Change no config key or value.
+- Refuse a tip read of a removed key (a `RemovedKeyRead` from the phase 22 scan) when the same source path on the base revision also reads that key (same read scan run on the base blob of that source; any line). Such a read is main code that the change leaves broken.
+- A tip read of a removed key that the base source does not read stays report-only. Reads of a key that no config file holds stay report-only.
+- Scan base sources only for sources that have a tip read of a removed key. With no removed key, scan nothing more. The check must stay as fast as today.
+- Output: the refused read line ends with `; main reads it too: refused`. After the summary line, print `config key check: refused <N> reads of a removed key that main still reads` when N > 0. Exit 1 when N > 0 (as for a missing fixture key). The other exit codes do not change.
+- Update the module docstring and `docs/production_format.md` step 3: the check refuses these reads; the rest of the read list is advisory.
 
-**Files:** `scripts/production/fixture_conf_keys.py`, `scripts/production/test_fixture_conf_keys.py`, `docs/production_format.md`.
+**Files:** `scripts/production/fixture_conf_keys.py`, `docs/production_format.md` (impl); `scripts/production/test_fixture_conf_keys.py` (test).
 
-**Workers:** 1 writer + 1 tester — `impl` holds the check and the doc; `test` holds the test module.
-- `impl`: `scripts/production/fixture_conf_keys.py`, `docs/production_format.md`.
-- `test`: `scripts/production/test_fixture_conf_keys.py`, written from this Spec.
+**Workers:** 1 writer + 1 tester. `impl` holds `fixture_conf_keys.py` and the doc; `test` holds `test_fixture_conf_keys.py`.
 
-**Invariants:** as Phase 22.
-
-**State:** none.
-
-**Acceptance gate:** `basedpyright` 0 errors, 0 warnings on the two Python files; the test module ids pass by name; a run on `--base origin/main --tip origin/main` still names `hana_source.py` 106 and 107.
+**Acceptance gate:** basedpyright 0/0 on each changed file; the named tests of `scripts.production.test_fixture_conf_keys` pass; new tests (written first, failing first): a rename whose old key main still reads in an unchanged source is refused with exit 1 and the named line; a reader that the change itself updates is not refused; a removed-key read only in the change's new code is reported, not refused; an absent-key read is not refused. Real case: `--base ca31f2226d~1` style probe not needed; run `--repo . --base origin/main --tip HEAD` and report its output and time.

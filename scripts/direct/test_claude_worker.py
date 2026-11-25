@@ -11,7 +11,10 @@ from pathlib import Path
 import subprocess
 import sys
 import signal
+import tempfile
+import time
 from typing import cast, override
+import unittest
 from unittest.mock import patch
 
 from scripts.lib.helper_tree_test_support import copy_helpers
@@ -131,6 +134,21 @@ class ClaudeWorkerFixture:
     sent: Path
     registry: Path
     environment: dict[str, str]
+
+
+class ClaudeTurnWaitTests(unittest.TestCase):
+    def test_wait_uses_the_configured_poll_interval(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = (root / "direct.conf").write_text("claude_worker_poll_secs=0.25\n")
+        turn = claude_worker.ClaudeTurn("fixture", root, root, root / "prompt",
+            root / "summary", root / "log", "", "", "", "", False,
+            {"CONF_DIR": str(root), "CLAUDE_BIN": "fixture-claude"})
+        delivered = claude_worker.Delivered("fixture-native", claude_worker.TurnsNotCounted())
+        with (patch.object(claude_worker, "_status", side_effect=["busy", "idle"]),
+              patch.object(claude_worker, "_refresh_log"),
+              patch.object(time, "sleep") as delay):
+            self.assertEqual(claude_worker.wait_for_turn(turn, delivered), 0)
+        delay.assert_called_once_with(0.25)
 
 
 class NativeClaudeWorkerTests(StaffTestCase):

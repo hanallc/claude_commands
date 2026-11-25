@@ -1526,7 +1526,7 @@ QUOTA_PANEL = ('<div class="quota-panel" id="quota-panel" role="dialog" aria-lab
                + '<strong id="quota-title"></strong><p data-quota-description></p>'
                + '<button type="button" data-quota-clear>Clear</button></div>')
 
-SCRIPT = page_frame.REFRESH_SCRIPT + r"""(() => {
+SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.ACTION_STATUS_SCRIPT + r"""(() => {
 let view = document.querySelector('[data-accounts]');
 let newestRequest = 0;
 const modelTooltip=document.querySelector('.model-tooltip');
@@ -1843,7 +1843,7 @@ async function publish(save){
    paint(save.key,save.oldColor);
    if(selected?.dataset.colorKey===save.key){picker.value=pickerColor(selected,save.oldColor);readHex();}
   }
-  message.textContent=save.name+': '+(unknown || error.message || 'The color could not be saved.');message.hidden=false;
+  showActionFailure(message,save.name+': '+(unknown || error.message || 'The color could not be saved.'));
  }finally{
   pending.shift();pendingSaves.delete(save);
   const next=pending[0];
@@ -1858,7 +1858,7 @@ popup.querySelector('[data-color-save]').addEventListener('click',()=>{
  const button=selected,key=button.dataset.colorKey,pending=queue(key);
  const save={key,name:button.dataset.colorName,value:picker.value,oldColor:button.dataset.savedColor};
  paint(key,save.value);pending.push(save);pendingSaves.add(save);
- message.textContent='';message.hidden=true;close(false);
+ showActionFailure(message);close(false);
  if(pending.length===1) void publish(save);
 });
 addEventListener('resize',position);addEventListener('scroll',position,{passive:true});
@@ -1960,7 +1960,7 @@ async function saveMove(form,button=null){
  const save={form};
  const fallback=button ? document.querySelector('main').dataset.retryFailure : 'The move could not be saved.';
  if(button){button.disabled=true;updates.abandon();}
- pendingMoves.add(save);message.textContent='';message.hidden=true;
+ pendingMoves.add(save);showActionFailure(message);
  try{
   const response=await fetch(location.pathname,{method:'POST',signal:pageRequestSignal(),
    headers:{'Content-Type':'application/x-www-form-urlencoded'},
@@ -1970,8 +1970,7 @@ async function saveMove(form,button=null){
    throw new Error(button ? fallback : result.reason || fallback);
   }
  }catch(error){
-  message.textContent=button ? fallback : form.group+': '+(saveTimeoutWords(error) || error.message || fallback);
-  message.hidden=false;
+  showActionFailure(message,button ? fallback : form.group+': '+(saveTimeoutWords(error) || error.message || fallback));
  }finally{
   if(button) button.disabled=false;
   pendingMoves.delete(save);updates.changed();
@@ -2080,7 +2079,7 @@ document.addEventListener('keydown',event=>{
 quotaClear.addEventListener('click',async()=>{
  if(!quotaButton || quotaSaving) return;
  const button=quotaButton, {quotaAccount,quotaLevel,quotaReset}=button.dataset;
- quotaSaving=true;quotaClear.disabled=true;message.hidden=true;updates.abandon();
+ quotaSaving=true;quotaClear.disabled=true;showActionFailure(message);updates.abandon();
  try{
   const response=await fetch(location.pathname,{method:'POST',signal:pageRequestSignal(),
    headers:{'Content-Type':'application/x-www-form-urlencoded'},
@@ -2095,7 +2094,7 @@ quotaClear.addEventListener('click',async()=>{
   if(hadFocus){cell.tabIndex=-1;cell.focus({preventScroll:true});}
   window.parent.postMessage('accounts-quota-cleared',location.origin);
  }catch(error){
-  message.textContent=saveTimeoutWords(error) || error.message || 'The quota alert could not be cleared.';message.hidden=false;
+  showActionFailure(message,saveTimeoutWords(error) || error.message || 'The quota alert could not be cleared.');
  }finally{
   quotaSaving=false;quotaClear.disabled=false;updates.changed();
   if(!hold()) void updates.refresh(true);

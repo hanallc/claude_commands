@@ -5154,6 +5154,8 @@ def role_color(group: str, colors: Mapping[str, str]) -> StaffRoleColor | NoAcco
 
 def staff_role_color(member: staff.StaffRow, colors: Mapping[str, str]) -> StaffRoleColor | NoAccountColor:
     """Resolve the staff kind through the Accounts role keys and color parser."""
+    if member.kind == "session":
+        return NoAccountColor()
     return role_color("units" if member.kind == "unit" else member.kind + "s", colors)
 
 

@@ -80,7 +80,7 @@ def card(item: investigation.Investigation, root: Path, members: staff.StaffSnap
                     + f'<input type="hidden" name="owner" value="{html.escape(item.owner, quote=True)}">'
                     + f'<input type="hidden" name="id" value="{item.id}">'
                     + f'<input type="hidden" name="token" value="{request_token(root, item.owner, item.id)}">'
-                    + '<button>Mark read</button><span role="status" data-save-status></span></form>')
+                    + '<button>Mark read</button><span role="status" data-save-status hidden></span></form>')
     elif item.state == investigation.InvestigationState.OPEN:
         content += '<p>Waiting for an answer</p>'
     content += '<dl class="change-details">' + ''.join(
@@ -135,7 +135,7 @@ STYLE = '''<style>[hidden]{display:none!important}
 [data-read-form]{display:flex;align-items:center;gap:8px}[data-read-form] button{margin:0}
 </style>'''
 
-SCRIPT = page_frame.REFRESH_SCRIPT + r'''(() => {
+SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.ACTION_STATUS_SCRIPT + r'''(() => {
 let content=document.querySelector('[data-investigations]'), sending=0, active=false, generation=0;
 const start=new URLSearchParams(location.hash.slice(1));
 let owner=start.get('owner') || '', show=start.get('show') || 'not-read';
@@ -160,7 +160,7 @@ function bind(){
   event.preventDefault();if(form.dataset.sending) return;
   form.dataset.sending='true';sending++;generation++;active=false;pageRefresh.abandon();
   const status=form.querySelector('[data-save-status]'), button=form.querySelector('button');
-  button.disabled=true;status.textContent='';let saved=false;
+  button.disabled=true;showActionFailure(status);let saved=false;
   try{
    const response=await fetch(location.pathname,{method:'POST',signal:pageRequestSignal(),
     body:new URLSearchParams(new FormData(form))});
@@ -169,7 +169,7 @@ function bind(){
    card.dataset.state='read';form.remove();
    const firstRead=[...list.children].find(other=>other!==card && other.dataset.state==='read');
    list.insertBefore(card,firstRead || null);apply();saved=true;
-  }catch(error){status.textContent=saveTimeoutWords(error) || 'Not saved: '+error.message;button.disabled=false;}
+  }catch(error){showActionFailure(status,saveTimeoutWords(error) || 'Not saved: '+error.message);button.disabled=false;}
   finally{delete form.dataset.sending;sending--;pageRefresh.changed();if(saved) void pageRefresh.refresh(true);}
  }));
 }

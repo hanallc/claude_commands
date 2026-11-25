@@ -52,7 +52,7 @@ class DiskTests(unittest.TestCase):
         # snapshot() walks SCCACHE_DIR as one more folder; the host's real cache must stay out of the test.
         _ = os.environ.pop("SCCACHE_DIR", None)
         _ = write_config_fixture(root / "buildlog.conf",
-                                 "DISK_WALK_MINUTES=60\nDISK_WALK_HOUR=3\n"
+                                 "disk_walk_minutes=60\ndisk_walk_hour=3\n"
                                  + "# whole: 1..\ndisk.min_outside_directory_bytes=1073741824\n")
 
     def set_outside_minimum(self, minimum: int) -> None:

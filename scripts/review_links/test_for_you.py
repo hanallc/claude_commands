@@ -7,7 +7,7 @@ import subprocess
 from subprocess import run as run_fixture_git
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, cast, override
@@ -54,9 +54,11 @@ class ForYouTests(unittest.TestCase):
         _ = self.enterContext(patch("scripts.accounts.accounts.role_colors", return_value={}))
         _ = self.enterContext(patch("subprocess.run", side_effect=AssertionError("The reader executed a command.")))
 
-    def write_comparison(self, machines: str = "", due: str = "9999999999") -> None:
+    def write_comparison(self, machines: str = "", due: str = "9999999999", *,
+                         running_paths: dict[str, str] | None = None) -> None:
         details = {"commit": "a" * 40, "source": [str(self.root / "nixos"), "main", "natedev", "MacBook-Pro"],
                    "natedev": "/nix/store/expected-linux", "mac": "/nix/store/expected-mac",
+                   "running_system_paths": running_paths or {},
                    "running_system_probes": {"natedev": True, "mac": True}}
         _ = self.cache.write_text(f"{machines}\n{due}\n\n{json.dumps(details)}\n", encoding="utf-8")
 
@@ -122,12 +124,20 @@ class ForYouTests(unittest.TestCase):
         self.assertEqual(snapshot.open_count, for_you.KnownOpenCount(2))
 
     def test_current_comparison_alone_creates_open_machine_row(self) -> None:
-        self.write_comparison("rebuild mac")
+        running = "/nix/store/running-mac"
+        self.write_comparison("rebuild mac", running_paths={"mac": running})
+        changes = rebuild_row.changes_path(self.cache)
+        self.assertEqual(self.read().rows[0].reason, rebuild_row.CHANGES_NOT_READ)
+        at = "2026-11-21T12:00:00Z"
+        commits = (rebuild_row.Change("a" * 40, at, "Update the editor", ""),
+                   rebuild_row.Change("c" * 40, at, "Update the shell", ""))
+        comparison = rebuild_row.ComparedChanges(running, "b" * 40, "a" * 40, commits)
+        _ = changes.write_text(json.dumps({"mac": asdict(comparison)}), encoding="utf-8")
         snapshot = self.read()
         self.assertEqual(snapshot.rows[0].key, "rebuild/mac")
         self.assertEqual(snapshot.rows[0].status, "open")
         self.assertEqual(snapshot.rows[0].requests, ())
-        self.assertEqual(snapshot.rows[0].reason, "")
+        self.assertEqual(snapshot.rows[0].reason, "Update the editor · Update the shell")
         self.assertEqual(snapshot.rows[0].created_at, "")
         self.assertEqual(snapshot.open_count, for_you.KnownOpenCount(1))
 
@@ -162,7 +172,7 @@ class ForYouTests(unittest.TestCase):
         _ = source.write_text(json.dumps(value))
         row, = self.read().rows
         members = staff.snapshot()
-        inputs = review_page.ReviewBodyInputs(change_page.ReviewBrowser("fixture"), members, 4, "",
+        inputs = review_page.ReviewBodyInputs(change_page.ReviewBrowser("fixture"), members, 4,
                                               {}, ZoneInfo("America/Los_Angeles"), staff_names.StaffNames(members))
         markup = review_page.details(review_items.for_you_item(row, members), inputs)
         self.assertIn("<h3>Why</h3>", markup)
@@ -241,7 +251,7 @@ class ForYouTests(unittest.TestCase):
         def run(command: list[str], *, timeout: int = 30) -> str:
             _ = timeout
             if command[0] == "git":
-                if command[3] == "rev-parse":
+                if command[3] == "show":
                     return configured
                 self.assertEqual(command[-1], f"{switched}..{configured}")
                 result = subprocess.CompletedProcess(command, 0, listing + "\n", "")
@@ -257,7 +267,7 @@ class ForYouTests(unittest.TestCase):
         rebuild_row.write(self.config, run, clock=lambda: 9_999_999_900)
         rebuild_row.write_changes(self.config, run)
 
-    def test_comparison_does_not_use_commit_titles_as_reasons(self) -> None:
+    def test_comparison_uses_commit_subjects_after_a_need_completes(self) -> None:
         _ = self.complete_need()
         at = "2026-11-21T12:00:00Z"
         self.refresh_with_revision_history(
@@ -266,7 +276,7 @@ class ForYouTests(unittest.TestCase):
         row, = self.read().rows
         self.assertEqual(row.status, "open")
         self.assertEqual(row.requested_by, "")
-        self.assertEqual(row.reason, "")
+        self.assertEqual(row.reason, "Update the editor · Update the shell")
         self.assertEqual(row.requests, ())
         self.assertEqual(row.evidence, "")
 
@@ -296,8 +306,8 @@ class ForYouTests(unittest.TestCase):
         def run(command: list[str], *, timeout: int = 30) -> str:
             _ = timeout
             match command[0], command[3] if len(command) > 3 else "":
-                case "git", "rev-parse":
-                    return configured
+                case "git", "show":
+                    return "" if "--name-only" in command else configured
                 case "git", "merge-base":
                     commit, revision = command[-2:]
                     checked.append((commit, revision))
@@ -344,7 +354,7 @@ class ForYouTests(unittest.TestCase):
         def run(command: list[str], *, timeout: int = 30) -> str:
             _ = timeout
             if command[0] == "git":
-                self.assertEqual(command[3], "rev-parse")
+                self.assertEqual(command[3], "show")
                 return commit
             if command[0] == "nix":
                 return json.dumps({"natedev": running, "mac": mac})
@@ -364,7 +374,7 @@ class ForYouTests(unittest.TestCase):
         self.assertEqual([request.reason for request in row.requests], ["Show the build result."])
         self.assertEqual(need.read_completed_needs(), ())
         names = staff.snapshot()
-        inputs = review_page.ReviewBodyInputs(change_page.ReviewBrowser("fixture"), names, 4, "",
+        inputs = review_page.ReviewBodyInputs(change_page.ReviewBrowser("fixture"), names, 4,
                                               {}, ZoneInfo("America/Los_Angeles"), staff_names.StaffNames(names))
         markup = review_page.details(review_items.for_you_item(row, names), inputs)
         self.assertIn("The running revision is unknown.", markup)
@@ -387,7 +397,7 @@ class ForYouTests(unittest.TestCase):
     def test_rebuilds_lists_changes_after_a_dirty_switch(self) -> None:
         self.refresh_with_revision_history(
             f"{'87bbeb2' + '0' * 33}\x1f2026-11-21T12:00:00Z\x1fUpdate the editor\x1f", dirty=True)
-        body = change_browser.rebuild_list(rebuild_row.read(self.config), rebuild_row.read_changes(self.config),
+        body = change_browser.rebuild_list(rebuild_row.read(self.config), rebuild_row.read_recorded_changes(self.config),
                                            staff.snapshot())
         self.assertIn('<article data-machine="natedev"><h2>Rebuild natedev</h2>', body)
         self.assertIn("<h3>Commits</h3>", body)
@@ -431,6 +441,7 @@ class ForYouTests(unittest.TestCase):
             with self.subTest(comparison=comparison):
                 row, = for_you.read(self.config, rebuild=comparison).rows
                 self.assertEqual(row.running_revision, "")
+                self.assertEqual(row.reason, rebuild_row.CHANGES_NOT_READ)
 
     def test_stale_comparison_never_proves_completion(self) -> None:
         need.add_need("natedev", "c" * 40, "Show the build result.", "console", "staff-a")

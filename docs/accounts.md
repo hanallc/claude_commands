@@ -730,7 +730,8 @@ At that reset, new launches use the default account.
 The Mac uses its last saved map when natedev is offline.
 A launch reports an error when no usable map exists.
 Bare `claude` keeps the caller or showrunners account.
-Subagents use their Claude session's account.
+An enrolled showrunner uses the worker account for read-only helpers.
+Before enrollment, built-in Claude helpers use the parent session's account.
 Only the first workers entry runs on natedev, before the zero policy.
 The selected account needs a fresh reading at or below the entry's percentage.
 A Codex target needs a fresh reading above that threshold and no unresolved quota refusal.
@@ -741,7 +742,7 @@ Each session attempt has its own `move_id`, with a request and one confirmed or 
 The request uses the session process account as its source.
 Saved launch settings cannot replace the requested destination account.
 The notes timer delegates moves to a detached batch before it stops any session.
-Each session moves at once, also when it owns a live build step, a queued run or a verify call.
+Each session moves at once, even if it owns a live build step, a queued run, or a verify call.
 The resumed session must do its interrupted work again.
 The batch records each outcome when its resume and existing stay observation finish.
 A failed resume uses the existing move failure report to tell the showrunners.

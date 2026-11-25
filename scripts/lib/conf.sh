@@ -16,12 +16,26 @@ source "$_CONF_LIB/conf_record.sh"
 if [[ -r /proc/sys/kernel/hostname ]]; then
     IFS= read -r _CONF_HOST < /proc/sys/kernel/hostname
 else
-    _CONF_HOST="$(uname -n)"
+    _CONF_HOST="$(uname -n)" || return
 fi
 _CONF_HOST="${_CONF_HOST%%.*}"
+if [[ "$_CONF_HOST" == *[[:upper:]]* ]]; then
+    if [[ -n "${ZSH_VERSION:-}" ]]; then
+        # shellcheck disable=SC2296 # zsh converts the host name to lower case.
+        _CONF_HOST="${(L)_CONF_HOST}"
+    elif (( BASH_VERSINFO[0] >= 4 )); then
+        _CONF_HOST="${_CONF_HOST,,}"
+    else
+        _CONF_HOST="$(printf '%s' "$_CONF_HOST" | LC_ALL=C tr '[:upper:]' '[:lower:]')" || return
+    fi
+fi
 
 conf_value() {
     local file="$1" key="$2" folder="${CONF_DIR:-$HOME/.claude/config}"
+    if [[ "$key" == *[[:upper:]]* ]]; then
+        printf 'conf_value: configuration key %q must be lower case\n' "$key" >&2
+        return 2
+    fi
     conf_record "$file"
     local raw line name value previous="" limit=""
     local base="" base_limit="" host_value="" host_limit="" base_seen=0 host_seen=0 found=0

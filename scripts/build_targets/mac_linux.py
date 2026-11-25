@@ -36,7 +36,7 @@ from threading import Thread
 from time import monotonic, sleep, time
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final
 from urllib.parse import urlsplit
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from scripts.aws_target import gate_box, ledger
 from scripts.build_queue import execution_identity
@@ -275,7 +275,7 @@ def consume_launch_permission(launch: GuestLaunchRecovery,
         if isinstance(permission.permission, placement.PermissionConsumed):
             raise GuestPermissionUnknown(reason, reference)
         raise GuestTookNoRun(reason)
-    return reference
+    return permission.claim
 
 
 @dataclass
@@ -292,7 +292,7 @@ class GuestGateDispatch:
 
 
 class GuestRunRequest(TypedDict):
-    """The fields of each guest request: the attempt, the commit to copy and the unit that owns the copy."""
+    """Each guest request names the attempt, the source commit, and the copy owner."""
     attempt: str
     commit: str
     tree: str
@@ -1791,7 +1791,7 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
     def send(deadline: float, timeout: float) -> None:
         report_guest_start(armed, dispatch, deadline=deadline, timeout=timeout, folder_payload=folder_payload)
 
-    # A Folder report can run through stream processing and cleanup. Collect it before reporting completion.
+    # Collect the Folder report after the stream ends and before the completion report.
     _start_guest_queue_report(send, transfer_deadline, dispatch.folder_start_reports if folder_payload else reports,
                               warn_guest_report, collect_in_background=bool(folder_payload))
 
@@ -2391,9 +2391,9 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
     A None module limit uses the configured full-run limit.
     """
     from scripts.aws_target import cloud_gate
-    from scripts.build_queue import mac_run, placement
-    from scripts.build_queue.admission_client import step_identity
+    from scripts.build_queue import admission_records, mac_run, placement
     from scripts.build_queue.execution_identity import attempt_key
+    from scripts.build_queue.snapshot_codec import UNKNOWN_CALLER
     from scripts.production import gate
 
     dispatch: GuestGateDispatch | None = None
@@ -2452,9 +2452,15 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         repo = repo.resolve()
         unit = gate_job.unit if isinstance(gate_job, StepJob) else ''
         if not unit:
-            unit = step_identity(mode.value, str(repo)).unit
-        if not unit:
-            raise GuestUnavailable('the gate has no owner unit for a numbered copy')
+            owner = admission_records.request_owner(str(repo))
+            unit = owner.unit
+            if not unit:
+                if (isinstance(owner, admission_records.OwnerNotGiven)
+                        or (owner.name == UNKNOWN_CALLER and not owner.session_id)):
+                    raise GuestUnavailable('the gate has no owner unit for a numbered copy')
+                name = owner.session_id if owner.name == UNKNOWN_CALLER else owner.name
+                # Staff names cannot be canonical UUIDs.
+                unit = str(uuid5(NAMESPACE_URL, f'{TARGET}:gate-copy-owner:{name}'))
         source = candidate_source(repo, selected)
         relative_type_dirs = [(repo / name).resolve().relative_to(repo).as_posix() for name in type_dirs]
         guest_attempt = _placed_guest_attempt(attempt_key(assignment.episode, assignment.attempt))

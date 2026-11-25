@@ -90,7 +90,7 @@ The showrunner staff row gives its path. The row's `name` is the production name
 
 - **Source plans:** <path(s)> — split on <date> by /producer:to_production
 - **Repository:** <main checkout path>
-- **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
+- **Merge branch:** `<branch>` — every unit merges here
 - **Kind:** style — optional; absent means a product production. A style production
   reads `~/.claude/docs/style_production.md`
 - **Branch point:** `<branch>` — style productions only: the parent's merge branch
@@ -98,8 +98,9 @@ The showrunner staff row gives its path. The row's `name` is the production name
 - **Parent production:** <path to parent production doc> — style productions only:
   the hand-off destination and the doc used to merge hand-offs while a root
 - **Showrunner checkout:** <path, on the merge branch>
+- **Merge checkout:** <absolute main checkout path> — add for an enrolled production
 - **Log:** <repo-relative path> — git-excluded; one line per event
-- **Merge tests:** <backticked commands for the showrunner checkout on every merge,
+- **Merge tests:** <backticked commands for the integration checkout on every merge,
   in addition to the changed packages' tests. The nightly run checks types.
   Exclude type checks from Merge tests.
   Use `bash ~/.claude/scripts/direct/verify.sh test app`, for example.
@@ -178,6 +179,15 @@ Direct units use `style_sync.py` for normal main merges; see `docs/style_product
 - <standing rules the user set for this production or project, each with its
   source; omit the section if none>
 ```
+
+An enrolled production uses `Repository` for the showrunner session directory.
+`Merge checkout` names the same main checkout as an absolute path.
+`Showrunner checkout` names the integration worktree on `Merge branch`.
+The serving merge unit uses a separate staging worktree.
+The live production document uses the name `<old-stem>-live.md`.
+Resolve its relative `Log` path from the main checkout.
+Keep both files and the production notes untracked and ignored.
+A document without `Merge checkout` uses the legacy layout.
 
 A production doc has no list of units. A unit is its staff row.
 The row gives its name, parent and worktree; git there gives the repository and branch.
@@ -285,8 +295,11 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    3. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/fixture_conf_keys.py --repo ~/.claude --base origin/main --tip <join>`.
       It names each literal test fixture of a config file that lacks a key
       the row adds. Add the key to each named fixture.
-      It reports reads of removed keys and keys that no config file holds.
-      It counts sources that it cannot scan. The advisory scan does not block the join.
+      It refuses matching literal file and key reads of a removed key in the same source on main and tip, with other reads advisory.
+      A Python loader needs one positional string literal and no keyword arguments to qualify for refusal.
+      A shell source with a `conf_value` function definition stays advisory.
+      It counts tip sources that it cannot scan.
+      A line inside a shell here-document can cause a false advisory report.
 
    Send the notice only when both runs are green. Name the join hash and both
    results in it.

@@ -1,6 +1,11 @@
 """Keep local Claude messages while a review is open."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
+import argparse
 import fcntl
 import hashlib
 import json
@@ -13,6 +18,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from time import time
 from typing import cast
 
 from scripts.lib import conf
@@ -493,10 +499,10 @@ def record_user_prompt(session: str, at: float, emit: Callable[[str], None], *,
             write_text_atomic(path.with_suffix(".prompt"), repr(at), new_file_mode=0o600)
             if isinstance(state.last_activity, EndedReview):
                 held = _reserve(path, state, delivery)
-                # The user is back in a review with open items, so the hold starts again.
-                # A release in transport passes the open hold by its notice; messages it left wait for the hold end.
                 if _read_count(count) and _enabled(conf.read("send")):
-                    _write_state(path, replace(_read_state(count, path), last_activity=at, release_pending=False))
+                    # Restart the hold and keep any release requested before this prompt.
+                    _write_state(path, replace(_read_state(count, path), last_activity=at,
+                                               release_pending=state.release_pending))
             else:
                 held = ()
         _emit_saved(count, path, held, at, emit, record_keys)
@@ -512,20 +518,32 @@ def deliver_if_disabled(session: str, at: float, emit: Callable[[str], None], *,
         _deliver_saved(session, at, emit, record_keys)
 
 
-def _deliver_saved(session: str, at: float, emit: Callable[[str], None], record_keys: RecordReleasedKeys) -> None:
+def _deliver_saved(session: str, at: float, emit: Callable[[str], None], record_keys: RecordReleasedKeys, *,
+                   end_now: bool = False) -> None:
     count = _count_file(session)
     path = _state_file(count)
-    if not path.exists():
+    notice = "No review hold is open."
+    if not (path.exists() or (end_now and count.exists())):
+        if end_now:
+            emit(notice)
         return
     with ExitStack() as delivery:
+        held: tuple[ReviewMessage, ...] = ()
         with _locked(path):
             state = _read_state(count, path)
-            if not (state.messages or state.reserved):
+            has_messages = bool(state.messages or state.reserved)
+            if not end_now and not has_messages:
                 return
-            if _hold_open(count, state, at, conf.read("send")):
+            hold_open = _hold_open(count, state, at, conf.read("send"))
+            if hold_open and not end_now:
                 return
-            held = _reserve(path, _end_review(path, state), delivery)
-        _emit_saved(count, path, held, at, emit, record_keys)
+            if has_messages or hold_open:
+                held = _reserve(path, _end_review(path, state), delivery)
+                notice = "A release of held messages is in progress." if has_messages else "No messages were held."
+        if held:
+            _emit_saved(count, path, held, at, emit, record_keys)
+        elif end_now:
+            emit(notice)
 
 
 @contextmanager
@@ -583,3 +601,25 @@ def route(session: str, message: ReviewMessage, *, urgent: bool,
                     yield batch
                     return
     yield ReleasedMessages(())
+
+
+def main(argv: list[str] | None = None) -> int:
+    from scripts.hooks import review_hold_delivery
+
+    parser = argparse.ArgumentParser(description="End the current review hold and release its messages.")
+    _ = parser.add_argument("command", choices=("end-now",))
+    _ = parser.parse_args(argv)
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not session:
+        parser.error("CLAUDE_CODE_SESSION_ID is required")
+    try:
+        _deliver_saved(session, time(), lambda notice: print(notice, flush=True),
+                       review_hold_delivery.record_keys, end_now=True)
+    except (OSError, ValueError) as error:
+        print(f"review hold: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

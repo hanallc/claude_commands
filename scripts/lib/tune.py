@@ -14,7 +14,6 @@ import re
 import sys
 
 from scripts.lib import conf, live_settings, main_publish
-from scripts.lib.conf import Unusable
 from scripts.build_hold.override_guard import refuse_overrides
 
 SUBJECT = "tune("
@@ -91,7 +90,7 @@ def main(arguments: list[str] | None = None) -> int:
         return change(args)
     except SystemExit as error:
         return error.code if isinstance(error.code, int) else 2
-    except (Unusable, main_publish.Refusal, OSError, UnicodeError) as error:
+    except (conf.InvalidKey, conf.Unusable, main_publish.Refusal, OSError, UnicodeError) as error:
         print(f"tune: {error}", file=sys.stderr)
         return 2
 
