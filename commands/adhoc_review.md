@@ -18,13 +18,15 @@ Run `~/.claude/scripts/adhoc_review/shared_review.py` with `~/.claude/scripts/li
 Pass the returned `owner` and `review` IDs as `OWNER REVIEW`.
 For `/adhoc_review join bob`, run `join bob` on the owner's machine.
 
+Apply `remaining` from `join` with the Step 3 status command.
+
 1. Run `show OWNER REVIEW` before each item to read the decisions.
 2. Run `next OWNER REVIEW` to claim an item. Use `--item N` to revisit one.
-3. On `busy`, say another session holds the remaining items. Wait for the user to continue.
-4. On `complete`, stop the walk.
-5. Apply Step 3.5 when needed. Use the split, explanation, and choice instructions in Step 4.
-6. Run `record OWNER REVIEW ITEM DECISION --actions ACTIONS` after a decision. Record `Skipped` if the user skips.
-7. Use the returned `remaining` for this session's count. Apply the status line rules below.
+3. Apply `remaining` from `next` before you handle the result, including `busy` or `complete`.
+4. On `busy`, say another session holds the remaining items. Wait for the user to continue.
+5. On `complete`, proceed to `leave` below.
+6. Apply Step 3.5 when needed. Use the split, explanation, and choice instructions in Step 4.
+7. Run `record OWNER REVIEW ITEM DECISION --actions ACTIONS` after a decision. Record `Skipped` if the user skips. Apply `remaining`.
 8. Run `leave OWNER REVIEW` when you stop. Skip it if the owner ended the review.
 9. Set this session's count to zero. Use the held message steps in Step 5.
 
@@ -53,8 +55,9 @@ Ask first only when an obvious doc is in scope that the user did not name, a fil
 
 Wait for that answer before continuing. Never write "existing path": name the doc. If the user names a path that doesn't exist, create it with the same one-line header.
 
-Run `start --source SOURCE --items -` without adding a user-facing step.
-Pass the full item texts as a JSON array on stdin. Keep the returned IDs.
+Try `start --source SOURCE --items -` with the full item texts as a JSON array on stdin.
+Enable sharing only after `start` returns the review IDs.
+If `start` fails, continue the solo review silently. Use shared commands only when sharing is active.
 
 ## Step 3: Build the todo list
 
@@ -106,16 +109,17 @@ turns.
 
 ## Step 4: Walk the list
 
-Run `claim OWNER REVIEW` before you open each task. Use `show OWNER REVIEW` to read decisions from joined sessions.
-Copy their decisions into the decision document and mark their tasks complete.
-Use the claimed item for the next task. On `busy`, wait for the user to continue.
+For a shared review, run `claim OWNER REVIEW` before you open each task.
+Reconcile tasks by stable ID in the returned `items` order. Add new tasks and update changed texts.
+Copy joined decisions into the decision document and mark their tasks complete.
+Open the task for the claimed item ID. On `busy`, wait for the user to continue.
 On `complete`, go to Step 5.
 
 For each item, in order:
 
 1. Mark the task `in_progress`.
 2. Check that the item contains **one decision**. If it contains independent questions, split them into ordered subitems, preserve the original ID as their prefix, update the task list, and present only the first.
-   If you split the item, run `split OWNER REVIEW ITEM SUBITEM1 SUBITEM2 ...` before you show the first subitem.
+   In a shared review, save the split with `split OWNER REVIEW ITEM SUBITEM1 SUBITEM2 ...` before you show it.
    Keep the original task ID prefix in each subitem's text.
 3. Build the causal explanation with the shared file's build order. Then use its **Ad hoc review items** template.
 4. When a subagent or worker prepares items, give it the shared guide, the user's own words for the request, and the text the user sees on screen.
@@ -128,7 +132,7 @@ For each item, in order:
    - If the user proposes a modification, restate only the revised decision, update the recommendation or example as needed, and wait for explicit acknowledgment before recording it.
 7. Accept a terse reply such as `okay` or `continue` when it clearly selects a terminal choice. Record the decision and any pending actions. Mark the task `completed` and continue to the next item.
 
-   Mirror each decision or skip in the shared record with `decide OWNER REVIEW ITEM DECISION --actions ACTIONS`.
+   When sharing, mirror each decision or skip with `decide OWNER REVIEW ITEM DECISION --actions ACTIONS`.
 
 Do not ask "continue or add more?" between items — assume continue unless the user volunteers something.
 
@@ -148,7 +152,13 @@ Run it again when the user returns to a closed item; include that item in the co
 
 ## Step 5: Wrap up
 
-Run `end OWNER REVIEW` as the owner. Copy any final decisions from joined sessions into the decision document.
+For a shared review, run these steps as the owner:
+
+1. Run `end OWNER REVIEW` to close claims and read the final decisions.
+2. Save those decisions in the decision document. Update existing entries by item ID.
+3. Run `finish OWNER REVIEW` after the save succeeds.
+
+If wrap-up stops, use `resume` to recover the IDs. If it returns `closing`, repeat these steps.
 
 Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" 0` when the review ends, including an early end.
 The command output names the held messages file. Read the file at your own pace.
@@ -175,8 +185,9 @@ When every item is done:
 - Put a number that the decision depends on in the point or the first fact line, with its unit.
 - An item that asks the user to approve a new thing (a type, a command, a setting, a page) says in one line what exists today that is nearest to it, and why that does not do the job. Check this before you show the item.
 - If the user says skip, use a supported skipped/cancelled terminal status; if none exists, mark it completed with the skip noted. Then move on without arguing.
-- If they want to revisit an earlier item, jump back. Don't insist on linear order. Use `claim OWNER REVIEW --item N` as owner or `next OWNER REVIEW --item N` after joining.
+- If they want to revisit an earlier item, jump back. Don't insist on linear order.
+  When sharing, use `claim OWNER REVIEW --item N` as owner or `next OWNER REVIEW --item N` after joining.
 - An explanation request never suspends the one-at-a-time rhythm.
 - If the review maintains a decision ledger, update it only after acknowledgment and leave undecided decision cells blank. Show it after each acknowledgment only when the user requested a running ledger; otherwise show it at wrap-up.
 - When the user adds a later review item, record it without forcing an immediate decision; place it after any prerequisites they named.
-  Use `add OWNER REVIEW TEXT`. Pass `--after N` to place the new item after its last prerequisite.
+  When sharing, use `add OWNER REVIEW TEXT`. Pass `--after N` to place the new item after its last prerequisite.

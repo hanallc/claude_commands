@@ -21,7 +21,7 @@ from scripts.adhoc_review import shared_review
 from scripts.copies.copies_test_support import copies_environment
 from scripts.lib import scratch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.message import sessions
+from scripts.message import session_records, sessions
 from scripts.production import staff
 
 
@@ -48,16 +48,15 @@ class SharedReviewTests(unittest.TestCase):
               patch.object(scratch, "maker", return_value="")):
             self.home = scratch.new("gate:adhoc-review-test", "review")
         self.liveness = {
-            identity: sessions.LiveSessionProcess(pid) for identity, pid in PIDS.items()
+            identity: sessions.LiveSessionProcess(pid, self.process_start(pid)) for identity, pid in PIDS.items()
         }
-        self.processes = {pid: sessions.LiveSessionProcess(pid) for pid in PIDS.values()}
+        self.processes = {pid: sessions.LiveSessionProcess(pid, self.process_start(pid)) for pid in PIDS.values()}
         named_owner = staff.StaffRow(staff.StaffId(OWNER), "showrunner", "bob", staff.StaffRoot(),
                                      current_session=staff.StaffId(OWNER))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)})))
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((named_owner,))))
         _ = self.enterContext(patch.object(sessions, "read_registry", return_value=sessions.RegistryRead((), ())))
         _ = self.enterContext(patch.object(sessions, "session_liveness", side_effect=self.observe_registry))
-        _ = self.enterContext(patch.object(sessions, "process_start", side_effect=self.process_start))
         _ = self.enterContext(patch.object(sessions, "process_liveness", side_effect=self.observe_process))
 
     def process_start(self, pid: int) -> str:
@@ -128,10 +127,11 @@ class SharedReviewTests(unittest.TestCase):
         handle = (review["owner"], review["review"])
         _ = self.cli(CLONE, "join", "bob")
         self.assertEqual(json.loads(self.cli(CLONE, "next", *handle))["item"], 1)
+        busy = {"state": "busy", "remaining": 1, "items": [{"item": 1, "text": "first"}]}
         self.liveness[CLONE] = sessions.SessionLivenessUnknown("fixture registry is unreadable")
-        self.assertEqual(json.loads(self.cli(OWNER, "claim", *handle)), {"state": "busy", "remaining": 1})
+        self.assertEqual(json.loads(self.cli(OWNER, "claim", *handle)), busy)
         self.liveness[CLONE] = sessions.SessionNotLive()
-        self.assertEqual(json.loads(self.cli(OWNER, "claim", *handle)), {"state": "busy", "remaining": 1})
+        self.assertEqual(json.loads(self.cli(OWNER, "claim", *handle)), busy)
         self.processes[PIDS[CLONE]] = sessions.SessionNotLive()
         self.assertEqual(json.loads(self.cli(OWNER, "claim", *handle))["item"], 1)
         self.assertIn("current claim", self.cli(CLONE, "record", *handle, "1", "Late decision", expected=2))
@@ -146,8 +146,9 @@ class SharedReviewTests(unittest.TestCase):
         self.assertEqual(json.loads(self.cli(OWNER, "claim", *handle))["item"], 1)
         _ = self.cli(OWNER, "decide", *handle, "1", "Accept")
         self.assertIn("1. first → Accept", self.cli(OWNER, "end", *handle))
-        self.assertFalse(Path(review["document"]).exists())
         self.assertIn("review has ended", self.cli(CLONE, "next", *handle, expected=2))
+        _ = self.cli(OWNER, "finish", *handle)
+        self.assertFalse(Path(review["document"]).exists())
         replacement = self.start("replacement")
         self.assertNotEqual(replacement["review"], review["review"])
         self.assertIn("review has ended", self.cli(CLONE, "next", *handle, expected=2))
@@ -184,8 +185,7 @@ class SharedReviewTests(unittest.TestCase):
         self.assertFalse(path.exists())
 
     def test_solo_command_keeps_its_document_announcement_todos_and_wrap_up(self) -> None:
-        command = Path(__file__).resolve().parents[2] / "commands/adhoc_review.md"
-        text = command.read_text(encoding="utf-8")
+        text = self.command_text()
         for line in (
             "Create a transient document at the repository root by default.",
             "Exclude it from Git with `bash ~/.claude/scripts/exclude/exclude.sh <path>`.",
@@ -216,6 +216,7 @@ class SharedReviewTests(unittest.TestCase):
         _ = document.write_text("# Review\nFirst choice → Accept\n", encoding="utf-8")
         _ = self.cli(OWNER, "decide", *handle, "1", "Accept")
         self.assertIn("First choice → Accept", self.cli(OWNER, "end", *handle))
+        _ = self.cli(OWNER, "finish", *handle)
         self.assertFalse(shared.exists())
         self.assertEqual(document.read_text(encoding="utf-8"), "# Review\nFirst choice → Accept\n")
 
@@ -262,3 +263,112 @@ class SharedReviewTests(unittest.TestCase):
         self.assertEqual(json.loads(self.cli(OWNER, "claim", *handle))["text"], "prerequisite")
         _ = self.cli(OWNER, "decide", *handle, "1", "Accept")
         self.assertEqual(json.loads(self.cli(OWNER, "claim", *handle))["text"], "new")
+
+    def command_text(self) -> str:
+        return (Path(__file__).resolve().parents[2] / "commands/adhoc_review.md").read_text(encoding="utf-8")
+
+    def test_interrupted_end_preserves_final_decisions_until_the_owner_saves_them(self) -> None:
+        review = self.start("First choice", "Second choice")
+        handle = (review["owner"], review["review"])
+        document = self.home / "decisions.md"
+        _ = document.write_text("# Review\n")
+        _ = self.cli(CLONE, "join", "bob")
+        _ = self.cli(CLONE, "next", *handle)
+        _ = self.cli(CLONE, "record", *handle, "1", "Accept")
+        _ = self.cli(CLONE, "next", *handle)
+        self.assertIn("save the final decisions", self.cli(OWNER, "finish", *handle, expected=2))
+        self.assertIn("First choice → Accept", self.cli(OWNER, "end", *handle))
+        self.assertEqual(document.read_text(), "# Review\n")
+        self.liveness[OWNER] = sessions.SessionNotLive()
+        self.processes[PIDS[OWNER]] = sessions.SessionNotLive()
+        self.assertIn("review has ended", self.cli(CLONE, "record", *handle, "2", "Late", expected=2))
+        self.assertTrue(json.loads(self.cli(OWNER, "resume"))["closing"])
+        _ = document.write_text(self.cli(OWNER, "end", *handle))
+        _ = self.cli(OWNER, "finish", *handle)
+        self.assertIn("First choice → Accept", document.read_text())
+        self.assertFalse(Path(review["document"]).exists())
+
+    def test_failed_sharing_setup_leaves_the_solo_steps_available(self) -> None:
+        text = self.command_text()
+        self.assertIn("Enable sharing only after `start` returns the review IDs.", text)
+        self.assertIn("If `start` fails, continue the solo review silently.", text)
+        self.assertIn("Use shared commands only when sharing is active.", text)
+        document = self.home / "decisions.md"
+        _ = document.write_text("# Review\n")
+        self.liveness[OWNER] = sessions.SessionLivenessUnknown("fixture registry is unreadable")
+        with patch("sys.stdin", StringIO('["First choice"]')):
+            self.assertIn("Cannot confirm your process", self.cli(
+                OWNER, "start", "--source", "Fixture", "--items", "-", expected=2))
+        self.liveness[OWNER] = sessions.LiveSessionProcess(PIDS[OWNER], self.process_start(PIDS[OWNER]))
+        old_review = self.start("First choice")
+        old_record = Path(old_review["document"])
+        before = old_record.read_text()
+        with patch("sys.stdin", StringIO('["First choice"]')):
+            self.assertIn("already has a review record", self.cli(
+                OWNER, "start", "--source", "Fixture", "--items", "-", expected=2))
+        self.assertEqual(old_record.read_text(), before)
+        self.assertEqual(document.read_text(), "# Review\n")
+
+    def test_claim_saves_the_start_that_the_registry_verified_before_pid_reuse(self) -> None:
+        registry = sessions.RegistryRead(tuple(
+            sessions.RegistryObservation(sessions.SessionRecord(
+                sessionId=identity, pid=pid, name="", messagingSocketPath="", updatedAt=1,
+                tmux="", formerNames=[], procStart=self.process_start(pid)), {})
+            for identity, pid in PIDS.items()), ())
+        with (patch.object(sessions, "read_registry", return_value=registry),
+              patch.object(sessions, "session_liveness", new=session_records.session_liveness),
+              patch.object(session_records, "headless", return_value=False),
+              patch.object(os, "kill"),
+              patch.object(session_records, "process_start", side_effect=self.process_start) as read_start,
+              patch.object(sessions, "process_start", new=read_start)):
+            review = self.start("First choice")
+            _ = self.cli(CLONE, "join", "bob")
+            starts = iter([self.process_start(PIDS[CLONE]), "reused-pid"])
+
+            def start_during_claim(pid: int) -> str:
+                return next(starts) if pid == PIDS[CLONE] else self.process_start(pid)
+
+            read_start.side_effect = start_during_claim
+            _ = self.cli(CLONE, "next", OWNER, review["review"])
+        self.assertEqual(next(starts), "reused-pid")
+        record = Path(review["document"]).read_text().splitlines()[0]
+        parsed = cast(shared_review.ActiveReview, json.loads(
+            record.removeprefix(shared_review.RECORD_PREFIX).removesuffix(shared_review.RECORD_SUFFIX)))
+        self.assertEqual(parsed["participants"][CLONE], {"pid": PIDS[CLONE], "started": self.process_start(PIDS[CLONE])})
+
+    def test_owner_claim_returns_new_joined_tasks_in_shared_order(self) -> None:
+        review = self.start("First choice", "Second choice")
+        handle = (review["owner"], review["review"])
+        _ = self.cli(CLONE, "join", "bob")
+        _ = self.cli(CLONE, "next", *handle)
+        _ = self.cli(CLONE, "split", *handle, "1", "First part", "Second part")
+        _ = self.cli(CLONE, "record", *handle, "1", "Accept")
+        _ = self.cli(CLONE, "add", *handle, "New choice", "--after", "3")
+        claim = cast(shared_review.ClaimedItem, json.loads(self.cli(OWNER, "claim", *handle)))
+        self.assertEqual(claim["item"], 3)
+        self.assertEqual(claim.get("items"), [
+            {"item": 1, "text": "First part", "decision": {"words": "Accept", "actions": ""}},
+            {"item": 3, "text": "Second part"},
+            {"item": 4, "text": "New choice"},
+            {"item": 2, "text": "Second choice"},
+        ])
+
+    def test_join_sets_the_hold_before_the_first_item_and_refreshes_it_on_busy(self) -> None:
+        review = self.start("First choice", "Second choice")
+        handle = (review["owner"], review["review"])
+        self.assertEqual(json.loads(self.cli(CLONE, "join", "bob"))["remaining"], 2)
+        self.assertEqual(json.loads(self.cli(CLONE, "next", *handle))["remaining"], 2)
+        self.assertEqual(json.loads(self.cli(CLONE, "record", *handle, "1", "Accept")), {"remaining": 1})
+        _ = self.cli(OWNER, "claim", *handle)
+        self.assertEqual(json.loads(self.cli(CLONE, "next", *handle)), {"state": "busy", "remaining": 1})
+        flow = self.command_text().split("## Join a review\n", 1)[1].split("## Step 1", 1)[0]
+        contract = (
+            "Apply `remaining` from `join` with the Step 3 status command.",
+            "Run `next OWNER REVIEW` to claim an item.",
+            "Apply `remaining` from `next` before you handle the result, including `busy` or `complete`.",
+            "On `busy`,",
+            "On `complete`,",
+            "Set this session's count to zero. Use the held message steps in Step 5.",
+        )
+        positions = [flow.index(line) for line in contract]
+        self.assertEqual(positions, sorted(positions))

@@ -45,15 +45,20 @@ These fields do not change the recipient, reply name, or message key.
 
 `/adhoc_review join <staff name>` opens the owner's review on the same machine.
 The owner keeps the decision document from the solo workflow.
+If sharing cannot start, the owner continues the solo review.
 The helper stores the shared record at `~/.local/state/adhoc_review/.shared/<owner-session-id>.md` with mode `0600`.
 One file lock covers changes to the item list, claims, and decisions in the shared record.
 The owner uses `claim` and `decide`. A joined session uses `next` and `record`.
+The owner's claim result includes items in review order with stable IDs and saved decisions.
 Without `--item`, `next` returns the current item or claims the first available item.
 `leave` releases a joined session's claim.
+The helper saves the PID and start from the verified process observation.
 If a registry record is absent, the helper checks the saved process identity before it releases a claim.
 The helper keeps claims when it cannot confirm that the process ended.
-The owner's `end` removes the shared record and returns the decisions.
+The owner's `end` freezes the shared record and returns the final decisions.
+The owner runs `finish` after saving the decisions in the decision document.
 Each session keeps its own message hold and item count.
+Joined sessions apply the count after `join`, `next`, and `record`.
 
 `review_hold=off` in `config/send.conf` disables message holding for all sessions.
 The next prompt or session start delivers any messages still held.
