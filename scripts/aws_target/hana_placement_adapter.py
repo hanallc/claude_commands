@@ -124,7 +124,7 @@ def validate_assignment(assignment: placement.PlacementAssignment, holder: place
         return HanaClaimRefused('Hana is disabled')
     if (destination.provider != 'ssh' or destination.host != transport.host or destination.slot != 1
             or not isinstance(destination.scope, claim_state.RepositoryScope)
-            or destination.scope.slot != 1 or destination.scope.key != settings.repository_key
+            or destination.scope.key != settings.repository_key
             or not isinstance(assignment.source_key, execution_identity.SourceKeyKnown)
             or not assignment.source_key.key or not assignment.episode or not assignment.attempt):
         return HanaClaimRefused('The assignment differs from the configured Hana scope')
@@ -191,16 +191,17 @@ def claim_assigned(assignment: placement.PlacementAssignment, holder: placement.
             'repo_key': destination.scope.key if isinstance(destination.scope, claim_state.RepositoryScope) else '',
             'slot': 1, 'remote_host': transport.host,
         }
+        path = held[0].path if held else mac_test.claim_path(paths, destination.scope)
         if generation.boot_id:
             record['instance_generation'] = generation_text(generation)
         if not (snapshot.state == box.Lifecycle.READY and result.claim.active and generation.boot_id
                 and isinstance(snapshot.permit, box.DeliveredPermit) and snapshot.permit.execution == execution
                 and snapshot.permit.expires > int(controller.clock())):
             record['cleanup_pending'] = True
-            write_text_atomic(mac_test.claim_path(paths, destination.scope), json.dumps(record) + '\n')
+            write_text_atomic(path, json.dumps(record) + '\n')
             deadline = result.claim.requested_at + conf.read(transport.settings).whole('start_timeout_seconds')
             return HanaClaimPending(reference, result.claim, deadline)
-        write_text_atomic(mac_test.claim_path(paths, destination.scope), json.dumps(record) + '\n')
+        write_text_atomic(path, json.dumps(record) + '\n')
         adopted = placement.AdoptedProviderClaim(reference, holder, assignment.session, transport.host, generation_text(generation))
         return HanaClaimAdopted(placement.ReservedHost(assignment, adopted), generation)
 
@@ -221,6 +222,8 @@ def read_assigned_adoption(assignment: placement.PlacementAssignment, holder: pl
         path = mac_test.claim_path(claim_state.state_paths(destination.target), scope)
         record = claim_state.read_run(path)
         if isinstance(record, claim_state.NoRun):
+            record = claim_state.read_run(path.with_name(f'{path.stem}.slot-1.json'))
+        if isinstance(record, claim_state.NoRun):
             return HanaClaimRefused('adoption evidence is unavailable: the Hana claim record is missing')
         controller = controller_for(transport, read_only=True)
         snapshot = controller.read_saved_lifecycle()
@@ -230,7 +233,7 @@ def read_assigned_adoption(assignment: placement.PlacementAssignment, holder: pl
         return HanaClaimRefused('adoption evidence is unavailable: the Hana lifecycle row is missing')
     if (record['claim_id'] != reference.claim_id or record['episode'] != reference.episode
             or record['attempt'] != reference.attempt or record.get('repo_name') != scope.name
-            or record.get('repo_key') != scope.key or record.get('slot') != scope.slot
+            or record.get('repo_key') != scope.key
             or record['pid'] != holder.pid or record['proc_start'] != holder.start_time
             or record['submitting_session'] != claim_state.session_id(assignment.session)
             or record.get('remote_host') != destination.host or record.get('cleanup_pending')):
@@ -406,12 +409,14 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
     controller = controller_for(transport, read_only=True)
     paths = claim_state.state_paths(target_name)
     with claim_state.locked(paths.lock):
+        blocked = not isinstance(mac_test.blocking_claim_block(paths, key.session), mac_test.NoMacBlock)
         snapshot = controller.inspect()
         resources_held = False
         if isinstance(snapshot, box.HanaResourcesHeld):
             snapshot = controller.inspect_for_settlement()
             if not isinstance(snapshot, box.HanaLifecycleEvidence):
-                return placement.FreshHostEvidence(key, now, '', placement.TemporaryExclusion('busy'))
+                return placement.FreshHostEvidence(key, now, '',
+                    placement.TemporaryExclusion('blocked' if blocked else 'busy'))
             resources_held = True
         if isinstance(snapshot, HanaUnprovisioned):
             return placement.FreshHostEvidence(key, now, '', placement.TemporaryExclusion('unprovisioned'))
@@ -452,8 +457,8 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
                         continue
             held.append(claim)
         if resources_held:
-            return placement.FreshHostEvidence(key, now, '', placement.TemporaryExclusion('busy'))
-        block = mac_test.blocking_claim_block(paths, key.session)
+            return placement.FreshHostEvidence(key, now, '',
+                placement.TemporaryExclusion('blocked' if blocked else 'busy'))
     adopted: list[placement.AdoptedProviderClaim] = []
     cleanup: list[placement.RetainedCleanupClaim] = []
     executions: list[tuple[placement.ProviderClaimReference, execution_identity.ExecutionEvidence]] = []
@@ -485,7 +490,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
     eligibility: placement.HostEligibility = placement.AllowedHost()
     if not controller.image_is_current(snapshot.deployment, workload=workload):
         eligibility = placement.FixedExclusion(placement.HANA_IMAGE_STALE)
-    elif not isinstance(block, mac_test.NoMacBlock):
+    elif blocked:
         eligibility = placement.TemporaryExclusion('blocked')
     elif (held or snapshot.claims) and not own_claim:
         eligibility = placement.TemporaryExclusion('busy')
@@ -656,7 +661,7 @@ def run_gpu_assignment(assignment: placement.PlacementAssignment, repo: Path, pa
     identity = eligibility.repository_identity(repo)
     scope = destination.scope
     if (destination.target != 'hana-gpu' or destination.provider != 'ssh'
-            or destination.slot != 1 or not isinstance(scope, claim_state.RepositoryScope) or scope.slot != 1
+            or destination.slot != 1 or not isinstance(scope, claim_state.RepositoryScope)
             or not isinstance(identity, eligibility.KnownRepository) or scope.key != identity.key or scope.name != identity.name
             or not isinstance(assignment.source_key, execution_identity.SourceKeyKnown) or not command):
         raise ValueError('The assignment does not identify the Hana GPU step')

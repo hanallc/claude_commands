@@ -1376,7 +1376,7 @@ def _copy_owner_record(path: Path, form: BuildCopy, fields: dict[str, object], *
 
 
 BUILD_ROOT_EXCEPTIONS = frozenset({
-    _UNIT_LOCKS, "sccache", "session", "lost+found", "old-cargo", "old-paths", "old-slot", "old-claude",
+    _UNIT_LOCKS, "sccache", "session", "lost+found", "old-cargo", "old-paths", "old-claude",
 })
 
 
