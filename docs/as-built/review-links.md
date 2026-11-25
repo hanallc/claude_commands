@@ -166,7 +166,7 @@ When a target has no unit or showrunner, the page shows the recorded holder with
 The AWS costs table colors the Unit header and recorded staff names in the Unit column.
 The Unit group control uses the role color before selection.
 An open AWS day applies role and staff-name color changes on the next Builds data reading.
-The refresh keeps focus on the same group control.
+The refresh keeps focus on the same control in the open day.
 The Builds page uses the saved staff ID to color the name in the bump mark and tooltip.
 Disks uses the same spans for slot holders, sessions, and shared tooltip fields.
 The slot tooltip colors the Showrunner label.

@@ -2390,7 +2390,7 @@ frame.addEventListener('load',async()=>{
         _ = self.long_log_item()
         self.set_log_max_height(9)
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
-        self.assertIn('style="--list-log-max-height:9rem"', markup)
+        self.assertRegex(markup, r'\bstyle="(?:[^"]*;)?--list-log-max-height:9rem[;"]')
         probe = r'''<script>
 document.querySelector('.list-toggle').click();
 const panel=document.querySelector('.list-panel'),[left,right]=panel.children;

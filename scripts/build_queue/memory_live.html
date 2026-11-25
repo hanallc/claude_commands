@@ -1571,7 +1571,7 @@ function awsTable(headers, rows, numeric) {
     <tbody>${body}</tbody></table>`;
 }
 
-function awsRunTable(runs, estimated, extraRows, units) {
+function awsRunTable(runs, estimated, extraRows, units, group = "") {
   const columns = values => units ? values : values.filter((_, index) => index !== AWS_UNIT_COLUMN);
   const rows = runs.map(run => {
     const [job, unit, region, zone, machine, mode] = awsRunFields(run);
@@ -1581,7 +1581,7 @@ function awsRunTable(runs, estimated, extraRows, units) {
   });
   const tableRows = [...rows, ...extraRows].map(row => ({...row, values:columns(row.values)}));
   const headers = awsRunHeaders().map((label, index) => index === AWS_UNIT_COLUMN ? roleLabel("unit", label) : esc(label));
-  return `<div class="aws-scroll aws-run-scroll" tabindex="0" aria-label="Individual runs">
+  return `<div class="aws-scroll aws-run-scroll" tabindex="0" aria-label="Individual runs" data-aws-focus="runs:${esc(group)}">
     ${awsTable(columns(headers), tableRows, units ? [7,8] : [6,7])}</div>`;
 }
 
@@ -1631,13 +1631,13 @@ function awsDayRuns(day, view) {
 
   const rows = awsRunGroups(day.runs_list, groupBy, hanaIdle).map(group => {
     const open = openGroups.has(group.key), count = group.runs.length;
-    const name = `<button type="button" class="aws-toggle" aria-expanded="${open}"><span class="aws-chev"
+    const name = `<button type="button" class="aws-toggle" aria-expanded="${open}" data-aws-focus="group:${esc(group.key)}"><span class="aws-chev"
       aria-hidden="true"></span>${esc(group.name)}</button>`;
     const note = group.unitUnknown ?
       '<span class="aws-dim aws-hint">Run records before this release have no unit.</span>' : "";
     const time = count ? awsRunTime(group.seconds) : "—";
     const idleRows = group.idle ? [runCharge(idleCharge)] : [];
-    return {group:group.key, detail:open ? awsRunTable(group.runs, estimated, idleRows, units) : "",
+    return {group:group.key, detail:open ? awsRunTable(group.runs, estimated, idleRows, units, group.key) : "",
       values:[name + note, count ? awsCount(count) : "—", time,
         awsMoney(group.cents + group.idle, estimated),
         count && !group.idle ? awsMoney(group.cents / count, estimated, 3) : "—"]};
@@ -1647,7 +1647,7 @@ function awsDayRuns(day, view) {
   rows.push({total:true, values:["Total", day.runs ? awsCount(day.runs) : "—",
     day.runs_list.length ? awsRunTime(seconds) : "—", amount(day.amount_usd), ""]});
   const groupLabel = roleLabel(groupBy, AWS_RUN_GROUPS[groupBy]);
-  return `<div class="aws-scroll aws-group-scroll" tabindex="0" aria-label="Run groups">
+  return `<div class="aws-scroll aws-group-scroll" tabindex="0" aria-label="Run groups" data-aws-focus="groups">
     ${awsTable([groupLabel, "Runs", "Run time", "Cost", "For one run"], rows, [1,2,3,4])}</div>`;
 }
 
@@ -1660,12 +1660,12 @@ function awsDayDetail(day, priceDay, view = awsNewRunView(), unitStart = null) {
   const controls = Object.entries(AWS_RUN_GROUPS).filter(([group]) => units || group !== "unit").map(([group, label]) => {
     const color = globalThis.staffNames?.roleLabels[group]?.css;
     const style = color ? ` style="--role-label-color:${color}"` : '';
-    return `<button type="button" data-aws-group-by="${group}" aria-pressed="${group === view.groupBy}"${style}>${label}</button>`;
+    return `<button type="button" data-aws-focus="group-by:${group}" data-aws-group-by="${group}" aria-pressed="${group === view.groupBy}"${style}>${label}</button>`;
   }).join("");
   return `<div class="aws-day-detail" data-aws-day="${day.day}">${estimate}
     <div class="aws-run-controls"><span class="aws-dim">Group by</span>
       <div class="filter" role="group" aria-label="Group by">${controls}</div>
-      <button type="button" class="aws-more" data-aws-csv>Download CSV</button></div>
+      <button type="button" class="aws-more" data-aws-focus="csv" data-aws-csv>Download CSV</button></div>
     <div class="aws-run-content">${awsDayRuns(day, view)}</div>${awsUnitNote(day, unitStart)}</div>`;
 }
 
@@ -2491,8 +2491,8 @@ function showQueueError(message) {
 function captureReportView() {
   const active = document.activeElement;
   const focus = active?.closest('[data-move-id], [data-tip], [data-owner-key], [id]');
-  const grouping = active?.closest('[data-aws-group-by]');
-  const day = grouping?.closest('[data-aws-day]');
+  const awsFocus = active?.dataset?.awsFocus;
+  const day = awsFocus && active.closest('[data-aws-day]');
   const selector = element => element?.dataset.moveId ? `.queue-grip[data-move-id="${CSS.escape(element.dataset.moveId)}"]`
     : element?.dataset.tip ? `${element.tagName.toLowerCase()}${element.classList.contains("wrow") ? ".wrow" : ""}[data-tip="${CSS.escape(element.dataset.tip)}"]`
     : element?.dataset.ownerKey ? `[data-owner-key="${CSS.escape(element.dataset.ownerKey)}"]`
@@ -2507,7 +2507,7 @@ function captureReportView() {
   const focusedRow = active?.closest('.wrow, tr[data-tip]');
   const candidates = [...document.querySelectorAll('.wrow[data-tip], main > section[id]')];
   const anchor = [tipRow, focusedRow].find(inView) || candidates.find(element => inView(element) && element.getBoundingClientRect().top >= 0);
-  const focusSelector = day ? `[data-aws-day="${CSS.escape(day.dataset.awsDay)}"] [data-aws-group-by="${CSS.escape(grouping.dataset.awsGroupBy)}"]`
+  const focusSelector = day ? `[data-aws-day="${CSS.escape(day.dataset.awsDay)}"] [data-aws-focus="${CSS.escape(awsFocus)}"]`
     : active?.matches?.('.row-add') ? selector(focus) + ' .row-add' : active !== document.body ? selector(focus) : '';
   return {anchor: selector(anchor), top: anchor?.getBoundingClientRect().top,
     focus: focusSelector,

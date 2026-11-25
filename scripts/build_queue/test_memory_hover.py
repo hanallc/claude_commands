@@ -2844,7 +2844,7 @@ process.stdout.write(JSON.stringify(steps));
             })()""", aws_cost_fixture(), walk=True, history=True)
         self.assertEqual(result, ["#ffaf02", "#a379fd", None, True])
 
-    def test_aws_color_refresh_keeps_focus_on_the_same_day_group_button(self) -> None:
+    def aws_focus_probe(self, probe: str) -> str:
         chrome = shutil.which("google-chrome")
         if chrome is None:
             self.skipTest("Chrome is required for the AWS focus check.")
@@ -2860,6 +2860,21 @@ render({...reading, staff_names:staffNames.values, role_labels:labels});
 renderReport({kind:"IndexUnavailable", aws_costs:costs});
 for (const day of costs.days.slice(0, 2)) awsCostOpen.get("day").set("day-" + day.day, true);
 renderAwsHistory();
+""".replace("__READING__", memory_feed.page_json(page_reading)).replace("__COSTS__", json.dumps(aws_cost_fixture()))
+        with tempfile.TemporaryDirectory(prefix="aws-color-focus-") as folder:
+            page = Path(folder) / PAGE_NAME
+            document = memory_feed.page_document(0).replace("</body>",
+                '<output id="result"></output><script>' + script + probe + '</script></body>')
+            _ = page.write_text(document, encoding="utf-8")
+            result = subprocess.run([chrome, "--headless", "--no-sandbox", "--disable-gpu",
+                "--disable-background-networking", f"--user-data-dir={folder}/chrome",
+                "--window-size=1440,900", "--dump-dom", page.as_uri()], capture_output=True,
+                text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.partition('<output id="result">')[2].partition("</output>")[0]
+
+    def test_aws_color_refresh_keeps_focus_on_the_same_day_group_button(self) -> None:
+        output = self.aws_focus_probe("""
 const buttons = () => [...document.querySelectorAll('[data-aws-group-by="unit"]')];
 const original = buttons()[1];
 const unit = labels.unit;
@@ -2872,19 +2887,28 @@ document.querySelector('#result').textContent = JSON.stringify([
   buttons().length, focusedBefore, current !== original, document.activeElement === current,
   current.style.getPropertyValue("--role-label-color"),
 ]);
-""".replace("__READING__", memory_feed.page_json(page_reading)).replace("__COSTS__", json.dumps(aws_cost_fixture()))
-        with tempfile.TemporaryDirectory(prefix="aws-color-focus-") as folder:
-            page = Path(folder) / PAGE_NAME
-            document = memory_feed.page_document(0).replace("</body>",
-                '<output id="result"></output><script>' + script + '</script></body>')
-            _ = page.write_text(document, encoding="utf-8")
-            result = subprocess.run([chrome, "--headless", "--no-sandbox", "--disable-gpu",
-                "--disable-background-networking", f"--user-data-dir={folder}/chrome",
-                "--window-size=1440,900", "--dump-dom", page.as_uri()], capture_output=True,
-                text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        output = result.stdout.partition('<output id="result">')[2].partition("</output>")[0]
+""")
         self.assertEqual(output, '[2,true,true,true,"#123456"]')
+
+    def test_aws_staff_refresh_keeps_focus_on_controls_in_an_open_day(self) -> None:
+        output = self.aws_focus_probe("""
+const date = costs.days[1].day;
+const day = () => document.querySelector(`[data-aws-day="${date}"]`);
+day().querySelector('tr[data-aws-group] button').click();
+const names = staffNames.values;
+const changed = {...names, report:names.report.replace('#ffaf02', '#123456')};
+const controls = ['[data-aws-csv]', 'tr[data-aws-group] button', '.aws-group-scroll', '.aws-run-scroll'];
+const results = controls.map((selector, index) => {
+  const original = day().querySelector(selector);
+  original.focus();
+  const focused = document.activeElement === original;
+  render({...reading, staff_names:index % 2 ? names : changed, role_labels:labels});
+  const current = day().querySelector(selector);
+  return [focused, current !== original, document.activeElement === current];
+});
+document.querySelector('#result').textContent = JSON.stringify(results);
+""")
+        self.assertEqual(json.loads(output), [[True, True, True]] * 4)
 
     def test_aws_cost_breakdowns_use_bill_day_states_and_recorded_job_and_unit_names(self) -> None:
         estimate, units, billed, no_attempt, older, zero = cast(list[str], self.page_expression(
