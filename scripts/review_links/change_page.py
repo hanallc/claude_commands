@@ -2702,6 +2702,12 @@ class OutboundReviewMessage:
         return error.replace(self.token, "[reply token]") if self.token else error
 
 
+def scoped_reply_message(key: str, proof: reply_tokens.ReplyTokenProof, prefix: str = "") -> OutboundReviewMessage:
+    """Build the reply command from a native proof."""
+    token = reply_tokens.derive(proof)
+    return OutboundReviewMessage(prefix + reply_command(key, token), token)
+
+
 def outbound_review_message(delivery: MessageDelivery) -> OutboundReviewMessage:
     """Derive the scoped reply token from its current native note."""
     from scripts.review_links import review_submissions
@@ -2716,8 +2722,7 @@ def outbound_review_message(delivery: MessageDelivery) -> OutboundReviewMessage:
     proof = review_submissions.current_reply_proof(scoped["key"])
     if proof.sha256 != scoped["token_sha256"]:
         raise reply_tokens.UnavailableReplyToken("The note has a different reply token.")
-    token = reply_tokens.derive(proof)
-    return OutboundReviewMessage(prefix + separator + reply_command(scoped["key"], token), token)
+    return scoped_reply_message(scoped["key"], proof, prefix + separator)
 
 
 def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, intent: DeliveryIntent,
@@ -3249,6 +3254,43 @@ def reply_command(key: str, question: str = '') -> str:
     return ('~/.claude/scripts/lib/py ~/.claude/scripts/review_links/change_page.py answer-question '
             + '--item '+shlex.quote(key)+(' --question '+shlex.quote(question) if question else '')+machine
             + " --text '<your answer>'")
+
+
+def resend_submission_reply(reference: str) -> str:
+    """Send the reply command to the current owner of a waiting item."""
+    from scripts.review_links import review_items, review_submissions
+
+    key = reference
+    if not reference.startswith(new_item_dialog.KEY_PREFIX):
+        kinds = {review_items.ReviewType.BUG: new_item_dialog.SubmissionKind.BUG,
+                 review_items.ReviewType.QUESTION: new_item_dialog.SubmissionKind.QUESTION,
+                 review_items.ReviewType.RESPONSE: new_item_dialog.SubmissionKind.QUESTION,
+                 review_items.ReviewType.INVESTIGATION: new_item_dialog.SubmissionKind.INVESTIGATION,
+                 review_items.ReviewType.PROPOSAL: new_item_dialog.SubmissionKind.PROPOSAL}
+        matches: list[str] = []
+        for item in review_items.read(review_link.review_root(), kinds=tuple(kinds)):
+            identity = item.id.rsplit("/", 1)[-1]
+            if reference not in (identity, item.id, item.key):
+                continue
+            details = review_items.submission_origin(item)
+            if isinstance(details, new_item_dialog.ReviewSubmission):
+                matches.append(new_item_dialog.submission_key(kinds[item.type], item.owner, identity, details.request_id))
+        if not matches:
+            raise question_record.AnswerRefused("No sent item has that ID.")
+        if len(matches) > 1:
+            raise question_record.AnswerRefused("More than one sent item has that ID. Use its full key.")
+        key, = matches
+    scoped = new_item_dialog.read_submission_key(key)
+    with review_submissions.scoped_submission(scoped) as located:
+        saved = review_submissions.renew_legacy_reply(located)
+        if not saved.awaiting_reply:
+            raise question_record.AnswerRefused("The item is not waiting for a reply.")
+        command = scoped_reply_message(saved.key, saved.details.reply_proof)
+        try:
+            send_to_staff(saved.owner, SENDER, f"Reply command for {saved.id}.\n\n{command.text}")
+        except SEND_ERRORS as error:
+            raise question_record.AnswerRefused(command.redact(str(error))) from None
+    return scoped.item_id
 
 
 def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) -> bool:

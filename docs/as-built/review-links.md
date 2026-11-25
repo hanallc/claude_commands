@@ -914,6 +914,15 @@ Send uses the transport result even if the server cannot save the delivery failu
 The dialog shows the error and keeps the draft for another Send.
 A retry after the wait ends returns the existing item without sending another message.
 
+Both `/new_item` and the New item window send the reply command to the owner through Review delivery.
+The CLI and browser return the public filing receipt. Keep the reply command in the owner session.
+Use the delivered `change_page.py answer-question` command for every New item type.
+
+Run `scripts/lib/py scripts/review_links/new_item.py resend-reply I45` to send a waiting item's reply command again.
+Use the native item ID or the full submission key. The command sends to the current owner session.
+The command reads the reply proof from the native item and renews a legacy proof if necessary.
+The command refuses unknown items and items that no longer wait for a reply.
+
 From the repository, run `scripts/lib/py -m scripts.review_links.review_submissions scrub-reply-tokens`.
 The command finds native records in their current folders, former folders and archives.
 It replaces each old `reply_token` field with its SHA-256 hash.

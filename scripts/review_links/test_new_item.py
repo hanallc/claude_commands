@@ -4,21 +4,32 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal, NoReturn, cast, override
 from unittest import mock
 from urllib.parse import urlencode
+from uuid import uuid4
 
 from scripts.agents.remote import local_machine
-from scripts.lib import conf, main_publish
+from scripts.lib import conf, file_lock, main_publish
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.production import staff, the_list
+from scripts.production import investigation, staff, the_list
 from scripts.production.staff_test_support import fixture_member
-from scripts.review_links import for_you, new_item, new_item_dialog, review_page, review_submissions, test_serve
+from scripts.review_links import (
+    change_page, for_you, new_item, new_item_dialog, review_items, review_page, review_submissions,
+    test_review_submissions, test_serve,
+)
+
+
+REPLY_TYPES = (new_item.ItemType.BUG, new_item.ItemType.QUESTION, new_item.ItemType.INVESTIGATION,
+               new_item.ItemType.ENHANCEMENT, new_item.ItemType.PROPOSAL,
+               new_item.ItemType.EFFICIENCY, new_item.ItemType.FEEDBACK)
 
 def member(identity: str, kind: staff.Kind, name: str, parent: staff.StaffRow | None = None) -> staff.StaffRow:
     reports: staff.ReportsTo | staff.StaffRoot = staff.ReportsTo(parent.id) if parent is not None else staff.StaffRoot()
@@ -129,6 +140,7 @@ class NewItemTests(ServerFixture):
             "/new_item <type> <assignee> <description> [extra, such as a time]",
             "Types: bug, question, investigation, proposal, efficiency, feedback, enhancement",
             "Assignee: a producer, a showrunner or a unit",
+            "Resend a reply command: new_item.py resend-reply <item-id>",
         ])
         self.assertEqual((self.server.reads, self.server.posts), (0, []))
 
@@ -170,7 +182,8 @@ class NewItemTests(ServerFixture):
         self.map_row(SPACETIME, DWIGHT)
         code, output, _ = self.run_main("bug", "models", "The frame time graph has a gap.")
         self.assertEqual(code, 0)
-        self.assertEqual(output, "Bug \u2192 models, a unit of spacetime. Producer: dwight (from spacetime). List item 3.\n")
+        self.assertEqual(output, "Bug → models, a unit of spacetime. Producer: dwight (from spacetime). "
+                         + "Reply command goes to spacetime. List item 3.\n")
         self.assertEqual(self.server.posts[0]["recipient_id"], SPACETIME.id)
         self.assertEqual(self.server.posts[0]["list_assignee"], MODELS.id)
 
@@ -179,16 +192,33 @@ class NewItemTests(ServerFixture):
         self.map_row(POSTMASTER, BOB)
         code, output, _ = self.run_main("proposal", "postmaster", "One phone text for each nightly result.")
         self.assertEqual(code, 0)
-        self.assertEqual(output,
-                         "Proposal \u2192 postmaster, a unit of natedev. Producer: bob (set for postmaster). List item 3.\n")
+        self.assertEqual(output, "Proposal → postmaster, a unit of natedev. Producer: bob (set for postmaster). "
+                         + "Reply command goes to natedev. List item 3.\n")
         self.assertEqual(self.server.posts[0]["recipient_id"], NATEDEV.id)
         self.assertEqual(self.server.posts[0]["list_assignee"], POSTMASTER.id)
 
     def test_an_item_for_this_session_says_so(self) -> None:
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": DWIGHT.id}):
+            receipt = self.run_main("feedback", "dwight", "The status of item 65 is old.")
+        self.assertEqual(receipt, (0, "Feedback → dwight, this session. List item 3.\n", ""))
+
+    def test_a_unit_receipt_uses_the_reply_recipients_session(self) -> None:
+        self.map_row(SPACETIME, DWIGHT)
+        for caller, session_label in ((MODELS, ""), (SPACETIME, ", this session")):
+            with (self.subTest(caller=caller.name),
+                  mock.patch.dict(os.environ, {"CODEX_THREAD_ID": caller.current_session})):
+                receipt = self.run_main("bug", "models", "The frame time graph has a gap.")
+                self.assertEqual(receipt,
+                                 (0, "Bug → models, a unit of spacetime. Producer: dwight (from spacetime). "
+                                  + f"Reply command goes to spacetime{session_label}. List item 3.\n", ""))
+                self.assertEqual(self.server.posts[-1]["recipient_id"], SPACETIME.id)
+
+    def test_a_session_argument_cannot_identify_the_caller(self) -> None:
         output, errors = io.StringIO(), io.StringIO()
-        with redirect_stdout(output), redirect_stderr(errors):
-            code = new_item.main(["feedback", "dwight", "The status of item 65 is old.", "--session", DWIGHT.id])
-        self.assertEqual((code, output.getvalue()), (0, "Feedback \u2192 dwight, this session. List item 3.\n"))
+        with (mock.patch.dict(os.environ, {"CODEX_THREAD_ID": BOB.id}),
+              redirect_stdout(output), redirect_stderr(errors)):
+            code = new_item.main(["bug", "dwight", "The status of item 65 is old.", "--session", DWIGHT.id])
+        self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, "Bug → dwight. List item 3.\n", ""))
 
     def test_a_showrunner_with_no_row_asks_and_files_nothing(self) -> None:
         code, output, _ = self.run_main("investigation", "cargo-liner", "Why does the tile test take 4 minutes?")
@@ -272,16 +302,24 @@ class NewItemTests(ServerFixture):
                 self.assertEqual(new_item.MAY_BE_FILED in str(caught.exception), expected)
 
     def test_the_mac_forwards_the_command_and_its_session_to_natedev(self) -> None:
-        arguments = ["bug", "models", "Fix the chart.", "Today."]
+        arguments = ["bug", "models", "Fix the chart.", "Today.", "--session", "draft-session"]
         output = io.StringIO()
         with (mock.patch("platform.system", return_value="Darwin"),
-                mock.patch.dict(os.environ, {"ZONE_SSH": "fixture-ssh", "CODEX_THREAD_ID": "",
-                                             "CLAUDE_CODE_SESSION_ID": "mac-session"}),
-                mock.patch.object(main_publish, "forward", return_value=0) as forward, redirect_stdout(output)):
+              mock.patch.dict(os.environ, {"ZONE_SSH": "fixture-ssh", "CODEX_THREAD_ID": "",
+                                           "CLAUDE_CODE_SESSION_ID": "mac-session"}),
+              mock.patch.object(main_publish, "ssh", return_value=subprocess.CompletedProcess(
+                  [], 0, "", "")) as ssh, redirect_stdout(output)):
             self.assertEqual(new_item.main(arguments), 0)
             self.assertEqual(new_item.main([]), new_item.Outcome.USAGE)
-        forward.assert_called_once_with("review_links/new_item.py", [*arguments, "--session", "mac-session"],
-                                        label="new_item", ssh_program="fixture-ssh")
+            self.assertEqual(new_item.main(["resend-reply", "I45"]), 0)
+        filing, resend = ssh.call_args_list
+        self.assertEqual(shlex.split(cast(str, filing.args[0])), [
+            "env", "CODEX_THREAD_ID=", "CLAUDE_CODE_SESSION_ID=mac-session",
+            "$HOME/.claude/scripts/lib/py", "$HOME/.claude/scripts/review_links/new_item.py", *arguments])
+        self.assertEqual(shlex.split(cast(str, resend.args[0])), [
+            "$HOME/.claude/scripts/lib/py", "$HOME/.claude/scripts/review_links/new_item.py", "resend-reply", "I45"])
+        for call in (filing, resend):
+            self.assertEqual((call.kwargs["host"], call.kwargs["ssh_program"]), ("natedev", "fixture-ssh"))
         self.assertEqual(output.getvalue(), new_item.usage() + "\n")
         self.assertEqual((self.server.reads, self.server.posts), (0, []))
 
@@ -347,6 +385,155 @@ class NewItemTests(ServerFixture):
 
 
 class NewItemServerTests(unittest.TestCase):
+    def test_self_filed_items_give_the_owner_a_scoped_reply_from_both_entry_points(self) -> None:
+        server = test_serve.ReviewLinksServerTests()
+        self.addCleanup(server.doCleanups)
+        server.setUp()
+        case = server.review_fixture()
+        owner = case.ready_submission_recipient()
+        morty = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\n")
+        _ = conf.path("producer_map").write_text(f"{owner.id} = {morty.id}\n", encoding="utf-8")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        address = for_you.ConsoleAddress("127.0.0.1", server.port)
+        received: list[tuple[str, str]] = []
+
+        def capture(recipient: str, _sender: str, message: str, **_options: str) -> None:
+            received.append((recipient, message.splitlines()[-1]))
+
+        with (mock.patch.object(server.server, "review_cache", cache),
+              mock.patch.object(server.server, "delivery_status", case.status),
+              mock.patch.object(server.server.RequestHandlerClass, "log_request"),
+              mock.patch.object(change_page, "send_message", side_effect=capture),
+              mock.patch.object(for_you, "console_address", return_value=address),
+              mock.patch("platform.system", return_value="Linux")):
+            for item_type in REPLY_TYPES:
+                with self.subTest(item_type=item_type):
+                    output, errors = io.StringIO(), io.StringIO()
+                    with (mock.patch.dict(os.environ, {"CODEX_THREAD_ID": owner.current_session}),
+                          redirect_stdout(output), redirect_stderr(errors)):
+                        outcome = new_item.main([item_type, owner.name, "Check the command filing."])
+                    self.assertEqual((outcome, errors.getvalue()), (new_item.Outcome.FILED, ""))
+                    command_owner, command = received.pop()
+                    self.assertEqual(command_owner, f"session:{owner.current_session}")
+                    self.assertIn("this session.", output.getvalue())
+                    self.assertIn("List item ", output.getvalue())
+                    token = self.run_reply_command(command, "The command reply works.")
+                    self.assertNotIn(token, output.getvalue())
+
+                    kind = new_item.FILED_KINDS[item_type]
+                    filed_kind = new_item_dialog.SubmissionKind.INVESTIGATION if kind == "enhancement" else kind
+                    request = replace(case.submission_request(filed_kind, owner.id), kind=kind, page="list",
+                                      request_id=f"r6-{uuid4().hex}",
+                                      page_recipient=new_item_dialog.PageRecipient.SELECTED)
+                    reply = server.new_item_http(server.new_item_body(request), finished=True)
+                    self.assertEqual(reply.status, 200, reply.body)
+                    window_owner, command = received.pop()
+                    self.assertEqual(window_owner, f"session:{owner.current_session}")
+                    token = self.run_reply_command(command, "The window reply works.")
+                    self.assertNotIn(token.encode(), reply.body)
+
+            output, errors = io.StringIO(), io.StringIO()
+            with (mock.patch.dict(os.environ, {"CODEX_THREAD_ID": morty.current_session}),
+                  redirect_stdout(output), redirect_stderr(errors)):
+                outcome = new_item.main(["bug", owner.name, "Check the caller identity.",
+                                         "--session", owner.current_session])
+            self.assertEqual((outcome, errors.getvalue()), (new_item.Outcome.FILED, ""))
+            self.assertNotIn("this session", output.getvalue())
+            command_owner, command = received.pop()
+            self.assertEqual(command_owner, f"session:{owner.current_session}")
+            token = self.run_reply_command(command, "Only the owner received the command.")
+            self.assertNotIn(token, output.getvalue())
+            self.assertEqual(received, [])
+
+    def test_resend_reply_reads_each_native_type_and_refuses_completed_or_unknown_items(self) -> None:
+        server = test_serve.ReviewLinksServerTests()
+        self.addCleanup(server.doCleanups)
+        server.setUp()
+        case = server.review_fixture()
+        owner = case.ready_submission_recipient()
+        with (mock.patch("platform.system", return_value="Linux"),
+              mock.patch.object(change_page, "send_to_staff") as send,
+              mock.patch.object(change_page.DeliveryStatus, "metadata_page",
+                                side_effect=AssertionError("Resend read delivery metadata."))):
+            for item_type in REPLY_TYPES:
+                with self.subTest(item_type=item_type):
+                    kind = new_item.FILED_KINDS[item_type]
+                    filed_kind = new_item_dialog.SubmissionKind.INVESTIGATION if kind == "enhancement" else kind
+                    request = replace(case.submission_request(filed_kind, owner.id), kind=kind)
+                    saved = review_submissions.submit(request)
+                    token = saved.details.reply_token
+                    expected = change_page.reply_command(saved.key, token)
+                    output, errors = io.StringIO(), io.StringIO()
+                    with redirect_stdout(output), redirect_stderr(errors):
+                        result = new_item.main(["resend-reply", saved.id])
+                    self.assertEqual((result, errors.getvalue()), (0, ""))
+                    self.assertEqual(output.getvalue(),
+                                     f"Accepted the reply command for delivery to the owner of {saved.id}.\n")
+                    send.assert_called_once_with(owner.id, change_page.SENDER,
+                                                 f"Reply command for {saved.id}.\n\n{expected}")
+                    send.reset_mock()
+                    if item_type == new_item.ItemType.QUESTION:
+                        with (mock.patch.object(change_page, "send_to_staff", side_effect=RuntimeError(token)),
+                              redirect_stderr(errors)):
+                            self.assertEqual(new_item.main(["resend-reply", saved.key]), new_item.Outcome.REFUSED)
+                        self.assertEqual(errors.getvalue(), "new_item: [reply token]\n")
+                        errors = io.StringIO()
+                    self.assertEqual(self.run_reply_command(expected, "The resent reply works."), token)
+                    if item_type == new_item.ItemType.BUG:
+                        closed = investigation.mark_read(owner.id, saved.id)
+                        self.assertEqual(closed.state, investigation.InvestigationState.READ)
+                    with redirect_stderr(errors):
+                        self.assertEqual(new_item.main(["resend-reply", saved.id]), new_item.Outcome.REFUSED)
+                    self.assertEqual(errors.getvalue(), "new_item: The item is not waiting for a reply.\n")
+                    send.assert_not_called()
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                self.assertEqual(new_item.main(["resend-reply", "I999999"]), new_item.Outcome.REFUSED)
+            self.assertEqual(errors.getvalue(), "new_item: No sent item has that ID.\n")
+            send.assert_not_called()
+
+    def test_resend_finds_a_transferred_item_and_holds_its_owner_lock_during_delivery(self) -> None:
+        case = test_review_submissions.ReviewSubmissionTests()
+        self.addCleanup(case.doCleanups)
+        case.setUp()
+        saved = review_submissions.submit(test_review_submissions.request(new_item_dialog.SubmissionKind.BUG))
+        successor = test_review_submissions.PRODUCER
+        read_items = review_items.read
+
+        def move_after_read(root: Path, *, kinds: tuple[review_items.ReviewType, ...]) -> list[review_items.ReviewItem]:
+            items = read_items(root, kinds=kinds)
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(case.tidy_fixture(case.wrap_fixture()), (0, ""))
+            return items
+
+        def send(address: str, sender: str, message: str) -> None:
+            self.assertEqual((address, sender), (f"session:{successor}", change_page.SENDER))
+            self.assertEqual(message.splitlines()[-1], change_page.reply_command(saved.key, saved.reply_token))
+            self.assertFalse(saved.path.exists())
+            lock = case.root / "state" / "investigation-locks" / (successor + ".lock")
+            self.assertEqual(file_lock.probe_existing_exclusive(lock), file_lock.LockAvailability.HELD)
+
+        with (mock.patch.object(review_items, "read", side_effect=move_after_read),
+              mock.patch.object(change_page, "send_message", side_effect=send) as delivered):
+            self.assertEqual(change_page.resend_submission_reply(saved.id), saved.id)
+        delivered.assert_called_once()
+
+    def run_reply_command(self, command: str, words: str) -> str:
+        arguments = shlex.split(command)
+        self.assertEqual(arguments[:3], ["~/.claude/scripts/lib/py",
+                                         "~/.claude/scripts/review_links/change_page.py", "answer-question"])
+        self.assertEqual(arguments[-2:], ["--text", "<your answer>"])
+        key = arguments[arguments.index("--item") + 1]
+        token = arguments[arguments.index("--question") + 1]
+        output, errors = io.StringIO(), io.StringIO()
+        with (mock.patch.object(staff, "is_owner", return_value=True),
+              redirect_stdout(output), redirect_stderr(errors)):
+            result = change_page.main([*arguments[2:-1], words])
+        self.assertEqual((result, output.getvalue(), errors.getvalue()), (0, f"Answered {key}\n", ""))
+        return token
+
     def test_identical_words_create_separate_list_rows_and_review_links(self) -> None:
         server = test_serve.ReviewLinksServerTests()
         self.addCleanup(server.doCleanups)
