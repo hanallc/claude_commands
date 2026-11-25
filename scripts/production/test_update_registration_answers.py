@@ -28,6 +28,36 @@ from scripts.production.staff_test_support import fixture_member
 
 
 class RegistrationTests(RegistrationFixture):
+    def test_scoped_reply_reviews_without_question_locks_and_refuses_a_changed_record(self) -> None:
+        from scripts.review_links import new_item_dialog, review_page, test_review_page
+
+        case = test_review_page.ReviewPageTests("runTest")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        owner = case.ready_submission_recipient()
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        saved = cache.create_submission(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id)).saved
+        key = new_item_dialog.read_submission_key(saved.key)
+        text = "Use the wide layout."
+        owner_lock = registration.outstanding_path_for_owner(owner.id).with_suffix(".lock")
+        number_lock = owner_lock.parent.parent / "review-folders" / owner.id / "question-numbers.lock"
+
+        def read_draft(*_args: object, **_kwargs: object) -> review.QuestionAccepted:
+            for lock in (owner_lock, number_lock):
+                with lock.open("a") as handle:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with registration.wrap_question_locks(owner.id):
+                current = registration.read_review_question(saved.path, owner.id)
+                current.item["waiting_why"] = "The owner must check the narrow layout."
+                registration.write_question_record(current)
+            return review.QuestionAccepted(text)
+
+        with mock.patch.object(review, "review_question", side_effect=read_draft) as reader:
+            with self.assertRaisesRegex(new_item_dialog.SubmissionError, "The selected Question changed"):
+                _ = registration.reply_to_submission(saved.path, key, text, saved.reply_token, owner=owner.id)
+        reader.assert_called_once()
+        self.assertNotIn(text, saved.path.read_text())
+
     def test_native_reply_requires_a_key_when_two_same_title_records_are_open(self) -> None:
         for earlier_status in ('closed', 'open'):
             with self.subTest(earlier_status=earlier_status):

@@ -2392,27 +2392,53 @@ def review_sent_question(record: QuestionRecord, scope: QuestionScope,
         write_question_record(current)
 
 
+def _submission_reply_target(path: Path, key: new_item_dialog.ScopedSubmissionKey, words: str, token: str,
+                             owner: staff.StaffId) -> tuple[QuestionRecord, bool]:
+    current = read_review_question(path, owner)
+    details = new_item_dialog.read_submission(current.item.get("review_submission"))
+    if current.owner != owner or current.item.get("review_id") != key.item_id or details.request_id != key.request_id:
+        raise new_item_dialog.SubmissionError("The selected Question changed.")
+    new_item_dialog.require_reply_token(details, token)
+    exchanges = current.item.get("followups", [])
+    repeated = current.status == "open" and "followup" not in current.item and bool(
+        exchanges and exchanges[-1]["reply"] == words)
+    if not repeated and not pending_review_reply(current):
+        raise new_item_dialog.SubmissionError("This item no longer accepts this reply.")
+    return current, repeated
+
+
 def reply_to_submission(path: Path, key: new_item_dialog.ScopedSubmissionKey, words: str, token: str, *,
                         owner: staff.StaffId) -> bool:
     """Apply a reply to the current wait on a question sent by the user."""
+    selected, repeated = _submission_reply_target(path, key, words, token, owner)
+    if repeated:
+        return False
+    unavailable = review_console_reply(selected, words, key.request_id)
     with (outstanding_lock(state_root() / "outstanding" / (owner + ".json")),
           _question_number_lock(owner)):
-        current = read_review_question(path, owner)
-        details = new_item_dialog.read_submission(current.item.get("review_submission"))
-        if current.owner != owner or current.item.get("review_id") != key.item_id or details.request_id != key.request_id:
-            raise new_item_dialog.SubmissionError("The selected Question changed.")
-        new_item_dialog.require_reply_token(details, token)
-        exchanges = current.item.get("followups", [])
-        repeated = current.status == "open" and "followup" not in current.item and bool(
-            exchanges and exchanges[-1]["reply"] == words)
-        if not repeated and not pending_review_reply(current):
-            raise new_item_dialog.SubmissionError("This item no longer accepts this reply.")
+        current, repeated = _submission_reply_target(path, key, words, token, owner)
         if repeated:
             return False
-        unavailable = review_console_reply(current, words, key.request_id)
+        if current != selected:
+            raise new_item_dialog.SubmissionError("The selected Question changed.")
         record_followup_reply(current.item, words, current.owner, review_unavailable=unavailable)
         write_question_record(current)
         return True
+
+
+def _native_reply_target(record: QuestionRecord, text: str, question_id: str
+                         ) -> tuple[QuestionRecord, delivery_state.NoQuestion | delivery_state.OpenQuestion |
+                                    delivery_state.AnsweredQuestion]:
+    current = current_open_question(record, "reply")
+    delivery = change_routing.delivery_path(change_routing.review_root(), current.path, current.path.stem)
+    if "review_submission" in current.item:
+        raise RegistrationFailure("reply", "Use the scoped reply from the Review item.")
+    exchange = change_routing.delivery_slots(delivery).question
+    if question_id or isinstance(exchange, delivery_state.OpenQuestion):
+        _ = delivery_state.question_exchange_for_reply(exchange, question_id, text.strip())
+    if "followup" not in current.item:
+        raise RegistrationFailure("reply", f"{current.item['text']}: no open follow-up waits for a reply")
+    return current, exchange
 
 
 def reply_record(record: QuestionRecord, text: str, who: str, *, identities: QuestionStaff, question_id: str = '') -> None:
@@ -2420,17 +2446,12 @@ def reply_record(record: QuestionRecord, text: str, who: str, *, identities: Que
     if not text.strip():
         raise RegistrationFailure("reply", "the reply is empty")
     scope = question_scope(record.owner, identities.record)
+    selected, exchange = _native_reply_target(record, text, question_id)
+    unavailable = review_console_reply(selected, text, question_id)
     with outstanding_lock(outstanding_path(scope)), _question_number_lock(record.owner):
-        current = current_open_question(record, "reply")
-        delivery = change_routing.delivery_path(change_routing.review_root(), current.path, current.path.stem)
-        if "review_submission" in current.item:
-            raise RegistrationFailure("reply", "Use the scoped reply from the Review item.")
-        exchange = change_routing.delivery_slots(delivery).question
-        if question_id or isinstance(exchange, delivery_state.OpenQuestion):
-            _ = delivery_state.question_exchange_for_reply(exchange, question_id, text.strip())
-        if "followup" not in current.item:
-            raise RegistrationFailure("reply", f"{current.item['text']}: no open follow-up waits for a reply")
-        unavailable = review_console_reply(current, text, question_id)
+        current, current_exchange = _native_reply_target(record, text, question_id)
+        if (current, current_exchange) != (selected, exchange):
+            raise RegistrationFailure("reply", "The selected Question changed.")
         record_followup_reply(current.item, text, who, review_unavailable=unavailable)
         _ = _publish_question(current)
     report("reply", "ok", f"{scope.name}: {current.item['text']}: back on the open-questions list with the reply")

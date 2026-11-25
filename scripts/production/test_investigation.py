@@ -71,6 +71,25 @@ class InvestigationTests(unittest.TestCase):
             self.assertIn("unreviewed: reviewer unavailable", (directory / "review.jsonl").read_text())
             reader.assert_called_once()
 
+    def test_answer_reviews_without_the_owner_lock_and_refuses_a_changed_record(self) -> None:
+        report = investigation.file(OWNER.id, "Find the cause", "Which check failed?",
+                                    waiting_why="The owner answers.")
+        answer = "The first check failed."
+        lock = investigation.state_root() / "investigation-locks" / (OWNER.id + ".lock")
+
+        def read_draft(*_args: object, **_kwargs: object) -> review.QuestionAccepted:
+            with lock.open("r") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            investigation.set_waiting_why(OWNER.id, report.id, "The owner checks a new result.")
+            return review.QuestionAccepted(answer)
+
+        with patch.object(review, "review_question", side_effect=read_draft) as reader:
+            with self.assertRaisesRegex(investigation.InvestigationError, "The selected investigation changed"):
+                _ = investigation.answer(OWNER.id, report.id, answer)
+        reader.assert_called_once()
+        current = investigation.load(OWNER.id, report.id)
+        self.assertEqual((current.waiting_why, current.answer), ("The owner checks a new result.", ""))
+
     def test_file_answer_read_and_list(self) -> None:
         question = "Find the cause.\r\n\n## Answer\n\nThis heading is part of the question.\n"
         title = 'Find the cause: "example"'
@@ -250,8 +269,18 @@ class InvestigationTests(unittest.TestCase):
         self.assertNotIn(token, note)
         self.assertIn(proof.nonce, note)
         reply_tokens.path().unlink()
-        self.assertTrue(investigation.answer_submission(path, new_item_dialog.read_submission_key(key),
-                                                        "The first check failed.", token, owner=OWNER.id))
+        answer = "The first check failed."
+
+        def read_draft(*_args: object, **_kwargs: object) -> review.QuestionAccepted:
+            lock = investigation.state_root() / "investigation-locks" / (OWNER.id + ".lock")
+            with lock.open("r") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return review.QuestionAccepted(answer)
+
+        with patch.object(review, "review_question", side_effect=read_draft) as reader:
+            self.assertTrue(investigation.answer_submission(path, new_item_dialog.read_submission_key(key),
+                                                            answer, token, owner=OWNER.id))
+        reader.assert_called_once()
         self.assertFalse(reply_tokens.path().exists())
 
     def test_all_owners_number_records_under_one_lock(self) -> None:

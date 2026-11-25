@@ -5,6 +5,7 @@ from scripts.lint.memory_test_support import config_environment, copy_config_fix
 
 import json
 import io
+import fcntl
 import os
 import shutil
 import unittest
@@ -707,6 +708,30 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertIn(f"Follow-up: Which file holds it?\nReply: {words}", listed.stdout)
         self.assertEqual(self.question_rows()[-1].get("followups"),
                          [{"followup": "Which file holds it?", "reply": words}])
+
+    def test_reply_reviews_without_record_locks_and_refuses_a_closed_question(self) -> None:
+        self.file_question()
+        words = "Use the layout settings."
+        question = self.question_record_path("Choose the layout")
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            scope = read_production("example")
+            _ = registration.followup(scope, "Choose the layout", "Where is the setting?")
+            owner_lock = self.outstanding().with_suffix(".lock")
+            number_lock = owner_lock.parent.parent / "review-folders" / scope.owner.id / "question-numbers.lock"
+
+            def read_draft(*_args: object, **_kwargs: object) -> review.QuestionAccepted:
+                for path in (owner_lock, number_lock):
+                    with path.open("r") as handle:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                registration.withdraw(scope, "Choose the layout")
+                return review.QuestionAccepted(words)
+
+            with mock.patch.object(review, "review_question", side_effect=read_draft) as reader:
+                with self.assertRaisesRegex(registration.RegistrationFailure, "no longer open"):
+                    registration.reply(scope, "Choose the layout", words)
+            reader.assert_called_once()
+        self.assertEqual(self.question_rows(), [])
+        self.assertNotIn(words, question.read_text())
 
     def test_reply_saves_the_reason_when_the_console_reviewer_times_out(self) -> None:
         self.file_question()

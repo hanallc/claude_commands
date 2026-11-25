@@ -399,40 +399,51 @@ def answer_submission(path: Path, key: new_item_dialog.ScopedSubmissionKey, text
     return changed
 
 
+def _answer_target(store: Investigations, identity: str, text: str, question_id: str,
+                   reply: SubmissionReply | NativeReply, source: Path | None) -> tuple[Path, Investigation, bool]:
+    path = _record_path(store, identity) if source is None else source
+    item = _load(store, identity, path)
+    if isinstance(reply, SubmissionReply):
+        key = reply.key
+        if (item.kind.value != key.kind.value
+                or not isinstance(item.submission, new_item_dialog.ReviewSubmission)
+                or item.submission.request_id != key.request_id):
+            raise InvestigationError("The selected investigation changed.")
+        new_item_dialog.require_reply_token(item.submission, reply.token)
+    else:
+        if isinstance(item.submission, new_item_dialog.ReviewSubmission):
+            raise InvestigationError("Use the scoped reply from the Review item.")
+        delivery = change_routing.delivery_path(change_routing.review_root(), store.path(identity), identity)
+        question = change_routing.delivery_slots(delivery).question
+        if question_id or isinstance(question, delivery_state.OpenQuestion):
+            try:
+                _ = delivery_state.question_exchange_for_reply(question, question_id, text.strip())
+            except delivery_state.StaleQuestionExchange as error:
+                raise InvestigationError(str(error)) from None
+    repeated = item.state == InvestigationState.ANSWER_READY and item.answer == text
+    if item.state != InvestigationState.OPEN and not repeated:
+        if isinstance(reply, SubmissionReply):
+            raise InvestigationError("This item no longer accepts this reply.")
+        raise InvestigationError(f"{identity}: cannot answer an investigation in state {item.state}")
+    return path, item, repeated
+
+
 def _answer(store: Investigations, identity: str, text: str, question_id: str,
             reply: SubmissionReply | NativeReply = _NATIVE_REPLY, *, source: Path | None = None) -> tuple[Investigation, bool]:
     if not text.strip():
         raise InvestigationError("answer must not be empty")
+    selected_path, selected, repeated = _answer_target(store, identity, text, question_id, reply, source)
+    if repeated:
+        return selected, False
+    exchange = reply.key.request_id if isinstance(reply, SubmissionReply) else question_id
+    console_text.require(text, "investigation answer", identity=f"{selected_path}/{exchange}",
+                         refusal=InvestigationError)
     with store.locked():
-        path = _record_path(store, identity) if source is None else source
-        item = _load(store, identity, path)
-        if isinstance(reply, SubmissionReply):
-            key = reply.key
-            if (item.kind.value != key.kind.value
-                    or not isinstance(item.submission, new_item_dialog.ReviewSubmission)
-                    or item.submission.request_id != key.request_id):
-                raise InvestigationError("The selected investigation changed.")
-            new_item_dialog.require_reply_token(item.submission, reply.token)
-        else:
-            if isinstance(item.submission, new_item_dialog.ReviewSubmission):
-                raise InvestigationError("Use the scoped reply from the Review item.")
-            delivery = change_routing.delivery_path(change_routing.review_root(), store.path(identity), identity)
-            question = change_routing.delivery_slots(delivery).question
-            if question_id or isinstance(question, delivery_state.OpenQuestion):
-                try:
-                    _ = delivery_state.question_exchange_for_reply(question, question_id, text.strip())
-                except delivery_state.StaleQuestionExchange as error:
-                    raise InvestigationError(str(error)) from None
-        repeated = item.state == InvestigationState.ANSWER_READY and item.answer == text
-        if item.state != InvestigationState.OPEN and not repeated:
-            if isinstance(reply, SubmissionReply):
-                raise InvestigationError("This item no longer accepts this reply.")
-            raise InvestigationError(f"{identity}: cannot answer an investigation in state {item.state}")
+        path, item, repeated = _answer_target(store, identity, text, question_id, reply, source)
         if repeated:
             return item, False
-        exchange = reply.key.request_id if isinstance(reply, SubmissionReply) else question_id
-        console_text.require(text, "investigation answer", identity=f"{path}/{exchange}",
-                             refusal=InvestigationError)
+        if (path, item) != (selected_path, selected):
+            raise InvestigationError("The selected investigation changed.")
         item = replace(item, state=InvestigationState.ANSWER_READY, answered=_now(), answer=text,
                        log=(*item.log, ReviewLog(datetime.now(timezone.utc), str(store.owner), "Answer: "+text)))
         _ = _save(store, item, path)
