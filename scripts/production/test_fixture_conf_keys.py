@@ -27,6 +27,7 @@ kind.natedev = local
 
 FIXTURE_SUMMARY = "fixture config keys: {} missing, {} fixtures not checked because their text is not a literal\n"
 KEY_READS_SUMMARY = "config key reads: {} of a removed key, {} of a key no config file holds\n"
+REFUSAL_SUMMARY = "config key check: refused {} reads of a removed key that main still reads\n"
 SUMMARY = FIXTURE_SUMMARY + KEY_READS_SUMMARY.format(0, 0)
 
 
@@ -243,6 +244,269 @@ def fixture(config: Path, template: str) -> None:
             + "removed keys in config/build_targets.conf: targets\n"
             + "scripts/read_targets.py:1: reads targets, which the tip removes from config/build_targets.conf\n"
             + FIXTURE_SUMMARY.format(1, 0) + KEY_READS_SUMMARY.format(1, 0)))
+
+    def test_a_renamed_key_is_refused_when_main_and_tip_read_the_old_key(self) -> None:
+        self.write("config/rollout.conf", "old_key=1\n")
+        self.write("scripts/reader.py", 'from scripts.lib import conf\nconf.read("rollout").text("old_key")\n')
+        shell_read = "conf_value rollout old_key\n"
+        self.write("scripts/reader.sh", shell_read)
+        self.base = self.commit()
+        self.write("config/rollout.conf", "new_key=1\n")
+        self.write("scripts/reader.sh", "\n" + shell_read)
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 1, output)
+        self.assertEqual(output, (
+            "new keys in config/rollout.conf: new_key\n"
+            + "removed keys in config/rollout.conf: old_key\n"
+            + "scripts/reader.py:2: reads old_key, which the tip removes from config/rollout.conf"
+            + "; main reads it too: refused\n"
+            + "scripts/reader.sh:2: reads old_key, which the tip removes from config/rollout.conf"
+            + "; main reads it too: refused\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(2, 0) + REFUSAL_SUMMARY.format(2)))
+
+    def test_updating_a_reader_clears_its_refusal(self) -> None:
+        self.write("config/rollout.conf", "old_key=1\n")
+        self.write("scripts/primary.sh", "conf_value rollout old_key\n")
+        self.write("scripts/secondary.sh", "conf_value rollout old_key\n")
+        self.base = self.commit()
+        self.write("config/rollout.conf", "new_key=1\n")
+        self.write("scripts/primary.sh", "conf_value rollout new_key\n")
+        key_changes = "new keys in config/rollout.conf: new_key\nremoved keys in config/rollout.conf: old_key\n"
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 1, output)
+        self.assertEqual(output, (
+            key_changes
+            + "scripts/secondary.sh:1: reads old_key, which the tip removes from config/rollout.conf"
+            + "; main reads it too: refused\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(1, 0) + REFUSAL_SUMMARY.format(1)))
+        self.write("scripts/secondary.sh", "conf_value rollout new_key\n")
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, key_changes + SUMMARY.format(0, 0))
+
+    def test_removed_key_reads_added_on_the_tip_are_advisory(self) -> None:
+        self.write("config/rollout.conf", "old_key=1\nretained=2\n")
+        self.write("scripts/changed.sh", "conf_value rollout retained\n")
+        self.write("scripts/stale.sh", "conf_value rollout old_key\n")
+        self.base = self.commit()
+        self.write("config/rollout.conf", "retained=2\n")
+        self.write("scripts/changed.sh", "conf_value rollout old_key\n")
+        self.write("scripts/new.sh", "conf_value rollout old_key\n")
+        advisory = (
+            "removed keys in config/rollout.conf: old_key\n"
+            + "scripts/changed.sh:1: reads old_key, which the tip removes from config/rollout.conf\n"
+            + "scripts/new.sh:1: reads old_key, which the tip removes from config/rollout.conf\n"
+        )
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 1, output)
+        self.assertEqual(output, (
+            advisory
+            + "scripts/stale.sh:1: reads old_key, which the tip removes from config/rollout.conf"
+            + "; main reads it too: refused\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(3, 0) + REFUSAL_SUMMARY.format(1)))
+        self.write("scripts/stale.sh", "conf_value rollout retained\n")
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, advisory + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(2, 0))
+
+    def test_an_absent_key_stays_advisory_even_when_main_reads_it(self) -> None:
+        self.write("config/rollout.conf", "old_key=1\n")
+        self.write("scripts/reader.sh", "conf_value rollout absent.always\nconf_value rollout old_key\n")
+        self.base = self.commit()
+        absent_read = "scripts/reader.sh:1: reads absent.always, which no config file on the tip holds\n"
+        status, output = self.run_check(self.base)
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, absent_read + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 1))
+        self.write("config/rollout.conf", "new_key=1\n")
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 1, output)
+        self.assertEqual(output, (
+            "new keys in config/rollout.conf: new_key\n"
+            + "removed keys in config/rollout.conf: old_key\n"
+            + absent_read
+            + "scripts/reader.sh:2: reads old_key, which the tip removes from config/rollout.conf"
+            + "; main reads it too: refused\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(1, 1) + REFUSAL_SUMMARY.format(1)))
+
+    def test_an_unchanged_python_key_mention_is_advisory(self) -> None:
+        self.write("config/rollout.conf", "old_key=1\nretained=2\n")
+        self.write("scripts/reader.py", 'print("old_key")\n')
+        self.base = self.commit()
+        self.write("config/rollout.conf", "retained=2\n")
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "removed keys in config/rollout.conf: old_key\n"
+            + "scripts/reader.py:1: reads old_key, which the tip removes from config/rollout.conf\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(1, 0)))
+
+    def test_an_unchanged_shell_here_document_key_mention_is_advisory(self) -> None:
+        self.write("config/rollout.conf", "old_key=1\nretained=2\n")
+        self.write("scripts/reader.sh", "cat <<'EOF'\nrollout old_key\nEOF\n")
+        self.base = self.commit()
+        self.write("config/rollout.conf", "retained=2\n")
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "removed keys in config/rollout.conf: old_key\n"
+            + "scripts/reader.sh:2: reads old_key, which the tip removes from config/rollout.conf\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(1, 0)))
+
+    def test_moving_a_read_to_the_config_file_that_holds_the_key_clears_its_refusal(self) -> None:
+        self.write("config/rollout.conf", "old_key=1\nretained=2\n")
+        self.write("config/other.conf", "old_key=3\n")
+        reader = ('from scripts.lib import conf\n'
+                  'conf.read("rollout").text("old_key")\n'
+                  'conf.read("rollout").text("retained")\n')
+        self.write("scripts/reader.py", reader)
+        self.base = self.commit()
+        self.write("config/rollout.conf", "retained=2\n")
+        self.write("scripts/reader.py", reader.replace('read("rollout").text("old_key")',
+                                                       'read("other").text("old_key")'))
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertIn("removed keys in config/rollout.conf: old_key\n", output)
+        self.assertNotIn("refused", output)
+
+    def test_an_absent_key_and_a_removed_key_mention_pass_without_a_refusal(self) -> None:
+        self.write("config/rollout.conf", "old_key=1\nretained=2\n")
+        self.write("scripts/reader.sh", "echo old_key\nconf_value rollout absent.always\n")
+        self.base = self.commit()
+        self.write("config/rollout.conf", "retained=2\n")
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "removed keys in config/rollout.conf: old_key\n"
+            + "scripts/reader.sh:1: reads old_key, which the tip removes from config/rollout.conf\n"
+            + "scripts/reader.sh:2: reads absent.always, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(1, 1)))
+
+    def test_an_escaped_newline_before_a_here_document_delimiter_keeps_the_read_advisory(self) -> None:
+        self.write("config/rollout.conf", "old_key=1\nretained=2\n")
+        self.write("scripts/reader.sh", "cat <<EOF\ntext\\\nEOF\nconf_value rollout old_key\nEOF\n")
+        self.base = self.commit()
+        self.write("config/rollout.conf", "retained=2\n")
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "removed keys in config/rollout.conf: old_key\n"
+            + "scripts/reader.sh:4: reads old_key, which the tip removes from config/rollout.conf\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(1, 0)))
+
+    def test_a_shell_source_with_a_left_shift_keeps_its_read_advisory(self) -> None:
+        self.write("config/rollout.conf", "old_key=1\nretained=2\n")
+        self.write("scripts/reader.sh", "(( 1 << 2 )) && conf_value rollout old_key\n")
+        self.base = self.commit()
+        self.write("config/rollout.conf", "retained=2\n")
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "removed keys in config/rollout.conf: old_key\n"
+            + "scripts/reader.sh:1: reads old_key, which the tip removes from config/rollout.conf\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(1, 0)))
+
+    def test_a_python_reader_bound_to_different_files_in_branches_is_advisory(self) -> None:
+        self.write("config/rollout.conf", "old_key=1\nretained=2\n")
+        self.write("config/other.conf", "old_key=3\n")
+        self.write("scripts/reader.py", '''\
+from scripts.lib import conf
+
+def read(use_other):
+    if use_other:
+        settings = conf.read("other")
+    else:
+        settings = conf.read("rollout")
+    return settings.text("old_key")
+''')
+        self.base = self.commit()
+        self.write("config/rollout.conf", "retained=2\n")
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "removed keys in config/rollout.conf: old_key\n"
+            + "scripts/reader.py:8: reads old_key, which the tip removes from config/rollout.conf\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(1, 0)))
+
+    def test_a_refused_occurrence_is_absent_from_advisory_removed_reads(self) -> None:
+        for name in ("other", "rollout"):
+            self.write(f"config/{name}.conf", "old_key=1\nretained=2\n")
+        source = "scripts/reader.py"
+        self.write(source, 'from scripts.lib import conf\nconf.read("rollout").text("old_key")\n')
+        self.base = self.commit()
+        for name in ("other", "rollout"):
+            self.write(f"config/{name}.conf", "retained=2\n")
+        report = fixture_conf_keys.check(self.repo, self.base, self.commit())
+        occurrence = (source, 2, "old_key")
+        self.assertEqual([(read.source, read.line, read.key) for read in report.refused_reads], [occurrence])
+        self.assertNotIn(occurrence, [(read.source, read.line, read.key) for read in report.advisory.removed])
+
+    def test_an_import_in_an_empty_loop_preserves_an_absent_key_read(self) -> None:
+        self.write("config/rollout.conf", "old_key=1\nretained=2\n")
+        self.write("scripts/reader.py", '''\
+from scripts.lib import conf
+
+key = "absent.always"
+for _ in ():
+    import os as key
+conf.read("rollout").text(key)
+''')
+        self.base = self.commit()
+        self.write("config/rollout.conf", "retained=2\n")
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "removed keys in config/rollout.conf: old_key\n"
+            + "scripts/reader.py:6: reads absent.always, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 1)))
+
+    def test_one_refused_occurrence_names_both_files_and_counts_once(self) -> None:
+        for name in ("other", "rollout"):
+            self.write(f"config/{name}.conf", "old_key=1\nretained=2\n")
+        self.write("scripts/reader.sh", "conf.py get rollout old_key\n")
+        self.base = self.commit()
+        for name in ("other", "rollout"):
+            self.write(f"config/{name}.conf", "retained=2\n")
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 1, output)
+        self.assertEqual(output, (
+            "removed keys in config/other.conf: old_key\n"
+            + "removed keys in config/rollout.conf: old_key\n"
+            + "scripts/reader.sh:1: reads old_key, which the tip removes from config/other.conf, config/rollout.conf"
+            + "; main reads it too: refused\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(1, 0) + REFUSAL_SUMMARY.format(1)))
+
+    def test_a_source_that_defines_conf_value_keeps_its_reads_advisory(self) -> None:
+        self.write("config/rollout.conf", "old_key=1\nretained=2\n")
+        self.write("scripts/keyword.sh", 'function conf_value { echo "$2"; }\nconf_value rollout old_key\n')
+        self.write("scripts/parentheses.sh", 'conf_value() { echo "$2"; }\nconf_value rollout old_key\n')
+        self.base = self.commit()
+        self.write("config/rollout.conf", "retained=2\n")
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "removed keys in config/rollout.conf: old_key\n"
+            + "scripts/keyword.sh:2: reads old_key, which the tip removes from config/rollout.conf\n"
+            + "scripts/parentheses.sh:2: reads old_key, which the tip removes from config/rollout.conf\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(2, 0)))
+
+    def test_python_loader_calls_with_keyword_arguments_are_advisory(self) -> None:
+        self.write("config/rollout.conf", "old_key=1\nretained=2\n")
+        self.write("scripts/reader.py", '''\
+from scripts.lib import conf
+conf.read(file="rollout", load=override).text("old_key")
+conf.read(stem="rollout").text("old_key")
+conf.read("rollout", load=override).text("old_key")
+''')
+        self.base = self.commit()
+        self.write("config/rollout.conf", "retained=2\n")
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "removed keys in config/rollout.conf: old_key\n"
+            + "scripts/reader.py:2: reads old_key, which the tip removes from config/rollout.conf\n"
+            + "scripts/reader.py:3: reads old_key, which the tip removes from config/rollout.conf\n"
+            + "scripts/reader.py:4: reads old_key, which the tip removes from config/rollout.conf\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(3, 0)))
 
     def test_bound_repository_read_reports_a_key_no_config_file_holds(self) -> None:
         self.write("config/hosts/limits.conf", "transfer_timeout.natedev=180\nslots.aws-hana.hana.max_bytes=5\n")
