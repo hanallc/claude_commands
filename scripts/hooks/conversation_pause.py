@@ -1157,25 +1157,7 @@ def _status(session_id: str) -> str:
         return f"paused: {names} ({kind})" if names else f"not paused ({kind})"
 
 
-def _codex_director_hold() -> int:
-    payload = cast(object, json.load(sys.stdin))
-    if not isinstance(payload, dict):
-        return 0
-    fields = cast(dict[str, object], payload)
-    session_id = fields.get("session_id")
-    if fields.get("hook_event_name") != "UserPromptSubmit" or not isinstance(session_id, str) or not session_id:
-        return 0
-    if director_turn(session_id, record=session_staff(session_id)) is DirectorTurn.HOLD:
-        print(json.dumps({"hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": DIRECTOR_HOLD_CONTEXT,
-        }}), flush=True)
-    return 0
-
-
 def main(arguments: list[str]) -> int:
-    if arguments == ["codex-director-hold"]:
-        return _codex_director_hold()
     if len(arguments) != 1 or arguments[0] not in {"status", "resume", "keep", "tick"}:
         print(USAGE, file=sys.stderr)
         return 2
