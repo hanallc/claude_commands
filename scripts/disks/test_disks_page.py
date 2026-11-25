@@ -97,6 +97,8 @@ class DisksPageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             page = disks_page.publish(Path(directory) / "page", SETTINGS).read_text()
         self.assertIn(page_frame.STYLE, page)
+        self.assertIn(page_frame.action_failure("measure-failure"), page)
+        self.assertIn(page_frame.ACTION_STATUS_SCRIPT, page)
         button = re.search(r'<button type="button" id="measure-now"[^>]*>.*?</button>', page, re.DOTALL)
         assert button is not None
         self.assertIn('aria-label="Measure now" title="Measure now"', button[0])
@@ -105,7 +107,8 @@ class DisksPageTests(unittest.TestCase):
         self.assertIn('</h1><p class="page-status"', page)
         self.assertIn('data-status-age hidden></span><span data-status-trip hidden></span>', page)
         self.assertIn('data-status-render hidden></span><span data-status-reason hidden></span>', page)
-        self.assertNotIn("__", page.split("<script>", 1)[0].split("</style>", 1)[1])
+        body = re.sub(r'<script\b[^>]*>.*?</script>', '', page.split('<body>', 1)[1], flags=re.DOTALL)
+        self.assertNotIn("__", body)
         settings_text = page.split('type="application/json">', 1)[1].split("</script>", 1)[0]
         self.assertEqual(json.loads(settings_text.replace("<\\/", "</")), SETTINGS)
         # The step tooltip rules and code come from the Builds page as they are, so the two pages share them.
@@ -201,7 +204,7 @@ class DisksPageTests(unittest.TestCase):
         self.assertIn(page_frame.REFRESH_SCRIPT, page)
         self.assertIn("createPageRefresh(loadDisks,()=>settings.poll_seconds)", page)
         self.assertIn('readAt:data.measured_at,renderSeconds:data.render_seconds', page)
-        self.assertIn('setMeasuring(null,"The measure did not finish.")', page)
+        self.assertIn('showActionFailure(measureFailure, "The measure did not finish.")', page)
         scenario = r"""
 const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
 let generation=0,fileAt=now/1000-4200,measureState='current',stalled=false,failedReads=false;
@@ -211,6 +214,7 @@ function render(){}
 function renderCards(){}
 const payload=()=>({generation,measured_at:fileAt,render_seconds:.03,drives:[]});
 const fetch=async(url)=>{
+ if(url==='measure' && measureState==='refused') return {ok:false,status:503,json:async()=>({reason:'Measure refused.'})};
  if(url==='measure') return {ok:true,json:async()=>({state:measureState,target:generation+(measureState==='current' ? 0 : 1)})};
  if(failedReads) return {ok:false,status:502};
  if(stalled) return new Promise(resolve=>pendingReads.push(resolve));
@@ -235,10 +239,13 @@ START
  measureState='started';await pageRefresh.refresh();
  advanceTime((settings.wait_seconds+1)*1000);pageRefresh.changed();
  await Promise.resolve();await Promise.resolve();
- check(line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
+ check(!measureIssue.hidden && measureIssue.textContent==='The measure did not finish.',
   'A measure timeout must keep its failure after the age clock runs.');
+ measureState='refused';await pageRefresh.refresh();
+ check(line.dataset.state==='Live' && !measureIssue.hidden && measureIssue.textContent==='Measure refused.',
+  'A refused automatic measure must show its reason with the old sizes.');
  measureState='current';await pageRefresh.refresh();
- check(line.dataset.state==='Live','A server answer must recover with the old sizes.');
+ check(line.dataset.state==='Live' && measureIssue.hidden,'A server answer must clear the measure failure.');
  measureState='started';await pageRefresh.refresh();
  failedReads=true;await pageRefresh.refresh();pageRefresh.changed();
  await Promise.resolve();await Promise.resolve();
@@ -250,6 +257,8 @@ START
  check(measuring===null,'Failed reads after the wait limit must clear measuring.');
  check(line.dataset.state==='Failed' && parts.reason.textContent==='HTTP 502',
   'Failed reads after the wait limit must show Failed and HTTP 502.');
+ check(!measureIssue.hidden && measureIssue.textContent==='The measure did not finish.',
+  'The timeout notice must show beside the read failure.');
  failedReads=false;measureState='current';await pageRefresh.refresh();
  check(line.dataset.state==='Live','A good read after failed reads must return to Live.');
  stalled=true;const pendingRead=pageRefresh.refresh();
@@ -273,6 +282,22 @@ START
 })().catch(error=>{console.error(error);process.exitCode=1;});
 """
         self.assert_status_scenario(scenario)
+
+    def test_a_refused_first_measure_shows_failed_without_data(self) -> None:
+        self.assert_status_scenario(r"""
+function render(){}
+function renderCards(){}
+const fetch=async(url)=>url==='measure'
+ ? {ok:false,status:503,json:async()=>({reason:'Measure refused.'})}
+ : {ok:false,status:404};
+START
+(async()=>{
+ await pageRefresh.refresh();
+ if(line.dataset.state!=='Failed' || parts.reason.textContent!=='Measure refused.' || !measureIssue.hidden)
+  throw new Error('A refused first measure must show its reason in the Failed status.');
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
 
     def test_the_first_measure_keeps_its_data_age_when_the_next_read_stalls(self) -> None:
         self.assert_status_scenario(r"""
@@ -335,11 +360,11 @@ START
  now+=1000;generation++;fileAt=now/1000;await pageRefresh.refresh();
  check(!measureButton.disabled && line.dataset.state==='Live','New data enables the button.');
  failed=true;await measureButton.press();
- check(!measureButton.disabled && line.dataset.state==='Failed' && parts.reason.textContent==='Launch failed.',
+ check(!measureButton.disabled && !measureIssue.hidden && measureIssue.textContent==='Launch failed.' && line.dataset.state==='Live',
   'A failed press shows its reason and enables the button.');
  failed=false;await measureButton.press();
  advanceTime((settings.wait_seconds+1)*1000);
- check(!measureButton.disabled && line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
+ check(!measureButton.disabled && !measureIssue.hidden && measureIssue.textContent==='The measure did not finish.',
   'The wait limit enables the button and shows the failure.');
  if(failures.length) throw new Error(failures.join('\n'));
  console.log('PASS');
@@ -401,10 +426,11 @@ START
  check(forced()===3 && pendingData.length===1,'The next read must remain pending after the forced POST.');
  advanceTime(settings.wait_seconds*1000);
  check(measuring===null && !measureButton.disabled,'The timer must end the measure state at the wait limit.');
- check(line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
+ check(!measureIssue.hidden && measureIssue.textContent==='The measure did not finish.',
   'The timer must show the failure before the stalled read ends.');
  stallData=false;pendingData.shift()(dataReply());await timedPress;
- check(!measureButton.disabled && line.dataset.state==='Failed','The abandoned read must not replace the timeout failure.');
+ check(!measureButton.disabled && !measureIssue.hidden && measureIssue.textContent==='The measure did not finish.',
+  'The abandoned read must keep the timeout failure.');
  if(failures.length) throw new Error(failures.join('\n'));
  console.log('PASS');
 })().catch(error=>{console.error(error);process.exitCode=1;});
@@ -439,7 +465,7 @@ START
  pendingPosts.shift()({ok:false,status:503,json:async()=>({reason:'Forced launch failed.'})});
  await failedPress;
  check(measuring===null && !measureButton.disabled,'A failed POST must clear the press after a poll.');
- check(line.dataset.state==='Failed' && parts.reason.textContent==='Forced launch failed.',
+ check(!measureIssue.hidden && measureIssue.textContent==='Forced launch failed.',
   'The failed POST must show its reason after a poll.');
 
  const answeredPress=measureButton.press(),before=fileAt;
@@ -527,7 +553,7 @@ START
  check(data===null && measuring!==null && measureButton.disabled,'The first measure must start without earlier data.');
  advanceTime(settings.wait_seconds*1000);
  check(measuring===null && !measureButton.disabled,'The timer must clear the first measure at the wait limit.');
- check(line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
+ check(!measureIssue.hidden && measureIssue.textContent==='The measure did not finish.',
   'The timer must report failure without earlier data.');
  if(failures.length) throw new Error(failures.join('\n'));
  console.log('PASS');
@@ -544,7 +570,9 @@ const settingsText=SETTINGS;
 const measureButton={disabled:false,addEventListener:(key,run)=>{
  measureButton.press=()=>measureButton.disabled ? undefined : run({currentTarget:measureButton});
 }};
-document.getElementById=key=>key==='measure-now' ? measureButton : {textContent:JSON.stringify(settingsText)};
+const measureIssue={hidden:true,textContent:''};
+const elements={'measure-now':measureButton,'measure-failure':measureIssue};
+document.getElementById=key=>elements[key] || {textContent:JSON.stringify(settingsText)};
 const localStorage={getItem:()=>null};
 """.replace("SETTINGS", json.dumps(SETTINGS))
         functions = page[page.index("const GIB ="):page.index("const updateSessions =")]
@@ -552,8 +580,8 @@ const localStorage={getItem:()=>null};
         assert start is not None
         scenario = scenario.replace("START", start[0])
         node = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
-        done = subprocess.run([node, "--unhandled-rejections=strict", "-"],
-                              input=environment + functions + page_frame.REFRESH_SCRIPT + scenario,
+        script = environment + functions + page_frame.REFRESH_SCRIPT + page_frame.ACTION_STATUS_SCRIPT + scenario
+        done = subprocess.run([node, "--unhandled-rejections=strict", "-"], input=script,
                               capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual((done.returncode, done.stdout.strip()), (0, "PASS"), done.stderr)
 

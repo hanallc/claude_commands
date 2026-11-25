@@ -891,6 +891,7 @@ def render() -> str:
    <fieldset><legend>Type</legend><div class="new-item-chips">{chips}</div></fieldset>
    <fieldset data-recipient-group><legend>To</legend>
     <p data-owner-reason hidden><span id="review-new-item-owner-reason"></span>&nbsp;<span aria-hidden="true">&#x1F986;</span></p>
+    <p data-recipients-loading role="status" hidden>Loading recipients…</p>
     <p data-recipients-status role="status" hidden></p>
     <div class="new-item-chips" data-recipients></div>
    </fieldset>
@@ -1009,14 +1010,18 @@ STYLE = '''
 :is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
 :is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="enhancement"] { --item-icon: #efbd63; }
 :is(#review-new-item,[data-new-item-draft]) .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
-:is(#review-new-item,[data-new-item-draft]) [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
+:is(#review-new-item,[data-new-item-draft]) :is([data-recipients-status], [data-recipients-loading]) {
+ margin: 0; color: var(--ink-2, #c3c2b7);
+}
 :is(#review-new-item,[data-new-item-draft]) [data-recipient-group] { display: flow-root; }
 :is(#review-new-item,[data-new-item-draft]) [data-recipient-group] > legend { float: left; margin-right: 12px; }
 :is(#review-new-item,[data-new-item-draft]) [data-owner-reason] {
  margin: 0 0 8px; font-size: 12px; line-height: 1.2; text-align: right; text-wrap: balance; overflow-wrap: anywhere;
  color: var(--ink-3, #9a988f);
 }
-:is(#review-new-item,[data-new-item-draft]) [data-recipients-status], :is(#review-new-item,[data-new-item-draft]) [data-recipients] { clear: both; }
+:is(#review-new-item,[data-new-item-draft]) :is([data-recipients-status], [data-recipients-loading], [data-recipients]) {
+ clear: both;
+}
 .new-item-route .route-steps {
  display: grid; gap: 8px;
  grid-template-columns: max-content minmax(16px, 1fr) minmax(0, 1.45fr) minmax(16px, 1fr) minmax(0, 2.8fr);
@@ -1138,7 +1143,7 @@ STYLE = '''
 '''
 
 
-SCRIPT = r'''(() => {
+SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''(() => {
  const endpoint = '/console/review/new-item';
  const limits = __LIMITS__;
  const original = document.querySelector('#review-new-item');
@@ -1181,6 +1186,7 @@ function bindDraft(dialog, fresh = false) {
  const form = dialog.querySelector('form'), body = dialog.querySelector('.new-item-body');
  const recipientChips = dialog.querySelector('[data-recipients]');
  const recipientStatus = dialog.querySelector('[data-recipients-status]');
+ const recipientLoading = dialog.querySelector('[data-recipients-loading]');
  const recipientGroup = dialog.querySelector('[data-recipient-group]');
  const ownerReason = dialog.querySelector('[data-owner-reason]');
  const ownerReasonText = ownerReason.querySelector('span');
@@ -1274,8 +1280,7 @@ function bindDraft(dialog, fresh = false) {
  }
 
  function setError(reason) {
-  error.textContent = reason;
-  error.hidden = !reason;
+  showActionFailure(error, reason);
  }
 
  function updateSend() {
@@ -1332,10 +1337,9 @@ function bindDraft(dialog, fresh = false) {
   recipientChips.replaceChildren();
   for (const recipient of available)
    recipientChips.append(choiceChip('recipient_id', recipient, selectedRecipient));
-  recipientStatus.textContent = selectedRecipient === null
+  showActionFailure(recipientStatus, selectedRecipient === null
    ? (assignees ? 'The producer you chose is unavailable.' : 'The recipient you chose is not available. Choose a recipient.')
-   : available.length ? '' : (assignees ? 'No producers are available.' : 'No recipients are available.');
-  recipientStatus.hidden = !recipientStatus.textContent;
+   : available.length ? '' : (assignees ? 'No producers are available.' : 'No recipients are available.'));
   showOwnerReason();
  }
 
@@ -1389,11 +1393,11 @@ function bindDraft(dialog, fresh = false) {
   event.preventDefault();
   const total = [...images.map(image => image.file), ...files].reduce((sum, file) => sum + file.size, 0);
   if (files.some(file => !limits.types.includes(file.type))) {
-   setError('Paste PNG, JPEG, GIF or WebP images.'); return;
+   showActionFailure(error, 'Paste PNG, JPEG, GIF or WebP images.'); return;
   }
   if (images.length + files.length > limits.images || total > limits.totalImageBytes ||
       files.some(file => !file.size || file.size > limits.imageBytes)) {
-   setError('Paste up to four images, at most 5 MiB each and 12 MiB total.'); return;
+   showActionFailure(error, 'Paste up to four images, at most 5 MiB each and 12 MiB total.'); return;
   }
   addImagePreviews(files);
   editDraft();
@@ -1576,18 +1580,18 @@ function bindDraft(dialog, fresh = false) {
 
  function collectPageContext() {
   const filters = [];
-  for (const chip of document.querySelectorAll('[data-type-chip],[data-show-chip],[data-owner-chip],[data-filter-value]')) {
+  for (const chip of document.querySelectorAll('[data-filter-row] [data-filter-value]')) {
    if (chip.getAttribute('aria-pressed') !== 'true' || !visible(chip)) continue;
    const group = chip.closest('[role="group"]')?.getAttribute('aria-label');
    if (!group) continue;
    const label = chip.cloneNode(true);
    label.querySelector('b')?.remove();
-   filters.push((group === 'Show' ? 'State' : group) + ' ' + clip(label.textContent));
+   filters.push(group + ' ' + clip(label.textContent));
   }
   const search = document.querySelector('#list-search,[data-filter-words]');
   if (search?.value && visible(search)) filters.push('Search ' + clip(search.value));
   const notices = new Set();
-  const selector = '[data-review-source-notices] li,[data-review-notice],[data-missing-item],.notice,' +
+  const selector = '[data-review-source-notices] li,[data-review-notice],[data-hidden-action-status],[data-missing-item],.notice,' +
                    '[role="alert"],[data-page-status][data-state="Failed"] [data-status-reason]';
   for (const element of document.querySelectorAll(selector)) {
    if (!visible(element)) continue;
@@ -1812,8 +1816,13 @@ function bindDraft(dialog, fresh = false) {
    }
   }
   const newDraft = !keepDraft && !draftId;
-  if (newDraft) showAssigneeChoices(false);
+  if (newDraft) {
+   selectedRecipient = '';
+   showAssigneeChoices(false);
+  }
+  // A refusal belongs to the page that sent it, so a new dialog starts without one.
   sendNotice.hidden = true;
+  sendNotice.textContent = '';
   includePage.closest('label').hidden = !pageContext;
   recipients = null;
   assignees = null;
@@ -1826,8 +1835,8 @@ function bindDraft(dialog, fresh = false) {
    setError('');
    form.elements.kind.value = kind;
   }
-  recipientStatus.textContent = 'Loading recipients…';
-  recipientStatus.hidden = false;
+  showActionFailure(recipientStatus);
+  recipientLoading.hidden = false;
   showEvidence();
   showBugPage();
   showSentDetails();
@@ -1845,7 +1854,9 @@ function bindDraft(dialog, fresh = false) {
    startCapture();
    showSentDetails();
   } catch (failure) {
-   if (!controller.signal.aborted) recipientStatus.textContent = failure.message;
+   if (!controller.signal.aborted) showActionFailure(recipientStatus, failure.message);
+  } finally {
+   if (!controller.signal.aborted) recipientLoading.hidden = true;
   }
  }
 

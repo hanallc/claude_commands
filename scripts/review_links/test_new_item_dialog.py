@@ -78,25 +78,31 @@ SHELL = '''
 PROBE = r'''
 const failures = [];
 const check = (ok, description) => { if (!ok) failures.push(description); };
-const dialog = document.querySelector('dialog'), body = dialog.querySelector('.new-item-body');
-const textarea = dialog.querySelector('textarea'), error = dialog.querySelector('[role="alert"]');
-const send = dialog.querySelector('[type="submit"]'), recipient = () => dialog.querySelector('[name="recipient_id"]');
+let dialog, body, textarea, error, send;
+const recipient = () => dialog.querySelector('[name="recipient_id"]');
 const launch = document.querySelector('[data-owner-new]'), png = '__PNG__';
 const to = () => [...dialog.querySelectorAll('[name="recipient_id"]')];
 const morty = () => to().find(input => input.nextElementSibling.textContent === 'morty');
 const selectType = kind => dialog.querySelector('[name="kind"][value="'+kind+'"]').click();
-const open = ({kind, page = 'builds'} = {}) => new Promise(resolve => {
- const status = dialog.querySelector('[data-recipients-status]');
- const observer = new MutationObserver(() => {
-  if (!status.hidden) return;
-  observer.disconnect();
-  if (kind) selectType(kind);
-  resolve();
- });
- observer.observe(status, {attributes:true, attributeFilter:['hidden']});
+async function open({kind, page = 'builds'} = {}) {
  launch.closest('[data-page-owner]').dataset.pageOwner = page;
  launch.click();
-});
+ dialog = document.querySelector('dialog:modal');
+ body = dialog.querySelector('.new-item-body');
+ textarea = dialog.querySelector('textarea');
+ error = dialog.querySelector('[role="alert"]');
+ send = dialog.querySelector('[type="submit"]');
+ const loading = dialog.querySelector('[data-recipients-loading]');
+ if (!loading.hidden) await new Promise(resolve => {
+  const observer = new MutationObserver(() => {
+   if (!loading.hidden) return;
+   observer.disconnect();
+   resolve();
+  });
+  observer.observe(loading, {attributes:true, attributeFilter:['hidden']});
+ });
+ if (kind) selectType(kind);
+}
 const closeToLauncher = () => !dialog.open && document.activeElement === launch;
 function type(text) {
  textarea.value = text;
@@ -195,6 +201,7 @@ async function sendSaved() {
          error.textContent === 'Fixture rejected the first send.' && !send.disabled,
          'Reopen keeps the failed draft and its error.');
    check((await sendSaved()).detail.id === 'I1', 'The event reports the saved item ID.');
+   check(error.hidden && !error.textContent, 'A successful Send shows no failure.');
 
    await open({kind:'question'});
    check(!textarea.value && dialog.querySelector('[data-previews]').hidden, 'Reopen clears the sent draft.');
@@ -256,7 +263,7 @@ async function sendSaved() {
    check(closeToLauncher(), 'Cancel restores focus to the launcher.');
 
    const ownerPosts = [], ownerEndpoint = '/console/review/new-item?page=builds';
-   let pngAvailable = true, discarded, useLiveSends = false, dropPageReply = true;
+   let pngAvailable = true, discarded, useLiveSends = false, dropPageReply = true, lostHold;
    let captureKey = 'd34db33fd34db33fd34db33fd34db33f';
    let ownerToken = 'owner-token';
    let releasePreview, expireNextSend = false, failNextSend = false;
@@ -272,6 +279,11 @@ async function sendSaved() {
      return previewGate.then(() => originalFetch('data:image/png;base64,' + png));
     }
     if (url !== '/console/review/new-item' || options?.method !== 'POST') return originalFetch(url, options);
+    const hold = new Headers(options.headers).get('X-Undo-Request');
+    if (lostHold && hold === lostHold && !options.keepalive) {
+     lostHold = null;
+     return Promise.reject(new Error('The Send response was lost.'));
+    }
     const payload = JSON.parse(options.body);
     ownerPosts.push(payload);
     if (payload.page_capture) {
@@ -305,6 +317,7 @@ async function sendSaved() {
      return payload.page && dropPageReply ? response.then(saved => {
       if (!saved.ok) return saved;
       dropPageReply = false;
+      if (options.keepalive) lostHold = hold;
       throw new Error('The Send response was lost.');
      }) : response;
     }
@@ -613,6 +626,9 @@ async function sendSaved() {
      return json({token:'', page_owner:'list-staff', recipients:[{id:'list-staff',name:'morty'}],
                   send_disabled:'Sending is off on a practice List.'});
     }
+    if (url === '/console/review/new-item?page=accounts') {
+     return json({error:'The recipient service is unavailable.'}, 503);
+    }
     if (url === '/console/review/new-item' && options?.method === 'POST') {
      ownerPosts.push(JSON.parse(options.body));
      return json({});
@@ -626,9 +642,19 @@ async function sendSaved() {
    type('A practice item.');
    check(!notice.hidden && notice.textContent === 'Sending is off on a practice List.',
          'The practice dialog shows one reason.');
-   check(send.disabled && checkbox.closest('label').hidden, 'The practice dialog disables Send and hides capture.');
+   check(send.disabled && dialog.querySelector('[name="include_page"]').closest('label').hidden,
+         'The practice dialog disables Send and hides capture.');
    send.click();
    check(ownerPosts.length === beforePractice, 'The practice dialog makes no POST.');
+   dialog.querySelector('[data-cancel]').click();
+   await open({page:'accounts',kind:'question'});
+   const nextNotice = dialog.querySelector('[data-send-disabled]');
+   check(nextNotice.hidden && !nextNotice.textContent, 'The next dialog clears the previous refusal.');
+   const recipientFailure = dialog.querySelector('[data-recipients-status]');
+   check(!recipientFailure.hidden && recipientFailure.textContent === 'The recipient service is unavailable.',
+         'The recipient request failure shows its reason.');
+   check(dialog.querySelector('[data-recipients-loading]').hidden && send.disabled,
+         'A failed request clears loading and leaves Send disabled.');
    dialog.querySelector('[data-cancel]').click();
    window.fetch = originalFetch;
   }
@@ -744,7 +770,7 @@ ROW_EVIDENCE_PROBE = r"""
   let dialog;
   const field = selector => dialog.querySelector(selector);
   const words = () => field('textarea'), send = () => field('[type="submit"]');
-  const status = () => field('[data-recipients-status]'), error = () => field('.new-item-error');
+  const loading = () => field('[data-recipients-loading]'), error = () => field('.new-item-error');
   const evidence = () => field('[data-evidence]');
   const include = () => field('[name="include_page"]').closest('label');
   const capture = __CAPTURE__, other = {...capture, step_id: 'other-step', title: 'cargo test', tip: []};
@@ -763,7 +789,7 @@ ROW_EVIDENCE_PROBE = r"""
   const selected = () => dialog.querySelector('[name="recipient_id"]:checked')?.value;
   async function openRow(trigger, data) {
    dialog = window.reviewNewItem.open({trigger, recipientName: 'builds', evidence: data});
-   await until(() => status().textContent !== 'Loading recipients…');
+   await until(() => loading().hidden);
   }
   async function save(id, trigger) {
    const saved = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once: true}));
@@ -806,7 +832,7 @@ ROW_EVIDENCE_PROBE = r"""
   await save('Q1', second);
   document.querySelector('[data-owner-new]').click();
   dialog = document.querySelector('dialog[open]');
-  await until(() => status().textContent !== 'Loading recipients…');
+  await until(() => loading().hidden);
   check(evidence().hidden && !include().hidden && dialog.querySelector('[name="kind"]:checked').value === 'bug',
         'The page owner button still opens the page dialog without row evidence.');
   dialog.querySelector('[data-cancel]').click();
@@ -833,7 +859,7 @@ const failures = [];
 const check = (value, description) => { if (!value) failures.push(description); };
 const wire = [], fetchHTTP = window.fetch;
 let holdCapture = __PHOTO__;
-let releaseCapture, loseSend = false, previewPending = false, previewRequests = 0;
+let releaseCapture, loseSend = false, lostHold, previewPending = false, previewRequests = 0;
 const saved = {id:'I1',key:'bug/owner/I1'};
 window.fetch = async (path, options) => {
  if (!String(path).startsWith('/console/review/new-item')) return fetchHTTP(path, options);
@@ -846,6 +872,11 @@ window.fetch = async (path, options) => {
   return new Response(new Blob(['PNG'], {type:'image/png'}));
  }
  if (!options.body) return Response.json({token:'fixture',page_owner:'owner',recipients:[{id:'owner',name:'sdlc',proposal:true}]});
+ const hold = new Headers(options.headers).get('X-Undo-Request');
+ if (lostHold && hold === lostHold && !options.keepalive) {
+  lostHold = null;
+  throw new TypeError('The Send response was lost.');
+ }
  const payload = JSON.parse(options.body);
  wire.push(payload);
  if (payload.page_capture) {
@@ -856,6 +887,7 @@ window.fetch = async (path, options) => {
  }
  if (loseSend) {
   loseSend = false;
+  if (options.keepalive) lostHold = hold;
   throw new TypeError('The Send response was lost.');
  }
  return Response.json(saved);
@@ -913,7 +945,7 @@ const send = async () => {
         'The Bug dialog lists the page facts with the evidence it sends.');
   check(dialog.querySelector('[data-kind="proposal"]').getClientRects().length > 0,
         'The owner dialog displays Proposal.');
-  check(state.textContent.includes('Type All · State Open · Owner builds'), 'The dialog shows the selected filters.');
+  check(state.textContent.includes('Type All · Show Open · Owner builds'), 'The dialog shows the selected filters.');
   const address = term('Address');
   check(address?.nextElementSibling.textContent === location.href, 'The Address row shows the full address.');
   check(state.querySelector('[data-visible-text]').textContent === 'Page data and visible text',
@@ -1052,9 +1084,9 @@ def bug_fixture_page(*, photo: bool = False, script: str = BUG_PROBE) -> bytes:
             '<main><div class="page-owner" data-page-owner="review"><span>sdlc</span>'
             f'<button data-owner-new aria-label="New item">{page_frame.icon_svg("message-circle-question")}</button></div>'
             '<h1>Review</h1><p data-page-status data-render-seconds="2.40">Live · render 2.40 s</p>'
-            '<div role="group" aria-label="Type"><button data-type-chip="" aria-pressed="true">All <b>2</b></button></div>'
-            '<div role="group" aria-label="Show"><button data-show-chip="open" aria-pressed="true">Open</button></div>'
-            '<div role="group" aria-label="Owner"><button data-owner-chip="builds" aria-pressed="true">builds</button></div>'
+            '<div role="group" aria-label="Type" data-filter-row="type"><button data-filter-value="all" aria-pressed="true">All <b>2</b></button></div>'
+            '<div role="group" aria-label="Show" data-filter-row="show"><button data-filter-value="open" aria-pressed="true">Open</button></div>'
+            '<div role="group" aria-label="Owner" data-filter-row="owner"><button data-filter-value="staff:builds" aria-pressed="true">builds</button></div>'
             '<p class="notice">Could not load …/brain.</p></main>'
             f'{new_item_dialog.render()}<script>{probe}</script></body></html>').encode()
 
@@ -1199,12 +1231,17 @@ const firstKey = 'e'.repeat(32), readyKey = 'f'.repeat(32);
 const probeKey = 'test-list-first-send', draftPrefix = 'console.list.pending-send.';
 const restored = JSON.parse(sessionStorage.getItem(probeKey) || 'null');
 const posts = [], fetchHTTP = window.fetch;
-let captures = 0;
+let captures = 0, lostHold;
 window.fetch = async (path, options) => {
  if (!reloadAfterSend && path.endsWith('?capture_key=' + firstKey)) {
   return fetchHTTP(path.replace(firstKey, readyKey), options);
  }
  if (path === '/console/review/new-item' && options?.method === 'POST') {
+  const hold = new Headers(options.headers).get('X-Undo-Request');
+  if (lostHold && hold === lostHold && !options.keepalive) {
+   lostHold = null;
+   throw new TypeError('The Send response was lost.');
+  }
   const item = JSON.parse(options.body);
   if (!reloadAfterSend && item.page_capture && ++captures === 1) {
    return Response.json({capture_key:firstKey}, {status:202});
@@ -1217,6 +1254,7 @@ window.fetch = async (path, options) => {
      const response = await fetchHTTP(path, options);
      if (response.status !== 503) return response;
     }
+    if (options.keepalive) lostHold = hold;
     throw new TypeError('The Send response was lost.');
    }
   }
@@ -1378,6 +1416,7 @@ const check = (ok, description) => { if (!ok) failures.push(description); };
 const dialog = document.querySelector('#review-new-item');
 const send = dialog.querySelector('[type="submit"]'), words = dialog.querySelector('textarea');
 const status = dialog.querySelector('[data-recipients-status]');
+const loading = dialog.querySelector('[data-recipients-loading]');
 const launch = document.querySelector('[data-owner-new]');
 const include = dialog.querySelector('[name="include_page"]');
 const selected = () => dialog.querySelector('[name="recipient_id"]:checked')?.value;
@@ -1411,7 +1450,7 @@ function waitFor(test) {
 }
 async function open() {
  launch.click();
- await waitFor(() => status.textContent !== 'Loading recipients…');
+ await waitFor(() => loading.hidden);
  if (include.checked) include.click();
 }
 function checkEmpty() {

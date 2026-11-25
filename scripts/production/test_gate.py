@@ -43,7 +43,7 @@ from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.process_start import Gone
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, gate, promotion, staff
-from scripts.production.gate_modules import GateRefused
+from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import (
     build_fixture_sessions, fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, source_environment,
@@ -359,6 +359,9 @@ class DirectGatePlacementTests(unittest.TestCase):
     def test_named_gate_refuses_an_inherited_assignment_for_a_different_source(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             source = self.checkout(folder)
+            test = source / "scripts/lib/test_fixture.py"
+            test.parent.mkdir(parents=True)
+            test.touch()
             path = source / ".git" / "assignment.json"
             key = treekey.tree_key(str(source))
             assert key is not None
@@ -392,6 +395,37 @@ class DirectGatePlacementTests(unittest.TestCase):
                         self.assertEqual(result, 1)
                     self.assertIn("source does not match", errors.getvalue())
                     run.assert_not_called()
+
+    def test_direct_gate_refuses_a_missing_module_before_admission(self) -> None:
+        with (tempfile.TemporaryDirectory() as folder,
+              mock.patch.dict(os.environ, {}, clear=True),
+              mock.patch.object(first_step, "admitted_run") as admit,
+              mock.patch.object(gate, "run_tests_only") as run,
+              redirect_stderr(io.StringIO()) as errors):
+            status = gate.main(["--tests-only", "--repo", folder, "--module", "lib/test_missing.py"])
+        self.assertEqual(status, 1)
+        self.assertIn("--module 'lib/test_missing.py' does not name a test module", errors.getvalue())
+        admit.assert_not_called()
+        run.assert_not_called()
+
+    def test_direct_gate_accepts_a_symlinked_module_that_discovery_accepts(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            source = base / "checkout"
+            shared = base / "sibling/test_shared.py"
+            shared.parent.mkdir()
+            shared.touch()
+            module = "lib/test_shared.py"
+            link = source / "scripts" / module
+            link.parent.mkdir(parents=True)
+            link.symlink_to(shared)
+            self.assertEqual(discover_test_modules(source), [("lib", link)])
+            with (mock.patch.dict(os.environ, {}, clear=True),
+                  mock.patch.object(gate, "checked_gate_target", return_value="natedev"),
+                  mock.patch.object(gate, "run_tests_only", return_value=0) as run):
+                self.assertEqual(gate.main(["--tests-only", "--repo", str(source), "--module", module]), 0)
+            args, mode, target = cast(tuple[gate.GateArguments, gate.SuiteMode, gate.GateTarget], run.call_args.args)
+            self.assertEqual((args.modules, mode, target), ([module], gate.SuiteMode.GATE, "natedev"))
 
     def test_direct_gate_refuses_an_assignment_for_a_different_source(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

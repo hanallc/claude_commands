@@ -23,12 +23,33 @@ from scripts.rebuild import need
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config/statusline.conf"
 MACHINES = ("natedev", "mac")
+CHANGE_LIMIT = 5
+SHORT_REASON_LIMIT = 60
+CHANGES_NOT_READ = "Changes not read yet"
+REASON_NOT_READ = "reason not read"
 
 
-def rebuild_names(machines: Iterable[str]) -> str:
-    """Name each waiting machine once in status line order."""
+def rebuild_names(machines: Iterable[str], reasons: Mapping[str, str] | None = None) -> str:
+    """Name each waiting machine and show its short reason when supplied."""
     waiting = set(machines)
-    return ", ".join(f"rebuild {machine}" for machine in MACHINES if machine in waiting)
+    labels: list[str] = []
+    for machine in MACHINES:
+        if machine not in waiting:
+            continue
+        label = f"rebuild {machine}"
+        reason = (reasons.get(machine) or REASON_NOT_READ) if reasons is not None else ""
+        labels.append(f"{label}: {reason}" if reason else label)
+    return ", ".join(labels)
+
+
+def short_reason(reason: str, more: int = 0) -> str:
+    """Fit a reason and its remaining count in the status line."""
+    words = " ".join("".join(char for char in reason if char.isprintable() or char.isspace()).split())
+    suffix = f" +{more}" if more > 0 else ""
+    limit = SHORT_REASON_LIMIT - len(suffix)
+    if len(words) > limit:
+        words = words[:limit - 1].rstrip() + "…"
+    return words + suffix
 
 
 @dataclass(frozen=True)
@@ -226,6 +247,7 @@ class RebuildAnswer:
     probes: RunningSystemProbes = RunningSystemProbes()
     running_paths: dict[str, str] = field(default_factory=dict)
     comparison_deadline: int = 0
+    configured_subject: str = ""
 
     def row(self) -> str:
         return rebuild_names(self.machines)
@@ -269,12 +291,80 @@ class Change:
 
 @dataclass(frozen=True)
 class ComparedChanges:
-    """The commits from the running system revision to the configured revision."""
+    """The cached changes for one running system and configured revision."""
 
     running_path: str
     active_revision: str
     configured_revision: str
     commits: tuple[Change, ...]
+    paths: tuple[str, ...] = ()
+    paths_between_revisions: bool = False
+    legacy_commits: dict[str, str] = field(default_factory=dict)
+
+
+def commits_with_subjects(changes: ComparedChanges | None) -> tuple[Change, ...]:
+    """Keep cached commits with displayable subjects."""
+    return tuple(change for change in changes.commits if change.reason.strip()) if changes else ()
+
+
+def more_changes(total: int) -> str:
+    """Label the changes beyond the page limit."""
+    return f"+{total - CHANGE_LIMIT} more" if total > CHANGE_LIMIT else ""
+
+
+def comparison_reason(changes: ComparedChanges | None, *, configured_subject: str = "", compact: bool = False) -> str:
+    """Name pending subjects or changed paths."""
+    subjects = tuple(change.reason for change in commits_with_subjects(changes))
+    entries = subjects or (changes.paths if changes else ())
+    if not entries:
+        if changes is not None and changes.paths_between_revisions:
+            if changes.active_revision.endswith("-dirty"):
+                return "The running build has local changes."
+            return "The two revisions have the same files."
+        reason = f"{CHANGES_NOT_READ} · {configured_subject}" if configured_subject else CHANGES_NOT_READ
+        return short_reason(reason) if compact else reason
+    prefix = ""
+    if not subjects:
+        compared_paths = changes is not None and changes.paths_between_revisions
+        prefix = ("Files changed between revisions: " if compared_paths
+                  else "Files changed in the configured commit: ")
+    if compact:
+        return short_reason(prefix + entries[0], len(entries) - 1)
+    shown = entries[:CHANGE_LIMIT]
+    more = more_changes(len(entries))
+    return prefix + " · ".join((*shown, more) if more else shown)
+
+
+@dataclass(frozen=True)
+class RebuildChangesDisplay:
+    """The commits and remaining count for a rebuild page."""
+
+    commits: tuple[Change, ...] = ()
+    more: str = ""
+    fallback: str = ""
+
+    def text(self) -> str:
+        if not self.commits:
+            return self.fallback
+        subjects = tuple(commit.reason for commit in self.commits)
+        return " · ".join((*subjects, self.more) if self.more else subjects)
+
+
+def changes_for_display(answer: RebuildAnswer, machine: str, changes: ComparedChanges | None,
+                        records: tuple[need.NeedRecord, ...]) -> RebuildChangesDisplay:
+    """Show cached subjects for commits without a filed reason."""
+    legacy_commits = changes.legacy_commits if changes else {}
+    filed = {legacy_commits.get(record["nixos_commit"], record["nixos_commit"])
+             for record in records if record["reason"].strip()}
+    subjects = commits_with_subjects(changes)
+    commits = tuple(change for change in subjects if change.commit not in filed)
+    if commits:
+        return RebuildChangesDisplay(commits[:CHANGE_LIMIT], more_changes(len(commits)))
+    if not subjects and (not records or (machine in answer.compared and any(
+            not record["reason"].strip() for record in records))):
+        subject = answer.configured_subject if answer.configured_revision() not in filed else ""
+        return RebuildChangesDisplay(fallback=comparison_reason(changes, configured_subject=subject))
+    return RebuildChangesDisplay()
 
 
 type CachedChanges = ComparedChanges | tuple[Change, ...]
@@ -309,16 +399,30 @@ def transcript_session(bridge: str, run: CommandRunner) -> str:
 
 
 def machine_changes(settings: RebuildSettings, system: need.ActiveSystem, known: dict[str, str],
-                    run: CommandRunner, *, configured: str) -> CachedChanges:
-    """List commits after a verified running revision."""
+                    run: CommandRunner, git_output: Callable[[list[str]], str | None], *,
+                    configured: str, compared: bool = False) -> ComparedChanges:
+    """List pending commits or changed paths."""
     commit = system.revision.removesuffix("-dirty")
-    if not commit:
-        return ()
-    listing = "" if commit == configured else run(["git", "-C", str(settings.repo), "log",
-        "--format=%H%x1f%aI%x1f%s%x1f%(trailers:key=Claude-Session,valueonly,separator=%x20)",
-        f"{commit}..{configured or settings.ref}"])
+    git = ["git", "-C", str(settings.repo)]
+    listing = None
+    if commit == configured and configured:
+        return ComparedChanges(system.path, system.revision, configured, (), paths_between_revisions=True)
+    if commit:
+        listing = git_output([*git, "log",
+                              "--format=%H%x1f%aI%x1f%s%x1f%(trailers:key=Claude-Session,valueonly,separator=%x20)",
+                              f"{commit}..{configured or settings.ref}"])
+        if listing == "" and configured:
+            names = git_output([*git, "diff", "--no-ext-diff", "--name-only", "-z", commit, configured, "--"])
+            if names is not None:
+                paths = tuple(name for name in names.split("\0") if name)
+                return ComparedChanges(system.path, system.revision, configured, (), paths, paths_between_revisions=True)
+            listing = None
+    if listing is None and configured and (compared or commit):
+        names = git_output([*git, "show", "--format=", "--diff-merges=first-parent", "--name-only", "-z", configured])
+        paths = tuple(name for name in (names or "").split("\0") if name)
+        return ComparedChanges(system.path, system.revision, configured, (), paths)
     changes: list[Change] = []
-    for line in listing.splitlines():
+    for line in (listing or "").splitlines():
         fields = line.split("\x1f")
         if len(fields) != 4:
             continue
@@ -329,8 +433,14 @@ def machine_changes(settings: RebuildSettings, system: need.ActiveSystem, known:
     return ComparedChanges(system.path, system.revision, configured, tuple(changes))
 
 
-def write_changes(config: Path, run: CommandRunner = command_output) -> None:
-    """Record each machine's pending /etc/nixos changes and the session that wrote each one."""
+def write_changes(config: Path, run: CommandRunner | None = None) -> None:
+    """Record pending changes and the session that wrote each commit."""
+    output = command_output if run is None else run
+
+    def git_output(command: list[str]) -> str | None:
+        # Existing output runners use empty text for failure.
+        return need.command_result(command) if run is None else run(command) or None
+
     try:
         settings = RebuildSettings.read(config)
         cache = cache_path(config)
@@ -349,22 +459,27 @@ def write_changes(config: Path, run: CommandRunner = command_output) -> None:
             known = {}
         # A machine that does not answer keeps its last list.
         previous = _read_changes(cache)
-        answer = _read_cache(config, time.time)
+        answer = read(config)
         configured = answer.configured_revision()
+        prefixes = {commit for summary in answer.needs for record in summary.records
+                    if need.SHORT_COMMIT.fullmatch(commit := record["nixos_commit"])}
+        legacy_commits = {prefix: commit for prefix in sorted(prefixes)
+                          if (commit := need.resolve_legacy_commit(prefix, settings.repo, output))}
         machines: dict[str, object] = {}
         for machine in MACHINES:
-            system = need.active_system(run(need.active_probe(machine, log=log, ssh=settings.ssh)))
+            system = need.active_system(output(need.active_probe(machine, log=log, ssh=settings.ssh)))
             if system is None:
-                old = previous.get(machine)
-                changes = old.commits if isinstance(old, ComparedChanges) else old
+                changes = previous.get(machine)
             else:
                 try:
-                    need.clear_running_needs(machine, system, settings.repo, run)
+                    need.clear_running_needs(machine, system, settings.repo, output, legacy_commits=legacy_commits)
                 except (OSError, ValueError, KeyError, TypeError) as error:
                     print(f"rebuild needs: {error}", file=sys.stderr)
-                changes = machine_changes(settings, system, known, run, configured=configured)
+                changes = machine_changes(settings, system, known, output, git_output, configured=configured,
+                                          compared=machine in answer.compared
+                                          and system.path == answer.running_paths.get(machine))
             if isinstance(changes, ComparedChanges):
-                machines[machine] = asdict(changes)
+                machines[machine] = asdict(replace(changes, legacy_commits=legacy_commits))
             elif changes is not None:
                 machines[machine] = [asdict(change) for change in changes]
         atomic_file.write_text_atomic(sessions_path(cache), json.dumps(known))
@@ -382,9 +497,12 @@ def _decode_commits(value: object) -> tuple[Change, ...]:
     return tuple(commits)
 
 
-def _read_changes(cache: Path) -> dict[str, CachedChanges]:
+def _read_changes(cache: Path, watch: need.SourceWatch | None = None) -> dict[str, CachedChanges]:
+    path = changes_path(cache)
+    if watch is not None:
+        watch.watch(path)
     try:
-        value = cast(object, json.loads(changes_path(cache).read_text(encoding="utf-8")))
+        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
         if not isinstance(value, dict):
             return {}
         result: dict[str, CachedChanges] = {}
@@ -395,40 +513,68 @@ def _read_changes(cache: Path) -> dict[str, CachedChanges]:
                     # Older caches did not verify the active generation.
                     result[machine] = _decode_commits(fields["commits"])
                     continue
-                path, running, configured = fields["running_path"], fields["active_revision"], fields["configured_revision"]
-                if (not isinstance(path, str) or not system_path(path)
-                        or not isinstance(running, str) or not REVISION.fullmatch(running.removesuffix("-dirty"))
+                running_path, running, configured = fields["running_path"], fields["active_revision"], fields["configured_revision"]
+                if (not isinstance(running_path, str) or not system_path(running_path)
+                        or not isinstance(running, str) or (running and not REVISION.fullmatch(running.removesuffix("-dirty")))
                         or not isinstance(configured, str) or (configured and not REVISION.fullmatch(configured))):
                     continue
-                result[machine] = ComparedChanges(path, running, configured, _decode_commits(fields["commits"]))
+                paths = fields.get("paths", [])
+                if not isinstance(paths, list) or not all(
+                        isinstance(name, str) and name for name in cast(list[object], paths)):
+                    continue
+                compared_paths = fields.get("paths_between_revisions", False)
+                aliases = fields.get("legacy_commits", {})
+                if not isinstance(compared_paths, bool) or not isinstance(aliases, dict):
+                    continue
+                legacy_commits = {prefix: commit for prefix, commit in cast(dict[str, object], aliases).items()
+                                  if need.SHORT_COMMIT.fullmatch(prefix) and isinstance(commit, str)
+                                  and need.FULL_NEED_COMMIT.fullmatch(commit) and commit.startswith(prefix)}
+                result[machine] = ComparedChanges(running_path, running, configured, _decode_commits(fields["commits"]),
+                                                  tuple(cast(list[str], paths)), compared_paths, legacy_commits)
             else:
                 result[machine] = _decode_commits(changes)
         return result
-    except (OSError, ValueError, KeyError, TypeError):
-        return {}
+    except FileNotFoundError:
+        if watch is not None and not watch.verified_absence(path):
+            watch.mark_incomplete()
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
+        if watch is not None:
+            watch.mark_incomplete()
+    return {}
 
 
-def _recorded_changes(config: Path) -> dict[str, CachedChanges]:
+def read_recorded_changes(config: Path, *, watch: need.SourceWatch | None = None) -> dict[str, CachedChanges]:
+    """Read both the current and legacy forms of the changes cache."""
     try:
-        return _read_changes(cache_path(config))
+        return _read_changes(cache_path(config), watch)
     except (OSError, ValueError, KeyError):
+        if watch is not None:
+            watch.mark_incomplete()
         return {}
 
 
 def read_changes(config: Path = DEFAULT_CONFIG) -> dict[str, tuple[Change, ...]]:
     """Read the recorded commit list for each machine."""
     return {machine: changes.commits if isinstance(changes, ComparedChanges) else changes
-            for machine, changes in _recorded_changes(config).items()}
+            for machine, changes in read_recorded_changes(config).items()}
 
 
-def read_compared_changes(config: Path, answer: RebuildAnswer) -> dict[str, ComparedChanges]:
-    """Read commits that match the running path and configured revision in the comparison."""
+def matched_changes(answer: RebuildAnswer, machine: str, cached: CachedChanges | None) -> ComparedChanges | None:
+    """Return changes only if the cache names both systems compared."""
     configured = answer.configured_revision()
-    if not configured:
+    if (isinstance(cached, ComparedChanges) and configured and cached.configured_revision == configured
+            and answer.probes.succeeded(machine) and cached.running_path == answer.running_paths.get(machine)):
+        return cached
+    return None
+
+
+def read_compared_changes(config: Path, answer: RebuildAnswer, *,
+                          watch: need.SourceWatch | None = None) -> dict[str, ComparedChanges]:
+    """Read change lists that match the two systems compared."""
+    if not answer.configured_revision():
         return {}
-    return {machine: changes for machine, changes in _recorded_changes(config).items()
-            if isinstance(changes, ComparedChanges) and changes.configured_revision == configured
-            and answer.probes.succeeded(machine) and changes.running_path == answer.running_paths.get(machine)}
+    return {machine: changes for machine, cached in read_recorded_changes(config, watch=watch).items()
+            if (changes := matched_changes(answer, machine, cached)) is not None}
 
 
 def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.time,
@@ -439,7 +585,7 @@ def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.tim
     try:
         needs = tuple(need.read_needs(errors) if watch is None else need.read_needs(errors, watch=watch))
         machines = set(answer.machines) | {summary.newest["machine"] for summary in needs}
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, RecursionError) as error:
         return replace(answer, needs=RebuildNeedsUnavailable(str(error)))
     return replace(answer, machines=tuple(machine for machine in MACHINES if machine in machines),
                    needs=RebuildNeedsUnavailable("\n".join(errors), needs) if errors else needs)
@@ -469,6 +615,7 @@ def _read_cache(config: Path, clock: Callable[[], float], *,
         failure: EvaluationFailure | NoEvaluationFailure = NoEvaluationFailure()
         probes = RunningSystemProbes()
         running_paths: dict[str, str] = {}
+        configured_subject = ""
         if len(lines) >= 4:
             try:
                 value = cast(object, json.loads(lines[3]))
@@ -483,6 +630,9 @@ def _read_cache(config: Path, clock: Callable[[], float], *,
                 commit, source = details["commit"], details["source"]
                 if (isinstance(commit, str) and REVISION.fullmatch(commit)
                         and isinstance(source, list) and all(isinstance(value, str) for value in cast(list[object], source))):
+                    subject = details.get("configured_subject")
+                    if isinstance(subject, str):
+                        configured_subject = subject
                     failed_at = details.get("failed_at")
                     if isinstance(failed_at, (float, int)) and 0 <= failed_at < float("inf"):
                         failure = EvaluationFailure(commit, tuple(cast(list[str], source)), failed_at)
@@ -493,8 +643,11 @@ def _read_cache(config: Path, clock: Callable[[], float], *,
             except (ValueError, KeyError, TypeError):
                 pass
         compared = tuple(item.removeprefix("rebuild ") for item in items)
+        if isinstance(expected, NoExpectedSystems) and isinstance(failure, NoEvaluationFailure):
+            configured_subject = ""
         return RebuildAnswer(compared, refresh_due, expected, failure, compared,
-                             probes=probes, running_paths=running_paths, comparison_deadline=deadline)
+                             probes=probes, running_paths=running_paths, comparison_deadline=deadline,
+                             configured_subject=configured_subject)
     except (OSError, ValueError):
         return RebuildAnswer((), True)
 
@@ -533,19 +686,24 @@ def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[
             return
         began = time.time_ns()
         line, due, details = "", "", ""
+        subject = ""
         probes = answer.probes
         running_paths = answer.running_paths
         if isinstance(answer.failure, EvaluationFailure):
             line, details = answer.row(), answer.failure.details()
+            subject = answer.configured_subject
         try:
             settings = RebuildSettings.read(config)
-            commit = run(["git", "-C", str(settings.repo), "rev-parse", "--verify", f"{settings.ref}^{{commit}}"])
+            resolved = run(["git", "-C", str(settings.repo), "show", "-s", "--format=%H%x00%s",
+                            "--end-of-options", f"{settings.ref}^{{commit}}"])
+            commit, _, resolved_subject = resolved.partition("\0")
             source = (str(settings.repo), settings.ref, settings.natedev, settings.mac)
             failure = answer.failure
             if (isinstance(failure, EvaluationFailure) and failure.commit == commit and failure.source == source
                     and clock() < failure.failed_at + settings.eval_retry_seconds):
                 line, details = answer.row(), failure.details()
             elif REVISION.fullmatch(commit):
+                subject = resolved_subject
                 expected = expected_systems(settings, answer.expected, run, commit)
                 evaluated_at = clock()
                 comparison = compare(settings, expected, run)
@@ -560,6 +718,7 @@ def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[
             pass
         if details:
             fields = cast(dict[str, object], json.loads(details))
+            fields["configured_subject"] = subject
             fields["running_system_probes"] = {"natedev": probes.natedev, "mac": probes.mac}
             fields["running_system_paths"] = running_paths
             details = json.dumps(fields)
