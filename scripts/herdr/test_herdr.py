@@ -3473,6 +3473,43 @@ class LaunchDestinationTests(StaffTestCase):
         stop.assert_not_called()
         self.assertEqual(list(panes), [source])
 
+    def test_failed_fork_tab_move_closes_only_the_created_terminal(self) -> None:
+        client = herdr.Herdr("private")
+        source = "w1:p1"
+        fork = "w1:p3"
+        panes: dict[str, herdr.PaneIdentity] = {
+            source: {"pane_id": source, "terminal_id": "source-terminal", "workspace_id": "w1",
+                     "tab_id": "w1:t1", "session_id": "source"},
+        }
+
+        def create(*arguments: str) -> dict[str, object]:
+            self.assertEqual(arguments[:4], ("tab", "create", "--workspace", "w1"))
+            panes[fork] = {"pane_id": fork, "terminal_id": "fork-terminal", "workspace_id": "w1",
+                           "tab_id": "w1:t3", "session_id": None}
+            return {"root_pane": {"pane_id": fork}, "tab": {"tab_id": "w1:t3"}}
+
+        def run(*arguments: str) -> str:
+            if arguments[:2] == ("pane", "close"):
+                self.assertEqual(arguments, ("pane", "close", fork))
+                del panes[fork]
+            return ""
+
+        tabs = [{"tab_id": "w1:t1"}, {"tab_id": "w1:t2"}]
+        with (patch.object(client, "pane_row", side_effect=panes.__getitem__),
+              patch.object(client, "panes", side_effect=lambda: list(panes.values())),
+              patch.object(client, "listed", return_value=tabs),
+              patch.object(client, "result", side_effect=create),
+              patch.object(client, "run", side_effect=run),
+              patch.object(client, "socket_request", side_effect=herdr_types.HerdrFailure("tab move refused")) as move,
+              patch.object(client, "run_in_pane") as setup,
+              self.assertRaisesRegex(herdr_types.HerdrFailure, "tab move refused")):
+            _ = herdr.launch_prepared_agent(client.session, herdr.ForkTab(source, "clone"),
+                herdr.PreparedAgentEnvironment(self.root, {}), "codex", ["fork", "source"],
+                herdr.NoOpeningPrompt(), 1_000, agent="clone", client=client)
+        move.assert_called_once_with("tab.move", tab_id="w1:t3", insert_index=1)
+        setup.assert_not_called()
+        self.assertEqual(list(panes), [source])
+
     def test_fork_start_timeout_closes_the_verified_terminal(self) -> None:
         client = Mock(spec=herdr.Herdr)
         cast(Mock, client.open_tab).return_value = "w1:p2"
@@ -6038,7 +6075,8 @@ class HerdrTests(unittest.TestCase):
             "terminal_id": "fixture-terminal", "label": "alpha", "session_id": None}
         tabs = [{"tab_id": "w1:t1"}, {"tab_id": "w1:t2"}]
         result = {"root_pane": {"pane_id": "w1:p3"}, "tab": {"tab_id": "w1:t3"}}
-        with (patch.object(client, "pane_row", return_value=source),
+        fork: herdr.PaneIdentity = {**source, "pane_id": "w1:p3", "tab_id": "w1:t3", "terminal_id": "fork-terminal"}
+        with (patch.object(client, "pane_row", side_effect={"w1:p1": source, "w1:p3": fork}.__getitem__),
               patch.object(client, "listed", return_value=tabs) as listed,
               patch.object(client, "result", return_value=result) as create,
               patch.object(client, "run", return_value=""),

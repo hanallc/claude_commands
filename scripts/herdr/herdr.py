@@ -2049,11 +2049,29 @@ class Herdr:
                 _ = self.run("tab", "rename", tab, title)
             root_pane = json_object(result.get("root_pane"), "herdr tab root pane")
             pane = json_text(root_pane.get("pane_id"), "herdr tab root pane id")
-            _ = self.run("pane", "rename", pane, title)
-            if move_new_tab:
-                tab = json_text(json_object(result.get("tab"), "created tab").get("tab_id"), "tab id")
-                _ = self.socket_request("tab.move", tab_id=tab, insert_index=position)
-            elif workspace is not None and not after_pane:
+            terminal = ""
+            if after_pane:
+                if pane == after_pane:
+                    raise HerdrFailure(f"{pane}: the fork did not open a separate pane", "wrong_target")
+                forget_pane_evidence(self.session, pane)
+                terminal = self.command_terminal(pane)
+            try:
+                _ = self.run("pane", "rename", pane, title)
+                if move_new_tab:
+                    tab = json_text(json_object(result.get("tab"), "created tab").get("tab_id"), "tab id")
+                    _ = self.socket_request("tab.move", tab_id=tab, insert_index=position)
+            except (HerdrFailure, OSError, subprocess.SubprocessError):
+                if terminal:
+                    forget_pane_evidence(self.session, pane)
+                    try:
+                        closed = self.close_terminal_pane(pane, terminal)
+                    except (HerdrFailure, OSError, subprocess.SubprocessError) as error:
+                        print(f"herdr {self.session}:{pane}: fork terminal closure is unconfirmed ({error})", file=sys.stderr)
+                    else:
+                        if not closed:
+                            print(f"herdr {self.session}:{pane}: fork terminal closure is unconfirmed", file=sys.stderr)
+                raise
+            if workspace is not None and not after_pane:
                 _ = self._close_placeholders(workspace)
                 try:
                     pane = self.order_tabs(workspace, saved, opening_members=((pane, member),) if member else ()).get(pane, pane)
