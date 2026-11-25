@@ -7230,16 +7230,45 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(stop_resume, "shutdown_state_root", return_value=self.root / "shutdown"),
               patch.object(stop_resume, "_detach", return_value=self.root / "move.log") as detach):
             moves.finish_move_progress(moves.TrackedMove(batch, moves.own_claim_owner(), now))
-            self.assertEqual(self.post(accounts_page.PAGE_PATH, form)[0], 403)
-            for batch_id, member in (("c" * 32, row.id), (batch.batch_id, "unknown"), (batch.batch_id, "other")):
-                with self.subTest(batch=batch_id, member=member):
-                    invalid = urlencode({"retry_move": batch_id, "member": member})
+            unknown_target = replace(failed, state=moves.MemberMoveFailed(now, timedelta(), "Fixture target refusal."))
+            unavailable = replace(batch, members=(unknown_target,))
+            with (patch.object(moves, "read_tracked_move", wraps=moves.read_tracked_move) as read_move,
+                  redirect_stderr(StringIO()) as errors):
+                words = {"reason": "The retry did not start. Try again."}
+                status, content = self.post(accounts_page.PAGE_PATH, form)
+                self.assertEqual((status, json.loads(content)), (403, words))
+                malformed = (form + "&member=other", urlencode({"retry_move": batch.batch_id}),
+                             form + "&key=fixture&value=fixture")
+                for invalid in malformed:
                     status, content = self.post(accounts_page.PAGE_PATH, invalid, origin=origin)
-                    self.assertEqual(status, 400)
-                    self.assertIn("reason", cast(dict[str, object], json.loads(content)))
-            detach.assert_not_called()
-            detach.side_effect = OSError("fixture launch failed")
-            self.assertEqual(self.post(accounts_page.PAGE_PATH, form, origin=origin)[0], 503)
+                    self.assertEqual((status, json.loads(content)), (400, words))
+                status, content = self.post(accounts_page.PAGE_PATH, "group=units&clear=fixture", origin=origin)
+                self.assertEqual((status, json.loads(content)),
+                                 (400, {"reason": "Send one Accounts action with its required fields."}))
+                read_move.assert_not_called()
+                for batch_id, member in (("c" * 32, row.id), (batch.batch_id, "unknown"), (batch.batch_id, "other")):
+                    with self.subTest(batch=batch_id, member=member):
+                        invalid = urlencode({"retry_move": batch_id, "member": member})
+                        status, content = self.post(accounts_page.PAGE_PATH, invalid, origin=origin)
+                        self.assertEqual((status, json.loads(content)), (400, words))
+                read_move.return_value = moves.TrackedMove(unavailable, moves.own_claim_owner(), now)
+                status, content = self.post(accounts_page.PAGE_PATH, form, origin=origin)
+                self.assertEqual((status, json.loads(content)), (400, words))
+                read_move.reset_mock(return_value=True)
+                detach.assert_not_called()
+                detach.side_effect = subprocess.CalledProcessError(1, ["fixture"], stderr="fixture launch failed\nfixture detail")
+                status, content = self.post(accounts_page.PAGE_PATH, form, origin=origin)
+                self.assertEqual((status, json.loads(content)), (503, words))
+            log_lines = [line for line in errors.getvalue().splitlines() if line.startswith("review-links: could not start")]
+            self.assertEqual(log_lines, ["review-links: could not start the move retry: " + detail for detail in (
+                "Open the retry button on this console.",
+                *(["Send one Accounts action with its required fields."] * len(malformed)),
+                "The move batch is unavailable.",
+                "This batch has no failed move for that member.",
+                "This batch has no failed move for that member.",
+                "This move has no recorded destination.",
+                "CalledProcessError: fixture launch failed fixture detail",
+            )])
             detach.side_effect = None
             detach.reset_mock()
             with (patch.object(staff, "session_operation", side_effect=AssertionError("POST checked a row lock")),

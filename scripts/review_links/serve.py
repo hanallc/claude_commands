@@ -37,6 +37,7 @@ from urllib.parse import SplitResult, parse_qs, unquote, urlsplit, urlunsplit
 # Detect file changes before the first stamp, including changes during imports.
 STARTED_NS = time.time_ns()
 
+from scripts.accounts import moves
 from scripts.disks import disks_page, sessions, slots
 from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import admission_client, admission_protocol as admission, memory_files
@@ -65,16 +66,22 @@ STALE_NEW_ITEM_TOKEN = "The New item token expired. Try Send again."
 ATTACHMENT_MEDIA = {f"image.{extension}": media for media, extension in new_item_dialog.IMAGE_FORMATS.items()}
 
 
+def _retry_failure_text(reason: str) -> str:
+    print(f"review-links: could not start the move retry: {moves.move_failure_reason(reason)}", file=sys.stderr)
+    return accounts_page.move_failure_text(moves.MoveFailureKind.OTHER)
+
+
 def retry_account_move(batch_id: str, member: str) -> accounts_page.Saved | accounts_page.Refused | accounts_page.SaveFailed:
     from scripts.agents import stop_resume
 
     try:
         result = stop_resume.start_console_retry(batch_id, member)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
-        print(f"review-links: could not start the move retry ({type(error).__name__})", file=sys.stderr)
-        return accounts_page.SaveFailed("The move retry could not start.")
+        diagnostic = cast(object, error.stderr) if isinstance(error, subprocess.CalledProcessError) else None
+        detail = diagnostic.strip() if isinstance(diagnostic, str) and diagnostic.strip() else str(error)
+        return accounts_page.SaveFailed(_retry_failure_text(f"{type(error).__name__}: {detail}"))
     if isinstance(result, stop_resume.ConsoleRetryRefused):
-        return accounts_page.Refused(result.reason)
+        return accounts_page.Refused(_retry_failure_text(result.reason))
     return accounts_page.Saved()
 
 
@@ -2195,17 +2202,20 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not 0 < length <= 4096:
                 raise ValueError("Invalid accounts request size.")
             fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
-            if (set(fields) not in ({"key", "value"}, {"group", "to"}, {"group", "clear"}, quota_fields, retry_fields)
-                    or any(len(values) != 1 for values in fields.values())
-                    or ("clear" in fields and fields["clear"] != ["first"])):
-                raise ValueError("Send one Accounts action with its required fields.")
         except (ValueError, UnicodeError) as error:
             self.json_response(400, {"reason": str(error)})
             return
+        keys = fields.keys()
+        if (keys not in ({"key", "value"}, {"group", "to"}, {"group", "clear"}, quota_fields, retry_fields)
+                or any(len(values) != 1 for values in fields.values())
+                or ("clear" in fields and fields["clear"] != ["first"])):
+            reason = "Send one Accounts action with its required fields."
+            self.json_response(400, {"reason": _retry_failure_text(reason) if retry_fields & keys else reason})
+            return
         server = cast(ReviewLinksServer, self.server)
-        if set(fields) == retry_fields:
+        if keys == retry_fields:
             if not self.same_origin(required=True):
-                self.json_response(403, {"reason": "Open the retry button on this console."})
+                self.json_response(403, {"reason": _retry_failure_text("Open the retry button on this console.")})
                 return
             result = retry_account_move(fields["retry_move"][0], fields["member"][0])
         else:

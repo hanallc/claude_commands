@@ -303,6 +303,10 @@ The batch progress record in `~/.local/state/accounts/move-progress/` starts wit
 It records the initiator and a safe display reason once.
 The CLI records target and live process refusals through the batch recorder.
 Each result keeps the requested account before the row and process checks.
+A failure keeps its diagnostic and a kind for an active move, a missing saved session, or another failure.
+For older records, the reader recognizes the two saved diagnostics for an active move and a missing saved session.
+The console uses the kind to display a message.
+A member without a saved name appears as "unnamed session".
 The timer records its rule's account and threshold apart from its initiator.
 Each batch file has one writer. The parent can record a launch failure only after a confirmed refusal.
 The child adopts the same file and keeps the roster and earlier results.

@@ -4,6 +4,7 @@ from scripts.lint.memory_test_support import copy_config_fixture, write_config_f
 
 from collections import Counter
 from collections.abc import Callable
+from contextlib import redirect_stderr
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import html
@@ -156,7 +157,8 @@ class MovesBoardTests(unittest.TestCase):
         self.assertIn('<span class="next-muted">Next:</span> report.', board)
         self.assertIn("<summary>All 4 units</summary>", board)
         self.assertIn("praxis did not start on claude1.", board)
-        self.assertIn("Claude gave no prompt in 90 s.", board)
+        self.assertIn("The retry did not start. Try again.", board)
+        self.assertNotIn("Claude gave no prompt in 90 s.", board)
         self.assertIn("praxis is stopped.", board)
         self.assertIn(f'data-retry-move="{move.batch_id}" data-move-member="member-2">Move praxis again', board)
         self.assertIn("The move ended it after 1 min 15 s and moved lfo.", board)
@@ -214,18 +216,20 @@ class MovesBoardTests(unittest.TestCase):
             moves.MemberMoveFailed(AT, timedelta(), "Fixture target refused.", "claude1"), moves.MoveMemberKind.REQUEST)
         refused = replace(move, batch_id="e" * 32, members=(refusal,))
         board = accounts_page.moves_board((refused,), AT, timezone.utc, 75)
-        self.assertIn("Fixture target refused.", board)
+        self.assertIn("The retry did not start. Try again.", board)
+        self.assertNotIn("Fixture target refused.", board)
         self.assertNotIn("All 1 units", board)
         self.assertNotIn('class="mv-bar"', board)
         self.assertNotIn("0 of 1 moved", board)
         self.assertNotIn("1 failed", board)
         archive = accounts_page.moves_board((move, refused), AT, timezone.utc, 75)
         earlier = archive.split("Earlier moves", 1)[1]
-        self.assertIn("Fixture target refused.", earlier)
+        self.assertIn("The retry did not start. Try again.", earlier)
+        self.assertNotIn("Fixture target refused.", earlier)
         self.assertNotIn("0 of 1 moved", earlier)
         self.assertNotIn("1 failed", earlier)
 
-    def test_timer_cause_uses_a_safe_display_reason_and_next_names_one_member(self) -> None:
+    def test_timer_cause_uses_a_safe_display_reason_and_next_counts_waiting_members(self) -> None:
         move = move_progress_fixture()
         move = replace(move, initiator=moves.MoveInitiator.AUTOMATIC,
                        reason=moves.move_display_reason("refusal", "claude3 refused: weekly limit until fixture@example.invalid"),
@@ -233,9 +237,76 @@ class MovesBoardTests(unittest.TestCase):
         board = accounts_page.moves_board((move,), AT, ZoneInfo("America/Los_Angeles"), 75)
         self.assertIn("automatic · claude3 refused: weekly limit", board)
         self.assertNotIn("fixture@example.invalid", board)
-        self.assertIn('<span class="next-muted">Next:</span> report.', board)
+        self.assertIn('<span class="next-muted">Next:</span> report. 1 more units wait.</p>', board)
         self.assertEqual(moves.move_display_reason("auto", "auto: fixture@example.invalid"), "scheduled quota limit")
         self.assertEqual(moves.move_display_reason("auto", "claude3 at 1e-05%"), "claude3 at 1e-05%")
+
+    def test_move_failure_text_uses_the_saved_kind_and_reads_old_records(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(patch.object(moves, "store_file", return_value=scratch / "moves.jsonl"))
+        move = move_progress_fixture()
+        rows: list[moves.MoveMemberProgress] = []
+        cases = (
+            ("Fixture conflict.", moves.MoveFailureKind.MOVE_IN_PROGRESS,
+             "Another move is in progress. Try again when it ends."),
+            ("Fixture session missing.", moves.MoveFailureKind.NO_SAVED_SESSION, "fixture &lt;1&gt; has no saved session."),
+            ("Another move is in progress.", moves.MoveFailureKind.OTHER, "The retry did not start. Try again."),
+            ("Another move is in progress.", None, "Another move is in progress. Try again when it ends."),
+            ("No saved session was found.", None, "fixture &lt;4&gt; has no saved session."),
+            ("Another operation held this row.", None, "The retry did not start. Try again."),
+            ("No saved session was found.", "fixture future kind", "The retry did not start. Try again."),
+        )
+        for index, (reason, kind, _) in enumerate(cases):
+            rows.append(moves.MoveMemberProgress(
+                moves.MoveMember(str(index), f"fixture <{index}>"),
+                moves.MemberMoveFailed(AT, timedelta(), reason, failure_kind=(
+                    kind if isinstance(kind, moves.MoveFailureKind) else moves.MoveFailureKind.OTHER))))
+        move = replace(move, members=tuple(rows))
+        moves.write_move_progress(moves.TrackedMove(move, moves.ClaimOwner(21, "start"), AT))
+        path = scratch / "move-progress" / f"{move.batch_id}.json"
+        record = cast(dict[str, list[dict[str, object]]], json.loads(path.read_text()))
+        for fields, (_, kind, _) in zip(record["members"], cases):
+            if kind is None:
+                del fields["failure_kind"]
+            elif isinstance(kind, str):
+                fields["failure_kind"] = kind
+            else:
+                self.assertEqual(fields["failure_kind"], kind.value)
+        _ = path.write_text(json.dumps(record), encoding="utf-8")
+        saved = moves.read_tracked_move(move.batch_id).progress
+        with redirect_stderr(io.StringIO()) as errors:
+            board = accounts_page.moves_board((saved,), AT, timezone.utc, 75)
+            earlier = accounts_page.moves_board((move_progress_fixture(), saved), AT, timezone.utc, 75)
+        self.assertIn("Earlier moves", earlier)
+        self.assertEqual(errors.getvalue(), "")
+        for row, (reason, _, _) in zip(saved.members, cases):
+            assert isinstance(row.state, moves.MemberMoveFailed)
+            self.assertEqual(row.state.reason, reason)
+        lines = [match[1] for match in re.finditer(r'<p class="mv-line mv-fault">(.*?)</p>', board)]
+        self.assertEqual(len(lines), len(cases))
+        for line, (reason, _, message) in zip(lines, cases):
+            self.assertTrue(line.endswith(message), line)
+            self.assertNotIn(f"</span> {reason}</p>", line)
+
+    def test_saved_move_uses_plain_labels_for_old_name_and_holder_fallbacks(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(patch.object(moves, "store_file", return_value=scratch / "moves.jsonl"))
+        move = move_progress_fixture()
+        identity = "c278a59b-8f28-4b73-9e28-32dbfca17648"
+        row = moves.MoveMemberProgress(moves.MoveMember(identity, identity),
+                                       moves.MemberMoved(AT, timedelta(), "operation", "claude1"))
+        noncanonical = identity.upper()
+        named = replace(row, member=moves.MoveMember(noncanonical, noncanonical))
+        move = replace(move, initiator=moves.HandMoveSession(identity), members=(row, named))
+        moves.write_move_progress(moves.TrackedMove(move, moves.ClaimOwner(21, "start"), AT))
+        saved = moves.read_tracked_move(move.batch_id).progress
+        board = accounts_page.moves_board((saved,), AT, timezone.utc, 75)
+        self.assertEqual(saved.members[0].member.reference, identity)
+        self.assertNotIn(identity, board)
+        self.assertIn(noncanonical, board)
+        self.assertIn("by hand · unnamed session", board)
+        self.assertIn("a hung task held unnamed session.", board)
+        self.assertIn("after a hung task", board)
 
     def test_completed_moves_show_the_end_and_earlier_origins(self) -> None:
         move = move_progress_fixture()
@@ -433,9 +504,10 @@ class AccountsPageTests(unittest.TestCase):
             page = accounts_page.page().decode()
         setup = """<script>
 const realMoveFetch=fetch, retryPosts=[];
-let completeRetry;
+let completeRetry, retryError;
 window.fetch=(path,options)=>{
  if(options?.method==='POST' && path===location.pathname){
+  if(retryError) return retryError();
   retryPosts.push(Object.fromEntries(new URLSearchParams(options.body)));
   const response=realMoveFetch(path,options);
   return new Promise(resolve=>{completeRetry=()=>resolve(response);});
@@ -465,7 +537,27 @@ window.fetch=(path,options)=>{
  try{
   await refreshed;
   check(details().open,'keep All units open');
-  check(document.querySelector('[data-color-save-error]').hidden,'the server accepts the retry');
+  const notice=document.querySelector('[data-color-save-error]');
+  check(notice.hidden,'the server accepts the retry');
+  const retryMessage=()=>new Promise(resolve=>{
+   const retry=document.querySelector('[data-retry-move]');
+   const observer=new MutationObserver(()=>{
+    if(!retry.disabled){observer.disconnect();resolve(notice.textContent);}
+   });
+   observer.observe(retry,{attributes:true,attributeFilter:['disabled']});
+   retry.click();
+  });
+  const refusal='The retry did not start. Try again.';
+  retryError=()=>Promise.resolve(new Response(JSON.stringify({reason:refusal}),{status:503}));
+  check(await retryMessage()===refusal,'show the retry failure text');
+  retryError=()=>Promise.resolve(new Response(JSON.stringify({reason:'Fixture private diagnostic.'}),{status:400}));
+  check(await retryMessage()===refusal,'use the same text for an unexpected JSON reason');
+  retryError=()=>Promise.resolve(new Response(JSON.stringify({reason:'Fixture private diagnostic.'}),{status:200}));
+  check(await retryMessage()===refusal,'show the failure when a successful HTTP response lacks a state');
+  retryError=()=>Promise.resolve(new Response(JSON.stringify({state:'queued'}),{status:200}));
+  check(await retryMessage()===refusal,'show the failure when the state is not saved');
+  retryError=()=>Promise.reject(new Error('fixture network failure'));
+  check(await retryMessage()===refusal,'use the same text after a request failure');
  }catch(error){failures.push(String(error));}
  await realMoveFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
@@ -2565,9 +2657,13 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         assert_status_states(self, good.decode(), 15, failed_markup=failed.decode())
 
     def test_render_runs_the_page_in_a_child_and_names_its_failure(self) -> None:
-        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess((), 0, b"<p>page</p>", b"")) as run:
+        diagnostics = b"fixture child warning\nreview-links: move failed: Fixture start failed.\n"
+        with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess((), 0, b"<p>page</p>",
+                                                                                       diagnostics)) as run,
+              redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(accounts_page.render(), b"<p>page</p>")
         self.assertEqual(run.call_args.args[0], accounts_page.CHILD)
+        self.assertEqual(errors.getvalue(), "")
         with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess((), 0, b'<p data-page-facts></p>', b"")),
               patch.object(time, "perf_counter", side_effect=[10, 10.75]),
               patch.object(time, "time", return_value=100)):

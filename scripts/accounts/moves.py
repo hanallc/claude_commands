@@ -21,6 +21,7 @@ from scripts.accounts import role_map, worker_names
 from scripts.agents.stop_results import MoveHandedOff, StopFailed
 from scripts.lib import process_start
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.production import staff
 
 if TYPE_CHECKING:
     from scripts.whoami.account import ResolvedHistoryLabel, HistoricalAccountUnresolved
@@ -235,6 +236,12 @@ class MemberAlreadyOnTarget:
     target: str
 
 
+class MoveFailureKind(Enum):
+    MOVE_IN_PROGRESS = "move in progress"
+    NO_SAVED_SESSION = "no saved session"
+    OTHER = "other"
+
+
 @dataclass(frozen=True)
 class MemberMoveFailed:
     ended: datetime
@@ -242,6 +249,7 @@ class MemberMoveFailed:
     reason: str
     target: MoveDestination = field(default_factory=MoveDestinationUnselected)
     stopped: bool = False
+    failure_kind: MoveFailureKind = MoveFailureKind.OTHER
 
 
 MoveMemberState = MoveQueued | MemberMoving | MemberMoved | MemberAlreadyOnTarget | MemberMoveFailed
@@ -337,7 +345,7 @@ def move_display_reason(cause: MoveCause, why: str) -> str:
 
 
 def move_failure_reason(reason: str) -> str:
-    """Keep a single line and remove email addresses from the console reason."""
+    """Keep one line and remove email addresses from the diagnostic."""
     return re.sub(r"[\w.!#$%&'*+/=?^_`{|}~-]+@[\w-]+(?:\.[\w-]+)*", "[account identity]", " ".join(reason.splitlines()))
 
 
@@ -359,6 +367,27 @@ def _progress_time(value: object) -> datetime:
     raise ValueError("move progress time needs a zone")
 
 
+def _read_failure_kind(fields: dict[str, object], reason: str) -> MoveFailureKind:
+    if "failure_kind" in fields:
+        try:
+            return MoveFailureKind(fields["failure_kind"])
+        except ValueError:
+            return MoveFailureKind.OTHER
+    if reason == "Another move is in progress.":
+        return MoveFailureKind.MOVE_IN_PROGRESS
+    if reason == "No saved session was found.":
+        return MoveFailureKind.NO_SAVED_SESSION
+    return MoveFailureKind.OTHER
+
+
+def _is_native_session_id(value: str) -> bool:
+    try:
+        _ = staff.native_id(value)
+    except staff.StaffRefused:
+        return False
+    return True
+
+
 def _progress_member(value: object, target: MoveDestination) -> MoveMemberProgress:
     if not isinstance(value, dict):
         raise ValueError("invalid member progress")
@@ -366,7 +395,7 @@ def _progress_member(value: object, target: MoveDestination) -> MoveMemberProgre
     reference, name = fields.get("reference"), fields.get("name")
     if not isinstance(reference, str) or not reference or not isinstance(name, str) or not name:
         raise ValueError("invalid move member")
-    member = MoveMember(reference, name)
+    member = MoveMember(reference, "unnamed session" if name == reference and _is_native_session_id(name) else name)
     kind = MoveMemberKind(fields.get("kind", MoveMemberKind.NATIVE.value))
     state = fields.get("state")
     destination = move_destination(fields["target"]) if "target" in fields else target
@@ -379,12 +408,14 @@ def _progress_member(value: object, target: MoveDestination) -> MoveMemberProgre
         raise ValueError("invalid move duration")
     ended, duration = _progress_time(fields.get("ended")), timedelta(seconds=elapsed)
     if state == "moved" and isinstance(holder := fields.get("recovered_holder", ""), str):
-        return MoveMemberProgress(member, MemberMoved(ended, duration, holder, destination), kind)
+        return MoveMemberProgress(member, MemberMoved(ended, duration, "task" if holder == "operation" else holder,
+                                                       destination), kind)
     if state == "already on target" and isinstance(destination, str):
         return MoveMemberProgress(member, MemberAlreadyOnTarget(ended, duration, destination), kind)
     if state == "failed" and isinstance(reason := fields.get("reason"), str):
         return MoveMemberProgress(member, MemberMoveFailed(ended, duration, move_failure_reason(reason), destination,
-                                                            stopped=fields.get("stopped") is True), kind)
+                                                            stopped=fields.get("stopped") is True,
+                                                            failure_kind=_read_failure_kind(fields, reason)), kind)
     raise ValueError("invalid move member state")
 
 
@@ -401,7 +432,8 @@ def _encode_member(row: MoveMemberProgress) -> dict[str, object]:
         return fields | {"state": "moved", "recovered_holder": state.recovered_holder}
     if isinstance(state, MemberAlreadyOnTarget):
         return fields | {"state": "already on target"}
-    return fields | {"state": "failed", "reason": move_failure_reason(state.reason), "stopped": state.stopped}
+    return fields | {"state": "failed", "reason": move_failure_reason(state.reason),
+                     "stopped": state.stopped, "failure_kind": state.failure_kind.value}
 
 
 def _numbered_target(target: str) -> bool:
@@ -420,7 +452,7 @@ def read_tracked_move(batch_id: str) -> TrackedMove:
             or pid <= 0 or not isinstance(start, str) or not isinstance(members, list) or not members):
         raise ValueError("invalid move progress fields")
     if initiator == "session" and isinstance(session, str) and session:
-        origin: HandMoveSession | MoveInitiator = HandMoveSession(session)
+        origin: HandMoveSession | MoveInitiator = HandMoveSession("unnamed" if _is_native_session_id(session) else session)
     elif initiator in tuple(source.value for source in MoveInitiator):
         origin = MoveInitiator(initiator)
     else:

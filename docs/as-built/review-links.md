@@ -1097,14 +1097,16 @@ The **Moves** section precedes the Accounts table.
 The section reads batch progress from `~/.local/state/accounts/move-progress/`.
 A progress record stores the initiator, cause, target, start time, and member order.
 Each member result keeps the requested account. An unknown account shows as moving in the Now line.
-The section shows which members move now and which member is next.
+The Now line shows which members move now.
+The Next line names the next unit and gives the number of other units that wait.
 It estimates the time left after the first result.
 **All N units** shows the state of each member.
-A refusal without named members shows the reason and omits the unit list, count and progress bar.
+A refusal without named members omits the unit list, count, and progress bar.
 It distinguishes members already on the target from moved members.
 It shows that a member stopped only when the result confirms the stop.
 **Earlier moves** includes the three newest ended batches and any interrupted batches.
 The holder note uses `move.stuck_seconds` in `config/shutdown.conf`.
+The note uses "task" when the command does not identify the type of task.
 The page preserves open move details during refresh.
 The writer saves the current batch with each result and saves the full batch at the end.
 The page offers retry when the member is off the target account and no operation holds it.
@@ -1112,7 +1114,16 @@ The page uses the board's local session read to check the account, including ses
 The Accounts POST accepts one failed member from one saved batch.
 The server starts the standard hand move command in a detached process.
 The command handles the row lock, queue and wait limit.
-An unknown batch or member receives a refusal.
+The failure line and retry response use the same rule for these messages.
+
+- `Another move is in progress. Try again when it ends.`
+- `<unit> has no saved session.`
+- `The retry did not start. Try again.`
+
+The progress record keeps the diagnostic for the move.
+The server logs one diagnostic line to stderr when it refuses a retry or fails to start it.
+The browser accepts a retry only when the HTTP response succeeds and its state is `saved`.
+A malformed retry or any other response uses the third message.
 A second retry starts another hand move.
 A hand move to the account the member already uses reports "already on" and stops no process.
 The server keeps the last good page, its completion time, its render times, and its usage store revision under one lock.

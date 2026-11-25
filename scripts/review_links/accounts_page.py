@@ -1035,6 +1035,16 @@ def _retryable_members(history: Sequence[moves.MoveProgress], reading: accounts.
     return retryable
 
 
+def move_failure_text(kind: moves.MoveFailureKind, member_name: str = "") -> str:
+    match kind:
+        case moves.MoveFailureKind.MOVE_IN_PROGRESS:
+            return "Another move is in progress. Try again when it ends."
+        case moves.MoveFailureKind.NO_SAVED_SESSION:
+            return f"{member_name} has no saved session."
+        case moves.MoveFailureKind.OTHER:
+            return "The retry did not start. Try again."
+
+
 def _move_failure(move: moves.MoveProgress, member: moves.MoveMember,
                   failure: moves.MemberMoveFailed, retryable: Collection[tuple[str, str]]) -> str:
     name = html.escape(member.name)
@@ -1046,7 +1056,8 @@ def _move_failure(move: moves.MoveProgress, member: moves.MoveMember,
     if (move.batch_id, member.reference) in retryable:
         retry = (f' <button type="button" data-retry-move="{html.escape(move.batch_id, quote=True)}"'
                  + f' data-move-member="{html.escape(member.reference, quote=True)}">Move {name} again</button>')
-    return f'<p class="mv-line mv-fault"><span class="error">{message}</span> {html.escape(failure.reason)}{stopped}{retry}</p>'
+    text = html.escape(move_failure_text(failure.failure_kind, member.name))
+    return f'<p class="mv-line mv-fault"><span class="error">{message}</span> {text}{stopped}{retry}</p>'
 
 
 def _move_members(move: moves.MoveProgress) -> str:
@@ -1126,7 +1137,8 @@ def _move_current(move: moves.MoveProgress, now: datetime, zone: tzinfo, wait_se
             "is moving" if len(moving) == 1 else "are moving")
         lines.append(f'<p class="mv-line"><span class="next-muted">Now:</span> {names} {motion}.</p>')
     if queued:
-        lines.append(f'<p class="mv-line"><span class="next-muted">Next:</span> {html.escape(queued[0])}.</p>')
+        waiting = f" {len(queued) - 1} more units wait." if len(queued) > 1 else ""
+        lines.append(f'<p class="mv-line"><span class="next-muted">Next:</span> {html.escape(queued[0])}.{waiting}</p>')
     lines.extend(_move_failure(move, member, failure, retryable) for member, failure in failed)
     for row in move.members:
         if isinstance(row.state, moves.MemberMoved) and row.state.recovered_holder:
@@ -1224,10 +1236,12 @@ def page() -> bytes:
     settings = conf.read("review_links")
     refresh_seconds = settings.number("page_refresh_seconds")
     request_timeout = settings.whole("page_request_timeout_seconds")
+    retry_failure = html.escape(move_failure_text(moves.MoveFailureKind.OTHER), quote=True)
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             + '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>'
             + f'{STYLE}</head><body><main data-refresh-seconds="{refresh_seconds}"'
-            + f' data-request-timeout-seconds="{request_timeout}">' + page_frame.title("Accounts", "accounts", SCRIPT_VERSION)
+            + f' data-request-timeout-seconds="{request_timeout}" data-retry-failure="{retry_failure}">'
+            + page_frame.title("Accounts", "accounts", SCRIPT_VERSION)
             + f'<div data-accounts>{body}</div></main>' + POPUP + MENU + QUOTA_PANEL
             + '<div class="model-tooltip" hidden aria-hidden="true"></div>'
             + f"<script>{SCRIPT}</script></body></html>").encode()
@@ -1804,8 +1818,9 @@ function keepMoveFocus(){
  }
  return null;
 }
-async function saveMove(form,label=form.group,button=null){
+async function saveMove(form,button=null){
  const save={form};
+ const fallback=button ? document.querySelector('main').dataset.retryFailure : 'The move could not be saved.';
  if(button){button.disabled=true;updates.abandon();}
  pendingMoves.add(save);message.textContent='';message.hidden=true;
  try{
@@ -1813,9 +1828,12 @@ async function saveMove(form,label=form.group,button=null){
    headers:{'Content-Type':'application/x-www-form-urlencoded'},
    body:new URLSearchParams(form).toString()});
   const result=await response.json();
-  if(!response.ok) throw new Error(result.reason || 'The move could not be saved.');
+  if(!response.ok || (button && result?.state!=='saved')){
+   throw new Error(button ? fallback : result.reason || fallback);
+  }
  }catch(error){
-  message.textContent=label+': '+(saveTimeoutWords(error) || error.message || 'The move could not be saved.');message.hidden=false;
+  message.textContent=button ? fallback : form.group+': '+(saveTimeoutWords(error) || error.message || fallback);
+  message.hidden=false;
  }finally{
   if(button) button.disabled=false;
   pendingMoves.delete(save);updates.changed();
@@ -1825,7 +1843,7 @@ async function saveMove(form,label=form.group,button=null){
 document.addEventListener('click',event=>{
  const button=event.target instanceof Element ? event.target.closest('[data-retry-move]') : null;
  if(!button || button.disabled) return;
- void saveMove({retry_move:button.dataset.retryMove,member:button.dataset.moveMember},button.textContent,button);
+ void saveMove({retry_move:button.dataset.retryMove,member:button.dataset.moveMember},button);
 });
 document.addEventListener('click',event=>{
  const button=event.target instanceof Element ? event.target.closest('[data-next-button]') : null;

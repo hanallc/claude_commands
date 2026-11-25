@@ -2726,7 +2726,7 @@ def _begin_move_progress(batch: MoveBatch, record: StaffSnapshot, entries: Mappi
     elif cause != "by hand":
         initiator = moves.MoveInitiator.AUTOMATIC
     elif caller := staff.caller_identity():
-        initiator = moves.HandMoveSession(_batch_member(caller, record, entries).name or caller)
+        initiator = moves.HandMoveSession(_batch_member(caller, record, entries).name or "unnamed")
     else:
         initiator = moves.MoveInitiator.HAND
     members: dict[str, moves.MoveMemberProgress] = {}
@@ -2740,7 +2740,9 @@ def _begin_move_progress(batch: MoveBatch, record: StaffSnapshot, entries: Mappi
         else:
             reference, name, kind = row.id, record.qualified_name(row), moves.MoveMemberKind.STAFF
             groups.add(row.kind + "s" if row.kind in ("unit", "showrunner", "producer", "worker") else "sessions")
-        members[session] = moves.MoveMemberProgress(moves.MoveMember(reference, name or session), moves.MoveQueued(),
+        if request_only and isinstance(batch.intent, moves.FollowGroupAccount):
+            name = batch.intent.group
+        members[session] = moves.MoveMemberProgress(moves.MoveMember(reference, name or "unnamed session"), moves.MoveQueued(),
                                                    moves.MoveMemberKind.REQUEST if request_only else kind)
     group = batch.intent.group if isinstance(batch.intent, moves.FollowGroupAccount) else (
         next(iter(groups)) if len(groups) == 1 else "sessions")
@@ -2772,10 +2774,9 @@ def _publish_move_progress(record: moves.TrackedMove, *, ended: bool = False) ->
 
 def _write_move_progress(batch: MoveBatch, session: str, result: MoveResult | moves.MemberMoving, *,
                          confirmed_stopped: bool = False) -> None:
-    if isinstance(result, moves.MoveInProgress):
-        result = StopFailed(session, "Another move is in progress.")
     writer = batch.progress
-    if isinstance(result, MoveHandedOff) or not isinstance(writer, MoveBatchProgress):
+    if (not isinstance(writer, MoveBatchProgress)
+            or isinstance(result, MoveHandedOff) and not isinstance(result, moves.MoveInProgress)):
         return
     progress = writer.record.progress
     reference = writer.references.get(session)
@@ -2798,15 +2799,21 @@ def _write_move_progress(batch: MoveBatch, session: str, result: MoveResult | mo
             else:
                 state = moves.MemberMoved(ended, elapsed, holder, moves.move_destination(result.account))
         else:
-            if isinstance(result, SessionNotFound):
+            failure_kind = moves.MoveFailureKind.OTHER
+            if isinstance(result, moves.MoveInProgress):
+                reason = "Another move is in progress."
+                failure_kind = moves.MoveFailureKind.MOVE_IN_PROGRESS
+            elif isinstance(result, SessionNotFound):
                 reason = "No saved session was found."
+                failure_kind = moves.MoveFailureKind.NO_SAVED_SESSION
             elif isinstance(result, moves.MoveWaitingForRow):
                 reason = "Another operation held this row."
             else:
                 reason = result.reason
             destination = result.account if isinstance(result, ResumePending) else batch.destinations.get(session, batch.target)
             state = moves.MemberMoveFailed(ended, elapsed, moves.move_failure_reason(reason),
-                                           moves.move_destination(destination), stopped=confirmed_stopped)
+                                           moves.move_destination(destination), stopped=confirmed_stopped,
+                                           failure_kind=failure_kind)
     target = moves.move_destination(batch.target)
     updated = replace(progress, target=target if isinstance(target, str) else progress.target,
                       members=tuple(replace(item, state=state) if item is row else item for item in progress.members))
@@ -2821,7 +2828,7 @@ def record_refused_hand_move(member: str, target: str, reason: str,
     try:
         record = staff.local_snapshot()
     except (OSError, ValueError):
-        record = StaffSnapshot(())
+        record = staff.StaffSnapshot(())
     batch = MoveBatch({member: _batch_member(member, record, {})}, intent, NewMoveRequest(), target)
     _begin_move_progress(batch, record, {}, "by hand", "", request_only=request_only)
     _write_move_progress(batch, member, StopFailed(member, reason))
@@ -2922,9 +2929,9 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                     results.append(StopFailed(session, str(read_error)))
                     continue
             results.append(StopFailed(session, str(error)))
-        members.update((session, ResolvedMoveMember(pane_launch.NativeLaunchReference(session), session))
-                       for session in selected)
-        _begin_move_progress(batch, StaffSnapshot(()), {}, cause, why)
+        for session in selected:
+            _ = members.setdefault(session, ResolvedMoveMember(pane_launch.NativeLaunchReference(session), ""))
+        _begin_move_progress(batch, staff.StaffSnapshot(()), {}, cause, why)
         for session, result in zip(sessions, results):
             _write_move_progress(batch, session, result)
         if isinstance(batch.progress, MoveBatchProgress):
@@ -3128,7 +3135,7 @@ def _holder_operation(command: str) -> str:
                 return "move"
     except ValueError:
         pass
-    return "operation"
+    return "task"
 
 
 @dataclass(frozen=True)

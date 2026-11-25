@@ -6430,6 +6430,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertIsInstance(saved.state, moves.MemberMoveFailed)
         assert isinstance(saved.state, moves.MemberMoveFailed)
         self.assertEqual(saved.state.reason, "Another move is in progress.")
+        self.assertIs(saved.state.failure_kind, moves.MoveFailureKind.MOVE_IN_PROGRESS)
 
     def test_delayed_group_handoff_cannot_reverse_a_newer_move(self) -> None:
         row = staff.StaffRow(staff.StaffId("fixed"), "showrunner", "fixture", staff.StaffRoot(),
@@ -6853,6 +6854,44 @@ class MoveNowTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "shutdown: could not write move progress (OSError)\n")
         self.assertEqual(self.moved, [])
 
+    def test_move_progress_records_the_missing_session_kind(self) -> None:
+        identity = "c278a59b-8f28-4b73-9e28-32dbfca17648"
+        missing = stop_resume.SessionNotFound(identity)
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": identity, "CODEX_THREAD_ID": ""}),
+              patch.object(stop_resume, "_prepare_move", return_value=missing)):
+            self.assertEqual(stop_resume.move_sessions([identity], "claude3", why="fixture"), [missing])
+        batch, = moves.read_move_progress()
+        member, = batch.members
+        self.assertEqual(member.member, moves.MoveMember(identity, "unnamed session"))
+        self.assertEqual(batch.initiator, moves.HandMoveSession("unnamed"))
+        data = (moves.store_file().parent / "move-progress" / f"{batch.batch_id}.json").read_text()
+        self.assertIn('"name": "unnamed session"', data)
+        self.assertIn('"session": "unnamed"', data)
+        failure = member.state
+        assert isinstance(failure, moves.MemberMoveFailed)
+        self.assertEqual(failure.reason, "No saved session was found.")
+        self.assertIs(failure.failure_kind, moves.MoveFailureKind.NO_SAVED_SESSION)
+
+    def test_group_refusal_records_the_group_name(self) -> None:
+        stop_resume.record_refused_hand_move("units", "claude3", "Fixture target refused.",
+                                             moves.FollowGroupAccount("units"), request_only=True)
+        batch, = moves.read_move_progress()
+        member, = batch.members
+        self.assertEqual(member.member, moves.MoveMember("units", "units"))
+        self.assertIs(member.kind, moves.MoveMemberKind.REQUEST)
+
+    def test_move_without_a_member_lookup_keeps_the_diagnostic(self) -> None:
+        identity = "c278a59b-8f28-4b73-9e28-32dbfca17648"
+        reason = "Fixture staff record unavailable."
+        with patch.object(staff, "initial_snapshot", side_effect=OSError(reason)):
+            self.assertEqual(stop_resume.move_sessions([identity], "claude3", why="fixture"),
+                             [stop_resume.StopFailed(identity, reason)])
+        batch, = moves.read_move_progress()
+        member, = batch.members
+        self.assertEqual(member.member, moves.MoveMember(identity, "unnamed session"))
+        assert isinstance(member.state, moves.MemberMoveFailed)
+        self.assertEqual(member.state.reason, reason)
+
     def test_failed_resume_cleanup_does_not_report_the_member_as_stopped(self) -> None:
         reason = "Fixture cleanup failed for fixture@example.invalid."
         with (patch.object(stop_resume, "_move_now", new=REAL_MOVE_NOW),
@@ -6895,7 +6934,7 @@ class MoveNowTests(unittest.TestCase):
             self.assertEqual(stop_resume.move_sessions(["beta", "alpha"], "claude3", why="fixture", user_command=True),
                              [stop_resume.MoveHandedOff("beta"), self.up("alpha")])
             original, = moves.read_move_progress()
-            self.assertEqual(original.initiator, moves.HandMoveSession("beta"))
+            self.assertEqual(original.initiator, moves.HandMoveSession("unnamed"))
             self.assertIsInstance(original.members[0].state, moves.MoveQueued)
             self.assertIsInstance(original.members[1].state, moves.MemberMoved)
             arguments = cast(list[str], detach.call_args.args[0])
@@ -7014,6 +7053,17 @@ with operation as activity, ExitStack() as locks:
         self.assertEqual(self.moved, [["alpha"]])
         self.assertEqual(output.getvalue(), f"alpha: ended a hung resume (pid {child.pid}) after 0.01 s "
                          + "and moved it to claude3\n")
+
+    @unittest.skipUnless(process_stop.supported(), "requires Linux pidfds")
+    def test_a_hand_move_records_an_unknown_holder_as_a_task(self) -> None:
+        with self.hung_operation("fixture-task") as child, redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.move_at_the_limit(), self.up("alpha"))
+            self.assertEqual(child.wait(timeout=5), -signal.SIGTERM)
+        self.assertIn("ended a hung task", output.getvalue())
+        batch, = moves.read_move_progress()
+        state = batch.members[0].state
+        assert isinstance(state, moves.MemberMoved)
+        self.assertEqual(state.recovered_holder, "task")
 
     @unittest.skipUnless(process_stop.supported(), "requires Linux pidfds")
     def test_a_hand_move_uses_the_kernel_lock_when_the_holder_record_is_stale(self) -> None:
