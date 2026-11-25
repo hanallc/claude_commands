@@ -290,6 +290,7 @@ Accounts preferences, News polls, and Disks polls keep the snapshot.
 Builds revalidates `memory.json` at its feed interval.
 The server uses only `If-None-Match` to decide whether to return HTTP 304 for a static file.
 The server sends static JSON with gzip when the client accepts gzip.
+Disks shows the drive cards and the session list.
 Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
 Disks shows Paused with the reason **Measuring…** while a measure runs and reads succeed.
 The loader result carries `busy:'Measuring…'` while the measure runs within `wait_seconds`.
@@ -487,6 +488,23 @@ Other pages use more icons from the same folder.
 That folder includes the versions, the sources, and the ISC license.
 The console shell inlines the icons and makes no CDN, font, script, or stylesheet request.
 
+### Builds memory tooltip
+
+Hover over a running local Hana nextest step with a program memory trace to see Compile and Test charts.
+The charts show program memory without file cache.
+Blue shows this run, and purple shows the latest whole run with the same build shape.
+Each chart has its own elapsed time axis and a dashed line for the phase reserve when known.
+The Compile chart scales this run to the past run's time axis and labels the scale.
+It shades the time when the past run compiled the final `hana` crate.
+The values show the latest sample, the past peak, and the past time above half its reserve.
+The Test chart shows **Not started** until tests start.
+The tooltip shows **No past run yet** when no whole run matches within the chart age limit.
+The `feed.past_run_max_age_days` setting in `config/memory_trace.conf` applies only to the chart.
+The trace worker keeps old trace files.
+On recovery, the worker saves an incomplete copy and keeps the original live trace.
+The open tooltip updates with each `memory.json` reading.
+Disks uses the shared step tooltip fields.
+
 ### Review page
 
 Select a Review row to show its detail and actions below the summary.
@@ -625,8 +643,8 @@ When a Review action removes a card, the shared table keeps a copy of the row an
 The copy fades and collapses while the rows below slide up.
 `card_fade_out_ms` in `config/review_links.conf` sets the duration. Its initial value is 450 ms.
 The Review page can restore a pending card after the user scrolls one viewport.
-The redraw that restores this card waits for all row animations to end.
-When Later hides the last card for an owner, the Owner filter stays selected with a zero count.
+The page restores this card after all row animations end.
+When Later hides the last card for an owner, Review keeps the Owner filter selected and shows a zero count.
 A save can change the card's sort values. The copy keeps its previous values until the fade ends.
 If the request fails, the row slides back into view and the current card stays selected.
 `card_fade_in_ms` sets the duration of the return. Its initial value is 600 ms.

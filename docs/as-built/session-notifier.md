@@ -61,7 +61,11 @@ The root is `$NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`. Each insta
   `HOLD` and `ALIGN` use 0 or 1.
 - `state`: `ENABLED`, `NEXT_DUE`, `LAST_SENT`, `LAST_RESTART`, `LAST_TARGET` (the socket of the last send).
 - `lock`: the instance's flock. Every read-modify-write of `conf` or `state` holds it, and each file is rewritten whole (temp file, then `mv`).
-- `fire.log`: one line per attempt, stamped in local time with UTC beside it: `<stamp> | exit <rc> | to <target> uds:<socket> | <send.py output>`, `<stamp> | skip <reason>` (`check timeout`, `check exit <rc>`, `session not running`, `session lookup exit <rc>`, `hold`), `<stamp> | hold released: socket changed|two intervals`, or, for a run-only instance, `<stamp> | run timeout` or `<stamp> | run exit <rc>` (a clean run logs nothing; its output replaces `run.log`).
+- `fire.log` records attempts in local time and UTC.
+  - A send logs `<stamp> | exit <rc> | to <target> uds:<socket> | <send.py output>`.
+  - A skip logs `<stamp> | skip <reason>`. Reasons include `check timeout`, `check exit <rc>`, `session not running`, `session lookup exit <rc>`, and `hold`.
+  - A hold release logs `<stamp> | hold released: socket changed|two intervals`.
+  - A run logs `<stamp> | run result exit <rc>` or `<stamp> | run result timeout`. Exit `0` records success.
 
 At the root: `.tick.lock`, `.last_tick` (epoch of the latest tick) and `notifier.log` (instance removals and lock or tick failures). `tick` creates the root only when it is absent.
 
@@ -90,7 +94,9 @@ job (15 s) → notifier.sh tick
   wait for every subshell, release .tick.lock
 ```
 
-A run-only instance (`RUN`) is not run inside the tick. `launch_run` starts `notifier.sh run-due <name>` in its own transient service (`systemd-run --user --collect --quiet --no-block --unit session-notifier-<name>-<pid>-<random>` on Linux; on the Mac a `launchctl submit` job that runs `run-due-and-remove`, which removes its own label). The Mac job is then started with `launchctl kickstart gui/<uid>/<label>`: on macOS 27 a submitted job is only registered and never runs on its own (measured 2026-10-16). With neither launcher, or when the Mac kickstart fails (the tick then removes the label), the tick logs `run launcher unavailable: <name>; waiting after tick` to `notifier.log` and runs the job once it has released `.tick.lock`. The job claims its slot, runs `RUN` with output to `<instance>/run.log` under the `zselect` watchdog (TERM at `TIMEOUT`), and logs only `run timeout` or `run exit <rc>`. A background child of the tick would die with the tick's cgroup or launchd job.
+A run-only instance (`RUN`) is not run inside the tick. `launch_run` starts `notifier.sh run-due <name>` in its own transient service (`systemd-run --user --collect --quiet --no-block --unit session-notifier-<name>-<pid>-<random>` on Linux; on the Mac a `launchctl submit` job that runs `run-due-and-remove`, which removes its own label). The Mac job is then started with `launchctl kickstart gui/<uid>/<label>`: on macOS 27 a submitted job is only registered and never runs on its own (measured 2026-10-16). With neither launcher, or when the Mac kickstart fails (the tick then removes the label), the tick logs `run launcher unavailable: <name>; waiting after tick` to `notifier.log` and runs the job once it has released `.tick.lock`.
+The job claims its slot and replaces `<instance>/run.log` with the command output. The `zselect` watchdog sends TERM at `TIMEOUT`.
+A background child of the tick would die with the tick's cgroup or launchd job.
 
 The slot is claimed before the check runs, so a concurrent tick or `fire` cannot send the same slot twice, and a skip uses up its slot: the next try is one interval later. The check runs as a background process with a `zselect` watchdog that kills it after `TIMEOUT` seconds. `TIMEOUT` is also the relay's delivery limit.
 
@@ -136,8 +142,12 @@ An undelivered tick replaces the previous queued tick for that instance.
 | `remove <instance>` | Deletes the instance directory. Exits 0 when it is already gone. |
 | `status <instance>` | Target, interval, enabled or stopped, `next_due`, `last_sent`, `last_restart`, `last_tick`, last five `fire.log` lines. |
 | `status` | One line per instance (`<name> every N min next HH:MM enabled\|stopped`), then `last_tick`. |
-| `health <instance>` | Exit 1 with `failing: no instance`, `failing: no tick since <time\|never>` (`.last_tick` missing or older than 120 s), or `failing: last two sends exit a, b` (the last two `exit` lines both nonzero). Otherwise exit 0 with `ok`, or `ok: stopped` for a stopped instance. |
+| `health <instance>` | Exit 1 if the instance is missing, the last tick is missing or older than 120 s, or the last two results failed. Print the reason. Otherwise exit 0 with `ok` or `ok: stopped`. |
 | `tick` | The job's verb. Always exits 0. |
+
+For a send job, health reports `failing: last two sends exit a, b` when both sends exit nonzero.
+For a run-only job, health reports both results, for example `failing: last two runs exit 3, timeout`.
+Health uses `run result` lines because older run logs omit successes.
 
 `restart`, `start`, `resume`, `interval`, `fire` and a fresh `new` print exactly one line `next_due=<epoch> (<YYYY-MM-DD HH:MM TZ>)`, in local time.
 

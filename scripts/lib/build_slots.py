@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 import fcntl
 import os
 from pathlib import Path
-import shutil
 import stat
 import subprocess
 import sys
@@ -24,7 +23,6 @@ from uuid import uuid4
 
 from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, conf, copy_record, git_files, git_rescue
-from scripts.lib.slot_root import configured_slot_root as configured_slot_root
 
 
 # Python writes these folders beside each imported module; they hold no work.
@@ -97,21 +95,6 @@ def source_checkout(source: Path) -> Path:
     configured = _git(source, "--git-dir", common, "config", "--default", str(checkout),
                       "--get", "core.worktree").strip()
     return (Path(common) / configured).resolve()
-
-
-def _root(settings: conf.ConfigRead, key: str) -> Path:
-    return Path(os.path.expandvars(settings.text(key))).expanduser().resolve()
-
-
-def slot_cargo_root(settings: conf.ConfigRead) -> Path:
-    """Read the root for each slot's build output."""
-    return _root(settings, "roots.slot_cargo")
-
-
-def configured_maximum(settings: conf.ConfigRead, machine: str, repository: str) -> int:
-    """Read the repository limit or the machine's default limit."""
-    key = f"slots.{machine}.{repository}.max"
-    return settings.whole(key if key in settings.values() else f"slots.{machine}.default_max")
 
 
 def _persistent_source(source: Path) -> Path:
@@ -304,6 +287,7 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 yield LeasedCopy(path, name, number, MappingProxyType({
                     "CARGO_TARGET_DIR": str(target), "CARGO_BUILD_BUILD_DIR": str(target),
                     build_folders.NUMBERED_COPY_LOCK_ENV: str(descriptor),
+                    build_folders.COPY_KEEP_ENV: str(build_folders.copy_keep_file(path)),
                 }), (descriptor,))
                 return
         if isinstance(selection, ExactSlotRequest):
@@ -314,7 +298,8 @@ def limit_copy_size(copy: LeasedCopy, limit: int) -> None:
     """Discard Cargo output when a held copy exceeds its size limit."""
     size = _size(copy.path)
     if size > limit:
-        shutil.rmtree(copy.cargo_dir)
+        if not build_folders.reset_numbered_copy_cargo(copy.path):
+            raise BlockingIOError(f"{copy.cargo_dir}: the build output or a child lease is held")
         copy.cargo_dir.mkdir()
         print(f"slots: {copy.path} was {size / 2**30:g} GiB, over its {limit / 2**30:g} GiB limit. "
               + "The maker deleted its Cargo output.")

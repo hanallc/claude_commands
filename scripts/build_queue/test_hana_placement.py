@@ -336,7 +336,7 @@ class HanaQueueTests(unittest.TestCase):
                 target.settings, hana_box.ProviderNotInstalled())
             controller.register(IDENTITY)
             original = placement_request(fixture)
-            scope = claim_state.RepositoryScope('hana', 'fixture-repository', 1)
+            scope = claim_state.RepositoryScope('hana', 'fixture-repository')
             destination = placement.PlacementDestination('ssh', target.name, 'fixture-hana', scope, 1)
             request = replace(original, prerequisite=placement.TokenNotRequired(),
                 constraints=replace(original.constraints, command=('cargo', 'check'), command_kind='check',
@@ -363,7 +363,7 @@ class HanaQueueTests(unittest.TestCase):
                 'claim_id': reference.claim_id, 'episode': reference.episode, 'attempt': reference.attempt,
                 'pid': holder.pid, 'proc_start': holder.start_time, 'what': 'Hana judgment', 'worktree': str(fixture.root),
                 'since': '2024-01-01T00:00:00+00:00', 'submitting_session': claim_state.session_id(assignment.session),
-                'repo_name': scope.name, 'repo_key': scope.key, 'slot': scope.slot, 'remote_host': destination.host,
+                'repo_name': scope.name, 'repo_key': scope.key, 'remote_host': destination.host,
             }
             controller.bind_execution(reference.claim_id)
             execution_fixture = test_hana_execution.HanaExecutionTests()
@@ -624,7 +624,7 @@ class HanaQueueTests(unittest.TestCase):
             original = placement_request(fixture)
             assert isinstance(original.profile, records.StepProfile)
             destination = placement.PlacementDestination('ssh', target.name, 'fixture-hana',
-                claim_state.RepositoryScope('hana', repo_key, 1), 1)
+                claim_state.RepositoryScope('hana', repo_key), 1)
             request = replace(original, profile=replace(original.profile, step='check'),
                 prerequisite=placement.TokenNotRequired(),
                 constraints=replace(original.constraints, command=('cargo', 'check'), command_kind='check',

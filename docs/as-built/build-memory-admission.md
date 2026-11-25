@@ -139,7 +139,7 @@ Both paths compute the evidence key from the submitted request and current confi
 Settlement schedules the probe before it reads the shared evidence result.
 Local placements release their reader subscriptions when their reservations end.
 
-`RepositorySlotReady()` advises a retry because `/proc/locks` can omit a held slot, and only the caller's successful `flock` proves it acquired the slot.
+The service has no repository slot request.
 
 ### Cloud gates
 
@@ -593,18 +593,53 @@ An expired estimate requires a client refresh through the service.
 | `release` | Finalize one reservation |
 | `width` | Record the requested test width |
 | `token_wait` | Finalize a reservation and preserve its queue place |
-| `priority_set`, `priority_clear` | Change the one unit priority |
+| `priority_set`, `priority_clear` | Add a unit entry to the priority list, or remove entries |
 | `view`, `explain`, `mine` | Read the stored pass |
 
-`/build:bump <position|session|folder>` selects a waiting step by position, session, or folder.
-The command resolves session names through the staff roster. It reads positions and folders from `queue.json`.
-Set and clear append to `admission/person_actions.jsonl` under a file lock and sync the file.
-Each record holds its id, actor, time and reason. A set also holds the selected step's queue key.
-The command prints `recorded` and the id after the write. It uses no service socket.
-An unmatched selector or unknown unit exits 3 and writes no record.
-The socket priority requests still serve existing clients.
-`/build:bump` works from any session or a plain shell.
-`queue_command_actor()` selects `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, then `"user"`.
+`/build:bump` selects a waiting step by position, session, or folder.
+A numeric selector uses the published queue view and includes kept positions.
+A session or folder selector can also use the saved queue order.
+Set and clear append to `admission/person_actions.jsonl` under a file lock.
+Each record contains an id, actor, time, and reason.
+A set also contains the selected step's queue key and position.
+The command syncs the record and prints its id.
+The command uses no service socket.
+The service still accepts socket priority requests from existing clients.
+Both paths apply priority through `_change_priority`.
+An empty saved clear advances the journal offset without reading history.
+An empty clear from a socket checks history.
+Neither empty clear writes a transition.
+
+`--words` supplies the record's reason and the history entry's reason.
+The command passes the user's request as `--words`.
+The command and the socket refuse a session that supplies no words.
+A plain shell without words stores `typed by nate in a plain shell`.
+`queue_command_actor()` checks `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, then uses `"user"`.
+
+A set stores the actor in `set_by` and resolves the actor's name for `asker`.
+If the roster has no name, the entry shows the session id.
+A plain shell shows `nate (plain shell)`.
+An older entry with no actor name shows its reason alone.
+A pending transition stays in state until the service writes its history row.
+The service retries a failed history write before it applies another change.
+
+`/build:bump` resolves the waiting step's recorded unit before it checks roster labels.
+The no-unit display placeholder supplies no unit.
+Unknown units keep the saved priority and return exit 3 with a refusal on stdout.
+Each pass applies bump records in file order before it ranks the waiters.
+The service saves the byte offset with the priority change in `admission/state.json`.
+A restart resumes at that offset.
+Complete records stay in the file.
+A bump for a departed step saves a refusal with the offset.
+The Builds page shows the saved time of each pending record in the user's zone.
+It shows the reason for each refusal.
+An applied record leaves the list of pending records.
+The priority tooltip shows the units in order and one `Bump` line for each entry.
+Each entry shows the unit, the actor's name, and the user's words.
+The service saves an applied move with the admission episode and the journal offset.
+Moved is the last column.
+It shows the actor in an orange mark for a moved row and a dash for other rows.
+The mark's tooltip shows the actor, source place, destination, and request time in the user's zone.
 
 Mutation requests have replay ids. The service persists each terminal reply before delivery.
 A replay returns the same reply. Live grants remain in the ledger until their reservation ends.
@@ -636,9 +671,9 @@ Evidence expires after the existing waiting poll interval plus the target probe 
 Stale evidence prevents a new decision that needs it; it never releases a provider claim.
 Mac and SSH records retain their claim id, episode, attempt and submitting session through adoption.
 Release compares the exact claim identity under the provider lock.
-The Mac claim count uses `build_slots.configured_maximum` to read the repository limit or host default in `build_folders.conf`.
-The mac-linux gate shares the claude_commands repository limit with native Mac runs, even from a differently named checkout.
-Each guest uses a numbered claim. Mac mirror work uses the unnumbered claim.
+The Mac allows one claim per repository.
+Native Mac and mac-linux runs share that claim across all checkouts of the repository.
+New claims use unnumbered files. Adoption and cleanup can still use saved numbered claim files.
 The Mac resolves the repository before it takes the claim lock.
 The key follows local clone origins to the upstream repository. Git alternates supply objects only.
 The Mac runner reads the step history key from the submitting checkout. This read includes Git worktree URL rewrites.
@@ -722,9 +757,32 @@ The same record holds Cargo, `test-affected`, and `gate` steps.
 The append function locks the file and removes incomplete rows before an append.
 At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 
-1. `admitted` records the original arrival, admission time, wait seconds, need, need source, and whether the step is first.
+1. `admitted` records the original arrival, admission time, wait seconds, need, need source, `is_head`, and `passed`.
 2. `left` records a cancelled waiter or a waiter whose owner is gone.
 3. `ended` records the reservation's end time, outcome, end kind, and sampled peak state.
+
+`is_head` is true when the step was the first queued row in queue order.
+A token-waiting row is not a queued row.
+A false `is_head` does not show that the step went past a row that waits for memory.
+The first queued row is often a step that waits for its repository run limit.
+
+`passed` is a `PassedRows` object. It counts the earlier rows that the step went past, by cause.
+`passed_rows` reads the walk of the pass that admitted the step.
+The walk records the `run_limit` cause on each row as `HeldByRunLimit`, so `passed_rows` does not repeat rule 8.
+A row that the same pass admits is not a passed row.
+Each passed row has one cause. The first cause in this list that applies is the cause:
+
+1. `run_limit`: the row waits for its repository run limit, or waits behind such a row (rule 8).
+2. `cargo_token`: the row left to wait for the Cargo token.
+3. `other_machine`: the row is not routed to natedev, or a remote start is pending for it.
+4. `gpu`: the row waits for a GPU test slot.
+5. `folder`: the row waits for a busy Cargo folder.
+6. `memory`: any other held local row.
+
+The walk never starts a step past a local row that waits for memory, so `memory` is always 0.
+A nonzero `memory` is a walk fault.
+A cloud admission is not in the local walk and has no `passed`.
+`read_queue_lifetimes` reads a row without `passed` as `PassedNotRecorded`, not as zero counts.
 
 Each event identifies the logical step by `pid`, `start_time`, and the original `since`.
 Each admission and end also identifies its reservation interval by `reservation_id`.
@@ -1377,23 +1435,6 @@ Install on natedev from the repo root with `scripts/build_hold/install_cargo_wra
 
 `verify.sh` also times the `cargo` board-token acquisition and passes it as `BUILDLOG_TOKEN_WAIT_S`. The clock is Bash's `$SECONDS`, or the integer in `UNIT_TOKEN_CLOCK_FILE` when set, so a test advances a file instead of sleeping. A wait that times out exits 1 before any call is recorded, so its time is in no row.
 
-`/build:bump` resolves the waiting step's recorded unit before it checks roster labels.
-The no-unit display placeholder supplies no unit.
-Unknown units keep the saved priority and return exit 3 with a refusal on stdout.
-Each pass applies bump records in file order before it ranks the waiters.
-The service persists the byte offset with the priority change in `admission/state.json`.
-A restart resumes at that offset. Complete records stay in the file.
-A set for a departed step saves a refusal with the offset.
-The Builds page shows the saved time of each waiting record in the user's zone.
-It shows the reason for each refusal. An applied record leaves the waiting list.
-A set record saves the selected step's queue place and the request time.
-When the service changes priority, it saves the applied bump with the admission episode and the journal offset.
-The applied record has the actor, source place, destination, and request time.
-The feed includes the bump on waiting and running rows for that episode.
-Moved is the last column. It shows the actor in an orange bump mark, or a dash when the row has no move.
-A kept place shows a dash.
-Hover on the mark to see the queue place, actor, source place, destination, and request time in the user's zone.
-
 Durable `Waiter` rows keep their join and token clocks. `RankedWaiter.order` holds `PriorityUnit` or `NormalOrder` only in the resolved queue. Priority transitions decode to `SettledPriority` or `PendingPriorityTransition`; a pending transition keeps its id and saved month-log offset through retries. One cleanup guard isolates both a failed token-wait intent and failed dead-owner reservation finalization. Each failure logs its record path and keeps the record for the next poll; other cleanup and admission continue.
 
 ### Cargo token reclaim (`scripts/direct/board.sh`)
@@ -1914,10 +1955,19 @@ While `/` has less free than `sweep_free_floor_gib.<host>` in `config/lint.conf`
   A measured scan took 0.21 seconds over 110 targets and about 600 readable processes.
   Without `/proc`, as on the Mac, the scan finds no use.
 - **Roots.** `sweep_floor_roots` is `~/rust`, `~/.local/state`, `~/.cache` and `/tmp`. `~/.cache` came in on 2026-10-21, after 421 GiB of idle targets under `~/.cache/trace-targets` had stayed unseen; it adds 0.4 s to the walk (21,000 folders). `~/.cache/sccache` holds no `.rustc_info.json` and no cargo tag, so it is never a target.
-- **Agent scratch under /tmp.** `sweep.py --floor-only` calls `tmp_sweep.run_if_due` before `hold_floor`, so idle scratch goes before any build cache. It runs the sweep when `tmp-sweep.stamp` in the lint-sweep state folder is an hour old or more (`RUN_INTERVAL_SECONDS`). The stamp moves before the run, so a failed run also waits an hour. `tmp_sweep.py [--dry-run]` runs it at once. For hand cleanup, run `tmp_sweep.py --plan <new-plan.json>` to list every candidate with `keep` or `remove` and one reason, and save the plan without deleting anything. Then run `tmp_sweep.py --apply <plan.json>`; it judges every candidate again once, at its start, with the timed sweep's ownership and process-use checks, keeps planned paths that gained a keep reason, and logs each removal. It never deletes an unplanned path. Hand cleanup also requires end evidence: all recorded workers ended, an expired scratch task, or a recorded verify run that stopped. Age alone does not permit hand cleanup. On the Mac, the hourly `tmp-sweep` job runs `tmp_sweep.py`.
+- **Agent scratch under /tmp.** `sweep.py --floor-only` calls `tmp_sweep.run_if_due` before `hold_floor`.
+  The tmp sweep lists eligible entries for vetted manual removal.
+  It runs when `tmp-sweep.stamp` in the lint-sweep state folder is at least `RUN_INTERVAL_SECONDS` old (one hour).
+  It updates the stamp before each run, so a failed run also waits an hour.
+  Run `tmp_sweep.py [--dry-run]` to start an assessment now.
+  Run `tmp_sweep.py --plan <new-plan.json>` to save each candidate with `keep` or `remove` and a reason.
+  The diagnostic plan requires end evidence from ended workers, an expired scratch task, or a stopped Verify run.
+  Review the hourly run's `removal_guard.py` list before manual removal.
+  `removal_guard.py remove --list <list.jsonl> --sha256 <hash>` removes only approved build rows.
+  The Mac's hourly `tmp-sweep` job runs `tmp_sweep.py`.
 `modules/darwin/tmp-sweep.nix` in nixos defines this job.
 The separate disk-floor job runs every 120 seconds.
- Each root is a real path, because the Mac's /tmp is a link to /private/tmp and lsof prints real paths. They are `/tmp/claude`, `/tmp/claude/delegate`, `/tmp/claude/unit`, each `-`-prefixed project folder in every `/tmp/claude-<uid>` this user owns (so Claude Code's own `bash-edit-diff/` stays), the scratch roots `build_folders.conf` `roots.scratch` and the former `/tmp/claude/scratch` (one entry per direct child; a change review row's folder stays until its verdict), and the temp folders: /tmp, `$TMPDIR` and the Mac's `CS_DARWIN_USER_TEMP_DIR`. In a temp folder only a tempfile folder and a `lint/invoke.sh` log file (`INVOKE_TEMP_NAME`: `lint_invoke.*.log`, `buildlog.*.log`, `.peak` and `.peak.cgroup`; a killed run leaves them, and natedev /tmp held 1,308 and 1,438 on 2026-10-27) are judged. A tempfile folder (`TEMPFILE_NAME`) is `.tmp` and 6 letters or digits (Rust's tempfile crate), `tmp.` and 8 to 10 letters or digits (mktemp), or `tmp` and 8 lower-case letters, digits or `_` (Python's tempfile), the names test runs leave behind (natedev /tmp held 2,662 Rust ones on 2026-10-26 and the Mac's temp folder 273; the first folder audit that day found 3,917 mktemp and Python ones). In /tmp alone (the wide root; `$TMPDIR` and the Mac's temp folder hold app state, and macOS clears its own) every other empty folder this user owns is judged too, whatever its name, and uses `lint.conf` `folder_remove_after_seconds` with the same process-use check. A folder that holds only folders, however deep, counts as empty (`holds_no_file`; a tree of more than 1,000 folders does not), and its idle time is the newest mtime in the tree (2026-10-27: 155 nix-shell folders of empty `hana-runtime` folders stayed). A `direct/verify.sh` run folder (`VERIFY_TEMP_NAME`: `verify-hold.<pid>.XXXXXX`, with the run's `verify-copy.<pid>.XXXXXX` folders inside it) is judged in every temp folder. Its EXIT trap removes it, but a killed run leaves it (natedev /tmp held 47 hold and 6 copy folders on 2026-10-27). It stays while the named pid runs `verify.sh` (a `verify.sh` argument in `/proc/<pid>/cmdline`, or `ps` on the Mac) and that process started no later than the folder's mtime, so a reused pid does not keep it; otherwise it goes at the next run. An old name with no pid takes the 4-hour rule. A folder there that holds something can hold work, so the folder audit judges it, with a git check first (2026-10-27; until then the sweep took any idle folder, and on 2026-10-26 1,103 month-old ones went by hand, an rm the user had to approve). A folder a system tool owns stays (`SYSTEM_TEMP_NAMES`: `claude`, `.X11-unix` and the other X folders; `SYSTEM_TEMP_PREFIXES`: `systemd-private-`, `tmux-`, `nix-`, `ssh-`, `claude-`, `com.apple.`, `powerlog`), except an empty `nix-` one (`EMPTY_PREFIXES`: nix-shell and nix develop leave theirs, 1,321 in natedev /tmp on 2026-10-27), as do another root and a folder that holds one. The sweep does not judge or log other entries in a temp folder. An entry is one top-level file, folder or link under a root. It goes when nothing in it changed in 4 hours (`IDLE_SECONDS`) and no process has its cwd, an open file or a mapped file in it (one `/proc` scan per run; where there is no `/proc`, one `lsof -n -P -w -F pfn` scan: `cwd`, open files, and `txt`/`mem` mapped files). A change is the newer of mtime and ctime, over everything inside the entry, except a folder's ctime in a temp folder or a session or run temp root (systemd-tmpfiles-clean moves it daily). The entry's own times count only for a file, a link or an empty folder. The roots stay. A staff row's `OpenRun` pointer keeps its run folder under `unit/` or `delegate/`. A staff worker also keeps the run when its pane state does not prove that it ended. A worktree in `progress_history_state.json` keeps the run when it belongs to a live or paused session. The shutdown mover records paused sessions. These runs and their temp entries stay when the director process stops. A running director recorded in `director` or the opening `run_started` history event also keeps the run. A kept run also keeps any folder that contains a `detached_runs/*.json` record's `cwd`, or is that working folder, only while that record has status `running`. Finished records do not keep worker folders. Only these records name worker folders; pending files are not read. An empty detached run file is not a record. Each current staff worker whose pane state does not prove it ended keeps its `/tmp/claude/session/<session_id>` parent; old entries inside that parent still take the 4-hour rule. An unreadable non-empty detached run record keeps scratch entries and top-level `/tmp/claude` entries and prints its path. It does not keep old temp entries in session roots. Before deleting an idle entry under any root, both timed and hand cleanup check for git worktrees down to three folder levels, without following links. Uncommitted changes, untracked files, a stash or commits absent from remote and local clone-source refs keep the entry. Git checks use `GIT_OPTIONAL_LOCKS=0`, a 10-second timeout per command, and never fetch. A failed check keeps the entry. The folder audit uses the same git check. The new reasons `a live worker uses it` and `it holds unsaved git work` include kept paths in the log. Unreadable staff, pane evidence, session, shutdown, or run ownership records keep the affected runs; a session folder named for a running session, though an entry of 1 GiB or more in its `scratchpad/` and `tasks/` is judged like any other (`SESSION_ENTRY_MIN_BYTES`; showrunner, 2026-10-25: a live session keeps small files there that it only reads, and a read does not move mtime); each of these when a session record cannot be read; an entry that cannot be read; and everything when neither `/proc` nor lsof can show which processes use the entries. Links are never followed, a read-only folder is made writable and deleted, and a project folder left empty goes. Each run appends one JSON line to `~/.local/state/lint-sweep/tmp-sweep.jsonl`: `deleted` (path, GiB, last change), `freed_gib`, `failed`, `kept` (a count per reason), and `kept_paths` (every reason except a recent change and a small entry in a running session's folder; an in-use path names its pid and how it uses the entry). Lines older than 7 days drop off. The sweep is the only remover under its roots: `disk-floor.nix` excludes `/tmp/claude` and `/tmp/claude-*` from systemd-tmpfiles' age cleanup (`x` rules). Its `q /tmp 10d` rule deletes each file in /tmp older than 10 days, and then each empty folder. On 2026-10-26 that rule had removed an idle unit's run folder and its run marker, one file at a time. The run also prints one line per deletion and a summary to the disk-floor journal. History: it replaced `remove_session_scratch` (2026-10-21: ended sessions only, 24 h idle) on 2026-10-25. That day /tmp/claude held 122 GiB and /tmp/claude-1000 held 86 GiB, and a one-time cleanup had deleted both `active/` folders. The first dry run, with the 1 GiB line, would delete 1,891 entries (20.4 GiB) in about 4 s. The rest stayed because processes used the entries (a 70 GiB target) or because running sessions and unit runs held them.
+ Each root is a real path, because the Mac's /tmp is a link to /private/tmp and lsof prints real paths. They are `/tmp/claude`, `/tmp/claude/delegate`, `/tmp/claude/unit`, each `-`-prefixed project folder in every `/tmp/claude-<uid>` this user owns (so Claude Code's own `bash-edit-diff/` stays), the scratch roots `build_folders.conf` `roots.scratch` and the former `/tmp/claude/scratch` (one entry per direct child; a change review row's folder stays until its verdict), and the temp folders: /tmp, `$TMPDIR` and the Mac's `CS_DARWIN_USER_TEMP_DIR`. In a temp folder only a tempfile folder and a `lint/invoke.sh` log file (`INVOKE_TEMP_NAME`: `lint_invoke.*.log`, `buildlog.*.log`, `.peak` and `.peak.cgroup`; a killed run leaves them, and natedev /tmp held 1,308 and 1,438 on 2026-10-27) are judged. A tempfile folder (`TEMPFILE_NAME`) is `.tmp` and 6 letters or digits (Rust's tempfile crate), `tmp.` and 8 to 10 letters or digits (mktemp), or `tmp` and 8 lower-case letters, digits or `_` (Python's tempfile), the names test runs leave behind (natedev /tmp held 2,662 Rust ones on 2026-10-26 and the Mac's temp folder 273; the first folder audit that day found 3,917 mktemp and Python ones). In /tmp alone (the wide root; `$TMPDIR` and the Mac's temp folder hold app state, and macOS clears its own) every other empty folder this user owns is judged too, whatever its name, and uses `lint.conf` `folder_remove_after_seconds` with the same process-use check. A folder that holds only folders, however deep, counts as empty (`holds_no_file`; a tree of more than 1,000 folders does not), and its idle time is the newest mtime in the tree (2026-10-27: 155 nix-shell folders of empty `hana-runtime` folders stayed). A `direct/verify.sh` run folder (`VERIFY_TEMP_NAME`: `verify-hold.<pid>.XXXXXX`, with the run's `verify-copy.<pid>.XXXXXX` folders inside it) is judged in every temp folder. Its EXIT trap removes it, but a killed run leaves it (natedev /tmp held 47 hold and 6 copy folders on 2026-10-27). The sweep checks `/proc/<pid>/cmdline` or uses `ps` on the Mac to identify `verify.sh`. The folder stays while the named PID runs `verify.sh` and its process start time is at or before the folder's mtime. Otherwise, the sweep lists it for vetted manual removal at the next run if the other checks pass. An old name with no pid takes the 4-hour rule. A folder there that holds something can hold work, so the folder audit judges it, with a git check first (2026-10-27; until then the sweep took any idle folder, and on 2026-10-26 1,103 month-old ones went by hand, an rm the user had to approve). A folder a system tool owns stays (`SYSTEM_TEMP_NAMES`: `claude`, `.X11-unix` and the other X folders; `SYSTEM_TEMP_PREFIXES`: `systemd-private-`, `tmux-`, `nix-`, `ssh-`, `claude-`, `com.apple.`, `powerlog`), except an empty `nix-` one (`EMPTY_PREFIXES`: nix-shell and nix develop leave theirs, 1,321 in natedev /tmp on 2026-10-27), as do another root and a folder that holds one. The sweep does not judge or log other entries in a temp folder. An entry is one top-level file, folder or link under a root. If an entry is idle for 4 hours (`IDLE_SECONDS`) and passes the other checks, the sweep lists it for vetted manual removal. The sweep checks for a working directory, an open file, or a mapped file in the entry. It scans `/proc` once per run. Where `/proc` is absent, it runs `lsof -n -P -w -F pfn` once. A change is the newer of mtime and ctime, over everything inside the entry, except a folder's ctime in a temp folder or a session or run temp root (systemd-tmpfiles-clean moves it daily). The entry's own times count only for a file, a link or an empty folder. The roots stay. A staff row's `OpenRun` pointer keeps its run folder under `unit/` or `delegate/`. A staff worker also keeps the run when its pane state does not prove that it ended. A worktree in `progress_history_state.json` keeps the run when it belongs to a live or paused session. The shutdown mover records paused sessions. These runs and their temp entries stay when the director process stops. A running director recorded in `director` or the opening `run_started` history event also keeps the run. A kept run also keeps any folder that contains a `detached_runs/*.json` record's `cwd`, or is that working folder, only while that record has status `running`. Finished records do not keep worker folders. Only these records name worker folders; pending files are not read. An empty detached run file is not a record. Each current staff worker whose pane state does not prove it ended keeps its `/tmp/claude/session/<session_id>` parent; old entries inside that parent still take the 4-hour rule. An unreadable non-empty detached run record keeps scratch entries and top-level `/tmp/claude` entries and prints its path. It does not keep old temp entries in session roots. The timed sweep and hand cleanup check idle entries for Git worktrees down to three folder levels. The check does not follow links. Uncommitted changes, untracked files, a stash or commits absent from remote and local clone-source refs keep the entry. Git checks use `GIT_OPTIONAL_LOCKS=0`, a 10-second timeout per command, and never fetch. A failed check keeps the entry. The folder audit uses the same git check. The new reasons `a live worker uses it` and `it holds unsaved git work` include kept paths in the log. Unreadable staff, pane evidence, session, shutdown, or run ownership records keep the affected runs; a session folder named for a running session, though an entry of 1 GiB or more in its `scratchpad/` and `tasks/` is judged like any other (`SESSION_ENTRY_MIN_BYTES`; showrunner, 2026-10-25: a live session keeps small files there that it only reads, and a read does not move mtime); each of these when a session record cannot be read; an entry that cannot be read; and everything when neither `/proc` nor lsof can show which processes use the entries. The sweep does not follow links. `disk-floor.nix` excludes `/tmp/claude` and `/tmp/claude-*` from systemd-tmpfiles' age cleanup with `x` rules. Its `q /tmp 10d` rule deletes each file in /tmp older than 10 days, and then each empty folder. On 2026-10-26 that rule had removed an idle unit's run folder and its run marker, one file at a time. The timed sweep prints one line per entry for review and a summary to the disk-floor journal. History: it replaced `remove_session_scratch` (2026-10-21: ended sessions only, 24 h idle) on 2026-10-25. That day /tmp/claude held 122 GiB and /tmp/claude-1000 held 86 GiB, and a one-time cleanup had deleted both `active/` folders. The first dry run used the 1 GiB limit and found 1,891 candidates (20.4 GiB) in about 4 s. The rest stayed because processes used the entries (a 70 GiB target) or because running sessions and unit runs held them.
 - **Use stamp.** `sweep_workspace()` sets the mtime of `.lint-sweep-used` (`USE_STAMP`) in every root `cargo_roots()` returns, before `lock_trees`, so a step that compiled nothing, or whose sweep was skipped because a build held a lock, still counts as use. A dry run and `--target-dir` (CI) write none; a write failure is ignored.
 - **Target last use.** `target_last_use(root, groups)` is the newest of the stamp's mtime and the target's build units' `last_used`.
 - **Order.** `shrink()` and `choose()` take a `RemovalOrder`, a sort key over `Group`; the smallest key goes first. The workspace budget sweep passes `unit_age` (most whole days unused, then oldest compile). For the floor's target order, see [Build output retained by the sweep](build-targets.md#build-output-retained-by-the-sweep). A scratch target a build holds is left like any held target. Orphaned files (`Scan.orphans`, one group per build tree) go first from any idle target, whatever the order.
@@ -1942,7 +1992,7 @@ The audit and repository scan share `scratch.conf` `repo_skip`.
 
 Agents made loose repo copies, repros and test trees in /tmp and ~/rust, and nothing removed them.
 Sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27).
-Each scratch folder belongs to a task. The task's end removes its folders.
+Each scratch folder belongs to a task. The task's end keeps its folders for manual removal.
 `scratch.py new [--task <task> | --until <when>] [--name <word>]` makes a folder and prints its path.
 `scratch.py new --worker [--name <word>]` makes a folder under `TMPDIR` for the caller's worker task.
 The DONE completion hook ends that task before pane closure. Other workers' folders remain.
@@ -1955,7 +2005,7 @@ Tasks use these forms:
 - `phase:<unit>/<phase>` ends through `merge_checkpoint.py` after the phase's code checkpoint.
 - `gate:<id>` ends through the gate's caller.
 - `row:<showrunner>-C<n>` ends through `change_review.py verdict` after either verdict.
-- `until:<YYYY-MM-DDTHHMMZ>/<id>` ends through the hourly temporary sweep when its time passes.
+- `until:<YYYY-MM-DDTHHMMZ>/<id>` ends at its deadline.
 
 `--until YYYY-MM-DD [HH:MM]` selects a deadline in the user's time zone.
 Each call creates a random task id from `scratch.conf` `suffix_length` characters.
@@ -1970,7 +2020,7 @@ A missing or unreadable plan refuses the new task and names the cause.
 Use a recorded phase id, `gate:<id>` or `--until <when>`.
 Existing tasks with an invalid phase id can still update and end.
 The sweep keeps a task's folder while the task remains open.
-It removes folders after seven idle days, even when the task remains open.
+After seven idle days, it lists eligible folders for vetted manual removal even when the task remains open.
 A plain file directly in the scratch root reads as `NotRegistered`.
 The sweep uses the existing idle limit for unregistered entries.
 An unreadable folder record still keeps the folder.
@@ -1978,8 +2028,7 @@ An unreadable folder record still keeps the folder.
 `scratch.py hold <path> --reason <why>` keeps a folder at its path until its task ends.
 `change_review.py add --hold <path>` also creates a hold.
 The hold record stays in `~/.local/state/scratch/holds.json`.
-`end` removes the held folder unless a repository in it has uncommitted changes, a stash or commits absent from all remotes.
-The folder stays with its hold marked ended.
+`end` keeps the held folder and marks its hold ended.
 
 A folder made without `--worker` uses `<scratch root>/<kind>-<name>-<word>-<6 chars>`.
 The scratch root is `build_folders.conf` `roots.scratch`: `/tmp/claude/scratch` on natedev and on the Mac.
@@ -1988,10 +2037,10 @@ Each folder holds `.scratch.json` with its task, maker staff id, and times.
 A Git worktree uses `git worktree remove` for removal.
 A failed removal prints a warning and does not fail the merge or the verdict.
 
-The scratch guard, a `PreToolUse` hook on `Bash` for Claude Code (`settings.json`) and Codex (`codex_hooks.py`), refuses a command that makes a new folder directly in /tmp, `$TMPDIR`, /tmp/claude, ~/rust or ~/rust/scratch (and judges a Write or NotebookEdit file path where its matcher names them): mkdir, mktemp -d, git clone, git worktree add, cp -r/-R/-a, rsync, cargo new/init, and tar extraction into a root. Allowed there: the session scratchpads (`/tmp/claude-<uid>`), `/tmp/claude/unit`, `/tmp/claude/delegate`, `/tmp/claude/session` and both scratch roots; ~/worktrees is no root, and a `make_a_worktree` command is never judged. A heredoc body, a quoted argument and a comment are data. A path the hook cannot follow (a variable other than HOME or TMPDIR, a command substitution, a command inside `bash -c` or ssh) is allowed, and the hourly tmp sweep is the backstop. A `TMPDIR` inside a session scratchpad, a session temp root or a run folder is no root.
+The scratch guard, a `PreToolUse` hook on `Bash` for Claude Code (`settings.json`) and Codex (`codex_hooks.py`), refuses a command that makes a new folder directly in /tmp, `$TMPDIR`, /tmp/claude, ~/rust or ~/rust/scratch (and judges a Write or NotebookEdit file path where its matcher names them): mkdir, mktemp -d, git clone, git worktree add, cp -r/-R/-a, rsync, cargo new/init, and tar extraction into a root. Allowed there: the session scratchpads (`/tmp/claude-<uid>`), `/tmp/claude/unit`, `/tmp/claude/delegate`, `/tmp/claude/session` and both scratch roots; ~/worktrees is no root, and a `make_a_worktree` command is never judged. A heredoc body, a quoted argument and a comment are data. A path the hook cannot follow (a variable other than HOME or TMPDIR, a command substitution, a command inside `bash -c` or ssh) is allowed, and the hourly tmp sweep lists eligible folders for vetted manual removal. A `TMPDIR` inside a session scratchpad, a session temp root or a run folder is no root.
 Before its checks, the scratch guard uses the session-start path helper to restore only the input session id's missing temp folder with mode `0700`; an existing folder costs one `os.stat`, a missing or invalid id creates nothing, and a repair error allows the tool call to proceed to the checks.
 
-Each Claude session's `TMPDIR` is `/tmp/claude/session/<session id>`: `hooks/session-start-temp-root.py` makes it at start, resume, clear and compact, and writes `export TMPDIR=...` to `$CLAUDE_ENV_FILE`. A run's workers and `verify.sh --session-dir` use `<run folder>/tmp`. So mktemp, tempfile and Rust `.tmpXXXXXX` folders land there, and the hourly tmp sweep judges each entry with its 4 h rule; the root goes only once its session or director stops, and nothing waits on that. In /tmp and the other temp folders a folder's ctime is no change, since `systemd-tmpfiles-clean` moves it every day (its 26 Oct run kept month-old folders such as `cargo-installQOkrzS` looking fresh to the 7-day rule).
+Each Claude session's `TMPDIR` is `/tmp/claude/session/<session id>`: `hooks/session-start-temp-root.py` makes it at start, resume, clear and compact, and writes `export TMPDIR=...` to `$CLAUDE_ENV_FILE`. A run's workers and `verify.sh --session-dir` use `<run folder>/tmp`. The mktemp, tempfile and Rust `.tmpXXXXXX` folders use these roots. The hourly tmp sweep lists eligible entries after four idle hours. It keeps the root while its session or director runs. In /tmp and the other temp folders a folder's ctime is no change, since `systemd-tmpfiles-clean` moves it every day (its 26 Oct run kept month-old folders such as `cargo-installQOkrzS` looking fresh to the 7-day rule).
 
 The daily folder audit (`scripts/lint/folder_audit.py --send`) checks loose folders that can hold work.
 A `nate.jobs` job runs it on natedev and the Mac.
@@ -2419,7 +2468,7 @@ The small text is empty when the showrunner is the same name as the unit.
 `queueRowLabels` gives the row start, the small text, and the `Step` and `Verify` cells from one place.
 For running rows, the table shows `Stage`, `Done`, `Dur`, `Verify`, `Step`, `Pid`, `Machine`, `vCPU`, and `Tokens`.
 The waiting table uses `#` and `Waiting`, and omits `Tokens`.
-The table has no `Unit` column and no `Slot` column. The feed sends no slot number; it sends only `slot_folder` and `slot_machine`, which the Disks page reads.
+The Disks page reads its own drive and session data.
 On 2026-11-23, Nate asked again for the Unit column to go because the row start shows the unit.
 At 10:00 he asked why the Slot column still showed; natedev has no slots, so each of its rows showed `—`.
 On 2026-11-23, Nate said: “where it is running should be what shows in the running column”.
@@ -2501,7 +2550,7 @@ The gap starts at 12 px and can decrease to 4 px before the card needs to scroll
 The label column is as wide as the widest row title or small line, running or waiting, with the reorder handle space of its row. The Free row also counts.
 When the queue shows reorder handles, every waiting row keeps the handle space, so the title of a fixed row lines up with the others.
 A row title never wraps. In a pane too narrow for it, the title ends in an ellipsis, and the row hover gives the full text.
-A small line under a title (the showrunner or repository line, or a waiting note with the job start of a CI row) never wraps either. It ends in an ellipsis in the same way.
+A small line under a title shows the showrunner, the repository, or a waiting note. The line stays on one line and ends in an ellipsis when space is short.
 The layout starts with compact gaps and a label width of up to 9 rem.
 It evaluates normal gaps and a label width of up to 12 rem.
 Each larger layout must fit the minimum chart width and preserve the Step width.
@@ -2525,7 +2574,7 @@ It loads `scripts/build_queue/builds_page_real_rows.json`, a cut of a real queue
 3. A running and a waiting hana CI row.
 4. A Mac build, and an AWS row.
 5. A fixed Mac-only waiting row.
-6. A waiting hana CI row with a long waiting note and a job start.
+6. A waiting hana CI row with a long waiting note, and a job start in its hover.
 The queue-move stub gives the page a token, so the reorder handles draw.
 At 1440 px and at 900 px, dark, it fails when one of these is false:
 1. The table has no Unit and no Slot column.
@@ -2735,8 +2784,8 @@ So each step of one CI job ranks at the job start, ahead of steps that arrived a
 Queue priority remains the first ordering field.
 A step with `NoJobStart` keeps its arrival place.
 `state.json` saves the job start with the waiter place, so the place survives a service restart.
-The Builds page waiting row shows `job started <time> · <age> ago` in the user zone, after any wait reason.
-Its hover shows the same time and age under `Job start`.
+The Builds page shows the job start only in the hover of the waiting row, under `Job start`.
+The hover shows the time in the user zone and the age.
 The page shows no time left to the 6-hour limit; that comes with a config key for the limit.
 
 Registered process trees count through their reservations.

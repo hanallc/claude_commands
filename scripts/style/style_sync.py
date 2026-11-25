@@ -11,7 +11,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import sqlite3
 import stat
 import subprocess
@@ -365,58 +364,59 @@ def verify_lint(session: LintSession) -> LintCompleted:
     return result
 
 
-def remove_lint_dir(repo: Path, directory: Path) -> bool:
-    """Delete the checkout, then its registration; the owner record goes last, once nothing is registered.
-
-    git removes the registration of a deleted checkout, also one without its `.git` file, which it
-    refuses to validate while the checkout exists. `--force` twice also removes a locked registration,
-    which a killed `worktree add` leaves and `git worktree prune` keeps. When either step fails,
-    the dir keeps its owner record, so the next sweep retries it. rmtree unlinks checkout/target
-    without following it, keeping the repo's warm target.
-    """
+def _remove_lint_registration(repo: Path, directory: Path) -> bool:
+    """Clear the checkout and its Git registration at the original path."""
     snapshot = directory / "checkout"
     # git lists the real path of the dir it was given; only the lint dir is resolved, never the checkout.
     listed = directory.resolve() / "checkout"
-    try:
-        if snapshot.is_symlink():
-            snapshot.unlink()
-        elif (snapshot.is_dir() or scratch.removal_mark(snapshot).exists()
-              or scratch.cargo_removal_mark(snapshot).exists()):
-            scratch.remove_with_cargo_output(snapshot)
+
+    def clear_registration() -> None:
         registered = {Path(line.removeprefix("worktree "))
                       for line in git(repo, "worktree", "list", "--porcelain").splitlines()
                       if line.startswith("worktree ")}
         if listed in registered:
+            if os.path.lexists(snapshot):
+                raise Refusal(f"{snapshot}: the checkout path is occupied")
             _ = git(repo, "worktree", "remove", "--force", "--force", str(listed))
+
+    try:
+        with scratch.removal_lock(snapshot, reserve_name=True) as idle:
+            if not idle:
+                return False
+            if snapshot.is_symlink():
+                snapshot.unlink()
+            if snapshot.is_dir():
+                scratch.remove_with_cargo_output(snapshot, prepare_staged=clear_registration)
+            else:
+                clear_registration()
+                if scratch.removal_mark(snapshot).exists() or scratch.cargo_removal_mark(snapshot).exists():
+                    scratch.remove_with_cargo_output(snapshot)
     except (Refusal, OSError, scratch.ScratchError) as error:
         print(f"style_sync: kept {directory} for the next lint run; worktree registration: "
               + " ".join(str(error).splitlines()))
         return False
-    record = directory / OWNER_FILE
-    for entry in directory.iterdir():
-        if entry == record:
-            continue
-        if entry.is_dir() and not entry.is_symlink():
-            shutil.rmtree(entry)
-        else:
-            entry.unlink()
-    record.unlink(missing_ok=True)
-    directory.rmdir()
     return True
+
+
+def remove_lint_dir(repo: Path, directory: Path, *, expected: os.stat_result | None = None) -> bool:
+    """Remove the lint folder after Git accepts its checkout cleanup."""
+    return build_folders.remove_build_folder(
+        directory, expected=expected, prepare=lambda: _remove_lint_registration(repo, directory))
 
 
 def remove_if_stale(directory: Path) -> None:
     # A link or another user's entry in a shared temp dir would aim the deletes below at its target.
-    if directory.is_symlink() or not directory.is_dir() or directory.stat().st_uid != os.getuid():
-        return
     try:
+        status = directory.lstat()
+        if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid():
+            return
         owner_record = OwnerRecord.read(directory)
         if lint_run_running(directory, owner_record):
             return
     except (OSError, ValueError):
         return
     try:
-        if build_folders.remove_build_folder(directory, lambda: remove_lint_dir(owner_record.repo, directory)):
+        if remove_lint_dir(owner_record.repo, directory, expected=status):
             print(f"style_sync: removed stale lint checkout {directory} (owner {owner_record.owner} not running)")
     except FileNotFoundError:
         # The keeper may finish cleanup while the sweep waits for the lock.
