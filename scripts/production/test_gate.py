@@ -887,6 +887,7 @@ with mock.patch.object(scratch.time, "sleep", side_effect=announce_wait):
 
     def test_finished_module_keeps_a_held_child_folder(self) -> None:
         prepare = gate.test_module_environment
+        finish = gate.finish_gate_job
         children: list[Path] = []
 
         def hold_child(root: Path, environment: dict[str, str]) -> dict[str, str]:
@@ -897,8 +898,14 @@ with mock.patch.object(scratch.time, "sleep", side_effect=announce_wait):
             children.append(child)
             return prepare(root, environment)
 
-        with mock.patch.object(gate, "test_module_environment", side_effect=hold_child):
+        def finish_successful_module(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
+            self.assertEqual(status, 0, job.log.read_text(errors="replace"))
+            return finish(job, status)
+
+        with (mock.patch.object(gate, "test_module_environment", side_effect=hold_child),
+              mock.patch.object(gate, "finish_gate_job", side_effect=finish_successful_module) as finished):
             result = self.run_gate("--tests-only", "--full")
+        finished.assert_called_once()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("UNRESOLVED: could not remove", result.stderr)
         self.assertTrue(children)
