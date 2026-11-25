@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from typing import cast, override
 from unittest.mock import MagicMock, patch
@@ -26,7 +27,7 @@ from unittest.mock import MagicMock, patch
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
 from scripts.lib.helper_tree_test_support import verify_test_environment
-from scripts.lib.shell_test_support import refusing_bash_startup
+from scripts.lib.shell_test_support import refusing_bash_startup, shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
 
@@ -219,6 +220,39 @@ class ProcessGroupTests(PrivateGroupFixture):
             send.assert_called_once_with(child.pid, signal.SIGKILL)
 
 
+def process_ended(pid: int) -> bool:
+    """Wait a short time for a process to leave or become a zombie."""
+    deadline = time.monotonic() + process_group.STOP_WAIT_SECONDS + 5
+    while time.monotonic() < deadline:
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True,
+                               timeout=TEST_HANG_GUARD_SECS, check=False).stdout.strip()
+        if not state or state.startswith("Z"):
+            return True
+        time.sleep(.05)
+    return False
+
+
+class RunProcessGroupTests(unittest.TestCase):
+    def test_a_finished_command_returns_at_once_and_leaves_no_child(self) -> None:
+        started = time.monotonic()
+        done = process_group.run_process_group(
+            ["sh", "-c", r"sleep 30 & echo $!; printf 'said \377' >&2"], timeout=TEST_HANG_GUARD_SECS)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual((done.returncode, done.stderr), (0, "said \ufffd"))
+        self.assertTrue(process_ended(int(done.stdout)))
+
+    def test_a_timeout_stops_the_command_and_its_child(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        record = folder / "child"
+        written = shlex.quote(str(folder / "child.new"))
+        with self.assertRaises(subprocess.TimeoutExpired) as stopped:
+            _ = process_group.run_process_group(
+                ["sh", "-c", f"sleep 30 & echo $! > {written}; mv {written} {shlex.quote(str(record))}; echo waiting; wait"],
+                timeout=15)
+        self.assertEqual(cast(str, stopped.exception.output), "waiting\n")
+        self.assertTrue(process_ended(int(record.read_text())))
+
+
 class ShellProcessGroupTests(PrivateGroupFixture):
     root: Path = Path()
     fixture_environment: dict[str, str] = {}
@@ -284,10 +318,8 @@ class ShellProcessGroupTests(PrivateGroupFixture):
             + f"raise SystemExit({status})\n")
 
     def cancel_step(self, function: str, child: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
-        source = (self.root / "scripts/direct/verify.sh").read_text()
-        definition = re.search(rf"^{function}\(\) \{{\n.*?^\}}", source, re.MULTILINE | re.DOTALL)
-        self.assertIsNotNone(definition)
-        assert definition is not None
+        verify = self.root / "scripts/direct/verify.sh"
+        definitions = shell_functions(verify, "save_verify_exit_stderr", "finish_exit_diagnostics", function)
         watch = self.root / "watch"
         watch.mkdir(exist_ok=True)
         driver = """
@@ -305,10 +337,20 @@ note_event() { :; }
 interrupt_hold_wait() { :; }
 verify_cleanup() { :; }
 final_pass_finish() { :; }
+finish_verify_run() { :; }
+stop_interrupted_run_log() { :; }
+"""
+        if function == "verify_interrupted":
+            driver += """
+VERIFY_START_DIR="$4"
+PY="$VERIFY_START_DIR/../lib/py"
+save_verify_exit_stderr
+exit_diagnostics="$TREE_WATCH_DIR/exit-diagnostics"
 """
         return subprocess.run(
-            ["bash", "-c", driver + definition.group() + f"\n{function} 15\n", "fixture",
-             str(child.pid), str(self.root / "scripts/direct/step_record.py"), str(watch)],
+            ["bash", "-c", definitions + driver + f"\n{function} 15\n", "fixture",
+             str(child.pid), str(verify.with_name("step_record.py")), str(watch),
+             str(Path(__file__).resolve().parents[1] / "direct")],
             env=self.environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
         )
 

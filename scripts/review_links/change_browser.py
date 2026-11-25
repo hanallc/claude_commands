@@ -9,20 +9,21 @@ import re
 import secrets
 import shlex
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from importlib import import_module
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from scripts.lib import conf, urgency
 from scripts.lib.user_zone import shown_time, user_zone
 from scripts.production import change_review, change_routing, next_item, staff, update_registration
-from scripts.production.production_doc import Production
+from scripts.production.production_doc import Production, Refusal as ProductionRefusal
 from scripts.production.issues import frontmatter
 from scripts.production.change_routing import UnavailableProduction
+from scripts.rebuild import need
 from scripts.review_links import change_page, console, new_item_dialog, page_frame, question_record, review_events, review_items, staff_names
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 from scripts.statusline import rebuild_row
@@ -244,7 +245,27 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus, *,
     return PreparedReviews(tuple(changes), queues, orders, tuple(questions), question_tabs, routing.record)
 
 
-def section(change: WaitingChange, feedback_rows: int) -> str:
+def receiver_names(members: staff.StaffSnapshot, recipients: tuple[staff.StaffId, ...]) -> str:
+    """Name the complete route when the staff snapshot has every receiver."""
+    names: list[str] = []
+    for recipient in recipients:
+        member = members.by_id(recipient)
+        if member is None:
+            return ""
+        names.append(member.name)
+    return " and ".join(names)
+
+
+def verdict_toast_labels(owner: change_routing.ChangeOwner, members: staff.StaffSnapshot) -> dict[str, str | None]:
+    """Give the browser a receiver label for each verdict."""
+    labels: dict[str, str | None] = {}
+    for action, verdict in (("works", "works"), ("works-with-words", "works: words"), ("not works", "not works")):
+        recipients = change_page.verdict_recipients(owner, verdict)
+        labels[action] = receiver_names(members, tuple(reversed(recipients))) if recipients else None
+    return labels
+
+
+def section(change: WaitingChange, feedback_rows: int, members: staff.StaffSnapshot | None = None) -> str:
     page, row = change.page, change.row
     shown = change_review.display_id(row, change.tab)
     anomaly = f"<p>{html.escape(change.anomaly)}</p>" if change.anomaly else ""
@@ -259,6 +280,11 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
     else:
         form = change_page.answer_form(page, change_page.AnswerNotice(row["#"]), feedback_rows).replace(
             '<form method="post">', f'<form method="post" action="{change_page.PAGE_NAME}">') if change.waiting else ""
+        if members is not None and form:
+            handoff = receiver_names(members, page.owner.showrunner_recipients)
+            labels: dict[str, str | None] = {action: handoff for action in change_page.CHANGE_HANDOFFS}
+            labels.update(verdict_toast_labels(page.owner, members))
+            form = form.replace('<form method="post"', '<form method="post" ' + send_route_attributes(labels), 1)
         text = change_page.answer_status(row.get("Verdict", ""), change.slots)
         saved = f'<p>{html.escape(text)}</p>' if text else ""
         content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
@@ -478,6 +504,11 @@ def question_details(question: WaitingQuestion,
             + '</dl>')
 
 
+def send_route_attributes(labels: dict[str, str | None]) -> str:
+    """Put the receiver labels on the form."""
+    return f'data-send-labels="{html.escape(json.dumps(labels), quote=True)}"'
+
+
 def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback_rows: int,
                      names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
     key = html.escape(question.key)
@@ -486,7 +517,9 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
     owned = question.tab != "unrouted"
     # Without an owner there is no form, so the choices show as a list the user cannot pick.
     shown_choices = "" if owned else choices.replace('<input type="radio"', '<input type="radio" disabled')
-    form = '<p>No showrunner owns this question.</p>' if not owned else f'''<form method="post" action="{change_page.PAGE_NAME}">
+    names = names if isinstance(names, staff_names.StaffNames) else staff_names.read()
+    routes = send_route_attributes(question_toast_labels(question.record, names.members)) if owned else ""
+    form = '<p>No showrunner owns this question.</p>' if not owned else f'''<form method="post" action="{change_page.PAGE_NAME}" {routes}>
 <input type="hidden" name="row" value="{key}">
 <input type="hidden" name="token" value="{row_token(browser, question.key)}">{choices}
 <label for="answer-{key}">Your answer</label>
@@ -503,16 +536,17 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
 
 @dataclass(frozen=True)
 class Rebuild:
-    """One change that a machine's rebuild applies: its time, its owner and its reason."""
+    """One entry with its time, owner, and text."""
 
     at: str
     owner: str
-    reason: str
+    text: str
 
 
 def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: dict[str, tuple[rebuild_row.Change, ...]],
-                 record: staff.StaffSnapshot) -> str:
-    """Show each machine the status line names, then its changes under each owner and each shown time."""
+                 record: staff.StaffSnapshot, completed: tuple[need.CompletedNeedRecord, ...] = (),
+                 damaged: Iterable[str] = ()) -> str:
+    """Show waiting machines and completed requests."""
     def who(session: str) -> str:
         member = record.by_member_reference(session) if session else None
         return (f"{member.name} ({member.kind})" if member is not None
@@ -523,29 +557,52 @@ def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: dict[str, tuple[reb
     for machine_name, name in zip(answer.machines, names):
         records = next((machine.records for machine in answer.needs if machine.newest["machine"] == machine_name), ())
         filed = {item["nixos_commit"] for item in records}
-        # A filed need and its commit are one change; the need gives the requester and the reason.
-        items = [Rebuild(item["created_at"], who(item["requested_by"] or item["concerns"]), item["reason"])
+        items = [Rebuild(item["created_at"], who(item["requested_by"] or item["concerns"]),
+                         item["reason"].strip() or need.NO_REASON)
                  for item in records]
-        items += [Rebuild(change.at, who(change.session), change.reason)
-                  for change in changes.get(machine_name, ()) if change.commit not in filed]
-        listed = owner_groups(items, staff_names.StaffNames(record)) if items else '<p>The change list is not available yet.</p>'
+        commits = [Rebuild(change.at, who(change.session), change.reason)
+                   for change in changes.get(machine_name, ()) if change.commit not in filed]
+        staff_names_by_reference = staff_names.StaffNames(record)
+        listed = owner_groups(items, staff_names_by_reference)
+        if commits:
+            listed += '<section class="rebuild-commits"><h3>Commits</h3>' + owner_groups(
+                commits, staff_names_by_reference, heading="h4") + '</section>'
+        if not listed:
+            listed = '<p>The change list is not available yet.</p>'
         blocks.append(f'<article data-machine="{html.escape(machine_name)}"><h2>Rebuild {html.escape(name)}</h2>{listed}</article>')
     label = f"Rebuild {' and '.join(names)}" if names else ""
+    if not blocks:
+        blocks.append('<p>No rebuilds needed.</p>')
+    if completed:
+        names_by_reference = staff_names.StaffNames(record)
+        history: list[str] = []
+        for item in completed:
+            at = need.completion_time(item)
+            requester = who(item["requested_by"] or item["concerns"])
+            metadata = names_by_reference.html(requester)
+            words = html.escape(item["reason"].strip() or need.NO_REASON)
+            history.append(f'<li>{words}<small>{html.escape(item["machine"])} · {metadata} · '
+                           + f'<time datetime="{at.isoformat()}">{shown_time(at)}</time></small></li>')
+        blocks.append('<section class="rebuild-history"><h2>Completed requests</h2><ul>'
+                      + ''.join(history) + '</ul></section>')
+    blocks.extend(f'<p class="rebuild-history" role="status">Cannot read completed request {html.escape(name)}.</p>'
+                  for name in damaged)
     return (f'<div data-rebuilds data-count="{len(names)}" data-label="{html.escape(label, quote=True)}">'
-            + (''.join(blocks) if blocks else '<p>No rebuilds needed.</p>') + '</div>')
+            + ''.join(blocks) + '</div>')
 
 
 def owner_groups(items: list[Rebuild],
-                 names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
-    """Name each owner once, newest change first; under an owner, changes at one shown time share that time."""
+                 names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT,
+                 *, heading: Literal["h3", "h4"] = "h3") -> str:
+    """Group entries by owner and time, newest first."""
     owners: dict[str, dict[str, list[Rebuild]]] = {}
     names = names if isinstance(names, staff_names.StaffNames) else staff_names.read()
-    for item in sorted(items, key=lambda item: datetime.fromisoformat(item.at), reverse=True):
-        owners.setdefault(item.owner, {}).setdefault(shown_time(datetime.fromisoformat(item.at)), []).append(item)
+    for item in sorted(items, key=lambda item: need.request_time(item.at), reverse=True):
+        owners.setdefault(item.owner, {}).setdefault(shown_time(need.request_time(item.at)), []).append(item)
     return ''.join(
-        f'<div data-owner><h3>{names.html(owner)}</h3><dl>'
+        f'<div data-owner><{heading}>{names.html(owner)}</{heading}><dl>'
         + ''.join(f'<dt><time datetime="{html.escape(group[0].at, quote=True)}">{html.escape(shown)}</time></dt>'
-                  + ''.join(f'<dd>{html.escape(item.reason)}</dd>' for item in group)
+                  + ''.join(f'<dd>{html.escape(item.text)}</dd>' for item in group)
                   for shown, group in times.items())
         + '</dl></div>' for owner, times in owners.items())
 
@@ -554,16 +611,24 @@ def owner_groups(items: list[Rebuild],
 REBUILD_STYLE = """<style>main{max-width:1124px}
 [data-rebuilds]{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:32px 48px;align-items:start}
 [data-rebuilds] h2{margin:8px 0 0}[data-rebuilds] h3{font-size:17px;line-height:1.3;margin:24px 0 8px}
+[data-rebuilds] h4{font-size:15px;line-height:1.3;margin:16px 0 8px}
 [data-rebuilds] dl{display:grid;grid-template-columns:max-content minmax(0,1fr);column-gap:16px;row-gap:4px;margin:0;font-size:15px}
 [data-rebuilds] dt{grid-column:1;color:light-dark(#5f5f5f,#b0b0b0)}[data-rebuilds] dd{grid-column:2;margin:0;min-width:0;overflow-wrap:anywhere}
 [data-rebuilds] dd+dt,[data-rebuilds] dd+dt+dd{padding-top:8px}
+.rebuild-history{grid-column:1/-1;overflow-wrap:anywhere}
+.rebuild-history ul{list-style:none;margin:0;padding:0}
+.rebuild-history li{margin-top:12px}
+.rebuild-history small{display:block;color:var(--ink-3)}
 @media (max-width:480px){[data-rebuilds] dl{display:block}[data-rebuilds] dd+dt{padding-top:12px}[data-rebuilds] dd+dt+dd{padding-top:0}}</style>"""
 
 
 def render_rebuilds() -> bytes:
     """Render the status line's rebuild answer for the console's rebuild link and Rebuilds page."""
     config = conf.path("statusline")
-    rebuilds = rebuild_list(rebuild_row.read(config), rebuild_row.read_changes(config), staff.snapshot())
+    damaged: list[str] = []
+    completed = need.read_completed_needs(damaged)
+    rebuilds = rebuild_list(rebuild_row.read(config), rebuild_row.read_changes(config), staff.snapshot(),
+                            completed, damaged)
     return change_page.document(REBUILD_STYLE + '<h1 class="page-title">Rebuilds needed</h1>' + rebuilds, "Rebuilds needed")
 
 
@@ -574,7 +639,7 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
     refresh_seconds = settings.number("page_refresh_seconds")
     card_motion = page_frame.CardMotion.read(settings)
     prepared = prepare(browser, status, settings=settings)
-    names_read = staff_names.read()
+    names_read = staff_names.StaffNames(prepared.record)
     kind = browser.kind
     names = prepared.queues if kind == "changes" else prepared.question_tabs
     menus: list[str] = []
@@ -584,7 +649,7 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
         label = "Owner unavailable" if name == "unrouted" else name
         menus.append(f'<option data-showrunner="{html.escape(name)}" '
                      + f'data-count="{count}"{names_read.style(name)} value="{html.escape(name)}">{html.escape(label)} ({count})</option>')
-    cards = (''.join(section(item, feedback_rows) for item in prepared.changes) if kind == "changes"
+    cards = (''.join(section(item, feedback_rows, prepared.record) for item in prepared.changes) if kind == "changes"
              else ''.join(question_section(item, browser, feedback_rows, names_read) for item in prepared.questions))
     content = (PAGE_STYLE + page_frame.title(change_page.TITLES[kind], "review")
                + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}"'
@@ -665,7 +730,8 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
         raise question_record.AnswerRefused("the production document is not available")
     fields["row"] = [found.row["#"]]
     rewritten = urlencode({key: values[0] for key, values in fields.items()})
-    delivery = change_page.submit(found.page, rewritten, status, prepared=prepared.queues[found.tab], feedback_closes=feedback_closes)
+    delivery = change_page.submit(found.page, rewritten, status, prepared=prepared.queues[found.tab],
+                                  feedback_closes=feedback_closes)
     answer = ""
     if fields["outcome"] not in (["validate"], ["question"]):
         answer = next(row.get("Verdict", "") for row in change_review.review_rows(found.page.review_list)
@@ -735,14 +801,15 @@ def save_outcome(production: update_registration.QuestionScope, question: Waitin
 
 def save_question_record(production: update_registration.QuestionScope, question: WaitingQuestion,
                          outcome: change_page.QuestionOutcome, words: str,
-                         verify_revision: Callable[[], object] | None = None) -> None:
+                         save: ExactQuestionSave | SelectedQuestionSave, *,
+                         before_write: Callable[[], None]) -> None:
     """Validate and write one canonical question under its owner's lock."""
     path = update_registration.outstanding_path(production)
     superseded = ''
     with update_registration.outstanding_lock(path):
-        if verify_revision is not None:
-            _ = verify_revision()
-        records = update_registration.selected_question_records([question.record.path], (), None)
+        if isinstance(save, ExactQuestionSave):
+            _ = save.verify_revision()
+        records = update_registration.selected_question_records([question.record.path], (), None, owner=question.owner)
         if not records or records[0].owner != question.owner or records[0].status != 'open':
             raise review_items.ReviewRecordChanged('This question is no longer open.')
         current = records[0]
@@ -750,7 +817,7 @@ def save_question_record(production: update_registration.QuestionScope, question
         pending = item.get('followup')
         if pending != question.record.item.get('followup'):
             raise review_items.ReviewRecordChanged('The follow-up on this question changed.')
-        if item != question.record.item:
+        if current != question.record:
             raise review_items.ReviewRecordChanged('This question changed. Check it again before saving.')
         now = datetime.now(production.zone)
         events = review_events.decode(item.get('review_log', ''))
@@ -770,7 +837,7 @@ def save_question_record(production: update_registration.QuestionScope, question
         label = 'feedback sent' if outcome == 'feedback' else outcome
         item['review_log'] = review_events.encode(review_events.append(
             events, review_events.ReviewLog(now.astimezone(user_zone()), 'nate', label+': '+words)))
-        update_registration.write_question_record(current)
+        update_registration.write_question_record(current, assign_id=True, before_write=before_write)
         if current.status == 'closed':
             with review_items.after_store_write(question.key):
                 update_registration.record_answer(path, production.name, item, now)
@@ -780,10 +847,57 @@ def save_question_record(production: update_registration.QuestionScope, question
                                            superseded, None, False)
 
 
+@dataclass(frozen=True)
+class ExactQuestionSave:
+    """Save the selected question after its revision check."""
+
+    verify_revision: Callable[[], object]
+
+
+@dataclass(frozen=True)
+class SelectedQuestionSave:
+    """Save a Question selected without a page snapshot."""
+
+
+@dataclass(frozen=True)
+class QuestionQueueSave:
+    """Save a question through its production queue."""
+
+
+QUESTION_QUEUE_SAVE = QuestionQueueSave()
+
+
+def question_relay(record: update_registration.QuestionRecord, production: update_registration.QuestionScope,
+                   identities: update_registration.QuestionStaff) -> update_registration.AnswerRelay:
+    return update_registration.answer_relay(production, production.name, update_registration.question_asker(
+        record.item, update_registration.OpenItemWithoutAsker(), identities), identities)
+
+
+def question_receiver(owner: staff.StaffId, outcome: change_page.QuestionOutcome,
+                      relay: update_registration.AnswerRelay) -> staff.StaffId:
+    return relay.recipient if outcome not in ("feedback", "question") and isinstance(relay.recipient, str) else owner
+
+
+def question_toast_labels(record: update_registration.QuestionRecord,
+                          members: staff.StaffSnapshot) -> dict[str, str | None]:
+    """Resolve the same owner or relay that receives an answer or a follow-up."""
+    owner = receiver_names(members, (record.owner,))
+    labels: dict[str, str | None] = {"question": owner, "feedback": owner}
+    if "review_submission" in record.item:
+        return {**labels, "answer": owner, "followup": owner}
+    try:
+        scope = update_registration.question_scope(record.owner, members)
+        relay = question_relay(record, scope, update_registration.QuestionStaff.for_record(members))
+    except (OSError, ValueError, ProductionRefusal, update_registration.RegistrationFailure):
+        return labels
+    return {**labels, "answer": receiver_names(members, (question_receiver(record.owner, "answer", relay),)),
+            "followup": receiver_names(members, (question_receiver(record.owner, "followup", relay),))}
+
+
 def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutcome, words: str,
                     status: change_page.DeliveryStatus, *,
-                    exact_record: bool = False,
-                    verify_revision: Callable[[], object] | None = None) -> tuple[change_page.MessageDelivery, str]:
+                    save: ExactQuestionSave | SelectedQuestionSave | QuestionQueueSave = QUESTION_QUEUE_SAVE
+                    ) -> tuple[change_page.MessageDelivery, str]:
     """Save through the production API before the existing sender delivers the message to the asker."""
     if question.tab == "unrouted":
         raise change_page.QuestionAnswerRefused("No showrunner owns this question.")
@@ -797,12 +911,9 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
                     import_module("scripts.review_links.review_actions").sent_question_action)
         return send(
             current, question.record, production, "question" if outcome == "followup" else outcome, words, status,
-            verify_revision=verify_revision)
-    relay = update_registration.answer_relay(production, production.name,
-        update_registration.question_asker(item, update_registration.OpenItemWithoutAsker(), identities), identities)
-    recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
-    if outcome in ('feedback','question'):
-        recipient = question.owner
+            verify_revision=save.verify_revision if isinstance(save, ExactQuestionSave) else None)
+    relay = question_relay(question.record, production, identities)
+    recipient = question_receiver(question.owner, outcome, relay)
     message = question_message(outcome, production.name, item["text"], relay.unit, words, question.key)
     answer = words if outcome == "answer" else ""
     document = production.doc if isinstance(production, Production) else question.record.path.parent
@@ -811,44 +922,48 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
     page = change_page.UserQuestionPage(question.record.path, document, (question.record.path.stem,), "", saved)
     # The delivery lock prevents startup recovery from reading an answer during its save.
     with status.locked():
-        if not exact_record and frontmatter(question.record.path).get("status") != ["open"]:
+        if isinstance(save, QuestionQueueSave) and frontmatter(question.record.path).get("status") != ["open"]:
             raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page")
         previous_page = status.metadata_page(page)
         previous_slots = status.slots(page, page.rows[0])
         attempt = secrets.token_hex()
         intent = change_page.DeliveryIntent(attempt, "verdict", recipients=(recipient,))
         slots = change_page.DeliverySlots(change_page.NoDelivery(), intent)
-        status.write_slots(page, page.rows[0], slots)
-        status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, page.rows[0]), "claimed")
+
+        def claim_delivery() -> None:
+            status.write_slots(page, page.rows[0], slots)
+            status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, page.rows[0]), "claimed")
+
         try:
-            if exact_record:
-                save_question_record(production, question, outcome, words, verify_revision)
+            if not isinstance(save, QuestionQueueSave):
+                save_question_record(production, question, outcome, words, save, before_write=claim_delivery)
             else:
+                claim_delivery()
                 relay = save_outcome(production, question, outcome, words, identities)
         except BaseException as error:
             try:
-                if exact_record:
-                    status.write_slots(previous_page, page.rows[0], previous_slots)
-                else:
-                    status.clear_locked(page, page.rows[0], status.slots(page, page.rows[0]), "verdict")
+                if attempt in status.request_attempts:
+                    if not isinstance(save, QuestionQueueSave):
+                        status.write_slots(previous_page, page.rows[0], previous_slots)
+                    else:
+                        status.clear_locked(page, page.rows[0], status.slots(page, page.rows[0]), "verdict")
             finally:
                 _ = status.request_attempts.pop(attempt, None)
             if isinstance(error, update_registration.RegistrationFailure):
                 raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page") from error
             raise
-        if outcome not in ('feedback', 'question'):
-            recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
+        recipient = question_receiver(question.owner, outcome, relay)
         intent = replace(intent, recipients=(recipient,))
         page = replace(page, saved={**saved, "saved": True})
         status.mark_review_saved(page, page.rows[0], replace(slots, verdict=intent), intent)
-        if not exact_record and outcome != "skip":
+        if isinstance(save, QuestionQueueSave) and outcome != "skip":
             with review_items.after_store_write(question.key):
                 update_registration.record_review_log(question.record.path,
                     ('feedback sent' if outcome == 'feedback' else outcome)+": "+words, owner=question.owner)
     return change_page.MessageDelivery(page, page.rows[0], (recipient,), message, attempt, (question.owner,)), answer
 
 
-SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + r'''
+SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + page_frame.HELD_SEND_SCRIPT + r'''
 let content=document.querySelector('[data-review-content]');
 const motion=createCardMotion(()=>content);
 let rows,viewOrders,runnerOptions,showrunners,runnerMenu,next,empty,saveNotice;
@@ -938,7 +1053,10 @@ async function save(row,form,outcome){
  const early=kind!=='questions' && (outcome==='works' || outcome==='not works');
  if(early) moveOn('Saving review.');
  try{
-  const response=await fetch(form.action,{method:'POST',body:data,headers:{Accept:'application/json'}});
+  // A Skip only moves the item, so it needs no Undo.
+  const options={method:'POST',body:data,headers:{Accept:'application/json'}};
+  const response=await (outcome==='skip' ? fetch(form.action,options)
+                                      : heldFetch(form.action,options,sendActionReceiver(form,data)));
   const reply=await response.json();
   if(!response.ok) throw new Error(reply.reason || 'The answer could not be saved. Try again.');
   state.textContent=reply.answer ? 'Saved: '+reply.answer :
@@ -950,13 +1068,15 @@ async function save(row,form,outcome){
   if(!early) moveOn(kind!=='questions' ? 'Review saved.' : outcome==='followup' ? 'Follow-up sent.' : outcome==='skip' ? 'Skipped.' : 'Answer saved.');
   else if(!saveNotice.hidden && saveNotice.textContent==='Saving review.') saveNotice.textContent='Review saved.';
  }catch(error){
+  const undone=error instanceof SendUndone;
   const reason=error instanceof SyntaxError ? 'The answer could not be saved. Try again.' : error.message;
-  row.dataset.saveState='failed'; state.textContent='Not saved: '+reason;
+  row.dataset.saveState=undone ? '' : 'failed'; state.textContent=undone ? reason : 'Not saved: '+reason;
   if(early){
    row.dataset.pending='true';form.hidden=false;show();
    const open=document.createElement('button');open.type='button';open.textContent='Open it';
    open.addEventListener('click',()=>go(row.dataset.key));
-   saveNotice.replaceChildren('Not saved: '+row.dataset.shown+'. '+reason+' It is back in the list. ',open);
+   saveNotice.replaceChildren((undone ? 'Undone: ' : 'Not saved: ')+row.dataset.shown+'. '+(undone ? '' : reason+' ')
+    +'It is back in the list. ',open);
    saveNotice.hidden=false;
   }
  }finally{

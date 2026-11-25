@@ -1,4 +1,4 @@
-"""Merge gate suites contracts."""
+"""Test the gate suite runner."""
 
 from __future__ import annotations
 
@@ -11,12 +11,13 @@ import signal
 import sys
 import time
 from typing import cast, final
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from unittest import mock
 from scripts.production import gate
 from scripts.production.gate_test_support import gate_suites
 from scripts.production.gate_suites_test_support import GateSuitesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib import build_folders
 from scripts.test_times import gate_record
 
 
@@ -80,12 +81,13 @@ class MergeGateTripwiresTests(GateSuitesFixture):
                  '{"reading": "/proc/meminfo", "argv": [7], "pid": 123}']
         for index, line in enumerate(lines):
             with self.subTest(line=line):
-                root = self.root / f"unreadable-memory-job-{index}"
-                root.mkdir()
+                cleanup = self.enterContext(ExitStack())
+                root = cleanup.enter_context(build_folders.tool_folder(f"unreadable-memory-job-{index}", self.root))
                 self.write(root / "live-memory-reads.jsonl", line)
                 job = gate.start_gate_job(
                     "hooks", Path("test_memory_reader.py"), [sys.executable, "-c", "print('module passed')"],
                     self.checkout, self.environment, root / "output.log")
+                job.folder_cleanup = cleanup
                 status = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
                 result = gate.finish_gate_job(job, status)
                 self.assertEqual(status, 0)

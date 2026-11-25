@@ -150,6 +150,15 @@ All main-path tests remain.
 `prepare_checkpoint` selects paths from the tip before the checkpoint merge through the prepared tip.
 `push_git` pushes without another merge.
 
+The checkpoint gate runs one Verify command from each Cargo workspace with changed packages.
+Packages in the same workspace share a step list, such as `verify.sh test alpha + test beta`, and one place in the build queue.
+A package outside a workspace gets its own command from its package folder.
+A package that reads `.cargo/config.toml` or `.cargo/config` below the workspace root runs separately from its package folder.
+Verify reports the exit status for each package it runs in a list.
+A red ends the list at the failed package. The gate uses that package for red attribution and retries.
+When the gate permits retries, it runs any packages that the list did not reach.
+Example checks and configured merge tests each keep their own step.
+
 `tested_main_push(production, tested_tip, retest, before_merge_tip, *, follow_main=True)` protects the final publication:
 
 1. Acquire `main_push_lock` and fetch main.
@@ -169,12 +178,8 @@ A rejected resumed handoff keeps its existing unpublished merge.
 The bump path pushes first and starts its background gate afterward.
 
 A main conflict aborts the merge and reports the conflicting paths.
-Before publication, a held batch checks each checkpoint against the same main commit with `git merge-tree --write-tree`.
-Only conflicting items receive their conflict files and instructions to merge `origin/main` into their own unit branch.
-The batch removes those items and their unit's later items, restores the starting tip, and retries the remaining items.
-Clean items can land in the same run.
-If every item is clean, the combined merge conflict keeps the batch held.
-Each notice then says the checkpoint is clean against main and can land alone.
+A conflict with main ends a batch and returns each row with the conflicting paths.
+The checkout returns to the batch's starting tip before the next queued item can proceed.
 A malformed incoming manifest also triggers preparation rollback.
 Rollback preserves unpublished work that existed before the run.
 Shrink and as-built ancestry uses Git, without requiring a checkpoint event from a particular worktree.
@@ -200,6 +205,10 @@ nate decides step 3 of the push lock plan (one landing queue) from these times.
 The helper tracks active holds in the process.
 A nested call in the same process uses the existing hold for that path.
 A different repository takes its own lock.
+A caller can use `wait=False` to try the lock once without waiting.
+The Change Review readiness scan does this once per list, including after a merge.
+Each failed commit attempt gives one warning with the list path, the number of new rows, and the reason.
+The next scan tries again.
 The helper does not change `os.environ`.
 `held_environment(checkout)` gives a named child `MAIN_PUSH_LOCK_HELD` with the absolute lock path.
 It refuses when the process does not hold that lock.

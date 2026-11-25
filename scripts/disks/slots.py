@@ -5,17 +5,17 @@ import json
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 from scripts.buildlog.store import host_name
 from scripts.disks import measure
 from scripts.disks.measure import DisksData
 from scripts.lib import build_folders, conf
 from scripts.lib.build_steps import StepNames, read_step_names
-from scripts.message.unit_labels import OwnerRole
+from scripts.build_queue.snapshot_codec import row_text
 from scripts.review_links import staff_names as name_rendering
 
-State = Callable[[Path], Literal["held", "free"]]
+SlotStateReader = Callable[[Path], build_folders.BuildFolderState]
 # The shown name of a lease owner: a staff id or a role name.
 OwnerNames = Callable[[str], str]
 
@@ -88,16 +88,13 @@ def slot_use(record: Mapping[str, object], steps: StepNames, owners: OwnerNames)
     text = {key: value for key in ("work", "purpose", "unit", "showrunner") if isinstance(value := record.get(key), str)}
     unit = owners(text.get("unit", ""))
     step = text.get("work", "")
-    current = " ".join(part for part in (unit, text.get("purpose", "")) if part)
-    name = steps.for_owner(step, unit, OwnerRole.UNIT, current_name=current) if step else current
-    current_parts = name_rendering.text_parts(name_rendering.StaffReference(unit),
-        " " if unit and text.get("purpose") else "", text.get("purpose", ""))
-    parts = name_rendering.owned_step_parts(steps, step, unit, OwnerRole.UNIT, current=current_parts) if step else current_parts
-    return {"name": name, "showrunner": text.get("showrunner", ""), "name_parts": parts}
+    what = steps.shown(step) if step else text.get("purpose", "")
+    return {"name": row_text(unit, what), "showrunner": text.get("showrunner", ""),
+            "name_parts": name_rendering.row_parts(unit, what, unit)}
 
 
 def slot_row(path: Path, form: build_folders.BuildCopy, days: int, data: DisksData | None, now: float,
-             state: State, steps: StepNames, owners: OwnerNames) -> SlotRow:
+             state: SlotStateReader, steps: StepNames, owners: OwnerNames) -> SlotRow:
     record = lease_record(path)
     try:
         held = state(path) == "held"
@@ -116,7 +113,8 @@ def slot_row(path: Path, form: build_folders.BuildCopy, days: int, data: DisksDa
 
 
 def read_slots(root: Path, settings: conf.ConfigRead, machine: str, data: DisksData | None,
-               now: float, state: State = build_folders.build_folder_state, owners: OwnerNames | None = None) -> SlotReport:
+               now: float, state: SlotStateReader = build_folders.build_folder_state,
+               owners: OwnerNames | None = None) -> SlotReport:
     """Group numbered copies by repository and unit for the Disks page."""
     groups: dict[tuple[str, str], list[SlotRow]] = {}
     steps = read_step_names()

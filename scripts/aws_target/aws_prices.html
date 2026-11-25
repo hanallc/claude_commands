@@ -73,8 +73,8 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 .filter button + button { border-left: 1px solid var(--line); }
 .filter button[aria-pressed="true"] { background: var(--accent); color: #fff; }
 .filter button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-/* The geography and region filters stay at the top of the view while the page scrolls. */
-.regions { position: sticky; top: 0; z-index: 3; display: grid; grid-template-columns: max-content minmax(0, 1fr);
+/* The geography and region filters stay directly below the page heading row and any sticky status line while the page scrolls. */
+.regions { position: sticky; top: calc(var(--page-actions-space, 0px) + var(--page-actions-height, 0px) + var(--page-status-height, 0px)); z-index: 3; display: grid; grid-template-columns: max-content minmax(0, 1fr);
   align-items: baseline; gap: 6px 8px; background: var(--bg); padding: 8px 0 12px; margin: 0 0 4px; border-bottom: 1px solid var(--line); }
 .regions, #prices-quotas { margin-inline: min(0px, calc((1124px - 100cqw) / 2)); }
 .regions-label { color: var(--ink-2); font-size: 0.86rem; font-weight: 600; }
@@ -98,9 +98,11 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 #quota-help, #hours details { margin-top: 10px; font-size: 0.86rem; }
 #quota-help summary, #hours summary { font-weight: 600; cursor: pointer; }
 #quota-help li + li { margin-top: 4px; }
-#quota-help a { color: var(--ink); overflow-wrap: anywhere; }
-#quota-help p { margin: 0; color: var(--ink-2); }
+#quota-help a, #quota-requests a { color: var(--ink); overflow-wrap: anywhere; }
+#quota-help p, .quota-requests p { margin: 0; color: var(--ink-2); }
 #quota-help p + p { margin-top: 4px; }
+#quota-requests > p { margin: 8px 0; color: var(--ink-2); }
+.quota-requests h3 { font-size: 1rem; margin: 0 0 4px; }
 </style>
 </head>
 <body>
@@ -140,6 +142,7 @@ __PAGE_TITLE__
     <span><span class="swatch dearest" aria-hidden="true"></span>Most expensive of each price measure</span>
   </p>
   <ul class="snapshot" id="snapshot"></ul>
+  <div id="quota-requests">__AWS_QUOTA_REQUESTS__</div>
   <details id="quota-help">
     <summary>How to open the quota cases in AWS</summary>
     __AWS_QUOTA_HELP__
@@ -755,6 +758,9 @@ async function loadAws(supersede = false, current = () => true) {
     markRegions = configureRegionFilter();
     markRegions();
   }
+  const requests = page.getElementById("quota-requests");
+  const displayed = document.getElementById("quota-requests");
+  if (requests && displayed && displayed.innerHTML !== requests.innerHTML) displayed.innerHTML = requests.innerHTML;
   drawLaunchState();
   drawSpend();
   draw();

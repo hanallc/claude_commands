@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -31,7 +32,7 @@ from scripts.direct import step_record
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import test_hang_guard
 from scripts.build_queue.admission_test_support import caller_admission, private_provider_evidence
-from scripts.build_queue import placement, admission_protocol as wire
+from scripts.build_queue import admission_service, placement, admission_protocol as wire
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue.test_placement import placement_request
 from scripts.mac_test import claim_state, mac_test
@@ -98,8 +99,8 @@ with log.open("a") as output:
 # runner-events.jsonl and takes the next word of TEST_COPY_MODES (the last one
 # repeats): failed, passed, lost, declined:<reason>, gave_way (exit 143 with no
 # result), hold (wait for SIGTERM, then exit 143 after writing runner-stopped)
-# or wait_failed (fail once `release-runner` exists). A `+busy` suffix first
-# writes TEST_BUSY_CLAIM as a live claim, so no further copy can start.
+# wait_failed (fail when `release-runner` exists), or wait_declined (decline after the release pipe sends a byte).
+# A `+busy` suffix installs TEST_BUSY_CLAIM before the result and prevents another copy.
 RUNNER_STUB = r'''
 import os
 import signal
@@ -149,6 +150,10 @@ if mode == "wait_failed":
     while not (root / "release-runner").exists():
         time.sleep(0.01)
     mode = "failed"
+if mode == "wait_declined":
+    with (root / "decline-release").open("rb", buffering=0) as release:
+        assert release.read(1) == b"x"
+    mode = "declined:no_tests"
 if mode == "failed":
     write("failed")
     raise SystemExit(42)
@@ -278,6 +283,14 @@ class StepProgressTests(unittest.TestCase):
 
 
 class CopyResultTests(unittest.TestCase):
+    def test_only_the_exact_mac_history_refusal_ends_the_copy(self) -> None:
+        for reason, status in (("busy", 1), ("busy", 11), ("busy", 15), ("history_key_unavailable", 1)):
+            with self.subTest(reason=reason, status=status):
+                words = copy_watch.MacWords("prelaunch_failed", reason, "0")
+                self.assertEqual(copy_watch.copy_result(words, status), copy_watch.CopyEnded("lost", final=False))
+        words = copy_watch.MacWords("prelaunch_failed", "history_key_unavailable", "0")
+        self.assertEqual(copy_watch.copy_result(words, 15), copy_watch.CopyEnded("declined", final=True))
+
     def test_each_runner_ending_maps_to_one_outcome(self) -> None:
         words = copy_watch.MacWords
         failed, passed = words("failed", "", "1.0"), words("passed", "", "1.0")
@@ -401,6 +414,10 @@ class CopyWatchProcessTests(unittest.TestCase):
         _ = subprocess.run(["git", "init", "-q", str(self.repository)], check=True, capture_output=True)
         _ = (self.repository / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
         _ = subprocess.run(["git", "-C", str(self.repository), "add", "Cargo.toml"], check=True, capture_output=True)
+        # A Mac claim needs a history key; a repository without an origin takes it from its root commit.
+        _ = subprocess.run(["git", "-C", str(self.repository), "-c", "user.name=fixture",
+                            "-c", "user.email=fixture@example.invalid", "commit", "-q", "--no-gpg-sign", "-m", "root"],
+                           check=True, capture_output=True)
         self.state = self.root / "state"
         self.info = self.root / "step-info"
         self.result = self.root / "watch-result"
@@ -624,11 +641,29 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.assertEqual((values["copy"], values["copy_count"]), ("gave_way", "1"))
 
     def test_a_final_decline_ends_copies_and_a_busy_decline_does_not(self) -> None:
+        release = self.root / "decline-release"
+        os.mkfifo(release)
+        admission = caller_admission(self, self.root, self.environment)
+        handle = admission.server.handle_request
+        candidate_ended = threading.Event()
+
+        def observe(request: wire.Request,
+                    connection: admission_service.Connection | admission_service.NoConnection = admission_service.NO_CONNECTION
+                    ) -> list[wire.Reply]:
+            replies = handle(request, connection)
+            if (isinstance(request, wire.CancelPlacement) and request.episode.startswith("v-call-copy-")
+                    and request.reason == "copy candidate ended" and replies == [wire.Ok()]):
+                candidate_ended.set()
+            return replies
+
         _ = self.start_step()
-        self.start_watcher("declined:no_tests")
-        self.compile_and_wait_for_copies(1)
-        time.sleep(SETTLE_S)
-        self.assertFalse(self.candidate_active())
+        with mock.patch.object(admission.server, "handle_request", side_effect=observe):
+            self.start_watcher("wait_declined")
+            self.compile_and_wait_for_copies(1)
+            with release.open("rb+", buffering=0) as pipe:
+                self.assertEqual(pipe.write(b"x"), 1)
+                self.assertTrue(candidate_ended.wait(COPY_FIXTURE_WAIT_SECONDS), "the copy candidate did not end")
+        self.wait_until(lambda: not self.candidate_active(), "candidacy to end")
         values = self.finish_watcher(terminate=True)
         self.assertEqual(len(self.runner_events()), 1)
         self.assertEqual((values["copy"], values["copy_count"]), ("declined", "1"))
@@ -686,7 +721,11 @@ class CopyWatchProcessTests(unittest.TestCase):
                 admission = caller_admission(self, self.root, self.environment)
                 with admission.loop_turn():
                     newer = placement_request(admission)
-                    destination = placement.PlacementDestination("mac", "mac", "mac", claim_state.RepositoryScope("repo"))
+                    # The newer copy competes only for the exact destination of the call, repository key included.
+                    mirror = claim_state.mac_repository_identity(str(self.repository))
+                    assert isinstance(mirror, claim_state.ResolvedMacMirror)
+                    scope = claim_state.RepositoryScope(mirror.mirror_name, mirror.key)
+                    destination = placement.PlacementDestination("mac", "mac", "mac", scope)
                     newer = replace(newer, episode=f"v-newer-{poll_s}", purpose=placement.SpeculativeCopy("newer-parent", 2000.0),
                         constraints=replace(newer.constraints, candidates=(placement.PlacementCandidate(destination),)))
                     _ = admission.server.handle_request(newer)

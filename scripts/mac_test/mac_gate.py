@@ -14,13 +14,13 @@ import re
 from pathlib import Path
 import select
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 from typing import cast, override
+from uuid import uuid4
 
 if __package__ in ('', None):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -140,24 +140,25 @@ def stop_inline_checkout(repo: Path) -> None:
         raise GateRefused('Test processes still use the Mac checkout')
 
 
-def stop_guest(folder: Path, deadline: float) -> None:
-    """Interrupt a live guest. Recover recorded resources after it exits."""
-    journal = folder / 'run.json'
-    if not journal.exists():
+def stop_guest(journal: Path, deadline: float, *, task_ended: bool = False) -> None:
+    """Recover the guest's recorded resources or check the groups after task cleanup."""
+    try:
+        record = cloud_gate.read(journal)
+    except FileNotFoundError:
         return
-    record = cloud_gate.read(journal)
-    pid, start = ledger.instant(record, 'pid'), ledger.text(record, 'start')
-    if pid <= 1 or pid == os.getpid():
-        raise GateRefused('Invalid Mac gate owner')
-    if running_owner(pid, start):
-        with suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGINT)
-        while running_owner(pid, start):
-            if time.monotonic() >= deadline:
-                raise GateRefused('The Mac gate guest did not exit')
-            time.sleep(0.05)
+    if not task_ended:
+        pid, start = ledger.instant(record, 'pid'), ledger.text(record, 'start')
+        if pid <= 1 or pid == os.getpid():
+            raise GateRefused('Invalid Mac gate owner')
+        if running_owner(pid, start):
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGINT)
+            while running_owner(pid, start):
+                if time.monotonic() >= deadline:
+                    raise GateRefused('The Mac gate guest did not exit')
+                time.sleep(0.05)
+        record = cloud_gate.read(journal)
 
-    record = cloud_gate.read(journal)
     groups = {int(group): stamp for group, stamp in ledger.mapping(record['groups']).items()}
     for pgid in live_groups(set(groups)):
         owner = process_start(pgid)
@@ -170,13 +171,15 @@ def stop_guest(folder: Path, deadline: float) -> None:
         if time.monotonic() >= deadline:
             raise GateRefused('The Mac gate job groups did not exit')
         time.sleep(0.05)
+    if task_ended:
+        return
     folders = record['folders']
     if not isinstance(folders, list):
         raise GateRefused('The Mac gate journal has no folder list')
     for name in cast(list[str], folders):
         path = Path(name)
         with suppress(FileNotFoundError):
-            if not build_folders.remove_build_folder(path, lambda: shutil.rmtree(path), wait=False):
+            if not build_folders.remove_build_folder(path, wait=False):
                 raise GateRefused(f'The Mac kept its gate folder {path}')
 
 
@@ -229,11 +232,12 @@ def stop_checkout(folder: Path, saved_checkout: Path | None = None) -> CheckoutC
         stop_inline_checkout(folder.resolve() / 'repo')
         checkout_file = folder / 'checkout.json'
         receipt = folder / 'task-ended.json'
+        journal = folder / 'run.json'
         cleanup_paths: dict[str, object]
         try:
             cleanup_paths = cloud_gate.read(receipt)
         except FileNotFoundError:
-            stop_guest(folder, deadline)
+            stop_guest(journal, deadline)
             # Until Mac promotion, scratch.end can return removed paths and a separate kept list.
             ended = cast(Sequence[Path | scratch.KeptFolder], scratch.end(checkout_task(folder)))
             legacy_kept = cast(Sequence[scratch.KeptFolder], getattr(ended, 'kept', ()))
@@ -257,6 +261,9 @@ def stop_checkout(folder: Path, saved_checkout: Path | None = None) -> CheckoutC
                 else:
                     cleanup_paths[str(path)] = 'the folder is still present'
             cloud_gate.save(receipt, cleanup_paths)
+        else:
+            stop_guest(journal, deadline, task_ended=True)
+        journal.unlink(missing_ok=True)
         paths: set[Path] = {read_checkout(folder)} if checkout_file.exists() else set()
         paths.update(Path(name) for name in cleanup_paths)
         outcome = CheckoutCleanup.REMOVED
@@ -270,8 +277,9 @@ def stop_checkout(folder: Path, saved_checkout: Path | None = None) -> CheckoutC
             else:
                 outcome = CheckoutCleanup.RETAINED
         if outcome is CheckoutCleanup.REMOVED:
-            shutil.rmtree(folder)
-            return saved_checkout_status(saved_checkout)
+            if build_folders.remove_build_folder(folder, wait=False, child_locks=(lock.fileno(),)):
+                return saved_checkout_status(saved_checkout)
+            return CheckoutCleanup.RETAINED
         return outcome
 
 
@@ -332,7 +340,17 @@ def checkout_cleanup_command(root: str, runner: str, checkout: str) -> str:
 
 
 def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
-    remote = f'{REMOTE_ROOT}/{attempt_name(folder)}'
+    source_attempt = attempt_name(folder)
+    attempt_file = argv_file.with_suffix('.json.attempt')
+    if phase == 'prepare':
+        remote_attempt = f'{source_attempt}_{uuid4().hex}'
+        write_text_atomic(attempt_file, remote_attempt)
+    else:
+        try:
+            remote_attempt = attempt_file.read_text()
+        except FileNotFoundError:
+            remote_attempt = source_attempt
+    remote = f'{REMOTE_ROOT}/{attempt_name(Path(remote_attempt))}'
     root = '"$HOME"/' + shlex.quote(remote)
     python = '/usr/bin/env PYTHONPATH="$HOME/.claude" "$HOME/.claude/scripts/lib/py"'
     runner = f'{python} {root}/mac_gate.py'
@@ -385,7 +403,7 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     write_text_atomic(checkout_file, checkout)
     _ = argv_file.with_suffix('.json.close').write_text(checkout_cleanup_command(root, runner, checkout))
     mirror = copies.RemoteMirror(owner, copies.SelectedRepository(repository), host, checkout, session,
-                                 task=checkout_task(folder))
+                                 task=checkout_task(Path(remote)))
     _ = argv_file.with_suffix('.json.lease').write_text(str(copies.remote_lease_path(mirror)))
     copies.register_remote(mirror)
     copies.reconcile_remote_mirrors(host, is_mac_gate_checkout)

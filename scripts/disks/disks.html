@@ -29,7 +29,7 @@
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 __PAGE_FRAME_STYLE__
 __STEP_TIP_STYLE__
-#tip > .tip[data-held-count] { max-width: min(60rem, calc(100vw - 16px)); grid-template-columns: minmax(0, auto) minmax(0, auto); }
+#tip > .tip[data-held-count] { max-width: min(60rem, var(--tip-width, 60rem)); grid-template-columns: minmax(0, auto) minmax(0, auto); }
 .tip dd.held-folder { text-align: left; opacity: 0.7; }
 @media (width >= 900px) {
   .tip .held-folder { overflow: hidden; text-overflow: ellipsis; }
@@ -121,6 +121,8 @@ tr[aria-expanded="true"] .twist svg { transform: rotate(90deg); }
 @media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
 @media (max-width: 560px) {
   .card { padding: 14px 12px 10px; }
+  .limit .range { flex-basis: 100%; min-width: 0; flex-wrap: wrap; gap: 4px 10px; }
+  .limit output { margin-inline-start: auto; }
   .tree col.place { width: auto; } .tree col.size { width: 64px; } .tree col.pct { width: 0; } .tree col.walk { width: 64px; }
   .tree .pct { display: none; }
   /* On a phone the holder goes under the slot name, so each column keeps its width. */
@@ -162,16 +164,6 @@ const INFO = icon("M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20M12 16v-4M12 8h.01");
 // The Builds page's step tooltip code, as it is (disks_page.shared_step_tip). Its names stay inside this function.
 const stepTip = (() => {
 __STEP_TIP_SCRIPT__
-  const placeSharedTip = placeTipAt;
-  placeTipAt = (tip, x, y) => {
-    const list = tip.querySelector(".tip[data-held-count]");
-    if (list) fitSessionTip(tip, list);
-    placeSharedTip(tip, x, y);
-    if (list) {
-      const bottomLimit = innerHeight - tip.offsetHeight - 8;
-      tip.style.top = `${Math.max(8, Math.min(parseFloat(tip.style.top), bottomLimit))}px`;
-    }
-  };
   return {field, staffField, staffTitle, tooltipHtml, tipRowsHtml, hoverTips, roleName, nameParts};
 })();
 
@@ -199,12 +191,44 @@ function toSlider(limit, range) {
   return Math.round(SLIDER_STEPS * Math.log(limit / range.min) / Math.log(range.max / range.min));
 }
 
+function roundLimit(bytes) {
+  const suffixes = ["MiB", "GiB", "TiB", "PiB", "EiB"];
+  let index = 0;
+  let unit = 1024 ** 2;
+  // Change units when rounding would show 1,000.
+  while (bytes / unit >= 999.5 && index < suffixes.length - 1) {
+    unit *= 1024;
+    index++;
+  }
+  const scaled = bytes / unit;
+  const value = Number(scaled < 10 ? scaled.toFixed(2) : scaled.toPrecision(3));
+  const suffix = suffixes[index];
+  const wholeWithDecimal = Number.isInteger(value)
+    && ((suffix === "GiB" && value >= 1 && value < 10) || (suffix === "TiB" && value < 100));
+  const text = wholeWithDecimal ? value.toFixed(1) : String(value);
+  return {bytes: value * unit, text: `${text} ${suffix}`};
+}
+
+function limitLabel(bytes) {
+  const rounded = roundLimit(bytes);
+  // An exact endpoint can need more digits than the label shows.
+  return rounded.bytes === bytes ? rounded.text : "≈" + rounded.text;
+}
+
+function snapLimit(bytes, range) {
+  if (bytes <= range.min) return range.min;
+  if (bytes >= range.max) return range.max;
+  return Math.min(range.max, Math.max(range.min, roundLimit(bytes).bytes));
+}
+
 function fromSlider(position, range) {
-  return range.min * (range.max / range.min) ** (position / SLIDER_STEPS);
+  if (position === SLIDER_STEPS) return range.max;
+  if (position === 0) return range.min;
+  return snapLimit(range.min * (range.max / range.min) ** (position / SLIDER_STEPS), range);
 }
 
 function startLimit(range, settings) {
-  return Math.min(range.max, Math.max(range.min, settings.slider_default_gib * GIB));
+  return snapLimit(settings.slider_default_gib * GIB, range);
 }
 
 function topPath(mount, name) {
@@ -536,7 +560,7 @@ function refill(part, attribute, html) {
 function driveView(card) {
   let drive = null, range = null, state = null, slider = null;
   const fill = () => {
-    card.querySelector("output").textContent = size(state.limit);
+    card.querySelector("output").textContent = limitLabel(state.limit);
     refill(card.querySelector("tbody"), "data-path",
            treeRows(drive.tree, drive.mount, state, data.keep_bytes).map(row => rowHtml(row, drive.tree.size)).join(""));
   };
@@ -569,8 +593,8 @@ function driveView(card) {
     range = sliderRange(drive.tree, settings);
     state = stateFor(drive, range);
     card.querySelector(".top").innerHTML = headHtml(drive);
-    card.querySelector(".end.low").textContent = size(range.min);
-    card.querySelector(".end.high").textContent = size(range.max);
+    card.querySelector(".end.low").textContent = limitLabel(range.min);
+    card.querySelector(".end.high").textContent = limitLabel(range.max);
     slider.disabled = range.max <= range.min;
     const position = String(toSlider(state.limit, range));
     if (slider.value !== position) slider.value = position;
@@ -582,7 +606,7 @@ function driveView(card) {
 function sessionsView(card) {
   let report = null, keepBytes = 0, range = null, slider = null;
   const fill = () => {
-    card.querySelector("output").textContent = sessionLimit ? size(sessionLimit) : "any size";
+    card.querySelector("output").textContent = sessionLimit ? limitLabel(sessionLimit) : "any size";
     card.querySelector("tbody").innerHTML = sessionRows(report, keepBytes, sessionLimit);
   };
   const build = () => {
@@ -611,7 +635,7 @@ function sessionsView(card) {
     range = sessionRange(report, keepBytes);
     // A filter with no range left shows every session, so no data change can lock it.
     sessionLimit = range.max <= range.min ? 0 : Math.min(sessionLimit, range.max);
-    card.querySelector(".end.high").textContent = size(range.max);
+    card.querySelector(".end.high").textContent = limitLabel(range.max);
     slider.disabled = range.max <= range.min;
     const position = String(sessionLimit ? toSlider(sessionLimit, range) : 0);
     if (slider.value !== position) slider.value = position;
@@ -740,9 +764,9 @@ function sessionTip(row, keepBytes) {
   return rows;
 }
 
-function fitSessionTip(tip, list) {
-  const maxHeight = innerHeight - 16;
-  if (tip.offsetHeight <= maxHeight) return;
+function fitSessionTip(tip, maxHeight) {
+  const list = tip.querySelector(".tip[data-held-count]");
+  if (!list || tip.offsetHeight <= maxHeight) return;
   const folders = [...list.querySelectorAll("dt.held-folder")];
   let summary = list.querySelector("dd.long");
   if (!summary) {
@@ -761,7 +785,7 @@ function fitSessionTip(tip, list) {
 function smallerTip(rows, limit, keepBytes) {
   const field = stepTip.field;
   return [field(`${rows.length} smaller session${rows.length === 1 ? "" : "s"}`, measuredSize(slotTotal(rows), keepBytes), "title"),
-    field("", `Each is below ${size(limit)}. Move the size filter to the left to show them.`, "long")];
+    field("", `Each is below ${limitLabel(limit)}. Move the size filter to the left to show them.`, "long")];
 }
 
 // The Builds page data, read again while the page shows, so a slot in use shows its step as it is now.
@@ -838,7 +862,7 @@ async function loadDisks(supersede=false,current=()=>true){
    busy:measuring ? 'Measuring…' : '',failure};
 }
 const updateSessions = sessionsView(document.getElementById("sessions"));
-stepTip.hoverTips(document.getElementById("tip"), tipFor);
+stepTip.hoverTips(document.getElementById("tip"), tipFor, fitSessionTip);
 onToggle(document.getElementById("slots"), "tr[data-group]", row => {
   toggleOpen(opened.groups, row.dataset.group);
   renderSlots();

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Count production CI points, verify their runs, and send one review alert."""
+"""Count production CI points and verify their runs."""
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -7,13 +7,11 @@ except FileNotFoundError:
     pass
 
 import argparse
-import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
@@ -47,19 +45,6 @@ class CiRecord(NamedTuple):
 
 class NoCiRecord(NamedTuple):
     pass
-
-
-class WatchFirstAlert(NamedTuple):
-    line: str
-    table: str
-
-
-class WatchRepeat(NamedTuple):
-    line: str
-
-
-class WatchBelowThreshold(NamedTuple):
-    line: str
 
 
 class CiRun(NamedTuple):
@@ -479,30 +464,6 @@ def ci_collect(production: Production, state_dir: Path, no_ci: bool) -> None:
     print(f"--ci-green {tip}")
 
 
-def review_watch(production: Production, state_dir: Path) -> WatchFirstAlert | WatchRepeat | WatchBelowThreshold:
-    review_script = Path(os.environ.get("CI_POINTS_REVIEW_REGIME", str(Path(__file__).with_name("review_regime.py"))))
-    state_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = state_dir / "review_watch.lock"
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        watch_result = command("watch", sys.executable, str(review_script), "watch")
-        if watch_result.returncode not in (0, 3):
-            raise PointFailure("watch", failure_detail(watch_result))
-        line = watch_result.stdout.strip()
-        if watch_result.returncode != 3:
-            return WatchBelowThreshold(line)
-        record = state_dir / "review_watch.json"
-        if record.exists():
-            return WatchRepeat(line)
-        table = required(command("watch", sys.executable, str(review_script), "report", "--since", "2026-09-28"), "watch")
-        moment = datetime.now(production.zone).strftime("%H:%M %Z")
-        production.log.parent.mkdir(parents=True, exist_ok=True)
-        with production.log.open("a", encoding="utf-8") as log:
-            _ = log.write(f"- {moment}: review watch: {line}\n{table}\n")
-        write_json(record, {"alerted": datetime.now(production.zone).isoformat(timespec="seconds"), "line": line})
-        return WatchFirstAlert(line, table)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
@@ -512,12 +473,9 @@ def main() -> int:
     start_parser = ci_commands.add_parser("start")
     _ = start_parser.add_argument("--cancel-prior", action="store_true")
     collect_parser = ci_commands.add_parser("collect")
-    watch_parser = commands.add_parser("watch")
-    for subparser in (due_parser, start_parser, collect_parser, watch_parser):
-        _ = subparser.add_argument("--production", required=True)
-    for subparser in (due_parser, start_parser, collect_parser, watch_parser):
-        _ = subparser.add_argument("--state-dir", required=True, type=Path)
     for subparser in (due_parser, start_parser, collect_parser):
+        _ = subparser.add_argument("--production", required=True)
+        _ = subparser.add_argument("--state-dir", required=True, type=Path)
         _ = subparser.add_argument("--no-ci", action="store_true")
     args = parser.parse_args()
     action = cast(str, args.action)
@@ -532,18 +490,12 @@ def main() -> int:
                 report("due", "ok", "CI point due")
             else:
                 report("due", "ok", f"{state.merges_since} of 5 code merges since last CI point")
-        elif action == "ci":
+        else:
             if cast(str, args.ci_action) == "start":
                 ci_start(production, cast(Path, args.state_dir), cast(bool, args.no_ci),
                          cast(bool, args.cancel_prior))
             else:
                 ci_collect(production, cast(Path, args.state_dir), cast(bool, args.no_ci))
-        elif action == "watch":
-            state = review_watch(production, cast(Path, args.state_dir))
-            detail = f"repeat: {state.line}" if isinstance(state, WatchRepeat) else state.line
-            report("watch", "ok", detail or "no open review watch")
-            if isinstance(state, WatchFirstAlert):
-                print(state.table)
         return 0
     except (copies.CopyError, PointFailure, Refusal, OSError, ValueError, json.JSONDecodeError) as error:
         report(error.step if isinstance(error, PointFailure) else step, "failed", str(error))

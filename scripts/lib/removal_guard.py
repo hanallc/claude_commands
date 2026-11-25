@@ -28,8 +28,9 @@ from typing import Protocol, cast, final
 
 from scripts.buildlog.repository import repo_name
 from scripts.lib import conf
-from scripts.lib.build_folders import OWNER_MARKER
 from scripts.production import staff
+
+OWNER_MARKER = ".build-folder-owner.json"
 
 PATH_TEMPLATES_KEY = "removal.path_templates"
 CARGO_TAG = "CACHEDIR.TAG"
@@ -447,7 +448,7 @@ class Tool(Enum):
     BUILD = "sweep"
     DOC = "sweep:rustdoc"
     CARGO = "scratch:cargo"
-    GATE = "gate_folders_delete"
+    RETIRED_GATE = "gate_folders_delete"
 
 
 LIST_DIRECTORY = Path(".local/state/removal-lists")

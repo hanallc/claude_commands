@@ -26,6 +26,8 @@ import sys
 
 GIT: str = shutil.which("git") or "git"
 
+from scripts.lib.fixture_test_support import set_up_fixture
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.accounts import accounts, next_moves, outage_alerts, refusal_watch, role_map, unit_watchdog
 from scripts.accounts import test_refusal_watch as fixtures
 from scripts.production import fake_unit_host, showrunners, staff
@@ -38,6 +40,7 @@ from scripts.agents import pane_record as hook_pane_record
 
 from scripts.agents import inventory, pane_record
 from scripts.herdr import herdr, pane_launch
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.herdr.test_herdr import ClaudeForegroundSocket
 from scripts.message import session_records, sessions
 from scripts.production import unit_lookup
@@ -84,11 +87,9 @@ class UnitWatchdogTests(unittest.TestCase):
     def setUp(self) -> None:
         _ = self.enterContext(redirect_stdout(io.StringIO()))
         _ = self.enterContext(redirect_stderr(io.StringIO()))
-        self.fixture = fixtures.RefusalWatchTests()
-        self.fixture.setUp()
-        write_text_atomic(Path(os.environ["CONF_DIR"]) / "shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = set_up_fixture(self.addCleanup, fixtures.RefusalWatchTests())
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/shutdown.conf",
+                                     Path(os.environ["CONF_DIR"]) / "shutdown.conf")
         self.home = self.fixture.home
         _ = self.enterContext(isolated_staff_file(self.home / "staff.json", {}))
         _ = showrunner_relationship("fixture")
@@ -117,7 +118,7 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.enterContext(patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()))
         _ = self.enterContext(patch.object(stop_resume, "_send_move_push"))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=self.command))
-        _ = self.enterContext(patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"))
+        _ = self.enterContext(patch.object(herdr, "herdr_binary", return_value=MISSING_HERDR_BIN))
         _ = self.enterContext(patch.object(herdr.Herdr, "panes", return_value=[]))
         _ = self.enterContext(patch.object(herdr.Herdr, "agents", return_value=[]))
         _ = self.enterContext(patch.object(herdr.Herdr, "close_restore_placeholders"))

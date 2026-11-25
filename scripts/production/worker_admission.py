@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 import io
 import hashlib
-import ast
 from importlib import import_module
 import json
 import re
@@ -225,6 +224,8 @@ def reply_ends_dispatch(reply: str, dispatch_id: str) -> bool:
 
 
 def transcript_entry(fields: dict[str, object], changed: set[str]) -> str:
+    if fields.get("isMeta") is True:
+        return ""
     if isinstance(fields.get("message"), dict) and fields.get("type") not in ("user", "assistant"):
         return ""
     raw = fields.get("message", fields.get("payload", {}))
@@ -342,6 +343,26 @@ def extract_transcript(row: staff.StaffRow, run: Path, backend: staff.ClaudeBack
         return TranscriptUnavailable(reason)
 
 
+_JS_ESCAPE = re.compile(r"\\(?:u\{[0-9a-fA-F]{1,6}\}|u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|\r\n|[\s\S])")
+_JS_CONTROLS = {"0": "\0", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+                "\n": "", "\r": "", "\r\n": "", "\u2028": "", "\u2029": ""}
+
+
+def _decode_patch_literal(value: str) -> str | None:
+    def decode(match: re.Match[str]) -> str:
+        escape = match[0][1:]
+        if len(escape) > 1 and escape[0] in "ux":
+            codepoint = int(escape[1:].strip("{}"), 16)
+            return chr(codepoint) if codepoint <= 0x10FFFF else match[0]
+        return _JS_CONTROLS.get(escape, escape)
+
+    decoded = _JS_ESCAPE.sub(decode, value[1:-1])
+    try:
+        return decoded.encode("utf-16-le", errors="surrogatepass").decode("utf-16-le")
+    except UnicodeDecodeError:
+        return None
+
+
 def _changed_files(message: dict[str, object], changed: set[str]) -> None:
     from scripts.direct.phase_reservation import patch_paths
     from scripts.usage import rollouts
@@ -358,10 +379,8 @@ def _changed_files(message: dict[str, object], changed: set[str]) -> None:
         visible = rollouts.javascript_without_string_literals(arguments)
         for call in re.finditer(r"\b(?:tools\.)?apply_patch\s*\(", visible):
             literal = re.match(r'''\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)''', arguments[call.end():], re.DOTALL)
-            if literal:
-                value = literal.group(1)
-                patch = value[1:-1].replace("\\n", "\n") if value.startswith("`") else ast.literal_eval(value)
-                changed.update(patch_paths(patch))
+            if literal and (decoded := _decode_patch_literal(literal.group(1))) is not None:
+                changed.update(patch_paths(decoded))
 
 
 def assignment_id(prompt: Path) -> str:

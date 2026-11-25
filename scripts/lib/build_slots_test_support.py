@@ -1,4 +1,4 @@
-"""Give slot tests private roots and explicit pool limits."""
+"""Give numbered copy tests private roots and Mac claim limits."""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.buildlog.store import host_name
+from scripts.lib import conf
 from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
@@ -18,21 +19,16 @@ class UseDefaultMaximum:
 @dataclass(frozen=True)
 class SlotTestConfiguration:
     settings: Path
-    slots: Path
-    cargo: Path
     machine: str
     environment: Mapping[str, str]
 
 
-def write_private_slot_roots(settings: Path, root: Path, machine: str) -> None:
-    """Set private slot, cargo, and build roots for the fixture."""
+def write_private_build_roots(settings: Path, root: Path, machine: str) -> None:
+    """Set a private build root for the fixture."""
     if not settings.exists():
         _ = write_config_fixture(settings)
-    lines = [line for line in settings.read_text().splitlines()
-             if not line.startswith(("roots.slots", "roots.slot_cargo", "roots.build"))]
-    lines.extend((f"roots.slots={root / 'default-slots'}", f"roots.slots.{machine}={root / 'slots'}",
-                  f"roots.slot_cargo={root / 'default-cargo'}", f"roots.slot_cargo.{machine}={root / 'cargo'}",
-                  f"roots.build={root / 'build'}"))
+    lines = [line for line in settings.read_text().splitlines() if not line.startswith("roots.build")]
+    lines.append(f"roots.build={root / 'build'}")
     for host in sorted({"natedev", machine}):
         lines.append(f"roots.build.{host}={root / 'build'}")
     _ = settings.write_text("\n".join(lines) + "\n")
@@ -43,8 +39,6 @@ def private_slot_config(root: Path, *, repository: str, maximum: int | UseDefaul
     """Give direct calls and child commands private roots without a caller session."""
     environment = config_environment(root / "config")
     settings = Path(environment["CONF_DIR"]) / "build_folders.conf"
-    slots = root / "slots"
-    cargo = root / "cargo"
     machine = host_name()
     fixed = f"""# whole: 1..
 names.suffix_length=8
@@ -56,17 +50,10 @@ roots.gate=/dev/shm
 roots.temporary={root / 'temporary'}
 roots.build={root / 'build'}
 roots.build.natedev={root / 'build'}
-roots.slots={root / 'default-slots'}
-roots.slots.{machine}={slots}
-roots.slot_cargo={root / 'default-cargo'}
-roots.slot_cargo.{machine}={cargo}
 roots.workspace={root / 'workspaces'}
 roots.session={root / 'session'}
 roots.scratch={root / 'scratch'}
 roots.copies={root / 'workspaces'}
-roots.mirror={root / 'mirrors'}
-roots.shell={root / 'shells'}
-patterns.slot={{repository}}-slot{{slot}}
 patterns.tool={{purpose}}{{suffix}}
 patterns.named={{showrunner}}-{{unit}}/{{work}}-{{purpose}}
 patterns.legacy-unique={{purpose}}{{suffix}}
@@ -75,9 +62,7 @@ patterns.editable={{repository}}-{{owner}}/{{purpose}}
 patterns.temporary={{repository}}/{{owner}}-{{purpose}}-{{suffix}}
 patterns.gate={{purpose}}-{{suffix}}
 patterns.standing={{repository}}/{{owner}}-gate{{suffix}}
-patterns.mirror={{repository}}/{{owner}}-s{{slot}}
 patterns.target={{purpose}}
-patterns.shell-cache={{repository}}
 patterns.scratch={{purpose}}-{{suffix}}
 prefixes.queue-place=queue-place-
 # range: 0.001..60
@@ -87,12 +72,13 @@ locks.probe_retry_seconds=0.005
 # whole: 1..
 slots.{machine}.default_max={default_maximum}
 # whole: 1..
-folders.unused_days=2
-# range: 5e-324..
-slots.wait_seconds=30"""
+folders.unused_days=2"""
     fixed_lines = fixed.splitlines()
     if machine != "natedev":
         fixed_lines.append(f"roots.build.{machine}={root / 'build'}")
+    mac_hosts = conf.read(settings.with_name("machines.conf")).words("mac.hosts")
+    if mac_hosts and mac_hosts[0] != machine:
+        fixed_lines.extend(("# whole: 1..", f"slots.{mac_hosts[0]}.default_max=1"))
     keys = {line.partition("=")[0] for line in fixed_lines if "=" in line}
     replaced_prefixes = ("slots.", *(f"{key}." for key in keys))
     lines = [line for line in settings.read_text().splitlines()
@@ -113,4 +99,4 @@ slots.wait_seconds=30"""
         "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
         "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
     })
-    return SlotTestConfiguration(settings, slots, cargo, machine, environment)
+    return SlotTestConfiguration(settings, machine, environment)

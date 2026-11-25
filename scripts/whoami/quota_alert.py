@@ -28,7 +28,7 @@ from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
@@ -38,7 +38,7 @@ from scripts.lib import process_group
 from scripts.lib.process_failure import failure_detail
 from scripts.message import send_result, send_budget, session_send
 from scripts.agents import remote
-from scripts.whoami import note_file
+from scripts.whoami import mac_fallback_token, note_file, token_expiry
 
 from scripts.lib import conf, models_registry  # noqa: E402
 
@@ -81,6 +81,7 @@ class ReadCurrentCodexReadings:
 
 READ_CURRENT_CODEX_READINGS = ReadCurrentCodexReadings()
 UNKNOWN_REFUSAL_WINDOW = refusals.UnknownWindow()
+QUEUED_WORKERS_OUTCOME = "workers wait for their queued move"
 
 
 def codex_alert_pass(home: Path | NoWorkersHome, reports: list[Report], observed_at: datetime) -> CodexAlertPassReadings:
@@ -440,10 +441,30 @@ class PreviousClaudeExpiryDelivery(TypedDict):
     delivered_at: str
 
 
+class TokenDeliveryAttempt(TypedDict):
+    attempted_at: str
+    delivered: bool
+
+
+class TokenExpiryAttempt(TokenDeliveryAttempt):
+    event: str
+
+
+class PreviousMacTokenLoginClaim(TypedDict):
+    made: str
+    failure: str
+
+
+class MacTokenLoginClaim(PreviousMacTokenLoginClaim, TokenDeliveryAttempt):
+    pass
+
+
 class State(TypedDict):
     # Account label ("codex1") -> its open episode.
     episodes: dict[str, Episode]
     claude_expiry: NotRequired[dict[str, ClaudeExpiryAttempt]]
+    token_expiry_alerts: NotRequired[dict[str, TokenExpiryAttempt]]
+    mac_token_login_claim: NotRequired[MacTokenLoginClaim]
     codex_zero: NotRequired[dict[str, CodexZeroEpisode]]
     refusal_notices: NotRequired[dict[str, RefusalNotice]]
     fallback: CodexQuotaFallback
@@ -470,6 +491,9 @@ class StoredFallback(TypedDict):
 class StoredState(TypedDict):
     episodes: dict[str, Episode]
     claude_expiry: NotRequired[dict[str, ClaudeExpiryAttempt | PreviousClaudeExpiryDelivery]]
+    token_expiry_alerts: NotRequired[dict[str, TokenExpiryAttempt]]
+    mac_token_alerts: NotRequired[dict[str, TokenExpiryAttempt]]
+    mac_token_login_claim: NotRequired[MacTokenLoginClaim | PreviousMacTokenLoginClaim]
     codex_zero: NotRequired[dict[str, CodexZeroEpisode]]
     refusal_notices: NotRequired[dict[str, RefusalNotice]]
     switch: NotRequired[StoredFallback]
@@ -535,6 +559,10 @@ def _stored_fallback(fallback: AccountCodexQuotaFallback | UnknownOwnerCodexQuot
 
 def _stored_state(state: State) -> StoredState:
     saved = StoredState(episodes=state["episodes"])
+    if token_attempts := state.get("token_expiry_alerts"):
+        saved["token_expiry_alerts"] = token_attempts
+    if "mac_token_login_claim" in state:
+        saved["mac_token_login_claim"] = state["mac_token_login_claim"]
     if expiry_attempts := state.get("claude_expiry"):
         saved["claude_expiry"] = {label: attempt for label, attempt in expiry_attempts.items()}
     if "no_worker_mode" in state:
@@ -782,6 +810,24 @@ def state_file() -> Generator[State]:
         try:
             saved = cast(StoredState, json.loads(STATE.read_text(encoding="utf-8")))
             state = State(episodes={note_file.canonical_label(label): episode for label, episode in saved.get("episodes", {}).items()}, fallback=_read_fallback(saved.get("switch")))
+            old_mac_prefix = token_expiry.LEGACY_MAC_EXPIRY_ID + "/"
+            token_attempts = dict(saved.get("token_expiry_alerts", {}))
+            for slot, attempt in saved.get("mac_token_alerts", {}).items():
+                if not slot.startswith(old_mac_prefix):
+                    continue
+                key = f"{token_expiry.MAC_TOKEN}/{slot.removeprefix(old_mac_prefix)}"
+                current = token_attempts.get(key)
+                if current is None or (current["event"] == attempt["event"]
+                                       and attempt["delivered"] and not current["delivered"]):
+                    token_attempts[key] = attempt
+            if token_attempts:
+                state["token_expiry_alerts"] = token_attempts
+            if "mac_token_login_claim" in saved:
+                claim = saved["mac_token_login_claim"]
+                state["mac_token_login_claim"] = (
+                    claim if "attempted_at" in claim and "delivered" in claim else
+                    MacTokenLoginClaim(made=claim["made"], failure=claim["failure"],
+                                       attempted_at=claim["failure"], delivered=False))
             if "claude_expiry" in saved:
                 state["claude_expiry"] = {
                     note_file.canonical_label(label): ClaudeExpiryAttempt(
@@ -840,9 +886,17 @@ def state_file() -> Generator[State]:
 
 
 
-def percent(note: AgentNote) -> str:
+def percent(note: AgentNote, *, whole: bool = False) -> str:
     value = note_file.remaining(note)
-    return "unknown" if value is None else f"{value:g}%"
+    if value is None:
+        return "unknown"
+    if not whole:
+        return f"{value:g}%"
+    if not 0 <= value <= 100:
+        return "unknown"
+    if 0 < value < 1:
+        return "<1%"
+    return f"{math.floor(value)}%"
 
 
 def low(notes: list[AgentNote], threshold: float, *, now: datetime) -> list[AgentNote]:
@@ -1148,7 +1202,7 @@ def switch_back(
             return NoCodexFallbackRestoration()
         if chosen.dir != readings.workers.home:
             move_id = uuid.uuid4().hex
-            recovery_request: moves.RequestedMove = {"kind": "requested", "at": now.isoformat(),
+            recovery_request: moves.RequestedMove = {"kind": "requested", "scope": "group", "at": now.isoformat(),
                 "tool": "codex", "subject": "workers", "move_id": move_id, "from": readings.workers.label,
                 "to": chosen.label, "why": "Codex has room again", "window": "unknown"}
             if policy_fallback:
@@ -1283,7 +1337,7 @@ def claude_next_move_push(note: AgentNote, selection: ClaudeAccountsInUse) -> Qu
             return QuotaStatusNote(note.label, "what happens next is set up")
     except next_moves.NextMoveError as error:
         return QuotaStatusNote(note.label, str(error))
-    return UserPush(note.label, render("quota.claude_next_move", account=note.label, remaining=percent(note)))
+    return UserPush(note.label, render("quota.claude_next_move", account=note.label, remaining=percent(note, whole=True)))
 
 
 def codex_next_move_push(note: AgentNote, fallback: CodexQuotaFallback = NO_CODEX_QUOTA_FALLBACK,
@@ -1313,20 +1367,14 @@ def codex_next_move_push(note: AgentNote, fallback: CodexQuotaFallback = NO_CODE
         return QuotaStatusNote(note.label, "what happens next is set up")
     credits_allowed = isinstance(agent_accounts.codex_credits_setting(note.label), agent_accounts.CreditsOn)
     chosen = _zero_destination(note.label, at, prefer_weekly_room=True, included_only=credits_allowed)
-    destination = chosen.label if isinstance(chosen, accounts.PickedAccount) else "Claude"
-    outcome_title = "use paid credits" if credits_allowed and isinstance(chosen, accounts.NoAccountWithRoom) else f"move to {destination}"
-    if credits_allowed and isinstance(chosen, accounts.NoAccountWithRoom):
-        outcome_body = (", and no move is set up for its workers. When it runs out, "
-                        + f"they spend its paid credits, then move to {destination}.")
-    elif isinstance(chosen, accounts.NoAccountWithRoom):
-        outcome_body = (". When it runs out, its workers move on their own to Claude, "
-                        + "since no other Codex account has room.")
+    if isinstance(chosen, accounts.PickedAccount):
+        outcome_title = f"{chosen.label} next"
+    elif credits_allowed:
+        outcome_title = "paid credits next"
     else:
-        outcome_body = (f". When it runs out, its workers move on their own to {destination}, "
-                        + "the Codex account with room whose weekly reset comes first.")
+        outcome_title = "units work alone next"
     return UserPush(note.label, render("quota.codex_next_move", account=note.label,
-                                      remaining=percent(note), fallback=destination,
-                                      outcome_title=outcome_title, outcome_body=outcome_body))
+                                      remaining=percent(note, whole=True), outcome_title=outcome_title))
 
 
 @dataclass(frozen=True)
@@ -1469,9 +1517,9 @@ def _workers_head_blocked(entry: next_moves.WorkersMove, reason: BlockedHeadReas
 
 
 def _workers_request_replay(history: moves.RecordedAutoEntries, rows: Sequence[moves.MoveEntry]
-                            ) -> tuple[moves.RecordedAutoEntries, dict[str, moves.RequestedMove]]:
+                            ) -> tuple[moves.RecordedAutoEntries, dict[str, moves.RecordedMoveRequest]]:
     """A request without a result stays due, also when its role write is done: the move was cut."""
-    pending: dict[str, moves.RequestedMove] = {}
+    pending: dict[str, moves.RecordedMoveRequest] = {}
     completed: set[str] = set()
     for index, row in enumerate(rows):
         if (row["kind"] != "requested" or row["tool"] != "codex" or row["subject"] != "workers"
@@ -1489,7 +1537,7 @@ def _workers_request_replay(history: moves.RecordedAutoEntries, rows: Sequence[m
             {key: request for key, request in pending.items() if key not in completed})
 
 
-def _start_workers_request(entry: next_moves.WorkersMove, request: moves.RequestedMove,
+def _start_workers_request(entry: next_moves.WorkersMove, request: moves.RecordedMoveRequest,
                            label: str, now: datetime, journal: Sequence[moves.MoveEntry]) -> bool | None:
     """Write the role and start detached moves; keep the entry until the moves end.
 
@@ -1650,11 +1698,12 @@ def _workers_next_move_pass(readings: CodexAlertPassReadings, now: datetime) -> 
                         request = pending_requests[entry.id]
                     else:
                         move_id = uuid.uuid4().hex
-                        request = moves.RequestedMove(kind="requested", at=stamp, tool="codex",
-                            subject="workers", move_id=move_id, cause="auto", why=why,
-                            **{"from": owner.label, "to": target.label}, window="weekly")
-                        moves.append_move(request)
-                        journal.append(request)
+                        new_request: moves.RequestedMove = {"kind": "requested", "scope": "group",
+                            "at": stamp, "tool": "codex", "subject": "workers", "move_id": move_id,
+                            "cause": "auto", "why": why, "from": owner.label, "to": target.label, "window": "weekly"}
+                        moves.append_move(new_request)
+                        journal.append(new_request)
+                        request = new_request
                     finished = _start_workers_request(entry, request, target.label, now, journal)
                     if finished is None:
                         return WorkersNextMovePass(readings, moves.UnreadableMoveJournal(), journal)
@@ -1744,13 +1793,16 @@ def tell_user(push: RenderedPush) -> PushDelivery:
     from scripts.notify.push_texts import user_send_argv
 
     expiry = push.id == "quota.claude_expiry"
+    needs_confirmation = expiry or push.id in token_expiry.ALERT_IDS
     user_send_timeout = review.user_send_seconds()
     command = user_send_argv(push, timeout=user_send_timeout)
     try:
         done = subprocess.run(command, capture_output=True, text=True,
                               timeout=send_budget.user_seconds(user_send_timeout),
                               check=False)
-    except (subprocess.TimeoutExpired, OSError) as error:
+    except subprocess.TimeoutExpired as error:
+        return PushUnconfirmed(str(error)) if needs_confirmation else PushFailed(str(error))
+    except OSError as error:
         return PushUnconfirmed(str(error)) if expiry else PushFailed(str(error))
     outcome = send_result.send_outcome(done.returncode, done.stdout)
     why = " ".join(failure_detail(done).split())
@@ -1761,16 +1813,16 @@ def tell_user(push: RenderedPush) -> PushDelivery:
             case "refused" | "held":
                 return PushFailed(why)
             case "skipped" | "replaced":
-                return PushFailed(why) if expiry else PushSent()
+                return PushFailed(why) if needs_confirmation else PushSent()
             case "kept":
-                if not expiry:
+                if not needs_confirmation:
                     return PushSent()
             case "retry":
                 if not expiry:
                     return PushFailed(" ".join(f"RETRY: {outcome.header.detail}".split()))
             case "queued" | "failed" | "pending" | "closed" | "absent":
                 pass
-    return PushUnconfirmed(why) if expiry else PushFailed(why)
+    return PushUnconfirmed(why) if needs_confirmation else PushFailed(why)
 
 
 def deliver(jobs: list[Job]) -> list[str | None]:
@@ -1855,30 +1907,6 @@ def _credits_run_out(balance: float, usage: run_out.CreditsUsed, now: datetime) 
     return until.astimezone(user_zone())
 
 
-def _worker_move_failure_cause(cause: str) -> str:
-    """Describe a swap failure without exposing the accounts command's diagnostics."""
-    text = cause.lower()
-    if "reading" in text or "cannot read" in text:
-        return "its usage reading is unavailable"
-    if "sign-in" in text or "sign in" in text:
-        return "its sign-in is unavailable"
-    if "used up" in text:
-        return "its usage is exhausted"
-    if "server" in text and "stop" in text:
-        return "its server could not stop"
-    if "permission" in text:
-        return "access to its worker settings was denied"
-    return "its worker account could not be prepared"
-
-
-def _work_routing_failure_cause(cause: str) -> str:
-    if "permission" in cause.lower():
-        return "permission to update the work-routing settings was denied"
-    if "longer than" in cause.lower() or "timeout" in cause.lower():
-        return "the work-routing update timed out"
-    return "the work-routing settings could not be updated"
-
-
 @dataclass(frozen=True)
 class WorkersMovedWithoutNotice:
     """The workers moved to room before they used paid credits."""
@@ -1890,20 +1918,19 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
     from scripts.accounts import accounts
     reset = report.weekly_reset
     assert reset is not None
-    values = {"account": label, "reset": reset_display(refusals.KnownReset(reset))}
     if isinstance(credits, agent_accounts.CreditsOff) and workers_queued:
-        return ZeroEpisodeNotice(id="quota.codex_workers_stay", values={**values,
-            "outcome": "workers wait for their next entry", "reason": "A workers next entry is queued.",
-            "fallback": "The queued head controls the next move; fallback moves wait."})
+        return ZeroEpisodeNotice(id="quota.codex_workers_stay",
+                                 values={"account": label, "outcome": QUEUED_WORKERS_OUTCOME})
     chosen = _zero_destination(label, now, prefer_weekly_room=True,
                                included_only=isinstance(credits, agent_accounts.CreditsOn))
     if isinstance(credits, agent_accounts.CreditsOn) and isinstance(chosen, accounts.PickedAccount):
         chosen = _zero_destination(label, now, prefer_weekly_room=True, included_only=True)
     stamp = now.isoformat(timespec="seconds")
+    move_failed = False
     if (isinstance(chosen, accounts.PickedAccount) and not workers_queued
             and isinstance(state["fallback"], NoCodexQuotaFallback)):
         move_id = uuid.uuid4().hex
-        request: moves.RequestedMove = {"kind": "requested", "at": stamp, "tool": "codex",
+        request: moves.RequestedMove = {"kind": "requested", "scope": "group", "at": stamp, "tool": "codex",
             "subject": "workers", "move_id": move_id, "from": label, "to": chosen.label,
             "why": f"{label} weekly usage used; " + ("credits off" if isinstance(credits, agent_accounts.CreditsOff) else "move to room"), "window": "weekly", "reset": reset.isoformat()}
         request["cause"] = "credits off" if isinstance(credits, agent_accounts.CreditsOff) else "auto"
@@ -1919,20 +1946,21 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
             if not isinstance(error, accounts.WorkerMovesStartFailed):
                 moves.append_move(moves.FailedMove(kind="failed", at=stamp, tool="codex", subject="workers",
                     move_id=move_id, reason=str(error)))
-            values["reason"] = f"Workers could not move to {chosen.label} because {_worker_move_failure_cause(str(error))}."
-            if isinstance(credits, agent_accounts.CreditsOn):
-                chosen = accounts.NoAccountWithRoom(accounts.NoResetKnown(), chosen.reasons)
+            move_failed = True
+            chosen = accounts.NoAccountWithRoom(accounts.NoResetKnown(), chosen.reasons)
         else:
             if isinstance(credits, agent_accounts.CreditsOn):
                 return WorkersMovedWithoutNotice()
-            values["target"] = chosen.label
-            values["transition"] = (f"Codex work now uses {chosen.label}" if not accounts.codex_destination_uses_credits(chosen, now) else "Codex work now spends paid credits")
-            values["funding"] = (f"{chosen.weekly_left:g}% weekly usage left"
-                                 if not accounts.codex_destination_uses_credits(chosen, now) else "its own paid credits")
-            return ZeroEpisodeNotice(id="quota.codex_workers_moved", values=values)
+            from scripts.notify.push_catalog import codex_workers_moved_title
+
+            uses_credits = accounts.codex_destination_uses_credits(chosen, now)
+            return ZeroEpisodeNotice(id="quota.codex_workers_moved", values={
+                "account": label, "reset": reset_display(refusals.KnownReset(reset)), "target": chosen.label,
+                "transition": codex_workers_moved_title(label, chosen.label, uses_credits=uses_credits),
+                "funding": "its own paid credits" if uses_credits else f"{chosen.weekly_left:g}% weekly usage left"})
     if isinstance(credits, agent_accounts.CreditsOn):
         return _paid_credits_notice(label, report, chosen, reset)
-    if isinstance(chosen, accounts.NoAccountWithRoom):
+    if isinstance(chosen, accounts.NoAccountWithRoom) and not move_failed:
         entries = moves.read_moves()
         closed = {entry["move_id"] for entry in entries if entry["kind"] == "room again"}
         if not any(entry["tool"] == "codex" and entry["subject"] == "workers" and entry["kind"] == "no room"
@@ -1940,7 +1968,6 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
             moves.append_move(moves.NoRoomMove(kind="no room", at=stamp, tool="codex", subject="workers",
                 move_id=uuid.uuid4().hex, earliest_reset=chosen.earliest_reset.at.isoformat()
                 if isinstance(chosen.earliest_reset, accounts.EarliestReset) else ""))
-        values["reason"] = "No other Codex account has room."
     candidates = [reset]
     if isinstance(chosen, accounts.NoAccountWithRoom) and isinstance(chosen.earliest_reset, accounts.EarliestReset):
         candidates.append(chosen.earliest_reset.at)
@@ -1949,20 +1976,31 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
             if isinstance(window, accounts.ReadingWindow) and isinstance(window.reset, accounts.KnownReset) and window.reset.at > now:
                 candidates.append(window.reset.at)
     until = min(candidates)
-    values["until"] = reset_display(refusals.KnownReset(until))
     note = CodexQuotaAccountNote(note_file.note_path(label), {"weekly_remaining_usage": "0", "resets": reset.isoformat()}, label)
     switched = switch_to_claude(state, note, stamp, owner, hold=CreditsOffHold(until))
     _ = _start_no_worker_mode(state, codex_can_work(report, now, credits), chosen)
     if isinstance(switched, CodexWorkSwitchFailed):
-        values["outcome"] = "work could not move"
-        values["fallback"] = (f"The switch to Claude failed because {_work_routing_failure_cause(switched.cause)}. "
-                              + f"Codex work stays on {label}.")
-    else:
-        values["outcome"] = "work moves to Claude"
-        values["fallback"] = ("New coding work uses Claude, the other coding assistant, until the earliest Codex refill "
-                              + f"at {values['until']}. Current turns finish first.")
-    del values["until"]
-    return ZeroEpisodeNotice(id="quota.codex_workers_stay", values=values)
+        return ZeroEpisodeNotice(id="quota.codex_refused", values={"account": label})
+    return ZeroEpisodeNotice(id="quota.codex_workers_stay", values={"account": label, "outcome": _self_actualize_outcome()})
+
+
+def _self_actualize_outcome() -> str:
+    """Give the workers-stay outcome when no-worker mode starts."""
+    return f"we're in self-actualize mode; worker work moves to {_units_account()}"
+
+
+def _units_account() -> str:
+    """Name the Claude account of the units group. Never raise: unknown gives generic words."""
+    from scripts.accounts import accounts
+
+    try:
+        label = accounts.group_label(accounts.group_accounts(), "units")
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return "the units account"
+    parsed = note_file.parse_account_label(label) if isinstance(label, str) else None
+    if isinstance(parsed, note_file.NumberedAccountLabel) and parsed.tool == "claude":
+        return parsed.label
+    return "the units account"
 
 
 def _paid_credits_notice(label: str, report: Report,
@@ -1997,38 +2035,48 @@ def _credits_forecast_notice(label: str, report: Report, now: datetime) -> ZeroE
     horizon = "run-out unknown"
     if balance_text == "unlimited":
         horizon = "have no limit"
-        forecast = f"Codex account {label} has unlimited paid credits; its coding workers remain on paid usage with no credit limit."
+        forecast = "Paid credits have no limit."
     elif not math.isfinite(balance) or balance < 0:
-        forecast = f"Codex account {label} reports no credit balance; its coding workers remain on paid usage, but the run-out time is unknown."
+        forecast = "No credit balance; the run-out time is unknown."
     else:
         usage = run_out.credits_used(run_out.read_credit_readings(run_out.READINGS_LOG), label,
                                      since=now - timedelta(hours=1), until=now)
         if isinstance(usage, (run_out.NoCreditReading, run_out.UsageUnknown)):
-            reason = usage.reason if isinstance(usage, run_out.UsageUnknown) else "no numeric credit observations were recorded"
-            forecast = f"Coding workers on Codex account {label} remain on paid usage. Their hourly use is unknown because {reason}; {balance:,.0f} credits left."
+            forecast = f"{balance:,.0f} credits left; the run-out time is unknown."
         elif usage.used == 0:
             horizon = "use is zero"
-            forecast = f"Workers on Codex account {label} used no credits in the last hour; {balance:,.0f} paid credits left."
+            forecast = f"{balance:,.0f} credits left; none used in the last hour."
         else:
             until = _credits_run_out(balance, usage, now)
-            time = until.strftime("%a %Y-%m-%d %H:%M %Z")
-            horizon = until.strftime("until %a %H:%M %Z")
-            forecast = (f"Workers on Codex account {label} used {usage.used:,.0f} paid credits in the last hour; "
-                        + f"its {balance:,.0f} credits last until about {time}.")
+            time = until.strftime("%a %H:%M")
+            horizon = f"until {time} {until:%Z}"
+            forecast = f"{balance:,.0f} credits left; they run out about {time}."
     return ZeroEpisodeNotice(id="quota.codex_credits_forecast", values={"account": label, "horizon": horizon, "forecast": forecast, "destination": destination})
 
 
-def _current_notice(label: str, notice: ZeroEpisodeNotice, *, workers_queued: bool = False) -> ZeroEpisodeNotice:
+def _current_notice(label: str, notice: ZeroEpisodeNotice, credit_accounts: frozenset[str],
+                    *, workers_queued: bool = False) -> ZeroEpisodeNotice:
     """Copy pending facts for rendering; never persist the queued advice overlay."""
     values = dict(notice["values"])
     if "file" in values:
         values["file"] = note_file.note_name(label)
-    if workers_queued:
-        if notice["id"] == "quota.paid_credits":
-            return ZeroEpisodeNotice(id="quota.paid_credits_queued", values={key: values[key] for key in
-                ("sender", "account", "machine", "credits", "refill")})
-        if notice["id"] == "quota.codex_credits_forecast":
-            values["destination"] = "When credits run out, workers wait for the account move you queued."
+    if notice["id"] == "quota.codex_workers_stay":
+        # An episode saved before the one-line text also holds reset, reason and fallback, and old outcome words.
+        outcome = values["outcome"]
+        if outcome == "work could not move":
+            return ZeroEpisodeNotice(id="quota.codex_refused", values={"account": values["account"]})
+        outcome = {"work moves to Claude": _self_actualize_outcome(),
+                   "workers wait for their next entry": QUEUED_WORKERS_OUTCOME}.get(outcome, outcome)
+        values = {"account": values["account"], "outcome": outcome}
+    if notice["id"] == "quota.paid_credits":
+        from scripts.notify.push_catalog import remaining_credit_accounts
+
+        values["credit_accounts"] = remaining_credit_accounts(label, credit_accounts)
+        if workers_queued:
+            del values["next_reset"]
+            return ZeroEpisodeNotice(id="quota.paid_credits_queued", values=values)
+    if workers_queued and notice["id"] == "quota.codex_credits_forecast":
+        values["destination"] = "When credits run out, workers wait for the account move you queued."
     return ZeroEpisodeNotice(id=notice["id"], values=values)
 
 
@@ -2063,26 +2111,26 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
         if at_zero and label in state["episodes"]:
             state["episodes"][label]["reached_zero"] = True
         existing_episode = label in episodes
+        if not existing_episode and not at_zero:
+            return log
+        credit_accounts = agent_accounts.codex_credit_accounts()
+        setting = agent_accounts.CreditsOn() if label in credit_accounts else agent_accounts.CreditsOff()
         if not existing_episode:
-            if not at_zero:
-                return log
             reset = report.weekly_reset
             assert reset is not None
-            credits = agent_accounts.codex_credits_setting(label)
-            notice = _zero_open_notice(label, report, credits, now, state=state, owner=identity,
+            notice = _zero_open_notice(label, report, setting, now, state=state, owner=identity,
                                       workers_queued=workers_queued)
             if isinstance(notice, WorkersMovedWithoutNotice):
                 return log
             episodes[label] = CodexZeroEpisode(since=stamp, weekly_reset=reset.isoformat(),
-                credits="off" if isinstance(credits, agent_accounts.CreditsOff) else "on",
+                credits="off" if isinstance(setting, agent_accounts.CreditsOff) else "on",
                 phone="due", forecast_at=stamp, notice=notice)
-            if isinstance(credits, agent_accounts.CreditsOff) and workers_queued:
+            if isinstance(setting, agent_accounts.CreditsOff) and workers_queued:
                 episodes[label]["credits_off_fallback"] = "waiting_for_next_entry"
-            current = _current_notice(label, notice, workers_queued=workers_queued)
+            current = _current_notice(label, notice, credit_accounts, workers_queued=workers_queued)
             rendered = render(current["id"], **current["values"])
-            log.append(f"quota zero {label}: {rendered.title}\n{rendered.body}")
+            log.append(f"quota zero {label}: {rendered.title}" + (f"\n{rendered.body}" if rendered.body else ""))
         episode = episodes[label]
-        setting = agent_accounts.codex_credits_setting(label)
         if (at_zero and existing_episode
                 and isinstance(setting, agent_accounts.CreditsOn) and not workers_queued
                 and isinstance(state["fallback"], NoCodexQuotaFallback)):
@@ -2109,20 +2157,21 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
             _ = episode.pop("forecast_phone", None)
             _ = episode.pop("forecast_notice", None)
             result = render(changed["id"], **changed["values"])
-            log.append(f"quota credits off {label}: {result.body}")
+            log.append(f"quota credits off {label}: {result.posted_body or result.posted_title}")
 
         # Old opening notices used values that the current templates do not accept.
-        if episode["notice"]["id"] not in ("quota.paid_credits", "quota.codex_workers_moved", "quota.codex_workers_stay"):
+        if episode["notice"]["id"] not in ("quota.paid_credits", "quota.codex_workers_moved", "quota.codex_workers_stay",
+                                           "quota.codex_refused"):
             episode["notice"] = _paid_credits_notice(label, report,
                 _zero_destination(label, now, prefer_weekly_room=True, included_only=True),
                 report.weekly_reset or datetime.fromisoformat(episode["weekly_reset"]))
         if episode["phone"] == "due":
-            episode["notice"] = _current_notice(label, episode["notice"])
-            notice = _current_notice(label, episode["notice"], workers_queued=workers_queued)
+            episode["notice"] = _current_notice(label, episode["notice"], credit_accounts)
+            notice = _current_notice(label, episode["notice"], credit_accounts, workers_queued=workers_queued)
             pushes.append((QuotaNote(label, render(notice["id"], **notice["values"])), "phone", episode["since"]))
         if at_zero and episode["credits"] == "on" and now - datetime.fromisoformat(episode["forecast_at"]) >= timedelta(hours=1):
             notice = _credits_forecast_notice(label, report, now)
-            current = _current_notice(label, notice, workers_queued=workers_queued)
+            current = _current_notice(label, notice, credit_accounts, workers_queued=workers_queued)
             rendered = render(current["id"], **current["values"])
             log.append(f"quota credits forecast {label}: {rendered.title}\n{rendered.body}")
             episode["forecast_at"] = stamp
@@ -2130,8 +2179,8 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
                 episode["forecast_phone"] = "due"
                 episode["forecast_notice"] = notice
         if episode.get("forecast_phone") == "due" and "forecast_notice" in episode:
-            episode["forecast_notice"] = _current_notice(label, episode["forecast_notice"])
-            notice = _current_notice(label, episode["forecast_notice"], workers_queued=workers_queued)
+            episode["forecast_notice"] = _current_notice(label, episode["forecast_notice"], credit_accounts)
+            notice = _current_notice(label, episode["forecast_notice"], credit_accounts, workers_queued=workers_queued)
             pushes.append((QuotaNote(label, render(notice["id"], **notice["values"])), "forecast_phone", episode["since"]))
     for push, field, since in pushes:
         delivery = tell_user(push.rendered)
@@ -2272,6 +2321,106 @@ def _send_claude_expiry(note: AgentNote, readings: list[run_out.Reading],
     return [f"quota Claude expiry {label} -> user: {_push_outcome(delivery)}"]
 
 
+def _token_retry_due(attempt: TokenDeliveryAttempt, now: datetime) -> bool:
+    last = reset_time(attempt["attempted_at"])
+    return not attempt["delivered"] and (not isinstance(last, note_file.KnownReset) or now >= last.value + timedelta(days=1))
+
+
+def _deliver_token_attempt(push: RenderedPush, attempt: TokenDeliveryAttempt, *,
+                           expiry_slot: str | None = None) -> list[str]:
+    delivery = tell_user(push)
+    if not isinstance(delivery, PushUnconfirmed):
+        with state_file() as state:
+            alerts = state.get("token_expiry_alerts", {})
+            current = state.get("mac_token_login_claim") if expiry_slot is None else alerts.get(expiry_slot)
+            if current is not None and current == attempt:
+                if isinstance(delivery, PushSent):
+                    current["delivered"] = True
+                elif expiry_slot is None:
+                    _ = state.pop("mac_token_login_claim", None)
+                else:
+                    del alerts[expiry_slot]
+    return [f"{push.id} -> user: {_push_outcome(delivery)}"]
+
+
+def _send_token_expiry(push: RenderedPush, slot: str, event: str, now: datetime) -> list[str]:
+    with state_file() as state:
+        alerts = state.setdefault("token_expiry_alerts", {})
+        previous = alerts.get(slot)
+        if previous is not None and previous["event"] == event and not _token_retry_due(previous, now):
+            return []
+        attempt = TokenExpiryAttempt(event=event, attempted_at=now.isoformat(), delivered=False)
+        alerts[slot] = attempt
+    return _deliver_token_attempt(push, attempt, expiry_slot=slot)
+
+
+def _send_mac_token_login(now: datetime, zone: tzinfo) -> list[str]:
+    from scripts.notify.push_texts import render
+
+    with state_file() as state:
+        token = mac_fallback_token.read()
+        if not isinstance(token, mac_fallback_token.MacFallbackToken) or not token.recently_checked(now):
+            return []
+        failure = token.active_login_failure(now)
+        if not isinstance(failure, datetime):
+            return []
+        previous = state.get("mac_token_login_claim")
+        if previous is not None:
+            claimed_made = reset_time(previous["made"])
+            if isinstance(claimed_made, note_file.KnownReset) and claimed_made.value > token.made:
+                return []
+            if isinstance(claimed_made, note_file.KnownReset) and claimed_made.value == token.made:
+                claimed_failure = reset_time(previous["failure"])
+                if isinstance(claimed_failure, note_file.KnownReset):
+                    if failure < claimed_failure.value:
+                        return []
+                    good = token.last_good_use
+                    if not isinstance(good, datetime) or good <= claimed_failure.value:
+                        if not _token_retry_due(previous, now):
+                            return []
+                        failure = claimed_failure.value
+        claim = MacTokenLoginClaim(made=token.made.isoformat(), failure=failure.isoformat(),
+                                  attempted_at=now.isoformat(), delivered=False)
+        state["mac_token_login_claim"] = claim
+    time = failure.astimezone(zone).strftime(WEEKLY_EMPTY_FORMAT)
+    return _deliver_token_attempt(render("quota.mac_token_login", time=time), claim)
+
+
+def token_alerts(now: datetime) -> list[str]:
+    from scripts.notify.push_texts import render
+
+    if not _claude_quota_sender() or silence.active():
+        return []
+    settings = conf.read(CONFIG)
+    keys = settings.settings if isinstance(settings.settings, dict) else ()
+    configured = token_expiry.configured_tokens(keys, settings.values)
+    tokens = [(token, token.ends.day.isoformat()) for token in configured
+              if isinstance(token.ends, token_expiry.CalendarEnd)]
+    missing = ", ".join(token.source for token in configured if isinstance(token.ends, token_expiry.EndUnavailable))
+    log: list[str] = []
+    zone = user_zone()
+    mac = mac_fallback_token.read()
+    if isinstance(mac, mac_fallback_token.MacFallbackToken) and mac.recently_checked(now):
+        if isinstance(mac.active_login_failure(now), datetime):
+            log += _send_mac_token_login(now, zone)
+        tokens.insert(0, (token_expiry.mac_token(mac, mac_fallback_token.Unknown.VALUE), mac.made.isoformat()))
+    if missing:
+        log.append(f"quota-alert: anomaly: token end dates unavailable: {missing}")
+    if not tokens:
+        return log
+    try:
+        leads = token_expiry.expiry_days(settings.values("token_expiry.lead_days").get("token_expiry.lead_days", ""))
+    except (OSError, ValueError):
+        return [*log, "quota-alert: token expiry days unavailable"]
+    for token, event in tokens:
+        lead = token.expiry_lead(now, zone, leads)
+        end_date = token.end_date(zone)
+        if lead is not None and end_date is not None:
+            push = render(token_expiry.EXPIRY_ALERT_ID, token=token.name, date=end_date.isoformat())
+            log += _send_token_expiry(push, f"{token.key}/{lead}", event, now)
+    return log
+
+
 def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: ClaudeAccountsInUse,
                               codex_readings: CodexAlertPassReadings) -> list[str]:
     stamp = now.isoformat(timespec="seconds")
@@ -2331,6 +2480,7 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
                 log.append(f"quota push {push.name} -> user: {outcome}")
     for future in expiry_futures:
         log.extend(future.result())
+    log.extend(token_alerts(now))
     return log
 
 
@@ -2544,7 +2694,7 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                     move_id = uuid.uuid4().hex
                     window_name: Literal["weekly", "five_hour", "unknown"] = window.name if isinstance(window, refusals.KnownWindow) else "unknown"
                     reason = f"{name} refused ({window_name} limit until {reset_display(reset)})"
-                    request: moves.RequestedMove = {"kind": "requested", "at": stamp, "tool": "codex",
+                    request: moves.RequestedMove = {"kind": "requested", "scope": "group", "at": stamp, "tool": "codex",
                         "subject": "workers", "move_id": move_id, "from": readings.workers.label, "to": chosen.label,
                         "why": reason, "window": window_name}
                     if isinstance(reset, refusals.KnownReset):

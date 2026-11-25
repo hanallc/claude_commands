@@ -21,15 +21,17 @@ from urllib.parse import unquote, urlsplit
 from unittest.mock import patch
 
 
+from scripts.lib import conf
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.review_links import review_link, serve
+from scripts.review_links.server_test_support import started_review_server
 
 
-from typing import cast, override
+from typing import Literal, cast, override
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("review_link.py")
-TAILSCALE_IP = "100.103.14.30"
+TAILSCALE_IP = "198.51.100.30"
 
 
 def setUpModule() -> None:
@@ -237,10 +239,32 @@ class ReviewLinkTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.linked_snapshot(result.stdout.strip()).read_bytes(), source.read_bytes())
 
+    def test_tailscale_reader_uses_the_configured_timeout_for_both_versions(self) -> None:
+        timeout = 1.75
+        configuration = self.root / "config"
+        _ = write_config_fixture(configuration / "review_links.conf", f"tailscale_timeout_seconds={timeout}\n")
+        addresses: dict[Literal[4, 6], str] = {4: TAILSCALE_IP, 6: "2001:db8::1"}
+        with patch.dict(os.environ, {"CONF_DIR": str(configuration)}):
+            for version, output in addresses.items():
+                with self.subTest(version=version):
+                    argv = ["tailscale", "ip", f"-{version}"]
+                    response = subprocess.CompletedProcess(argv, 0, stdout=output + "\n")
+                    with patch.object(subprocess, "run", return_value=response) as command:
+                        self.assertEqual(review_link.tailscale_ip(version), output)
+                    command.assert_called_once_with(argv, capture_output=True, text=True, check=True, timeout=timeout)
+
+    def test_tailscale_reader_rejects_missing_or_wrong_version_ipv6(self) -> None:
+        argv = ["tailscale", "ip", "-6"]
+        for output in ("", "192.0.2.254"):
+            with (self.subTest(output=output),
+                  patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(argv, 0, stdout=output)),
+                  self.assertRaises(ValueError)):
+                _ = review_link.tailscale_ip(6)
+
     def test_missing_or_invalid_tailscale_ipv4_refuses_without_creating_a_snapshot(self) -> None:
         source = self.source("notes.txt", "must not be copied")
         tailscale = self.root / "bin" / "tailscale"
-        for output, exit_code in (("", 0), ("fd7a:115c:a1e0::1", 0), ("natedev", 0), ("", 1)):
+        for output, exit_code in (("", 0), ("2001:db8::1", 0), ("natedev", 0), ("", 1)):
             with self.subTest(output=output, exit_code=exit_code):
                 _ = tailscale.write_text(
                     f"#!{sys.executable}\nprint({output!r})\nraise SystemExit({exit_code})\n", encoding="utf-8",
@@ -264,7 +288,7 @@ class ReviewLinkTests(unittest.TestCase):
         self.assertEqual(old_snapshot.parent, new_snapshot.parent)
         self.assertEqual(old_snapshot.read_text(encoding="utf-8"), "revised version")
         self.assertEqual(new_snapshot.read_text(encoding="utf-8"), "revised version")
-        with serve.ReviewLinksServer(("127.0.0.1", 0), self.snapshots) as server:
+        with started_review_server(("127.0.0.1", 0), self.snapshots) as server:
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             connection = HTTPConnection("127.0.0.1", server.server_port, timeout=TEST_HANG_GUARD_SECS)
@@ -314,9 +338,11 @@ class ReviewLinkTests(unittest.TestCase):
         initial = self.run_link(str(expired_source))
         self.assertEqual(initial.returncode, 0, initial.stderr)
         expired = self.linked_snapshot(initial.stdout.strip()).parent
-        old = time.time() - 8 * 24 * 60 * 60
+        now = time.time()
+        retention = conf.read("review_links").number("snapshot_retention_seconds")
+        old = now - retention - 1
         os.utime(expired, (old, old))
-        self.assertEqual(serve.sweep_snapshots(self.snapshots, time.time()), 1)
+        self.assertEqual(serve.sweep_snapshots(self.snapshots, now), 1)
         other = self.run_link(str(other_source))
         self.assertEqual(other.returncode, 0, other.stderr)
         index = (self.snapshots / ".index.json").read_text(encoding="utf-8")
@@ -342,7 +368,7 @@ class ReviewLinkTests(unittest.TestCase):
         self.assertNotEqual(original_copy.parent, alias_copy.parent)
         self.assertEqual(original_copy.name, "original.txt")
         self.assertEqual(alias_copy.name, "alias.txt")
-        with serve.ReviewLinksServer(("127.0.0.1", 0), self.snapshots) as server:
+        with started_review_server(("127.0.0.1", 0), self.snapshots) as server:
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:

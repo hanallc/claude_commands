@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import nullcontext, redirect_stderr
+from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import errno
 import fcntl
@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import socket
 import subprocess
 import sys
@@ -22,13 +23,17 @@ from scripts.lib.nix_env_test_support import NixFixture
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.nix_env import heal
 from scripts.agents import stop_resume
-from scripts.notify import push_texts
+from scripts.herdr import herdr
+from scripts.notify import push_texts, review
 from scripts.message import sessions
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.whoami import account
 
 
 class HealTests(NixFixture):
     session: heal.HealSession = heal.HealSession("fixture", 811, "start-811", "worker", Path(), "idle", Path())
+    staff_file: Path = Path()
 
     @override
     def setUp(self) -> None:
@@ -36,6 +41,25 @@ class HealTests(NixFixture):
         _ = self.envrc(self.work)
         self.session = heal.HealSession("fixture", 811, "start-811", "worker", self.work, "idle", self.home / ".claude3")
         _ = self.enterContext(patch.object(heal, "state_directory", return_value=self.root / "journal"))
+        _ = self.enterContext(patch.object(review, "user_send_seconds", return_value=60.0))
+        self.staff_file = self.root / "staff.json"
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"STAFF_FILE": str(self.staff_file)})))
+        self.write_staff()
+
+    def write_staff(self, *rows: staff.StaffRow) -> None:
+        _ = self.staff_file.write_text(json.dumps({"schema": 2, "rows": [row.to_json() for row in rows]}))
+
+    def showrunner_fixture(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow]:
+        root_id, owner_id = (staff.StaffId(fixture_runtime_id(name)) for name in ("root", "owner"))
+        root = staff.StaffRow(root_id, "showrunner", "root", staff.StaffRoot(), current_session=root_id)
+        owner = staff.StaffRow(owner_id, "showrunner", "owner", staff.ReportsTo(root.id), current_session=owner_id)
+        unit = staff.StaffRow(staff.StaffId(fixture_runtime_id("unit")), "unit", "unit", staff.ReportsTo(owner.id),
+                              current_session=staff.StaffId(fixture_runtime_id("unit-session")),
+                              unit_type=staff.UnitDetails("direct"), home=staff.SessionHome(self.session.config_dir))
+        worker = staff.StaffRow(staff.StaffId(fixture_runtime_id("worker")), "worker", "worker", staff.ReportsTo(unit.id),
+                                current_session=staff.StaffId(fixture_runtime_id("worker-session")))
+        self.write_staff(root, owner, unit, worker)
+        return owner, unit, worker
 
     def records(self) -> list[dict[str, object]]:
         path = heal.state_directory() / "log.jsonl"
@@ -322,6 +346,294 @@ class HealTests(NixFixture):
         self.assertIn("--only fixture --check", command[command.index("--clears-when") + 1])
         self.assertEqual([entry["action"] for entry in self.records()], ["refused", "refused"])
 
+    def test_unit_and_worker_alert_the_nearest_showrunner(self) -> None:
+        owner, unit, worker = self.showrunner_fixture()
+        raw = f"nix_env: {self.work}: .envrc loaded but no nix shell (IN_NIX_SHELL unset)"
+        directory = heal.state_directory()
+        directory.mkdir()
+        limits = heal.HealLimits.read()
+        for row, code, status in ((unit, 0, "SENT"), (worker, 1, "QUEUED"), (unit, 0, "KEPT"), (worker, 0, "SKIPPED")):
+            with self.subTest(kind=row.kind, status=status):
+                session = replace(self.session, session_id=str(row.current_session), name=row.name)
+                history = heal.new_history()
+                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, f"{status}: fixture", "")) as run:
+                    heal.alert(directory, limits, session, history, raw)
+                    heal.alert(directory, limits, session, history, raw)
+                run.assert_called_once()
+                command = cast(list[str], run.call_args.args[0])
+                self.assertEqual(command[2:-1], ["--to", owner.id, "--from", "nix-heal",
+                                                 "--key", history["showrunner_alert_key"], "--text"])
+                text = command[-1]
+                for detail in (session.name, socket.gethostname(), str(self.work), raw,
+                               "The .envrc file loaded, but no nix shell started.", "Get Nate's approval",
+                               "/etc/nixos", "to send Nate a push"):
+                    self.assertIn(detail, text)
+                for verb in ("retry", "escalate"):
+                    argv = [str(heal.SCRIPTS / "lib/py"), str(Path(heal.__file__).resolve()), verb,
+                            "--only", session.session_id]
+                    self.assertIn(shlex.join(argv), text)
+                self.assertTrue(history["notified"])
+                self.assertEqual(history["alert_reason"], raw)
+                self.assertEqual((self.records()[-1]["action"], self.records()[-1]["reason"]),
+                                 ("showrunner_alerted", owner.name))
+
+    def test_alert_falls_back_without_an_owner_or_readable_staff(self) -> None:
+        directory = heal.state_directory()
+        directory.mkdir()
+        root_id = staff.StaffId(fixture_runtime_id("root"))
+        root = staff.StaffRow(root_id, "showrunner", "root", staff.StaffRoot(), current_session=root_id)
+        session = replace(self.session, session_id=str(root.current_session))
+        self.write_staff(root)
+        for unreadable in (False, True):
+            with self.subTest(unreadable=unreadable):
+                if unreadable:
+                    _ = self.staff_file.write_text("invalid staff JSON")
+                history = heal.new_history()
+                with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture", "")) as run,
+                      patch.object(heal, "save_history", side_effect=PermissionError("fixture state is read-only")) as save,
+                      redirect_stderr(io.StringIO()) as errors):
+                    heal.alert(directory, heal.HealLimits.read(), session, history, "fixture refusal")
+                run.assert_called_once()
+                save.assert_not_called()
+                command = cast(list[str], run.call_args.args[0])
+                self.assertEqual(command[2:4], ["--to", "user"])
+                self.assertIn("nix_heal.failed", command)
+                self.assertIn("Could not read the staff record" if unreadable else "no owning showrunner", errors.getvalue())
+                self.assertTrue(history["notified"])
+
+    def test_alert_falls_back_when_the_showrunner_send_is_unconfirmed(self) -> None:
+        owner, unit, _ = self.showrunner_fixture()
+        session = replace(self.session, session_id=str(unit.current_session))
+        directory = heal.state_directory()
+        directory.mkdir()
+        limits = heal.HealLimits.read()
+        for refusal in (subprocess.CompletedProcess([], 0, "QUEUED: inconsistent exit", ""),
+                        subprocess.TimeoutExpired("fixture send", 1)):
+            with self.subTest(refusal=refusal):
+                history = heal.new_history()
+                with (patch.object(subprocess, "run", side_effect=[
+                    refusal, subprocess.CompletedProcess([], 0, "SENT: fixture", "")]) as run,
+                      redirect_stderr(io.StringIO()) as errors):
+                    heal.alert(directory, limits, session, history, "fixture refusal")
+                self.assertEqual(run.call_count, 2)
+                peer, push = run.call_args_list
+                self.assertIn(owner.id, cast(list[str], peer.args[0]))
+                self.assertIn("nix_heal.failed", cast(list[str], push.args[0]))
+                self.assertEqual(peer.kwargs["timeout"], push.kwargs["timeout"])
+                self.assertIn(f"Could not confirm the alert to {owner.name}", errors.getvalue())
+                self.assertTrue(history["notified"])
+
+    def test_escalate_uses_the_saved_alert_reason_for_a_live_session(self) -> None:
+        _, unit, _ = self.showrunner_fixture()
+        session = replace(self.session, session_id=str(unit.current_session), name=unit.name)
+        raw = "session still has no nix shell after its heal restart"
+        directory = heal.state_directory()
+        directory.mkdir()
+        history = heal.new_history()
+        histories = {session.session_id: history}
+        with (patch.object(heal, "list_sessions", return_value=heal.HealSessionRead((session,))) as registry,
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture", "")) as run,
+              redirect_stdout(io.StringIO()) as output):
+            heal.alert(directory, heal.HealLimits.read(), session, history, raw)
+            heal.alert(directory, heal.HealLimits.read(), session, history, "later refusal")
+            heal.log(directory, session, history, "skip", "session is not idle")
+            heal.save_history(directory, histories)
+            run.reset_mock()
+            args = ["escalate", "--only", session.session_id]
+            self.assertEqual(heal.main(args), 0)
+            run.assert_called_once()
+            command = cast(list[str], run.call_args.args[0])
+            self.assertEqual(command[2:4], ["--to", "user"])
+            self.assertIn("nix_heal.failed", command)
+            self.assertIn("cause=An automatic restart did not fix it.", command)
+            self.assertEqual(command[command.index("--key") + 1], f"nix-heal-{session.session_id}")
+            check = [str(heal.SCRIPTS / "lib/py"), str(Path(heal.__file__).resolve()), "sweep",
+                     "--only", session.session_id, "--check"]
+            self.assertEqual(command[command.index("--clears-when") + 1], shlex.join(check))
+            self.assertEqual(output.getvalue().splitlines(), [f"SENT push for {session.session_id}."])
+            run.reset_mock()
+            run.return_value = subprocess.CompletedProcess([], 1, "SENT: inconsistent", "first line\nsecond line")
+            self.assertEqual(heal.main(args), 1)
+            self.assertEqual(output.getvalue().splitlines()[-1], "Push failed. first line second line")
+            run.reset_mock()
+            old_history: dict[str, object] = dict(history)
+            del old_history["alert_reason"]
+            old_history.update(action="skip", reason="session is not idle")
+            _ = (directory / "state.json").write_text(json.dumps({session.session_id: old_history}))
+            self.assertEqual(heal.main(args), 1)
+            self.assertIn("No failure reason is saved", output.getvalue().splitlines()[-1])
+            heal.save_history(directory, histories)
+            registry.return_value = heal.HealSessionRead(())
+            self.assertEqual(heal.main(args), 1)
+            self.assertIn("No live session matches", output.getvalue().splitlines()[-1])
+            run.assert_not_called()
+
+    def test_escalate_uses_the_saved_pending_session_when_the_process_is_gone(self) -> None:
+        owner, unit, _ = self.showrunner_fixture()
+        session = replace(self.session, session_id=str(unit.current_session), name="saved session")
+        directory = heal.state_directory()
+        directory.mkdir()
+        history = heal.new_history()
+        pending = heal.PendingRestart(kind="launching", login="fixture", name=session.name, cwd=str(session.cwd),
+                                      pid=session.pid, proc_start=session.proc_start, stop_request_sent=True)
+        history["pending"] = pending
+        histories = {session.session_id: history}
+        escalate = heal.heal_command("escalate", session.session_id)
+        with (patch.object(heal, "list_sessions", return_value=heal.HealSessionRead(())),
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture", "")) as run,
+              redirect_stdout(io.StringIO()) as output):
+            heal.alert(directory, heal.HealLimits.read(), session, history, "relaunch refused")
+            heal.save_history(directory, histories)
+            peer = cast(list[str], run.call_args.args[0])
+            self.assertEqual(peer[2:4], ["--to", owner.id])
+            steps = ("Repair the nix setup for this worktree.", "Get Nate's approval before you change /etc/nixos.",
+                     "Retry refuses while a restart is pending.",
+                     "after the repair or if you cannot repair the setup.", escalate,
+                     "Nate gets a push to restart the session.")
+            offsets = [peer[-1].index(step) for step in steps]
+            self.assertEqual(offsets, sorted(offsets))
+            self.assertNotIn(heal.heal_command("retry", session.session_id), peer[-1])
+            run.reset_mock()
+
+            self.assertEqual(heal.main(["retry", "--only", session.session_id]), 1)
+            self.assertEqual(output.getvalue().splitlines(), [
+                f"A restart is pending for {session.session_id}. Run {escalate} to send Nate a push."])
+            self.assertEqual(heal.read_history(directory)[session.session_id], history)
+            run.assert_not_called()
+
+            self.assertEqual(heal.main(["escalate", "--only", session.session_id]), 0)
+            run.assert_called_once()
+            push = cast(list[str], run.call_args.args[0])
+            self.assertEqual(push[2:4], ["--to", "user"])
+            self.assertIn(f"session={session.name}", push)
+            self.assertIn(f"cwd={session.cwd}", push)
+            self.assertEqual(push[push.index("--key") + 1], f"nix-heal-{session.session_id}")
+            self.assertEqual(output.getvalue().splitlines()[-1], f"SENT push for {session.session_id}.")
+            self.assertEqual(heal.read_history(directory)[session.session_id]["pending"], pending)
+
+    def test_recovery_commands_report_when_to_retry_a_busy_state_lock(self) -> None:
+        for command in ("retry", "escalate"):
+            with (self.subTest(command=command), patch.object(fcntl, "flock", side_effect=BlockingIOError),
+                  patch.object(heal, "read_history") as read_history,
+                  redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(heal.main([command, "--only", self.session.session_id]), 1)
+                self.assertEqual(output.getvalue().splitlines(), [
+                    f"The nix-heal state is busy. Run {command} again after the sweep ends."])
+                read_history.assert_not_called()
+
+    def test_recovery_clears_the_held_alert_key_before_a_new_failure(self) -> None:
+        owner, unit, _ = self.showrunner_fixture()
+        session = replace(self.session, session_id=str(unit.current_session))
+        _, ensure, run = self.install_sweep([session])
+        directory = heal.state_directory()
+        ensure.return_value = nix_env.Refused("fixture refusal")
+        held_keys: set[str] = set()
+
+        def keep_for_review(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            del kwargs
+            self.assertEqual(command[2:4], ["--to", owner.id])
+            key = command[command.index("--key") + 1]
+            outcome = "SKIPPED" if key in held_keys else "KEPT"
+            held_keys.add(key)
+            return subprocess.CompletedProcess(command, 0, f"{outcome}: fixture review", "")
+
+        run.side_effect = keep_for_review
+        self.assertEqual(heal.sweep(), 0)
+        self.assertTrue(heal.read_history(directory)[session.session_id]["notified"])
+        with patch.object(heal, "inspect", return_value=heal.Healthy()):
+            self.assertEqual(heal.sweep(), 0)
+        healthy = heal.read_history(directory)[session.session_id]
+        self.assertFalse(healthy["notified"])
+        self.assertEqual(healthy["showrunner_alert_key"], "")
+        self.assertEqual(heal.sweep(), 0)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(len(held_keys), 2)
+        self.assertTrue(heal.read_history(directory)[session.session_id]["notified"])
+
+    def test_acknowledged_user_push_key_does_not_skip_the_showrunner_alert(self) -> None:
+        owner, unit, _ = self.showrunner_fixture()
+        session = replace(self.session, session_id=str(unit.current_session))
+        _, ensure, run = self.install_sweep([session])
+        ensure.return_value = nix_env.Refused("fixture refusal")
+        acknowledged_key = f"nix-heal-{session.session_id}"
+
+        def send(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            del kwargs
+            key = command[command.index("--key") + 1]
+            outcome = "SKIPPED: acknowledged" if key == acknowledged_key else "SENT: fixture"
+            return subprocess.CompletedProcess(command, 0, outcome, "")
+
+        run.side_effect = send
+        self.assertEqual(heal.sweep(), 0)
+        run.assert_called_once()
+        command = cast(list[str], run.call_args.args[0])
+        self.assertEqual(command[2:4], ["--to", owner.id])
+        key = command[command.index("--key") + 1]
+        self.assertTrue(key.startswith(f"nix-heal-showrunner-{session.session_id}-"))
+        self.assertNotEqual(key, acknowledged_key)
+        self.assertTrue(heal.read_history(heal.state_directory())[session.session_id]["notified"])
+
+    def test_unconfirmed_showrunner_alert_reuses_the_saved_episode_key(self) -> None:
+        owner, unit, _ = self.showrunner_fixture()
+        session = replace(self.session, session_id=str(unit.current_session))
+        _, ensure, run = self.install_sweep([session])
+        ensure.return_value = nix_env.Refused("fixture refusal")
+        directory = heal.state_directory()
+        directory.mkdir()
+        other = heal.new_history()
+        heal.save_history(directory, {self.session.session_id: other})
+        keys: list[str] = []
+
+        def send(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            del kwargs
+            key = command[command.index("--key") + 1]
+            if command[3] == "user":
+                self.assertEqual(key, f"nix-heal-{session.session_id}")
+                return subprocess.CompletedProcess(command, 1, "FAILED: fixture", "")
+            self.assertEqual(command[2:4], ["--to", owner.id])
+            keys.append(key)
+            if len(keys) == 1:
+                raise subprocess.TimeoutExpired(command, 1)
+            return subprocess.CompletedProcess(command, 0, "SKIPPED: already held for review", "")
+
+        run.side_effect = send
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(heal.sweep(), 0)
+        self.assertEqual(run.call_count, 2)
+        saved = heal.read_history(directory)
+        self.assertFalse(saved[session.session_id]["notified"])
+        self.assertEqual(saved[session.session_id]["showrunner_alert_key"], keys[0])
+        self.assertEqual(saved[self.session.session_id], other)
+        self.assertEqual(heal.sweep(), 0)
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(keys[0], keys[1])
+        self.assertTrue(heal.read_history(directory)[session.session_id]["notified"])
+
+    def test_retry_lets_the_next_sweep_restart_a_repaired_session(self) -> None:
+        _, ensure, run = self.install_sweep([self.session])
+        directory = heal.state_directory()
+        directory.mkdir()
+        history = heal.new_history()
+        history.update(restart_at=time.time(), restart_pid=self.session.pid,
+                       restart_proc_start=self.session.proc_start, notified=True,
+                       showrunner_alert_key=f"nix-heal-showrunner-{self.session.session_id}-before-retry")
+        heal.save_history(directory, {self.session.session_id: history})
+        self.assertEqual(heal.sweep(), 0)
+        ensure.assert_not_called()
+        run.assert_not_called()
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(heal.main(["retry", "--only", self.session.session_id]), 0)
+        cleared = heal.read_history(directory)[self.session.session_id]
+        self.assertEqual((cleared["restart_at"], cleared["restart_pid"], cleared["restart_proc_start"]), (0.0, 0, ""))
+        self.assertFalse(cleared["notified"])
+        self.assertEqual(cleared["showrunner_alert_key"], "")
+        self.assertEqual(heal.sweep(), 0)
+        self.assertEqual(ensure.call_args_list, [call(self.work), call(self.work)])
+        commands = [cast(list[str], item.args[0])[2] for item in run.call_args_list]
+        self.assertEqual(commands, ["stop", "resume"])
+        self.assertTrue(heal.read_history(directory)[self.session.session_id]["healthy_since_restart"])
+
     def test_retained_alert_marks_notified_without_another_send(self) -> None:
         heal.state_directory().mkdir()
         for code, output in ((1, "checking delivery\nQUEUED: offline"), (0, "KEPT: until silence ends"),
@@ -527,6 +839,30 @@ class HealTests(NixFixture):
         resume.assert_called_once_with(self.session.session_id, why="nix shell heal")
         self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "none")
 
+    def test_reboot_after_stop_preserves_the_next_sweep_relaunch(self) -> None:
+        _held, _ensure, run = self.install_sweep([self.session])
+        command = cast(Callable[..., subprocess.CompletedProcess[str]], run.side_effect)
+        lock = herdr.reboot_lock_path()
+        lock.parent.mkdir(parents=True)
+        with ExitStack() as reboot:
+            def stop_before_reboot(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                self.assertEqual(arguments[2], "stop")
+                result = command(arguments, **options)
+                external = reboot.enter_context(lock.open("a"))
+                fcntl.flock(external, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return result
+
+            run.side_effect = stop_before_reboot
+            self.assertEqual(heal.sweep(), 0)
+        history = heal.read_history(heal.state_directory())[self.session.session_id]
+        self.assertEqual(history["pending"]["kind"], "stopping")
+        self.assertEqual(history["action"], "pending")
+        self.assertEqual(history["reason"], "A reboot is running; wait for it to end.")
+        run.side_effect = command
+        self.assertEqual(heal.sweep(), 0)
+        self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "none")
+        self.assertEqual([cast(list[str], item.args[0])[2] for item in run.call_args_list], ["stop", "resume"])
+
     def test_relaunch_failure_keeps_pending_and_pushes_once_without_a_duplicate_launch(self) -> None:
         for failure in ("timeout", "nonzero", "oserror"):
             with self.subTest(failure=failure), patch.object(heal, "state_directory", return_value=self.root / failure):
@@ -572,7 +908,12 @@ class HealTests(NixFixture):
 
         run.side_effect = success_without_registry
         self.assertEqual(heal.sweep(), 0)
-        self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "launching")
+        directory = heal.state_directory()
+        histories = heal.read_history(directory)
+        history = histories[self.session.session_id]
+        self.assertEqual(history["pending"]["kind"], "launching")
+        history.update(notified=True, showrunner_alert_key=f"nix-heal-showrunner-{self.session.session_id}-held")
+        heal.save_history(directory, histories)
         replacement = replace(self.session, pid=913, proc_start="confirmed-replacement")
         path = self.root / "unreadable.json"
         with (patch.object(heal, "list_sessions", return_value=heal.HealSessionRead((), (path,))) as registry,
@@ -586,7 +927,10 @@ class HealTests(NixFixture):
             self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "launching")
             registry.return_value = heal.HealSessionRead((replacement,))
             self.assertEqual(heal.sweep(), 0)
-        self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "none")
+        recovered = heal.read_history(directory)[self.session.session_id]
+        self.assertEqual(recovered["pending"]["kind"], "none")
+        self.assertFalse(recovered["notified"])
+        self.assertEqual(recovered["showrunner_alert_key"], "")
         self.assertEqual(run.call_count, 2)
         self.assertEqual(ensure.call_count, 2)
         self.assertEqual(self.records()[-1]["action"], "restart")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.production import checkpoint_gate
 
 from scripts.agents import remote
@@ -80,7 +81,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
             self.assertEqual(steps[1].command[-4:], ["example", "aws-routing-proof", "--name", "demo"])
             self.assertEqual(steps[1].folder, checkout)
 
-    def test_package_commands_and_retries_use_the_package_folder(self) -> None:
+    def test_package_commands_use_the_workspace_and_retries_use_the_package_folder(self) -> None:
         for workspace in (False, True):
             for retry in (False, True):
                 with self.subTest(workspace=workspace, retry=retry), tempfile.TemporaryDirectory(dir=os.environ["ZONE_STATE"]) as temporary:
@@ -98,8 +99,9 @@ class CheckpointTestFolderTests(unittest.TestCase):
                     _ = verify.write_text(
                         f"#!{sys.executable}\nfrom pathlib import Path\nimport sys\n"
                         + "print(f'{sys.argv[1]}={Path.cwd()}')\n"
-                        + ("if sys.argv[1] == 'test' and not Path('retried').exists():\n"
-                           + "    Path('retried').touch()\n    sys.exit(1)\n" if retry else ""))
+                        + ("marker = Path(__file__).with_name('retried')\n"
+                           + "if sys.argv[1] == 'test' and not marker.exists():\n"
+                           + "    marker.touch()\n    sys.exit(1)\n" if retry else ""))
                     verify.chmod(0o755)
                     production = production_doc.ProductionDocument(checkout / "production.md", "fixture", "merge", checkout,
                                                           checkout / "production.log", ZoneInfo("UTC"))
@@ -107,9 +109,14 @@ class CheckpointTestFolderTests(unittest.TestCase):
                     merge_tests = ((sys.executable, "-c", "from pathlib import Path; print(f'merge={Path.cwd()}')"),)
                     with mock.patch.dict(os.environ, {"MERGE_CHECKPOINT_VERIFY": str(verify)}):
                         _ = checkpoint_gate.run_checkpoint_test_steps(
-                            production, (relative,), merge_tests, frozenset({"proof_crate"}), frozenset(), log)
+                            production, (relative,), merge_tests, frozenset({"proof_crate"}), frozenset(), log,
+                            merge_head="fixture-merge")
                     output = log.read_text()
-                    self.assertEqual(output.count(f"test={package}\n"), 2 if retry else 1)
+                    initial_folder = checkout.resolve() if workspace else package.resolve()
+                    expected = [f"test={initial_folder}"]
+                    if retry:
+                        expected.append(f"test={package.resolve()}")
+                    self.assertEqual([line for line in output.splitlines() if line.startswith("test=")], expected)
                     self.assertIn("package_proof_crate_EXIT=" + ("1" if retry else "0"), output)
                     if retry:
                         self.assertIn("package_proof_crate_RERUN_EXIT=0", output)
@@ -124,7 +131,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         checkout = Path(__file__).resolve().parents[2]
         records = self.root / "worktree-records"
         config = self.root / "staff.conf"
-        _ = config.write_text((checkout / "config/staff.conf").read_text())
+        _ = copy_config_file_fixture(checkout / "config/staff.conf", config)
         self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config)})
         _ = self.git("remote", "set-head", "origin", "production")
         checkpoint = self.checkpoint()
@@ -267,6 +274,90 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                     self.assertIn("docs/as-built/alpha.md", tree)
                     self.assertNotIn("docs/plans/alpha.md", tree)
                     self.assertRegex(self.git("log", "-1", "--format=%s"), r"^Merge alpha phase \S+ as-built \(")
+
+    def duplicate_shrink_on_unit_branch(self) -> str:
+        plan = "docs/plans/alpha.md"
+        subject = "shrink(alpha): phase 43"
+        initial = "Phase 43 is open.\n\n# Schedule\n\nReview the plan.\n\n# Phase 44\n"
+        base = self.checkpoint(plan, initial, subject="Add the plan", push=False)
+        _ = self.git("merge", "--ff-only", base)
+        _ = self.git("merge", "--ff-only", base, cwd=self.promote)
+        shortened = initial.replace("Phase 43 is open.", "Phase 43 is complete.")
+        original = self.checkpoint(plan, shortened, subject=subject, push=False)
+        _ = self.git("merge", "--no-ff", "-m", "Merge the first shrink", original, cwd=self.promote)
+        _ = self.git("push", "origin", "main", "production")
+        _ = self.push_main_change("src/alpha.txt", "main changes this file\n")
+        _ = self.git("reset", "--hard", base, cwd=self.unit)
+        duplicate = self.checkpoint(plan, shortened, subject=subject + " again", push=False)
+        self.assertEqual(self.git("merge-base", original, duplicate), base)
+        self.assertEqual(self.git("diff", original, duplicate), "")
+        return duplicate
+
+    def test_shrink_scope_accepts_an_empty_diff_already_on_main(self) -> None:
+        shrink = self.duplicate_shrink_on_unit_branch()
+        _ = self.git("fetch", "origin", "main")
+        _ = self.git("merge", "--no-ff", "-m", "Bring main into production", "origin/main")
+        _ = self.git("push", "origin", "production")
+        _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+        before = self.git("rev-parse", "HEAD^{tree}")
+        main = self.git("rev-parse", "main", cwd=self.origin)
+        _ = self.git("update-ref", "refs/heads/main", f"{shrink}^1", cwd=self.origin)
+        held = self.run_checkpoint(shrink, "--shrink", phase="43", review=False)
+        self.assertEqual(held.process.returncode, 1, held.process.stdout + held.process.stderr)
+        self.assertIn("scope: held — shrink paths must be", held.process.stdout)
+        _ = self.git("update-ref", "refs/heads/main", main, cwd=self.origin)
+
+        result = self.run_checkpoint(shrink, "--shrink", phase="43", review=False)
+
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("scope: ok — 0 changed paths", result.process.stdout)
+        self.assertEqual(self.git("rev-parse", "origin/production^{tree}"), before)
+        self.assertEqual(self.git("rev-parse", "origin/production^2"), shrink)
+
+    def test_shrink_ancestry_accepts_a_duplicate_shrink_on_another_branch(self) -> None:
+        duplicate = self.duplicate_shrink_on_unit_branch()
+        plan = "docs/plans/alpha.md"
+        content = (self.unit / plan).read_text() + "\nPhase 44 is complete.\n"
+        closing = self.checkpoint(plan, content, subject="shrink(alpha): phase 44")
+        self.assertEqual(self.git("rev-parse", f"{closing}^"), duplicate)
+        result = self.run_checkpoint(closing, "--shrink", phase="44", review=False)
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("ancestry: ok", result.process.stdout)
+
+    def test_shrink_ancestry_accepts_a_duplicate_with_a_production_only_parent(self) -> None:
+        duplicate = self.duplicate_shrink_on_unit_branch()
+        _ = self.git("reset", "--hard", f"{duplicate}^", cwd=self.unit)
+        parent = self.checkpoint("src/beta.txt", "production work\n", subject="Update production", push=False)
+        _ = self.git("merge", "--ff-only", parent)
+        _ = self.git("push", "origin", "production")
+        _ = self.git("cherry-pick", duplicate, cwd=self.unit)
+        plan = "docs/plans/alpha.md"
+        content = (self.unit / plan).read_text() + "\nPhase 44 is complete.\n"
+        closing = self.checkpoint(plan, content, subject="shrink(alpha): phase 44")
+        self.assertEqual(self.git("rev-list", "main..production", cwd=self.origin), parent)
+
+        result = self.run_checkpoint(closing, "--shrink", phase="44", review=False)
+
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("ancestry: ok", result.process.stdout)
+
+    def test_shrink_ancestry_holds_on_content_after_a_duplicate_shrink(self) -> None:
+        _ = self.duplicate_shrink_on_unit_branch()
+        subject = "Add pending work"
+        pending = self.checkpoint("src/beta.txt", "pending work\n", subject=subject, push=False)
+        closing = self.checkpoint("docs/plans/alpha.md", "phase 44 complete\n", subject="shrink(alpha): phase 44")
+        result = self.run_checkpoint(closing, "--shrink", phase="44", review=False)
+        self.assert_stopped_before_merge(result, "held", f"ancestry: held — unmerged commit {pending[:12]}: {subject}")
+        self.assertIn(f"wait for {pending[:12]} to merge, then resend the shrink", result.process.stdout)
+
+    def test_shrink_ancestry_holds_on_conflict_after_a_duplicate_shrink(self) -> None:
+        _ = self.duplicate_shrink_on_unit_branch()
+        subject = "Change a line that main changed"
+        pending = self.checkpoint("src/alpha.txt", "branch changes this file\n", subject=subject, push=False)
+        closing = self.checkpoint("docs/plans/alpha.md", "phase 44 complete\n", subject="shrink(alpha): phase 44")
+        result = self.run_checkpoint(closing, "--shrink", phase="44", review=False)
+        self.assert_stopped_before_merge(result, "held", f"ancestry: held — unmerged commit {pending[:12]}: {subject}")
+        self.assertIn(f"wait for {pending[:12]} to merge, then resend the shrink", result.process.stdout)
 
     def test_checkpoint_merges_into_its_staff_parent_and_ignores_unavailable_worktrees(self) -> None:
         checkpoint = self.checkpoint()
@@ -991,6 +1082,133 @@ raise SystemExit(1)
         all_args = [arg for event in (self.events("python3") + self.events("basedpyright")) for arg in event]
         self.assertFalse(any(".venv" in arg for arg in all_args))
         self.assertIn("test: ok", result.process.stdout)
+
+    def test_red_merge_gate_uses_the_unpushed_tip_and_checks_the_base_after_rollback(self) -> None:
+        self.production_doc(merge_tests_line="- **Merge tests:** `env HERDR_BIN=/nonexistent/herdr "
+                            + "python3 scripts/production/gate.py --checkout . --tests-only`")
+        self.env["BUILDLOG_UNIT"] = "fixture-merge-unit"
+        original_tip = self.git("rev-parse", "HEAD")
+        main = self.push_main_change("src/main.txt", "new on main\n")
+        checkpoint = self.checkpoint()
+        tested: list[str] = []
+
+        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(options["cwd"], self.checkout)
+            self.assertNotIn("env", options)
+            self.assertEqual(os.environ["BUILDLOG_UNIT"], "fixture-merge-unit")
+            self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), original_tip)
+            self.assertEqual(command[:2], ["env", "HERDR_BIN=/nonexistent/herdr"])
+            self.assertEqual(command[4:8], ["run", "--repo", str(self.checkout), "--commit"])
+            tip = self.git("rev-parse", "HEAD")
+            self.assertEqual(command[8:15], [tip, "--", "python3", "scripts/production/gate.py",
+                                            "--checkout", "{tree}", "--tests-only"])
+            _ = self.git("merge-base", "--is-ancestor", main, tip)
+            tested.append(tip)
+            if len(tested) < 3:
+                _ = self.git("merge-base", "--is-ancestor", checkpoint, tip)
+                self.assertEqual(command[15:], [])
+                return subprocess.CompletedProcess(command, 1, "--- lib/test_fixture.py exit=1 ---\n", "")
+            self.assertEqual(command[15:], ["--module", "lib/test_fixture.py"])
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(checkpoint_gate, "subprocess", mock.Mock(run=run)):
+            result = self.run_checkpoint(checkpoint).process
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(len(tested), 3)
+        self.assertEqual(tested[0], tested[1])
+        self.assertNotEqual(tested[0], tested[2])
+        self.assertEqual(self.git("rev-parse", "HEAD"), original_tip)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), original_tip)
+        self.assertIn("red: failed", result.stdout)
+
+    def test_git_push_uses_the_tested_tip_when_the_branch_moves_during_publication(self) -> None:
+        self.production_doc(merge_tests_line="- **Merge tests:** `python3 scripts/production/gate.py "
+                            + "--checkout . --tests-only`")
+        checkpoint = self.checkpoint()
+        tested: list[str] = []
+        original_git = merge_checkpoint.git
+
+        def run(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            tested.append(command[command.index("--commit") + 1])
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        def git(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
+            if checkout == self.checkout and args[:2] == ("push", "origin"):
+                _ = self.git("commit", "--allow-empty", "-m", "Operator commit before push")
+            return original_git(checkout, *args)
+
+        with (mock.patch.object(checkpoint_gate, "subprocess", mock.Mock(run=run)),
+              mock.patch.object(merge_checkpoint, "git", side_effect=git)):
+            result = self.run_checkpoint(checkpoint).process
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        tip, = tested
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tip)
+        self.assertEqual(self.git("rev-parse", "HEAD^"), tip)
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "Operator commit before push")
+
+    def test_base_check_keeps_an_operator_commit_when_the_gate_finishes(self) -> None:
+        self.production_doc(merge_tests_line="- **Merge tests:** `python3 scripts/production/gate.py "
+                            + "--checkout . --tests-only`")
+        main = self.push_main_change("src/main.txt", "new on main\n")
+        checkpoint = self.checkpoint()
+        tested: list[str] = []
+
+        def run(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            tip = command[command.index("--commit") + 1]
+            tested.append(tip)
+            if "--module" in command:
+                _ = self.git("merge-base", "--is-ancestor", main, tip)
+                _ = self.git("commit", "--allow-empty", "-m", "Operator commit during base check")
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.CompletedProcess(command, 1, "--- lib/test_fixture.py exit=1 ---\n", "")
+
+        with mock.patch.object(checkpoint_gate, "subprocess", mock.Mock(run=run)):
+            result = self.run_checkpoint(checkpoint)
+        self.assertEqual(result.process.returncode, 77, result.process.stdout + result.process.stderr)
+        self.assertEqual(len(tested), 3)
+        self.assertEqual(self.git("rev-parse", "HEAD^"), tested[-1])
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "Operator commit during base check")
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), result.before)
+
+    def assert_moved_merge_tip_cancels_publication(self, *, move_during_retest: bool, retest_status: int = 0) -> None:
+        self.production_doc(merge_tests_line="- **Merge tests:** `python3 scripts/production/gate.py "
+                            + "--checkout . --tests-only`")
+        checkpoint = self.checkpoint()
+        original_main = self.git("rev-parse", "main", cwd=self.origin)
+        new_main = self.push_main_change("main-retest.txt", "new main\n")
+        _ = self.git("update-ref", "refs/heads/main", original_main, cwd=self.origin)
+        tested: list[str] = []
+
+        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(options["cwd"], self.checkout)
+            tip = self.git("rev-parse", "HEAD")
+            self.assertIn(tip, command)
+            tested.append(tip)
+            if move_during_retest and len(tested) == 1:
+                _ = self.git("update-ref", "refs/heads/main", new_main, cwd=self.origin)
+            else:
+                _ = self.git("commit", "--allow-empty", "-m", "Operator commit during tests")
+                return subprocess.CompletedProcess(command, retest_status, "", "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(checkpoint_gate, "subprocess", mock.Mock(run=run)):
+            result = self.run_checkpoint(checkpoint)
+        self.assertEqual(result.process.returncode, 77, result.process.stdout + result.process.stderr)
+        self.assertIn("publication cancelled because the tree changed", result.process.stdout)
+        self.assertEqual(len(tested), 2 if move_during_retest else 1)
+        self.assertEqual(self.git("rev-parse", "HEAD^"), tested[-1])
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "Operator commit during tests")
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), result.before)
+
+    def test_copied_gate_cancels_publication_when_the_merge_tip_moves(self) -> None:
+        self.assert_moved_merge_tip_cancels_publication(move_during_retest=False)
+
+    def test_copied_gate_cancels_publication_when_the_retested_tip_moves(self) -> None:
+        self.assert_moved_merge_tip_cancels_publication(move_during_retest=True)
+
+    def test_blocked_retest_keeps_an_operator_commit(self) -> None:
+        self.assert_moved_merge_tip_cancels_publication(move_during_retest=True,
+                                                       retest_status=os.EX_TEMPFAIL)
     def test_merge_tests_that_are_not_commands_are_refused_by_name_before_the_merge(self) -> None:
         """cargo-liner wrote packages and a crate directory where the line wants commands."""
         (self.checkout / "crates/tui_pane").mkdir(parents=True)

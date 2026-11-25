@@ -32,6 +32,8 @@ from typing import ClassVar, cast, override
 from zoneinfo import ZoneInfo
 
 from scripts.agents import detached_runs
+from scripts.build_hold.build_hold_test_support import write_holder
+from scripts.buildlog.test_holds import write_mac_block
 from scripts.lib import unit_runs
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.process_group import send_process_group
@@ -55,6 +57,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production.test_showrunners import stalled_session_reader
 from scripts.agents import pane_record
 from scripts.production import session_staff, unit_lookup
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
 
 
 SCRIPT = Path(__file__).with_name("stall_watch.py")
@@ -265,6 +268,7 @@ class StallWatchTests(unittest.TestCase):
         _ = defaults.write_text(WATCH_DEFAULTS)
         _ = self.enterContext(mock.patch.object(stall_watch, "WATCH_DEFAULTS", defaults))
         configuration = {
+            "build_targets": "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n",
             "production": "# range: 0..\nPROMPT_ALERT_SECONDS=60\n",
             "rca": "# range: 0.001..\nsend_seconds=300\n",
             "staff": ("# range: 0.001..\nOPERATION_LOCK_SECONDS=30\n# range: 0.001..\nREMOTE_SECONDS=20\n"
@@ -325,6 +329,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             "NOTIFIER_SESSIONS_DIR": str(self.sessions),
             "SHOWRUNNERS_SESSIONS": str(self.sessions_script),
             "STALL_WATCH_STATE_DIR": str(self.state),
+            "BUILD_HOLD_DIR": str(self.root / "build-holders"),
             "STALL_WATCH_CONFIG": str(self.root / "stall_watch.conf"),
             "STALL_TEST_WATCH_DEFAULTS": str(defaults),
             "STALL_WATCH_SESSIONS": str(self.sessions_script),
@@ -1453,6 +1458,7 @@ runpy.run_path(str(script), run_name='__main__')
               mock.patch("scripts.production.stall_watch.STATE_DIR", self.state),
               mock.patch.object(accounts, "check_move_target", return_value=destination),
               mock.patch.object(stop_resume, "_record_launches"),
+              mock.patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
               mock.patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("204f532d-a97a-59e7-a6a7-caf86af3f5ee")),
               mock.patch.object(stop_resume, "resume", side_effect=resumed),
               mock.patch.object(stall_watch, "read_place", side_effect=resume_during_inspection)):
@@ -1702,8 +1708,11 @@ runpy.run_path(str(script), run_name='__main__')
         # also when the screen shows a description or the outside warning.
         for pane in ("", BASH_PROMPT, OUTSIDE_PROMPT):
             self.assertEqual(stall_watch.prompt_request(pane, call), "run rm -f b1e4yc8b9.txt")
-        edit = stall_watch.PendingTool("toolu_1", "Edit", {"file_path": "/home/natepiano/rust/x/src/panes.py"}, START)
-        self.assertEqual(stall_watch.prompt_request("", edit), "edit panes.py")
+        for path, request in (("/home/natepiano/rust/x/src/panes.py", "edit panes.py"),
+                              ("/home/natepiano/rust/x/src/line\nbreak.py", "edit line break.py")):
+            with self.subTest(path=path):
+                edit = stall_watch.PendingTool("toolu_1", "Edit", {"file_path": path}, START)
+                self.assertEqual(stall_watch.prompt_request("", edit), request)
         # A tool the transcript cannot word falls back to the prompt on screen.
         other = stall_watch.PendingTool("toolu_1", "WebFetch", {"url": "https://example.com"}, START)
         self.assertEqual(stall_watch.prompt_request(EDIT_PROMPT, other), "edit panes.py")
@@ -1969,10 +1978,18 @@ runpy.run_path(str(script), run_name='__main__')
         self.assertEqual(stall_watch.prompt_request(BASH_PROMPT, pending), "run cargo build -p cargo-handler")
         long = stall_watch.PendingTool("x", "Bash", {"command": "echo " + "y" * 120}, START)
         self.assertEqual(stall_watch.prompt_request("", long), "run echo " + "y" * 84 + "…")
-        rendered = push_texts.render(stall_watch.PROMPT_TEXT_ID, unit="handler", machine="natedev",
-                                     since="09:01 AST", request="run cargo build -p cargo-handler")
-        self.assertEqual(rendered.body, "handler asks to run cargo build -p cargo-handler. It has waited since 09:01 AST."
-                         + "\n\nYes: it does that and goes on.\n\nNo: it does not, and asks you what to do instead.")
+        for unit, title in (("handler", "handler is stuck at a permission prompt"),
+                            ("cargo-handler", "cargo-handler stuck at a permission prompt"),
+                            ("cargo-handler-worker", "cargo-handler-… stuck at a permission prompt")):
+            with self.subTest(unit=unit):
+                rendered = push_texts.render(stall_watch.PROMPT_TEXT_ID, unit=unit, machine="natedev",
+                                             since="09:01 AST", request="run cargo build -p cargo-handler")
+                self.assertEqual(rendered.title, title)
+                self.assertLessEqual(len(rendered.title), 44)
+                self.assertEqual(rendered.body, "It asks to run cargo build -p cargo-handler.")
+                self.assertEqual(rendered.message, f"Session: {unit}\n"
+                                 + f"Action: On natedev, open the {unit} herdr tab and answer its prompt\n"
+                                 + "It asks to run cargo build -p cargo-handler.")
 
     def test_blocked_turn_end_waits_for_a_new_unblocked_status(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
@@ -2497,10 +2514,33 @@ runpy.run_path(str(script), run_name='__main__')
                     path.unlink()
 
     def test_holding_statuses_log_each_pass_without_any_delivery(self) -> None:
-        for status in ("— holding: no work until the showrunner restarts it on your word",
-                       "holding: waiting on your confirmed values"):
+        _ = (self.root / "build_targets.conf").write_text(
+            "targets=natedev,mac\npinned_targets=hana-gpu\nkind.natedev=local\nplatform.natedev=linux\n"
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
+        (self.root / "mac_test.conf").touch()
+        mac_state = self.root / "mac-state"
+        self.environment["MAC_TEST_STATE_DIR"] = str(mac_state)
+        cases = (
+            ("— holding: no work until the showrunner restarts it on your word", "", True),
+            ("holding: waiting on your confirmed values", "", True),
+            ("— holding: waiting for the fps hold release", "natedev", True),
+            ("holding: the build hold ended; waiting for my tests", "natedev", False),
+            ("holding: waiting for the build hold log", "natedev", False),
+            ("— holding: waiting on the natedev hold release", "mac", False),
+            ("— holding: waiting on the hana-gpu hold release", "mac", False),
+        )
+        for status, held_target, holding in cases:
             with self.subTest(status=status):
-                self.send_log.unlink(missing_ok=True)
+                holders = Path(self.environment["BUILD_HOLD_DIR"])
+                holder = holders / "fps"
+                for path in (holder, mac_state / "block.json", self.send_log):
+                    path.unlink(missing_ok=True)
+                if held_target == "natedev":
+                    holders.mkdir(exist_ok=True)
+                    _ = write_holder(holders, "fps", "2026-10-06T18:59:00+00:00", "Build tests")
+                if held_target == "mac":
+                    with mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": str(mac_state)}):
+                        write_mac_block(datetime.fromisoformat("2026-10-06T18:59:00+00:00"))
                 self.state.mkdir(exist_ok=True)
                 for path in self.state.glob("*.json"):
                     path.unlink()
@@ -2508,12 +2548,20 @@ runpy.run_path(str(script), run_name='__main__')
                 for at in (START, START + 300, START + 600):
                     result = self.tick(at)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    if at >= START + 300:
+                    if holding and at >= START + 300:
                         self.assertIn("inspected showrunner/unit-one: holding", result.stdout)
                         self.assertEqual(self.sent(), [])
                         path = self.watches["unit-one"].stretch_path
                         self.assertFalse(stall_watch.saved_stretch(path)["tell_sent"])
                         self.assertFalse(stall_watch.saved_stretch(path)["bump_sent"])
+                if held_target == "natedev" and holding:
+                    holder.unlink()
+                    result = self.tick(START + 601)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                if held_target:
+                    sent = self.sent()
+                    self.assertEqual(len(sent), 2)
+                    self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
 
     def test_own_work_order_and_own_names_do_not_hold_the_unit(self) -> None:
         self.configure({"showrunner": ["unit-one"], "sdlc": ["style"]})

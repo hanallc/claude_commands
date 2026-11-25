@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.agents import remote
+from scripts.lib import models_registry
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 
 import hashlib
@@ -29,7 +30,7 @@ from scripts.notify import pushover
 from scripts.notify import review
 from scripts.notify import reply_asks
 from scripts.notify import push_texts
-from scripts.notify import push_reference
+from scripts.notify import push_reference, text_asks
 from scripts.notify.push_test_support import registered_send
 from scripts.notify.user_action import ActionRequired, NoActionRequired, SessionLine, first_line
 
@@ -156,7 +157,7 @@ class LocalReviewTests(unittest.TestCase):
         guide = self.root / "guide"
         guide.mkdir()
         _ = self.enterContext(mock.patch.object(review, "GUIDE", guide))
-        _ = self.enterContext(mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", accounts.account_dir("claude2"))))
+        _ = self.enterContext(mock.patch.object(accounts, "group_account", return_value=accounts.NamedAccount("claude2", accounts.account_dir("claude2"))))
         registry = write_registry(self.root / "models.conf")
 
         def process(argv: list[str], *, env: dict[str, str], capture_output: bool, text: bool,
@@ -1067,6 +1068,111 @@ class LocalReviewTests(unittest.TestCase):
         self.assertFalse(pushover.LOG_FILE.exists())
         self.assertFalse((self.root / "state/held").exists())
 
+    def test_texts_ask_shows_every_example_and_saves_the_ask(self) -> None:
+        entry = push_texts.PushText("test", "script", "note", "Finished", push_texts.NoActionNeeded(),
+            "Checked {version}.", (push_texts.PushExample("first", {"version": "1"}),
+                                   push_texts.PushExample("second", {"version": "2"})), purpose="Test.")
+        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
+              mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2", "CLAUDE_CODE_SESSION_ID": "session-1"}),
+              mock.patch.object(review, "texts", side_effect=AssertionError("review ran")),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.main(["texts", "--ask", "--id", entry.id]), 0)
+        self.assertIn("Checked 1.", output.getvalue())
+        self.assertIn("Checked 2.", output.getvalue())
+        path = self.root / "state/text-asks/w1:p2.json"
+        ask = cast(dict[str, str], json.loads(path.read_text()))
+        self.assertEqual((ask["text_id"], ask["session"], ask["fingerprint"]),
+                         (entry.id, "session-1", push_texts.fingerprint(entry)))
+        self.assertIsNotNone(datetime.fromisoformat(ask["time"]).tzinfo)
+
+    def test_texts_ask_and_approval_review_show_text_as_posted(self) -> None:
+        one_line = push_texts.PushText("test", "script", "note", "codex1 has {left} left", push_texts.NoActionNeeded(), "",
+            (push_texts.PushExample("typical", {"left": "1%"}),), purpose="Test.", one_line=True)
+        no_header = push_texts.PushText("test", "script", "note", "Nightly check failed", push_texts.NoActionNeeded(),
+            "Fix assigned to: {unit}.", (push_texts.PushExample("typical", {"unit": "staff"}),),
+            purpose="Test.", header=False)
+        for entry, ask_title, title, body in (
+                (one_line, "none (the phone shows the app name)", "", "codex1 has 1% left"),
+                (no_header, "Nightly check failed", "Nightly check failed", "Fix assigned to: staff.")):
+            with self.subTest(title=ask_title), mock.patch.object(push_texts, "catalog", return_value=(entry,)):
+                with (mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2", "CLAUDE_CODE_SESSION_ID": "session-1"}),
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(review.main(["texts", "--ask", "--id", entry.id]), 0)
+                self.assertEqual(output.getvalue(), f"test/typical\nTitle: {ask_title}\n{body}\n")
+                with (mock.patch.object(review, "_review", return_value=review.Unreviewed("fixture")) as judge,
+                      redirect_stdout(io.StringIO()) as output):
+                    _ = review.texts(["test"], approve=False)
+                judge.assert_called_once()
+                draft = cast(review.Draft, judge.call_args.args[0])
+                self.assertEqual((draft.title, draft.body), (title, body))
+                title_line = f"{title}\n" if title else ""
+                self.assertEqual(output.getvalue(), f"test/typical unreviewed: fixture; failed rules: none\n{title_line}{body}\n")
+
+    def test_texts_ask_clears_the_previous_request_if_the_save_fails(self) -> None:
+        entry = push_texts.PushText("test", "script", "note", "Finished", push_texts.NoActionNeeded(),
+            "The check passed.", (push_texts.PushExample("example", {}),), purpose="Test.")
+        pane, session = "w1:p2", "session-1"
+        text_asks.open_ask("previous", "previous-digest", session, pane, datetime.now(timezone.utc))
+        path = self.root / "state/text-asks/w1:p2.json"
+        self.assertTrue(path.exists())
+        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
+              mock.patch.dict(os.environ, {"HERDR_PANE_ID": pane, "CLAUDE_CODE_SESSION_ID": session}),
+              mock.patch.object(text_asks, "write_text_atomic", side_effect=OSError("save failed")),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error):
+            self.assertEqual(review.main(["texts", "--ask", "--id", entry.id]), 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("save failed", error.getvalue())
+        self.assertFalse(path.exists())
+
+    def test_texts_ask_requires_a_herdr_pane_and_a_session_id(self) -> None:
+        for pane, session in (("", "session-1"), ("w1:p2", "")):
+            with (self.subTest(pane=pane, session=session),
+                  mock.patch.dict(os.environ, {"HERDR_PANE_ID": pane, "CLAUDE_CODE_SESSION_ID": session}),
+                  redirect_stderr(io.StringIO()) as output):
+                self.assertEqual(review.main(["texts", "--ask", "--id", "test"]), 2)
+                self.assertIn("requires a herdr pane and a Claude session ID", output.getvalue())
+
+    def test_texts_approves_a_matching_user_prompt_and_reviews_a_changed_text(self) -> None:
+        entry = push_texts.PushText("test", "script", "note", "Finished", push_texts.NoActionNeeded(),
+            "The check passed.", (push_texts.PushExample("first", {}), push_texts.PushExample("second", {})),
+            purpose="Test.")
+        pane, session, words = "w1:p2", "session-1", "yes i approve it"
+        now = datetime(2026, 11, 21, 12, tzinfo=timezone.utc)
+        digest = push_texts.fingerprint(entry)
+        config = self.root / "ask-config"
+        config.mkdir()
+        _ = (config / "notify.conf").write_text("# range: 1..60\nTEXT_ASK_MINUTES=7\n", encoding="utf-8")
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config),
+                                         "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "pause")}),
+              mock.patch.object(text_asks, "read_pane",
+                                return_value={"focused": True, "agent_session": {"value": session}})):
+            text_asks.open_ask(entry.id, digest, session, pane, now - timedelta(seconds=1))
+            self.assertIsInstance(text_asks.answer(session, pane, words, True, now), text_asks.Approved)
+
+        approvals = self.root / "reviewed.json"
+        changed = replace(entry, title="All checks finished")
+        changed_draft = review.Draft("script", "0", changed.title, NoActionRequired(), changed.body, False)
+        runner = FakeReviewer(verdict(changed_draft))
+        with (mock.patch.object(push_texts, "REVIEWED_FILE", approvals),
+              mock.patch.object(push_texts, "catalog", return_value=(entry,)) as catalog,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.texts([entry.id], True, runner=runner), 0)
+            self.assertFalse(runner.calls)
+            self.assertIn(words, output.getvalue())
+            saved = review.text_approvals(cast(object, json.loads(approvals.read_text())))
+            self.assertEqual(set(saved[entry.id]), {"first", "second"})
+            for approval in saved[entry.id].values():
+                self.assertEqual(approval, {"sha256": digest, "time": now.isoformat(), "objections": [],
+                    "reviewer": f"user-prompt: {words} ({session}, {now.isoformat()})"})
+
+            catalog.return_value = (changed,)
+            self.assertEqual(review.texts([entry.id], True, runner=runner), 0)
+        self.assertEqual(len([item for item in runner.calls if Path(item.argv[0]).name == "claude"]), 2)
+        saved = review.text_approvals(cast(object, json.loads(approvals.read_text())))
+        for approval in saved[entry.id].values():
+            self.assertEqual(approval["sha256"], push_texts.fingerprint(changed))
+            self.assertFalse(approval["reviewer"].startswith("user-prompt:"))
+
     def test_user_spec_approves_original_text_and_keeps_ask_objections_and_existing_approvals(self) -> None:
         entry = push_texts.PushText("test", "shutdown", "decision", "Owner remote-control is off",
             push_texts.ActionTemplate("run /remote-control"), "Reason: Remote control is off.",
@@ -1142,9 +1248,9 @@ class LocalReviewTests(unittest.TestCase):
                     _ = review.main(arguments)
                 self.assertEqual(error.exception.code, 2)
             texts.assert_not_called()
-            self.assertEqual(review.main(["texts", "--id", "shutdown.manual_restart", "--approve",
+            self.assertEqual(review.main(["texts", "--id", "shutdown.restart_failed", "--approve",
                                           "--user-spec", "User words"]), 0)
-        texts.assert_called_once_with(["shutdown.manual_restart"], True, authority=review.UserSpecifiedText("User words"))
+        texts.assert_called_once_with(["shutdown.restart_failed"], True, authority=review.UserSpecifiedText("User words"))
 
     def test_list_and_show_cli_print_the_catalog(self) -> None:
         listing = push_texts.listing(push_texts.catalog())
@@ -1402,6 +1508,28 @@ class LocalReviewTests(unittest.TestCase):
                 assert isinstance(result, review.Unreviewed)
                 self.assertTrue(result.why)
 
+    def test_model_program_and_model_name_errors_keep_the_review_unavailable_text(self) -> None:
+        result = review.review(self.draft, False, runner=FakeReviewer(verdict(self.draft), failure="missing"))
+        assert isinstance(result, review.Unreviewed)
+        self.assertEqual(result.why, "review unavailable: claude unavailable")
+        with mock.patch.object(models_registry, "claude_model", side_effect=ValueError("no model alias")):
+            result = review.review(self.draft, False, runner=FakeReviewer(verdict(self.draft)))
+        assert isinstance(result, review.Unreviewed)
+        self.assertEqual(result.why, "review unavailable: no model alias")
+
+    def test_structured_call_returns_runner_and_model_name_errors_as_model_unavailable(self) -> None:
+        def broken(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+            del argv, timeout, env
+            raise PermissionError("claude is not executable")
+
+        def call(runner: review.ProcessRunner) -> review.StructuredOutcome:
+            return review.structured_call(runner, Path("claude"), {}, model="opus", effort="high", system_prompt="",
+                                          schema={}, prompt="", deadline=time.monotonic() + 60).outcome
+
+        self.assertEqual(call(broken), review.ModelUnavailable("claude is not executable"))
+        with mock.patch.object(models_registry, "claude_model", side_effect=ValueError("no model alias")):
+            self.assertEqual(call(FakeReviewer(verdict(self.draft))), review.ModelUnavailable("no model alias"))
+
     def test_unexpected_review_faults_send_the_original_push(self) -> None:
         keys = self.root / "keys"
         _ = keys.write_text("PUSHOVER_USER=test-user\nPUSHOVER_TOKEN=test-token\n")
@@ -1546,10 +1674,10 @@ class LocalReviewTests(unittest.TestCase):
         runner = FakeReviewer(verdict(self.draft))
         create_claude_account("claude3", "unit@example.invalid")
         directory = accounts.account_dir("claude3")
-        with (mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude3", directory)) as select,
+        with (mock.patch.object(accounts, "group_account", return_value=accounts.NamedAccount("claude3", directory)) as select,
               mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "writer config", "ANTHROPIC_API_KEY": "writer key"})):
             result = review.review(self.draft, False, runner=runner)
-        select.assert_called_once_with("unit")
+        select.assert_called_once_with("units")
         self.assertEqual(result.metadata.account, "claude3")
         for call in runner.calls:
             self.assertEqual(call.environment["CLAUDE_CONFIG_DIR"], str(directory))

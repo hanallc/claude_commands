@@ -6,12 +6,14 @@ from contextlib import nullcontext, redirect_stderr, redirect_stdout
 import io
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
 
+from scripts.build_queue import admission_records
 from scripts.copies import copies
 from scripts.lib import scratch
 from scripts.lint import sweep as folder_sweep
@@ -57,7 +59,8 @@ class NightlySlotSweepTests(unittest.TestCase):
                       mock.patch.object(gate, "nightly_git") as git,
                       mock.patch.object(gate, "checked_git", return_value="fixture-commit"),
                       mock.patch.object(copies, "standing", return_value=nullcontext(Path(checkout))) as take,
-                      mock.patch.object(gate, "run_suites", return_value=gate.GateRun((gate.GateJobResult("test", "fixture", 0, 0, ""),), 0, 0)),
+                      mock.patch.object(gate, "run_gate_suites", return_value=gate.GateRun(
+                          (gate.GateJobResult("test", "fixture", 0, 0, ""),), 0, 0)),
                       mock.patch.object(gate, "gate_state_dir", return_value=Path(checkout)),
                       mock.patch.object(gate, "push_nightly_result"),
                       mock.patch.object(gate, "_sweep_nightly_build_folders") as sweep,
@@ -71,6 +74,29 @@ class NightlySlotSweepTests(unittest.TestCase):
                         take.assert_not_called()
                         sweep.assert_not_called()
                         self.assertIn("sdlc: the production record has multiple merge units", output.getvalue())
+
+    def test_a_timer_nightly_names_its_merge_unit_as_the_queue_owner(self) -> None:
+        # The timer gives no owner variable, so each queue request of the nightly names the merge unit.
+        merge = staff.StaffId("11111111-0000-4000-8000-111111111111")
+        unit = staff.StaffRow(merge, "unit", "fixture-merge", staff.ReportsTo(staff.StaffId("sdlc")),
+                              current_session=merge, unit_type=staff.UnitDetails("merge"))
+        names = (*admission_records.OWNER_VARIABLES, admission_records.BUILDLOG_UNIT)
+        observed: list[dict[str, str]] = []
+
+        def nightly(_args: gate.GateArguments, target: gate.GateTarget) -> int:
+            self.assertIsInstance(target, gate.NoGateAssignment)
+            observed.append({name: os.environ[name] for name in names if os.environ.get(name)})
+            return 0
+
+        with (mock.patch.dict(os.environ, dict.fromkeys(names, "")),
+              mock.patch.object(admission_records, "queue_staff", return_value=staff.StaffSnapshot((unit,))),
+              mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
+              mock.patch.object(gate, "nightly", side_effect=nightly),
+              mock.patch.object(gate, "_sweep_nightly_build_folders")):
+            self.assertEqual(gate.main(["--nightly", "--merge-branch", "fixture", "--unit", str(merge)]), 0)
+            self.assertFalse(admission_records.owner_given(os.environ))
+        self.assertEqual(observed, [{"CLAUDE_SESSION_NAME": "fixture-merge",
+                                     admission_records.BUILDLOG_UNIT: "fixture-merge"}])
 
     def test_local_sweep_failure_reports_once_and_keeps_the_nightly_result(self) -> None:
         for status in (0, 1, 75):
@@ -90,11 +116,17 @@ class NightlySlotSweepTests(unittest.TestCase):
                         self.assertEqual(list(argv[2:4]), ["exec", sys.executable])
                         self.assertTrue(argv[4].endswith("mac_queue_run.py"))
                         events.append("Mac")
-                        self.assertEqual(list(argv[5:15]),
+                        self.assertEqual(list(argv[5:13]),
                                          ["--kind", "run", "--what", "Sweep unused Mac build folders", "--package", "claude",
-                                          "--worktree", str(Path(gate.__file__).resolve().parents[2]), "--", "/bin/zsh"])
+                                          "--worktree", str(Path(gate.__file__).resolve().parents[2])])
                         # The nightly runs from $HOME; the Mac queue refuses a worktree that is not a repository.
                         self.assertTrue((Path(argv[12]) / ".git").exists())
+                        self.assertEqual(argv[13], "--caller-fd")
+                        caller = int(argv[14])
+                        self.assertEqual(list(argv[15:17]), ["--", "/bin/zsh"])
+                        self.assertEqual(options["pass_fds"], (caller,))
+                        self.assertIs(options["start_new_session"], True)
+                        self.assertEqual(select.select([caller], [], [], 0)[0], [])
                     else:
                         self.assertTrue(argv[1].endswith("send.py"))
                         self.assertEqual(list(argv[2:6]), ["--to", "builds", "--from", "nightly"])
@@ -148,7 +180,8 @@ class NightlySlotSweepTests(unittest.TestCase):
             config = private_slot_config(Path(temporary), repository="fixture")
             events: list[str] = []
 
-            def nightly(args: gate.GateArguments) -> int:
+            def nightly(args: gate.GateArguments, target: gate.GateTarget) -> int:
+                self.assertIsInstance(target, gate.NoGateAssignment)
                 events.append("nightly:" + args.merge_branch)
                 raise GateRefused("gate failed")
 

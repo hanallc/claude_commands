@@ -31,8 +31,8 @@ PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/{PAGE_NAME}"
 LOCK = image_store.LOCK
 SENDER = Path(__file__).stem
 # Each answer button and the first line of the message that it sends to the owner.
-ANSWERS = {"approved": "your image is approved.", "not approved": "your image is not approved.",
-           "feedback": "feedback on your image."}
+# Feedback always means the image is not approved.
+ANSWERS = {"approved": "your image is approved.", "feedback": "your image is not approved. The feedback follows."}
 # A page loaded before the answer buttons existed can still post delete.
 ACTIONS = frozenset(("delete", "question", *ANSWERS))
 
@@ -135,7 +135,7 @@ def register(image: Path, caption: str, owner: staff.StaffId, subject: str,
              *, before: Path | None = None) -> image_store.ImageRecord:
     """Register one image or a before and after pair for its staff owner."""
     if not caption.strip():
-        raise ValueError("the caption is empty; say what changed and what to look at")
+        raise ValueError("the caption is empty; say the change in the fewest plain words that stay accurate")
     if staff.snapshot().by_id(owner) is None:
         raise ValueError(f"no staff record for owner {owner}")
     return image_store.register_file(image, images_root(review_link.review_root().resolve()),
@@ -169,10 +169,11 @@ def owner_names(record: staff.StaffSnapshot, identity: str) -> tuple[str, str]:
 
 
 def picture(record: image_store.ImageRecord, label: str, file: str) -> str:
-    """Link one image to the shared zoom; show its pair label above it."""
+    """Link one image to the shared zoom; show its pair label above it and in the zoom."""
     path = html.escape(image_path(record, file), quote=True)
     alt = record["caption"].splitlines()[0]
-    linked = (f'<a data-image-zoom href="{path}" target="_blank" rel="noopener"><img src="{path}" '
+    zoom_label = f' data-image-zoom-label="{html.escape(label, quote=True)}"' if label else ''
+    linked = (f'<a data-image-zoom{zoom_label} href="{path}" target="_blank" rel="noopener"><img src="{path}" '
               + f'alt="{html.escape(f"{label}: {alt}" if label else alt, quote=True)}" loading="lazy"></a>')
     return f'<figure><figcaption>{label}</figcaption>{linked}</figure>' if label else linked
 
@@ -196,21 +197,21 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
     names = staff_names.for_page(names, members)
     member = members.by_id(staff.StaffId(record["owner"]))
     shown_owner = names.html(record["owner"], name) + f" ({member.kind})" if member is not None else html.escape(owner)
+    receiver = f' data-send-receiver="{html.escape(name, quote=True)}"' if member is not None else ""
     questions = sorted((question_record.read(saved) for saved in record.get('questions', [])),
                        key=lambda question: (question.answer is not None, int(question.question_id[1:])))
     round_id = feedback_round(answered_question_ids(record))
     closing_buttons = ('<button type="submit" name="action" value="approved">Approved</button>'
-                       '<button type="submit" name="action" value="not approved">Not Approved</button>'
                        '<button type="submit" name="action" value="feedback">Send Feedback</button>')
     returning_buttons = '<button type="submit" name="action" value="question">Ask question</button>'
     return (f'<article id="image-{record["id"]}"{' class="pair"' if pair else ''} data-image="{record["id"]}" '
-            + f'data-owner="{html.escape(record["owner"], quote=True)}" data-owner-name="{html.escape(name, quote=True)}">'
+            + f'data-owner="{html.escape(record["owner"], quote=True)}" data-owner-name="{html.escape(name, quote=True)}"{receiver}>'
             + f'<h2 class="caption">{html.escape(caption)}</h2><dl class="image-details">'
             + f'<dt>Owner:</dt><dd>{shown_owner}</dd>'
             + f'<dt>For  :</dt><dd>{html.escape(record["subject"])}</dd>'
             + f'<dt>Added:</dt><dd><time datetime="{html.escape(record["registered_at"], quote=True)}">'
             + f'{shown_time(added)}</time></dd></dl>'
-            + (f'<div class="image-pair">{pictures}</div>' if pair else pictures)
+            + (f'<div class="image-pair" data-image-zoom-group>{pictures}</div>' if pair else pictures)
             + ''.join(question_html(question, open_questions) for question in questions)
             + '<form method="post" data-image-form>'
             + f'<input type="hidden" name="image" value="{record["id"]}">'
@@ -271,6 +272,9 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     if not secrets.compare_digest(fields["token"][0].encode(), expected.encode()):
         raise question_record.AnswerRefused("the image token does not match this page")
     action = fields.get("action", ["delete"])[0]
+    if action == "not approved":
+        # A card loaded before I21 can still show the removed button.
+        raise question_record.AnswerRefused("Not Approved was removed. Use Send Feedback.")
     if action not in ACTIONS:
         raise question_record.AnswerRefused("use the form on this page")
     if action == 'question':
@@ -372,8 +376,9 @@ def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_
         image_store.write_record(folder, current)
 
 
-# At 1108px and wider, the page fills the frame inside its 32px gutters, and the
-# image column keeps its full 680px. 1108 = 32 + 300 + 64 + 680 + 32.
+# The group index is as wide as its cells need above 900px, so no name or time wraps.
+# At 1108px and wider, the page fills the frame inside its 32px gutters, and the image
+# column keeps its full 680px while the index is 300px or narrower. 1108 = 32 + 300 + 64 + 680 + 32.
 # There a single card keeps 680px, and a pair card takes up to two of them: 1376 = 680 + 16 + 680.
 # A pair stacks, before on top, when its card is narrower than 600px.
 STYLE = """<style>[hidden]{display:none!important}
@@ -391,9 +396,12 @@ STYLE = """<style>[hidden]{display:none!important}
 [data-image-form] .review-actions button{margin:0}
 .page-question p{white-space:pre-wrap;overflow-wrap:anywhere}
 @media (max-width:480px){[data-image-form] .review-actions button{font-size:15px;padding:6px 8px}}
-[data-image-layout]{display:grid;grid-template-columns:300px minmax(0,680px);gap:32px;align-items:start}
-[data-image-groups]{position:sticky;top:16px;max-height:calc(100vh - 32px);overflow:auto;display:grid;
-grid-template-columns:minmax(0,max-content) max-content max-content;font-size:14px;border:1px solid #8886;border-radius:8px}
+[data-image-layout]{display:grid;grid-template-columns:max-content minmax(0,680px);gap:32px;align-items:start}
+[data-image-groups]{position:sticky;
+top:calc(var(--page-actions-space,0px) + var(--page-actions-height,0px) + var(--page-status-height,0px) + 16px);
+max-height:calc(100vh - 32px - var(--page-status-height,0px) - var(--page-actions-space,0px)
+- var(--page-actions-height,0px));overflow:auto;display:grid;
+grid-template-columns:repeat(3,max-content);font-size:14px;border:1px solid #8886;border-radius:8px;white-space:nowrap}
 [data-image-groups] a{grid-column:1/-1;display:grid;grid-template-columns:subgrid;cursor:pointer;
 color:inherit;text-decoration:none;overflow-wrap:anywhere}
 [data-image-groups] a+a{border-top:1px solid #8884}
@@ -401,9 +409,9 @@ color:inherit;text-decoration:none;overflow-wrap:anywhere}
 [data-image-groups] a:hover,[data-image-groups] a:focus-visible{background:#8883;outline:none}
 [data-image-groups] .group-count{text-align:right;font-variant-numeric:tabular-nums}
 @media (max-width:900px){[data-image-layout]{display:block}
-[data-image-groups]{position:static;max-height:none;margin-bottom:16px;grid-template-columns:minmax(0,1fr) max-content max-content}}
+[data-image-groups]{position:static;max-height:none;margin-bottom:16px;grid-template-columns:minmax(0,1fr) max-content max-content;white-space:normal}}
 @media (min-width:1108px){
-[data-image-layout]{grid-template-columns:300px minmax(0,1fr);column-gap:64px}
+[data-image-layout]{grid-template-columns:max-content minmax(0,1fr);column-gap:64px}
 [data-image-layout]>div{width:100%;max-width:1376px;justify-self:center}
 [data-images] article:not(.pair),[data-empty]{max-width:680px;margin-inline:auto}}
 </style>"""
@@ -479,7 +487,7 @@ function bind(root) {
     sending++;
     try {
       if (!question) await motion.removeCard(card, apply);
-      const response = await fetch(location.pathname, {method: 'POST', body});
+      const response = await heldFetch(location.pathname, {method: 'POST', body}, card.dataset.sendReceiver);
       if (!response.ok) {
         const reason = await response.json().then(body => body.reason, () => '');
         throw new Error(reason || 'HTTP ' + response.status);
@@ -494,8 +502,10 @@ function bind(root) {
     } catch (error) {
       postFailed = true;
       if (!question) home.insertBefore(card, next?.parentNode === home ? next : null);
-      status.textContent = 'Not sent: ' + error.message;
+      const undone = error instanceof SendUndone;
+      status.textContent = undone ? error.message : 'Not sent: ' + error.message;
       apply();
+      if (undone) form.elements.feedback.focus();
     } finally {
       sending--;
       setCardSubmitting(form, false);
@@ -582,7 +592,7 @@ def main(arguments: list[str]) -> int:
     _ = add.add_argument("--image", type=Path, help="the image file to copy")
     _ = add.add_argument("--before", type=Path, help="the before image of a pair; give --after with it")
     _ = add.add_argument("--after", type=Path, help="the after image of a pair; give --before with it")
-    _ = add.add_argument("--caption", required=True, help="what changed and what to look at")
+    _ = add.add_argument("--caption", required=True, help="the change in the fewest plain words that stay accurate")
     _ = add.add_argument("--owner", required=True, help="the staff id that owns the image")
     subject = add.add_mutually_exclusive_group(required=True)
     _ = subject.add_argument("--change", help="the change id, such as sdlc/C12")

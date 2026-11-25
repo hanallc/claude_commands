@@ -18,7 +18,7 @@ from scripts.mac_test import eligibility, nextest_log, offload
 from scripts.mac_test.claim_state import RepositoryScope
 from scripts.buildlog import sync as buildlog_sync
 from scripts.mac_test.offload_test_support import HANA, OffloadCommandFixture
-from scripts.lib import test_hang_guard
+from scripts.lib import conf, test_hang_guard
 
 
 class OffloadForwardTests(OffloadCommandFixture):
@@ -86,7 +86,7 @@ class OffloadForwardTests(OffloadCommandFixture):
             + "BUILDLOG_CALLER=verify-mac BUILDLOG_PINNED_TARGET='' BUILDLOG_CALL_ID=call-forward BUILDLOG_SYNC=1 "
             + 'LINT_SKIP_SWEEP=1 LINT_SWEEP_BUDGET_GIB=64 MACOSX_DEPLOYMENT_TARGET=14.0 '
             + 'run_nextest_logged ~/.claude/scripts/lint/lint nextest --workspace || echo mac_nextest_setup=failed; '
-            + 'cd "$HOME"/.local/state/mac-test/test-mirror/hana && trim_started=$(date +%s); '
+            + '{ if cd "$HOME"/.local/state/mac-test/test-mirror/hana; then trim_started=$(date +%s); '
             + 'if LINT_SWEEP_BUDGET_GIB=64 "$HOME/.claude/scripts/lib/py" -B -c '
             + shlex.quote('import sys; from scripts.lint import sweep; from scripts.lib import conf; '
                           + 'config = conf.read("lint"); '
@@ -110,7 +110,8 @@ class OffloadForwardTests(OffloadCommandFixture):
             + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
             + 'if rm -rf -- "$HOME"/.local/state/mac-test/test-mirror/hana/target; then '
             + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
-            + 'else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi'
+            + 'else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi; '
+            + 'else echo mac_cleanup=$?; fi; } 2>/dev/null'
         )
         self.assertEqual(offload.remote_test_command(config, request, HANA), expected)
         fetch = offload.remote_test_command(config, replace(request, fetch=offload.FetchFolder("target/shots")), HANA)
@@ -317,7 +318,8 @@ class OffloadForwardTests(OffloadCommandFixture):
             subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 75, answer.stdout + answer.stderr)
-        self.assert_fetch_wire("not_run", "lost")
+        # The launch was authorized and its start never settled, so its cleanup is unconfirmed.
+        self.assert_fetch_wire("not_run", "lost", "cleanup_unconfirmed")
         self.assertFalse((self.stub_directory / "pull-started").exists())
         self.config["offload"] = "off"
         self.sync_config()
@@ -345,22 +347,26 @@ class OffloadForwardTests(OffloadCommandFixture):
 
     def test_prune_removes_only_entries_older_than_fourteen_days(self) -> None:
         fetched = self.state_directory / "fetched"
-        old = time.time() - 15 * 24 * 60 * 60
-        for name in ("old-call", "old-call.partial", "recent-call"):
+        days = conf.read(self.config_path).number("fetch_retention_days")
+        now = 1_800_000_000.0
+        cutoff = now - days * 24 * 60 * 60
+        old = cutoff - 1
+        for name, modified in (("old-call", old), ("old-call.partial", old), ("cutoff-call", cutoff)):
             folder = fetched / name
             folder.mkdir(parents=True)
             _ = (folder / "keep").write_text(name)
-            if name.startswith("old-"):
-                os.utime(folder, (old, old))
+            os.utime(folder, (modified, modified))
         self.configure_fetch(fetch_answer="fetch=missing\nrc=0")
-        answer = self.command(
-            "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
-        )
+        with mock.patch.object(offload, "time", mock.Mock(wraps=time, time=lambda: now)):
+            answer = self.command(
+                "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
+                separate_stderr=True, assigned_adapter=True,
+            )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+        self.assert_fetch_wire("missing")
         self.assertFalse((fetched / "old-call").exists())
         self.assertFalse((fetched / "old-call.partial").exists())
-        self.assertEqual((fetched / "recent-call/keep").read_text(), "recent-call")
+        self.assertEqual((fetched / "cutoff-call/keep").read_text(), "cutoff-call")
 
     def test_signal_during_pull_removes_partial_and_checks_leftovers_before_release(self) -> None:
         self.configure_fetch(hold_pull=True)

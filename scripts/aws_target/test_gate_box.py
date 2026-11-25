@@ -19,6 +19,7 @@ from unittest import mock
 from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger
 from scripts.aws_target import test_aws_trial as trial_tests
 from scripts.aws_target.ledger_test_support import write_gate_config
+from scripts.lib.python_startup import sitecustomize as python_startup
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import gate
 from scripts.test_times import gate_record
@@ -162,16 +163,19 @@ subprocess.run = fail_log_put
         self.assertIs(aws_trial.GUEST, gate_box.GUEST)
         _ = compile(gate_box.GUEST, '<gate guest>', 'exec')
         self.assertNotIn('basedpyright', gate_box.GUEST)
-        self.assertNotIn('merge_gate', gate_box.GUEST)
-        self.assertIn('merge_gate.SelectedModules', gate_box.CANDIDATE_GUEST)
+        # The embedded startup hook names merge_gate.py to recognize a gate parent; the guest itself never runs it.
+        startup = repr(inspect.getsource(python_startup))
+        self.assertIn(startup, gate_box.GUEST)
+        self.assertNotIn('merge_gate', gate_box.GUEST.replace(startup, ''))
+        self.assertIn('gate_runner.SelectedModules', gate_box.CANDIDATE_GUEST)
         self.assertIn("'HEAD^{tree}'", gate_box.GUEST)
         self.assertIn("'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']", gate_box.GUEST)
         self.assertIn("'fetch', str(root / 'source.bundle'), links['commit']", gate_box.GUEST)
 
-    def test_guest_names_no_merge_gate_signal_function(self) -> None:
+    def test_guest_names_no_gate_signal_function(self) -> None:
         for code in (gate_box.GUEST, gate_box.CANDIDATE_GUEST, gate_box.PAIRED_GUEST):
             self.assertNotIn('rollback_signals', code)
-            self.assertNotRegex(code, r'\bmerge_gate\.\w*signal\w*')
+            self.assertNotRegex(code, r'\bgate_runner\.\w*signal\w*')
             self.assertNotIn('signal.signal', code)
 
     def test_boot_timestamps_use_local_kernel_and_cached_metadata(self) -> None:
@@ -329,12 +333,16 @@ subprocess.run = fail_log_put
         self.production_boot_stubs(('',), candidate_change='missing')
 
     def test_bootstrap_renders_with_mock_process_memory_mib(self) -> None:
-        code = '''from unittest import mock
-from scripts.production import merge_gate
-with mock.patch.object(merge_gate, 'process_memory_mib'):
+        code = '''import inspect
+from unittest import mock
+from scripts.lib.python_startup import sitecustomize as python_startup
+from scripts.production import gate
+with mock.patch.object(gate, 'process_memory_mib'):
     from scripts.aws_target import gate_box
     compile(gate_box.GUEST, '<bootstrap>', 'exec')
-    assert 'merge_gate' not in gate_box.GUEST
+    startup = repr(inspect.getsource(python_startup))
+    assert startup in gate_box.GUEST
+    assert 'merge_gate' not in gate_box.GUEST.replace(startup, '')
     assert 'inspect.getsource' not in gate_box.GUEST
 '''
         reply = subprocess.run([sys.executable, '-c', code], cwd=ROOT, capture_output=True, text=True,
@@ -372,7 +380,7 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                 _ = (library / 'py').write_text('#!/bin/sh\nexec python3 "$@"\n')
                 self.assertFalse((library / 'python_startup/sitecustomize.py').exists())
                 _ = (library / 'cancellation.py').write_bytes((ROOT / 'scripts/lib/cancellation.py').read_bytes())
-                _ = (repo / 'scripts/production/merge_gate.py').write_text(
+                _ = (repo / 'scripts/production/gate.py').write_text(
                     'from __future__ import annotations\nfrom types import SimpleNamespace\nfrom enum import Enum\nfrom typing import override\nimport os\n'
                     + inspect.getsource(gate.SuiteMode)
                     + 'WholeMachine = lambda times: times\nSelectedModules = tuple\n'
@@ -391,7 +399,7 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                     + '\ndef encode_run(run): return {"passed": run.passed}\n'
                     + 'def completion_record(*args, **kwargs): return {"kind": "gate_run"}\n')
                 if candidate_change == 'rename':
-                    for relative in ('scripts/aws_target/gate_box.py', 'scripts/production/merge_gate.py'):
+                    for relative in ('scripts/aws_target/gate_box.py', 'scripts/production/gate.py'):
                         path = repo / relative
                         _ = path.write_text(path.read_text().replace('run_suites', 'candidate_suites'))
                 elif candidate_change == 'missing':

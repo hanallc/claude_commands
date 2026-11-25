@@ -1,8 +1,8 @@
 """Real-Git acceptance tests for the standing gate checkout contract."""
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from contextlib import ExitStack, nullcontext, redirect_stderr
+from collections.abc import Callable, Generator, Mapping
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr
 import fcntl
 import io
 import json
@@ -23,11 +23,12 @@ from unittest import mock
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.copies.workspace_test_support import registered_workspace
-from scripts.build_queue import slot_wait
+from scripts.build_queue import first_step, slot_wait
+from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
-from scripts.lib import build_folders, copy_record, nix_env, scratch, session_folder
+from scripts.lib import build_folders, copy_record, nix_env, process_start, scratch, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.lint import folder_audit, tmp_sweep
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, write_config_fixture
@@ -68,6 +69,29 @@ class ImportTests(unittest.TestCase):
             capture_output=True, text=True, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class RunCopyTests(unittest.TestCase):
+    def test_gate_cleanup_error_keeps_the_gate_status(self) -> None:
+        command = ["python3", "scripts/production/gate.py", "--tests-only"]
+        tree = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for status in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS):
+            with self.subTest(status=status), redirect_stderr(io.StringIO()) as errors:
+                run_gate = mock.Mock(return_value=subprocess.CompletedProcess(command, status))
+                admitted = mock.Mock(spec=first_step.FirstStepAdmission, run_gate=run_gate)
+
+                @contextmanager
+                def command_copy() -> Generator[copies.AdmittedCommandCopy]:
+                    yield copies.AdmittedCommandCopy(tree, admitted)
+                    raise copies.CopyError("cannot release gate placement")
+
+                with (mock.patch.object(copies, "caller_owner", return_value="fixture"),
+                      mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+                      mock.patch.object(copies, "_command_copy", return_value=command_copy())):
+                    result = copies.main(["run", "--repo", str(tree), "--commit", "HEAD", "--", *command])
+                self.assertEqual(result, status)
+                run_gate.assert_called_once()
+                self.assertEqual(errors.getvalue(), "Gate cleanup failed. cannot release gate placement\n")
 
 
 class StandingTests(unittest.TestCase):
@@ -144,7 +168,6 @@ record_lock_attempts=3
 repo_depth=3
 repo_skip=target node_modules .git
 suffix_length=6
-visible_root={home / 'rust/repro'}
 """)
         _ = write_config_fixture(configuration / "nix_env.conf", """\
 command_timeout_seconds=600
@@ -238,6 +261,52 @@ source_check_seconds=1
     def run_cli(self, *options: str, command: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
         return self.cli("run", "--repo", str(self.source),
                         "--commit", "HEAD", *options, "--", *(command or ("true",)))
+
+    def test_run_keeps_a_numbered_copy_with_the_childs_reason(self) -> None:
+        reason = "checkout exit is unconfirmed"
+        result = self.run_cli(command=(
+            sys.executable, "-c",
+            "import os, pathlib, sys; pathlib.Path(os.environ['COPIES_KEEP_FILE']).write_text(sys.argv[1])",
+            reason,
+        ))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        first = self.gates / "1"
+        self.assertEqual(build_folders.build_folder_state(first), "kept")
+        self.assertEqual(first.with_name("1.keep").read_text(), reason)
+        self.assertIs(build_folders.folder_lease_fields(first)["released"], False)
+        listing = self.cli("list")
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        row = next(line.split("\t") for line in listing.stdout.splitlines() if str(first) in line)
+        self.assertEqual(row[7], "kept")
+        with build_folders.folder_removal_lease(first) as lease:
+            self.assertIsInstance(lease, build_folders.RefusedRemovalLease)
+        location = self.base / "command-location"
+        next_run = self.run_cli(command=(
+            sys.executable, "-c", "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text(str(pathlib.Path.cwd()))",
+            str(location),
+        ))
+        self.assertEqual(next_run.returncode, 0, next_run.stderr)
+        self.assertEqual(Path(location.read_text()), self.gates / "2")
+        self.assertTrue(first.is_dir())
+
+    def test_run_reuses_a_numbered_copy_when_the_child_leaves_no_reason(self) -> None:
+        result = self.run_cli(command=(
+            sys.executable, "-c",
+            "import os, pathlib; path = pathlib.Path(os.environ['COPIES_KEEP_FILE']); "
+            + "assert path.is_absolute() and not path.exists(); path.touch(); raise SystemExit(7)",
+        ))
+        self.assertEqual(result.returncode, 7, result.stderr)
+        first = self.gates / "1"
+        self.assertEqual(build_folders.build_folder_state(first), "free")
+        self.assertFalse(first.with_name("1.keep").exists())
+        self.assertIs(build_folders.folder_lease_fields(first)["released"], True)
+        location = self.base / "command-location"
+        next_run = self.run_cli(command=(
+            sys.executable, "-c", "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text(str(pathlib.Path.cwd()))",
+            str(location),
+        ))
+        self.assertEqual(next_run.returncode, 0, next_run.stderr)
+        self.assertEqual(Path(location.read_text()), first)
 
     def test_claude_and_codex_workers_use_their_unit_owner(self) -> None:
         unit = next(row for row in staff.local_snapshot().rows if row.kind == "unit")
@@ -629,8 +698,14 @@ source_check_seconds=1
         self.assertEqual(build_folders.build_folder_state(tree), 'free')
 
     def test_clone_cli_creates_a_task_owned_checkout_without_a_root_busy_mark(self) -> None:
-        result = self.cli("clone", str(self.source), "--task", "gate:camera", "--name", "camera")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = ("clone", str(self.source), "--task", "gate:camera")
+        blocked_registry = self.base / "unwritable-registry"
+        blocked_registry.touch()
+        self.write_config({**self.settings, "remote_registry": str(blocked_registry)})
+        with self.subTest(holder="unwritable registry"):
+            result = self.cli(*arguments, "--name", "camera")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.write_config(self.settings)
         checkout = Path(result.stdout.strip())
         self.assertTrue(checkout.is_relative_to(self.base / "scratch"))
         self.assertEqual((checkout / "tracked.txt").read_text(), "source HEAD\n")
@@ -644,6 +719,170 @@ source_check_seconds=1
         self.assertEqual([entry.path for entry in scratch.end("gate:camera")], [checkout])
         self.assertTrue(checkout.is_dir())
         self.assertEqual((self.source / "tracked.txt").read_text(), "source HEAD\n")
+
+        for holder in ("gone", "implicit owner", "live", "registration exited", "another owner",
+                       "another host", "reused", "unreadable", "malformed start", "replaced clone",
+                       "protected checkout", "wrong clone path", "invalid repository", "same owner replacement",
+                       "unusual start", "session command", "lease after setup", "implicit lease after setup"):
+            with self.subTest(holder=holder), tempfile.TemporaryDirectory(prefix="lease case ",
+                                                                         dir=checkout.parent) as directory, \
+                    mock.patch.dict(os.environ, {copy_record.ROOT_ENV: directory}), ExitStack() as scope:
+                root = Path(directory)
+                self.write_config({**self.settings, "remote_registry": str(root / "mirrors")})
+                owner = "another-owner" if holder == "another owner" else self.owner_id
+                saved_session = "--flag-like" if holder == "session command" else "fixture"
+                parent = root
+                setup: list[Path] = []
+                if holder == "session command":
+                    session_root = root / "sessions"
+                    parent = session_root / "clone maker"
+                    parent.mkdir(parents=True)
+                    _ = cast(object, scope.enter_context(mock.patch.dict(os.environ, {session_folder.ROOT_ENV: str(session_root)})))
+                if holder in ("lease after setup", "implicit lease after setup"):
+                    owner_options = ("--owner", owner) if holder == "lease after setup" else ()
+                    result = self.cli(*arguments, "--name", "previous", "--repository", "origin",
+                                      "--session", saved_session, *owner_options)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    completed = Path(result.stdout.strip())
+                    self.assertEqual((completed / "tracked.txt").read_text(), "source HEAD\n")
+                    setup.append(completed)
+                with self.clone_lease_fixture(parent, owner, saved_session, setup, second=holder == "gone") as (maker, existing):
+                    assert maker.stdin is not None
+                    if holder not in ("live", "registration exited"):
+                        maker.stdin.close()
+                        self.assertEqual(maker.wait(timeout=TEST_HANG_GUARD_SECS), 0)
+                    tree = existing[0]
+                    if holder in ("registration exited", "protected checkout", "wrong clone path", "malformed start",
+                                  "invalid repository", "another host", "same owner replacement"):
+                        # The registrar runs separately from the folder lease holder.
+                        registration = subprocess.run([
+                            sys.executable, str(Path(copies.__file__).resolve()), "register-remote",
+                            "--host", "localhost", "--path", str(tree), "--owner", owner,
+                            "--repository", "origin", "--session", "fixture",
+                        ], text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual(registration.returncode, 0, registration.stderr)
+                    if holder in ("reused", "unreadable", "malformed start", "unusual start"):
+                        fields = copies.clone_lease_fields(tree)
+                        if holder == "unreadable":
+                            fields["pid"] = "unknown"
+                        elif holder == "malformed start":
+                            fields.update(pid=os.getpid(), process_start="bad identity")
+                        elif holder == "unusual start":
+                            current = process_start.process_start(os.getpid())
+                            assert isinstance(current, process_start.Started)
+                            fields.update(pid=os.getpid(), process_start=(
+                                "0" + current.start if os.uname().sysname == "Linux" else "Sun Feb 31 22:00:00 2020"))
+                        else:
+                            fields.update(pid=os.getpid(), process_start=(
+                                "0" if os.uname().sysname == "Linux" else "Wed Nov  4 22:00:00 2020"))
+                        _ = build_folders.lease_path(tree).write_text(json.dumps(fields))
+                    elif holder in ("another host", "invalid repository"):
+                        path = copies.remote_record_path(copies.RemoteMirror(owner, copies.SelectedRepository("origin"),
+                                                                           "localhost", str(tree), saved_session))
+                        fields = cast(dict[str, object], json.loads(path.read_text()))
+                        if holder == "another host":
+                            fields["host"] = "other-host"
+                        else:
+                            del fields["repo"]
+                        _ = path.write_text(json.dumps(fields))
+                    elif holder == "replaced clone":
+                        copies.mark_mirror(tree, "another-owner", "origin", "fixture")
+                    elif holder == "same owner replacement":
+                        copies.mark_mirror(tree, owner, "origin", "replacement")
+                        copies.register_scratch_clone(tree, copies.CloneSource.UNAPPROVED,
+                                                     owner=owner, repository="origin", session="replacement")
+                    elif holder == "wrong clone path":
+                        _ = scratch.update_record(tree, lambda current: {
+                            **(current.fields if isinstance(current, copy_record.Registered) else {}),
+                            "clone_path": str(root / "different clone"),
+                        })
+
+                    if holder in ("gone", "implicit owner", "reused", "session command", "lease after setup",
+                                  "implicit lease after setup"):
+                        before = sorted(root.rglob("*"))
+                        contents = self.snapshot(root)
+                        owner_options = () if holder in ("implicit owner", "implicit lease after setup") else ("--owner", self.owner_id)
+                        result = self.cli(*arguments, "--name", "camera", *owner_options)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(result.stdout, "")
+                        lines = result.stderr.splitlines()
+                        self.assertEqual(lines[1:1 + len(existing)], [str(path) for path in existing])
+                        self.assertEqual(lines[1 + len(existing)], "Run one removal command per path.")
+                        commands = [shlex.split(line) for line in lines[2 + len(existing):]]
+                        session_options = ([f"--session={saved_session}"] if holder == "session command"
+                                           else ["--session", saved_session])
+                        self.assertEqual(commands, [[
+                            "~/.claude/scripts/lib/py", "~/.claude/scripts/copies/copies.py", "mirror-remove",
+                            "--path", str(path), "--owner", self.owner_id, "--repository", "origin",
+                            *session_options, "--host", "localhost",
+                        ] for path in existing])
+                        for path, command in zip(existing, commands, strict=True):
+                            removal = copies.parse_copy_arguments(command[2:])
+                            self.assertEqual((removal.action, removal.path, removal.owner, removal.repository,
+                                              removal.session, removal.host),
+                                             ("mirror-remove", str(path), self.owner_id, "origin", saved_session, "localhost"))
+                        self.assertEqual(sorted(root.rglob("*")), before)
+                        self.assertEqual(self.snapshot(root), contents)
+                    else:
+                        # The name check runs after the guard and before Git creates another clone.
+                        options = [*arguments, "--name", "invalid/name"]
+                        result = invoke_cli(copies, lambda: copies.main(options), options, dict(os.environ),
+                                            tree if holder == "protected checkout" else self.base)
+                        self.assertIn("a name is letters, digits, - and _", result.stderr)
+
+    @contextmanager
+    def clone_lease_fixture(self, root: Path, owner: str, session: str, setup: list[Path], *, second: bool
+                            ) -> Generator[tuple[subprocess.Popen[str], list[Path]]]:
+        """Hold real folder leases until the fixture closes the maker's input."""
+        program = """
+import json
+from contextlib import ExitStack
+from pathlib import Path
+import sys
+import time
+from scripts.copies import copies
+from scripts.lib import build_folders, scratch
+
+root, owner, session, *names = sys.argv[1:]
+with ExitStack() as leases:
+    paths = []
+    for name in names:
+        if Path(name).is_absolute():
+            checkout = Path(name)
+            spec = build_folders.BuildFolderSpec(kind="legacy-stable", parent=checkout.parent,
+                                                suffix_length=0, purpose=checkout.name, owner=owner)
+            path = leases.enter_context(build_folders.leased_build_folder(spec))
+        else:
+            spec = build_folders.BuildFolderSpec(kind="legacy-unique", parent=Path(root),
+                                                suffix_length=0, suffix=copies.clone_owner_prefix(owner) + name, owner=owner)
+            path = leases.enter_context(build_folders.leased_build_folder(spec))
+            scratch.write_record(path, "gate:previous", time.time())
+            copies.register_scratch_clone(path, copies.CloneSource.UNAPPROVED, owner=owner,
+                                         repository="origin", session=session)
+            copies.mark_mirror(path, owner, "origin", session)
+            copies.record_clone_setup_lease(path)
+        paths.append(str(path))
+    print(json.dumps(paths), flush=True)
+    sys.stdin.read(1)
+"""
+        names = tuple(map(str, setup)) if setup else ("old-clone-1", "old-clone-2") if second else ("old-clone",)
+        maker: subprocess.Popen[str] = subprocess.Popen(
+            [sys.executable, "-c", program, str(root), owner, session, *names],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        with maker:
+            assert maker.stdout is not None and maker.stdin is not None
+            output = cast(TextIO, maker.stdout)
+            self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0],
+                            "The maker did not report the leases.")
+            line = output.readline()
+            self.assertTrue(line, "The maker exited before it reported the leases.")
+            paths = [Path(path) for path in cast(list[str], json.loads(line))]
+            try:
+                yield maker, paths
+            finally:
+                if not maker.stdin.closed:
+                    maker.stdin.close()
+                    self.assertEqual(maker.wait(timeout=TEST_HANG_GUARD_SECS), 0)
 
     def test_task_end_during_clone_setup_keeps_completion_fields(self) -> None:
         task = "gate:clone-setup"
@@ -946,9 +1185,11 @@ with patch.object(subprocess, 'run', pause_clone):
 
         remove = scratch.remove
 
+        original = clone.stat()
+
         def check_retry(path: Path) -> None:
-            self.assertEqual(path, clone)
-            with busy.open("rb") as other, self.assertRaises(BlockingIOError):
+            self.assertTrue(os.path.samestat(path.stat(), original))
+            with (path / busy.relative_to(clone)).open("rb") as other, self.assertRaises(BlockingIOError):
                 fcntl.flock(other, fcntl.LOCK_SH | fcntl.LOCK_NB)
             with self.assertRaises(BlockingIOError):
                 _ = build_folders.create_build_folder(request)
@@ -1090,7 +1331,7 @@ with patch.object(subprocess, 'run', pause_clone):
         remove = scratch.remove
 
         def delete(folder: Path) -> None:
-            self.assertTrue(scratch.removal_mark(folder).exists())
+            self.assertTrue(scratch.removal_mark(checkout).exists())
             self.assert_clone_project_removed(checkout, paths)
             remove(folder)
 
@@ -2227,6 +2468,13 @@ with patch.object(subprocess, 'run', pause_clone):
                 self.assertEqual(commit, self.head)
                 self.assertEqual(Path(path).read_bytes(), b"same artifact")
 
+    def test_run_refuses_a_named_gate_without_a_test_mode_before_admission(self) -> None:
+        with mock.patch.object(first_step, "admitted_run") as admit:
+            result = self.run_cli(command=("./scripts/lib/py", "scripts/production/gate.py", "--module", "x"))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, "copies: --module needs --tests-only or --affected\n")
+        admit.assert_not_called()
+
     def test_run_uses_tree_cwd_substitution_and_command_exit_status(self) -> None:
         output = self.base / "command-result.json"
         evidence = self.base / "build-evidence.json"
@@ -2741,6 +2989,59 @@ with patch.object(subprocess, 'run', pause_clone):
                 _ = manifest_path.write_text(json.dumps(manifest))
                 copies.remove_trees(self.owner_id)
                 self.assertFalse(active.exists())
+
+    def test_owner_removal_preserves_a_crate_copy_without_terminal_evidence(self) -> None:
+        name = "crate-recovery"
+        tree = copies.workspace_path(self.owner_id, self.source, name)
+        manifest_path = self.base / "crate-recovery.json"
+        manifest = json.dumps({
+            "version": 2, "canonical": str(self.source), "base": self.head,
+            "crates": {"sample": {"checkout": str(tree), "stage": "selected"}},
+        })
+        _ = manifest_path.write_text(manifest)
+        with registered_workspace(self.owner_id, self.source, self.head, name=name, branch="worker",
+                                  run_manifest=manifest_path) as worker:
+            self.assertEqual(worker, tree)
+        _ = scratch.hold(tree, f"gate:{name}", copies.LEGACY_WORKER_HOLD_REASON)
+        scratch.hand_over(tree, self.owner_id, "gate:changed-task")
+        record = scratch.task_of(tree)
+        assert isinstance(record, copy_record.Registered)
+
+        with self.subTest(evidence="blank run link"):
+            _ = scratch.update_record(tree, lambda _: {**record.fields, "crate_run": ""})
+            with self.assertRaisesRegex(copies.CopyError, "repair crate run link"):
+                copies.remove_trees(self.owner_id)
+            self.assertTrue(tree.is_dir())
+            self.assertEqual(manifest_path.read_text(), manifest)
+            self.assertIn(str(tree), scratch.holds())
+        _ = scratch.update_record(tree, lambda _: record.fields.copy())
+
+        for evidence in ("missing", "corrupt"):
+            with self.subTest(evidence=evidence):
+                if evidence == "missing":
+                    manifest_path.unlink()
+                else:
+                    _ = manifest_path.write_text("{invalid")
+                with self.assertRaisesRegex(copies.CopyError, "repair crate run") as refused:
+                    copies.remove_trees(self.owner_id)
+                self.assertIn(str(manifest_path), str(refused.exception))
+                self.assertTrue(tree.is_dir())
+            _ = manifest_path.write_text(manifest)
+
+        with mock.patch.object(scratch, "remove", side_effect=OSError("interrupted removal")):
+            with self.assertRaisesRegex(OSError, "interrupted removal"):
+                scratch.remove_marked(tree)
+        marker = scratch.removal_mark(tree)
+        saved = marker.read_bytes()
+        for missing in (tree / ".git", tree):
+            with self.subTest(missing=missing.name):
+                shutil.rmtree(missing)
+                with self.assertRaisesRegex(copies.CopyError, "not terminal") as refused:
+                    copies.remove_trees(self.owner_id)
+                self.assertIn(str(manifest_path), str(refused.exception))
+                self.assertEqual(marker.read_bytes(), saved)
+                self.assertEqual(manifest_path.read_text(), manifest)
+                self.assertEqual(tree.exists(), missing != tree)
 
     def test_owner_removal_preserves_a_source_with_an_adopted_borrower(self) -> None:
         with registered_workspace(self.owner_id, self.source, self.head, name="parent", branch="worker") as parent:

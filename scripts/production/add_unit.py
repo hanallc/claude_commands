@@ -27,7 +27,7 @@ from scripts.herdr import pane_launch
 from scripts.herdr import herdr
 from scripts.agents import pane_record, remote
 from scripts.lib import build_folders, git_exclude, git_files, models_registry
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.production import autocompact
@@ -312,8 +312,8 @@ def default_worktree(production: Production, unit: str) -> Path:
     word = build_folders.repo_word(production.checkout)
     path = build_folders.worktree_path(word, unit, worktrees.UNIT_WORKTREE_NAME)
     legacy = path.with_name("director")
-    if not os.path.lexists(path) and worktrees.checkout_record(path) is None:
-        if worktrees.checkout_record(legacy) is not None:
+    if not os.path.lexists(path) and worktree_records.checkout_record(path) is None:
+        if worktree_records.checkout_record(legacy) is not None:
             return legacy
     return path
 
@@ -407,7 +407,7 @@ def launch_request(args: argparse.Namespace, *,
     if isinstance(member, staff_sources.MemberFound) and isinstance(member.row.worktree, staff.PresentWorktree):
         recorded = unit_lookup.local_worktree(member).path
         if isinstance(session, NewSession) or recorded != worktree or os.path.lexists(recorded):
-            saved_make = worktrees.checkout_record(recorded)
+            saved_make = worktree_records.checkout_record(recorded)
             if saved_make is not None and worktrees.pending_checkout(recorded, production.checkout, saved_make.branch):
                 branch = saved_make.branch
             else:
@@ -769,8 +769,9 @@ def ensure_worktree(request: UnitLaunch) -> None:
     try:
         _ = worktrees.create_checkout(
             worktree, production.checkout, build_folders.NewWorktreeBranch(request.branch, production.merge_branch),
-            layout, owner=request.identity.unit, merge_branch=production.merge_branch, allow_existing=True)
-    except worktrees.Refused as error:
+            layout, owner=request.identity.unit, merge_branch=production.merge_branch,
+            allow_existing=True, record_adoption=True)
+    except worktree_records.Refused as error:
         raise Refusal(str(error)) from error
     if isinstance(request.plan, PlanGiven):
         destination = worktree / request.plan.path
@@ -1383,15 +1384,20 @@ def _main(argv: list[str]) -> int:
     _ = parser.add_argument("--model", default="")
     _ = parser.add_argument("--autocompact", default="", help="auto or 100k-1M; kept for every relaunch of --resume; a listed unit only records it")
     _ = parser.add_argument("--config-dir", default="", help=argparse.SUPPRESS)
+    _ = parser.add_argument("--join-recovery-locks", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--cwd")
     _ = parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     staff.validate_unit_name_for_write(cast(str, args.name))
     try:
+        from scripts.accounts import moves
+
         request = launch_request(args)
-        with staff.row_operation(request.session.session_id if isinstance(request.session, ResumedSession)
-                                 else request.unit_id):
-            identity_record = staff.initial_snapshot()
+        session = request.session
+        with (staff.session_operation(session.session_id, native_key=moves.native_row_key(session.session_id),
+                                      join_recovery=cast(bool, args.join_recovery_locks))
+              if isinstance(session, ResumedSession) else staff.row_operation(request.unit_id)) as locked:
+            identity_record = locked if isinstance(locked, staff.StaffSnapshot) else staff.initial_snapshot()
             request = launch_request(args, record=identity_record)
             explicit_autocompact = cast(str, args.autocompact)
             if (explicit_autocompact and isinstance(request.session, ResumedSession)

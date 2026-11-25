@@ -17,7 +17,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.production import proposal_issue, proposals_folder, staff
-from scripts.review_links import new_item_dialog
+from scripts.review_links import new_item_dialog, reply_tokens
 from scripts.production.issues import Issue, frontmatter
 from scripts.production.production_doc import read_production
 from scripts.production.cli_fixture import invoke_cli
@@ -35,16 +35,22 @@ class RegistrationTests(RegistrationFixture):
         config.mkdir()
         _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
         self.env["CONF_DIR"] = str(config)
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)})))
+        self.env["REVIEW_LINKS_ROOT"] = str(self.root / "review-links")
+        self.env["XDG_STATE_HOME"] = str(self.root / "key-state")
+        _ = self.enterContext(mock.patch.object(reply_tokens, "platform", "linux"))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(config), "REVIEW_LINKS_ROOT": self.env["REVIEW_LINKS_ROOT"],
+            "XDG_STATE_HOME": self.env["XDG_STATE_HOME"]})))
 
     def test_f079_new_question_keeps_the_answer_at_a_late_collision(self) -> None:
         identities = registration.QuestionStaff.read()
         scope = registration.question_scope(self.owner_id, identities.record)
+        token = "r" + "b" * 42
 
         def file(title: str, before_write: Callable[[str, Path], None]) -> registration.QuestionRecord:
             nonce = hashlib.sha256(title.encode()).hexdigest()[:32]
             request = f"r1-{nonce}-question-{self.owner_id}"
-            details = new_item_dialog.ReviewSubmission(request, "a" * 64, new_item_dialog.NoEvidence(), (), "a" * 43)
+            details = new_item_dialog.ReviewSubmission(request, "a" * 64, new_item_dialog.NoEvidence(), (), token)
             parts = registration.QuestionParts(ask=title, context="", items=[], recommend="", choices=[])
             return registration.ask(
                 scope, title, parts, "", registration.Ranking(), identities=identities,
@@ -66,6 +72,9 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(collision.read_bytes(), original)
         self.assertEqual(saved.path, collision.with_stem(collision.stem + "-2"))
         self.assertEqual(saved.item.get("review_id"), "Q2")
+        note = saved.path.read_text(encoding="utf-8")
+        self.assertNotIn(token, note)
+        self.assertIn(reply_tokens.digest(token), note)
 
     def test_f072_question_numbering_scans_the_former_folder(self) -> None:
         identities = registration.QuestionStaff.read()

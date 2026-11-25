@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,7 @@ from uuid import UUID, uuid4
 from scripts.lib import atomic_file, file_lock
 
 ActionStatus = Literal["open", "done", "withdrawn"]
+REVIEW_PATH = "/console/review.html"
 
 
 class ActionStoreError(ValueError):
@@ -123,15 +125,21 @@ class ActionStore:
 
     folder: Path = field(default_factory=actions_folder)
 
-    def list(self) -> tuple[UserAction, ...]:
+    def list(self, *, watch: Callable[[Path], None] | None = None) -> tuple[UserAction, ...]:
         """Read every retained action or report the damaged source."""
+        if watch is not None:
+            watch(self.folder)
         try:
             paths = sorted(path for path in self.folder.iterdir() if path.suffix == ".json")
         except FileNotFoundError:
+            if watch is not None and (self.folder.exists() or self.folder.is_symlink()):
+                raise
             return ()
         records: list[UserAction] = []
         for path in paths:
             try:
+                if watch is not None:
+                    watch(path)
                 record = UserAction.decode(path.read_text(encoding="utf-8"))
                 if path.stem != action_id(record.key):
                     raise ActionStoreError("The filename does not match the action key.")
@@ -159,7 +167,8 @@ class ActionStore:
                     return existing
             return self._write(record)
 
-    def _find(self, key: str) -> UserAction:
+    def get(self, key: str) -> UserAction:
+        """Read the action with this key."""
         canonical = f"action/{action_id(key)}"
         for record in self.list():
             if record.key == canonical:
@@ -172,7 +181,7 @@ class ActionStore:
             raise ActionStoreError("Provide a withdrawal reason.")
         self.folder.mkdir(parents=True, exist_ok=True)
         with file_lock.exclusive(self.folder / ".lock"):
-            record = self._find(key)
+            record = self.get(key)
             if record.requested_by != requested_by:
                 raise ActionStoreError("Another requester owns this action.")
             if record.status != "open":
@@ -186,7 +195,7 @@ class ActionStore:
             raise ActionStoreError("Provide completion evidence.")
         self.folder.mkdir(parents=True, exist_ok=True)
         with file_lock.exclusive(self.folder / ".lock"):
-            record = self._find(key)
+            record = self.get(key)
             if record.status == "done":
                 return record
             if record.status != "open":
@@ -195,13 +204,21 @@ class ActionStore:
             return self._write(replace(record, status="done", updated_at=now, completed_at=now, evidence=evidence))
 
 
+def review_place(key: str = "") -> str:
+    """Link to the open actions or select one action."""
+    fields = {"type": "for-you", "show": "open"}
+    if key:
+        fields["item"] = key
+    return REVIEW_PATH + "?" + urlencode(fields)
+
+
 def card_url(key: str) -> str:
     """Use the existing Review origin and path without creating a console page."""
-    from scripts.review_links import review_link, review_page
+    from scripts.review_links import review_link
 
     root = review_link.review_root()
-    url = review_link.snapshot_url(root, root / review_page.PAGE_PATH.lstrip("/"))
-    return url + "?" + urlencode({"type": "for-you", "show": "open", "item": key})
+    url = review_link.snapshot_url(root, root / REVIEW_PATH.lstrip("/"))
+    return url + review_place(key).removeprefix(REVIEW_PATH)
 
 
 class Arguments(argparse.Namespace):

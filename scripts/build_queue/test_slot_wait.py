@@ -1,24 +1,48 @@
-"""Check queue names and refusal of retired capacity requests."""
+"""Check queue names and package parser retries."""
 from __future__ import annotations
 
+import subprocess
 import unittest
+from unittest import mock
 
-from scripts.build_queue import admission_protocol as wire, slot_wait
-from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue import slot_wait
+from scripts.lib.build_steps import RECORDED_STEP_NAMES
+
+
+class VerifyPackageTests(unittest.TestCase):
+    def test_failed_parse_retries_and_caches_the_next_package(self) -> None:
+        cases = (
+            ("timeout-package", subprocess.TimeoutExpired("bash", 2)),
+            ("os-error-package", OSError("cannot start bash")),
+            ("failed-exit-package", subprocess.CompletedProcess(["bash"], 2, stdout="partial", stderr="")),
+            ("failed-extraction-package", AssertionError("cannot extract the parser")),
+        )
+        for package, failure in cases:
+            success = subprocess.CompletedProcess(["bash"], 0, stdout=package, stderr="")
+            with (self.subTest(package=package),
+                  mock.patch.object(slot_wait, "verify_package_parser", return_value="") as extract,
+                  mock.patch.object(subprocess, "run", return_value=success) as run):
+                if isinstance(failure, AssertionError):
+                    parse = extract
+                    parse.side_effect = (failure, "")
+                else:
+                    parse = run
+                    parse.side_effect = (failure, success)
+                arguments = ("--filter", "name with spaces", package)
+                self.assertEqual(slot_wait.verify_package("test", arguments), "")
+                self.assertEqual(slot_wait.verify_package("test", arguments), package)
+                self.assertEqual(slot_wait.verify_package("test", arguments), package)
+                self.assertEqual(parse.call_count, 2)
 
 
 class QueueRowNameTests(unittest.TestCase):
     def test_an_unknown_repository_uses_the_folder_name(self) -> None:
         self.assertEqual(slot_wait.QueueRowName.repository("unregistered session", "/private/widget"), "widget build")
 
-
-class RepositorySlotWaitTests(unittest.TestCase):
-    def test_retired_capacity_request_never_waits_or_reserves_memory(self) -> None:
-        fixture = self.enterContext(AdmissionFixture())
-        original = fixture.request()
-        request = wire.RepositorySlotRequest(original.episode, original.owner, original.since,
-            "widget", "fixture", str(fixture.root / "copies"), 1, original.since + 30, original.identity)
-        self.assertEqual(fixture.connect(request).replies(),
-                         [wire.Refused("Repository copy capacity no longer requires admission")])
-        self.assertFalse(fixture.server.reservations)
-        self.assertFalse(fixture.server.waiters)
+    def test_slot_name_includes_the_package_after_a_parse_timeout(self) -> None:
+        command = ("bash", "/fixture/verify.sh", "test", "slot-retry-package")
+        success = subprocess.CompletedProcess(["bash"], 0, stdout="slot-retry-package", stderr="")
+        with mock.patch.object(subprocess, "run", side_effect=(subprocess.TimeoutExpired("bash", 2), success)) as parse:
+            self.assertEqual(slot_wait.command_slot_name(command, RECORDED_STEP_NAMES), "test")
+            self.assertEqual(slot_wait.command_slot_name(command, RECORDED_STEP_NAMES), "test slot-retry-package")
+        self.assertEqual(parse.call_count, 2)

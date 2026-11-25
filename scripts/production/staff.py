@@ -23,7 +23,7 @@ from enum import Enum
 from functools import cached_property
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, IO, Literal, NewType, Protocol, Self, TypeVar, cast
+from typing import TYPE_CHECKING, ClassVar, IO, Literal, NewType, Protocol, Self, TypeVar, cast, override
 from uuid import UUID
 
 from scripts.lib import git_files
@@ -34,6 +34,7 @@ if __name__ == "__main__":
 # The status line imports this module on each refresh. Defer imports for other paths.
 if TYPE_CHECKING:
     import argparse
+    from scripts.accounts import role_map
 
 OWNER_MACHINE = "natedev"
 StaffId = NewType("StaffId", str)
@@ -197,6 +198,15 @@ class StaffAbsent(StaffUnreadable):
 class StaffRefused(Exception):
     """A requested change would break the staff rules."""
 
+    def __init__(self, *args: object, holder: str = "") -> None:
+        super().__init__(*args)
+        # The process that holds a busy row, as "pid N: command"; empty when unknown.
+        self.holder: str = holder
+
+
+class UpkeepRowBusy(StaffRefused):
+    """Herdr upkeep did not release the row within the wait time."""
+
 
 class StaffNotFound(LookupError):
     """A requested member does not exist."""
@@ -345,6 +355,49 @@ class HoldRecord:
 class Paused(HoldRecord):
     """The director holds at its prompt."""
 
+    keep_workers: bool = False
+
+    @override
+    def to_json(self) -> dict[str, object]:
+        fields = super().to_json()
+        if self.keep_workers:
+            fields["keep_workers"] = True
+        return fields
+
+    @classmethod
+    @override
+    def from_json(cls, value: object) -> Self:
+        hold = super().from_json(value)
+        unknown = hold.unknown_fields.copy()
+        keep_workers = unknown.pop("keep_workers", False)
+        if not isinstance(keep_workers, bool):
+            raise StaffUnreadable("paused keep_workers must be a boolean")
+        return replace(hold, keep_workers=keep_workers, unknown_fields=unknown)
+
+
+@dataclass(frozen=True)
+class NoPendingResume:
+    """The director has no continuation to recover."""
+
+
+@dataclass(frozen=True)
+class ResumePending:
+    key: str
+    original_pause: Paused
+
+    def to_json(self) -> dict[str, object]:
+        return {"key": self.key, "original_pause": self.original_pause.to_json()}
+
+    @classmethod
+    def from_json(cls, value: object) -> ResumePending:
+        if not isinstance(value, dict):
+            raise StaffUnreadable("pending resume must be an object")
+        fields = cast(dict[str, object], value)
+        key = fields.get("key")
+        if not isinstance(key, str) or not key:
+            raise StaffUnreadable("pending resume requires a key")
+        return cls(key, Paused.from_json(fields.get("original_pause")))
+
 
 @dataclass(frozen=True)
 class Exited(HoldRecord):
@@ -386,6 +439,7 @@ class StaffRow:
     run: OpenRun | NoRun = field(default_factory=NoRun, kw_only=True)
     unit_type: UnitDetails | NotUnit = field(default_factory=NotUnit, kw_only=True)
     retirement: RetiredProducer | Active = field(default_factory=Active, kw_only=True)
+    resume_pending: ResumePending | NoPendingResume = field(default_factory=NoPendingResume, kw_only=True)
     unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
     def reports_to(self, identity: StaffId) -> bool:
@@ -417,6 +471,8 @@ class StaffRow:
             value["paused"] = self.paused.to_json()
         if isinstance(self.exited, Exited):
             value["exited"] = self.exited.to_json()
+        if isinstance(self.resume_pending, ResumePending):
+            value["resume_pending"] = self.resume_pending.to_json()
         if isinstance(self.retirement, RetiredProducer):
             value["retired_producer"] = self.retirement.profile
         return value
@@ -455,6 +511,7 @@ class StaffRow:
         parsed_home = SessionHome(Path(home)) if isinstance(home, str) and Path(home).is_absolute() else HomeUnknown()
         known_fields = {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused", "exited", "run", "unit_type"}
         known_fields.add("retired_producer")
+        known_fields.add("resume_pending")
         retirement: RetiredProducer | Active = Active()
         if "retired_producer" in fields:
             profile = fields["retired_producer"]
@@ -477,6 +534,8 @@ class StaffRow:
                    run=OpenRun(Path(run)) if isinstance(run, str) else NoRun(), retirement=retirement,
                    paused=Paused.from_json(fields["paused"]) if "paused" in fields else Active(),
                    exited=Exited.from_json(fields["exited"]) if "exited" in fields else Active(),
+                   resume_pending=ResumePending.from_json(fields["resume_pending"])
+                   if "resume_pending" in fields else NoPendingResume(),
                    unknown_fields=_unknown_fields(fields, known_fields))
 
 
@@ -837,6 +896,53 @@ def _file() -> Path:
     return Path(_file_override() or _default_file()).expanduser()
 
 
+def _record_lock_path(record: Path) -> Path:
+    return record.with_name(record.name + ".lock")
+
+
+def _operation_lock_path(record: Path) -> Path:
+    return record.with_name("operation.lock")
+
+
+@dataclass(frozen=True)
+class StaffWorktreeWriteAvailable:
+    """No held lock prevents the staff worktree write."""
+
+
+@dataclass(frozen=True)
+class StaffWorktreeWriteLockHeld:
+    lock: Path
+
+
+def _probe_worktree_write(*, check_operation: bool) -> StaffWorktreeWriteAvailable | StaffWorktreeWriteLockHeld:
+    from scripts.lib import file_lock
+
+    record = _file()
+    locks = (_record_lock_path(record),)
+    if check_operation:
+        locks = (_operation_lock_path(record), *locks)
+    for lock in locks:
+        try:
+            if file_lock.probe_existing_exclusive(lock) is file_lock.LockAvailability.HELD:
+                return StaffWorktreeWriteLockHeld(lock.absolute())
+        except OSError as error:
+            raise StaffUnreadable(f"cannot check staff lock {lock}: {error}") from error
+    return StaffWorktreeWriteAvailable()
+
+
+def worktree_write_lock_status() -> StaffWorktreeWriteAvailable | StaffWorktreeWriteLockHeld:
+    """Check the staff locks on the machine that writes the record."""
+    if is_owner():
+        return _probe_worktree_write(check_operation=False)
+    match _remote(["worktree-write-lock-status"]):
+        case {"state": "available"}:
+            return StaffWorktreeWriteAvailable()
+        case {"state": "held", "lock": str() as lock} if Path(lock).is_absolute():
+            return StaffWorktreeWriteLockHeld(Path(lock))
+        case _:
+            raise StaffUnreadable("invalid worktree write lock status from the staff owner")
+
+
 def is_owner() -> bool:
     """An explicit STAFF_FILE is local state owned by this process."""
     from scripts.agents import remote
@@ -887,8 +993,12 @@ def row_operation(reference: str) -> Generator[None]:
         yield
 
 
+def _holder_fields() -> dict[str, object]:
+    return {"pid": os.getpid(), "command": shlex.join(sys.argv)}
+
+
 def _write_slot_holder(lock: IO[bytes]) -> None:
-    holder = {"pid": os.getpid(), "command": shlex.join(sys.argv)}
+    holder = _holder_fields()
     with suppress(OSError):
         os.ftruncate(lock.fileno(), 0)
         _ = lock.write((json.dumps(holder) + "\n").encode("utf-8"))
@@ -899,35 +1009,115 @@ def _clear_slot_holder(lock: IO[bytes]) -> None:
         os.ftruncate(lock.fileno(), 0)
 
 
-def _slot_holder_suffix(lock: IO[bytes]) -> str:
+def _slot_holder(lock: IO[bytes]) -> tuple[int, str] | None:
     try:
         _ = lock.seek(0)
         line = lock.read(4096).partition(b"\n")[0]
         holder = cast(object, json.loads(line))
     except (OSError, ValueError):
-        return ""
+        return None
     if not isinstance(holder, dict):
-        return ""
+        return None
     record = cast(dict[str, object], holder)
     pid, command = record.get("pid"), record.get("command")
     if type(pid) is not int or pid <= 0 or not isinstance(command, str) or not command:
-        return ""
-    return f" (pid {pid}: {command})"
+        return None
+    return pid, command
+
+
+_UPKEEP_LOCK_WAIT: ContextVar[float | None] = ContextVar("_UPKEEP_LOCK_WAIT", default=None)
 
 
 @contextmanager
-def slot_operation(key: str, name: str) -> Generator[None]:
+def upkeep_lock_wait(seconds: float) -> Generator[None]:
+    token = _UPKEEP_LOCK_WAIT.set(seconds)
+    try:
+        yield
+    finally:
+        _UPKEEP_LOCK_WAIT.reset(token)
+
+
+def _upkeep_pid(holder: tuple[int, str]) -> int | None:
+    with suppress(ValueError):
+        arguments = shlex.split(holder[1])
+        if "--work" in arguments and any(Path(arg).name == "herdr_upkeep.py" for arg in arguments):
+            return holder[0]
+    return None
+
+
+def _acquire_slot(lock: IO[bytes], name: str) -> None:
+    seconds = _UPKEEP_LOCK_WAIT.get()
+    deadline = time.monotonic() + seconds if seconds is not None else 0.0
+    upkeep_pid: int | None = None
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError as error:
+            holder = _slot_holder(lock)
+            if seconds is not None:
+                if holder is not None:
+                    upkeep_pid = _upkeep_pid(holder)
+                if upkeep_pid is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise UpkeepRowBusy(f"Herdr upkeep still holds {name} (pid {upkeep_pid})") from error
+                    time.sleep(min(0.05, remaining))
+                    continue
+            named = f"pid {holder[0]}: {holder[1]}" if holder else ""
+            raise StaffRefused(f"{name}: another operation holds this row" + (f" ({named})" if named else ""),
+                               holder=named) from error
+
+
+def wait_for_upkeep_row(row: StaffRow, deadline: float) -> None:
+    """Wait for upkeep to release this row before reading liveness."""
+    path, _variable = _row_lock(row.id)
+    try:
+        with path.open("rb", buffering=0) as lock, upkeep_lock_wait(max(0, deadline - time.monotonic())):
+            try:
+                _acquire_slot(lock, row.name)
+            except UpkeepRowBusy:
+                raise
+            except StaffRefused:
+                pass
+    except FileNotFoundError:
+        pass
+
+
+@contextmanager
+def session_operation(session: str, *, native_key: str, join_recovery: bool = False) -> Generator[StaffSnapshot]:
+    """Lock the native session before its staff row, if it has one."""
+    if join_recovery:
+        if not _joined_operation(*_row_lock(native_key)):
+            raise StaffRefused("recovery did not pass the native session lock")
+        record = initial_snapshot()
+        row = record.by_current_session(session)
+        if row is None or not _joined_operation(*_row_lock(row.id)):
+            raise StaffRefused("recovery did not pass the staff row lock")
+        yield record
+        return
+    with slot_operation(native_key, session, join=False), ExitStack() as locks:
+        record = initial_snapshot()
+        row = record.by_current_session(session)
+        if row is not None:
+            _ = locks.enter_context(slot_operation(row.id, row.name, join=False))
+            record = initial_snapshot()
+            current = record.by_current_session(session)
+            if current is None or current.id != row.id:
+                raise StaffRefused(f"{row.name}: the session owner changed while acquiring its row")
+        yield record
+
+
+@contextmanager
+def slot_operation(key: str, name: str, *, join: bool = True) -> Generator[None]:
     """Lock a row or a named worker slot across inherited children."""
     path, variable = _row_lock(key)
-    if _joined_operation(path, variable):
+    if join and _joined_operation(path, variable):
         yield
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b", buffering=0) as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise StaffRefused(f"{name}: another operation holds this row{_slot_holder_suffix(lock)}") from error
+        _acquire_slot(lock, name)
         previous = os.environ.get(variable)
         _write_slot_holder(lock)
         try:
@@ -1002,14 +1192,13 @@ def mark_row_move(key: str, target: str) -> Generator[None]:
             _ = stream.truncate()
             stream.flush()
 
-        pid = os.getpid()
-        owner = process_start.process_start(pid)
-        write({"pid": pid, "start": owner.start, "target": target}
-              if isinstance(owner, process_start.Started) else {})
+        holder = _holder_fields()
+        owner = process_start.process_start(os.getpid())
+        write(holder | {"start": owner.start, "target": target} if isinstance(owner, process_start.Started) else holder)
         try:
             yield
         finally:
-            write({})
+            write(holder)
 
 
 def _joined_operation(path: Path, variable: str = "STAFF_OPERATION_FD") -> bool:
@@ -1068,7 +1257,7 @@ def operation() -> AbstractContextManager[None]:
 
     @contextmanager
     def locked() -> Generator[None]:
-        path = _file().parent / "operation.lock"
+        path = _operation_lock_path(_file())
         if _joined_operation(path):
             yield
             return
@@ -1479,6 +1668,72 @@ def authority_snapshot() -> StaffSnapshot:
     return replace(_snapshot_value(cast(dict[str, object], value)), production=True)
 
 
+@dataclass(frozen=True)
+class PeerStatusAuthority:
+    membership: StaffSnapshot
+    accounts: role_map.RoleMap
+
+    def encode(self) -> str:
+        from scripts.accounts import role_map
+
+        return json.dumps({
+            "staff": self.membership.encode(),
+            "role_map": role_map.encode_role_map(self.accounts),
+        })
+
+
+@dataclass(frozen=True)
+class ReadStatusAuthority:
+    """Read staff and roles from their authorities during status."""
+
+
+def peer_status_authority() -> PeerStatusAuthority | ReadStatusAuthority:
+    """Supply staff and roles from the production staff owner."""
+    from scripts.accounts import role_map
+
+    if _file_override() or not is_owner():
+        return ReadStatusAuthority()
+    try:
+        roles = role_map.read_role_map()
+    except role_map.RoleMapUnavailable:
+        return ReadStatusAuthority()
+    return PeerStatusAuthority(authority_snapshot(), roles)
+
+
+def decode_peer_status_authority(text: str) -> PeerStatusAuthority | ReadStatusAuthority:
+    """Decode the peer's staff and roles together."""
+    from scripts.accounts import role_map
+
+    try:
+        value = _decode(text)
+        if not isinstance(value, dict):
+            return ReadStatusAuthority()
+        document = cast(dict[str, object], value)
+        membership, roles = document.get("staff"), document.get("role_map")
+        if not isinstance(membership, str) or not isinstance(roles, str):
+            return ReadStatusAuthority()
+        accounts = role_map.decode_role_map_strict(roles)
+        fields = _record_fields(membership)
+        record = _snapshot_value(fields)
+    except (OSError, ValueError, RecursionError):
+        return ReadStatusAuthority()
+    if not _clean_parse(fields, record):
+        return ReadStatusAuthority()
+    return PeerStatusAuthority(replace(record, production=True), accounts)
+
+
+@contextmanager
+def status_authority(reading: PeerStatusAuthority | ReadStatusAuthority) -> Generator[None]:
+    """Use the supplied staff and roles for this status command."""
+    from scripts.accounts import role_map
+
+    with ExitStack() as scope:
+        if isinstance(reading, PeerStatusAuthority):
+            _ = scope.enter_context(supplied_snapshot(reading.membership))
+            _ = scope.enter_context(role_map.supplied_role_map(reading.accounts))
+        yield
+
+
 def local_snapshot() -> StaffSnapshot:
     """Read only this machine's retained record; never contact its remote owner."""
     return _load()
@@ -1490,7 +1745,7 @@ def wait_for_writes() -> None:
 
     path = _file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
+    with _record_lock_path(path).open("a", encoding="utf-8") as lock:
         worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_SH)
 
 
@@ -1605,14 +1860,8 @@ def _copy_to_mac(*, detached: bool = True) -> None:
                     stdout=subprocess.DEVNULL, stderr=errors, start_new_session=True,
                 )
             return
-        import signal
-
         path = _default_file()
-        # Keep this lock through SSH so an older send cannot follow a newer send.
-        with path.with_name("mac-copy.lock").open("a", encoding="utf-8") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            text = path.read_text(encoding="utf-8")
-            command = '''set -e
+        command = '''set -e
 directory="$HOME/.local/state/staff"
 mkdir -p "$directory"
 temporary=$(mktemp "$directory/staff.json.mac-copy.XXXXXXXX")
@@ -1620,31 +1869,18 @@ trap 'rm -f "$temporary"' EXIT
 cat > "$temporary"
 mv -f "$temporary" "$directory/staff.json"
 '''
-            def stop(_number: int, _frame: object) -> None:
-                raise InterruptedError("copier terminated")
-
-            # Defer SIGTERM until the SSH child has a cleanup handler.
-            blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
-            previous_handler = signal.signal(signal.SIGTERM, stop)
-            try:
-                with subprocess.Popen(
-                    ["ssh", "-o", "BatchMode=yes", remote.other_machine(), command],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                ) as process:
-                    try:
-                        _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-                        _, errors = process.communicate(input=text, timeout=remote.STANDARD_TIME_LIMIT["seconds"])
-                    except BaseException:
-                        _ = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
-                        process.terminate()
-                        _ = process.wait()
-                        raise
-                    if process.returncode:
-                        reason = " ".join(errors.split()) or f"ssh exited {process.returncode}"
-                        raise OSError(reason)
-            finally:
-                _ = signal.signal(signal.SIGTERM, previous_handler)
-                _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+        seconds = remote.STANDARD_TIME_LIMIT["seconds"]
+        # The holder keeps the lock if the copier exits before SSH.
+        result = subprocess.run([
+            "flock", str(path.with_name("mac-copy.lock")), "sh", "-c",
+            'exec timeout -s KILL "$1" ssh -o BatchMode=yes "$2" "$3" < "$4"',
+            "sh", str(seconds), remote.other_machine(), command, str(path),
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, check=False)
+        if result.returncode in (124, 137):
+            raise OSError(f"ssh timed out after {seconds:g} s")
+        if result.returncode:
+            reason = " ".join(result.stderr.split()) or f"ssh exited {result.returncode}"
+            raise OSError(reason)
     except (OSError, subprocess.SubprocessError) as error:
         print(f"staff: Mac copy failed: {' '.join(str(error).split())}", file=sys.stderr)
 
@@ -1656,7 +1892,7 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
     path = _file()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
+        with _record_lock_path(path).open("a", encoding="utf-8") as lock:
             worker_lifecycle.acquire_flock(lock)
             for temporary in path.parent.glob(f".{path.name}.*"):
                 temporary.unlink()
@@ -2042,7 +2278,13 @@ def set_hold(reference: str, hold: Paused | Exited | Active) -> StaffRow:
         if row is None:
             raise StaffNotFound(StaffId(reference))
         if isinstance(hold, Paused):
-            changed = replace(row, paused=row.paused if isinstance(row.paused, Paused) else hold, exited=Active())
+            paused = row.paused
+            if isinstance(paused, Paused):
+                if paused.keep_workers and not hold.keep_workers:
+                    paused = replace(paused, keep_workers=False)
+            else:
+                paused = hold
+            changed = replace(row, paused=paused, exited=Active())
         elif isinstance(hold, Exited):
             changed = replace(row, exited=row.exited if isinstance(row.exited, Exited) else hold, paused=Active())
         else:
@@ -2053,16 +2295,19 @@ def set_hold(reference: str, hold: Paused | Exited | Active) -> StaffRow:
     return _transaction(edit)
 
 
-def _hold(reference: str, why: str, state: type[Paused] | type[Exited]) -> StaffRow:
+def _hold(reference: str, why: str, state: type[Paused] | type[Exited], *, keep_workers: bool = False) -> StaffRow:
     from scripts.lib.user_zone import user_zone
 
     caller = by_current_session(runtime_id())
-    return set_hold(reference, state(datetime.now(user_zone()).isoformat(), caller.name if caller else "", why))
+    since = datetime.now(user_zone()).isoformat()
+    name = caller.name if caller else ""
+    hold = Paused(since, name, why, keep_workers=keep_workers) if state is Paused else Exited(since, name, why)
+    return set_hold(reference, hold)
 
 
-def pause(reference: str, why: str) -> StaffRow:
+def pause(reference: str, why: str, *, keep_workers: bool = False) -> StaffRow:
     """Record the director's pause request."""
-    return _hold(reference, why, Paused)
+    return _hold(reference, why, Paused, keep_workers=keep_workers)
 
 
 def exit(reference: str, why: str) -> StaffRow:
@@ -2073,6 +2318,46 @@ def exit(reference: str, why: str) -> StaffRow:
 def resume(reference: str) -> StaffRow:
     """Remove the pause or exit record."""
     return set_hold(reference, Active())
+
+
+def begin_resume(identity: StaffId, pause: Paused) -> StaffRow:
+    """Save the continuation and clear the matching pause in one write."""
+    if not is_owner():
+        return _remote_row(["begin-resume", identity, "--record", json.dumps(pause.to_json())])
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, identity)
+        if isinstance(row.resume_pending, ResumePending):
+            return row
+        if row.paused != pause or isinstance(row.exited, Exited):
+            raise StaffRefused(f"{row.name}: the pause changed")
+        pending = ResumePending(f"agents-resume:{identity}:{pause.since}", pause)
+        changed = replace(row, paused=Active(), resume_pending=pending)
+        rows[rows.index(row)] = changed
+        return changed
+
+    return _transaction(edit)
+
+
+def finish_resume(identity: StaffId, key: str, *, restore_pause: bool = False) -> StaffRow:
+    """Settle the matching continuation and preserve any newer hold."""
+    if not is_owner():
+        return _remote_row(["finish-resume", identity, f"--resume-key={key}",
+                            *(["--restore-pause"] if restore_pause else [])])
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, identity)
+        pending = row.resume_pending
+        if isinstance(pending, NoPendingResume) or pending.key != key:
+            return row
+        pause = row.paused
+        if restore_pause and isinstance(pause, Active) and isinstance(row.exited, Active):
+            pause = pending.original_pause
+        changed = replace(row, paused=pause, resume_pending=NoPendingResume())
+        rows[rows.index(row)] = changed
+        return changed
+
+    return _transaction(edit)
 
 
 def set_worktree(unit: StaffId, worktree: PresentWorktree | RemovedWorktree, *,
@@ -2403,6 +2688,8 @@ class _Arguments:
     marker: str = ""
     profile: str = ""
     hold_record: str = ""
+    resume_key: str = ""
+    restore_pause: bool = False
     home: str = ""
     runtime_id: str = ""
     new_id: str = ""
@@ -2439,6 +2726,8 @@ def _parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description=__doc__)
     verbs = parser.add_subparsers(dest="verb", required=True)
+    lock_status = verbs.add_parser("worktree-write-lock-status", help=argparse.SUPPRESS)
+    _ = lock_status.add_argument("--json", action="store_true")
     for command in ("set-worker-role", "set-home"):
         fact = verbs.add_parser(command, help=argparse.SUPPRESS)
         _ = fact.add_argument("target")
@@ -2456,6 +2745,15 @@ def _parser() -> argparse.ArgumentParser:
     _ = hold.add_argument("--state", choices=("paused", "exited", "active"), required=True)
     _ = hold.add_argument("--record", dest="hold_record", default="{}")
     _ = hold.add_argument("--json", action="store_true")
+    begin_resume_cmd = verbs.add_parser("begin-resume", help=argparse.SUPPRESS)
+    _ = begin_resume_cmd.add_argument("target")
+    _ = begin_resume_cmd.add_argument("--record", dest="hold_record", required=True)
+    _ = begin_resume_cmd.add_argument("--json", action="store_true")
+    finish_resume_cmd = verbs.add_parser("finish-resume", help=argparse.SUPPRESS)
+    _ = finish_resume_cmd.add_argument("target")
+    _ = finish_resume_cmd.add_argument("--resume-key", required=True)
+    _ = finish_resume_cmd.add_argument("--restore-pause", action="store_true")
+    _ = finish_resume_cmd.add_argument("--json", action="store_true")
     show = verbs.add_parser("show", help="show the production staff")
     _ = show.add_argument("--kind", choices=_KINDS)
     _ = show.add_argument("--live", action="store_true", help="show live member identities")
@@ -2572,6 +2870,10 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
         hold = (Paused.from_json(_decode(arguments.hold_record)) if arguments.state == "paused" else
                 Exited.from_json(_decode(arguments.hold_record)) if arguments.state == "exited" else Active())
         return set_hold(arguments.target, hold)
+    if arguments.verb == "begin-resume":
+        return begin_resume(StaffId(arguments.target), Paused.from_json(_decode(arguments.hold_record)))
+    if arguments.verb == "finish-resume":
+        return finish_resume(StaffId(arguments.target), arguments.resume_key, restore_pause=arguments.restore_pause)
     if arguments.verb == "ensure-worker":
         assert arguments.parent is not None
         return ensure_worker(native_id(arguments.target), arguments.name, StaffId(arguments.parent))
@@ -2636,6 +2938,14 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
 
 
 def _main(arguments: _Arguments) -> int:
+    if arguments.verb == "worktree-write-lock-status":
+        if not is_owner():
+            raise StaffRefused("the staff owner must check the worktree write lock")
+        status = _probe_worktree_write(check_operation=True)
+        lock_result = ({"state": "held", "lock": str(status.lock)} if isinstance(status, StaffWorktreeWriteLockHeld)
+                       else {"state": "available"})
+        print(json.dumps(lock_result))
+        return 0
     if arguments.verb == "producer-creation":
         action = arguments.creation_action
         creation = producer_creation_registry("read" if action == "read-named" else action,

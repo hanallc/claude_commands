@@ -38,6 +38,7 @@ from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
 from scripts.production import showrunners, staff
 from scripts.production.cli_fixture import invoke_cli
+from scripts.production.production_doc import Refusal
 from scripts.style.style_plan_test_support import run_style_command
 from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
 from scripts.style.ledger_test_support import style_staff_fixture, style_unit_id, ticket_owner_id, write_style_units
@@ -215,7 +216,6 @@ class StyleSyncTests(unittest.TestCase):
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json"),
             "SCRATCH_ROOT": str(self.root / "scratch"),
             "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
-            "SCRATCH_VISIBLE_ROOT": str(self.root / "repro"),
             # A child's fresh gate copy goes in the test folder, so a killed child leaves nothing outside it.
             "TMPDIR": str(self.root),
         })))
@@ -1016,6 +1016,19 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         copy = self.standing_target().parent
         return original + f"\n\nworktree {copy}\nHEAD {self.tip}\ndetached"
 
+    def test_lint_removal_clears_git_registration_and_keeps_a_held_child(self) -> None:
+        directory = self.stale_dir("held-child", 0, registered=True)
+        snapshot = directory / "checkout"
+        child = directory / "child"
+        child.mkdir()
+        with (directory / "child.lock").open("wb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertFalse(style_sync.remove_lint_dir(self.repo, directory))
+            self.assertTrue(child.is_dir())
+            self.assertTrue((directory / style_sync.OWNER_FILE).is_file())
+            self.assertNotIn(f"worktree {snapshot}", self.git("worktree", "list", "--porcelain"))
+        self.assertTrue(style_sync.remove_lint_dir(self.repo, directory))
+
     def test_absent_checkout_keeps_recovery_marks_when_cargo_refuses_cleanup(self) -> None:
         directory = self.stale_dir("cargo-recovery", 0, registered=True)
         snapshot = directory / "checkout"
@@ -1036,6 +1049,34 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         self.assertTrue((directory / style_sync.OWNER_FILE).is_file())
         self.assertTrue(style_sync.remove_lint_dir(self.repo, directory))
         self.assertFalse(directory.exists())
+
+    def test_git_cleanup_failure_preserves_the_checkout_and_owner_for_retry(self) -> None:
+        directory = self.stale_dir("git-cleanup", ended_pid(), registered=True)
+        snapshot = directory / "checkout"
+        (snapshot / ".git").unlink()
+        proof = snapshot / "incomplete-checkout"
+        _ = proof.write_text("keep")
+        owner = style_sync.OwnerRecord.read(directory)
+        git = style_sync.git
+        lock_states: list[str] = []
+
+        def refuse_remove(repo: Path, *arguments: str) -> str:
+            if arguments[:2] == ("worktree", "remove"):
+                lock_states.append(build_folders.build_folder_state(snapshot))
+                raise Refusal("Git cleanup failed")
+            return git(repo, *arguments)
+
+        with (mock.patch.object(style_sync, "git", side_effect=refuse_remove),
+              redirect_stdout(io.StringIO()) as report):
+            self.assertFalse(style_sync.remove_lint_dir(self.repo, directory))
+        self.assertIn("Git cleanup failed", report.getvalue())
+        self.assertEqual(proof.read_text(), "keep")
+        self.assertEqual(lock_states, ["held"])
+        self.assertEqual(style_sync.OwnerRecord.read(directory), owner)
+        self.assertIn(f"worktree {snapshot}", self.git("worktree", "list", "--porcelain"))
+        self.assertTrue(style_sync.remove_lint_dir(self.repo, directory))
+        self.assertFalse(directory.exists())
+        self.assertNotIn(f"worktree {snapshot}", self.git("worktree", "list", "--porcelain"))
 
     def standing_target(self) -> Path:
         return build_folders.copy_path("sample", "sample-style", 1) / "target"

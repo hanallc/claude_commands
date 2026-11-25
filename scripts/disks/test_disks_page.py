@@ -3,7 +3,6 @@ from __future__ import annotations
 import html
 import io
 import json
-import math
 import os
 import re
 import shutil
@@ -21,11 +20,12 @@ from unittest import mock
 
 from scripts.build_queue import memory_files
 from scripts.build_queue.test_memory_hover import RAM_FIXTURE, SWAP_FIXTURE
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states
 from scripts.disks import disks_page, slots
 from scripts.production import staff
 from scripts.review_links import staff_names
 from scripts.lib import file_lock, test_hang_guard
+from scripts.lib.process_group import run_process_group
 from scripts.review_links import page_frame, test_page_frame
 
 GIB = 1 << 30
@@ -225,14 +225,40 @@ class DisksPageTests(unittest.TestCase):
                                   "The cleanup floor is unknown."])
 
     def test_the_slider_runs_on_a_log_scale_from_the_least_value_to_the_largest_top_folder(self) -> None:
-        calls = ("range.min", "range.max", "toSlider(range.min, range)", "toSlider(range.max, range)",
-                 "fromSlider(SLIDER_STEPS / 2, range)", "startLimit(range, data.settings)")
-        result = cast(list[float], self.run_page(
-            f"(() => {{ const range = sliderRange(data.tree, data.settings); return [{', '.join(calls)}]; }})()"))
-        self.assertEqual(result[:4], [GIB, 60 * GIB, 0, 1000])
-        middle: float = result[4]
-        self.assertAlmostEqual(middle, GIB * math.sqrt(60), delta=1)
-        self.assertEqual(result[5], 10 * GIB)
+        result = self.run_page("""(() => {
+            const range = sliderRange(data.tree, data.settings);
+            const limits = [0, SLIDER_STEPS / 2, SLIDER_STEPS].map(step => fromSlider(step, range));
+            const precise = sliderRange(data.tree, {slider_min_gib: 1.04});
+            const minimum = fromSlider(0, precise);
+            const drive = sliderRange({children: [{size: 27 * GIB}]}, {slider_min_gib: 0.7});
+            const sessions = sessionRange({sessions: [{size: 3 * GIB}]}, Math.ceil(0.7 * GIB));
+            const uneven = fromSlider(SLIDER_STEPS, {...range, max: range.max + 1});
+            const nearTib = 1023.99 * GIB;
+            const largeRange = {...range, max: 2048 * GIB};
+            const snapped = snapLimit(nearTib, largeRange);
+            const boundary = snapLimit(999.99 * GIB, largeRange);
+            const threeDigits = snapLimit(99.94 * GIB, largeRange);
+            return {
+                limits, labels: limits.map(limitLabel),
+                positions: [toSlider(range.min, range), toSlider(range.max, range)],
+                start: startLimit(range, data.settings),
+                minimum: [minimum, limitLabel(minimum)],
+                top: [fromSlider(SLIDER_STEPS, drive), sessionLimitAt(SLIDER_STEPS, sessions)],
+                uneven: [uneven, limitLabel(uneven)],
+                large: [limitLabel(nearTib), snapped, limitLabel(snapped), limitLabel(boundary),
+                        limitLabel(999.94 * GIB), threeDigits, limitLabel(threeDigits)],
+            };
+        })()""")
+        self.assertEqual(result, {
+            "limits": [GIB, 7.75 * GIB, 60 * GIB],
+            "labels": ["1.0 GiB", "7.75 GiB", "60 GiB"],
+            "positions": [0, 1000],
+            "start": 10 * GIB,
+            "minimum": [1.04 * GIB, "1.04 GiB"],
+            "top": [27 * GIB, 3 * GIB],
+            "uneven": [60 * GIB + 1, "≈60 GiB"],
+            "large": ["≈1.0 TiB", 1024 * GIB, "1.0 TiB", "0.98 TiB", "≈0.98 TiB", 99.9 * GIB, "99.9 GiB"],
+        })
 
     def test_the_status_line_uses_the_shared_reader_and_measured_facts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -602,8 +628,8 @@ const localStorage={getItem:()=>null};
         assert start is not None
         scenario = scenario.replace("START", start[0])
         node = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
-        done = subprocess.run([node, "--unhandled-rejections=strict", "-e",
-                               environment + functions + page_frame.REFRESH_SCRIPT + scenario],
+        done = subprocess.run([node, "--unhandled-rejections=strict", "-"],
+                              input=environment + functions + page_frame.REFRESH_SCRIPT + scenario,
                               capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual((done.returncode, done.stdout.strip()), (0, "PASS"), done.stderr)
 
@@ -803,11 +829,11 @@ async function checkSessionLayout() {
                         profile = Path(directory) / f"profile-{width}"
                         profile.mkdir()
                         _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
-                        done = subprocess.run(
+                        done = run_process_group(
                             ["firefox", "--headless", "--no-remote", "--profile", str(profile),
                              "--window-size", f"{width},900", "--screenshot", str(profile / "disks.png"),
                              f"http://127.0.0.1:{server.server_port}/"],
-                            capture_output=True, text=True, timeout=45, check=False)
+                            timeout=45)
                         self.assertEqual(done.returncode, 0, done.stderr)
                         self.assertEqual(results, [{"width": width, "failures": []}])
             finally:
@@ -838,7 +864,7 @@ async function checkSessionLayout() {
 
     def test_a_slot_shows_the_builds_tooltip_without_a_title_field(self) -> None:
         row = {"name": "report integrate", "unit": "report", "showrunner": "builds", "started_at": NOW - 60,
-               "key": "run", "used": 2.0, "slot": 1, "slot_folder": "hana/report/1", "slot_machine": "natedev",
+               "key": "run", "used": 2.0, "slot_folder": "hana/report/1", "slot_machine": "natedev",
                "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
         builds = {"read_at": NOW, "walk": [row], "waiters": [], "ram": RAM_FIXTURE, "swap": SWAP_FIXTURE}
         body = cast(str, self.run_drive("""
@@ -854,7 +880,7 @@ async function checkSessionLayout() {
         # the build queue so they share code and data".
         now = NOW
         step = {"name": "report integrate", "unit": "report", "showrunner": "builds", "started_at": now - 600, "used": 2.0,
-                "slot": 1, "slot_folder": "hana/report/1", "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
+                "slot_folder": "hana/report/1", "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
         builds = {"read_at": now, "waiters": [], "swap_by": [], "ram": RAM_FIXTURE, "swap": SWAP_FIXTURE,
                   "walk": [{**step, "key": "mac-run", "slot_machine": "mac"}, {**step, "key": "run", "slot_machine": "natedev"},
                            {**step, "key": "free-run", "slot_folder": "hana/report/2", "slot_machine": "natedev"}]}

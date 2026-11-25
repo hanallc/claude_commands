@@ -11,16 +11,15 @@ import subprocess
 import tempfile
 import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from dataclasses import dataclass
 from typing import cast
 from unittest.mock import patch
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.nix_env_test_support import NixFixture
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment, memory_gate_shell_environment, write_config_fixture
 from scripts.lib import test_hang_guard
-from scripts.copies import copies
-from scripts.style import bulk_run
 
 from scripts.buildlog.cgroup_test_support import write_cgroup
 from scripts.buildlog.test_memory_window import write_lint_config
@@ -29,6 +28,19 @@ from scripts.buildlog.test_memory_window import write_lint_config
 INVOKE = Path(__file__).with_name("invoke.sh")
 LINT_CONFIG_READER = INVOKE.with_name("lint_config.sh")
 OOM_SCORE_ADJ = "/proc/self/oom_score_adj"
+COPY_LEASE_DESCRIPTOR_VARIABLES = (
+    "COPIES_COMMAND_LEASE_FDS",
+    "COPIES_MIRROR_LEASE_FDS",
+    "DOC_COPY_LEASE_FD",
+    "NUMBERED_COPY_LOCK_FD",
+    "COPIES_STEP_SOURCE_LOCK_FD",
+)
+
+
+def invoke_test_environment() -> dict[str, str]:
+    """Omit the parent reservation and lease numbers because the fixture opens its own descriptors."""
+    return {name: value for name, value in memory_gate_shell_environment().items()
+            if name not in COPY_LEASE_DESCRIPTOR_VARIABLES}
 
 
 class VerifyTemporaryParentTests(NixFixture):
@@ -340,7 +352,7 @@ times=(1000 1059 1060 1120 1121 1122 1182 1183)
 values=(100 50 50 49 50 200 99 100)
 index=0
 date() { printf "%s\\n" "${times[index]}"; }
-sleep() {
+buildlog_wait_sample_tick() {
     printf "%s:%s\\n" "$(cat "$maximum_path")" "$(cat "$near_peak_path")"
     index=$((index + 1))
     (( index < ${#times[@]} )) || exit 0
@@ -382,7 +394,7 @@ mv() {
     fi
 }
 rm() { return 1; }
-sleep() {
+buildlog_wait_sample_tick() {
     printf '%s\n' "$(cat "$maximum_path")"
     index=$((index + 1))
     (( index < ${#values[@]} )) || exit 0
@@ -409,10 +421,11 @@ buildlog_sample_anon "$1" "$2" "$$"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             shell: subprocess.Popen[str] = subprocess.Popen(
-                ["bash", "-c", 'source "$1"; parent=$BASHPID; buildlog_sample_anon "$2" "$3" "$parent" & printf "%s\\n" "$!"; wait',
-                 "sampler-test", str(INVOKE), str(root / "scope.cgroup"), str(root / "maximum")],
+                ["bash", "-c", 'source "$1"; ' +
+                 'coproc { buildlog_sample_anon "$2" "$3" "$4"; } >/dev/null; printf "%s\\n" "$!"; wait',
+                 "sampler-test", str(INVOKE), str(root / "scope.cgroup"), str(root / "maximum"), str(os.getpid())],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                env={**os.environ,
+                env={**invoke_test_environment(),
                      "BUILD_HOLD_DIR": str(root / "holders"),
                      "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                      "STAFF_FILE": str(root / "staff.json"),
@@ -475,7 +488,7 @@ buildlog_sample_anon "$1" "$2" "$$"
             result = subprocess.run(
                 ["bash", "-c", shell, "sidecar-test", str(INVOKE), command],
                 capture_output=True, text=True, check=False,
-                env={**os.environ,
+                env={**invoke_test_environment(),
                      "BUILD_HOLD_DIR": str(root / "holders"),
                      "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
                      "STAFF_FILE": str(root / "staff.json"),
@@ -494,6 +507,7 @@ class SweepRun:
     journal: str
 
 
+SWEEP_EVENTS = "started\nfinished\n"
 JOURNAL_WRITER = """#!/bin/sh
 printf '%s\\n' "$*" > "$SWEEP_TEST_JOURNAL.part"
 cat >> "$SWEEP_TEST_JOURNAL.part"
@@ -537,22 +551,21 @@ invoke_sweep() {
 sweep_after_step test-step
 """
             with ((root / "planning").open("w") as planning, (root / "validation").open("w") as validation,
-                  patch.dict(os.environ, {**configuration, "HOME": directory, "TMPDIR": directory,
+                  patch.dict(os.environ, {**invoke_test_environment(), **configuration, "HOME": directory, "TMPDIR": directory,
                                          "XDG_RUNTIME_DIR": str(runtime), "BUILD_HOLD_DIR": str(root / "hold"),
-                                         "LINT_INVOKE_SOURCED": "", "LINT_SKIP_SWEEP": ""})):
+                                         "LINT_INVOKE_SOURCED": "", "LINT_SKIP_SWEEP": ""}, clear=True)):
                 leases = (planning.fileno(), validation.fileno())
-                token = copies.COMMAND_LOCKS.set(leases)
-                try:
-                    result = bulk_run.run_command(root, ("bash", "-c", command, "sweep-test", str(INVOKE),
-                                                         *map(str, leases)))
-                finally:
-                    copies.COMMAND_LOCKS.reset(token)
-            self.assertEqual(result.code, 0, result.stdout + result.stderr)
+                environment = {**os.environ, "COPIES_COMMAND_LEASE_FDS": ",".join(map(str, leases))}
+                result = subprocess.run(("bash", "-c", command, "sweep-test", str(INVOKE), *map(str, leases)),
+                                        cwd=root, capture_output=True, text=True, check=False,
+                                        pass_fds=leases, env=environment)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             readable, _, _ = select.select([read_fd], [], [], test_hang_guard.TEST_HANG_GUARD_SECS)
             self.assertTrue(readable, "the sweep did not report its descriptors")
             self.assertEqual(os.read(read_fd, 4096), b"closed\n")
 
-    def sweep_run(self, switch: str, systemd_cat: str = JOURNAL_WRITER) -> SweepRun:
+    def sweep_run(self, switch: str, systemd_cat: str = JOURNAL_WRITER, *,
+                  stale_lease_variables: tuple[str, ...] = ()) -> SweepRun:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tools = root / "bin"
@@ -567,11 +580,14 @@ sweep_after_step test-step
             environment = config_environment(configuration)
             _ = write_config_fixture(configuration / "build_folders.conf", "patterns.legacy-stable={purpose}\n")
             reader, writer = os.pipe()
+            with patch.dict(os.environ, dict.fromkeys(stale_lease_variables, str(writer))):
+                caller_environment = invoke_test_environment()
             process = subprocess.Popen(
-                ["bash", "-c", f'source "$1"; {SWEEP_STAND_IN}; sweep_after_step test-step', "sweep-test", str(INVOKE)],
+                ["bash", "-c", 'source "$1"; exec 74>&2; VERIFY_EXIT_STDERR_FD=74; '
+                 + SWEEP_STAND_IN + "; sweep_after_step test-step", "sweep-test", str(INVOKE)],
                 cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 pass_fds=(writer,),
-                env={**os.environ, **environment, "HOME": directory, "TMPDIR": directory,
+                env={**caller_environment, **environment, "HOME": directory, "TMPDIR": directory,
                      "BUILD_HOLD_DIR": str(root / "holders"),
                      "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
                      "XDG_RUNTIME_DIR": str(root / "runtime"), "LINT_INVOKE_SOURCED": "",
@@ -595,14 +611,7 @@ sweep_after_step test-step
                 # A read-write open does not wait for the reader; the line waits in the FIFO.
                 release_writer = os.open(release, os.O_RDWR)
                 _ = os.write(release_writer, b"go\n")
-                events = b""
-                while True:
-                    ready, _, _ = select.select([reader], [], [], max(0, deadline - time.monotonic()))
-                    self.assertTrue(ready, "sweep stand-in still holds its pipe")
-                    chunk = os.read(reader, 4096)
-                    if not chunk:
-                        break
-                    events += chunk
+                events = self.read_until_closed(reader, deadline)
                 if switch == "1":
                     self.assertFalse((root / "runtime" / "lint-sweep").exists())
                 # systemd-cat inherits the events pipe, so it has ended with the pipe.
@@ -615,21 +624,84 @@ sweep_after_step test-step
                     _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 os.close(reader)
 
+    def read_until_closed(self, reader: int, deadline: float) -> bytes:
+        """Read the pipe until every writer closes it, or fail at the deadline."""
+        data = b""
+        while True:
+            ready, _, _ = select.select([reader], [], [], max(0, deadline - time.monotonic()))
+            self.assertTrue(ready, "the sweep still holds its pipe")
+            chunk = os.read(reader, 4096)
+            if not chunk:
+                return data
+            data += chunk
+
+    def forced_sweep_launches(self, state: str) -> str:
+        """Run a forced step, as verify.sh doc runs it, and return the commands its sweep starts.
+
+        The step carries the force both exported and as a call prefix, so the sweep sees both layers.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            (runtime / "lint-sweep").mkdir(parents=True)
+            tools = root / "bin"
+            tools.mkdir()
+            tool = tools / "systemd-cat"
+            _ = tool.write_text("#!/bin/sh\nexec cat >/dev/null\n")
+            tool.chmod(0o755)
+            lint_config = root / "lint.conf"
+            _ = lint_config.write_text(f"sweep={state}\n")
+            reader, writer = os.pipe()
+            try:
+                command = ('source "$1"; run_once() { printf "%s\\n" "${2##*/}" >&"$SWEEP_TEST_FD"; }; '
+                           "LINT_CONFIG_FORCE=1 sweep_after_step test-step")
+                result = subprocess.run(
+                    ("bash", "-c", command, "sweep-test", str(INVOKE)), cwd=root, capture_output=True,
+                    text=True, check=False, pass_fds=(writer,), timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+                    env={**invoke_test_environment(), **config_environment(root / "config"), "HOME": directory,
+                         "TMPDIR": directory, "XDG_RUNTIME_DIR": str(runtime), "BUILD_HOLD_DIR": str(root / "hold"),
+                         "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}", "LINT_INVOKE_SOURCED": "",
+                         "LINT_SKIP_SWEEP": "", "LINT_CONFIG_FORCE": "1", "LINT_CONFIG_FILE": str(lint_config),
+                         "SWEEP_TEST_FD": str(writer)})
+                os.close(writer)
+                writer = -1
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                deadline = time.monotonic() + test_hang_guard.TEST_HANG_GUARD_SECS
+                return self.read_until_closed(reader, deadline).decode()
+            finally:
+                if writer >= 0:
+                    os.close(writer)
+                os.close(reader)
+
+    def test_forced_step_starts_no_sweep_when_sweep_is_off(self) -> None:
+        self.assertEqual(self.forced_sweep_launches("off"), "")
+
+    def test_forced_step_starts_the_sweep_when_sweep_is_on(self) -> None:
+        self.assertEqual(self.forced_sweep_launches("on"), "sweep.py\n")
+
     def test_offload_switch_starts_no_detached_sweep(self) -> None:
         self.assertEqual(self.sweep_run("1"), SweepRun("", ""))
 
+    def assert_sweep_runs(self, switch: str, check: Callable[[SweepRun], None],
+                          systemd_cat: str = JOURNAL_WRITER) -> None:
+        check(self.sweep_run(switch, systemd_cat))
+        for variable in COPY_LEASE_DESCRIPTOR_VARIABLES:
+            with self.subTest(stale_lease_variable=variable):
+                run = self.sweep_run(switch, systemd_cat, stale_lease_variables=(variable,))
+                check(run)
+
     def test_without_offload_switch_the_detached_sweep_still_starts(self) -> None:
-        self.assertEqual(self.sweep_run("").events, "started\nfinished\n")
+        self.assert_sweep_runs("", lambda run: self.assertEqual(run.events, SWEEP_EVENTS))
 
     def test_switch_set_to_zero_keeps_detached_sweep_enabled(self) -> None:
-        self.assertEqual(self.sweep_run("0").events, "started\nfinished\n")
+        self.assert_sweep_runs("0", lambda run: self.assertEqual(run.events, SWEEP_EVENTS))
 
     def test_detached_sweep_lines_reach_the_journal(self) -> None:
-        self.assertEqual(self.sweep_run("").journal,
-                         "-t lint-sweep\nlint sweep: the floor took 1.0 GiB from /t/target\n")
+        journal = "-t lint-sweep\nlint sweep: the floor took 1.0 GiB from /t/target\n"
+        self.assert_sweep_runs("", lambda run: self.assertEqual(run, SweepRun(SWEEP_EVENTS, journal)))
 
     def test_sweep_finishes_when_the_journal_refuses_its_lines(self) -> None:
-        self.assertEqual(self.sweep_run("", JOURNAL_REFUSED), SweepRun("started\nfinished\n", ""))
+        self.assert_sweep_runs("", lambda run: self.assertEqual(run, SweepRun(SWEEP_EVENTS, "")), JOURNAL_REFUSED)
 
 
 class BuildAdmissionTests(unittest.TestCase):
@@ -711,7 +783,7 @@ sweep_after_step() { :; }
     ) -> subprocess.CompletedProcess[str]:
         command = ["bash", "-c", 'set -euo pipefail; source "$1"; shift; ' + shell,
                    "admission-test", str(INVOKE), *arguments]
-        isolated = {**os.environ,
+        isolated = {**invoke_test_environment(),
                  "HOME": str(root), "TMPDIR": str(root),
                  "BUILDLOG_DIR": str(root / "buildlog"),
                  "BUILD_HOLD_DIR": str(root / "holders"),

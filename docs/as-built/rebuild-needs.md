@@ -16,11 +16,11 @@ The record has these fields:
 | `id` | The machine and commit, joined with `-`. |
 | `machine` | `natedev` or `mac`. |
 | `nixos_commit` | The full commit that needs a rebuild. |
-| `reason` | One sentence that explains the rebuild. |
+| `reason` | Plain words that explain what changes for the user after the rebuild. |
 | `concerns` | The staff ID affected by the rebuild. |
 | `requested_by` | The requesting staff ID, or an empty string when omitted. |
 | `created_at` | The creation time in ISO format with the UTC offset. |
-| `cleared_by` | The exact generation log line that cleared a completed need. |
+| `cleared_by` | The generation log line or verified running system that completed the request. |
 
 Open records omit `cleared_by`.
 `NeedRecord` describes an open record.
@@ -30,7 +30,7 @@ Record writes use temporary files and atomic file operations.
 Adding the same key changes neither an open record nor a completed record.
 The needs folder contains one `.lock` file.
 `add_need` holds an exclusive `fcntl.flock` from the existence check through the record write.
-`clear_needs` holds the same lock while it rewrites and moves each completed record.
+`clear_needs` holds the same lock while it archives each completed record and removes the open file.
 The list command takes no lock and stays read-only.
 
 ## Commands
@@ -38,13 +38,19 @@ The list command takes no lock and stays read-only.
 Run commands from the repository folder.
 
 ```sh
-scripts/lib/py -m scripts.rebuild.need add --machine natedev --commit <full-nixos-hash> --reason "Apply the rebuild settings." --concerns <staff-id> --requested-by <staff-id>
+scripts/lib/py -m scripts.rebuild.need add --machine natedev --commit <full-nixos-hash> --reason "The CI repair command will report when its toolchain test fails." --concerns <staff-id> --requested-by <staff-id>
 scripts/lib/py -m scripts.rebuild.need list
 scripts/lib/py -m scripts.rebuild.need list --json
 scripts/lib/py -m scripts.rebuild.need clear --machine natedev --generations "$HOME/.local/state/rebuild/generations.log" --nixos-repo /etc/nixos
 ```
 
-`--requested-by` is optional.
+Use `--reason` to explain what the user can do or see after the rebuild.
+The requesting session supplies this text.
+The command rejects a missing or blank reason.
+Supply a full 40-character Git hash with `--commit`.
+The command rejects short or malformed hashes.
+Use `--requested-by` to record the requesting session or staff ID.
+Old requests without a reason show `No reason given`.
 The list command returns one row per machine with open needs.
 Each row uses the newest need by creation time.
 The row joins all open reasons for that machine with spaces, from oldest to newest.
@@ -60,23 +66,33 @@ The reader reads only the open JSON files in the needs folder.
 It does not read completed files or run subprocesses.
 A missing folder returns an empty list.
 The reader skips files that a concurrent clear moves before the read.
+The reader returns valid summaries and reports each damaged file through the optional `errors` list.
+Without an errors list, the reader reports problems to stderr.
 
 ## Status line
 
-`scripts/statusline/rebuild_row.py` combines cached system comparisons with `read_needs()` on each status read.
+On a Linux status line cache miss, `scripts/statusline/rebuild_row.py` combines cached system comparisons with the open needs from `read_needs()`.
+A fresh render uses the saved fields and skips the scan.
 Its `read()` answer keeps the compared machines in `compared` and the needs in `needs`.
 The console Rebuilds page renders that answer, so the page and the row name the same machines.
 The refresh also writes each machine's change list to `<rebuild.cache>-changes.json`.
-It reads the machine's last switch from `rebuild.generations` (on the Mac over `rebuild.ssh`) and lists the commits after it.
+It reads the active system and `rebuild.generations` on each machine.
+It connects to the Mac over `rebuild.ssh`.
+The refresh uses the same completion rule as the clear command.
+The refresh lists commits after the verified revision.
 Each commit's `Claude-Session` id maps to a local session through the transcript that records it.
 The refresh finds that transcript with one `rg` scan of the Claude projects folders and keeps the answer in `<rebuild.cache>-sessions.json`.
 A new session id costs one scan; a known id costs none.
 A machine that does not answer keeps its last list.
-The Hana console's bottom-left rebuild link shows only while the answer names a machine (`docs/as-built/review-links.md`, Rebuilds page).
-The `For you:` row shows `rebuild natedev`, `rebuild mac`, or both, without duplicates.
+The status line names each waiting rebuild once in the `For you:` row.
+It shows `rebuild natedev`, `rebuild mac`, or both.
 Open needs appear even when evaluation has no result or the cache does not exist.
 Completed needs leave the row unless the cached system comparison still requires a rebuild.
-A failed need read leaves the cached answer visible.
+The For you card lists the open reasons and uses the oldest open request for its age.
+The Rebuild details page shows completed requests once per machine and commit, newest completion first.
+The page names each damaged archive and shows the valid records.
+A failed need read leaves the cached system comparison visible.
+For the partial count rule, see [For you](for-you.md).
 The refresh compares running systems with `rebuild.ref` in `rebuild.repo`.
 It reuses an evaluation only when both machine paths are valid for the same commit and source.
 A timeout, error, or empty path leaves no reusable evaluation.
@@ -99,40 +115,55 @@ The rebuild writer records each activation in `generations.log` with five space-
 ```
 
 The time uses `%FT%T%z`.
-Only `switch` lines can clear a need.
-The command removes a final `-dirty` suffix from the logged commit before comparison.
-It runs this command for each open need of the selected machine:
+The clear command and the refresh first read the active system at `/run/current-system`.
+They use its embedded `configuration-revision` when present.
+Otherwise, they require a switch log entry for the active generation.
+The system profile must name a generation that resolves to the active store path.
+The profile link must precede the active system link.
+The newest log entry for that generation must be a switch to that store path.
+Its timestamp must follow the change to the active system link.
+The log records whole seconds, so an entry in the activation second cannot confirm the order.
+The probe checks the links twice to detect changes during the read.
+The probe separates live metadata from the log before checking the revision.
+An older switch can share the active store path.
+The store path and the evaluated path supply no completion evidence.
+An unlogged activation without embedded metadata leaves the revision unknown.
+The card shows that state and the requests stay open until a logged rebuild confirms the active revision.
+A revision with local changes has a `-dirty` suffix and leaves the requests open.
+
+For a clean active revision, the reader checks the Git ancestry of each open request for that machine.
+It accepts a legacy short hash only when the prefix names one Git object and resolves to that commit.
+An ambiguous or unknown short hash keeps the request open.
 
 ```sh
-git -C <nixos-repo> merge-base --is-ancestor <needed-commit> <logged-commit>
+git -C <nixos-repo> merge-base <needed-commit> <active-commit>
 ```
 
-A successful comparison clears the need.
-The command adds the exact log line as `cleared_by` and moves the record to `needs/done/`.
-A non-ancestor keeps the need open.
-When the comparison returns neither 0 nor 1, the command checks both commits with `git cat-file -e <commit>^{commit}`.
-These checks run only after a comparison error.
+A merge base equal to the needed commit completes the request.
+The reader records the active switch log line or the time, embedded revision, and store path in `cleared_by`.
+It stores the request under its full hash in `needs/done/` and removes the open file.
+When Git returns no merge base, the reader checks which commits are available.
 An unknown commit keeps the need open.
-Each distinct unknown commit produces one line per clear command:
+The reader reports each distinct unknown full commit once per machine check.
 
 ```text
 anomaly: unknown logged commit <commit>
 anomaly: unknown need commit <commit> (need <id>)
 ```
 
-The command does not delete completed records.
-
-Run the natedev clear command on natedev:
+Run the clear commands on natedev.
+The natedev command reads the local active system.
 
 ```sh
 "$HOME/.claude/scripts/lib/py" -m scripts.rebuild.need clear --machine natedev --generations "$HOME/.local/state/rebuild/generations.log" --nixos-repo /etc/nixos
 ```
 
-Run the Mac clear command on the Mac:
+The Mac job copies the Mac log to a local file and calls the same command with `--machine mac`.
+The command checks the active system over SSH.
 
 ```sh
-"$HOME/.claude/scripts/lib/py" -m scripts.rebuild.need clear --machine mac --generations "$HOME/.local/state/rebuild/generations.log" --nixos-repo "$HOME/nixos"
+"$HOME/.claude/scripts/lib/py" -m scripts.rebuild.need clear --machine mac --generations <local-copy-of-mac-log> --nixos-repo /etc/nixos
 ```
 
-Both commands use the selected needs folder on their machine.
-The job must supply the selected machine's log and a repository that contains the compared commits.
+Both commands write to the same needs folder on natedev.
+Supply the selected machine's log and a repository that contains the compared commits.

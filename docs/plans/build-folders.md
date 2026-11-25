@@ -139,7 +139,7 @@ A size limit covers the build-dir and the workspace `target/` together. The budg
 
 | Machine | Repository | Peak | Count | Largest folder | Size limit | Sum |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| natedev | hana (all natepiano/hana worktrees and gate caches) | 7 | 7 | 74.1 GiB | 78 GiB | 546 GiB |
+| natedev | hana (all hanallc/hana worktrees and gate caches) | 7 | 7 | 74.1 GiB | 78 GiB | 546 GiB |
 | natedev | cargo-liner | 5 | 5 | 30.2 GiB | 32 GiB | 160 GiB |
 | natedev | bevy_brp | 0 | 1 | 18.4 GiB | 20 GiB | 20 GiB |
 | natedev | nateroids | 0 | 1 | 16.7 GiB | 18 GiB | 18 GiB |

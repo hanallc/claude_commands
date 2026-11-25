@@ -21,7 +21,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.production import showrunners, staff
 from scripts.lib import build_folders
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.production import showrunner_tree
 from scripts.production.add_showrunner import NoEndingTab, herdr_tab_open
@@ -34,6 +34,7 @@ from scripts.lib.atomic_file import write_text_atomic
 
 FAMILIES: tuple[rules.Family, ...] = ("names", "values", "types", "modules")
 PLAN_DIRECTORY = Path("docs/style-production/units")
+LEGACY_STYLE_BRANCH_PREFIX = "style/"
 LAUNCHER = Path(os.environ.get("ADD_STYLE_LAUNCHER") or SCRIPTS / "production/add_showrunner.py")
 SHOWRUNNERS = Path(os.environ.get("ADD_STYLE_SHOWRUNNERS") or SCRIPTS / "production/showrunners.py")
 
@@ -100,7 +101,8 @@ class NoStyleProduction:
 
     @property
     def checkout(self) -> Path:
-        return build_folders.worktree_path(build_folders.repo_word(self.repository), self.name, "production")
+        return build_folders.worktree_path(build_folders.repo_word(self.repository), self.name,
+                                           worktrees.UNIT_WORKTREE_NAME)
 
     @property
     def doc(self) -> Path:
@@ -164,6 +166,14 @@ def _style_production(repo_dir: Path, *, include_direct: bool) -> StandingStyleP
     return NoStyleProduction(repository, f"{repository.name}-style")
 
 
+def style_production_branch(name: str) -> str:
+    return f"{name}-{worktrees.UNIT_WORKTREE_NAME}"
+
+
+def is_style_production_branch(branch: str, production: str) -> bool:
+    return branch.startswith(LEGACY_STYLE_BRANCH_PREFIX) or branch == style_production_branch(production)
+
+
 def _request(name: str) -> StyleProduction:
     parent = read_production(name)
     lines = parent.doc.read_text().splitlines()
@@ -174,27 +184,86 @@ def _request(name: str) -> StyleProduction:
     branch_point = parent.merge_branch.removeprefix("refs/heads/")
     _ = _git(repository, "check-ref-format", f"refs/heads/{branch_point}")
     branch_tip = _git(repository, "rev-parse", "--verify", f"refs/heads/{branch_point}^{{commit}}")
+    checkout, doc = standing.checkout, standing.doc
+    legacy_checkout = checkout.with_name("production")
+    legacy_doc = legacy_checkout / "docs" / doc.name
+    if isinstance(standing, NoStyleProduction) and not doc.is_file() and legacy_doc.is_file():
+        checkout, doc = legacy_checkout, legacy_doc
+    if isinstance(standing, StandingStyleProduction) or doc.is_file():
+        merge_branch = production_field(doc.read_text().splitlines(), "Merge branch")
+    else:
+        merge_branch = style_production_branch(name)
+        branches = worktree_records.worktree_branches(repository)
+        for candidate, candidate_doc in ((checkout, doc), (legacy_checkout, legacy_doc)):
+            branch = branches.get(candidate.resolve(), "")
+            if not branch and (record := worktree_records.checkout_record(candidate)) is not None:
+                if Path(record.repo) == repository:
+                    branch = record.branch
+            if is_style_production_branch(branch, name):
+                checkout, doc, merge_branch = candidate, candidate_doc, branch
+                break
+        else:
+            legacy_branch = LEGACY_STYLE_BRANCH_PREFIX + branch_point.replace("/", "-")
+            if not worktrees.has_branch(repository, merge_branch) and worktrees.has_branch(repository, legacy_branch):
+                merge_branch = legacy_branch
     return StyleProduction(
-        parent, repository, name, branch_point, branch_tip,
-        "style/" + branch_point.replace("/", "-"), standing.checkout,
-        standing.doc, proposals,
+        parent, repository, name, branch_point, branch_tip, merge_branch, checkout, doc, proposals,
         tuple(line for line in lines if line.startswith("- **Merge tests:** ")),
     )
 
 
+def _require_branch_point(style: StyleProduction, branch_point: str) -> None:
+    if branch_point != style.branch_point:
+        raise StyleBranchPointTaken(
+            f"{style.repository.name} already has style production {style.name} on branch point {branch_point}; "
+            + "one branch point per repository",
+        )
+
+
+def _legacy_branch_point(style: StyleProduction) -> str:
+    suffix = style.merge_branch.removeprefix(LEGACY_STYLE_BRANCH_PREFIX)
+    branches = _git(style.repository, "for-each-ref", "--format=%(refname:lstrip=2)", "refs/heads").splitlines()
+    matches = [branch for branch in branches if branch.replace("/", "-") == suffix]
+    if len(matches) > 1:
+        raise Refusal(f"{style.merge_branch}: more than one branch point matches: {', '.join(matches)}")
+    return matches[0] if matches else suffix
+
+
+def _branch_description_key(style: StyleProduction) -> str:
+    return f"branch.{style.merge_branch}.description"
+
+
+def _recorded_branch_point(style: StyleProduction) -> str:
+    result = worktree_records.git(style.repository, "config", "--local", "--get", _branch_description_key(style), check=False)
+    if result.returncode not in (0, 1):
+        raise Refusal(result.stderr.strip() or f"cannot read the description for {style.merge_branch}")
+    return result.stdout.rstrip("\n")
+
+
+def _record_branch_point(style: StyleProduction) -> None:
+    with worktrees.move_lock():
+        branch_point = _recorded_branch_point(style)
+        if branch_point:
+            _require_branch_point(style, branch_point)
+        else:
+            _ = _git(style.repository, "config", "--local", _branch_description_key(style), style.branch_point)
+
+
 def _check_existing(style: StyleProduction) -> bool:
-    standing = standing_style_production(style.repository)
-    if isinstance(standing, StandingStyleProduction):
-        existing = read_production(standing.name)
-        lines = existing.doc.read_text().splitlines()
-        branch_point = standing.branch_point
-        if branch_point != style.branch_point:
-            raise StyleBranchPointTaken(
-                f"{style.repository.name} already has style production {style.name} on branch point {branch_point}; "
-                + "one branch point per repository",
-            )
+    if style.doc.is_file():
+        lines = style.doc.read_text().splitlines()
+        _require_branch_point(style, production_field(lines, "Branch point").removeprefix("refs/heads/"))
+        existing = read_new_production(style.doc, style.name)
         if production_field(lines, "Kind") != "style" or existing.merge_branch != style.merge_branch:
             raise Refusal(f"{style.doc}: does not describe {style.name} on {style.merge_branch}")
+    elif style.merge_branch.startswith(LEGACY_STYLE_BRANCH_PREFIX):
+        _require_branch_point(style, _legacy_branch_point(style))
+    else:
+        branch_point = _recorded_branch_point(style)
+        if branch_point:
+            _require_branch_point(style, branch_point)
+        elif (style.checkout / ".git").exists() or worktree_records.checkout_record(style.checkout) is not None:
+            raise Refusal(f"{style.checkout}: no recorded branch point for {style.merge_branch}")
     if (style.checkout / ".git").exists():
         common = _git(style.checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
         if common != _git(style.repository, "rev-parse", "--path-format=absolute", "--git-common-dir"):
@@ -407,7 +476,9 @@ def main(argv: list[str]) -> int:
         branch = (build_folders.ExistingWorktreeBranch(style.merge_branch)
                   if worktrees.has_branch(style.repository, style.merge_branch)
                   else build_folders.NewWorktreeBranch(style.merge_branch, style.branch_tip))
-        layout = worktrees.output_record(build_folders.repo_word(style.repository), style.name, "production")
+        layout = worktrees.unit_checkout_output(style.checkout, build_folders.repo_word(style.repository), style.name)
+        if not style.doc.is_file() and style.merge_branch == style_production_branch(style.name):
+            _record_branch_point(style)
         _ = worktrees.create_checkout(style.checkout, style.repository, branch, layout, owner=style.name,
                                       allow_empty=True, allow_existing=True)
         if existing:
@@ -441,7 +512,7 @@ def main(argv: list[str]) -> int:
             raise Refusal(f"{LAUNCHER.name} exited {result.returncode}; rerun add_style to continue")
         _attach_parent(style)
         return 0
-    except (Refusal, worktrees.Refused, rules.RuleValidationError, style_ledger.LedgerError,
+    except (Refusal, worktree_records.Refused, rules.RuleValidationError, style_ledger.LedgerError,
             OSError, ValueError, sqlite3.Error) as error:
         print("add_style: " + " ".join(str(error).splitlines()), file=sys.stderr)
         return 2

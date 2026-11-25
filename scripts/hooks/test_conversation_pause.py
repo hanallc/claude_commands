@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stderr
+from datetime import datetime, timezone
 import hashlib
+import io
 import json
 import os
+from pathlib import Path
 import shutil
+import stat
 import sys
 import unittest
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 from scripts.production import session_pane
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.herdr import herdr
-from scripts.message import review_hold
+from scripts.message import review_hold, send
 from scripts.message.relay_identity import relay_session_name
 from scripts.production.unit_lookup import Place
 from scripts.hooks import hook_dispatch, review_hold_delivery
@@ -70,6 +75,54 @@ class ConversationPauseRegistrationTests(unittest.TestCase):
 
 
 class ConversationPauseTests(ConversationPauseFixture):
+    def test_review_release_reads_one_active_director_state(self) -> None:
+        director = fixture_member("showrunner", name="director")
+        pause = staff.Paused("2026-11-24T08:31:00-08:00", "operator", "review", keep_workers=True)
+        _ = staff.set_hold(director.id, pause)
+        row = staff.begin_resume(director.id, pause)
+        assert isinstance(row.resume_pending, staff.ResumePending)
+        session = str(director.current_session)
+        key = row.resume_pending.key
+        self.write_review_config("on")
+        with (patch.dict(os.environ, self.environment),
+              patch.object(send, "STATE", self.root / "message-state")):
+            review_hold.set_count(session, 2, 100, self.fail, record_keys=review_hold_delivery.record_keys)
+            message = review_hold.ReviewMessage("shutdown", 101, "Continue where you stopped.",
+                                                key=key, once_per_key=True)
+            with review_hold.route(session, message, urgent=False, record_keys=review_hold_delivery.record_keys) as route:
+                assert isinstance(route, review_hold.OpenReview)
+                route.keep(message)
+            reply = self.run_prompt("Continue review.", now=161, extra={"session_id": session})
+            held_file = review_hold.held_file(session)
+            contents = held_file.read_text()
+        self.assertEqual(reply.returncode, 0, reply.stderr)
+        self.assertNotIn("review hold:", reply.stderr)
+        expected_header = contents.splitlines()[0]
+        self.assertEqual(json.loads(reply.stdout), {"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": review_hold.held_notice(1, held_file, expected_header),
+        }})
+        self.assertEqual(contents.count("Continue where you stopped."), 1)
+        self.assertEqual(staff.by_id(director.id), row)
+
+    def test_claude_prompt_adds_the_hold_only_for_the_paused_director(self) -> None:
+        owner = fixture_member("showrunner", name="production")
+        director = fixture_member("unit", name="selected", parent=owner.id)
+        child = fixture_member("worker", name="impl", parent=director.id)
+        _ = staff.pause(str(director.id), "maintenance", keep_workers=True)
+        prompt = cross_session(child.name, "The worker finished the review.")
+
+        def submit(session_id: str) -> str:
+            result = self.run_prompt(prompt, extra={"session_id": session_id})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout
+
+        context = conversation_pause.DIRECTOR_HOLD_CONTEXT
+        self.assertIn(context, submit(director.current_session))
+        self.assertNotIn(context, submit(child.current_session))
+        _ = staff.resume(str(director.id))
+        self.assertNotIn(context, submit(director.current_session))
+
     def test_unreadable_staff_reports_the_error_and_keeps_the_native_timer_pause(self) -> None:
         other = self.create_instance("showrunner-other", session_id="another-owner")
         for failure in ("invalid JSON", "directory"):
@@ -430,6 +483,12 @@ class ConversationPauseTests(ConversationPauseFixture):
             review_hold.set_count(SESSION, 2, at, self.fail,
                 record_keys=review_hold_delivery.record_keys)
 
+    def held_file(self) -> Path:
+        return self.root / ".local/state/adhoc_review/.holds" / f"{SESSION}.held.md"
+
+    def notice(self, count: int, header: str) -> str:
+        return review_hold.held_notice(count, self.held_file(), header)
+
     def end_review(self, at: int) -> list[str]:
         held: list[str] = []
         with patch.dict(os.environ, self.environment):
@@ -443,13 +502,118 @@ class ConversationPauseTests(ConversationPauseFixture):
                                  ("stall-watch", "Report the current status.", 121)):
             with self.subTest(sender=sender):
                 reply = self.parsed_reply(self.run_prompt(cross_session(sender, body), now=at))
-                self.assertEqual(reply, {"decision": "block", "reason": "Kept for the end of the review."})
+                self.assertEqual(reply, {
+                    "decision": "block",
+                    "reason": "Kept for the end of the review.",
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "suppressOriginalPrompt": True,
+                    },
+                })
         self.assertEqual(self.end_review(122), [
-            "Messages from the review\n\n"
-            + "1. Review peer\n   Sent: 00:02 UTC\n   Sender native id: uds:/tmp/source.sock\n"
-            + "   The checks passed.\n   URGENT: quoted text\n\n"
-            + "2. stall-watch\n   Sent: 00:02 UTC\n   Sender native id: uds:/tmp/source.sock\n"
-            + "   Report the current status."])
+            f'2 held messages from the review in {self.held_file()}, under "Released at 00:02:02 UTC".'
+            + " Read them at your own pace."])
+        first_release = ("Released at 00:02:02 UTC\n\n"
+                         + "1. Review peer\n   Sent: 00:02 UTC\n   Sender native id: uds:/tmp/source.sock\n"
+                         + "   The checks passed.\n   URGENT: quoted text\n\n"
+                         + "2. stall-watch\n   Sent: 00:02 UTC\n   Sender native id: uds:/tmp/source.sock\n"
+                         + "   Report the current status.\n")
+        self.assertEqual(self.held_file().read_text(encoding="utf-8"), first_release)
+        self.assertEqual(stat.S_IMODE(self.held_file().stat().st_mode), 0o600)
+        self.open_review(180)
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "A later report."), now=181))
+        self.assertEqual(kept["decision"], "block")
+        self.assertEqual(self.end_review(182), [
+            f'1 held message from the review in {self.held_file()}, under "Released at 00:03:02 UTC".'
+            + " Read it at your own pace."])
+        self.assertEqual(self.held_file().read_text(encoding="utf-8"), first_release
+                         + "\nReleased at 00:03:02 UTC\n\n"
+                         + "1. Review peer\n   Sent: 00:03 UTC\n   Sender native id: uds:/tmp/source.sock\n"
+                         + "   A later report.\n")
+
+    def test_a_failed_append_keeps_the_messages_held(self) -> None:
+        self.open_review()
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Held report."), now=101))
+        self.assertEqual(kept["decision"], "block")
+        self.held_file().mkdir()
+        with self.assertRaises(IsADirectoryError):
+            _ = self.end_review(102)
+        self.held_file().rmdir()
+        emitted: list[str] = []
+        with patch.dict(os.environ, self.environment):
+            review_hold.record_user_prompt(SESSION, 103, emitted.append, record_keys=review_hold_delivery.record_keys)
+        self.assertEqual(emitted, [self.notice(1, "Released at 00:01:43 UTC")])
+        self.assertEqual(self.held_file().read_text(encoding="utf-8").count("Held report."), 1)
+
+    def release_one_report(self, text: str, at: int) -> str:
+        """Hold one report, release it with a confirmed delivery and give the file text."""
+        self.open_review(at)
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", text), now=at + 1))
+        self.assertEqual(kept["decision"], "block")
+        self.assertEqual(len(self.end_review(at + 2)), 1)
+        return self.held_file().read_text(encoding="utf-8")
+
+    def test_an_unconfirmed_release_after_a_confirmed_one_leaves_the_first_release(self) -> None:
+        first_release = self.release_one_report("First report.", 100)
+        self.open_review(110)
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Second report."), now=111))
+        self.assertEqual(kept["decision"], "block")
+        pending = review_hold.ReviewMessage("Later peer", 200, "Unsent report.", "session:later")
+        with patch.dict(os.environ, self.environment), review_hold.route(
+                SESSION, pending, urgent=False, record_keys=review_hold_delivery.record_keys) as release:
+            assert isinstance(release, review_hold.ReleasedMessages)
+            notice = review_hold.file_release(SESSION, release, 200, batch_only=False)
+            self.assertEqual(notice, self.notice(1, "Released at 00:03:20 UTC"))
+            self.assertIn("Second report.", self.held_file().read_text(encoding="utf-8"))
+        self.assertEqual(self.held_file().read_text(encoding="utf-8"), first_release)
+        self.assertEqual(len(self.end_review(201)), 1)
+        self.assertIn("Second report.", self.held_file().read_text(encoding="utf-8"))
+
+    def test_an_unconfirmed_release_keeps_the_file_when_it_changed_after_the_append(self) -> None:
+        self.open_review()
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Held report."), now=101))
+        self.assertEqual(kept["decision"], "block")
+        pending = review_hold.ReviewMessage("Later peer", 200, "Unsent report.", "session:later")
+        errors = io.StringIO()
+        with patch.dict(os.environ, self.environment), redirect_stderr(errors), review_hold.route(
+                SESSION, pending, urgent=False, record_keys=review_hold_delivery.record_keys) as release:
+            assert isinstance(release, review_hold.ReleasedMessages)
+            _ = review_hold.file_release(SESSION, release, 200, batch_only=False)
+            with self.held_file().open("a", encoding="utf-8") as held:
+                _ = held.write("Agent note.\n")
+            changed = self.held_file().read_text(encoding="utf-8")
+        self.assertEqual(self.held_file().read_text(encoding="utf-8"), changed)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("changed after the append", errors.getvalue())
+        self.assertEqual(self.end_review(201), [self.notice(1, "Released at 00:03:21 UTC")])
+        newest = self.held_file().read_text(encoding="utf-8").removeprefix(changed)
+        self.assertTrue(newest.startswith("\nReleased at 00:03:21 UTC\n\n"), newest)
+        self.assertIn("Held report.", newest)
+
+    def test_a_partial_write_returns_the_file_to_its_size_before_the_append(self) -> None:
+        first_release = self.release_one_report("First report.", 100)
+        self.open_review(110)
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Partial report."), now=111))
+        self.assertEqual(kept["decision"], "block")
+        real_write = os.write
+        writes: list[int] = []
+
+        def partial_write(descriptor: int, data: bytes | memoryview) -> int:
+            """Write part of the release, then fail on the next write to the same file."""
+            if len(writes) == 1 and descriptor == writes[0]:
+                writes.append(descriptor)
+                raise OSError(28, "No space left on device")
+            if not writes and b"Partial report." in bytes(data):
+                writes.append(descriptor)
+                return real_write(descriptor, bytes(data)[:20])
+            return real_write(descriptor, data)
+
+        with patch.object(os, "write", side_effect=partial_write), self.assertRaises(OSError):
+            _ = self.end_review(112)
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(self.held_file().read_text(encoding="utf-8"), first_release)
+        self.assertEqual(len(self.end_review(113)), 1)
+        self.assertEqual(self.held_file().read_text(encoding="utf-8").count("Partial report."), 1)
 
     def test_disabled_review_passes_native_prompts_with_an_open_count(self) -> None:
         self.open_review()
@@ -480,7 +644,8 @@ class ConversationPauseTests(ConversationPauseFixture):
                 self.assertEqual(held["decision"], "block")
                 self.write_review_config("off")
                 reply = self.parsed_reply(self.run_prompt(prompt, now=102))
-                self.assertIn("Saved update.", str(reply["hookSpecificOutput"]))
+                self.assertIn(self.notice(1, "Released at 00:01:42 UTC"), str(reply["hookSpecificOutput"]))
+                self.assertIn("Saved update.", self.held_file().read_text(encoding="utf-8"))
                 self.assertEqual(self.end_review(103), [])
 
     def test_count_set_while_disabled_preserves_items_without_opening_a_hold(self) -> None:
@@ -516,10 +681,13 @@ class ConversationPauseTests(ConversationPauseFixture):
         with patch.dict(os.environ, self.environment), review_hold.route(SESSION, message, urgent=False,
                                                            record_keys=review_hold_delivery.record_keys) as release:
             assert isinstance(release, review_hold.ReleasedMessages)
-            batch = review_hold.render(release.messages)
-            self.assertIn("Held update.", batch)
-            self.assertIn("New update.", batch)
-            self.assertNotIn("After the idle limit.", batch)
+            self.assertEqual(release.new_message, message)
+            entries = review_hold.numbered_entries(release.messages)
+            self.assertIn("Held update.", entries)
+            self.assertIn("New update.", entries)
+            self.assertNotIn("After the idle limit.", entries)
+            notice = review_hold.file_release(SESSION, release, 161, batch_only=False)
+            batch = notice + "\n\n" + review_hold.numbered_entries((message,))
             typed = self.parsed_reply(self.run_prompt("Continue the review.", now=161))
             self.assertEqual(typed, {
                 "systemMessage": f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
@@ -530,8 +698,38 @@ class ConversationPauseTests(ConversationPauseFixture):
             })
             reply = self.run_prompt(cross_session("Later peer", batch), now=161)
             self.assertEqual((reply.returncode, reply.stdout, reply.stderr), (0, "", ""))
+            state = self.root / ".local/state/adhoc_review/.holds" / f"{SESSION}.json"
+            self.assertIs(cast(dict[str, object], json.loads(state.read_text(encoding="utf-8")))["release_pending"], False)
+            late = self.parsed_reply(self.run_prompt(cross_session("Review peer", "A late report."), now=161))
+            self.assertEqual(late["decision"], "block")
             release.accepted_at = 161.0
-        self.assertEqual(self.end_review(162), [])
+        self.assertEqual(len(self.end_review(162)), 1)
+        filed = self.held_file().read_text(encoding="utf-8")
+        self.assertLess(filed.index("Held update."), filed.index("A late report."))
+        self.assertNotIn("New update.", filed)
+
+    def test_a_release_batch_passes_the_restarted_hold_and_a_late_message_waits(self) -> None:
+        self.open_review()
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Held update."), now=101))
+        self.assertEqual(kept["decision"], "block")
+        emitted: list[str] = []
+        with patch.dict(os.environ, self.environment):
+            review_hold.record_user_prompt(SESSION, 170, emitted.append, record_keys=review_hold_delivery.record_keys)
+        self.assertEqual(emitted, [self.notice(1, "Released at 00:02:50 UTC")])
+        notice = self.notice(1, "Released at 00:02:51 UTC")
+        entry = "1. Later peer\n   Sent: 00:02 UTC\n   Sender native id: session:later\n   New report."
+        for path, body in (("relay", f"{notice}\nSender native id: session:later\n\n{entry}"),
+                           ("postmaster", "Later peer: Messages from the review\nSender native id: session:later\n"
+                                          + f"Tag: 0123abcd\n\n{notice}\n\n{entry}")):
+            with self.subTest(path=path):
+                reply = self.run_prompt(cross_session("Later peer", body), now=171)
+                self.assertEqual((reply.returncode, reply.stdout, reply.stderr), (0, "", ""))
+        late = self.parsed_reply(self.run_prompt(cross_session("Review peer", "A late report."), now=172))
+        self.assertEqual(late["decision"], "block")
+        self.assertEqual(len(self.end_review(173)), 1)
+        filed = self.held_file().read_text(encoding="utf-8")
+        self.assertEqual(filed.count("A late report."), 1)
+        self.assertNotIn("New report.", filed)
 
     def test_failed_idle_release_restores_its_messages_before_newer_review_messages(self) -> None:
         self.open_review()
@@ -541,33 +739,52 @@ class ConversationPauseTests(ConversationPauseFixture):
         with patch.dict(os.environ, self.environment), review_hold.route(SESSION, pending, urgent=False,
                                                            record_keys=review_hold_delivery.record_keys) as release:
             assert isinstance(release, review_hold.ReleasedMessages)
+            notice = review_hold.file_release(SESSION, release, 161, batch_only=False)
+            self.assertEqual(notice, self.notice(1, "Released at 00:02:41 UTC"))
+            self.assertIn("Older report.", self.held_file().read_text(encoding="utf-8"))
             self.assertEqual(self.end_review(161), [])
             review_hold.set_count(SESSION, 2, 162, self.fail,
                 record_keys=review_hold_delivery.record_keys)
             kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Newer report."), now=163))
             self.assertEqual(kept["decision"], "block")
+        self.assertEqual(self.held_file().read_text(encoding="utf-8"), "")
         batches = self.end_review(164)
         self.assertEqual(len(batches), 1)
-        self.assertLess(batches[0].index("Older report."), batches[0].index("Newer report."))
-        self.assertNotIn("Unsent report.", batches[0])
+        filed = self.held_file().read_text(encoding="utf-8")
+        self.assertEqual(filed.count("Released at"), 1)
+        self.assertLess(filed.index("Older report."), filed.index("Newer report."))
+        self.assertNotIn("Unsent report.", filed)
 
-    def test_session_start_release_ends_the_hold_before_it_emits_the_list(self) -> None:
+    def test_session_start_keeps_messages_until_the_hold_expires(self) -> None:
         self.open_review()
         kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Held update."), now=101))
         self.assertEqual(kept["decision"], "block")
+        count = self.root / ".local/state/adhoc_review" / SESSION
+        state = count.parent / ".holds" / f"{SESSION}.json"
+        saved = state.read_bytes()
         batches: list[str] = []
 
         def receive(batch: str) -> None:
             batches.append(batch)
-            reply = self.run_prompt(cross_session("Review peer", batch), now=102)
+            reply = self.run_prompt(cross_session("Review peer", batch), now=160)
             self.assertEqual((reply.returncode, reply.stdout, reply.stderr), (0, "", ""))
 
-        with patch.dict(os.environ, self.environment):
+        start_times = [datetime.fromtimestamp(at, timezone.utc) for at in (159, 160)]
+        clock = Mock(wraps=datetime, now=Mock(side_effect=start_times))
+        with patch.dict(os.environ, self.environment), patch.object(review_hold, "datetime", clock):
+            review_hold.deliver_at_session_start(SESSION, batches.append,
+                record_keys=review_hold_delivery.record_keys)
+            self.assertEqual(batches, [])
+            self.assertEqual(state.read_bytes(), saved)
+            self.assertEqual(review_hold.item_count(SESSION), 2)
+            kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Second update."), now=159))
+            self.assertEqual(kept["decision"], "block")
             review_hold.deliver_at_session_start(SESSION, receive,
                 record_keys=review_hold_delivery.record_keys)
         self.assertEqual(len(batches), 1)
-        self.assertIn("Held update.", batches[0])
-        self.assertEqual(self.end_review(103), [])
+        self.assertIn("Held update.", self.held_file().read_text(encoding="utf-8"))
+        self.assertIn("Second update.", self.held_file().read_text(encoding="utf-8"))
+        self.assertEqual(self.end_review(161), [])
 
     def test_native_review_prompt_fails_open_when_the_hold_is_unreadable(self) -> None:
         self.open_review()
@@ -600,8 +817,7 @@ class ConversationPauseTests(ConversationPauseFixture):
                 "systemMessage": f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
                 "hookSpecificOutput": {
                     "hookEventName": "UserPromptSubmit",
-                    "additionalContext": PAUSE_CONTEXT + "\n\nMessages from the review\n\n"
-                    + "1. Review peer\n   Sent: 00:01 UTC\n   Sender native id: session:peer\n   The checks passed.",
+                    "additionalContext": PAUSE_CONTEXT + "\n\n" + self.notice(1, "Released at 00:02:41 UTC"),
                 },
             })
             review_hold.set_count(SESSION, 1, 162, self.fail,

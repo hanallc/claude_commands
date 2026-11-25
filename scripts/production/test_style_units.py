@@ -6,7 +6,6 @@ from scripts.agents import remote
 import json
 import os
 import sqlite3
-import shutil
 import tempfile
 import unittest
 from contextlib import closing
@@ -18,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 
 from scripts.lib.terminal_cells import terminal_width
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 from scripts.production import live_units
 from scripts.production import proposal_issue
 from scripts.production.issues import frontmatter
@@ -30,6 +29,7 @@ from scripts.herdr.herdr import HerdrPlace
 from scripts.direct import plan_history
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, unit_membership
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 NOW = datetime(2026, 10, 28, 12, tzinfo=UTC)
@@ -55,13 +55,13 @@ class StyleUnitsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / "table-conf"
-        _ = cast(object, shutil.copytree(Path(__file__).resolve().parents[2] / "config", config))
+        _ = copy_config_fixture(Path(__file__).resolve().parents[2] / "config", config)
         _ = write_config_fixture(config / "production.conf", "units_table_columns=170\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.database = self.root / "ledger.sqlite"
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        self.enterContext(patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}))
+        self.enterContext(patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN}))
         self.doc = self.root / "style-production.md"
         _ = self.doc.write_text(f"# Production\n- **Merge branch:** main\n- **Showrunner checkout:** {self.root}\n")
         write_style_units(self.doc)

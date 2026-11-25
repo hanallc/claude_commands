@@ -342,6 +342,7 @@ class SnapshotCodecTests(unittest.TestCase):
             records.EstimateExpired: records.EstimateExpired(1000.0),
             records.BehindHead: records.BehindHead("organon", 900.0, "session"),
             records.GpuSlotWait: records.GpuSlotWait(1, 1),
+            records.RunLimitWait: records.RunLimitWait(2, 2, "claude_commands", "natedev"),
             placement.CargoFolderWait: placement.CargoFolderWait(),
             records.BuildSpaceLow: records.BuildSpaceLow(125, 150),
             records.BuildSpaceUnreadable: records.BuildSpaceUnreadable("fixture disk offline"),
@@ -365,12 +366,31 @@ class SnapshotCodecTests(unittest.TestCase):
                         older_reason = cast(object, getattr(parse_reply(line), "reason"))
                         older_cause = (cast(object, getattr(older_reason, "cause"))
                                        if type(older_reason).__name__ == "HeadAdmissionStatus" else older_reason)
-                        legacy_wait = (records.GpuSlotWait | records.NatedevHeld | placement.CargoFolderWait
+                        legacy_wait = (records.GpuSlotWait | records.RunLimitWait | records.NatedevHeld | placement.CargoFolderWait
                                        | records.BuildSpaceHold)
                         self.assertEqual(type(older_cause).__name__,
                                          "BehindHead" if isinstance(cause, legacy_wait) else type(cause).__name__)
                         if isinstance(cause, records.BuildSpaceHold):
                             self.assertEqual(cast(str, getattr(older_cause, "head_name")), "the build space floor")
+                        if isinstance(cause, records.RunLimitWait):
+                            self.assertEqual(cast(str, getattr(older_cause, "head_name")),
+                                             "2 of 2 claude_commands runs on natedev")
+
+    def test_each_pinned_client_reads_a_machine_choice_row_and_the_current_client_keeps_it(self) -> None:
+        reading = head_reading()
+        row = replace(reading.view.waiting[0], reason=records.MachineChoiceWait())
+        reading = replace(reading, view=replace(reading.view, waiting=(row, *reading.view.waiting[1:])))
+        reply = wire.ViewReply(reading)
+        line = wire.encode_reply(reply)
+        self.assertEqual(wire.parse_reply(line), reply)
+        for revision in (*OLDER_CLIENTS, CI_CLIENT):
+            with self.subTest(revision=revision), pinned_snapshot_reader(revision) as (_parse, _schema, pinned):
+                older = cast(Callable[[str], object], getattr(pinned, "parse_reply"))(line)
+                view = cast(object, getattr(cast(object, getattr(older, "reading")), "view"))
+                waiting = cast(tuple[object, ...], getattr(view, "waiting"))
+                reason = cast(object, getattr(waiting[0], "reason"))
+                self.assertEqual(type(reason).__name__, "BehindHead")
+                self.assertEqual(cast(str, getattr(reason, "head_name")), "a machine choice")
 
     def test_the_pinned_ci_client_reads_a_natedev_hold_as_a_wait_and_the_current_client_keeps_it(self) -> None:
         held = records.NatedevHeld("fps", "Phase 3 timing")

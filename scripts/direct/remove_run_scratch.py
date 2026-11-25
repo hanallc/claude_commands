@@ -5,6 +5,7 @@ The report includes Verify caches, outermost Git checkouts, and Cargo targets.
 The report skips folders that still host live commands.
 With --tracked, record the end of the run's scratch task.
 With --owned-workspaces, report the caller's retained workspaces.
+The command removes generated assignment prompts when no pass can use them.
 """
 
 from __future__ import annotations
@@ -14,17 +15,20 @@ except FileNotFoundError:
     pass
 
 import argparse
+import fcntl
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import cast
 
-from scripts.direct import workers
+from scripts.direct import recorder_state, workers
 from scripts.lib import git_files, scratch
 
 VERIFY_CACHE = "verify_cache"
+ASSIGNMENT_PROMPT_LOCK = "assignment_prompts.lock"
 # A folder holding any of these is a checkout or a cargo target.
 COPY_MARKERS = (".git", ".rustc_info.json", "CACHEDIR.TAG")
 
@@ -104,6 +108,45 @@ def end_tracked_scratch(run: Path) -> list[scratch.KeptFolder]:
     return scratch.end(task, keep=retained)
 
 
+def remove_assignment_prompts(run: Path) -> None:
+    """Keep prompts for current passes that can still accept a retry."""
+    if run.is_symlink() or not run.is_dir():
+        return
+    phases = run / "phases"
+    if phases.is_symlink() or not phases.is_dir():
+        return
+    with (run / ASSIGNMENT_PROMPT_LOCK).open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = recorder_state.read_state(run / recorder_state.STATE_FILENAME)
+        except FileNotFoundError:
+            state = {}
+        slots = state.get("pass", {})
+        if not isinstance(slots, dict):
+            raise ValueError("Invalid assignment pass records")
+        slots = cast(dict[str, object], slots)
+        passes = (slots,) if "instance_id" in slots else slots.values()
+        retained = set[str]()
+        for item in passes:
+            if isinstance(item, dict):
+                passed = cast(dict[str, object], item)
+                if passed.get("status") in ("active", "refused", "completed"):
+                    prompt = passed.get("prompt_file")
+                    if isinstance(prompt, str):
+                        retained.add(prompt)
+        for phase in phases.iterdir():
+            if phase.is_symlink() or not phase.is_dir():
+                continue
+            prompts = phase / "prompts"
+            if prompts.is_symlink() or not prompts.is_dir():
+                continue
+            for path in prompts.iterdir():
+                if str(path.resolve()) in retained:
+                    continue
+                if re.fullmatch(r"[0-9a-f]{64}\.txt", path.name) and not path.is_symlink() and path.is_file():
+                    path.unlink(missing_ok=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0] if __doc__ else None)
     _ = parser.add_argument("runs", nargs="*", help="run folders whose scratch folders stay")
@@ -111,15 +154,23 @@ def main() -> int:
     _ = parser.add_argument("--owned-workspaces", action="store_true", help="also report the caller's workspaces")
     args = parser.parse_args()
     runs = [Path(run) for run in cast("list[str]", args.runs)]
+    failed = False
     reported: set[Path] = set()
 
     def report(folder: Path, reason: str) -> None:
+        if not scratch.retained_folder_exists(folder):
+            return
         resolved = folder.resolve()
         if resolved not in reported:
             print(f"kept for a manual removal list: {folder} (remove_run_scratch, {reason})", file=sys.stderr)
             reported.add(resolved)
 
     for run in dict.fromkeys(runs):
+        try:
+            remove_assignment_prompts(run)
+        except (OSError, ValueError, recorder_state.OldRecorderState) as error:
+            failed = True
+            print(f"remove_run_scratch: could not remove assignment prompts from {run}: {error}", file=sys.stderr)
         if cast(bool, args.tracked):
             reported.update(folder.path.resolve() for folder in end_tracked_scratch(run))
         for folder in scratch_folders(run):
@@ -129,11 +180,10 @@ def main() -> int:
 
         try:
             for folder, _ in copies.owned_workspaces(copies.caller_owner(), purpose=copies.WorkspaceScanPurpose.REPORT):
-                if os.path.lexists(folder):
-                    report(folder, "the session ended")
+                report(folder, "the session ended")
         except (copies.CopyError, OSError, scratch.ScratchError) as error:
             print(f"remove_run_scratch: cannot report owned workspaces: {error}", file=sys.stderr)
-    return 0
+    return int(failed)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import json
 import shutil
-import subprocess
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +14,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from unittest.mock import patch
 
 from scripts.lib import conf, urgency
+from scripts.lib.process_group import run_process_group
 from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import change_review, footer_counts, investigation, next_item, staff, update_registration
@@ -350,12 +350,17 @@ class ReviewRepairsTests(unittest.TestCase):
                         later = saved.item.times.later
                         result.update(state=saved.item.state, later=0 if isinstance(later, review_items.NoLaterTime)
                                       else later.timestamp()*1000)
-                    delivery = change_page.finish_verdict_cleanup(saved.delivery, case.status)
-                    change_page.deliver(delivery, case.status)
-                    self.send_response(200)
-                    self.send_header('Content-Type','application/json')
-                    self.end_headers()
-                    _ = self.wfile.write(json.dumps(result).encode())
+                    try:
+                        content = json.dumps(result).encode()
+                        self.send_response(200)
+                        self.send_header('Content-Type','application/json')
+                        self.send_header('Content-Length', str(len(content)))
+                        self.end_headers()
+                        _ = self.wfile.write(content)
+                        self.wfile.flush()
+                    finally:
+                        delivery = change_page.finish_verdict_cleanup(saved.delivery, case.status)
+                        change_page.deliver(delivery, case.status)
                     return
                 results.append(cast(list[str],json.loads(body)))
                 complete.set()
@@ -371,10 +376,9 @@ class ReviewRepairsTests(unittest.TestCase):
             thread.start()
             try:
                 with tempfile.TemporaryDirectory(dir=self.case.fixture.temporary) as profile:
-                    done = subprocess.run(['firefox','--headless','--no-remote','--profile',profile,
+                    done = run_process_group(['firefox','--headless','--no-remote','--profile',profile,
                         '--window-size',f'{width},1100','--screenshot',str(self.case.fixture.temporary/'repair.png'),
-                        f'http://127.0.0.1:{server.server_port}'+place],capture_output=True,text=True,
-                        timeout=probe_timeout+30)
+                        f'http://127.0.0.1:{server.server_port}'+place],timeout=probe_timeout+30)
                 self.assertEqual(done.returncode,0,done.stderr)
             finally:
                 server.shutdown()
@@ -582,11 +586,11 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
   form.requestSubmit(form.querySelector('[value="question"]'));await complete;
  };
  try{
-  check(!document.querySelector('[data-show-chip="Done"]'),'Review has no Done chip.');
+  check(count('Done')===0,'Done has no rows for these records.');
   for(const [id,selected] of [['C1','all'],['C2','Validating']]){
    await show('open');const before=count('open'),all=count('all');
    const key='page-owner/'+id,row=document.querySelector('[data-key="'+key+'"]');
-   row.querySelector('.list-toggle').click();await readyReviewCard(row);await save(row.querySelector('form'));
+   row.querySelector('.list-toggle').click();await save(await readyReviewCard(row));
    await show(selected);await nativeFetch('/owner-answer?item='+encodeURIComponent(key));await refresh();
    check(count('open')===before && count('all')===all,
     'F005: the fresh index restores the counts after an owner answer in '+selected);
@@ -662,12 +666,12 @@ window.fetch=async(url,options={})=>{
   chip.click();await new Promise(resolve=>requestAnimationFrame(resolve));
  };
  try{
-  row('C1').querySelector('.list-toggle').click();await readyReviewCard(row('C1'));
-  const counts=()=>['open','Validating','all'].map(value=>
-   Number(document.querySelector('[data-show-chip="'+value+'"] b').textContent));
-  check(!document.querySelector('[data-show-chip="Done"]'),'Review has no Done chip.');
+  row('C1').querySelector('.list-toggle').click();
+  const count=value=>Number(document.querySelector('[data-show-chip="'+value+'"] b').textContent);
+  const counts=()=>['open','Validating','all'].map(count);
+  check(count('Done')===0,'Done has no rows for these records.');
   const before=counts();
-  const form=row('C1').querySelector('form');await save(form,'validate');
+  const form=await readyReviewCard(row('C1'));await save(form,'validate');
   check(JSON.stringify(counts())===JSON.stringify([before[0]-1,before[1]+1,before[2]]),
    'A save moves the entry from Open to Validating without changing All.');
   check(!row('C1') || row('C1').hidden,'the saved check leaves Open');
@@ -683,8 +687,8 @@ window.fetch=async(url,options={})=>{
    'All shows the elapsed time and a button to open the active check.');
   await show('open');
   await nativeFetch('/problem');await refresh();check(!row('C1').hidden,'a problem returns to Open');
-  row('C2').querySelector('.list-toggle').click();await readyReviewCard(row('C2'));
-  const second=row('C2').querySelector('form');await save(second,'validate');
+  row('C2').querySelector('.list-toggle').click();
+  const second=await readyReviewCard(row('C2'));await save(second,'validate');
   const [openBeforePass,validatingBeforePass,allBeforePass]=counts();
   await nativeFetch('/passed');await refresh();check(!row('C2') || row('C2').hidden,'a passed check stays out of Open');
   const [openAfterPass,validatingAfterPass,allAfterPass]=counts();
@@ -692,12 +696,13 @@ window.fetch=async(url,options={})=>{
    'A passed check leaves the Validating and All counts.');
   await show('all');
   check(!row('C2') || row('C2').hidden,'A passed check stays out of All.');
-  row('C3').querySelector('.list-toggle').click();await readyReviewCard(row('C3'));
+  row('C3').querySelector('.list-toggle').click();
+  const third=await readyReviewCard(row('C3'));
   const [openBeforeWorks,validatingBeforeWorks,allBeforeWorks]=counts();
   let resumeRefresh;
   allowReviewRefresh=new Promise(resolve=>{resumeRefresh=resolve;});
   try{
-   const third=row('C3').querySelector('form');await save(third,'works');
+   await save(third,'works');
    check(!row('C3') || row('C3').hidden,'F010: Works leaves All');
    const [open,validating,all]=counts();
    check(open===openBeforeWorks-1 && validating===validatingBeforeWorks && all===allBeforeWorks-1,
@@ -718,9 +723,13 @@ window.fetch=async(url,options={})=>{
   for(const key of keys){
    await show('open');
    const asked=()=>document.querySelector('[data-key="'+key+'"]');
-   asked().querySelector('.list-toggle').click();await readyReviewCard(asked());
-   const asking=asked().querySelector('form');asking.elements.feedback.value='Check the next case.';
+   asked().querySelector('.list-toggle').click();
+   const asking=await readyReviewCard(asked());asking.elements.feedback.value='Check the next case.';
+   const openBeforeAsk=count('open');
    await save(asking,'question');
+   check(count('open')===openBeforeAsk-1,'F021: Ask question reduces the Open count for '+key);
+   // A change or proposal Ask keeps its row open; any other row that stays open fails below.
+   if(STAYS_OPEN.includes(key)) asked().querySelector('.list-toggle').click();
    check(!asked() || asked().hidden,'F021: Ask question leaves Open for '+key);
    for(let pass=0;pass<2;pass++){
     await refresh();check(!asked() || asked().hidden,'F021: the sent request stays out of Open after refresh for '+key);
@@ -731,11 +740,17 @@ window.fetch=async(url,options={})=>{
   }
   location.hash=new URLSearchParams({owner:UNIT_OWNER,show:'open',type:'investigation'});
   await new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
-  const investigation=document.querySelector('[data-key="'+keys.at(-1)+'"]');
+  const investigation=()=>document.querySelector('[data-key="'+keys.at(-1)+'"]');
   const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
   const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
   check(selectedOwner()===ownerChip(UNIT_OWNER),'The investigation owner starts selected.');
-  investigation.querySelector('.list-toggle').click();await readyReviewCard(investigation);await save(investigation.querySelector('form'),'read');
+  investigation().querySelector('.list-toggle').click();
+  await readyReviewCard(investigation());
+  const latest=()=>recordDetails(investigation())?.textContent.includes('The owner checked the next case.');
+  const deadline=performance.now()+8000;
+  while(!latest() && performance.now()<deadline) await new Promise(resolve=>requestAnimationFrame(resolve));
+  check(latest(),'The row shows the current answer before marking it read.');
+  await save(await readyReviewCard(investigation()),'read');
   await refresh();
   check(selectedOwner().dataset.ownerChip===UNIT_OWNER && selectedOwner().textContent===UNIT_NAME+' 0' &&
     ownerChip('').textContent==='All 0' && counts()[0]===0,
@@ -749,6 +764,7 @@ window.fetch=async(url,options={})=>{
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();'''
         probe = probe.replace('QUESTION_KEYS',json.dumps([question,'page-owner/C1',*decisions,f'investigation/{ready.owner}/{ready.id}']))
+        probe = probe.replace('STAYS_OPEN', json.dumps(['page-owner/C1', decisions[0]]))
         probe = probe.replace('UNIT_OWNER', json.dumps(str(ready.owner))).replace(
             'UNIT_NAME', json.dumps(review_items.name(ready.owner, staff.snapshot())))
         self.assertEqual(self.browser(markup,probe),[])
@@ -793,9 +809,16 @@ window.fetch=async(url,options={})=>{
    check(visible.length===entry.count && visible.every(row=>row.dataset.type===entry.type),'F012: legacy records '+entry.url);
    if(entry.owner) check(page.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip===entry.owner &&
     visible.every(row=>row.dataset.sourceOwner===entry.owner),'F012: the legacy link keeps its owner.');
-   if(entry.type==='investigation') check(!page.querySelector('[data-show-chip="Done"],[data-state="Done"]'),
+   if(entry.type==='investigation') check(page.querySelector('[data-show-chip="Done"] b')?.textContent==='0' &&
+    !page.querySelector('[data-state="Done"]'),
     'F012: the legacy link shows only active states.');
-   if(entry.item) check(!page.querySelector('[data-key="'+entry.item+'"] [data-detail]').hidden,'F012: legacy row opens its card');
+   if(entry.item){
+    const item=page.querySelector('[data-list-item][data-key="'+entry.item+'"]');
+    const summary=item?.querySelector('.list-toggle'),detail=item?.querySelector('[data-detail]');
+    const owner=page.querySelector('[data-owner-chip][aria-pressed="true"]');
+    check(summary?.getAttribute('aria-expanded')==='true' && detail && !detail.hidden &&
+     owner?.dataset.ownerChip===item.dataset.owner,'F012: the legacy row opens in its row with the review owner kept.');
+   }
    legacy.remove();
   }
  }catch(error){failures.push(String(error));}
@@ -832,12 +855,14 @@ window.fetch=async(url,options={})=>{
    await new Promise(resolve=>requestAnimationFrame(resolve));
   }
   const page=frame.contentDocument;
+  const place=new URLSearchParams(frame.contentWindow.location.hash.slice(1));
   const rows=[...page.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
-  if(page.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip!=='open' ||
+  if(place.get('show')!=='open' || place.get('source-owner')!==INVESTIGATION_OWNER ||
+   page.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip!=='open' ||
    page.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip!==INVESTIGATION_OWNER ||
    rows.length!==1 || rows[0].dataset.key!==READY_KEY || rows[0].dataset.sourceOwner!==INVESTIGATION_OWNER ||
-   page.querySelector('[data-key="'+READ_KEY+'"],[data-show-chip="Done"],[data-state="Done"]') ||
-   count('open')!=='1' || count('all')!=='2')
+   page.querySelector('[data-key="'+READ_KEY+'"],[data-state="Done"]') ||
+   count('open')!=='1' || count('all')!=='2' || count('Done')!=='0')
    failures.push('F012: the Read alias opens Open for its owner and excludes the completed record.');
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});

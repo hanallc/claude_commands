@@ -207,7 +207,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual((status, output), (0, ""))
         self.assertEqual(error, "accounts: anomaly: remote-only: no saved session was found\n")
         moved.assert_called_once_with(["remote-only"], "claude3", why="finish account move", cause="by hand",
-                                      source_accounts={})
+                                      source_accounts={}, user_command=True)
 
     def test_stopped_move_keeps_pending_outcome_then_rerun_reaches_resume(self) -> None:
         with (patch.object(inventory, "listing", return_value=[]),
@@ -307,7 +307,7 @@ class AccountMoveTests(ShutdownTestCase):
             result = accounts.move_group("showrunners", "claude3", why="manual group move")
         self.assertIsInstance(result, accounts.GroupMoveStarted)
         self.assertEqual(self.moves.calls, [MoveCall(identity, "claude3", "manual group move") for identity in ("first", "second")])
-        self.assertEqual(self.moves.batches, [["first", "second"]])
+        self.assertEqual(self.moves.batches, [["first", "second", "already"]])
         self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
         assert isinstance(result, accounts.GroupMoveStarted)
         self.assertEqual(sum("Claude is up on" in line for line in result.stdout.splitlines()), 2)
@@ -389,7 +389,8 @@ class AccountMoveTests(ShutdownTestCase):
                   stop_resume.SessionNotFound("missing")]) as batch):
             outcomes = accounts.move_sessions(("failed", "ok", "worker", "missing"), "claude3", why="retry")
         batch.assert_called_once_with(["failed", "ok", "worker", "missing"], "claude3", why="retry", cause="by hand",
-                                      source_accounts={"failed": "claude1", "ok": "claude1", "worker": "claude1"})
+                                      source_accounts={"failed": "claude1", "ok": "claude1", "worker": "claude1"},
+                                      user_command=False)
         self.assertEqual([accounts.move_result_line(item) for item in outcomes], [
             "failed: not moved: stop refused", "ok: Claude is up on claude3 in w1:p1 (0.0 s)",
             "worker: Claude is up on claude3 in w1:p1 (0.0 s)"])
