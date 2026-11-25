@@ -464,7 +464,7 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual([event.args[1] for event in read_session.call_args_list], [8101, 8100])
 
     def test_outside_queue_shares_one_herdr_host_scan_for_three_codex_agents(self) -> None:
-        fixture = write_outside_queue_fixture(self.root, siblings=(8200, 8201))
+        fixture = write_outside_queue_fixture(self.root, siblings=(8200, 8201, 8202, 8203))
         runner, director, worker = fixture.rows
         director = replace(director, current_session=staff.StaffId(fixture_runtime_id("director-session")))
         owners = memory_feed.FeedStaff(replace(fixture, rows=(runner, director, worker)))
@@ -472,14 +472,30 @@ class MemoryFeedTests(unittest.TestCase):
         config = self.root / "config"
         sockets = proc / "net/unix"
         sockets.parent.mkdir()
-        _ = sockets.write_text(f"0: 00000002 00000000 00010000 0001 01 100 {config}/herdr/herdr.sock\n")
+        _ = sockets.write_text(f"0: 00000002 00000000 00010000 0001 01 100 {config}/herdr/herdr.sock\n"
+                               + f"0: 00000002 00000000 00010000 0001 01 101 {config}/herdr/sessions/unrelated/herdr.sock\n")
         write_process(proc, 8090)
         descriptors = proc / "8090/fd"
         descriptors.mkdir()
         (descriptors / "3").symlink_to("socket:[100]")
+        write_process(proc, 8091)
+        descriptors = proc / "8091/fd"
+        descriptors.mkdir()
+        (descriptors / "3").symlink_to("socket:[101]")
+        write_process(proc, 8092, parent=8091)
+        _ = (proc / "8092/cmdline").write_text("/bin/codex\0")
+        _ = (proc / "8092/environ").write_text("HERDR_PANE_ID=w2:p1\0")
+        write_process(proc, 8093, parent=1)
+        for pid in (8091, 8093):
+            _ = (proc / str(pid) / "cgroup").write_text("0::/user.slice/session-7.scope\n")
+        write_process(proc, 8094, parent=1)
+        _ = (proc / "8094/cmdline").write_text(f"/bin/codex\0resume\0{worker.current_session}\0")
+        _ = (proc / "8094/environ").write_text("")
         set_outside_cpu(self.root, 8100, (200, 0, 0, 0), parent=8090)
         set_outside_cpu(self.root, 8200, (121, 0, 0, 0), parent=8104)
         set_outside_cpu(self.root, 8201, (121, 0, 0, 0), parent=8107)
+        set_outside_cpu(self.root, 8202, (119, 0, 0, 0), parent=8092)
+        set_outside_cpu(self.root, 8203, (121, 0, 0, 0), parent=8094)
         panes: dict[str, dict[str, object]] = {}
         foreground: dict[str, dict[str, object]] = {}
         for pid, member in ((8101, worker), (8104, director), (8107, runner)):
@@ -491,9 +507,13 @@ class MemoryFeedTests(unittest.TestCase):
             foreground[pane] = {"pid": pid, "argv": argv}
 
         foreground_reads: list[str] = []
+        pane_reads: list[str] = []
 
-        def result(_client: herdr.Herdr, *arguments: str) -> dict[str, object]:
+        def result(client: herdr.Herdr, *arguments: str) -> dict[str, object]:
             if arguments == ("pane", "list"):
+                pane_reads.append(client.session)
+                if client.session == "unrelated":
+                    return {"panes": [{"pane_id": "w2:p1", "workspace_id": "w2"}]}
                 return {"panes": list(panes.values())}
             if arguments[:2] == ("pane", "get"):
                 return {"pane": panes[arguments[-1]]}
@@ -518,14 +538,16 @@ class MemoryFeedTests(unittest.TestCase):
               mock.patch.object(Path, "read_text", new=count_host_reads)):
             rows = memory_feed.outside_queue_processes(inputs, owners, for_table=True)
             self.assertEqual({row["pid"]: row["owner"] for row in rows},
-                             {8102: "test", 8200: "queue", 8201: "builds"})
+                             {8102: "test", 8200: "queue", 8201: "builds", 8203: "test"})
             self.assertEqual(socket_reads, [sockets])
+            self.assertEqual(pane_reads, ["default"])
             self.assertCountEqual(foreground_reads, panes)
 
             foreground["w1:p8104"]["pid"] = 8107
             rows = memory_feed.outside_queue_processes(inputs, owners, for_table=True)
-            self.assertEqual({row["pid"] for row in rows if "kill_ref" in row}, {8102, 8201})
+            self.assertEqual({row["pid"] for row in rows if "kill_ref" in row}, {8102, 8201, 8203})
             self.assertEqual(socket_reads, [sockets, sockets])
+            self.assertEqual(pane_reads, ["default", "default"])
 
     def test_outside_kill_uses_the_nearest_registered_agent_for_each_row(self) -> None:
         members = write_outside_queue_fixture(self.root, siblings=(8200, 8201))
@@ -592,8 +614,12 @@ class MemoryFeedTests(unittest.TestCase):
               mock.patch.object(admission_client, "view", return_value=reading),
               mock.patch.object(kill_action, "outside_stop_route", return_value=kill_action.OutsideCommandTree())):
             self.assertEqual(memory_feed.live_outside_kill_targets(), {})
-            rows = memory_feed.outside_queue_processes(reading.explanation.decided_from,
-                                                       memory_feed.FeedStaff(members), for_table=True)
+            inputs = reading.explanation.decided_from
+            owners = memory_feed.FeedStaff(members)
+            scan = memory_feed.OutsideQueueScan(inputs, memory_feed.outside_process_table(), owners,
+                                                self.root / "cgroup/user/builds.slice", for_table=True)
+            self.assertIsInstance(scan.codex_session(8101), memory_feed.OutsideIdentityUnreadable)
+            rows = memory_feed.outside_queue_processes(inputs, owners, for_table=True)
             row, = rows
             self.assertEqual(row["pid"], 8102)
             self.assertNotIn("kill_ref", row)

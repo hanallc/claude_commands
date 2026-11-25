@@ -2795,7 +2795,7 @@ class OutsideCommand:
     row: OutsideQueueProcess
     sample_seconds: float
     over_limit: bool
-    caller: staff.StaffRow | None
+    caller: staff.StaffRow | None = None
 
 
 class OutsideCpuReadings:
@@ -2852,6 +2852,8 @@ class OutsideQueueScan:
         self.for_table = for_table
         self.commands: dict[int, tuple[str, ...]] = {}
         self.native_sessions: dict[int, str | OutsideThreadHost | OutsideIdentityUnreadable] = {}
+        self.herdr_pids: set[int] = set()
+        self.codex_environments: dict[int, dict[str, str] | None] = {}
         self.children: dict[int, list[int]] = {}
         for pid, process in processes.items():
             self.children.setdefault(process.parent, []).append(pid)
@@ -2895,27 +2897,42 @@ class OutsideQueueScan:
 
     @cached_property
     def herdr_places(self) -> herdr.HerdrProcessPlacements:
-        return herdr.herdr_places()
+        return herdr.herdr_places({pid for pid in self.herdr_pids
+                                  if (environment := self.codex_environment(pid)) is not None
+                                  and environment.get("HERDR_PANE_ID") and not environment.get("TMUX_PANE")})
 
-    def codex_session(self, pid: int) -> str:
-        environment = herdr.process_environment(pid)
-        if environment.get("HERDR_PANE_ID") and not environment.get("TMUX_PANE"):
-            place = self.herdr_places.get(pid)
-        else:
-            place = herdr.process_placement(pid, environment=environment)
-        if isinstance(place, herdr.NotInHerdr):
-            return herdr.codex_resume_thread(pid)
-        if not isinstance(place, herdr.HerdrPlace):
-            return ""
-        client = herdr.Herdr(place.session)
-        info = herdr.json_object(client.result("pane", "process-info", "--pane", place.pane).get("process_info"),
-                                 "Codex pane process info")
-        owner = herdr.pane_foreground(place, info)
-        if not isinstance(owner, herdr.ProvedCodexForeground) or owner.pid != pid:
-            return ""
-        pane = herdr.json_object(client.result("pane", "get", place.pane).get("pane"), "Codex pane")
-        native = herdr.read_foreground_pane_owner(owner, {**pane, "pane_id": place.pane})
-        return native.current_identity if native.started == self.processes[pid].start else ""
+    def codex_environment(self, pid: int) -> dict[str, str] | None:
+        if pid not in self.codex_environments:
+            try:
+                self.codex_environments[pid] = herdr.process_environment(pid)
+            except (OSError, ValueError, HerdrFailure, subprocess.SubprocessError):
+                self.codex_environments[pid] = None
+        return self.codex_environments[pid]
+
+    def codex_session(self, pid: int) -> str | OutsideIdentityUnreadable:
+        try:
+            environment = self.codex_environment(pid)
+            if environment is None:
+                return OutsideIdentityUnreadable()
+            if environment.get("HERDR_PANE_ID") and not environment.get("TMUX_PANE"):
+                place = self.herdr_places.get(pid)
+            else:
+                place = herdr.process_placement(pid, environment=environment)
+            if isinstance(place, herdr.NotInHerdr):
+                return herdr.codex_resume_thread(pid)
+            if not isinstance(place, herdr.HerdrPlace):
+                return OutsideIdentityUnreadable()
+            client = herdr.Herdr(place.session)
+            info = herdr.json_object(client.result("pane", "process-info", "--pane", place.pane).get("process_info"),
+                                     "Codex pane process info")
+            owner = herdr.pane_foreground(place, info)
+            if not isinstance(owner, herdr.ProvedCodexForeground) or owner.pid != pid:
+                return OutsideIdentityUnreadable()
+            pane = herdr.json_object(client.result("pane", "get", place.pane).get("pane"), "Codex pane")
+            native = herdr.read_foreground_pane_owner(owner, {**pane, "pane_id": place.pane})
+            return native.current_identity if native.started == self.processes[pid].start else OutsideIdentityUnreadable()
+        except (OSError, ValueError, HerdrFailure, subprocess.SubprocessError):
+            return OutsideIdentityUnreadable()
 
     def read_native_session(self, pid: int, command: tuple[str, ...]) -> str | OutsideThreadHost | OutsideIdentityUnreadable:
         if is_claude_process(command):
@@ -2924,12 +2941,11 @@ class OutsideQueueScan:
             process = self.current_process(pid)
             return OutsideThreadHost() if process is not None and not process.zombie else OutsideIdentityUnreadable()
         else:
-            try:
-                native = self.codex_session(pid)
-            except (OSError, ValueError, HerdrFailure, subprocess.SubprocessError):
-                return OutsideIdentityUnreadable()
+            native = self.codex_session(pid)
+        if isinstance(native, OutsideIdentityUnreadable) or not native:
+            return OutsideIdentityUnreadable()
         process = self.current_process(pid)
-        return native if native and process is not None and not process.zombie else OutsideIdentityUnreadable()
+        return native if process is not None and not process.zombie else OutsideIdentityUnreadable()
 
     def parent_first(self, pids: set[int]) -> Iterable[int]:
         """Visit each candidate after its candidate ancestors."""
@@ -2999,19 +3015,33 @@ class OutsideQueueScan:
         process = read_outside_process(pid)
         return process if process is not None and process.start == self.processes[pid].start else None
 
-    def command_row(self, pid: int, command: tuple[str, ...],
-                    caller: staff.StaffRow | None, seconds: float, sample: float, *, over_limit: bool) -> OutsideCommand:
+    def command_row(self, pid: int, command: tuple[str, ...], seconds: float,
+                    sample: float, *, over_limit: bool) -> OutsideCommand:
         process = self.processes[pid]
-        owner = self.staff_members.fixed_owner_labels(caller.id) if caller is not None else None
-        owner = owner or unit_labels.UnitLabels("")
         script = command_script(command)
         label = (public_queue_text(Path(script or command[0]).name) or "Unknown command")[:80]
-        row: OutsideQueueProcess = {"pid": pid, "start_time": process.start, "unit": staff_unit(owner),
-            "owner": public_queue_text(owner.session), "command": label, "cpu_seconds": seconds,
+        row: OutsideQueueProcess = {"pid": pid, "start_time": process.start, "unit": "",
+            "owner": "", "command": label, "cpu_seconds": seconds,
             "age_seconds": max(0.0, self.boot_now - int(process.start) / self.ticks_per_second), "current_cpu": None}
-        if self.for_table and caller is not None and pid > 1:
-            row["kill_ref"] = kill_action.OutsideKillCandidate(pid, process.start, label).reference
-        return OutsideCommand(row, sample, over_limit, caller)
+        return OutsideCommand(row, sample, over_limit)
+
+    def find_owners(self, rows: list[OutsideCommand]) -> None:
+        """Collect the Codex candidates before reading their shared Herdr placement."""
+        over_limit = [command.row["pid"] for command in rows if command.over_limit]
+        ancestors = {ancestor for pid in over_limit for ancestor in self.ancestors(pid) if ancestor != pid}
+        self.herdr_pids.update(pid for pid in ancestors if is_codex_agent(argv := self.command(pid))
+                               and not staff_sources.codex_thread_host(list(argv)))
+        for index, command in enumerate(rows):
+            row = command.row
+            pid = row["pid"]
+            if not command.over_limit or (caller := self.agent_owner(pid)) is None:
+                continue
+            if (owner := self.staff_members.fixed_owner_labels(caller.id)) is not None:
+                row["unit"] = staff_unit(owner)
+                row["owner"] = public_queue_text(owner.session)
+            if self.for_table and pid > 1:
+                row["kill_ref"] = kill_action.OutsideKillCandidate(pid, row["start_time"], row["command"]).reference
+            rows[index] = replace(command, caller=caller)
 
     def has_queue_work(self, pids: Iterable[int], scopes: set[Path]) -> bool:
         return any(pid in self.queued or pid in self.queue_ancestors or (
@@ -3068,8 +3098,7 @@ def outside_agent_rows(scopes: Iterable[Path], scan: OutsideQueueScan, limit: fl
                     live += member.ticks
         seconds = (live + root_process.reaped_ticks) / scan.ticks_per_second
         over_limit = limit_ticks / scan.ticks_per_second > limit
-        caller = scan.agent_owner(pid) if over_limit else None
-        rows.append(scan.command_row(pid, commands[pid], caller, seconds, live / scan.ticks_per_second,
+        rows.append(scan.command_row(pid, commands[pid], seconds, live / scan.ticks_per_second,
                                      over_limit=over_limit))
     return rows
 
@@ -3103,8 +3132,7 @@ def outside_detached_row(scope: Path, scan: OutsideQueueScan, limit: float) -> O
     for pid in sorted(commands, key=lambda item: (scan.processes[item].parent in pids, int(scan.processes[item].start))):
         if (not is_outside_tree_wrapper(commands[pid])
                 and (process := scan.current_process(pid)) is not None and not process.zombie):
-            owner = scan.agent_owner(pid) if seconds > limit else None
-            return scan.command_row(pid, commands[pid], owner, seconds, seconds, over_limit=seconds > limit)
+            return scan.command_row(pid, commands[pid], seconds, seconds, over_limit=seconds > limit)
     return None
 
 
@@ -3135,6 +3163,7 @@ def outside_commands(inputs: admission_records.QueueInputs, staff_members: FeedS
     scan = OutsideQueueScan(inputs, processes, staff_members, builds, for_table=for_table)
     rows = outside_agent_rows(agent_scopes, scan, limit)
     rows.extend(row for scope in sorted(detached_scopes) if (row := outside_detached_row(scope, scan, limit)) is not None)
+    scan.find_owners(rows)
     return rows
 
 

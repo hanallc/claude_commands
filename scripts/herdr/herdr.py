@@ -6204,27 +6204,29 @@ class HerdrProcessPlacements:
 
 
 @pane_snapshot()
-def herdr_places() -> HerdrProcessPlacements:
-    """Read one process scan and preserve each unreadable placement."""
+def herdr_places(pids: Set[int] | None = None) -> HerdrProcessPlacements:
+    """Share one process scan and limit placement reads to the selected PIDs."""
+    if pids is not None and not pids:
+        return HerdrProcessPlacements({})
     failures: list[str] = []
     servers: dict[int, str] = {}
     try:
         if _platform() == "darwin":
             processes = {process.pid: process for process in _darwin_processes()}
-            sessions = _darwin_process_sessions(processes, _darwin_bound_sockets(), failures=failures)
+            sessions = _darwin_process_sessions(processes, _darwin_bound_sockets(), failures=failures, pids=pids)
 
             def parent(pid: int) -> int:
                 return processes[pid].parent
         else:
             candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
             servers = _live_server_processes(candidates, failures=failures)
-            sessions = _process_sessions(candidates, servers, failures=failures)
+            sessions = _process_sessions(candidates, servers, failures=failures, pids=pids)
             parent = linux_process_parent
     except (OSError, HerdrFailure, ValueError, subprocess.SubprocessError) as error:
         return HerdrProcessPlacements({}, (str(error),))
     placements: dict[int, ProcessPlacement] = {}
     for pid, session in sessions.items():
-        if pid in servers:
+        if pid in servers or (pids is not None and pid not in pids):
             continue
         try:
             environment = process_environment(pid)
@@ -6357,7 +6359,8 @@ class _LinuxProcessScan:
 
 
 def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
-                      failures: list[str] | None = None, scan: _LinuxProcessScan | None = None) -> dict[int, str]:
+                      failures: list[str] | None = None, scan: _LinuxProcessScan | None = None,
+                      pids: Set[int] | None = None) -> dict[int, str]:
     """Associate descendants and handoff survivors with socket-owned sessions."""
     if not servers:
         return {}
@@ -6396,7 +6399,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
             continue
         sessions[pid] = session
         descendants.extend((child, session) for child in children.get(pid, []))
-    if unit_groups or shared_groups:
+    if (unit_groups or shared_groups) and (pids is None or not pids <= sessions.keys()):
         # Handoff transfers PTYs without reparenting their processes to the
         # replacement. setsid leaves their dedicated service cgroup unchanged.
         shared_sessions: set[str] = set()
@@ -6424,6 +6427,8 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
                     break
             if pid not in sessions and (scopes := pane_scopes(groups, read_slice())):
                 loose[pid] = scopes
+        if pids is not None and pids <= sessions.keys():
+            return {pid: sessions[pid] for pid in pids if pid not in servers}
         # A pane scope holds one pane's processes, as the unit's cgroup held
         # them before. Only a scope that no matched process explains needs the
         # unit servers' pane shells.
@@ -6611,7 +6616,7 @@ def _darwin_process_cwds(pids: Sequence[int]) -> dict[int, str | UnreadableCwd]:
 
 
 def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_BoundUnixSocket], *,
-                             failures: list[str] | None = None) -> dict[int, str]:
+                             failures: list[str] | None = None, pids: Set[int] | None = None) -> dict[int, str]:
     config = _session_socket("default").parent
     holders: dict[str, set[int]] = {}
     for listener in listeners:
@@ -6631,15 +6636,26 @@ def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_B
     for process in by_pid.values():
         children.setdefault(process.parent, []).append(process.pid)
     sessions: dict[int, str] = {}
-    for server, session in servers.items():
-        # A live handoff preserves pane shell PIDs even after reparenting.
-        pending = [*children.get(server, []), *_pane_shell_pids(session)]
+
+    def add_descendants(pending: list[int], session: str) -> None:
         while pending:
             pid = pending.pop()
             if pid in sessions or pid not in by_pid or pid in servers:
                 continue
             sessions[pid] = session
             pending.extend(children.get(pid, []))
+
+    for server, session in servers.items():
+        pending = list(children.get(server, []))
+        if pids is None:
+            pending.extend(_pane_shell_pids(session))
+        add_descendants(pending, session)
+    if pids is not None:
+        # A live handoff preserves pane shell PIDs after reparenting.
+        for session in servers.values():
+            if pids <= sessions.keys():
+                break
+            add_descendants(_pane_shell_pids(session), session)
     return sessions
 
 
