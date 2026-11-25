@@ -285,6 +285,26 @@ class MacGateTests(unittest.TestCase):
             return mac_gate.route(self.repo, mode=gate.SuiteMode.GATE, full=False,
                                   module_time_limit_s=30, selected=selection)
 
+    def test_manual_run_selects_modules_from_head(self) -> None:
+        one, two = module_job('one'), module_job('two')
+        self.add_module(two)
+        _ = commit_repository(self.repo, 'second module')
+        tree = gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}')
+        output = self.root / 'result.json'
+        result = mac_gate.MacGateResult({'tree': tree}, gate.GateRun((), 1, 0))
+        for paths in ((), (module_path(one),), (module_path(one), module_path(two))):
+            options = [word for path in paths for word in ('--module', path)]
+            words = ['mac_gate.py', 'run', str(self.repo), str(output), *options]
+            selected = gate.TreeSelection(paths, tree) if paths else gate.ALL_MODULES
+            with (self.subTest(paths=paths), mock.patch.object(sys, 'argv', words),
+                  mock.patch.object(mac_gate, 'run_remote', return_value=result) as run):
+                self.assertEqual(mac_gate.main(), 0)
+                run.assert_called_once_with(
+                    self.repo.resolve(), mode=gate.SuiteMode.GATE, full=True,
+                    module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=selected,
+                    cancellation=mac_gate.USE_CALLER_PROCESS_LIFETIME,
+                )
+
     def test_returns_pass_and_test_failure(self) -> None:
         for status in (0, 1):
             with self.subTest(status=status):

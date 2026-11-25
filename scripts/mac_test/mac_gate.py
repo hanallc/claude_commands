@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stdout, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 import fcntl
 import json
@@ -621,6 +621,7 @@ class Arguments(argparse.Namespace):
     argv_file: Path = Path()
     repo: Path = Path()
     output: Path = Path()
+    modules: list[str] = field(default_factory=list)
     mac_result: Path = Path()
     natedev_record: Path = Path()
     owner: str = ''
@@ -631,9 +632,11 @@ class Arguments(argparse.Namespace):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='action', required=True)
-    manual = commands.add_parser('run', help='run all modules on the Mac and save the result')
+    manual = commands.add_parser('run', help='run modules on the Mac and save the result')
     _ = manual.add_argument('repo', type=Path)
     _ = manual.add_argument('output', type=Path)
+    _ = manual.add_argument('--module', dest='modules', action='append', metavar='PATH',
+                            help='select a test module by repository-relative path (repeatable)')
     writer = commands.add_parser('write-list', help='write exclusions from a Mac result and a natedev gate log')
     _ = writer.add_argument('repo', type=Path)
     _ = writer.add_argument('mac_result', type=Path)
@@ -671,8 +674,11 @@ def main() -> int:
         elif args.action == 'write-list':
             write_modules(args.repo.resolve(), args.mac_result, args.natedev_record)
         else:
-            result = run_remote(args.repo.resolve(), mode=gate.SuiteMode.GATE, full=True,
-                                module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=gate.ALL_MODULES,
+            repo = args.repo.resolve()
+            selected = (gate.TreeSelection(tuple(args.modules), gate.checked_git(repo, 'rev-parse', 'HEAD^{tree}'))
+                        if args.modules else gate.ALL_MODULES)
+            result = run_remote(repo, mode=gate.SuiteMode.GATE, full=True,
+                                module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=selected,
                                 cancellation=USE_CALLER_PROCESS_LIFETIME)
             if isinstance(result, str):
                 raise GateRefused(result)
