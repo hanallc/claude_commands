@@ -64,7 +64,8 @@ class CleanupTests(unittest.TestCase):
             f"[cleanup]\ncleanup.dead.natedev={dead}\ncleanup.dead.mac={dead}\n"
             + f"cleanup.list_only.natedev={self.build / 'sccache'}\n"
             + "cleanup.list_only.mac=~/build/slot\ncleanup.list_only_reason.natedev=shared tool cache\n"
-            + "cleanup.list_only_reason.mac=bob's hand step\n# whole: 1..\ncleanup.ssh_seconds=17\n")
+            + "cleanup.list_only_reason.mac=bob's hand step\n")
+        _ = (self.configuration.parent / "mac_test.conf").write_text("# range: 5e-324..\nfloor_sweep_timeout_s=17\n")
 
     def candidate(self, name: str = "old", *, home: Path | None = None) -> Path:
         path = (self.home if home is None else home) / name
@@ -392,8 +393,9 @@ for folder in masks:
 
     def test_sudo_remote_parent_starts_only_setpriv_and_opens_no_file_for_writing(self) -> None:
         self.write_settings("~/missing")
-        _ = self.configuration.write_text(self.configuration.read_text().replace(
-            "cleanup.ssh_seconds=17\n", "cleanup.ssh_seconds=invalid\n"))
+        mac_settings = self.configuration.parent / "mac_test.conf"
+        _ = mac_settings.write_text(mac_settings.read_text().replace(
+            "floor_sweep_timeout_s=17\n", "floor_sweep_timeout_s=invalid\n"))
         read_log = self.home / "config-reads.log"
         shift_log = self.home / "config-shift-reads.log"
         program = """
