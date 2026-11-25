@@ -3115,11 +3115,11 @@ def move_gate_folder(path: Path, guard: CleanupGuard, approval: WouldMove, detai
                         require_gate_move_parent_owner(target_parent)
                         session_move.require_parent_path(target.parent, target_parent)
                         check_protected_masks()
-                        require_unchanged_gate_sidecars(target, target_parent, verified)
                         recheck_move_source((*fds, source))
 
-                    removal_guard.remove_proved_copy(checked, verified.source, approval.target,
-                                                     before_delete=before_delete)
+                    removal_guard.remove_proved_copy(
+                        checked, verified.source, approval.target, before_delete=before_delete,
+                        after_copy_check=lambda: require_unchanged_gate_sidecars(target, target_parent, verified))
             if sidecars.stamps:
                 finish_sidecars(path, guard, lease, locked_sidecars, ignored_fds=fds)
 
