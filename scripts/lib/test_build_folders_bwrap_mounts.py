@@ -191,7 +191,7 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
                     if not mount.is_absolute() or target == root or not target.is_relative_to(root):
                         self.fail("\n".join([f"{device} has a mount outside the fixture: {mount}", *attempts]))
                     mounts.append(target)
-            result = self.cleanup_command(attempts, "/usr/bin/hdiutil", "detach", "-force", device)
+            result = self.cleanup_command(attempts, "/usr/bin/hdiutil", "detach", device)
             if result is not None and result.returncode == 16 and any(
                     "resource busy" in stream.lower() for stream in (result.stdout, result.stderr)):
                 self.busy_mount_diagnostics(mounts, attempts)
@@ -303,7 +303,7 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
         self.assertEqual([call.args[0] for call in run.call_args_list], [
             ["/usr/bin/hdiutil", "attach", "-nobrowse", "-mountpoint", str(mount), "-owners", "off", "-plist", str(image)],
             ["/usr/bin/hdiutil", "info", "-plist"],
-            ["/usr/bin/hdiutil", "detach", "-force", "/dev/disk9"],
+            ["/usr/bin/hdiutil", "detach", "/dev/disk9"],
             ["/usr/bin/hdiutil", "info", "-plist"],
         ])
 
@@ -314,7 +314,7 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
             {"image-path": str(image), "system-entities": [{"dev-entry": device}]},
         ]}).decode()
         query = ["/usr/bin/hdiutil", "info", "-plist"]
-        detach = ["/usr/bin/hdiutil", "detach", "-force", device]
+        detach = ["/usr/bin/hdiutil", "detach", device]
         for status in (0, 3):
             with (self.subTest(status=status), mock.patch.object(subprocess, "run", side_effect=[
                 subprocess.CompletedProcess(query, 0, info, "before"),
@@ -360,7 +360,7 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
             self.cleanup_image(image, device, [])
         self.assertEqual([call.args[0] for call in run.call_args_list], [
             ["/usr/bin/hdiutil", "info", "-plist"],
-            ["/usr/bin/hdiutil", "detach", "-force", device],
+            ["/usr/bin/hdiutil", "detach", device],
             ["/usr/sbin/lsof", "-n", "+f", "--", str(mount)],
             ["/bin/ps", "-axo", "pid=,ppid=,state=,comm="],
             ["/usr/sbin/lsof", "-n", "-a", "-p", "101,106,102", "-d", "cwd", "-Fpn"],
@@ -453,7 +453,7 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
         ]) as run:
             self.cleanup_image(image, device, [])
         self.assertEqual([call.args[0] for call in run.call_args_list], [
-            query, query, ["/usr/bin/hdiutil", "detach", "-force", device], query,
+            query, query, ["/usr/bin/hdiutil", "detach", device], query,
         ])
 
     def test_mac_fixture_timeout_reports_partial_output(self) -> None:

@@ -635,8 +635,8 @@ cleanup.detach_interval_seconds=0.5
         private = [image(folder / 'm0001/fixture/removal.dmg', '/dev/disk9'),
                    image(folder / 'm0002/fixture/removal.dmg', '/dev/disk10')]
         query = ['/usr/bin/hdiutil', 'info', '-plist']
-        first = ['/usr/bin/hdiutil', 'detach', '-force', '/dev/disk9']
-        second = ['/usr/bin/hdiutil', 'detach', '-force', '/dev/disk10']
+        first = ['/usr/bin/hdiutil', 'detach', '/dev/disk9']
+        second = ['/usr/bin/hdiutil', 'detach', '/dev/disk10']
         both = subprocess.CompletedProcess(query, 0, plistlib.dumps({'images': [*other, *private]}), b'')
         one = subprocess.CompletedProcess(query, 0, plistlib.dumps({'images': [*other, private[1]]}), b'')
         with (mock.patch.object(sys, 'platform', 'darwin'),
@@ -661,7 +661,7 @@ cleanup.detach_interval_seconds=0.5
         mount = folder / 'mounted'
         device = '/dev/disk9'
         query = ['/usr/bin/hdiutil', 'info', '-plist']
-        detach = ['/usr/bin/hdiutil', 'detach', '-force', device]
+        detach = ['/usr/bin/hdiutil', 'detach', device]
         attached = subprocess.CompletedProcess(query, 0, plistlib.dumps({'images': [{
             'image-path': str(folder / 'removal.dmg'),
             'system-entities': [{'dev-entry': device, 'mount-point': str(mount)}],
@@ -705,7 +705,7 @@ cleanup.detach_interval_seconds=0.5
         folder, journal = self.image_cleanup_fixture()
         device = '/dev/disk9'
         query = ['/usr/bin/hdiutil', 'info', '-plist']
-        detach = ['/usr/bin/hdiutil', 'detach', '-force', device]
+        detach = ['/usr/bin/hdiutil', 'detach', device]
 
         def attached(source: Path, mount: Path) -> subprocess.CompletedProcess[bytes]:
             return subprocess.CompletedProcess(query, 0, plistlib.dumps({'images': [{
@@ -733,7 +733,7 @@ cleanup.detach_interval_seconds=0.5
         mount = folder / 'mounted'
         device = '/dev/disk9'
         query = ['/usr/bin/hdiutil', 'info', '-plist']
-        detach = ['/usr/bin/hdiutil', 'detach', '-force', device]
+        detach = ['/usr/bin/hdiutil', 'detach', device]
         attached = plistlib.dumps({'images': [{
             'image-path': str(folder / 'removal.dmg'),
             'system-entities': [{'dev-entry': device, 'mount-point': str(mount)}],
@@ -760,7 +760,7 @@ cleanup.detach_interval_seconds=0.5
         mount = folder / 'mounted'
         device = '/dev/disk9'
         query = ['/usr/bin/hdiutil', 'info', '-plist']
-        detach = ['/usr/bin/hdiutil', 'detach', '-force', device]
+        detach = ['/usr/bin/hdiutil', 'detach', device]
         attached = plistlib.dumps({'images': [{
             'image-path': str(folder / 'removal.dmg'),
             'system-entities': [{'dev-entry': device, 'mount-point': str(mount)}],

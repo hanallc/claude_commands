@@ -270,7 +270,7 @@ def detach_gate_image(path: Path, folder: Path, retained: os.stat_result, image:
         if remaining <= 0:
             raise GateRefused(busy or f'The image detach time expired for {device} at {mount}')
         try:
-            result = run_hdiutil('detach', '-force', device, timeout=remaining)
+            result = run_hdiutil('detach', device, timeout=remaining)
         except GateRefused as error:
             raise GateRefused(f'{busy or f"Cannot detach disk image {device} at {mount}."}\n{error}') from error
         if result.returncode == 0:
