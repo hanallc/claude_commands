@@ -17,13 +17,14 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.build_queue import (
-    admission_client, admission_protocol, admission_records, admission_wire, execution_identity, first_step, placement,
+    admission_client, admission_protocol, admission_records, admission_service, admission_wire, execution_identity,
+    first_step, placement,
 )
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.queue_fixture import write_process
-from scripts.build_queue.queue_place import queue_place
 from scripts.build_queue.test_placement import PlacementFixture
+from scripts.build_targets.target_config import PinnedTarget
 from scripts.copies import copies
 from scripts.lib import build_folders, process_stat
 from scripts.lib.build_steps import GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS, gate_job_from_process
@@ -33,6 +34,7 @@ from scripts.mac_test.claim_state import RepositoryScope
 from scripts.production import checkpoint_gate, merge_checkpoint
 from scripts.production.gate_suites_test_support import GateSuitesFixture
 from scripts.production.production_doc import ProductionDocument
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 
 GATE = ("python3", "scripts/production/gate.py", "--tests-only")
@@ -333,11 +335,11 @@ RED_OUTPUT = "  FAIL [  0.1s] (1/1) check known_flake\n--- lib/test_infrastructu
 
 
 class BatchProbeTests(GateSuitesFixture):
-    def test_configured_merge_commands_probe_under_the_parent_reservation(self) -> None:
-        # These are the forms in the builds, natedev, and sdlc production docs.
+    def test_configured_merge_commands_probe_on_natedev_only(self) -> None:
         configured = (
             "env HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/merge_gate.py",
             "env HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py ~/.claude/scripts/production/gate.py",
+            "~/.claude/scripts/lib/py ~/.claude/scripts/production/gate.py",
         )
         install = Path(self.environment["HOME"]) / ".claude"
         install.mkdir()
@@ -353,7 +355,17 @@ class BatchProbeTests(GateSuitesFixture):
         observed = self.state / "probe-input"
         admission = self.admission.server
         previous = admission.reply_filter
+        handle_request = admission.handle_request
+        requests: list[admission_wire.PlacementRequest] = []
         grants: list[admission_protocol.Reply] = []
+
+        def observe_request(
+            request: admission_protocol.Request,
+            connection: admission_service.Connection | admission_service.NoConnection = admission_service.NO_CONNECTION,
+        ) -> list[admission_protocol.Reply]:
+            if isinstance(request, admission_wire.PlacementRequest):
+                requests.append(request)
+            return handle_request(request, connection)
 
         def observe(reply: admission_protocol.Reply) -> admission_protocol.Reply:
             if isinstance(reply, (admission_protocol.Admitted, admission_protocol.LocalPlacementGranted,
@@ -366,13 +378,17 @@ class BatchProbeTests(GateSuitesFixture):
                                         log, ZoneInfo("UTC"))
         record = merge_checkpoint.BatchResumeRecord(self.state / "batch", (), ())
         rollback = merge_checkpoint.ResetBatchCheckout(production, self.base, self.base, self.base, record)
-        # Take one parent reservation for all four probes.
-        with (mock.patch.dict(os.environ, self.environment, clear=True),
+        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
+            owner = fixture_member("showrunner", name="probe-owner")
+        environment = {**self.environment, "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": owner.current_session,
+                       "BUILDLOG_GATE_TARGETS": "natedev,mac-linux"}
+        for key in (admission_client.RESERVED_STEP_ENV, "BUILDLOG_PLACEMENT_FILE", "BUILDLOG_PLACEMENT_EPISODE"):
+            _ = environment.pop(key, None)
+        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_targets.conf",
+                                 "targets=natedev,mac-linux\n")
+        with (mock.patch.dict(os.environ, environment, clear=True),
               mock.patch.object(admission, "reply_filter", side_effect=observe),
-              queue_place("gate", self.checkout) as parent,
-              mock.patch.dict(os.environ, parent.child_environment(os.environ))):
-            self.assertEqual(len(grants), 1)
-            self.assertIsInstance(grants[0], admission_protocol.Admitted)
+              mock.patch.object(admission, "handle_request", side_effect=observe_request)):
             for prefix in configured:
                 field = f"- **Merge tests:** `{prefix} --checkout . --tests-only`"
                 command, = merge_checkpoint.parse_merge_tests([field], self.checkout)
@@ -384,11 +400,23 @@ class BatchProbeTests(GateSuitesFixture):
                 batch = merge_checkpoint.BatchRed(failure, (), rollback, pinned_main, log, {})
                 for row, expected in (("", "base"), (self.checkpoint, "checkpoint\n")):
                     with self.subTest(prefix=prefix, row=row):
+                        requests.clear()
+                        grants.clear()
                         observed.unlink(missing_ok=True)
                         result = merge_checkpoint.run_batch_probe(batch, row)
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                         self.assertEqual(observed.read_text(), expected)
+                        self.assertTrue(requests)
+                        for request in requests:
+                            self.assertEqual(request.route, PinnedTarget("natedev"))
+                            self.assertEqual([candidate.destination.target for candidate in request.constraints.candidates],
+                                             ["natedev"])
                         self.assertEqual(len(grants), 1)
+                        grant = grants[0]
+                        self.assertIsInstance(grant, admission_wire.LocalPlacementGranted)
+                        assert isinstance(grant, admission_wire.LocalPlacementGranted)
+                        self.assertEqual(grant.assignment.destination.target, "natedev")
+                        self.assert_gate_released()
                         self.assertEqual(list(build_folders.held_folder_leases()), [])
             slot, = build_folders.numbered_copy_records()
             self.assertIsInstance(slot, build_folders.NumberedCopySource)
@@ -396,9 +424,9 @@ class BatchProbeTests(GateSuitesFixture):
             self.assertEqual(slot.commit, pinned_main)
             self.assertEqual(slot.source, self.checkout)
         self.assert_gate_released()
-        self.assertEqual(log.read_text().count("PROBE_EXIT=0\n"), 4)
+        self.assertEqual(log.read_text().count("PROBE_EXIT=0\n"), 6)
         self.assertEqual([event["module"] for event in self.module_events() if event["event"] == "start"],
-                         ["test_first.py"] * 4)
+                         ["test_first.py"] * 6)
 
 
 @final

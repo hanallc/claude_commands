@@ -2168,7 +2168,8 @@ def run_batch_probe(red: BatchRed, commit: str = "") -> subprocess.CompletedProc
                              merge=merge, step="test-modules") as tree:
             command = checkpoint_gate.batch_module_command(red.red[0], checkout, tree)
             assert command is not None
-            result = checkpoint_gate.run_test_command(command, tree, raise_start_errors=True)
+            submitted = checkpoint_gate.gate_step_command(command, tree, ("natedev",))
+            result = checkpoint_gate.run_test_command(submitted, tree, raise_start_errors=True)
             with red.log.open("a", encoding="utf-8") as output:
                 _ = output.write(f"\nProbe {commit or 'main'} on {red.main_tip}\n")
                 _ = output.write(result.stdout + result.stderr)

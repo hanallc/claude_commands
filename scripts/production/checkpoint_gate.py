@@ -153,6 +153,16 @@ def gate_copy_command(command: Sequence[str]) -> list[str]:
     return arguments
 
 
+def gate_step_command(command: list[str], folder: Path, targets: tuple[str, ...]) -> list[str]:
+    """Place a gate in its prepared checkout and keep its environment and lease."""
+    scripts = Path(__file__).resolve().parents[1]
+    start = gate_program_start(command)
+    return [*command[:start], str(scripts / "lib/py"), str(scripts / "copies/copies.py"), "gate-step",
+            "--repo", str(folder.resolve()), "--targets", ",".join(targets),
+            *(word for fd in copies.COMMAND_LOCKS.get() for word in ("--lease-fd", str(fd))),
+            "--", *command[start:]]
+
+
 def run_test_command(command: list[str], folder: Path, *, merge_head: str = "",
                      raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
     locks = copies.COMMAND_LOCKS.get()
@@ -165,9 +175,7 @@ def run_test_command(command: list[str], folder: Path, *, merge_head: str = "",
                      "--repo", str(folder.resolve()), "--commit", merge_head, "--",
                      *gate_copy_command(command[start:])]
     elif targets := checkpoint_gate_targets(command, folder):
-        submitted = [str(scripts / "lib/py"), str(scripts / "copies/copies.py"), "gate-step",
-                     "--repo", str(folder.resolve()), "--targets", ",".join(targets),
-                     *(word for fd in locks for word in ("--lease-fd", str(fd))), "--", *command]
+        submitted = gate_step_command(command, folder, targets)
     try:
         return subprocess.run(submitted, cwd=folder, capture_output=True, text=True, check=False, pass_fds=locks)
     except OSError as error:

@@ -1030,7 +1030,7 @@ The batch stops at the first failed test command.
 
 If a fresh batch gate names red modules, the batch runs those modules on pinned main in a numbered copy.
 It probes unpublished checkpoints separately on the same base and tests the rows with the most changed module paths first.
-The probes use the merge run's existing reservation.
+The probes request only natedev for gate placement.
 The batch drops a row only if the base passes and that row alone reproduces every red module.
 The batch stops if the base, a survivor, or the starting tip contains the dropped checkpoint.
 A batch gate or probe treats a module that passes on rerun alone as red.
