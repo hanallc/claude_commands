@@ -2255,7 +2255,6 @@ function applyReviewDetail(key,row,detail,text,bodyVersion=''){
   focus=applyReviewSummary(row,entry);body=template.content;
  }
  installReviewBody(row,body);
- row.dataset.bodyVersion=bodyVersion;
  const departure=saved.get(key);
  if(departure?.closes && departure.awaitingSnapshot)
   detail.querySelector('[data-review-form]')?.remove();
@@ -2275,7 +2274,8 @@ function loadBodies(){
    view.itemError('');
    current.dataset.bodyLoaded='true';
    view.preserveRecordRowTop(()=>{
-    view.presentItemRevision(current,text,apply,{initial:true});
+    view.presentItemRevision(current,text,apply,{force:version!==content.dataset.version});
+    current.dataset.bodyVersion=version;
     drawSaveControls(detail.querySelector('[data-review-form]'));
     restoreFocus(key);
    });
@@ -2426,7 +2426,10 @@ function bindForm(row){
       text=body;
      }
      if(typeof text==='string' && view.currentItemRequest(request))
-      view.preserveRecordRowTop(()=>view.installOwnItemResult(request,text,(item,detail)=>applyReviewDetail(key,item,detail,text)));
+      view.preserveRecordRowTop(()=>view.installOwnItemResult(request,text,(item,detail)=>{
+       delete item.dataset.bodyVersion;
+       applyReviewDetail(key,item,detail,text);
+      }));
     }
     if(validationQuestion){
      hold.restore();

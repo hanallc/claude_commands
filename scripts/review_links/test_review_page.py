@@ -7206,6 +7206,7 @@ window.fetch=async(url,options)=>{
   const row=()=>document.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
   row().querySelector('.list-toggle').click();
   let form=await readyReviewCard(row());
+  const version=document.querySelector('[data-review]').dataset.version;
   form.elements.feedback.value=words;
   form.requestSubmit(form.querySelector('[value="works"]'));
   await until(()=>host.querySelector('[data-send-undo] button'),'The Undo toast did not show.');
@@ -7220,6 +7221,9 @@ window.fetch=async(url,options)=>{
   await until(undone,'The card did not say that the send was undone.');
   form=cardForm();
   check(form.elements.feedback.value===words,'After Undo the card keeps the words.');
+  await until(()=>row()?.dataset.bodyVersion && row().dataset.bodyVersion!==version,
+   'The restored card did not receive the new snapshot.');
+  check(cardForm()===form,'A refresh with the same body keeps the restored form.');
   await until(()=>document.activeElement===form.elements.feedback,'Undo did not focus the feedback field.');
   await until(()=>!form.querySelector('[value="works"]').disabled,'The card did not enable Send after Undo.');
   // The row comes back with a short fade, and a Send during that fade does nothing, so Send again until it posts.
