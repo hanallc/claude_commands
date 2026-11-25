@@ -26,7 +26,7 @@ log='natedev/logs/YYYY-MM/<record-id>.log.gz'
 zcat "${BUILDLOG_DIR:-$HOME/.local/state/buildlog}/$log"
 ```
 
-`GATE_FAILURE_LOG_KIB` in `config/test_times.conf` limits the saved tail to 64 KiB by default.
+`gate_failure_log_kib` in `config/test_times.conf` limits the saved tail to 64 KiB by default.
 The writer reads this setting for each record that has failed attempts.
 The first line states how many bytes the writer cut from the start.
 That line is outside the limit.
@@ -56,7 +56,7 @@ buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modu
 
 `show.py top` ranks live gate modules by median CPU time.
 It keeps passed, unrestarted attempts from the selected host, checkout and time window.
-Each module uses one attempt per run, up to `TOP_RUNS`.
+Each module uses one attempt per run, up to `top_runs`.
 The commit time of the merge base with `origin/main` orders the runs.
 The newest start time breaks ties.
 Runs with unknown commit times fill any remaining places.
@@ -1282,7 +1282,7 @@ This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_g
 | Override | File | Production default | How tests use it |
 |---|---|---|---|
 | `UNIT_EARLY_POLL_SECS` | `scripts/direct/review.sh` | `5` (s) | `0.01`; unset-default test sees one `sleep 5` |
-| `UNIT_WORKER_POLL_SECS` | `scripts/direct/claude_worker.py` (worker polls) | `CLAUDE_WORKER_POLL_SECS=15` (s), from `config/direct.conf` | `0.01` |
+| `UNIT_WORKER_POLL_SECS` | `scripts/direct/claude_worker.py` (worker polls) | `claude_worker_poll_secs=15` (s), from `config/direct.conf` | `0.01` |
 | `UNIT_TOKEN_CLOCK_FILE` | `scripts/direct/verify.sh` | unset → `$SECONDS` | a file the test advances; unset-default test measures from `$SECONDS` |
 | `UNIT_SYNC_WRITES` | `progress_history.py`, `findings.py` | `1` (fsync) | `0`; each has a test with it unset |
 | `--durability {full,off}` (`LedgerDurability.DURABLE`/`DISPOSABLE`) | `scripts/usage/collect.py` | `full` → `PRAGMA synchronous=FULL` | `off`; default pinned by an SQL trace |

@@ -102,6 +102,10 @@ cargo_output_roots() {
     fi
     [[ -f "$config" && -r "$config" ]] || return 1
     host=$(hostname -s) || return 1
+    host=${host%%.*}
+    if [[ "$host" == *[[:upper:]]* ]]; then
+        host=$(printf '%s' "$host" | LC_ALL=C tr '[:upper:]' '[:lower:]') || return 1
+    fi
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" =~ ^[[:space:]]*(roots\.(build|workspace)(\.[^[:space:]=]+)?)[[:space:]]*=[[:space:]]*([^[:space:]#]+)[[:space:]]*($|[[:space:]]#) ]]; then
             key=${BASH_REMATCH[1]}

@@ -18,6 +18,7 @@ Use the `agents` program.
   A production pause reports each refusal and pauses the other selected directors.
 - Use `agents resume --production SHOWRUNNER` to resume its units.
 - `agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]`: resume a staff name, staff id, launch reference, or native session id.
+- `agents clone NAME --as NEW`: fork a live Claude or Codex session beside its source tab.
 - Use `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]` to rename a staff member.
 - `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]`: move Claude sessions to a numbered account.
 - `agents retire NAME`: remove the unit worktree and branch. Keep its retired staff row and conversations.
@@ -33,6 +34,17 @@ Use the `agents` program.
 - `agents remove-stray NAME SESSION`: remove a stray producer conversation on this machine.
 - `agents transfer NAME [--model MODEL --effort EFFORT]`: give the producer role NAME to the session that runs the command.
 
+## Clone a session
+
+Run the command on the source session's machine.
+Use its staff name, saved launch name, staff ID, or native session ID.
+The source must have one proved Herdr pane.
+Show the current model and effort in that pane.
+For Codex, include Model with Reasoning in the status line.
+The clone uses the source folder and account.
+Its opening prompt names both sessions.
+Send messages to the clone by its new name.
+
 ## Create a producer
 
 Use `agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]` to create a producer.
@@ -41,7 +53,7 @@ It creates the README if needed and prints the staff id, account and tab.
 Repeat the command with the same options after an interruption.
 
 First admission adopts one proved live Claude session or Codex thread with the producer name.
-It also checks live agents in matching tabs and panes in `PRODUCER_WORKSPACE`.
+It also checks live agents in matching tabs and panes in `producer_workspace`.
 Adoption writes the staff row with that native session. It launches nothing.
 Two live sessions cause refusal. An unproved live session also causes refusal.
 The refusal names each conflicting session and pane. It writes no staff row.
