@@ -1740,10 +1740,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except OSError:
             self.json_response(400, {"error": "Could not read the New item request."})
             return
-        self.review_item_post(server, fields, token, valid_token)
+        self.review_item_post(server, fields, token, valid_token, size, limits)
 
     def review_item_post(self, server: ReviewLinksServer, fields: dict[str, object], token: object,
-                         valid_token: bool) -> None:
+                         valid_token: bool, size: int, limits: new_item_dialog.NewItemLimits) -> None:
         try:
             draft = fields.get("request_id")
             list_draft_id = (draft if fields.get("page") == "list" and isinstance(draft, str)
