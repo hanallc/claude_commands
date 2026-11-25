@@ -91,7 +91,7 @@ class BuildlogAwsSnapshotTests(AwsSettingsFixture):
         manifest = self.state / 'gate-deployment.json'
         self.state.mkdir(exist_ok=True)
         regions = [{'region': 'fixture-region', 'source_bucket': 'fixture-source'}]
-        _ = manifest.write_text(json.dumps({'source_tool_paths': ['/nix/store/' + 'a' * 32 + '-fixture'],
+        _ = manifest.write_text(json.dumps({'deployment_id': 'fixture', 'source_tool_paths': ['/nix/store/' + 'a' * 32 + '-fixture'],
                                            'regions': regions}))
         api = aws_target.AwsCli('fixture', 'fixture-region', 1,
                                 execute=mock.Mock(side_effect=AssertionError('unexpected AWS command')))
@@ -105,7 +105,8 @@ class BuildlogAwsSnapshotTests(AwsSettingsFixture):
             refresh.assert_not_called()
             self.configure_gate('enabled=on')
             self.assertEqual(aws_target.hourly(self.settings, self.state), 0)
-            refresh.assert_called_once_with(api, Path(__file__).resolve().parents[2], regions=tuple(regions))
+            refresh.assert_called_once_with(api, Path(__file__).resolve().parents[2], regions=tuple(regions),
+                git_timeout=conf.read_or_repository('cloud_gate').number('git_network_timeout_s'), write_access=mock.ANY)
 
     def test_buildlog_snapshot_accepts_auth_failure_and_reports_local_write_error(self) -> None:
         self.configure_gate('spot_candidate_regions=us-east-1')

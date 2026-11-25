@@ -805,7 +805,7 @@ else:
                     }
                     with (mock.patch.object(gate, "checked_git", return_value="head"),
                           mock.patch.object(cloud_gate, "import_record") as import_record):
-                        result = cloud_gate.run_service(folder, folder, request, (), lambda _: 0)
+                        result = cloud_gate.run_service(folder, folder, request, (), lambda _: 0, ledger.CostLedger(folder))
                     self.assertIsInstance(result, cloud_gate.CloudCompleted)
                     import_record.assert_called_once_with(folder, {**row, "record": {**guest_record, "selection": selection}})
 

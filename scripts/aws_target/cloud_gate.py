@@ -33,7 +33,6 @@ from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
 from scripts.aws_target.config import (AwsOn, account_settings_path, aws_switch, cloud_gate_off_reason, gate_deployment,
     gate_regions, read_settings)
-from scripts.aws_target.controller_lock import account_stack_lock
 from scripts.aws_target.run_cost import GateLaunchVariant as GateLaunchVariant
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, execution_identity, placement, progress_profile, queue_place, snapshot_codec
 from scripts.build_queue.admission_wire import CloudGroup, NoCloudGroup, NO_CLOUD_GROUP
@@ -913,6 +912,11 @@ class GateWorker:
                 return CloudDeclined(f'The AWS scaler is {candidate.eligibility.reason}')
         return switch
 
+    def _launch_access(self, request: dict[str, object], deployment: dict[str, object]) -> AbstractContextManager[None]:
+        if request.get('source_form') == 'regional-bundle':
+            return gate_source.source_write_access(self.book.directory, ledger.text(deployment, 'deployment_id'))
+        return nullcontext()
+
     def launch(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> str | CloudDeclined:
         attempt = ledger.text(request, 'attempt')
         self.book.require_gate_launchable(attempt)
@@ -922,6 +926,7 @@ class GateWorker:
             self.box_region = str(launch.get('region', self.api.region))
             self.box_zone = str(launch.get('zone', ''))
             return ledger.text(launch, 'instance')
+        private_source = request.get('source_form') == 'regional-bundle'
         sizes = settings().words('instance_types')
         deployed = run_cost.deployed_gate_variants(deployment, sizes)
         if 'instance_types' in deployment:
@@ -976,7 +981,7 @@ class GateWorker:
                 source_record: dict[str, object] = {}
                 tools: tuple[str, ...] = ()
                 source_urls: dict[str, gate_source.SourceObject] = {}
-                if request.get('source_form') == 'regional-bundle':
+                if private_source:
                     permission = self.launch_switch(request)
                     if isinstance(permission, CloudDeclined):
                         self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
@@ -993,7 +998,7 @@ class GateWorker:
                         continue
                     try:
                         pin = gate_source.pin_source(self.regional_api(self.box_region), source_bucket, folder, request,
-                                                     self.clock())
+                            self.clock(), write_access=lambda: self._launch_access(request, deployment))
                     except (gate_source.RegionalSourceBaseUnavailable, gate_source.SourceBaseMismatch,
                             gate_source.SourceDeltaUploadFailed) as error:
                         source_failures.append(str(error))
@@ -1057,7 +1062,7 @@ class GateWorker:
                           'gate_time_limit_s': seconds}
                 if source_record:
                     launch['regional_source'] = source_record
-                if not fresh_assignment:
+                if not fresh_assignment and not private_source:
                     save(path, launch)
             api = self.regional_api(self.box_region)
             self.book.gate_region(attempt, self.box_region)
@@ -1081,19 +1086,28 @@ class GateWorker:
                         if retry == 0:
                             cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress(
                                 'requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
-                        permission = self.launch_switch(request)
-                        if isinstance(permission, CloudDeclined):
-                            if not earlier_call_may_have_launched:
-                                self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
-                            return permission
-                        if retry == 0 and fresh_assignment:
-                            if reason := self._check_launch_booking(attempt):
-                                return CloudDeclined(reason)
-                            save(path, launch)
-                        self.book.require_gate_launchable(attempt)
-                        reply = api.call('run-instances', '--cli-input-json', launch_json)
-                        self.record_launch(request, size, zone, 'launched')
-                        break
+                        with self._launch_access(request, deployment):
+                            permission = self.launch_switch(request)
+                            if isinstance(permission, CloudDeclined):
+                                if not earlier_call_may_have_launched:
+                                    self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
+                                return permission
+                            if retry == 0 and fresh_assignment:
+                                if reason := self._check_launch_booking(attempt):
+                                    return CloudDeclined(reason)
+                            if retry == 0 and (fresh_assignment or private_source and not earlier_call_may_have_launched):
+                                save(path, launch)
+                            self.book.require_gate_launchable(attempt)
+                            reply = api.call('run-instances', '--cli-input-json', launch_json)
+                            self.record_launch(request, size, zone, 'launched')
+                            instances = ledger.rows(reply, 'Instances')
+                            if len(instances) != 1:
+                                raise AwsUnavailable('The launch reply has no unique instance')
+                            instance = ledger.text(instances[0], 'InstanceId')
+                            save(path, {**launch, 'instance': instance})
+                            self.book.resolve_gate(attempt, ledger.GateRunning(instance), instance_type=size)
+                            self.box_zone = zone
+                            return instance
                     except AwsUnavailable as error:
                         reason = str(error)
                         if not (not_sent(reason) or definite_refusal(reason) or capacity_error(reason)):
@@ -1134,14 +1148,6 @@ class GateWorker:
                     raise
                 self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
                 return CloudDeclined(f'{size} in {zone}: {launch_error_code(str(error))}')
-            instances = ledger.rows(reply, 'Instances')
-            if len(instances) != 1:
-                raise AwsUnavailable('The launch reply has no unique instance')
-            instance = ledger.text(instances[0], 'InstanceId')
-            save(path, {**launch, 'instance': instance})
-            self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance), instance_type=size)
-            self.box_zone = zone
-            return instance
         self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
         return CloudDeclined('; '.join(source_failures) if source_failures
                              else 'Spot capacity is unavailable in every configured region')
@@ -1162,27 +1168,17 @@ class GateWorker:
 
     def _start(self, folder: Path, request: dict[str, object], deployment: dict[str, object], *,
                new_launch: bool) -> str | CloudDeclined:
-        private_source = request.get('source_form') == 'regional-bundle'
-        directory = self.book.directory
-        lock = account_stack_lock(directory, shared=True) if private_source else nullcontext(LockResult.ACQUIRED)
-        with lock as access:
-            if access is LockResult.BUSY:
-                raise ValueError('The AWS account stack is busy. The gate cannot launch')
-            if private_source:
-                manifest = directory / 'gate-deployment.json'
-                if ((directory / 'down.json').exists() or not manifest.is_file()
-                        or read(manifest).get('deployment_id') != ledger.text(deployment, 'deployment_id')):
-                    raise ValueError('The AWS gate deployment is no longer available')
+        with self._launch_access(request, deployment):
             if new_launch:
                 bucket = ledger.text(deployment, 'bucket')
-                if request['source_key']:
-                    self.upload(bucket, ledger.text(request, 'source_key'), folder / 'source.bundle')
                 attempt = ledger.text(request, 'attempt')
-                self.upload(bucket, 'requests/' + attempt + '.json', folder / 'request.json')
                 guest = folder / 'guest.py'
                 _ = guest.write_text(gate_box.GUEST)
+                if request['source_key']:
+                    self.upload(bucket, ledger.text(request, 'source_key'), folder / 'source.bundle')
+                self.upload(bucket, 'requests/' + attempt + '.json', folder / 'request.json')
                 self.upload(bucket, 'requests/' + attempt + '.guest.py', guest)
-            return self.launch(folder, request, deployment)
+        return self.launch(folder, request, deployment)
 
     def execute(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> dict[str, object]:
         attempt = ledger.text(request, 'attempt')
@@ -1792,7 +1788,6 @@ def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
     request = prepare_request(repo, folder, mode, limit, selected=selected)
     commit, base = (ledger.text(request, key) for key in ('commit', 'origin_main'))
     if isinstance(source, gate_source.PrivateBundleSource):
-        gate_source.archive(repo, folder, (commit, base))
         request['source_form'] = 'regional-bundle'
     elif int(gate.checked_git(repo, 'rev-list', '--count', commit, '--not', base)):
         bundle = folder / 'source.bundle'
@@ -2073,7 +2068,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                     save(saved_deployment, attempt_deployment)
                     if isinstance(dispatch, AssignedCloudGate):
                         dispatch.journal.register(dispatch.binding.claim, dispatch.holder, folder)
-                    outcome = run_service(repo, folder, request, command, service)
+                    outcome = run_service(repo, folder, request, command, service, book)
                     result = read(result_path) if result_path.exists() else {}
                     failure = retryable_cloud_failure(result)
                 if isinstance(outcome, CloudCompleted):
@@ -2145,12 +2140,33 @@ def service_command(module: str, arguments: Sequence[str], unit: str, *, paired:
 
 
 def run_service(repo: Path, folder: Path, request: dict[str, object], command: Sequence[str],
-                service: Callable[[Sequence[str]], int]) -> CloudDeclined | CloudCompleted:
+                service: Callable[[Sequence[str]], int], book: ledger.CostLedger) -> CloudDeclined | CloudCompleted:
+    launch = folder / 'launch.json'
+    result = folder / 'outcome.json'
+    archive = folder / gate_source.SOURCE_ARCHIVE
+    if request.get('source_form') == 'regional-bundle' and not launch.exists() and not archive.is_file():
+        gate_source.archive(repo, folder, gate_source.request_commits(request))
+
+    def discard_unstarted_archive() -> None:
+        if not archive.is_file() or launch.exists():
+            return
+        try:
+            rows = book.read_snapshot().gate_reservations if book.path.exists() else ()
+            if not any(row.attempt == folder.name and ledger.gate_is_open(row) for row in rows):
+                discard_source_archive(folder)
+        except ledger.LedgerUnavailable as error:
+            print(f'Gate source archive cleanup failed. {error}', file=sys.stderr)
+
     # The service owns every AWS call. The session only reads local evidence.
-    _ = service(command)
-    if not (folder / 'outcome.json').exists():
+    try:
+        _ = service(command)
+    except OSError:
+        discard_unstarted_archive()
+        raise
+    if not result.exists():
+        discard_unstarted_archive()
         return CloudDeclined('The scaler service has no final result')
-    outcome = read(folder / 'outcome.json')
+    outcome = read(result)
     if outcome.get('status') != 'complete':
         return CloudDeclined(ledger.text(outcome, 'reason'))
     try:

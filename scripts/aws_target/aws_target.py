@@ -28,14 +28,13 @@ from scripts.aws_target import gate_source, hana_spend, key_refusal, ledger, mea
 from scripts.aws_target.aws_cli import KEY_REFUSED_CODES, aws_error_code
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
 from scripts.aws_target.config import AwsOff, AwsOn, aws_switch, read_settings
-from scripts.aws_target.controller_lock import account_stack_lock, control_lock as control_lock
+from scripts.aws_target.controller_lock import control_lock as control_lock
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
 from scripts.message import send_budget, send_result
 from scripts.message.session_send import send_argv
 from scripts.notify import push_texts
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.file_lock import LockResult
 
 
 SNAPSHOT_ERROR_PATTERNS = (
@@ -693,19 +692,22 @@ def refresh_gate_source(settings_path: Path, directory: Path) -> int:
     from scripts.aws_target import admin_secrets
 
     manifest = directory / 'gate-deployment.json'
-    if not manifest.is_file():
+    if (directory / 'down.json').exists():
         return 0
-    with account_stack_lock(directory) as access:
-        if access is LockResult.BUSY or (directory / 'down.json').exists() or not manifest.is_file():
-            return 0
+    try:
         deployment = ledger.mapping(cast(object, json.loads(manifest.read_text())))
-        if isinstance(gate_source.deployment_source(deployment), gate_source.PublicCloneSource):
-            return 0
-        if not isinstance(aws_switch(conf.read_or_repository('cloud_gate')), AwsOn):
-            return 0
-        api = scaler_snapshot_api(conf.read(settings_path), admin_secrets.credentials_file(), execute_command)
-        failures = gate_source.refresh_bases(api, Path(__file__).resolve().parents[2],
-                                             regions=ledger.rows(deployment, 'regions'))
+    except FileNotFoundError:
+        return 0
+    if isinstance(gate_source.deployment_source(deployment), gate_source.PublicCloneSource):
+        return 0
+    values = conf.read_or_repository('cloud_gate')
+    if not isinstance(aws_switch(values), AwsOn):
+        return 0
+    deployment_id = ledger.text(deployment, 'deployment_id')
+    api = scaler_snapshot_api(conf.read(settings_path), admin_secrets.credentials_file(), execute_command)
+    failures = gate_source.refresh_bases(api, Path(__file__).resolve().parents[2],
+        regions=ledger.rows(deployment, 'regions'), git_timeout=values.number('git_network_timeout_s'),
+        write_access=lambda: gate_source.source_write_access(directory, deployment_id))
     for failure in failures:
         print(f'aws_target: {failure}', file=sys.stderr)
     return int(bool(failures))

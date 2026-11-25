@@ -28,7 +28,7 @@ class SourceBucketRemovalTests(CostFixture):
             _ = removal.regional_gates()
         execute.assert_not_called()
 
-    def check_bucket_removal(self, *, home_only: bool) -> None:
+    def check_bucket_removal(self, *, home_only: bool, late_write: bool = False) -> None:
         home = conf.read(self.settings).text('region')
         west = 'us-west-2'
         deployment = 'a' * 32
@@ -44,6 +44,7 @@ class SourceBucketRemovalTests(CostFixture):
         contents = {region: {'base/current.json', 'base/generation/base.bundle', 'delta/generation/delta.bundle'}
                     for region in names}
         deleted: list[str] = []
+        failed: set[str] = set()
         operations: list[tuple[str, str]] = []
 
         def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
@@ -58,7 +59,13 @@ class SourceBucketRemovalTests(CostFixture):
                     return subprocess.CompletedProcess(arguments, 1, '', 'ValidationError: Stack does not exist')
                 reply = {'Stacks': [{'StackName': names[region], 'StackId': names[region], 'Outputs': [
                     {'OutputKey': 'GateSourceBucket', 'OutputValue': buckets[region]},
-                ]}]}
+                ], 'StackStatus': 'DELETE_FAILED' if region in failed else 'CREATE_COMPLETE'}]}
+            elif operation == 'describe-stack-events':
+                self.assertIn(region, failed)
+                reply = {'StackEvents': [
+                    {'LogicalResourceId': 'GateSourceBucket', 'ResourceStatus': 'DELETE_FAILED',
+                     'ResourceStatusReason': 'The bucket you tried to delete is not empty'},
+                ]}
             elif operation == 'list-objects-v2':
                 self.assertEqual(arguments[arguments.index('--bucket') + 1], buckets[region])
                 if contents[region]:
@@ -68,8 +75,16 @@ class SourceBucketRemovalTests(CostFixture):
                 contents[region].clear()
             elif operation == 'delete-stack':
                 self.assertFalse(contents[region])
-                deleted.append(region)
-            elif operation != 'wait':
+                if late_write and region not in failed:
+                    contents[region].add('delta/generation/late.bundle')
+                    failed.add(region)
+                else:
+                    failed.discard(region)
+                    deleted.append(region)
+            elif operation == 'wait':
+                if region in failed:
+                    return subprocess.CompletedProcess(arguments, 255, '', 'Waiter reached DELETE_FAILED')
+            else:
                 raise AssertionError(arguments)
             return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
 
@@ -80,16 +95,20 @@ class SourceBucketRemovalTests(CostFixture):
         self.assertTrue(removal.regional_gates())
         self.assertTrue(removal.foundation())
         self.assertEqual(deleted, [west, home])
+        tries = 2 if late_write else 1
         self.assertEqual([(region, operation) for region, operation in operations
                           if operation in ('delete-objects', 'delete-stack')],
-                         [(west, 'delete-objects'), (west, 'delete-stack'),
-                          (home, 'delete-objects'), (home, 'delete-stack')])
+            ([(west, 'delete-objects'), (west, 'delete-stack')] * tries
+             + [(home, 'delete-objects'), (home, 'delete-stack')] * tries))
 
     def test_down_empties_the_home_and_regional_source_buckets_before_stack_deletion(self) -> None:
         self.check_bucket_removal(home_only=False)
 
     def test_down_empties_the_saved_regional_stack_after_a_home_only_manifest(self) -> None:
         self.check_bucket_removal(home_only=True)
+
+    def test_down_retries_home_and_regional_stack_deletion_after_a_late_source_write(self) -> None:
+        self.check_bucket_removal(home_only=False, late_write=True)
 
     def test_source_bucket_removal_uses_at_most_500_keys_per_batch(self) -> None:
         region = conf.read(self.settings).text('region')

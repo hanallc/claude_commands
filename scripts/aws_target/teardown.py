@@ -21,6 +21,7 @@ from scripts.mac_test import mac_test
 
 
 SOURCE_DELETE_BATCH_SIZE = 500
+SOURCE_DELETE_RETRIES = 3
 
 
 DRY_RUN = '''down would disable AWS routing and aws-target.service.
@@ -300,10 +301,15 @@ class TargetRemoval:
         stack = self._stack()
         if not stack:
             return False
-        if stack.get('StackStatus') != 'DELETE_IN_PROGRESS':
-            empty_gate_source_bucket(self.api, stack, self.identity.deployment_id)
-            _ = self.api.call('delete-stack', '--stack-name', self.identity.stack_id, service='cloudformation')
-        self._wait(lambda: not self._stack(), 'foundation deletion did not finish')
+
+        def deleted() -> bool:
+            current = self._stack()
+            if current.get('StackStatus') == 'DELETE_FAILED':
+                raise AwsUnavailable(f"The foundation has status DELETE_FAILED. {current.get('StackStatusReason', '')}")
+            return not current
+
+        delete_gate_stack(self.api, stack, self.identity.stack_id, self.identity.deployment_id,
+                          lambda: self._wait(deleted, 'foundation deletion did not finish'))
         print('removed: foundation stack, scaler user, policies, and Budget actions')
         return True
 
@@ -459,6 +465,45 @@ def empty_gate_source_bucket(api: AwsCli, stack: dict[str, object], deployment: 
             raise AwsUnavailable('The source bucket still contains objects')
 
 
+def source_bucket_not_empty(reason: str) -> bool:
+    return 'BucketNotEmpty' in reason or 'bucket you tried to delete is not empty' in reason.lower()
+
+
+def source_bucket_delete_failed(api: AwsCli, name: str, stack: dict[str, object], error: AwsUnavailable) -> bool:
+    outputs = ledger.rows(stack, 'Outputs') if 'Outputs' in stack else ()
+    if not any(row.get('OutputKey') == 'GateSourceBucket' for row in outputs):
+        return False
+    if source_bucket_not_empty(str(error)):
+        return True
+    if 'DELETE_FAILED' not in str(error):
+        return False
+    events = api.call('describe-stack-events', '--stack-name', name, service='cloudformation')
+    for event in ledger.rows(events, 'StackEvents'):
+        if (event.get('PhysicalResourceId') == stack.get('StackId') and event.get('ResourceType') == 'AWS::CloudFormation::Stack'
+                and event.get('ResourceStatus') == 'DELETE_IN_PROGRESS'):
+            break
+        if event.get('LogicalResourceId') == 'GateSourceBucket':
+            return event.get('ResourceStatus') == 'DELETE_FAILED' and source_bucket_not_empty(
+                str(event.get('ResourceStatusReason', '')))
+    return False
+
+
+def delete_gate_stack(api: AwsCli, stack: dict[str, object], name: str, deployment: str,
+                      wait: Callable[[], None]) -> None:
+    for retry in range(SOURCE_DELETE_RETRIES + 1):
+        start_delete = retry > 0 or stack.get('StackStatus') != 'DELETE_IN_PROGRESS'
+        if start_delete:
+            empty_gate_source_bucket(api, stack, deployment)
+        try:
+            if start_delete:
+                _ = api.call('delete-stack', '--stack-name', name, service='cloudformation')
+            wait()
+            return
+        except AwsUnavailable as error:
+            if retry == SOURCE_DELETE_RETRIES or not source_bucket_delete_failed(api, name, stack, error):
+                raise
+
+
 def verified_gate_deployment(directory: Path, region: str, deployment: str) -> dict[str, object]:
     from scripts.aws_target.config import gate_deployment
 
@@ -502,10 +547,10 @@ def remove_regional_gates(api: AwsCli, directory: Path, deployment: str, *, incl
             if len(saved_stacks) != 1 or saved_stacks[0].get('StackName') != name:
                 raise ValueError('The regional stack differs from the saved deployment')
             stack = saved_stacks[0]
-            if stack.get('StackStatus') != 'DELETE_IN_PROGRESS':
-                empty_gate_source_bucket(target, stack, deployment)
-                _ = target.call('delete-stack', '--stack-name', str(name), service='cloudformation')
-            _ = target.call('wait', 'stack-delete-complete', '--stack-name', str(name), service='cloudformation')
+            def wait_for_stack() -> None:
+                _ = target.call('wait', 'stack-delete-complete', '--stack-name', str(name), service='cloudformation')
+
+            delete_gate_stack(target, stack, str(name), deployment, wait_for_stack)
         except AwsUnavailable as error:
             if 'does not exist' not in str(error):
                 raise

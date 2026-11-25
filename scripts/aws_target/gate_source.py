@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from base64 import b64encode
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from hashlib import file_digest
@@ -17,8 +18,9 @@ from uuid import uuid4
 
 from scripts.aws_target import ledger
 from scripts.aws_target.aws_cli import AwsCli, AwsUnavailable, aws_error_code
+from scripts.aws_target.controller_lock import account_stack_lock
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.file_lock import exclusive
+from scripts.lib.file_lock import LockResult, exclusive
 
 
 DAY_SECONDS = 24 * 60 * 60
@@ -154,6 +156,22 @@ def bucket_name(deployment: str, region: str) -> str:
     return f'gate-src-{deployment}-{region}'
 
 
+@contextmanager
+def source_write_access(directory: Path, deployment_id: str) -> Generator[None]:
+    """Check the live deployment under the lock before an AWS write."""
+    with account_stack_lock(directory, shared=True) as access:
+        if access is LockResult.BUSY:
+            raise ValueError('The AWS account stack is busy. The gate cannot launch')
+        try:
+            manifest = ledger.mapping(cast(object, json.loads((directory / 'gate-deployment.json').read_text())))
+        except FileNotFoundError:
+            manifest = {}
+        if ((directory / 'down.json').exists()
+                or manifest.get('deployment_id') != deployment_id):
+            raise ValueError('The AWS gate deployment is no longer available')
+        yield
+
+
 def prepare_tools(revision: str, packages: Sequence[str]) -> tuple[str, ...]:
     """Resolve the pinned Linux outputs and check the binary cache."""
     nix = ('nix', '--extra-experimental-features', 'nix-command flakes')
@@ -183,26 +201,29 @@ def bundle_sha256(path: Path) -> str:
         return file_digest(stream, 'sha256').hexdigest()
 
 
-def git(repo: Path, *arguments: str) -> str:
-    result = subprocess.run(['git', '-C', str(repo), *arguments], check=False, capture_output=True, text=True)
+def git(repo: Path, *arguments: str, timeout: float | None = None) -> str:
+    result = subprocess.run(['git', '-C', str(repo), *arguments], check=False, capture_output=True, text=True,
+                            timeout=timeout)
     if result.returncode:
         raise SourceBaseMismatch('SourceBaseMismatch: git ' + arguments[0] + ' failed: ' + result.stderr.strip())
     return result.stdout.strip()
 
 
-def create_bundle(repo: Path, bundle: Path, commits: Sequence[str], *, exclude: str = '') -> None:
+def create_bundle(repo: Path, bundle: Path, commits: Sequence[str], *, exclude: str = '',
+                  timeout: float | None = None) -> None:
     """Write a bundle with unique temporary refs for its tips."""
     refs: list[str] = []
     nonce = uuid4().hex
     try:
         for index, commit in enumerate(dict.fromkeys(commits)):
             ref = f'refs/cloud-gates/{nonce}-{index}'
-            _ = git(repo, 'update-ref', ref, commit)
             refs.append(ref)
-        _ = git(repo, 'bundle', 'create', str(bundle.resolve()), *refs, *(('^' + exclude,) if exclude else ()))
+            _ = git(repo, 'update-ref', ref, commit, timeout=timeout)
+        _ = git(repo, 'bundle', 'create', str(bundle.resolve()), *refs, *(('^' + exclude,) if exclude else ()),
+                timeout=timeout)
     finally:
         for ref in refs:
-            _ = git(repo, 'update-ref', '-d', ref)
+            _ = git(repo, 'update-ref', '-d', ref, timeout=timeout)
 
 
 def archive(repo: Path, folder: Path, commits: Sequence[str]) -> None:
@@ -272,7 +293,9 @@ def publish_base(api: AwsCli, bucket: str, base: PinnedBase, bundle: Path, scrat
 
 
 def refresh_bases(api: AwsCli, repo: Path, *, regions: Sequence[dict[str, object]], clock: Callable[[], float] = time.time,
-                  force: bool = False) -> tuple[SourceBasePublishFailed, ...]:
+                  force: bool = False, git_timeout: float | None = None,
+                  write_access: Callable[[], AbstractContextManager[None]] = nullcontext
+                  ) -> tuple[SourceBasePublishFailed, ...]:
     """Capture one main commit and publish it to each region that needs a base."""
     started = clock()
     generation = f'g{int(started * 1_000_000_000):020d}-{uuid4().hex}'
@@ -294,8 +317,8 @@ def refresh_bases(api: AwsCli, repo: Path, *, regions: Sequence[dict[str, object
         if not due:
             return tuple(failures)
         try:
-            commit = git(repo, 'rev-parse', '--verify', 'refs/remotes/origin/main^{commit}')
-            create_bundle(repo, bundle, (commit,))
+            commit = git(repo, 'rev-parse', '--verify', 'refs/remotes/origin/main^{commit}', timeout=git_timeout)
+            create_bundle(repo, bundle, (commit,), timeout=git_timeout)
             digest = bundle_sha256(bundle)
         except (OSError, ValueError, subprocess.SubprocessError):
             failures.extend(SourceBasePublishFailed(f'SourceBasePublishFailed in {target.region}') for target in due)
@@ -303,7 +326,8 @@ def refresh_bases(api: AwsCli, repo: Path, *, regions: Sequence[dict[str, object
         base = PinnedBase(generation, commit, int(started), SourceObject(f'base/{generation}/{digest}.bundle', digest))
         for target in due:
             try:
-                publish_base(api.in_region(target.region), target.name, base, bundle, scratch)
+                with write_access():
+                    publish_base(api.in_region(target.region), target.name, base, bundle, scratch)
             except (AwsUnavailable, OSError, ValueError, subprocess.SubprocessError):
                 failures.append(SourceBasePublishFailed(f'SourceBasePublishFailed in {target.region}'))
     return tuple(failures)
@@ -317,7 +341,8 @@ def request_commits(request: dict[str, object]) -> tuple[str, ...]:
 
 
 def pin_source(api: AwsCli, target: SourceBucket, folder: Path, request: dict[str, object],
-               now: float) -> BaseOnly | BaseAndDelta:
+               now: float, *, write_access: Callable[[], AbstractContextManager[None]] = nullcontext
+               ) -> BaseOnly | BaseAndDelta:
     """Select the exact base and prepare its delta before launch."""
     shared = folder.parent if request.get('task') == 'paired' else folder
     expires = ledger.instant(request, 'expires')
@@ -371,7 +396,8 @@ def pin_source(api: AwsCli, target: SourceBucket, folder: Path, request: dict[st
             digest = bundle_sha256(bundle)
             delta = SourceObject(f'{DELTA_PREFIX}{base.generation}/{digest}.bundle', digest)
             try:
-                head = put_bundle(api, target.name, delta, bundle)
+                with write_access():
+                    head = put_bundle(api, target.name, delta, bundle)
                 uploaded = datetime.fromisoformat(ledger.text(head, 'LastModified').replace('Z', '+00:00'))
                 delta_expires = int(uploaded.timestamp()) + DELTA_RETENTION_DAYS * DAY_SECONDS
                 if expires >= delta_expires:

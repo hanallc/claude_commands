@@ -3056,7 +3056,7 @@ class Deployment:
                     cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             source_api = self._gate_scaler_api(settings, values.number('api_timeout_s'))
             source_failures = gate_source.refresh_bases(source_api, Path(__file__).resolve().parents[2],
-                                                        regions=regional, clock=self.clock, force=True)
+                regions=regional, clock=self.clock, force=True, git_timeout=values.number('git_network_timeout_s'))
             for failure in source_failures:
                 print(f'cloud-gate: {failure}', file=sys.stderr, flush=True)
             print('cloud-gate: deployed')

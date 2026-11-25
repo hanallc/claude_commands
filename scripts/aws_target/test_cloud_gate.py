@@ -1656,6 +1656,42 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
         self.assertTrue(any(operation == 'put-object' and key.startswith(gate_source.DELTA_PREFIX)
                             for _, operation, key in s3.operations))
 
+    def test_private_source_preparation_leaves_the_account_lock_available(self) -> None:
+        from scripts.aws_target.controller_lock import account_stack_lock
+        from scripts.lib.file_lock import LockResult, exclusive
+
+        s3, repo, _ = self.private_source_fixture(changed=True)
+        regions = ledger.rows(self.deployment, 'regions')
+        api = AwsCli('fixture', 'us-east-2', 1, execute=s3)
+        self.assertEqual(gate_source.refresh_bases(api, repo, regions=regions, clock=lambda: self.now), ())
+
+        @contextmanager
+        def receipt_lock(path: Path) -> Generator[LockResult]:
+            with account_stack_lock(self.state) as access:
+                self.assertIs(access, LockResult.ACQUIRED)
+            with exclusive(path) as receipt:
+                yield receipt
+
+        git = gate_source.git
+
+        def unlocked_git(folder: Path, *arguments: str, timeout: float | None = None) -> str:
+            with account_stack_lock(self.state) as access:
+                self.assertIs(access, LockResult.ACQUIRED)
+            return git(folder, *arguments, timeout=timeout)
+
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if any(argument in ('source-us-east-2', 'source-us-west-2') for argument in arguments):
+                return s3(arguments, **options)
+            return self.fake(arguments, **options)
+
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-2', 1, execute=transport), self.book,
+            self.settings, self.folder / 'reservation', clock=lambda: self.now, pause=self.advance)
+        with (mock.patch.object(gate_source, 'exclusive', side_effect=receipt_lock) as lock,
+              mock.patch.object(gate_source, 'git', side_effect=unlocked_git) as command):
+            self.assertEqual(worker.execute(self.folder, self.request, self.deployment)['status'], 'complete')
+        lock.assert_called_once()
+        command.assert_any_call(mock.ANY, 'init', '--bare')
+
     def test_a_newer_regional_base_contains_the_entire_captured_source(self) -> None:
         s3, repo, old_base = self.private_source_fixture()
         _ = gate_source.git(repo, 'commit', '--allow-empty', '-qm', 'New regional base')
@@ -4584,6 +4620,31 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                 self.assertEqual(len(rows), before + 1)
                 self.assertEqual((rows[-1]['mode'], rows[-1]['reason']), (mode.value, reason))
                 self.assertTrue(self.admission.callers_released())
+
+    def test_private_archive_requires_a_supported_mode_and_is_removed_if_the_service_does_not_start(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template',
+            'source_tool_paths': ['/nix/store/' + 'a' * 32 + '-fixture']})
+        service = mock.Mock(side_effect=AssertionError('The service must not start for an unsupported mode'))
+        with (mock.patch.object(cloud_gate, 'accepts_suite_mode', return_value=False),
+              mock.patch.object(gate_source, 'archive', wraps=gate_source.archive) as archive):
+            result = cloud_gate.run(self.repo, full=True, mode=gate.SuiteMode.GATE, module_time_limit_s=1800, service=service)
+        self.assertIsInstance(result, cloud_gate.CloudDeclined)
+        archive.assert_not_called()
+        service.assert_not_called()
+
+        archive_paths: list[Path] = []
+
+        def refuse(command: Sequence[str]) -> int:
+            folder = Path(command[command.index('--worker') + 1])
+            path = folder / gate_source.SOURCE_ARCHIVE
+            self.assertTrue(path.is_file())
+            archive_paths.append(path)
+            return 1
+
+        result = cloud_gate.run(self.repo, full=True, mode=gate.SuiteMode.GATE, module_time_limit_s=1800, service=refuse)
+        self.assertEqual(result, cloud_gate.CloudDeclined('The scaler service has no final result'))
+        path, = archive_paths
+        self.assertFalse(path.exists())
 
     def retry_fixture(self) -> CloudRouteTests:
         fixture = CloudRouteTests()

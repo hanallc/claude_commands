@@ -92,7 +92,7 @@ SCENARIOS = {
         'test_delta_upload_failure_uses_the_other_region_and_an_uncertain_retry_keeps_its_pin',
     ),
     'test_teardown.SourceBucketRemovalTests': (
-        'test_down_empties_the_home_and_regional_source_buckets_before_stack_deletion',),
+        'test_down_retries_home_and_regional_stack_deletion_after_a_late_source_write',),
     'test_gpu_size_trial.GpuOnlineTests': (
         'test_upload_uses_s3_cp_at_the_multipart_limit',
         'test_hana_nextest_uses_the_cheapest_offer_within_quota_and_settles',
