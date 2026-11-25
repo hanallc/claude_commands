@@ -1698,6 +1698,58 @@ document.querySelector('#result').textContent = JSON.stringify({
                 self.assertIn("+ hana CI service hana-linux-1  0.7 GiB", tip[1])
                 self.assertIn("+ hana CI service hana-linux-2  <0.1 GiB", tip[1])
 
+    def test_build_tools_tooltip_wraps_runner_labels_and_keeps_values_visible(self) -> None:
+        chrome = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
+        if chrome is None:
+            self.skipTest("Chrome is required for the tooltip layout check.")
+        ram = {**RAM_FIXTURE, "ci_services": [{"name": "hana-linux-1", "bytes": 704 * MIB},
+                                              {"name": "hana-linux-2", "bytes": 16 * MIB}]}
+        tip = self.page_expression("buildsTooltipHtml('tools', data)", {"ram": ram}, walk=True)
+        source = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
+        styles = source.partition("<style>")[2].partition("</style>")[0].replace("__PAGE_FRAME_STYLE__", "")
+        position = source[source.index("function placeTipAt("):source.index("const f1 =")]
+        markup = json.dumps(f'<!doctype html><style>{styles}</style><div id="tip">{tip}</div>')
+        with tempfile.TemporaryDirectory(prefix="tools-tip-") as folder:
+            page = Path(folder) / "tools.html"
+            _ = page.write_text(f"""<!doctype html><meta charset="utf-8">
+<iframe height="1647" style="border:0"></iframe><output id="result"></output>
+<script>{position}
+const frame = document.querySelector('iframe'), doc = frame.contentDocument;
+doc.open();
+doc.write({markup});
+doc.close();
+const tip = doc.querySelector('#tip');
+const services = [...tip.querySelectorAll('dt')].filter(cell => cell.textContent.includes('hana-linux-'));
+function textRects(cell) {{
+  const range = doc.createRange();
+  range.selectNodeContents(cell);
+  return [...range.getClientRects()];
+}}
+const layouts = [240, 360, 1600].map(width => {{
+  frame.width = width;
+  frame.contentWindow.eval('(' + placeTipAt.toString() + ')')(tip, width / 2, 600);
+  const box = tip.firstElementChild.getBoundingClientRect();
+  return {{width:doc.documentElement.clientWidth, labels:services.map(cell => textRects(cell).length),
+    valuesFit:services.every(cell => {{
+      const [value, ...rest] = textRects(cell.nextElementSibling);
+      return value && !rest.length && value.left >= box.left && value.right <= box.right &&
+        value.top >= box.top && value.bottom <= box.bottom;
+    }})}};
+}});
+document.querySelector('#result').textContent = JSON.stringify(layouts);
+</script>""")
+            result = subprocess.run([chrome, "--headless", "--no-sandbox", "--disable-gpu",
+                "--disable-background-networking", f"--user-data-dir={folder}/chrome",
+                "--dump-dom", page.as_uri()], capture_output=True, text=True,
+                timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = result.stdout.partition('<output id="result">')[2].partition("</output>")[0]
+        layouts = cast(list[dict[str, object]], json.loads(output))
+        self.assertEqual([layout["width"] for layout in layouts], [240, 360, 1600])
+        self.assertTrue(all(layout["valuesFit"] for layout in layouts), layouts)
+        self.assertGreater(min(cast(list[int], layouts[0]["labels"])), 1)
+        self.assertEqual([layout["labels"] for layout in layouts[1:]], [[1, 1], [1, 1]])
+
     def test_mac_row_uses_its_stage_step_name_memory_and_aligned_tooltip(self) -> None:
         for stage, expected in (("MacBuilding", "building"), ("MacTesting", "testing"),
                                 ("MacTestingCounter", "testing"), ("MacStageUnavailable", "—")):
@@ -3093,8 +3145,6 @@ renderWalk = reading => { painted = reading; };
         self.assertRegex(page, r"\.tip \{[^}]*grid-template-columns: fit-content\(44%\) minmax\(0, 1fr\)")
         self.assertIn('data-build-tools-tip=""', grids["tools"])
         self.assertRegex(page, r"\.tip \{[^}]*[;{]\s*width: max-content;")
-        self.assertEqual(re.findall(r"\.tip\[data-build-tools-tip\][^{}]*\{[^{}]*\}", page),
-                         [".tip[data-build-tools-tip] dt { min-width: max-content; }"])
         self.assertIn(".tip :is(dt, dd) { overflow-wrap: anywhere; }", page)
         self.assertRegex(page, r"\.tip dt \{[^}]*text-align: left")
         self.assertRegex(page, r"\.tip dd \{[^}]*text-align: right")
