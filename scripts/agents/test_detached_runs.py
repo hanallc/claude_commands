@@ -335,6 +335,8 @@ class DetachedRunsTests(unittest.TestCase):
               patch.object(detached_runs, "import_module", new=completion_import)):
             record = self.supervise(path)
         self.assertEqual(module.read_text(), replacement)
+        self.assertIs(record.get("completion_after_slice_cleanup"), True)
+        self.assertIn("supervisor_started", record)
         self.assertEqual(received.read_text(), self.worker_id)
         self.assertIs(record.get("completion_pending"), False)
         message, = cast(list[str], self.pending()["messages"])
@@ -1240,9 +1242,12 @@ sys.exit(1)
                 self.update_record(newer, run_id="r2", started_at=time.time(), pid=DEAD_PID)
                 if stopped:
                     self.update_record(older, stop_pass_requested=True, stop_reason="Private stop.", pane_dispatch_id="")
-                self.assertEqual(detached_runs.reap_orphans(str(self.session), WORKER), ["r1", "r2"])
+                saved_newer = newer.read_bytes()
+                detached_runs.reap_orphan(older)
+                self.assertEqual(newer.read_bytes(), saved_newer)
                 older_record = cast(detached_runs.RunRecord, json.loads(older.read_text(encoding="utf-8")))
                 self.assertIn("a newer run of the same command answers", older_record.get("delivery", ""))
+                self.assertEqual(detached_runs.reap_orphans(str(self.session), WORKER), ["r2"])
                 messages = cast(list[str], self.pending()["messages"])
                 self.assertEqual(len(messages), 1, "only the newest dead run reports")
 
@@ -1359,6 +1364,7 @@ sys.exit(1)
 
         run_id, separator, staff_id = path.stem.partition("@")
         self.assertEqual((separator, staff_id), ("@", self.worker_id))
+        self.assertNotIn("completion_after_slice_cleanup", worker_lifecycle.read_json_object(path))
 
         def run(command: list[str], _environment: dict[str, str], _log: Path) -> int:
             self.assertIn(f"--unit=detached-python-tests-{run_id}.scope", command)
