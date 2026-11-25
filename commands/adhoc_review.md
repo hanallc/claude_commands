@@ -12,6 +12,14 @@ proposal and recommendation. A vague name or domain-owned `Option<T>` is a
 design issue; consider the restructuring needed to make a precise semantic type
 truthful, not only a rename.
 
+## Open or join a review
+
+Run `~/.claude/scripts/adhoc_review/shared_review.py` with `~/.claude/scripts/lib/py`.
+For `/adhoc_review join bob` or “join Bob's ad hoc review”, run `join bob` on the owner's machine.
+For `/adhoc_review resume`, run `resume` to open your review again.
+Keep the returned `owner` and `review` IDs. Pass them in that order as `OWNER REVIEW` below.
+After a join or resume, run `show OWNER REVIEW`. Then go to Step 3.
+
 ## Step 1: Identify the items
 
 Find the list to review. Look in this order:
@@ -26,22 +34,20 @@ count into Step 2 without listing the items.
 
 ## Step 2: Set up where decisions get recorded
 
-Create a transient document at the repository root by default.
-Give it today's date and the source of the items.
-Exclude it from Git with `bash ~/.claude/scripts/exclude/exclude.sh <path>`.
-Record each decision and its pending actions. If you act on a decision during the review, record the action as done.
-Before the first item's choice line, add `N items. Decisions go in <path>. I'll delete this file when the review ends.`
-
-Ask first only when an obvious doc is in scope that the user did not name, a file they have been editing or named this session that the decisions belong in:
+If the user chose a document for decisions, use it. Otherwise, ask only if an obvious document exists:
   > `N items. Record decisions in <relative/path/to/doc.md> (recommended)? (yes / transient doc)`
 
-Wait for that answer before continuing. Never write "existing path": name the doc. If the user names a path that doesn't exist, create it with the same one-line header.
+If you ask, wait for the answer. Create a missing document the user names with the date and item source.
+Split independent decisions before you share the list. Keep the original ID as the prefix of each subitem.
+Use `scripts/lib/scratch.py new --name adhoc-items` for the input folder. Write a JSON array of full item texts.
+Run `start --source SOURCE --items FILE`. Delete the input folder in Python after the script saves the list.
+Tell the user the item count and where the temporary shared document is. Keep the returned IDs.
 
 ## Step 3: Build the todo list
 
 Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" <remaining>` with the item count.
 
-If a todo tool is available (e.g. `TaskCreate`), add one task per item, in order, each with a short label and status `pending`. If not, keep an inline numbered checklist and refer to items by number.
+The shared list is the task list. Use its item numbers in both sessions.
 
 ## Step 3.5: Establish the shared model
 
@@ -87,10 +93,10 @@ turns.
 
 ## Step 4: Walk the list
 
-For each item, in order:
+For each item:
 
-1. Mark the task `in_progress`.
-2. Check that the item contains **one decision**. If it contains independent questions, split them into ordered subitems, preserve the original ID as their prefix, update the task list, and present only the first.
+1. Run `next OWNER REVIEW`. Present only the item it claims for this session.
+2. On `busy`, say that another session holds the remaining items. Resume when asked. On `complete`, go to Step 5.
 3. Build the causal explanation with the shared file's build order. Then use its **Ad hoc review items** template.
 4. When a subagent or worker prepares items, give it the shared guide, the user's own words for the request, and the text the user sees on screen.
 5. Run the shared **reader test** and **comprehension gate** on each item before the user sees it, prepared items included. Then show the item.
@@ -100,12 +106,14 @@ For each item, in order:
    - If the user says they are lost, confused, or asks what the introduced concepts mean, treat that as a failed initial explanation and stop asking for a decision. Apply repair-downward-then-upward from the shared file: **the upward repair here is Step 3.5** — run it now, whether or not it ran earlier. Re-running it mid-walk costs one turn; iterating item detail at ever finer grain costs many and does not terminate.
    - If the user asks a clarifying question, answer it without recording a decision or advancing. Re-present the choices only when useful.
    - If the user proposes a modification, restate only the revised decision, update the recommendation or example as needed, and wait for explicit acknowledgment before recording it.
-7. Accept a terse reply such as `okay` or `continue` when it clearly selects a terminal choice. Record the decision and any pending actions. Mark the task `completed` and continue to the next item.
+7. Treat `okay` or `continue` as a decision when the choice is clear. Run `record OWNER REVIEW ITEM DECISION --actions ACTIONS`.
+8. Include pending actions and actions you completed. If the user chose a document, the owner copies decisions from `show` there.
 
 Do not ask "continue or add more?" between items — assume continue unless the user volunteers something.
 
-After each terminal choice, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" <remaining>` if items remain.
-Run it again when the user returns to a closed item; include that item in the count.
+Update the status line with `remaining` after each change to the item count.
+Use `next OWNER REVIEW --item N` to revisit an item. Use `add OWNER REVIEW TEXT` to append an item.
+If the helper reports that the review ended, go to Step 5.
 
 ### Simplify the item
 
@@ -120,17 +128,15 @@ Run it again when the user returns to a closed item; include that item in the co
 
 ## Step 5: Wrap up
 
-Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" 0` when the review ends, including an early end.
+If you joined, run `leave OWNER REVIEW` to release your claim. Only the owner runs `end OWNER REVIEW`.
+If the review already ended, skip `leave` and `end`.
+The `end` command returns the final decisions and removes the shared document, including when the owner ends early.
+Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" 0` when this session stops its review.
 The command output names the held messages file. Read the file at your own pace.
 Each release in the file lists its messages oldest first.
 
-For a transient document, summarize each completed decision inline as `1. <label> → <decision>`.
-List all pending actions, or say `none pending`. Then delete the document.
-
-When every item is done:
-
-- A doc the user chose: one-line summary — `Wrote decisions for N completed items to <path>`. It stays.
-- Ensure every task has a terminal status.
+The owner summarizes each completed decision as `1. <label> → <decision>`. List pending actions or say `none pending`.
+If the user chose a document, the owner copies the final decisions there and names the document.
 
 ## Rules
 
@@ -145,7 +151,6 @@ When every item is done:
 - Put a number that the decision depends on in the point or the first fact line, with its unit.
 - An item that asks the user to approve a new thing (a type, a command, a setting, a page) says in one line what exists today that is nearest to it, and why that does not do the job. Check this before you show the item.
 - If the user says skip, use a supported skipped/cancelled terminal status; if none exists, mark it completed with the skip noted. Then move on without arguing.
-- If they want to revisit an earlier item, jump back. Don't insist on linear order.
 - An explanation request never suspends the one-at-a-time rhythm.
 - If the review maintains a decision ledger, update it only after acknowledgment and leave undecided decision cells blank. Show it after each acknowledgment only when the user requested a running ledger; otherwise show it at wrap-up.
-- When the user adds a later review item, record it without forcing an immediate decision; place it after any prerequisites they named.
+- When the user adds an item, record it without asking for its decision. Put prerequisites first when you add related items.

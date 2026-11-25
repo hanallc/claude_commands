@@ -43,6 +43,14 @@ These fields do not change the recipient, reply name, or message key.
 
 ### Messages during an ad hoc review
 
+`/adhoc_review join <staff name>` opens the owner's review on the same machine.
+`scripts/adhoc_review/shared_review.py` stores one private decision document per review under `~/.local/state/adhoc_review/.shared/`.
+The document holds the item list, claims, and decisions. One file lock covers changes to all three.
+Each session holds one item per review. `next` returns its current item or claims the first available item.
+`leave` releases a claim. `next` also releases claims when the session registry confirms the sessions have ended.
+An unreadable registry keeps the claims. The owner can end the review and remove the document.
+Each session keeps its own message hold and item count.
+
 `review_hold=off` in `config/send.conf` disables message holding for all sessions.
 The next prompt or session start delivers any messages still held.
 Use `/tune` to set `review_hold=on` when message holding can resume.
