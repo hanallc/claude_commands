@@ -89,7 +89,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_user_send_uses_configured_review_limit_without_shortening_agent_relays(self) -> None:
         settings = Path(os.environ["CONF_DIR"]) / "accounts.conf"
         _ = write_config_fixture(settings, "quota_relay_timeout_seconds=40\n")
-        _ = write_config_fixture(settings.with_name("notify.conf"), "REVIEW_TIMEOUT_SECONDS=90\n")
+        _ = write_config_fixture(settings.with_name("notify.conf"), "review_timeout_seconds=90\n")
         done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user", "")
         with mock.patch.object(subprocess, "run", return_value=done) as run:
             self.assertIsInstance(REAL_TELL_USER(render("quota.claude_next_move", account="claude2", remaining="0%")), quota_alert.PushSent)

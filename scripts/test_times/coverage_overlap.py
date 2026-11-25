@@ -81,7 +81,7 @@ class ChildEnvironment:
 
         paths = inherited_paths(previous)
         self.python_path: str = os.pathsep.join((child_path, *paths))
-        self.leaves: str = " ".join(conf.read("test_times").words("COVERAGE_LEAF_PROGRAMS"))
+        self.leaves: str = " ".join(conf.read("test_times").words("coverage_leaf_programs"))
 
     def start_test(self, test_id: str) -> None:
         os.environ["PYTHONPATH"] = self.python_path

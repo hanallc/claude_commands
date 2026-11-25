@@ -29,7 +29,7 @@ from scripts.lib import conf
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, sync_folder, write_text_atomic
 from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
-from scripts.production import delivery_state, record_store, session_pane, staff
+from scripts.production import delivery_state, goal, record_store, session_pane, staff
 from scripts.review_links import change_page, page_question, question_path, question_record
 
 
@@ -132,6 +132,13 @@ class ItemChange:
     time: datetime
     what: LogContent
     source: str
+
+
+@dataclass(frozen=True)
+class _ImageAnswerChange(ItemChange):
+    what: str
+    key: str
+    producer: staff.StaffId
 
 
 @dataclass(frozen=True)
@@ -247,6 +254,7 @@ class Ask:
 
 
 PAGE_SOURCE = "nate via List"
+_IMAGE_ANSWER_SOURCE = "nate via Images"
 _LEGACY_RECEIPT = "List request receipt: "
 _LEGACY_FEEDBACK = "Feedback to morty: "
 feedback_claims: set[tuple[Path, str]] = set()
@@ -502,6 +510,12 @@ def later_value(parking: Parking) -> question_path.Later:
 
 def parking_active(value: Parking, moment: datetime) -> bool:
     return question_path.later_active(later_value(value), moment)
+
+
+def require_active_parking(value: Parking, moment: datetime) -> None:
+    """Refuse a parking deadline that has passed."""
+    if not parking_active(value, moment):
+        raise ListError("Choose a future parking date.")
 
 
 def _request_parking(value: Parking) -> Parking:
@@ -808,7 +822,10 @@ def _validate(item: ListItem) -> None:
                         ("evidence", item.evidence), ("done_when", item.done_when)):
         _ = _field_text(value, name)
     for change in item.log:
-        if isinstance(change.what, str):
+        if isinstance(change, _ImageAnswerChange):
+            if not change.what.strip() or change.source != _IMAGE_ANSWER_SOURCE:
+                raise ListError("invalid image answer log")
+        elif isinstance(change.what, str):
             _log_line(change.what, "log text")
         if isinstance(change.what, (PageFeedback, PageRequest, QuestionRequestReceipt, UnparkNoChangeReceipt)):
             _validate_page_source(change.source)
@@ -1108,6 +1125,9 @@ def _read_log_line(line: str, number: int) -> ItemChange:
         match fields:
             case {"note": str(note)} if len(fields) == 1:
                 content = _read_legacy_note(note, source, number)
+            case {"note": str(note), "image_answer": {"key": str(key), "producer": str(producer)}} if len(fields) == 2:
+                return _ImageAnswerChange(_required_time(time), note, source, _request_id(key),
+                                          staff_id(producer, "image answer producer"))
             case {"action": "Parked", "fields": values, "request": request} if len(fields) == 3:
                 parking = _read_field_change("Parked", values, number)
                 content = PageParkingChange("Parked", parking.fields, _request_id(request))
@@ -1224,7 +1244,20 @@ def _require_active_open_producers(items: Sequence[ListItem]) -> None:
             raise RetiredListProducer(f"{producer.name}: retired producer. Choose an active producer.")
 
 
-def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
+def _stored_log_line(entry: ItemChange) -> str:
+    fields = _log_content(entry.what)
+    if isinstance(entry, _ImageAnswerChange):
+        fields["image_answer"] = {"key": entry.key, "producer": entry.producer}
+    return "- " + json.dumps({"time": entry.time.isoformat(), "source": entry.source, **fields},
+                              ensure_ascii=False)
+
+
+def _goal_status(item: ListItem) -> goal.ItemStatus:
+    eta = "none recorded" if item.eta is EtaStatus.NOT_ASKED else eta_text(item.eta)
+    return goal.ItemStatus(item.title, item.state.value, eta)
+
+
+def _save(store: record_store.NumberedRecords, item: ListItem, *, previous_producer: staff.StaffId | None = None) -> None:
     _validate(item)
     fields = {"id": item.id, "number": str(item.number), "title": item.title,
               "owner": item.owner, "producer": item.producer, "unit": item.unit, "state": item.state.value,
@@ -1242,15 +1275,15 @@ def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
     if item.asks:
         fields["asks"] = json.dumps([_stored_ask(ask) for ask in item.asks], ensure_ascii=False)
     body = "## Next step\n\n" + item.next_step
-    log = "\n".join("- " + json.dumps({"time": entry.time.isoformat(), "source": entry.source,
-                                         **_log_content(entry.what)}, ensure_ascii=False) for entry in item.log)
+    log = "\n".join(_stored_log_line(entry) for entry in item.log)
     for key, text, heading, following in (("next_step", item.next_step, "Latest status", item.latest_status),
                                           ("latest_status", item.latest_status, "Evidence", item.evidence),
                                           ("evidence", item.evidence, "Done when", item.done_when),
                                           ("done_when", item.done_when, "Log", log)):
         fields[key + "_length"] = str(len(text))
         body += record_store.section(heading) + following
-    store.write(item.id, fields, body)
+    with goal.list_item_change(store.owner, item.id, item.producer, _goal_status(item), previous_producer):
+        store.write(item.id, fields, body)
 
 
 def records(keeper: staff.StaffId, *, include_closed: bool = False,
@@ -1300,7 +1333,7 @@ def question_visibility(keeper: staff.StaffId, item: ListItem,
     waiting = True
     failed: set[str] = set()
     for question in unanswered:
-        target = _list_question_target(keeper, item, question.recipient_id(keeper))
+        target = list_question_target(keeper, item, question.recipient_id(keeper))
         delivery = change_page.published_question_delivery_view(status, target.saved(question))
         waiting &= delivery.state.waits
         if delivery.state is delivery_state.QuestionSendState.FAILED:
@@ -1540,13 +1573,28 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
         if isinstance(request, PageRequest):
             changed = _save_page_request(store, keeper, changed, request)
         else:
-            _save(store, changed)
+            _save(store, changed, previous_producer=item.producer)
         return SavedEdit(item, changed)
 
 
 def _open(item: ListItem) -> None:
     if item.state == ItemState.CLOSED:
         raise ListError(f"{item.id}: reopen the Closed item before changing it")
+
+
+def make_top_priority(keeper: staff.StaffId, identity: str, *,
+                      assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListItem:
+    """Make an open item the top priority item of its producer. A producer names only its own items."""
+    item = load(keeper, identity)
+    if item.state == ItemState.CLOSED:
+        raise ListError(f"{item.id} is Closed. Only an open item can be the top priority item.")
+    if assigned_to is not AllItems.INCLUDED and item.producer != assigned_to:
+        raise ListError(f"{item.id} is assigned to another producer")
+    try:
+        _ = staff.set_producer_top_item(item.producer, staff.TopItem(item.number))
+    except (staff.StaffRefused, staff.StaffNotFound) as error:
+        raise ListError(f"{item.id}: {error}") from error
+    return item
 
 
 def _without_evidence_block(evidence: str, start: int, end: int) -> str:
@@ -1742,6 +1790,7 @@ def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, sour
 
 def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
          notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
+         check_deadline: Callable[[datetime], None] | None = None,
          assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListItem:
     fields: LogFields = {"parked_until": until}
     event = FieldChange("Parked", fields)
@@ -1752,8 +1801,10 @@ def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
         event = PageParkingChange("Parked", fields, notice.request)
 
     def edit(item: ListItem, moment: datetime) -> ListItem:
-        if isinstance(notice, PageItemNotice) and not parking_active(until, moment):
-            raise ListError("Choose a future parking date.")
+        if check_deadline is not None:
+            check_deadline(moment)
+        elif isinstance(notice, PageItemNotice):
+            require_active_parking(until, moment)
         _open(item)
         if until is ParkUntilDelivered.DELIVERED and item.state in (ItemState.DELIVERED, ItemState.DONE):
             raise ListError("This item is already delivered.")
@@ -1846,7 +1897,9 @@ def unread_update(item: ListItem) -> UnreadUpdate | NoUnreadUpdate:
 
 
 def _own_page_entry(entry: ItemChange) -> bool:
-    """Find nate's own List page entries: a read, his words and the request receipts. They are not unread content."""
+    """Find nate's own page entries. They do not change the unread update."""
+    if entry.source == _IMAGE_ANSWER_SOURCE:
+        return True
     return entry.source == PAGE_SOURCE and (isinstance(entry.what, MarkedRead) or entry.what == "Marked read"
                                             or _is_feedback(entry) or is_page_request_receipt(entry))
 
@@ -1886,6 +1939,10 @@ def unread_answer_ids(item: ListItem) -> frozenset[str]:
     return frozenset(answers)
 
 
+def _clear_unread(item: ListItem) -> ListItem:
+    return replace(item, unread_since=NoTimestamp.UNSET)
+
+
 def mark_read(keeper: staff.StaffId, identity: str, *, source: str,
               update: UnreadUpdate | NoUnreadUpdate | ReadCurrentUpdate = ReadCurrentUpdate.CURRENT,
               page_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
@@ -1903,7 +1960,7 @@ def mark_read_edit(keeper: staff.StaffId, identity: str, *, source: str,
     def edit(item: ListItem, moment: datetime) -> ListItem:
         if update is not ReadCurrentUpdate.CURRENT and unread_update(item) != update:
             return item
-        read = replace(item, unread_since=NoTimestamp.UNSET)
+        read = _clear_unread(item)
         if not isinstance(page_request, PageRequest) or not _waits_for_nate(item, moment):
             return read
         return _start_working(read, moment, source)
@@ -1926,6 +1983,11 @@ def add_ask(keeper: staff.StaffId, identity: str, *, kind: AskKind, target: staf
     return _change(keeper, identity, edit, lambda changed: AskOpened(changed.asks[-1]), source).item.asks[-1]
 
 
+def _close_asks(item: ListItem, ask_ids: set[str], moment: datetime, reference: str) -> ListItem:
+    return replace(item, asks=tuple(replace(ask, closed=moment, go_id=reference) if ask.ask_id in ask_ids else ask
+                                    for ask in item.asks))
+
+
 def give_go(keeper: staff.StaffId, identity: str, ask_id: str, go_id: str, *, source: str) -> ListEdit:
     """Close the ask with the go id; mark the item read when no answerable ask stays open.
 
@@ -1936,8 +1998,7 @@ def give_go(keeper: staff.StaffId, identity: str, ask_id: str, go_id: str, *, so
         _open(item)
         if not any(ask.ask_id == ask_id for ask in open_asks(item)):
             raise ListError("This ask is no longer open.")
-        closed = replace(item, asks=tuple(replace(ask, closed=moment, go_id=go_id) if ask.ask_id == ask_id else ask
-                                          for ask in item.asks))
+        closed = _close_asks(item, {ask_id}, moment, go_id)
         return replace(closed, state=ItemState.WORKING) if _waits_for_nate(closed, moment) else closed
 
     def event(changed: ListItem) -> GoGiven:
@@ -2296,15 +2357,62 @@ def _claim_question(questions: _ListQuestionStore, item: ListItem, words: str,
                     recipient: staff.StaffId | question_record.KeeperForUnavailableProducer,
                     status: change_page.DeliveryStatus) -> change_page.MessageDelivery:
     recipient_id = recipient.keeper if isinstance(recipient, question_record.KeeperForUnavailableProducer) else recipient
-    target = _list_question_target(questions.keeper, item, recipient_id)
+    target = list_question_target(questions.keeper, item, recipient_id)
     return page_question.ask(questions, replace(target, initial_recipient=recipient), words, status)
 
 
-def _list_question_target(keeper: staff.StaffId, item: ListItem, recipient: staff.StaffId
-                          ) -> change_page.QuestionDeliveryTarget:
+def list_question_target(keeper: staff.StaffId, item: ListItem,
+                         recipient: staff.StaffId) -> change_page.QuestionDeliveryTarget:
+    """Use the saved keeper and recipient for a List question."""
     owner = None if isinstance(item.owner, UnassignedOwner) else item.owner
     return change_page.list_question_target(_store(keeper).path(item.id), item.id, item.number, item.title,
                                            recipient, keeper=keeper, alert_owner=owner)
+
+
+def image_list_keeper(identity: str) -> staff.StaffId:
+    """Find the List folder that holds this item, including old folders."""
+    if re.fullmatch(r"L[1-9][0-9]*", identity) is None:
+        raise ListError("Use a List item id such as L324.")
+    candidates = tuple(record_store.owner_state_paths(
+        record_store.state_root(), f"list/{identity}.md", strict=True))
+    if not candidates:
+        raise ListError(f"No List item {identity}.")
+    if len(candidates) != 1:
+        raise ListError(f"More than one List folder holds {identity}.")
+    keeper = staff.StaffId(candidates[0].parent.parent.name)
+    _ = load(keeper, identity)
+    return keeper
+
+
+def save_image_answer(keeper: staff.StaffId, identity: str, key: str, words: str, *,
+                      image_id: str, approved: bool) -> staff.StaffId:
+    """Save the answer before delivery. Return the producer for this answer."""
+    _ = _request_id(key)
+    store = _store(keeper)
+    with store.locked():
+        item = load(keeper, identity)
+        for entry in reversed(item.log):
+            if isinstance(entry, _ImageAnswerChange) and entry.key == key:
+                sync_folder(store.folder())
+                return entry.producer
+        moment = now()
+        producer = staff.snapshot().by_id(item.producer)
+        producer_name = producer.name if producer is not None else item.producer
+        changes: ItemChanges = {"next_step": f"{producer_name}: act on nate's answer to picture {image_id}"}
+        keeps_delivery = item.state is ItemState.DELIVERED and approved
+        if item.state in (ItemState.WAITING_FOR_NATE, ItemState.DELIVERED) and not keeps_delivery:
+            changes["state"] = ItemState.WORKING
+        if item.eta is EtaStatus.WAITING_FOR_NATE and not keeps_delivery:
+            changes["eta"] = EtaStatus.NO_TIME_YET
+        picture = re.compile(r"(?<![a-z0-9])" + re.escape(image_id) + r"(?![a-z0-9])", re.IGNORECASE)
+        asks = {ask.ask_id for ask in open_asks(item) if picture.search(ask.what) or picture.search(ask.why)}
+        changed = _close_asks(_clear_unread(item), asks, moment, key)
+        log = (*item.log, ItemChange(moment, FieldChange("Updated", {**changes}), _IMAGE_ANSWER_SOURCE))
+        if item.unread_since is not NoTimestamp.UNSET:
+            log = (*log, ItemChange(moment, MarkedRead(), _IMAGE_ANSWER_SOURCE))
+        answer = _ImageAnswerChange(moment, words, _IMAGE_ANSWER_SOURCE, key, item.producer)
+        _save(store, replace(changed, **changes, updated=moment, log=(*log, answer)))
+        return answer.producer
 
 
 def save_feedback(keeper: staff.StaffId, identity: str, feedback: PageFeedback) -> PageFeedback:
@@ -2488,6 +2596,11 @@ def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot, add_evi
     return changes
 
 
+def _cli_item_id(text: str) -> str:
+    """Accept an item number with or without its L prefix."""
+    return f"L{text}" if text.isascii() and text.isdecimal() else text
+
+
 def _send_assignment_notice(recipient: staff.StaffRow, text: str) -> None:
     command = session_send.send_argv("--to", recipient.id, "--recipient-kind", recipient.kind,
                                      "--from", "morty", "--text", text)
@@ -2539,17 +2652,101 @@ def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId
     return status
 
 
+class _GoalArguments(argparse.Namespace):
+    action: str = ""
+    item: str = ""
+    blocked: str = ""
+    faster: str = ""
+    keeper: staff.StaffId | None = None
+
+
+def _set_goal(producer: staff.StaffId, identity: str, *, keeper: staff.StaffId) -> str:
+    with _store(keeper).locked(), goal.locked(producer):
+        saved = goal.load(producer)
+        item = load(keeper, identity)
+        if item.producer != producer:
+            raise ListError(f"{item.id} is assigned to another producer.")
+        if saved is goal.NoGoal.UNSET or (saved["keeper"], saved["item"]) != (keeper, item.id):
+            saved = goal.GoalRecord(keeper=keeper, item=item.id, blocked="", faster="", noted_at="")
+        goal.write_goal(producer, saved)
+        return goal.save(producer, saved, _goal_status(item))
+
+
+def _refresh_goal(producer: staff.StaffId, *, note: tuple[str, str] | None = None) -> str:
+    with goal.locked(producer):
+        saved = goal.load(producer)
+        if saved is goal.NoGoal.UNSET:
+            if note is not None:
+                raise ListError(saved.value)
+            goal.clear_card(producer)
+            return saved.value
+        item = load(saved["keeper"], saved["item"])
+        if item.producer != producer:
+            if note is not None:
+                raise ListError(f"{item.id} is assigned to another producer.")
+            return goal.save(producer, saved, goal.ItemAvailability.UNAVAILABLE)
+        if note is not None:
+            blocked, faster = note
+            _line(blocked, "Blocked by")
+            _line(faster, "Faster if")
+            saved["blocked"] = blocked.strip()
+            saved["faster"] = faster.strip()
+            saved["noted_at"] = now().isoformat(timespec="seconds")
+            goal.write_goal(producer, saved)
+        return goal.save(producer, saved, _goal_status(item))
+
+
+def goal_main(argv: list[str] | None = None) -> int:
+    """Run the producer's main goal command."""
+    parser = argparse.ArgumentParser(description=goal.__doc__)
+    actions = parser.add_subparsers(dest="action", required=True)
+    mark = actions.add_parser("set", help="mark one List item as your main goal")
+    _ = mark.add_argument("item", help="the List item ID, such as L1")
+    _ = mark.add_argument("--keeper", type=staff.StaffId, help=_KEEPER_HELP + _CALLER_FIRST_HELP)
+    _ = actions.add_parser("card", help="refresh and print your main goal card")
+    note = actions.add_parser("note", help="write the blocker and what can make work faster")
+    _ = note.add_argument("--blocked", required=True, help="what blocks the main goal")
+    _ = note.add_argument("--faster", required=True, help="what can make work faster")
+    args = parser.parse_args(argv, namespace=_GoalArguments())
+    try:
+        members = staff.snapshot()
+        producer = members.by_current_session(staff.caller_identity())
+        if producer is None or producer not in staff.active(members, "producer"):
+            raise ListError("Run this command in a producer session.")
+        if args.action == "set":
+            keeper = _record_keeper(_active_morty(members), producer.id, args.item, args.keeper,
+                                    policy=_KeeperRouting.CALLER_FIRST)
+            card = _set_goal(producer.id, args.item, keeper=keeper)
+        elif args.action == "note":
+            card = _refresh_goal(producer.id, note=(args.blocked, args.faster))
+        else:
+            card = _refresh_goal(producer.id)
+        print(card)
+    except (OSError, ValueError, staff.StaffRefused) as error:
+        print(f"goal: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 _KEEPER_HELP = "the staff ID of the record keeper"
+_CALLER_FIRST_HELP = " (defaults to your folder if it holds the item, else morty's)"
 
 
 class _KeeperRouting(StrEnum):
-    ANSWER = "answer"
+    CALLER_FIRST = "caller-first"
     UPDATE = "update"
+
+
+def _active_morty(members: staff.StaffSnapshot) -> staff.StaffId | _NoActiveMorty:
+    try:
+        return producer_id(members, "morty")
+    except ListError:
+        return _NoActiveMorty.UNAVAILABLE
 
 
 def _record_keeper(morty: staff.StaffId | _NoActiveMorty, caller: staff.StaffId, identity: str,
                    chosen: staff.StaffId | None, *, policy: _KeeperRouting) -> staff.StaffId:
-    """Select the folder for an answer or an update.
+    """Select the List folder for the command.
 
     The locked write checks the caller against the saved record.
     """
@@ -2557,7 +2754,7 @@ def _record_keeper(morty: staff.StaffId | _NoActiveMorty, caller: staff.StaffId,
         if not _store(chosen).folder().is_dir():
             raise ListError(f"no List folder for keeper {chosen}")
         return chosen
-    if policy is _KeeperRouting.ANSWER:
+    if policy is _KeeperRouting.CALLER_FIRST:
         own = _store(caller)
         if own.valid_id(identity) and os.path.lexists(own.path(identity)):
             return caller
@@ -2573,8 +2770,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = answer.add_argument("id", help="the List item ID, such as L1")
     _ = answer.add_argument("--question", required=True, help="the question ID, such as Q1")
     _ = answer.add_argument("--text", required=True, help="the answer to show on The List")
-    _ = answer.add_argument("--keeper", type=staff.StaffId,
-                            help=_KEEPER_HELP + " (defaults to your folder if it holds the item, else morty's)")
+    _ = answer.add_argument("--keeper", type=staff.StaffId, help=_KEEPER_HELP + _CALLER_FIRST_HELP)
     ask = commands.add_parser("ask", help="ask nate for a Go or an approval on the List page")
     _ = ask.add_argument("id", help="the List item ID, such as L1")
     _ = ask.add_argument("--kind", required=True, choices=[kind.value for kind in AskKind])
@@ -2582,6 +2778,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = ask.add_argument("--what", required=True, help="the one change that nate approves")
     _ = ask.add_argument("--why", required=True, help="why the session needs nate's word")
     _ = ask.add_argument("--config", action="store_true", help="the change is a settings.json, CLAUDE.md or config change")
+    top = commands.add_parser("top-priority", help="make an open item the top priority item of its producer")
+    _ = top.add_argument("--id", required=True, help="the List item ID, such as L1")
     for name in ("add", "update", "park", "unpark", "close", "reopen", "mark-read", "clean-evidence", "link", "unlink", "list"):
         command = commands.add_parser(name)
         if name != "list":
@@ -2633,12 +2831,9 @@ def main(argv: list[str] | None = None) -> int:
             raise ListError("the current session must be a producer")
         if name == "answer":
             identity, question = cast(str, args.id), cast(str, args.question)
-            try:
-                answer_morty = producer_id(record, "morty")
-            except ListError:
-                answer_morty = _NoActiveMorty.UNAVAILABLE
+            answer_morty = _active_morty(record)
             keeper = _record_keeper(answer_morty, caller.id, identity, cast(staff.StaffId | None, args.keeper),
-                                    policy=_KeeperRouting.ANSWER)
+                                    policy=_KeeperRouting.CALLER_FIRST)
             answerer = _QuestionAnswerer(caller, answer_morty)
             result = page_question.answer(_ListQuestionStore(keeper, answerer=answerer), identity, question,
                                           cast(str, args.text))
@@ -2676,9 +2871,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise ListError("The List results are incomplete. Could not read every record.")
             return 0
         if name == "update":
-            identity = cast(str, args.id)
-            if identity.isascii() and identity.isdecimal():
-                identity = f"L{identity}"
+            identity = _cli_item_id(cast(str, args.id))
             keeper = _record_keeper(morty, caller.id, identity, cast(staff.StaffId | None, args.keeper),
                                     policy=_KeeperRouting.UPDATE)
             reassigns = cast(str | None, args.producer) is not None or cast(str | None, args.owner) is not None
@@ -2699,6 +2892,11 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(changed, UnchangedEdit):
                 return 0
             return _notify_producer_assignment(changed.item, changed.before.producer, keeper, caller=caller.id)
+        if name == "top-priority":
+            item = make_top_priority(keeper, _cli_item_id(cast(str, args.id)), assigned_to=assigned_to)
+            producer = record.by_id(item.producer)
+            print(f"{item.id} is the top priority item of {producer.name if producer is not None else item.producer}")
+            return 0
         if assigned_to is not AllItems.INCLUDED and name not in ("add", "park", "unpark", "close", "reopen"):
             raise ListError(f"only morty can run {name}")
         assert source is not None

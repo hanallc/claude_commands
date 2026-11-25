@@ -38,7 +38,7 @@ Use `/showrunner:units` for production status.
 
 
 
-| `config/direct.conf` | `UNIT_PROGRESS_INTERVAL_SECONDS`, the Codex unit poll timeout. |
+| `config/direct.conf` | `unit_progress_interval_seconds`, the Codex unit poll timeout. |
 
 | `/etc/nixos/modules/common/session-notifier.nix` | The 15 s job. |
 

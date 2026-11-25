@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Smoke launch for /showrunner:produce <PromoteMain/>: builds hana at a checkout
-# that sits at the sha being promoted, starts it on a test port, waits until BRP
-# answers, and shuts it down over BRP. Exits 0 only when every step passed.
+# Build Hana in an item 143 test copy at the commit to promote.
+# Start Hana on a test port, wait for BRP, then shut it down through BRP.
+# Exit 0 only when every step passes.
 #
-# Usage: smoke_launch.sh <checkout> <sha> <log> [port]
+# Usage: smoke_launch.sh <test-copy> <sha> <log> [port]
 #
 # The app starts with XDG_CONFIG_HOME at an empty scratch directory, the way
 # units launch Hana for screenshots, so it never reads or writes the user's
@@ -15,9 +15,9 @@ HANA_TEST_PURPOSE="${HANA_TEST_PURPOSE:-}"
 HANA_TEST_OWNER="${HANA_TEST_OWNER:-${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}}"
 export HANA_TEST_PURPOSE HANA_TEST_OWNER
 
-CHECKOUT="${1:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
-SHA="${2:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
-LOG="${3:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
+CHECKOUT="${1:?Usage: smoke_launch.sh <test-copy> <sha> <log> [port]}"
+SHA="${2:?Usage: smoke_launch.sh <test-copy> <sha> <log> [port]}"
+LOG="${3:?Usage: smoke_launch.sh <test-copy> <sha> <log> [port]}"
 LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
 source "$LIB/conf.sh"
 PORT="${4:-$(conf_value production smoke_port)}"

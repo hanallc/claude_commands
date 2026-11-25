@@ -116,18 +116,17 @@ def decide(raw: str) -> int:
         return _refuse(phase_reservation.refusal_reason(phases, attribution.refused))
     groups = list(attribution.by_phase.items()) if isinstance(attribution, phase_reservation.Attribution) else [(None, scopes)]
     for phase, phase_scopes in groups:
-        answer = phase_reservation.phase_check(root, phase_scopes, session_id, phase)
+        if phase is None:
+            answer = phase_reservation.check(root, phase_scopes, session_id)
+        else:
+            try:
+                answer = phase_reservation.check_phase_edit(root, phase_scopes, session_id, phase, phases)
+            except (OSError, phase_reservation.StateRefused) as error:
+                return _refuse(str(error))
         if answer.status in phase_reservation.FAILS_OPEN:
             return _refuse("binding reservation ledger is unreadable") if held else 0
         if answer.status != phase_reservation.CLEAR:
             return _refuse(f"{answer.status}: {answer.message or 'no detail'}.")
-        if phase is None:
-            continue
-        try:
-            _ = phase_reservation.record_own_acquisition(answer, root, phases, session_id, phase)
-        except OSError:
-            # The edit stays protected. The checkpoint backstop records Active later.
-            pass
     return 0
 
 

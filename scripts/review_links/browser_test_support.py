@@ -21,6 +21,37 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.review_links import console
 
 NO_DATA_FILE: dict[str, object] = {}
+UNDO_ACTION_SCRIPT = r"""
+function fixtureUndo(){
+ const realFetch=window.fetch.bind(window),posts=[];
+ window.fetch=async(url,options={})=>{
+  if(options.method!=='POST') return realFetch(url,options);
+  if(String(url).endsWith('/undo')) return Response.json({outcome:'undone'});
+  if(new Headers(options.headers).get('X-Undo-Hold')!=='1') throw new Error('The action sent no hold header.');
+  posts.push(new URLSearchParams(options.body));
+  return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+ };
+ const until=async(test,label)=>{
+  const end=performance.now()+8000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ const toast=()=>window.top.document.querySelector('[data-send-undo]');
+ async function undo(){
+  await until(()=>toast()?.querySelector('button'),'The Undo toast did not show.');
+  const current=toast();
+  const button=current.querySelector('button');
+  if(current.querySelector('span').textContent!=='Saved.' || button.textContent!=='Undo')
+   throw new Error('The toast must say Saved and offer Undo.');
+  button.click();
+  await until(()=>!current.isConnected,'The Undo toast did not close.');
+ }
+ return {realFetch,posts,until,undo};
+}
+"""
+
 STATUS_PAGES = (
     ("accounts", "Accounts", "users", "Accounts", 45),
     ("aws", "AWS", "cloud", "AWS", 3900),
@@ -178,6 +209,12 @@ window.fetch=async(url,options={})=>{
    button.top>=bar.top && button.bottom<=bar.bottom,
    'the '+state()+' line shows the same labeled Measure now button at its right edge');
  };
+ const checkMeasureFailure=()=>{
+  const notice=document.querySelector('#measure-failure');
+  check(state()==='Live' && !part('age').hidden && age()==='0 s ago' &&
+   notice.checkVisibility() && notice.textContent==='HTTP 502',
+   'a refused Disks measure shows its notice and keeps the live data time');
+ };
  const shown=()=>dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  const requestTimer=()=>[...intervals.values()].find(timer=>timer.ms===expectedPeriod);
  const clock=()=>[...intervals.values()].find(timer=>timer.ms===1000);
@@ -186,10 +223,14 @@ window.fetch=async(url,options={})=>{
   checkMeasure();
   if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
   await flush();
-  if(mode==='retained' || measureFails){
+  if(mode==='retained'){
    check(state()==='Failed' && !part('age').hidden && age()==='0 s ago',
     'a first failed read with shown data keeps its data time');
-   mode='good';measureFails=false;
+   mode='good';
+  }
+  if(measureFails){
+   checkMeasureFailure();
+   measureFails=false;
   }
   shown();await flush();
   check(reads>0 && state()==='Live','the real loader completes a good read');
@@ -200,14 +241,17 @@ window.fetch=async(url,options={})=>{
   const positions=[...line.children].filter(node=>!node.hidden && !node.matches('[data-status-announcement]'));
   check(positions.length===4 && positions[0].matches('.page-status-state') && positions[1]===part('age') &&
    positions[2]===part('trip') && positions[3]===part('render'),'the Live line has the same four positions');
+  const originalScroll=scrollY;
+  scrollTo({top:0,behavior:'instant'});
   const title=document.querySelector('.page-title'),titleBox=title.getBoundingClientRect(),lineBox=line.getBoundingClientRect();
+  const header=title.closest('.page-top');
   const headingBox=(title.closest('.page-heading') || title).getBoundingClientRect();
   const main=document.querySelector('main'),mainBox=main.getBoundingClientRect(),width=document.documentElement.clientWidth;
   // A wide page uses the pane width; a text page keeps the 1124 px column.
   check(mainBox.width===(main.classList.contains('page-wide')?width:Math.min(width,1124)) &&
    Math.abs(mainBox.left-(width-mainBox.right))<1,'the page uses the shared centered column');
   check(main.classList.contains('page-wide')===(document.title==='Builds'),'only the Builds page is wide');
-  check(titleBox.x===mainBox.x+32 && headingBox.y+scrollY===32,'the title starts at the shared column edge');
+  check(titleBox.x===mainBox.x+32 && headingBox.y===32,'the title starts at the shared column edge');
   const searchField=main.querySelector('[data-review] #list-search');
   const search=searchField?.getBoundingClientRect();
   if(search){
@@ -221,8 +265,11 @@ window.fetch=async(url,options={})=>{
   check(lineBox.height===21,'the line uses the shared height');
   check(getComputedStyle(title).fontSize==='26px' && getComputedStyle(title).fontWeight==='700',
    'the title uses the shared size and weight');
-  check(getComputedStyle(line).fontSize==='14px' && getComputedStyle(line).lineHeight==='21px' &&
-   getComputedStyle(line).marginBottom===(search ? '0px' : '20px'),'the line uses the shared font and the expected lower space');
+  check(getComputedStyle(line).fontSize==='14px' && getComputedStyle(line).lineHeight==='21px',
+   'the line uses the shared font');
+  const lowerSpace=header.getBoundingClientRect().bottom-Math.max(lineBox.bottom,search?.bottom ?? lineBox.bottom)
+   +parseFloat(getComputedStyle(header).marginBottom);
+  check(Math.abs(lowerSpace-(search ? 12 : 20))<1,'the header keeps the expected space below the status row');
   const ink=document.createElement('span');ink.style.color='var(--ink)';line.append(ink);
   check(getComputedStyle(title).color===getComputedStyle(ink).color,'the title uses the shared ink color');ink.remove();
   check(getComputedStyle(document.body).backgroundColor===getComputedStyle(line).backgroundColor,
@@ -231,6 +278,7 @@ window.fetch=async(url,options={})=>{
   if(content) check(content.getBoundingClientRect().x===titleBox.x,'the page content starts at the title edge');
   const icon=line.querySelector('[data-status-icon=Live] svg').getBoundingClientRect();
   check(icon.width===16 && icon.height===16,'the Live icon uses the shared size');
+  scrollTo({top:originalScroll,behavior:'instant'});
   const root=document.querySelector('[data-accounts],[data-review-content],[data-images],[data-investigations],[data-list],[data-review]');
   if(root) check(root.dataset.loaded==='true','the real loader replaces page content');
   if(expectedPeriod) check(!!requestTimer(),'the real request period runs');
@@ -241,8 +289,11 @@ window.fetch=async(url,options={})=>{
    root.querySelector('.review-queue').append(spacer);
    const top=scrollY;
    scrollTo({top:innerHeight,behavior:'instant'});
-   check(scrollY>0 && title.getBoundingClientRect().bottom<0 && Math.abs(line.getBoundingClientRect().top)<1,
-    'The '+state()+' status stays visible when the Review queue scrolls.');
+   const frozenTop=header.getBoundingClientRect();
+   const frozenTitle=title.getBoundingClientRect(), frozenLine=line.getBoundingClientRect();
+   check(scrollY>0 && Math.abs(frozenTop.top)<1 && frozenTitle.top>=0 &&
+    frozenLine.top>=frozenTitle.bottom && frozenLine.bottom<=innerHeight,
+    'The title and '+state()+' status stay visible when the Review queue scrolls.');
    scrollTo({top,behavior:'instant'});spacer.remove();
   };
   const count=reads;
@@ -330,8 +381,7 @@ window.fetch=async(url,options={})=>{
    check(state()==='Failed' && part('reason').textContent==='HTTP 404','a missing Disks file reports failure');
    check(document.querySelector('#drives').innerHTML===kept,'a missing Disks file keeps the shown drives');
    mode='good';measureFails=true;await read();
-   check(state()==='Failed' && !part('age').hidden && age()==='0 s ago',
-    'a failed Disks measure retains the time of the shown data');
+   checkMeasureFailure();
   }
   statusVisibility='hidden';document.dispatchEvent(new Event('visibilitychange'));await flush();
   check(state()==='Paused','a hidden page pauses');

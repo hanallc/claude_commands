@@ -51,7 +51,7 @@ Each producer loads the common command and reads its job and current work from i
 The commands live in `commands/producer/`.
 Morty's operations document is `docs/producer/morty-operations.md`.
 The Codex command sync names the common skill `producer-produce` and the List skill `producer-morty`.
-`PRODUCER_FOLDER_ROOT` in `config/staff.conf` selects the document root, with default `~/rust/hanadocs`.
+`producer_folder_root` in `config/staff.conf` selects the document root, with default `~/rust/hanadocs`.
 Each producer uses `<root>/<name>/README.md`.
 The [shared resume path](shutdown-and-restart.md#producer-launch-and-admission) admits a first conversation through `staff.ensure`.
 A producer's `worktree` is its launch folder and owns no path.
@@ -60,6 +60,12 @@ A producer's `worktree` is its launch folder and owns no path.
 `staff.transfer_producer(identity, session, home, folder)` sets `current_session`, `home`, and the launch folder in one transaction.
 It refuses a row that is not a producer and a session that another row holds.
 The hidden `transfer-producer` CLI verb sends the write to the owner machine.
+`StaffRow.top_item` is `TopItem(number)` or `NoTopItem()`: one List item number, the producer's top priority item.
+JSON stores it as the integer `top_item` on a producer row only.
+`staff.set_producer_top_item(identity, top_item)` takes a `TopItem` and writes it for an active producer.
+The hidden `set-producer-top-item` CLI verb requires `--number` and sends the write to the owner machine.
+`the_list.make_top_priority` is its one caller. It checks that the item is open and, for a producer, that the item is its own.
+No call clears the field: a reader treats a Closed or missing item as no top item.
 
 ## Backend and hold evidence
 
@@ -113,7 +119,7 @@ A joined child leaves that record intact.
 The busy-row error includes the PID and command when it can read the record.
 `staff.child_environment` removes inherited row-lock proofs and the staff ID before an agent starts.
 It also removes the [operation configuration](agent-registry.md#agent-environment-boundary).
-Staff lock and remote waits read `OPERATION_LOCK_SECONDS` and `REMOTE_SECONDS` from `config/staff.conf` at use.
+Staff lock and remote waits read `operation_lock_seconds` and `remote_seconds` from `config/staff.conf` at use.
 Each wait uses the smaller configured limit or remaining operation deadline.
 
 ## Production document lookup
@@ -212,6 +218,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/herdr/worker_panes.py` | write | snapshot, runtime_id, row_operation, slot_operation; worker_admission.publish |
 | `scripts/hooks/conversation_pause.py` | read | local_by_current_session; StaffSnapshot, LiveDoc, WrappedDoc |
 | `scripts/hooks/conversation_pause_test_support.py` | write | LiveDoc; fixture_member calls ensure |
+| `scripts/hooks/goal_card.py` | read | Reads staff.json for the current session. StaffRow.from_json, StaffSnapshot, active |
 | `scripts/hooks/herdr_tab_title.py` | read | snapshot |
 | `scripts/hooks/idle_update.py` | read | StaffSnapshot and Kind (types); the prompt hook passes the row |
 | `scripts/hooks/post-tool-use-sendmessage-miss.py` | read | snapshot |
@@ -222,6 +229,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/hooks/stop-direct-continue.py` | read | local_by_current_session, unit_command, local_snapshot; active_dispatch reads the worker's fixed staff ID |
 | `scripts/hooks/user-prompt-submit-conversation-pause.py` | read | StaffSnapshot (type); conversation_pause.session_staff reads the row |
 | `scripts/lib/build_copies.py` | read | local_snapshot, RemovedWorktree, StaffUnreadable |
+| `scripts/lib/origin_deletion.py` | read | operation_fds; retains the operation locks during the Git command |
 | `scripts/lib/python_startup/sitecustomize.py` | read | `TEST_RUNNER_FILES` lists `staff.py` for the removal guard in test checkouts. |
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/removal_guard.py` | read | snapshot, all_rows, StaffRefused, PresentWorktree, RemovedWorktree; known_names reads unit and repository names |
@@ -278,11 +286,14 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/gate.py` | read | snapshot, initial_snapshot, doc_owner |
 | `scripts/production/merge_gate.py` | read | snapshot, initial_snapshot, doc_owner |
 | `scripts/production/gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
+| `scripts/production/goal.py` | read | StaffId type for the producer and List owner |
 | `scripts/production/next_item.py` | read | snapshot |
+| `scripts/production/production_admission.py` | write | record_path, snapshot, authority_snapshot, set_doc; checks and records a change to the document binding |
 | `scripts/production/production_doc.py` | read | StaffRow, StaffSnapshot, LiveDoc, WrappedDoc |
 | `scripts/production/production_lifecycle.py` | write | defer_retire, operation, retire_pending, set_doc, set_worktree, snapshot |
 | `scripts/production/production_lifecycle_test_support.py` | read | find, pane, register_production, session_transcript |
 | `scripts/production/promote_showrunner.py` | read | cli_result, find, native_id, operation, promote_unit, runtime_id, snapshot |
+| `scripts/production/promotion.py` | read | snapshot, LiveDoc; identifies the owner of the live document |
 | `scripts/production/proposal_issue.py` | read | snapshot, StaffId |
 | `scripts/production/proposals_folder.py` | read | initial_snapshot |
 | `scripts/production/proposals_table.py` | read | none (StaffSnapshot type) |
@@ -304,7 +315,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/stall_watch.py` | read | snapshot |
 | `scripts/production/store_owner.py` | read | snapshot |
 | `scripts/production/style_units.py` | read | snapshot |
-| `scripts/production/the_list.py` | read | snapshot, by_current_session and by_id find the caller and check the owner of a list item |
+| `scripts/production/the_list.py` | write | snapshot, by_current_session and by_id find the caller and check the owner of a list item; `make_top_priority` writes set_producer_top_item |
 | `scripts/production/tidy_wrapped.py` | read | initial_snapshot |
 | `scripts/production/transfer_unit.py` | write | cli_result, move, operation, snapshot |
 | `scripts/production/unit_command.py` | read | snapshot |
@@ -343,7 +354,8 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/serve.py` | read | snapshot supplies the recipients for the New item dialog. |
 | `scripts/review_links/staff_names.py` | read | snapshot gives the staff rows; StaffRow kind and name pick each staff name's role color for the console pages |
 | `scripts/review_links/investigations_page.py` | read | snapshot and by_id resolve legacy investigation submissions |
-| `scripts/review_links/list_page.py` | read | snapshot, by_id, and parent_of name List owners, validate morty, resolve the alert showrunner, and supply identities to the shared count readers |
+| `scripts/review_links/list_page.py` | read | snapshot, by_id, and parent_of name List owners, validate morty, resolve the alert showrunner, and supply identities to the shared count readers; by_id and StaffRow top_item mark the top priority items |
+| `scripts/review_links/studio_page.py` | read | active and StaffRow retirement pick the producers that get a Studio tab; the snapshot comes from `list_page.render` |
 | `scripts/agents/inventory.py` | read | local_snapshot |
 | `scripts/agents/launch_names.py` | read | initial_snapshot |
 | `scripts/agents/member_account.py` | write | StaffRow, SessionHome, set_home; repairs the home from live process evidence |
@@ -385,7 +397,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-The table has 241 accessor rows (41 write, 199 read, and 1 owner).
+The table has 247 accessor rows (43 write, 203 read, and 1 owner).
 
 ## Approved copies
 

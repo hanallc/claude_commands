@@ -79,7 +79,7 @@ def short_resume_check_config(file: str | Path) -> conf.ConfigRead:
     settings = READ_CONFIG(file)
     if file == "shutdown" and isinstance(settings.settings, dict):
         values = dict(settings.settings)
-        for key in ("RESUME_CHECK_SECONDS", "RESUME_CHECK_INTERVAL_SECONDS"):
+        for key in ("resume_check_seconds", "resume_check_interval_seconds"):
             values[key] = conf.Setting("0.001", "# range: 0..3600", 0)
         return replace(settings, settings=values)
     return settings
@@ -1301,7 +1301,7 @@ class RestartTests(RestartTestCase):
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
             _ = write_config_fixture(configuration / source.name)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
-        _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
+        _ = write_config_fixture(configuration / "staff.conf", "producer_workspace=producers\n")
         _ = write_registry(configuration / "models.conf", {"producers": {
             "unit-0": "claude:opus:max", "probe-codex": "codex:gpt-test:high",
             "morty": "claude:opus:max", "TEST-agent": "claude:opus:max",
@@ -1690,7 +1690,7 @@ class RestartTests(RestartTestCase):
         for release in (True, False):
             with self.subTest(release=release):
                 config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
-                text = config.read_text().replace("UPKEEP_ROW_WAIT_SECONDS=5", "UPKEEP_ROW_WAIT_SECONDS=0.04")
+                text = config.read_text().replace("upkeep_row_wait_seconds=5", "upkeep_row_wait_seconds=0.04")
                 write_text_atomic(config, text)
                 shutdown_record.save([str(row.id)])
                 with path.open("w+") as lock:
@@ -2296,7 +2296,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         record_lock = shutdown_record.record_path().with_suffix(".lock")
         if step == "busy lock":
             config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
-            _ = write_config_fixture(config, "RESTART_RECORD_LOCK_SECONDS=0.05\n")
+            _ = write_config_fixture(config, "restart_record_lock_seconds=0.05\n")
         read_fd, ready_fd = os.pipe()
         lock_context = record_lock.open("a") if step == "busy lock" else nullcontext()
         with lock_context as lock, os.fdopen(read_fd, "rb"), os.fdopen(ready_fd, "wb"), path.open("ab") as log:
@@ -2997,7 +2997,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
                 if incomplete:
                     fixture = set_up_fixture(scope.callback, WorkerPaneTests("runTest"))
                     config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
-                    _ = write_config_fixture(config, "UPKEEP_ROW_WAIT_SECONDS=0\n")
+                    _ = write_config_fixture(config, "upkeep_row_wait_seconds=0\n")
                     owner = staff.rename(fixture.parent.id, "TEST-selected-owner")
                     other = fixture_member("unit", name="TEST-other-owner", parent=owner.parent)
                     selected = fixture.worker("TEST-selected")
@@ -3376,8 +3376,8 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
                         self.running.clear()
                         config = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
                         write_text_atomic(config,
-                            f"# range: 1..\nSTART_SECONDS={start_seconds}\n"
-                            + f"# range: 1..\nOPENING_PROMPT_SECONDS={opening_seconds}\n")
+                            f"# range: 1..\nstart_seconds={start_seconds}\n"
+                            + f"# range: 1..\nopening_prompt_seconds={opening_seconds}\n")
                         row = self.rows[0]
                         arguments = (["--resume", str(row.current_session)] if kind == "claude" else
                                      ["resume", str(row.current_session)])
@@ -3810,7 +3810,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
 
     def test_saved_tab_waits_for_its_own_shell_and_never_splits(self) -> None:
         settings = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
-        _ = write_config_fixture(settings, "OWN_PANE_SHELL_SECONDS=0.2\n")
+        _ = write_config_fixture(settings, "own_pane_shell_seconds=0.2\n")
         layout: herdr.SavedLayout = {"at": 1, "workspaces": [{"name": "saved", "seen": 1,
             "tabs": [{"staff_id": "row-0", "seen": 1}]}]}
         self.rows = (self.rows[0], replace(self.rows[1], kind="worker", parent=staff.ReportsTo(self.rows[0].id)), self.rows[2])
@@ -5348,7 +5348,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             with self.subTest(source=source, shared_checks=shared_checks):
                 self.running.clear()
                 now = [100.0]
-                start_seconds = READ_CONFIG("shutdown").number("START_SECONDS")
+                start_seconds = READ_CONFIG("shutdown").number("start_seconds")
                 exit_at = (100.3 if source == "exits within start" else
                            100.0 + start_seconds + 1 if source in ("exits during check", "missing publication") else math.inf)
                 locations = {"w1:p0": pane.copy()}

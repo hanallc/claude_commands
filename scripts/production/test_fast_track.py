@@ -369,7 +369,7 @@ owner.verify=verify
         _ = (config / "build_steps.conf").write_text("names.fast-track=fast track\n")
         _ = (config / "main_push_lock.conf").write_text("# whole: 1..\nrecord_days=14\n")
         _ = (config / "merge_checkpoint.conf").write_text(
-            "# whole: 1..\nMAC_PULL_TRIES=3\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n",
+            "# whole: 1..\nmac_pull_tries=3\n# range: 0..\nmac_pull_retry_seconds=0\n",
         )
 
     def save_config(self) -> None:

@@ -24,8 +24,8 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.waiting_rows import (
     NAMED_ROWS, ORDER_PATH, AcceptedSave, LockedJournal, SaveOrders, WaitingChange as WaitingChange,
     append_setting, apply_move, check_move, git,
-    journal_path as journal_path, locked_journal, model_color_host, model_color_key, model_color_value, move_target,
-    named_row, published_orders, replace_value, show, tree_value,
+    journal_path as journal_path, live_text, locked_journal, migrated_setting_name, model_color_host, model_color_key,
+    model_color_value, move_target, named_row, publish_setting_text, published_orders, replace_value, show, tree_value,
 )
 from scripts.production import producer_map_rows
 
@@ -74,6 +74,9 @@ def check_value_line(stem: str, key: str, value: str) -> None:
 def editable_setting(stem: str, key: str, value: str, *, accepted: bool = False,
                      comment: str | None = None) -> ExistingSetting | NewModelColor | NamedRow:
     """Validate the change and identify the current setting; only the Mac takes natedev's name comment unchecked."""
+    current_stem, _ = migrated_setting_name(stem, key)
+    if current_stem != stem:
+        raise conf.Unusable(f"Use {current_stem} for this Save.")
     check_value_line(stem, key, value)
     if stem == NAMED_ROWS:
         current = conf.settings(conf.path(stem).read_text(encoding="utf-8")).get(key)
@@ -136,12 +139,10 @@ def _commit_row(checkout: Path, relative: str, change: WaitingChange, orders: Sa
     """Commit only this row onto HEAD; other waiting rows stay live and uncommitted."""
     entry = git(checkout, "ls-tree", "HEAD", "--", relative)
     head = show(checkout, "HEAD", relative) if entry else ""
-    setting = conf.settings(head).get(change.key)
     if change.stem == NAMED_ROWS:
         text = named_row(head, change.key, change.value, producer_map_rows.name_comment(change.key, change.value))
     else:
-        text = (replace_value(head, setting.line, change.value) if setting
-                else append_setting(head, change.key, change.value))
+        text = publish_setting_text(head, live_text(checkout / relative) or "", change)
     mode = entry.split()[0] if entry else "100644"
     orders.setdefault(change.stem, {})[change.key] = change.save_order
     parent = git(checkout, "rev-parse", "HEAD").strip()
@@ -298,7 +299,7 @@ def main(arguments: list[str] | None = None) -> int:
                 _ = pending.accept(stem, key, AcceptedSave(order, value, base))
                 pending.save()
                 _ = _write_setting(stem, key, value, setting)
-    except (OSError, ValueError, main_publish.Refusal) as error:
+    except (conf.InvalidKey, OSError, ValueError, main_publish.Refusal) as error:
         print(f"live_settings: {error}", file=sys.stderr)
         return 1
     return 0

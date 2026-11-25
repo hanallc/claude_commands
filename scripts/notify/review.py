@@ -59,7 +59,7 @@ EXPIRY_KEYS_FILE = Path.home() / ".config/pushover/env"
 
 def review_timeout_seconds() -> float:
     """Read the current reviewer time limit."""
-    return conf.read("notify").number("REVIEW_TIMEOUT_SECONDS")
+    return conf.read("notify").number("review_timeout_seconds")
 
 
 @dataclass(frozen=True)

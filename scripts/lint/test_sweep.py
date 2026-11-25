@@ -283,7 +283,7 @@ class SweepCase(unittest.TestCase):
         self.declare_output_root(self.output_root)
 
     def declare_output_root(self, root: Path) -> None:
-        host = socket.gethostname().partition(".")[0]
+        host = conf.local_host_key_name()
         _ = write_config_fixture(conf.path("build_folders"), f"removal.path_templates.{host}={root}/<repo>/<unit>/<short> {root}/<repo>/ci/<number>\n")
 
     def output_fixture(self) -> Path:
@@ -2650,7 +2650,7 @@ class FloorTests(SweepCase):
         natedev_floor = "# range: 0..\nsweep_build_floor_gib.natedev=733.29\n"
         for host, overrides, expected in (("testhost", "", 1000 * 4096 // 4),
                                           ("testhost", plain_floor, int(40.5 * GIB)),
-                                          ("testhost", plain_floor + host_floor, 55 * GIB),
+                                          ("TestHost.Example", host_floor, 55 * GIB),
                                           ("natedev", natedev_floor, int(733.29 * GIB))):
             with self.subTest(host=host, overrides=overrides):
                 base = self.base()
@@ -6000,7 +6000,7 @@ raise SystemExit(int(os.environ[variable]))
                              sweep.FloorChannelOutcome.FAILED)
 
     def test_phone_alert_wait_covers_configured_review_while_session_wait_stays_short(self) -> None:
-        _ = write_config_fixture(conf.path("notify"), "REVIEW_TIMEOUT_SECONDS=90\n")
+        _ = write_config_fixture(conf.path("notify"), "review_timeout_seconds=90\n")
         with (mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
               redirect_stdout(io.StringIO())):
             self.assertEqual(sweep.send_floor_alert("disk notice"), sweep.FloorChannelOutcome.DELIVERED)
