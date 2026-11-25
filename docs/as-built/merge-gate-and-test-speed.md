@@ -433,6 +433,14 @@ The scanner skips finished records on later runs.
 If recovery refuses a record from another checkout, the gate reports its path and reason on stderr.
 Each gate process reports a refused record once.
 The gate keeps that record and checks the remaining records.
+
+Run `./scripts/lib/py -m scripts.test_times.gate_record [ROOT]` from the checkout to read the suite folder report.
+The command reads direct suite folders with leases under ROOT or the configured gate root.
+It prints one JSON line per folder and leaves the files unchanged.
+The join uses the path, PID, process start, and boot identity.
+A matching start without a recorded end shows `killed`.
+A missing start or incomplete owner identity shows `no record`.
+Use kernel or earlyoom logs to identify the cause of a `killed` outcome.
 A recovery refusal in the gate's own checkout stops the gate.
 A clean tree with a recorded full pass on this host reuses its test modules.
 Test modules use `builds.slice` scopes when available.
@@ -804,9 +812,17 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   The lease records the owner PID, directory device, and inode.
   It includes the process start and, on Linux, the boot identity when the gate can read them.
   Lease readers continue to accept older records.
+  After it writes the lease, the gate appends a `gate_folder_start` line to the local host log.
+  The line contains the folder path, lease owner identity, commit SHA, branch, and step.
+  The `gate_run` line adds the same owner identity, `suite_folders`, and `end`.
+  Runs without timing history use a `gate_folder_end` line.
+  The end is `normal`, `red`, or `sigterm`.
+  Log errors report to stderr and preserve the gate verdict.
+  The timing index continues to accept older run lines and skips the folder event lines.
   Both modes use the configured gate root for top-level runs.
   If that root contains the calling module folder, the nested gate uses the module folder as its parent.
   The outer gate removes the nested gate files when it removes the module folder.
+
   The short names leave room for Unix socket paths below `TMPDIR`.
   The runner reads the output and removes the temporary folder when the job ends.
   At the first unittest load or run, the bootstrap disables bytecode writes for the test.

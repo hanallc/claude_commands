@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 import gzip
 import io
 import os
 from pathlib import Path
 import re
+import signal
 import time
 from typing import final, override
 import unittest
@@ -71,6 +72,50 @@ class MergeGateTestTimesTests(MergeGateFixture):
         records = self.gate_run_records()
         self.assertEqual(len(records), 1, records)
         return records[0]
+
+    def test_suite_folder_start_and_end_match_the_live_lease(self) -> None:
+        for end, status in (("normal", 0), ("red", 1), ("sigterm", -signal.SIGTERM)):
+            with self.subTest(end=end):
+                if end == "red":
+                    self.write(self.state / "red-hooks", "red")
+                buildlog = self.root / f"records-{end}"
+                preamble = f"""from contextlib import contextmanager
+from scripts.buildlog import store
+from scripts.lib import build_folders
+allocate = gate.gate_temporary
+
+@contextmanager
+def observe_folder(recovery, tool, parent):
+    with allocate(recovery, tool, parent) as folder:
+        lease = build_folders.gate_folder_lease_fields(folder, parent)
+        start, = [row for path in store.root().glob("*/*.jsonl")
+                  for row in store.locked_rows(path) if row.get("kind") == "gate_folder_start"]
+        assert start["folder"] == str(folder.resolve())
+        for field in ("pid", "process_start", "boot_id"):
+            assert start.get(field) == lease.get(field)
+        if {end!r} == "sigterm":
+            signal.raise_signal(signal.SIGTERM)
+        yield folder
+
+gate.gate_temporary = observe_folder
+"""
+                with mock.patch.dict(self.environment, {"BUILDLOG_DIR": str(buildlog)}):
+                    result = self.run_gate("--tests-only", "--full", own_process=True, preamble=preamble)
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                    record = self.only_record()
+                start, = [row for path in buildlog.glob("*/*.jsonl")
+                          for row in store.locked_rows(path) if row.get("kind") == "gate_folder_start"]
+                self.assertEqual(start["sha"], self.base)
+                self.assertEqual(start["branch"], "integration")
+                self.assertEqual(start["step"], "gate")
+                self.assertEqual(record.get("end"), end)
+                self.assertEqual(record.get("suite_folders"), [start["folder"]])
+                fields: Mapping[str, object] = record
+                for field in ("pid", "process_start", "boot_id", "sha", "branch", "step"):
+                    self.assertEqual(fields.get(field), start.get(field))
+                self.assertEqual(record["aborted"], end == "sigterm")
+                if end == "sigterm":
+                    self.assertEqual(record["modules"], [])
 
     @gate_suites("hooks", "notify", "direct")
     def test_record_keeps_each_attempt_and_only_failed_or_slow_tests(self) -> None:

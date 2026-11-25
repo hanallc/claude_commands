@@ -1127,6 +1127,12 @@ def folder_lease_fields(path: Path) -> dict[str, object]:
         return _read_folder_lease(path, directory)
 
 
+def gate_folder_lease_fields(path: Path, root: Path) -> dict[str, object]:
+    """Read a lease under the gate root without acquiring a removal lock."""
+    with build_folder_lock.folder_parent(path, root, create=False) as directory:
+        return _read_folder_lease(path, directory)
+
+
 @dataclass(frozen=True)
 class CopyDirectoryIdentity:
     """The device and inode of a copy directory or its Git directory."""

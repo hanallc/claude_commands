@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 import gzip
 import io
@@ -322,6 +322,62 @@ class GateRecordTests(unittest.TestCase):
             self.assertEqual(row["slow_test_s"], 0.5)
             self.assertEqual(row["tests_run"], 2)
         self.assertNotEqual(rows[0]["id"], rows[1]["id"])
+
+    def test_folder_status_matches_each_end_and_the_exact_lease_owner(self) -> None:
+        root = self.root / "gate"
+        root.mkdir()
+        expected: list[gate_record.GateFolderStatus] = []
+        cases: tuple[tuple[str, gate_record.GateFolderOutcome], ...] = (
+            ("g-normal", "normal"), ("g-red", "red"), ("g-term", "sigterm"),
+            ("g-killed", "killed"), ("t-no-start", "no record"), ("t-other-pid", "no record"),
+            ("t-reused-pid", "no record"), ("t-other-boot", "no record"), ("t-missing-boot", "no record"),
+        )
+        for name, outcome in cases:
+            folder = root / name
+            folder.mkdir()
+            owner: gate_record.GateFolderOwner = {"pid": 12, "process_start": "100", "boot_id": "boot-a"}
+            lease: dict[str, object] = dict(owner)
+            if name == "t-other-pid":
+                lease["pid"] = 13
+            if name == "t-reused-pid":
+                lease["process_start"] = "200"
+            if name == "t-other-boot":
+                lease["boot_id"] = "boot-b"
+            if name == "t-missing-boot":
+                del lease["boot_id"]
+            _ = folder.with_name(folder.name + ".lease.json").write_text(json.dumps(lease))
+            if name != "t-no-start":
+                gate_record.write_gate_folder_event({**owner, "folder": str(folder), "sha": name,
+                                                    "branch": "main", "step": "gate"})
+            if outcome == "no record":
+                expected.append({"folder": str(folder), "pid": 13 if name == "t-other-pid" else 12, "end": "no record"})
+                continue
+            expected.append({"folder": str(folder), "pid": 12, "sha": name, "step": "gate", "end": outcome})
+            if outcome == "sigterm":
+                gate_record.write_gate_folder_event({**owner, "suite_folders": [str(folder)], "end": outcome})
+            elif outcome != "killed":
+                run = gate_run()
+                run.update(pid=12, process_start="100", boot_id="boot-a", suite_folders=[str(folder)], end=outcome)
+                gate_record.write_gate_run(run, fixture_executions(run))
+        (root / "g-without-lease").mkdir()
+        run = gate_run()
+        run.update(pid=12, process_start="100", boot_id="boot-b", suite_folders=[str(root / "g-killed")], end="red")
+        gate_record.write_gate_run(run, fixture_executions(run))
+        legacy = gate_run()
+        gate_record.write_gate_run(legacy, fixture_executions(legacy))
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(gate_record.main([str(root)]), 0)
+        rows = [cast(object, json.loads(line)) for line in output.getvalue().splitlines()]
+        self.assertCountEqual(rows, expected)
+
+    def test_folder_start_write_failure_reports_on_one_line(self) -> None:
+        output = io.StringIO()
+        with redirect_stderr(output), mock.patch.object(store, "append_line", side_effect=OSError("disk\nfull")):
+            gate_record.write_gate_folder_event({"folder": str(self.root / "g-test"), "pid": 12,
+                                                "sha": "sha", "branch": "main", "step": "gate"})
+        self.assertEqual(output.getvalue(), "gate_folder_start not written: disk full\n")
 
     def test_gate_write_keeps_the_used_threshold_and_counts_each_module_attempt(self) -> None:
         config = self.config / "test_times.conf"

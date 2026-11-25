@@ -1,7 +1,8 @@
 """Read module times and append gate runs to the build log."""
 from __future__ import annotations
 
-from collections.abc import Sequence
+import argparse
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -75,8 +76,34 @@ class SuiteRun(TypedDict):
     status: int
 
 
+GateEnd = Literal["normal", "red", "sigterm"]
+
+
+class GateFolderOwner(TypedDict):
+    pid: int
+    process_start: NotRequired[str]
+    boot_id: NotRequired[str]
+
+
+class GateFolderStart(GateFolderOwner):
+    folder: str
+    sha: str
+    branch: str
+    step: str
+
+
+class GateFolderEnd(GateFolderOwner):
+    suite_folders: list[str]
+    end: GateEnd
+
+
 class GateRun(TypedDict):
     vcpus: NotRequired[int]
+    pid: NotRequired[int]
+    process_start: NotRequired[str]
+    boot_id: NotRequired[str]
+    suite_folders: NotRequired[list[str]]
+    end: NotRequired[GateEnd]
     step: str
     dirty_paths: list[str]
     dirty_path_count: int
@@ -402,6 +429,119 @@ def write_gate_run(run: GateRun, executions: Sequence[Execution]) -> None:
         report_not_written(error)
 
 
+def write_gate_folder_event(event: GateFolderStart | GateFolderEnd) -> None:
+    """Append a folder start or an end without timing history."""
+    from scripts.buildlog import record, store
+
+    kind = "gate_folder_start" if "folder" in event else "gate_folder_end"
+    try:
+        epoch = time.time()
+        host = store.host_name()
+        store.append_line(store.host_file(host, epoch), {
+            "kind": kind, "v": record.RECORD_VERSION, "id": record.new_id(host, epoch),
+            "host": host, "at": store.utc_iso(epoch), **event,
+        })
+    except Exception as error:
+        print(f"{kind} not written: {' '.join(str(error).splitlines())}", file=sys.stderr)
+
+
+@dataclass(frozen=True)
+class _GateLeaseOwner:
+    """Identify a process on one boot."""
+
+    pid: int
+    process_start: str
+    boot_id: str
+
+
+def _lease_owner(fields: Mapping[str, object]) -> _GateLeaseOwner | None:
+    pid, start, boot = fields.get("pid"), fields.get("process_start"), fields.get("boot_id")
+    if type(pid) is int and pid > 0 and isinstance(start, str) and start and isinstance(boot, str) and boot:
+        return _GateLeaseOwner(pid, start, boot)
+    return None
+
+
+GateFolderOutcome = GateEnd | Literal["killed", "no record"]
+
+
+class GateFolderStatus(TypedDict):
+    folder: str
+    pid: int | None
+    sha: NotRequired[str]
+    step: NotRequired[str]
+    end: GateFolderOutcome
+
+
+def gate_folder_status(root: Path) -> list[GateFolderStatus]:
+    """Join direct suite folders to the local host log without changing either."""
+    from scripts.buildlog import store
+    from scripts.lib.build_folders import gate_folder_lease_fields
+
+    root = root.expanduser().resolve()
+    statuses: list[GateFolderStatus] = []
+    candidates: dict[tuple[str, _GateLeaseOwner], GateFolderStatus] = {}
+    for folder in sorted(root.iterdir()):
+        if not folder.name.startswith(("g-", "t-")) or folder.is_symlink() or not folder.is_dir():
+            continue
+        try:
+            fields = gate_folder_lease_fields(folder, root)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as error:
+            print(f"cannot read the lease for {folder}: {error}", file=sys.stderr)
+            fields = {}
+        pid = fields.get("pid")
+        status: GateFolderStatus = {"folder": str(folder), "pid": pid if type(pid) is int else None, "end": "no record"}
+        statuses.append(status)
+        owner = _lease_owner(fields)
+        if owner is not None:
+            candidates[str(folder), owner] = status
+    if not candidates:
+        return statuses
+
+    ends: dict[tuple[str, _GateLeaseOwner], GateEnd] = {}
+    host_logs = store.root() / store.host_name()
+    for path in sorted(host_logs.glob("[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl")):
+        for row in store.locked_rows(path):
+            kind = row.get("kind")
+            if kind not in ("gate_folder_start", "gate_run", "gate_folder_end"):
+                continue
+            owner = _lease_owner(row)
+            if owner is None:
+                continue
+            if kind == "gate_folder_start":
+                folder, sha, step = row.get("folder"), row.get("sha"), row.get("step")
+                if isinstance(folder, str) and isinstance(sha, str) and isinstance(step, str):
+                    if (candidate := candidates.get((folder, owner))) is not None:
+                        candidate.update(sha=sha, step=step, end="killed")
+            else:
+                folders, end = row.get("suite_folders"), row.get("end")
+                if isinstance(folders, list) and end in ("normal", "red", "sigterm"):
+                    for folder in cast(list[object], folders):
+                        if isinstance(folder, str) and (folder, owner) in candidates:
+                            ends[folder, owner] = end
+    for key, end in ends.items():
+        if candidates[key]["end"] == "killed":
+            candidates[key]["end"] = end
+    return statuses
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    from scripts.lib.build_folders import configured_gate_root
+
+    parser = argparse.ArgumentParser(description="Read suite folders and their gate outcomes.")
+    _ = parser.add_argument("root", nargs="?", type=Path, help="suite parent (default: the configured gate root)")
+    args = parser.parse_args(argv)
+    try:
+        root = cast(Path | None, args.root)
+        for status in gate_folder_status(configured_gate_root() if root is None else root):
+            print(json.dumps(status))
+    except (OSError, ValueError) as error:
+        print(f"gate folder status: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 @dataclass(frozen=True)
 class GateTimeLimit:
     """The history supports a deadline for this run."""
@@ -460,3 +600,7 @@ def history_time_limit(connection: sqlite3.Connection, vcpus: int, modules: Sequ
     if medians:
         return GateTimeLimit(factor * max(max(medians), sum(medians) / jobs))
     return NoGateTimeLimit(f"no passing module history for {vcpus} vCPUs")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
