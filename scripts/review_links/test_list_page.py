@@ -6575,7 +6575,7 @@ window.fetch=async(_path,options={})=>{
                 for key, value in (("EDGE", edge), ("AFTER_PAGE", after), ("REMOVED_ROWS", removed)):
                     steps = steps.replace(key, json.dumps(value).replace("</", "<\\/"))
                 self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=before,
-                                             open_number=opened, window_size=(1280, 1050))
+                                             open_number=opened, window_size=(1280, 1150))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_list_refresh_preserves_the_open_row_when_the_page_fits(self) -> None:
@@ -6611,7 +6611,7 @@ window.fetch=async(_path,options={})=>{
  check(scroller.scrollHeight===scroller.clientHeight,'The scroll removes all space below the list.');
 """
         self.browser_action_sequence(steps.replace("AFTER_PAGE", json.dumps(after).replace("</", r"<\/")),
-                                     reduced_motion=True, add_item=False, markup=before, window_size=(1280, 1100))
+                                     reduced_motion=True, add_item=False, markup=before, window_size=(1280, 1200))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_list_scroll_input_removes_the_top_space_on_a_short_page(self) -> None:
