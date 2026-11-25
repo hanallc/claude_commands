@@ -1994,23 +1994,27 @@ The Studio uses the List status age limit and has no `status.studio` key.
 `/console/images.html` shows registered images with their instructions, oldest first.
 A new image goes to the end, so the cards above it keep their places.
 The console lists it as **Images**, with the Lucide `image` icon.
-A showrunner or unit registers each image, or a before and after pair, with one command:
+A showrunner or unit uses one command to register an image or a pair.
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image PATH | --before PATH --after PATH) --caption "TEXT" --owner STAFF_ID (--change ID | --phase ID) [--list-item L<n>]
+~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image PATH | --before PATH --after PATH) --title "TITLE" [--look-for "POINT"]... --owner STAFF_ID (--change ID | --phase ID) [--list-item L<n>]
 ```
 
-- The caption is the change in the fewest plain words that stay accurate. It adds a second line, `Look for: <place>`, only when the change is hard to find.
+- The title says what the image shows. Give one `--look-for` for each point the user needs to check.
+- `max_chars.image_title` in `config/review_links.conf` sets the title limit. The default is 80 characters.
 - `scripts/review_links/reply_shot.py <markdown> <columns> <png>` renders a Markdown reply in the Claude Code terminal.
   It resumes a placeholder transcript in Xvfb and xterm, so no model call happens.
   It cuts the shot at the first blank band of `reply_shot_gap_rows` pixel rows, so the page shows readable text.
   `config/review_links.conf` sets the wait, the terminal rows and the band height.
 - The owner is the staff id that made the image. The command refuses an id that is not in the staff record.
-- The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files and refuses an empty caption.
+- The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files.
+- Use one nonempty line for the title and one for each point.
 - Use `--list-item L<n>` to link the picture to a List item.
   Registration searches the current and old List folders.
   The picture record stores the List id and its keeper id.
 - It copies the image to `<review root>/images/<12-hex id>/image<suffix>` with a private `.review-link-image.json` record.
+  The record stores `title` and the `look_for` list. It also stores the full text in `caption` for older services.
+  The page uses the full `caption` as the title if the record has no `title`.
   A pair copies `before<suffix>` and `after<suffix>` to one folder with one record and one id.
   The record keeps the after image in `file` and the before image in `before`.
   It builds the folder under a private draft name, then renames it, so the page never shows a partial image.
@@ -2019,13 +2023,14 @@ A showrunner or unit registers each image, or a before and after pair, with one 
   `console.place_query` builds the query from the console's place key.
 - The server serves the copy, so the user never needs the source path.
 
-Each card shows, in this order:
+A card with an image shows these parts in order.
 
-1. The caption as the card title, in a larger font.
-2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
-3. The image link. A pair shows its two images side by side, under **Before** and **After** labels.
-4. The **Feedback** field, with `feedback_rows` rows from `config/review_links.conf`.
-5. The answer buttons: **Approved** and **Send Feedback**.
+1. The full title in normal weight at the List title size. The title wraps when it exceeds the card width.
+2. The optional points as bullets in the secondary text color.
+3. The details with aligned labels for the owner, subject, and time.
+4. The image link. A pair shows both images under **Before** and **After** labels.
+5. The **Feedback** field. `feedback_rows` in `config/review_links.conf` sets its height.
+6. The **Approved**, **Send Feedback**, and **Ask question** buttons.
 
 A plain click on a single image or either pair image opens the shared image zoom.
 The zoom centers the full image over a dark backdrop within the page view.
@@ -2047,7 +2052,8 @@ The modal dialog takes focus and uses the image's alt text as its accessible nam
 **Owner** is `<name> (<kind>)`, or `Unknown session: <id>`. **For** is `Change <id>` or `Phase <id>`.
 **Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).
 The Images page shows every waiting image, oldest first, with no age filter.
-A pair has one caption, one details block, one Feedback field and one set of answer buttons. The owner delete removes both images.
+A pair shares one title, bullet list, details block, Feedback field, and set of answer buttons.
+The owner can delete both images with one command.
 On a page 1108px or wider, a single card is 680px wide while the group panel is 300px or narrower, and a pair card is up to 1376px wide; both are centered in the images pane.
 When a pair card is narrower than 600px, its images stack, before on top.
 A page URL with `#image=<id>` opens at that card.
@@ -2094,19 +2100,22 @@ One staff id receives one message if it serves both roles.
 The server resolves each recipient to its current session at each try.
 The send uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
 An answer message gives the verdict and any feedback.
-For a current picture it also gives the image links, caption, subject and delete command.
+For a current picture it also gives the image links, the title, the look-for points, the subject, and the delete command.
+The question message also includes the title and the look-for points.
 For a removed picture it gives the picture id.
-The message includes the List id when the picture has one.
+The message includes the List id for a linked picture.
 
 A private answer record outside the picture folder saves the words, delivery key and confirmed recipients.
 A retry uses the saved delivery key and sends only to recipients that have no confirmation.
 The live picture gets `feedback_at` after all recipients confirm the send.
 The page then hides the card unless a new question answer needs review.
-Delete saves the picture reference in the same private store before it removes the picture folder.
+Delete saves the picture reference, title, and look-for points before it removes the picture folder.
 An open card can still send an answer after deletion.
 The page shows **This picture was removed; your words went to <owner name>.**
 If a save or delivery fails, the server answers 503 and names the step or recipient.
-On reload, each pending answer for a removed picture shows its words, **Not sent yet**, and a **Retry** button.
+On reload, each pending answer for a removed picture shows its saved title and look-for points.
+It also shows the saved words, **Not sent yet**, and a **Retry** button.
+Older records without a saved title show the picture id.
 The page also shows Retry if the picture folder remains after its record is removed.
 The retry card leaves the page when delivery is confirmed.
 The browser keeps editable drafts separate from saved answer attempts.

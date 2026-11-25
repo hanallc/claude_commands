@@ -39,9 +39,13 @@ class ImageReference(TypedDict):
     list_keeper: NotRequired[str]
 
 
-class ImageRecord(ImageReference):
+class ImageHeading(TypedDict):
+    title: str
+    look_for: list[str]
+
+
+class ImageRecord(ImageReference, ImageHeading):
     file: str
-    caption: str
     subject: str
     # A pair keeps its second image in file and its first image here.
     before: NotRequired[str]
@@ -59,6 +63,7 @@ class ImageAnswer(TypedDict):
 
 
 class ImageAnswers(ImageReference):
+    heading: NotRequired[ImageHeading]
     attempts: dict[str, ImageAnswer]
 
 
@@ -81,8 +86,9 @@ def image_reference(fields: dict[str, object], identity: str) -> ImageReference:
     return reference
 
 
-def new_answers(record: ImageReference) -> ImageAnswers:
+def new_answers(record: ImageRecord) -> ImageAnswers:
     answers: ImageAnswers = {"id": record["id"], "owner": record["owner"], "registered_at": record["registered_at"],
+                             "heading": {"title": record["title"], "look_for": record["look_for"]},
                              "attempts": {}}
     if "list_item" in record:
         answers["list_item"] = record["list_item"]
@@ -118,6 +124,13 @@ def _texts(value: object) -> list[str]:
     return cast(list[str], value)
 
 
+def _image_heading(title: object, lines: object, identity: str) -> ImageHeading:
+    if (not isinstance(title, str) or not isinstance(lines, list)
+            or not all(isinstance(line, str) for line in cast(list[object], lines))):
+        raise ValueError(f"{identity}: invalid image title or look-for points")
+    return {"title": title, "look_for": cast(list[str], lines)}
+
+
 def read_answers(directory: Path, identity: str) -> ImageAnswers:
     """Read the saved picture reference and answer attempts."""
     fields = delivery_state.read_fields(_answers_path(directory, identity))
@@ -125,6 +138,12 @@ def read_answers(directory: Path, identity: str) -> ImageAnswers:
     if not isinstance(attempts, dict):
         raise ValueError(f"{identity}: invalid image answer record")
     answers: ImageAnswers = {**image_reference(fields, identity), "attempts": {}}
+    if "heading" in fields:
+        value = fields["heading"]
+        if not isinstance(value, dict):
+            raise ValueError(f"{identity}: invalid image heading")
+        heading = cast(dict[str, object], value)
+        answers["heading"] = _image_heading(heading.get("title"), heading.get("look_for"), identity)
     for key, attempt in cast(dict[str, object], attempts).items():
         if not isinstance(attempt, dict):
             raise ValueError(f"{identity}: invalid image answer attempt")
@@ -151,11 +170,11 @@ def read_record(folder: Path) -> ImageRecord:
     if folder.is_symlink() or (folder / RECORD).is_symlink():
         raise ValueError(f"{folder.name}: not a regular image record")
     fields = delivery_state.read_fields(folder / RECORD)
-    texts = ("file", "caption", "subject")
-    if any(not isinstance(fields.get(key), str) for key in texts):
+    title = fields.get("title", fields.get("caption"))
+    if not isinstance(file := fields.get("file"), str) or not isinstance(subject := fields.get("subject"), str):
         raise ValueError(f"{folder.name}: invalid image record")
-    record: ImageRecord = {**image_reference(fields, folder.name), "file": cast(str, fields["file"]),
-                           "caption": cast(str, fields["caption"]), "subject": cast(str, fields["subject"])}
+    record: ImageRecord = {**image_reference(fields, folder.name), "file": file, "subject": subject,
+                           **_image_heading(title, fields.get("look_for", []), folder.name)}
     for key in ("before", "feedback_at"):
         value = fields.get(key)
         if value is not None and not isinstance(value, str):
@@ -176,7 +195,14 @@ def read_record(folder: Path) -> ImageRecord:
 
 
 def write_record(folder: Path, record: ImageRecord) -> None:
-    atomic_file.write_bytes_atomic(folder / RECORD, json.dumps(record).encode("utf-8"), mode=0o600)
+    # Older services require a caption. Keep all the text if they save the record.
+    caption = "\n".join((record["title"], *look_for_message_lines(record)))
+    atomic_file.write_bytes_atomic(folder / RECORD, json.dumps({**record, "caption": caption}).encode("utf-8"), mode=0o600)
+
+
+def look_for_message_lines(record: ImageHeading) -> tuple[str, ...]:
+    lines = record["look_for"]
+    return ("Look for:", *(f"- {line}" for line in lines)) if lines else ()
 
 
 @dataclass(frozen=True)
@@ -222,9 +248,9 @@ class ImageQuestionStore:
             write_record(folder, record)
 
 
-def register_file(image: Path, folder: Path, caption: str = "", owner: str = "", subject: str = "",
-                  *, before: Path | None = None, identity: str = "", private: bool = False,
-                  list_item: str | None = None, list_keeper: str | None = None) -> ImageRecord:
+def register_file(image: Path, folder: Path, title: str = "", owner: str = "", subject: str = "",
+                  *, look_for: tuple[str, ...] = (), before: Path | None = None, identity: str = "",
+                  private: bool = False, list_item: str | None = None, list_keeper: str | None = None) -> ImageRecord:
     """Publish one image or a pair with one record and one atomic folder rename."""
     if list_item is not None and not _LIST_ITEM_ID.fullmatch(list_item):
         raise ValueError("Use a List item id such as L324.")
@@ -244,7 +270,7 @@ def register_file(image: Path, folder: Path, caption: str = "", owner: str = "",
         files = {stem: stem + source.suffix.casefold() for stem, source in sources}
         # The last source is the after image of a pair, or the single image.
         record: ImageRecord = {"id": identity, "file": files[sources[-1][0]],
-                               "caption": caption.strip(), "owner": owner, "subject": subject,
+                               "title": title.strip(), "look_for": list(look_for), "owner": owner, "subject": subject,
                                "registered_at": datetime.now(UTC).isoformat(timespec="seconds")}
         if "before" in files:
             record["before"] = files["before"]
