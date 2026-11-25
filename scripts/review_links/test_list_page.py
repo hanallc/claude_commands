@@ -47,7 +47,7 @@ from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import (browser_test_support, console, go_ledger, list_page, page_frame, serve, staff_names,
                                   studio_page)
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
-from scripts.review_links import review_items, review_link, review_page, search_fold, send_hold
+from scripts.review_links import review_items, review_link, review_page, review_submissions, search_fold, send_hold
 from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
 from scripts.review_links.server_test_support import started_review_server
 from scripts.review_links.test_change_page import BrowserForms
@@ -2586,6 +2586,46 @@ frame.addEventListener('load',async()=>{
                 self.assertEqual('<section class="list-field-latest_status">' in left, shows_status)
                 if shows_status:
                     self.assertIn(f"<p>{status}</p>", left)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_report_page_details_open_separately_from_the_screenshot(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        words = "The menu hides choices."
+        viewport = new_item_dialog.PageViewport(1440, 900, True)
+        state = new_item_dialog.BugPageState(
+            "http://127.0.0.1/console/list.html", viewport,
+            0.25, ("One menu option is missing.",), (), "Show All", True, "The List")
+        request = new_item_dialog.NewItemRequest(
+            f"r1-{uuid4().hex}-bug-{MORTY.id}", new_item_dialog.SubmissionKind.BUG, MORTY.id,
+            words, new_item_dialog.NoEvidence(), page_state=state)
+        saved = review_submissions.submit(
+            request, screenshot=new_item_dialog.PageScreenshot(base64.b64decode(PNG), viewport))
+        native = saved.record
+        assert isinstance(native, investigation.Investigation)
+        report = the_list.ListReport(the_list.ReportKind.BUG, review_items.investigation_record_key(native), words,
+                                     saved.key)
+        _ = the_list.file_report(MORTY.id, report, native.title, owner=OWNER.id, producer=DWIGHT.id,
+                                 unit="", source="nate")
+        self.browser_action_sequence(r"""
+ const box=recordDetails(row).querySelector('[data-submission-page-state]');
+ const details=box.querySelector('details'),summary=details.querySelector('summary');
+ const table=details.querySelector('dl'),thumbnail=box.querySelector('figure img');
+ check(!details.open && summary.textContent==='Page details' && box.innerText.includes('Screenshot of The List') &&
+  !box.innerText.includes('Show All') && thumbnail.getClientRects().length,
+  'Page details start closed and the picture stays visible.');
+ const style=getComputedStyle(box);
+ check(style.paddingBlockStart==='12px' && style.paddingInlineStart==='14px' && style.marginBlockStart==='12px',
+  'The report card has padding and space above it.');
+ summary.click();
+ check(details.open && table.innerText.includes('Show All') && table.innerText.includes('0.25 s'),
+  'The disclosure shows the saved page details.');
+ summary.click();
+ thumbnail.click();
+ const zoom=document.querySelector('[data-image-zoom-dialog]');
+ check(zoom.open && zoom.querySelector('img').src===thumbnail.src && !details.open,
+  'The picture opens the shared zoom with the original attachment.');
+""", add_item=False, window_size=(1440, 1000))
 
     def test_log_shows_the_recorded_clock_time_once(self) -> None:
         log = self.legacy_log('- 2026-11-16 18:20:00+00:00 Updated state: "Working" — morty, 09:00 CST')

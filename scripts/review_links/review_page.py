@@ -365,6 +365,9 @@ def retain_record_assets(item: ReviewItem, status: change_page.DeliveryStatus,
 
 SUBMISSION_EVIDENCE_STYLE = """
 .review-attachments img{max-width:min(240px,100%);max-height:160px;object-fit:contain;margin-inline-end:8px}
+.page-state-box[data-submission-page-state]{margin:12px 0 0;padding:12px 14px}
+[data-submission-page-state]>details>summary{min-height:24px}
+[data-submission-page-state] .page-state{margin-top:8px}
 [data-submission-page-state] img{max-width:min(420px,100%);max-height:270px;object-fit:contain}
 """
 
@@ -417,7 +420,7 @@ def attachment_url(key: str, image: new_item_dialog.ImageReference) -> str:
 
 
 def bug_page_state_box(key: str, state: new_item_dialog.BugPageState, title: str, captured: bool) -> str:
-    """Show the state from the Bug and its screenshot thumbnail."""
+    """Show the Bug screenshot and keep the page details in a disclosure."""
     errors: list[str] = []
     for count, label in ((len(state.notices), 'error line'), (len(state.script_errors), 'script error')):
         if count:
@@ -432,10 +435,10 @@ def bug_page_state_box(key: str, state: new_item_dialog.BugPageState, title: str
     if captured:
         url = attachment_url(key, review_submissions.PAGE_SCREENSHOT)
         caption = html.escape('Screenshot of '+title, quote=True)
-        figure = (f'<figure><a href="{url}" target="_blank" rel="noopener">'
+        figure = (f'<figure><a data-image-zoom href="{url}" target="_blank" rel="noopener">'
                   f'<img src="{url}" loading="lazy" alt="{caption}"></a><figcaption>{caption}</figcaption></figure>')
-    return ('<section class="page-state-box" data-submission-page-state><h4>Page state</h4>'
-            f'<dl class="page-state">{fields}</dl>{figure}</section>')
+    return ('<section class="page-state-box" data-submission-page-state><details><summary>Page details</summary>'
+            f'<dl class="page-state">{fields}</dl></details>{figure}</section>')
 
 
 def card_entry(item: ReviewItem, members: staff.StaffSnapshot, names: staff_names.StaffNames,

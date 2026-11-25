@@ -3499,6 +3499,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         from scripts.review_links.test_review_submissions import EVIDENCE
 
         folder, cache, request = self.page_bug_fixture()
+        morty = fixture_member("producer", name="morty")
+        _ = conf.path("producer_map").write_text(f"{request.recipient_id} = {morty.id}\n", encoding="utf-8")
         standard = replace(request, page="", page_state=None, evidence=EVIDENCE)
         handler = cast(type[serve.ReviewLinksHandler], self.server.RequestHandlerClass)
         respond = handler.json_response
@@ -3533,7 +3535,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         assert isinstance(origin, new_item_dialog.ReviewSubmission)
         self.assertEqual(origin.evidence, EVIDENCE)
         self.assertEqual(origin.bug_page_data, request.evidence)
-        self.assertIn(b"Page state", cache.get().body(key))
+        self.assertIn(b"<summary>Page details</summary>", cache.get().body(key))
         self.assertEqual(json.loads(path.read_text())["request_id"], origin.request_id)
         self.assertEqual(len(investigation.records(request.recipient_id)), 1)
 
@@ -3541,6 +3543,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         from scripts.review_links.test_review_submissions import EVIDENCE, PNG
 
         folder, cache, request = self.page_bug_fixture()
+        morty = fixture_member("producer", name="morty")
+        _ = conf.path("producer_map").write_text(f"{request.recipient_id} = {morty.id}\n", encoding="utf-8")
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={request.recipient_id}\n")
         state = request.page_state
         assert state is not None
@@ -3570,7 +3574,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         assert isinstance(origin, new_item_dialog.ReviewSubmission)
         self.assertEqual(origin.evidence, EVIDENCE)
         self.assertEqual(origin.bug_page_data, request.evidence)
-        self.assertIn(b"Screenshot of List", cache.get().body(key))
+        body = cache.get().body(key)
+        self.assertIn(b"<summary>Page details</summary>", body)
+        self.assertIn(b"Screenshot of List", body)
         path, = folder.glob("*.json")
         self.assertEqual(json.loads(path.read_text())["screenshot"], review_submissions.PAGE_SCREENSHOT.id)
         self.assertEqual(self.request(review_page.ATTACHMENT_PATH + "?" + urlencode(
@@ -3682,6 +3688,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         from scripts.review_links.test_review_submissions import EVIDENCE
 
         folder, cache, request = self.page_bug_fixture()
+        morty = fixture_member("producer", name="morty")
+        _ = conf.path("producer_map").write_text(f"{request.recipient_id} = {morty.id}\n", encoding="utf-8")
         request = replace(request, request_id="r6-" + uuid4().hex)
         standard = replace(request, page="", page_state=None, evidence=EVIDENCE)
         handler = cast(type[serve.ReviewLinksHandler], self.server.RequestHandlerClass)
@@ -3717,7 +3725,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         assert isinstance(origin, new_item_dialog.ReviewSubmission)
         self.assertEqual(origin.evidence, EVIDENCE)
         self.assertIsNone(origin.bug_page_data)
-        self.assertNotIn(b"Page state", cache.get().body(key))
+        self.assertNotIn(b"<summary>Page details</summary>", cache.get().body(key))
         self.assertEqual(len(investigation.records(request.recipient_id)), 1)
 
     def test_edited_send_resumes_publication_of_the_first_bug(self) -> None:
