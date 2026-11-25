@@ -2474,6 +2474,7 @@ fi
         read_started = Event()
         release_read = Event()
         expire_join = Event()
+        preparation_join_timeouts: list[float | None] = []
         output = io.StringIO()
         read = conf.read
 
@@ -2484,7 +2485,8 @@ fi
                 raise TimeoutError('the fixture released the stalled read')
             return read(file)
 
-        def join_preparation(**_timing: float) -> None:
+        def join_preparation(timeout: float | None = None) -> None:
+            preparation_join_timeouts.append(timeout)
             guard.event(expire_join)
 
         with (guard.protect(), redirect_stdout(output), redirect_stderr(output),
@@ -2492,12 +2494,15 @@ fi
               patch.object(mac_linux, 'monotonic', return_value=0.0), ExitStack() as threads):
             def new_thread(*, target: Callable[[], None], daemon: bool) -> Thread:
                 worker = Thread(target=target, daemon=daemon)
+                if target.__name__ == 'prepare':
+                    self.assertTrue(worker.daemon, 'The stalled read must let the process exit.')
+                elif target.__name__ == 'collect':
+                    self.assertFalse(worker.daemon, 'The collector must keep the process alive to report the timeout.')
                 _ = threads.callback(guard.join, worker)
                 if target.__name__ == 'prepare':
                     _ = threads.callback(release_read.set)
                     _ = threads.enter_context(patch.object(worker, 'join', join_preparation))
                 elif target.__name__ == 'collect':
-                    self.assertFalse(daemon)
                     # Let the collector warn before releasing the read.
                     _ = threads.callback(expire_join.set)
                 return worker
@@ -2506,6 +2511,7 @@ fi
             self.check_folder_report_stream()
             guard.event(read_started)
             print('Guest result returned.', flush=True)
+        self.assertEqual(preparation_join_timeouts, [2.0], 'The join must end by the guest deadline.')
         self.assertEqual(output.getvalue().splitlines(), [
             'Guest result returned.',
             'Mac Linux guest queue report failed: the queue report configuration read timed out',
