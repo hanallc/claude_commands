@@ -48,6 +48,7 @@ from typing import IO, TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict,
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
+from scripts.direct import recorder_state
 from scripts.lib import atomic_file, conf, process_group, process_start, process_stop, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.python_startup.sitecustomize import startup_pythonpath
@@ -2144,7 +2145,7 @@ def command_start(args: argparse.Namespace) -> int:
           + "its result arrives as your next message", flush=True)
     try:
         _ = prune_finished(runs)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, recorder_state.OldRecorderState) as error:
         print(f"detached_runs: could not prune finished runs in {runs}: {error}", file=sys.stderr)
     return 0
 
@@ -2484,7 +2485,6 @@ def _deliver(record: RunRecord, result: CommandResult, *,
 
         def read_pass(selected: staff.StaffRow, selected_membership: staff.StaffSnapshot
                       ) -> tuple[ResultPassOwnership, dict[str, object]]:
-            from scripts.direct import recorder_state
             from scripts.herdr import worker_panes
 
             if record.get("pane_dispatch_id") == "":

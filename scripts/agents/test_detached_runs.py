@@ -40,7 +40,7 @@ from scripts.agents import detached_run_process, detached_runs, pane_record, wor
 from scripts.agents.detached_runs import deliver_in_fresh_process
 from scripts.buildlog import treekey
 from scripts.build_hold import build_hold, hold_enforcer, shared_state_defaults
-from scripts.direct import progress_history
+from scripts.direct import progress_history, recorder_state
 from scripts.lib import atomic_file, conf, process_group, process_start, process_stop, unit_runs
 from scripts.lib.unit_runs_test_support import start_new_command
 from scripts.lib.atomic_file import write_text_atomic
@@ -484,12 +484,19 @@ class DetachedRunsTests(unittest.TestCase):
                     self.assertEqual(original.read_bytes(), legacy_before)
 
     def test_start_reports_the_run_when_prune_fails(self) -> None:
+        self.assert_start_reports_the_run_when_prune_fails(PermissionError("fixture cannot delete a run log"))
+
+    def test_start_reports_the_run_when_prune_finds_old_recorder_state(self) -> None:
+        self.assert_start_reports_the_run_when_prune_fails(
+            recorder_state.OldRecorderState(self.session / recorder_state.STATE_FILENAME))
+
+    def assert_start_reports_the_run_when_prune_fails(self, error: Exception) -> None:
         def fail_prune(runs: Path) -> list[str]:
             spawn.assert_called_once()
             record, = runs.glob("*.json")
             saved = cast(detached_runs.RunRecord, json.loads(record.read_text()))
             self.assertEqual((saved["status"], saved["pid"]), ("running", 4321))
-            raise PermissionError("fixture cannot delete a run log")
+            raise error
 
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD_ONE}),
               patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)) as spawn,
@@ -503,7 +510,7 @@ class DetachedRunsTests(unittest.TestCase):
         record, = runs.glob("*.json")
         prune.assert_called_once_with(runs)
         self.assertIn(f"run {record.stem} started detached for {WORKER} (pid 4321,", output.getvalue())
-        self.assertIn("fixture cannot delete a run log", errors.getvalue())
+        self.assertEqual(errors.getvalue().splitlines(), [f"detached_runs: could not prune finished runs in {runs}: {error}"])
 
     def test_start_refuses_systemd_run_without_an_exact_scope_prefix(self) -> None:
         for command in (

@@ -2826,15 +2826,9 @@ class OutsideQueueScan:
         waiters = (row for _, row in inputs.ordered) if for_table else ()
         pending = [row["pid"] for row in (*inputs.reservations, *waiters)
                    if (owner := processes.get(row["pid"])) is not None and owner.start == row["start_time"]]
-        if inputs.running:
-            try:
-                boot = read_boot_time(PROC)
-            except (OSError, ValueError, IndexError, StopIteration):
-                boot = None
-            pending.extend(step.pid for step in inputs.running if isinstance(step.pid, int)
-                           and (process := processes.get(step.pid)) is not None and not process.zombie
-                           and (step.started_at == 0 or (boot is not None
-                                and boot + int(process.start) / self.ticks_per_second <= step.started_at)))
+        pending.extend(run.pid for step in inputs.running if isinstance(run := step.run, LiveBuildRun)
+                       and (process := processes.get(run.pid)) is not None and not process.zombie
+                       and process.start == run.start_time)
         self.queue_ancestors: set[int] = set()
         if for_table:
             scope_pids = {pid for source in sources for pid in source.members if pid in processes
