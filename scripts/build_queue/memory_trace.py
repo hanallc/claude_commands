@@ -42,6 +42,9 @@ _POLICY_SETTINGS = {
     "shutdown_timeout_seconds": ("worker.shutdown_timeout_seconds", 1, 60),
 }
 
+# Each general trace can use two slots. Allow general traces to use at most half of all slots.
+_GENERAL_TRACE_LIMIT_DIVISOR = 4
+
 
 @dataclass(frozen=True)
 class MemoryTracePolicy:
@@ -181,7 +184,7 @@ class TraceHeader:
         _ = _name(self.shape_key, _SHAPE_NAME)
         _ = _integer(self.scope_started_at_ms)
         _ = _integer(self.sample_interval_ms, minimum=1)
-        _ = _integer(self.compile_reserve_bytes, minimum=1)
+        _ = _integer(self.compile_reserve_bytes, minimum=1 if self.general is None else 0)
         if self.general is not None and self.shape_key != shape_key(self.general):
             raise ValueError("trace shape key differs from the general shape")
 
@@ -764,27 +767,32 @@ class TraceStore:
     def peaks_for(self, identifiers: set[str]) -> dict[str, int]:
         """Read sample peaks for the requested reservations."""
         peaks: dict[str, int] = {}
+        remaining = {identifier for identifier in identifiers if _RESERVATION_NAME.fullmatch(identifier)}
 
-        def record(trace: MemoryTrace) -> None:
-            identifier = trace.header.reservation_id
-            peak = max((sample.program_bytes for sample in (*trace.compile_samples, *trace.test_samples)), default=-1)
-            if peak >= 0:
-                peaks[identifier] = max(peaks.get(identifier, 0), peak)
+        def record(trace: MemoryTrace) -> bool:
+            peak = max((sample.program_bytes for sample in (*trace.compile_samples, *trace.test_samples)), default=None)
+            if peak is None:
+                return False
+            peaks[trace.header.reservation_id] = peak
+            return True
 
-        if not identifiers:
+        if not remaining:
             return peaks
         for folder in _directory_entries(self.root / "finished"):
-            if _SHAPE_NAME.fullmatch(folder.name):
-                for candidate in _finished_files(_directory_entries(folder)):
-                    if candidate.reservation_id in identifiers:
-                        trace = self._read_finished(candidate, folder.name)
-                        if trace is not None:
-                            record(trace)
-        for identifier in identifiers - peaks.keys():
-            if _RESERVATION_NAME.fullmatch(identifier):
-                trace = self.read_live(identifier)
-                if isinstance(trace, MemoryTrace):
-                    record(trace)
+            if not _SHAPE_NAME.fullmatch(folder.name):
+                continue
+            for candidate in _finished_files(_directory_entries(folder)):
+                if candidate.reservation_id not in remaining:
+                    continue
+                trace = self._read_finished(candidate, folder.name)
+                if trace is not None and record(trace):
+                    remaining.remove(candidate.reservation_id)
+                    if not remaining:
+                        return peaks
+        for identifier in remaining:
+            trace = self.read_live(identifier)
+            if isinstance(trace, MemoryTrace):
+                _ = record(trace)
         return peaks
 
     def recover_abandoned(self) -> None:
@@ -1399,6 +1407,7 @@ class TraceWorker:
         self._shutdown_at: float | None = None
         self._queue_full = False
         self._tracked: dict[str, int | TestReserveUnavailable] = {}
+        self._general: set[str] = set()
         self._reserves_ready = False
         self.thread = Thread(target=self._run, name="admission-memory-traces", daemon=True)
         try:
@@ -1419,13 +1428,20 @@ class TraceWorker:
                 if self._reserves_ready:
                     self._ready.notify()
                 return
-            if command.reservation_id in self._tracked:
+            identifier = command.reservation_id
+            if identifier in self._tracked or identifier in self._general:
+                return
+            general = isinstance(command.shape, GeneralTraceShape)
+            limit = self.capture.store.policy.max_pending_commands
+            if general and len(self._general) >= limit // _GENERAL_TRACE_LIMIT_DIVISOR:
                 return
             # Each grant needs a command slot and a slot for its release.
-            if len(self._commands) + len(self._tracked) + 2 > self.capture.store.policy.max_pending_commands:
+            if len(self._commands) + len(self._tracked) + 2 > limit:
                 self._queue_full = True
             else:
-                self._tracked[command.reservation_id] = TestReserveUnavailable()
+                self._tracked[identifier] = TestReserveUnavailable()
+                if general:
+                    self._general.add(identifier)
                 self._commands.append(command)
             self._ready.notify()
 
@@ -1445,6 +1461,7 @@ class TraceWorker:
         with self._ready:
             identifier = release.reservation_id
             if identifier in self._tracked:
+                self._general.discard(identifier)
                 return replace(release, test_reserve=self._tracked.pop(identifier))
         return None
 
@@ -1462,6 +1479,8 @@ class TraceWorker:
             command: TraceCommand | None = None
             if self._commands:
                 command = self._commands.popleft()
+                if isinstance(command, TraceRelease):
+                    self._general.discard(command.reservation_id)
             elif self._reserves_ready:
                 command = {identifier: reserve for identifier, reserve in self._tracked.items() if isinstance(reserve, int)}
                 self._reserves_ready = False
@@ -1491,6 +1510,7 @@ class TraceWorker:
                 shutdown_at, self._shutdown_at = self._shutdown_at, 0
                 self._commands.clear()
                 self._tracked.clear()
+                self._general.clear()
             self.capture.close(seal_until=shutdown_at or 0)
 
     def close(self) -> None:

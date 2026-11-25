@@ -6263,14 +6263,43 @@ class QueueLifecycleTests(unittest.TestCase):
                 self.assertEqual(row["reservation_id"], grant.reservation)
                 self.assertEqual((row["need"], row["room"], row["loan"], row["fit"]), (need, 2 * GIB, GIB, fit))
 
-    def test_an_outbox_admission_saved_without_passed_decodes_as_not_recorded(self) -> None:
-        saved = cast(dict[str, object], codec.snapshot_value(
-            service.PendingAdmission("episode", "measured", True, 1.0, gate.PassedRows(1, 0, 0, 0, 0, 0),
-                                     room=11, loan=3, fit="loan")))
-        for key in ("passed", "room", "loan", "fit"):
-            del saved[key]
-        pending = codec.parse_snapshot_value(saved, service.PendingAdmission)
-        self.assertEqual(pending, service.PendingAdmission("episode", "measured", True, 1.0, gate.PassedNotRecorded()))
+    def test_loan_calculation_failure_keeps_the_grant(self) -> None:
+        with AdmissionFixture() as fixture:
+            with (mock.patch.object(records, "growth_loan_bytes", side_effect=RuntimeError("fixture fault")) as loan,
+                  redirect_stderr(io.StringIO()) as journal):
+                grant = only_admitted(fixture.server.handle_request(fixture.request(step="lint")))
+            loan.assert_called_once()
+            self.assertEqual(journal.getvalue().splitlines().count(
+                "memory admission: cannot calculate the growth loan: fixture fault"), 1)
+            row, = self.events(fixture, "admitted")
+            self.assertEqual(row["reservation_id"], grant.reservation)
+            self.assertFalse({"room", "loan", "fit"} & row.keys())
+
+    def test_continuation_grant_omits_fit_when_memory_is_unavailable(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            grant = only_admitted(fixture.server.handle_request(fixture.request(run=run, need=6 * GIB)))
+            fixture.release(grant)
+            fixture.readings.host_path.unlink()
+            successor = fixture.request(run=run, need=6 * GIB)
+            continuation = only_admitted(fixture.server.handle_request(successor))
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            self.assertIsInstance(result.policy.room, records.ReadingUnavailable)
+            row = self.events(fixture, "admitted")[-1]
+            self.assertEqual(row["reservation_id"], continuation.reservation)
+            self.assertFalse({"room", "loan", "fit"} & row.keys())
+
+    def test_outbox_admission_loads_with_and_without_telemetry(self) -> None:
+        current = service.PendingAdmission("episode", "measured", True, 1.0, gate.PassedRows(1, 0, 0, 0, 0, 0),
+                                           service.AdmissionFit(11, 3, "loan"))
+        state = service.ServiceState({}, {}, {}, records.ReadyToStart(), lifecycle_outbox=(current,))
+        saved = cast(dict[str, object], codec.snapshot_value(state))
+        entries = cast(list[dict[str, object]], saved["lifecycle_outbox"])
+        entries.append({key: value for key, value in entries[0].items() if key not in ("passed", "memory_fit")})
+        loaded = service.parse_service_state(json.dumps(saved))
+        self.assertEqual(loaded.lifecycle_outbox, (current,
+            replace(current, passed=gate.PassedNotRecorded(), memory_fit=None)))
 
     def test_admission_recovery_keeps_one_event_for_the_durable_grant(self) -> None:
         for boundary in ("after_state_write", "after_admitted_append"):
@@ -11272,11 +11301,11 @@ class ScopedMemoryTrace:
 
 class MemoryTraceCaptureTests(unittest.TestCase):
     def grant(self, fixture: AdmissionFixture, *, repository: str = "hana",
-              step: str = "nextest", scoped: bool = True,
+              step: str = "nextest", scoped: bool = True, need: int = 8 * GIB,
               argv: tuple[str, ...] = ("cargo", "nextest", "run", "--test-threads", "8"),
               policy: memory_trace.MemoryTracePolicy = TRACE_POLICY) -> ScopedMemoryTrace:
         server = fixture.server
-        request = fixture.request(step=step, width=records.RequestedTestWidth(8))
+        request = fixture.request(step=step, need=need, width=records.RequestedTestWidth(8))
         sidecar = fixture.root / f"sample-{request.owner.pid}.cgroup"
         request = replace(request, sidecar=str(sidecar) if scoped else "",
                           argv=argv,
@@ -11398,6 +11427,20 @@ class MemoryTraceCaptureTests(unittest.TestCase):
             self.assertEqual(trace.state.coverage, memory_trace.WholeRun())
             path, = (run.store.root / "finished").glob(f"*/*-{run.grant.reservation}.jsonl")
             print(f"General lint trace, 31 samples over 60 seconds: {path.stat().st_size} bytes")
+
+    def test_zero_need_scoped_steps_record_only_general_traces(self) -> None:
+        for repository, step in (("fixture", "lint"), ("hana", "nextest")):
+            with self.subTest(step=step), AdmissionFixture() as fixture:
+                run = self.grant(fixture, repository=repository, step=step, need=0)
+                self.drive(fixture, run, 3, ((2.5, lambda: fixture.release(run.grant)),))
+                if step == "lint":
+                    trace = self.sealed(run)
+                    self.assertEqual(trace.header.compile_reserve_bytes, 0)
+                    self.assertIsNotNone(trace.header.general)
+                    self.assertEqual([sample.elapsed_ms for sample in trace.compile_samples], [0, 2000])
+                else:
+                    self.assertEqual(list(run.store.root.glob("*/*/*.jsonl")), [])
+                    self.assertIsInstance(run.store.read_live(run.grant.reservation), memory_trace.TraceUnavailable)
 
     def test_full_read_publishes_while_release_seal_is_blocked(self) -> None:
         with AdmissionFixture() as fixture:
@@ -11635,6 +11678,23 @@ class MemoryTraceCaptureTests(unittest.TestCase):
                 self.drive(fixture, run, 2, ((1, release),))
             self.assertIn("command queue is full", error_output.getvalue())
             self.assertEqual([sample.elapsed_ms for sample in self.sealed(run).compile_samples], [0])
+
+    def test_general_trace_commands_leave_capacity_for_hana(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture, repository="fixture", step="lint")
+            worker = self.trace_worker(run)
+            commands = worker._commands  # pyright: ignore[reportPrivateUsage]
+            general, = commands
+            assert isinstance(general, memory_trace.TraceGrant)
+            worker.submit(replace(general, reservation_id="general-2"))
+            worker.submit(replace(general, reservation_id="general-3"))
+            worker.submit(replace(general, reservation_id="general-4"))
+            worker.release("general-2", fixture.clock.now(), 0)
+            worker.submit(replace(general, reservation_id="general-5"))
+            hana = memory_trace.HanaTraceShape("natedev", "hana", ("cargo", "nextest"), records.RequestedTestWidth(8))
+            worker.submit(replace(general, reservation_id="hana", shape=hana))
+            self.assertEqual([entry.reservation_id for entry in commands if isinstance(entry, memory_trace.TraceGrant)],
+                             [run.grant.reservation, "general-2", "hana"])
 
     def test_full_queue_keeps_the_first_test_reserve(self) -> None:
         with AdmissionFixture() as fixture:
