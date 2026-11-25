@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 import fcntl
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -217,42 +218,52 @@ def attached_gate_images(folder: Path, *, timeout: float = HDIUTIL_TIMEOUT_S) ->
     return attached
 
 
-def gate_image_target(folder: Path, image: dict[str, object]) -> tuple[str, Path]:
+def gate_image_entities(image: dict[str, object]) -> list[dict[str, object]]:
     entities = image.get('system-entities')
+    return [ledger.mapping(entry) for entry in cast(list[object], entities)] if isinstance(entities, list) else []
+
+
+def gate_image_target(folder: Path, image: dict[str, object]) -> tuple[str, Path]:
     devices: set[str] = set()
     mounts: list[Path] = []
-    if isinstance(entities, list):
-        for entry in cast(list[object], entities):
-            entity = ledger.mapping(entry)
-            device = entity.get('dev-entry')
-            if isinstance(device, str) and re.fullmatch(r'/dev/disk[0-9]+', device):
-                devices.add(device)
-            if 'mount-point' in entity:
-                point = entity['mount-point']
-                if not isinstance(point, str) or not Path(point).is_absolute():
-                    raise GateRefused(f'Invalid mount point for {image["image-path"]}: {point}')
-                mount = Path(point).resolve()
-                if mount == folder or not mount.is_relative_to(folder):
-                    raise GateRefused(f'Mount outside the gate folder for {image["image-path"]}: {mount}')
-                if mount.is_mount():
-                    mounts.append(mount)
+    for entity in gate_image_entities(image):
+        device = entity.get('dev-entry')
+        if isinstance(device, str) and re.fullmatch(r'/dev/disk[0-9]+', device):
+            devices.add(device)
+        if 'mount-point' in entity:
+            point = entity['mount-point']
+            if not isinstance(point, str) or not Path(point).is_absolute():
+                raise GateRefused(f'Invalid mount point for {image["image-path"]}: {point}')
+            mount = Path(point).resolve()
+            if mount == folder or not mount.is_relative_to(folder):
+                raise GateRefused(f'Mount outside the gate folder for {image["image-path"]}: {mount}')
+            if mount.is_mount():
+                mounts.append(mount)
     if len(devices) != 1 or not mounts:
         raise GateRefused(f'Cannot identify one disk device and a live mount for {image["image-path"]}')
     return devices.pop(), mounts[0]
 
 
-def detach_attached_gate_images(path: Path, folder: Path, retained: os.stat_result) -> None:
-    images = attached_gate_images(folder)
-    if not images:
-        return
-    settings = conf.read('mac_gate')
-    seconds = settings.number('cleanup.detach_seconds')
-    interval = settings.number('cleanup.detach_interval_seconds')
-    deadline = time.monotonic() + seconds
+def detach_gate_image(path: Path, folder: Path, retained: os.stat_result, image: dict[str, object],
+                      deadline: float, interval: float) -> list[dict[str, object]]:
+    device, mount = gate_image_target(folder, image)
+    source = image['image-path']
     busy = ''
-    while images:
-        image = images[0]
-        device, mount = gate_image_target(folder, image)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GateRefused(busy or f'The image detach time expired for {device} at {mount}')
+        try:
+            attached = attached_gate_images(folder, timeout=remaining)
+        except GateRefused as error:
+            if not busy:
+                raise
+            raise GateRefused(f'{busy}\n{error}') from error
+        current = next((entry for entry in attached if entry['image-path'] == source
+                        and any(entity.get('dev-entry') == device for entity in gate_image_entities(entry))), None)
+        if current is None:
+            break
+        _, mount = gate_image_target(folder, current)
         if not os.path.samestat(retained, path.lstat()) or path.resolve() != folder:
             raise GateRefused('The gate folder changed before image detach')
         remaining = deadline - time.monotonic()
@@ -263,11 +274,10 @@ def detach_attached_gate_images(path: Path, folder: Path, retained: os.stat_resu
         except GateRefused as error:
             raise GateRefused(f'{busy or f"Cannot detach disk image {device} at {mount}."}\n{error}') from error
         if result.returncode == 0:
-            images = attached_gate_images(folder)
-            if any(entry['image-path'] == image['image-path'] for entry in images):
+            attached = attached_gate_images(folder)
+            if any(entry['image-path'] == source for entry in attached):
                 raise GateRefused(f'Disk image {device} remains attached at {mount}. {hdiutil_detail(result)}')
-            busy = ''
-            continue
+            return attached
         detail = hdiutil_detail(result)
         if result.returncode != 16 or 'resource busy' not in detail.lower():
             raise GateRefused(f'Cannot detach disk image {device} at {mount}. {detail}')
@@ -275,13 +285,23 @@ def detach_attached_gate_images(path: Path, folder: Path, retained: os.stat_resu
         remaining = deadline - time.monotonic()
         if remaining > 0:
             time.sleep(min(interval, remaining))
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise GateRefused(busy)
-        try:
-            images = attached_gate_images(folder, timeout=remaining)
-        except GateRefused as error:
-            raise GateRefused(f'{busy}\n{error}') from error
+    return attached_gate_images(folder)
+
+
+def detach_attached_gate_images(path: Path, folder: Path, retained: os.stat_result) -> None:
+    images = attached_gate_images(folder)
+    if not images:
+        return
+    try:
+        seconds = float(os.environ['MAC_GATE_DETACH_SECONDS'])
+        interval = float(os.environ['MAC_GATE_DETACH_INTERVAL_SECONDS'])
+    except (KeyError, ValueError) as error:
+        raise GateRefused('The Mac gate cleanup has no valid detach timing') from error
+    if not all(math.isfinite(value) and value > 0 for value in (seconds, interval)):
+        raise GateRefused('The Mac gate cleanup has no valid detach timing')
+    deadline = time.monotonic() + seconds
+    while images:
+        images = detach_gate_image(path, folder, retained, images[0], deadline, interval)
 
 
 def detach_gate_images(path: Path, retained: os.stat_result) -> None:
@@ -506,12 +526,19 @@ def checkout_bundle(ssh: list[str], checkout: str, repo: Path, folder: Path,
     return [bundle]
 
 
-def checkout_cleanup_command(root: str, runner: str, checkout: str) -> str:
+def checkout_stop_command(root: str, runner: str) -> str:
+    settings = conf.read('mac_gate')
+    seconds = settings.number('cleanup.detach_seconds')
+    interval = settings.number('cleanup.detach_interval_seconds')
+    return f'MAC_GATE_DETACH_SECONDS={seconds} MAC_GATE_DETACH_INTERVAL_SECONDS={interval} {runner} stop {root}'
+
+
+def checkout_cleanup_command(root: str, stop: str, checkout: str) -> str:
     fallback = f'printf "{CheckoutCleanup.RETAINED}\\n"'
     if Path(checkout).is_absolute():
         probe = copies.path_missing_command(checkout)
         fallback = f'if {probe}; then printf "{CheckoutCleanup.REMOVED}\\n"; else {fallback}; fi'
-    return (f'if [ -f {root}/mac_gate.py ]; then {runner} stop {root}; '
+    return (f'if [ -f {root}/mac_gate.py ]; then {stop}; '
             f'else rm -rf -- {root} && {fallback}; fi')
 
 
@@ -541,11 +568,11 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
         if phase == 'cleanup-ended':
             from scripts.mac_test.mac_queue_run import MAC_GATE_SCRIPT
 
-            cleanup = f'{python} "$HOME/.claude"/{MAC_GATE_SCRIPT} stop {root}'
+            cleanup = checkout_stop_command(root, f'{python} "$HOME/.claude"/{MAC_GATE_SCRIPT}')
             if Path(checkout).is_absolute():
                 cleanup += ' ' + shlex.join(['--checkout', checkout])
         else:
-            cleanup = checkout_cleanup_command(root, runner, checkout)
+            cleanup = checkout_cleanup_command(root, checkout_stop_command(root, runner), checkout)
         result = subprocess.run([*ssh, cleanup], capture_output=True, text=True, check=False)
         outcome = result.stdout.strip()
         if result.returncode or outcome not in (CheckoutCleanup.REMOVED, CheckoutCleanup.RETAINED):
@@ -558,6 +585,7 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
             copies.unregister_remote(host, checkout)
         return 0
 
+    stop = checkout_stop_command(root, runner)
     request = cloud_gate.read(folder / 'request.json')
     local_repo = Path((folder / 'local-repo').read_text())
     owner = copies.source_owner(local_repo)
@@ -577,7 +605,7 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     if not response.startswith('mac_gate_checkout=') or not Path(checkout).is_absolute() or '\n' in checkout:
         raise GateRefused('The Mac did not confirm the gate checkout')
     write_text_atomic(checkout_file, checkout)
-    _ = argv_file.with_suffix('.json.close').write_text(checkout_cleanup_command(root, runner, checkout))
+    _ = argv_file.with_suffix('.json.close').write_text(checkout_cleanup_command(root, stop, checkout))
     mirror = copies.RemoteMirror(owner, copies.SelectedRepository(repository), host, checkout, session,
                                  task=checkout_task(Path(remote)))
     _ = argv_file.with_suffix('.json.lease').write_text(str(copies.remote_lease_path(mirror)))
