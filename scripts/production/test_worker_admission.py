@@ -456,7 +456,7 @@ class FamilyHandoffTests(StaffTestCase):
         self.assertEqual(repeated, allowed)
         self.assertEqual(self.staff_state(), before)
 
-    def test_switch_preserves_staff_graph_slot_folder_and_held_messages_before_dispatch(self) -> None:
+    def test_switch_preserves_staff_graph_build_folder_and_held_messages_before_dispatch(self) -> None:
         families: tuple[Literal["claude", "codex"], ...] = ("claude", "codex")
         for family in families:
             interrupted = family == "claude"

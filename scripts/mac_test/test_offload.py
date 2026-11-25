@@ -574,12 +574,12 @@ class LocalVersionPreflightTests(unittest.TestCase):
                     if later_match:
                         _ = (root / "box-tools.json").write_text('{"versions":{"rustc":"rustc 1.99.0"}}')
                         _ = offload.run_offload(controller, config, request, 1)
-                        claim.assert_called_once_with(controller, config, request, HANA, mock.ANY,
+                        claim.assert_called_once_with(controller, config, request, HANA,
                                                       mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
                                                       retire_wait=False)
                         self.assertFalse(eligibility.linux_version_decline_path("linux", HANA.name).exists())
                 else:
-                    claim.assert_called_once_with(controller, config, request, HANA, mock.ANY,
+                    claim.assert_called_once_with(controller, config, request, HANA,
                                                   mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
                                                   retire_wait=False)
                     self.assertFalse(offload.linux_version_declined_recently("linux", HANA.name, 60, 100))
@@ -626,14 +626,15 @@ class OffloadSettingsTests(unittest.TestCase):
               mock.patch.object(offload, "check_taken_over_claim", return_value=offload.LeftoversEnded()),
               mock.patch.object(offload, "release_claim", return_value=offload.ClaimReleaseConfirmed()) as release,
               redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
-            result = offload.leased_offload(controller, config, request, HANA, time.monotonic(), True, {1: lease})
+            result = offload.leased_offload(controller, config, request, HANA, time.monotonic(), True, lease,
+                                            admission_slot=1)
             assert isinstance(result, offload.DeclinedMacRun)
             self.assertEqual(offload.write_result(result, offload.ResultFile(result_path)), 75)
 
         self.assertEqual(claim.call_args_list, [
-            mock.call(controller, config, request, HANA, (1,), mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
+            mock.call(controller, config, request, HANA, mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
                       retire_wait=False),
-            mock.call(controller, config, replace(request, admission=offload.UnclaimedMacRun()), HANA, (1,),
+            mock.call(controller, config, replace(request, admission=offload.UnclaimedMacRun()), HANA,
                       mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY),
         ])
         release.assert_called_once_with(controller, request.target)
@@ -1084,7 +1085,7 @@ class BusyHolderTests(unittest.TestCase):
         unknown = "cannot adopt the Mac claim: unknown check\n"
         cases = (
             (12, "state", "", offload.NoWaitClaimCheck),
-            (11, "busy", "cannot adopt the Mac claim: leased slot\n", claim_state.WaitClaimCheck.LEASED_SLOT),
+            (11, "busy", "cannot adopt the Mac claim: scope\n", claim_state.WaitClaimCheck.SCOPE),
         )
         for status, reason, diagnostic, check in cases:
             with self.subTest(status=status):
@@ -1155,9 +1156,6 @@ fi
 """
         script = git.read_text().replace("#!/bin/bash\n", "#!/bin/bash\n" + origin, 1)
         self.write_executable(git, script)
-        mac_host = conf.read(self.root / "machines.conf").words("mac.hosts")[0]
-        with (self.root / "build_folders.conf").open("a", encoding="utf-8") as settings:
-            _ = settings.write(f"\n# whole: 1..\nslots.{mac_host}.{self.root.name}.max=1\n")
         holder = "last recorded mirror session reader (mirror process check)"
         self.environment.update({"TEST_FREE_NOW_FREE": "1", "TEST_RUNNER_HOLDER": holder})
         process = self.start_routing()

@@ -126,7 +126,7 @@ class QueueDiskRecoveryTests(unittest.TestCase):
                 candidates = (mac, local)
                 if disabled_linux:
                     linux = placement.PlacementCandidate(placement.PlacementDestination(
-                        "ssh", "disabled-linux", "fixture-linux", RepositoryScope("hana", "key", 1), 1))
+                        "ssh", "disabled-linux", "fixture-linux", RepositoryScope("hana", "key"), 1))
                     candidates += (linux,)
                     key = fixture.server.host_evidence_key(request, linux.destination)
                     evidence = placement.FreshHostEvidence(key, fixture.clock.now(), "linux-generation",
@@ -209,7 +209,7 @@ class StepRetryPermissionTests(unittest.TestCase):
                             configuration += f"kind.{name}=ssh\nplatform.{name}={'macos' if name == 'mac' else 'linux'}\n"
                             configuration += f"settings.{name}={name}.conf\n"
                             _ = write_config_fixture(fixture.root / f"{name}.conf",
-                                "offload=on\nlinux_only.hana=\nslots=1\nkinds=test,check,lint,doc,build,example\n",
+                                "offload=on\nlinux_only.hana=\nkinds=test,check,lint,doc,build,example\n",
                                 template="mac_test")
                         configuration += "kind.natedev=local\nplatform.natedev=linux\n"
                         _ = (fixture.root / "build_targets.conf").write_text(configuration + UNREACHABLE_WAIT_FIXTURE)

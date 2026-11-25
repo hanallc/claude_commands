@@ -37,7 +37,7 @@ class BuildSlotsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        configuration = private_slot_config(self.root, repository="widget")
+        configuration = private_slot_config(self.root)
         self.enterContext(mock.patch.dict(os.environ, configuration.environment))
         self.source = self.root / "source-folder"
         self.source.mkdir()
