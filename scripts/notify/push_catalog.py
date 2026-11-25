@@ -69,11 +69,11 @@ def snapshot_failure_values(given: dict[str, str]) -> TemplateValues:
         (read, regions), = regions_by_read.items()
         read_summary = f"a {read} read"
         sentences = f"AWS refused the {regions[0]} {read} read, because our AWS setup does not allow it yet."
-        consequence = "After 2 hours without the read, AWS merge tests can pick a region that costs more."
+        consequence = "After 2 hours without the read, test runs on AWS can pick a region that costs more."
     else:
         read_summary = f"{len(reads)} reads"
         sentences = " ".join(regional_read_refusal(read, regions) for read, regions in regions_by_read.items())
-        consequence = "After 2 hours without the reads, AWS merge tests can pick a region that costs more."
+        consequence = "After 2 hours without the reads, test runs on AWS can pick a region that costs more."
     return TemplateValues({"read_summary": read_summary, "refusals": sentences, "consequence": consequence},
                           dict(given))
 
@@ -280,8 +280,8 @@ ENTRIES = (
          PushExample("safety", {"accounts": "claude4: Mac Sat 11-28"})),
         purpose="The weekly sitting or safety margin requires a preventive Claude login.", header=False),
     PushText("aws.snapshot_failed", "buildlog", "note", "AWS refused {read_summary}",
-        ActionTemplate("In a terminal on natedev, run aws-deploy. It asks for your AWS admin passphrase."),
-        "{refusals} The command adds the permission. {consequence}",
+        ActionTemplate("Do the step under For you on the console."),
+        "{refusals} The step adds the permission. {consequence}",
         (PushExample("permission", {
             "failures": json.dumps([{"region": "us-east-2", "read": "price"}])}),
          PushExample("regional_permissions", {

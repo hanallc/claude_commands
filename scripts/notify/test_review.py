@@ -1043,7 +1043,7 @@ class LocalReviewTests(unittest.TestCase):
             self.assertEqual(registered_send(["--priority", "2", "--source", draft.source,
                 "--action", cast(ActionRequired, draft.action).text, draft.title, draft.body], keys, post), 0)
         form = urllib.parse.parse_qs(cast(bytes, post.call_args.args[1]).decode())
-        self.assertEqual(form["message"], [with_footer(first_line(revised.action) + "\n" + revised.body, draft.source, "fixture.admitted")])
+        self.assertEqual(form["message"], [with_footer(first_line(revised.action) + "\n\n" + revised.body, draft.source, "fixture.admitted")])
         self.assertIn("sent despite failed review", str(self.entries()[0]["detail"]))
 
     def test_texts_reviews_every_example_and_approves_only_unchanged_send_results(self) -> None:
@@ -1321,8 +1321,26 @@ class LocalReviewTests(unittest.TestCase):
                     with redirect_stdout(io.StringIO()):
                         self.assertEqual(pushover.deliver(result.version, keys, post), 0)
                     form = urllib.parse.parse_qs(cast(bytes, post.call_args.args[1]).decode())
-                    self.assertEqual(form["message"], [with_footer(header + "\n" + expected_body, draft.source)])
+                    self.assertEqual(form["message"], [with_footer(header + "\n\n" + body, draft.source)])
                     self.assertEqual(form["message"][0].splitlines().count(header), 1)
+
+    def test_title_only_rewrite_posts_the_action_line_once(self) -> None:
+        action = ActionRequired("Choose retry.")
+        header = first_line(action)
+        body = "The build stopped."
+        draft = replace(self.draft, priority="0", title="T" * 45, action=action, body=header + "\n" + body)
+        result = review.validate(verdict(draft, "rewrite", title="Build stopped", failed_rules=[]), draft, False)
+        self.assertIsInstance(result, review.Rewritten)
+        assert isinstance(result, review.Rewritten)
+
+        keys = self.root / "keys"
+        _ = keys.write_text("PUSHOVER_USER=test-user\nPUSHOVER_TOKEN=test-token\n")
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(pushover.deliver(result.version, keys, post), 0)
+        post.assert_called_once()
+        form = urllib.parse.parse_qs(cast(bytes, post.call_args.args[1]).decode())
+        self.assertEqual(form["message"], [with_footer(header + "\n\n" + body, draft.source)])
 
     def test_review_action_prefix_is_removed_before_body_validation(self) -> None:
         header = first_line(self.draft.action)
@@ -1431,7 +1449,7 @@ class LocalReviewTests(unittest.TestCase):
 
     def test_length_counts_check_original_and_proposed_text_at_the_boundaries(self) -> None:
         for field, boundary, rule in (("title", 45, "push-title-under-45"),
-                                     ("body", 500 - len(first_line(self.draft.action) + "\n"),
+                                     ("body", 500 - len(first_line(self.draft.action) + "\n\n"),
                                       "push-body-under-500")):
             for size in (boundary - 1, boundary):
                 draft = replace(self.draft, **{field: "X" * size})
@@ -1450,7 +1468,7 @@ class LocalReviewTests(unittest.TestCase):
             for length in (499, 500):
                 with self.subTest(action=action, length=length):
                     draft = replace(self.draft, action=action, priority="0",
-                        body="B" * (length - len(first_line(action) + "\n")))
+                        body="B" * (length - len(first_line(action) + "\n\n")))
                     result = review.validate(verdict(draft, "rewrite", body="The build stopped.", failed_rules=[]), draft, False)
                     if length == 499:
                         self.assertIsInstance(result, review.Approved)
@@ -1466,6 +1484,18 @@ class LocalReviewTests(unittest.TestCase):
                         self.assertIsInstance(proposed, review.Rewritten)
                     else:
                         self.assertIsInstance(proposed, review.Failed)
+
+    def test_499_character_draft_fails_the_phone_body_length_rule(self) -> None:
+        header = first_line(self.draft.action, self.draft.session)
+        body = "B" * (499 - len(header) - 1)
+        draft = replace(self.draft, body=body)
+        self.assertEqual(draft.message, header + "\n" + body)
+        self.assertEqual(len(draft.message), 499)
+        self.assertEqual(draft.phone_message_length, 500)
+        result = review.validate(verdict(draft), draft, False)
+        self.assertIsInstance(result, review.Failed)
+        assert isinstance(result, review.Failed)
+        self.assertEqual(result.failed_rules, ["push-body-under-500"])
 
     def test_action_cannot_be_removed_emptied_or_added(self) -> None:
         for action in (None, "", "   ", "none"):
@@ -1564,7 +1594,7 @@ class LocalReviewTests(unittest.TestCase):
                 self.assertEqual(len(posted), 1)
                 form = urllib.parse.parse_qs(posted[0].decode())
                 self.assertEqual(form["title"], [self.draft.title])
-                self.assertEqual(form["message"], [with_footer(first_line(self.draft.action) + "\n" + self.draft.body,
+                self.assertEqual(form["message"], [with_footer(first_line(self.draft.action) + "\n\n" + self.draft.body,
                                                                self.draft.source, "fixture.admitted")])
                 self.assertIn(outcome.why, str(self.entries()[-1]["verdict"]))
 
@@ -1734,6 +1764,27 @@ class LocalReviewTests(unittest.TestCase):
         assert isinstance(found, review.LiveHold)
         self.assertEqual(found.hold, held)
         review.release(held.source)
+        self.assertIsInstance(review.held_for(held.source), review.NoHold)
+
+    def test_hold_at_the_message_limit_posts_with_the_new_separator(self) -> None:
+        held = self.held()
+        header = first_line(held.best_version.action, held.best_version.session)
+        body = "B" * (1024 - len(header) - 1)
+        self.assertEqual(len(header + "\n" + body), 1024)
+        held = replace(held, best_version=replace(held.best_version, body=body))
+        review.hold(held)
+        self.assertEqual(review.held_for(held.source), review.LiveHold(held))
+
+        keys = self.root / "keys"
+        _ = keys.write_text("PUSHOVER_USER=test-user\nPUSHOVER_TOKEN=test-token\n")
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        with mock.patch.object(time, "time", return_value=1301), redirect_stdout(io.StringIO()):
+            self.assertEqual(review.due(post=post, keys_file=keys), 0)
+        post.assert_called_once()
+        form = urllib.parse.parse_qs(cast(bytes, post.call_args.args[1]).decode())
+        budget = 1024 - len(with_footer(header + "\n\n", held.source))
+        self.assertEqual(form["message"], [with_footer(header + "\n\n" + body[:budget], held.source)])
+        self.assertEqual(len(form["message"][0]), 1024)
         self.assertIsInstance(review.held_for(held.source), review.NoHold)
 
     def test_unreadable_hold_is_quarantined_and_logged(self) -> None:
@@ -2024,6 +2075,199 @@ class LocalReviewTests(unittest.TestCase):
         with mock.patch.object(review, "review", side_effect=approve), redirect_stdout(io.StringIO()):
             self.assertEqual(review.replay(), 0)
         self.assertEqual([draft.title for draft in drafts], ["new", "old"])
+
+    def test_replay_preserves_a_headerless_adhoc_body_that_starts_with_a_header(self) -> None:
+        sender = self.draft.source
+        text_id = "nate.adhoc"
+        keys = self.root / "keys"
+        _ = keys.write_text("PUSHOVER_USER=test-user\nPUSHOVER_TOKEN=test-token\n")
+        for body, expected_length in (("No action needed.\nThe build passed.", len(with_footer(
+                "No action needed.\nThe build passed.", sender, text_id))),
+                ("Action: literal body\n" + "B" * 1100, 1024)):
+            with self.subTest(body_start=body.partition("\n")[0]):
+                draft = review.Draft(sender, "0", "Build done", NoActionRequired(), body, False, header=False)
+                post = mock.Mock(return_value=(200, b'{"status":1}'))
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(pushover.deliver(draft, keys, post, text_id=text_id), 0)
+                post.assert_called_once()
+                form = urllib.parse.parse_qs(cast(bytes, post.call_args.args[1]).decode())
+                posted, = form["message"]
+                expected_body = body[:pushover.phone_message_limit(sender, text_id)]
+                self.assertEqual(posted, with_footer(expected_body, sender, text_id))
+                self.assertEqual(len(posted), expected_length)
+
+                def validate(draft: review.Draft, revision: bool) -> review.ReviewOutcome:
+                    return review.validate(verdict(draft), draft, revision)
+
+                with (mock.patch.object(review, "review", side_effect=validate) as reviewer,
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(review.replay(1), 0)
+                reviewer.assert_called_once()
+                replayed = cast(review.Draft, reviewer.call_args.args[0])
+                self.assertFalse(replayed.header)
+                self.assertEqual(replayed.action, NoActionRequired())
+                self.assertEqual(replayed.message, posted)
+                self.assertIn(f"Build done\n{posted}\n", output.getvalue())
+                result = validate(replayed, False)
+                if expected_length == 1024:
+                    self.assertIsInstance(result, review.Failed)
+                    assert isinstance(result, review.Failed)
+                    self.assertEqual(result.failed_rules, ["push-body-under-500"])
+                else:
+                    self.assertEqual(result, review.Approved(replayed))
+
+    def test_replay_uses_the_legacy_parser_when_the_saved_header_state_is_unknown(self) -> None:
+        message = "Session: Owner\nAction: stop Owner\nReason: waiting."
+        pushover.log("shutdown", "1", "Owner is blocked", message, "sent")
+
+        def validate(draft: review.Draft, revision: bool) -> review.ReviewOutcome:
+            result = review.validate(verdict(draft), draft, revision)
+            self.assertEqual(result, review.Approved(draft))
+            return result
+
+        with (mock.patch.object(review, "review", side_effect=validate) as reviewer,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.replay(), 0)
+        reviewer.assert_called_once()
+        draft = cast(review.Draft, reviewer.call_args.args[0])
+        self.assertTrue(draft.header)
+        self.assertEqual(draft.session, SessionLine("Owner"))
+        self.assertEqual(draft.action, ActionRequired("stop Owner"))
+        self.assertEqual(draft.body, "Reason: waiting.")
+        self.assertIn(f"Owner is blocked\n{message}\n", output.getvalue())
+
+    def test_replay_accepts_an_unchanged_legacy_body_at_the_transport_limit(self) -> None:
+        message = "B" * 1024
+        pushover.log("writer one", "0", "Build done", message, "sent")
+
+        def validate(draft: review.Draft, revision: bool) -> review.ReviewOutcome:
+            self.assertEqual(draft.body, message)
+            self.assertEqual(len(draft.message), 1042)
+            result = review.validate(verdict(draft), draft, revision)
+            self.assertIsInstance(result, review.Failed)
+            assert isinstance(result, review.Failed)
+            self.assertEqual(result.failed_rules, ["push-body-under-500"])
+            changed = review.validate(verdict(draft, "rewrite", body=draft.body + "X", failed_rules=[]),
+                                      draft, revision)
+            self.assertEqual(changed, review.Unreviewed("message exceeds 1024", failures=(
+                review.RuleFailure("push-body-under-500", draft.message),)))
+            return result
+
+        with mock.patch.object(review, "review", side_effect=validate) as reviewer, redirect_stdout(io.StringIO()):
+            self.assertEqual(review.replay(), 0)
+        reviewer.assert_called_once()
+
+    def test_replay_validates_unchanged_body_lines_that_look_like_headers(self) -> None:
+        keys = self.root / "keys"
+        _ = keys.write_text("PUSHOVER_USER=test-user\nPUSHOVER_TOKEN=test-token\n")
+        for leading_line in ("No action needed.", "Session: build"):
+            for long_body in (False, True):
+                with self.subTest(leading_line=leading_line, long_body=long_body):
+                    original = "\r\n" + leading_line + "\n" + ("B" * 1100 if long_body else "The build passed.")
+                    draft = replace(self.draft, action=NoActionRequired(), priority="0", body=original)
+                    post = mock.Mock(return_value=(200, b'{"status":1}'))
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(pushover.deliver(draft, keys, post), 0)
+                    post.assert_called_once()
+                    form = urllib.parse.parse_qs(cast(bytes, post.call_args.args[1]).decode())
+                    posted, = form["message"]
+                    header = "No action needed.\n\n"
+                    self.assertTrue(posted.startswith(header + leading_line + "\n"))
+                    if long_body:
+                        self.assertEqual(len(posted), 1024)
+
+                    def validate(draft: review.Draft, revision: bool) -> review.ReviewOutcome:
+                        expected_body = posted.removeprefix(header)
+                        if not long_body:
+                            expected_body = "\r\n" + expected_body
+                        self.assertEqual(draft.body, expected_body)
+                        result = review.validate(verdict(draft), draft, revision)
+                        if long_body:
+                            self.assertIsInstance(result, review.Failed)
+                            assert isinstance(result, review.Failed)
+                            self.assertEqual(result.failed_rules, ["push-body-under-500"])
+                        else:
+                            self.assertEqual(result, review.Approved(draft))
+                        return result
+
+                    with (mock.patch.object(review, "review", side_effect=validate) as reviewer,
+                          redirect_stdout(io.StringIO())):
+                        self.assertEqual(review.replay(1), 0)
+                    reviewer.assert_called_once()
+
+    def test_replay_keeps_the_original_leading_body_newline(self) -> None:
+        draft = replace(self.draft, body="\nExplanation.")
+        keys = self.root / "keys"
+        _ = keys.write_text("PUSHOVER_USER=test-user\nPUSHOVER_TOKEN=test-token\n")
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(pushover.deliver(draft, keys, post), 0)
+
+        def approve(draft: review.Draft, _revision: bool) -> review.ReviewOutcome:
+            return review.Approved(draft)
+
+        with (mock.patch.object(review, "review", side_effect=approve) as reviewer, redirect_stdout(io.StringIO())):
+            self.assertEqual(review.replay(), 0)
+        replayed = cast(review.Draft, reviewer.call_args.args[0])
+        self.assertEqual(replayed.action, draft.action)
+        self.assertEqual(replayed.body, with_footer(draft.body, draft.source))
+
+    def test_replay_reads_the_multiline_action_and_the_body_that_the_phone_received(self) -> None:
+        draft = replace(self.draft, action=ActionRequired("Choose A\n\nor B"), body="B" * 1024,
+                        title="T" * 251, session=SessionLine("Owner"))
+        keys = self.root / "keys"
+        _ = keys.write_text("PUSHOVER_USER=test-user\nPUSHOVER_TOKEN=test-token\n")
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(pushover.deliver(draft, keys, post), 0)
+        post.assert_called_once()
+        form = urllib.parse.parse_qs(cast(bytes, post.call_args.args[1]).decode())
+        posted = form["message"][0]
+        header = first_line(draft.action, draft.session)
+        self.assertEqual(len(posted), 1024)
+        self.assertTrue(posted.startswith(header + "\n\nB"))
+
+        def approve(draft: review.Draft, _revision: bool) -> review.ReviewOutcome:
+            return review.Approved(draft)
+
+        with (mock.patch.object(review, "review", side_effect=approve) as reviewer, redirect_stdout(io.StringIO())):
+            self.assertEqual(review.replay(), 0)
+        replayed = cast(review.Draft, reviewer.call_args.args[0])
+        self.assertEqual(replayed.action, draft.action)
+        self.assertEqual(replayed.session, draft.session)
+        self.assertEqual(replayed.title, form["title"][0])
+        self.assertEqual(replayed.body, posted.removeprefix(header + "\n\n"))
+
+    def test_replay_does_not_restore_crlf_pairs_past_the_phone_message_length(self) -> None:
+        prefix = "\r\n" * 10
+        draft = replace(self.draft, body=prefix + "B" * 1024)
+        keys = self.root / "keys"
+        _ = keys.write_text("PUSHOVER_USER=test-user\nPUSHOVER_TOKEN=test-token\n")
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(pushover.deliver(draft, keys, post), 0)
+        post.assert_called_once()
+        form = urllib.parse.parse_qs(cast(bytes, post.call_args.args[1]).decode())
+        posted, = form["message"]
+        header = first_line(draft.action, draft.session)
+        self.assertEqual(len(posted), 1024)
+        self.assertTrue(posted.startswith(header + "\n\nB"))
+        record = cast(dict[str, object], json.loads(pushover.LOG_FILE.read_text()))
+        self.assertEqual(record["body_prefix"], prefix)
+
+        def validate_length(draft: review.Draft, revision: bool) -> review.ReviewOutcome:
+            outcome = review.validate(verdict(draft), draft, revision)
+            self.assertIsInstance(outcome, review.Failed)
+            assert isinstance(outcome, review.Failed)
+            self.assertEqual(outcome.failed_rules, ["push-body-under-500"])
+            return outcome
+
+        with (mock.patch.object(review, "review", side_effect=validate_length) as reviewer, redirect_stdout(io.StringIO())):
+            self.assertEqual(review.replay(), 0)
+        reviewer.assert_called_once()
+        replayed = cast(review.Draft, reviewer.call_args.args[0])
+        self.assertEqual(replayed.body, posted.removeprefix(header + "\n\n"))
+        self.assertLessEqual(len(first_line(replayed.action, replayed.session) + "\n" + replayed.body), len(posted))
 
     def test_check_is_dry_even_when_reviewer_asks(self) -> None:
         def ask(draft: review.Draft, _revision: bool) -> review.ReviewOutcome:

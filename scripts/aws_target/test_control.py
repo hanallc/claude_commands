@@ -33,10 +33,10 @@ from scripts.notify.user_action import ActionRequired
 from scripts.review_links import console_theme, review_link
 
 
-AWS_DEPLOY_ACTION = ActionRequired('In a terminal on natedev, run aws-deploy. It asks for your AWS admin passphrase.')
+AWS_READ_FIX_ACTION = ActionRequired('Do the step under For you on the console.')
 PRICE_REFUSAL_BODY = (
     'AWS refused the us-east-1 price read, because our AWS setup does not allow it yet. '
-    + 'The command adds the permission. After 2 hours without the read, AWS merge tests can pick a region that costs more.'
+    + 'The step adds the permission. After 2 hours without the read, test runs on AWS can pick a region that costs more.'
 )
 
 
@@ -946,7 +946,7 @@ region_transfer_usd={"us-west-1":0.00015}
         self.assertEqual(len(self.notices), 1)
         key, text, timeout = self.notices[0]
         self.assertEqual(text.body, PRICE_REFUSAL_BODY)
-        self.assertEqual(text.action, AWS_DEPLOY_ACTION)
+        self.assertEqual(text.action, AWS_READ_FIX_ACTION)
         self.assertEqual(timeout, conf.read(self.settings).number('snapshot_notification_timeout_s'))
         self.failure = ''
         self.assertEqual(self.snapshot(), 0)
@@ -1001,7 +1001,7 @@ region_transfer_usd={"us-west-1":0.00015}
             self.assertEqual(self.snapshot(), 1)
         self.assertEqual(len(self.notices), 2)
         self.assertEqual(self.notices[0][0], self.notices[1][0])
-        self.assertEqual(self.notices[1][1].action, AWS_DEPLOY_ACTION)
+        self.assertEqual(self.notices[1][1].action, AWS_READ_FIX_ACTION)
         self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
         with redirect_stderr(StringIO()):
             self.assertEqual(self.snapshot(), 1)
@@ -1089,7 +1089,7 @@ region_transfer_usd={"us-west-1":0.00015}
         expected_failures = [{'region': 'us-east-1', 'read': 'price'}]
         self.assertEqual(cast(object, json.loads(value)), expected_failures)
         self.assertEqual(push.title, 'AWS refused a price read')
-        self.assertEqual(push.action, AWS_DEPLOY_ACTION)
+        self.assertEqual(push.action, AWS_READ_FIX_ACTION)
         self.assertEqual(set(push.values), {'failures'})
         self.assertEqual(cast(object, json.loads(push.values['failures'])), expected_failures)
         self.assertEqual(push.body, PRICE_REFUSAL_BODY)
@@ -1106,19 +1106,22 @@ region_transfer_usd={"us-west-1":0.00015}
         self.assertEqual(push.title, 'AWS refused 2 reads')
         self.assertEqual(push.body,
                          'AWS refused the price reads in us-east-1 and us-west-1, because our AWS setup does not allow them yet. '
-                         + 'The command adds the permission. After 2 hours without the reads, '
-                         + 'AWS merge tests can pick a region that costs more.')
+                         + 'The step adds the permission. After 2 hours without the reads, '
+                         + 'test runs on AWS can pick a region that costs more.')
         self.assertNotIn('DescribeSpotPriceHistory', push.body)
         self.assertNotIn(reason, push.body)
 
     def test_saved_failure_has_the_same_bounded_redacted_reason_as_the_log(self) -> None:
         self.failure = 'describe-spot-price-history'
         self.failure_reason = 'AccessDenied: fixture refusal ' * conf.read(self.settings).whole('snapshot_error_reason_max_chars')
-        with redirect_stderr(StringIO()):
+        with redirect_stderr(StringIO()) as log:
             self.assertEqual(self.snapshot(), 1)
         failure, = aws_target.snapshot_failures(aws_target.read_snapshot(self.state))
         self.assertEqual(len(failure.reason), conf.read(self.settings).whole('snapshot_error_reason_max_chars'))
         self.assertIn('AccessDenied', failure.reason)
+        self.assertIn(
+            f'aws_target: snapshot {failure.region} {failure.read} unavailable: {failure.error}: {failure.reason}',
+            log.getvalue().splitlines())
         self.assertEqual(self.notices[0][1].body, PRICE_REFUSAL_BODY)
 
     def test_fresh_reply_without_an_offer_names_the_missing_price(self) -> None:

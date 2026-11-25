@@ -104,19 +104,10 @@
   },
   "aws.snapshot_failed": {
     "permission": {
-      "objections": [
-        {
-          "quote": "The command adds the permission. After 2 hours without the read, AWS merge tests can pick a region that costs more.",
-          "rule": "what-happened-why-what-you-do"
-        },
-        {
-          "quote": "AWS refused a price read",
-          "rule": "title-names-the-stake"
-        }
-      ],
-      "reviewer": "user-spec: nate: Approved on the Images page (image 12b54537d309), 11:41 PST Nov 24: title AWS refused a price read; action run aws-deploy on natedev; After 2 hours without the read, AWS merge tests can pick a region that costs more; reviewer: claude-opus-5-5",
-      "sha256": "16f760ffdde00de936754282015392384d4d2325de4b7275044621417afe8297",
-      "time": "2026-11-24T14:42:25.775799-05:00"
+      "objections": [],
+      "reviewer": "user-spec: nate: Approved on the Images page (image 96ba073cc79b), 2026-11-24 21:44 PST; reviewer: claude-opus-5-5",
+      "sha256": "d4f7f63d31d1c0666cc9e1a9c1ea83ea080b00689e4324743e961b44b77cf3a5",
+      "time": "2026-11-25T02:58:21.508867-05:00"
     },
     "regional_permissions": {
       "objections": [
@@ -129,13 +120,13 @@
           "rule": "short-plain-sentences"
         },
         {
-          "quote": "The command adds the permission. After 2 hours without the reads, AWS merge tests can pick a region that costs more.",
+          "quote": "The step adds the permission. After 2 hours without the reads, test runs on AWS can pick a region that costs more.",
           "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: nate: Approved on the Images page (image 12b54537d309), 11:41 PST Nov 24: title AWS refused a price read; action run aws-deploy on natedev; After 2 hours without the read, AWS merge tests can pick a region that costs more; reviewer: claude-opus-5-5",
-      "sha256": "16f760ffdde00de936754282015392384d4d2325de4b7275044621417afe8297",
-      "time": "2026-11-24T14:42:34.195985-05:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (image 96ba073cc79b), 2026-11-24 21:44 PST; reviewer: claude-opus-5-5",
+      "sha256": "d4f7f63d31d1c0666cc9e1a9c1ea83ea080b00689e4324743e961b44b77cf3a5",
+      "time": "2026-11-25T02:58:30.463923-05:00"
     }
   },
   "build_hold.blocking": {
