@@ -701,12 +701,13 @@ def main(argv: list[str] | None = None) -> int:
                      "then run blind-score with the sheet path to see which source you preferred."))
     _ = blind_command.add_argument("run_id", help="Saved run filename, with or without .jsonl")
     _ = blind_command.add_argument("--count", type=int, default=UseConfiguredValue.CURRENT,
-                                   help="Number of items; default blind_sample_count in issue_score.conf")
-    _ = blind_command.add_argument("--seed", type=int, default=0, help="Shuffle seed; the same seed gives the same sheet")
+                                   help="Most items to write; fewer when eligible issues run out; default blind_sample_count in issue_score.conf")
+    _ = blind_command.add_argument("--seed", type=int, default=0, help="Shuffle seed; fixes item order and A/B sides for the same run and issues")
     blind_score_command = commands.add_parser(
         "blind-score", help="Tally a completed A/B preference sheet",
         description=("Tally a sheet that blind wrote, after each pick is set to A, B or same. "
-                     "Prints the path of a results file with Jev, vault and same counts per field."))
+                     "Writes the results beside the sheet, with .results.md in place of .json, as Jev, vault and same counts per field, "
+                     "and prints its path."))
     _ = blind_score_command.add_argument("sheet", help="Path of the sheet that blind printed")
     args = parser.parse_args(argv, namespace=CommandArguments())
     try:
