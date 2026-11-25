@@ -350,7 +350,7 @@ scripts.lib.conf.read("build_targets").whole("absent.direct")
             + "scripts/reader.py:4: reads absent.direct, which no config file on the tip holds\n"
             + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 2)))
 
-    def test_nested_functions_inherit_readers_until_a_local_binding_shadows_them(self) -> None:
+    def test_nested_functions_inherit_readers_even_with_a_local_binding(self) -> None:
         self.write("scripts/reader.py", '''\
 from scripts.lib import conf
 module_settings = conf.read("build_targets")
@@ -370,9 +370,10 @@ def outer():
         self.assertEqual(output, (
             "scripts/reader.py:8: reads absent.enclosing, which no config file on the tip holds\n"
             + "scripts/reader.py:9: reads absent.module, which no config file on the tip holds\n"
-            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 2)))
+            + "scripts/reader.py:12: reads absent.shadowed, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 3)))
 
-    def test_readers_follow_assignments_and_loop_bindings_in_statement_order(self) -> None:
+    def test_reader_bindings_apply_across_reassignments_and_loops(self) -> None:
         self.write("scripts/reader.py", '''\
 from scripts.lib import conf
 
@@ -389,7 +390,66 @@ def reads(readers):
         self.assertEqual(status, 0, output)
         self.assertEqual(output, (
             "scripts/reader.py:5: reads absent.before, which no config file on the tip holds\n"
-            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 1)))
+            + "scripts/reader.py:7: reads absent.rebound, which no config file on the tip holds\n"
+            + "scripts/reader.py:10: reads absent.loop, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 3)))
+
+    def test_reader_bindings_apply_in_else_branches_and_earlier_closures(self) -> None:
+        self.write("scripts/reader.py", '''\
+from scripts.lib import conf
+
+def branch(flag):
+    settings = conf.read("build_targets")
+    if flag:
+        settings = None
+    else:
+        settings.text("absent.else")
+
+def outer():
+    def inner():
+        settings.text("absent.closure")
+
+    settings = conf.read("build_targets")
+    inner()
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/reader.py:8: reads absent.else, which no config file on the tip holds\n"
+            + "scripts/reader.py:12: reads absent.closure, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 2)))
+
+    def test_relative_imports_resolve_the_config_module_and_reader_type(self) -> None:
+        self.write("scripts/production/probe.py", '''\
+from ..lib import conf
+conf.read("build_targets").text("absent.relative_module")
+''')
+        self.write("scripts/lib/probe.py", '''\
+from .conf import ConfigRead
+
+def probe(settings: ConfigRead):
+    settings.text("absent.relative_type")
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/lib/probe.py:4: reads absent.relative_type, which no config file on the tip holds\n"
+            + "scripts/production/probe.py:2: reads absent.relative_module, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 2)))
+
+    def test_shell_fixed_reads_accept_assignment_and_interpreter_prefixes(self) -> None:
+        self.write("scripts/reader.sh", '''\
+CONF_DIR=/tmp conf_value build_targets absent.assignment
+./scripts/lib/py ./scripts/lib/conf.py get build_targets absent.wrapper
+python3 scripts/lib/conf.py get build_targets absent.python
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/reader.sh:1: reads absent.assignment, which no config file on the tip holds\n"
+            + "scripts/reader.sh:2: reads absent.wrapper, which no config file on the tip holds\n"
+            + "scripts/reader.sh:3: reads absent.python, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 3)))
 
     def test_shell_fixed_reads_use_command_position_and_a_literal_key(self) -> None:
         self.write("config/other.conf", "held.elsewhere=1\n")
@@ -447,6 +507,206 @@ def imported(settings: Reader):
             "scripts/reader.py:14: reads absent.qualified, which no config file on the tip holds\n"
             + "scripts/reader.py:17: reads absent.imported, which no config file on the tip holds\n"
             + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 2)))
+
+    def test_class_reads_use_the_module_binding_before_class_reassignment(self) -> None:
+        self.write("scripts/reader.py", '''\
+from scripts.lib import conf
+class Example:
+    settings = conf.read("x")
+    settings.text("absent.class")
+    conf = None
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/reader.py:4: reads absent.class, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 1)))
+
+    def test_global_and_nonlocal_reader_assignments_bind_in_the_declared_scope(self) -> None:
+        self.write("scripts/reader.py", '''\
+from scripts.lib import conf
+
+module_settings = None
+
+def load_global():
+    global module_settings
+    module_settings = conf.read("x")
+
+def read_global():
+    module_settings.text("absent.global")
+
+def outer():
+    settings = None
+
+    def load_nonlocal():
+        nonlocal settings
+        settings = conf.read("x")
+
+    def read_nonlocal():
+        settings.text("absent.nonlocal")
+
+    load_nonlocal()
+    read_nonlocal()
+
+load_global()
+read_global()
+outer()
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/reader.py:10: reads absent.global, which no config file on the tip holds\n"
+            + "scripts/reader.py:20: reads absent.nonlocal, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 2)))
+
+    def test_a_missing_blob_does_not_stop_later_sources(self) -> None:
+        self.write("scripts/after_missing.py", '''\
+from scripts.lib import conf
+conf.read("x").text("absent.after_missing")
+''')
+        tip = self.commit()
+        missing = "scripts/missing.py"
+        self.write(missing, "# This source has no object in the repository.\n")
+        sources = {
+            missing: self.git("hash-object", "--", str(self.repo / missing)),
+            "scripts/after_missing.py": self.git("rev-parse", f"{tip}:scripts/after_missing.py"),
+        }
+        advisory = fixture_conf_keys.tip_key_reads(self.repo, sources, {}, {})
+        self.assertEqual(advisory.sources_not_scanned, 1)
+        self.assertEqual(advisory.absent, [
+            fixture_conf_keys.AbsentKeyRead("scripts/after_missing.py", 2, "absent.after_missing"),
+        ])
+
+    def test_the_scan_runs_without_a_writable_temp_directory(self) -> None:
+        self.write("scripts/aws_target/hana_source.py", '''\
+from scripts.lib import conf
+settings = conf.read("x")
+settings.text("slots.aws-hana.hana.max")
+settings.text("slots.aws-hana.hana.max_bytes")
+''')
+        tip = self.commit()
+        read_only = self.repo / "read-only"
+        read_only.mkdir(mode=0o500)
+        self.addCleanup(read_only.chmod, 0o700)
+        # Set tempdir to prevent tempfile from using another directory.
+        with (mock.patch.dict("os.environ", {"TMPDIR": str(read_only)}),
+              mock.patch.object(tempfile, "tempdir", str(read_only))):
+            status, output = self.run_check(tip)
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/aws_target/hana_source.py:3: reads slots.aws-hana.hana.max, which no config file on the tip holds\n"
+            + "scripts/aws_target/hana_source.py:4: reads slots.aws-hana.hana.max_bytes, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 2)))
+
+    def test_key_strings_follow_assignment_order_and_literal_loop_values(self) -> None:
+        self.write("config/other.conf", "held=1\n")
+        self.base = self.commit()
+        self.write("scripts/reader.py", '''\
+from scripts.lib import conf
+settings = conf.read("x")
+key = "held"
+settings.text(key)
+key = "absent.unused"
+for key in ("absent.loop_a", "absent.loop_b"):
+    settings.text(key)
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/reader.py:7: reads absent.loop_a, which no config file on the tip holds\n"
+            + "scripts/reader.py:7: reads absent.loop_b, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 2)))
+
+    def test_shell_prefix_skips_redirects_and_treats_a_keyword_after_an_assignment_as_the_command(self) -> None:
+        self.write("scripts/reader.sh", '''\
+CONF_DIR=/tmp >out conf_value x absent.redirect
+CONF_DIR=/tmp then conf_value x absent.control
+2>&1 conf_value x absent.descriptor
+<in conf_value x absent.input
+> out conf_value x absent.output_word
+< in conf_value x absent.input_word
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/reader.sh:1: reads absent.redirect, which no config file on the tip holds\n"
+            + "scripts/reader.sh:3: reads absent.descriptor, which no config file on the tip holds\n"
+            + "scripts/reader.sh:4: reads absent.input, which no config file on the tip holds\n"
+            + "scripts/reader.sh:5: reads absent.output_word, which no config file on the tip holds\n"
+            + "scripts/reader.sh:6: reads absent.input_word, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 5)))
+
+    def test_comprehension_walrus_binds_a_name_in_the_enclosing_function(self) -> None:
+        self.write("scripts/reader.py", '''\
+from scripts.lib import conf
+
+def outer():
+    [(settings := None) for _ in range(1)]
+
+    def load():
+        nonlocal settings
+        settings = conf.read("x")
+
+    def read():
+        settings.text("absent.nonlocal")
+
+    load()
+    read()
+
+outer()
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/reader.py:11: reads absent.nonlocal, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 1)))
+
+    def test_an_empty_literal_loop_preserves_the_key_string(self) -> None:
+        self.write("scripts/reader.py", '''\
+from scripts.lib import conf
+settings = conf.read("x")
+key = "absent.after_empty"
+for key in (): pass
+settings.text(key)
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/reader.py:5: reads absent.after_empty, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 1)))
+
+    def test_a_keyword_after_a_leading_redirect_is_the_command(self) -> None:
+        self.write("scripts/reader.sh", "</dev/null then conf_value x absent.control\n")
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, SUMMARY.format(0, 0))
+
+    def test_a_comprehension_reads_a_key_bound_by_its_walrus(self) -> None:
+        self.write("scripts/reader.py", '''\
+from scripts.lib import conf
+
+def read():
+    settings = conf.read("x")
+    [(key := "absent.walrus", settings.text(key)) for _ in range(1)]
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/reader.py:5: reads absent.walrus, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 1)))
+
+    def test_a_loop_body_assignment_preserves_the_key_from_before_the_loop(self) -> None:
+        self.write("scripts/reader.py", '''\
+from scripts.lib import conf
+settings = conf.read("x")
+key = "absent.after_empty"
+for key in ():
+    key = "absent.never"
+settings.text(key)
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertIn("scripts/reader.py:6: reads absent.after_empty, which no config file on the tip holds\n", output)
 
 
 if __name__ == "__main__":

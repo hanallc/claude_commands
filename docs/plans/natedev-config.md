@@ -894,7 +894,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Acceptance gate:** no conflict markers; `basedpyright` 0/0/0 on each resolved Python file; the conflict test ids pass by name; `fixture_conf_keys` 0 missing; after combo2 reaches main, a green `copies.py run --affected` of the real join.
 
-### Phase 24 — Read scan recall follow-ups  · status: todo
+### Phase 24 — Read scan recall follow-ups  · status: done
 
 **Depends on:** Phase 22
 
