@@ -90,7 +90,7 @@ if service == 'sts' and operation == 'get-caller-identity':
         sys.exit(1)
     reply({'Arn': 'arn:aws:iam::123456789012:user/build-scaler'})
 elif service == 'iam' and operation == 'get-user':
-    if (root / 'deleted-stack').exists():
+    if (root / 'deleted-stack').exists() or (root / 'deleted-scaler').exists():
         print('NoSuchEntity', file=sys.stderr); sys.exit(1)
     user = args[args.index('--user-name') + 1]
     reply({'User': {'Arn': 'arn:aws:iam::123456789012:user/' + user, 'UserId': 'user-fixture'}})
@@ -5356,6 +5356,44 @@ else: raise AssertionError(args)
         self.assertEqual(len(self.commands('update-stack')), 0)
         self.assertEqual(len(self.commands('delete-stack')), 1)
         self.assertEqual(len(self.commands('delete-volume')), 1)
+
+    def test_down_resumes_when_cloudformation_already_deleted_the_scaler(self) -> None:
+        _ = self.removal_fixture()
+        interrupted = self.root / 'fail-down-delete-stack'
+        interrupted.touch()
+        success, output = self.down_output()
+        self.assertFalse(success, output)
+        self.assertIn('foundation: refused:', output)
+        self.assertTrue((self.state / 'down.json').is_file())
+        interrupted.unlink()
+
+        stack_path = self.root / 'fake-stack.json'
+        stack = remote.read_record(stack_path)
+        stack['status'] = 'DELETE_FAILED'
+        saved = remote.read_record(self.state / 'deployment.json')
+        source_bucket = gate_source.bucket_name(ledger.text(saved, 'deployment_id'), ledger.text(saved, 'region'))
+        ledger.mapping(stack['outputs'])['GateSourceBucket'] = source_bucket
+        write_text_atomic(stack_path, json.dumps(stack))
+        (self.root / 'deleted-scaler').touch()
+        success, output = self.down_output()
+        self.assertFalse(success, output)
+        self.assertIn('scaler-keys: refused: NoSuchEntity', output)
+        self.assertEqual(self.commands('delete-stack'), [])
+
+        write_text_atomic(self.root / 'describe-stack-resource.json', json.dumps({'StackResourceDetail': {
+            'PhysicalResourceId': 'build-scaler', 'ResourceStatus': 'DELETE_COMPLETE',
+        }}))
+        write_text_atomic(self.root / 'list-objects-v2.json', '{}')
+        before = len(self.commands('list-access-keys'))
+
+        success, output = self.down_output()
+
+        self.assertTrue(success, output)
+        self.assertEqual(len(self.commands('list-access-keys')), before)
+        self.assertEqual(len(self.commands('delete-stack')), 1)
+        args = cast(list[str], self.commands('list-objects-v2')[-1]['args'])
+        self.assertEqual(args[args.index('--bucket') + 1], source_bucket)
+        self.assertFalse((self.state / 'down.json').exists())
 
     def test_down_refuses_a_live_claim_after_disabling_routing(self) -> None:
         devices = self.removal_fixture()

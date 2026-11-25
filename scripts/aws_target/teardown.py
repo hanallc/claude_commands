@@ -150,6 +150,7 @@ class TargetRemoval:
         if not identity:
             raise ValueError('missing saved scaler identity; run deploy.py up once to record it')
         name = ledger.text(identity, 'name')
+        resource: dict[str, object] = {}
         if self._stack():
             resource = ledger.mapping(self.api.call('describe-stack-resource', '--stack-name', self.identity.stack_id,
                                                    '--logical-resource-id', 'ScalerUser', service='cloudformation').get('StackResourceDetail'))
@@ -158,7 +159,9 @@ class TargetRemoval:
         try:
             user = ledger.mapping(self.api.call('get-user', '--user-name', name, service='iam').get('User'))
         except AwsUnavailable as error:
-            if 'NoSuchEntity' in str(error) and not self._stack():
+            if 'NoSuchEntity' in str(error) and (
+                    resource.get('ResourceStatus') == 'DELETE_COMPLETE' and self._has_matching_journal()
+                    or not self._stack()):
                 return ''
             raise
         if user.get('Arn') != identity.get('arn') or user.get('UserId') != identity.get('user_id'):
@@ -244,12 +247,7 @@ class TargetRemoval:
                                         str(outputs.get('InstanceId', '')), str(saved.get('data_volume_id', '')),
                                         str(saved.get('budget_name', '')))
         _ = verified_gate_deployment(self.directory, self.api.region, deployment_id)
-        path = self.directory / 'down.json'
-        if path.exists():
-            journal = remote.read_record(path)
-            for key in ('account_id', 'region', 'stack_id', 'deployment_id'):
-                if journal.get(key) != getattr(self.identity, key):
-                    raise ValueError('the removal journal differs from the current deployment identity')
+        _ = self._has_matching_journal()
         stack = self._stack()
         if not stack:
             try:
@@ -291,6 +289,16 @@ class TargetRemoval:
                 if value and outputs.get(key, value) != value:
                     raise ValueError(f'the live {key} differs from the deployment record')
         return False
+
+    def _has_matching_journal(self) -> bool:
+        path = self.directory / 'down.json'
+        if not path.exists():
+            return False
+        journal = remote.read_record(path)
+        for key in ('account_id', 'region', 'stack_id', 'deployment_id'):
+            if journal.get(key) != getattr(self.identity, key):
+                raise ValueError('the removal journal differs from the current deployment identity')
+        return True
 
     def remember(self) -> None:
         path = self.directory / 'down.json'
