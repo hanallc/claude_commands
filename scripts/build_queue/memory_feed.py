@@ -1428,12 +1428,16 @@ def cargo_job(command: tuple[str, ...]) -> str:
     return ""
 
 
+def read_boot_time(proc: Path) -> float:
+    return float(next(line.split()[1] for line in read_proc_text(proc / "stat").splitlines()
+                      if line.startswith("btime ")))
+
+
 def read_ci_runner(unit: Path, proc: Path) -> CIRunner:
     name = unit.name.removeprefix("github-runner-").removesuffix(".service")
     try:
         used = gib(gate.slice_working_set(unit).bytes)
-        boot = float(next(line.split()[1] for line in read_proc_text(proc / "stat").splitlines()
-                          if line.startswith("btime ")))
+        boot = read_boot_time(proc)
         ticks = int(os.sysconf("SC_CLK_TCK"))
         members: set[int] = set()
         pending = [unit]
@@ -2822,6 +2826,15 @@ class OutsideQueueScan:
         waiters = (row for _, row in inputs.ordered) if for_table else ()
         pending = [row["pid"] for row in (*inputs.reservations, *waiters)
                    if (owner := processes.get(row["pid"])) is not None and owner.start == row["start_time"]]
+        if inputs.running:
+            try:
+                boot = read_boot_time(PROC)
+            except (OSError, ValueError, IndexError, StopIteration):
+                boot = None
+            pending.extend(step.pid for step in inputs.running if isinstance(step.pid, int)
+                           and (process := processes.get(step.pid)) is not None and not process.zombie
+                           and (step.started_at == 0 or (boot is not None
+                                and boot + int(process.start) / self.ticks_per_second <= step.started_at)))
         self.queue_ancestors: set[int] = set()
         if for_table:
             scope_pids = {pid for source in sources for pid in source.members if pid in processes

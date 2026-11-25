@@ -331,6 +331,59 @@ class MemoryFeedTests(unittest.TestCase):
         with mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root)):
             self.assertEqual(memory_feed.outside_queue_processes(captured_reading().explanation.decided_from, owners), [])
 
+    def outside_verify_fixture(self, *, detached: bool = False) -> tuple[staff.StaffSnapshot, admission_records.RunningStep]:
+        members = write_outside_queue_fixture(self.root)
+        user = self.root / "cgroup/user"
+        agent = user / "app.slice/app-agents.slice/run-p8100.scope"
+        scope = agent
+        if detached:
+            scope = (user / "builds.slice/builds-detached.slice/builds-detached-20261125T10310726128505358.slice"
+                     / "detached-detect-20261125T103107-2612850-5358.scope")
+            write_scope(agent, members=(8100, 8101))
+            write_scope(scope, members=(8102, 8105))
+            _ = (scope / "cpu.stat").write_text("usage_usec 151500000\n")
+        else:
+            write_scope(agent, members=(8100, 8101, 8102, 8105))
+        proc = self.root / "proc"
+        _ = (proc / "stat").write_text("btime 190000\n")
+        _ = (proc / "8102/cmdline").write_text("/bin/bash\0/fixture/verify.sh\0lint\0hana\0")
+        _ = (proc / "8105/cmdline").write_text("/bin/python3\0/fixture/scripts/mac_test/offload.py\0run\0")
+        for pid in (8102, 8105):
+            _ = (proc / str(pid) / "cgroup").write_text(f"0::/{scope.relative_to(self.root / 'cgroup')}\n")
+        started = 190_000 + 8102 / os.sysconf("SC_CLK_TCK")
+        return members, replace(leftover_step(0), step="between steps", pid=8102, started_at=started)
+
+    def test_outside_queue_excludes_a_detached_verify_between_steps(self) -> None:
+        members, step = self.outside_verify_fixture(detached=True)
+        self.assertFalse(gate.running_has_reservation(step))
+        inputs = captured_reading(running=(step,)).explanation.decided_from
+        with mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root)):
+            self.assertEqual(memory_feed.outside_queue_processes(inputs, memory_feed.FeedStaff(members), for_table=True), [])
+
+    def test_outside_queue_excludes_an_agent_verify_between_steps(self) -> None:
+        members, step = self.outside_verify_fixture()
+        reading = captured_reading(running=(step,))
+        with (mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root)),
+              mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(staff, "snapshot", return_value=members),
+              mock.patch.object(memory_feed, "host_name", return_value="natedev"),
+              mock.patch.object(kill_action, "outside_stop_route", return_value=kill_action.OutsideCommandTree())):
+            self.assertEqual(memory_feed.live_outside_kill_targets(), {})
+            self.assertEqual(memory_feed.outside_queue_processes(memory_feed.outside_queue_inputs(reading),
+                             memory_feed.FeedStaff(members), for_table=True), [])
+
+    def test_outside_queue_keeps_a_reused_pid_from_a_running_record(self) -> None:
+        members, step = self.outside_verify_fixture()
+        inputs = captured_reading(running=(step,)).explanation.decided_from
+        owners = memory_feed.FeedStaff(members)
+        with mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root)):
+            stale = replace(inputs, running=(replace(step, started_at=step.started_at - 1),))
+            rows = memory_feed.outside_queue_processes(stale, owners, for_table=True)
+            self.assertEqual([(row["pid"], row["command"]) for row in rows], [(8102, "verify.sh")])
+            self.assertEqual(memory_feed.outside_queue_processes(inputs, owners, for_table=True), [])
+            undated = replace(inputs, running=(replace(step, started_at=0),))
+            self.assertEqual(memory_feed.outside_queue_processes(undated, owners, for_table=True), [])
+
     def test_outside_cpu_limit_counts_cpu_reaped_by_a_live_child(self) -> None:
         owners = memory_feed.FeedStaff(write_outside_queue_fixture(self.root))
         set_outside_launcher(self.root)
