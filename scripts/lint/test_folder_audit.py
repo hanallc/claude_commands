@@ -15,7 +15,7 @@ import sys
 import time
 import tempfile
 import unittest
-from collections.abc import Generator, Iterator
+from collections.abc import Collection, Generator, Iterator
 from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from scripts.lib.transcript_test_support import compressed_copy
@@ -873,12 +873,15 @@ class FolderAuditTests(unittest.TestCase):
         clone = self.clone_folder("partial-git-removal", 3)
         checkout = clone
 
-        def stop_during_git_delete(path: str) -> None:
-            self.assertEqual(Path(path), clone)
-            (checkout / ".git" / "HEAD").unlink()
+        expected = clone.stat()
+
+        def stop_during_git_delete(tree: build_folders.CheckedRemovalTree, *, repair_access: bool = False) -> None:
+            self.assertTrue(os.path.samestat(tree.info, expected))
+            self.assertTrue(repair_access)
+            (tree.path / ".git" / "HEAD").unlink()
             raise RuntimeError("stopped during git deletion")
 
-        with unittest.mock.patch.object(scratch, "delete_sweep_tree", side_effect=stop_during_git_delete):
+        with unittest.mock.patch.object(build_folders.CheckedRemovalTree, "remove", stop_during_git_delete):
             with self.assertRaisesRegex(RuntimeError, "stopped during git deletion"):
                 _ = self.judge_clones([clone])
         self.assertIsInstance(scratch.pending_removal(clone), copy_record.Registered)
@@ -1101,11 +1104,14 @@ class FolderAuditTests(unittest.TestCase):
         git(source, "commit", "-q", "--allow-empty", "-m", "c")
         worktree = self.rust / "stopped-worktree"
         git(source, "worktree", "add", "-q", "--detach", str(worktree), "HEAD")
-        delete = scratch.delete_sweep_tree
-        def stop(path: str) -> None:
-            delete(path)
+        delete = build_folders.CheckedRemovalTree.remove
+
+        def stop(tree: build_folders.CheckedRemovalTree, *, repair_access: bool = False,
+                 metadata_last: Collection[str] = ()) -> None:
+            delete(tree, repair_access=repair_access, metadata_last=metadata_last)
             raise RuntimeError("stopped before prune")
-        with unittest.mock.patch.object(scratch, "delete_sweep_tree", side_effect=stop):
+
+        with unittest.mock.patch.object(build_folders.CheckedRemovalTree, "remove", stop):
             with self.assertRaisesRegex(RuntimeError, "stopped before prune"):
                 _ = folder_audit.remove(worktree, 0, 1000)
         self.assertFalse(worktree.exists())
