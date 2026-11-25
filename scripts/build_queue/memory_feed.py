@@ -1381,52 +1381,61 @@ def ci_runner_name(unit: Path) -> str:
     return unit.name.removeprefix("github-runner-").removesuffix(".service")
 
 
-def read_ci_runner(unit: Path, members: frozenset[int], scopes: Mapping[Path, int],
-                   processes: Mapping[int, int]) -> CIRunnerServiceRam:
-    """Read runner memory after deducting the Cargo memory that the queue counts."""
-    reading = gate.slice_working_set(unit)
-    use = reading.anonymous.bytes if isinstance(reading.anonymous, admission_records.AnonymousRunUse) else reading.bytes
-    owned = sum(scopes[scope] for scope in gate.owned_scope_roots(scopes, unit))
-    owned += sum(processes[pid] for pid in processes.keys() & members)
-    return {"name": ci_runner_name(unit), "bytes": max(0, use - owned)}
+def read_ci_runner(unit: Path, members: frozenset[int], scopes: set[Path], processes: set[int],
+                   membership: gate.ScopeMembershipPass) -> CIRunnerServiceRam | None:
+    """Read runner and Cargo memory in the same pass."""
+    runner = gate.slice_working_set(unit)
+    owned = [gate.scope_memory(scope, membership) for scope in gate.owned_scope_roots(scopes, unit)]
+    scoped_pids = {pid for memory in owned if isinstance(memory.anonymous_source, admission_records.ScopeSource)
+                   for pid in memory.anonymous_source.members}
+    process_use = gate.process_memory((processes & members) - scoped_pids, PROC).anonymous
+    use = gate.swap_backed_use_less(runner.anonymous, (process_use, *(memory.anonymous for memory in owned)))
+    return {"name": ci_runner_name(unit), "bytes": use.bytes} if isinstance(use, admission_records.AnonymousRunUse) else None
 
 
-def ci_runner_service_ram(units: Sequence[Path], steps: Iterable[admission_records.RunningStep],
+def ci_runner_service_ram(units: Sequence[Path],
+                          steps: Iterable[tuple[admission_records.Reservation, admission_records.ExplainedRunningStep]],
                           budget: int) -> list[CIRunnerServiceRam]:
-    """Split the saved CI charge among the runner services."""
-    scopes: dict[Path, int] = {}
-    processes: dict[int, int] = {}
-    scoped_pids: set[int] = set()
-    for step in steps:
-        memory = step.measured
+    """Show service amounts that fit within the saved CI charge."""
+    if not units:
+        return []
+    scopes: set[Path] = set()
+    process_roots: dict[int, str] = {}
+    recorded_pids: set[int] = set()
+    for reservation, entry in steps:
+        memory = entry.step.measured
         if not isinstance(memory, admission_records.MeasuredMemory):
             continue
         source = memory.anonymous_source
         if isinstance(source, admission_records.ScopeSource):
-            if isinstance(memory.anonymous, admission_records.AnonymousRunUse):
-                amount = memory.anonymous.bytes
-                scopes[source.directory] = max(scopes.get(source.directory, 0), amount)
-            scoped_pids.update(source.members)
+            scopes.add(source.directory)
         elif isinstance(source, admission_records.ProcessSource):
-            for process in source.processes:
-                if isinstance(process.use, admission_records.AnonymousRunUse):
-                    processes[process.pid] = max(processes.get(process.pid, 0), process.use.bytes)
-    counted_processes = {pid: use for pid, use in processes.items() if pid not in scoped_pids}
-    services: list[CIRunnerServiceRam] = []
+            process_roots[reservation["pid"]] = reservation["start_time"]
+            recorded_pids.update(process.pid for process in source.processes)
     membership = gate.ScopeMembershipPass()
+    runners: dict[Path, frozenset[int]] = {}
     for unit in units:
         try:
             members = membership.read(unit)
             if members:
-                services.append(read_ci_runner(unit, members, scopes, counted_processes))
+                runners[unit] = members
+        except (OSError, ValueError):
+            continue
+    processes: set[int] = set()
+    if any(not members.isdisjoint(recorded_pids) or not members.isdisjoint(process_roots) for members in runners.values()):
+        try:
+            processes = gate.process_tree(process_roots, gate.process_table(PROC))
+        except OSError:
+            return []
+    services: list[CIRunnerServiceRam] = []
+    for unit, members in runners.items():
+        try:
+            if (service := read_ci_runner(unit, members, scopes, processes, membership)) is not None:
+                services.append(service)
         except (OSError, ValueError, KeyError):
             continue
-    total = sum(service["bytes"] for service in services)
-    if total > budget:
-        # A new sample can grow after the saved reading. Keep the saved total.
-        for service in services:
-            service["bytes"] = service["bytes"] * budget // total
-    return services
+    # Keep the charge in Other build tools if the current amounts exceed the saved charge.
+    return services if sum(service["bytes"] for service in services) <= budget else []
 
 
 def external_ci_owners(readings: Sequence[admission_records.UnownedSliceMemory],
@@ -3525,7 +3534,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     steps_by_owner: dict[str, list[admission_records.RunningStep]] = {}
     trace_reservations: program_memory_feed.ReservationsByOwner = {}
     reserved_steps = (entry for entry in explanation.running if gate.running_has_reservation(entry.step))
-    for reservation, entry in zip(explanation.decided_from.reservations, reserved_steps, strict=True):
+    reservations = tuple(zip(explanation.decided_from.reservations, reserved_steps, strict=True))
+    for reservation, entry in reservations:
         owner = gate.reservation_owner(reservation, entry.step)
         by_owner[owner] = entry.step, reservation
         steps_by_owner.setdefault(owner, []).append(entry.step)
@@ -3534,8 +3544,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     ci_owners = external_ci_owners(ci_readings, by_owner, gate.builds_slice_cgroup())
     queued_ci = sum(hold.memory.use.bytes for hold in captured.runs if hold.memory.owner in ci_owners
                     and isinstance(hold.memory.use, admission_records.AnonymousRunUse))
-    ci_services = ci_runner_service_ram(ci_units,
-        (step for steps in steps_by_owner.values() for step in steps), captured.ci_use)
+    ci_services = ci_runner_service_ram(ci_units, reservations, captured.ci_use)
     tools = build_tool_ram(explanation.running, captured.used - queued_ci, explanation.ordered)
     ram = ram_blocks(captured, tools, explanation.now, configuration.other_rows, ci_services)
     cap = gib(ram["cap_bytes"]) if isinstance(captured.cap, int) else captured.cap

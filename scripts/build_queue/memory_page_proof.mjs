@@ -19,7 +19,7 @@
 // Use --queue-rows to capture the dark queue card, its tooltips, and its right edge.
 // Use the fourth argument to select the older page.
 // Use --guest-tip after the output folder for the guest row tooltip screenshot.
-// Use --standing-orders as the third argument for nate's standing orders on real-shape rows; a fourth argument names a rendered page to check.
+// Use --standing-orders to check the current page with real-shape rows. A fourth argument adds a rendered baseline.
 
 // Use --rowask to capture the rows and the New item dialog.
 // Use <output-folder> --tip-design for the six dark tooltip captures.
@@ -187,7 +187,8 @@ async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
       await writeFile(join(shotFolder, `real-${width}.png`), Buffer.from(shot.data,'base64'));
     }
     const kinds = new Set(shown.rows.map(row => row.kind));
-    assert.ok(!kinds.has('tools') && kinds.has('row') && kinds.has('wait'), `The real-shape rows did not all show at ${width} px.`);
+    assert.ok(kinds.has('row') && kinds.has('wait'), `The real-shape rows did not all show at ${width} px.`);
+    if (path !== 'before.html') assert.ok(!kinds.has('tools'), `Running shows a Build tools row at ${width} px.`);
     assert.deepEqual(shown.headers.filter(header => ['Unit', 'Slot'].includes(header)), [],
       `Orders 2 and 4: the table has a Unit or Slot column at ${width} px.`);
     const word = name => new RegExp('(^|[^a-z-])' + name.toLowerCase() + '([^a-z-]|$)');
@@ -1635,11 +1636,11 @@ try {
           servedReading.ram = {...servedReading.ram, build_tools_bytes:real.build_tools_bytes};
           // The queue-move stub gives the page a token, so the reorder handles draw.
           queueFixture = servedReading;
-          await checkStandingOrders(navigate, evaluate, call, standingProof && beforePage ? 'before.html' : 'memory_live.html',
-            standingProof ? folder : '');
+          if (standingProof && beforePage) await checkStandingOrders(navigate, evaluate, call, 'before.html', folder);
+          await checkStandingOrders(navigate, evaluate, call, 'memory_live.html', standingProof && !beforePage ? folder : '');
           queueFixture = null;
           if (standingProof) {
-            console.log(JSON.stringify({pass:true}));
+            console.log(JSON.stringify({pass:true, pages:beforePage ? ['baseline', 'current'] : ['current'], widths:[1440, 900]}));
             break browserProof;
           }
           await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
