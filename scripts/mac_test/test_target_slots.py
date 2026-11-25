@@ -1,4 +1,4 @@
-"""Check repository identity, slot ownership, and worktree affinity."""
+"""Check Mac claims, Linux claims, and worktree affinity."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from types import FrameType
 from typing import cast, override
 
 from scripts.build_hold.owning_session import NoOwningSession
+from scripts.build_queue import admission_wire as wire, execution_identity, placement
 from scripts.buildlog import repository
 from scripts.lib import process_start as process_identity
 from scripts.lib.git_test_support import commit_repository
@@ -136,7 +137,7 @@ class RepositorySlotTests(unittest.TestCase):
             "mirror_root=~/.local/state/mac-test/test-mirror\n"
             "block_warn_minutes=15\ngh_timeout_s=1\nclaim_idle_minutes=15\n"
             "claim_poll_seconds=60\nconnect_timeout_s=1\nprobe_timeout_s=1\n"
-            "unreachable_backoff_s=30\nslots=2\nslots.hana=4\n"
+            "unreachable_backoff_s=30\n"
             "build_budget_gib=32\ntarget_budget_gib=24\n"
         )
         for name in ("mac", "linux"):
@@ -152,10 +153,7 @@ class RepositorySlotTests(unittest.TestCase):
         private = copies_environment(self.root)
         _ = shutil.copy2(Path(private["CONF_DIR"]) / "build_folders.conf", self.root / "build_folders.conf")
         _ = write_config_fixture(self.root / "machines.conf", "mac.hosts=fake-mac\n")
-        _ = write_config_fixture(self.root / "build_folders.conf",
-            "names.repository_key_length=8\n"
-            + "# whole: 1..\nslots.fake-mac.default_max=1\n"
-            + "# whole: 1..\nslots.fake-mac.hana.max=2\n")
+        _ = write_config_fixture(self.root / "build_folders.conf", "names.repository_key_length=8\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
             **private,
@@ -275,7 +273,7 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertEqual(cast(eligibility.KnownRepository, identities[0]).name, "hana")
 
         paths = mac_test.state_paths("mac")
-        for worktree, pid in ((main, 101), (clone, 102)):
+        for worktree, pid, expected in ((main, 101, 0), (clone, 102, 11)):
             args = self.arguments("mac", worktree, pid)
             mirror = claim_state.mac_repository_identity(args.worktree)
             assert isinstance(mirror, claim_state.ResolvedMacMirror)
@@ -285,10 +283,15 @@ class RepositorySlotTests(unittest.TestCase):
             with claim_state.locked(paths.lock):
                 result = mac_test.claim_once(args, paths, scope, session=NoOwningSession(),
                                              mac_kind=mac_test.MacClaimKind.GUEST, mac_repository=saved)
-            assert isinstance(result, mac_test.ClaimFinished), result
-            self.assertEqual(result.status, 0)
+            if expected == 0:
+                self.assertIsInstance(result, mac_test.ClaimFinished)
+            else:
+                self.assertIsInstance(result, mac_test.ClaimBusy)
 
         self.assertEqual(self.claim("mac", linked, 103)[0], 11)
+        self.assertNotIn("slot", self.claims("mac")[101])
+        self.release("mac", 101)
+        self.assertEqual(self.claim("mac", clone, 102), (0, "claimed\n"))
 
     def test_saved_github_key_in_mixed_case_still_holds_capacity(self) -> None:
         first = self.repository("first/hana", "https://github.com/Nate/Hana.git")
@@ -306,7 +309,7 @@ class RepositorySlotTests(unittest.TestCase):
         main = self.repository("project", "git@github.com:nate/project.git")
         clone = self.repository("phase-copy", "https://github.com/nate/project.git")
         self.assertEqual(self.claim("linux", main, 101)[0], 0)
-        self.assertEqual(self.claim("linux", clone, 102)[0], 0)
+        self.assertEqual(self.claim("linux", clone, 102)[0], 11)
 
         self.assertEqual(self.claim("linux", main, 103)[0], 11)
         self.assertEqual(self.claim("linux", clone, 104)[0], 11)
@@ -325,12 +328,11 @@ class RepositorySlotTests(unittest.TestCase):
     def test_linux_keeps_same_name_origins_independent(self) -> None:
         first = self.repository("first/project", "https://github.com/first/project.git")
         second = self.repository("second/project", "https://github.com/second/project.git")
-        for pid in (101, 102):
-            self.assertEqual(self.claim("linux", first, pid)[0], 0)
-        self.assertEqual(self.claim("linux", first, 103)[0], 11)
+        self.assertEqual(self.claim("linux", first, 101)[0], 0)
+        self.assertEqual(self.claim("linux", first, 102)[0], 11)
 
         self.assertEqual(self.claim("linux", second, 103)[0], 0)
-        self.assertEqual(set(self.claims("linux")), {101, 102, 103})
+        self.assertEqual(set(self.claims("linux")), {101, 103})
 
     def test_local_and_shared_clones_keep_the_original_identity(self) -> None:
         main = self.repository("hana", "https://github.com/nate/hana.git")
@@ -353,7 +355,7 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertEqual(eligibility.repository_identity(first), eligibility.repository_identity(second))
         self.assertNotEqual(eligibility.repository_identity(second), eligibility.repository_identity(third))
 
-    def test_concurrent_requests_never_share_a_slot(self) -> None:
+    def test_concurrent_requests_take_one_repository_claim(self) -> None:
         root = self.repository("project", "https://github.com/nate/project.git")
         barrier = threading.Barrier(6)
 
@@ -364,62 +366,22 @@ class RepositorySlotTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()), ThreadPoolExecutor(max_workers=6) as workers:
             statuses = list(workers.map(contend, range(101, 107)))
 
-        self.assertEqual(sorted(statuses), [0, 0, 11, 11, 11, 11])
-        records = list(self.claims("linux").values())
-        self.assertEqual(len(records), 2)
-        self.assertEqual(len({record.get("slot") for record in records}), 2)
-
-    def test_repository_override_and_config_reload_control_capacity(self) -> None:
-        root = self.repository("phase-copy", "https://github.com/nate/hana.git")
-        settings = self.root / "linux.conf"
-        for pid in range(101, 105):
-            self.assertEqual(self.claim("linux", root, pid)[0], 0)
-        self.assertEqual(self.claim("linux", root, 105)[0], 11)
-        _ = settings.write_text(settings.read_text().replace("slots.hana=4", "slots.hana=5"))
-
-        self.assertEqual(self.claim("linux", root, 105)[0], 0)
-        self.assertEqual(len(self.claims("linux")), 5)
-
-    def test_free_slot_prefers_the_last_worktree(self) -> None:
-        first = self.repository("project", "https://github.com/nate/project.git")
-        second = self.repository("feature", "https://github.com/nate/project.git", first)
-        self.assertEqual(self.claim("linux", first, 101)[0], 0)
-        self.assertEqual(self.claim("linux", second, 102)[0], 0)
-        preferred = self.claims("linux")[102].get("slot")
-        self.release("linux", 101)
-        self.release("linux", 102)
-
-        self.assertEqual(self.claim("linux", second, 103)[0], 0)
-        self.assertEqual(self.claims("linux")[103].get("slot"), preferred)
-
-    def test_occupied_affinity_slot_is_never_reused(self) -> None:
-        first = self.repository("project", "https://github.com/nate/project.git")
-        second = self.repository("feature", "https://github.com/nate/project.git", first)
-        self.assertEqual(self.claim("linux", first, 101)[0], 0)
-        self.assertEqual(self.claim("linux", second, 102)[0], 0)
-        occupied = self.claims("linux")[102].get("slot")
-        self.release("linux", 101)
-
-        self.assertEqual(self.claim("linux", second, 103)[0], 0)
-        self.assertNotEqual(self.claims("linux")[103].get("slot"), occupied)
+        self.assertEqual(sorted(statuses), [0, 11, 11, 11, 11, 11])
+        self.assertEqual(len(self.claims("linux")), 1)
 
     def test_remote_claims_remain_when_the_local_owner_ends(self) -> None:
         root = self.repository("project", "https://github.com/nate/project.git")
-        for pid in (101, 102):
-            self.assertEqual(self.claim("linux", root, pid, remote=True)[0], 0)
+        self.assertEqual(self.claim("linux", root, 101, remote=True)[0], 0)
         before = self.claims("linux")
-        self.dead.update((101, 102))
+        self.dead.add(101)
 
         self.assertEqual(self.claim("linux", root, 103)[0], 11)
         self.assertEqual(self.claims("linux"), before)
         self.release("linux", 101)
         self.assertEqual(self.claim("linux", root, 103)[0], 0)
-        self.assertIn(102, self.claims("linux"))
 
-    def test_repeated_claim_preserves_its_occupied_slot(self) -> None:
+    def test_repeated_claim_preserves_its_identity(self) -> None:
         root = self.repository("project", "https://github.com/nate/project.git")
-        settings = self.root / "linux.conf"
-        _ = settings.write_text(settings.read_text().replace("slots=2", "slots=1"))
         requested = claim_state.ClaimIdentity("claim-a", "episode-a", "attempt-a")
         self.assertEqual(self.claim("linux", root, 101, request_identity=requested)[0], 0)
         before = self.claims("linux")
@@ -434,9 +396,7 @@ class RepositorySlotTests(unittest.TestCase):
                 self.assertEqual(self.claim("linux", root, 101, request_identity=other)[0], 11)
                 self.assertEqual(self.claims("linux"), before)
 
-    def test_takeover_keeps_the_remote_slot_until_cleanup(self) -> None:
-        settings = self.root / "linux.conf"
-        _ = settings.write_text(settings.read_text().replace("slots=2", "slots=1"))
+    def test_takeover_keeps_the_remote_claim_until_cleanup(self) -> None:
         root = self.repository("project", "https://github.com/nate/project.git")
         self.assertEqual(self.claim("linux", root, 101, remote=True)[0], 0)
         before = self.claims("linux")[101]
@@ -449,12 +409,11 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertIsInstance(answer, offload.TakenOverMacClaim)
         self.assertEqual(set(self.claims("linux")), {102})
         retained = self.claims("linux")[102]
-        self.assertEqual(retained.get("slot"), before.get("slot"))
         self.assertEqual(retained.get("remote_host"), before.get("remote_host"))
         if isinstance(answer, offload.TakenOverMacClaim):
-            self.assertEqual(answer.slot, before.get("slot"))
+            self.assertEqual(answer.slot, 1)
 
-    def test_dead_request_cannot_replace_slot_affinity(self) -> None:
+    def test_dead_request_does_not_write_claim_state(self) -> None:
         root = self.repository("project", "https://github.com/nate/project.git")
         self.assertEqual(self.claim("linux", root, 101)[0], 0)
         self.release("linux", 101)
@@ -467,16 +426,6 @@ class RepositorySlotTests(unittest.TestCase):
         after = {str(path.relative_to(paths.directory)): path.read_bytes()
                  for path in paths.directory.rglob("*.json")}
         self.assertEqual(after, before)
-
-    def test_claim_answer_preserves_the_allocated_slot(self) -> None:
-        root = self.repository("project", "https://github.com/nate/project.git")
-        for pid in (101, 102):
-            status, output = self.claim("linux", root, pid, identity=True)
-            answer = offload.read_claim_answer(offload.CommandOutput(status, output, ""))
-
-            self.assertIsInstance(answer, offload.FreshMacClaim)
-            if isinstance(answer, offload.FreshMacClaim):
-                self.assertEqual(answer.slot, self.claims("linux")[pid].get("slot"))
 
     def test_linux_mirrors_use_the_build_folder_rule_without_percent_encoding_the_key(self) -> None:
         cases = (
@@ -556,8 +505,6 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertEqual(list(paths.claims.iterdir()), [path])
 
     def test_takeover_retry_requires_cleanup_before_a_fresh_claim(self) -> None:
-        settings = self.root / "linux.conf"
-        _ = settings.write_text(settings.read_text().replace("slots=2", "slots=1"))
         root = self.repository("project", "https://github.com/nate/project.git")
         self.assertEqual(self.claim("linux", root, 101, remote=True)[0], 0)
         self.dead.add(101)
@@ -574,41 +521,6 @@ class RepositorySlotTests(unittest.TestCase):
             offload.CommandOutput(repeated_status, repeated_output, "")), offload.TakenOverMacClaim)
         self.release("linux", 102)
         self.assertEqual(self.claim("linux", root, 102, remote=True)[0], 0)
-
-    def test_another_worktree_can_clean_full_slots_after_the_owners_end(self) -> None:
-        source = self.repository("project", "https://github.com/nate/project.git")
-        abandoned = [self.repository(name, "https://github.com/nate/project.git", source)
-                     for name in ("old-a", "old-b")]
-        for pid, root in zip((101, 102), abandoned, strict=True):
-            self.assertEqual(self.claim("linux", root, pid, remote=True)[0], 0)
-            (root / ".git").unlink()
-            root.rmdir()
-        self.dead.update((101, 102))
-        replacement = self.repository("replacement", "https://github.com/nate/project.git", source)
-
-        status, output = self.claim("linux", replacement, 103, remote=True)
-
-        self.assertEqual(status, 13)
-        self.assertIn("leftovers: fake-linux", output)
-        taken = self.claims("linux")[103]
-        self.assertEqual(taken.get("worktree"), str(abandoned[0]))
-        self.assertIs(taken.get("cleanup_pending"), True)
-        self.assertEqual(len(self.claims("linux")), 2)
-
-    def test_affinity_writes_remove_deleted_worktrees(self) -> None:
-        source = self.repository("project", "https://github.com/nate/project.git")
-        removed = self.repository("removed", "https://github.com/nate/project.git", source)
-        self.assertEqual(self.claim("linux", removed, 101)[0], 0)
-        self.release("linux", 101)
-        (removed / ".git").unlink()
-        removed.rmdir()
-
-        self.assertEqual(self.claim("linux", source, 102)[0], 0)
-
-        paths = mac_test.state_paths("linux")
-        affinity = cast(dict[str, object], json.loads(next(paths.affinity.iterdir()).read_text()))
-        self.assertNotIn(str(removed), affinity)
-        self.assertIn(str(source), affinity)
 
     def test_target_platform_selects_the_mirror_and_claim_layout(self) -> None:
         registry = self.root / "build_targets.conf"
@@ -629,15 +541,16 @@ class RepositorySlotTests(unittest.TestCase):
 
         self.assertTrue(offload.remote_mirror(identity, "mac", 2).endswith("/mac-s2"))
         self.assertEqual(self.claim("mac", root, 103)[0], 0)
-        self.assertIn("slot", self.claims("mac")[103])
+        self.assertNotIn("slot", self.claims("mac")[103])
 
-    def test_target_state_includes_every_active_slot(self) -> None:
+    def test_target_state_includes_each_repository_claim(self) -> None:
         registry = self.root / "build_targets.conf"
         _ = registry.write_text(registry.read_text().replace('targets=mac,linux,', 'targets=mac,linux-one,').replace('.linux=', '.linux-one=').replace('=linux.conf', '=linux-one.conf'))
         _ = (self.root / "linux.conf").rename(self.root / "linux-one.conf")
         root = self.repository("project", "https://github.com/nate/project.git")
-        for pid in (101, 102):
-            self.assertEqual(self.claim("linux-one", root, pid)[0], 0)
+        other = self.repository("other", "https://github.com/nate/other.git")
+        self.assertEqual(self.claim("linux-one", root, 101)[0], 0)
+        self.assertEqual(self.claim("linux-one", other, 102)[0], 0)
         configured = next(target for target in targets.read_targets() if target.name == "linux-one")
 
         state = targets.target_state(configured)
@@ -645,21 +558,6 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertIsInstance(state, targets.Running)
         if isinstance(state, targets.Running):
             self.assertEqual(len(state.jobs), 2)
-
-    def test_linux_origin_slot_override_applies_to_differently_named_clones(self) -> None:
-        origin = "https://github.com/nate/hana.git"
-        main = self.repository("hana", origin)
-        clone = self.repository("phase-copy", origin)
-        settings = self.root / "linux.conf"
-        _ = settings.write_text(settings.read_text().replace("slots.hana=4", "slots.hana=3")
-                                + "slots.phase-copy=1\n")
-
-        for root, pid in ((clone, 101), (clone, 102), (main, 103)):
-            self.assertEqual(self.claim("linux", root, pid)[0], 0)
-
-        self.assertEqual(self.claim("linux", clone, 104)[0], 11)
-        self.assertEqual(self.claim("linux", main, 104)[0], 11)
-        self.assertEqual(len({record.get("slot") for record in self.claims("linux").values()}), 3)
 
     def test_mac_skip_keeps_legacy_filters_when_linux_filter_support_expands(self) -> None:
         identity = eligibility.KnownRepository("hana", "https://github.com/nate/hana")
@@ -683,33 +581,50 @@ class RepositorySlotTests(unittest.TestCase):
                 start = invocation.index("~/.claude/scripts/lint/lint") + 1
                 self.assertEqual(invocation[start:], ["nextest", *expected])
 
-    def test_deleted_worktree_takeover_preserves_the_other_occupied_slot(self) -> None:
+    def test_saved_numbered_ssh_assignment_adopts_its_exact_reservation(self) -> None:
         source = self.repository("project", "https://github.com/nate/project.git")
-        old = self.repository("deleted", "https://github.com/nate/project.git", source)
-        self.assertEqual(self.claim("linux", old, 101, remote=True)[0], 0)
-        self.assertEqual(self.claim("linux", source, 102, remote=True)[0], 0)
-        before = self.claims("linux")
-        (old / ".git").unlink()
-        old.rmdir()
+        paths = mac_test.state_paths("linux")
+        scope = claim_state.RepositoryScope("project", "https://github.com/nate/project")
+        destination = placement.PlacementDestination("ssh", "linux", "fake-linux", scope, 2)
+        owner = placement.SubmittingOwner("fixture", 101, "start-101")
+        assignment = placement.PlacementAssignment("episode", "attempt", destination,
+            execution_identity.SourceKeyKnown("source"), owner, NoOwningSession(), 0)
+        identity = claim_state.ClaimIdentity(execution_identity.assigned_claim_id("episode", "attempt"),
+                                             "episode", "attempt")
+        self.assertEqual(self.claim("linux", source, owner.pid, request_identity=identity)[0], 0)
+        claim, = claim_state.read_claims(paths)
+        legacy = claim.path.with_name(f"{claim.path.stem}.slot-2.json")
+        _ = claim.path.rename(legacy)
+
+        runner = self.arguments("linux", source, 102, remote=True)
+        runner.from_pid = owner.pid
+        runner.claim_id, runner.episode, runner.attempt = identity.claim_id, identity.episode, identity.attempt
+        runner.assignment = wire.encode_reply(wire.Assignment(assignment))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(mac_test.command_claim(runner, paths), 0)
+
+        saved, = claim_state.read_claims(paths)
+        self.assertEqual((saved.path, saved.scope), (legacy, scope))
+        self.assertEqual(claim_state.claim_identity(saved.record), identity)
+        self.assertEqual((saved.record["pid"], saved.record.get("remote_host")), (102, destination.host))
+        self.assertEqual(output.getvalue().splitlines(), ["slot: 2", "claimed"])
+
+    def test_legacy_linux_claim_holds_repository_until_its_owner_ends(self) -> None:
+        source = self.repository("project", "https://github.com/nate/project.git")
+        paths = mac_test.state_paths("linux")
+        self.assertEqual(self.claim("linux", source, 101)[0], 0)
+        claim, = mac_test.read_claims(paths)
+        legacy = claim.path.with_name(claim.path.stem + ".slot-2.json")
+        _ = claim.path.rename(legacy)
+
+        self.assertEqual(self.claim("linux", source, 102)[0], 11)
+        self.assertTrue(legacy.is_file())
         self.dead.add(101)
 
-        self.assertEqual(self.claim("linux", source, 103, remote=True)[0], 13)
-        retained = self.claims("linux")[103]
-        self.assertEqual(retained.get("slot"), before[101].get("slot"))
-        self.assertEqual(retained.get("repo_key"), before[101].get("repo_key"))
-        self.assertEqual(retained.get("repo_name"), before[101].get("repo_name"))
-        self.assertEqual(retained.get("worktree"), str(old))
-        self.assertIs(retained.get("cleanup_pending"), True)
-        requested = claim_state.ClaimIdentity(cast(str, retained["claim_id"]),
-                                               cast(str, retained["episode"]), cast(str, retained["attempt"]))
-        self.assertEqual(self.claim("linux", source, 103, remote=True, request_identity=requested)[0], 13)
-        self.assertEqual(self.claim("linux", source, 104, remote=True)[0], 11)
-        self.assertEqual(self.claims("linux")[102], before[102])
-
-        self.release("linux", 103)
-        self.assertEqual(self.claim("linux", source, 104, remote=True)[0], 0)
-        self.assertEqual(self.claims("linux")[104].get("slot"), before[101].get("slot"))
-        self.assertEqual(self.claims("linux")[102], before[102])
+        self.assertEqual(self.claim("linux", source, 102)[0], 0)
+        self.assertFalse(legacy.exists())
+        self.assertTrue(claim.path.is_file())
 
 
 if __name__ == "__main__":

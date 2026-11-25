@@ -817,12 +817,6 @@ def ci_step_label(runner: str, job: str) -> str:
     return codec.ci_label(template, runner, job)
 
 
-class SlotPlace(TypedDict):
-    # The slot folder's name and machine; the Disks page finds the step that holds a slot by them.
-    slot_folder: NotRequired[str]
-    slot_machine: NotRequired[str]
-
-
 @dataclass(frozen=True)
 class RecordedRunFolder:
     """The full execution path and its matching home, if known."""
@@ -922,7 +916,7 @@ def ended_step_name(facts: admission_records.EndedStepFacts, names: StepNames, c
         facts.project if isinstance(facts.project, str) else "", facts.folder if isinstance(facts.folder, str) else "", names)
 
 
-class RunRow(RowQueueNotes, SlotPlace, NamedQueueRow, RunFolderField):
+class RunRow(RowQueueNotes, NamedQueueRow, RunFolderField):
     kill_ref: NotRequired[str]
     admitted: NotRequired[bool]
     machine: NotRequired[str]
@@ -1129,7 +1123,7 @@ def leftover_program(pid: int | admission_records.PidNotRecorded, recorded: str)
     return ProcessName(Path(recorded).name)
 
 
-class WaitRow(RowQueueNotes, SlotPlace, NamedQueueRow):
+class WaitRow(RowQueueNotes, NamedQueueRow):
     showrunner: str
     unit: str
     pid: int
@@ -1181,7 +1175,7 @@ def held_place_row(place: admission_records.HeldPlace, zone: tzinfo) -> HeldPlac
             "kept_until": targets.clock(datetime.fromtimestamp(place.ends_at, UTC), zone)}
 
 
-class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow, RunFolderField):
+class MacBuildRow(RowQueueNotes, NamedQueueRow, RunFolderField):
     kind: Literal["mac-build"]
     row_owner: QueueRowName
     row_step: str
@@ -1197,8 +1191,6 @@ class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow, RunFolderField):
     stage: queue_view.MacBuildStage
     progress: RowProgress | NoProgress
     vcpus: int | queue_view.MacJobsUnavailable
-    slot_folder: NotRequired[str]
-    slot_machine: NotRequired[str]
 
 
 class MacReadingUnavailableRow(RowQueueNotes, NamedQueueRow):
@@ -1697,44 +1689,6 @@ def mac_build_units(builds: Sequence[queue_view.MacBuild],
     return result
 
 
-def build_slot_number(folder: str, machine: str, roots: Mapping[str, str], *, home: str) -> int | Literal["—"]:
-    """Read the number of a test copy under the machine's build root."""
-    root = roots.get(f"roots.build.{machine}", roots.get("roots.build", ""))
-    if not root or not folder:
-        return "—"
-    uses_home = root == "~" or root.startswith("~/") or re.search(r"\$(?:HOME\b|\{HOME\})", root)
-    if uses_home and not home:
-        return "—"
-    root = re.sub(r"\$(?:HOME\b|\{HOME\})", lambda _: home, root)
-    if root == "~" or root.startswith("~/"):
-        root = home + root[1:]
-    # Compare the Mac root unresolved; the page cannot resolve Mac paths locally.
-    configured = Path(os.path.realpath(root) if machine == host_name() else os.path.normpath(root))
-    run_folder = Path(os.path.normpath(folder))
-    if not run_folder.is_relative_to(configured):
-        return "—"
-    parts = run_folder.relative_to(configured).parts
-    if len(parts) != 3 or parts[1] in ("main", "ci") or not re.fullmatch(r"[1-9][0-9]*", parts[2]):
-        return "—"
-    try:
-        return int(parts[2])
-    except ValueError:
-        return "—"
-
-
-def slot_place(number: int | Literal["—"], folder: str, machine: str) -> SlotPlace:
-    """The slot folder and machine of a step in slot number; empty for a step in no slot."""
-    if number == "—":
-        return {}
-    key = "/".join(Path(os.path.normpath(folder)).parts[-3:])
-    return {"slot_folder": key, "slot_machine": machine}
-
-
-def build_slot(folder: str, machine: str, roots: Mapping[str, str], *, home: str) -> SlotPlace:
-    """The slot folder and machine when the run is in a slot; the Disks page finds the run by them."""
-    return slot_place(build_slot_number(folder, machine, roots, home=home), folder, machine)
-
-
 @dataclass(frozen=True)
 class MacBuildSource:
     """The checkout, submitting session, and host of an offloaded build."""
@@ -1772,7 +1726,6 @@ def mac_verify_sources(call_ids: set[str]) -> dict[str, MacBuildSource]:
 
 def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading,
                  identity: unit_labels.UnitLabels, *, names: StepNames,
-                 slot_roots: Mapping[str, str], slot_machine: str,
                  placed_step: admission_records.RunningStep | None = None, source_folder: str = "",
                  verify_source_missing: bool = False) -> MacBuildRow:
     """Keep Mac memory and its stage separate from natedev admission values."""
@@ -1821,7 +1774,6 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
             "pid": build.pid, "machine": "mac", "started_at": build.started_at, "read_at": reading.read_at,
             "used": gib(build.resident_bytes) if isinstance(build.resident_bytes, int) else build.resident_bytes,
             "stage": build.stage, "vcpus": queue_view.mac_command_jobs(build.command),
-            **build_slot(build.folder, slot_machine, slot_roots, home=reading.home),
             "run_folder": run_folder(build.folder, reading.home),
             "progress": ({"kind": "RowProgress", "phase": "testing" if build.counter.phase.startswith("test:") else "building",
                           "done": build.counter.done, "total": build.counter.total, "percent": build.counter.percent,
@@ -3575,11 +3527,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     snapshots = target_availability.read_snapshots()
     mac = mac_source(snapshots) if mac_source is not None else None
     mac_sessions = [claim.working_session for claim in mac.claims if claim.working_session] if mac else []
-    slot_roots = conf.read_or_repository("build_folders").values()
     mac_reading = queue_view.read_mac_builds()
     mac_machine = conf.read_or_repository("machines").words("mac.hosts")[0]
     machine = host_name()
-    slot_homes = {mac_machine: mac_reading.home, machine: str(Path.home())}
+    run_homes = {mac_machine: mac_reading.home, machine: str(Path.home())}
     with staff.supplied_snapshot(staff_display.members):
         labels = unit_labels.unit_labels_for(
             [*(step.session_id for step in (*parsed.view.running, *parsed.view.waiting)),
@@ -3715,13 +3666,11 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             run.pid if isinstance(run, LiveBuildRun) else admission_records.PidNotRecorded())
         row_labels = queue_row_labels(title_step, display_name, unit=owner.unit, ci_label=ci_label, caller=owner.caller)
         step_host = admission_records.execution_host(step, machine) if step is not None else machine
-        step_home = slot_homes.get(step_host, "")
+        step_home = run_homes.get(step_host, "")
         walk.append({**row_labels, **move_fields(move, members, zone),
                      "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                      **owner.fields(ci_label=ci_label), "between_steps": step is None,
                      "state": "", "pid": pid, "detail": detail, "used": use,
-                     **(build_slot(step.folder, step_host, slot_roots, home=step_home)
-                        if step is not None else SlotPlace()),
                      "run_folder": run_folder(step.folder, step_home) if step is not None else RunFolderNotReported(),
                      "counted": use + gib(hold.bytes) if isinstance(use, float) else use, "reserved": gib(hold.bytes),
                      "started_at": step.started_at if step is not None else 0,
@@ -3794,9 +3743,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 "vcpus": queue_view.UnknownCpuCount(),
                 **call_notes(step.verify, step.step),
                 **job_notes(job, names, step=step.step, verify=step.verify,
-                            ci=step.unit in ci_runners),
-                **build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
-                    home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))}
+                            ci=step.unit in ci_runners)}
             if step.step != HAND_MADE.step or step.assignment_target != MAC_LINUX_TARGET:
                 remote_row["run_folder"] = folder
             if placed := gate_placement_notes(step):
@@ -3965,9 +3912,6 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                                 else wait_why(waiter.reason),
                         **local_call_notes(waiter),
                         **notes,
-                        # A waiting step names its slot, so the Disks page names the slot's work as this row does.
-                        **slot_place(build_slot_number(waiter.folder, host_name(), slot_roots, home=slot_homes[host_name()]),
-                                     waiter.folder, host_name()),
                         **job_notes(job, names, step=waiter.step, verify=waiter.verify, ci=bool(ci_label))}
         if waiter.speculative_copy:
             waiters[place]["order_note"] = "Newest eligible copy starts first"
@@ -4009,8 +3953,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 current = members.labels_for(build.session, mac_machine, Path(build.folder))
                 identity = current if current is not None and public_owner_name(current.owner_text, build.session) else (
                     mac_units.get(build.pid) or current or unit_labels.UnitLabels(""))
-            mac_row: MacBuildRow = mac_work_row(build, mac_reading, identity, names=names, slot_roots=slot_roots,
-                                   slot_machine=mac_machine, placed_step=placed,
+            mac_row: MacBuildRow = mac_work_row(build, mac_reading, identity, names=names, placed_step=placed,
                                    source_folder=source.folder if source is not None else "",
                                    verify_source_missing=verify_source_missing)
             if placed is not None:

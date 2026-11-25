@@ -205,7 +205,7 @@ class RemoteCommandTests(VerifySshTargetsFixture):
 
 def add_peer_target(root: Path) -> None:
     """Register a linux SSH target named peer, with its settings file."""
-    _ = write_config_fixture(root / "linux.conf", "offload=on\nhost=fake-linux\nslots=1\nkinds=test,check,doc\n",
+    _ = write_config_fixture(root / "linux.conf", "offload=on\nhost=fake-linux\nkinds=test,check,doc\n",
                              template="mac_test")
     targets_file = root / "build_targets.conf"
     _ = targets_file.write_text(targets_file.read_text().replace("targets=mac,natedev", "targets=mac,natedev,peer")
