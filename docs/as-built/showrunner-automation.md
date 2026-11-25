@@ -659,6 +659,8 @@ The command refuses a `--source` that ends with a clock time.
 Morty can use every command.
 Other producers can add items assigned to themselves.
 The command uses the caller's staff name as the source for those items.
+On add, producers can use `--related-to` for any existing List item.
+They can use `--blocked-by` only for their own List items.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.

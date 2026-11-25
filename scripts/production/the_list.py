@@ -1308,9 +1308,10 @@ def question_visibility(keeper: staff.StaffId, item: ListItem,
     return WaitingForAnswer() if waiting else QuestionAttention(frozenset(failed))
 
 
-def _check_links(read: Callable[[int], ListItem], number: int, changes: ItemChanges) -> None:
+def _check_links(number: int, changes: ItemChanges, *, require_related: Callable[[int], None],
+                 read_dependency: Callable[[int], ListItem]) -> None:
     for related in changes.get("related_to", ()):
-        _ = read(related)
+        require_related(related)
     visited: set[int] = set()
 
     def visit(target: int) -> None:
@@ -1319,7 +1320,7 @@ def _check_links(read: Callable[[int], ListItem], number: int, changes: ItemChan
         if target in visited:
             return
         visited.add(target)
-        for dependency in read(target).blocked_by:
+        for dependency in read_dependency(target).blocked_by:
             visit(dependency.number)
 
     for dependency in changes.get("blocked_by", ()):
@@ -1341,16 +1342,22 @@ def create_records(keeper: staff.StaffId, items: Sequence[ListItem]) -> None:
         pending = {item.number: item for item in items}
         if len(pending) != len(items):
             raise ListError("item numbers must be unique")
+
         def read(number: int) -> ListItem:
             item = pending.get(number)
             return item if item is not None else load(keeper, f"L{number}")
+
+        def require_related(number: int) -> None:
+            _ = read(number)
+
         for item in items:
             _validate(item)
             if not item.log:
                 raise ListError("the log must not be empty")
             if store.path(item.id).exists():
                 raise ListError(f"{item.id}: the item already exists")
-            _check_links(read, item.number, {"blocked_by": item.blocked_by, "related_to": item.related_to})
+            _check_links(item.number, {"blocked_by": item.blocked_by, "related_to": item.related_to},
+                         require_related=require_related, read_dependency=read)
         _require_active_open_producers(items)
         if pending:
             store.reserve_number(max(pending))
@@ -1388,17 +1395,21 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         ) -> ListItem:
     """Create an item without reusing an existing record number."""
     store = _store(keeper)
-    def read_reference(number: int) -> ListItem:
+
+    def read_reference(number: int, *, scope: staff.StaffId | AllItems) -> ListItem:
         identity = f"L{number}"
         if assigned_to is AllItems.INCLUDED:
             return load(keeper, identity)
         try:
             fields, body = store.read(identity)
-            if fields.get("producer", keeper) == assigned_to:
+            if scope is AllItems.INCLUDED or fields.get("producer", keeper) == scope:
                 return _read_item(store, identity, fields, body)
         except (ListError, OSError):
             pass
         raise ListError("the referenced List item does not exist")
+
+    def require_related(number: int) -> None:
+        _ = read_reference(number, scope=AllItems.INCLUDED)
 
     with store.list_allocation():
         next_number = store.next_number()
@@ -1409,7 +1420,8 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         if chosen < next_number:
             raise ListError(f"{identity}: the next available number is L{next_number}")
         item = _new_item(chosen, title, owner, keeper, source, changes, requested_by=requested_by)
-        _check_links(read_reference, item.number, changes)
+        _check_links(item.number, changes, require_related=require_related,
+                     read_dependency=lambda number: read_reference(number, scope=assigned_to))
         _require_active_open_producers((item,))
         store.reserve_number(chosen)
         _save(store, item)
@@ -1677,6 +1689,12 @@ def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, sourc
         source = assigned_to.name
         scope = assigned_to.id
 
+    def read_reference(number: int) -> ListItem:
+        return load(keeper, f"L{number}")
+
+    def require_related(number: int) -> None:
+        _ = read_reference(number)
+
     def edit(item: ListItem, _: datetime) -> ListItem:
         _open(item)
         if changes.get("state") == ItemState.CLOSED:
@@ -1685,7 +1703,7 @@ def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, sourc
         if add_evidence:
             changed = replace(changed, evidence=_append_evidence(changed.evidence, add_evidence))
         _validate(changed)
-        _check_links(lambda number: load(keeper, f"L{number}"), changed.number, changes)
+        _check_links(changed.number, changes, require_related=require_related, read_dependency=read_reference)
         return changed
 
     def event(changed: ListItem) -> FieldChange:

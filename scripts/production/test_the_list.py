@@ -955,19 +955,29 @@ class TheListTests(unittest.TestCase):
             _ = self.add(number=2)
         self.assertEqual(self.add().number, 3)
 
-    def test_producer_add_only_resolves_its_own_references(self) -> None:
+    def test_producer_add_resolves_related_items_across_producers(self) -> None:
         foreign = self.add("Private prerequisite", changes={"producer": BOB.id})
         own = self.add("Visible prerequisite", changes={"producer": OTHER.id})
         command = ("add", "--title", "Track the result", "--owner", RUNNER.id, "--source", OTHER.name)
+        refused = (1, "", "the_list: the referenced List item does not exist\n")
+        cases = (
+            ("--related-to", "L99", refused),
+            ("--blocked-by", "L99:Complete", refused),
+            ("--blocked-by", foreign.id + ":Complete", refused),
+            ("--related-to", foreign.id, (0, "L3\n", "")),
+        )
         with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
-            for option, suffix in (("--related-to", ""), ("--blocked-by", ":Complete")):
-                with self.subTest(option=option):
-                    missing = self.command(*command, option, "L99" + suffix)
-                    self.assertEqual(missing, (1, "", "the_list: the referenced List item does not exist\n"))
-                    self.assertEqual(self.command(*command, option, foreign.id + suffix), missing)
+            for option, reference, expected in cases:
+                with self.subTest(option=option, reference=reference):
+                    self.assertEqual(self.command(*command, option, reference), expected)
             self.assertEqual(self.command(*command, "--related-to", own.id, "--blocked-by", own.id + ":Complete"),
-                             (0, "L3\n", ""))
-        saved = the_list.load(MORTY.id, "L3")
+                             (0, "L4\n", ""))
+            result, output, error = self.command("list", "--all")
+            self.assertEqual((result, error), (0, ""))
+            self.assertIn("Track the result", output)
+            self.assertNotIn(foreign.title, output)
+        self.assertEqual(the_list.load(MORTY.id, "L3").related_to, (foreign.number,))
+        saved = the_list.load(MORTY.id, "L4")
         self.assertEqual(saved.related_to, (own.number,))
         self.assertEqual(saved.blocked_by, (the_list.ItemDependency(own.number, "Complete"),))
 
