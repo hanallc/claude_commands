@@ -668,7 +668,7 @@ class RebuildClasses:
 
     @cached_property
     def edited_crate_max(self) -> int:
-        return conf.read("buildlog").whole("report.edited_crate_max_crates")
+        return conf.read("buildlog").whole("report.max_edited_crates")
 
     @cached_property
     def edited_label(self) -> str:

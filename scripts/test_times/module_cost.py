@@ -327,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
     request = parser.parse_args(argv, namespace=CostArguments())
     try:
         timeout_s = task_cpu.measurement_timeout_s()
-        replay_limit = conf.read("test_times").whole("module_cost.output_replay_limit_bytes")
+        replay_limit = conf.read("test_times").whole("module_cost.max_output_replay_bytes")
     except conf.Unusable as error:
         print(f"module_cost: {error}", file=sys.stderr, flush=True)
         return 1

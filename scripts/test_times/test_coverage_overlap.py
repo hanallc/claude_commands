@@ -220,7 +220,7 @@ class CoverageOverlapTests(unittest.TestCase):
             sources = {
                 "scripts/fixture/product.py": PRODUCT,
                 "config/test_times.conf": ("COVERAGE_LEAF_PROGRAMS=git\n\n"
-                                           + "# whole: 1..\nmodule_cost.output_replay_limit_bytes=1048576\n"),
+                                           + "# whole: 1..\nmodule_cost.max_output_replay_bytes=1048576\n"),
                 **sources,
             }
             for relative, source in sources.items():

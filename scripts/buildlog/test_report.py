@@ -45,7 +45,7 @@ HISTORY_STAMP = "2026-09-30T12:00:00Z"
 
 
 def write_edited_crate_maximum(folder: Path, maximum: int) -> None:
-    _ = write_config_fixture(folder / "buildlog.conf", f"report.edited_crate_max_crates={maximum}\n")
+    _ = write_config_fixture(folder / "buildlog.conf", f"report.max_edited_crates={maximum}\n")
 
 
 def table_cells(heading: str, rows: list[str]) -> list[dict[str, str]]:
@@ -1285,7 +1285,7 @@ class ReportTests(unittest.TestCase):
                 def read_and_update(settings: conf.ConfigRead, key: str) -> int:
                     nonlocal reads
                     value = read_whole(settings, key)
-                    if key == "report.edited_crate_max_crates":
+                    if key == "report.max_edited_crates":
                         reads += 1
                         if reads == 1 and maximum_after_read != maximum:
                             write_edited_crate_maximum(config, maximum_after_read)

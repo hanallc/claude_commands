@@ -37,7 +37,7 @@ class ModuleCostTests(unittest.TestCase):
     def setUp(self) -> None:
         folder = Path(self.enterContext(tempfile.TemporaryDirectory())) / "config"
         self.config = folder / "test_times.conf"
-        _ = write_config_fixture(self.config, "# whole: 1..\nmodule_cost.output_replay_limit_bytes=1048576\n")
+        _ = write_config_fixture(self.config, "# whole: 1..\nmodule_cost.max_output_replay_bytes=1048576\n")
         _ = config_environment(folder)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {"CONF_DIR": str(folder)})))
 
@@ -475,7 +475,7 @@ with (mock.patch.object(module_cost, 'supervise', side_effect=stall),
 
         for limit in (1_048_576, 129):
             with self.subTest(limit=limit):
-                _ = write_config_fixture(self.config, f"module_cost.output_replay_limit_bytes={limit}\n")
+                _ = write_config_fixture(self.config, f"module_cost.max_output_replay_bytes={limit}\n")
                 prefix = "a" * (limit - 2) + "é"
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with redirect_stdout(stdout), redirect_stderr(stderr):
@@ -486,13 +486,13 @@ with (mock.patch.object(module_cost, 'supervise', side_effect=stall),
                     self.assertEqual(notice, f"module_cost: output truncated after {limit} bytes")
 
     def test_unusable_replay_limit_refuses_before_starting_the_supervisor(self) -> None:
-        _ = write_config_fixture(self.config, "module_cost.output_replay_limit_bytes=0\n")
+        _ = write_config_fixture(self.config, "module_cost.max_output_replay_bytes=0\n")
         errors = io.StringIO()
         with (mock.patch.object(module_cost, "start_supervisor", return_value=0) as start,
               redirect_stderr(errors)):
             status = module_cost.main(["--tree", ".", "fixture/test_pause.py"])
         self.assertEqual(status, 1)
-        self.assertIn("module_cost.output_replay_limit_bytes", errors.getvalue())
+        self.assertIn("module_cost.max_output_replay_bytes", errors.getvalue())
         self.assertIn("no usable committed value", errors.getvalue())
         start.assert_not_called()
 

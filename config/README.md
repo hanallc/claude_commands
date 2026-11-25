@@ -692,7 +692,7 @@ The scan runs in series if the setting is unusable.
 `NEXTEST_SLOW_TEST_S` sets the recording threshold for nextest rows.
 Failed tests, errors, and unexpected successes remain in the log at every duration.
 `TOP_RUNS` sets the number of recent gate runs used to rank each module by its median CPU time.
-`module_cost.output_replay_limit_bytes` limits the bytes replayed from each module cost output stream.
+`module_cost.max_output_replay_bytes` limits the bytes replayed from each module cost output stream.
 Callers read these settings through `scripts/lib/conf.py` at each use.
 `CONF_DIR` selects a fixture folder for tests.
 
