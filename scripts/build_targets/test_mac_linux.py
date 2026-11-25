@@ -3929,6 +3929,27 @@ with (patch.object(conf, 'read', read_config),
         self.assertTrue(result.passed)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
+    def test_nightly_owner_without_a_unit_gets_a_numbered_copy(self) -> None:
+        owner_variables = dict.fromkeys(admission_records.OWNER_VARIABLES, '')
+        with patch.dict(os.environ, {**owner_variables, 'CLAUDE_SESSION_NAME': 'nightly',
+                                     'BUILDLOG_UNIT': '',
+                                     'FIXTURE_EXPECTED_UNIT': 'c410c68e-7115-552d-b80c-bbaa69545d75'}):
+            result = self.route(gate_job=StepJob('test-nightly', branch='main'))
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_gate_without_an_owner_refuses_before_guest_contact(self) -> None:
+        owner_variables = dict.fromkeys((*admission_records.OWNER_VARIABLES, 'BUILDLOG_UNIT'), '')
+        with (patch.dict(os.environ, owner_variables),
+              patch.object(admission_records, 'family_owner',
+                           return_value=admission_records.OwnerNotGiven('systemd · fixture.service')),
+              patch.object(admission_records, 'folder_owner', return_value='')):
+            result = self.route(gate_job=StepJob('test-nightly', branch='main'))
+        self.assertEqual(result, 'mac-linux: the gate has no owner unit for a numbered copy')
+        self.assertEqual(self.trace.read_text(), '')
+        self.assertEqual(self.consumed, ())
+
     def test_full_and_delta_bundles_run_the_committed_runner_with_its_modules(self) -> None:
         main = self.guest_home / '.claude'
         candidate_main = self.git('rev-parse', 'origin/main')
