@@ -983,6 +983,17 @@ Send uses the transport result even if the server cannot save the delivery failu
 The dialog shows the error and keeps the draft for another Send.
 A retry after the wait ends returns the existing item without sending another message.
 
+Both `/new_item` and the New item window send the reply command to the owner through Review delivery.
+The CLI and browser return the public filing receipt.
+Keep the reply command in the owner session.
+Use the delivered `change_page.py answer-question` command for every New item type.
+
+Run `scripts/lib/py scripts/review_links/new_item.py resend-reply I45` to resend a waiting item's reply command.
+Use the native item ID or the full submission key.
+The command reads the proof from the state store and renews a legacy proof if necessary.
+The command sends to the current owner session.
+It refuses unknown items and items that no longer wait for a reply.
+
 Run `scripts/lib/py -m scripts.review_links.review_submissions move-reply-proofs --dry-run` to preview the move.
 The preview prints three lines.
 
