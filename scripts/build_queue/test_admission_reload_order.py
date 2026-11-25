@@ -107,7 +107,7 @@ class AdmissionReloadOrderTests(unittest.TestCase):
                 fixture.configure()
                 settings = fixture.root / "build_admission.conf"
                 _ = settings.write_text(settings.read_text()
-                    + f"\nmax_runs.{fixture.server.host}.fixture=1\nmax_runs.exempt_unit=natemerge\n")
+                    + f"\nmax_runs.{conf.host_key_name(fixture.server.host)}.fixture=1\nmax_runs.exempt_unit=natemerge\n")
                 _ = write_config_fixture(conf.path("build_targets"), "targets=natedev\n")
                 checkout = fixture.root / "fixture"
                 checkout.mkdir()

@@ -84,9 +84,9 @@ class SimplifyResultTests(unittest.TestCase):
         log = json.dumps({"type": "result", "subagent_stats": {"completed": 2, "failed": 0}})
         for agents, expected in (("reuse efficiency", ""), ("reuse efficiency altitude", "3 simplify agents")):
             with self.subTest(agents=agents):
-                _ = write_config_fixture(config / "direct.conf", f"SIMPLIFY_AGENTS={agents}\n")
+                _ = write_config_fixture(config / "direct.conf", f"simplify_agents={agents}\n")
                 with patch.dict(os.environ, {"CONF_DIR": str(config)}):
-                    reason = simplify_result.validate("Pass", log, len(conf.read("direct").words("SIMPLIFY_AGENTS")))
+                    reason = simplify_result.validate("Pass", log, len(conf.read("direct").words("simplify_agents")))
                 if expected:
                     self.assertIn(expected, reason)
                 else:
@@ -96,7 +96,7 @@ class SimplifyResultTests(unittest.TestCase):
         from scripts.lint.memory_test_support import write_config_fixture
 
         config = self.directory / "config"
-        _ = write_config_fixture(config / "direct.conf", "SIMPLIFY_AGENTS=reuse altitude\n")
+        _ = write_config_fixture(config / "direct.conf", "simplify_agents=reuse altitude\n")
         review = config / "review"
         review.mkdir()
         _ = (review / "simplify.md").write_text("Keep these agents: $agents.\n")

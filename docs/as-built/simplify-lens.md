@@ -25,7 +25,7 @@ Codex fix workers apply the repairs.
 | `scripts/direct/simplify_result.py` | Prepares the prompt and checks the report and agent results. |
 | `scripts/copies/copies.py` | Creates the task clone that the reviewer reads. |
 | `scripts/agents/agent_exec.sh` | Starts Claude in plan mode without the three editing tools. |
-| `config/direct.conf` | Sets `SIMPLIFY_LENS`, `SIMPLIFY_FIRST_RUN_BEFORE`, and `SIMPLIFY_AGENTS`. |
+| `config/direct.conf` | Sets `simplify_lens`, `simplify_first_run_before`, and `simplify_agents`. |
 | `config/models.conf` | Selects `direct.simplify=claude` and `simplify=opus:high`. |
 | `config/review/simplify.md` | Defines the diff scope and report rules. |
 | `scripts/direct/findings.py` | Stores findings, held items, answers, and closure verdicts. |
@@ -37,7 +37,7 @@ bash ~/.claude/scripts/direct/assign.sh --role simplify --session-dir "${SESSION
 ```
 
 This role takes no phase, prompt, lens, or pass.
-`SIMPLIFY_LENS=off` prints `simplify: off` before Git or Claude starts.
+`simplify_lens=off` prints `simplify: off` before Git or Claude starts.
 
 ### Scope and claim
 
@@ -46,7 +46,7 @@ It fetches that branch and `refs/simplify/*` from origin.
 The fetched branch tip supplies `tip`; the unit worktree's `HEAD` does not select the review scope.
 
 `refs/simplify/last` supplies `base` when it exists.
-The first run selects the last commit before `SIMPLIFY_FIRST_RUN_BEFORE` on the default branch.
+The first run selects the last commit before `simplify_first_run_before` on the default branch.
 The configured time is `2026-11-05T22:50:00-05:00`.
 Without an earlier commit, the repository's root commit supplies `base`.
 An empty `git diff <base> <tip>` prints `simplify: no changes` and creates no claim.
@@ -156,7 +156,7 @@ The next day's run includes the failed scope.
 A successful no-change check creates no claim, so a later checkpoint that day can start a run.
 A stale lease during the final ref update reports an error.
 
-`SIMPLIFY_AGENTS` supplies both the prompt names and the expected completed-agent count.
+`simplify_agents` supplies both the prompt names and the expected completed-agent count.
 A model or Claude output change can affect result extraction.
 A held finding requires the `simplify` lens; other lenses cannot use the held state.
 

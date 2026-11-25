@@ -1262,7 +1262,7 @@ A first checker failure or explicit refusal stops at once. A launch deadline app
 A zero launch limit refuses its first hold and accepts an immediate grant.
 The leave hook runs during held waits and returns `LeftQueue` when another machine can start the step.
 
-`detached_runs.py start` checks for a live twin before it applies `config/detached_runs.conf` `LIVE_RUN_LIMIT` to the worker.
+`detached_runs.py start` checks for a live twin before it applies `config/detached_runs.conf` `live_run_limit` to the worker.
 The launcher accepts `--kind python-tests` before `--` and defaults to `detect`.
 It records the kind and creates the scope `detached-<kind>-<run-id>.scope` when systemd is available.
 The scope name omits the worker suffix from the run ID.
@@ -2578,7 +2578,7 @@ The page fits and positions the open hover again after a feed refresh.
 The AWS progress record has no working path.
 The CI summary and hand-made Mac Linux runs have no `Folder` field.
 The hover lists the other machines that the step named under `Named targets`.
-A waiting row's `Machine` cell shows one dim icon for each machine that can take the step, in the feed's order.
+A waiting row's `Machine` cell shows one icon at half opacity for each machine that can take the step, in the feed's order.
 A waiting CI step has one target: the host machine, where the CI runners run (`memory_feed.ci_target_notes`). The running CI row shows the same machine.
 Its hover names those machines in words under `Runs on`, after the `Waits for` reason.
 A machine with no icon shows its name as text in its machine color.

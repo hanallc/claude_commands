@@ -25,11 +25,11 @@ The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Workers compact between assignments when their recorded context exceeds the configured limit.
 The launcher returns when a child accepts that dispatch through `scripts.lib.detached.start_detached`.
 The child uses a separate session, so a signal to the caller's process group does not stop it.
-`WORKER_COMPACT_SECONDS` sets the deadline for `/compact --wait --timeout` and the following turn-end wait.
+`worker_compact_seconds` sets the deadline for `/compact --wait --timeout` and the following turn-end wait.
 Only a new compaction record in the transcript proves completion.
 If the deadline expires, the worker checks for this record before it reports a timeout.
 A complete compaction record lets the worker send the assignment.
-The child then sends the prompt and confirms its transcript receipt within `WORKER_SETTLE_SECONDS`.
+The child then sends the prompt and confirms its transcript receipt within `worker_settle_seconds`.
 It writes its output to `compact-<dispatch id>.log` in the run folder.
 A compaction failure sends no prompt and clears only matching `/compact` composer text.
 A detached delivery failure ends the pass with `error` and reports through the existing completion hook.
@@ -56,7 +56,7 @@ The early return prints `compaction runs detached; the prompt follows` with the 
 The pass stays active while the child completes delivery.
 An assignment with no compaction due keeps its attached delivery path.
 Codex dispatch also requires the prompt in its transcript before it reports submission.
-Codex dispatch waits up to `WORKER_SETTLE_SECONDS` for the receipt.
+Codex dispatch waits up to `worker_settle_seconds` for the receipt.
 An unproved Codex prompt returns uncertain when this bound passes or the process exits.
 A recorded prompt remains submitted after a process exit.
 Claude can record the prompt later.
@@ -197,7 +197,7 @@ A later reply updates an unfinished completion without repeating its actions or 
 A Stop with unresolved transcript evidence saves pending verification under the worker lock.
 The pending record identifies the pass and stage.
 The next turn event or a detached-run reap can retry the transcript read.
-Reap uses `RESULT_PUSH_RETRY_SECONDS` in `detached_runs.conf` as the minimum interval between attempts.
+Reap uses `result_push_retry_seconds` in `detached_runs.conf` as the minimum interval between attempts.
 Reap also checks pending verification for workers that have no detached runs.
 The hook can submit a finished result while verification remains pending.
 Verification continues until completion or a pass or stage change.
@@ -491,7 +491,7 @@ The launcher retains its original prompt identity and its dispatch record.
 The retained `scripts/direct/claude_worker.py` API runs Claude coordinator steps within its caller's process.
 `assign_claude._run` calls its functions directly.
 The module has no command line or shell protocol.
-It reads `CLAUDE_WORKER_REGISTER_WAIT_SECS` before it stops a source.
+It reads `claude_worker_register_wait_secs` before it stops a source.
 It verifies the destination against the running Claude registry before staff publication.
 It records the role before delivery.
 Delivery starts one Python child through `scripts/lib/py`.
@@ -504,11 +504,11 @@ The child calls `send.py --to session:<id> --from launcher --file <prompt>`.
 The launch returns `Delivered(native_id, turns_before, launch_environment)`, `Unchanged`, or `NotDelivered(code)`.
 `TurnsNotCounted` represents a new session without an earlier turn count.
 `wait_for_turn` reads Claude agent listings and logs in the same process.
-`CLAUDE_WORKER_POLL_SECS` sets its interval; `UNIT_WORKER_POLL_SECS` overrides it.
+`claude_worker_poll_secs` sets its interval; `UNIT_WORKER_POLL_SECS` overrides it.
 One `nix_env.ensure` supplies the settings and start environment.
 The account step uses `accounts.account_for_unscoped_launch`.
 The banner's `backgrounded` line supplies the native id.
-The registry lookup resolves that id within `CLAUDE_WORKER_REGISTER_WAIT_SECS`.
+The registry lookup resolves that id within `claude_worker_register_wait_secs`.
 `assign_claude._run` records published workers in `finally` before it starts the heartbeat watch.
 The watch follows the coordinator process during the wait.
 A signal after the banner stops an unpublished session through `claude stop`.
@@ -786,7 +786,9 @@ The start lock serializes orphan scans.
 The reaper saves an ended orphan as finished before it makes one delivery attempt.
 The reaper alerts the director if a finished run still has a failed push and its supervisor is gone.
 Before the reaper alerts for an unconfirmed push, it checks for a receipt.
-A failed turn-end replay waits for the next start or launcher reap to send its alert.
+After the supervisor exits, a worker event records a delivery error even if it occurs before pane input.
+The worker event checks for a receipt and alerts the director if delivery fails or remains unconfirmed.
+A live supervisor retains control of retries and alerts.
 A deferred replay keeps a saved push failure.
 The supervisor uses the retry count and delay in `detached_runs.conf` after it releases the completion lock.
 The supervisor sends again only when the previous attempt sent nothing.
@@ -1072,6 +1074,14 @@ A detached run result that arrives after the DONE needs a new matching DONE.
 Until that DONE, `end` keeps the worker and `answer` sends input with the DONE instruction.
 When the pass is open, the `end` refusal names the next step: `worker.py answer <name> --text TEXT` from the parent session.
 That command asks the worker for the DONE.
+When an ended pass still waits for DONE, `worker.py answer` checks the same receipt.
+This includes a canceled pass without a stopped hook outcome.
+If the idle worker still owes a reply, `answer` sends the director's text and names the results that need replies.
+If Codex aborts that turn after it accepts the prompt, the director can repeat `answer`.
+Each reply clears the results it names by run ID. A matching DONE follows the pass receipt rules.
+When no reply is due, `answer` queues undelivered results for the director before it releases the wait.
+The run ID identifies the notice across retries.
+The command keeps saved delivery records for results it releases.
 `end` gives no `answer` step while a detached run is live, while the pass waits only for reap, or after the pass is canceled.
 `worker.py end` also checks for a late reply after recorder cancellation, even when the pane is closed.
 If it finds a verified reply, it saves the reply and completes the hook before retirement.
