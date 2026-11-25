@@ -143,7 +143,20 @@ Missing action flags cause a usage error with exit 2.
 Callers use `send.py`; they do not invoke `pushover.py` directly.
 Mac callers add `--machine natedev`.
 
-A script never writes a literal phone text. It renders a catalog entry from `scripts/notify/push_catalog.py` and sends it with `push_texts.user_send_argv`, which becomes `send.py --to user --text-id ID --value k=v…`; the entry sets the need and the action. The script callers are `rust_release.send_release_text(push)` (`rust.*`), the phone branch of `sweep.send_floor_alert` (`sweep.disk_floor`), `codex_winddown` (`codex.reset_ready`), `quota_alert` (`quota.*`) and `restart_support.alert_user` (`shutdown.*`, the only phone path in `scripts/agents/`). `escalate.py` delivers registered holds through the same helper. It retains legacy free-text holds without delivery. `ci_points.review_watch` writes its alert to the production log and sends no push. The showrunner, build-report and fix instructions use the session command.
+Scripts render phone text from `scripts/notify/push_catalog.py`. Each catalog entry sets the need and the action.
+The helper `push_texts.user_send_argv` builds `send.py --to user --text-id ID --value k=v…`.
+These scripts use the helper.
+
+- `rust_release.send_release_text(push)` sends `rust.*`.
+- `sweep.send_floor_alert` sends `sweep.disk_floor` through its phone branch.
+- `codex_winddown` sends `codex.reset_ready`.
+- `quota_alert` sends `quota.*`.
+- `restart_support.alert_user` sends `shutdown.*`. It is the only phone path in `scripts/agents/`.
+- `escalate.py` sends registered holds. It retains legacy free-text holds without delivery.
+
+The showrunner, build-report, and fix instructions use the session command.
+
+The 2026-11-24 change removed the review watch and its push.
 
 ## Invariants
 
