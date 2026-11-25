@@ -120,7 +120,8 @@ class FirstStepTests(unittest.TestCase):
     def test_copies_run_hana_gate_keeps_unassigned_route(self) -> None:
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "hana")
-            script = source / "gate.py"
+            script = source / GATE_COMMAND[1]
+            script.parent.mkdir(parents=True, exist_ok=True)
             _ = script.write_text("import os\nassert 'BUILDLOG_PLACEMENT_FILE' not in os.environ\n")
             with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}),
                   mock.patch.object(copies, "caller_owner", return_value="fixture"),
@@ -132,8 +133,7 @@ class FirstStepTests(unittest.TestCase):
                   mock.patch.object(queue_place, "release_place", return_value=wire.Ok()),
                   mock.patch.object(first_step, "_placement_grant", side_effect=AssertionError("Hana placement")),
                   forbid_admission_calls()):
-                self.assertEqual(copies.main(["run", "--repo", str(source), "--commit", "HEAD", "--", "python3", str(script),
-                                              "--tests-only"]), 0)
+                self.assertEqual(copies.main(["run", "--repo", str(source), "--commit", "HEAD", "--", *GATE_COMMAND]), 0)
                 program.assert_called_once()
 
     def test_gate_modes_submit_one_default_request(self) -> None:
@@ -344,9 +344,9 @@ class FirstStepTests(unittest.TestCase):
     def test_copies_run_nested_named_gate_reuses_the_parent_with_target_overrides(self) -> None:
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "claude_commands")
-            script = source / "gate.py"
+            script = source / MODULE_GATE_COMMAND[1]
+            script.parent.mkdir(parents=True, exist_ok=True)
             _ = script.write_text("raise SystemExit(17)\n")
-            command = ("python3", str(script), *MODULE_GATE_COMMAND[2:])
             parent = client.OuterReservation("parent", os.getpid())
             with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "mac-linux"}),
                   mock.patch.object(gate_targets, "outer_reservation", return_value=parent),
@@ -359,7 +359,7 @@ class FirstStepTests(unittest.TestCase):
                 for targets in ([], ["--targets", "aws"]):
                     with self.subTest(targets=targets):
                         self.assertEqual(copies.main(["run", "--repo", str(source), "--commit", "HEAD",
-                                                     *targets, "--", *command]), 17)
+                                                     *targets, "--", *MODULE_GATE_COMMAND]), 17)
 
     def test_direct_nightly_default_excludes_aws_when_cloud_gates_are_enabled(self) -> None:
         with PlacementFixture() as fixture:

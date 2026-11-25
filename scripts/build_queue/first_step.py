@@ -326,15 +326,28 @@ def read_gate_claim_failure(assignment_file: Path, request: wire.PlacementReques
     return refusal
 
 
-def canonical_gate_command(command: Sequence[str], source: Path) -> bool:
-    """Check for a direct call to the checkout's gate script."""
+_GATE_SCRIPT_PATH = Path("scripts/production/gate.py")
+
+
+def canonical_gate_spelling(command: Sequence[str], *, copy_prefix: str = "{tree}") -> bool:
+    """Check the written gate path without reading the copy."""
     program = parse_command_program(command, keep_path=True)
     if isinstance(program, OtherCommand) or Path(command[0]).name in {"bash", "sh"}:
         return False
+    spelling = program[0]
+    path = Path(spelling)
+    if path == _GATE_SCRIPT_PATH:
+        return True
+    if copy_prefix == "{tree}" and not spelling.startswith("{tree}/"):
+        return False
+    return path == Path(copy_prefix) / _GATE_SCRIPT_PATH
+
+
+def canonical_gate_command(command: Sequence[str], source: Path) -> bool:
+    """Check for a direct call to the checkout's gate script."""
     root = source.resolve()
-    path = root / program[0]
-    canonical = root / "scripts/production/gate.py"
-    return path == canonical and path.resolve() == canonical
+    script = root / _GATE_SCRIPT_PATH
+    return canonical_gate_spelling(command, copy_prefix=str(root)) and script.resolve() == script
 
 
 def gate_module_mode_error(*, has_modules: bool, tests_only: bool, affected: bool) -> str:

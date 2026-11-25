@@ -2653,6 +2653,9 @@ def run_prepared_gate(command: Sequence[str], *, cwd: Path, descriptors: tuple[i
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
     """Run verify from a snapshot and other commands under a numbered copy lease."""
     program = parse_command_program(command)
+    if (not isinstance(program, OtherCommand) and program[0] == "gate.py"
+            and not first_step.canonical_gate_spelling(command)):
+        raise CopyError("Run gate.py inside the copy. Use ./scripts/lib/py scripts/production/gate.py ...")
     if not isinstance(program, OtherCommand) and program[0] in MERGE_GATE_PROGRAMS:
         arguments = program[1]
         if "-h" not in arguments and "--help" not in arguments:

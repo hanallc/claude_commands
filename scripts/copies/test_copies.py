@@ -2473,6 +2473,37 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertEqual(result.stderr, "copies: --module needs --tests-only or --affected\n")
         admit.assert_not_called()
 
+    def test_run_refuses_a_gate_outside_the_copy_before_snapshot_or_admission(self) -> None:
+        launcher = str(self.source / "scripts/lib/py")
+        gate = self.source / "scripts/production/gate.py"
+        with (mock.patch.object(copies, "requested_source", wraps=copies.requested_source) as snapshot,
+              mock.patch.object(first_step, "gate_targets", return_value=("natedev",)),
+              mock.patch.object(first_step, "admitted_run",
+                                side_effect=copies.CopyError("fixture reached admission")) as admit):
+            refusal = self.run_cli(command=(launcher, str(gate), "--affected", "--checkout", "{tree}"))
+            admit.assert_not_called()
+            snapshot.assert_not_called()
+            self.assertEqual(refusal.returncode, 2)
+            self.assertIn("./scripts/lib/py scripts/production/gate.py ...", refusal.stderr)
+
+            legacy = self.run_cli(command=("python3", str(gate.with_name("merge_gate.py")),
+                                           "--checkout", "{tree}", "--tests-only"))
+            snapshot.assert_called_once()
+            admit.assert_called_once()
+            self.assertEqual(legacy.stderr, "copies: fixture reached admission\n")
+
+    def test_run_refuses_gate_module_invocation_before_snapshot_or_admission(self) -> None:
+        with (mock.patch.object(copies, "requested_source", wraps=copies.requested_source) as snapshot,
+              mock.patch.object(first_step, "gate_targets", return_value=("natedev",)),
+              mock.patch.object(first_step, "admitted_run",
+                                side_effect=copies.CopyError("fixture reached admission")) as admit):
+            result = self.run_cli(command=("python3", "-m", "scripts.production.gate",
+                                           "--affected", "--checkout", "{tree}"))
+        admit.assert_not_called()
+        snapshot.assert_not_called()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("./scripts/lib/py scripts/production/gate.py ...", result.stderr)
+
     def test_run_uses_tree_cwd_substitution_and_command_exit_status(self) -> None:
         output = self.base / "command-result.json"
         evidence = self.base / "build-evidence.json"
