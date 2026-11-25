@@ -1,12 +1,11 @@
-"""Check queue names, package parser retries, and refusal of retired capacity requests."""
+"""Check queue names and package parser retries."""
 from __future__ import annotations
 
 import subprocess
 import unittest
 from unittest import mock
 
-from scripts.build_queue import admission_protocol as wire, slot_wait
-from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue import slot_wait
 from scripts.lib.build_steps import RECORDED_STEP_NAMES
 
 
@@ -47,15 +46,3 @@ class QueueRowNameTests(unittest.TestCase):
             self.assertEqual(slot_wait.command_slot_name(command, RECORDED_STEP_NAMES), "test")
             self.assertEqual(slot_wait.command_slot_name(command, RECORDED_STEP_NAMES), "test slot-retry-package")
         self.assertEqual(parse.call_count, 2)
-
-
-class RepositorySlotWaitTests(unittest.TestCase):
-    def test_retired_capacity_request_never_waits_or_reserves_memory(self) -> None:
-        fixture = self.enterContext(AdmissionFixture())
-        original = fixture.request()
-        request = wire.RepositorySlotRequest(original.episode, original.owner, original.since,
-            "widget", "fixture", str(fixture.root / "copies"), 1, original.since + 30, original.identity)
-        self.assertEqual(fixture.connect(request).replies(),
-                         [wire.Refused("Repository copy capacity no longer requires admission")])
-        self.assertFalse(fixture.server.reservations)
-        self.assertFalse(fixture.server.waiters)

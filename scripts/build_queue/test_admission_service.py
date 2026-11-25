@@ -21,6 +21,7 @@ import math
 import errno
 import os
 from pathlib import Path
+from queue import Queue
 import stat
 import select
 import shutil
@@ -62,13 +63,19 @@ from scripts.message.roster import UnitLabels
 from scripts.lint.build_shape import build_shape
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service
 from scripts.build_queue import admission_wire as status_wire
-from scripts.build_queue import admission_code, queue_snapshot, queue_view, head_facts, person_actions, placement
+from scripts.build_queue import admission_code, queue_snapshot, queue_view, head_facts, memory_trace, person_actions, placement
 from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from zoneinfo import ZoneInfo
-from scripts.build_queue.queue_fixture import write_memory_config, write_process
+from scripts.build_queue.queue_fixture import write_memory_config, write_process, write_scope
 from scripts.build_queue.admission_test_support import (
     AdmissionFixture, FixedSystemReader, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted,
 )
+
+
+TRACE_POLICY = memory_trace.MemoryTracePolicy(2, 100, 8192, 7, 16, 1024,
+                                            final_replay_bytes=131072,
+                                            max_pending_commands=8,
+                                            scope_loss_grace_seconds=5, seal_retry_count=4, shutdown_timeout_seconds=3)
 
 
 def setUpModule() -> None:
@@ -1553,6 +1560,36 @@ class MacBackoffTestFixture:
         return evidence.eligibility
 
 
+def mac_cycle_probe_ok(_fixture: MacBackoffTestFixture) -> Callable[[Sequence[str]], offload.CommandOutput]:
+    from scripts.mac_test import offload
+
+    return lambda _arguments: offload.CommandOutput(
+        0, "free_gib=60\nhost=fixture-mac\nrc=0\nmirror_setup=0\tready\n", "")
+
+
+@dataclass(frozen=True)
+class MacDiskSweepFixture:
+    admission: AdmissionFixture
+    key: placement.HostEvidenceKey
+    started: threading.Event
+    release: threading.Event
+    inline: threading.Event
+    disk_ready: threading.Event
+    readings: Queue[placement.HostEvidence]
+
+    def subscribe(self, key: placement.HostEvidenceKey) -> service.HostEvidenceReader:
+        reader = cast(Callable[[placement.HostEvidenceKey, float], service.HostEvidenceReader],
+                      getattr(self.admission.server, "_host_evidence_reader"))
+        return reader(key, test_hang_guard.TEST_HANG_GUARD_SECS)
+
+    def other_key(self) -> placement.HostEvidenceKey:
+        server = self.admission.server
+        other = replace(self.key, package="another-package")
+        request = server.host_requests[self.key]
+        server.host_requests[other] = replace(request, constraints=replace(request.constraints, package=other.package))
+        return other
+
+
 class LocalHoldPlacementTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
@@ -1924,14 +1961,15 @@ class LocalHoldPlacementTests(unittest.TestCase):
                 "the claim has no saved Mac mirror", fixture.clock.now())),))
 
     @contextmanager
-    def mac_backoff_fixture(self) -> Generator[MacBackoffTestFixture]:
+    def mac_backoff_fixture(self, *, backoff: bool = True, probe_timeout: int = 1) -> Generator[MacBackoffTestFixture]:
         from scripts.build_queue.test_placement import placement_request
         from scripts.build_targets import target_config
         from scripts.mac_test import claim_state, eligibility, offload
 
         with AdmissionFixture() as fixture:
             settings = fixture.root / "mac_test.conf"
-            _ = write_config_fixture(settings, "offload=on\nhost=fixture-mac\nlinux_only.hana=\nprobe_timeout_s=1\n")
+            _ = write_config_fixture(settings,
+                f"offload=on\nhost=fixture-mac\nlinux_only.hana=\nprobe_timeout_s={probe_timeout}\nfree_floor_gib=60\n")
             target = target_config.SshTarget("mac", "macos", settings)
             request = placement_request(fixture)
             destination = request.constraints.candidates[0].destination
@@ -1941,10 +1979,384 @@ class LocalHoldPlacementTests(unittest.TestCase):
                   mock.patch.object(claim_state, "mac_repository_identity", return_value=mirror),
                   mock.patch.object(eligibility, "state_directory", return_value=fixture.root / "mac-state"),
                   mock.patch.object(offload.ProcessController, "capture", probe.capture)):
-                offload.write_backoff(time.time() + 300, target.name)
+                if backoff:
+                    offload.write_backoff(time.time() + 300, target.name)
                 key = fixture.server.host_evidence_key(request, destination)
                 fixture.server.host_requests[key] = request
                 yield MacBackoffTestFixture(fixture, eligibility.backoff_path(target.name), key, probe)
+
+    @contextmanager
+    def mac_cycle_fixture(self, *, keys: int, probe_seconds: int = 0, blocked_key: bool = False,
+                          repositories: Sequence[str] = (),
+                          configure_probe: Callable[[MacBackoffTestFixture], Callable[[Sequence[str]], offload.CommandOutput]]
+                          = mac_cycle_probe_ok,
+                          ) -> Generator[tuple[MacBackoffTestFixture, tuple[placement.HostEvidenceKey, ...]]]:
+        from scripts.mac_test import claim_state, mac_test
+
+        start = threading.Event()
+        readings: Queue[placement.HostEvidence] = Queue()
+        guard = test_hang_guard.TEST_HANG_GUARD_SECS
+
+        class ObservedWorker(service.HostEvidenceWorker):
+            @override
+            def _read(self) -> None:
+                if not start.wait(guard):
+                    raise AssertionError("the test did not start the probe cycle")
+                super()._read()
+
+            @override
+            def _probe(self, key: placement.HostEvidenceKey, subscription: object) -> bool:
+                running = super()._probe(key, subscription)
+                readings.put(self.evidence(key))
+                return running
+
+        with (self.mac_backoff_fixture(backoff=False, probe_timeout=15) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ObservedWorker)):
+            server = fixture.admission.server
+            server.host_probe = server.read_provider_evidence
+            if repositories:
+                _ = write_config_fixture(conf.path("mac_test"), "".join(f"linux_only.{name}=\n" for name in repositories))
+            probe = configure_probe(fixture)
+
+            def capture(arguments: Sequence[str]) -> offload.CommandOutput:
+                fixture.admission.clock.advance(probe_seconds)
+                return probe(arguments)
+
+            def mirror(root: str) -> claim_state.ResolvedMacMirror:
+                name = Path(root).name
+                return claim_state.ResolvedMacMirror("https://fixture.invalid/team/hana", name, f"{name}.json", name, root)
+
+            _ = fixture.admission.enter_context(mock.patch.object(
+                claim_state, "mac_repository_identity", side_effect=mirror))
+
+            fixture.probe.answer = capture
+            request = server.host_requests[fixture.key]
+            subscribed: list[placement.HostEvidenceKey] = []
+            read = cast(Callable[[placement.HostEvidenceKey, float], service.HostEvidenceReader],
+                        getattr(server, "_host_evidence_reader"))
+            try:
+                for index in range(keys):
+                    session = (OwningSession("blocked-session") if blocked_key and index == 0
+                               else fixture.key.session)
+                    root = fixture.admission.root / (repositories[index] if repositories else "hana")
+                    key = replace(fixture.key, repository=str(root), package=f"package-{index}", session=session)
+                    server.host_requests[key] = replace(request, constraints=replace(
+                        request.constraints, repository=key.repository, package=key.package, session=session))
+                    _ = read(key, guard)
+                    subscribed.append(key)
+                if blocked_key:
+                    paths = mac_test.state_paths(fixture.key.destination.target)
+                    paths.block.parent.mkdir(parents=True, exist_ok=True)
+                    since = datetime.now(UTC)
+                    mac_test.write_block(paths.block, claim_state.ActiveMacBlock(
+                        "nate", "release work", since, since + timedelta(hours=1),
+                        claim_state.RecordedSession("submitting-session", "nate"), mac_test.NO_SHOWRUNNER,
+                        "off_by_this_block", mac_test.FREE_MESSAGE_NOT_NEEDED))
+                start.set()
+                completed = {readings.get(timeout=guard).key for _ in subscribed}
+                self.assertEqual(completed, set(subscribed))
+                worker, = server.host_targets.values()
+                worker.close()
+                worker.thread.join(guard)
+                self.assertFalse(worker.thread.is_alive())
+                yield fixture, tuple(subscribed)
+            finally:
+                server.close()
+                start.set()
+                for worker in server.host_targets.values():
+                    worker.thread.join(guard)
+                    self.assertFalse(worker.thread.is_alive())
+
+    def test_mac_cycle_reads_the_host_once_for_many_policy_keys(self) -> None:
+        with self.mac_cycle_fixture(keys=5) as (fixture, _keys):
+            self.assertEqual(fixture.probe.call_count, 1)
+
+    def test_mac_cycle_keeps_sixteen_slow_readings_fresh_together(self) -> None:
+        with self.mac_cycle_fixture(keys=16, probe_seconds=12) as (fixture, keys):
+            evidence = [fixture.admission.server.host_evidence(key) for key in keys]
+            for reading in evidence:
+                self.assertIsInstance(reading, placement.FreshHostEvidence)
+                assert isinstance(reading, placement.FreshHostEvidence)
+                self.assertEqual(reading.eligibility, placement.AllowedHost())
+            self.assertEqual(len({reading.observed_at for reading in evidence}), 1)
+
+    def test_mac_cycle_keeps_the_session_block_for_each_key(self) -> None:
+        with self.mac_cycle_fixture(keys=3, blocked_key=True) as (fixture, keys):
+            evidence = [fixture.admission.server.host_evidence(key) for key in keys]
+            results = [reading.eligibility for reading in evidence if isinstance(reading, placement.FreshHostEvidence)]
+            self.assertEqual(results, [placement.TemporaryExclusion("blocked"), placement.AllowedHost(),
+                                       placement.AllowedHost()])
+            self.assertEqual(fixture.probe.call_count, 1)
+
+    def test_mac_cycle_includes_a_cleanup_claim_written_during_ssh(self) -> None:
+        from scripts.mac_test import claim_state, mac_test, offload
+
+        def configure_probe(fixture: MacBackoffTestFixture) -> Callable[[Sequence[str]], offload.CommandOutput]:
+            paths = mac_test.state_paths(fixture.key.destination.target)
+            request = fixture.admission.server.host_requests[fixture.key]
+            paths.claims.mkdir(parents=True, exist_ok=True)
+            cleanup: claim_state.RemoteJobClaim = {
+                "claim_id": "cleanup", "episode": "previous", "attempt": "previous-attempt",
+                "submitting_session": "", "pid": request.owner.pid, "proc_start": "ended",
+                "remote_host": fixture.key.destination.host, "what": "check", "cleanup_pending": True,
+                "worktree": str(fixture.admission.root / "hana"), "since": "2026-11-17T11:00:00+00:00",
+            }
+            kept = cleanup.copy()
+            del kept["cleanup_pending"]
+            kept.update(claim_id="kept", repo_key="kept", repo_name="kept",
+                        mac_repository=claim_state.MacMirrorIdentity("kept", "kept", "kept.json", "kept").record())
+            mac_test.write_json(paths.claims / "kept.json", kept)
+            replaced = kept.copy()
+            replaced.update(claim_id="old", repo_key="replaced", repo_name="replaced",
+                            mac_repository=claim_state.MacMirrorIdentity(
+                                "replaced", "replaced", "replaced.json", "replaced").record())
+            mac_test.write_json(paths.claims / "replaced.json", replaced)
+
+            def capture(_arguments: Sequence[str]) -> offload.CommandOutput:
+                mac_test.write_json(paths.claims / "hana.json", cleanup)
+                mac_test.write_json(paths.claims / "replaced.json", {**replaced, "claim_id": "new"})
+                return offload.CommandOutput(0,
+                    "free_gib=60\nhost=fixture-mac\nrc=0\nmirror_setup=0\tready\n"
+                    + "mirror_process=0\t41\told-kept-start\nmirror_process=1\t42\told-replaced-start\n", "")
+
+            return capture
+
+        with self.mac_cycle_fixture(keys=2, configure_probe=configure_probe) as (fixture, keys):
+            server = fixture.admission.server
+            for key in keys:
+                evidence = server.host_evidence(key)
+                assert isinstance(evidence, placement.FreshHostEvidence)
+                self.assertEqual([claim.reference.claim_id for claim in evidence.cleanup_claims], ["cleanup"])
+                self.assertEqual(evidence.eligibility, placement.AllowedHost())
+                executions = {reference.claim_id: execution for reference, execution in evidence.executions}
+                self.assertEqual(executions["kept"], execution_identity.ObservedExecution(
+                    execution_identity.ProcessExecution(key.destination.host, "", 41, "old-kept-start")))
+                self.assertEqual(executions["new"], execution_identity.ExecutionEvidenceUnavailable(
+                    "remote execution remains unresolved", evidence.observed_at))
+                self.assertNotIn("old", executions)
+            request = server.host_requests[keys[0]]
+            reply, = server.handle_request(request)
+            assert isinstance(reply, wire.PlacementWait)
+            self.assertEqual(reply.eligibility, (placement.CandidateEligibility(
+                keys[0].destination, placement.TemporaryExclusion("busy")),))
+
+    def test_mac_cycle_applies_each_mirrors_setup_result(self) -> None:
+        from scripts.mac_test import floor_claims, offload
+
+        setup_reports: list[str] = []
+
+        def configure_probe(fixture: MacBackoffTestFixture) -> Callable[[Sequence[str]], offload.CommandOutput]:
+            root = fixture.admission.root
+            ready = root / offload.mac_mirror_root().relative / "hana"
+            ready.mkdir(parents=True)
+            (ready / floor_claims.MIRROR_MARK).touch()
+            runner = root / ".claude/scripts/lib/py"
+            runner.parent.mkdir(parents=True)
+            _ = runner.write_text("#!/bin/sh\nexit 1\n")
+            runner.chmod(0o700)
+            commands = "df() { printf 'header\\nfs a b 60\\n'; }\nhostname() { printf 'fixture-mac\\n'; }\n"
+
+            def capture(arguments: Sequence[str]) -> offload.CommandOutput:
+                result = subprocess.run(["/bin/sh", "-c", commands + arguments[-1]], capture_output=True,
+                                        text=True, timeout=5, check=False)
+                setup_reports.extend(line for line in result.stdout.splitlines() if line.startswith("mirror_setup="))
+                return offload.CommandOutput(result.returncode, result.stdout, result.stderr)
+
+            return capture
+
+        with self.mac_cycle_fixture(keys=2, repositories=("hana", "other"),
+                                    configure_probe=configure_probe) as (fixture, keys):
+            evidence = [fixture.admission.server.host_evidence(key) for key in keys]
+            results = [reading.eligibility for reading in evidence if isinstance(reading, placement.FreshHostEvidence)]
+            self.assertEqual(results, [placement.AllowedHost(), placement.TemporaryExclusion("copy")])
+            self.assertEqual(fixture.probe.call_count, 1)
+            self.assertEqual(setup_reports, ["mirror_setup=0\tready", "mirror_setup=1\tfailed"])
+
+    @contextmanager
+    def mac_disk_sweep_fixture(self) -> Generator[MacDiskSweepFixture]:
+        from scripts.mac_test import offload
+
+        started, release, inline, disk_ready = (threading.Event() for _ in range(4))
+        readings: Queue[placement.HostEvidence] = Queue()
+        recoveries: list[threading.Thread] = []
+        guard = test_hang_guard.TEST_HANG_GUARD_SECS
+        caller = threading.current_thread()
+        start = threading.Thread.start
+
+        class ObservedWorker(service.HostEvidenceWorker):
+            @override
+            def _probe(self, key: placement.HostEvidenceKey, subscription: object) -> bool:
+                running = super()._probe(key, subscription)
+                readings.put(self.evidence(key))
+                return running
+
+        def capture(arguments: Sequence[str]) -> offload.CommandOutput:
+            if arguments[-1].endswith("--floor-only --host mac"):
+                started.set()
+                thread = threading.current_thread()
+                if thread is caller or thread.name.startswith("placement-evidence-"):
+                    inline.set()
+                elif not release.wait(guard):
+                    raise AssertionError("the test did not release the sweep")
+                disk_ready.set()
+                return offload.CommandOutput(0, "", "")
+            free = 60 if disk_ready.is_set() else 59
+            return offload.CommandOutput(0, f"free_gib={free}\nhost=fixture-mac\nrc=0\nmirror_setup=0\tready\n", "")
+
+        def start_thread(thread: threading.Thread) -> None:
+            start(thread)
+            if thread.name == "mac-disk-recovery":
+                recoveries.append(thread)
+
+        with (self.mac_backoff_fixture(backoff=False) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ObservedWorker),
+              mock.patch.object(threading.Thread, "start", start_thread)):
+            fixture.probe.answer = capture
+            server = fixture.admission.server
+            server.host_probe = server.read_provider_evidence
+            try:
+                yield MacDiskSweepFixture(fixture.admission, fixture.key, started, release, inline, disk_ready, readings)
+            finally:
+                release.set()
+                server.close()
+                for worker in server.host_targets.values():
+                    worker.thread.join(guard)
+                for recovery in recoveries:
+                    recovery.join(guard)
+                self.assertFalse(any(worker.thread.is_alive() for worker in server.host_targets.values()))
+                self.assertFalse(any(recovery.is_alive() for recovery in recoveries))
+
+    def test_mac_disk_probe_returns_pending_before_the_sweep_ends(self) -> None:
+        from scripts.mac_test import offload
+
+        with self.mac_disk_sweep_fixture() as fixture:
+            evidence = fixture.admission.server.read_provider_evidence(fixture.key)
+            self.assertFalse(fixture.inline.is_set(), "the probe ran the sweep inline")
+            assert isinstance(evidence, service.MacDiskRecoveryPendingEvidence)
+            self.assertEqual(evidence.disk, offload.MacDiskShort(59, 60))
+            self.assertEqual(evidence.eligibility, placement.TemporaryExclusion("disk"))
+            self.assertTrue(fixture.started.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+            self.assertFalse(fixture.release.is_set())
+
+    def test_another_mac_key_gets_fresh_disk_evidence_during_the_sweep(self) -> None:
+        with self.mac_disk_sweep_fixture() as fixture:
+            server = fixture.admission.server
+            guard = test_hang_guard.TEST_HANG_GUARD_SECS
+            first = fixture.subscribe(fixture.key)
+            self.assertEqual(fixture.readings.get(timeout=guard).key, fixture.key)
+            self.assertFalse(fixture.inline.is_set(), "the first probe ran the sweep inline")
+            self.assertTrue(fixture.started.wait(guard))
+            fixture.admission.clock.advance(1)
+            other = fixture.other_key()
+            second = fixture.subscribe(other)
+            self.assertIs(first.worker, second.worker)
+            evidence = fixture.readings.get(timeout=guard)
+            self.assertEqual(evidence.key, other)
+            self.assertIsInstance(evidence, service.MacDiskRecoveryPendingEvidence)
+            self.assertEqual(evidence.observed_at, fixture.admission.clock.now())
+            self.assertEqual(server.host_evidence(other), evidence)
+            self.assertFalse(fixture.release.is_set())
+
+    def test_mac_at_the_disk_floor_stays_excluded_until_the_sweep_ends(self) -> None:
+        from scripts.mac_test import offload
+
+        with self.mac_disk_sweep_fixture() as fixture:
+            server = fixture.admission.server
+            first = server.read_provider_evidence(fixture.key)
+            assert isinstance(first, service.MacDiskRecoveryPendingEvidence)
+            self.assertTrue(fixture.started.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+            fixture.disk_ready.set()
+            second = server.read_provider_evidence(fixture.other_key())
+            assert isinstance(second, placement.FreshHostEvidence)
+            self.assertEqual(second.eligibility, placement.TemporaryExclusion("disk"))
+            assert isinstance(second, service.MacDiskRecoveryPendingEvidence)
+            self.assertEqual(second.disk, offload.MacDiskShort(59, 60))
+            self.assertFalse(fixture.release.is_set())
+
+    def test_mac_disk_recovery_excludes_another_keys_cached_allowed_reading(self) -> None:
+        for during_pass in (False, True):
+            with self.subTest(during_pass=during_pass):
+                self.assert_mac_disk_recovery_blocks_cached_reading(during_pass)
+
+    def assert_mac_disk_recovery_blocks_cached_reading(self, during_pass: bool) -> None:
+        with self.mac_disk_sweep_fixture() as fixture:
+            server = fixture.admission.server
+            fixture.disk_ready.set()
+            cached = server.read_provider_evidence(fixture.key)
+            assert isinstance(cached, placement.FreshHostEvidence)
+            self.assertEqual(cached.eligibility, placement.AllowedHost())
+            server.publish_host_evidence(cached)
+
+            def start_recovery() -> None:
+                fixture.disk_ready.clear()
+                other = server.read_provider_evidence(fixture.other_key())
+                self.assertIsInstance(other, service.MacDiskRecoveryPendingEvidence)
+                self.assertTrue(fixture.started.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+
+            request = server.host_requests[fixture.key]
+            if during_pass:
+                read = server.host_evidence
+
+                def read_before_recovery(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                    evidence = read(key)
+                    if key == fixture.key and not fixture.started.is_set():
+                        self.assertEqual(evidence, cached)
+                        start_recovery()
+                    return evidence
+
+                with mock.patch.object(server, "host_evidence", side_effect=read_before_recovery):
+                    reply, = server.handle_request(request)
+            else:
+                start_recovery()
+                reply, = server.handle_request(request)
+            self.assertIsInstance(reply, wire.PlacementWait)
+            assert isinstance(reply, wire.PlacementWait)
+            self.assertEqual(reply.eligibility, (placement.CandidateEligibility(
+                fixture.key.destination, placement.TemporaryExclusion("disk")),))
+            self.assertNotIn(request.episode, server.current_assignments)
+            self.assertEqual(server.host_observations[fixture.key], cached)
+
+    def test_mac_sweep_completion_refreshes_every_key_during_a_probe(self) -> None:
+        with self.mac_disk_sweep_fixture() as fixture:
+            server = fixture.admission.server
+            guard = test_hang_guard.TEST_HANG_GUARD_SECS
+            first_read, publish_first, refresh = (threading.Event() for _ in range(3))
+            read = server.host_probe
+
+            def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                evidence = read(key)
+                if key == fixture.key and not first_read.is_set():
+                    first_read.set()
+                    if not publish_first.wait(guard):
+                        raise AssertionError("the test did not release the probe")
+                return evidence
+
+            server.host_probe = probe
+            reader = fixture.subscribe(fixture.key)
+            try:
+                self.assertTrue(first_read.wait(guard))
+                self.assertFalse(fixture.inline.is_set(), "the probe ran the sweep inline")
+                self.assertTrue(fixture.started.wait(guard))
+                other = fixture.other_key()
+                _ = fixture.subscribe(other)
+                request = reader.worker.requested.set
+
+                def notify() -> None:
+                    request()
+                    refresh.set()
+
+                with mock.patch.object(reader.worker.requested, "set", side_effect=notify):
+                    fixture.release.set()
+                    self.assertTrue(refresh.wait(guard))
+                publish_first.set()
+                self.assertIsInstance(fixture.readings.get(timeout=guard), service.MacDiskRecoveryPendingEvidence)
+                refreshed = [fixture.readings.get(timeout=guard) for _ in range(2)]
+                self.assertEqual({reading.key for reading in refreshed}, {fixture.key, other})
+                for evidence in refreshed:
+                    assert isinstance(evidence, placement.FreshHostEvidence)
+                    self.assertEqual(evidence.eligibility, placement.AllowedHost())
+            finally:
+                publish_first.set()
 
     def test_good_mac_probe_ends_active_backoff(self) -> None:
         from scripts.mac_test import offload
@@ -3086,7 +3498,7 @@ class ReplyPublicationTests(unittest.TestCase):
             next_grant = only_admitted(server.handle_request(next_request))
             _ = server.handle_request(wire.ReleaseRequest("cached-release", next_grant.reservation, 0))
             assert_full_state()
-            _ = server.handle_request(wire.PriorityClearRequest("cached-priority", "fixture"))
+            _ = server.handle_request(wire.PriorityClearRequest("cached-priority", "fixture", why="clear words"))
             assert_full_state()
 
     def test_unchanged_persist_does_not_encode_durable_records_again(self) -> None:
@@ -3201,7 +3613,7 @@ class RunnerAuthorizationTests(unittest.TestCase):
                             self.assertNotIn(request.episode, service.read_state(fixture.state_dir).reservations)
                         elif operation == "priority":
                             self.assertEqual(fixture.completed_queue_change(
-                                wire.PriorityClearRequest("guard-priority", "fixture")), [wire.Ok()])
+                                wire.PriorityClearRequest("guard-priority", "fixture", why="clear words")), [wire.Ok()])
                         elif operation == "finalization boundary":
                             boundary = service.StateIntents(fixture.server.reservations, advance_generation,
                                 request.episode, fixture.server.persist, fixture.fault, fixture.server.places,
@@ -3386,8 +3798,8 @@ class RunnerAuthorizationTests(unittest.TestCase):
                 _ = (directory / "fps").write_text(json.dumps({"holder": "fps", "since": "2026-11-15T12:00:00+00:00",
                     "for": "Phase 3 timing", "release_eta": "unknown", "keep": []}))
                 request = fixture.service_request()
-                priority = records.QueuePriority(({"unit": request.runner, "why": "fixture",
-                    "set_at": fixture.clock.now(), "set_by": "fixture"},))
+                priority = records.QueuePriority(({"kind": "UnitPriorityEntry", "unit": request.runner, "why": "fixture",
+                    "set_at": fixture.clock.now(), "set_by": "fixture", "asker": records.UnstaffedSession("fixture")},))
                 if priority_source == "existing":
                     fixture.server.priority = priority
                 waiting, = fixture.server.handle_request(request)
@@ -3658,7 +4070,7 @@ class RunnerAuthorizationTests(unittest.TestCase):
     def test_runner_cannot_change_priority(self) -> None:
         with AdmissionFixture() as fixture, fixture.peer_account(os.getuid() + 10000):
             for request in (wire.PrioritySetRequest("set", "unit", "why", "director"),
-                            wire.PriorityClearRequest("clear", "director")):
+                            wire.PriorityClearRequest("clear", "director", why="clear words")):
                 with self.subTest(request=type(request).__name__):
                     replies = fixture.completed_queue_change(request)
                     self.assertEqual(len(replies), 1)
@@ -3996,7 +4408,7 @@ class PendingPriorityTests(unittest.TestCase):
             try:
                 priority = self.connect(fixture, wire.PrioritySetRequest("set", "chosen", "urgent", "director"))
                 self.assertTrue(entered.wait())
-                cleared = self.connect(fixture, wire.PriorityClearRequest("clear", "director"))
+                cleared = self.connect(fixture, wire.PriorityClearRequest("clear", "director", why="clear words"))
                 self.assertIsInstance(self.reply(self.connect(fixture, wire.ViewRequest())), wire.ViewReply)
                 self.assertEqual(select.select([cleared], [], [], 0)[0], [])
                 finish.set()
@@ -4087,11 +4499,11 @@ class PendingPriorityTests(unittest.TestCase):
         with AdmissionFixture() as fixture, self.delayed_roster() as (entered, finish), fixture.serving():
             try:
                 request = wire.PrioritySetRequest("apply-set", "chosen", "urgent", "director")
-                clear = wire.PriorityClearRequest("apply-clear", "director")
+                clear = wire.PriorityClearRequest("apply-clear", "director", why="clear words")
                 priority = self.connect(fixture, request)
                 self.assertTrue(entered.wait())
                 cleared = self.connect(fixture, clear)
-                following = self.connect(fixture, wire.PriorityClearRequest("following", "director", "missing"))
+                following = self.connect(fixture, wire.PriorityClearRequest("following", "director", "missing", why="clear words"))
                 self.assertIsInstance(self.reply(self.connect(fixture, wire.ViewRequest())), wire.ViewReply)
                 self.assertEqual(select.select([priority, cleared, following], [], [], 0)[0], [])
                 with mock.patch.object(store, "read_last_whole_row_end", side_effect=ValueError("history unreadable")):
@@ -5818,6 +6230,30 @@ class QueueLifecycleTests(unittest.TestCase):
             self.assertNotIn("budget", row)
             self.assertTrue(row["is_head"])
 
+    def test_admitted_row_counts_the_token_waiting_row_it_passed(self) -> None:
+        with AdmissionFixture() as fixture:
+            first = fixture.request(since=fixture.clock.now() - 5)
+            grant = only_admitted(fixture.server.handle_request(first))
+            fixture.clock.advance(10)
+            _ = fixture.server.handle_request(wire.TokenWaitRequest("token-wait", grant.reservation))
+            waiting = fixture.server.handle_request(replace(first, episode="token-wait-reconnect"))[0]
+            assert isinstance(waiting, wire.Wait)
+            self.assertIsInstance(waiting.reason, records.TokenWaitingWaiter)
+            later = fixture.request(since=fixture.clock.now())
+            _ = only_admitted(fixture.server.handle_request(later))
+            rows = {row["pid"]: row for row in self.events(fixture, "admitted")}
+            self.assertEqual(rows[later.owner.pid]["passed"],
+                             codec.snapshot_value(gate.PassedRows(0, 1, 0, 0, 0, 0)))
+            # A token-waiting row is not a queued row, so the later step is still the first queued row.
+            self.assertTrue(rows[later.owner.pid]["is_head"])
+
+    def test_an_outbox_admission_saved_without_passed_decodes_as_not_recorded(self) -> None:
+        saved = cast(dict[str, object], codec.snapshot_value(
+            service.PendingAdmission("episode", "measured", True, 1.0, gate.PassedRows(1, 0, 0, 0, 0, 0))))
+        del saved["passed"]
+        pending = codec.parse_snapshot_value(saved, service.PendingAdmission)
+        self.assertEqual(pending, service.PendingAdmission("episode", "measured", True, 1.0, gate.PassedNotRecorded()))
+
     def test_admission_recovery_keeps_one_event_for_the_durable_grant(self) -> None:
         for boundary in ("after_state_write", "after_admitted_append"):
             with self.subTest(boundary=boundary), AdmissionFixture() as fixture:
@@ -6814,7 +7250,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_mutation_refusals_replay_durably_after_state_changes(self) -> None:
         with AdmissionFixture() as fixture:
-            empty = wire.PriorityClearRequest("refused-unit", "director", "missing")
+            empty = wire.PriorityClearRequest("refused-unit", "director", "missing", why="clear words")
             refused = fixture.server.handle_request(empty)
             fixture.restart()
             fixture.free(0)
@@ -8223,10 +8659,10 @@ class CutoverServiceTests(unittest.TestCase):
                 assert isinstance(view, wire.ViewReply)
                 self.assertEqual([step.pid for step in view.reading.view.waiting],
                     [requests[index].owner.pid for index in (2, 3, 1, 4, 0)])
-                text = "queue priority: demo (why-demo), cables (why-cables)"
+                text = 'queue priority: demo (actor-demo: "why-demo"), cables (actor-cables: "why-cables")'
                 self.assertIn(text, head_facts.priority_text(view.reading.explanation.priority))
                 self.assertEqual(fixture.server.handle_request(wire.PriorityClearRequest(
-                    "remove-demo", "director", "demo")), [wire.Ok()])
+                    "remove-demo", "director", "demo", why="clear words")), [wire.Ok()])
                 priority = fixture.server.priority
                 assert isinstance(priority, records.QueuePriority)
                 self.assertEqual(priority.entries, saved.entries[1:])
@@ -8235,12 +8671,12 @@ class CutoverServiceTests(unittest.TestCase):
                 self.assertEqual([step.pid for step in view.reading.view.waiting],
                     [requests[index].owner.pid for index in (1, 4, 0, 2, 3)])
                 self.assertEqual(fixture.server.handle_request(wire.PriorityClearRequest(
-                    "unknown-clear", "director", "missing")), [wire.Refused(
+                    "unknown-clear", "director", "missing", why="clear words")), [wire.Refused(
                         "unknown unit missing; the queue priority did not change")])
                 self.assertEqual(fixture.server.priority, priority)
                 self.assertEqual(logged.call_count, 3)
                 self.assertEqual(fixture.server.handle_request(wire.PriorityClearRequest(
-                    "clear-all", "director")), [wire.Ok()])
+                    "clear-all", "director", why="clear words")), [wire.Ok()])
                 self.assertIsInstance(fixture.server.priority, records.NoQueuePriority)
                 self.assertEqual(logged.call_count, 4)
                 self.assertEqual([call.args[:2] for call in logged.call_args_list],
@@ -8257,6 +8693,8 @@ class CutoverServiceTests(unittest.TestCase):
             assert isinstance(priority, records.QueuePriority)
             self.assertEqual(priority.entries, ({"unit": "demo", "why": "user work",
                 "set_at": fixture.clock.now(), "set_by": "director"},))
+            self.assertEqual(records.entry_asker(priority.entries[0]), records.AskerNotRecorded())
+            self.assertEqual(head_facts.priority_text(priority), "queue priority: demo (user work)")
             self.assertEqual(path.read_bytes(), before)
             path = fixture.state_dir / "state.json"
             state = cast(dict[str, object], json.loads(path.read_text()))
@@ -8281,19 +8719,42 @@ class CutoverServiceTests(unittest.TestCase):
                 fixture.free(60 * GIB if running else 0)
                 _ = fixture.server.handle_request(request)
                 absent = wire.PrioritySetRequest("absent", "missing", "urgent", "director")
+                refusal = wire.Refused("unknown unit missing; the queue priority did not change")
                 with mock.patch.object(gate, "priority_labels", return_value={
                         "unrelated": UnitLabels("other", unit="roster-unit"),
                         request.identity.session_id: UnitLabels("worker", unit="present")}):
-                    refused = fixture.completed_queue_change(absent)
-                    self.assertEqual(refused, [wire.Refused(
-                        "unknown unit missing; the queue priority did not change")])
+                    self.assertEqual(fixture.completed_queue_change(absent), [refusal])
                     self.assertIsInstance(fixture.server.priority, records.NoQueuePriority)
                     self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
                         "present", "present", "urgent", "director")), [wire.Ok()])
-                    self.assertEqual(fixture.completed_queue_change(absent), refused)
+                    self.assertEqual(fixture.completed_queue_change(absent), [refusal])
                     priority = fixture.server.priority
                     assert not isinstance(priority, records.NoQueuePriority)
                     self.assertEqual(priority.entries[0]["unit"], "present")
+
+    def test_retired_priority_requests_leave_priority_unchanged(self) -> None:
+        with AdmissionFixture() as fixture:
+            with mock.patch.object(gate, "priority_labels", return_value={
+                    "session": UnitLabels("worker", unit="present")}):
+                self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
+                    "initial", "present", "urgent", "director")), [wire.Ok()])
+            priority = fixture.server.priority
+            self.assertIsInstance(priority, records.QueuePriority)
+            self.assertEqual(service.read_state(fixture.state_dir).priority, priority)
+            request = wire.PrioritySetRequest("retired", "present", "other words", "director")
+            envelope = cast(dict[str, object], json.loads(wire.encode_request(request)))
+            data = cast(dict[str, object], envelope["data"])
+            data["target"] = {"kind": "OneRun", "run": codec.snapshot_value(wire.RunIdentity(41, "900")),
+                              "step": "nextest"}
+            for name in ("priority_set", "priority_run_set"):
+                with self.subTest(name=name):
+                    envelope["type"] = name
+                    peer = fixture.connect(json.dumps(envelope) + "\n")
+                    self.assertEqual(peer.replies(), [wire.Refused("priority applies to a unit")])
+                    reply, = fixture.connect(wire.ViewRequest()).replies()
+                    assert isinstance(reply, wire.ViewReply)
+                    self.assertEqual(reply.reading.explanation.priority, priority)
+                    self.assertEqual(service.read_state(fixture.state_dir).priority, priority)
 
     def test_waiter_keeps_source_basis_scope_and_typed_width_in_state_and_views(self) -> None:
         for source, runs in (("measured", 7), ("buildlog", 12), ("pooled", 31), ("fallback", 0)):
@@ -8343,7 +8804,7 @@ class CutoverServiceTests(unittest.TestCase):
                     request.identity.session_id: UnitLabels("worker", unit="old")}))
                 self.assertEqual(fixture.completed_queue_change(
                     wire.PrioritySetRequest("initial", "old", "initial", "director")), [wire.Ok()])
-                mutation = (wire.PriorityClearRequest("change", "director") if action == "clear" else
+                mutation = (wire.PriorityClearRequest("change", "director", why="clear words") if action == "clear" else
                             wire.PrioritySetRequest("change", "new", "replacement", "director"))
                 if action == "replace":
                     _ = self.enterContext(mock.patch.object(gate, "priority_labels", return_value={
@@ -8921,6 +9382,7 @@ class CutoverServiceTests(unittest.TestCase):
             server = mock.MagicMock(replace_in_place=False)
             with mock.patch.object(store, "root", return_value=root), \
                  mock.patch.object(service, "AdmissionServer", return_value=server) as made, \
+                 mock.patch.object(memory_trace, "read_policy", return_value=TRACE_POLICY), \
                  mock.patch.object(sys, "argv", ["admission_service", "serve"]):
                 self.assertEqual(service.main(), 0)
             self.assertEqual(made.call_args.args[0], root / "admission")
@@ -9100,7 +9562,7 @@ class CutoverServiceTests(unittest.TestCase):
                     for key, place in state.places.items()}
                 for waiting in fixture.server.waiters.values():
                     self.assertNotIn("priority_rank", records.stored_waiter(waiting.row))
-                self.assertEqual(fixture.server.handle_request(wire.PriorityClearRequest("clear", "director")), [wire.Ok()])
+                self.assertEqual(fixture.server.handle_request(wire.PriorityClearRequest("clear", "director", why="clear words")), [wire.Ok()])
                 view = fixture.server.handle_request(wire.ViewRequest())[0]
                 assert isinstance(view, wire.ViewReply)
                 self.assertEqual([step.pid for step in view.reading.view.waiting],
@@ -9687,6 +10149,96 @@ class RunPlaceTests(unittest.TestCase):
             assert "order_since" in row
             self.assertEqual(row["order_since"], second.since)
             self.assertFalse(fixture.server.reservations)
+
+    def test_doc_keeps_its_run_rank_without_a_memory_hold_or_repository_slot(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run)
+            grant = fixture.finish_step(first)
+            self.assertIsInstance(fixture.server.slots[grant.reservation], records.BetweenStepsSlot)
+            fixture.free(0)
+            fixture.hold_starts()
+            fixture.clock.advance(1)
+            peer = fixture.request()
+            _ = fixture.server.handle_request(peer)
+            fixture.clock.advance(1)
+            doc = fixture.request(step="doc", run=run)
+            doc = replace(doc, identity=replace(doc.identity, verify=records.VerifyCall("doc", "verify doc", 1, 2)))
+            self.assertIsInstance(fixture.server.handle_request(doc)[0], wire.Wait)
+            self.assertEqual(fixture.queue_pids(), [doc.owner.pid, peer.owner.pid])
+            self.assertIsInstance(fixture.server.slots[grant.reservation], records.BetweenStepsSlot)
+            self.assertIsInstance(fixture.server.waiters[doc.episode].continuation_claim, service.NoContinuationClaim)
+
+            fixture.free(60 * GIB)
+            write_pressure_reading(fixture.root / "pressure")
+            fixture.allow_next_start()
+            _ = fixture.run_pass()
+            doc_grant = fixture.server.reservations[doc.episode].reservation_id
+            self.assertFalse(fixture.server.verify_run_slots)
+            self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("doc", doc_grant, 0)), [wire.Ok()])
+            self.assertNotIn(doc_grant, fixture.server.slots)
+
+    def test_mac_busy_mend_keeps_its_rank_for_the_retry(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, adopt_assignment, assignment_for, consume_permission, local_candidate,
+            placement_request, publish_candidate,
+        )
+
+        with PlacementFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run)
+            _ = fixture.finish_step(first)
+            fixture.free(0)
+            fixture.hold_starts()
+            fixture.clock.advance(1)
+            peer = fixture.request()
+            _ = fixture.server.handle_request(peer)
+            fixture.clock.advance(1)
+            mend = placement_request(fixture)
+            assert isinstance(mend.profile, records.StepProfile)
+            mend = replace(mend, run=run, profile=replace(mend.profile, step="mend"),
+                identity=replace(mend.identity, step="mend"), constraints=replace(mend.constraints,
+                    command=("cargo", "mend"), candidates=(*mend.constraints.candidates, local_candidate(fixture))))
+            _ = publish_candidate(fixture, mend)
+            remote = assignment_for(fixture, mend)
+            self.assertEqual(remote.destination.provider, "mac")
+            saved_place = next(place for place in fixture.server.places.values() if place.episode == mend.episode)
+            self.assertTrue(saved_place.move_id)
+            claim = adopt_assignment(fixture, mend, remote)
+            self.assertEqual(fixture.server.handle_request(consume_permission("mend-start", remote, claim)),
+                             [wire.FirstAuthorization(remote, claim)])
+
+            key = fixture.server.host_evidence_key(mend, remote.destination)
+            evidence = fixture.provider_evidence[key]
+            assert isinstance(evidence, placement.FreshHostEvidence)
+            execution = execution_identity.ProcessExecution(remote.destination.host, evidence.generation, 700001, "start")
+            observed = replace(evidence, executions=((claim, execution_identity.ObservedExecution(execution)),))
+            fixture.provider_evidence[key] = observed
+            fixture.server.publish_host_evidence(observed)
+            _ = fixture.run_pass()
+            self.assertNotIn(mend.owner.pid, fixture.queue_pids())
+
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, mend, placement.TemporaryExclusion("busy"))
+            refused, = fixture.server.handle_request(wire.ExecutionReport("mend-busy", remote, claim,
+                execution_identity.ExecutionNotStarted(), placement.PrelaunchRefused("busy"),
+                placement.DispatchPathSettled()))
+            assert isinstance(refused, wire.DispatchStatus)
+            self.assertEqual(refused.state, placement.ClosedAssignment("busy"))
+            waiting, = fixture.server.handle_request(mend)
+            self.assertIsInstance(waiting, wire.PlacementWait)
+            self.assertEqual(fixture.queue_pids(), [mend.owner.pid, peer.owner.pid])
+            returned = next(place for place in fixture.server.places.values() if place.episode == mend.episode)
+            self.assertEqual(returned.move_id, saved_place.move_id)
+            row = next(row for _, row in self.reading(fixture).ordered if row["pid"] == mend.owner.pid)
+            self.assertEqual(row.get("order_since"), first.since)
+
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, mend)
+            retry = assignment_for(fixture, mend)
+            self.assertEqual(retry.destination, remote.destination)
+            self.assertNotEqual(retry.attempt, remote.attempt)
+            self.assertEqual(retry.episode, remote.episode)
 
     def test_restart_between_steps_keeps_the_run_watch_without_a_memory_charge(self) -> None:
         with AdmissionFixture() as fixture:
@@ -10687,3 +11239,1200 @@ class CiJobStartPlaceTests(unittest.TestCase):
             fixture.job_starts[local.owner.pid] = records.JobStart(fixture.clock.now() - 900)
             _ = fixture.server.handle_request(local)
             self.assertNotIn("ci_job_start", fixture.server.waiters[local.episode].row)
+
+
+@dataclass(frozen=True)
+class ScopedMemoryTrace:
+    reader: service.OperatingSystemReader
+    request: wire.AdmitRequest
+    grant: wire.Admitted
+    sidecar: Path
+    scope: Path
+    log: Path
+    store: memory_trace.TraceStore
+
+
+class MemoryTraceCaptureTests(unittest.TestCase):
+    def grant(self, fixture: AdmissionFixture, *, repository: str = "hana",
+              step: str = "nextest", scoped: bool = True,
+              policy: memory_trace.MemoryTracePolicy = TRACE_POLICY) -> ScopedMemoryTrace:
+        server = fixture.server
+        request = fixture.request(step=step, width=records.RequestedTestWidth(8))
+        sidecar = fixture.root / f"sample-{request.owner.pid}.cgroup"
+        request = replace(request, sidecar=str(sidecar) if scoped else "",
+                          argv=("cargo", "nextest", "run", "--test-threads", "8"),
+                          profile=replace(request.profile, repo=repository,
+                              repository=records.RepositoryIdentity(f"git-root:{repository}", repository)))
+        _ = server.run_pass()
+        server.trace_policy = policy
+        with mock.patch.object(threading.Thread, "start"):
+            server.start_reader()
+        reader = server.system_reader
+        assert isinstance(reader, service.OperatingSystemReader)
+
+        def close_server() -> None:
+            with mock.patch.object(reader.thread, "join"):
+                server.close()
+
+        _ = fixture.callback(close_server)
+        grant = only_admitted(server.handle_request(request))
+        if scoped:
+            _ = fixture.scope(request.owner, current=8 * GIB, anonymous=2 * GIB, swap=3 * GIB)
+            stamp = round(fixture.clock.now() * 1_000_000_000)
+            os.utime(sidecar, ns=(stamp, stamp))
+        scope = fixture.root / f"scope-{request.owner.pid}"
+        log = progress.progress_path(sidecar, "log")
+        return ScopedMemoryTrace(reader, request, grant, sidecar, scope, log,
+                                 memory_trace.TraceStore(fixture.state_dir / "memory_traces", policy))
+
+    @staticmethod
+    def trace_worker(run: ScopedMemoryTrace) -> memory_trace.TraceWorker:
+        worker = run.reader.traces
+        assert isinstance(worker, memory_trace.TraceWorker)
+        return worker
+
+    def drive(self, fixture: AdmissionFixture, run: ScopedMemoryTrace, finish_at: float,
+              events: tuple[tuple[float, Callable[[], None]], ...]) -> None:
+        reader = run.reader
+        worker = self.trace_worker(run)
+        start = fixture.clock.monotonic()
+        end_at = start + finish_at
+        scheduled = iter((start + elapsed, action) for elapsed, action in events)
+        next_event = next(scheduled, None)
+        waits = 0
+
+        class Idle(Exception):
+            pass
+
+        def dispatch() -> None:
+            with mock.patch.object(worker._ready, "wait", side_effect=Idle):  # pyright: ignore[reportPrivateUsage]
+                try:
+                    while worker._step():  # pyright: ignore[reportPrivateUsage]
+                        pass
+                except Idle:
+                    pass
+
+        def delay(seconds: float) -> bool:
+            nonlocal next_event, waits
+            full_at = fixture.clock.monotonic() + seconds
+            while True:
+                waits += 1
+                self.assertLess(waits, 60)
+                now = fixture.clock.monotonic()
+                while next_event is not None and next_event[0] <= now:
+                    _, action = next_event
+                    next_event = next(scheduled, None)
+                    action()
+                if now >= end_at:
+                    reader.stopped.set()
+                    return False
+                if reader.requested.is_set():
+                    return True
+                if now >= full_at:
+                    return False
+                dispatch()
+                destination = min(full_at, worker.capture.deadline,
+                                  next_event[0] if next_event is not None else end_at, end_at)
+                fixture.clock.advance(max(0, destination - fixture.clock.monotonic()))
+
+        worker.capture.recover()
+        try:
+            with mock.patch.object(reader.requested, "wait", side_effect=delay):
+                reader.thread.run()
+            dispatch()
+        finally:
+            worker.capture.close()
+
+    @staticmethod
+    def append(path: Path, content: str) -> None:
+        with path.open("a") as output:
+            _ = output.write(content)
+
+    def sealed(self, run: ScopedMemoryTrace) -> memory_trace.MemoryTrace:
+        path, = (run.store.root / "finished").glob(f"*/*-{run.grant.reservation}.jsonl")
+        trace = memory_trace.read_trace(path, run.store.policy)
+        assert isinstance(trace, memory_trace.MemoryTrace)
+        self.assertIsInstance(trace.state, memory_trace.TraceEnd)
+        return trace
+
+    def test_full_read_publishes_while_release_seal_is_blocked(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            worker = self.trace_worker(run)
+            created, sealing, resume, published = (threading.Event() for _ in range(4))
+            start = memory_trace.TraceStore.start
+            seal = memory_trace.TraceWriter.seal
+            write_event = os.eventfd_write
+
+            def remember(store: memory_trace.TraceStore, header: memory_trace.TraceHeader) -> memory_trace.TraceWriter:
+                writer = start(store, header)
+                created.set()
+                return writer
+
+            def slow_seal(writer: memory_trace.TraceWriter, end: memory_trace.TraceEnd) -> memory_trace.TraceEnd:
+                sealing.set()
+                self.assertTrue(resume.wait(timeout=5))
+                return seal(writer, end)
+
+            def notify(fd: int, value: int) -> None:
+                write_event(fd, value)
+                if fd == fixture.server.reading_events:
+                    published.set()
+
+            with (mock.patch.object(memory_trace.TraceStore, "start", autospec=True, side_effect=remember),
+                  mock.patch.object(memory_trace.TraceWriter, "seal", autospec=True, side_effect=slow_seal),
+                  mock.patch.object(os, "eventfd_write", side_effect=notify)):
+                worker.thread.start()
+                try:
+                    self.assertTrue(created.wait(timeout=3))
+                    self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                        "blocked-seal", run.grant.reservation, 0)), [wire.Ok()])
+                    self.assertTrue(sealing.wait(timeout=3))
+                    initial = run.reader.latest
+                    run.reader.thread.start()
+                    run.reader.request_read()
+                    self.assertTrue(published.wait(timeout=3))
+                    self.assertIsNot(run.reader.latest, initial)
+                finally:
+                    resume.set()
+                    if run.reader.thread.ident is None:
+                        worker.close()
+                    else:
+                        run.reader.close()
+
+    def test_recovery_error_keeps_the_worker_and_the_admission_reader_running(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            worker = self.trace_worker(run)
+            published, captured = threading.Event(), threading.Event()
+            initial = run.reader.latest
+            start = memory_trace.TraceStore.start
+
+            def notify(fd: int, _value: int) -> None:
+                if fd == fixture.server.reading_events:
+                    published.set()
+
+            def remember(store: memory_trace.TraceStore, header: memory_trace.TraceHeader) -> memory_trace.TraceWriter:
+                writer = start(store, header)
+                captured.set()
+                return writer
+
+            with (mock.patch.object(memory_trace.TraceStore, "recover_abandoned", side_effect=OverflowError("recovery")),
+                  mock.patch.object(memory_trace.TraceStore, "start", autospec=True, side_effect=remember),
+                  mock.patch.object(os, "eventfd_write", side_effect=notify)):
+                worker.thread.start()
+                run.reader.thread.start()
+                try:
+                    run.reader.request_read()
+                    self.assertTrue(published.wait(timeout=3))
+                    run.reader.raise_failure()
+                    self.assertIsNot(run.reader.latest, initial)
+                    self.assertTrue(captured.wait(timeout=3))
+                    self.assertTrue(worker.thread.is_alive())
+                finally:
+                    run.reader.close()
+
+    def test_narrow_ticks_leave_the_full_cadence_and_admission_result_intact(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            server = fixture.server
+            record = server.reservations[run.request.episode]
+            need = records.TestPhaseNeed(2 * GIB, 1, 8, 8, "same_width", 1.5)
+            server.reservations[run.request.episode] = replace(record, test_phase_need=need)
+            run.reader.update(replace(run.reader.plan, config=replace(run.reader.plan.config, running_pass_seconds=4),
+                                      reservations=(server.reservations[run.request.episode],)))
+            initial_result = server.last_result
+            initial_epoch = fixture.clock.now()
+            initial_monotonic = fixture.clock.monotonic()
+            full_times: list[float] = []
+            _ = run.log.write_text("\r\x1b[32m Compiling hana v0.1.0\x1b[0m\rBuilding [=>] 8/9\r")
+            _ = (run.scope / "memory.stat").write_text(
+                f"anon {2 * GIB}\nshmem {GIB}\ninactive_file {4 * GIB}\nfile {5 * GIB}\n")
+
+            def start_tests() -> None:
+                self.assertIs(server.last_result, initial_result)
+                self.append(run.log, "    Nextest run ID edd0\n    Starting 20 tests\n")
+
+            def publish_phase() -> None:
+                phase = Path(record.sidecar).with_suffix(".test-phase.json")
+                _ = phase.write_text(json.dumps({"test_phase_peak_bytes": 3 * GIB,
+                    "test_phase_started_at": initial_epoch + 3.5, "repo_identity": record.repo_identity,
+                    "test_scope": "full", "package": "", "filters": [], "call_id": "", "test_threads": 8,
+                    "reservation_id": record.reservation_id}))
+
+            def release() -> None:
+                self.append(run.log, "    Summary [   2.97s] 20 tests run: 19 passed, 1 failed")
+                self.assertEqual(server.handle_request(wire.ReleaseRequest("trace-release", run.grant.reservation, 100)),
+                                 [wire.Ok()])
+                run.log.unlink(missing_ok=True)
+                run.sidecar.unlink(missing_ok=True)
+
+            read_system = service.read_system
+
+            def timed_full_read(plan: service.SystemReadingPlan, readings: service.Readings,
+                                proc: service.Proc, clock: service.Clock) -> service.SystemEvidence:
+                full_times.append(clock.monotonic() - initial_monotonic)
+                return read_system(plan, readings, proc, clock)
+
+            read_scope = gate.slice_working_set
+            scope_reads: list[Path] = []
+
+            def timed_scope_read(directory: Path) -> records.MeasuredMemory:
+                scope_reads.append(directory.resolve())
+                return read_scope(directory)
+
+            with mock.patch.object(service, "read_system", side_effect=timed_full_read), \
+                 mock.patch.object(gate, "slice_working_set", side_effect=timed_scope_read), \
+                 mock.patch.object(gate, "admission_pass", side_effect=AssertionError("trace tick ran admission")):
+                self.drive(fixture, run, 7.5, ((4, start_tests), (6, publish_phase), (7, release)))
+            self.assertEqual(full_times, [0, 4])
+            self.assertEqual(scope_reads.count(run.scope), 6)
+            self.assertEqual(os.eventfd_read(server.reading_events), 2)
+            self.assertIs(server.last_result, initial_result)
+            trace = self.sealed(run)
+            self.assertEqual(trace.compile_samples, tuple(
+                memory_trace.CompileSample(elapsed, 3 * GIB, memory_trace.CargoProgress(8, 9), "hana")
+                for elapsed in (0, 2000)))
+            self.assertEqual(trace.test_start, memory_trace.TestStarted(4000, memory_trace.TestReserveUnavailable()))
+            self.assertEqual(trace.test_samples, tuple(memory_trace.TestSample(elapsed, 3 * GIB)
+                                                      for elapsed in (4000, 6000)))
+            self.assertEqual(trace.state, memory_trace.TraceEnd(round((initial_epoch + 7) * 1000),
+                                                               7000, 100, memory_trace.WholeRun()))
+            shape = memory_trace.HanaTraceShape(server.host, record.repo_identity, run.request.argv,
+                                                records.RequestedTestWidth(8))
+            self.assertEqual(trace.header.shape_key, memory_trace.shape_key(shape))
+            self.assertEqual(trace.header.compile_reserve_bytes, run.grant.need)
+
+    def test_first_sample_reads_the_scope_that_exists_when_the_worker_binds(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            record = fixture.server.reservations[run.request.episode]
+            run.reader.update(replace(run.reader.plan, reservations=(record,)))
+            run.reader.request_read()
+            read_system = service.read_system
+
+            def read_then_replace_scope(plan: service.SystemReadingPlan, readings: service.Readings,
+                                        proc: service.Proc, clock: service.Clock) -> service.SystemEvidence:
+                evidence = read_system(plan, readings, proc, clock)
+                _ = run.scope.rename(fixture.root / "old-scope")
+                write_scope(run.scope, members=(run.request.owner.pid,), current=9 * GIB, anonymous=9 * GIB)
+                return evidence
+
+            with mock.patch.object(service, "read_system", side_effect=read_then_replace_scope):
+                self.drive(fixture, run, 1, ())
+            trace = run.store.read_live(run.grant.reservation)
+            assert isinstance(trace, memory_trace.MemoryTrace)
+            self.assertEqual([sample.program_bytes for sample in trace.compile_samples], [9 * GIB])
+
+    def test_trace_keeps_only_the_first_test_reserve_from_an_admission_pass(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            server = fixture.server
+            record = server.reservations[run.request.episode]
+            need = records.TestPhaseNeed(2 * GIB, 1, 8, 8, "same_width", 1.5)
+            updated = replace(record, test_phase_need=need)
+            server.reservations[run.request.episode] = updated
+            run.reader.update(replace(run.reader.plan, reservations=(updated,)))
+            began = fixture.clock.now()
+
+            def write_phase(peak: int) -> None:
+                _ = Path(record.sidecar).with_suffix(".test-phase.json").write_text(json.dumps({
+                    "test_phase_peak_bytes": peak * GIB, "test_phase_started_at": began + 2,
+                    "repo_identity": record.repo_identity, "test_scope": "full", "package": "",
+                    "filters": [], "call_id": "", "test_threads": 8, "reservation_id": record.reservation_id,
+                }))
+
+            def before_decision() -> None:
+                trace = run.store.read_live(run.grant.reservation)
+                assert isinstance(trace, memory_trace.MemoryTrace)
+                self.assertEqual(trace.test_start, memory_trace.TestStarted(2000, memory_trace.TestReserveUnavailable()))
+                write_phase(6)
+                run.reader.request_read()
+
+            def decide(need_bytes: int) -> None:
+                _ = server.run_pass()
+                published = server.published
+                assert isinstance(published, service.PublishedReplies)
+                running = published.view.reading.explanation.running
+                entry = next(entry for entry in running if entry.step.pid == run.request.owner.pid)
+                self.assertEqual(entry.promise, need_bytes)
+                for _ in range(run.store.policy.max_pending_commands + 1):
+                    run.reader.record_trace_reserves(published.view.reading.explanation)
+
+            def later_read() -> None:
+                write_phase(8)
+                run.reader.request_read()
+
+            self.drive(fixture, run, 7, ((2, lambda: write_phase(2)), (3, before_decision),
+                (3.5, lambda: decide(9 * GIB)), (4.5, later_read), (5, lambda: decide(12 * GIB))))
+            trace = run.store.read_live(run.grant.reservation)
+            assert isinstance(trace, memory_trace.MemoryTrace)
+            self.assertEqual(trace.test_start, memory_trace.TestStarted(2000, 9 * GIB))
+
+    def test_trace_worker_reports_queue_saturation(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture, policy=replace(TRACE_POLICY, max_pending_commands=2))
+            worker = self.trace_worker(run)
+            record = fixture.server.reservations[run.request.episode]
+            shape = memory_trace.HanaTraceShape(fixture.server.host, record.repo_identity, run.request.argv,
+                                                records.RequestedTestWidth(8))
+            worker.submit(memory_trace.TraceGrant("excess", shape, service.reservation_row(record),
+                                                  fixture.clock.now(), fixture.clock.monotonic()))
+
+            def release() -> None:
+                for _ in range(3):
+                    worker.release(run.grant.reservation, fixture.clock.now(), 0)
+                command = worker._commands[-1]  # pyright: ignore[reportPrivateUsage]
+                assert isinstance(command, memory_trace.TraceRelease)
+                self.assertIsInstance(command.test_reserve, memory_trace.TestReserveUnavailable)
+
+            error_output = io.StringIO()
+            with mock.patch.object(sys, "stderr", error_output):
+                self.drive(fixture, run, 2, ((1, release),))
+            self.assertIn("command queue is full", error_output.getvalue())
+            self.assertEqual([sample.elapsed_ms for sample in self.sealed(run).compile_samples], [0])
+
+    def test_full_queue_keeps_the_first_test_reserve(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture, policy=replace(TRACE_POLICY, max_pending_commands=2))
+            worker = self.trace_worker(run)
+            identifier = run.grant.reservation
+            worker.submit({identifier: 9 * GIB})
+
+            def later_reserve() -> None:
+                self.append(run.log, "    Starting 1 test\n")
+                worker.submit({identifier: 12 * GIB})
+
+            self.drive(fixture, run, 3, ((2, later_reserve),))
+            live = run.store.read_live(identifier)
+            assert isinstance(live, memory_trace.MemoryTrace)
+            self.assertEqual(live.test_start, memory_trace.TestStarted(2000, 9 * GIB))
+
+    def test_expired_scope_releases_its_queue_capacity(self) -> None:
+        with AdmissionFixture() as fixture:
+            policy = replace(TRACE_POLICY, max_pending_commands=2, scope_loss_grace_seconds=1)
+            run = self.grant(fixture, policy=policy)
+            record = fixture.server.reservations[run.request.episode]
+            shape = memory_trace.HanaTraceShape(fixture.server.host, record.repo_identity, run.request.argv,
+                                                records.RequestedTestWidth(8))
+
+            def remove_scope() -> None:
+                _ = run.scope.rename(fixture.root / "old-scope")
+
+            def submit_next() -> None:
+                write_scope(run.scope, members=(run.request.owner.pid,), current=2 * GIB, anonymous=2 * GIB)
+                stamp = round(fixture.clock.now() * 1_000_000_000)
+                os.utime(run.sidecar, ns=(stamp, stamp))
+                self.trace_worker(run).submit(memory_trace.TraceGrant(
+                    "replacement", shape, service.reservation_row(record), fixture.clock.now(), fixture.clock.monotonic()))
+
+            self.drive(fixture, run, 5, ((2, remove_scope), (4, submit_next)))
+            _ = self.sealed(run)
+            self.assertIsInstance(run.store.read_live("replacement"), memory_trace.MemoryTrace)
+
+    def test_scope_expiry_seals_the_reserve_accepted_during_its_tick(self) -> None:
+        for queued_release in (False, True):
+            with self.subTest(queued_release=queued_release), AdmissionFixture() as fixture:
+                run = self.grant(fixture, policy=replace(TRACE_POLICY, scope_loss_grace_seconds=1))
+                worker = self.trace_worker(run)
+                sample_due = worker.capture.sample_due
+                expiry = fixture.clock.monotonic() + 5
+
+                def submit_reserve(release_time: Callable[[str], float],
+                                   claim_expiry: Callable[[memory_trace.TraceRelease], memory_trace.TraceRelease | None]
+                                   ) -> None:
+                    if fixture.clock.monotonic() == expiry:
+                        worker.submit({run.grant.reservation: 9 * GIB})
+                        if queued_release:
+                            worker.release(run.grant.reservation, fixture.clock.now(), 0)
+                    sample_due(release_time, claim_expiry)
+
+                def remove_scope() -> None:
+                    _ = run.scope.rename(fixture.root / "old-scope")
+
+                with mock.patch.object(worker.capture, "sample_due", side_effect=submit_reserve):
+                    self.drive(fixture, run, 6, ((2, lambda: self.append(run.log, "    Starting 1 test\n")),
+                                                 (4, remove_scope)))
+                trace = self.sealed(run)
+                self.assertEqual(trace.test_start, memory_trace.TestStarted(2000, 9 * GIB))
+                end = trace.state
+                assert isinstance(end, memory_trace.TraceEnd)
+                self.assertEqual(end.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.SCOPE_LOST))
+
+    def test_worker_shutdown_uses_the_policy_timeout(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            worker = self.trace_worker(run)
+            worker.thread.start()
+            with mock.patch.object(worker.thread, "join", wraps=worker.thread.join) as join:
+                worker.close()
+            join.assert_called_once_with(timeout=run.store.policy.shutdown_timeout_seconds)
+
+    def test_worker_shutdown_retries_a_pending_seal(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            worker = self.trace_worker(run)
+            live_path = run.store.root / "live" / f"{run.grant.reservation}.jsonl"
+            move = Path.replace
+            attempts: list[Path] = []
+
+            def fail_first_move(path: Path, destination: Path) -> Path:
+                if path == live_path:
+                    attempts.append(destination)
+                    if len(attempts) == 1:
+                        raise OSError("first trace move")
+                return move(path, destination)
+
+            def release() -> None:
+                self.append(run.log, "    Summary [  1.0s] 1 test run: 1 passed\n")
+                worker.release(run.grant.reservation, fixture.clock.now(), 0)
+
+            def shutdown() -> None:
+                self.assertEqual(len(attempts), 1)
+                with mock.patch.object(worker.capture, "recover"):
+                    worker.thread.start()
+                    worker.close()
+                self.assertFalse(worker.thread.is_alive())
+
+            with mock.patch.object(Path, "replace", autospec=True, side_effect=fail_first_move):
+                self.drive(fixture, run, 3.5, ((2, lambda: self.append(run.log, "    Starting 1 test\n")),
+                                               (3, release), (3.5, shutdown)))
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(attempts[0], attempts[1])
+            end = self.sealed(run).state
+            assert isinstance(end, memory_trace.TraceEnd)
+            self.assertEqual((end.elapsed_ms, end.coverage), (3000, memory_trace.WholeRun()))
+
+    def test_release_seals_the_minimum_wire_status(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+
+            def release() -> None:
+                self.append(run.log, "    Summary [  1.0s] 1 test run: 1 passed\n")
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                    "minimum-status", run.grant.reservation, status_wire.CLEANUP_STATUS_MIN)), [wire.Ok()])
+
+            self.drive(fixture, run, 4, ((2, lambda: self.append(run.log, "    Starting 1 test\n")), (3, release)))
+            end = self.sealed(run).state
+            assert isinstance(end, memory_trace.TraceEnd)
+            self.assertEqual(end.exit_status, status_wire.CLEANUP_STATUS_MIN)
+            self.assertEqual(end.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.NEXTTEST_STATUS))
+
+    def test_release_drops_a_sample_read_after_the_release_time(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            _ = run.log.write_text("Compiling hana v0.1.0\rBuilding [=>] 8/9\r")
+            read_scope = gate.slice_working_set
+            start = fixture.clock.monotonic()
+            release_time = 4.01
+            record = fixture.server.reservations[run.request.episode]
+
+            def read(directory: Path) -> records.MeasuredMemory:
+                if directory.resolve() == run.scope and fixture.clock.monotonic() == start + 4:
+                    fixture.clock.advance(release_time - 4)
+                    self.append(run.log, "    Summary [  2.01s] 1 test run: 1 passed")
+                    ending = service.ReleaseStatus("sample-after-release", 0)
+                    run.reader.release_trace(record, ending, fixture.clock.now())
+                    fixture.clock.advance(8 - release_time)
+                return read_scope(directory)
+
+            with mock.patch.object(gate, "slice_working_set", side_effect=read):
+                self.drive(fixture, run, 9, ((2, lambda: self.append(run.log, "    Starting 1 test\n")),))
+            trace = self.sealed(run)
+            self.assertEqual([sample.elapsed_ms for sample in trace.test_samples], [2000])
+            end = trace.state
+            assert isinstance(end, memory_trace.TraceEnd)
+            self.assertEqual((end.elapsed_ms, end.exit_status, end.coverage), (4010, 0, memory_trace.WholeRun()))
+
+    def test_summary_after_the_memory_read_keeps_the_test_sample(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            _ = run.log.write_text("Building [=>] 9/10\r")
+            read = gate.slice_working_set
+            start = fixture.clock.monotonic()
+
+            def read_then_finish(directory: Path) -> records.MeasuredMemory:
+                memory = read(directory)
+                if directory.resolve() == run.scope and fixture.clock.monotonic() == start + 4:
+                    self.append(run.log, "    Summary [  1.0s] 1 test run: 1 passed\n")
+                return memory
+
+            def release() -> None:
+                _ = run.scope.rename(fixture.root / "old-scope")
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                    "summary-after-read", run.grant.reservation, 0)), [wire.Ok()])
+
+            with mock.patch.object(gate, "slice_working_set", side_effect=read_then_finish):
+                self.drive(fixture, run, 5, ((3, lambda: self.append(run.log, "    Starting 1 test\n")), (4.01, release)))
+            trace = self.sealed(run)
+            self.assertEqual(trace.test_samples, (memory_trace.TestSample(4000, 2 * GIB),))
+            end = trace.state
+            assert isinstance(end, memory_trace.TraceEnd)
+            self.assertEqual(end.coverage, memory_trace.WholeRun())
+
+    def test_sample_append_failure_keeps_the_prefix_for_release(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            append = memory_trace.TraceWriter.append
+
+            def fail_second_sample(writer: memory_trace.TraceWriter, observation: memory_trace.TraceObservation
+                                   ) -> memory_trace.TraceRecording | memory_trace.TraceLimit:
+                if isinstance(observation, memory_trace.CompileSample) and observation.elapsed_ms == 2000:
+                    raise PermissionError("sample append")
+                return append(writer, observation)
+
+            def release() -> None:
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                    "failed-sample-append", run.grant.reservation, 0)), [wire.Ok()])
+
+            with mock.patch.object(memory_trace.TraceWriter, "append", autospec=True, side_effect=fail_second_sample):
+                self.drive(fixture, run, 4, ((3, release),))
+            trace = self.sealed(run)
+            self.assertEqual([sample.elapsed_ms for sample in trace.compile_samples], [0])
+            self.assertFalse((run.store.root / "live" / f"{run.grant.reservation}.jsonl").exists())
+            end = trace.state
+            assert isinstance(end, memory_trace.TraceEnd)
+            self.assertEqual(end.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.RECORDING_ERROR))
+
+    def test_reserve_append_failure_keeps_the_prefix_for_release(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            _ = run.log.write_text("Building [=>] 9/10\r")
+            writer_append = memory_trace.TraceWriter.append
+
+            def append(writer: memory_trace.TraceWriter, observation: memory_trace.TraceObservation
+                       ) -> memory_trace.TraceRecording | memory_trace.TraceLimit:
+                if isinstance(observation, memory_trace.TestReserveObserved):
+                    raise OSError("reserve append")
+                return writer_append(writer, observation)
+
+            def release() -> None:
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                    "reserve-append-failure", run.grant.reservation, 0)), [wire.Ok()])
+
+            def reserve() -> None:
+                self.trace_worker(run).submit({run.grant.reservation: 3 * GIB})
+
+            with mock.patch.object(memory_trace.TraceWriter, "append", autospec=True, side_effect=append):
+                self.drive(fixture, run, 4, ((2, lambda: self.append(run.log, "    Starting 1 test\n")),
+                                             (2.5, reserve), (3, release)))
+            trace = self.sealed(run)
+            self.assertEqual(trace.test_samples, (memory_trace.TestSample(2000, 2 * GIB),))
+            end = trace.state
+            assert isinstance(end, memory_trace.TraceEnd)
+            self.assertEqual(end.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.RECORDING_ERROR))
+
+    def test_final_log_error_keeps_the_prefix_for_release(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            _ = run.log.write_text("Building [=>] 9/10\r")
+
+            def release() -> None:
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                    "final-log-error", run.grant.reservation, 0)), [wire.Ok()])
+
+            with mock.patch.object(progress.CaptureReader, "trace_tail", side_effect=PermissionError("final log")):
+                self.drive(fixture, run, 4, ((3, release),))
+            trace = self.sealed(run)
+            self.assertEqual([sample.elapsed_ms for sample in trace.compile_samples], [0, 2000])
+            end = trace.state
+            assert isinstance(end, memory_trace.TraceEnd)
+            self.assertEqual(end.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.RECORDING_ERROR))
+
+    def test_release_reads_the_summary_after_a_full_log_chunk(self) -> None:
+        for budget, coverage in ((131072, memory_trace.WholeRun()),
+                                 (65536, memory_trace.IncompleteRun(memory_trace.IncompleteReason.NO_NEXTTEST_COMPLETION))):
+            with self.subTest(budget=budget), AdmissionFixture() as fixture:
+                run = self.grant(fixture, policy=replace(TRACE_POLICY, final_replay_bytes=budget))
+                _ = run.log.write_text("Building [=>] 9/10\r")
+
+                def release() -> None:
+                    self.append(run.log, "test output\n" * 6000 + "    Summary [  1.0s] 1 test run: 1 passed")
+                    run.log.unlink()
+                    self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                        "final-log-replay", run.grant.reservation, 0)), [wire.Ok()])
+
+                self.drive(fixture, run, 4, ((2, lambda: self.append(run.log, "    Starting 1 test\n")), (3, release)))
+                end = self.sealed(run).state
+                assert isinstance(end, memory_trace.TraceEnd)
+                self.assertEqual(end.coverage, coverage)
+
+    def test_release_with_invalid_wall_time_seals_the_prefix(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            worker = self.trace_worker(run)
+            self.drive(fixture, run, 4, ((3, lambda: worker.release(run.grant.reservation, float("inf"), 0)),))
+            trace = self.sealed(run)
+            end = trace.state
+            assert isinstance(end, memory_trace.TraceEnd)
+            self.assertEqual(end.ended_at_ms, trace.header.scope_started_at_ms + 3000)
+            self.assertEqual(end.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.RECORDING_ERROR))
+
+    def test_final_append_that_never_recovers_seals_the_prefix(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture, policy=replace(TRACE_POLICY, seal_retry_count=1))
+            _ = run.log.write_text("Building [=>] 9/10\r")
+            writer_append = memory_trace.TraceWriter.append
+            attempts = 0
+
+            def fail_phase(writer: memory_trace.TraceWriter, observation: memory_trace.TraceObservation
+                           ) -> memory_trace.TraceRecording | memory_trace.TraceLimit:
+                nonlocal attempts
+                if isinstance(observation, memory_trace.TestStarted):
+                    attempts += 1
+                    raise OSError("final phase write")
+                return writer_append(writer, observation)
+
+            def release() -> None:
+                self.append(run.log, "    Starting 1 test\n")
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                    "failed-final-phase", run.grant.reservation, 0)), [wire.Ok()])
+
+            with mock.patch.object(memory_trace.TraceWriter, "append", autospec=True, side_effect=fail_phase):
+                self.drive(fixture, run, 5, ((1.5, release),))
+            self.assertEqual(attempts, 2)
+            trace = self.sealed(run)
+            self.assertIsInstance(trace.test_start, memory_trace.TestNotStarted)
+            self.assertEqual([sample.elapsed_ms for sample in trace.compile_samples], [0])
+            end = trace.state
+            assert isinstance(end, memory_trace.TraceEnd)
+            self.assertEqual(end.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.RECORDING_ERROR))
+
+    def test_missing_process_identity_does_not_hide_other_terminal_evidence(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            worker = self.trace_worker(run)
+            worker.capture.boot_id = "fixture"
+            owner = run.request.owner.pid
+            other = owner + 1
+            _ = (run.scope / "cgroup.procs").write_text(f"{owner}\n{other}\n")
+
+            def start_time(pid: int) -> str:
+                if pid == owner:
+                    raise PermissionError("process identity")
+                self.assertEqual(pid, other)
+                return "17"
+
+            worker.capture.process_start = start_time
+            with mock.patch.object(progress.CaptureReader, "trace_terminal", return_value=progress.NoTraceCapture()) as terminal:
+                self.drive(fixture, run, 1, ())
+            terminal.assert_called_once_with({other: "17"}, "fixture")
+            trace = run.store.read_live(run.grant.reservation)
+            assert isinstance(trace, memory_trace.MemoryTrace)
+            self.assertEqual([sample.program_bytes for sample in trace.compile_samples], [2 * GIB])
+
+    def test_phase_sidecar_must_match_the_reservation_and_sample_time(self) -> None:
+        for fault in ("stale", "future", "other reservation"):
+            with self.subTest(fault=fault), AdmissionFixture() as fixture:
+                run = self.grant(fixture)
+                record = fixture.server.reservations[run.request.episode]
+                began = fixture.clock.now()
+                when = {"stale": began - 1, "future": began + 4, "other reservation": began + 1}[fault]
+                phase: dict[str, object] = {
+                    "test_phase_peak_bytes": 3 * GIB, "test_phase_started_at": when,
+                    "repo_identity": record.repo_identity, "test_scope": "full", "package": "",
+                    "filters": [], "call_id": "", "test_threads": 8,
+                    "reservation_id": "other" if fault == "other reservation" else run.grant.reservation,
+                }
+                _ = run.sidecar.with_suffix(".test-phase.json").write_text(json.dumps(phase))
+                self.drive(fixture, run, 3, ())
+                trace = run.store.read_live(run.grant.reservation)
+                assert isinstance(trace, memory_trace.MemoryTrace)
+                self.assertEqual([sample.elapsed_ms for sample in trace.compile_samples], [0, 2000])
+                self.assertIsInstance(trace.test_start, memory_trace.TestNotStarted)
+
+    def assert_phase_does_not_start_tests(self, *, phase_offset: float, include_reservation: bool = True,
+                                         scope_offset: float = 0.9996, modification_offset: float | None = None) -> None:
+        with AdmissionFixture() as fixture:
+            second = int(fixture.clock.now())
+            fixture.clock.advance(scope_offset)
+            run = self.grant(fixture)
+            phase = buildlog_record.test_phase_context(wire.encode_record(run.grant.sampling_context), list(run.request.argv))
+            if not include_reservation:
+                del phase["reservation_id"]
+            phase.update(test_phase_peak_bytes=3 * GIB, test_phase_started_at=second + phase_offset)
+            path = run.sidecar.with_suffix(".test-phase.json")
+            _ = path.write_text(json.dumps(phase))
+            if modification_offset is not None:
+                stamp = round((second + modification_offset) * 1_000_000_000)
+                os.utime(path, ns=(stamp, stamp))
+
+            self.drive(fixture, run, 1, ())
+            trace = run.store.read_live(run.grant.reservation)
+            assert isinstance(trace, memory_trace.MemoryTrace)
+            self.assertIsInstance(trace.test_start, memory_trace.TestNotStarted)
+            self.assertEqual(trace.test_samples, ())
+            self.assertEqual([sample.elapsed_ms for sample in trace.compile_samples], [0])
+
+    def test_precise_phase_start_before_scope_creation_is_stale(self) -> None:
+        self.assert_phase_does_not_start_tests(phase_offset=0.5)
+
+    def test_phase_file_written_before_scope_creation_is_stale(self) -> None:
+        self.assert_phase_does_not_start_tests(phase_offset=0, modification_offset=0.5)
+
+    def test_phase_start_after_observation_is_rejected_before_rounding(self) -> None:
+        self.assert_phase_does_not_start_tests(phase_offset=0.0004, scope_offset=0)
+
+    def test_phase_without_a_reservation_id_is_ignored(self) -> None:
+        self.assert_phase_does_not_start_tests(phase_offset=0, include_reservation=False)
+
+    def test_whole_second_phase_start_matches_scope_created_in_the_same_second(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.clock.advance(0.9996)
+            run = self.grant(fixture)
+            phase = buildlog_record.test_phase_context(wire.encode_record(run.grant.sampling_context), list(run.request.argv))
+            self.assertEqual(phase["reservation_id"], run.grant.reservation)
+            phase.update(test_phase_peak_bytes=3 * GIB, test_phase_started_at=int(fixture.clock.now()))
+            _ = run.sidecar.with_suffix(".test-phase.json").write_text(json.dumps(phase))
+
+            self.drive(fixture, run, 1, ())
+            trace = run.store.read_live(run.grant.reservation)
+            assert isinstance(trace, memory_trace.MemoryTrace)
+            self.assertEqual(trace.test_start, memory_trace.TestStarted(0, memory_trace.TestReserveUnavailable()))
+            self.assertEqual(trace.test_samples, (memory_trace.TestSample(0, 2 * GIB),))
+            self.assertEqual(trace.compile_samples, ())
+
+    def test_warm_run_records_test_memory_from_a_marker_written_before_bind(self) -> None:
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal), AdmissionFixture() as fixture:
+                run = self.grant(fixture)
+                path = run.log
+                if terminal:
+                    capture = self.trace_worker(run).capture
+                    capture.capture_root = fixture.root / "captures"
+                    capture.boot_id = "fixture"
+                    owner = run.request.owner
+                    capture.process_start = fixture.proc.starts.get
+                    account = capture.capture_root / "1000"
+                    registration = account / f"state/pids/{owner.pid}.run"
+                    registration.parent.mkdir(parents=True)
+                    _ = registration.write_bytes(
+                        f"cargo-tile-v3\0run\0fixture\0{owner.start_time}\0cargo.log\0folder\0".encode())
+                    path = account / "cargo.log"
+                fixture.clock.advance(1)
+                _ = path.write_text("    Starting 1 test\n")
+                stamp = round(fixture.clock.now() * 1_000_000_000)
+                os.utime(path, ns=(stamp, stamp))
+                fixture.clock.advance(1)
+
+                self.drive(fixture, run, 1, ())
+                trace = run.store.read_live(run.grant.reservation)
+                assert isinstance(trace, memory_trace.MemoryTrace)
+                self.assertEqual(trace.compile_samples, ())
+                self.assertEqual(trace.test_samples, (memory_trace.TestSample(2000, 2 * GIB),))
+
+    def test_progress_log_ignores_phase_markers_from_before_scope_creation(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            _ = run.log.write_text("Compiling hana v0.1.0\nBuilding [=>] 8/9\r    Starting 1 test\n" +
+                                   "    Summary [  1.0s] 1 test run: 1 passed\n    Starting 1 test")
+            stamp = round((fixture.clock.now() - 1) * 1_000_000_000)
+            os.utime(run.log, ns=(stamp, stamp))
+
+            self.drive(fixture, run, 5, ((2, lambda: self.append(run.log, "\n")),
+                                         (4, lambda: self.append(run.log, "    Starting 2 tests\n"))))
+            trace = run.store.read_live(run.grant.reservation)
+            assert isinstance(trace, memory_trace.MemoryTrace)
+            self.assertEqual(trace.test_start, memory_trace.TestStarted(4000, memory_trace.TestReserveUnavailable()))
+            self.assertEqual(trace.test_samples, (memory_trace.TestSample(4000, 2 * GIB),))
+            self.assertEqual([sample.elapsed_ms for sample in trace.compile_samples], [0, 2000])
+            self.assertEqual(trace.compile_samples[0].last_compiling, "hana")
+
+    def test_restarted_progress_log_reads_new_phase_frames_from_the_beginning(self) -> None:
+        for replace_log in (False, True):
+            with self.subTest(replace_log=replace_log), AdmissionFixture() as fixture:
+                run = self.grant(fixture)
+                _ = run.log.write_text("output\n" * 100)
+
+                def restart_log() -> None:
+                    if replace_log:
+                        _ = run.log.rename(fixture.root / "old.log")
+                    suffix = "output\n" * 100 if replace_log else ""
+                    _ = run.log.write_text("    Starting 1 test\n" + suffix)
+
+                self.drive(fixture, run, 3, ((2, restart_log),))
+                trace = run.store.read_live(run.grant.reservation)
+                assert isinstance(trace, memory_trace.MemoryTrace)
+                self.assertEqual(trace.test_start, memory_trace.TestStarted(2000, memory_trace.TestReserveUnavailable()))
+                self.assertEqual(trace.test_samples, (memory_trace.TestSample(2000, 2 * GIB),))
+                self.assertEqual([sample.elapsed_ms for sample in trace.compile_samples], [0])
+
+    def test_replaced_path_during_read_cannot_supply_memory_from_another_scope(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            read = gate.slice_working_set
+            at = fixture.clock.monotonic() + 2
+
+            def swap_then_read(directory: Path) -> records.MeasuredMemory:
+                if directory.resolve() != run.scope or fixture.clock.monotonic() != at:
+                    return read(directory)
+                original = run.scope.rename(fixture.root / "old-scope")
+                write_scope(run.scope, members=(run.request.owner.pid,), current=9 * GIB, anonymous=9 * GIB)
+                try:
+                    return read(directory)
+                finally:
+                    _ = run.scope.rename(fixture.root / "new-scope")
+                    _ = original.rename(run.scope)
+
+            with mock.patch.object(gate, "slice_working_set", side_effect=swap_then_read):
+                self.drive(fixture, run, 3, ())
+            trace = run.store.read_live(run.grant.reservation)
+            assert isinstance(trace, memory_trace.MemoryTrace)
+            self.assertEqual([sample.program_bytes for sample in trace.compile_samples], [2 * GIB, 2 * GIB])
+
+    def test_trace_sample_reads_the_sidecar_once(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            run.reader.requested.clear()
+            open_path = Path.open
+            opened: list[float] = []
+            start = fixture.clock.monotonic()
+
+            def count_reads(path: Path, mode: str = "r", buffering: int = -1, encoding: str | None = None,
+                            errors: str | None = None, newline: str | None = None):
+                if path == run.sidecar:
+                    opened.append(fixture.clock.monotonic() - start)
+                return open_path(path, mode, buffering, encoding, errors, newline)
+
+            with mock.patch.object(Path, "open", autospec=True, side_effect=count_reads):
+                self.drive(fixture, run, 3, ())
+            self.assertEqual(opened, [0, 2])
+
+    def test_binding_uses_the_age_of_the_sidecar_it_opens(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            stat_path = Path.stat
+            fresh = run.sidecar.stat()
+            old = round((fixture.clock.now() - 1) * 1_000_000_000)
+            os.utime(run.sidecar, ns=(old, old))
+
+            def stale_snapshot(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+                if path == run.sidecar:
+                    return fresh
+                return stat_path(path, follow_symlinks=follow_symlinks)
+
+            with mock.patch.object(Path, "stat", autospec=True, side_effect=stale_snapshot):
+                self.drive(fixture, run, 3, ())
+            self.assertIsInstance(run.store.read_live(run.grant.reservation), memory_trace.TraceUnavailable)
+
+    def test_failed_scope_read_preserves_the_trace_for_release(self) -> None:
+        for disappears in (False, True):
+            with self.subTest(disappears=disappears), AdmissionFixture() as fixture:
+                run = self.grant(fixture)
+                _ = run.log.write_text("Compiling hana v0.1.0\rBuilding [=>] 8/9\r")
+                read_scope = gate.slice_working_set
+                start = fixture.clock.monotonic()
+
+                def read(directory: Path) -> records.MeasuredMemory:
+                    if directory.resolve() == run.scope and fixture.clock.monotonic() == start + 4:
+                        if disappears:
+                            _ = run.scope.rename(fixture.root / "old-scope")
+                            raise OSError(errno.ENODEV, "scope disappeared")
+                        raise PermissionError(errno.EACCES, "memory.stat")
+                    return read_scope(directory)
+
+                def release() -> None:
+                    self.append(run.log, "    Summary [  2.01s] 1 test run: 1 passed\n")
+                    self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                        "scope-read-failure", run.grant.reservation, 0)), [wire.Ok()])
+
+                with mock.patch.object(gate, "slice_working_set", side_effect=read):
+                    self.drive(fixture, run, 5, (
+                        (2, lambda: self.append(run.log, "    Starting 1 test\n")), (4.01, release)))
+                trace = self.sealed(run)
+                self.assertEqual([sample.elapsed_ms for sample in trace.test_samples], [2000])
+                end = trace.state
+                assert isinstance(end, memory_trace.TraceEnd)
+                self.assertEqual((end.exit_status, end.coverage), (0, memory_trace.WholeRun()))
+
+    def test_delayed_tick_uses_scope_loss_time_for_the_release_grace(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture, policy=replace(TRACE_POLICY, scope_loss_grace_seconds=1))
+            _ = run.log.write_text("Compiling hana v0.1.0\rBuilding [=>] 8/9\r")
+            sample_due = memory_trace.TraceCapture.sample_due
+            start = fixture.clock.monotonic()
+
+            def delayed(capture: memory_trace.TraceCapture, release_time: Callable[[str], float],
+                        claim_expiry: Callable[[memory_trace.TraceRelease], memory_trace.TraceRelease | None]) -> None:
+                if fixture.clock.monotonic() == start + 4:
+                    fixture.clock.advance(1.5)
+                    self.append(run.log, "    Summary [  3.51s] 1 test run: 1 passed\n")
+                    _ = run.scope.rename(fixture.root / "old-scope")
+                    run.log.unlink()
+                sample_due(capture, release_time, claim_expiry)
+
+            def release() -> None:
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                    "delayed-tick", run.grant.reservation, 0)), [wire.Ok()])
+
+            with mock.patch.object(memory_trace.TraceCapture, "sample_due", autospec=True, side_effect=delayed):
+                self.drive(fixture, run, 6, (
+                    (2, lambda: self.append(run.log, "    Starting 1 test\n")), (5.51, release)))
+            end = self.sealed(run).state
+            assert isinstance(end, memory_trace.TraceEnd)
+            self.assertEqual((end.elapsed_ms, end.exit_status, end.coverage), (5510, 0, memory_trace.WholeRun()))
+
+    def test_narrow_sample_uses_the_time_of_the_scope_read(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            read_scope = gate.slice_working_set
+            start = fixture.clock.monotonic()
+
+            def read(directory: Path) -> records.MeasuredMemory:
+                if directory.resolve() == run.scope and fixture.clock.monotonic() == start + 2:
+                    fixture.clock.advance(0.5)
+                return read_scope(directory)
+
+            with mock.patch.object(gate, "slice_working_set", side_effect=read):
+                self.drive(fixture, run, 3, ())
+            live = run.store.read_live(run.grant.reservation)
+            assert isinstance(live, memory_trace.MemoryTrace)
+            self.assertEqual([sample.elapsed_ms for sample in live.compile_samples], [0, 2500])
+
+    def test_release_after_scope_loss_can_seal_a_complete_run(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            _ = run.log.write_text("Compiling hana v0.1.0\rBuilding [=>] 8/9\r")
+
+            def remove_scope() -> None:
+                self.append(run.log, "    Summary [   3.99s] 1 test run: 1 passed\n")
+                _ = run.scope.rename(fixture.root / "old-scope")
+                run.log.unlink()
+                run.sidecar.unlink()
+
+            def release() -> None:
+                live = run.store.read_live(run.grant.reservation)
+                assert isinstance(live, memory_trace.MemoryTrace)
+                self.assertEqual([sample.elapsed_ms for sample in live.test_samples], [2000, 4000])
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                    "late-release", run.grant.reservation, 0)), [wire.Ok()])
+
+            self.drive(fixture, run, 7, (
+                (2, lambda: self.append(run.log, "    Starting 1 test\n")), (6, remove_scope), (6.01, release)))
+            end = self.sealed(run).state
+            assert isinstance(end, memory_trace.TraceEnd)
+            self.assertEqual((end.elapsed_ms, end.exit_status, end.coverage), (6010, 0, memory_trace.WholeRun()))
+
+    def test_release_retries_a_failed_trace_move(self) -> None:
+        with AdmissionFixture() as fixture:
+            policy = replace(TRACE_POLICY, sample_seconds=3)
+            run = self.grant(fixture, policy=policy)
+            live_path = run.store.root / "live" / f"{run.grant.reservation}.jsonl"
+            move = Path.replace
+            attempts: list[tuple[float, Path]] = []
+            start = fixture.clock.monotonic()
+
+            def move_once(path: Path, target: Path) -> Path:
+                if path == live_path:
+                    attempts.append((fixture.clock.monotonic() - start, target))
+                    if len(attempts) == 1:
+                        raise OSError("first trace move")
+                return move(path, target)
+
+            def release() -> None:
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                    "retry-seal", run.grant.reservation, 0)), [wire.Ok()])
+
+            def check_pending() -> None:
+                trace = run.store.read_live(run.grant.reservation)
+                assert isinstance(trace, memory_trace.MemoryTrace)
+                self.assertIsInstance(trace.state, memory_trace.TraceEnd)
+                self.assertEqual(len(attempts), 1)
+
+            due = 4 + policy.sample_seconds
+            with mock.patch.object(Path, "replace", autospec=True, side_effect=move_once):
+                self.drive(fixture, run, due + 1, ((4, release), (due - 0.5, check_pending)))
+            self.assertEqual([at for at, _ in attempts], [4, due])
+            self.assertEqual(attempts[0][1], attempts[1][1])
+            self.assertFalse(live_path.exists())
+            end = self.sealed(run).state
+            assert isinstance(end, memory_trace.TraceEnd)
+            self.assertEqual((end.elapsed_ms, end.exit_status), (4000, 0))
+
+    def test_release_retries_when_the_end_record_cannot_open_the_trace(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            live_path = run.store.root / "live" / f"{run.grant.reservation}.jsonl"
+            moved_path = live_path.with_suffix(".held")
+
+            def release() -> None:
+                _ = run.scope.rename(fixture.root / "old-scope")
+                _ = live_path.rename(moved_path)
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                    "open-failure", run.grant.reservation, 0)), [wire.Ok()])
+
+            def restore() -> None:
+                _ = moved_path.rename(live_path)
+                trace = run.store.read_live(run.grant.reservation)
+                assert isinstance(trace, memory_trace.MemoryTrace)
+                self.assertIsInstance(trace.state, memory_trace.TraceRecording)
+
+            self.drive(fixture, run, 4 + TRACE_POLICY.sample_seconds, ((3, release), (3.5, restore)))
+            trace = self.sealed(run)
+            end = trace.state
+            assert isinstance(end, memory_trace.TraceEnd)
+            self.assertEqual((end.elapsed_ms, end.exit_status), (3000, 0))
+            self.assertEqual([sample.elapsed_ms for sample in trace.compile_samples], [0, 2000])
+
+    def test_release_retries_the_final_phase_record_and_seal(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            _ = run.log.write_text("Building [=>] 9/10\r")
+            append = memory_trace.TraceWriter.append
+            phase_attempts: list[memory_trace.TestStarted] = []
+            move = Path.replace
+            move_attempts: list[Path] = []
+            live_path = run.store.root / "live" / f"{run.grant.reservation}.jsonl"
+
+            def append_once(writer: memory_trace.TraceWriter, observation: memory_trace.TraceObservation
+                            ) -> memory_trace.TraceRecording | memory_trace.TraceLimit:
+                if isinstance(observation, memory_trace.TestStarted):
+                    phase_attempts.append(observation)
+                    if len(phase_attempts) == 1:
+                        raise OSError("first final phase write")
+                return append(writer, observation)
+
+            def move_once(path: Path, target: Path) -> Path:
+                if path == live_path:
+                    move_attempts.append(target)
+                    if len(move_attempts) == 1:
+                        raise OSError("first trace move")
+                return move(path, target)
+
+            def release() -> None:
+                self.append(run.log, "    Starting 1 test\n    Summary [   0.02s] 1 test run: 1 passed")
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                    "retry-final-phase", run.grant.reservation, 0)), [wire.Ok()])
+
+            with (mock.patch.object(memory_trace.TraceWriter, "append", autospec=True, side_effect=append_once),
+                  mock.patch.object(Path, "replace", autospec=True, side_effect=move_once)):
+                self.drive(fixture, run, 2 + 2 * run.store.policy.sample_seconds, ((1.5, release),))
+            trace = self.sealed(run)
+            self.assertEqual(trace.test_start, memory_trace.TestStarted(1500, memory_trace.TestReserveUnavailable()))
+            self.assertEqual(trace.test_samples, ())
+            self.assertEqual(phase_attempts, [trace.test_start, trace.test_start])
+            self.assertEqual(len(move_attempts), 2)
+            self.assertEqual(move_attempts[0], move_attempts[1])
+            end = trace.state
+            assert isinstance(end, memory_trace.TraceEnd)
+            self.assertEqual(end.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.MISSING_TEST))
+
+    def test_failed_trace_move_stops_at_the_policy_retry_count(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            live_path = run.store.root / "live" / f"{run.grant.reservation}.jsonl"
+            move = Path.replace
+            attempts: list[tuple[Path, bytes]] = []
+
+            def deny_trace_move(path: Path, target: Path) -> Path:
+                if path == live_path:
+                    attempts.append((target, path.read_bytes()))
+                    raise OSError("trace move failed")
+                return move(path, target)
+
+            def release() -> None:
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                    "retry-limit", run.grant.reservation, 0)), [wire.Ok()])
+
+            with mock.patch.object(Path, "replace", autospec=True, side_effect=deny_trace_move):
+                self.drive(fixture, run, 4 + TRACE_POLICY.sample_seconds * TRACE_POLICY.seal_retry_count,
+                           ((3, release),))
+            self.assertEqual(len(attempts), 1 + TRACE_POLICY.seal_retry_count)
+            destination, original = attempts[-1]
+            self.assertEqual(live_path.read_bytes(), original)
+            self.assertEqual(destination.read_bytes(), original)
+            end = self.sealed(run).state
+            assert isinstance(end, memory_trace.TraceEnd)
+            self.assertEqual(end.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.NO_NEXTTEST_COMPLETION))
+
+    def test_replaced_scope_directory_seals_without_sampling_the_new_scope(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+
+            def replace_scope() -> None:
+                _ = run.scope.rename(fixture.root / "old-scope")
+                write_scope(run.scope, members=(run.request.owner.pid,), current=9 * GIB, anonymous=9 * GIB)
+
+            def check_pending() -> None:
+                live = run.store.read_live(run.grant.reservation)
+                assert isinstance(live, memory_trace.MemoryTrace)
+                self.assertIsInstance(live.state, memory_trace.TraceRecording)
+
+            grace = TRACE_POLICY.scope_loss_grace_seconds
+            finish_at = 3 + grace
+            self.drive(fixture, run, finish_at, ((2, replace_scope), (2 + grace - 0.5, check_pending)))
+            trace = self.sealed(run)
+            self.assertEqual([sample.program_bytes for sample in trace.compile_samples], [2 * GIB])
+            self.assertEqual(trace.state, memory_trace.TraceEnd(
+                round((fixture.clock.now() - finish_at + 2) * 1000), 2000, memory_trace.ExitStatusUnavailable(),
+                memory_trace.IncompleteRun(memory_trace.IncompleteReason.SCOPE_LOST)))
+
+    def test_tests_that_finish_between_ticks_seal_without_a_test_sample(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            _ = run.log.write_text("Building [=>] 9/10\r")
+
+            def completed() -> None:
+                self.append(run.log, "    Nextest run ID edd0\n    Starting 1 test\n"
+                            + "    Summary [   0.02s] 1 test run: 1 passed\n")
+
+            def release() -> None:
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                    "short-release", run.grant.reservation, 0)), [wire.Ok()])
+
+            self.drive(fixture, run, 3.5, ((2, completed), (3, release)))
+            trace = self.sealed(run)
+            self.assertEqual(trace.test_start, memory_trace.TestStarted(2000, memory_trace.TestReserveUnavailable()))
+            self.assertEqual(trace.test_samples, ())
+            assert isinstance(trace.state, memory_trace.TraceEnd)
+            self.assertEqual(trace.state.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.MISSING_TEST))
+
+    def test_owner_exit_seals_an_incomplete_trace_after_the_scope_drains(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+
+            def owner_exit() -> None:
+                fixture.proc.kill(run.request.owner)
+                _ = (run.scope / "cgroup.procs").write_text("")
+                _ = (run.scope / "cgroup.events").write_text("populated 0\n")
+                run.reader.request_read()
+
+            def finalize_owner() -> None:
+                fixture.server.run_once(0)
+                self.assertNotIn(run.request.episode, fixture.server.reservations)
+
+            self.drive(fixture, run, 4, ((2, owner_exit), (3, finalize_owner)))
+            trace = self.sealed(run)
+            assert isinstance(trace.state, memory_trace.TraceEnd)
+            self.assertEqual(trace.state.exit_status, memory_trace.ExitStatusUnavailable())
+            self.assertEqual(trace.state.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.SCOPE_LOST))
+
+    def test_a_restart_seals_the_readable_prefix_as_incomplete(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture)
+            self.drive(fixture, run, 1, ())
+            live = run.store.read_live(run.grant.reservation)
+            assert isinstance(live, memory_trace.MemoryTrace)
+            partial = run.store.root / "live" / f"{run.grant.reservation}.jsonl"
+            self.append(partial, '["t",')
+            original = partial.read_bytes()
+            with mock.patch.object(threading.Thread, "start"):
+                restarted = service.OperatingSystemReader(run.reader.plan, run.reader.latest,
+                    fixture.readings, fixture.proc, fixture.clock, fixture.server.reading_events,
+                    traces=memory_trace.TraceCapture(run.store, fixture.root, "", fixture.clock))
+            updated = replace(run, reader=restarted)
+            self.drive(fixture, updated, 1, ())
+            trace = self.sealed(run)
+            self.assertEqual(trace.compile_samples, live.compile_samples)
+            self.assertEqual(partial.read_bytes(), original)
+            assert isinstance(trace.state, memory_trace.TraceEnd)
+            self.assertEqual(trace.state.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.RESTART))
+            self.assertIsInstance(run.store.newest_whole_run(trace.header.shape_key), memory_trace.NoMatchingWholeRun)
+
+    def test_non_hana_other_steps_and_unscoped_grants_do_not_record(self) -> None:
+        for repository, step, scoped in (("other", "nextest", True), ("hana", "check", True), ("hana", "nextest", False)):
+            with self.subTest(repository=repository, step=step, scoped=scoped), AdmissionFixture() as fixture:
+                run = self.grant(fixture, repository=repository, step=step, scoped=scoped)
+                self.drive(fixture, run, 3, ())
+                self.assertFalse(list(run.store.root.glob("*/*.jsonl")))
+                self.assertFalse(list(run.store.root.glob("*/*/*.jsonl")))

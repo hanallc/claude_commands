@@ -48,7 +48,7 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.lib.build_steps import (
-    GATE_SCRIPTS,
+    GATE_SCRIPTS, MERGE_GATE_PROGRAMS,
     OtherCommand, StepJob, VerifyCommand, build_call_arguments, command_job, command_program,
     parse_command_program, read_step_names, verify_command,
 )
@@ -84,7 +84,7 @@ ACTIVE_GATES: ContextVar[tuple[ActiveGate, ...]] = ContextVar("active_gate_check
 
 @dataclass(frozen=True)
 class AdmissionSourceCopy:
-    """A temporary source copy uses the real repository's slot pool."""
+    """A temporary source copy uses the real repository's numbered copies."""
 
     tree: Path
     source: Path
@@ -1600,6 +1600,8 @@ def list_trees() -> None:
         number += 1
         owner = held.pop(path, None)
         state = "busy" if isinstance(owner, build_folders.KnownFolderLease) else "unknown" if owner else "idle"
+        if owner is None and build_folders.build_folder_state(path) == "kept":
+            state = "kept"
         try:
             fields = build_folders.folder_lease_fields(path)
         except (OSError, ValueError):
@@ -2732,7 +2734,16 @@ def run_prepared_gate(command: Sequence[str], *, cwd: Path, descriptors: tuple[i
 
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
     """Run verify from a snapshot and other commands under a numbered copy lease."""
-    owner = caller_owner()
+    program = parse_command_program(command)
+    if not isinstance(program, OtherCommand) and program[0] in MERGE_GATE_PROGRAMS:
+        arguments = program[1]
+        if "-h" not in arguments and "--help" not in arguments:
+            error = first_step.gate_module_mode_error(
+                has_modules=any(word == "--module" or word.startswith("--module=") for word in arguments),
+                tests_only="--tests-only" in arguments, affected="--affected" in arguments)
+            if error:
+                raise CopyError(error)
+    owner = checked_owner(args.owner) if args.owner else caller_owner()
     source = Path(args.repo or "").expanduser().resolve()
     check_source = gate_command_source_check(command, numbered_copy=True)
     verification = verify_command(command)
@@ -3169,6 +3180,7 @@ def parse_copy_arguments(argv: list[str] | None) -> CopyArguments:
     _ = run.add_argument("--repo", required=True)
     _ = remove.add_argument("--repo")
     _ = run.add_argument("--commit", required=True)
+    _ = run.add_argument("--owner", default="", help="select a fixed owner or staff member ID")
     _ = run.add_argument("--apply-uncommitted")
     _ = run.add_argument("--merge")
     _ = run.add_argument("--targets", default="", help="name the gate targets in a comma-separated list")

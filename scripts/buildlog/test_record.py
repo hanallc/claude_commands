@@ -22,7 +22,7 @@ import threading
 import time
 import unittest
 from unittest import mock
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import BinaryIO, ClassVar, cast, override
 
@@ -1508,6 +1508,34 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual(call_record["token_wait_s"], 4)
         self.assertEqual(call_record["wait_s"], 9)
 
+    def test_later_memory_wait_preserves_the_cargo_token_interval(self) -> None:
+        directory = self.base / "waits"
+        fmt = directory / "wait-fmt"
+        clippy = directory / "wait-clippy"
+        fmt.mkdir(parents=True)
+        clippy.mkdir()
+        _ = (fmt / "token-seconds").write_text("4\n")
+        _ = (clippy / "placement-call-1-1").write_text("11\n")
+
+        args = ("call", "ran", "0", "0", "9", "30", "", "0", "39", "lint", "hana")
+        legacy = self.record(*args, extra={"BUILDLOG_WAIT_DIR": "", "BUILDLOG_TOKEN_WAIT_S": "4"})
+        self.assertEqual(legacy.returncode, 0, legacy.stderr)
+        measured = self.record(*args, extra={"BUILDLOG_WAIT_DIR": str(directory), "BUILDLOG_TOKEN_WAIT_S": "0"})
+        self.assertEqual(measured.returncode, 0, measured.stderr)
+        legacy_row, measured_row = self.records()
+        self.assertEqual(measured_row["wait_s"], legacy_row["wait_s"])
+        self.assertEqual(measured_row["token_wait_s"], legacy_row["token_wait_s"])
+        self.assertEqual(measured_row["admission_wait_s"], 15)
+        self.assertEqual(measured_row["step_wait_s"], {"fmt": 4, "clippy": 11})
+
+        for row in (legacy_row, measured_row):
+            start = report.call_time(row["started_at"])
+            holder = report.TokenHolder("previous-call", "unit", "worker",
+                                        start + timedelta(seconds=5), start + timedelta(seconds=9))
+            attribution = report.attribute_token_wait(str(row["id"]), "unit", "worker", start,
+                report.wait_seconds(row["wait_s"]), report.wait_seconds(row["token_wait_s"]), [holder])
+            self.assertEqual(attribution, report.TokenWaitAttribution(0, 4))
+
     def test_ssh_attempts_keep_each_target_and_outcome_after_local_fallback(self) -> None:
         for target, outcome, completion in (
             ("aws", "failed", "confirmed"),
@@ -1701,6 +1729,39 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.records()[-1]["target"], "")
         self.assertIsNone(self.records()[-1]["hold_wait_s"])
+
+    def test_call_waits_keep_missing_hold_measurements_null(self) -> None:
+        directory = self.base / "waits"
+        step = directory / "wait-clippy"
+        step.mkdir(parents=True)
+        cases = ((None, "", None), ("nan\n", "0", None), ("0\n", "0", 0.0), ("0.4\n", "0", 0.4))
+        for sample, initial_hold_wait, expected in cases:
+            with self.subTest(sample=sample):
+                if sample is not None:
+                    _ = (step / "seconds").write_text(sample)
+                result = self.record("call", "reused", "0", "1", "0", "0", "0", "9", "0", "lint", "hana",
+                                     extra={"BUILDLOG_WAIT_DIR": str(directory),
+                                            "BUILDLOG_HOLD_WAIT_S": initial_hold_wait})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.records()[-1]["hold_wait_s"], expected)
+
+    def test_call_waits_keep_zero_when_verify_skips_the_hold_check(self) -> None:
+        directory = self.base / "waits"
+        (directory / "wait-clippy").mkdir(parents=True)
+        environment = {"BUILDLOG_WAIT_DIR": str(directory), "BUILDLOG_HOLD_WAIT_S": "0"}
+        for outcome, expected in (("ran", 0.0), ("interrupted", None)):
+            with self.subTest(outcome=outcome):
+                result = self.record("call", outcome, "0", "0", "0", "0", "0", "0", "0", "lint", "hana",
+                                     extra=environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.records()[-1]["hold_wait_s"], expected)
+
+        (directory / "wait-clippy" / "placement-call-1.pending").mkdir()
+        result = self.record("call", "failed", "2", "0", "0", "0", "0", "0", "0", "lint", "hana",
+                             extra=environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.records()[-1]["hold_wait_s"])
+        self.assertIsNone(self.records()[-1]["admission_wait_s"])
 
     def test_call_records_null_mac_seconds_when_value_is_unusable(self) -> None:
         for value in ("", "abc", "-1"):

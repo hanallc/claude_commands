@@ -17,7 +17,7 @@ The repo word and unit select the parent folder under the host's build root.
 The maker takes the lowest free existing number or creates the smallest missing number.
 An identical nested committed proof can reuse its held copy.
 A run can still wait for normal build admission.
-The AWS gate uses its separate slot path.
+The AWS gate takes its assigned numbered copy under `~/build/hana/aws-hana`.
 
 The Hana AWS guest uses its main checkout at `~/rust/hana` for bundle fetches.
 The sender accepts the main checkout or a model worktree linked to it.
@@ -32,7 +32,12 @@ The shell cache lives at `~/build/hana/main/shells`.
 The caller holds the copy lease through preparation and execution.
 The lease records the source checkout, commit, Git directory identities, and holder.
 Python callers pass the lock descriptor and its environment setting to build and test children.
-The copy becomes free when the kernel lock is free.
+The lease gives the child a `COPIES_KEEP_FILE` path beside the copy.
+A nonempty file keeps the copy after the kernel lock is free.
+The file contains the reason. The collector and copy allocator skip kept copies.
+Remove the keep file only after a manual check confirms that the copy is clear.
+The Mac smoke run uses this lease and keeps the copy if its process check fails.
+The smoke run passes its owner to the Mac with `copies.py run --owner`.
 A lease release failure after use raises `PostUseError` and retains the caller error.
 
 The maker rescues source work before Git resets the copy to the requested commit.
@@ -178,7 +183,7 @@ A successful retry removes the record.
 Removal requires a zero status marker from the remote command before it deletes the local record.
 Authentication failures and remote removal refusals still raise `RemoteMirrorKept` and prevent retirement.
 A kept local tree prints one line, and retirement continues.
-The sweep removes the local tree later.
+The tmp sweep lists eligible local trees for vetted manual removal.
 Another owner's records remain.
 
 Local mirror rows display the machine name while their records retain `localhost`.

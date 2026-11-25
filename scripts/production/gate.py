@@ -23,7 +23,8 @@ A green nightly sends a result push unless gate.conf disables it.
 A red nightly records its result and notifies sdlc.
 The nightly run sends type diagnostics to the units that changed the code.
 The user receives a push after the nightly run or after sdlc assigns the fix.
-A failure before the checks start sends the reason. Silence keeps the newest result.
+A failure before the checks start sends the reason and the next run time.
+Silence keeps the newest result.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
 the production's top-level showrunner keeps (`change_review.list_path`), with the doc stamped into
@@ -89,7 +90,8 @@ from scripts.lib.build_steps import (
 from scripts.lint import memory_admit, sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
-    affected_modules, change_review, land_runs, session_staff, showrunners, staff, unit_config, unit_lookup, unit_names,
+    affected_modules, change_review, land_runs, nightly_schedule, session_staff, showrunners, staff,
+    unit_config, unit_lookup, unit_names,
 )
 from scripts.production.gate_modules import GateRefused, discover_test_modules, is_test_module, test_module_name
 from scripts.production.gate_routes import (
@@ -113,7 +115,7 @@ from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
 from scripts.build_queue import admission_client, admission_records, admission_wire, first_step, placement  # noqa: E402
-from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
+from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER, MAC_LINUX_START_UNCONFIRMED
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import (  # noqa: E402
     AdmissionHoldCheck, OuterReservation, cpu_pool_path, outer_reservation, step_identity,
@@ -2620,19 +2622,19 @@ def push_nightly_result(args: GateArguments, result: GateRun | Exception) -> Non
     try:
         from scripts.message import send_budget
         from scripts.notify import push_texts, review
-        from scripts.notify.pushover import MESSAGE_MAX
+        from scripts.notify.pushover import phone_message_limit
         config = conf.read("gate")
         if config.text("nightly_result_push") == "off":
             return
-        values = {"branch": args.merge_branch, "time": datetime.now(user_zone()).strftime("%H:%M %Z")}
         if isinstance(result, Exception):
-            values["action"] = "None. The next nightly run tries again."
-            values["reason"] = ""
+            values = {"action": "", "reason": "", "next_run": nightly_schedule.nightly_next_run()}
             empty = push_texts.render("nightly.not_run", **values)
             reason = " ".join(str(result).split()).rstrip(".") or type(result).__name__
-            values["reason"] = reason[:max(0, MESSAGE_MAX - len(empty.message))].rstrip(".")
+            room = phone_message_limit(empty.sender, empty.id) - len(empty.message)
+            values["reason"] = reason[:max(0, room)].rstrip(" .")
             rendered = push_texts.render("nightly.not_run", **values)
         else:
+            values = {"branch": args.merge_branch, "time": datetime.now(user_zone()).strftime("%H:%M %Z")}
             values.update(nightly_check_values(result))
             rendered = push_texts.render("nightly.result", **values)
         sent = subprocess.run(push_texts.user_send_argv(rendered, key="nightly-result"),
@@ -3426,6 +3428,9 @@ class GuestNotStartedOutcome(Protocol):
     @property
     def settlement_required(self) -> bool: ...
 
+    @property
+    def retry_before_settlement(self) -> bool: ...
+
 
 class GuestToolSettings(Protocol):
     def command(self, shell: str) -> tuple[str, ...]: ...
@@ -3527,15 +3532,18 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         if isinstance(outcome, str):
             raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
         if not isinstance(outcome, GateRun):
-            failure = admission_wire.ClaimFailure(token_hex(16), assignment, MAC_LINUX_NO_ANSWER)
-            if outcome.settlement_required:
-                try:
-                    write_gate_claim_failure(failure)
-                except (KeyError, OSError) as error:
-                    raise GateSettlementPending(f'Mac Linux guest took no run. {outcome.reason}. '
-                                                + f'Cannot save the placement refusal. {error}') from error
-                raise GateSettlementPending(f"Mac Linux guest took no run: {outcome.reason}")
-            write_gate_claim_failure(failure)
+            if outcome.settlement_required and not outcome.retry_before_settlement:
+                raise GateSettlementPending(f'Mac Linux guest gate blocked. {outcome.reason}. '
+                                            + 'The queue did not confirm consumption for this launch claim.')
+            reason = MAC_LINUX_START_UNCONFIRMED if outcome.retry_before_settlement else MAC_LINUX_NO_ANSWER
+            failure = admission_wire.ClaimFailure(token_hex(16), assignment, reason)
+            try:
+                write_gate_claim_failure(failure)
+            except (KeyError, OSError) as error:
+                if not outcome.settlement_required:
+                    raise
+                raise GateSettlementPending(f'Mac Linux guest took no run. {outcome.reason}. '
+                                            + f'Cannot save the placement refusal. {error}') from error
             raise MacLinuxTookNoRun(f"Mac Linux guest took no run: {outcome.reason}")
         first_failures = {(job.suite, job.module): job for job in outcome.executions
                           if job.kind is GateJobKind.TEST_MODULE and job.returncode

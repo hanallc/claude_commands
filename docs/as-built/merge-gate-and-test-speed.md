@@ -514,7 +514,9 @@ The six merge flags are required for a checkpoint merge.
 Use `--tests-only` for a merge-line test run and `--affected` for a unit test run.
 Use one `--module <suite>/<module>` for each module with `--tests-only` or `--affected`.
 Give each path relative to `scripts/`, for example `lib/test_x.py`.
-Use the exact script word `scripts/production/gate.py` to check arguments before placement in `copies.py run` or `copies.py gate-step`.
+`copies.py run` refuses a named gate without a test mode before placement.
+Use `scripts/production/gate.py` as the exact script path in `copies.py run` or `copies.py gate-step`.
+This path uses the gate parser to check arguments before placement.
 `copies.py run` uses the gate parser from the requested source snapshot.
 Revisions without the validation entry point check arguments when the gate starts.
 Omit the inner `--repo` option or use `--repo .` or `--repo '{tree}'` to select the numbered copy.
@@ -645,10 +647,12 @@ The 03:00 timer calls this path.
 Each green exit sends `nightly.result`.
 An exit before the checks start sends `nightly.not_run`.
 The result names the branch, finish time, type result and full test result.
-The failure text names the reason on one line within the message limit.
+The failure push shows `Nightly check did not run`, the reason, and the next run time in the user's time zone.
+The gate reads the schedule from `claude-nightly.timer`.
+The gate limits the reason so the next run time and footer fit in the push.
 Both pushes use need `note` and the key `nightly-result`.
-The result requires no action. The failure text includes an action.
-The gate says the next nightly run tries again. The cold credentials example directs the user to run `github-warmup`.
+The gate sends the failure push without an action line.
+The timer keeps the `github-warmup` action line when GitHub credentials are cold.
 Silence keeps only the newest push on that key and delivers it when silence ends.
 The gate reads `nightly_result_push` and `nightly_result_modules` from `config/gate.conf` at use.
 `nightly_result_push=off` disables all nightly result pushes. The default is `on`.
@@ -692,8 +696,7 @@ The command accepts a unit director of any production.
 `UNIT` accepts the staff ID, a `<production>/<unit>` path, or the name of an sdlc unit.
 The command confirms receipt if the original notice has no delivery confirmation.
 It saves the assignment before it sends `nightly.assigned`.
-The push places the receipt and assignment status before the failure list.
-The phone retains that status when it truncates a long failure list.
+The push shows the title `Nightly check failed` and one body line that names the assigned unit.
 A rerun prints `unchanged` after the sender accepts the push.
 Both automatic and manual assignment send a user push.
 The push names the assignee when the receipt is confirmed.
