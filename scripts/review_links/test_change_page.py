@@ -703,7 +703,7 @@ class ChangePageTests(unittest.TestCase):
             self.assertEqual(saved.question_id, "new-question")
 
         config = self.temporary / "notify.conf"
-        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=113\n")
+        _ = config.write_text("review_timeout_seconds=113\n")
         with (patch.object(review, "NOTIFY_CONFIG", config),
               patch.object(remote, "local_machine", return_value="natedev"),
               patch.object(remote, "machine_alias", return_value=remote.MachineAlias("mac")),

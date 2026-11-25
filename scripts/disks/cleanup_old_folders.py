@@ -17,6 +17,7 @@ import json
 import os
 import pwd
 import re
+import secrets
 import shutil
 import socket
 import stat
@@ -26,19 +27,23 @@ import time
 from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from itertools import chain
 from pathlib import Path
-from typing import Literal, NamedTuple, NotRequired, TextIO, TypedDict, cast, override
+from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TextIO, TypedDict, cast, final, override
 from urllib.parse import unquote, urlsplit
 
 from scripts.copies import copies
-from scripts.lib import build_folder_lock, build_folders, conf, git_files, git_rescue, process_start, removal_guard
+from scripts.lib import build_folder_lock, build_folders, conf, git_files, git_rescue, process_start
+from scripts.lib import removal_guard
 from scripts.lib.process_failure import failure_detail
 from scripts.lint import tmp_sweep
 from scripts.production import staff
 from scripts.worktree import worktree_records
+
+if TYPE_CHECKING:
+    from scripts.lib.session_move import TreeEntry
 
 
 class Machine(Enum):
@@ -60,6 +65,11 @@ class CleanupPlace(Enum):
     UNREADABLE_GATE_ROOT = "unreadable gate root"
 
 
+class CleanupMode(Enum):
+    STANDARD = "standard"
+    MOVE_GATE_GIT = "move-gate-git"
+
+
 @dataclass(frozen=True)
 class Candidate:
     path: Path
@@ -69,6 +79,12 @@ class Candidate:
 
 @dataclass(frozen=True)
 class WouldRemove:
+    fingerprint: str
+
+
+@dataclass(frozen=True)
+class WouldMove:
+    target: Path
     fingerprint: str
 
 
@@ -116,7 +132,7 @@ class GateDeviceUnavailable(Enum):
 class Row:
     path: Path
     size: int | None
-    outcome: WouldRemove | removal_guard.Kept
+    outcome: WouldMove | WouldRemove | removal_guard.Kept
     git: str = ""
     sidecars: tuple[str, ...] = ()
     place: CleanupPlace = CleanupPlace.FOLDER
@@ -138,6 +154,7 @@ class RowRecord(TypedDict):
     git: str
     sidecars: NotRequired[tuple[str, ...]]
     gate: NotRequired[GateRecord]
+    move_to: NotRequired[str]
 
 
 class HostRecord(TypedDict):
@@ -155,11 +172,13 @@ def row_record(row: Row) -> RowRecord:
     record: RowRecord = {
         "path": str(row.path), "bytes": row.size,
         "keep": outcome.reason if isinstance(outcome, removal_guard.Kept) else "",
-        "fingerprint": outcome.fingerprint if isinstance(outcome, WouldRemove) else "",
+        "fingerprint": outcome.fingerprint if isinstance(outcome, (WouldMove, WouldRemove)) else "",
         "git": row.git,
     }
     if row.sidecars:
         record["sidecars"] = row.sidecars
+    if isinstance(outcome, WouldMove):
+        record["move_to"] = str(outcome.target)
     if isinstance(row.gate, GateDetails):
         gate = row.gate
         record["gate"] = {"kind": gate.kind, "newest_ns": gate.newest_ns if isinstance(gate.newest_ns, int) else None,
@@ -200,10 +219,30 @@ class GatePathUse(Enum):
     UNREADABLE = "cannot check for other paths to the gate root"
 
 
-class GateTaskState(Enum):
+class CleanupTaskState(Enum):
     OTHER_USER = "the task belongs to another user"
     ENDED = "the task has ended"
-    ALIVE = "the current user owns the live task"
+    ALIVE = "a live task to check"
+
+
+class InheritedCleanupUser(Enum):
+    CURRENT = "use the current user"
+
+
+@dataclass(frozen=True)
+class SudoCleanupUser:
+    uid: int
+    gid: int
+    name: str
+    home: Path
+    setpriv: str
+
+    def command(self, command: Sequence[str]) -> tuple[str, ...]:
+        return (self.setpriv, f"--reuid={self.uid}", f"--regid={self.gid}", "--clear-groups", "--no-new-privs",
+                "--inh-caps=-all", "--ambient-caps=-all", "--bounding-set=-all", *command)
+
+    def environment(self) -> dict[str, str]:
+        return {**os.environ, "HOME": str(self.home), "USER": self.name, "LOGNAME": self.name}
 
 
 class Arguments(argparse.Namespace):
@@ -236,6 +275,9 @@ GATE_IF_NAMED = removal_guard.Kept("would remove if named")
 GATE_RECOVERY = "gate recovery record"
 GATE_OTHER_OWNER = "other user's files; live use not provable"
 GATE_GIT_KEEP_REASON = "holds a Git repository; manual review"
+GATE_ALTERNATES = "Git alternates; manual review"
+GATE_MOVE_LABEL = "would move to disk"
+STANDARD_CLEANUP_ONLY = removal_guard.Kept("use the standard cleanup list to remove this folder")
 GATE_GIT_STORAGE = "Git data in the gate root; manual review"
 TEST_GATE_KINDS = ("t", "targeted-test")
 GATE_PREFIXES = ("merge-gate-recovery", "gate-recovery", "phase-44ca-gate",
@@ -361,7 +403,7 @@ def masked_cleanup_command(mounts: Sequence[Path], command: Sequence[str]) -> tu
     options: list[str] = []
     for path in mounts:
         options.extend(("--tmpfs", str(path), "--remount-ro", str(path)))
-    return (bwrap, "--unshare-user", "--disable-userns", "--die-with-parent",
+    return (bwrap, "--unshare-user", "--disable-userns", "--cap-drop", "ALL", "--die-with-parent",
             "--bind", "/", "/", "--dev-bind", "/dev", "/dev", *options, "--", *command)
 
 
@@ -463,6 +505,10 @@ class CheckedCleanup:
     @property
     def name(self) -> str:
         return self.path.name
+
+    @property
+    def published_copy_path(self) -> Path:
+        return gate_move_target(self.path, self.bounds)
 
     def recheck(self) -> None:
         if removal_guard.identity(self.path.parent.stat()) != self.parent_identity:
@@ -662,6 +708,8 @@ def inspect_cleanup_tree(checked: CheckedCleanup,
                 gate_issue = GATE_OTHER_OWNER
             elif not gate_issue and not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
                 gate_issue = f"contains a link or an unknown entry type: {path}"
+            elif not gate_issue and stat.S_ISREG(info.st_mode) and path.parts[-3:] == ("objects", "info", "alternates"):
+                gate_issue = GATE_ALTERNATES
         evidence = json.dumps((str(path.relative_to(checked.path)), stamp)).encode()
         fingerprint.update(evidence)
         in_git = path.is_relative_to(dot_git)
@@ -694,6 +742,16 @@ def inspect_cleanup_tree(checked: CheckedCleanup,
                     visit(descriptor, child, path / child)
                 if entry_stamp(os.fstat(descriptor)) != stamp:
                     raise removal_guard.ChangedEntry("folder changed during assessment")
+            finally:
+                os.close(descriptor)
+        elif gate and isinstance(entries, dict) and sys.platform == "linux":
+            flags = os.O_RDONLY | os.O_NONBLOCK if stat.S_ISREG(info.st_mode) else os.O_PATH
+            descriptor = os.open(name, flags | os.O_NOFOLLOW, dir_fd=parent)
+            try:
+                if info.st_dev != checked.info.st_dev or removal_guard.mount_id(descriptor) != checked.mount:
+                    raise removal_guard.Refused(removal_guard.RefusalReason.MOUNT, str(path))
+                if entry_stamp(os.fstat(descriptor)) != stamp:
+                    raise removal_guard.ChangedEntry("entry changed during assessment")
             finally:
                 os.close(descriptor)
         if isinstance(entries, dict):
@@ -1617,11 +1675,11 @@ def top_worktrees(bounds: CleanupBounds) -> Iterator[tuple[Path, CleanupPlace]]:
         return
 
 
-def process_name(pid: int, *, fallback: str = "<command unavailable>") -> str:
+def process_name(pid: int) -> str:
     try:
         return (Path(PROC_ROOT) / str(pid) / "comm").read_text(errors="replace").strip()
     except OSError:
-        return fallback
+        return "<command unavailable>"
 
 
 def incomplete_scan_reason(unreadable: Sequence[tuple[int, str]]) -> str:
@@ -1788,108 +1846,208 @@ def process_uses(paths: Sequence[Path], *, check_links: bool = False,
     return read_process_use(paths, check_links=check_links, ignored_fds=ignored_fds, gate_root=gate_root)
 
 
-def gate_link_is_alias(link: Path, root: Path, device: int) -> bool:
-    return link.stat().st_dev == device and not Path(os.readlink(link)).is_relative_to(root)
+@final
+@dataclass
+class CleanupProcessScan:
+    folders: frozenset[bytes]
+    descendants: tuple[bytes, ...]
+    gate_root: Path | GateRootNotSelected
+    gate_device: int | GateDeviceUnavailable
+    gate_paths: GatePathUse
+    paths: list[tuple[str, int, str]] = field(default_factory=list)
+    pwd_users: list[tuple[Path, int]] = field(default_factory=list)
 
+    def record_path(self, target: bytes, pid: int, action: str) -> None:
+        candidates = tmp_sweep.proc_path_candidates(target)
+        if isinstance(candidates, tmp_sweep.MissingProcessData):
+            raise ValueError(candidates.value)
+        self.paths.extend((os.fsdecode(path), pid, action) for path in candidates
+                          if path in self.folders or path.startswith(self.descendants))
 
-def gate_task_uses_alias(task: Path, root: Path, device: int, ignored: frozenset[int]) -> bool:
-    if any(gate_link_is_alias(task / name, root, device) for name in ("cwd", "root")):
-        return True
-    try:
-        if gate_link_is_alias(task / "exe", root, device):
-            return True
-    except FileNotFoundError:
-        pass
-    for link in (task / "fd").iterdir():
-        if link.name.isdecimal() and int(link.name) not in ignored:
+    def check_gate_link(self, link: Path, target: bytes) -> None:
+        if (isinstance(self.gate_root, Path) and isinstance(self.gate_device, int)
+                and self.gate_paths is not GatePathUse.ALIAS
+                and not Path(os.fsdecode(target)).is_relative_to(self.gate_root)):
             try:
-                if gate_link_is_alias(link, root, device):
-                    return True
-            except FileNotFoundError:
+                if link.stat().st_dev == self.gate_device:
+                    self.gate_paths = GatePathUse.ALIAS
+            except (FileNotFoundError, ProcessLookupError):
                 if not process_ended(link):
-                    raise
-    return False
+                    self.gate_paths = GatePathUse.UNREADABLE
+            except OSError:
+                self.gate_paths = GatePathUse.UNREADABLE
 
+    def read_link(self, link: Path, pid: int, action: str, *, required: bool) -> None:
+        try:
+            target = os.readlink(os.fsencode(link))
+        except (FileNotFoundError, ProcessLookupError):
+            if required:
+                raise
+            return
+        self.record_path(target, pid, action)
+        self.check_gate_link(link, target)
 
-def gate_mappings_use_alias(process: Path, root: Path, device: int) -> bool:
-    with (process / "maps").open("rb") as mappings:
-        for line in mappings:
-            fields = line.split(maxsplit=5)
-            if len(fields) < 5 or fields[4] == b"0":
-                continue
-            major, minor = (int(part, 16) for part in fields[3].split(b":"))
-            if (major, minor) != (os.major(device), os.minor(device)):
-                continue
-            # The map table identifies the device. Check the matching link in /proc.
+    def check_gate_mapping(self, task: Path, fields: list[bytes]) -> None:
+        root, device = self.gate_root, self.gate_device
+        if (not isinstance(root, Path) or not isinstance(device, int) or self.gate_paths is GatePathUse.ALIAS
+                or len(fields) < 5 or fields[4] == b"0"):
+            return
+        major, minor = (int(part, 16) for part in fields[3].split(b":"))
+        if (major, minor) != (os.major(device), os.minor(device)):
+            return
+        try:
+            target = os.readlink(task / "map_files" / os.fsdecode(fields[0]))
+            aliases = not Path(target).is_relative_to(root)
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            # The map table includes the device and the path when the link is unavailable.
+            if len(fields) < 6:
+                raise
+            names = tmp_sweep.proc_path_candidates(fields[5])
+            if isinstance(names, tmp_sweep.MissingProcessData):
+                raise ValueError(names.value) from None
+            aliases = any(not Path(os.fsdecode(name)).is_relative_to(root) for name in names)
+        if aliases:
+            self.gate_paths = GatePathUse.ALIAS
+
+    def read_task(self, task: Path, pid: int, ignored: frozenset[int], *,
+                  threaded: bool, read_shared_paths: bool) -> None:
+        stop_on_use = len(self.folders) == 1 and isinstance(self.gate_root, GateRootNotSelected)
+        first = len(self.paths)
+        require_task_links = threaded or isinstance(self.gate_root, Path)
+        self.read_link(task / "cwd", pid, tmp_sweep.WORKS_IN, required=require_task_links)
+        if stop_on_use and len(self.paths) > first:
+            return
+        self.read_link(task / "root", pid, tmp_sweep.ROOTS_IN, required=require_task_links)
+        if read_shared_paths or isinstance(self.gate_root, Path):
+            self.read_link(task / "exe", pid, tmp_sweep.MAPS_FILE, required=False)
+        with os.scandir(str(task / "fd")) as descriptors:
+            for entry in descriptors:
+                if entry.name.isdecimal() and int(entry.name) not in ignored:
+                    self.read_link(Path(entry.path), pid, tmp_sweep.HOLDS_FILE, required=False)
+                if stop_on_use and len(self.paths) > first:
+                    return
+        if read_shared_paths:
             try:
-                if gate_link_is_alias(process / "map_files" / os.fsdecode(fields[0]), root, device):
-                    return True
-            except (FileNotFoundError, PermissionError):
-                if len(fields) < 6:
+                with (task / "maps").open("rb") as mappings:
+                    for line in mappings:
+                        fields = line.removesuffix(b"\n").split(maxsplit=5)
+                        if len(fields) == 6:
+                            self.record_path(fields[5], pid, tmp_sweep.MAPS_FILE)
+                        self.check_gate_mapping(task, fields)
+                        if stop_on_use and len(self.paths) > first:
+                            return
+            except (FileNotFoundError, ProcessLookupError):
+                if isinstance(self.gate_root, Path):
                     raise
-                names = tmp_sweep.proc_path_candidates(fields[5].removesuffix(b"\n"))
-                if isinstance(names, tmp_sweep.MissingProcessData):
-                    raise
-                if any(not Path(os.fsdecode(name)).is_relative_to(root) for name in names):
-                    return True
-    return False
+
+    def read_pwd(self, process: Path, pid: int) -> None:
+        fields = (process / "environ").read_bytes().split(b"\0")
+        for field in fields:
+            if field.startswith(b"PWD="):
+                path = Path(os.fsdecode(field[4:]))
+                if path.is_absolute():
+                    self.pwd_users.append((path, pid))
 
 
-def gate_task_state(status: Sequence[str], uid: str) -> GateTaskState:
+def task_state(status: Sequence[str], uid: int) -> CleanupTaskState:
     users = next(line.split()[1:3] for line in status if line.startswith("Uid:"))
     if len(users) != 2 or not all(user.isdecimal() for user in users):
         raise ValueError("cannot read the process user")
-    if uid not in users:
-        return GateTaskState.OTHER_USER
+    if uid and str(uid) not in users:
+        return CleanupTaskState.OTHER_USER
     state = next(line.split()[1] for line in status if line.startswith("State:"))
-    return GateTaskState.ENDED if state in ("Z", "X") else GateTaskState.ALIVE
+    if state in ("Z", "X") or "Kthread:\t1" in status:
+        return CleanupTaskState.ENDED
+    return CleanupTaskState.ALIVE
 
 
-def gate_process_use(root: Path, ignored_fds: frozenset[int],
-                     worker_fds: tmp_sweep.WorkerRemovalDescriptors | tmp_sweep.NoWorkerDescriptors) -> GatePathUse:
-    uid = str(os.geteuid())
+def task_read_failed(task: Path, error: Exception) -> bool:
+    if not isinstance(error, (FileNotFoundError, ProcessLookupError)):
+        return True
+    if process_ended(task):
+        return False
     try:
-        device = root.stat().st_dev
-        processes = tuple(Path(PROC_ROOT).iterdir())
+        status = (task / "status").read_text(errors="replace").splitlines()
+        return task_state(status, 0) is not CleanupTaskState.ENDED
+    except (FileNotFoundError, ProcessLookupError):
+        return not process_ended(task)
+    except (OSError, ValueError, StopIteration, IndexError):
+        return True
+
+
+def scan_cleanup_process(process: Path, scan: CleanupProcessScan, uid: int, ignored: frozenset[int]) -> bool:
+    pid = int(process.name)
+    status = (process / "status").read_text(errors="replace").splitlines()
+    leader_state = task_state(status, uid)
+    if leader_state is CleanupTaskState.OTHER_USER:
+        return False
+    threaded = leader_state is CleanupTaskState.ENDED or not any(
+        line.startswith("Threads:") and line.split() == ["Threads:", "1"] for line in status)
+    tasks = ((task for task in (process / "task").iterdir()
+              if task.name.isdecimal() and task.name != process.name) if threaded else ())
+    unreadable = False
+    shared_paths_read = False
+    for task in chain((process,), tasks):
+        try:
+            leader = task == process
+            state = (leader_state if leader
+                     else task_state((task / "status").read_text(errors="replace").splitlines(), uid))
+            if state is not CleanupTaskState.ALIVE:
+                continue
+            if not shared_paths_read:
+                scan.read_pwd(task, pid)
+            scan.read_task(task, pid, ignored if leader else tmp_sweep.NO_IGNORED_FDS,
+                           threaded=threaded, read_shared_paths=not shared_paths_read)
+            shared_paths_read = True
+        except (OSError, ValueError, StopIteration, IndexError) as error:
+            unreadable |= task_read_failed(task, error)
+        if len(scan.folders) == 1 and isinstance(scan.gate_root, GateRootNotSelected):
+            if scan.paths and scan.paths[-1][1] == pid:
+                break
+    return unreadable
+
+
+class ProcessTableAbsent(Enum):
+    ABSENT = "no local process table"
+
+
+def scan_cleanup_processes(paths: Sequence[Path], gate_root: Path | GateRootNotSelected, ignored_fds: frozenset[int],
+                           worker_fds: tmp_sweep.WorkerRemovalDescriptors | tmp_sweep.NoWorkerDescriptors
+                           ) -> CleanupProcessReview | ProcessTableAbsent:
+    try:
+        with os.scandir(PROC_ROOT) as entries:
+            processes = [Path(entry.path) for entry in entries if entry.name.isdecimal()]
+    except FileNotFoundError:
+        return ProcessTableAbsent.ABSENT
     except OSError:
-        return GatePathUse.UNREADABLE
-    result = GatePathUse.CLEAR
+        reason = removal_guard.Kept(incomplete_scan_reason(()))
+        return CleanupProcessReview(path_failure=reason, pwd_failure=reason)
+    gate_device = GateDeviceUnavailable.UNKNOWN
+    gate_paths = GatePathUse.CLEAR
+    if isinstance(gate_root, Path):
+        try:
+            gate_device = gate_root.stat().st_dev
+        except OSError:
+            gate_paths = GatePathUse.UNREADABLE
+    folders = frozenset(os.fsencode(path) for path in paths)
+    scan = CleanupProcessScan(folders, tuple(path.rstrip(b"/") + b"/" for path in folders),
+                              gate_root, gate_device, gate_paths)
+    unreadable: dict[int, str] = {}
+    uid = os.geteuid()
     for process in processes:
-        if not process.name.isdecimal():
-            continue
         pid = int(process.name)
         ignored = ignored_fds if pid == os.getpid() else tmp_sweep.NO_IGNORED_FDS
         if isinstance(worker_fds, tmp_sweep.WorkerRemovalDescriptors) and pid == worker_fds.pid:
             ignored |= worker_fds.numbers
         try:
-            status = (process / "status").read_text(errors="replace").splitlines()
-            leader_state = gate_task_state(status, uid)
-            if leader_state is GateTaskState.OTHER_USER:
-                continue
-            threaded = not any(line.startswith("Threads:") and line.split() == ["Threads:", "1"] for line in status)
-            tasks = ((task for task in (process / "task").iterdir()
-                      if task.name.isdecimal() and task.name != process.name) if threaded else ())
-            read_maps = False
-            for task in chain((process,), tasks):
-                try:
-                    leader = task == process
-                    state = (leader_state if leader
-                             else gate_task_state((task / "status").read_text(errors="replace").splitlines(), uid))
-                    if state is not GateTaskState.ALIVE:
-                        continue
-                    if gate_task_uses_alias(task, root, device, ignored if leader else tmp_sweep.NO_IGNORED_FDS):
-                        return GatePathUse.ALIAS
-                    if not read_maps:
-                        if gate_mappings_use_alias(task, root, device):
-                            return GatePathUse.ALIAS
-                        read_maps = True
-                except (OSError, ValueError, StopIteration, IndexError):
-                    if not process_ended(task):
-                        result = GatePathUse.UNREADABLE
-        except (OSError, ValueError, StopIteration, IndexError):
-            if not process_ended(process):
-                result = GatePathUse.UNREADABLE
-    return result
+            if scan_cleanup_process(process, scan, uid, ignored):
+                unreadable[pid] = process_name(pid)
+        except (OSError, ValueError, StopIteration, IndexError) as error:
+            if task_read_failed(process, error):
+                unreadable[pid] = process_name(pid)
+    failures = tuple(sorted(unreadable.items()))
+    reason = removal_guard.Kept(incomplete_scan_reason(failures)) if failures else NoUseFound.CLEAR
+    return CleanupProcessReview(tuple(scan.paths), reason, tuple(scan.pwd_users), reason, failures, scan.gate_paths)
 
 
 def read_process_use(paths: Sequence[Path], *, check_links: bool,
@@ -1899,47 +2057,21 @@ def read_process_use(paths: Sequence[Path], *, check_links: bool,
                      gate_root: Path | GateRootNotSelected = GateRootNotSelected.NOT_SELECTED) -> CleanupProcessReview:
     if not (paths or check_links):
         return CleanupProcessReview()
-    prefix = tuple(str(path) for path in paths)
+    scan = scan_cleanup_processes(paths, gate_root, ignored_fds, worker_fds)
+    if isinstance(scan, CleanupProcessReview):
+        return scan
+    failure = removal_guard.Kept(incomplete_scan_reason(()))
     if isinstance(worker_fds, tmp_sweep.WorkerRemovalDescriptors):
-        uses = tmp_sweep.process_paths(PROC_ROOT, prefix, require_readable_user_processes=True, worker_fds=worker_fds,
-                                      stop_after_first_use=True)
-    else:
-        uses = tmp_sweep.process_paths(PROC_ROOT, prefix, require_readable_user_processes=True,
-                                      ignored_self_fds=ignored_fds, stop_after_first_use=True)
-    use_lsof = (type(uses) is tmp_sweep.ProcessUsesUnavailable
-                and isinstance(worker_fds, tmp_sweep.NoWorkerDescriptors))
-    pwd_scan = read_worktree_pwd() if not use_lsof or check_links else WorktreePwdScan()
-    if use_lsof:
-        if not paths:
-            uses = tmp_sweep.ProcessUsesKnown([])
-        elif ignored_fds:
-            uses = tmp_sweep.lsof_paths(prefix, require_complete=True, ignored_self_fds=ignored_fds, same_user_only=True)
-        else:
-            uses = tmp_sweep.lsof_paths(prefix, require_complete=True, same_user_only=True)
-    incomplete = dict(pwd_scan.unreadable)
-    ended: set[int] = set()
-    path_failure: removal_guard.Kept | NoUseFound = NoUseFound.CLEAR
-    if isinstance(uses, tmp_sweep.ProcessUsesKnown):
-        hidden = {item.pid: item.comm for item in uses.kernel_hidden}
-        for pid in {*uses.unreadable_cwd_pids, *uses.unreadable_process_pids, *hidden} - incomplete.keys():
-            process = Path(PROC_ROOT) / str(pid)
-            if process_ended(process):
-                ended.add(pid)
-            else:
-                incomplete[pid] = process_name(pid, fallback=hidden.get(pid, "<command unavailable>"))
-    unreadable = tuple(sorted(incomplete.items()))
-    pwd_failure = pwd_scan.table_failure
-    if unreadable or not isinstance(uses, tmp_sweep.ProcessUsesKnown):
-        path_failure = removal_guard.Kept(incomplete_scan_reason(unreadable))
-        if not use_lsof or unreadable:
-            pwd_failure = path_failure
-    elif not use_lsof:
-        path_failure = pwd_failure
-    pwd_users = tuple((path, pid) for path, pid in pwd_scan.users if pid not in ended)
-    found = [item for item in uses.paths if item[1] not in ended] if isinstance(uses, tmp_sweep.ProcessUsesKnown) else []
-    gate_paths = (gate_process_use(gate_root, ignored_fds, worker_fds)
-                  if isinstance(gate_root, Path) and not use_lsof else GatePathUse.CLEAR)
-    return CleanupProcessReview(tuple(found), path_failure, pwd_users, pwd_failure, unreadable, gate_paths)
+        return CleanupProcessReview(path_failure=failure, pwd_failure=failure)
+    pwd_failure = removal_guard.Kept("cannot read the process PWD list") if check_links else NoUseFound.CLEAR
+    if not paths:
+        return CleanupProcessReview(pwd_failure=pwd_failure)
+    prefix = tuple(map(str, paths))
+    uses = (tmp_sweep.lsof_paths(prefix, require_complete=True, ignored_self_fds=ignored_fds, same_user_only=True)
+            if ignored_fds else tmp_sweep.lsof_paths(prefix, require_complete=True, same_user_only=True))
+    if not isinstance(uses, tmp_sweep.ProcessUsesKnown):
+        return CleanupProcessReview(path_failure=failure, pwd_failure=pwd_failure)
+    return CleanupProcessReview(tuple(uses.paths), pwd_failure=pwd_failure)
 
 
 def answer_process_check(channel: WorkerChannel, request: dict[str, object]) -> None:
@@ -1986,55 +2118,6 @@ def find_process_use(path: Path, uses: CleanupProcessReview, *, sidecars: tuple[
     return NoUseFound.CLEAR
 
 
-@dataclass(frozen=True)
-class WorktreePwdScan:
-    users: tuple[tuple[Path, int], ...] = ()
-    unreadable: tuple[tuple[int, str], ...] = ()
-    table_failure: removal_guard.Kept | NoUseFound = NoUseFound.CLEAR
-
-
-def read_worktree_pwd() -> WorktreePwdScan:
-    users: list[tuple[Path, int]] = []
-    unreadable: dict[int, str] = {}
-    uid = str(os.geteuid())
-    try:
-        processes = tuple(Path(PROC_ROOT).iterdir())
-    except OSError:
-        return WorktreePwdScan(table_failure=removal_guard.Kept("cannot read the process PWD list"))
-    for process in processes:
-        if not process.name.isdecimal():
-            continue
-        pid = int(process.name)
-        try:
-            status = (process / "status").read_text(errors="replace").splitlines()
-            uids = next(line.split()[1:3] for line in status if line.startswith("Uid:"))
-            if len(uids) != 2:
-                raise ValueError("cannot read the process user")
-            if uid not in uids:
-                continue
-            state = next(line.split()[1] for line in status if line.startswith("State:"))
-            if state in ("Z", "X"):
-                continue
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-        except (OSError, StopIteration, IndexError, ValueError):
-            if not process_ended(process):
-                unreadable[pid] = process_name(pid)
-            continue
-        try:
-            fields = (process / "environ").read_bytes().split(b"\0")
-        except OSError:
-            if not process_ended(process):
-                unreadable[pid] = process_name(pid)
-            continue
-        for field in fields:
-            if field.startswith(b"PWD="):
-                path = Path(os.fsdecode(field[4:]))
-                if path.is_absolute():
-                    users.append((path, pid))
-    return WorktreePwdScan(tuple(users), tuple(unreadable.items()))
-
-
 def worktree_staff() -> staff.StaffSnapshot | removal_guard.Kept:
     try:
         return staff.snapshot()
@@ -2068,7 +2151,7 @@ def check_worktree_link(checked: CheckedCleanup, uses: CleanupProcessReview,
     return WouldRemove(digest((CleanupPlace.LINK.value, checked.parent_identity, entry_stamp(checked.info))))
 
 
-def list_only(reason: removal_guard.Kept, outcome: WouldRemove | removal_guard.Kept) -> removal_guard.Kept:
+def list_only(reason: removal_guard.Kept, outcome: WouldMove | WouldRemove | removal_guard.Kept) -> removal_guard.Kept:
     if isinstance(outcome, removal_guard.Kept):
         return removal_guard.Kept(f"{reason.reason}; {outcome.reason}")
     return reason
@@ -2242,31 +2325,37 @@ def confirm_sidecars(checked: CheckedCleanup, guard: CleanupGuard, related: tupl
         raise removal_guard.ChangedEntry(reason.reason)
 
 
+@contextmanager
+def approved_sidecar_targets(path: Path, guard: CleanupGuard, lease: build_folders.HeldFolderRemovalLease,
+                             approved: WorktreeSidecars) -> Generator[list[removal_guard.CleanupTarget]]:
+    lock_stamp = approved.stamps.get(worktree_sidecar_names(path)[1])
+    if lock_stamp is None or lease.sidecar_identities() != approved.stamps:
+        raise removal_guard.ChangedEntry("worktree sidecars changed")
+    check = (LeasePidCheck.MATCH_START_IF_PRESENT if guard.bounds.is_gate_child(path)
+             else LeasePidCheck.ANY_LIVE_PID)
+    if isinstance(reason := keep_for_lease(path, check=check), removal_guard.Kept):
+        raise removal_guard.ChangedEntry(reason.reason)
+    with ExitStack() as stack:
+        targets: list[removal_guard.CleanupTarget] = []
+        for name in worktree_sidecar_names(path):
+            if name not in approved.stamps:
+                continue
+            place = path.with_name(name)
+            checked = stack.enter_context(guard.check_sidecar(place, lease, lock_stamp))
+            stamp = entry_stamp(checked.info)
+            if (stamp.device, stamp.inode, stamp.changed_ns) != approved.stamps[name]:
+                raise removal_guard.ChangedEntry(f"worktree sidecar changed: {place}")
+            approval = removal_guard.ApprovedCleanup({place: CleanupEntry(stamp, ())}, removal_guard.CleanupRemoval.PLAIN)
+            targets.append(removal_guard.CleanupTarget(checked, approval))
+        yield targets
+
+
 def finish_sidecars(path: Path, guard: CleanupGuard, lease: build_folders.HeldFolderRemovalLease,
-                    approved: WorktreeSidecars) -> None:
+                    approved: WorktreeSidecars, *, ignored_fds: Sequence[int] = ()) -> None:
     try:
-        lock_stamp = approved.stamps.get(worktree_sidecar_names(path)[1])
-        if lock_stamp is None or lease.sidecar_identities() != approved.stamps:
-            raise removal_guard.ChangedEntry("worktree sidecars changed")
-        check = (LeasePidCheck.MATCH_START_IF_PRESENT if guard.bounds.is_gate_child(path)
-                 else LeasePidCheck.ANY_LIVE_PID)
-        if isinstance(reason := keep_for_lease(path, check=check), removal_guard.Kept):
-            raise removal_guard.ChangedEntry(reason.reason)
-        with ExitStack() as stack:
-            targets: list[removal_guard.CleanupTarget] = []
-            for name in worktree_sidecar_names(path):
-                if name not in approved.stamps:
-                    continue
-                place = path.with_name(name)
-                checked = stack.enter_context(guard.check_sidecar(place, lease, lock_stamp))
-                stamp = entry_stamp(checked.info)
-                if (stamp.device, stamp.inode, stamp.changed_ns) != approved.stamps[name]:
-                    raise removal_guard.ChangedEntry(f"worktree sidecar changed: {place}")
-                approval = removal_guard.ApprovedCleanup({place: CleanupEntry(stamp, ())},
-                                                         removal_guard.CleanupRemoval.PLAIN)
-                targets.append(removal_guard.CleanupTarget(checked, approval))
+        with approved_sidecar_targets(path, guard, lease, approved) as targets:
             first, *other = targets
-            descriptors = (lease.descriptor, *(target.checked.parent for target in targets))
+            descriptors = (*ignored_fds, lease.descriptor, *(target.checked.parent for target in targets))
             sidecars = tuple(target.checked.path for target in targets)
             remove_reviewed_entries(first.checked, first.approval, *other, before_delete=lambda: require_no_process_use(
                 path, descriptors, sidecars=sidecars))
@@ -2337,6 +2426,8 @@ def candidate_order(candidate: Candidate) -> tuple[int, str, Path]:
 def gate_tree_refusal(kind: str, tree: CleanupTree) -> str:
     if kind in ("gate-recovery", "merge-gate-recovery") or tree.gate_issue == GATE_RECOVERY:
         return GATE_RECOVERY
+    if tree.gate_issue == GATE_ALTERNATES:
+        return GATE_ALTERNATES
     if tree.git is not CleanupGit.NONE:
         return GATE_GIT_KEEP_REASON
     if tree.gate_issue:
@@ -2344,8 +2435,56 @@ def gate_tree_refusal(kind: str, tree: CleanupTree) -> str:
     return "unknown gate entry type" if kind == UNKNOWN_GATE_KIND else ""
 
 
+def gate_move_target(path: Path, bounds: CleanupBounds) -> Path:
+    return build_folders.unit_folder("claude", "resources", root=bounds.build) / "shm-moved" / path.name
+
+
+@contextmanager
+def gate_move_parent(target: Path, bounds: CleanupBounds, *, create: bool) -> Generator[int]:
+    from scripts.lib import session_move
+
+    with ExitStack() as stack:
+        directory = stack.enter_context(session_move.open_directory(bounds.build))
+        mount = session_move.mount_identity(directory)
+        for name in target.parent.relative_to(bounds.build).parts:
+            directory = stack.enter_context(session_move.child_directory(directory, name, create=create, mount=mount))
+        require_gate_move_parent_owner(directory)
+        yield directory
+
+
+def require_gate_move_parent_owner(parent: int) -> None:
+    if os.fstat(parent).st_uid != os.geteuid():
+        raise removal_guard.ChangedEntry("the move target parent belongs to another user")
+
+
+def require_vacant_move_target(target: Path, directory: int) -> None:
+    for name in (target.name, *worktree_sidecar_names(target)):
+        try:
+            _ = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        raise removal_guard.ChangedEntry(f"move target already exists: {target.with_name(name)}")
+
+
+def require_movable_git(kind: str, tree: CleanupTree, entries: dict[Path, CleanupEntry]) -> None:
+    if kind in ("gate-recovery", "merge-gate-recovery"):
+        raise removal_guard.ChangedEntry(GATE_RECOVERY)
+    if tree.gate_issue or kind == UNKNOWN_GATE_KIND:
+        raise removal_guard.ChangedEntry(tree.gate_issue or "unknown gate entry type")
+    if any(entry_path.name.casefold() == ".git" and stat.S_ISREG(entry.stamp.mode)
+           for entry_path, entry in entries.items()):
+        raise removal_guard.ChangedEntry("linked worktree; its registration is elsewhere")
+    if tree.git is CleanupGit.NONE:
+        raise removal_guard.ChangedEntry("no Git repository to move")
+
+
+def gate_move_leases(path: Path, tree: CleanupTree) -> tuple[FolderLeaseReview, ...]:
+    return tuple(review_lease(owner, LeasePidCheck.MATCH_START_IF_PRESENT)
+                 for owner in (path, *tree.lease_owners))
+
+
 def assess_gate(candidate: Candidate, guard: CleanupGuard, uses: CleanupProcessReview,
-                related: tuple[Path, ...]) -> Row:
+                related: tuple[Path, ...], mode: CleanupMode) -> Row:
     path = candidate.path
     kind = gate_kind(path)
     check = LeasePidCheck.MATCH_START_IF_PRESENT
@@ -2359,7 +2498,7 @@ def assess_gate(candidate: Candidate, guard: CleanupGuard, uses: CleanupProcessR
     newest: int | GateEvidenceUnavailable = GateEvidenceUnavailable.UNKNOWN
     size: int | None = None
     names: tuple[str, ...] = ()
-    outcome: removal_guard.Kept | WouldRemove
+    outcome: removal_guard.Kept | WouldRemove | WouldMove
     try:
         with build_folder_lock.folder_parent(path, Path("/"), create=False) as parent:
             orphan = candidate.place is CleanupPlace.GATE_SIDECARS
@@ -2387,12 +2526,16 @@ def assess_gate(candidate: Candidate, guard: CleanupGuard, uses: CleanupProcessR
                     "gate entry is a link" if stat.S_ISLNK(info.st_mode) else "unknown gate entry type")
             size, newest = None, GateEvidenceUnavailable.UNKNOWN
             with guard.check(path) as checked:
-                tree = inspect_cleanup_tree(checked)
+                entries: dict[Path, CleanupEntry] = {}
+                tree = inspect_cleanup_tree(checked, entries if mode is CleanupMode.MOVE_GATE_GIT else Snapshot.PREVIEW)
                 size = tree.size + sidecars.size
                 newest = sidecars.newest_with(tree.newest_ns)
                 leases = (base_lease, *(review_lease(owner, check) for owner in tree.lease_owners))
                 lease_statuses = tuple(lease.status for lease in leases if lease.status.state is not LeaseState.ABSENT)
-                if reason := gate_tree_refusal(kind, tree):
+                moving = mode is CleanupMode.MOVE_GATE_GIT and tree.git is not CleanupGit.NONE
+                if moving:
+                    require_movable_git(kind, tree, entries)
+                elif reason := gate_tree_refusal(kind, tree):
                     raise removal_guard.ChangedEntry(reason)
                 if use_notes:
                     raise removal_guard.ChangedEntry(use_notes[0])
@@ -2402,13 +2545,29 @@ def assess_gate(candidate: Candidate, guard: CleanupGuard, uses: CleanupProcessR
                 with build_folders.folder_removal_lease(path, children=True, wait=False, root=Path("/")) as lease:
                     if isinstance(lease, build_folders.RefusedRemovalLease):
                         raise removal_guard.ChangedEntry("a folder lock is held or unreadable")
-                    confirm_sidecars(checked, guard, related, lease, sidecars)
-                    if candidate.decision is RemovalAssessment.PENDING:
-                        outcome = WouldRemove(sidecars.bind(tree.fingerprint))
-                    elif candidate.decision == NO_CLEANUP_SETTING:
-                        outcome = GATE_IF_NAMED
+                    if moving and (candidate.decision is RemovalAssessment.PENDING
+                                   or candidate.decision == NO_CLEANUP_SETTING):
+                        if isinstance(lease, build_folders.HeldFolderRemovalLease):
+                            confirm_sidecars(checked, guard, related, lease, sidecars)
+                        if inspect_sidecars(checked.parent, guard, related) != sidecars:
+                            raise removal_guard.ChangedEntry("worktree sidecars changed")
+                        from scripts.lib import session_move
+
+                        target = gate_move_target(path, guard.bounds)
+                        with session_move.open_directory(guard.bounds.build):
+                            pass
+                        try:
+                            with gate_move_parent(target, guard.bounds, create=False) as directory:
+                                require_vacant_move_target(target, directory)
+                        except FileNotFoundError:
+                            pass
+                        outcome = WouldMove(target, sidecars.bind(tree.fingerprint))
                     else:
-                        outcome = candidate.decision
+                        confirm_sidecars(checked, guard, related, lease, sidecars)
+                        if candidate.decision is RemovalAssessment.PENDING:
+                            outcome = WouldRemove(sidecars.bind(tree.fingerprint))
+                        else:
+                            outcome = GATE_IF_NAMED if candidate.decision == NO_CLEANUP_SETTING else candidate.decision
     except (OSError, removal_guard.Refused, RuntimeError, ValueError) as error:
         reason = removal_guard.single_line(error)
         if kind in ("gate-recovery", "merge-gate-recovery") and reason != GATE_RECOVERY:
@@ -2418,7 +2577,8 @@ def assess_gate(candidate: Candidate, guard: CleanupGuard, uses: CleanupProcessR
     return Row(path, size, outcome, sidecars=names, place=candidate.place, gate=details)
 
 
-def assess(candidates: Sequence[Candidate], guard: CleanupGuard, machine: Machine) -> HostList:
+def assess(candidates: Sequence[Candidate], guard: CleanupGuard, machine: Machine, *,
+           mode: CleanupMode = CleanupMode.STANDARD) -> HostList:
     """Measure each guarded candidate and check process use and leases."""
     prefixes: list[Path] = []
     gate_root: Path | GateRootNotSelected = GateRootNotSelected.NOT_SELECTED
@@ -2444,7 +2604,7 @@ def assess(candidates: Sequence[Candidate], guard: CleanupGuard, machine: Machin
             continue
         related = related_sidecars(path, machine, guard.bounds)
         if candidate.place in (CleanupPlace.GATE_FOLDER, CleanupPlace.GATE_SIDECARS):
-            rows.append(assess_gate(candidate, guard, uses, related))
+            rows.append(assess_gate(candidate, guard, uses, related, mode))
             continue
         pid_check = LeasePidCheck.ANY_LIVE_PID if related else LeasePidCheck.MATCH_START
         size = None
@@ -2760,16 +2920,226 @@ def remove_configured_folder(path: Path, guard: CleanupGuard, machine: Machine, 
                 finish_sidecars(path, guard, lease, sidecars)
 
 
-def apply(review: HostList, bounds: CleanupBounds) -> int:
+def copy_gate_tree(source: int, destination: int) -> None:
+    result = subprocess.run(("cp", "-a", "--reflink=auto", "--one-file-system", "-T", "--",
+                             f"/proc/self/fd/{source}/.", f"/proc/self/fd/{destination}/."),
+                            pass_fds=(source, destination), capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise removal_guard.ChangedEntry(f"cannot copy the gate folder: {result.stderr.strip()}")
+
+
+def sync_gate_copy(destination: int, destination_parent: int) -> None:
+    from scripts.lib import session_move
+
+    mount = session_move.mount_identity(destination)
+    for path, parent, info, kind in session_move.tree_entries(destination, mount):
+        if kind is session_move.HashedEntry.FILE:
+            with session_move.regular_file(parent, path.name, info, mount) as entry:
+                os.fsync(entry)
+        elif kind is session_move.HashedEntry.DIRECTORY:
+            with session_move.child_directory(parent, path.name, mount=mount) as entry:
+                os.fsync(entry)
+    os.fsync(destination)
+    os.fsync(destination_parent)
+
+
+def copy_gate_sidecar(source: int, destination: int, name: str, expected: build_folders.SidecarIdentity) -> None:
+    from scripts.lib import session_move
+
+    info = os.stat(name, dir_fd=source, follow_symlinks=False)
+    if (*removal_guard.identity(info), info.st_ctime_ns) != expected:
+        raise removal_guard.ChangedEntry(f"worktree sidecar changed: {name}")
+    with (session_move.regular_file(source, name, info, session_move.mount_identity(source)) as original,
+          os.fdopen(original, "rb", closefd=False) as reader):
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=destination)
+        with os.fdopen(fd, "wb") as writer:
+            shutil.copyfileobj(reader, writer)
+            writer.flush()
+            os.fchmod(fd, stat.S_IMODE(info.st_mode))
+            os.utime(fd, ns=(info.st_atime_ns, info.st_mtime_ns))
+            os.fsync(fd)
+
+
+def move_copy_differs(source: TreeEntry, target: TreeEntry,
+                      before: os.stat_result, after: os.stat_result) -> bool:
+    return (not source.same_content(target) or before.st_mode != after.st_mode
+            or before.st_mtime_ns != after.st_mtime_ns)
+
+
+@dataclass(frozen=True)
+class VerifiedGateCopy:
+    source: removal_guard.ProvedCopyCleanup
+    sidecars: dict[str, EntryStamp]
+
+
+def verify_gate_copy(checked: CheckedCleanup, source: int, target: int, target_parent: int,
+                     entries: dict[Path, CleanupEntry], sidecars: WorktreeSidecars, *,
+                     target_path: Path) -> VerifiedGateCopy:
+    from scripts.lib import session_move
+
+    proof = removal_guard.ProvedCopyCleanup(checked, source, removal_guard.CopyDestination(target_path, target), entries)
+    copied_sidecars: dict[str, EntryStamp] = {}
+    for name in worktree_sidecar_names(checked.path):
+        expected = sidecars.stamps.get(name)
+        try:
+            after = os.stat(name, dir_fd=target_parent, follow_symlinks=False)
+        except FileNotFoundError:
+            if expected is None:
+                continue
+            raise
+        if expected is None:
+            raise removal_guard.ChangedEntry(f"unexpected sidecar at the move target: {name}")
+        before = os.stat(name, dir_fd=checked.parent, follow_symlinks=False)
+        if (*removal_guard.identity(before), before.st_ctime_ns) != expected or not stat.S_ISREG(after.st_mode):
+            raise removal_guard.ChangedEntry(f"copy differs from the checked sidecar: {name}")
+        original_file = session_move.read_entry(checked.parent, Path(name), before, session_move.HashedEntry.FILE,
+                                                session_move.mount_identity(checked.parent))
+        copied_file = session_move.read_entry(target_parent, Path(name), after, session_move.HashedEntry.FILE,
+                                              session_move.mount_identity(target_parent))
+        if move_copy_differs(original_file, copied_file, before, after):
+            raise removal_guard.ChangedEntry(f"copy differs from the checked sidecar: {name}")
+        copied_sidecars[name] = entry_stamp(after)
+    return VerifiedGateCopy(proof, copied_sidecars)
+
+
+def require_unchanged_gate_sidecars(target: Path, parent: int, verified: VerifiedGateCopy) -> None:
+    sidecars: dict[str, EntryStamp] = {}
+    for name in worktree_sidecar_names(target):
+        try:
+            sidecars[name] = entry_stamp(os.stat(name, dir_fd=parent, follow_symlinks=False))
+        except FileNotFoundError:
+            continue
+    if sidecars != verified.sidecars:
+        raise removal_guard.ChangedEntry("the published copy changed during verification")
+
+
+def publish_gate_copy(target: Path, parent: int, stage_name: str, stage: int, sidecars: WorktreeSidecars) -> None:
+    from scripts.lib import session_move
+
+    require_gate_move_parent_owner(parent)
+    session_move.require_parent_path(target.parent, parent)
+    session_move.require_parent_path(target.parent / stage_name, stage)
+    require_vacant_move_target(target, parent)
+    attempted: list[tuple[str, removal_guard.Identity]] = []
+    try:
+        for name in (target.name, *sidecars.stamps):
+            identity = removal_guard.identity(os.stat(name, dir_fd=stage, follow_symlinks=False))
+            # The rename helper can fail when it syncs a directory after the rename.
+            attempted.append((name, identity))
+            session_move.rename_exclusive(stage, name, parent, name)
+        os.fsync(stage)
+        os.fsync(parent)
+        session_move.require_parent_path(target.parent / stage_name, stage)
+        os.rmdir(stage_name, dir_fd=parent)
+    except (OSError, ValueError) as error:
+        failures: list[str] = []
+        for name, identity in reversed(attempted):
+            try:
+                staged = session_move.stat_at(stage, name)
+                if staged is not None and removal_guard.identity(staged) == identity:
+                    continue
+                removal_guard.require_identity(parent, name, identity)
+                session_move.rename_exclusive(parent, name, stage, name)
+            except (OSError, ValueError, removal_guard.Refused) as rollback_error:
+                failures.append(f"{name}: {removal_guard.single_line(rollback_error)}")
+        if failures:
+            detail = ", ".join(failures)
+            raise removal_guard.ChangedEntry(
+                f"{removal_guard.single_line(error)}. Cannot return the published paths to staging: {detail}") from error
+        raise
+
+
+def move_gate_folder(path: Path, guard: CleanupGuard, approval: WouldMove, details: GateDetails) -> None:
+    from scripts.lib import session_move
+
+    target = gate_move_target(path, guard.bounds)
+    if not guard.bounds.is_gate_child(path) or target != approval.target:
+        raise removal_guard.ChangedEntry("the approved move path changed")
+    related = related_sidecars(path, Machine.NATEDEV, guard.bounds)
+    with guard.check(path) as checked:
+        if checked.info.st_uid != os.geteuid():
+            raise removal_guard.ChangedEntry(GATE_OTHER_OWNER)
+        sidecars = inspect_sidecars(checked.parent, guard, related)
+        fds = [checked.parent]
+        with build_folders.folder_removal_lease(path, children=True, wait=False, create=True, transient_lock=True,
+                                                probe_fds=fds, root=Path("/")) as lease:
+            if not isinstance(lease, build_folders.HeldFolderRemovalLease):
+                raise removal_guard.ChangedEntry("a folder lock is held or unreadable")
+            locked_sidecars = inspect_sidecars(checked.parent, guard, related)
+            lock_name = worktree_sidecar_names(path)[1]
+            existing = {name: stamp for name, stamp in locked_sidecars.stamps.items()
+                        if not (lease.created and name == lock_name)}
+            if existing != sidecars.stamps or (lease.created and lock_name in sidecars.stamps):
+                raise removal_guard.ChangedEntry("worktree sidecars changed")
+            entries: dict[Path, CleanupEntry] = {}
+            tree = inspect_cleanup_tree(checked, entries)
+            require_movable_git(details.kind, tree, entries)
+            if sidecars.bind(tree.fingerprint) != approval.fingerprint:
+                raise removal_guard.ChangedEntry("identity or contents changed since the list was checked")
+
+            def recheck_move_source(descriptors: Sequence[int]) -> None:
+                confirm_sidecars(checked, guard, related, lease, locked_sidecars)
+                leases = gate_move_leases(path, tree)
+                for reviewed in leases:
+                    if isinstance(reviewed.keep, removal_guard.Kept):
+                        raise removal_guard.ChangedEntry(reviewed.keep.reason)
+                states = tuple(reviewed.status for reviewed in leases if reviewed.status.state is not LeaseState.ABSENT)
+                if states != details.leases:
+                    raise removal_guard.ChangedEntry("lease state changed since the list was checked")
+                require_no_process_use(path, descriptors, sidecars=related, gate_root=guard.bounds.gate)
+
+            recheck_move_source(fds)
+            with (session_move.child_directory(checked.parent, checked.name, mount=int(checked.mount)) as source,
+                  gate_move_parent(target, guard.bounds, create=True) as target_parent):
+                if entry_stamp(os.fstat(source)) != entries[path].stamp:
+                    raise removal_guard.ChangedEntry("source folder changed before the copy")
+                require_vacant_move_target(target, target_parent)
+                mount = session_move.mount_identity(target_parent)
+                stage_name = ".gate-move-" + secrets.token_hex(16)
+                os.mkdir(stage_name, mode=0o700, dir_fd=target_parent)
+                with (session_move.child_directory(target_parent, stage_name, mount=mount) as stage,
+                      session_move.child_directory(stage, target.name, create=True, mount=mount) as destination):
+                    copy_gate_tree(source, destination)
+                    for name, expected in sidecars.stamps.items():
+                        copy_gate_sidecar(checked.parent, stage, name, expected)
+                    sync_gate_copy(destination, stage)
+                    _ = verify_gate_copy(checked, source, destination, stage, entries, sidecars,
+                                         target_path=target.parent / stage_name / target.name)
+                    publish_gate_copy(target, target_parent, stage_name, stage, sidecars)
+
+                    check_protected_masks()
+                    verified = verify_gate_copy(checked, source, destination, target_parent, entries, sidecars,
+                                                target_path=target)
+
+                    def before_delete() -> None:
+                        require_gate_move_parent_owner(target_parent)
+                        session_move.require_parent_path(target.parent, target_parent)
+                        check_protected_masks()
+                        require_unchanged_gate_sidecars(target, target_parent, verified)
+                        recheck_move_source((*fds, source))
+
+                    removal_guard.remove_proved_copy(checked, verified.source, approval.target,
+                                                     before_delete=before_delete)
+            if sidecars.stamps:
+                finish_sidecars(path, guard, lease, locked_sidecars, ignored_fds=fds)
+
+
+def apply(review: HostList, bounds: CleanupBounds, *, mode: CleanupMode = CleanupMode.STANDARD) -> int:
     """Recheck each approved row while holding its removal leases."""
     guard = read_cleanup_guard(frozenset(row.path for row in review.rows), bounds)
     status = 0
     for row in review.rows:
-        if not isinstance(row.outcome, WouldRemove):
+        if isinstance(row.outcome, removal_guard.Kept):
+            continue
+        if mode is not (CleanupMode.MOVE_GATE_GIT if isinstance(row.outcome, WouldMove) else CleanupMode.STANDARD):
             continue
         path = row.path
         try:
-            if row.place is CleanupPlace.LINK:
+            if isinstance(row.outcome, WouldMove):
+                if review.machine is not Machine.NATEDEV or not isinstance(row.gate, GateDetails):
+                    raise removal_guard.ChangedEntry("only a natedev gate folder can move")
+                move_gate_folder(path, guard, row.outcome, row.gate)
+            elif row.place is CleanupPlace.LINK:
                 remove_worktree_link(path, guard, row.outcome)
             elif row.place in (CleanupPlace.FOLDER, CleanupPlace.GATE_FOLDER):
                 remove_configured_folder(path, guard, review.machine, row.outcome)
@@ -2782,13 +3152,55 @@ def apply(review: HostList, bounds: CleanupBounds) -> int:
             report_removal(f"kept {str(path)!r}: {removal_guard.single_line(error)}")
             status = 1
         else:
-            report_removal(f"removed {str(path)!r}")
+            if isinstance(row.outcome, WouldMove):
+                report_removal(f"moved {str(path)!r} to {str(row.outcome.target)!r}")
+            else:
+                report_removal(f"removed {str(path)!r}")
     return status
 
 
-def run_remote(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    timeout = conf.read("disks").whole("cleanup.ssh_seconds")
+def run_remote(arguments: Sequence[str], *,
+               user: SudoCleanupUser | InheritedCleanupUser = InheritedCleanupUser.CURRENT
+               ) -> subprocess.CompletedProcess[str]:
+    if isinstance(user, SudoCleanupUser):
+        checkout = Path(__file__).absolute().parents[2]
+        child = (
+            "import sys\n"
+            + "sys.path.insert(0, sys.argv[1])\n"
+            + "from scripts.disks.cleanup_old_folders import run_remote_after_drop\n"
+            + "raise SystemExit(run_remote_after_drop(sys.argv[2:]))"
+        )
+        command = user.command((sys.executable, "-IB", "-c", child, str(checkout), *arguments))
+        return subprocess.run(command, capture_output=True, text=True, check=False, env=user.environment())
+    return run_ssh_with_config(arguments, "mac_test")
+
+
+def run_ssh_with_config(arguments: Sequence[str], config: str | Path) -> subprocess.CompletedProcess[str]:
+    timeout = conf.read(config).number("floor_sweep_timeout_s")
     return subprocess.run(arguments, capture_output=True, text=True, timeout=timeout, check=False)
+
+
+def ssh_timeout_detail(error: subprocess.TimeoutExpired) -> str:
+    stderr = error.stderr
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors="replace")
+    return stderr or f"SSH timed out after {error.timeout:g} seconds"
+
+
+def run_remote_after_drop(arguments: Sequence[str]) -> int:
+    try:
+        require_sudo_caller()
+        config = "mac_test" if "CONF_DIR" in os.environ else Path.home() / ".claude/config/mac_test.conf"
+        result = run_ssh_with_config(arguments, config)
+    except subprocess.TimeoutExpired as error:
+        print(ssh_timeout_detail(error), file=sys.stderr)
+        return 1
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        print(error, file=sys.stderr)
+        return 1
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
 
 
 def decode_gate_details(raw: object) -> GateDetails | NoGateDetails:
@@ -2833,7 +3245,17 @@ def decode_cleanup_rows(raw: object, machine: Machine) -> tuple[Row, ...]:
             raise ValueError("invalid gate row place")
         if stamp and place not in (CleanupPlace.FOLDER, CleanupPlace.LINK, CleanupPlace.GATE_FOLDER):
             raise ValueError("invalid cleanup approval")
-        rows.append(Row(path, size, removal_guard.Kept(keep) if keep else WouldRemove(stamp), git, sidecars, place, gate))
+        move = fields.get("move_to")
+        outcome: WouldMove | WouldRemove | removal_guard.Kept
+        if move is not None:
+            if (machine is not Machine.NATEDEV or place is not CleanupPlace.GATE_FOLDER or not stamp
+                    or not isinstance(move, str) or not Path(move).is_absolute() or ".." in Path(move).parts
+                    or Path(move).name != path.name):
+                raise ValueError("invalid gate move approval")
+            outcome = WouldMove(Path(move), stamp)
+        else:
+            outcome = removal_guard.Kept(keep) if keep else WouldRemove(stamp)
+        rows.append(Row(path, size, outcome, git, sidecars, place, gate))
     return tuple(rows)
 
 
@@ -2856,10 +3278,7 @@ def remote_list(run_ssh: SshRunner) -> HostList | MacListUnavailable:
             return parse_mac_list(answer.stdout)
         detail = detail or f"SSH exited with status {answer.returncode}"
     except subprocess.TimeoutExpired as error:
-        stderr = error.stderr
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode(errors="replace")
-        detail = stderr or f"SSH timed out after {error.timeout:g} seconds"
+        detail = ssh_timeout_detail(error)
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         detail = detail or str(error)
     first_line = next(iter(detail.splitlines()), "")
@@ -2883,12 +3302,14 @@ def remove_remote(review: HostList, run_ssh: SshRunner) -> int:
     return answer.returncode
 
 
-def show_gate_totals(review: HostList) -> None:
+def show_gate_totals(review: HostList, mode: CleanupMode) -> None:
     groups: dict[tuple[str, str], list[int | None]] = {}
     kept: dict[str, list[int | None]] = {}
     for row in review.rows:
         if isinstance(row.gate, GateDetails):
-            if isinstance(row.outcome, WouldRemove):
+            if isinstance(row.outcome, WouldMove):
+                verdict = GATE_MOVE_LABEL
+            elif isinstance(row.outcome, WouldRemove):
                 verdict = "would remove"
             elif row.outcome == GATE_IF_NAMED:
                 verdict = GATE_IF_NAMED.reason
@@ -2896,7 +3317,8 @@ def show_gate_totals(review: HostList) -> None:
                 verdict = "kept"
                 kept.setdefault(row.outcome.reason, []).append(row.size)
             groups.setdefault((row.gate.kind, verdict), []).append(row.size)
-    if groups:
+    show_moves = mode is CleanupMode.MOVE_GATE_GIT and review.machine is Machine.NATEDEV
+    if groups or show_moves:
         def total(label: str, sizes: list[int | None]) -> str:
             gib = sum(size or 0 for size in sizes) / (1 << 30)
             unknown = sizes.count(None)
@@ -2905,19 +3327,26 @@ def show_gate_totals(review: HostList) -> None:
 
         test_sizes = [size for kind in TEST_GATE_KINDS for size in groups.get((kind, GATE_IF_NAMED.reason), [])]
         totals = [total(f"t and targeted-test {GATE_IF_NAMED.reason}", test_sizes)]
+        moves = [size for (_, verdict), sizes in groups.items() if verdict == GATE_MOVE_LABEL for size in sizes]
+        if moves or show_moves:
+            totals.append(total(GATE_MOVE_LABEL, moves))
         for kind, verdict in sorted(groups, key=lambda group: (group[0] not in TEST_GATE_KINDS, group)):
             totals.append(total(f"{kind} {verdict}", groups[kind, verdict]))
         totals.extend(total(f"kept ({table_text(reason)})", sizes) for reason, sizes in sorted(kept.items()))
         print(f"Gate rows on {review.machine.value}: " + "; ".join(totals))
 
 
-def show(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, approval: str) -> None:
+def show(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, approval: str, *,
+         mode: CleanupMode = CleanupMode.STANDARD) -> None:
     uid = os.geteuid()
-    try:
-        user = pwd.getpwuid(uid).pw_name
-    except KeyError:
-        user = str(uid)
-    print(f"Use check: processes of {user} only; other users' processes are not checked.")
+    if uid == 0:
+        print("Use check: processes of all users.")
+    else:
+        try:
+            user = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            user = str(uid)
+        print(f"Use check: processes of {user} only; other users' processes are not checked.")
     if local.unreadable_processes:
         reason = incomplete_scan_reason(local.unreadable_processes)
         print(reason[0].upper() + reason[1:])
@@ -2925,7 +3354,10 @@ def show(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, ap
     reviews = (local, mac) if isinstance(mac, HostList) else (local,)
     for review in reviews:
         for row in review.rows:
-            reason = row.outcome.reason if isinstance(row.outcome, removal_guard.Kept) else "would remove"
+            if isinstance(row.outcome, WouldMove):
+                reason = f"{GATE_MOVE_LABEL} at {str(row.outcome.target)!r}"
+            else:
+                reason = row.outcome.reason if isinstance(row.outcome, removal_guard.Kept) else "would remove"
             if row.git:
                 reason = f"{reason}, {row.git}"
             if row.sidecars:
@@ -2944,7 +3376,7 @@ def show(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, ap
         total = sum(row.size or 0 for row in review.rows)
         note = " measured (some sizes unknown)" if any(row.size is None for row in review.rows) else ""
         print(f"{review.machine.value} total: {total} bytes{note}")
-        show_gate_totals(review)
+        show_gate_totals(review, mode)
     if isinstance(mac, MacListUnavailable):
         print("mac total: unknown")
     print(f"Digest: {approval}")
@@ -2981,7 +3413,13 @@ def read_gate_device(root: Path) -> int | GateDeviceUnavailable:
     return info.st_dev if stat.S_ISDIR(info.st_mode) else GateDeviceUnavailable.UNKNOWN
 
 
-def review_local(machine: Machine) -> tuple[HostList, CleanupBounds]:
+def move_only_list(review: HostList) -> HostList:
+    rows = tuple(replace(row, outcome=STANDARD_CLEANUP_ONLY) if isinstance(row.outcome, WouldRemove) else row
+                 for row in review.rows)
+    return replace(review, rows=rows)
+
+
+def review_local(machine: Machine, *, mode: CleanupMode = CleanupMode.STANDARD) -> tuple[HostList, CleanupBounds]:
     gate = build_folders.configured_gate_root()
     if not gate.is_absolute() or ".." in gate.parts or gate == Path("/"):
         raise ValueError(f"invalid gate root: {gate}")
@@ -2990,10 +3428,32 @@ def review_local(machine: Machine) -> tuple[HostList, CleanupBounds]:
     candidates = collect(machine, conf.read("disks"), bounds)
     paths = frozenset(candidate.path for candidate in candidates)
     guard = read_cleanup_guard(paths, bounds)
-    return assess(candidates, guard, machine), bounds
+    listed = assess(candidates, guard, machine, mode=mode)
+    return (move_only_list(listed) if mode is CleanupMode.MOVE_GATE_GIT else listed), bounds
 
 
-def finish_cleanup(args: Arguments, local: HostList, run_ssh: SshRunner, apply_local: Callable[[], int]) -> int:
+def show_apply_command(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, approval: str, *,
+                       mode: CleanupMode, host_list: bool) -> None:
+    sudo = mode is CleanupMode.MOVE_GATE_GIT
+    outcome = WouldMove if sudo else WouldRemove
+    rows = chain(local.rows, mac.rows) if not sudo and isinstance(mac, HostList) else local.rows
+    applied = [row for row in rows if isinstance(row.outcome, outcome)]
+    if applied:
+        prefix = "sudo " if sudo else ""
+        scope = " --host-list" if host_list else ""
+        if sudo:
+            gib = sum(row.size or 0 for row in applied) / (1 << 30)
+            unknown = sum(row.size is None for row in applied)
+            note = f" (size unknown for {unknown})" if unknown else ""
+            folders = "folder" if len(applied) == 1 else "folders"
+            print(f"{len(applied)} {folders}, {gib:.2f} GiB{note}, would move from memory to disk.")
+        print(f"To {'move' if sudo else 'remove'} these folders, run:")
+        print(f'{prefix}"$(command -v python3)" -IB "$HOME/.claude/scripts/disks/cleanup_old_folders.py"'
+              + f"{scope} --go {approval}")
+
+
+def finish_cleanup(args: Arguments, local: HostList, run_ssh: SshRunner, apply_local: Callable[[], int], *,
+                   mode: CleanupMode = CleanupMode.STANDARD) -> int:
     local_record = local.record()
     if args.json:
         print(json.dumps(local_record))
@@ -3002,18 +3462,21 @@ def finish_cleanup(args: Arguments, local: HostList, run_ssh: SshRunner, apply_l
            else LocalListOnly.REQUESTED)
     approval = local_record["digest"]
     if isinstance(mac, HostList):
+        if mode is CleanupMode.MOVE_GATE_GIT:
+            mac = move_only_list(mac)
         approval = digest((approval, mac.record()["digest"]))
     elif isinstance(mac, MacListUnavailable):
         approval = digest((approval, MAC_UNREACHABLE))
     if args.go is None:
-        show(local, mac, approval)
+        show(local, mac, approval, mode=mode)
+        show_apply_command(local, mac, approval, mode=mode, host_list=args.host_list)
         return 0
     if isinstance(mac, MacListUnavailable):
         print(mac.message(), file=sys.stderr)
     if not DIGEST.fullmatch(args.go) or not hmac.compare_digest(args.go, approval):
         print("cleanup_old_folders refused: the list digest changed", file=sys.stderr)
         return 1
-    if isinstance(mac, HostList) and remove_remote(mac, run_ssh):
+    if mode is CleanupMode.STANDARD and isinstance(mac, HostList) and remove_remote(mac, run_ssh):
         return 1
     return apply_local()
 
@@ -3021,6 +3484,9 @@ def finish_cleanup(args: Arguments, local: HostList, run_ssh: SshRunner, apply_l
 def main(argv: Sequence[str], *, run_ssh: SshRunner = run_remote) -> int:
     args = parse_arguments(argv)
     try:
+        if os.geteuid() == 0:
+            _ = sudo_cleanup_user()
+            raise ValueError("cleanup through sudo requires the Linux cleanup worker")
         local, bounds = review_local(local_machine())
         return finish_cleanup(args, local, run_ssh, lambda: apply(local, bounds))
     except (OSError, ValueError, removal_guard.Refused) as error:
@@ -3033,12 +3499,17 @@ def worker_review(local: HostList) -> WorkerReview:
     return {"kind": "review", "rows": rows, "unreadable": local.unreadable_processes}
 
 
-def serve_masked_cleanup(channel: WorkerChannel, build: Path, mounts: frozenset[Path]) -> int:
+def serve_masked_cleanup(channel: WorkerChannel, build: Path, mounts: frozenset[Path], *,
+                         mode: CleanupMode = CleanupMode.STANDARD) -> int:
+    if os.geteuid() == 0:
+        raise ValueError("the cleanup worker must run as an unprivileged user")
+    if mode is CleanupMode.MOVE_GATE_GIT:
+        require_sudo_caller()
     token = MASKED_WORKER_CHANNEL.set(channel)
     mask_token = MASKS_IN_FORCE.set(ProtectedFolderMasks(build, mounts))
     try:
         check_protected_masks()
-        local, bounds = review_local(Machine.NATEDEV)
+        local, bounds = review_local(Machine.NATEDEV, mode=mode)
         check_protected_masks()
         channel.send(worker_review(local))
         line = channel.incoming.readline()
@@ -3047,7 +3518,8 @@ def serve_masked_cleanup(channel: WorkerChannel, build: Path, mounts: frozenset[
             return 0
         if message_object(cast(object, json.loads(line))) != {"kind": "apply"}:
             raise ValueError("invalid cleanup approval message")
-        result: WorkerRunResult = {"kind": "applied", "status": apply(local, bounds)}
+        status = apply(local, bounds, mode=mode) if mode is CleanupMode.MOVE_GATE_GIT else apply(local, bounds)
+        result: WorkerRunResult = {"kind": "applied", "status": status}
         channel.send(result)
         return 0
     finally:
@@ -3055,13 +3527,13 @@ def serve_masked_cleanup(channel: WorkerChannel, build: Path, mounts: frozenset[
         MASKED_WORKER_CHANNEL.reset(token)
 
 
-def masked_child(build: Path, mounts: frozenset[Path]) -> int:
+def masked_child(build: Path, mounts: frozenset[Path], *, mode: CleanupMode = CleanupMode.STANDARD) -> int:
     # The rescue and worktree helpers also start Git commands.
     sys.addaudithook(check_before_git)
     try:
         with os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8") as outgoing:
             _ = os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
-            return serve_masked_cleanup(WorkerChannel(sys.stdin, outgoing), build, mounts)
+            return serve_masked_cleanup(WorkerChannel(sys.stdin, outgoing), build, mounts, mode=mode)
     except (OSError, ValueError, removal_guard.Refused, ProtectedMaskChanged) as error:
         print(f"masked cleanup worker failed: {removal_guard.single_line(error)}", file=sys.stderr)
         return 1
@@ -3087,8 +3559,14 @@ def finish_worker(child: subprocess.Popen[str], channel: WorkerChannel) -> None:
         raise ValueError("the masked cleanup worker failed")
 
 
-def run_masked_cleanup(command: Sequence[str], args: Arguments, run_ssh: SshRunner) -> int:
-    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding="utf-8") as child:
+def run_masked_cleanup(command: Sequence[str], args: Arguments, run_ssh: SshRunner, *,
+                       user: SudoCleanupUser | InheritedCleanupUser = InheritedCleanupUser.CURRENT) -> int:
+    environment = None
+    if isinstance(user, SudoCleanupUser):
+        command = user.command(command)
+        environment = user.environment()
+    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding="utf-8",
+                          env=environment) as child:
         assert child.stdout is not None and child.stdin is not None
         channel = WorkerChannel(cast(TextIO, child.stdout), cast(TextIO, child.stdin))
         report = receive_worker_report(channel, "review")
@@ -3106,7 +3584,35 @@ def run_masked_cleanup(command: Sequence[str], args: Arguments, run_ssh: SshRunn
             finish_worker(child, channel)
             return status
 
-        return finish_cleanup(args, local, run_ssh, apply_local)
+        mode = CleanupMode.MOVE_GATE_GIT if isinstance(user, SudoCleanupUser) else CleanupMode.STANDARD
+        return finish_cleanup(args, local, run_ssh, apply_local, mode=mode)
+
+
+def sudo_cleanup_ids() -> tuple[int, int]:
+    uid, gid = (os.environ.get(name, "") for name in ("SUDO_UID", "SUDO_GID"))
+    if not all(re.fullmatch(r"[0-9]{1,10}", value) for value in (uid, gid)):
+        raise ValueError("root must use sudo with SUDO_UID and SUDO_GID")
+    uid_number, gid_number = int(uid), int(gid)
+    if not 0 < uid_number < 2**32 - 1 or not 0 <= gid_number < 2**32 - 1:
+        raise ValueError("invalid SUDO_UID or SUDO_GID")
+    return uid_number, gid_number
+
+
+def require_sudo_caller() -> None:
+    if (os.geteuid(), os.getegid()) != sudo_cleanup_ids():
+        raise ValueError("the cleanup worker must run as the sudo caller")
+
+
+def sudo_cleanup_user() -> SudoCleanupUser:
+    uid_number, gid_number = sudo_cleanup_ids()
+    try:
+        account = pwd.getpwuid(uid_number)
+    except KeyError:
+        raise ValueError("SUDO_UID has no local account") from None
+    setpriv = shutil.which("setpriv")
+    if setpriv is None:
+        raise ValueError("cleanup through sudo requires setpriv")
+    return SudoCleanupUser(uid_number, gid_number, account.pw_name, Path(account.pw_dir), setpriv)
 
 
 def run_cli(argv: Sequence[str], *, run_ssh: SshRunner = run_remote) -> int:
@@ -3114,19 +3620,25 @@ def run_cli(argv: Sequence[str], *, run_ssh: SshRunner = run_remote) -> int:
         return main(argv, run_ssh=run_ssh)
     args = parse_arguments(argv)
     try:
+        user = sudo_cleanup_user() if os.geteuid() == 0 else InheritedCleanupUser.CURRENT
+        mode = CleanupMode.MOVE_GATE_GIT if isinstance(user, SudoCleanupUser) else CleanupMode.STANDARD
         _ = local_machine()
         checkout = Path(__file__).absolute().parents[2]
         child = (
             "from pathlib import Path\n"
             + "import sys\n"
             + "sys.path.insert(0, sys.argv[1])\n"
-            + "from scripts.disks.cleanup_old_folders import masked_child\n"
-            + "raise SystemExit(masked_child(Path(sys.argv[2]), frozenset(map(Path, sys.argv[3:]))))"
+            + "from scripts.disks.cleanup_old_folders import CleanupMode, masked_child\n"
+            + "raise SystemExit(masked_child(Path(sys.argv[2]), frozenset(map(Path, sys.argv[4:])), "
+            + "mode=CleanupMode(sys.argv[3])))"
         )
-        mounts = protected_mounts(Path.home(), LINUX_BUILD_ROOT)
+        home = user.home if isinstance(user, SudoCleanupUser) else Path.home()
+        mounts = protected_mounts(home, LINUX_BUILD_ROOT)
         command = masked_cleanup_command(mounts, (sys.executable, "-B", "-c", child, str(checkout),
-                                                  str(LINUX_BUILD_ROOT), *map(str, mounts)))
-        return run_masked_cleanup(command, args, run_ssh)
+                                                  str(LINUX_BUILD_ROOT), mode.value, *map(str, mounts)))
+        if isinstance(user, SudoCleanupUser) and run_ssh is run_remote:
+            run_ssh = lambda arguments: run_remote(arguments, user=user)
+        return run_masked_cleanup(command, args, run_ssh, user=user)
     except (OSError, ValueError) as error:
         print(f"cleanup_old_folders refused: {removal_guard.single_line(error)}", file=sys.stderr)
         return 1

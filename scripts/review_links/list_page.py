@@ -2646,7 +2646,7 @@ function bindScheduleFields(form,until,zone,draft,edit){
  });
  observer.observe(menu,{attributes:true,attributeFilter:['hidden']});
  const custom=panel.querySelector('[data-edit-custom]');
- const label=panel.querySelector('[for="'+select.id+'"]');
+ const label=panel.querySelector('[data-repeat-field]');
  const {start='',rule='',repeatStart,repeatText,repeatZone,repeatOffset,revision}=panel.dataset;
  const number=Number(panel.dataset.run || 0);
  const savedWords=words.value;

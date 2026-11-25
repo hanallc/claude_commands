@@ -19,11 +19,12 @@ import secrets
 import stat
 import sys
 import time
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Protocol, cast, final
 
 from scripts.buildlog.repository import repo_name
@@ -357,6 +358,11 @@ class CheckedCleanupPath(Protocol):
     def recheck(self) -> None: ...
 
 
+class CheckedCopySource(CheckedCleanupPath, Protocol):
+    @property
+    def published_copy_path(self) -> Path: ...
+
+
 class ApprovedCleanupEntry(Protocol):
     @property
     def stamp(self) -> tuple[int, ...]: ...
@@ -368,6 +374,97 @@ class ApprovedCleanupEntry(Protocol):
 class ApprovedCleanup:
     entries: Mapping[Path, ApprovedCleanupEntry]
     kind: CleanupRemoval
+
+
+class _CopyEntry(Protocol):
+    @property
+    def size_bytes(self) -> int: ...
+    @property
+    def sha256(self) -> str: ...
+
+
+class _CopyTreeReader(Protocol):
+    def SourceRemoval(self, parent: int, path: Path) -> object: ...
+    def read_manifest(self, fd: int, identities: dict[Path, os.stat_result], *,
+                      removal: object = ...) -> Mapping[Path, _CopyEntry]: ...
+    def mount_identity(self, fd: int) -> int: ...
+    def tree_entries(self, fd: int, mount: int) -> Iterator[tuple[Path, int, os.stat_result, object]]: ...
+    def require_parent_path(self, path: Path, expected: int) -> None: ...
+
+
+def _copy_tree_reader() -> _CopyTreeReader:
+    from importlib import import_module
+
+    # The move module also imports the removal guard through the temporary sweep.
+    return cast(_CopyTreeReader, cast(object, import_module("scripts.lib.session_move")))
+
+
+@dataclass(frozen=True)
+class CopyDestination:
+    path: Path
+    directory: int
+
+
+@dataclass(frozen=True, init=False)
+class ProvedCopyCleanup:
+    """Approve removal of the source entries that match a verified copy."""
+
+    source: Path
+    entries: Mapping[Path, ApprovedCleanupEntry]
+    published_path: Path
+    destination: CopyDestination
+    destination_stamps: Mapping[Path, tuple[int, ...]]
+
+    def __init__(self, checked: CheckedCopySource, source: int, destination: CopyDestination,
+                 entries: Mapping[Path, ApprovedCleanupEntry]) -> None:
+        reader = _copy_tree_reader()
+        if (not destination.path.is_absolute() or ".." in destination.path.parts
+                or destination.path.is_relative_to(checked.path) or checked.path.is_relative_to(destination.path)
+                or identity(os.fstat(destination.directory)) == identity(checked.info)):
+            raise ChangedEntry("the copy destination overlaps the source or has an unsafe path")
+        reader.require_parent_path(destination.path, destination.directory)
+        if identity(os.fstat(source)) != identity(checked.info):
+            raise ChangedEntry("the copy proof names a different source")
+        original_ids: dict[Path, os.stat_result] = {}
+        copied_ids: dict[Path, os.stat_result] = {}
+        original = reader.read_manifest(source, original_ids, removal=reader.SourceRemoval(checked.parent, checked.path))
+        copied = reader.read_manifest(destination.directory, copied_ids)
+        if original.keys() != copied.keys() or len(original) != len(entries):
+            raise ChangedEntry("copy differs from the checked source paths")
+        source_links: dict[Identity, Path] = {}
+        target_links: dict[Identity, Path] = {}
+        for path, entry in original.items():
+            before, after = original_ids[path], copied_ids[path]
+            approved = entries.get(checked.path / path)
+            if approved is None or approved.stamp != _stamp(before):
+                raise ChangedEntry(f"entry changed before removal: {checked.path / path}")
+            other = copied[path]
+            if ((entry.size_bytes, entry.sha256, before.st_mode, before.st_mtime_ns)
+                    != (other.size_bytes, other.sha256, after.st_mode, after.st_mtime_ns)):
+                raise ChangedEntry(f"copy differs from the checked source: {path}")
+            if stat.S_ISREG(before.st_mode) and (source_links.setdefault(identity(before), path)
+                                                 != target_links.setdefault(identity(after), path)):
+                raise ChangedEntry(f"copy differs in hard links: {path}")
+        object.__setattr__(self, "source", checked.path)
+        object.__setattr__(self, "entries", MappingProxyType(dict(entries)))
+        object.__setattr__(self, "published_path", checked.published_copy_path)
+        object.__setattr__(self, "destination", destination)
+        object.__setattr__(self, "destination_stamps", MappingProxyType({
+            path: _stamp(info) for path, info in copied_ids.items()
+        }))
+
+    def require_unchanged_destination(self, approved_target: Path) -> None:
+        path, directory = self.destination.path, self.destination.directory
+        if self.published_path != approved_target or path != approved_target:
+            raise ChangedEntry("the verified copy is not at the approved final target path")
+        reader = _copy_tree_reader()
+        reader.require_parent_path(path, directory)
+        current = {relative: _stamp(info) for relative, _parent, info, _kind
+                   in reader.tree_entries(directory, reader.mount_identity(directory))}
+        reader.require_parent_path(path, directory)
+        current[Path(".")] = _stamp(os.fstat(directory))
+        if current != self.destination_stamps:
+            raise ChangedEntry("the published copy changed during verification")
 
 
 @dataclass(frozen=True)
@@ -394,21 +491,38 @@ def remove(checked: CheckedEntry, *, account: Callable[[str, os.stat_result], No
     _remove(checked, BuildRemoval.BY_FORM, account)
 
 
+def remove_proved_copy(checked: CheckedCleanupPath, proof: ProvedCopyCleanup, approved_target: Path, *,
+                       before_delete: Callable[[], None]) -> None:
+    """Remove only the checked source after verifying its approved copy."""
+    _remove(checked, proof, None, mode=RemovalPass.CHECK)
+    proof.require_unchanged_destination(approved_target)
+    before_delete()
+    _delete_cleanup_entries(checked, proof, ())
+
+
 def remove_cleanup(checked: CheckedCleanupPath, approval: ApprovedCleanup, *additional: CleanupTarget,
                    before_delete: Callable[[], None] | None = None) -> None:
     """Remove the exact entries approved for cleanup."""
-    targets = (CleanupTarget(checked, approval), *additional)
-    for target in targets:
+    if any(isinstance(item, ProvedCopyCleanup) for item in (approval, *(target.approval for target in additional))):
+        raise ChangedEntry("a copy proof requires removal with an approved move target")
+    _remove(checked, approval, None, mode=RemovalPass.CHECK)
+    for target in additional:
         _remove(target.checked, target.approval, None, mode=RemovalPass.CHECK)
     if before_delete is not None:
         before_delete()
+    _delete_cleanup_entries(checked, approval, additional)
+
+
+def _delete_cleanup_entries(checked: CheckedCleanupPath, approval: ApprovedCleanup | ProvedCopyCleanup,
+                            additional: tuple[CleanupTarget, ...]) -> None:
     deleted: list[Path] = []
 
     def record(path: str, _info: os.stat_result) -> None:
         deleted.append(Path(path))
 
     try:
-        for target in targets:
+        _remove(checked, approval, record)
+        for target in additional:
             _remove(target.checked, target.approval, record)
     except (OSError, Refused) as error:
         if deleted:
@@ -424,12 +538,15 @@ def _matches_cleanup_stamp(expected: tuple[int, ...], info: os.stat_result, unli
     return current == expected
 
 
-def _remove(checked: CheckedEntry | CheckedCleanupPath, approval: ApprovedCleanup | BuildRemoval,
+def _remove(checked: CheckedEntry | CheckedCleanupPath, approval: ApprovedCleanup | ProvedCopyCleanup | BuildRemoval,
             account: Callable[[str, os.stat_result], None] | None, *, mode: RemovalPass = RemovalPass.DELETE) -> None:
     """Remove the checked entry below the held parent descriptor."""
     checked.recheck()
-    cleanup = isinstance(approval, ApprovedCleanup)
+    cleanup = isinstance(approval, (ApprovedCleanup, ProvedCopyCleanup))
+    copied = isinstance(approval, ProvedCopyCleanup)
     saved_git = (isinstance(approval, ApprovedCleanup) and approval.kind is CleanupRemoval.SAVED_CHECKOUT)
+    if isinstance(approval, ProvedCopyCleanup) and approval.source != checked.path:
+        raise ChangedEntry("the copy proof names a different source")
     parents: list[tuple[int, str, Identity]] = []
     unlinked: dict[Identity, int] = {}
 
@@ -440,10 +557,12 @@ def _remove(checked: CheckedEntry | CheckedCleanupPath, approval: ApprovedCleanu
 
     def visit(parent: int, name: str, path: Path, before: os.stat_result) -> None:
         key = identity(before)
-        if isinstance(approval, ApprovedCleanup):
+        if not isinstance(approval, BuildRemoval):
             expected = approval.entries.get(path)
             if expected is None or not _matches_cleanup_stamp(expected.stamp, before, unlinked.get(key, 0)):
                 raise ChangedEntry(f"entry changed before removal: {path}")
+        if copied and path.name.casefold() == ".git" and not stat.S_ISDIR(before.st_mode):
+            raise ChangedEntry("holds Git work")
         if key[0] != checked.info.st_dev:
             raise Refused(RefusalReason.MOUNT, str(path))
         if stat.S_ISDIR(before.st_mode):
@@ -458,15 +577,15 @@ def _remove(checked: CheckedEntry | CheckedCleanupPath, approval: ApprovedCleanu
                 try:
                     names = os.listdir(folder)
                     in_saved_git = saved_git and path.is_relative_to(checked.path / ".git")
-                    if not in_saved_git:
+                    if not (in_saved_git or copied):
                         git_names = {child.casefold() for child in names}
                         if saved_git and path == checked.path and ".git" in names:
                             git_names.discard(".git")
                         if ".git" in git_names or (cleanup and {"head", "objects", "refs"} <= git_names):
                             raise ChangedEntry("holds Git work" if cleanup else "the folder contains Git metadata")
-                    if isinstance(approval, ApprovedCleanup) and tuple(sorted(names)) != approval.entries[path].children:
+                    if not isinstance(approval, BuildRemoval) and tuple(sorted(names)) != approval.entries[path].children:
                         raise ChangedEntry(f"entries changed before removal: {path}")
-                    marker_last = saved_git and path == checked.path and ".git" in names
+                    marker_last = (saved_git or copied) and path == checked.path and ".git" in names
                     if marker_last:
                         names.remove(".git")
                     if cleanup:
@@ -509,12 +628,12 @@ def _remove(checked: CheckedEntry | CheckedCleanupPath, approval: ApprovedCleanu
             else:
                 require_identity(parent, name, key)
             os.unlink(name, dir_fd=parent)
-            if isinstance(approval, ApprovedCleanup) and before.st_nlink > 1:
+            if cleanup and before.st_nlink > 1:
                 unlinked[key] = unlinked.get(key, 0) + 1
         if account is not None:
             account(str(path), before)
 
-    if isinstance(checked, CheckedEntry) and checked.form.empty:
+    if not copied and isinstance(checked, CheckedEntry) and checked.form.empty:
         os.rmdir(checked.name, dir_fd=checked.parent)
         if account is not None:
             account(str(checked.path), checked.info)
