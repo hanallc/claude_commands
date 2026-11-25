@@ -113,7 +113,8 @@ class LandRunTests(unittest.TestCase):
         self.assertEqual((failed["landed"], failed["step"], failed["state"], failed["detail"], failed["unit"]),
                          (False, "conflicts", "held", "scripts/x.py conflicts\nmore", "unit-board"))
         with (patch.object(merge_checkpoint, "record"), patch.object(merge_checkpoint, "end_phase_scratch"),
-              patch.object(merge_checkpoint, "checkpoint_step_record", return_value=self.root / "steps" / "promotion"),
+              patch.object(merge_checkpoint, "production_checkpoint_step_record",
+                           return_value=self.root / "steps" / "promotion"),
               contextlib.redirect_stdout(io.StringIO())):
             merge_checkpoint.finish_checkpoint(request, "b" * 40, "merge tests")
         landed = land_runs.result_for(land_runs.last_results(), "a" * 40)

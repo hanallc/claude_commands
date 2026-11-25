@@ -14,7 +14,6 @@ import os
 from errno import EACCES, EIO
 import select
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -150,7 +149,7 @@ class TmpSweepCase(unittest.TestCase):
             + "patterns.legacy-unique={purpose}{suffix}\n"
             + f"roots.build={base / 'build'}\nroots.build.natedev={base / 'build'}\n"
             + f"roots.workspace={base / 'worktrees'}\n"
-            + f"removal.path_templates.{os.uname().nodename.partition('.')[0]}={base / 'build'}/<repo>/<unit>/<short>\n")
+            + f"removal.path_templates.{conf.local_host_key_name()}={base / 'build'}/<repo>/<unit>/<short>\n")
         (base / "build").mkdir()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "NOTIFIER_SESSIONS_DIR": str(registry), "SHUTDOWN_STATE_DIR": str(base / "shutdown"),
@@ -718,7 +717,7 @@ class NextestLogRetentionTests(TmpSweepCase):
         old = self.now - 3 * DAY
         for path in (expired, opened, unrelated, linked, folder):
             os.utime(path, (old, old), follow_symlinks=False)
-        host = socket.gethostname().partition(".")[0]
+        host = conf.local_host_key_name()
         _ = conf.path("mac_test").write_text(f"# whole: 1..\n{nextest_log.RETENTION_DAYS}.{host}=2\n")
         scan = ("printf", "%s", f"p41\nf4\naw\nn{opened}\n")
         with mock.patch.object(tmp_sweep, "LSOF", scan):

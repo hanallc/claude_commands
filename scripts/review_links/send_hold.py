@@ -27,6 +27,7 @@ from scripts.lib.atomic_file import write_text_atomic
 
 HOLD_PATH = "/send-hold"
 HOLD_HEADER = "X-Undo-Hold"
+REQUEST_HEADER = "X-Undo-Request"
 REPLAY_HEADER = "X-Undo-Replay"
 HOLD_FOLDER = ".review-link-holds"
 # The request headers that a replay needs. The handlers read the body, its type, and the origin checks.
@@ -64,7 +65,12 @@ class UndoneFile(TypedDict):
     undone_at: float
 
 
-HoldFile = PendingFile | ReleasedFile | UndoneFile
+class ClosingFile(TypedDict):
+    state: Literal["closing"]
+    closed_at: float
+
+
+HoldFile = PendingFile | ReleasedFile | UndoneFile | ClosingFile
 
 
 class BadFile(Enum):
@@ -80,7 +86,7 @@ class HoldHeader(Enum):
 
 class HeldFields(TypedDict):
     hold: str
-    seconds: int
+    seconds: float
 
 
 class HoldsStopped(Exception):
@@ -154,7 +160,7 @@ class Holds:
         """Read one hold file, or name it on stderr when it is not a hold."""
         try:
             saved = cast(HoldFile, json.loads(path.read_text(encoding="utf-8")))
-            if saved["state"] in ("pending", "released", "undone"):
+            if saved["state"] in ("pending", "released", "undone", "closing"):
                 return saved
         except (OSError, ValueError, KeyError, TypeError) as error:
             print(f"review-links send hold {path.name}: {error}", file=sys.stderr)
@@ -178,18 +184,46 @@ class Holds:
             with self._lock:
                 self._answering -= 1
 
-    def hold(self, path: str, headers: Mapping[str, str], body: bytes, seconds: float) -> str:
-        """Save one send and start its timer. Return the hold id."""
-        hold_id = new_hold_id()
+    def has_hold(self, hold_id: str) -> bool:
+        """Check for a saved request when the current Undo time is zero."""
+        with self._lock:
+            if hold_id in self._timers or hold_id in self._releasing or hold_id in self._failed:
+                return True
+            saved = self._existing(hold_id)
+            return saved is not BadFile.UNREADABLE and saved["state"] != "closing"
+
+    def _existing(self, hold_id: str) -> HoldFile | BadFile:
+        path = self._file(hold_id)
+        return self._saved(path) if path.exists() else BadFile.UNREADABLE
+
+    def hold(self, path: str, headers: Mapping[str, str], body: bytes, seconds: float, *,
+             request_id: str = "") -> HeldFields:
+        """Save a send or return its existing hold with the remaining Undo time."""
+        hold_id = request_id or new_hold_id()
+        if not valid_hold_id(hold_id):
+            raise ValueError("Invalid hold id")
         saved: PendingFile = {
             "state": "pending", "path": path, "body": base64.b64encode(body).decode("ascii"),
             "headers": {name: value for name, value in headers.items() if name.lower() in REPLAY_HEADERS},
             "due": time.time() + seconds + RELEASE_GRACE_SECONDS}
-        # The id is new and the sweep keeps pending files, so the large write needs no lock.
-        self._write(hold_id, saved)
         with self._lock:
+            if hold_id in self._releasing or hold_id in self._failed:
+                return {"hold": hold_id, "seconds": 0}
+            timer = self._timers.get(hold_id)
+            existing = self._existing(hold_id)
+            if timer is not None:
+                remaining = (max(0.0, existing["due"] - RELEASE_GRACE_SECONDS - time.time())
+                             if existing is not BadFile.UNREADABLE and existing["state"] == "pending"
+                             and not timer.finished.is_set() else 0.0)
+                return {"hold": hold_id, "seconds": remaining}
+            if existing is not BadFile.UNREADABLE:
+                if existing["state"] != "closing":
+                    return {"hold": hold_id, "seconds": 0}
+                saved["due"] = time.time()
+                seconds = 0
+            self._write(hold_id, saved)
             self._schedule(hold_id, saved["due"])
-        return hold_id
+        return {"hold": hold_id, "seconds": seconds}
 
     def _schedule(self, hold_id: str, due: float) -> None:
         timer = threading.Timer(max(0.0, due - time.time()), self._release, (hold_id,))
@@ -213,18 +247,23 @@ class Holds:
                 return UndoResult.UNDONE
             if hold_id in self._releasing or hold_id in self._failed:
                 return UndoResult.ALREADY_SENT
-            path = self._file(hold_id)
-            saved = self._saved(path) if path.exists() else BadFile.UNREADABLE
-        if saved is BadFile.UNREADABLE:
+            saved = self._existing(hold_id)
+        if saved is BadFile.UNREADABLE or saved["state"] == "closing":
             return UndoResult.MISSING
         return UndoResult.UNDONE if saved["state"] == "undone" else UndoResult.ALREADY_SENT
 
-    def send_now(self, hold_id: str) -> bool:
-        """Release a pending send at once, because its page closed. Return whether it was pending."""
+    def send_now(self, hold_id: str, *, expect_post: bool = False) -> bool:
+        """Release a pending send or record that its POST must send at once."""
         with self._lock:
             timer = self._timers.get(hold_id)
             if timer is None:
-                return False
+                if not expect_post or hold_id in self._releasing or hold_id in self._failed:
+                    return False
+                saved = self._existing(hold_id)
+                if saved is BadFile.UNREADABLE:
+                    self._write(hold_id, {"state": "closing", "closed_at": time.time()})
+                    return True
+                return saved["state"] == "closing"
             timer.cancel()
         threading.Thread(target=self._release, args=(hold_id,), daemon=True).start()
         return True
@@ -303,6 +342,8 @@ class Holds:
                 return HoldState.PENDING
             case "undone":
                 return HoldState.UNDONE
+            case "closing":
+                return HoldState.MISSING
             case "released":
                 return HeldResponse(saved["status"], saved["content_type"], base64.b64decode(saved["body"]))
 
@@ -342,6 +383,11 @@ class Holds:
                 path.unlink(missing_ok=True)
             elif saved["state"] == "undone" and saved["undone_at"] < oldest:
                 path.unlink(missing_ok=True)
+            elif saved["state"] == "closing" and saved["closed_at"] < oldest:
+                with self._lock:
+                    current = self._existing(path.stem)
+                    if current == saved:
+                        path.unlink(missing_ok=True)
 
 
 def replay_to(address: str, port: int) -> Replay:
@@ -361,8 +407,3 @@ def replay_to(address: str, port: int) -> Replay:
         finally:
             connection.close()
     return replay
-
-
-def held_fields(hold_id: str, seconds: int) -> HeldFields:
-    """Return the 202 answer that tells the browser to show its Undo for this many seconds."""
-    return {"hold": hold_id, "seconds": seconds}

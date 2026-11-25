@@ -23,8 +23,9 @@ from unittest.mock import patch
 from scripts.production.cli_fixture import invoke_cli
 from scripts.accounts import accounts
 from scripts.whoami.account_test_support import create_claude_account, write_claude_account
-from scripts.production import add_showrunner
+from scripts.production import add_showrunner, production_doc
 from scripts.production import showrunners, showrunner_tree, staff
+from scripts.production.production_names import GUARD_READY_FILE, LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
 from scripts.herdr import herdr, pane_launch
 from scripts.message import sessions
 from scripts.herdr.fake_herdr import CommandResponse
@@ -67,6 +68,32 @@ with open(os.environ["TEST_SENT"], "a") as handle:
 
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+def write_guard_proof(root: Path, state: Path, repository: Path) -> None:
+    settings = root / "guard-settings.json"
+    codex_home = root / "guard-codex"
+    codex_home.mkdir(exist_ok=True)
+    events = ("PreToolUse", "PostToolUse")
+    claude = [{"settings": str(settings), "event": event, "matcher": "Bash", "command": f"claude-{event}"}
+              for event in events]
+    codex = [{"codex_home": str(codex_home), "event": event, "tool": tool, "command": f"codex-{event}-{tool}"}
+             for event in events for tool in ("Bash", "apply_patch")]
+
+    def registrations(entries: list[dict[str, str]], match_field: str) -> str:
+        return json.dumps({"hooks": {event: [
+            {"matcher": entry[match_field], "hooks": [{"type": "command", "command": entry["command"]}]}
+            for entry in entries if entry["event"] == event] for event in events}})
+
+    revision = subprocess.run(["git", "-C", str(repository), "rev-parse", "refs/heads/main"],
+                              check=True, capture_output=True, text=True).stdout.strip()
+    _ = settings.write_text(registrations(claude, "matcher"), encoding="utf-8")
+    _ = (codex_home / "hooks.json").write_text(registrations(codex, "tool"), encoding="utf-8")
+    state.mkdir(parents=True, exist_ok=True)
+    _ = (state / GUARD_READY_FILE).write_text(json.dumps({
+        "version": 1, "revision": revision, "recorded_at": "2026-11-20T00:00:00Z",
+        "claude": claude, "codex": codex,
+    }), encoding="utf-8")
+
 
 class AddShowrunnerFixture(unittest.TestCase):
     staff: StaffTestCase = StaffTestCase()
@@ -111,6 +138,9 @@ class AddShowrunnerFixture(unittest.TestCase):
         self.state = self.root / "stub"
         self.env = self.fixture_env.copy()
         self.env["STAFF_FILE"] = str(self.staff.staff_file)
+        _ = self.enterContext(patch.object(production_doc, "GUARD_REPOSITORY", self.root / "kid-checkout"))
+        _ = self.enterContext(patch.object(showrunners, "SHOWRUNNER_STATE_DIR",
+                                           Path(self.env["SHOWRUNNER_STATE_DIR"])))
         self.env["HERDR_PANE_RECORD_DIR"] = str(self.staff.source_root / "panes")
         self.on_start = {}
         self.herdr_overrides = {}
@@ -233,6 +263,8 @@ class AddShowrunnerFixture(unittest.TestCase):
         with patch.dict(os.environ, self.env):
             write_claude_account("claude2", "main@example.invalid", 1, datetime.now(timezone.utc) + timedelta(days=2))
         _ = self.configure_groups()
+        _ = self.doc("kid")
+        write_guard_proof(self.root, Path(self.env["SHOWRUNNER_STATE_DIR"]), self.root / "kid-checkout")
 
     def configure_groups(self, *, units: str = "claude2", showrunners: str = "claude2") -> Path:
         path = Path(self.env["HOME"]) / ".local/state/accounts/groups.json"
@@ -247,13 +279,32 @@ class AddShowrunnerFixture(unittest.TestCase):
         _ = (self.root / "claude.json").write_text(json.dumps({**(extra or {}), "projects": projects}), encoding="utf-8")
 
     def doc(self, production_name: str) -> Path:
-        path = self.root / f"{production_name}-production.md"
+        main = self.root / f"{production_name}-checkout"
+        legacy = production_name == "top"
+        path = (self.root / f"{production_name}-production.md" if legacy else
+                main / f"{production_name}-production{LIVE_DOCUMENT_SUFFIX}")
         if not path.exists():
-            (self.root / f"{production_name}-checkout").mkdir()
+            main.mkdir(exist_ok=True)
+            checkout = main
+            log = f"docs/plans/{production_name}-log.md"
+            fields: list[str] = []
+            if not legacy:
+                checkout = self.root / f"{production_name}-integration"
+                for command in (
+                    ("init", "-qb", "main"),
+                    ("commit", "--allow-empty", "-qm", "Create fixture repository"),
+                    ("worktree", "add", "-qb", production_name, str(checkout), "main"),
+                ):
+                    _ = subprocess.run(["git", "-C", str(main), "-c", "user.name=Fixture",
+                        "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false",
+                        "-c", "core.hooksPath=/dev/null", *command], check=True, capture_output=True)
+                with (main / ".git/info/exclude").open("a", encoding="utf-8") as excluded:
+                    _ = excluded.write(f"\n/*{LIVE_DOCUMENT_SUFFIX}\n/{log}\n")
+                fields = [f"- **Repository:** `{main}`", f"- **{MERGE_CHECKOUT_FIELD}:** `{main}`"]
             _ = path.write_text("\n".join([
                 f"# {production_name}", "", f"- **Merge branch:** `{production_name}`",
-                f"- **Showrunner checkout:** `{self.root / f'{production_name}-checkout'}`",
-                f"- **Log:** `docs/plans/{production_name}-log.md`", "- **User zone:** America/Los_Angeles",
+                f"- **Showrunner checkout:** `{checkout}`", *fields,
+                f"- **Log:** `{log}`", "- **User zone:** America/Los_Angeles",
                 "- **Updates:** every 15 minutes", ""]),
                 encoding="utf-8")
         return path
@@ -335,7 +386,14 @@ class AddShowrunnerFixture(unittest.TestCase):
     def invoke(self, arguments: list[str], *, cwd: Path | None = None,
                subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
         if subprocess_cli:
-            return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=self.env,
+            bootstrap = (
+                "import sys; from pathlib import Path; "
+                "from scripts.production import add_showrunner, production_doc; "
+                "production_doc.GUARD_REPOSITORY = Path(sys.argv[1]); "
+                "raise SystemExit(add_showrunner.main(sys.argv[2:]))"
+            )
+            return subprocess.run([sys.executable, "-c", bootstrap, str(self.root / "kid-checkout"), *arguments],
+                                  env={**self.env, "PYTHONPATH": str(SCRIPT.parents[2])},
                                   capture_output=True, text=True, check=False, cwd=cwd,
                                   timeout=TEST_HANG_GUARD_SECS)
         real_run = subprocess.run
