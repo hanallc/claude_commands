@@ -15,12 +15,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
 from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
-from scripts.review_links import page_frame, review_submissions, serve
+from scripts.review_links import change_page, list_page, page_frame, record_table, review_items, review_page, review_submissions, serve, staff_names
 from scripts.review_links.browser_test_support import STATUS_PAGES, firefox_probe_results, status_configuration
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -189,6 +190,277 @@ class PageStatusTests(unittest.TestCase):
 })();</script>'''
         page = long_open_row_page()
         self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+
+    def check_phone_undo_stack(self, checks: str, *, linked_card: bytes = b"", height: int = 844) -> None:
+        probe = r'''<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const host=window.top.document,root=document.documentElement;
+ const stack=()=>host.querySelector('[data-send-undo-stack]');
+ const controls=document.querySelector('#last-card-actions');
+ const bottom=()=>root.scrollHeight-innerHeight;
+ const inset=(doc=document)=>parseFloat(doc.defaultView.getComputedStyle(doc.documentElement).scrollPaddingBottom);
+ const realFetch=fetch.bind(window);
+ const holdPath='/send-hold/';
+ window.fetch=async url=>{
+  const path=new URL(url,location.href).pathname;
+  if(path.startsWith('/hold-')){
+   const id=path.slice(6).padStart(24,'0');
+   return Response.json({hold:id,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+  }
+  if(path.endsWith('/undo')) return Response.json({outcome:'undone'});
+  if(path.startsWith(holdPath)){
+   return path.endsWith('bad') ? Response.json({send_failure:'The recipient is offline.'},{status:503})
+    : Response.json({outcome:'sent'});
+  }
+  return realFetch(url);
+ };
+ const hold=(id,receiver='The producer of the final review card')=>
+  heldFetch('/hold-'+id,{method:'POST'},receiver).catch(error=>error);
+ const undoButtons=()=>[...stack().querySelectorAll('button')];
+ const clearButtons=()=>{
+  const top=stack().getBoundingClientRect().top;
+  return [...controls.querySelectorAll('button')].every(button=>{
+   const box=button.getBoundingClientRect();
+   const hit=host.elementFromPoint(box.left+box.width/2,box.top+box.height/2+56);
+   return box.top>=0 && box.bottom+56<=top+1 && hit===frameElement;
+  });
+ };
+ try{
+  host.body.style.cssText='margin:0;overflow:hidden;padding-top:56px';
+  host.body.id='console-shell';
+  frameElement.style.cssText='display:block;width:390px;border:0';
+  frameElement.style.height=(host.defaultView.innerHeight-56)+'px';
+  await painted();
+  CHECKS
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        card = json.dumps(linked_card.decode()).replace("<", r"\u003c")
+        content = ('<style>main{padding-bottom:8px}</style>'
+                   + page_frame.title("Review", "review")
+                   + '<section style="padding-top:1000px"><h2>Last card</h2><div id="last-card-actions">'
+                   + '<button style="height:40px">Approve</button><button>Send feedback</button><button>Later</button>'
+                   + '</div></section>'
+                   + (list_page.STYLE + '<dialog data-list-review-dialog data-fullscreen></dialog>' if linked_card else '')
+                   + '<script id="held-send-fixture">' + page_frame.HELD_SEND_SCRIPT + '</script>'
+                   + probe.replace("CHECKS", checks.replace("LINKED_CARD", card)))
+        page = change_page.document(content, "Review")
+        self.assertEqual(firefox_probe_results(page, window_size=(390, height), dark=True), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the Undo stack.")
+    def test_phone_undo_stack_leaves_room_for_the_last_card_controls(self) -> None:
+        self.check_phone_undo_stack(r'''
+  scrollTo({top:bottom(),behavior:'instant'});
+  const baseline=bottom(),start=controls.getBoundingClientRect().bottom;
+  const first=hold('a');
+  await painted();
+  const one=stack().getBoundingClientRect();
+  check(one.width<=280 && Math.abs(one.right-374)<1 && Math.abs(one.bottom-820)<1,
+   'The stack wraps at 280 px and stays at the bottom right.');
+  check(start+56>one.top,'The last card starts under the stack.');
+  check(Math.abs(inset()-one.height-24)<1 && Math.abs(bottom()-baseline-inset())<1,
+   'The scroll range and scroll padding use the measured stack height and bottom gap.');
+  const second=hold('b','Another producer');
+  await painted();
+  const both=stack().getBoundingClientRect();
+  check(both.height>one.height && Math.abs(inset()-both.height-24)<1,
+   'The scroll padding grows when a second toast appears.');
+  controls.scrollIntoView({block:'end',behavior:'instant'});
+  await painted();
+  check(clearButtons(),'All last card buttons can scroll fully above the stack.');
+  undoButtons().at(-1).click();
+  await second;await painted();
+  check(Math.abs(inset()-one.height-24)<1,'The scroll padding shrinks when one toast leaves.');
+  undoButtons()[0].click();
+  await first;await painted();
+  check(!stack() && !root.hasAttribute('data-send-undo-space') &&
+   getComputedStyle(root).scrollPaddingBottom==='auto' && bottom()===baseline,
+   'The scroll space and scroll padding disappear when the stack empties.');
+''')
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the stack limit.")
+    def test_phone_undo_stack_caps_below_the_frozen_header(self) -> None:
+        self.check_phone_undo_stack(r'''
+  const sends=Array.from({length:20},(_,index)=>hold(index.toString(16)));
+  await painted();
+  const box=stack(),initial=box.getBoundingClientRect();
+  check(box.scrollHeight>box.clientHeight && initial.top>=96,
+   'The capped stack scrolls below the 56 px console header and a full button.');
+  let scans=0;
+  const query=host.querySelectorAll.bind(host);
+  host.querySelectorAll=selector=>{if(selector==='iframe') scans++;return query(selector);};
+  root.style.setProperty('--page-top-height','100px');
+  dispatchEvent(new Event('page-top-resize'));
+  dispatchEvent(new Event('page-top-resize'));
+  host.defaultView.dispatchEvent(new Event('page-top-resize'));
+  await new Promise(resolve=>host.defaultView.requestAnimationFrame(resolve));
+  check(scans===1,'The resize events share one measurement in the next frame.');
+  host.querySelectorAll=query;
+  await painted();
+  const top=box.getBoundingClientRect().top;
+  check(top>=196 && top>initial.top,'The cap uses the page header inside the frame.');
+  controls.scrollIntoView({block:'end',behavior:'instant'});
+  await painted();
+  check(clearButtons() && controls.getBoundingClientRect().top>=100,
+   'The last card buttons fit between the frozen header and the stack.');
+  const buttons=undoButtons();
+  box.scrollTop=box.scrollHeight;
+  const last=buttons.at(-1).getBoundingClientRect();
+  check(last.bottom<=box.getBoundingClientRect().bottom && last.top>=top,
+   'The last Undo button scrolls fully into view.');
+  buttons.forEach(button=>button.click());
+  await Promise.all(sends);await painted();
+  check(!stack(),'Undo removes the capped stack.');
+''')
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the stack limit.")
+    def test_short_undo_stack_fits_one_full_toast(self) -> None:
+        self.check_phone_undo_stack(r'''
+  const first=hold('a'),second=hold('b');
+  await painted();
+  const box=stack();
+  box.scrollTop=box.scrollHeight;
+  const area=box.getBoundingClientRect(),last=box.lastElementChild.getBoundingClientRect();
+  check(host.defaultView.innerHeight===160 && box.scrollTop>0 && last.top>=area.top-1 &&
+   last.bottom<=area.bottom+1,'A full toast fits in the capped stack at 160 px.');
+  const button=undoButtons().at(-1),rect=button.getBoundingClientRect();
+  check(host.elementFromPoint(rect.left+rect.width/2,rect.top+rect.height/2)===button,
+   'Undo is clickable in the short viewport.');
+  undoButtons().forEach(button=>button.click());
+  await Promise.all([first,second]);await painted();
+''', height=160)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the linked Review card.")
+    def test_linked_review_later_clears_the_undo_stack(self) -> None:
+        members = staff.StaffSnapshot((PAGE_OWNER,))
+        snapshot = review_page.ReviewSnapshot(
+            version="test", records={}, entries=[], members=members, browser=change_page.ReviewBrowser("test"),
+            words_rows=3, refresh_seconds=15, request_timeout_seconds=10, card_motion=page_frame.CardMotion(0, 0),
+            assets={}, zone=ZoneInfo("UTC"), source_stamps={}, later={"soon": 60, "morning": 480, "weekDay": 0,
+                                                                    "weekTime": 480, "step": 15},
+            names=staff_names.StaffNames(members), log_max_height_rem=15,
+        )
+        entry = review_page.ReviewIndexEntry(
+            key="test/C1", id="C1", type=review_items.ReviewType.CHANGE, owner="owner",
+            sourceOwner="owner", ownerName="Page owner", title="Linked change", state=review_items.ReviewState.OPEN,
+            filed=0, updated="", hiddenUntil=0, sourceName="Page owner", ownerHtml="", sourceHtml="",
+            urgency="normal",
+        )
+        later = record_table.park_control("Later", field="later", action="outcome", value="later")
+        body = ('<div class="review-panel"><div data-review-body><p style="height:1400px">Details</p></div>'
+                + '<form data-review-form><textarea name="feedback"></textarea><div class="review-actions">'
+                + '<button type="submit" value="approve">Approve</button>' + later + '</div></form></div>')
+        card = review_page.render_card(snapshot, entry, body, waiting_why="")
+        self.check_phone_undo_stack(r'''
+  const dialog=document.querySelector('[data-list-review-dialog]');
+  const frame=document.createElement('iframe');
+  const loaded=new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  frame.srcdoc=LINKED_CARD;dialog.append(frame);dialog.showModal();await loaded;await painted();
+  const doc=frame.contentDocument,body=doc.querySelector('.review-box-scroll');
+  const later=doc.querySelector('[data-later-toggle]'),footer=later.closest('footer');
+  const top=()=>stack().getBoundingClientRect().top;
+  const bounds=()=>frame.getBoundingClientRect();
+  const clearsStack=()=>{
+   const button=later.getBoundingClientRect(),area=bounds();
+   const x=button.left+button.width/2,y=button.top+button.height/2;
+   return area.top+56+button.bottom<=top()+1 && button.top>=0 &&
+    host.elementFromPoint(area.left+x,area.top+56+y)===frameElement &&
+    document.elementFromPoint(area.left+x,area.top+y)===frame &&
+    doc.elementFromPoint(x,y)?.closest('[data-later-toggle]')===later;
+  };
+  const box=footer.closest('.review-box');
+  const baseline=footer.getBoundingClientRect().bottom;
+  const first=hold('a'),second=hold('b');
+  await painted();
+  check(footer.getBoundingClientRect().bottom<baseline && clearsStack(),
+   'Later fits above the stack in a full-height linked card.');
+  const bottomWithStack=footer.getBoundingClientRect().bottom;
+  body.scrollTop=body.scrollHeight;
+  check(body.scrollTop>0 && footer.getBoundingClientRect().bottom===bottomWithStack,
+   'The linked body scrolls and the footer stays fixed.');
+  later.click();await painted();
+  check(!doc.querySelector('[data-later-menu]').hidden,'Later opens its menu.');
+  undoButtons().forEach(button=>button.click());
+  await Promise.all([first,second]);await painted();
+  check(!stack() && !doc.documentElement.hasAttribute('data-send-undo-space') &&
+   footer.getBoundingClientRect().bottom===baseline,'Undo restores the full-height card.');
+  later.click();
+  const sends=Array.from({length:20},(_,index)=>hold(index.toString(16)));
+  await painted();
+  box.scrollTop=box.scrollHeight;
+  check(box.hasAttribute('data-whole-scroll') && box.scrollTop>0 && clearsStack(),
+   'With a capped stack, the full card scrolls until Later clears the stack.');
+  undoButtons().forEach(button=>button.click());
+  await Promise.all(sends);await painted();
+  check(!box.hasAttribute('data-whole-scroll') && footer.getBoundingClientRect().bottom===baseline,
+   'The body scrolls again after the stack leaves.');
+''', linked_card=card)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check cleanup.")
+    def test_undo_stack_clears_space_after_timeout_failure_and_frame_close(self) -> None:
+        self.check_phone_undo_stack(r'''
+  const frame=document.createElement('iframe');
+  frame.style.cssText='position:fixed;inset:0;width:100%;height:100%;border:0';
+  const loaded=new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  frame.srcdoc='<p>Linked frame</p>';document.body.append(frame);await loaded;
+  const doc=frame.contentDocument,frameRoot=doc.documentElement,loadListeners=new Set();
+  const add=doc.addEventListener.bind(doc),remove=doc.removeEventListener.bind(doc);
+  doc.addEventListener=(name,handler,...options)=>{
+   if(name==='load') loadListeners.add(handler);
+   add(name,handler,...options);
+  };
+  doc.removeEventListener=(name,handler,...options)=>{
+   if(name==='load') loadListeners.delete(handler);
+   remove(name,handler,...options);
+  };
+  const timeout=hold('a');
+  await painted();
+  check(frameRoot.hasAttribute('data-send-undo-space') && loadListeners.size===1,
+   'The linked frame has the inset and one load listener.');
+  const measured=stack().getBoundingClientRect().height;
+  frame.remove();
+  await painted();
+  check(!frameRoot.hasAttribute('data-send-undo-space') &&
+   !frameRoot.style.getPropertyValue('--send-undo-space') && loadListeners.size===0 &&
+   stack().getBoundingClientRect().height===measured,'Removing the frame clears it while the toast stays.');
+  const expire=()=>stack().lastElementChild.getAnimations({subtree:true}).forEach(animation=>animation.finish());
+  expire();await timeout;await painted();
+  check(!stack() && !root.hasAttribute('data-send-undo-space'),'A completed send clears the inset after timeout.');
+  const failure=hold('bad');
+  await painted();expire();await failure;await painted();
+  check(stack()?.textContent.includes('The recipient is offline.') && root.hasAttribute('data-send-undo-space'),
+   'The failure message keeps the inset while it is visible.');
+  await new Promise(resolve=>setTimeout(resolve,3100));await painted();
+  check(!stack() && !root.hasAttribute('data-send-undo-space'),'The inset clears after the failure message leaves.');
+''')
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check cleanup.")
+    def test_undo_stack_clears_when_the_sending_frame_closes_during_failure(self) -> None:
+        self.check_phone_undo_stack(r'''
+  const frame=document.createElement('iframe');
+  frame.style.cssText='position:fixed;inset:0;width:100%;height:100%;border:0';
+  const loaded=new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  frame.srcdoc='<p>Sending frame</p>';document.body.append(frame);await loaded;
+  const sender=frame.contentWindow,frameRoot=frame.contentDocument.documentElement;
+  const script=frame.contentDocument.createElement('script');
+  script.textContent=document.querySelector('#held-send-fixture').textContent;
+  frame.contentDocument.head.append(script);
+  sender.fetch=window.fetch;
+  const failure=sender.heldFetch(location.origin+'/hold-bad',{method:'POST'},'The producer');
+  await painted();
+  stack().lastElementChild.getAnimations({subtree:true}).forEach(animation=>animation.finish());
+  await failure;await painted();
+  check(stack()?.textContent.includes('The recipient is offline.') &&
+   root.hasAttribute('data-send-undo-space') && frameRoot.hasAttribute('data-send-undo-space'),
+   'The sending frame shows a failure in the top window.');
+  frame.remove();
+  await painted();
+  check(!stack(),'Closing the sender removes the failure toast.');
+  check(!root.hasAttribute('data-send-undo-space') && !frameRoot.hasAttribute('data-send-undo-space'),
+   'Closing the sender clears both insets.');
+''')
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the owner button position.")
     def test_page_owner_stays_visible_above_a_long_open_row(self) -> None:
