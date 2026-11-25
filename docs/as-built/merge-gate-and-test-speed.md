@@ -1028,9 +1028,9 @@ A red report names the failed test step and says whether the row selects it.
 If command selection failed for a row, report unknown changed paths and include the error.
 The batch stops at the first failed test command.
 
-If a fresh batch gate names red modules, the batch runs those modules on pinned main in a private checkout.
+If a fresh batch gate names red modules, the batch runs those modules on pinned main in a numbered copy.
 It probes unpublished checkpoints separately on the same base and tests the rows with the most changed module paths first.
-The probes use the gate admission path.
+The probes use the merge run's existing reservation.
 The batch drops a row only if the base passes and that row alone reproduces every red module.
 The batch stops if the base, a survivor, or the starting tip contains the dropped checkpoint.
 A batch gate or probe treats a module that passes on rerun alone as red.

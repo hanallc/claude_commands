@@ -153,7 +153,7 @@ def gate_copy_command(command: Sequence[str]) -> list[str]:
     return arguments
 
 
-def run_test_command(command: list[str], folder: Path, *, merge_head: str = "", merge_revision: str = "",
+def run_test_command(command: list[str], folder: Path, *, merge_head: str = "",
                      raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
     locks = copies.COMMAND_LOCKS.get()
     submitted = command
@@ -161,9 +161,8 @@ def run_test_command(command: list[str], folder: Path, *, merge_head: str = "", 
     start = gate_program_start(command)
     use_copy = bool(merge_head) and command_program(command[start:]) in GATE_SCRIPTS
     if use_copy:
-        merge = ["--merge", merge_revision] if merge_revision else []
         submitted = [*command[:start], str(scripts / "lib/py"), str(scripts / "copies/copies.py"), "run",
-                     "--repo", str(folder.resolve()), "--commit", merge_head, *merge, "--",
+                     "--repo", str(folder.resolve()), "--commit", merge_head, "--",
                      *gate_copy_command(command[start:])]
     elif targets := checkpoint_gate_targets(command, folder):
         submitted = [str(scripts / "lib/py"), str(scripts / "copies/copies.py"), "gate-step",
@@ -219,7 +218,7 @@ def gate_command_words(command: Sequence[str]) -> Sequence[str]:
     return command[index:]
 
 
-def batch_module_command(red: RedStep, checkout: Path) -> list[str] | None:
+def batch_module_command(red: RedStep, checkout: Path, probe: Path) -> list[str] | None:
     """Select the red modules. Keep the environment and a checkout of dot."""
     command = red.step.command
     program = parse_command_program(gate_command_words(command), keep_path=True)
@@ -243,7 +242,7 @@ def batch_module_command(red: RedStep, checkout: Path) -> list[str] | None:
     prefix = command[:len(command) - len(program[1])]
     script = Path(program[0])
     if script.is_absolute() and script.is_relative_to(checkout):
-        prefix[-1] = f"{{tree}}/{script.relative_to(checkout)}"
+        prefix[-1] = str(probe / script.relative_to(checkout))
     return [*prefix, *checkout_option, "--tests-only",
             *(word for name in sorted(red.names) for word in ("--module", name))]
 

@@ -13,7 +13,6 @@ from typing import NamedTuple, final
 from unittest.mock import patch
 
 from scripts.buildlog import record as build_record
-from scripts.copies import copies
 from scripts.production import checkpoint_gate, land_runs, merge_checkpoint, staff
 from scripts.production.staff_test_support import recorded_showrunner, unit_membership
 from scripts.lib import atomic_file
@@ -1004,18 +1003,9 @@ raise SystemExit(1)
         run_test_command = checkpoint_gate.run_test_command
 
         def run(command: list[str], folder: Path, *, merge_head: str = "",
-                merge_revision: str = "", raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
+                raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
             if not checkpoint_gate.runs_merge_gate(command):
                 return run_test_command(command, folder, merge_head=merge_head, raise_start_errors=raise_start_errors)
-            if "--module" not in command:
-                return run_gate(command, folder)
-            self.assertEqual(folder, self.checkout)
-            self.assertEqual(merge_head, self.git("rev-parse", "origin/main"))
-            merge = copies.MergeRevision(merge_revision) if merge_revision else copies.NO_MERGE
-            with copies.requested_source(folder, copies.CommittedSource(merge_head), merge) as tree:
-                return run_gate(command, tree)
-
-        def run_gate(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
             probe = "--module" in command
             if probe:
                 self.assertNotEqual(folder, self.checkout)
@@ -1110,12 +1100,11 @@ raise SystemExit(1)
                 resend_gate = self.row_drop_gate(runs, survivor_red=survivors, resumed=survivors)
 
                 def interrupt(command: list[str], folder: Path, *, merge_head: str = "",
-                              merge_revision: str = "", raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
+                              raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
                     if (checkpoint_gate.runs_merge_gate(command) and "--module" not in command
                             and (not survivors or not (folder / "src/drop-alpha.txt").exists())):
                         raise KeyboardInterrupt
-                    return gate(command, folder, merge_head=merge_head, raise_start_errors=raise_start_errors,
-                                merge_revision=merge_revision)
+                    return gate(command, folder, merge_head=merge_head, raise_start_errors=raise_start_errors)
 
                 with patch.object(checkpoint_gate, "run_test_command", side_effect=gate):
                     with (patch.object(checkpoint_gate, "run_test_command", side_effect=interrupt),

@@ -22,6 +22,7 @@ from scripts.build_queue import (
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.queue_fixture import write_process
+from scripts.build_queue.queue_place import queue_place
 from scripts.build_queue.test_placement import PlacementFixture
 from scripts.copies import copies
 from scripts.lib import build_folders, process_stat
@@ -32,7 +33,6 @@ from scripts.mac_test.claim_state import RepositoryScope
 from scripts.production import checkpoint_gate, merge_checkpoint
 from scripts.production.gate_suites_test_support import GateSuitesFixture
 from scripts.production.production_doc import ProductionDocument
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 
 GATE = ("python3", "scripts/production/gate.py", "--tests-only")
@@ -332,8 +332,8 @@ REASON = "mac_linux_no_answer"
 RED_OUTPUT = "  FAIL [  0.1s] (1/1) check known_flake\n--- lib/test_infrastructure.py exit=1 ---\n"
 
 
-class BatchProbeAdmissionTests(GateSuitesFixture):
-    def test_configured_merge_commands_admit_the_named_probe(self) -> None:
+class BatchProbeTests(GateSuitesFixture):
+    def test_configured_merge_commands_probe_under_the_parent_reservation(self) -> None:
         # These are the forms in the builds, natedev, and sdlc production docs.
         configured = (
             "env HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/merge_gate.py",
@@ -353,39 +353,50 @@ class BatchProbeAdmissionTests(GateSuitesFixture):
         observed = self.state / "probe-input"
         admission = self.admission.server
         previous = admission.reply_filter
-        grants: list[admission_protocol.Admitted | admission_protocol.LocalPlacementGranted] = []
+        grants: list[admission_protocol.Reply] = []
 
         def observe(reply: admission_protocol.Reply) -> admission_protocol.Reply:
-            if isinstance(reply, (admission_protocol.Admitted, admission_protocol.LocalPlacementGranted)):
+            if isinstance(reply, (admission_protocol.Admitted, admission_protocol.LocalPlacementGranted,
+                                  admission_protocol.Assignment)):
                 grants.append(reply)
             return previous(reply)
 
-        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
-            owner = fixture_member("showrunner", name="probe-owner")
-        environment = {**self.environment, "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": owner.current_session,
-                       "BUILDLOG_GATE_TARGETS": "natedev"}
-        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_targets.conf",
-                                 "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
-        with (mock.patch.dict(os.environ, environment, clear=True),
-              mock.patch.object(admission, "reply_filter", side_effect=observe)):
+        log = self.state / "probe.log"
+        production = ProductionDocument(self.quiet_production, "fixture", "integration", self.checkout,
+                                        log, ZoneInfo("UTC"))
+        record = merge_checkpoint.BatchResumeRecord(self.state / "batch", (), ())
+        rollback = merge_checkpoint.ResetBatchCheckout(production, self.base, self.base, self.base, record)
+        # Take one parent reservation for all four probes.
+        with (mock.patch.dict(os.environ, self.environment, clear=True),
+              mock.patch.object(admission, "reply_filter", side_effect=observe),
+              queue_place("gate", self.checkout) as parent,
+              mock.patch.dict(os.environ, parent.child_environment(os.environ))):
+            self.assertEqual(len(grants), 1)
+            self.assertIsInstance(grants[0], admission_protocol.Admitted)
             for prefix in configured:
                 field = f"- **Merge tests:** `{prefix} --checkout . --tests-only`"
                 command, = merge_checkpoint.parse_merge_tests([field], self.checkout)
                 step = checkpoint_gate.CheckpointTestStep("merge test 1", list(command), self.checkout)
                 red = checkpoint_gate.RedStep(step, frozenset({module}))
-                probe = checkpoint_gate.batch_module_command(red, self.checkout)
+                probe = checkpoint_gate.batch_module_command(red, self.checkout, self.checkout)
                 self.assertEqual(probe, [*command, "--module", module])
-                assert probe is not None
+                failure = checkpoint_gate.RedCheckpointTests("red fixture", "red fixture", (red,))
+                batch = merge_checkpoint.BatchRed(failure, (), rollback, pinned_main, log, {})
                 for row, expected in (("", "base"), (self.checkpoint, "checkpoint\n")):
                     with self.subTest(prefix=prefix, row=row):
-                        grants.clear()
                         observed.unlink(missing_ok=True)
-                        result = checkpoint_gate.run_test_command(probe, self.checkout,
-                                                                  merge_head=pinned_main, merge_revision=row)
+                        result = merge_checkpoint.run_batch_probe(batch, row)
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                         self.assertEqual(observed.read_text(), expected)
                         self.assertEqual(len(grants), 1)
-                        self.assert_gate_released()
+                        self.assertEqual(list(build_folders.held_folder_leases()), [])
+            slot, = build_folders.numbered_copy_records()
+            self.assertIsInstance(slot, build_folders.NumberedCopySource)
+            assert isinstance(slot, build_folders.NumberedCopySource)
+            self.assertEqual(slot.commit, pinned_main)
+            self.assertEqual(slot.source, self.checkout)
+        self.assert_gate_released()
+        self.assertEqual(log.read_text().count("PROBE_EXIT=0\n"), 4)
         self.assertEqual([event["module"] for event in self.module_events() if event["event"] == "start"],
                          ["test_first.py"] * 4)
 
