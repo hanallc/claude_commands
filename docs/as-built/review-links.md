@@ -124,6 +124,31 @@ Proposal limits the row to recipients with a native proposal folder.
 When the selected recipient becomes unavailable, the dialog clears the selection and disables Send until you choose a recipient.
 Changing the type or reopening a kept draft preserves this empty selection.
 Feedback uses the native Investigation record.
+Bug and Enhancement use the same List workflow.
+The List keeps the report type and shows the original words and picture.
+The state shows when the item entered New, Working, Repaired, or Delivered.
+The producer uses `the_list.py update --state Repaired --next-step "How to try the repair"` after testing.
+Needs me shows the repair instructions and the Works and Not fixed buttons.
+Works records Delivered after the Undo timer expires.
+Not fixed sends the user's words to the owner and producer through the same Undo control.
+Both verdicts clear the repair instructions from Next step.
+A saved Not fixed verdict returns the item to Working.
+The browser stores the signed Not fixed request and its hold ID before sending.
+The card keeps Not fixed available after an unknown result, including after a reload.
+A confirmed Undo of the original hold or an exact refusal ends the request before acceptance.
+A refusal keeps the draft so the user can correct it and start a new request.
+A retry sends the original words and keeps any newer edits in the draft.
+The List receipt identifies the exact request and distinguishes acceptance from confirmed delivery.
+Confirmed delivery clears the draft if it still contains the unchanged submitted words.
+When Tell or Ask clears the draft, the browser also clears its stored copy.
+Server recovery retries pending notices with the same delivery key.
+Review and Changes use Does not work for a change verdict.
+Server recovery finishes an interrupted report filing before it sends the first notice.
+The dialog keeps a report's draft ID across a reload.
+Run `the_list.py move-review-bugs` from the Morty session to move existing open Review bugs.
+A migration marks the native record before it writes the List item.
+The command keeps the original words and attachments and records the List number on each completed Review record.
+Run the command again to finish an interrupted migration.
 The List colors Owner, Producer, supporting unit names, staff names in log sources, and showrunner names in the count strip.
 List delivery notices and feedback log entries use role colors for the notice recipient.
 Delivery notices also color the showrunner who received an alert.

@@ -6,7 +6,7 @@ import hashlib
 import gzip
 import threading
 import logging
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass, field, replace
 import json
 import re
@@ -23,7 +23,8 @@ from zoneinfo import ZoneInfo
 from scripts.lib import conf
 from scripts.for_you.action import ActionStore, ActionStoreError, REVIEW_PATH
 from scripts.lib.user_zone import CONF as USER_ZONE_CONF, user_zone
-from scripts.production import change_review, change_routing, proposal_issue, staff, update_registration
+from scripts.production import change_review, change_routing, investigation, proposal_issue
+from scripts.production import record_store, staff, the_list, update_registration
 from scripts.production.record_store import FileStamp, state_root
 from scripts.rebuild import need
 from scripts.lib import urgency
@@ -231,7 +232,9 @@ class ReviewSnapshot:
         body = self.render_body(item, self.assets)
         if view is ReviewBodyView.TABLE:
             return body
-        entry = next(entry for entry in self.entries if entry['key'] == key)
+        entry = next((entry for entry in self.entries if entry['key'] == key), None)
+        if entry is None:
+            entry = card_entry(item, self.members, self.names, self.zone)
         return render_card(self, entry, body.decode(), waiting_why=item.waiting_why)
 
     def linked_card(self, root: Path, key: str, *, view: ReviewBodyView = ReviewBodyView.CARD) -> bytes:
@@ -261,6 +264,42 @@ class ReviewSnapshot:
             except Exception as error:
                 logging.getLogger(__name__).warning('Review card %s: %s', item.key, error)
         return body
+
+
+def list_destination(item: ReviewItem) -> investigation.ListDestination | investigation.NoListDestination:
+    source = item.source
+    return (source.record.list_destination if isinstance(source, review_items.InvestigationSource)
+            else investigation.NoListDestination.ABSENT)
+
+
+def report_url(destination: investigation.ListDestination) -> str:
+    return page_frame.LIST_PAGE_PATH + page_frame.list_item_fragment(destination.keeper, destination.number)
+
+
+def report_belongs_on_list(item: ReviewItem) -> bool:
+    return isinstance(item.source, review_items.InvestigationSource) and item.source.record.belongs_on_list
+
+
+def list_report_details(report: the_list.ListReport) -> str:
+    """Use the Review card renderers for the report words and picture."""
+    content = section(report.kind.value, report.words)
+    try:
+        if report.submission_scope:
+            scope = new_item_dialog.read_submission_key(report.submission_scope)
+            with review_submissions.scoped_submission(scope) as located:
+                original = located.record
+                if not isinstance(original, investigation.Investigation):
+                    raise investigation.InvestigationError("The source of this report changed.")
+        else:
+            original = investigation.list_evidence_record(report.evidence_key)
+    except (OSError, ValueError) as error:
+        logging.getLogger(__name__).warning("List report evidence %s: %s", report.evidence_key, error)
+        return content + '<p>The original evidence is unavailable.</p>'
+    if original.answer:
+        content += answer_section(original.answer)
+    if isinstance(original.submission, new_item_dialog.ReviewSubmission):
+        content += submission_assets(review_items.investigation_record_key(original), original.submission)
+    return content
 
 
 def retain_asset(item: ReviewItem, assets: dict[str, str]) -> None:
@@ -321,6 +360,15 @@ def retain_record_assets(item: ReviewItem, status: change_page.DeliveryStatus,
     return assets
 
 
+SUBMISSION_EVIDENCE_STYLE = """
+.review-attachments img{max-width:min(240px,100%);max-height:160px;object-fit:contain;margin-inline-end:8px}
+.page-state-box[data-submission-page-state]{margin:12px 0 0;padding:12px 14px}
+[data-submission-page-state]>details>summary{min-height:24px}
+[data-submission-page-state] .page-state{margin-top:8px}
+[data-submission-page-state] img{max-width:min(420px,100%);max-height:270px;object-fit:contain}
+"""
+
+
 def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str:
     """Render the saved evidence and references for one lazy card."""
     evidence = origin.evidence
@@ -369,7 +417,7 @@ def attachment_url(key: str, image: new_item_dialog.ImageReference) -> str:
 
 
 def bug_page_state_box(key: str, state: new_item_dialog.BugPageState, title: str, captured: bool) -> str:
-    """Show the state from the Bug and its screenshot thumbnail."""
+    """Show the Bug screenshot and keep the page details in a disclosure."""
     errors: list[str] = []
     for count, label in ((len(state.notices), 'error line'), (len(state.script_errors), 'script error')):
         if count:
@@ -384,10 +432,10 @@ def bug_page_state_box(key: str, state: new_item_dialog.BugPageState, title: str
     if captured:
         url = attachment_url(key, review_submissions.PAGE_SCREENSHOT)
         caption = html.escape('Screenshot of '+title, quote=True)
-        figure = (f'<figure><a href="{url}" target="_blank" rel="noopener">'
+        figure = (f'<figure><a data-image-zoom href="{url}" target="_blank" rel="noopener">'
                   f'<img src="{url}" loading="lazy" alt="{caption}"></a><figcaption>{caption}</figcaption></figure>')
-    return ('<section class="page-state-box" data-submission-page-state><h4>Page state</h4>'
-            f'<dl class="page-state">{fields}</dl>{figure}</section>')
+    return ('<section class="page-state-box" data-submission-page-state><details><summary>Page details</summary>'
+            f'<dl class="page-state">{fields}</dl></details>{figure}</section>')
 
 
 def card_entry(item: ReviewItem, members: staff.StaffSnapshot, names: staff_names.StaffNames,
@@ -456,6 +504,22 @@ def pack_snapshot(snapshot: ReviewSnapshot, index: str, started: float) -> Revie
                    full_index=full_index, legacy_index=legacy_index)
 
 
+def moved_report_evidence(members: staff.StaffSnapshot, sources: ReviewSourceStamps, zone: ZoneInfo
+                          ) -> list[ReviewItem]:
+    """Retain image access for moved reports without reading other Done records."""
+    kind = record_store.RecordKind.INVESTIGATION
+    items: list[ReviewItem] = []
+    for owner in record_store.store_owners(kind):
+        folders = record_store.known_folders(kind, owner, sources=sources)
+        for path in review_items.store_paths(folders, sources):
+            with guard_source(path, sources):
+                header = record_store.read_header(path, keys=frozenset(('state', 'list_destination')), strict=True)
+                if header.get('state') == [investigation.InvestigationState.READ] and header.get('list_destination'):
+                    record = investigation.read_review_record(path)
+                    items.append(review_items.investigation_item(record, members, path, zone=zone))
+    return items
+
+
 def build_snapshot(root: Path) -> ReviewSnapshot:
     """Read the stores before publication and retain all request dependencies."""
     started, read_at = time.perf_counter(), time.time()
@@ -476,6 +540,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     unavailable_cards: set[str] = set()
     status = change_page.DeliveryStatus(root)
     items = review_items.read(root, members=members, show='active', sources=sources, zone=zone)
+    items.extend(moved_report_evidence(members, sources, zone))
     sources.extend(for_you.source_paths())
     actions = for_you.read(members=members)
     items.extend(review_items.for_you_item(row, members, zone=zone) for row in actions.rows)
@@ -497,7 +562,8 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
                 origin = review_items.submission_origin(item)
                 if isinstance(origin, new_item_dialog.ReviewSubmission):
                     submission_keys[origin.request_id] = item.key
-            entries.append(summary)
+            if not report_belongs_on_list(item):
+                entries.append(summary)
             records[item.key] = item
     browser = change_page.ReviewBrowser(token, initial)
     settings = conf.read('review_links')
@@ -716,7 +782,24 @@ class ReviewSnapshotCache:
             current = self.get()
             remote_staff = not staff.is_owner()
             members = staff.snapshot()
-            with staff.supplied_snapshot(members) if remote_staff else nullcontext():
+            with (staff.supplied_snapshot(members) if remote_staff else nullcontext(), ExitStack() as filing):
+                def select_type(item: new_item_dialog.NewItemRequest) -> None:
+                    if item.kind == new_item_dialog.SubmissionKind.BUG:
+                        filing.enter_context(investigation.file_for_list(investigation.InvestigationPurpose.BUG_REPORT))
+                    elif item.kind == "enhancement":
+                        filing.enter_context(investigation.file_for_list(investigation.InvestigationPurpose.ENHANCEMENT))
+
+                if isinstance(request, review_submissions.ListDraftSend):
+                    prepare = request.prepare
+
+                    def prepare_typed_draft() -> review_submissions.ListDraftFiling:
+                        draft = prepare()
+                        select_type(draft.request)
+                        return draft
+
+                    request = replace(request, prepare=prepare_typed_draft)
+                elif isinstance(request, new_item_dialog.NewItemRequest):
+                    select_type(request)
                 saved = review_submissions.submit(request, members=members, screenshot=screenshot,
                                                   capture_requested=capture_requested, refusal=refusal,
                                                   capture_intent=capture_intent, capture_target=capture_target,
@@ -726,6 +809,10 @@ class ReviewSnapshotCache:
             path = saved.path
             stamps = {source: source_stamp(source) for source in (path, path.parent)}
             try:
+                if isinstance(saved.record, investigation.Investigation) and saved.record.belongs_on_list:
+                    with staff.supplied_snapshot(members):
+                        review_actions.ensure_submission_list_item(saved.address)
+                    stamps[path] = source_stamp(path)
                 projected = review_items.submission_item(saved, members)
                 previous_key = current.submission_keys.get(saved.request_id, projected.key)
                 previous = current.records.get(previous_key)
@@ -794,7 +881,9 @@ class ReviewSnapshotCache:
                 _ = submission_keys.pop(previous_origin.request_id, None)
         names = staff_names.StaffNames(members)
         sources = ReviewSourceStamps()
-        if isinstance(item, ReviewRecordNotPublished) or (item.state == ReviewState.DONE and item.type != ReviewType.FOR_YOU):
+        if isinstance(item, ReviewRecordNotPublished) or (
+                item.state == ReviewState.DONE and item.type != ReviewType.FOR_YOU
+                and not report_belongs_on_list(item)):
             _ = records.pop(key, None)
             entries = [entry for entry in current.entries if entry['key'] not in (key, previous_key)]
             record_version = key
@@ -811,11 +900,14 @@ class ReviewSnapshotCache:
             if isinstance(origin, new_item_dialog.ReviewSubmission):
                 submission_keys[origin.request_id] = key
             validate_body_inputs(item, record_assets)
-            updated_entry = card_entry(item, members, names, current.zone)
-            entries = [updated_entry if entry['key'] == previous_key else entry for entry in current.entries
-                       if entry['key'] != key or key == previous_key]
-            if previous_key not in current.records:
-                entries.append(updated_entry)
+            if not report_belongs_on_list(item):
+                updated_entry = card_entry(item, members, names, current.zone)
+                entries = [updated_entry if entry['key'] == previous_key else entry for entry in current.entries
+                           if entry['key'] != key or key == previous_key]
+                if not any(entry['key'] == key for entry in entries):
+                    entries.append(updated_entry)
+            else:
+                entries = [entry for entry in current.entries if entry['key'] not in (key, previous_key)]
             record_version = repr((item, tuple(assets.get(asset) for asset in asset_keys)))
         version = hashlib.sha256((current.version+record_version).encode()).hexdigest()[:20]
         fresh = pack_snapshot(replace(current, version=version, members=members, names=names, records=records, assets=assets, entries=entries,
@@ -892,7 +984,8 @@ def waiting_items(request: console.NewsRequest, *, snapshot: ReviewSnapshot | No
     else:
         now = datetime.now(snapshot.zone)
         records = (item for item in snapshot.records.values() if item.for_you(now))
-    return frozenset(item.key+'/'+item.times.updated.isoformat() for item in records if item.type != ReviewType.FOR_YOU)
+    return frozenset(item.key+'/'+item.times.updated.isoformat() for item in records
+                     if item.type != ReviewType.FOR_YOU and not report_belongs_on_list(item))
 
 
 def legacy_url(path: str, query: str) -> str:
@@ -933,13 +1026,14 @@ def assign_menu(item: ReviewItem, names: staff_names.StaffNames) -> str:
 
 def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *,
          owner: str = '', validator: str = '', assignment: str = '', routes: str = '') -> str:
-    if item.state == ReviewState.DONE or (item.type == ReviewType.FOR_YOU and not item.actions):
+    if (report_belongs_on_list(item) or item.state == ReviewState.DONE
+            or (item.type == ReviewType.FOR_YOU and not item.actions)):
         return ''
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key), 'revision': revision}
     hidden = ''.join(f'<input type="hidden" name="{key}" value="{html.escape(value, quote=True)}">' for key, value in fields.items())
     closes: list[str] = []
     returns: list[str] = []
-    labels = {'answer': 'Answer', 'works': 'Works', 'not works': 'Does not work', 'validate': 'Ask showrunner to check',
+    labels = {'answer': 'Answer', 'validate': 'Ask showrunner to check',
               'question': 'Ask question', 'feedback': 'Send feedback', 'read': 'Mark read',
               'approve': 'Approve', 'decline': 'Decline', 'done': 'Done'}
     acknowledge = ('<button name="outcome" value="read">Mark read</button>'
@@ -951,7 +1045,13 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
     elif validator:
         labels['question'] = 'Ask a question'
     for index, action in enumerate(item.actions):
-        button = f'<button name="outcome" value="{action}"'+(' class="primary"' if index == 0 and not validator else '')+'>'+labels[action]+'</button>'
+        primary = index == 0 and not validator
+        if action in (page_frame.VerdictAction.WORKS, page_frame.VerdictAction.NOT_FIXED):
+            button = page_frame.verdict_button(page_frame.VerdictItemType.CHANGE, page_frame.VerdictAction(action),
+                                               primary=primary)
+        else:
+            style = ' class="primary"' if primary else ''
+            button = f'<button name="outcome" value="{action}"{style}>{labels[action]}</button>'
         (returns if action == 'question' or (item.type == ReviewType.CHANGE and action in change_page.CHANGE_HANDOFFS)
          else closes).append(button)
         if action == 'approve':
@@ -1069,6 +1169,7 @@ def review_toast_routes(item: ReviewItem, members: staff.StaffSnapshot) -> str:
 
 
 def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
+    destination = list_destination(item)
     names = inputs.names
     source = item.source
     if isinstance(source, review_items.ForYouSource):
@@ -1131,6 +1232,8 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
                     +html.escape(path,quote=True)+'" alt="'+alt+'"></a>')
     elif isinstance(source, review_items.InvestigationSource):
         body = section('You asked', source.record.question)
+        if isinstance(destination, investigation.ListDestination):
+            body = f'<p><a href="{report_url(destination)}">Open List item {destination.number}</a></p>' + body
         if source.record.answer:
             body += answer_section(source.record.answer)
     elif isinstance(source, review_items.ProposalSource):
@@ -1286,6 +1389,8 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         return review_items.read_current(root, retained, staff.snapshot())
 
     def validate_revision(current: ReviewItem) -> ReviewItem:
+        if report_belongs_on_list(current):
+            raise review_items.ReviewRecordChanged('Open the report on the List.')
         if current.state == ReviewState.DONE:
             raise review_items.ReviewRecordChanged('This item is already Done.')
         assets: dict[str, str] = {}
@@ -1467,7 +1572,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
 
 
 QUESTION_COLOR_RULE = '.question{--type-color:#b99aff}'
-STYLE = '<style>' + QUESTION_COLOR_RULE + '''
+STYLE = '<style>' + QUESTION_COLOR_RULE + SUBMISSION_EVIDENCE_STYLE + '''
 main:has(>[data-review]){max-width:1124px}
 [data-review]{display:flex;flex-wrap:wrap;align-items:center}
 [data-review]>:is(.page-title,.page-heading,.review-queue){flex:0 0 100%;min-width:0}
@@ -1476,7 +1581,6 @@ main:has(>[data-review]){max-width:1124px}
 [data-review]>.page-top>.record-filter-words{margin:0}
 .review-title{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .review-waiting-why{display:block;color:var(--ink-3);font-size:.85em}
-.review-attachments img{max-width:min(240px,100%);max-height:160px;object-fit:contain;margin-inline-end:8px}
 [data-review] .record-filter-row{margin-bottom:12px}
 [data-review] .list-filters:has(>[data-clear-linked-reviews][hidden]){display:none}
 [data-review] .record-filter-row>div{gap:8px}

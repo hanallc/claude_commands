@@ -46,7 +46,7 @@ from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import (browser_test_support, console, go_ledger, list_page, page_frame, serve, staff_names,
                                   studio_page)
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
-from scripts.review_links import review_items, review_link, review_page, search_fold, send_hold
+from scripts.review_links import review_items, review_link, review_page, review_submissions, search_fold, send_hold
 from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
 from scripts.review_links.server_test_support import started_review_server
 from scripts.review_links.test_change_page import BrowserForms
@@ -667,7 +667,11 @@ document.body.append(result);
     def test_exact_window_retry_returns_the_first_item_and_closes(self) -> None:
         self.check_live_window_send(lose_reply=True)
 
-    def check_live_window_send(self, *, lose_reply: bool) -> None:
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_window_bug_receipt_shows_the_saved_number_owner_and_producer(self) -> None:
+        self.check_live_window_send(lose_reply=False, kind="bug")
+
+    def check_live_window_send(self, *, lose_reply: bool, kind: str = "investigation") -> None:
         root = self.root / "reviews"
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={MORTY.id}\n")
         _ = write_config_fixture(conf.path("producer_map"))
@@ -696,8 +700,10 @@ document.body.append(result);
   document.querySelector('[data-owner-new]').click();
   const includePage=dialog.querySelector('[name="include_page"]');
   if(includePage.checked) includePage.click();
-  await until(dialog,()=>dialog.querySelector('[name="recipient_id"]:checked'));
-  dialog.querySelector('[name="kind"][value="investigation"]').click();
+  const recipient=()=>dialog.querySelector('[name="recipient_id"][value="'+__OWNER__+'"]');
+  await until(dialog,recipient);
+  recipient().click();
+  dialog.querySelector('[name="kind"][value="'+__KIND__+'"]').click();
   words.value=__WORDS__;
   words.dispatchEvent(new Event('input',{bubbles:true}));
   let filed=false;
@@ -712,13 +718,18 @@ document.body.append(result);
    await until(document.body,settled);
   }
   if(!filed || dialog.open) throw new Error(error.textContent || 'The List did not confirm the item.');
+  const receipt = document.querySelector('[data-report-receipt]')?.textContent;
+  if(__KIND__==='bug' && receipt !== 'List item 1. Owner morty. Producer morty.')
+   throw new Error('The report receipt shows: ' + receipt);
   result.textContent=JSON.stringify([]);
  } catch(error){
   result.textContent=JSON.stringify([String(error)]);
  }
  document.body.append(result);
 })();
-</script>""".replace("__WORDS__", json.dumps(words)).replace("__RETRY__", json.dumps(lose_reply))
+</script>"""
+        probe = probe.replace("__WORDS__", json.dumps(words)).replace("__RETRY__", json.dumps(lose_reply))
+        probe = probe.replace("__KIND__", json.dumps(kind)).replace("__OWNER__", json.dumps(MORTY.id))
 
         @final
         class Probe(serve.ReviewLinksHandler):
@@ -733,13 +744,14 @@ document.body.append(result);
 
             @override
             def json_response(self, status: int, fields: Mapping[str, object], *,
-                              hold: send_hold.HoldHeader | None = None) -> None:
+                              hold: send_hold.HoldHeader | None = None,
+                              hold_outcome: Literal["undone", "missing"] | None = None) -> None:
                 if self.command == "POST" and self.path == review_page.NEW_ITEM_PATH and "id" in fields:
                     saved.append((status, fields))
                     if lose_reply and len(saved) <= 2 and status == 200:
                         self.close_connection = True
                         return
-                super().json_response(status, fields, hold=hold)
+                super().json_response(status, fields, hold=hold, hold_outcome=hold_outcome)
 
         with (patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "key-state"),
                                      "REBUILD_NEEDS_DIR": str(self.root / "rebuild-needs")}),
@@ -767,7 +779,13 @@ document.body.append(result);
             self.assertEqual(notice["rows"], [row.id])
             first_status, first = saved[0]
             self.assertEqual(first_status, 200)
-            self.assertEqual((first["id"], first["list_number"], row.reviews), (record.id, row.number, (first["key"],)))
+            self.assertEqual((first["id"], first["list_number"]), (record.id, row.number))
+            if kind == "bug":
+                self.assertIsInstance(row.report, the_list.ListReport)
+                assert isinstance(row.report, the_list.ListReport)
+                self.assertEqual(row.report.evidence_key, first["key"])
+            else:
+                self.assertEqual(row.reviews, (first["key"],))
             if lose_reply:
                 _, fallback, retry = saved
                 for status, receipt in (fallback, retry):
@@ -2544,6 +2562,60 @@ frame.addEventListener('load',async()=>{
             body = list_page.render(self.root / "reviews", include_counts=False).decode()
             self.assertIn(f'<h3>Latest status · <time datetime="{updated.isoformat()}">2026-11-16 13:20 EST</time></h3>', body)
 
+    def test_report_hides_latest_status_only_when_it_repeats_the_report_words(self) -> None:
+        item = self.file_repaired_report("Fix the menu")
+        assert isinstance(item.report, the_list.ListReport)
+        report_words = item.report.words
+        for status, shows_status in ((report_words, False), ("The cause is known.", True), (report_words, False)):
+            with self.subTest(status=status):
+                _ = the_list.update(MORTY.id, item.id, {"latest_status": status}, source="dwight")
+                saved = list_page.saved_action_state(MORTY.id, item.id, include_detail=True)
+                left = saved.get("detail_html", "").split('<section class="list-log-panel">', 1)[0]
+                self.assertEqual(left.count(f"<p>{report_words}</p>"), 1)
+                self.assertEqual('<section class="list-field-latest_status">' in left, shows_status)
+                if shows_status:
+                    self.assertIn(f"<p>{status}</p>", left)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_report_page_details_open_separately_from_the_screenshot(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        words = "The menu hides choices."
+        viewport = new_item_dialog.PageViewport(1440, 900, True)
+        state = new_item_dialog.BugPageState(
+            "http://127.0.0.1/console/list.html", viewport,
+            0.25, ("One menu option is missing.",), (), "Show All", True, "The List")
+        request = new_item_dialog.NewItemRequest(
+            f"r1-{uuid4().hex}-bug-{MORTY.id}", new_item_dialog.SubmissionKind.BUG, MORTY.id,
+            words, new_item_dialog.NoEvidence(), page_state=state)
+        saved = review_submissions.submit(
+            request, screenshot=new_item_dialog.PageScreenshot(base64.b64decode(PNG), viewport))
+        native = saved.record
+        assert isinstance(native, investigation.Investigation)
+        report = the_list.ListReport(the_list.ReportKind.BUG, review_items.investigation_record_key(native), words,
+                                     saved.key)
+        _ = the_list.file_report(MORTY.id, report, native.title, owner=OWNER.id, producer=DWIGHT.id,
+                                 unit="", source="nate")
+        self.browser_action_sequence(r"""
+ const box=recordDetails(row).querySelector('[data-submission-page-state]');
+ const details=box.querySelector('details'),summary=details.querySelector('summary');
+ const table=details.querySelector('dl'),thumbnail=box.querySelector('figure img');
+ check(!details.open && summary.textContent==='Page details' && box.innerText.includes('Screenshot of The List') &&
+  !box.innerText.includes('Show All') && thumbnail.getClientRects().length,
+  'Page details start closed and the picture stays visible.');
+ const style=getComputedStyle(box);
+ check(style.paddingBlockStart==='12px' && style.paddingInlineStart==='14px' && style.marginBlockStart==='12px',
+  'The report card has padding and space above it.');
+ summary.click();
+ check(details.open && table.innerText.includes('Show All') && table.innerText.includes('0.25 s'),
+  'The disclosure shows the saved page details.');
+ summary.click();
+ thumbnail.click();
+ const zoom=document.querySelector('[data-image-zoom-dialog]');
+ check(zoom.open && zoom.querySelector('img').src===thumbnail.src && !details.open,
+  'The picture opens the shared zoom with the original attachment.');
+""", add_item=False, window_size=(1440, 1000))
+
     def test_log_shows_the_recorded_clock_time_once(self) -> None:
         log = self.legacy_log('- 2026-11-16 18:20:00+00:00 Updated state: "Working" — morty, 09:00 CST')
         self.assertIn('<time datetime="2026-11-16T18:20:00+00:00">13:20 EST</time>', log)
@@ -2686,11 +2758,15 @@ frame.addEventListener('load',async()=>{
 document.querySelector('.list-toggle').click();
 const panel=document.querySelector('.list-panel'),[left,right]=panel.children;
 const log=right.querySelector('.list-log-scroll');
+const logStyle=getComputedStyle(log);
 const desktop=innerWidth>600,box=log.getBoundingClientRect();
 const rem=parseFloat(getComputedStyle(document.documentElement).fontSize);
 const failures=[];
-if(getComputedStyle(log).overflowY!=='auto' || log.scrollHeight<=log.clientHeight)
+if(logStyle.overflowY!=='auto' || log.scrollHeight<=log.clientHeight)
  failures.push('The log scrolls in its own area.');
+const ink=getComputedStyle(right.querySelector('h3')).color;
+if(logStyle.scrollbarColor!==ink+' rgba(0, 0, 0, 0)')
+ failures.push('The log uses the theme for the thumb and shows the panel color through the track.');
 if(desktop && !(box.left>left.getBoundingClientRect().right && box.bottom<=panel.getBoundingClientRect().bottom &&
  panel.getBoundingClientRect().height<innerHeight))
  failures.push('On a desktop the log sits beside the details and ends with the panel.');
@@ -3972,6 +4048,144 @@ window.fetch=(url,options)=>{
         form = list_page.signed_form_fields(list_page.ListRecord(MORTY.id, item), secret)
         fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', form))
         return {**fields, "action": action, "words": "", "until": "", **changes}
+
+    def test_report_verdicts_use_a_signed_repair_and_send_to_both_recipients(self) -> None:
+        root = self.root / "reviews"
+        for kind in the_list.ReportKind:
+            with self.subTest(kind=kind):
+                native = investigation.file(OWNER.id, "Check the menu", "The menu hides half the choices.",
+                                            waiting_why="sdlc checks the menu.")
+                report = the_list.ListReport(kind, review_items.investigation_record_key(native), native.question)
+                number = the_list.file_report(MORTY.id, report, native.title, owner=OWNER.id, producer=DWIGHT.id,
+                                              unit="", source="nate")
+                item = the_list.load(MORTY.id, f"L{number}")
+                self.assertEqual((item.state, item.state_entered), (the_list.ItemState.NEW, item.opened))
+                with patch.object(the_list, "now", return_value=NOW + timedelta(minutes=1)):
+                    working = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.WORKING}, source="dwight")
+                self.assertEqual((working.state, working.state_entered),
+                                 (the_list.ItemState.WORKING, NOW + timedelta(minutes=1)))
+                with self.assertRaisesRegex(the_list.ListError, "Use Works or Not fixed"):
+                    _ = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.DELIVERED}, source="dwight")
+                instructions = "Open the menu and count the choices."
+                with patch.object(the_list, "now", return_value=NOW + timedelta(minutes=2)):
+                    repaired = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.REPAIRED,
+                                                "next_step": instructions}, source="dwight")
+                page = list_page.render(root, include_counts=False, query="show=needs-me").decode()
+                self.assertIn(f'<strong>{native.title}</strong>', page)
+                self.assertIn('<h3>How to try</h3>', page[:page.index('</main>')])
+                self.assertIn(instructions, page[:page.index('</main>')])
+                self.assertIn('value="works">Works</button>', page)
+                self.assertIn('value="not works" disabled>Not fixed</button>', page)
+                self.assertEqual(repaired.state_entered, NOW + timedelta(minutes=2))
+                stale = self.fields(repaired, "works")
+                with self.assertRaisesRegex(question_record.AnswerRefused, "List token"):
+                    _ = list_page.submit(root, urlencode({**stale, "token": "wrong"}))
+                revision = repaired.repair_revision
+                _ = the_list.save_image_answer(MORTY.id, item.id, f"review:picture-{number}",
+                                               "The image shows the chooser.", image_id="000000000001", approved=True)
+                after_image = the_list.load(MORTY.id, item.id)
+                self.assertEqual((after_image.state, after_image.next_step, after_image.repair_revision),
+                                 (the_list.ItemState.REPAIRED, instructions, revision))
+                words = "The last two choices still disappear."
+                rejected = self.fields(repaired, "not works", words=f"\x85 {words}\x1c\u3000")
+                with patch.object(change_page, "send_to_staff") as send:
+                    delivery = list_page.submit(root, urlencode(rejected))
+                    self.assertEqual(the_list.load(MORTY.id, item.id).state, the_list.ItemState.WORKING)
+                    self.assertEqual(the_list.load(MORTY.id, item.id).next_step, "")
+                    send.assert_not_called()
+                    list_page.deliver(delivery)
+                    list_page.deliver(list_page.submit(root, urlencode(rejected)))
+                    self.assertEqual({call.args[0] for call in send.call_args_list}, {OWNER.id, DWIGHT.id})
+                    self.assertEqual([cast(str, call.args[2]).splitlines()[-1] for call in send.call_args_list], [words, words])
+
+                panel = list_page.saved_action_state(MORTY.id, item.id, include_detail=True)
+                self.assertIn(f"<p>Not fixed: {words}</p>", panel.get("detail_html", ""))
+                self.assertEqual(panel.get("next_step_sort"), "dwight repairs it again")
+                _ = the_list.update(MORTY.id, item.id, {"latest_status": "The producer found the cause.",
+                                                     "next_step": "Check the menu code."}, source="dwight")
+                panel = list_page.saved_action_state(MORTY.id, item.id, include_detail=True)
+                self.assertIn("<p>The producer found the cause.</p>", panel.get("detail_html", ""))
+                self.assertEqual(panel.get("next_step_html"), "<p>Check the menu code.</p>")
+
+                with patch.object(the_list, "now", return_value=NOW + timedelta(minutes=3)):
+                    repaired_again = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.REPAIRED,
+                                                      "next_step": instructions}, source="dwight")
+                with self.assertRaisesRegex(the_list.ListError, "The repair changed"):
+                    _ = list_page.submit(root, urlencode(stale))
+                with patch.object(the_list, "now", return_value=NOW + timedelta(minutes=4)):
+                    _ = list_page.submit(root, urlencode(self.fields(repaired_again, "works")))
+                delivered = the_list.load(MORTY.id, item.id)
+                self.assertEqual((delivered.state, delivered.state_entered),
+                                 (the_list.ItemState.DELIVERED, NOW + timedelta(minutes=4)))
+                self.assertEqual(delivered.next_step, "")
+                panel = list_page.saved_action_state(MORTY.id, item.id, include_detail=True)
+                self.assertEqual(panel.get("next_step_html"), "")
+                self.assertNotIn('<h3>Next step</h3>', panel.get("detail_html", ""))
+                done_page = list_page.render(root, include_counts=False, query="show=needs-me").decode()
+                row = re.search(r'<tbody data-list-item [^>]+data-number="'+str(number)+r'"[^>]*>', done_page)
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertIn(" hidden", row[0])
+                _ = the_list.close(MORTY.id, item.id, "Test finished.", source="nate")
+
+    def test_repair_feedback_recovers_after_pending_or_partial_delivery(self) -> None:
+        root = self.root / "reviews"
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\n")
+        words = "The menu still hides the last choice."
+        for scenario in ("both pending", "owner pending", "owner failed", "owner failed and alerted"):
+            with self.subTest(scenario=scenario):
+                native = investigation.file(OWNER.id, "Check the menu", words, waiting_why="sdlc checks the menu.")
+                report = the_list.ListReport(the_list.ReportKind.BUG, review_items.investigation_record_key(native), words)
+                number = the_list.file_report(MORTY.id, report, native.title, owner=OWNER.id, producer=DWIGHT.id,
+                                              unit="", source="nate")
+                identity = f"L{number}"
+                _ = the_list.update(MORTY.id, identity, {"state": the_list.ItemState.WORKING}, source="dwight")
+                repaired = the_list.update(MORTY.id, identity, {"state": the_list.ItemState.REPAIRED,
+                            "next_step": "Open the menu."}, source="dwight")
+                fields = self.fields(repaired, "not works", words=words)
+                delivery = list_page.submit(root, urlencode(fields))
+                accepted: list[tuple[staff.StaffId, str]] = []
+                recover = False
+
+                def send(recipient: staff.StaffId, _sender: str, message: str, *,
+                         key: str) -> Literal["pending", "skipped"] | None:
+                    self.assertTrue(message.endswith(words))
+                    if not recover:
+                        if recipient == OWNER.id and scenario.startswith("owner failed"):
+                            raise OSError("The owner is unavailable.")
+                        if recipient == OWNER.id or scenario == "both pending":
+                            return "pending"
+                    if (recipient, key) in accepted:
+                        return "skipped"
+                    accepted.append((recipient, key))
+                    return None
+
+                alerted = scenario == "owner failed and alerted"
+                with (patch.object(change_page, "send_to_staff", side_effect=send),
+                      patch.object(list_page, "alert_showrunners", return_value=(OTHER,) if alerted else ()),
+                      patch.object(change_page, "alert_delivery_failures", return_value=alerted) as alert):
+                    first = list_page.deliver_with_outcome(delivery)
+                    expected = (change_page.FailedDelivery if scenario.startswith("owner failed")
+                                else change_page.DeliveryUnconfirmed)
+                    self.assertIsInstance(first, expected)
+                    saved = the_list.load(MORTY.id, identity)
+                    feedback = the_list.feedback_requests(saved)[fields["request"]]
+                    self.assertEqual(feedback.state, "alerted" if alerted else "pending")
+                    self.assertEqual(saved.next_step, "")
+                    recover = True
+                    if alerted:
+                        alert.assert_called_once()
+                    else:
+                        list_page.recover_pending(root)
+                        list_page.recover_pending(root)
+                    self.assertIsInstance(list_page.deliver_with_outcome(list_page.submit(root, urlencode(fields))),
+                                          change_page.DeliveryConfirmed)
+                done = the_list.load(MORTY.id, identity)
+                notices = [entry.what for entry in done.log if isinstance(entry.what, the_list.PageFeedback)]
+                self.assertEqual(notices, [replace(feedback, state="sent", alerted_to="")])
+                self.assertCountEqual([target for target, _ in accepted], [DWIGHT.id, OWNER.id])
+                self.assertEqual(len({key for _, key in accepted}), 1)
+                _ = the_list.close(MORTY.id, identity, "Test finished.", source="nate")
 
     def test_unpark_saves_before_delivery_and_sends_one_notice(self) -> None:
         root = self.root / "reviews"
@@ -7578,6 +7792,425 @@ window.fetch=async(_url,options)=>{
   'After Undo the row keeps its state and its unread mark, so it is not marked sent.');
  check(undos===1 && requests.length===1,'Undo posts once and nothing else is sent.');
 ''')
+
+    def file_repaired_report(self, title: str, instructions: str = "Open the menu.") -> the_list.ListItem:
+        native = investigation.file(OWNER.id, title, "The menu hides choices.", waiting_why="sdlc checks the menu.")
+        report = the_list.ListReport(the_list.ReportKind.BUG, review_items.investigation_record_key(native), native.question)
+        number = the_list.file_report(MORTY.id, report, native.title, owner=OWNER.id, producer=DWIGHT.id,
+                                      unit="", source="nate")
+        identity = f"L{number}"
+        _ = the_list.update(MORTY.id, identity, {"state": the_list.ItemState.WORKING}, source="dwight")
+        return the_list.update(MORTY.id, identity, {"state": the_list.ItemState.REPAIRED, "next_step": instructions},
+                               source="dwight")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_repair_undo_restores_the_draft_and_works_leaves_needs_me(self) -> None:
+        _ = self.file_repaired_report("Fix the menu", "Open the menu and count all six choices.")
+        steps = r"""
+ document.querySelector('[data-undo-enabled]').dataset.undoEnabled='true';
+ const originalFetch=window.fetch;let undos=0;
+ const undoOutcome=UNDO_OUTCOME;
+ let undoPath='';
+ const delivered={item_state:'Delivered',unread:'false',state_time_html:'<time>13:00</time>'};
+ window.fetch=async(path,options={})=>{
+  if(String(path).endsWith('/undo')){
+   undos++;undoPath=String(path);
+   if(undoOutcome===null) return new Response('Invalid JSON');
+   return Response.json({outcome:undoOutcome});
+  }
+  if(String(path).startsWith('/send-hold/')){
+   if(undoOutcome==='undone') return Response.json(delivered);
+   return Response.json({reason:'The hold result is unavailable.'},
+    {status:404,headers:{'X-Send-Hold-Outcome':'missing'}});
+  }
+  if(options.method==='POST'){
+   const fields=new URLSearchParams(options.body);
+   check(new Headers(options.headers).get('X-Undo-Hold')==='1',
+    fields.get('action')+' uses the shared Undo flow.');
+   requests.push(fields);
+   return Response.json({hold:new Headers(options.headers).get('X-Undo-Request'),seconds:30},
+    {status:202,headers:{'X-Send-Hold':'held'}});
+  }
+  return originalFetch(path,options);
+ };
+ const until=async(test,label)=>{
+  const end=performance.now()+5000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ const words=form.elements.words;
+ const text='The last choice is missing.';
+ const reject=form.querySelector('[value="not works"]');
+ const toast=()=>document.querySelector('[data-send-undo]:has(button)');
+ show('needs-me');
+ check(row.getClientRects().length && recordIsOpen(row),'Needs me contains the open Repaired item.');
+ check(recordDetails(row).textContent.includes('Open the menu and count all six choices.'),'The panel shows how to try it.');
+ check(reject.disabled,'Not fixed needs words.');
+ for(const blank of ['\u0085','\u001c\t\u2028','\u00a0\n\u3000']){
+  words.value=blank;words.dispatchEvent(new Event('input'));
+  check(reject.disabled,'Not fixed rejects words with only server whitespace.');
+  form.requestSubmit(reject);
+  check(!requests.length,'A blank draft sends no request.');
+ }
+ words.value=text;words.dispatchEvent(new Event('input'));
+ const store=Storage.prototype.setItem;
+ Storage.prototype.setItem=function(){throw new Error('Storage unavailable');};
+ reject.click();
+ Storage.prototype.setItem=store;
+ check(!requests.length && form.querySelector('[data-send-status]').textContent.includes('cannot store Not fixed'),
+  'A storage failure shows before any request leaves.');
+ submit('not works');
+ await until(toast,'The Undo toast did not show.');
+ check(toast().textContent.includes('Sent to sdlc and dwight.'),'The toast names the owner and producer.');
+ check(!row.getClientRects().length,'The held repair report is hidden.');
+ toast().querySelector('button').click();
+ if(undoOutcome!=='undone'){
+  await until(()=>!form.dataset.sending && row.getClientRects().length,'An uncertain Undo did not restore the row.');
+  const key=Object.keys(sessionStorage).find(name=>name.includes('/list-not-fixed-v1/'));
+  const saved=JSON.parse(sessionStorage.getItem(key));
+  check(undoPath==='/send-hold/'+saved?.hold+'/undo','Undo uses the original hold.');
+  check(saved?.payload.request===requests[0].get('request'),'An uncertain Undo keeps the saved request.');
+  check(words.value===text && !reject.disabled,'An uncertain Undo keeps the words and permits retry.');
+  check(!form.querySelector('[data-send-status]').textContent.startsWith('Undone.'),'The card reports uncertainty.');
+ }else{
+  await until(()=>row.getClientRects().length && words===document.activeElement,'Undo did not restore the draft.');
+  check(row.dataset.state==='Repaired' && words.value===text && undos===1,'Undo keeps the Repaired state and words.');
+  check(!Object.keys(sessionStorage).some(key=>key.includes('/list-not-fixed-v1/')),
+   'Undo before acceptance removes the request from storage.');
+  submit('works');
+  await until(toast,'Works did not show the Undo toast.');
+  check(toast().textContent.includes('Saved.') && row.dataset.state==='Repaired',
+   'Works offers Undo before it changes the state.');
+  toast().querySelector('button').click();
+  await until(()=>row.getClientRects().length && words===document.activeElement,'Undo did not restore the repair.');
+  check(row.dataset.state==='Repaired' && undos===2,'Undo keeps the repair in Needs me.');
+  submit('works');
+  await until(toast,'Works did not offer Undo again.');
+  toast().getAnimations()[0].finish();
+  await until(()=>row.dataset.state==='Delivered' && row.hidden,'Works did not leave Needs me.');
+  show('all');
+  check(row.getClientRects().length && row.dataset.state==='Delivered','All shows the Delivered item.');
+  check(row.querySelector('[data-list-state-time]').textContent==='13:00','The row shows the Delivered time.');
+ }
+"""
+        for outcome in ("undone", "missing", None):
+            with self.subTest(outcome=outcome):
+                self.browser_action_sequence(steps.replace("UNDO_OUTCOME", json.dumps(outcome)),
+                                             add_item=False, reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_not_fixed_undo_times_out_while_reading_the_body(self) -> None:
+        _ = self.file_repaired_report("Fix the menu")
+        self.browser_action_sequence(r"""
+ const deadlines=new Map(),originalFetch=window.fetch;
+ AbortSignal.timeout=milliseconds=>{
+  const controller=new AbortController();
+  deadlines.set(controller.signal,{controller,milliseconds});
+  return controller.signal;
+ };
+ const words=form.elements.words,button=form.querySelector('[value="not works"]');
+ const text='The last menu choice still disappears.';
+ let undoSignal,resultSignal,bodyReads=0;
+ const until=async(condition,message)=>{
+  const deadline=performance.now()+4000;
+  while(!condition()){
+   if(performance.now()>deadline) throw new Error(message);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ window.fetch=async(path,options={})=>{
+  if(String(path).endsWith('/undo')){
+   undoSignal=options.signal;
+   const response=new Response(new ReadableStream({start(controller){
+    controller.enqueue(new TextEncoder().encode('{"outcome":'));
+    undoSignal?.addEventListener('abort',()=>controller.error(undoSignal.reason),{once:true});
+   }}));
+   const read=response.json.bind(response);
+   response.json=()=>{bodyReads++;return read();};
+   return response;
+  }
+  if(String(path).startsWith('/send-hold/')){
+   resultSignal=options.signal;
+   return Response.json({reason:'The hold result is unavailable.'},
+    {status:404,headers:{'X-Send-Hold-Outcome':'missing'}});
+  }
+  if(new URL(path,location.href).searchParams.has('not-fixed-request')){
+   const request=requests[0].get('request');
+   return Response.json({not_fixed_receipt:{request,state:'absent'}});
+  }
+  if(options.method!=='POST' || requests.length) return originalFetch(path,options);
+  requests.push(new URLSearchParams(options.body));
+  const hold=new Headers(options.headers).get('X-Undo-Request');
+  return Response.json({hold,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+ };
+ words.value=text;words.dispatchEvent(new Event('input'));
+ const initial=submit('not works');
+ const undo=()=>document.querySelector('[data-send-undo] button');
+ await until(undo,'The Undo toast did not show.');
+ undo().click();
+ await until(()=>bodyReads===1,'The browser did not read the Undo body.');
+ const deadline=deadlines.get(undoSignal);
+ if(!deadline) throw new Error('The Undo POST has no request deadline.');
+ check(Boolean(form.dataset.sending),'The card waits for the incomplete Undo body.');
+ deadline.controller.abort(new DOMException('The fixture timed out.','TimeoutError'));
+ await until(()=>!form.dataset.sending && !button.disabled,'The Undo timeout did not release the card.');
+ check(!undo() && !resultSignal,'The timeout clears the Undo toast and defers the result read until retry.');
+ const key=Object.keys(sessionStorage).find(name=>name.includes('/list-not-fixed-v1/'));
+ const saved=JSON.parse(sessionStorage.getItem(key));
+ check(saved?.payload.request===initial.id && words.value===text,'The timeout keeps the request and the words.');
+ check(form.querySelector('[data-send-status]').textContent.includes('The Undo response timed out.'),
+  'The card reports the timeout.');
+ button.click();
+ await until(()=>requests.length===2,'Retry did not send the original request.');
+ check(deadline.milliseconds===deadlines.get(resultSignal)?.milliseconds,
+  'Undo and hold result reads use the same time limit.');
+ check(requests[1].toString()===requests[0].toString(),'Retry uses the original signed payload.');
+ finishPost({status:503,reason:'The fixture did not confirm delivery.'});
+ await until(()=>!form.dataset.sending,'Retry did not finish.');
+""", add_item=False, reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_not_fixed_keeps_the_draft_until_delivery_is_confirmed(self) -> None:
+        repaired = self.file_repaired_report("Fix the menu")
+        root = self.root / "reviews"
+        before = list_page.render(root, include_counts=False).decode()
+        words = "The last choice is missing."
+        _ = list_page.submit(root, urlencode(self.fields(repaired, "not works", words=words)))
+        saved = list_page.saved_action_state(MORTY.id, "L1", include_detail=True)
+        probe = r"""
+ const result=SAVED,expected=EXPECTED;
+ const until=async(condition,message)=>{
+  const limit=performance.now()+4000;
+  while(!condition()){
+   if(performance.now()>limit) throw new Error(message);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ show('needs-me');
+ const text='The last choice is missing.', words=form.elements.words;
+ words.value=text;words.dispatchEvent(new Event('input'));
+ const first=submit('not works');
+ const receipt=state=>({not_fixed_receipt:{request:first.id,state}});
+ finishPost({...result,...receipt(expected ? 'delivered' : 'accepted')});
+ await until(()=>row.dataset.state==='Working' && row.hidden,'The saved item did not leave Needs me.');
+ show('working');
+ row.querySelector('.list-toggle').click();
+ await until(()=>recordDetails(row)?.querySelector('[data-feedback-form]'),'Working did not open the saved card.');
+ const detail=recordDetails(row),nextStep=detail.querySelector('.list-field-next_step');
+ const nextStepCell=row.querySelector('[data-label="Next step"]');
+ check(nextStep?.textContent==='Next stepdwight repairs it again','The card says who repairs it again.');
+ check(nextStepCell.textContent==='dwight repairs it again','The row says who repairs it again.');
+ check([nextStep,nextStepCell].every(field=>field.querySelector('.staff-name')?.textContent==='dwight'),
+  'The next step uses the producer role color.');
+ check(detail.querySelector('.list-field-latest_status p')?.textContent==='Not fixed: '+text,
+  'The latest status shows the repair feedback.');
+ const draft=detail.querySelector('textarea[name=words]').value;
+ check(draft===(expected ? '' : text),'The card clears the draft only after confirmed delivery.');
+ const retryForm=detail.querySelector('[data-feedback-form]'),retry=retryForm.querySelector('[value="not works"]');
+ check(Boolean(retry.getClientRects().length)===!expected,'Only unconfirmed delivery shows Not fixed on the Working card.');
+ if(!expected){
+  retryForm.requestSubmit(retry);
+  await until(()=>requests.length===2,'The test retry did not start.');
+  const second=requests.at(-1);
+  check(second.get('request')===first.id && second.get('token')===first.token,'The retry uses the signed request that saved the words.');
+  check(second.get('words')===text,'The retry sends the original words.');
+  finishPost({...CONFIRMED,...receipt('delivered')});
+  await until(()=>!recordDetails(row).querySelector('textarea[name=words]')?.value,
+   'The confirmed retry did not clear the words.');
+  const settled=recordDetails(row).querySelector('[value="not works"]');
+  check(!settled?.getClientRects().length,'The confirmed retry hides Not fixed.');
+ }
+"""
+        for case in ({}, {"delivery_pending": True}, {"send_failure": "The owner is unavailable."}):
+            with self.subTest(result=case):
+                steps = probe.replace("SAVED", json.dumps({**saved, **case}).replace("</", "<\\/"))
+                steps = steps.replace("EXPECTED", json.dumps(not case))
+                steps = steps.replace("CONFIRMED", json.dumps(saved).replace("</", "<\\/"))
+                self.browser_action_sequence(steps, add_item=False, markup=before, reduced_motion=True)
+
+        self.browser_action_sequence(r"""
+ const words=form.elements.words,button=form.querySelector('[value="not works"]');
+ const edit=value=>{words.value=value;words.dispatchEvent(new Event('input'));};
+ const storedKey=()=>Object.keys(sessionStorage).find(key=>key.includes('/list-not-fixed-v1/'));
+ for(const [invalid,corrected] of [['The original words.','\u0085The corrected words.\u001c'],
+                                  ['\ufeff','\u00a0The final words.\u2029']]){
+  edit(invalid);
+  const first=submit('not works');
+  finishPost({reason:'The server refused these words.',not_fixed_receipt:{request:first.id,state:'refused'}});
+  await flush();
+  check(!storedKey() && words.value===invalid,'An exact refusal removes the request and keeps the draft.');
+  edit(corrected);
+  const retry=submit('not works');
+  check(retry.id!==first.id,'Corrected words start a new request.');
+  check(requests.at(-1).get('words')===corrected.slice(1,-1),'The browser sends words without edge whitespace.');
+  finishPost({reason:'The server refused these words.',not_fixed_receipt:{request:retry.id,state:'refused'}});
+  await flush();
+  check(!storedKey() && !button.disabled,'A refused correction can be edited again.');
+ }
+""", add_item=False, markup=before, reduced_motion=True)
+
+        for scenario in ("temporary failure", "lost hold result", "tell"):
+            with self.subTest(scenario=scenario):
+                item = self.file_repaired_report(f"Fix the menu in case {scenario}")
+                self.check_not_fixed_retry_after_reload(root, item, words, scenario=scenario)
+
+    def check_not_fixed_retry_after_reload(self, root: Path, item: the_list.ListItem, words: str,
+                                          *, scenario: Literal["temporary failure", "lost hold result", "tell"]) -> None:
+        lose_hold_result = scenario == "lost hold result"
+        tell_after_failure = scenario == "tell"
+        tell_words = "A separate Tell before the retry."
+        _ = write_config_fixture(conf.path("review_links"), f"undo_seconds={int(lose_hold_result)}\ndelivery_tries=1\n")
+        posted: list[dict[str, list[str]]] = []
+        tells: list[str] = []
+        accepted: set[tuple[staff.StaffId, str]] = set()
+        save_action = list_page.save_action
+
+        def save(request_root: Path, body: str, status: change_page.DeliveryStatus | None = None, *,
+                 review_records: list_page.ImmediateReviewRecords, include_detail: bool,
+                 top_priority: list_page.TopPriority) -> tuple[list_page.ListActionSubmission, list_page.SavedActionState | None]:
+            fields = parse_qs(body, keep_blank_values=True)
+            if fields["action"] == ["not works"]:
+                posted.append(fields)
+                if scenario == "temporary failure" and len(posted) == 2:
+                    raise OSError("The List is temporarily unavailable.")
+            return save_action(request_root, body, status, review_records=review_records,
+                               include_detail=include_detail, top_priority=top_priority)
+
+        def send(recipient: staff.StaffId, _sender: str, message: str, *,
+                 key: str) -> Literal["pending", "skipped"] | None:
+            if tell_after_failure and message.endswith(tell_words):
+                self.assertEqual(recipient, DWIGHT.id)
+                tells.append(message)
+                return None
+            self.assertTrue(message.endswith(words))
+            if recipient == OWNER.id and len(posted) == 1:
+                return "pending"
+            if (recipient, key) in accepted:
+                return "skipped"
+            accepted.add((recipient, key))
+            return None
+
+        script = r"""
+(async()=>{
+ const frame=document.createElement('iframe'),failures=[];
+ const loseHoldResult=LOSE_HOLD_RESULT,tellAfterFailure=TELL_AFTER_FAILURE,holdReads=[];
+ const expectedDraft=tellAfterFailure ? '' : 'A separate edit for later.';
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const until=async(test,message)=>{
+  const end=performance.now()+4500;
+  while(!test()){
+   if(performance.now()>end) throw new Error(message);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ const load=action=>new Promise(resolve=>{frame.addEventListener('load',resolve,{once:true});action();});
+ const win=()=>frame.contentWindow;
+ const row=()=>win().document.querySelector('[data-number="ITEM_NUMBER"]');
+ const form=()=>win().recordDetails(row()).querySelector('[data-feedback-form]');
+ const open=()=>{
+  if(!win().recordIsOpen(row())) row().querySelector('.list-toggle').click();
+ };
+ const words=()=>form().elements.words;
+ const edit=value=>{words().value=value;words().dispatchEvent(new (win().Event)('input'));};
+ const click=async({loseResult=false}={})=>{
+  const view=win(),target=form(),button=target.querySelector('[value="not works"]'),actual=view.fetch;
+  let result;
+  view.fetch=async(url,options)=>{
+   const response=await actual.call(view,url,options);
+   if(String(url).startsWith('/send-hold/') && !options?.method){
+    holdReads.push(url);
+    if(loseResult && response.status===200){
+     result={status:503,fields:{reason:'The hold result was lost.'}};
+     return Response.json(result.fields,{status:result.status});
+    }
+   }else if(options?.method==='POST') result={status:response.status,fields:await response.clone().json()};
+   return response;
+  };
+  try{
+   check(!button.disabled && button.getClientRects().length,'Not fixed is available on the card.');
+   button.click();
+   await until(()=>result && !target.dataset.sending,'Not fixed did not finish.');
+   return result;
+  }finally{view.fetch=actual;}
+ };
+ try{
+  await load(()=>{frame.src=location.pathname;document.body.append(frame);});
+  open();edit(SUBMITTED_WORDS);
+  const first=await click({loseResult:loseHoldResult}),receipt=first.fields.not_fixed_receipt;
+  if(loseHoldResult){
+   check(first.status===503 && holdReads.length===1,'The first held result is lost.');
+  }else{
+   check(first.status===200 && first.fields.send_failure && receipt?.state==='accepted','The first send saves without delivery.');
+   check(row().dataset.state==='Working' && words().value===SUBMITTED_WORDS,'Working keeps the submitted words.');
+  }
+  edit('');
+  check(!form().querySelector('[value="not works"]').disabled,'An empty draft still permits retry.');
+  if(tellAfterFailure){
+   edit(TELL_WORDS);
+   form().querySelector('[value="tell"]').click();
+   await until(()=>!words().value && !form().dataset.sending,'Tell did not clear the draft.');
+  }else edit(expectedDraft);
+  if(!loseHoldResult && !tellAfterFailure){
+   const second=await click();
+   check(second.status===503,'The second send has a temporary failure.');
+  }
+  await load(()=>win().location.reload());
+  open();
+  check(words().value===expectedDraft,'Reload restores only unsent draft words.');
+  const beforeRefresh=win().document.querySelector('[data-list]');
+  const resumed=await click();
+  check(resumed.status===200 && resumed.fields.not_fixed_receipt?.state==='delivered',
+   'The original request confirms delivery after reload.');
+  if(loseHoldResult) check(holdReads.length===2 && holdReads[0]===holdReads[1],'The retry reads the original hold.');
+  else check(resumed.fields.not_fixed_receipt.request===receipt?.request,'The delivery receipt names the original request.');
+  check(words().value===expectedDraft,'Confirmation keeps the current draft.');
+  check(!form().querySelector('[value="not works"]').getClientRects().length,'The confirmed request leaves the card.');
+  await until(()=>!beforeRefresh.isConnected,'The List did not refresh after the confirmed retry.');
+ }catch(error){failures.push(String(error));}
+ return failures;
+})()
+""".replace("ITEM_NUMBER", str(item.number)).replace("SUBMITTED_WORDS", json.dumps(words))
+        script = script.replace("LOSE_HOLD_RESULT", json.dumps(lose_hold_result))
+        script = script.replace("TELL_AFTER_FAILURE", json.dumps(tell_after_failure))
+        script = script.replace("TELL_WORDS", json.dumps(tell_words))
+        with (patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(root)}),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(list_page, "save_action", side_effect=save),
+              patch.object(list_page, "counts_strip", return_value=""),
+              patch.object(list_page, "recover_pending"),
+              patch.object(change_page, "send_to_staff", side_effect=send),
+              started_review_server(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            chrome = self.chrome()
+            try:
+                chrome.navigate(f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}")
+                reply = chrome.command("Runtime.evaluate", {"expression": script, "awaitPromise": True,
+                                       "returnByValue": True}, chrome.session)
+                self.assertNotIn("exceptionDetails", reply)
+                self.assertEqual(cast(dict[str, object], reply["result"])["value"], [])
+            finally:
+                chrome.navigate("about:blank")
+                server.shutdown()
+                thread.join()
+        self.assertEqual(len(posted), 3 if scenario == "temporary failure" else 2)
+        self.assertEqual(posted, [posted[0]] * len(posted))
+        self.assertEqual(posted[0]["words"], [words])
+        request, = posted[0]["request"]
+        feedback = the_list.feedback_requests(the_list.load(MORTY.id, item.id))
+        if tell_after_failure:
+            self.assertEqual(len(tells), 1)
+            self.assertEqual([entry.words for entry in feedback.values() if entry.action == "tell"], [tell_words])
+            self.assertEqual(len(feedback), 2)
+            self.assertEqual(feedback[request].action, the_list.ReportVerdict.NOT_FIXED)
+        else:
+            self.assertEqual(list(feedback), [request])
+        self.assertEqual((feedback[request].state, feedback[request].words), ("sent", words))
+        self.assertCountEqual([recipient for recipient, _ in accepted], (OWNER.id, DWIGHT.id))
+        self.assertEqual(len({key for _, key in accepted}), 1)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_held_question_hides_the_item_and_failure_restores_it(self) -> None:

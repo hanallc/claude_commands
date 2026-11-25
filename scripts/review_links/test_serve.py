@@ -1243,6 +1243,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             result = f"{send_hold.HOLD_PATH}/{hold_id}"
             self.assertEqual(self.held_http("GET", result, headers={"Origin": "https://elsewhere.invalid"})[0], 403)
             self.assertEqual(self.held_http("GET", result)[::2], (404, {"reason": "This send was undone."}))
+            self.assertEqual(self.request(result).headers.get("x-send-hold-outcome"), "undone")
+            missing = self.request(f"{send_hold.HOLD_PATH}/{send_hold.new_hold_id()}")
+            self.assertEqual((missing.status, missing.headers.get("x-send-hold-outcome")), (404, "missing"))
             send.assert_not_called()
         self.assertEqual(investigation.records(other.id), [])
         self.assertEqual(self.hold_states(), ["undone"])
@@ -1464,8 +1467,12 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(repeated, saved | {"version": repeated["version"]})
                     number = saved["list_number"]
                     row = the_list.load(morty.id, f"L{number}")
-                    self.assertEqual((row.owner, row.producer, row.reviews),
-                                     (recipient.id, recipient.id, (saved["key"],)))
+                    self.assertEqual((row.owner, row.producer), (recipient.id, recipient.id))
+                    if kind == new_item_dialog.SubmissionKind.BUG:
+                        assert isinstance(row.report, the_list.ListReport)
+                        self.assertEqual(row.report.evidence_key, saved["key"])
+                    else:
+                        self.assertEqual(row.reviews, (saved["key"],))
                     send.assert_called_once_with(f"session:{recipient.current_session}", change_page.SENDER, ANY)
 
     def test_new_item_command_files_through_the_handler_and_makes_its_list_item(self) -> None:
@@ -1665,7 +1672,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         self.addCleanup(cache.close)
-        request = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id),
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
                           page="list", request_id="r6-" + uuid4().hex,
                           page_recipient=new_item_dialog.PageRecipient.SELECTED)
         body = self.new_item_body(request)
@@ -2098,6 +2105,7 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_f016_page_owner_retry_reuses_item_after_child_retires(self) -> None:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
+        _ = fixture_member("producer", name="morty")
         parent_doc = case.fixture.temporary / "parent.md"
         _ = parent_doc.write_text(case.fixture.production.read_text())
         parent = fixture_member("showrunner", name="parent", doc=staff.LiveDoc(local_machine(), parent_doc))
@@ -2140,7 +2148,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
         other = fixture_member("producer", name="another-recipient")
-        _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\npage.list.owner={owner.id}\n")
+        keeper = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\npage.list.owner={keeper.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         standard = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, other.id),
                            request_id="r2-" + uuid4().hex)
@@ -2178,6 +2187,7 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_f019_page_owner_send_reuses_standard_item_for_same_recipient(self) -> None:
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
+        _ = fixture_member("producer", name="morty")
         _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         standard = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id),
@@ -2220,6 +2230,10 @@ class ReviewLinksServerTests(unittest.TestCase):
         remote_owner = replace(owner, doc=staff.LiveDoc("natedev", remote_path))
         members = staff.local_snapshot()
         _ = staff.record_path().write_text(replace(members, rows=(remote_owner,)).encode())
+        recipients = [{"id": owner.id, "name": owner.name, "proposal": False}]
+        if kind == new_item_dialog.SubmissionKind.BUG:
+            keeper = fixture_member("producer", name="morty")
+            recipients.append({"id": keeper.id, "name": keeper.name, "proposal": True})
         config = conf.path("console")
         _ = write_config_fixture(conf.path("machines"))
         _ = write_config_fixture(config, f"page.review.owner={owner.id}\n")
@@ -2240,8 +2254,8 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(change_page, "send_to_staff", side_effect=note_delivery) as deliver):
             options = self.new_item_http(query="?page=review")
             self.assertEqual(options.status, 200, options.body)
-            self.assertEqual(json.loads(options.body)["recipients"],
-                             [{"id": owner.id, "name": owner.name, "proposal": False}])
+            fields = cast(dict[str, list[dict[str, object]]], json.loads(options.body))
+            self.assertCountEqual(fields["recipients"], recipients)
             _ = cache.create_submission(request)
             response = self.new_item_http(body, finished=True)
             self.assertEqual(response.status, 200, response.body)
@@ -2511,6 +2525,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
+        _ = fixture_member("producer", name="morty")
         _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         place = "/console/review.html?show=all#owner=builds"
@@ -2573,6 +2588,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                          ) -> tuple[Path, review_page.ReviewSnapshotCache, new_item_dialog.NewItemRequest]:
         case = self.review_fixture()
         owner = case.ready_submission_recipient() if legacy_owner else fixture_member("producer", name="capture-producer")
+        _ = fixture_member("producer", name="morty")
         _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         _ = self.enterContext(patch.object(self.server, "review_cache", cache))
@@ -3266,7 +3282,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         assert isinstance(origin, new_item_dialog.ReviewSubmission)
         self.assertEqual(origin.evidence, EVIDENCE)
         self.assertEqual(origin.bug_page_data, request.evidence)
-        self.assertIn(b"Page state", cache.get().body(key))
+        self.assertIn(b"<summary>Page details</summary>", cache.get().body(key))
         self.assertEqual(json.loads(path.read_text())["request_id"], origin.request_id)
         self.assertEqual(len(investigation.records(request.recipient_id)), 1)
 
@@ -3303,7 +3319,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         assert isinstance(origin, new_item_dialog.ReviewSubmission)
         self.assertEqual(origin.evidence, EVIDENCE)
         self.assertEqual(origin.bug_page_data, request.evidence)
-        self.assertIn(b"Screenshot of List", cache.get().body(key))
+        body = cache.get().body(key)
+        self.assertIn(b"<summary>Page details</summary>", body)
+        self.assertIn(b"Screenshot of List", body)
         path, = folder.glob("*.json")
         self.assertEqual(json.loads(path.read_text())["screenshot"], review_submissions.PAGE_SCREENSHOT.id)
         self.assertEqual(self.request(review_page.ATTACHMENT_PATH + "?" + urlencode(
@@ -3450,7 +3468,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         assert isinstance(origin, new_item_dialog.ReviewSubmission)
         self.assertEqual(origin.evidence, EVIDENCE)
         self.assertIsNone(origin.bug_page_data)
-        self.assertNotIn(b"Page state", cache.get().body(key))
+        self.assertNotIn(b"<summary>Page details</summary>", cache.get().body(key))
         self.assertEqual(len(investigation.records(request.recipient_id)), 1)
 
     def test_edited_send_resumes_publication_of_the_first_bug(self) -> None:
@@ -6538,6 +6556,17 @@ class ReviewLinksServerTests(unittest.TestCase):
             fields = {"keeper": morty.id, "id": item.id, "request": request,
                     "token": list_page.request_token(self.root, morty.id, item.id, request),
                     "action": "read", "words": "Explain this simply.", "until": "2026-12-03"}
+            for invalid_words in ("", "\x85", "\x1c\t\u2028\u3000", "x" * 10001):
+                with self.subTest(invalid_words=len(invalid_words), action="not works"):
+                    verdict = {**fields, "action": "not works", "words": invalid_words}
+                    code, body = self.post(list_page.PAGE_PATH, urlencode(verdict))
+                    self.assertEqual(code, 400)
+                    self.assertEqual(json.loads(body), {
+                        "reason": "Enter your words for the owner and the producer.",
+                        "not_fixed_receipt": {"request": request, "state": "refused"},
+                    })
+                    self.assertEqual(the_list.load(morty.id, item.id), item)
+                    delivery.assert_not_called()
             for action in ("read", "park", "tell", "remove"):
                 fields["action"] = action
                 with self.subTest(action=action):
