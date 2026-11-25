@@ -102,7 +102,7 @@ class VerifyStepListTests(VerifyStepRoutesFixture):
         self.assertIn("Mac only (Mac-only docs + Swift)", result.stderr)
         self.assert_removed()
 
-    def test_comma_steps_keep_one_run_identity_in_a_slot_copy(self) -> None:
+    def test_comma_steps_keep_one_run_identity_in_a_numbered_copy(self) -> None:
         self.prepare_repository()
         root = self.fixture.root
         _ = subprocess.run(["git", "remote", "add", "origin", str(root)], cwd=root,
