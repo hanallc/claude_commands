@@ -2217,18 +2217,23 @@ The detached helper keeps the original run record until the server acknowledges 
 If the server saved **Stopped**, it resumes only pending delivery.
 The server retains a verified handle for two `page_refresh_seconds` intervals.
 If the live row disappears, the retained handle can report an already ended run.
-The Tests outside the queue table offers **Kill this run** for a verified natedev command with a registered owner.
-The same confirmation shows the command, process tree, age, and recorded caller.
-The server checks the handle against the current outside queue reading when the operator confirms.
-It checks the PID and start time through a pidfd and saves the process lifetimes in the command's tree.
-The server sends the signal through pidfds for those lifetimes.
-A reused PID receives no signal.
+The Tests outside the queue table offers **Kill this run** for local commands with a verified starter and stop path.
+The confirmation shows the command, PID, age, and starter.
+The server checks the handle against the current reading when the operator confirms.
+A command with a detached record uses the detached stop path and its slice check.
+For other commands, the server opens a pidfd and checks the PID and start time before it sends any signal.
+The server scans parent IDs to find descendants. It sends TERM to each process through its own pidfd.
+It keeps the identities of descendants that reparent during the stop.
+After the grace period, it sends KILL through the pidfds of processes that remain.
+The server saves **Stopped** only when the last scan finds no live process in the observed tree.
+The scan can miss a child that starts and reparents between readings.
+If a process remains, the result names its PID.
+If the server restarts during the stop, it saves **Stop unconfirmed**.
 The page shows **Stopping** while the command is still present in the reading.
 The row leaves the table when the feed no longer lists the command.
 If the stop fails, the row shows **Not stopped** and the reason.
 The control returns if the server still verifies the command.
-The server confirms the saved processes have ended before it sends the same keyed notice.
-A direct Cargo scope without a detached run record can use Kill only if it appears in Tests outside the queue.
+The server sends the keyed notice and the operator's words to the starter after it confirms the stop.
 Verify still has no Kill action because it creates only step scopes.
 The server retries pending actions during its existing maintenance cycle.
 It retries an unclear delivery result with the saved key.

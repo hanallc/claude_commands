@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable, Generator, Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
@@ -28,7 +28,7 @@ from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.buildlog import store
 from scripts.buildlog.parse import CARGO_BUILD_VERBS
-from scripts.lib import atomic_file, process_start, process_stop
+from scripts.lib import atomic_file, conf, process_start, process_stop
 from scripts.lib.build_steps import GATE_PROGRAMS, command_program, live_process_arguments
 from scripts.lib.user_zone import user_zone
 from scripts.lint import memory_admit
@@ -127,8 +127,14 @@ class KillTarget:
 
 
 @dataclass(frozen=True)
+class OutsideCommandTree:
+    """Stop the row process and its descendants by pidfd."""
+
+
+@dataclass(frozen=True)
 class OutsideKillTarget:
     candidate: OutsideKillCandidate
+    route: DetachedCommand | OutsideCommandTree
     recipient: staff.StaffId
     starter: str
     recipient_name: str
@@ -146,47 +152,10 @@ def notice_recipient(members: staff.StaffSnapshot, caller: staff.StaffRow) -> tu
 
 @dataclass(frozen=True)
 class OutsideProcessTree:
+    """Read stop records saved before a verified boundary was required."""
+
     boot_id: str
     processes: tuple[process_stop.ProcessLifetime, ...]
-
-
-def boot_id() -> str:
-    return (PROC / "sys/kernel/random/boot_id").read_text().strip()
-
-
-def outside_process_tree(run: OutsideKillCandidate) -> OutsideProcessTree:
-    root = process_stop.ProcessLifetime(run.row_pid, run.row_start)
-    with process_stop.pin_process(root):
-        processes = memory_admit.process_table(PROC)
-        # Exclude links to a parent PID from a later process lifetime.
-        processes = {pid: entry for pid, entry in processes.items()
-                     if entry.parent not in processes or int(processes[entry.parent].start) <= int(entry.start)}
-        tree = memory_admit.process_tree({root.pid: root.start}, processes)
-        if root.pid not in tree or os.getpid() in tree or not live(root.pid, root.start):
-            raise ProcessLookupError("the outside command changed")
-        children = tuple(process_stop.ProcessLifetime(pid, processes[pid].start) for pid in sorted(tree - {root.pid}))
-        return OutsideProcessTree(boot_id(), (root, *children))
-
-
-def stop_outside_tree(tree: OutsideProcessTree) -> bool:
-    """Signal only the saved process lifetimes. Return true when all have ended."""
-    if tree.boot_id != boot_id():
-        raise ProcessLookupError("the system restarted")
-    with ExitStack() as pins:
-        descriptors: list[int] = []
-        for process in tree.processes:
-            try:
-                descriptors.append(pins.enter_context(process_stop.pin_process(process)))
-            except ProcessLookupError:
-                if isinstance(process_start.proc_table_start(process.pid, PROC), process_start.Unreadable):
-                    raise
-        for descriptor in descriptors:
-            try:
-                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
-            except ProcessLookupError:
-                continue
-    return not descriptors
-
 
 
 def live(pid: int, started: str) -> bool:
@@ -196,6 +165,127 @@ def live(pid: int, started: str) -> bool:
 def program(pid: int, processes: dict[int, memory_admit.ProcessIdentity]) -> str:
     args = live_process_arguments(PROC / str(pid), processes[pid].start)
     return command_program(args) if isinstance(args, list) else ""
+
+
+def in_run_slice(process: process_stop.ProcessLifetime, run_slice: process_stop.RunSliceIdentity) -> bool:
+    try:
+        with process_stop.pin_process(process):
+            cgroup = (PROC / str(process.pid) / "cgroup").read_text()
+            unit = next((Path(line[3:]).name for line in cgroup.splitlines() if line.startswith("0::/")), "")
+            member_scope = process_stop.ScopeUnit(run_slice["unit"], unit)
+            return (process_stop.command_slice(process.pid, member_scope) == run_slice
+                    and live(process.pid, process.start))
+    except (OSError, ValueError):
+        return False
+
+
+def in_detached_scope(pid: int) -> bool:
+    scope = (PROC / str(pid) / "cgroup").read_text()
+    return any("builds-detached.slice" in line.split("/") for line in scope.splitlines())
+
+
+def outside_stop_route(
+    run: OutsideKillCandidate, recipient: staff.StaffId,
+) -> DetachedCommand | OutsideCommandTree | NoStopRoute:
+    """Select the stop path for the exact outside process."""
+    if not process_stop.supported() or not live(run.row_pid, run.row_start):
+        return NoStopRoute()
+    try:
+        environment = (PROC / str(run.row_pid) / "environ").read_bytes().split(b"\0")
+        record = next((field.partition(b"=")[2] for field in environment
+                       if field.startswith(b"UNIT_DETACHED_RECORD=")), None)
+        if record is None:
+            if in_detached_scope(run.row_pid):
+                return NoStopRoute()
+            return OutsideCommandTree()
+        path = Path(os.fsdecode(record))
+        if not path.is_absolute() or path.parent.name != detached_runs.DETACHED_RUNS_DIR:
+            return NoStopRoute()
+        raw = worker_lifecycle.read_json_object(path)
+        group = detached_runs.command_group(path)
+        run_slice = raw.get("command_slice")
+        if (group is not None and raw.get("run_id") == path.stem and raw.get("staff_id") == recipient
+                and raw.get("command_pid") == group.group and raw.get("completion_after_slice_cleanup") is True
+                and isinstance(supervisor := raw.get("pid"), int) and supervisor > 1
+                and isinstance(start := raw.get("supervisor_started"), str)
+                and live(supervisor, start) and detached_run_process.supervisor_match(supervisor, path) is True
+                and live(group.group, group.started) and process_stop.is_slice_identity(run_slice)
+                and in_run_slice(process_stop.ProcessLifetime(run.row_pid, run.row_start), run_slice)):
+            return DetachedCommand(path, group.group, group.started, supervisor, start, run_slice)
+    except (OSError, ValueError):
+        pass
+    return NoStopRoute()
+
+
+def outside_tree(known: set[process_stop.ProcessLifetime]) -> set[process_stop.ProcessLifetime]:
+    """Find live descendants of each process already observed."""
+    processes = memory_admit.process_table(PROC)
+    roots = {item.pid: item.start for item in known
+             if (identity := processes.get(item.pid)) is not None and identity.start == item.start}
+    members = {process_stop.ProcessLifetime(pid, processes[pid].start)
+               for pid in memory_admit.process_tree(roots, processes)}
+    # A process can leave the table during a scan. Check its identity before declaring it gone.
+    for item in known - members:
+        state = process_start.proc_table_start(item.pid, PROC)
+        if isinstance(state, process_start.Unreadable):
+            raise OSError(f"Cannot confirm whether pid {item.pid} is still running.")
+        if state == process_start.Started(item.start):
+            members.add(item)
+    return members
+
+
+def signal_outside_process(process: process_stop.ProcessLifetime, number: int) -> None:
+    try:
+        with process_stop.pin_process(process) as descriptor:
+            signal.pidfd_send_signal(descriptor, number)
+    except (ProcessLookupError, PermissionError):
+        # The next scan reports a process that stays.
+        pass
+
+
+def wait_outside_tree(known: set[process_stop.ProcessLifetime], sent: set[process_stop.ProcessLifetime],
+                      number: int, grace: float) -> set[process_stop.ProcessLifetime]:
+    deadline = time.monotonic() + grace
+    while members := outside_tree(known):
+        known.update(members)
+        for process in members - sent:
+            signal_outside_process(process, number)
+        sent.update(members)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return outside_tree(known)
+        time.sleep(min(remaining, 0.1))
+    return set()
+
+
+def stop_outside_tree(run: OutsideKillCandidate) -> str | None:
+    """Return a reason if the stop cannot confirm an empty tree."""
+    settings = conf.read("shutdown")
+    grace = float(settings.text("STOP_GRACE_SECONDS"))
+    kill_grace = float(settings.text("KILL_GRACE_SECONDS"))
+    root = process_stop.ProcessLifetime(run.row_pid, run.row_start)
+    known = {root}
+    try:
+        with process_stop.pin_process(root) as descriptor:
+            members = outside_tree(known)
+            if root not in members or not live(root.pid, root.start):
+                return "The command ended before the tree could be checked."
+            known.update(members)
+            for process in members - {root}:
+                signal_outside_process(process, signal.SIGTERM)
+            try:
+                signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+    except ProcessLookupError:
+        return "The command PID changed before the stop."
+    remaining = wait_outside_tree(known, members, signal.SIGTERM, grace)
+    if remaining:
+        remaining = wait_outside_tree(known, set(), signal.SIGKILL, kill_grace)
+    if remaining:
+        pid = min(process.pid for process in remaining)
+        return f"Still running after Kill: pid {pid}"
+    return None
 
 
 def detached_command(run: KillCandidate, recipient: staff.StaffId,
@@ -230,16 +320,9 @@ def detached_command(run: KillCandidate, recipient: staff.StaffId,
                     and detached_run_process.supervisor_match(supervisor, path) is True
                     and detached_build(raw.get("command"), program(pid, processes))
                     and all(in_group(child, pid) for child in descendants)):
-                try:
-                    with process_stop.pin_process(process_stop.ProcessLifetime(run.holder_pid, run.holder_start)):
-                        cgroup = (PROC / str(run.holder_pid) / "cgroup").read_text()
-                        unit = next((Path(line[3:]).name for line in cgroup.splitlines() if line.startswith("0::/")), "")
-                        member_scope = process_stop.ScopeUnit(run_slice["unit"], unit)
-                        if (process_stop.command_slice(run.holder_pid, member_scope) == run_slice
-                                and live(run.holder_pid, run.holder_start)):
-                            return DetachedCommand(path, pid, group.started, supervisor, start, run_slice)
-                except (OSError, ValueError):
-                    return NoStopRoute()
+                if in_run_slice(process_stop.ProcessLifetime(run.holder_pid, run.holder_start), run_slice):
+                    return DetachedCommand(path, pid, group.started, supervisor, start, run_slice)
+                return NoStopRoute()
         if parent not in processes or int(processes[parent].start) > int(processes[pid].start):
             break
         pid = parent
@@ -371,7 +454,7 @@ class SavedKillAction:
     recipient: staff.StaffId
     message: str
     stage: StopRequested | SendingNotice | FinishedStop
-    route: DetachedCommand | OutsideProcessTree
+    route: DetachedCommand | OutsideCommandTree | OutsideProcessTree
 
 
 def notification(run: KillCandidate | OutsideKillCandidate, at: datetime) -> str:
@@ -422,14 +505,16 @@ def detached_run_state(
 def request_stop(action: SavedKillAction) -> bool:
     """Ask the detached run stop path to stop the saved command."""
     route, run = action.route, action.run
-    if not isinstance(route, DetachedCommand) or not isinstance(run, KillCandidate):
+    if not isinstance(route, DetachedCommand):
         return False
 
     def can_stop() -> bool:
         state = detached_run_state(route, action.recipient, notice_id=action.id)
-        return isinstance(state, RunningDetachedRun) and (
-            state.stop_committed
-            or stop_route(run, action.recipient, memory_admit.process_table(PROC)) == route)
+        if not isinstance(state, RunningDetachedRun) or state.stop_committed:
+            return isinstance(state, RunningDetachedRun)
+        if isinstance(run, OutsideKillCandidate):
+            return outside_stop_route(run, action.recipient) == route
+        return stop_route(run, action.recipient, memory_admit.process_table(PROC)) == route
 
     return detached_runs.stop_command(route.record, action.message.partition("\n")[0], check=can_stop,
                                       stop_notice_id=action.id)
@@ -484,8 +569,7 @@ class KillActions:
         self._worker: threading.Thread | None = None
 
     def handle(self, target: KillTarget | OutsideKillTarget) -> str:
-        identity = target.route if isinstance(target, KillTarget) else target.candidate
-        data = repr((target.candidate.reference, identity, target.recipient)).encode()
+        data = repr((target.candidate.reference, target.route, target.recipient)).encode()
         return hmac.new(self._key, data, sha256).hexdigest()
 
     def _cache(self, action: SavedKillAction) -> None:
@@ -597,14 +681,10 @@ class KillActions:
         if isinstance(action.stage, StopRequested):
             route = action.route
             if isinstance(route, OutsideProcessTree):
-                try:
-                    ended = stop_outside_tree(route)
-                except OSError as error:
-                    print(f"review-links build kill {action.run.reference}: {error}", file=sys.stderr)
-                    return self._finish(action, {**action.result, "stop": StopState.UNCONFIRMED,
-                                                 "reason": "The command could not be stopped."})
-                if ended:
-                    action = self._stopped(action)
+                return self._finish(action, {**action.result, "stop": StopState.UNCONFIRMED,
+                                             "reason": "The saved stop uses an older process list."})
+            elif isinstance(route, OutsideCommandTree):
+                action = self._advance_outside_tree(action, recover_orphan=recover_orphan)
             else:
                 action = self._advance_detached(action, route, recover_orphan=recover_orphan)
         if isinstance(action.stage, SendingNotice):
@@ -623,6 +703,19 @@ class KillActions:
         action = replace(action, stage=SendingNotice(), result={**action.result, "stop": StopState.STOPPED})
         self._save(action)
         return action
+
+    def _advance_outside_tree(self, action: SavedKillAction, *, recover_orphan: bool) -> SavedKillAction:
+        if recover_orphan or not isinstance(action.run, OutsideKillCandidate):
+            reason = "The stop was interrupted before the tree could be confirmed empty."
+        else:
+            try:
+                reason = stop_outside_tree(action.run)
+            except (OSError, ValueError) as error:
+                print(f"review-links build kill {action.run.reference}: {error}", file=sys.stderr)
+                reason = "The server could not check or signal the process tree."
+        if reason is not None:
+            return self._finish(action, {**action.result, "stop": StopState.UNCONFIRMED, "reason": reason})
+        return self._stopped(action)
 
     def _advance_detached(self, action: SavedKillAction, route: DetachedCommand, *,
                           recover_orphan: bool) -> SavedKillAction:
@@ -732,23 +825,16 @@ class KillActions:
                 current = self._outside_targets().get(reference) if self._outside_targets is not None else None
                 if current is None or self.handle(current) != handle:
                     return NoStopRoute()
-                try:
-                    route = outside_process_tree(target.candidate)
-                except ProcessLookupError:
-                    return NoStopRoute()
-                ended = False
-            else:
-                state = detached_run_state(target.route, target.recipient)
-                if isinstance(state, ChangedDetachedRun):
-                    return NoStopRoute()
-                if isinstance(state, RunningDetachedRun):
-                    current = live_targets().get(reference)
-                    if current is None or self.handle(current) != handle:
-                        state = detached_run_state(target.route, target.recipient)
-                        if not isinstance(state, EndedDetachedRun):
-                            return NoStopRoute()
-                route = target.route
-                ended = isinstance(state, EndedDetachedRun)
+            route = target.route
+            state = detached_run_state(route, target.recipient) if isinstance(route, DetachedCommand) else None
+            if isinstance(state, ChangedDetachedRun):
+                return NoStopRoute()
+            if isinstance(target, KillTarget) and isinstance(route, DetachedCommand) and isinstance(state, RunningDetachedRun):
+                queued = live_targets().get(reference)
+                if queued is None or self.handle(queued) != handle:
+                    state = detached_run_state(route, target.recipient)
+                    if not isinstance(state, EndedDetachedRun):
+                        return NoStopRoute()
             at = datetime.now(user_zone())
             message = notification(run, at)
             result: KillResult = {"reference": reference, "step": run.step, "pid": run.row_pid,
@@ -758,7 +844,7 @@ class KillActions:
             body = f"{message}\n{words}" if words else message
             action = SavedKillAction(secrets.token_hex(16), run, result, target.recipient, body, StopRequested(),
                                      route)
-            if ended:
+            if isinstance(state, EndedDetachedRun):
                 return self._finish(action, {**result, "stop": StopState.ALREADY_ENDED}).result
             self._save(action)
             try:

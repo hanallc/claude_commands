@@ -2,15 +2,14 @@
 from __future__ import annotations
 
 from argparse import Namespace
-from collections.abc import Callable
-from contextlib import nullcontext, redirect_stdout, suppress
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, nullcontext, redirect_stdout, suppress
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 import fcntl
 from io import StringIO
 import json
 import os
-import select
 from pathlib import Path
 import signal
 import socket
@@ -135,75 +134,208 @@ class KillActionTests(unittest.TestCase):
             self.assertEqual(offers, {})
         return result
 
-    def outside_target(self, pid: int, *, replaced: bool = False) -> kill_action.OutsideKillTarget:
-        started = process_start.process_start(pid)
-        assert isinstance(started, process_start.Started)
-        start = str(int(started.start) + 1) if replaced else started.start
-        run = kill_action.OutsideKillCandidate(pid, start, "direct_test.py")
-        return kill_action.OutsideKillTarget(run, staff.StaffId("fixture"), "impl3, a worker", "impl3", "worker")
-
-    @unittest.skipUnless(process_stop.supported(), "The test needs Linux pidfds")
-    def test_outside_kill_stops_only_the_live_command_tree_and_informs_the_owner(self) -> None:
-        reader, ready = socket.socketpair()
-        with reader, ready:
-            reader.settimeout(TEST_HANG_GUARD_SECS)
-            sibling = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
-            command = subprocess.Popen([sys.executable, "-c", """
-import os, signal, sys
-if os.fork() == 0:
-    os.setsid()
-    os.write(int(sys.argv[1]), str(os.getpid()).encode())
-signal.pause()
-""", str(ready.fileno())], pass_fds=(ready.fileno(),))
-            child_fd: IO[bytes] | None = None
-            try:
-                child_fd = os.fdopen(os.pidfd_open(int(reader.recv(32))), "rb")
-                target = self.outside_target(command.pid)
-                reference = target.candidate.reference
-                actions = kill_action.KillActions(self.root, lambda: {reference: target})
-                with (patch.object(kill_action, "live_targets", return_value={}),
-                      patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.SENT) as deliver):
-                    offers, _ = actions.options(15)
-                    outcome = actions.stop(reference, offers[reference]["handle"], "Run it again tomorrow.")
-                    assert not isinstance(outcome, kill_action.NoStopRoute)
-                    self.assertEqual(outcome["stop"], kill_action.StopState.STOPPING)
-                    deliver.assert_not_called()
-                    self.assertEqual(command.wait(TEST_HANG_GUARD_SECS), -signal.SIGKILL)
-                    self.assertEqual(select.select([child_fd], [], [], TEST_HANG_GUARD_SECS)[0], [child_fd])
-                    result = self.resume()
-                    deliver.assert_called_once()
-                    action = cast(kill_action.SavedKillAction, deliver.call_args.args[0])
-                    self.assertEqual(action.recipient, target.recipient)
-                    self.assertTrue(action.message.endswith("\nRun it again tomorrow."))
-                    self.assertEqual(action.result["stop"], kill_action.StopState.STOPPED)
-                    self.assertEqual(result["delivery"], kill_action.DeliveryState.SENT)
-                    self.assertIsNone(sibling.poll())
-            finally:
-                if child_fd is not None:
-                    with child_fd, suppress(ProcessLookupError):
-                        signal.pidfd_send_signal(child_fd.fileno(), signal.SIGKILL)
-                for process in (command, sibling):
-                    process.kill()
-                    _ = process.wait(TEST_HANG_GUARD_SECS)
+    def test_outside_detached_command_requires_its_verified_route(self) -> None:
+        queued, _, scope = self.scoped_target()
+        run = kill_action.OutsideKillCandidate(queued.candidate.holder_pid, queued.candidate.holder_start, "test.py")
+        self.assertEqual(kill_action.outside_stop_route(run, queued.recipient), queued.route)
+        proc = kill_action.PROC / str(run.row_pid)
+        _ = (proc / "cgroup").write_text(f"0::{scope.parent.with_name('other.slice') / scope.name}\n")
+        self.assertIsInstance(kill_action.outside_stop_route(run, queued.recipient), kill_action.NoStopRoute)
+        _ = (proc / "cgroup").write_text(f"0::{scope}\n")
+        _ = (proc / "environ").write_text("")
+        self.assertIsInstance(kill_action.outside_stop_route(run, queued.recipient), kill_action.NoStopRoute)
+        _ = (proc / "cgroup").write_text("0::/app.slice/app-agents.slice/test.scope\n")
+        self.assertEqual(kill_action.outside_stop_route(run, queued.recipient), kill_action.OutsideCommandTree())
 
     @unittest.skipUnless(process_stop.supported(), "The test needs Linux pidfds")
     def test_outside_kill_refuses_a_reused_pid(self) -> None:
         with subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"]) as process:
             try:
-                target = self.outside_target(process.pid, replaced=True)
-                reference = target.candidate.reference
-                actions = kill_action.KillActions(self.root, lambda: {reference: target})
-                with (patch.object(kill_action, "live_targets", return_value={}),
-                      patch.object(signal, "pidfd_send_signal") as send,
-                      patch.object(kill_action, "deliver") as deliver):
-                    offers, _ = actions.options(15)
-                    self.assertIsInstance(actions.stop(reference, offers[reference]["handle"], ""), kill_action.NoStopRoute)
-                    self.assertIsNone(process.poll())
-                    self.assertFalse(list(self.root.rglob("*.json")))
-                    send.assert_not_called()
-                    deliver.assert_not_called()
+                started = process_start.process_start(process.pid)
+                assert isinstance(started, process_start.Started)
+                run = kill_action.OutsideKillCandidate(process.pid, str(int(started.start) + 1), "test.py")
+                self.install_outside_stop_graces()
+                with patch.object(signal, "pidfd_send_signal") as sent:
+                    self.assertEqual(kill_action.stop_outside_tree(run), "The command PID changed before the stop.")
+                sent.assert_not_called()
+                self.assertIsNone(process.poll())
             finally:
                 process.kill()
+
+    def install_outside_stop_graces(self) -> None:
+        _ = write_config_fixture(self.root / "shutdown.conf", "STOP_GRACE_SECONDS=1\nKILL_GRACE_SECONDS=1")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root)})))
+
+    @contextmanager
+    def launch_outside_process(self, source: str) -> Generator[tuple[subprocess.Popen[bytes], IO[bytes]]]:
+        reader, writer = socket.socketpair()
+        with reader, writer:
+            reader.settimeout(TEST_HANG_GUARD_SECS)
+            environment = {name: value for name, value in os.environ.items() if name != "UNIT_DETACHED_RECORD"}
+            command = [sys.executable, "-c", source, str(writer.fileno())]
+            with subprocess.Popen(command, env=environment, pass_fds=(writer.fileno(),),
+                                  start_new_session=True) as process:
+                writer.close()
+                try:
+                    with reader.makefile("rb") as stream:
+                        yield process, stream
+                finally:
+                    with suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+
+    def stop_outside_process(self, pid: int, *, words: str = "") -> tuple[kill_action.KillResult, list[str]]:
+        started = process_start.process_start(pid)
+        assert isinstance(started, process_start.Started)
+        run = kill_action.OutsideKillCandidate(pid, started.start, "test.py")
+        recipient = staff.StaffId("starter")
+        with patch.object(kill_action, "in_detached_scope", return_value=False):
+            route = kill_action.outside_stop_route(run, recipient)
+        self.assertEqual(route, kill_action.OutsideCommandTree())
+        assert isinstance(route, kill_action.OutsideCommandTree)
+        target = kill_action.OutsideKillTarget(run, route, recipient, "test, worker", "test", "worker")
+        actions = kill_action.KillActions(self.root, lambda: {run.reference: target})
+        delivered: list[str] = []
+
+        def deliver(action: kill_action.SavedKillAction) -> kill_action.DeliveryState:
+            self.assertEqual(action.recipient, recipient)
+            delivered.append(action.message)
+            return kill_action.DeliveryState.SENT
+
+        with (patch.object(kill_action, "live_targets", return_value={}),
+              patch.object(kill_action, "deliver", side_effect=deliver)):
+            offers, _ = actions.options(15)
+            result = actions.stop(run.reference, offers[run.reference]["handle"], words)
+        assert not isinstance(result, kill_action.NoStopRoute)
+        record = self.root / ".review-link-build-kill" / f"{run.reference}.json"
+        saved = admission_wire.parse_record(record.read_text(), kill_action.SavedKillAction)
+        self.assertEqual((saved.route, saved.result), (route, result))
+        return result, delivered
+
+    @unittest.skipUnless(process_stop.supported(), "The test needs Linux pidfds")
+    def test_outside_kill_keeps_the_starter_in_the_shared_group(self) -> None:
+        self.install_outside_stop_graces()
+        with self.launch_outside_process("""
+import os, signal, socket, sys
+with socket.socket(fileno=int(sys.argv[1])) as peer:
+    command = os.fork()
+    if command == 0:
+        while True:
+            signal.pause()
+    peer.sendall(f"{command}\\n".encode())
+    _, status = os.waitpid(command, 0)
+    peer.sendall(f"{os.waitstatus_to_exitcode(status)}\\n".encode())
+    peer.recv(1)
+""") as (starter, stream):
+            command_pid = int(stream.readline())
+            self.assertEqual(os.getpgid(command_pid), os.getpgid(starter.pid))
+            result, notices = self.stop_outside_process(command_pid, words="Run it again later.")
+            self.assertEqual(result["stop"], kill_action.StopState.STOPPED)
+            self.assertEqual(int(stream.readline()), -signal.SIGTERM)
+            self.assertIsNone(starter.poll())
+            message, = notices
+            self.assertTrue(message.endswith("\nRun it again later."))
+
+    @unittest.skipUnless(process_stop.supported(), "The test needs Linux pidfds")
+    def test_outside_tree_kill_lets_the_command_handle_term(self) -> None:
+        self.install_outside_stop_graces()
+        with self.launch_outside_process("""
+import signal, socket, sys
+with socket.socket(fileno=int(sys.argv[1])) as peer:
+    def finish(*_):
+        peer.sendall(b"clean\\n")
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, finish)
+    peer.sendall(b"ready\\n")
+    while True:
+        signal.pause()
+""") as (process, stream):
+            self.assertEqual(stream.readline(), b"ready\n")
+            result, notices = self.stop_outside_process(process.pid)
+            self.assertEqual(stream.readline(), b"clean\n")
+            self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 0)
+            self.assertEqual(result["stop"], kill_action.StopState.STOPPED)
+            self.assertEqual(len(notices), 1)
+
+    @unittest.skipUnless(process_stop.supported(), "The test needs Linux pidfds")
+    def test_outside_tree_kills_a_reparented_child_that_ignores_term(self) -> None:
+        self.install_outside_stop_graces()
+        with self.launch_outside_process("""
+import os, signal, socket, sys
+with socket.socket(fileno=int(sys.argv[1])) as peer:
+    if os.fork() == 0:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        peer.sendall(f"{os.getpid()}\\n".encode())
+    while True:
+        signal.pause()
+""") as (process, stream):
+            child = int(stream.readline())
+            result, notices = self.stop_outside_process(process.pid)
+            self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), -signal.SIGTERM)
+            self.assertEqual(stream.readline(), b"")
+            self.assertNotIsInstance(process_start.process_start(child), process_start.Started)
+            self.assertEqual(result["stop"], kill_action.StopState.STOPPED)
+            self.assertEqual(len(notices), 1)
+
+    @unittest.skipUnless(process_stop.supported(), "The test needs Linux pidfds")
+    def test_outside_tree_reports_a_process_that_stays(self) -> None:
+        self.install_outside_stop_graces()
+        with self.launch_outside_process("""
+import signal, socket, sys
+with socket.socket(fileno=int(sys.argv[1])) as peer:
+    peer.sendall(b"ready\\n")
+    while True:
+        signal.pause()
+""") as (process, stream):
+            self.assertEqual(stream.readline(), b"ready\n")
+            with patch.object(signal, "pidfd_send_signal", return_value=None) as sent:
+                result, notices = self.stop_outside_process(process.pid)
+            self.assertEqual(sent.call_count, 2)
+            self.assertIsNone(process.poll())
+            self.assertEqual(result["stop"], kill_action.StopState.UNCONFIRMED)
+            self.assertEqual(result.get("reason"), f"Still running after Kill: pid {process.pid}")
+            self.assertEqual(notices, [])
+
+    def test_outside_kill_waits_for_a_late_child_in_the_run_slice(self) -> None:
+        queued, _, scope = self.scoped_target()
+        run = kill_action.OutsideKillCandidate(queued.candidate.holder_pid, queued.candidate.holder_start, "test.py")
+        route = kill_action.outside_stop_route(run, queued.recipient)
+        assert isinstance(route, kill_action.DetachedCommand)
+        target = kill_action.OutsideKillTarget(run, route, queued.recipient, queued.starter,
+                                               queued.recipient_name, queued.recipient_role)
+        folder = process_stop.CGROUP_ROOT / scope.parent.relative_to("/")
+        events = folder / "cgroup.events"
+        kill_file = folder / "cgroup.kill"
+        members = folder / scope.name / "cgroup.procs"
+        _ = events.write_text("populated 1\n")
+        kill_file.touch()
+
+        def term(_directory: int, identity: process_stop.RunSliceIdentity) -> None:
+            self.assertEqual(identity, route.run_slice)
+            # After TERM, the command exits and a child remains in the slice.
+            _ = members.write_text("918\n")
+
+        actions = kill_action.KillActions(self.root, lambda: {run.reference: target})
+        with (patch.object(kill_action, "live_targets", return_value={}),
+              patch.object(detached_runs, "_scope_stop_graces", return_value=(0.0, 0.0)),
+              patch.object(detached_runs, "stop_command", wraps=detached_runs.stop_command) as stop,
+              patch.object(process_stop, "_term_slice", side_effect=term) as send_term,
+              patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.SENT) as deliver):
+            offers, _ = actions.options(15)
+            outcome = actions.stop(run.reference, offers[run.reference]["handle"], "")
+            assert not isinstance(outcome, kill_action.NoStopRoute)
+            self.assertEqual(outcome["stop"], kill_action.StopState.STOPPING)
+            stop.assert_called_once()
+            self.assertEqual(cast(object, stop.call_args.args[0]), route.record)
+            send_term.assert_called_once()
+            self.assertEqual(members.read_text(), "918\n")
+            self.assertEqual(kill_file.read_text(), "1\n")
+            deliver.assert_not_called()
+
+            _ = members.write_text("")
+            _ = events.write_text("populated 0\n")
+            self.finish_run(queued)
+            self.assertEqual(self.resume()["stop"], kill_action.StopState.STOPPED)
+            deliver.assert_called_once()
 
     def test_only_local_running_cargo_is_a_candidate(self) -> None:
         reading = reservation_reading()
@@ -382,18 +514,25 @@ signal.pause()
         stop.assert_called_once()
         send.assert_called_once()
 
-    def launch_live_run(self, caller: detached_runs.Caller) -> tuple[Path, subprocess.Popen[bytes], socket.socket]:
+    def launch_live_run(
+        self, caller: detached_runs.Caller, *, handle_term: bool = False,
+    ) -> tuple[Path, subprocess.Popen[bytes], socket.socket]:
         listener = self.enterContext(socket.socket())
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         listener.settimeout(TEST_HANG_GUARD_SECS)
         port = cast(tuple[str, int], listener.getsockname())[1]
         command = [sys.executable, "-c", """
-import socket, sys
+import signal, socket, sys
 with socket.create_connection(("127.0.0.1", int(sys.argv[1]))) as peer:
+    def finish(*_):
+        peer.sendall(b"t")
+        sys.exit(0)
+    if sys.argv[2] == "1":
+        signal.signal(signal.SIGTERM, finish)
     peer.sendall(b"r")
     peer.recv(1)
-""", str(port)]
+""", str(port), str(int(handle_term))]
         popen = subprocess.Popen
         supervisors: list[subprocess.Popen[bytes]] = []
 
@@ -460,6 +599,39 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
                          (kill_action.StopState.STOPPED, kill_action.DeliveryState.SENT))
         stopped.assert_called_once()
         reaped.assert_not_called()
+        sent.assert_called_once()
+
+    def test_outside_kill_lets_the_command_handle_term(self) -> None:
+        path, supervisor, connection = self.launch_live_run(
+            detached_runs.DirectorCaller("impl3", staff.StaffId("fixture")), handle_term=True)
+        queued, events = self.live_target(path)
+        route = queued.route
+        run = kill_action.OutsideKillCandidate(route.group, route.started, "test.py")
+        target = kill_action.OutsideKillTarget(run, route, queued.recipient, queued.starter,
+                                               queued.recipient_name, queued.recipient_role)
+        actions = kill_action.KillActions(self.root, lambda: {run.reference: target})
+
+        def term(_directory: int, run_slice: process_stop.RunSliceIdentity) -> None:
+            self.assertEqual(run_slice, route.run_slice)
+            with process_stop.pin_process(process_stop.ProcessLifetime(run.row_pid, run.row_start)) as descriptor:
+                signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+            self.assertEqual(connection.recv(1), b"t")
+            self.assertEqual(connection.recv(1), b"")
+            _ = events.write_text("populated 0\n")
+
+        with (patch.object(kill_action, "live_targets", return_value={}),
+              patch.object(kill_action, "outside_stop_route", return_value=route),
+              patch.object(detached_runs, "stop_command", wraps=detached_runs.stop_command) as stop,
+              patch.object(process_stop, "_term_slice", side_effect=term),
+              patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.SENT) as sent):
+            offers, _ = actions.options(15)
+            _ = actions.stop(run.reference, offers[run.reference]["handle"], "")
+            self.assertEqual(supervisor.wait(TEST_HANG_GUARD_SECS), 0, path.with_suffix(".log").read_text())
+            record = worker_lifecycle.read_json_object(path)
+            self.assertEqual((record["status"], record["exit_code"]), ("finished", 0))
+            result = self.resume() if not sent.called else actions.options(15)[1][0]
+        self.assertEqual(result["stop"], kill_action.StopState.STOPPED)
+        stop.assert_called()
         sent.assert_called_once()
 
     def live_target(self, path: Path) -> tuple[kill_action.KillTarget, Path]:
@@ -644,8 +816,8 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
         target = self.detached_target(step="nextest")
         run = target.candidate
         actions = kill_action.KillActions(self.root)
-        at = datetime(2026, 11, 18, 19, 41, 0, 900_000, tzinfo=ZoneInfo("America/New_York"))
-        reason = 'nate killed your run "nextest" (pid 17) from the Builds page at 19:41 EST'
+        at = datetime(2026, 11, 19, 0, 41, 0, 900_000, tzinfo=timezone.utc)
+        reason = 'nate killed your run "nextest" (pid 17) from the Builds page at 16:41 PST'
 
         class FixtureClock(datetime):
             @classmethod
@@ -655,7 +827,7 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
 
         with (patch.object(kill_action, "live_targets", return_value={run.reference: target}) as targets,
               patch.object(kill_action, "datetime", FixtureClock),
-              patch.object(kill_action, "user_zone", return_value=at.tzinfo),
+              patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}),
               patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.SENT) as deliver):
             offers, _ = actions.options(15)
             self.assertEqual(offers[run.reference]["message"], reason)
@@ -684,7 +856,7 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
             self.assertEqual((saved.recipient, saved.message), (target.recipient, reason + "\nUse the next slot."))
             self.assertEqual(result, {"reference": run.reference, "step": "nextest", "pid": 17,
                                       "stop": kill_action.StopState.STOPPED, "delivery": kill_action.DeliveryState.SENT,
-                                      "time": "19:41 EST", "recipient_name": "impl3", "recipient_role": "worker"})
+                                      "time": "16:41 PST", "recipient_name": "impl3", "recipient_role": "worker"})
             self.assertEqual(actions.options(15), ({}, [result]))
             self.assertIsInstance(actions.stop(run.reference, handle, "Again."), kill_action.NoStopRoute)
 

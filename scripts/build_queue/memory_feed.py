@@ -2790,7 +2790,8 @@ def outside_process_group(pid: int) -> Path | None:
 class OutsideCommand:
     row: OutsideQueueProcess
     sample_seconds: float
-    kill_target: kill_action.OutsideKillTarget | None
+    over_limit: bool
+    caller: staff.StaffRow | None
 
 
 class OutsideCpuReadings:
@@ -2923,7 +2924,7 @@ class OutsideQueueScan:
         return process if process is not None and process.start == self.processes[pid].start else None
 
     def command_row(self, pid: int, command: tuple[str, ...],
-                    caller: staff.StaffRow | None, seconds: float, sample: float) -> OutsideCommand:
+                    caller: staff.StaffRow | None, seconds: float, sample: float, *, over_limit: bool) -> OutsideCommand:
         process = self.processes[pid]
         owner = self.staff_members.fixed_owner_labels(caller.id) if caller is not None else None
         owner = owner or unit_labels.UnitLabels("")
@@ -2932,12 +2933,9 @@ class OutsideQueueScan:
         row: OutsideQueueProcess = {"pid": pid, "start_time": process.start, "unit": staff_unit(owner),
             "owner": public_queue_text(owner.session), "command": label, "cpu_seconds": seconds,
             "age_seconds": max(0.0, self.boot_now - int(process.start) / self.ticks_per_second), "current_cpu": None}
-        target = None
         if self.for_table and caller is not None and pid > 1:
-            candidate = kill_action.OutsideKillCandidate(pid, process.start, label)
-            target = kill_action.OutsideKillTarget(candidate, *kill_action.notice_recipient(self.staff_members.members, caller))
-            row["kill_ref"] = candidate.reference
-        return OutsideCommand(row, sample, target)
+            row["kill_ref"] = kill_action.OutsideKillCandidate(pid, process.start, label).reference
+        return OutsideCommand(row, sample, over_limit, caller)
 
     def has_queue_work(self, pids: Iterable[int], scopes: set[Path]) -> bool:
         return any(pid in self.queued or pid in self.queue_ancestors or (
@@ -2984,18 +2982,22 @@ def outside_agent_rows(scope: Path, scan: OutsideQueueScan, limit: float) -> lis
         # Read the root first so a child it reaps during the scan cannot count twice.
         members = {pid}
         live = root_process.ticks
+        reaped = root_process.reaped_ticks
         for child in tree[1:]:
             member = scan.live_process(child)
             if member is not None and member.parent in members:
                 members.add(child)
                 live += member.ticks
+                reaped += member.reaped_ticks
         seconds = (live + root_process.reaped_ticks) / scan.ticks_per_second
+        over_limit = (live + reaped) / scan.ticks_per_second > limit
         caller = None
-        if seconds > limit:
+        if over_limit:
             if owner is None:
                 owner = scan.owner(agents)
             caller = owner or scan.owner(scan.ancestors(pid), (DETACHED_OWNER_KEY, *SESSION_OWNER_KEYS))
-        rows.append(scan.command_row(pid, commands[pid], caller, seconds, live / scan.ticks_per_second))
+        rows.append(scan.command_row(pid, commands[pid], caller, seconds, live / scan.ticks_per_second,
+                                     over_limit=over_limit))
     return rows
 
 
@@ -3028,7 +3030,7 @@ def outside_detached_row(scope: Path, scan: OutsideQueueScan, limit: float) -> O
     for pid in sorted(commands, key=lambda item: (scan.processes[item].parent in pids, int(scan.processes[item].start))):
         if not is_outside_tree_wrapper(commands[pid]) and scan.live_process(pid) is not None:
             owner = scan.owner(scan.ancestors(pid), (DETACHED_OWNER_KEY, *SESSION_OWNER_KEYS)) if seconds > limit else None
-            return scan.command_row(pid, commands[pid], owner, seconds, seconds)
+            return scan.command_row(pid, commands[pid], owner, seconds, seconds, over_limit=seconds > limit)
     return None
 
 
@@ -3069,7 +3071,7 @@ def outside_queue_processes(inputs: admission_records.QueueInputs, staff_members
     commands = outside_commands(inputs, staff_members, limit, for_table=for_table) if limit is not None else []
     if cpu is not None:
         cpu.update(commands, time.monotonic() if sampled_at is None else sampled_at)
-    rows = [command.row for command in commands if limit is not None and command.row["cpu_seconds"] > limit]
+    rows = [command.row for command in commands if command.over_limit]
     return sorted(rows, key=lambda row: (-row["cpu_seconds"], row["pid"]))
 
 
@@ -3079,9 +3081,19 @@ def live_outside_kill_targets() -> dict[str, kill_action.OutsideKillTarget]:
     if limit is None or host_name() != "natedev":
         return {}
     reading = admission_client.view()
-    commands = outside_commands(outside_queue_inputs(reading), FeedStaff(staff.snapshot()), limit, for_table=True)
-    return {target.candidate.reference: target for command in commands if command.row["cpu_seconds"] > limit
-            and (target := command.kill_target) is not None}
+    members = staff.snapshot()
+    commands = outside_commands(outside_queue_inputs(reading), FeedStaff(members), limit, for_table=True)
+    targets: dict[str, kill_action.OutsideKillTarget] = {}
+    for command in commands:
+        row, caller = command.row, command.caller
+        if "kill_ref" not in row or caller is None:
+            continue
+        candidate = kill_action.OutsideKillCandidate(row["pid"], row["start_time"], row["command"])
+        route = kill_action.outside_stop_route(candidate, caller.id)
+        if not isinstance(route, kill_action.NoStopRoute):
+            targets[candidate.reference] = kill_action.OutsideKillTarget(
+                candidate, route, *kill_action.notice_recipient(members, caller))
+    return targets
 
 
 def outside_queue_inputs(reading: admission_records.QueueRead) -> admission_records.QueueInputs:

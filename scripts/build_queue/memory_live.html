@@ -420,7 +420,6 @@ body:has(.queue-lift) #tip { visibility: hidden; }
   padding: 2px 6px; border-radius: 4px; background: var(--ink); color: var(--bg);
   font: 12px/1.4 system-ui, sans-serif; white-space: nowrap; pointer-events: none;
 }
-#outside-queue td:last-child { text-align: right; }
 .kill-run[aria-expanded="true"] { color: white; background: #8f2a21; }
 .kill-state, #kill-results { color: var(--ink-2); font-size: .82rem; }
 .kill-state { display: block; white-space: nowrap; }
@@ -429,6 +428,8 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 #kill-dialog { position: fixed; inset: auto; margin: 0; width: min(470px, calc(100vw - 24px));
   max-height: calc(100dvh - 24px); padding: 17px 20px 16px; border: 0; border-radius: 12px;
   box-shadow: 0 10px 30px #0008; background: #efeeea; color: #1b1b1a; font-size: .95rem; }
+#kill-dialog.outside { position: absolute; }
+#outside-queue:not([hidden])::after { content: ""; display: block; height: var(--kill-space, 0px); }
 #kill-dialog::backdrop { background: transparent; }
 #kill-dialog h2 { margin: 0 0 8px; font-size: 1.12rem; }
 #kill-dialog dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 0 0 12px; }
@@ -543,6 +544,7 @@ body.queue-unavailable [data-page-action^="builds-"] { display: none; }
 .outside-queue-table th { font-weight: 600; }
 .outside-queue-table tbody tr { border-top: 1px solid var(--line); }
 .outside-queue-table .num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.outside-queue-table .outside-pid:not(:has(.kill-run)) { padding-right: 42px; }
 .report-window { color: var(--ink-2); font-size: 0.85rem; }
 .report-top-row { margin: 0; padding: 10px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .report-top-row:last-child { border-bottom: 0; }
@@ -795,9 +797,9 @@ __BUILDS_PAGE_DIALOGS__
       <dt id="kill-progress-label">Progress</dt><dd id="kill-progress"></dd>
       <dt>Started by</dt><dd id="kill-starter"></dd>
     </dl>
-    <p>The work in this run will be lost. This message goes to <span id="kill-recipient"></span>:</p>
+    <p id="kill-warning">The run stops at once and its work is lost. This message goes to <span id="kill-recipient"></span>:</p>
     <p id="kill-message"></p>
-    <label for="kill-words">Your own words (optional)</label>
+    <label for="kill-words">Your own words, added to the message (optional)</label>
     <textarea id="kill-words" name="words" rows="2"></textarea>
     <div class="kill-buttons">
       <button id="kill-cancel" type="button" autofocus>Cancel</button>
@@ -2658,6 +2660,7 @@ function render(d) {
   renderSwap(d);
   renderLeftovers(d);
   renderOutsideQueue(d);
+  placeOutsideKillDialog();
   restoreReportView(view);
 }
 
@@ -2916,14 +2919,15 @@ function renderOutsideQueue(d) {
       ? `${staffName(row.unit)} · ${staffName(owner)}` : staffName(owner);
     const kill = row.kill_ref ? ` data-kill-ref="${esc(row.kill_ref)}"` : "";
     return `<tr class="outside-queue-row" data-tip="${esc(outsideQueueKey(row))}">` +
-      `<th scope="row" class="outside-command">${esc(row.command)}</th><td>${names}</td><td class="num">${validOutsideQueuePid(row.pid) ? row.pid : "—"}</td>` +
+      `<th scope="row" class="outside-command">${esc(row.command)}</th><td>${names}</td>` +
+      `<td class="num outside-pid"${kill} title="Kill is not available for this run yet">${validOutsideQueuePid(row.pid) ? row.pid : "—"}</td>` +
       `<td class="num">${outsideQueueAge(row)}</td><td class="num">${outsideQueueCpu(row)}</td>` +
-      `<td class="num">${outsideQueueTotal(row)}</td><td${kill}></td></tr>`;
+      `<td class="num">${outsideQueueTotal(row)}</td></tr>`;
   }).join("");
   target.innerHTML = `<table aria-labelledby="outside-queue-heading"><thead><tr>` +
     `<th scope="col">Command</th><th scope="col">Owner</th><th scope="col" class="num">Pid</th>` +
     `<th scope="col" class="num">Age</th><th scope="col" class="num">Current CPU</th>` +
-    `<th scope="col" class="num">CPU total</th><th scope="col"></th></tr></thead><tbody>${body}</tbody></table>`;
+    `<th scope="col" class="num">CPU total</th></tr></thead><tbody>${body}</tbody></table>`;
   showKillResults();
 }
 
@@ -3423,6 +3427,7 @@ function showKillResults() {
     if (!statuses.has(reference)) statuses.set(reference, result);
   }
   const statusText = result => {
+    if (result.stop === "Stop unconfirmed" && result.reason) return result.reason;
     if (result.stop !== "Stopped") return result.stop;
     const delivery = result.delivery === "Message sent" ? `${result.recipient_role} ${result.recipient_name} informed`
       : result.delivery === "Message queued" ? `Message queued for ${result.recipient_role} ${result.recipient_name}`
@@ -3498,10 +3503,24 @@ async function refreshKill() {
 function placeKillDialog(anchor) {
   const dialog = $("kill-dialog"), bounds = anchor.getBoundingClientRect();
   const width = dialog.offsetWidth, height = dialog.offsetHeight;
-  const left = Math.max(12, Math.min(window.innerWidth - width - 12, bounds.right - width));
+  const maxLeft = window.innerWidth - width - 12;
+  const left = Math.max(12, Math.min(maxLeft, bounds.right - width));
   const top = Math.max(12, Math.min(window.innerHeight - height - 12, bounds.bottom + 8));
   dialog.style.left = `${left}px`;
   dialog.style.top = `${top}px`;
+}
+
+function placeOutsideKillDialog() {
+  const dialog = $("kill-dialog");
+  if (!dialog.open || !killConfirmation?.outside) return;
+  const wrapper = $("outside-queue-rows");
+  const bounds = wrapper.getBoundingClientRect();
+  const pid = wrapper.querySelector(".outside-pid")?.getBoundingClientRect();
+  const right = Math.min(pid?.right ?? bounds.right, bounds.right);
+  const left = Math.max(12, right - dialog.offsetWidth);
+  dialog.style.left = `${left + window.scrollX}px`;
+  dialog.style.top = `${bounds.bottom + window.scrollY + 8}px`;
+  $("outside-queue").style.setProperty("--kill-space", `${dialog.offsetHeight + 8}px`);
 }
 
 document.addEventListener("click", event => {
@@ -3533,13 +3552,21 @@ document.addEventListener("click", event => {
     outside: Boolean(outside)};
   control.setAttribute("aria-expanded", "true");
   hideTip();
-  $("kill-dialog").showModal();
-  placeKillDialog(control);
+  const dialog = $("kill-dialog");
+  dialog.classList.toggle("outside", killConfirmation.outside);
+  dialog.showModal();
+  if (killConfirmation.outside) {
+    placeOutsideKillDialog();
+    dialog.scrollIntoView({block: "nearest"});
+  } else {
+    placeKillDialog(control);
+  }
 });
 $("kill-cancel").addEventListener("click", () => $("kill-dialog").close());
 $("kill-dialog").addEventListener("close", () => {
   const reference = killConfirmation?.reference;
   killConfirmation = null;
+  $("outside-queue").style.removeProperty("--kill-space");
   const button = [...document.querySelectorAll("td[data-kill-ref]")].find(cell => cell.dataset.killRef === reference)?.querySelector("button");
   button?.setAttribute("aria-expanded", "false");
   button?.focus({preventScroll: true});
@@ -4138,6 +4165,7 @@ function fitLabels() {
     if (lbl.offsetWidth + 6 > seg.clientWidth) lbl.classList.add("tight");
     lbl.classList.toggle("hide", lbl.offsetWidth + 2 > seg.clientWidth);
   }
+  placeOutsideKillDialog();
 }
 window.addEventListener("resize", fitLabels);
 

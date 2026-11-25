@@ -38,7 +38,7 @@ from scripts.buildlog import aws_costs, charts, cost_actions, costs, index, mach
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config, write_live_mac_state
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, person_actions, step_estimator, progress_profile, queue_lines, queue_view, queue_snapshot, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
-from scripts.build_queue import memory_trace
+from scripts.build_queue import kill_action, memory_trace
 from scripts.build_queue.test_program_memory_feed import TRACE_POLICY
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.slot_wait import NoNamedStep, recorded_step
@@ -322,6 +322,18 @@ class MemoryFeedTests(unittest.TestCase):
         with mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root)):
             self.assertEqual(memory_feed.outside_queue_processes(captured_reading().explanation.decided_from, owners), [])
 
+    def test_outside_cpu_limit_counts_cpu_reaped_by_a_live_child(self) -> None:
+        owners = memory_feed.FeedStaff(write_outside_queue_fixture(self.root))
+        set_outside_launcher(self.root)
+        set_outside_cpu(self.root, 8102, (60, 0, 0, 0), parent=8101)
+        set_outside_cpu(self.root, 8105, (30, 0, 40, 0))
+        inputs = captured_reading().explanation.decided_from
+        with mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root)):
+            row, = memory_feed.outside_queue_processes(inputs, owners, for_table=True)
+            self.assertEqual((row["pid"], row["cpu_seconds"]), (8102, 90.0))
+            set_outside_cpu(self.root, 8105, (30, 0, 30, 0))
+            self.assertEqual(memory_feed.outside_queue_processes(inputs, owners, for_table=True), [])
+
     def test_outside_queue_shows_current_cpu_for_agent_and_detached_commands(self) -> None:
         owners = memory_feed.FeedStaff(write_outside_queue_fixture(self.root))
         set_outside_launcher(self.root)
@@ -356,8 +368,10 @@ class MemoryFeedTests(unittest.TestCase):
         reservation = fixture_reservation(8105, admission_records.GIB)
         occupancy = admission_records.LocalAdmissionOccupancy((reservation,), {})
         admitted = replace(reading, explanation=replace(reading.explanation, local_occupancy=occupancy))
+        route = kill_action.OutsideCommandTree()
         with (mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root)),
               mock.patch.object(staff, "snapshot", return_value=members),
+              mock.patch.object(kill_action, "outside_stop_route", return_value=route) as resolve_stop,
               mock.patch.object(memory_feed, "host_name", return_value="natedev"),
               mock.patch.object(admission_client, "view", return_value=reading) as live,
               mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading))
@@ -367,6 +381,11 @@ class MemoryFeedTests(unittest.TestCase):
             reference = row.get("kill_ref", "")
             (target,) = memory_feed.live_outside_kill_targets().values()
             self.assertEqual((target.candidate.reference, target.recipient_name), (reference, "test"))
+            self.assertEqual(target.route, route)
+            resolve_stop.assert_called_once_with(target.candidate, target.recipient)
+            resolve_stop.return_value = kill_action.NoStopRoute()
+            self.assertEqual(memory_feed.live_outside_kill_targets(), {})
+            resolve_stop.return_value = route
             for current in (waiting, admitted):
                 snapshot.return_value = fixture_published_view(current)
                 live.return_value = current

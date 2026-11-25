@@ -421,17 +421,25 @@ try {
 
   let servedReading = base;
   let currentFixture = base;
+  const killTime = killProof ? execFileSync(process.env.PYTHON || 'python3', ['-c', [
+    'from datetime import datetime',
+    'from scripts.lib.user_zone import user_zone',
+    'print(datetime.fromisoformat("2026-11-19T00:41:00+00:00").astimezone(user_zone()).strftime("%H:%M %Z"))',
+  ].join('\n')], {cwd:repo, encoding:'utf8'}).trim() : '';
+  const killMessage = (step, pid) => `nate killed your run "${step}" (pid ${pid}) from the Builds page at ${killTime}`;
+  const killWarning = name => `The run stops at once and its work is lost. This message goes to ${name}:`;
+  const killWordsLabel = 'Your own words, added to the message (optional)';
   const killPath = '/console/build-kill';
   const killRef = 'a'.repeat(64);
   const killOffer = {handle:'b'.repeat(64),pid:2712994,started_by:'impl3, a worker of unit-board',
     recipient_name:'impl3',step:'check',
-    message:'nate killed your run "check" (pid 2712994) from the Builds page at 19:41 EST'};
+    message:killMessage('check', 2712994)};
   const researchRef = 'c'.repeat(64);
   const researchOffer = {handle:'e'.repeat(64),pid:2637799,started_by:'test, a worker of research',
     recipient_name:'test',step:'nextest',
-    message:'nate killed your run "nextest" (pid 2637799) from the Builds page at 19:41 EST'};
+    message:killMessage('nextest', 2637799)};
   const killedResult = {reference:killRef,step:'check',pid:killOffer.pid,stop:'Stopped',delivery:'Message sent',
-    time:'19:41 EST',recipient_role:'worker',recipient_name:'impl3'};
+    time:killTime,recipient_role:'worker',recipient_name:'impl3'};
   const killToken = 'fixture-token';
   const killRefreshSeconds = 17;
   const stoppingResult = {...killedResult,stop:'Stopping',delivery:''};
@@ -441,10 +449,10 @@ try {
   const outsideOffers = Object.fromEntries(outsideRows.map(row => [row.kill_ref, {
     handle:'d'.repeat(64), pid:row.pid, started_by:row.pid === 8102 ? 'test, a worker of queue' : 'builds, a showrunner',
     recipient_name:row.owner, step:row.command,
-    message:`nate killed your run "${row.command}" (pid ${row.pid}) from the Builds page at 19:41 EST`,
+    message:killMessage(row.command, row.pid),
   }]));
   const outsideStopped = {reference:outsideRef,step:outsideRow?.command,pid:outsideRow?.pid,
-    stop:'Stopped',delivery:'Message sent',time:'19:41 EST',recipient_role:'worker',recipient_name:outsideRow?.owner};
+    stop:'Stopped',delivery:'Message sent',time:killTime,recipient_role:'worker',recipient_name:outsideRow?.owner};
   let killPost;
   let killPostReply;
   let killResults = [];
@@ -542,12 +550,13 @@ try {
         req.on('data', part => fields.push(part));
         req.on('end', () => {
           killPost = Object.fromEntries(new URLSearchParams(fields.join('')));
-          killPostReply = reason => {
+          killPostReply = (reason, accepted) => {
             if (reason) {
               res.writeHead(409).end(JSON.stringify({reason}));
               return;
             }
-            const result = killPost.reference === outsideRef ? {...outsideStopped,stop:'Stopping',delivery:''} : stoppingResult;
+            const result = accepted ?? (killPost.reference === outsideRef
+              ? {...outsideStopped,stop:'Stopping',delivery:''} : stoppingResult);
             killResults = [result];
             res.end(JSON.stringify({result}));
           };
@@ -556,7 +565,7 @@ try {
       } else {
         const offers = {[killRef]:killOffer, ...(killShot ? {} : outsideOffers)};
         if (killBothShot) offers[researchRef] = researchOffer;
-        for (const result of killResults) delete offers[result.reference];
+        for (const result of killResults) if (result.stop !== 'Stop unconfirmed') delete offers[result.reference];
         res.end(JSON.stringify({token:killToken,offers,results:killResults,refresh_seconds:killRefreshSeconds}));
       }
       return;
@@ -692,6 +701,7 @@ try {
           const other = {...source,key:'research-fixture',machine:'natedev',pid:researchOffer.pid,
             name:'research nextest',unit:'research',kill_ref:researchRef,started_at:fixtureTime - 1200};
           servedReading = {...(killBothShot ? readings.outside_queue : base),
+            psi:{some:0,full:0}, pressure:'none',
             walk:[other,local], waiters:[], queued_priority_units:[], outside_queue:killShot ? [] : outsideRows};
           await call('Emulation.setDeviceMetricsOverride',{width:1600,height:1200,deviceScaleFactor:1,mobile:false});
           await navigate('memory_live.html');
@@ -700,25 +710,32 @@ try {
             const height = await evaluate(`(async () => {
               document.querySelector('.legend-box').open = false;
               await refreshKill();
-              return document.documentElement.scrollHeight;
+              document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run').click();
+              return Math.max(1400, document.documentElement.scrollHeight);
             })()`);
             await call('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
-            const pointer = await evaluate(`(() => {
-              scrollTo(0, 0);
-              const control = document.querySelector('#outside-queue .kill-run');
-              const {x,y,width,height} = control.getBoundingClientRect();
-              return {x:x+width/2,y:y+height/2};
-            })()`);
-            await call('Input.dispatchMouseEvent',{type:'mouseMoved',...pointer});
+            await evaluate('scrollTo(0, 0)');
+            // The modal blocks pointer input. Force the hover style for the comparison image.
+            await call('DOM.enable');
+            await call('CSS.enable');
+            const {root} = await call('DOM.getDocument');
+            const hoverTarget = 'tr[data-tip="row:kill-fixture"] .kill-run';
+            const {nodeId} = await call('DOM.querySelector', {nodeId:root.nodeId, selector:hoverTarget});
+            await call('CSS.forcePseudoState',{nodeId,forcedPseudoClasses:['hover']});
             const shown = await evaluate(`(() => {
               const queue = document.querySelectorAll('.walk-table .kill-run');
               const outside = document.querySelectorAll('#outside-queue .kill-run');
-              return {queue:queue.length,outside:outside.length,open:document.querySelector('#kill-dialog').open,
-                label:getComputedStyle(outside[0],'::after').content,
-                dark:matchMedia('(prefers-color-scheme: dark)').matches,height:document.documentElement.scrollHeight};
+              const dialog = document.querySelector('#kill-dialog');
+              const box = dialog.getBoundingClientRect();
+              return {queue:queue.length,outside:outside.length,open:dialog.open,
+                belowTable:box.top >= document.querySelector('#outside-queue table').getBoundingClientRect().bottom,
+                fits:box.top >= 0 && box.bottom <= innerHeight && dialog.scrollHeight <= dialog.clientHeight,
+                label:getComputedStyle(document.querySelector(${JSON.stringify(hoverTarget)}),'::after').content,
+                dark:matchMedia('(prefers-color-scheme: dark)').matches,
+                pressure:document.querySelector('#pill-t').textContent,height:document.documentElement.scrollHeight};
             })()`);
-            assert.deepEqual(shown,{queue:servedReading.walk.length,outside:outsideRows.length,open:false,
-              label:'"Kill this run"',dark:true,height});
+            assert.deepEqual(shown,{queue:servedReading.walk.length,outside:outsideRows.length,open:true,
+              belowTable:true,fits:true,label:'"Kill this run"',dark:true,pressure:'no memory pressure',height});
             const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,
               clip:{x:0,y:0,width,height,scale:1}});
             const path = comparison ? resolve(comparison) : join(folder,'kill-both-tables-dark.png');
@@ -745,7 +762,8 @@ try {
               labels:[...dialog.querySelectorAll('dt')].map(label => label.textContent),
               fields:[...dialog.querySelectorAll('dd')].map(field => field.textContent),
               preview:document.querySelector('#kill-message').textContent,
-              recipient:document.querySelector('#kill-recipient').textContent,
+              warning:document.querySelector('#kill-warning').textContent,
+              wordsLabel:document.querySelector('label[for="kill-words"]').textContent,
               clip:{x:Math.max(0,rect.left-8)+scrollX,y:Math.max(0,Math.min(top.top,pop.top)-8)+scrollY,
                 width:Math.min(innerWidth,rect.right+8)-Math.max(0,rect.left-8),
                 height:Math.max(rect.bottom,pop.bottom)+8-Math.max(0,Math.min(top.top,pop.top)-8),scale:1}
@@ -775,7 +793,8 @@ try {
             assert.deepEqual(confirmation.fields,
               ['unit-board · check','2712994 and its child processes','6.5% done after 11 min','impl3, a worker of unit-board']);
             assert.equal(confirmation.preview,killOffer.message);
-            assert.equal(confirmation.recipient,killOffer.recipient_name);
+            assert.equal(confirmation.warning,killWarning(killOffer.recipient_name));
+            assert.equal(confirmation.wordsLabel,killWordsLabel);
             killResults = [{...killedResult,stop:'Run already ended',delivery:''}];
             assert.deepEqual(await evaluate(`(async () => {
               await refreshKill();
@@ -785,7 +804,7 @@ try {
             assert.equal(await evaluate(`(async () => {
               await refreshKill();
               return document.querySelector('.kill-state').textContent;
-            })()`),'Killed by you at 19:41 EST · Message pending');
+            })()`),`Killed by you at ${killTime} · Message pending`);
             killResults = [];
             await evaluate(`refreshKill()`);
             await evaluate(`document.querySelector('#kill-submit').click()`);
@@ -823,7 +842,7 @@ try {
               }
             })()`);
             assert.deepEqual(returned,{early:'check (pid 2712994) · Stopping',
-              finished:'check (pid 2712994) · Killed by you at 19:41 EST · worker impl3 informed'});
+              finished:`check (pid 2712994) · Killed by you at ${killTime} · worker impl3 informed`});
             assert.ok(outsideRef, 'The outside feed must publish a Kill reference for a registered owner.');
             killResults = [];
             killPost = killPostReply = undefined;
@@ -832,14 +851,21 @@ try {
               const control = document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run');
               control.click();
               const dialog = document.querySelector('#kill-dialog');
+              const box = dialog.getBoundingClientRect();
+              const table = document.querySelector('#outside-queue table').getBoundingClientRect();
               return {icons:document.querySelectorAll('#outside-queue .kill-run').length, icon:control.innerHTML,
+                pid:control.closest('.outside-pid')?.firstChild.textContent,
                 label:control.getAttribute('aria-label'), fields:[...dialog.querySelectorAll('dd')].map(field => field.textContent),
                 labels:[...dialog.querySelectorAll('dt')].map(label => label.textContent),
+                warning:document.querySelector('#kill-warning').textContent,
+                wordsLabel:document.querySelector('label[for="kill-words"]').textContent,
+                belowTable:box.top >= table.bottom, fits:box.top >= 0 && box.bottom <= innerHeight,
                 preview:document.querySelector('#kill-message').textContent, submit:document.querySelector('#kill-submit').textContent};
             })()`);
-            assert.deepEqual(outside,{icons:2,icon:confirmation.icon,label:'Kill this run',
+            assert.deepEqual(outside,{icons:2,icon:confirmation.icon,pid:'8102',label:'Kill this run',
               fields:['queue · targeted_test.py','8102 and its child processes','5 min','test, a worker of queue'],
-              labels:['Run','Pid','Age','Started by'],preview:outsideOffers[outsideRef].message,submit:'Kill the run'});
+              labels:['Run','Pid','Age','Started by'],warning:killWarning(outsideRow.owner),wordsLabel:killWordsLabel,
+              belowTable:true,fits:true,preview:outsideOffers[outsideRef].message,submit:'Kill the run'});
             const outsideState = () => evaluate(`document.querySelector('[data-kill-ref="${outsideRef}"]')
               ?.closest('tr').querySelector('.kill-state')?.textContent`);
             const submitOutside = async () => {
@@ -861,15 +887,32 @@ try {
             assert.equal(await outsideState(),'Not stopped: The run or its stop route changed.');
             killPost = killPostReply = undefined;
             await submitOutside();
+            killPostReply(undefined, {...outsideStopped,stop:'Stop unconfirmed',delivery:'',
+              reason:'Still running after Kill: pid 8105'});
+            await evaluate(`(async () => {
+              while (pendingKills.size) await new Promise(resolve => setTimeout(resolve, 10));
+              await refreshKill();
+              document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run').click();
+            })()`);
+            assert.equal(await outsideState(),'Not stopped: Still running after Kill: pid 8105');
+            killPost = killPostReply = undefined;
+            await submitOutside();
             killPostReply();
             await evaluate('refreshKill()');
             assert.equal(await outsideState(),'Stopping');
             killResults = [outsideStopped];
             await evaluate('refreshKill()');
-            assert.equal(await outsideState(),'Killed by you at 19:41 EST · worker test informed');
+            assert.equal(await outsideState(),`Killed by you at ${killTime} · worker test informed`);
             servedReading = {...servedReading,outside_queue:outsideRows.filter(row => row.kill_ref !== outsideRef)};
             await evaluate('(async () => { window.render = renderReading; await pageRefresh.refresh(true); })()');
             assert.equal(await outsideState(),undefined);
+            const unavailable = await evaluate(`(() => {
+              const rows = latest.outside_queue.map(row => ({...row,kill_ref:undefined}));
+              renderReading({...latest,outside_queue:rows});
+              const row = document.querySelector('.outside-queue-row');
+              return {label:row.querySelector('.outside-pid').title, icon:!!row.querySelector('.kill-run')};
+            })()`);
+            assert.deepEqual(unavailable,{label:'Kill is not available for this run yet',icon:false});
             console.log(JSON.stringify({pass:true,proof:'Kill control'}));
           }
           break browserProof;
@@ -904,11 +947,11 @@ try {
           assert.equal(result.heading, 'Tests outside the queue');
           assert.equal(result.previousCard, 'build-limits', 'Tests outside the queue must follow Build limits.');
           assert.equal(result.nextCard, 'aws-costs', 'AWS costs must follow Tests outside the queue.');
-          assert.deepEqual(result.headers, ['Command', 'Owner', 'Pid', 'Age', 'Current CPU', 'CPU total', '']);
+          assert.deepEqual(result.headers, ['Command', 'Owner', 'Pid', 'Age', 'Current CPU', 'CPU total']);
           assert.deepEqual(result.rows, [
-            {cells:['verify_cache_test.py', 'builds', '8112', '5 min', '25%', '153 s', ''],
+            {cells:['verify_cache_test.py', 'builds', '8112', '5 min', '25%', '153 s'],
               color:'role.showrunner', clipped:false},
-            {cells:['targeted_test.py', 'queue · test', '8102', '5 min', '75%', '139 s', ''],
+            {cells:['targeted_test.py', 'queue · test', '8102', '5 min', '75%', '139 s'],
               color:'role.unit-director', clipped:false},
           ]);
           assert.equal(await evaluate(`(() => {
@@ -939,7 +982,7 @@ try {
           ]};
           await evaluate('pageRefresh.refresh(true)');
           assert.deepEqual((await inspectOutside()).rows.map(row => row.cells.slice(2)),
-            [['8112', '—', '—', '153 s', ''], ['—', '—', '—', '139 s', '']]);
+            [['8112', '—', '—', '153 s'], ['—', '—', '—', '139 s']]);
           if (outsideQueueProof) {
             if (beforePage) {
               servedReading = readings.outside_queue;
