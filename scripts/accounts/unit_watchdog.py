@@ -52,10 +52,26 @@ class RecoveryOwner(TypedDict):
     unit: str
 
 
+class RestartFailureNotice(TypedDict):
+    account: str
+    generation: str
+    session: str
+    reference: str
+    delivered: NotRequired[bool]
+
+
+@dataclass
+class ExitRecovery:
+    identity: str
+    notice: RestartFailureNotice | None
+    managed: bool = False
+
+
 class DownOutage(TypedDict):
     first_seen: str
     job: NotRequired[RecoveryJob]
     alert_context: NotRequired[RecoveryOwner]
+    restart_notice: NotRequired[RestartFailureNotice]
 
 
 @dataclass(frozen=True)
@@ -117,6 +133,16 @@ def _read_state() -> dict[str, DownOutage]:
                 if not isinstance(production, str) or not isinstance(unit, str):
                     raise ValueError("invalid watchdog recovery owner")
                 outage["alert_context"] = RecoveryOwner(production=production, unit=unit)
+            notice = fields.get("restart_notice")
+            if isinstance(notice, dict):
+                details = cast(dict[str, object], notice)
+                label, generation = details.get("account"), details.get("generation")
+                session, reference = details.get("session"), details.get("reference")
+                if not (isinstance(label, str) and isinstance(generation, str)
+                        and isinstance(session, str) and isinstance(reference, str)):
+                    raise ValueError("invalid watchdog restart notice")
+                outage["restart_notice"] = RestartFailureNotice(account=label, generation=generation,
+                    session=session, reference=reference, delivered=details.get("delivered") is True)
             job = fields.get("job")
             if isinstance(job, dict):
                 job_fields = cast(dict[str, object], job)
@@ -290,7 +316,7 @@ def _recovery_result(job: RecoveryJob, now: datetime) -> RecoveryStillRunning | 
     return RecoveryFinished(failure, result)
 
 
-def run(now: datetime, *, dry_run: bool) -> list[str]:
+def run(now: datetime, *, dry_run: bool, exited: ExitRecovery | None = None) -> list[str]:
     """Serialize direct calls with the same state lock as the scheduled pass."""
     if not role_map.is_role_map_host():
         return []
@@ -304,12 +330,19 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
         with herdr.process_snapshot():
             token = _recovery_observations.set(cache(_fresh_units))
             try:
-                return _run(now, dry_run=dry_run)
+                return _run(now, dry_run=dry_run, exited=exited)
             finally:
                 _recovery_observations.reset(token)
 
 
-def _run(now: datetime, *, dry_run: bool) -> list[str]:
+def _retain_exit(exited: ExitRecovery, outage: DownOutage, state: dict[str, DownOutage]) -> None:
+    if exited.notice is not None and "restart_notice" not in outage:
+        outage["restart_notice"] = exited.notice
+        _write_state(state)
+    exited.managed = True
+
+
+def _run(now: datetime, *, dry_run: bool, exited: ExitRecovery | None = None) -> list[str]:
     """Check local production units, under the watcher's lock."""
     lines: list[str] = []
     runners = showrunners.ShowrunnerDiscovery()
@@ -319,6 +352,9 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
     try:
         state = _read_state()
         before = deepcopy(state)
+        if exited is not None and (outage := state.get(exited.identity)) is not None and "job" in outage:
+            exited.managed = True
+            _retain_exit(exited, outage, state)
         sources = _sources(lines.append)
         runners = showrunners.registered_showrunners()
         observed_at = time.time()
@@ -372,6 +408,8 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                                 if not restored:
                                     claude = unit_lookup.ClaudeNotRunning()
                             if isinstance(claude, unit_lookup.LiveClaude):
+                                if exited is not None and source.session["session_id"] == exited.identity:
+                                    exited.managed = True
                                 if not dry_run:
                                     _ = outage_alerts.clear(claude.session_id, observed_at)
                                 if outage is not None and not dry_run:
@@ -386,9 +424,9 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                         outage = state.get(key)
                         if outage is None:
                             outage = DownOutage(first_seen=now.isoformat())
-                            retained[key] = outage
-                            continue
                         retained[key] = outage
+                        if exited is not None and key == exited.identity and not exited.managed:
+                            _retain_exit(exited, outage, retained)
                         if datetime.fromisoformat(outage["first_seen"]) >= now:
                             continue
                         if dry_run:
@@ -401,6 +439,12 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                                 continue
                             failure = outcome.failure
                             restored = _live_account(runner["name"], unit)
+                            notice = outage.get("restart_notice")
+                            if not restored and notice is not None and not notice.get("delivered"):
+                                send = cast(Callable[[str, RestartFailureNotice], bool],
+                                            import_module("scripts.agents.stop_resume").send_restart_failure)
+                                if send(key, notice):
+                                    notice["delivered"] = True
                             # Keep the result and job if the fresh read is unreadable.
                             outcome.result_path.unlink(missing_ok=True)
                             _ = outage.pop("job")

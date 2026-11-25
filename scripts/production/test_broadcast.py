@@ -759,6 +759,32 @@ class BroadcastTests(unittest.TestCase):
             {"worker:run-a/impl": "A text", "worker:run-b/impl": "B text"},
         )
 
+    def test_broadcast_replays_showrunner_and_director_texts_in_one_ssh_call(self) -> None:
+        self.peer_rows = [
+            replace(entry("peer runner", "session:peer-runner", role="showrunner"), machine="mac"),
+            replace(entry("peer director", "session:peer-director", role="unit director"), machine="mac"),
+        ]
+        os.environ["SSH_SNAPSHOT"] = roster.RosterSnapshot(roster.Roster(self.peer_rows, [])).encode()
+        with (patch.object(staff, "runtime_id", return_value="id-natedev"),
+              patch.object(roster, "roster", side_effect=self.fixture_roster) as read,
+              redirect_stdout(io.StringIO()) as output):
+            deliveries = broadcast.broadcast("natedev", {
+                broadcast.Showrunners(): "Runner update",
+                broadcast.UnitDirectors(): "Director update",
+            })
+            self.assertTrue(broadcast.report(deliveries))
+
+        read.assert_called_once_with(os.environ, roster.ThisMachine())
+        self.assertCountEqual([command[1] for command in self.sends()], ["session:id-hana", "session:id-trunk"])
+        calls = self.ssh_calls()
+        self.assertEqual(len(calls), 1)
+        remote = shlex.split(calls[0][-1])
+        self.assertEqual(remote[remote.index("--here"):],
+                         ["--here", "--from", "natedev", "--showrunners", "Runner update",
+                          "--all-units", "Director update"])
+        self.assertIn("mac: showrunner [session:peer-runner] - sent", output.getvalue())
+        self.assertIn("mac: unit director [session:peer-director] - sent", output.getvalue())
+
     def test_here_never_runs_ssh_and_every_recipient_send_stays_here(self) -> None:
         result, output, errors = self.run_main("--all", "stop")
         self.assertEqual((result, errors), (0, ""), output)

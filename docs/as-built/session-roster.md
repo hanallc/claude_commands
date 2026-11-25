@@ -603,9 +603,9 @@ The roster keeps these rows for direct sends and other readers.
   The report ends with `<N> sent in <S> s` and the closing line.
   Exit 0 when nothing is `NOT sent`, 1 on a delivery failure, and 2 on a usage error. Roster problems print as `broadcast: roster: <problem>`.
   Without a production scope, delivery to the other rows continues.
-- Library API: `broadcast(sender, texts: Mapping[BroadcastGroup, str], *, scope=ALL_MACHINES) -> list[Delivery]` runs the same orchestration as the command; `report(deliveries) -> bool`; `send(session, sender, text, *options) -> str` (empty on success). `codex_winddown.announce()` calls `broadcast.broadcast(sender, {Showrunners(): ..., UnitDirectors(): ...})` and `broadcast.report`.
+- Library API: `broadcast(sender, texts: Mapping[BroadcastGroup, str], *, scope=ALL_MACHINES) -> list[Delivery]` runs the same orchestration as the command; `report(deliveries) -> bool`; `send(session, sender, text, *options) -> str` (empty on success).
 
-The commands `/announce` (`--all`), `/producer:announce` (`--producers`), `/unit:announce` (`--units`), and `/showrunner:announce` (`--showrunners`) use both machines. `/codex_winddown` also calls broadcast.
+The commands `/announce` (`--all`), `/producer:announce` (`--producers`), `/unit:announce` (`--units`), and `/showrunner:announce` (`--showrunners`) use both machines.
 
 ### `top_level.py`
 
@@ -628,7 +628,9 @@ It asks showrunners to give the message to their unit directors.
 
 ### `process_table.py`
 
-`Process(pid, parent, command, arguments)` (`NamedTuple`); `snapshot() -> dict[int, Process]` runs `PS` (from `PROCESS_TABLE_PS`, read at import); `is_codex_agent(process)` recognizes `codex exec`. Standard library only, importing no other script; `roster.py`, `broadcast.py` and `codex_winddown.py` read it.
+`Process(pid, parent, command, arguments)` is a `NamedTuple`.
+`snapshot() -> dict[int, Process]` runs `PS`.
+The module reads `PROCESS_TABLE_PS` at import and uses only the standard library.
 
 ### `codex_daemon.py`
 
@@ -719,7 +721,7 @@ Release recalculates the priority of a kept decision.
 - `scripts/message/escalate.py`, `scripts/agents/restart_support.py`, `scripts/agents/restart.py` — held and shutdown messages
 - `scripts/agents/test_support.py` — shutdown send guard
 - `codex/AGENTS-messaging.md`, `scripts/message/install_codex_agents.py`, `commands/message.md`, `commands/announce.md`, `commands/producer/announce.md`, `commands/unit/announce.md`, `commands/showrunner/announce.md`, `commands/notify_top_level.md`, `commands/alert_user.md` — instructions
-- Tests: `scripts/message/test_{roster,send,postmaster,codex_daemon,process_table,sessions,top_level,install_codex_agents}.py`, `scripts/notify/test_pushover.py`, `scripts/production/test_{broadcast,codex_winddown}.py`, `scripts/agents/test_*.py` (`test_send_guard.py` proves the guard); `mods/postmaster/tests/*.test.ts` exercise fake call sets and kit-loaded hooks
+- Tests: `scripts/message/test_{roster,send,postmaster,codex_daemon,process_table,sessions,top_level,install_codex_agents}.py`, `scripts/notify/test_pushover.py`, `scripts/production/test_broadcast.py`, `scripts/agents/test_*.py` (`test_send_guard.py` proves the guard); `mods/postmaster/tests/*.test.ts` exercise fake call sets and kit-loaded hooks
 
 ## Invariants
 
@@ -742,11 +744,9 @@ Release recalculates the priority of a kept decision.
 
 - `--all-workers` appears in no command file or Codex text.
 
-- `process_table` imports none of `roster`, `broadcast` or `codex_winddown`, so `broadcast.py` imports `roster.py` without a cycle.
+- `process_table` uses only the standard library, so `broadcast.py` can import `roster.py` without a cycle.
 
 - `running_sessions()` and `live_sessions()` select per record through their own predicate; a change to `running_session` keeps that. `sessions.process_start` is the one process-start reader. A record with a `procStart` is running only while it matches its process, socket or not, so a phantom is never a roster row, a broadcast line, an unreachable line or a cause of name ambiguity. A headless run (`sessions.headless`) is never running either, so a relay is never a roster row and no name lookup finds it.
-
-- A role-key or signature change in `broadcast.broadcast` carries `codex_winddown.py` and `test_codex_winddown.py`.
 
 - The mod writes its claim before checking the outbox entry. The client withdraws the entry before checking the claim. An unconfirmed claimed send gets no relay or queued copy.
 
@@ -812,7 +812,6 @@ Release recalculates the priority of a kept decision.
 - Read `/proc/<pid>/stat` as bytes: the kernel's 15-byte `comm` limit can cut a process name inside a UTF-8 character.
 - When `process_start` returns `None` (malformed stat, `ps` failure), a record with a `procStart` is not running until its start reads again, socket or not.
 - The macOS `ps -o lstart=` path is covered in tests only with a faked `ps`.
-- `codex_winddown.start()` keeps the first record per name, so it depends on `sessions.live_sessions()` listing the newest first.
 
 **Imports**
 - Repository modules share one package identity.
@@ -840,8 +839,6 @@ Release recalculates the priority of a kept decision.
 - A session's role from its name (a Claude worker's slot role is the one value read from a name); a transport-specific route state in `broadcast.py`; name matching for membership or sender exclusion; a `--json` field for `RosterEntry.session`.
 
 - `live_sessions()` as `running_sessions()` filtered by the socket check; making `procStart` required.
-
-- A module-wide ban on wind-down calling `broadcast`.
 
 - Writing AGENTS.md in place.
 
@@ -871,8 +868,6 @@ Release recalculates the priority of a kept decision.
 - **Shutdown tests can never reach the user's phone.** Two fixture alerts once reached it from a test whose fake had gone stale. The guard fails at the last call before a real process, so a stale fake fails loudly instead of sending.
 
 - **The installer writes atomically.** `Path.write_bytes` truncates first, so a failed in-place write would erase the user's rules outside the block and leave markers every later install refuses.
-
-- **The process table has its own module** so `broadcast.py` can import `roster.py` without a cycle, and roster, broadcast and wind-down share one reader.
 
 The owning machine reads account attribution and includes it in the snapshot.
 Claude rows use their process configuration.
