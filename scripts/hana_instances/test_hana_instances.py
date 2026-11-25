@@ -324,6 +324,199 @@ class HanaInstancesTests(unittest.TestCase):
                                   else "mac:201: environment unknown", errors.getvalue())
                     uses.assert_not_called()
 
+    def test_check_checkout_reports_clear_hana_process_and_scan_failure_without_stopping(self) -> None:
+        from scripts.lint import tmp_sweep
+
+        checkout = self.process(101, {"HANA_TEST_OWNER": "proof"}).resolve()
+        hana = self.local_rows()
+        in_use = tmp_sweep.ProcessUsesKnown([(str(checkout), 202, tmp_sweep.WORKS_IN)])
+        scans: list[tuple[list[hana_instances.HanaProcess], list[str]]] = [
+            ([], []), (hana, []), ([], []), ([], []), ([], ["local process table unavailable"]),
+        ]
+        cases = (
+            (0, "hana-instances: checkout clear\n", ""),
+            (2, "", "hana-instances: Hana still runs in the checkout\n"),
+            (2, "", "hana-instances: a process still uses the checkout\n"),
+            (2, "", "hana-instances: process use could not be read\n"),
+            (2, "", "hana-instances: local process table unavailable\n"),
+        )
+        with (mock.patch.object(sys, "platform", "linux"),
+              mock.patch.object(hana_instances, "collect_processes", side_effect=scans) as collect,
+              mock.patch.object(tmp_sweep, "process_paths", side_effect=[
+                  tmp_sweep.ProcessUsesKnown([]), in_use, tmp_sweep.ProcessUsesUnavailable(),
+              ]) as uses,
+              mock.patch.object(hana_instances, "stop_process", side_effect=AssertionError("a process was stopped"))):
+            for expected in cases:
+                with self.subTest(expected=expected):
+                    output, errors = io.StringIO(), io.StringIO()
+                    with redirect_stdout(output), redirect_stderr(errors):
+                        code = hana_instances.main(["check-checkout", str(checkout)])
+                    self.assertEqual((code, output.getvalue(), errors.getvalue()), expected)
+        self.assertEqual(collect.call_args_list, [mock.call(local_only=True)] * len(cases))
+        self.assertEqual(uses.call_args_list, [
+            mock.call(tmp_sweep.PROC_DIR, (str(checkout.parent) + os.sep,), require_readable_user_processes=True),
+        ] * 3)
+
+    def test_check_checkout_fails_when_a_process_working_directory_is_unreadable(self) -> None:
+        from scripts.lib.build_folders import CheckFailed
+        from scripts.lint import tmp_sweep
+
+        checkout = self.root.resolve() / "checkout"
+        with (mock.patch.object(sys, "platform", "linux"),
+              mock.patch.object(hana_instances, "collect_processes", return_value=([], [])),
+              mock.patch.object(tmp_sweep, "process_paths", return_value=tmp_sweep.ProcessUsesKnown(
+                  [], unreadable_cwd_pids=(202,))) as uses):
+            scan = hana_instances.scan_checkouts([checkout])
+        uses.assert_called_once_with(tmp_sweep.PROC_DIR, (str(checkout.parent) + os.sep,),
+                                     require_readable_user_processes=True)
+        self.assertEqual(hana_instances.check_checkout(checkout, scan), CheckFailed("process use could not be read"))
+
+    def test_check_checkout_detects_process_use_directly_under_root(self) -> None:
+        from scripts.lib.build_folders import Clear, NotClear
+        from scripts.lint import tmp_sweep
+
+        checkout = Path("/hana-checkout-test")
+        sibling = checkout.with_name("hana-checkout")
+        process = self.proc / "202"
+        process.mkdir()
+        (process / "cwd").symlink_to(checkout / "work")
+        _ = (process / "status").write_text(f"Uid:\t{os.geteuid()}\t{os.geteuid()}\nState:\tS\nThreads:\t1\n")
+        caller = self.proc / "self"
+        caller.mkdir()
+        _ = (caller / "status").write_text("CapPrm:\t0\n")
+
+        with (mock.patch.object(sys, "platform", "linux"),
+              mock.patch.object(hana_instances, "collect_processes", return_value=([], [])),
+              mock.patch.object(tmp_sweep, "PROC_DIR", str(self.proc))):
+            scan = hana_instances.scan_checkouts([checkout, sibling])
+        self.assertEqual(hana_instances.check_checkout(checkout, scan), NotClear("a process still uses the checkout"))
+        self.assertEqual(hana_instances.check_checkout(sibling, scan), Clear())
+
+    def test_checkout_scan_covers_multiple_paths_with_one_local_process_read(self) -> None:
+        from scripts.lib.build_folders import CheckFailed, Clear, NotClear
+        from scripts.lint import tmp_sweep
+
+        checkout = self.root.resolve() / "first"
+        second = checkout.with_name("second")
+        other = checkout.with_name("unscanned")
+        in_use = tmp_sweep.ProcessUsesKnown([(str(checkout), 202, tmp_sweep.WORKS_IN)])
+        collect = hana_instances.collect_processes
+
+        def collect_fixture(*, local_only: bool) -> tuple[list[hana_instances.HanaProcess], list[str]]:
+            return collect(self.local_rows, self.ssh, platform="linux", local_only=local_only)
+
+        with (mock.patch.object(sys, "platform", "linux"),
+              mock.patch.object(hana_instances, "collect_processes", side_effect=collect_fixture) as inventory,
+              mock.patch.object(tmp_sweep, "process_paths", return_value=in_use) as uses):
+            scan = hana_instances.scan_checkouts([checkout, second])
+            self.assertEqual(scan.uses, hana_instances.CheckoutUsesKnown((checkout, second), in_use))
+            self.assertEqual(hana_instances.check_checkout(checkout, scan), NotClear("a process still uses the checkout"))
+            self.assertEqual(hana_instances.check_checkout(second, scan), Clear())
+            self.assertEqual(hana_instances.check_checkout(other, scan), CheckFailed("process use could not be read"))
+        inventory.assert_called_once_with(local_only=True)
+        uses.assert_called_once_with(tmp_sweep.PROC_DIR, (str(checkout.parent) + os.sep,),
+                                     require_readable_user_processes=True)
+        self.assertEqual(self.ssh_calls, [])
+
+    def test_checkout_scan_distinguishes_skipped_and_unavailable_process_use(self) -> None:
+        from scripts.lib.build_folders import CheckFailed, NotClear
+        from scripts.lint import tmp_sweep
+
+        active = self.process(101, {"HANA_TEST_OWNER": "proof"}).resolve()
+        idle = active.with_name("idle")
+        with (mock.patch.object(sys, "platform", "linux"),
+              mock.patch.object(hana_instances, "collect_processes", return_value=(self.local_rows(), [])),
+              mock.patch.object(tmp_sweep, "process_paths", side_effect=[
+                  tmp_sweep.ProcessUsesUnavailable(), PermissionError("process table access denied"),
+              ]) as uses):
+            skipped = hana_instances.scan_checkouts([active])
+            self.assertEqual(skipped.uses, hana_instances.CheckoutUsesSkipped())
+            uses.assert_not_called()
+            missing = hana_instances.scan_checkouts([active, idle])
+            failed = hana_instances.scan_checkouts([active, idle])
+
+        self.assertEqual(missing.uses, hana_instances.CheckoutUsesUnavailable((idle,), "process use could not be read"))
+        self.assertEqual(hana_instances.check_checkout(idle, missing), CheckFailed("process use could not be read"))
+        self.assertEqual(failed.uses, hana_instances.CheckoutUsesUnavailable((idle,), "process table access denied"))
+        self.assertEqual(hana_instances.check_checkout(idle, failed), CheckFailed("process table access denied"))
+        self.assertEqual(hana_instances.check_checkout(active, failed), NotClear("Hana still runs in the checkout"))
+
+    def test_stop_checkout_stops_a_test_hana_before_it_reports_clear(self) -> None:
+        from scripts.lint import folder_audit, tmp_sweep
+
+        checkout = self.process(101, {"HANA_TEST_OWNER": "proof"}).resolve()
+        stop = hana_instances.stop_process
+
+        def stop_fixture(row: hana_instances.HanaProcess, config: hana_instances.HanaInstancesConfig) -> None:
+            stop(row, config, signal_call=self.send_signal, sleep_call=self.sleeps.append,
+                 identity_reader=self.identity, platform="linux")
+
+        def collect_fixture() -> tuple[list[hana_instances.HanaProcess], list[str]]:
+            return self.local_rows(), []
+
+        output, errors = io.StringIO(), io.StringIO()
+        with (redirect_stdout(output), redirect_stderr(errors),
+              mock.patch.object(hana_instances, "collect_processes", side_effect=collect_fixture),
+              mock.patch.object(hana_instances, "stop_process", side_effect=stop_fixture),
+              mock.patch.object(folder_audit, "process_uses", return_value=tmp_sweep.ProcessUsesKnown([])) as uses):
+            code = hana_instances.main(["stop-checkout", str(checkout)])
+        self.assertEqual((code, output.getvalue(), errors.getvalue()),
+                         (0, "natedev:101: stopped\nhana-instances: checkout clear\n", ""))
+        self.assertEqual(self.signals, [(101, signal.SIGTERM), (101, signal.SIGKILL)])
+        self.assertEqual(self.sleeps, [0.125])
+        uses.assert_called_once_with([checkout])
+
+    def test_stop_checkout_uses_the_hana_classification_from_before_the_process_scan(self) -> None:
+        from scripts.lint import folder_audit, tmp_sweep
+
+        unrelated = self.process(101, {"HANA_TEST_OWNER": "proof"})
+        checkout = self.root.resolve() / "checkout"
+        checkout.mkdir()
+        alias = self.root / "alias"
+        alias.symlink_to(unrelated)
+        row = replace(self.local_rows()[0], checkout=alias)
+
+        def uses_fixture(paths: list[Path]) -> tmp_sweep.ProcessUsesKnown:
+            self.assertEqual(paths, [checkout])
+            alias.unlink()
+            alias.symlink_to(checkout)
+            return tmp_sweep.ProcessUsesKnown([], unreadable_cwd_pids=(202,))
+
+        output, errors = io.StringIO(), io.StringIO()
+        with (redirect_stdout(output), redirect_stderr(errors),
+              mock.patch.object(hana_instances, "collect_processes", return_value=([row], [])) as collect,
+              mock.patch.object(hana_instances, "stop_process") as stop,
+              mock.patch.object(folder_audit, "process_uses", side_effect=uses_fixture) as uses):
+            code = hana_instances.main(["stop-checkout", str(checkout)])
+        self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, "hana-instances: checkout clear\n", ""))
+        self.assertEqual(collect.call_count, 2)
+        uses.assert_called_once_with([checkout])
+        stop.assert_not_called()
+
+    def test_stop_checkout_reports_mac_unreachable_before_resolving_known_hana(self) -> None:
+        from scripts.lint import folder_audit
+
+        unreadable = self.process(101, {"HANA_TEST_OWNER": "proof"})
+        checkout = self.root / "checkout"
+        resolve = Path.resolve
+
+        def resolve_fixture(path: Path) -> Path:
+            if path == unreadable:
+                raise PermissionError("Hana checkout path could not be resolved")
+            return resolve(path)
+
+        rows = self.local_rows()
+        output, errors = io.StringIO(), io.StringIO()
+        with (redirect_stdout(output), redirect_stderr(errors),
+              mock.patch.object(Path, "resolve", autospec=True, side_effect=resolve_fixture),
+              mock.patch.object(hana_instances, "collect_processes", return_value=(rows, ["mac: unreachable"])),
+              mock.patch.object(hana_instances, "stop_process") as stop,
+              mock.patch.object(folder_audit, "process_uses") as uses):
+            code = hana_instances.main(["stop-checkout", str(checkout)])
+        self.assertEqual((code, output.getvalue(), errors.getvalue()), (2, "", "hana-instances: mac: unreachable\n"))
+        stop.assert_not_called()
+        uses.assert_not_called()
+
     def test_each_configured_exempt_port_requires_labels_or_agent_environment(self) -> None:
         _ = self.process(101, {"BRP_EXTRAS_PORT": "31002"})
         base = self.local_rows()[0]

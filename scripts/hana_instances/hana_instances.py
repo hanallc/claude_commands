@@ -9,7 +9,7 @@ except FileNotFoundError:
 
 import argparse
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 import os
 from pathlib import Path
@@ -19,14 +19,17 @@ import signal
 import subprocess
 import sys
 import time
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 PROC_ROOT = Path("/proc")
 # offload shares sibling modules with its CLI; keep that existing import boundary.
 
 from scripts.lib import conf
+from scripts.lib.build_folders import CheckFailed, Clear, NotClear
 from scripts.lib.conf import UseConfiguredValue
 
+if TYPE_CHECKING:
+    from scripts.lint.tmp_sweep import ProcessUsesKnown, ProcessUsesUnavailable
 
 
 @dataclass(frozen=True)
@@ -257,6 +260,7 @@ def collect_processes(
     *, platform: str | None = None,
     local_runner: Callable[[list[str]], subprocess.CompletedProcess[str]] = run_local,
     environment_reader: Callable[[int], dict[str, str]] = darwin_environment,
+    local_only: bool = False,
 ) -> tuple[list[HanaProcess], list[str]]:
     problems: list[str] = []
     if (sys.platform if platform is None else platform) == "darwin":
@@ -264,6 +268,8 @@ def collect_processes(
         if result.returncode:
             raise ValueError("mac: local process table could not be read")
         rows = mac_processes(result.stdout, environment_reader)
+    elif local_only:
+        rows = local_source()
     else:
         from scripts.mac_test import eligibility, offload
         rows = local_source()
@@ -365,34 +371,137 @@ def row_text(row: HanaProcess) -> str:
             f"purpose {row.purpose or 'unlabelled'} age {row.age_seconds / 3600:.2f} h checkout {row.checkout}")
 
 
-def stop_checkout(checkout: Path, config: HanaInstancesConfig) -> None:
-    """Confirm test Hanas exited and no process still uses a checkout before its task ends."""
+@dataclass(frozen=True)
+class CheckoutUsesSkipped:
+    pass
+
+
+@dataclass(frozen=True)
+class CheckoutUsesUnavailable:
+    checkouts: tuple[Path, ...]
+    reason: str
+
+
+@dataclass(frozen=True)
+class CheckoutUsesKnown:
+    checkouts: tuple[Path, ...]
+    processes: ProcessUsesKnown
+
+
+CheckoutUseScan = CheckoutUsesSkipped | CheckoutUsesUnavailable | CheckoutUsesKnown
+
+
+@dataclass(frozen=True)
+class CheckoutScan:
+    hanas: list[HanaProcess]
+    problems: list[str]
+    uses: CheckoutUseScan = CheckoutUsesSkipped()
+
+    def check_checkout(self, checkout: Path, /) -> Clear | NotClear | CheckFailed:
+        return check_checkout(checkout, self)
+
+
+_HANA_STILL_RUNNING = "Hana still runs in the checkout"
+_PROCESS_USE_UNREADABLE = "process use could not be read"
+_CHECKOUT_SCAN_ERRORS = (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired, StopIteration, IndexError)
+
+
+def _checkout_hanas(checkout: Path, scan: CheckoutScan) -> list[HanaProcess] | CheckFailed:
+    unrelated_problems = {
+        environment_problem(row, row.environment_status)
+        for row in scan.hanas
+        if isinstance(row.environment_status, EnvironmentUnknown)
+        and not row.checkout.resolve().is_relative_to(checkout)
+    }
+    relevant_problems = [problem for problem in scan.problems if problem not in unrelated_problems]
+    if relevant_problems:
+        return CheckFailed("; ".join(relevant_problems))
+    return [row for row in scan.hanas if row.checkout.resolve().is_relative_to(checkout)]
+
+
+def _read_checkout_uses(paths: tuple[Path, ...]) -> ProcessUsesKnown | ProcessUsesUnavailable:
+    from scripts.lint import tmp_sweep
+
+    prefixes = tuple(dict.fromkeys(os.path.join(path.parent, "") for path in paths))
+    if sys.platform == "linux":
+        # Scan this user's processes, as stop-checkout does.
+        return tmp_sweep.process_paths(tmp_sweep.PROC_DIR, prefixes, require_readable_user_processes=True)
+    return tmp_sweep.process_uses_with_lsof(tmp_sweep.PROC_DIR, prefixes)
+
+
+def _checkout_use_scan(paths: tuple[Path, ...], processes: ProcessUsesKnown | ProcessUsesUnavailable
+                       ) -> CheckoutUsesKnown | CheckoutUsesUnavailable:
+    from scripts.lint.tmp_sweep import ProcessUsesUnavailable
+
+    if isinstance(processes, ProcessUsesUnavailable):
+        return CheckoutUsesUnavailable(paths, _PROCESS_USE_UNREADABLE)
+    return CheckoutUsesKnown(paths, processes)
+
+
+def scan_checkouts(checkouts: Sequence[Path]) -> CheckoutScan:
+    """Read this host's process use for the named checkouts."""
+    try:
+        scan = CheckoutScan(*collect_processes(local_only=True))
+        resolved = dict.fromkeys(path.resolve() for path in checkouts)
+        paths = tuple(path for path in resolved if not _checkout_hanas(path, scan))
+    except _CHECKOUT_SCAN_ERRORS as error:
+        return CheckoutScan([], [str(error) or _PROCESS_USE_UNREADABLE])
+    if not paths:
+        return scan
+    try:
+        uses = _checkout_use_scan(paths, _read_checkout_uses(paths))
+    except _CHECKOUT_SCAN_ERRORS as error:
+        uses = CheckoutUsesUnavailable(paths, str(error) or _PROCESS_USE_UNREADABLE)
+    return replace(scan, uses=uses)
+
+
+def _check_checkout(checkout: Path, hanas: list[HanaProcess] | CheckFailed,
+                    uses: CheckoutUseScan, *,
+                    require_complete: bool) -> Clear | NotClear | CheckFailed:
+    if isinstance(hanas, CheckFailed):
+        return hanas
+    if hanas:
+        return NotClear(_HANA_STILL_RUNNING)
+    if isinstance(uses, CheckoutUsesSkipped) or checkout not in uses.checkouts:
+        return CheckFailed(_PROCESS_USE_UNREADABLE)
+    if isinstance(uses, CheckoutUsesUnavailable):
+        return CheckFailed(uses.reason)
+    processes = uses.processes
+    if any(Path(path).resolve().is_relative_to(checkout) for path, _, _ in processes.paths):
+        return NotClear("a process still uses the checkout")
+    if require_complete and (processes.unreadable_cwd_pids or processes.unreadable_process_pids
+                             or processes.kernel_hidden):
+        return CheckFailed(_PROCESS_USE_UNREADABLE)
+    return Clear()
+
+
+def check_checkout(checkout: Path, scan: CheckoutScan) -> Clear | NotClear | CheckFailed:
+    """Check a checkout against the supplied process scan."""
     checkout = checkout.resolve()
+    return _check_checkout(checkout, _checkout_hanas(checkout, scan), scan.uses, require_complete=True)
 
-    def checkout_processes() -> list[HanaProcess]:
-        rows, problems = collect_processes()
-        unrelated_environment_problems = {
-            environment_problem(row, row.environment_status)
-            for row in rows
-            if isinstance(row.environment_status, EnvironmentUnknown)
-            and not row.checkout.resolve().is_relative_to(checkout)
-        }
-        relevant_problems = [problem for problem in problems if problem not in unrelated_environment_problems]
-        if relevant_problems:
-            raise ValueError("; ".join(relevant_problems))
-        return [row for row in rows if row.checkout.resolve().is_relative_to(checkout)]
 
-    for row in checkout_processes():
+def stop_checkout(checkout: Path, config: HanaInstancesConfig) -> None:
+    """Stop test Hanas and confirm that the checkout is clear."""
+    checkout = checkout.resolve()
+    hanas = _checkout_hanas(checkout, CheckoutScan(*collect_processes()))
+    if isinstance(hanas, CheckFailed):
+        raise ValueError(hanas.reason)
+    for row in hanas:
         stop_process(row, config)
-    if checkout_processes():
-        raise ValueError(f"{checkout}: Hana exit could not be confirmed")
-    # Reuse the audit's host-aware process-use scan for builds and examples too.
-    from scripts.lint.folder_audit import ProcessUsesUnavailable, process_uses
-    uses = process_uses([checkout])
-    if isinstance(uses, ProcessUsesUnavailable):
-        raise ValueError(f"{checkout}: process use could not be read")
-    if any(Path(path).resolve().is_relative_to(checkout) for path, _, _ in uses.paths):
-        raise ValueError(f"{checkout}: a process still uses the checkout")
+    remaining = _checkout_hanas(checkout, CheckoutScan(*collect_processes()))
+    uses: CheckoutUseScan = CheckoutUsesSkipped()
+    if not remaining:
+        from scripts.lint.folder_audit import process_uses
+
+        uses = _checkout_use_scan((checkout,), process_uses([checkout]))
+    result = _check_checkout(checkout, remaining, uses, require_complete=False)
+    if isinstance(result, CheckFailed):
+        reason = result.reason if isinstance(remaining, CheckFailed) else f"{checkout}: {result.reason}"
+        raise ValueError(reason)
+    if isinstance(result, NotClear):
+        reason = "Hana exit could not be confirmed" if result.reason == _HANA_STILL_RUNNING else result.reason
+        raise ValueError(f"{checkout}: {reason}")
     print("hana-instances: checkout clear")
 
 
@@ -410,10 +519,19 @@ def main(argv: list[str] | None = None) -> int:
     _ = stop.add_argument("target", help="natedev:<pid|port> or mac:<pid|port>")
     checkout = commands.add_parser("stop-checkout")
     _ = checkout.add_argument("target", help="local checkout whose test Hanas must exit before removal")
+    check = commands.add_parser("check-checkout")
+    _ = check.add_argument("target", help="local checkout to check for process use")
     sweep = commands.add_parser("sweep")
     _ = sweep.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv, namespace=Arguments())
     try:
+        if args.command == "check-checkout":
+            path = Path(args.target)
+            result = check_checkout(path, scan_checkouts([path]))
+            if not isinstance(result, Clear):
+                raise ValueError(result.reason)
+            print("hana-instances: checkout clear")
+            return 0
         config = read_config()
         if args.command == "stop-checkout":
             stop_checkout(Path(args.target), config)

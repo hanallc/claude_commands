@@ -35,7 +35,7 @@ from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.copies import copies
 from scripts.lib import build_folders, conf, scratch
-from scripts.lib.build_slots import SlotQueuePosition
+from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.build_steps import (
     GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, gate_job_for_command,
 )
@@ -147,7 +147,7 @@ class DirectGatePlacementTests(unittest.TestCase):
         assignment = replace(placed(target).assignment, owner=owner,
                              source_key=execution_identity.SourceKeyKnown(key))
         grant = admission_wire.Assignment(assignment)
-        position = SlotQueuePosition(assignment.episode, assignment.since)
+        position = CopyQueuePosition(assignment.episode, assignment.since)
         profile = admission_records.ProgramProfile("gate", str(source), str(source),
             admission_records.HistoryPeakSizing(1, admission_records.FirstProgramPeak(1), 0))
         constraints = placement.PlacementConstraints(assignment.source_key, command, str(source), "", assignment.session,
@@ -369,7 +369,7 @@ class DirectGatePlacementTests(unittest.TestCase):
             identity = build_hold.ProcessIdentity(owner.pid, owner.start_time)
             grant = admission_wire.Assignment(assignment)
             admission_client.write_assignment(path, grant)
-            inherited = first_step.FirstStepAdmission(SlotQueuePosition(assignment.episode, assignment.since),
+            inherited = first_step.FirstStepAdmission(CopyQueuePosition(assignment.episode, assignment.since),
                                                        first_step.InheritedGatePlacement(grant), path)
             _ = (source / "edit.txt").write_text("Changed since placement.\n")
             response = admission_wire.PlacementStatusReply(admission_wire.KnownPlacementStatus(
@@ -666,7 +666,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         @contextmanager
         def admit() -> Generator[first_step.FirstStepAdmission]:
             try:
-                position = SlotQueuePosition(assignment.episode, assignment.since)
+                position = CopyQueuePosition(assignment.episode, assignment.since)
                 yield first_step.FirstStepAdmission(position, first_step.OwnedGatePlacement(grant, request),
                                                    self.root / "assignment.json")
             finally:
