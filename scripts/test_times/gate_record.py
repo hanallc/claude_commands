@@ -389,11 +389,15 @@ def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[Mod
     return modules
 
 
-def report_not_written(error: BaseException, *, record_name: str = "gate run") -> None:
-    """Report a failed record on one line."""
+def _report_record_error(message: str, error: BaseException) -> None:
     detail = " ".join(str(error).splitlines())
     with suppress(OSError, ValueError):
-        print(f"{record_name} not written: {detail}", file=sys.stderr, flush=True)
+        print(f"{message}: {detail}", file=sys.stderr, flush=True)
+
+
+def report_not_written(error: BaseException, *, record_name: str = "gate run") -> None:
+    """Report a failed record on one line."""
+    _report_record_error(f"{record_name} not written", error)
 
 
 def keep_failure_logs(record_id: str, host: str, epoch: float, modules: Sequence[ModuleRun],
@@ -421,6 +425,7 @@ def keep_failure_logs(record_id: str, host: str, epoch: float, modules: Sequence
 
 def write_gate_run(run: GateRun, executions: Sequence[Execution]) -> None:
     """Append one gate record without failing the caller."""
+    row_written = False
     try:
         # This import keeps gate_record free of an import cycle with index.py.
         from scripts.buildlog import record, store
@@ -431,8 +436,13 @@ def write_gate_run(run: GateRun, executions: Sequence[Execution]) -> None:
                                 "id": record.new_id(host, epoch), "host": host, **run,
                                 "tests_run": sum(module["tests_run"] for module in run["modules"])}
         keep_failure_logs(entry["id"], host, epoch, run["modules"], executions)
-        store.append_line(store.host_file(host, epoch), entry)
+        with store.locked_append(store.host_file(host, epoch)) as handle:
+            store.append_locked(handle, entry)
+            row_written = True
     except Exception as error:
+        if row_written:
+            _report_record_error("gate run sync failed", error)
+            return
         report_not_written(error)
         if "pid" in run and "suite_folders" in run and run["suite_folders"] and "end" in run:
             end: GateFolderEnd = {"pid": run["pid"], "suite_folders": run["suite_folders"], "end": run["end"]}

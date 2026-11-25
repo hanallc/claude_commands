@@ -1640,6 +1640,7 @@ class GateFolderJournal:
     branch: str
     step: str
     start: gate_record.GateFolderStart | GateFolderAllocation = GateFolderAllocation.NOT_ALLOCATED
+    end_write_finished: bool = False
 
 
 _ACTIVE_GATE_FOLDER_JOURNAL: ContextVar[GateFolderJournal | None] = ContextVar(
@@ -1774,21 +1775,34 @@ def unwind_gate_on_sigterm() -> Generator[None]:
         yield
         return
     token = _GATE_RECEIVED_SIGTERM.set(False)
+    interrupted_journal: GateFolderJournal | None = None
 
     def terminate(number: int, _frame: object) -> None:
+        nonlocal interrupted_journal
         if not _GATE_RECEIVED_SIGTERM.get():
             _ = _GATE_RECEIVED_SIGTERM.set(True)
+            interrupted_journal = _ACTIVE_GATE_FOLDER_JOURNAL.get()
             raise SystemExit(128 + number)
+
+    def write_interrupted_end() -> None:
+        if interrupted_journal is not None and not interrupted_journal.end_write_finished:
+            start = interrupted_journal.start
+            if not isinstance(start, GateFolderAllocation):
+                gate_record.write_gate_folder_event(gate_folder_end(start, "sigterm"))
 
     try:
         _ = signal.signal(signal.SIGTERM, terminate)
         yield
     finally:
-        _ = signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        terminated = _GATE_RECEIVED_SIGTERM.get()
-        _GATE_RECEIVED_SIGTERM.reset(token)
-        if terminated:
-            signal.raise_signal(signal.SIGTERM)
+        # The handler ignores later SIGTERM signals until the fallback ends.
+        try:
+            write_interrupted_end()
+        finally:
+            _ = signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            terminated = _GATE_RECEIVED_SIGTERM.get()
+            _GATE_RECEIVED_SIGTERM.reset(token)
+            if terminated:
+                signal.raise_signal(signal.SIGTERM)
 
 
 @unwind_gate_on_sigterm()
@@ -1947,16 +1961,15 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     began = time.monotonic()
     started_at = time.time()
     initial_hold_seconds = hold.seconds if hold is not None else 0.0
-    end_recorded = False
 
     def can_retry_memory_stop(result: GateJobResult) -> bool:
         return (result.memory_stopped and result.returncode != 0 and not result.tripwire_tripped
                 and memory_reruns.get((result.suite, result.module), 0) < memory_stop_reruns)
 
     def record(status: int, aborted: bool) -> None:
-        nonlocal end_recorded
-        previous_signals = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+        previous_signals = signal.pthread_sigmask(signal.SIG_BLOCK, ())
         try:
+            _ = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
             end = gate_run_end(status)
             if ledger is None or admission is None or isinstance(selection, NamedModules) or (
                     aborted and not job_started and end != "sigterm"):
@@ -1969,7 +1982,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                                 wall_s=wall_s, hold_wait_s=waited, selection=selection, reused=reused,
                                 reason=reason, status=status, max_jobs=max_running_jobs, peak_mib=admission.peak_mib,
                                 cap_mib=admission.governor_mib, aborted=aborted, mode=mode, folder_start=journal.start)
-            end_recorded = True
+            journal.end_write_finished = True
         finally:
             _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous_signals)
 
@@ -1990,7 +2003,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             status = int(not suite_result().passed)
             record(status, aborted=False)
         except BaseException:
-            if not end_recorded and not isinstance(journal.start, GateFolderAllocation):
+            if not journal.end_write_finished and not isinstance(journal.start, GateFolderAllocation):
                 record(1, aborted=True)
             raise
         finally:

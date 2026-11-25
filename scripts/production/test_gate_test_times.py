@@ -146,6 +146,51 @@ gate.gate_temporary = arm_after_suite
                  for row in store.locked_rows(path)]
         self.assertEqual(kinds.count("gate_folder_end"), 0)
 
+    def test_sigterm_during_cleanup_error_unwind_writes_one_end(self) -> None:
+        preamble = """from contextlib import contextmanager
+from scripts.lib import build_folders
+allocate = gate.gate_temporary
+remove = build_folders._remove_build_folder
+sigmask = signal.pthread_sigmask
+
+def stop_before_mask(how, signals):
+    if how == signal.SIG_BLOCK and signals == {signal.SIGTERM}:
+        signal.pthread_sigmask = sigmask
+        assert signal.SIGTERM not in sigmask(signal.SIG_BLOCK, ())
+        signal.raise_signal(signal.SIGTERM)
+    return sigmask(how, signals)
+
+@contextmanager
+def fail_suite_cleanup(recovery, tool, parent):
+    try:
+        with allocate(recovery, tool, parent) as folder:
+            yield folder
+
+            def refuse_removal(path, **options):
+                if path == folder:
+                    raise OSError("fixture cleanup failure")
+                return remove(path, **options)
+
+            build_folders._remove_build_folder = refuse_removal
+    except OSError as error:
+        assert str(error) == "fixture cleanup failure"
+        assert folder.is_dir()
+        signal.pthread_sigmask = stop_before_mask
+        raise
+    finally:
+        build_folders._remove_build_folder = remove
+
+gate.gate_temporary = fail_suite_cleanup
+"""
+        result = self.run_gate("--tests-only", "--full", own_process=True, preamble=preamble)
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
+        rows = [row for path in Path(self.environment["BUILDLOG_DIR"]).glob("*/*.jsonl")
+                for row in store.locked_rows(path)]
+        start, = [row for row in rows if row.get("kind") == "gate_folder_start"]
+        ends = [row for row in rows if row.get("kind") in ("gate_run", "gate_folder_end")]
+        self.assertEqual([(row.get("end"), row.get("suite_folders")) for row in ends],
+                         [("sigterm", [start["folder"]])])
+
     def test_sigterm_during_the_timing_append_writes_one_end(self) -> None:
         preamble = """from scripts.buildlog import store
 write_all = store._write_all

@@ -14,7 +14,7 @@ import sqlite3
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
-from typing import cast, override
+from typing import BinaryIO, cast, override
 import unittest
 from unittest import mock
 
@@ -503,14 +503,15 @@ class GateRecordTests(unittest.TestCase):
         self.write_leased_folder(folder, owner)
         run = gate_run()
         run.update(pid=12, process_start="100", boot_id="boot-a", suite_folders=[str(folder)], end="normal")
-        append = store.append_line
+        append = store.append_locked
 
-        def refuse_timing(path: Path, row: Mapping[str, object]) -> None:
+        def refuse_timing(handle: BinaryIO, row: Mapping[str, object]) -> None:
             if row["kind"] == "gate_run":
+                _ = handle.write(b'{"kind":"gate_run",')
                 raise OSError("timing append failed")
-            append(path, row)
+            append(handle, row)
 
-        with mock.patch.object(store, "append_line", side_effect=refuse_timing), redirect_stderr(io.StringIO()) as error:
+        with mock.patch.object(store, "append_locked", side_effect=refuse_timing), redirect_stderr(io.StringIO()) as error:
             gate_record.write_gate_run(run, fixture_executions(run))
         self.assertEqual(error.getvalue(), "gate run not written: timing append failed\n")
         [path] = list(self.buildlog.glob("*/*.jsonl"))
@@ -518,9 +519,33 @@ class GateRecordTests(unittest.TestCase):
         [status] = gate_record.gate_folder_status(folder.parent)
         self.assertEqual(status["end"], "normal")
 
+    def test_timing_sync_failure_keeps_one_end(self) -> None:
+        folder = self.root.resolve() / "gate/g-retained"
+        owner: gate_record.GateFolderOwner = {"pid": 12, "process_start": "100", "boot_id": "boot-a"}
+        self.write_leased_folder(folder, owner)
+        [path] = list(self.buildlog.glob("*/*.jsonl"))
+        run = gate_run()
+        run.update(pid=12, process_start="100", boot_id="boot-a", suite_folders=[str(folder)], end="normal")
+        sync = os.fsync
+        identity = path.stat()
+
+        def fail_log_sync(descriptor: int) -> None:
+            if os.path.samestat(os.fstat(descriptor), identity):
+                raise OSError("fixture sync failure")
+            sync(descriptor)
+
+        with (mock.patch.object(store, "host_file", return_value=path),
+              mock.patch.object(os, "fsync", side_effect=fail_log_sync),
+              redirect_stderr(io.StringIO()) as error):
+            gate_record.write_gate_run(run, fixture_executions(run))
+        self.assertEqual([row["kind"] for row in store.locked_rows(path)], ["gate_folder_start", "gate_run"])
+        self.assertEqual(error.getvalue(), "gate run sync failed: fixture sync failure\n")
+        [status] = gate_record.gate_folder_status(folder.parent)
+        self.assertEqual(status["end"], "normal")
+
     def test_log_write_and_stderr_failure_leave_the_gate_result_alone(self) -> None:
         run = gate_run()
-        with (mock.patch.object(store, "append_line", side_effect=OSError("log failed")),
+        with (mock.patch.object(store, "append_locked", side_effect=OSError("log failed")),
               redirect_stderr(io.StringIO()) as output,
               mock.patch.object(output, "write", side_effect=BrokenPipeError("closed pipe")) as write):
             gate_record.write_gate_folder_event({"folder": str(self.root / "g-test"), "pid": 12,
