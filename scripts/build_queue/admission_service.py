@@ -4928,7 +4928,7 @@ class AdmissionServer:
             session_id = record["submitting_session"]
             session = OwningSession(session_id) if session_id else NoOwningSession()
             if record.get("cleanup_pending", False):
-                cleanup.append(placement.RetainedCleanupClaim(reference, "provider cleanup remains unresolved"))
+                cleanup.append(placement.RetainedCleanupClaim(reference, "provider cleanup remains unresolved", session))
                 executions.append((reference, execution_identity.ExecutionEvidenceUnavailable("provider cleanup remains unresolved", self.clock.now())))
                 continue
             adopted.append(placement.AdoptedProviderClaim(reference,
@@ -5440,6 +5440,7 @@ done
                 if isinstance(evidence, placement.FreshHostEvidence) and isinstance(permitted, placement.AllowedHost):
                     from scripts.mac_test.mac_test import scopes_overlap
 
+                    mac = destination.provider == "mac"
                     retained = tuple((attempt.provider, report.received_at) for attempt in self.assignments.values()
                         for report in (attempt.terminal_report,)
                         if isinstance(attempt.state, placement.ClosedAssignment)
@@ -5447,13 +5448,20 @@ done
                         and isinstance(report.outcome, BeforeLaunchRefusal)
                         and isinstance(attempt.provider, placement.ProviderClaimReference)
                         and attempt.provider.provider == destination.provider and attempt.provider.target == destination.target
-                        and scopes_overlap(attempt.provider.scope, destination.scope, mac=destination.provider == "mac"))
-                    if any(scopes_overlap(claim.reference.scope, destination.scope, mac=destination.provider == "mac")
-                            and (isinstance(claim, placement.RetainedCleanupClaim)
-                                 or any(claim.reference == item[0] for item in retained))
-                            for claim in (*evidence.cleanup_claims, *evidence.claims)):
+                        and scopes_overlap(attempt.provider.scope, destination.scope, mac=mac))
+                    # The Mac runner can take over cleanup before it asks for launch permission.
+                    session = request.constraints.session
+                    own_cleanup = {claim for claim in evidence.cleanup_claims
+                                   if mac and isinstance(session, OwningSession) and claim.session == session}
+                    other_busy = any(claim not in own_cleanup and scopes_overlap(claim.reference.scope, destination.scope, mac=mac)
+                                     for claim in evidence.cleanup_claims)
+                    own_references = {claim.reference for claim in own_cleanup}
+                    if other_busy or any(claim.reference == reference
+                                         for claim in evidence.claims for reference, _ in retained):
                         permitted = placement.TemporaryExclusion("busy")
-                    elif evidence.observed_at < max((item[1] for item in retained), default=float("-inf")):
+                    elif any(evidence.observed_at < received_at
+                             or (evidence.observed_at == received_at and reference in own_references)
+                             for reference, received_at in retained):
                         permitted = placement.EvidenceNeeded("provider evidence predates the retained claim report")
             result.append(placement.CandidateEligibility(destination, permitted))
         return tuple(result), local_holder

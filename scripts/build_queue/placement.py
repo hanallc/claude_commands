@@ -413,6 +413,7 @@ class RetainedCleanupClaim:
     """The claim remains retained for cleanup for this reason."""
     reference: ProviderClaimReference
     reason: str
+    session: OwningSession | NoOwningSession = NoOwningSession()
 
 
 @dataclass(frozen=True)

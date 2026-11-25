@@ -5136,6 +5136,72 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                     reply, = fixture.server.handle_request(consume_permission("valid-consumption", original, claim))
                     self.assertEqual(reply, wire.FirstAuthorization(original, claim))
 
+    def test_only_the_owning_session_can_place_for_kept_mac_cleanup(self) -> None:
+        from scripts.build_targets import build_targets
+
+        for session in (OwningSession("another-session"), NoOwningSession(), SUBMITTING_SESSION):
+            with (self.subTest(session=session), PlacementFixture() as fixture,
+                  mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+                owner_request = placement_request(fixture)
+                request = owner_request if session == SUBMITTING_SESSION else placement_request(fixture, session=session)
+                destination = request.constraints.candidates[0].destination
+                target = target_config.SshTarget("mac", "macos", fixture.root / "mac_test.conf")
+                paths = claim_state.StatePaths(fixture.root / "mac-state")
+                paths.directory.mkdir()
+                record: claim_state.RemoteJobClaim = {
+                    "claim_id": "kept-claim", "episode": "old-episode", "attempt": "old-attempt",
+                    "submitting_session": SUBMITTING_SESSION.session_id, "pid": request.owner.pid,
+                    "proc_start": "ended", "remote_host": destination.host, "what": "clippy hana",
+                    "worktree": str(fixture.root), "since": "2026-11-17T10:00:00+00:00",
+                    "cleanup_pending": True,
+                }
+                mac_test.write_json(paths.run, record)
+                before = paths.run.read_bytes()
+                key = fixture.server.host_evidence_key(request, destination)
+                fixture.server.host_requests[key] = request
+                with (mock.patch.object(target_config, "read_targets", return_value=(target,)),
+                      mock.patch.object(claim_state, "state_paths", return_value=paths),
+                      mock.patch.object(build_targets, "ssh_target_eligibility",
+                                        return_value=target_config.EligibleTarget(target)),
+                      mock.patch.object(mac_test, "free_now", return_value="free")):
+                    evidence = fixture.read_host_evidence(key)
+                    assert isinstance(evidence, placement.FreshHostEvidence), evidence
+                claim, = evidence.cleanup_claims
+                self.assertEqual(claim.session, SUBMITTING_SESSION)
+                owner_key = fixture.server.host_evidence_key(owner_request, destination)
+                owner_evidence = replace(evidence, key=owner_key)
+                fixture.provider_evidence[owner_key] = owner_evidence
+                fixture.server.publish_host_evidence(owner_evidence)
+                original = assignment_for(fixture, owner_request)
+
+                fixture.clock.advance(1)
+                refused_at = fixture.clock.now()
+                _ = fixture.server.handle_request(wire.ClaimFailure("cleanup-busy", original, "busy", claim.reference))
+                saved = fixture.server.assignments[execution_identity.attempt_key(original.episode, original.attempt)]
+                self.assertEqual(saved.state, placement.ClosedAssignment("busy"))
+                self.assertEqual(saved.provider, claim.reference)
+                self.assertEqual(saved.terminal_report, placement.TerminalAttemptReport(
+                    placement.PrelaunchRefused("busy"), placement.DispatchPathSettled(), refused_at))
+
+                for observed_at in (evidence.observed_at, refused_at, refused_at + 1):
+                    with self.subTest(evidence_age=observed_at - refused_at):
+                        fixture.clock.advance(max(0, observed_at - fixture.clock.now()))
+                        reading = replace(evidence, observed_at=observed_at)
+                        fixture.provider_evidence[key] = reading
+                        fixture.server.publish_host_evidence(reading)
+                        reply, = fixture.server.handle_request(request)
+                        if session == SUBMITTING_SESSION and observed_at > refused_at:
+                            assert isinstance(reply, wire.Assignment), reply
+                            self.assertNotEqual(reply.assignment.attempt, original.attempt)
+                        else:
+                            assert isinstance(reply, wire.PlacementWait), reply
+                            eligibility = reply.eligibility[0].eligibility
+                            if session == SUBMITTING_SESSION:
+                                self.assertIsInstance(eligibility, placement.EvidenceNeeded)
+                            else:
+                                self.assertEqual(eligibility, placement.TemporaryExclusion("busy"))
+                self.assertEqual(paths.run.read_bytes(), before)
+
     def test_session_evidence_cannot_transfer_a_holders_exemption(self) -> None:
         with PlacementFixture() as fixture:
             holder = placement_request(fixture, session=OwningSession("holder"))
