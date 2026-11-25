@@ -59,22 +59,27 @@ class TuneTests(PublicationTestCase):
         )
 
     def test_only_a_saved_guest_key_prints_the_hana_image_notice(self) -> None:
-        source = self.repository.checkout / 'hana_aws.conf'
-        _ = source.write_text('host=fixture-hana\nenabled=on\nspot_max_usd_per_hour=0.35\n')
-        for key, saved, expected in (
-            ('host', live_settings.StagedSave('fixture-hana', 1), 1),
-            ('enabled', live_settings.StagedSave('off', 1), 1),
-            ('spot_max_usd_per_hour', live_settings.StagedSave('0.25', 2), 0),
-            ('enabled', live_settings.UnchangedSave(), 0),
+        checkout = self.repository.checkout
+        _ = (checkout / 'hana_aws.conf').write_text('host=fixture-hana\nenabled=on\nspot_max_usd_per_hour=0.35\n')
+        _ = (checkout / 'aws_target.conf').write_text('hana.copies.max=2\nhana.copies.max_bytes=4096\ndaily_limit_usd=35\n')
+        for file, key, value, saved, expected in (
+            ('hana_aws', 'host', 'fixture-hana', live_settings.StagedSave('old-hana', 1), 1),
+            ('hana_aws', 'enabled', 'on', live_settings.StagedSave('off', 1), 1),
+            ('hana_aws', 'spot_max_usd_per_hour', '0.35', live_settings.StagedSave('0.25', 2), 0),
+            ('hana_aws', 'enabled', 'on', live_settings.UnchangedSave(), 0),
+            ('aws_target', 'hana.copies.max', '2', live_settings.StagedSave('1', 3), 1),
+            ('aws_target', 'hana.copies.max_bytes', '4096', live_settings.StagedSave('2048', 4), 1),
+            ('aws_target', 'daily_limit_usd', '35', live_settings.StagedSave('30', 5), 0),
         ):
-            with (self.subTest(key=key, saved=saved), mock.patch.object(conf, 'path', return_value=source),
+            with (self.subTest(file=file, key=key, saved=saved),
+                    mock.patch.object(conf, 'path', return_value=checkout / f'{file}.conf'),
                     mock.patch.object(main_publish, 'checkout_of', return_value=self.repository.checkout),
                     mock.patch.object(live_settings, 'stage_save', return_value=saved),
                     mock.patch.object(live_settings, 'publish', return_value=[]),
                     mock.patch.object(live_settings, 'start_readers', return_value=[]),
                     mock.patch.object(live_settings, 'write_mac', return_value='Mac updated'),
                     redirect_stdout(io.StringIO()) as output):
-                args = tune.RequestedValueChange(file='hana_aws', key=key, value='on')
+                args = tune.RequestedValueChange(file=file, key=key, value=value)
                 self.assertEqual(tune.change(args), 0)
             self.assertEqual(output.getvalue().splitlines().count(
                 'The Hana image is now stale. Build and register a current Hana image.'), expected)

@@ -435,6 +435,34 @@ class HanaExecutionTests(unittest.TestCase):
         self.assertEqual(self.settle(), first)
         self.assertEqual(self.releases, 1)
 
+    def test_replay_settles_a_saved_abi_2_request_and_observation(self) -> None:
+        self.assertIsInstance(self.dispatch(), execution.DispatchSent)
+        observation = replace(self.objects.observe_execution(self.key), fenced=True, terminated=True, lease_free=True)
+        with mock.patch.object(self.objects, 'observe_execution', return_value=observation):
+            self.assertEqual(execution.observe_execution(self.root, self.request, self.objects), observation.evidence)
+
+        path = execution.execution_path(self.root, self.key.claim_id)
+        row = result.object_fields(cast(object, json.loads(path.read_text())))
+        request = result.object_fields(row['request'])
+        result.object_fields(request['manifest'])['runtime_abi'] = 2
+        request['slot'] = request.pop('copy_number')
+        saved_observation = result.object_fields(row['observation'])
+        saved_observation['slot'] = saved_observation.pop('copy_number')
+        _ = path.write_text(json.dumps(row))
+
+        with self.assertRaisesRegex(ValueError, 'copy_number'):
+            _ = hana_protocol.decode_request(hana_protocol.encode_document(request))
+        with self.assertRaisesRegex(ValueError, 'copy_number'):
+            _ = hana_protocol.decode_observation(hana_protocol.encode_document(saved_observation))
+
+        self.assertEqual(execution.read_dispatch_observation(self.root, self.request), observation)
+        settled = execution.replay_execution_settlement(self.root, self.assignment,
+            retained_generation=hana.generation_text(self.key.generation), release_claim=self.release)
+        self.assertEqual(settled, execution.HanaSettled(
+            placement.AttemptDeclined('The Hana command has no accepted result'), observation.evidence))
+        self.assertEqual(self.releases, 1)
+        self.assertFalse(execution.claim_dispatch_pending(self.root, self.reference))
+
     def test_nonzero_compiler_result_is_terminal_and_replay_is_idempotent(self) -> None:
         _ = self.dispatch()
         content = result.encode_result(self.command_result(1))

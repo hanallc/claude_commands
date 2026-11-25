@@ -14,8 +14,8 @@ Placement remains disabled.
 7. Preserve mode `0600` for the receiver, safety configuration, and control files.
 8. Give `hana-runner` the home `/var/lib/hana/runner` on the data filesystem.
 9. Create that home in a oneshot unit after `var-lib-hana.mount`, with `RequiresMountsFor=/var/lib/hana`.
-10. Give `hana-runner` its approved slot, Cargo, mirror, shell, and temporary directories on the data filesystem.
-11. Install the approved `roots.slots.aws-hana`, `slots.aws-hana.hana.max`, and `slots.aws-hana.hana.max_bytes` settings.
+10. Give `hana-runner` its approved copy, Cargo, mirror, shell, and temporary directories on the data filesystem.
+11. Set the Hana copy limits with `hana.copies.max` and `hana.copies.max_bytes` in `config/aws_target.conf`.
 12. Preserve the root-only IMDS rule and the independent guard and watchdog units.
 13. Review the complete import closure in `scripts/aws_target/hana_render.files`.
 
@@ -26,7 +26,7 @@ It checks the actual data mount and the current acknowledged permit before comma
 
 The receiver invokes `hana_guest.admit_command` before it starts the unit.
 The unit runs `/var/lib/hana-runtime/runner.py` as `hana-runner` inside `hana-work.slice`.
-The unit acquires the assigned slot after systemd starts the unit.
+The unit acquires the assigned copy after systemd starts the unit.
 The unit retains maker descriptors through source preparation, shell preparation, Cargo, and result capture.
 `ExitType=main` sets the unit lifetime to the payload process.
 When the runner observes Cargo exit, it measures and reads the bytes pending on each pipe.
@@ -36,7 +36,7 @@ The watchdog can kill these processes during source or shell preparation.
 `RuntimeMaxSec` bounds the whole unit, including source and shell preparation.
 The runner uses a monotonic deadline to bound the wait for Cargo exit.
 The deadline ends the command cgroup even when the controller continues permit renewal.
-The receiver reports a terminal loss after the cgroup and exact slot lease end.
+The receiver reports a terminal loss after the cgroup and exact copy lease end.
 
 The receiver supplies only the request and the output bound through standard input.
 The request includes scoped source GET access.
@@ -60,7 +60,7 @@ The receiver reads that runtime configuration through `CONF_DIR`.
 The image installs `/etc/hana-aws/runner-environment` for the transient command and source-only units.
 That file supplies the runner home, Cargo home, rustup home, temporary path, configuration path, and shared sccache environment.
 The data directory unit installs the common Cargo configuration without a separate copy.
-The approved pool has one Hana slot with a 128 GiB size limit.
+The approved pool has one Hana copy with a 128 GiB size limit.
 
 The shell and compiler checks precede the requested Cargo judgment.
 The source toolchain hash still binds `rust-toolchain.toml` to the exact captured commit.
@@ -72,13 +72,13 @@ F1 calls `SourceSender.retry_complete` for the original captured commit.
 F1 sends `HanaSourceUpdateEnvelope` with the `source-update` action through the command object.
 The action carries no new command permission.
 The receiver checks the original request binding, the current permit, and the exact attempt fence.
-The receiver requires the original unit and its slot lease to end before it accepts source preparation.
-The source update must preserve the commit, command, environment, features, toolchain, repository, attempt, and slot.
+The receiver requires the original unit and its copy lease to end before it accepts source preparation.
+The source update must preserve the commit, command, environment, features, toolchain, repository, attempt, and copy number.
 The complete bundle must require no basis commits.
 
 The receiver starts one bounded source-only unit as `hana-runner` inside `hana-work.slice`.
 That unit materializes the complete source and runs no shell preparation or Cargo command.
-The receiver reports `source_updated` after the source-only unit and its exact slot lease end.
+The receiver reports `source_updated` after the source-only unit and its exact copy lease end.
 Repeated delivery cannot repeat preparation or grant command execution.
 Fencing stops both the original unit and the source-only unit.
 F1 fences and settles the original attempt after source preparation.

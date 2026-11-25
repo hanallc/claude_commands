@@ -60,8 +60,7 @@ The target name occurs in configuration and fixtures, never in production select
 `max_steps` supplies the one-step claim limit; E introduces no second concurrency setting.
 The target advertises one candidate slot through the existing slot-capacity boundary.
 The guest still requires separately approved maker capacity.
-The current guest keys are `roots.slots.aws-hana`, `slots.aws-hana.hana.max`, and `slots.aws-hana.hana.max_bytes`.
-The older `slots.aws.hana` spelling in the parent plan does not authorize another pool.
+Set the Hana copy limits with `hana.copies.max` and `hana.copies.max_bytes` in `config/aws_target.conf`.
 
 The user must approve active target ordering through `/tune` after approving the USD 6 trial bound.
 The recommended order places the Hana target before natedev and preserves every other target's relative order.
@@ -157,7 +156,7 @@ Background workers return evidence to the loop thread rather than changing these
 3. Validate the normalized repository key and the existing Linux capability keys.
 4. Reject unsupported Hana step semantics before requesting a lifecycle claim.
 5. Request placement through `admission_client.request_placement()`.
-6. Claim only the assigned target, repository scope, and slot.
+6. Claim only the assigned target, repository scope, and copy number.
 7. Commit incoming work through `HanaController.request()` with the exact assignment execution key.
 8. Wait through the existing controller lifecycle until readiness or the configured start deadline.
 9. Adopt the exact claim with the checked local holder, submitting session, and verified boot generation.
@@ -194,7 +193,7 @@ Start and idle-stop serialization remains in `HanaController` under `controller_
 A committed incoming claim prevents idle stop.
 A saved stop intent prevents a later start claim.
 Two requests may observe an idle box, but only one controller claim can succeed.
-There is no overflow slot or second instance.
+There is no overflow copy or second instance.
 
 Provider evidence runs in the existing background worker with the configured bounded call timeout.
 Use `aws_timeout_s` for Hana rather than adding unused SSH timeout keys.
@@ -271,9 +270,9 @@ No area can activate the route alone.
 | E | Target transport types, inactive registration, capability checks, lifecycle projection, spending preview, background evidence, notices, and hold classification. | Owns target and admission-service edits. Supplies assignment-bound claim results to F1. |
 | F1 | Extend `ProcessController`, pending operation tracking, `claimed_run()`, transport selection in `run_offload()`, and `report_placement_result()`. | Uses E transport and claim results. Keeps exact adoption, first authorization, local admission release, and settlement. |
 | G | Define linked attempt rows, compatible schema fields, source and command validation, host separation, and ledger cost readers. | Uses existing episode and attempt identities. Wires the final F1/F2 result after those adapters exist. |
-| F2 | Build guest tool setup, leased-slot command execution, mount and toolchain checks, cgroups, bounded command transport, and result delivery. | Uses phase B's `hana_source.materialize()` and the agreed F1 command identity. Activation needs F1 settlement. |
+| F2 | Build guest tool setup, command execution in a leased copy, mount and toolchain checks, cgroups, bounded command transport, and result delivery. | Uses phase B's `hana_source.materialize()` and the agreed F1 command identity. Activation needs F1 settlement. |
 
-F2 must retain the maker slot lock in the command and its descendants.
+F2 must retain the maker copy lock in the command and its descendants.
 It must use `hana_guest.admit_command()` and the independent watchdog.
 It must use the shared NixOS toolchain and source-derived compiler identity.
 G computes costs only in the AWS ledger report path, never in `record.py`.
@@ -292,12 +291,12 @@ Stored shapes added: none.
 If implementation requires a stored shape change, define an external conversion and stopped-writer deployment before merging it.
 Do not add compatibility guesses to strict readers.
 Add the service module to `admission_code.py` before deployment.
-Activation still requires owner agreement, F1/G/F2 acceptance, approved slot capacity, and the user's USD 6 first-day approval.
+Activation still requires owner agreement, F1/G/F2 acceptance, approved copy capacity, and the user's USD 6 first-day approval.
 
 ## 8. Required E test rows
 
 Use private roots, private configuration, fake provider calls, private process evidence, and real fixture sockets where required.
-Create test repositories through the existing maker and slot fixtures.
+Create test repositories through the existing maker and copy fixtures.
 Contact no live queue service, AWS account, or unit.
 Keep existing Mac, SSH, and verify routing assertions unchanged.
 
@@ -314,7 +313,7 @@ Keep existing Mac, SSH, and verify routing assertions unchanged.
 | E9 | Natedev drain during remote execution | Keep the exact remote waiter without a local memory reservation or cargo token. Preserve unrelated waiting-run behavior. |
 | E10 | Memory, disk, workload budget, account cap | Exclude with a safe reason. A spending preview mutates nothing. An actual start rechecks the current ledger. |
 | E11 | Interruption, restart, cancellation | Exclude interrupted capacity and retain uncertain claims. F1 owns fencing, command departure, and the single final outcome. |
-| E12 | Claim identity and replay | Reject a mismatched slot, session, holder, source, or generation. Lost first authorization launches zero commands; repeated consumption grants no permission. |
+| E12 | Claim identity and replay | Reject a mismatched copy number, session, holder, source, or generation. Lost first authorization launches zero commands; repeated consumption grants no permission. |
 | E13 | Edited source or lost result | Keep fallback behind settlement. F1/G reject stale source and late fenced results before row or cache writes. |
 | E14 | Compiler, shell, disk, or setup failure | E consumes a refusal without an SSH probe. F2 proves the mount, compiler, shell, and independent guard behavior. |
 | E15 | Configuration and evidence refresh | Changed enabled state, spend, hold, or readiness invalidates affected evidence without permanently removing the candidate. |
@@ -324,7 +323,7 @@ Keep existing Mac, SSH, and verify routing assertions unchanged.
 | E19 | Queue read snapshots | Set each new field shown by `View`, `Mine`, `Explain`, `BuildHistory`, or `PlacementStatus` on the loop thread. Verify snapshot dirty marking. |
 
 Phase B already owns exact dirty-source capture, rescue, retained target paths, and missing-basis transfer tests.
-F2 owns physical slot acquisition, full-pool behavior, inherited locks, oversized slots, and actual command limits.
+F2 owns copy acquisition, full-pool behavior, inherited locks, oversized copies, and actual command limits.
 G owns linked fallback counting, historical records, host-specific totals, stop intervals, and delayed bills.
 E adds boundary fixtures for those outcomes rather than recreating their implementations.
 
