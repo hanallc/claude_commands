@@ -6416,12 +6416,12 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
             try:
                 if process.stat().st_uid != os.getuid():
                     continue
+                groups = systemd_cgroups(process)
             except FileNotFoundError:
                 present.discard(pid)
                 continue
             except OSError:
                 continue
-            groups = _systemd_cgroups(process)
             for hierarchy, path in groups:
                 shared_sessions.update(shared_groups.get((hierarchy, path), set()))
                 for ancestor in (path, *path.parents):

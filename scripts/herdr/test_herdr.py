@@ -6285,9 +6285,11 @@ class HerdrTests(unittest.TestCase):
         orphan = self.process(41, 1, ["sh"], {})
         for process in (other_server, orphan):
             _ = (process / "cgroup").write_text("0::/user.slice/session-7.scope\n")
+        # PID 13 has a stat record but its cgroup read fails after exit.
+        _ = self.process(13, 1, ["codex"], {"HERDR_PANE_ID": "w1:p2"})
         (self.proc / "12").mkdir()
 
-        self.assertEqual(herdr.herdr_places({11, 12, 99}).placements, {11: herdr.HerdrPlace("writing", "w1:p1")})
+        self.assertEqual(herdr.herdr_places({11, 12, 13, 99}).placements, {11: herdr.HerdrPlace("writing", "w1:p1")})
         pane_lists = [command for command in self.commands() if command[2:4] == ["pane", "list"]]
         self.assertEqual(pane_lists, [["--session", "writing", "pane", "list"]])
 
