@@ -208,9 +208,11 @@ class ChangeImageTests(ImagesFixture):
 
 class ImagesTests(ImagesFixture):
     def test_staff_image_owners_have_role_colors_and_unknown_owners_stay_plain(self) -> None:
+        _ = (self.temporary / "config/statusline.conf").write_text("role.unit-director=#ffaf02\n")
         record = self.register()
         body = images.render(self.status).decode()
         self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>shot-owner</span>')
+        self.assertRegex(body, r'\(<span[^>]*data-color-text="role.unit-director" style="color:#ffaf02">unit</span>\)</dd>')
         unknown = record.copy()
         unknown["owner"] = "missing-owner"
         self.assertIn('Unknown session: missing-owner</dd>', images.card(unknown, "private", staff.snapshot(), 2))

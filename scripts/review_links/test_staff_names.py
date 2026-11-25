@@ -22,6 +22,27 @@ def without_role_colors(markup: str) -> str:
 
 
 class StaffNameTests(unittest.TestCase):
+    def test_role_labels_use_accounts_colors_and_escape_the_text(self) -> None:
+        colors = {"role.showrunner": "#123456", "role.unit-director": "yellow",
+                  "role.worker": "bright-blue", "role.producer": "pink"}
+        with patch.object(accounts, "role_colors", return_value=colors):
+            names = staff_names.StaffNames(staff.StaffSnapshot(()))
+        for role, group in (("producer", "producers"), ("showrunner", "showrunners"), ("unit", "units"),
+                            ("unit director", "units"), ("merge director", "units"), ("style director", "units"),
+                            ("worker", "workers")):
+            with self.subTest(role=role):
+                color = accounts.role_color(group, colors)
+                assert isinstance(color, accounts.StaffRoleColor)
+                self.assertEqual(names.role_label(role, '<Role & "text">'),
+                    f'<span class="staff-name" data-color-text="{color.key}" style="color:{color.css}">'
+                    + '&lt;Role &amp; &quot;text&quot;&gt;</span>')
+        self.assertEqual(names.role_label("unlisted", "<Role>"), "&lt;Role&gt;")
+        with patch.object(accounts, "role_colors", return_value={"role.worker": "invalid"}):
+            uncolored = staff_names.StaffNames(staff.StaffSnapshot(()))
+        self.assertEqual(uncolored.role_label("worker", "Worker"), "Worker")
+        self.assertEqual(uncolored.role_label("unit", "Unit"), "Unit")
+        self.assertEqual(uncolored.role_labels(), {})
+
     def test_every_role_uses_the_accounts_keys_and_current_config(self) -> None:
         kinds: tuple[staff.Kind, ...] = ("showrunner", "unit", "worker", "producer")
         rows = tuple(staff.StaffRow(staff.StaffId(kind), kind, "Name " + kind, staff.StaffRoot(),

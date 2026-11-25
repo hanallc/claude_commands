@@ -744,7 +744,7 @@ function slotTip(slot, group, keepBytes, now, unusedDays) {
   const rows = [field(slot.name, slot.used_by ? "in use" : slot.needs_review ? "review" : "free", "title"),
     field("Repository", group.repository), field("Size", measuredSize(slot.size, keepBytes)), field("Last used", lastUsedText(slot, now))];
   if (slot.used_by) rows.push({...field("Used by", slot.used_by.name || "—"), valueParts:slot.used_by.name_parts},
-    stepTip.staffField("Showrunner", [slot.used_by.showrunner || "—"]));
+    stepTip.staffField("Showrunner", [slot.used_by.showrunner || "—"], "showrunner"));
   if (slot.needs_review) rows.push(field("", `The nightly sweep lists this folder after ${unusedDays} days without use.`, "long", true));
   return rows;
 }
@@ -801,7 +801,7 @@ async function readBuilds(current) {
   }
   if (!current()) return;
   builds = next;
-  if (builds?.staff_names) globalThis.staffNames?.set(builds.staff_names);
+  if (builds?.staff_names) globalThis.staffNames?.set(builds.staff_names, undefined, builds.role_labels);
   renderSlots();
 }
 

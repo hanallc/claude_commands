@@ -2110,11 +2110,14 @@ frame.addEventListener('load',async()=>{
         self.assertIn('<td data-label="Owner"><span class="list-owner-name"><span>nate</span></span></td>', body)
 
     def test_added_log_shows_staff_colors_local_eta_and_field_labels(self) -> None:
-        _ = self.add("Log labels")
+        item = self.add("Log labels")
+        _ = the_list.update(MORTY.id, item.id, {"unit": "fixture-unit"}, source="morty")
         body = list_page.render(self.root / "reviews").decode()
         log = body.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
         self.assertRegex(log, r'Owner</dt><dd><span[^>]*data-color-text="role.showrunner"[^>]*>sdlc</span>')
-        self.assertRegex(log, r'Producer</dt><dd><span[^>]*data-color-text="role.producer"[^>]*>morty</span>')
+        self.assertRegex(log, r'<dt><span[^>]*data-color-text="role.producer" style="color:#90fe42">Producer</span></dt>'
+                         + r'<dd><span[^>]*data-color-text="role.producer"[^>]*>morty</span>')
+        self.assertRegex(log, r'<dt><span[^>]*data-color-text="role.unit-director" style="color:#ffaf02">Unit</span></dt>')
         self.assertIn("ETA</dt><dd>14:00 EST – 15:00 EST</dd>", log)
         self.assertIn("State</dt><dd>Working</dd>", log)
         self.assertIn("Next step</dt><dd>", log)
@@ -2122,6 +2125,19 @@ frame.addEventListener('load',async()=>{
         shown = re.sub(r"<[^>]+>", "", log)
         for text in (OWNER.id, MORTY.id, "EtaRange(", "next_step", "latest_status"):
             self.assertNotIn(text, shown)
+
+    def test_producer_filter_and_both_tables_show_the_producer_label_color(self) -> None:
+        _ = self.add("Producer labels")
+        body = list_page.render(self.root / "reviews", include_counts=False).decode()
+        label = '<span class="staff-name" data-color-text="role.producer" style="color:#90fe42">Producer</span>'
+        self.assertIn(f'aria-label="Producer" data-filter-row="producer"><span aria-hidden="true">{label}</span>', body)
+        self.assertIn('<th scope="col" aria-sort="none" data-list-producer>'
+                      + '<button type="button" id="list-sort-2" data-sort="2">Producer', body)
+        self.assertIn('th[data-list-producer] button{color:var(--producer-label-color,inherit)}', body)
+        self.assertIn(f'<th scope="col">{label}</th>', body.split('<section data-linked-item', 1)[1])
+        self.assertIn('--producer-label-color:#90fe42', body)
+        self.assertIn('td[data-label="Producer"]::before{color:var(--producer-label-color,var(--ink-3))}', body)
+        self.assertIn('<td data-label="Producer">', body)
 
     def test_updated_log_shows_full_eta_and_shares_the_next_step_renderer(self) -> None:
         item = self.add("Log an update")
@@ -2284,7 +2300,8 @@ frame.addEventListener('load',async()=>{
         note = "; ".join(f"{key}: {json.dumps(value)}" for key, value in fields.items())
         log = self.legacy_log("- 2026-11-16 18:00:00+00:00 Added; " + note + " — nate")
         self.assertRegex(log, r'Owner</dt><dd><span[^>]*data-color-text="role.showrunner"[^>]*>sdlc</span>')
-        self.assertRegex(log, r'Producer</dt><dd><span[^>]*data-color-text="role.producer"[^>]*>morty</span>')
+        self.assertRegex(log, r'data-color-text="role.producer"[^>]*>Producer</span></dt>'
+                         + r'<dd><span[^>]*data-color-text="role.producer"[^>]*>morty</span>')
         self.assertIn("State</dt><dd>Working</dd>", log)
         self.assertIn("ETA</dt><dd>14:00 EST – 15:00 EST</dd>", log)
         self.assertIn("Next step</dt><dd>", log)
@@ -7316,6 +7333,10 @@ const change=async path=>{
             return " ".join(re.sub(r"<[^>]+>", " ", markup).split()).replace(" :", ":")
         self.assertEqual(text(list_page.staff_role_html(merge, names)), "the merge director of sdlc")
         self.assertEqual(text(list_page.staff_role_html(MORTY, names)), "the List producer")
+        self.assertRegex(list_page.staff_role_html(merge, names),
+                         r'data-color-text="role.unit-director" style="color:#ffaf02">merge director</span>')
+        self.assertRegex(list_page.staff_role_html(MORTY, names),
+                         r'data-color-text="role.producer" style="color:#90fe42">List producer</span>')
         item = self.add("Merge the needsme unit", number=1)
         ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=merge.id, what="Merge needsme to main.",
                                why="The merge needs nate's go.", config=False, requester=MORTY.id, source="morty")

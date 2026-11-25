@@ -1342,6 +1342,7 @@ class MemoryPage(TypedDict):
     colors: PageColors
     staff_names: NotRequired[dict[str, str]]
     unit_open: NotRequired[str]
+    role_labels: NotRequired[dict[str, staff_names.RoleLabel]]
     ok: bool
     read_at: float
     fresh_until: float
@@ -3951,6 +3952,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     page: MemoryPage = {
         "colors": configuration.colors,
         "staff_names": staff_display.registry(), "unit_open": staff_display.unit_open(),
+        "role_labels": staff_display.role_labels(),
         "ok": True, "read_at": published.written_at, "fresh_until": published.fresh_until,
         "render_seconds": 0.0, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety,

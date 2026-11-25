@@ -544,7 +544,7 @@ body.queue-unavailable [data-page-action^="builds-"] { display: none; }
 .aws-history { margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--line); }
 .aws-history h3 { margin: 0; font-size: 1rem; font-weight: 600; }
 #aws-costs .filter { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-#aws-costs .filter button { font: inherit; font-size: 0.86rem; color: var(--ink-2); background: transparent; border: 0; padding: 5px 12px; cursor: pointer; }
+#aws-costs .filter button { font: inherit; font-size: 0.86rem; color: var(--role-label-color, var(--ink-2)); background: transparent; border: 0; padding: 5px 12px; cursor: pointer; }
 #aws-costs .filter button + button { border-left: 1px solid var(--line); }
 #aws-costs .filter button[aria-pressed="true"] { background: var(--accent); color: #fff; }
 #aws-costs .filter button:focus-visible { outline: 2px solid var(--ink); outline-offset: -2px; }
@@ -751,8 +751,8 @@ let latest = null;
 function field(label, value, kind = 'field', group = false) {
   return {kind, label, value: String(value ?? ''), group};
 }
-function staffField(label, names) {
-  return {...field(label, names.join(', ')), valueStaffNames: names};
+function staffField(label, names, labelRole) {
+  return {...field(label, names.join(', ')), valueStaffNames: names, labelRole};
 }
 // Each bump line names the unit or the one run, the actor that asked, and the user's words.
 function priorityFields(entries, lines) {
@@ -766,6 +766,9 @@ function staffName(text) {
 }
 function roleName(text) {
   return globalThis.staffNames?.parts(text) ?? esc(text);
+}
+function roleLabel(role, text) {
+  return globalThis.staffNames?.roleLabel(role, text) ?? esc(text);
 }
 function nameParts(parts) {
   return parts.map(part => part.kind === 'staff' ? staffName(part.text)
@@ -1577,8 +1580,9 @@ function awsRunTable(runs, estimated, extraRows, units) {
       awsRunTime(run.seconds), awsMoney(awsCents(run.cost_usd), estimated)]};
   });
   const tableRows = [...rows, ...extraRows].map(row => ({...row, values:columns(row.values)}));
+  const headers = awsRunHeaders().map((label, index) => index === AWS_UNIT_COLUMN ? roleLabel("unit", label) : esc(label));
   return `<div class="aws-scroll aws-run-scroll" tabindex="0" aria-label="Individual runs">
-    ${awsTable(columns(awsRunHeaders()), tableRows, units ? [7,8] : [6,7])}</div>`;
+    ${awsTable(columns(headers), tableRows, units ? [7,8] : [6,7])}</div>`;
 }
 
 function awsRunGroups(runs, groupBy, hanaIdle) {
@@ -1642,8 +1646,9 @@ function awsDayRuns(day, view) {
   const seconds = day.runs_list.reduce((total, run) => total + run.seconds, 0);
   rows.push({total:true, values:["Total", day.runs ? awsCount(day.runs) : "—",
     day.runs_list.length ? awsRunTime(seconds) : "—", amount(day.amount_usd), ""]});
+  const groupLabel = roleLabel(groupBy, AWS_RUN_GROUPS[groupBy]);
   return `<div class="aws-scroll aws-group-scroll" tabindex="0" aria-label="Run groups">
-    ${awsTable([AWS_RUN_GROUPS[groupBy], "Runs", "Run time", "Cost", "For one run"], rows, [1,2,3,4])}</div>`;
+    ${awsTable([groupLabel, "Runs", "Run time", "Cost", "For one run"], rows, [1,2,3,4])}</div>`;
 }
 
 function awsDayDetail(day, priceDay, view = awsNewRunView(), unitStart = null) {
@@ -1652,8 +1657,11 @@ function awsDayDetail(day, priceDay, view = awsNewRunView(), unitStart = null) {
   const estimate = day.state === "estimate" ? `<p class="aws-note">This amount is our estimate. It uses our run records${price}.
     AWS has no amount for this day yet.</p>` : "";
   const units = awsDayHasUnits(day);
-  const controls = Object.entries(AWS_RUN_GROUPS).filter(([group]) => units || group !== "unit").map(([group, label]) =>
-    `<button type="button" data-aws-group-by="${group}" aria-pressed="${group === view.groupBy}">${label}</button>`).join("");
+  const controls = Object.entries(AWS_RUN_GROUPS).filter(([group]) => units || group !== "unit").map(([group, label]) => {
+    const color = globalThis.staffNames?.roleLabels[group]?.css;
+    const style = color ? ` style="--role-label-color:${color}"` : '';
+    return `<button type="button" data-aws-group-by="${group}" aria-pressed="${group === view.groupBy}"${style}>${label}</button>`;
+  }).join("");
   return `<div class="aws-day-detail" data-aws-day="${day.day}">${estimate}
     <div class="aws-run-controls"><span class="aws-dim">Group by</span>
       <div class="filter" role="group" aria-label="Group by">${controls}</div>
@@ -1927,8 +1935,8 @@ function doneText(row) {
 }
 function ownerFields(row) {
   const showrunner = ownerText(row.showrunner);
-  const fields = [staffField('Showrunner', [showrunner])];
-  if (row.runner === 'worker') fields.push(staffField('Worker', [ownerText(row.worker)]));
+  const fields = [staffField('Showrunner', [showrunner], 'showrunner')];
+  if (row.runner === 'worker') fields.push(staffField('Worker', [ownerText(row.worker)], 'worker'));
   if (row.caller) fields.push(field('Caller', row.caller));
   return fields.filter(row => row.value);
 }
@@ -2100,7 +2108,7 @@ function tooltipRows(key, rawData) {
     const match = row.match_rule ? ` (${row.match_rule})` : "";
     return [field('Kept place', `place ${row.position}`, 'title'),
       field('', `Kept for the next run of unit ${unit}`, 'caption'),
-      field('Unit', unit, 'field', true), field('Failed run', row.failed_run),
+      {...field('Unit', unit, 'field', true), labelRole:'unit'}, field('Failed run', row.failed_run),
       field('Failed step', row.failed_step || '—'), field(row.ended === 'no_result' ? 'Ended at' : 'Failed at', row.failed_at),
       field('Kept until', row.kept_until),
       field('', `If the next run of unit ${unit}${match} arrives before ${row.kept_until}, ` +
@@ -2133,8 +2141,11 @@ function tipCellsHtml(rows) {
       : row.kind === 'folder' ? row.value.split(/(?<=\/)(?=.)/).map(segment => `<span>${esc(segment)}</span>`).join('<wbr/>')
       : row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(staffName).join(', ') : esc(row.value);
     const cell = `<dd${attr}>${value}</dd>`;
-    return ['caption','long'].includes(row.kind) ? cell
-      : `<dt${attr}>${row.labelParts ? nameParts(row.labelParts) : row.labelStaffName ? staffName(row.labelStaffName) + esc(row.labelSuffix) : esc(row.label)}</dt>` + cell;
+    if (['caption','long'].includes(row.kind)) return cell;
+    const label = row.labelParts ? nameParts(row.labelParts)
+      : row.labelStaffName ? staffName(row.labelStaffName) + esc(row.labelSuffix)
+      : row.labelRole ? roleLabel(row.labelRole, row.label) : esc(row.label);
+    return `<dt${attr}>${label}</dt>` + cell;
   }).join('');
 }
 function tipText(key, data) {
@@ -2144,8 +2155,9 @@ function tipText(key, data) {
 }
 function sentence(text) { return text ? text[0].toUpperCase() + text.slice(1) : ""; }
 function targetOwner(row) {
-  const roles = [["Unit", ownerText(row.unit)], ["Showrunner", ownerText(row.showrunner)]].filter(([, name]) => name);
-  if (roles.length) return roles.map(([label, name]) => label + ' ' + staffName(name)).join(' · ');
+  const roles = [["unit", "Unit", ownerText(row.unit)], ["showrunner", "Showrunner", ownerText(row.showrunner)]]
+    .filter(([, , name]) => name);
+  if (roles.length) return roles.map(([role, label, name]) => roleLabel(role, label) + ' ' + staffName(name)).join(' · ');
   const holder = ownerText(row.holder);
   return holder ? 'Holder ' + staffName(holder) : '';
 }
@@ -2511,7 +2523,7 @@ function restoreReportView(view) {
   }
 }
 function render(d) {
-  if (d.staff_names) globalThis.staffNames?.set(d.staff_names, d.unit_open);
+  if (d.staff_names) globalThis.staffNames?.set(d.staff_names, d.unit_open, d.role_labels);
   if (d.error || !d.ok) {
     throw new Error("The queue did not answer.");
   }

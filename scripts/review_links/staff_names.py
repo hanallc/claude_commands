@@ -1,4 +1,4 @@
-"""Render staff names with the current Accounts role colors."""
+"""Render staff names and role labels with the current Accounts role colors."""
 from __future__ import annotations
 
 import html
@@ -31,6 +31,22 @@ class ContextTextPart(TypedDict):
 
 
 NamePart = StaffNamePart | ContextTextPart
+
+
+ROLE_GROUPS = {
+    "producer": "producers",
+    "showrunner": "showrunners",
+    "unit": "units",
+    "unit director": "units",
+    "merge director": "units",
+    "style director": "units",
+    "worker": "workers",
+}
+
+
+class RoleLabel(TypedDict):
+    opening: str
+    css: str
 
 
 def text_parts(*values: str | StaffReference) -> list[NamePart]:
@@ -107,6 +123,25 @@ class StaffNames:
             return label
         return _role_span_open(color) + label + "</span>"
 
+    def label_color(self, role: str) -> accounts.StaffRoleColor | None:
+        """Resolve the configured color for an explicit role label."""
+        group = ROLE_GROUPS.get(role)
+        if group is None:
+            return None
+        color = accounts.role_color(group, self.colors)
+        return color if isinstance(color, accounts.StaffRoleColor) else None
+
+    def role_label(self, role: str, text: str) -> str:
+        """Render a role label with escaped text."""
+        label = html.escape(text)
+        color = self.label_color(role)
+        return _role_span_open(color) + label + "</span>" if color is not None else label
+
+    def role_labels(self) -> dict[str, RoleLabel]:
+        """Supply validated label colors and spans to JavaScript."""
+        return {role: {"opening": _role_span_open(color), "css": color.css}
+                for role in ROLE_GROUPS if (color := self.label_color(role)) is not None}
+
     def source(self, identity: staff.StaffId) -> str:
         """Keep a unit's parent and name separate, with their own role colors."""
         member = self.members.by_id(identity)
@@ -130,7 +165,7 @@ class StaffNames:
 
 
 def _role_span_open(color: accounts.StaffRoleColor) -> str:
-    """Open the span that shows a name in its role color. This is the one copy of that markup."""
+    """Open a span in the role color."""
     return f'<span class="staff-name" data-color-text="{color.key}" style="color:{color.css}">'
 
 
@@ -143,17 +178,23 @@ def read() -> StaffNames:
     return StaffNames(members)
 
 
-def script(registry: dict[str, str]) -> str:
-    """Share the Python name spans with a page's JavaScript renderer."""
-    return '<script>' + SCRIPT.replace('STAFF_NAMES_DATA', json.dumps(registry).replace('<', '\\u003c')) + '</script>'
+def script(registry: dict[str, str], role_labels: dict[str, RoleLabel] | None = None) -> str:
+    """Share the name spans and role labels with JavaScript."""
+    values = json.dumps({"values": registry, "roleLabels": role_labels or {}}).replace('<', '\\u003c')
+    return '<script>' + SCRIPT.replace('STAFF_NAMES_DATA', values) + '</script>'
 
 
 SCRIPT = r'''window.staffNames={
- values:STAFF_NAMES_DATA,
+ ...STAFF_NAMES_DATA,
  unitOpen:'',
- set(values,unitOpen=''){this.values=values;this.unitOpen=unitOpen;},
+ set(values,unitOpen='',roleLabels=this.roleLabels){this.values=values;this.unitOpen=unitOpen;this.roleLabels=roleLabels;},
  escape(text){return String(text).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#x27;'}[c]));},
  html(text){return this.values[text] ?? this.escape(text);},
+ roleLabel(role,text){
+  const opening=this.roleLabels[role]?.opening;
+  const label=this.escape(text);
+  return opening ? opening+label+'</span>' : label;
+ },
  unit(text){return this.unitOpen ? this.unitOpen+this.escape(text)+'</span>' : this.html(text);},
  parts(text){return String(text).split(' · ').map(part=>this.html(part)).join(' · ');}
 };'''

@@ -14,8 +14,10 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from xml.etree import ElementTree
 from typing import cast
+from scripts.accounts import accounts
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import limits_view, memory_feed, program_memory_feed, progress_profile as progress, queue_view, snapshot_codec
 from scripts.build_queue import test_memory_feed
@@ -452,8 +454,33 @@ class MemoryHoverTests(unittest.TestCase):
     def role_setup(self) -> str:
         members = tuple(staff.StaffRow(staff.StaffId(name), "unit", name, staff.StaffRoot(),
                         current_session=staff.StaffId(name)) for name in ("builder", "helper"))
-        names = staff_names.StaffNames(staff.StaffSnapshot(members))
-        return "globalThis.window=globalThis;" + staff_names.script(names.registry())[8:-9]
+        colors = {"role.unit-director": "#ffaf02", "role.showrunner": "#a379fd", "role.worker": "#ff0404"}
+        with patch.object(accounts, "role_colors", return_value=colors):
+            names = staff_names.StaffNames(staff.StaffSnapshot(members))
+        return "globalThis.window=globalThis;" + staff_names.script(names.registry(), names.role_labels())[8:-9]
+
+    def test_role_labels_color_tooltips_targets_and_aws_controls(self) -> None:
+        tip, held, targets, grouped, individual, csv = cast(list[str], self.page_expression(
+            "(()=>{" + self.role_setup() + """
+            renderTargets([{target:"Mac", state:"Held", unit:"builder", showrunner:"builds"}]);
+            return [tipRowsHtml(ownerFields({showrunner:"builds", runner:"worker", worker:"worker"})),
+              tipRowsHtml(tooltipRows("held:4242-99", data)), $('targets').innerHTML,
+              awsDayDetail(data.days[0], data.price_day, {groupBy:"unit", openGroups:new Set()}),
+              awsDayDetail(data.days[0], data.price_day, {groupBy:"none", openGroups:new Set()}),
+              awsRunsCsv(data.days)];
+            })()""", {**aws_cost_fixture(), "held_places": [self.kept_place_row()]}, walk=True))
+        self.assertRegex(tip, r'<dt><span[^>]*data-color-text="role.showrunner" style="color:#a379fd">Showrunner</span></dt>')
+        self.assertRegex(tip, r'<dt><span[^>]*data-color-text="role.worker" style="color:#ff0404">Worker</span></dt>')
+        self.assertRegex(held, r'<dt[^>]*><span[^>]*data-color-text="role.unit-director" style="color:#ffaf02">Unit</span></dt>')
+        self.assertRegex(targets, r'data-color-text="role.unit-director"[^>]*>Unit</span> ')
+        self.assertRegex(targets, r'data-color-text="role.showrunner"[^>]*>Showrunner</span> builds')
+        for table in (grouped, individual):
+            self.assertRegex(table, r'<th scope="col"><span[^>]*data-color-text="role.unit-director"'
+                             + ' style="color:#ffaf02">Unit</span></th>')
+        self.assertIn('data-aws-group-by="unit" aria-pressed="false" style="--role-label-color:#ffaf02">Unit</button>',
+                      individual)
+        self.assertIn('"Unit"', csv.splitlines()[0])
+        self.assertNotIn('data-color-text', csv)
 
     def test_target_fallback_keeps_holder_text_and_colors_only_staff_names(self) -> None:
         for holder in ("nate", "builder", "<unknown>"):

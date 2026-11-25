@@ -941,7 +941,8 @@ def assign_menu(item: ReviewItem, names: staff_names.StaffNames) -> str:
 
 
 def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *,
-         soon: str = "In 1 hour", owner: str = '', validator: str = '', assignment: str = '', routes: str = '') -> str:
+         soon: str = "In 1 hour", owner: str = '', validator: str = '', assignment: str = '', routes: str = '',
+         names: staff_names.StaffNames | None = None) -> str:
     if item.state == ReviewState.DONE or (item.type == ReviewType.FOR_YOU and not item.actions):
         return ''
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key), 'revision': revision}
@@ -965,8 +966,6 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
          else closes).append(button)
         if action == 'approve':
             closes.append(assignment)
-    heading = (page_frame.ReturningActionHeading.SENDS_TO_SHOWRUNNER if item.type == ReviewType.CHANGE
-               else page_frame.ReturningActionHeading.ITEM_RETURNS)
     later = ''
     if (item.state not in (ReviewState.DONE, ReviewState.VALIDATING)
             and item.type not in (ReviewType.RESPONSE, ReviewType.FOR_YOU) and not waiting_change(item)):
@@ -997,7 +996,11 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
         groups = ('<div class="review-actions"><div class="review-action-group"><span>Sends to '
                   +html.escape(validator)+'</span><div>'+''.join(returns)+'</div></div></div>')
     else:
-        groups = page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading=heading)
+        heading = ''
+        if item.type == ReviewType.CHANGE and returns:
+            names = names if names is not None else staff_names.StaffNames(staff.StaffSnapshot(()))
+            heading = 'Sends to ' + names.role_label('showrunner', 'showrunner')
+        groups = page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading_html=heading)
     return (f'<form method="post" data-review-form {routes}>'+hidden+words+groups+acknowledge
             +'<span role="status" data-send-status></span></form>')
 
@@ -1161,7 +1164,7 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+handoff+'<div data-review-body>'+body+'</div></div>'
             +'<div class="review-log-column">'+record_table.log_panel(log_id, log_html(item, inputs, owner))+exchange+'</div>'
             +form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets), soon=inputs.soon_label,
-                  owner=owner, validator=validator, routes=review_toast_routes(item, inputs.members),
+                  owner=owner, validator=validator, routes=review_toast_routes(item, inputs.members), names=names,
                   assignment=assign_menu(item, names) if 'approve' in item.actions else '')+footer+'</div>')
 
 

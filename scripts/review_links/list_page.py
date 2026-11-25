@@ -248,9 +248,11 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
         heading = content.action + by
         body = f'<strong>{heading}</strong>'
         if fields:
-            body += '<dl>' + ''.join(
-                f'<dt>{FIELD_LABELS[field]}</dt><dd>{log_field_html(field, value, today, names, evidence_id)}</dd>'
-                for field, value in fields.items()) + '</dl>'
+            details: list[str] = []
+            for field, value in fields.items():
+                label = names.role_label(field, FIELD_LABELS[field])
+                details.append(f'<dt>{label}</dt><dd>{log_field_html(field, value, today, names, evidence_id)}</dd>')
+            body += '<dl>' + ''.join(details) + '</dl>'
     elif isinstance(content, the_list.PageFeedback):
         label = {"pending": "Feedback for", "sent": "Feedback sent to", "alerted": "Feedback could not reach"}[content.state]
         recipient = content.recipient_id(keeper)
@@ -514,17 +516,17 @@ ASK_HEADINGS = {the_list.AskKind.GO: "Needs your go", the_list.AskKind.APPROVAL:
 ASK_BUTTONS = {the_list.AskKind.GO: "Go", the_list.AskKind.APPROVAL: "Approved"}
 ASK_NOTES = {the_list.AskKind.GO: "Pressing Go sends your go to {agent}.",
              the_list.AskKind.APPROVAL: "Pressing Approved sends your approval to {agent}."}
-STAFF_ROLES = {"showrunner": "a showrunner", "unit": "a unit director", "worker": "a worker", "producer": "a producer"}
-UNIT_ROLES = {"direct": "a unit director", "merge": "the merge director", "style": "the style director"}
+UNIT_ROLES = {"direct": ("a", "unit director"), "merge": ("the", "merge director"), "style": ("the", "style director")}
 
 
 def staff_role_html(member: staff.StaffRow, names: staff_names.StaffNames) -> str:
-    """Name the role as the Go box shows it, such as "the merge director of sdlc" or "the List producer"."""
+    """Show the staff role and parent in the Go box."""
     if member.kind == "producer" and member.name == "morty":
-        return "the List producer"
-    role = UNIT_ROLES[member.unit_type.value] if isinstance(member.unit_type, staff.UnitDetails) else STAFF_ROLES[member.kind]
+        return "the " + names.role_label("producer", "List producer")
+    article, role = (UNIT_ROLES[member.unit_type.value] if isinstance(member.unit_type, staff.UnitDetails)
+                     else ("a", "unit director" if member.kind == "unit" else member.kind))
     parent = names.members.by_id(member.parent.id) if isinstance(member.parent, staff.ReportsTo) else None
-    return role + (" of " + names.html(parent.id, parent.name) if parent is not None else "")
+    return article + " " + names.role_label(role, role) + (" of " + names.html(parent.id, parent.name) if parent is not None else "")
 
 
 def ask_boxes(entry: ListRecord, secret: str, names: staff_names.StaffNames) -> str:
@@ -1315,9 +1317,15 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     shows = [record_table.Chip("all", "All", len(items)),
              *(record_table.Chip(chip.value, chip.label, chip_counts[chip])
                for chip in ListChip if chip != ListChip.ALL)]
-    headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" id="list-sort-{index}" data-sort="{index}">{label}'
-                      + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
-    linked_headers = ''.join(f'<th scope="col">{label}</th>' for label in HEADERS)
+    producer_label = FIELD_LABELS["producer"]
+    producer_color = names.label_color("producer")
+    headers = ''.join(
+        f'<th scope="col" aria-sort="none"{" data-list-producer" if label == producer_label else ""}>'
+        + f'<button type="button" id="list-sort-{index}" data-sort="{index}">{label}'
+        + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
+    colored_producer = names.role_label("producer", producer_label)
+    linked_headers = ''.join(f'<th scope="col">{colored_producer if label == producer_label else label}</th>'
+                             for label in HEADERS)
     columns = ('<colgroup><col class="list-number-column"><col class="list-owner-column"><col style="width:10%">'
                '<col><col style="width:14%"><col class="list-next-step-column"><col style="width:14%">'
                '<col style="width:8%"></colgroup>')
@@ -1328,6 +1336,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     card_motion = page_frame.CardMotion.read(settings)
     morning = record_table.clock_minutes(settings, "later_morning")
     log_max_height = record_table.log_max_height_rem(settings)
+    producer_property = f';--producer-label-color:{producer_color.css}' if producer_color is not None else ''
     counts = ''
     if include_counts:
         if defer_counts:
@@ -1341,11 +1350,11 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
                + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
-               + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
+               + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem{producer_property}">'
                + '<div data-record-filters>'
                + record_table.chip_row('Owner', staff_chips(members, owners), 'all')
                + '<div class="list-producer-filter">'
-               + record_table.chip_row('Producer', staff_chips(members, producers), 'all')
+               + record_table.chip_row(producer_label, staff_chips(members, producers), 'all', label_html=colored_producer)
                + record_table.words_box('list-search', 'Filter by number, owner, item or state')
                + '</div>'
                + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, 'all')
@@ -1415,6 +1424,8 @@ background:var(--ink-2);border-radius:50%}
 [data-linked-item]{margin-top:16px}
 [data-linked-item] h2{font-size:14px;margin:0 0 8px}
 [data-linked-item] th{padding:8px}
+.list-table th[data-list-producer] button{color:var(--producer-label-color,inherit)}
+.list-table th[data-list-producer] [data-sort-mark]{color:var(--accent)}
 .list-number-column{width:6%}
 @media(960px < width <= 1100px){.list-number-column{width:62px}}
 .list-owner-column{width:var(--list-owner-width,4.5rem)}
@@ -1479,6 +1490,7 @@ border:1px solid var(--line);border-radius:6px;overflow-wrap:anywhere}
 .list-eta-text{white-space:normal;overflow:visible}
 .list-table .list-row td[data-label="Producer"]::before,.list-table .list-row td[data-label="ETA"]::before{
 content:attr(data-label) ': ';color:var(--ink-3)}
+.list-table .list-row td[data-label="Producer"]::before{color:var(--producer-label-color,var(--ink-3))}
 }
 </style>'''
 

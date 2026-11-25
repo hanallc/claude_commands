@@ -109,7 +109,8 @@ def publish(folder: Path, settings: PageSettings) -> Path:
     page = (page_frame.template(source, "Disks", "disks")
             .replace("__STEP_TIP_STYLE__", tip.style).replace("__STEP_TIP_SCRIPT__", tip.script)
             .replace("__DISKS_SETTINGS__", json.dumps(settings).replace("</", "<\\/")))
-    page = page.replace('</head>', staff_names.script(staff_names.read().registry()) + '</head>', 1)
+    names = staff_names.read()
+    page = page.replace('</head>', staff_names.script(names.registry(), names.role_labels()) + '</head>', 1)
     folder.mkdir(parents=True, exist_ok=True)
     page_path = folder / PAGE_NAME
     try:

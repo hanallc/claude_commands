@@ -459,10 +459,19 @@ class MemoryFeedTests(unittest.TestCase):
         runner = staff.StaffRow(staff.StaffId("fixture-runner"), "showrunner", "fixture-runner", staff.StaffRoot(),
                                 current_session=staff.StaffId("fixture-runner"))
         owner = unit_labels.make_labels("fixture-runner", unit_labels.RunsProduction("fixture-runner"), unit_labels.NoDirector())
+        settings = self.root / "statusline.conf"
+        _ = settings.write_text("role.showrunner=#123456\n")
         with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((runner,))):
             page = self.owner_machine_page(owner)
+            _ = settings.write_text("role.showrunner=#abcdef\n")
+            refreshed = self.owner_machine_page(owner)
         self.assertIn('data-color-text="role.showrunner"', page.get("staff_names", {}).get(runner.name, ""))
         self.assertNotIn("nate", page.get("staff_names", {}))
+        self.assertEqual(page.get("role_labels"), {"showrunner": {
+            "opening": '<span class="staff-name" data-color-text="role.showrunner" style="color:#123456">',
+            "css": "#123456"}})
+        assert "role_labels" in refreshed
+        self.assertEqual(refreshed["role_labels"]["showrunner"]["css"], "#abcdef")
 
     def test_feed_reads_the_staff_record_once_across_destinations(self) -> None:
         reading = cloud_reading(with_wait_reason(reservation_reading(), admission_records.NeedsMemory()))

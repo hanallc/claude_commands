@@ -4823,8 +4823,12 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 self.assertEqual(item.actions,expected[item.key])
                 form = review_page.form(item,change_page.ReviewBrowser(token,initial),4,'fixture-revision')
                 self.assertIn('Closes the item',form)
-                heading = 'Sends to showrunner' if item.type == review_items.ReviewType.CHANGE else 'The item returns to you'
-                self.assertIn(heading,form)
+                if item.type == review_items.ReviewType.CHANGE:
+                    self.assertIn('<span>Sends to <span class="staff-name" data-color-text="role.showrunner"'
+                                  + ' style="color:#a379fd">showrunner</span></span>', form)
+                    self.assertIn('value="validate">Ask showrunner to check</button>', form)
+                else:
+                    self.assertIn('The item returns to you', form)
                 self.assertIn('aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later',form)
                 for label in ('In 1 hour','This evening','Tomorrow morning','Next week','Choose a time…'):
                     self.assertIn('<span>'+label+'</span>',form)

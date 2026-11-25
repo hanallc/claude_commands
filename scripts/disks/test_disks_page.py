@@ -76,9 +76,13 @@ class DisksPageTests(unittest.TestCase):
     def setUp(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = (configuration / "disks.conf").write_text("# whole: 1..\ncache_seconds=600\n")
-        # The page reads staff names, and staff reads the machine list.
+        _ = (configuration / "statusline.conf").write_text("role.unit-director=#ffaf02\nrole.showrunner=#a379fd\n")
+        staff_file = configuration / "staff.json"
+        _ = staff_file.write_text('{"schema": 1, "rows": []}')
+        # Staff reads the machine list.
         _ = shutil.copy(Path(__file__).parents[2] / "config" / "machines.conf", configuration)
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(configuration), "STAFF_FILE": str(staff_file)})))
 
     def test_current_builds_keep_staff_parts_in_slot_names(self) -> None:
         member = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(),
@@ -137,8 +141,9 @@ class DisksPageTests(unittest.TestCase):
                                 current_session=staff.StaffId("builds"))
         names = staff_names.StaffNames(staff.StaffSnapshot((runner,)))
         page = self.page_html()
+        self.assertIn('"roleLabels": {"showrunner"', page)
         functions = page[page.index("function slotTip("):page.index("function smallerTip(")]
-        setup = "globalThis.window=globalThis;" + staff_names.script(names.registry())[8:-9] + functions
+        setup = "globalThis.window=globalThis;" + staff_names.script(names.registry(), names.role_labels())[8:-9] + functions
         body = str(self.run_page("(()=>{" + setup + "return stepTip.tipRowsHtml(slotTip("
             + "{name:'builds',size:0,last_used:0,used_by:{name:'builds',showrunner:'builds'}},"
             + "{repository:'builds'},0,100,30));})()"))
@@ -149,8 +154,10 @@ class DisksPageTests(unittest.TestCase):
             value = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == label)
             self.assertEqual(value.text, "builds")
             self.assertEqual(list(value), [])
-        value = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == "Showrunner")
-        self.assertEqual(value.findtext("span"), "builds")
+        label_index = next(index for index, cell in enumerate(grid) if cell.findtext("span") == "Showrunner")
+        label = grid[label_index][0]
+        self.assertEqual((label.get("data-color-text"), label.get("style")), ("role.showrunner", "color:#a379fd"))
+        self.assertEqual(grid[label_index + 1].findtext("span"), "builds")
         session_body = str(self.run_page("(()=>{" + setup
             + "return stepTip.tipRowsHtml(sessionTip({name:'builds',state:'running',size:0,"
             + "held:[{name:'builds',task:'builds'}]},0));})()"))
