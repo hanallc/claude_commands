@@ -4681,6 +4681,8 @@ class StatusRow:
     model_names_by_role: dict[str, dict[SessionModel, ModelSessionNames]] = field(default_factory=dict)
     # The read fills this field only for local sessions and only with include_models=True.
     named_sessions_by_role: dict[str, tuple[NamedSession, ...]] = field(default_factory=dict)
+    fable_left_percent: float | StatusUnavailable = field(default_factory=StatusUnavailable)
+    limit_reset_count: int | StatusUnavailable = field(default_factory=StatusUnavailable)
 
 
 def weekly_quotas(rows: Iterable[StatusRow]) -> dict[str, WeeklyQuota]:
@@ -4830,6 +4832,7 @@ def _status_row(
     credits: float | Literal["unlimited"] | StatusUnavailable = StatusUnavailable()
     read_at: datetime | StatusUnavailable = StatusUnavailable()
     on_credits = NO_VALUE
+    fable_left: float | StatusUnavailable = StatusUnavailable()
     login = status.login if status.is_set_up and status.account_is_safe_to_inspect else ""
     if login:
         read_at = _read_at(usage) or StatusUnavailable()
@@ -4849,6 +4852,8 @@ def _status_row(
                 weekly = WeeklyNotReadSince(read_at, usage_store.weekly_read_skip(held))
             if tool == "codex":
                 on_credits, credits = _credit_reading(held, now, account_config=account_config)
+            elif (fable := held.get("weekly_fable")) is not None and 0 <= fable["left"] <= 100 and _is_current(fable, now):
+                fable_left = fable["left"]
     return StatusRow(status.label, tool, status.folder, login, roles,
         weekly, resets, credits, on_credits,
         tool == "codex" and isinstance(agent_accounts.codex_credits_setting(status.label), agent_accounts.CreditsOn),
@@ -4856,7 +4861,21 @@ def _status_row(
         else agent_accounts.UsageReadOutcome.OK,
         _stored_time((usage or {}).get("attempted_at", "")) or StatusUnavailable(),
         login_ends_at=agent_accounts.login_end_from_iso((usage or {}).get("login_ends_at"))
-        if login and tool == "claude" else agent_accounts.LoginEndUnknown())
+        if login and tool == "claude" else agent_accounts.LoginEndUnknown(),
+        fable_left_percent=fable_left)
+
+
+def _codex_limit_reset_count(label: str) -> int | StatusUnavailable:
+    if _label_is(label, "codex"):
+        note = note_file.read_note(note_file.note_path(label))
+        if isinstance(note, note_file.Note):
+            count = note.get("limit_reset_count") or ""
+            if count.isascii() and count.isdecimal():
+                try:
+                    return int(count)
+                except ValueError:
+                    pass
+    return StatusUnavailable()
 
 
 def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[str, ...]:
@@ -5931,8 +5950,9 @@ def _read_status(source: UsageSource, *, detail: bool, include_models: bool = Fa
         *(_status_row(status, usage.get(usage_store.key("Claude", status.login)), now,
             tuple(group for group, directory in group_directories.items() if status.config_dir == directory), account_config=account_config)
           for status in statuses),
-        *(_status_row(status, usage.get(usage_store.key("Codex", status.login)), now,
-            (status.role,) if status.role in (CODEX_ROLE, "spare") else (), account_config=account_config) for status in codex),
+        *(replace(_status_row(status, usage.get(usage_store.key("Codex", status.login)), now,
+                  (status.role,) if status.role in (CODEX_ROLE, "spare") else (), account_config=account_config),
+                  limit_reset_count=_codex_limit_reset_count(status.label)) for status in codex),
     )
     local_sessions = _read_local_role_sessions(groups, include_models=include_models)
     rows, session_inputs = _count_role_sessions(rows, local_sessions)

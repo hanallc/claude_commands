@@ -298,14 +298,15 @@ def page_url() -> str:
     return PAGE_PATH
 
 
-def _spans(spans: list[accounts.BoardSpan]) -> str:
+def _spans(spans: list[accounts.BoardSpan], *, title: str = "") -> str:
     parts: list[str] = []
+    tooltip = f' title="{html.escape(title, quote=True)}"' if title else ""
     for span in spans:
         color = accounts.account_color(span.get("color", ""))
         style = f' style="color:{color.css}"' if isinstance(color, accounts.AccountColor) else ""
         if "color_key" in span:
             style += f' data-color-text="{html.escape(span["color_key"], quote=True)}"'
-        parts.append(f'<span class="{span["tone"]}{" bold" if span["kind"] == "bold" else ""}"{style}>{html.escape(span["text"])}</span>')
+        parts.append(f'<span{tooltip} class="{span["tone"]}{" bold" if span["kind"] == "bold" else ""}"{style}>{html.escape(span["text"])}</span>')
     return "".join(parts)
 
 
@@ -365,32 +366,43 @@ def _swatch(spans: list[accounts.BoardSpan]) -> str:
 
 
 def _sort_heading(column: accounts.BoardColumn, default: str, descending_columns: tuple[str, ...],
-                  *, sort_field: str = "") -> str:
-    key = column["heading"]
+                  *, sort_field: str = "", label_markup: str = "") -> str:
+    key = column["key"]
     if not key:
         return f'<th class="{column["align"]}"></th>'
     direction = "ascending" if key == default else "none"
     descending = " data-sort-descending" if key in descending_columns else ""
-    label = html.escape(key)
+    label = html.escape(column["heading"])
     arrow = '<span class="sort-arrow" aria-hidden="true">▲</span>'
-    content = arrow + label if column["align"] == "right" else label + arrow
-    return (f'<th class="{column["align"]}" data-{sort_field or default}-sort="{label}" tabindex="0" aria-sort="{direction}"{descending}>'
+    word = label_markup or label
+    content = arrow + word if column["align"] == "right" else word + arrow
+    return (f'<th class="{column["align"]}" data-{sort_field or default}-sort="{html.escape(key, quote=True)}"'
+            + f' tabindex="0" aria-sort="{direction}"{descending}>'
             + f'<span class="sort-label">{content}</span></th>')
 
 
 SortValue = str | float | None
 SortValues = dict[str, SortValue]
-ACCOUNT_COLUMNS = (
-    ("", "left"), ("account", "left"), ("", "left"), ("left", "right"),
-    ("used / hour", "right"), ("empty at", "left"), ("role", "left"), ("", "left"), ("next", "left"),
-    ("resets", "right"), ("credits", "right"), ("enabled", "left"),
+# Keep the saved sort key for the weekly reset date.
+ACCOUNT_SORT_KEYS = {"weekly reset": "resets", "resets": "reset count"}
+ACCOUNT_COLUMNS = tuple(
+    accounts.BoardColumn(key=ACCOUNT_SORT_KEYS.get(heading, heading),
+                         heading=heading, align="right" if align == "right" else "left")
+    for heading, align in (
+        ("", "left"), ("account", "left"), ("", "left"), ("left", "right"), ("Fable left", "right"),
+        ("used / hour", "right"), ("empty at", "left"), ("role", "left"), ("", "left"), ("next", "left"),
+        ("weekly reset", "right"), ("resets", "right"), ("credits", "right"), ("enabled", "left"),
+    )
 )
 ROLE_COUNT_COLUMNS = ("busy", "idle", "total")
 # Paused and exited sessions are not running. They have no column: a warning icon after the role total names them.
 NOT_RUNNING_STATES: tuple[Literal["paused", "exited"], ...] = ("paused", "exited")
 BUSY_LINE_HEADING = "busy, last 24 h"
-ROLE_COLUMNS = (("role", "left"), ("", "left"), (BUSY_LINE_HEADING, "left"), ("account", "left"), ("next", "left"),
-                *((key, "right") for key in ROLE_COUNT_COLUMNS))
+ROLE_COLUMNS = (
+    *(accounts.BoardColumn(key=key, heading=key, align="left")
+      for key in ("role", "", BUSY_LINE_HEADING, "account", "next")),
+    *(accounts.BoardColumn(key=key, heading=key, align="right") for key in ROLE_COUNT_COLUMNS),
+)
 # The busy line of each role, in SVG pixels: the line area, then the hour labels under it.
 BUSY_LINE_WIDTH = 288
 BUSY_LINE_HEIGHT = 22
@@ -402,7 +414,7 @@ BUSY_LINE_LABEL_HOURS = 3
 # The statusline.conf key of the codex pair row tint, and the strength of that tint over the card.
 PAIR_TINT_KEY = "background.codex-pair"
 PAIR_TINT_PERCENT = 12
-ACCOUNT_DETAIL_COLUMNS = "1,0,2,3,4,5,9,10,11"
+ACCOUNT_DETAIL_COLUMNS = "1,0,2,3,4,5,6,10,11,12,13"
 DASH = '<span class="next-muted">—</span>'
 
 
@@ -417,14 +429,12 @@ def _sort_orders(values: list[SortValues], descending: tuple[str, ...]) -> dict[
     return orders
 
 
-def _split_card(title: str, name: str, default: str, columns: tuple[tuple[str, str], ...],
+def _split_card(title: str, name: str, default: str, columns: Sequence[accounts.BoardColumn],
                 rows: list[str], orders: dict[str, list[int]] | dict[str, list[accounts.AccountRowPlacement]],
                 *, descending: tuple[str, ...] = (), unsorted: tuple[str, ...] = (),
                 sort_field: str = "", attributes: str = "", after: str = "") -> str:
-    head = "".join(f'<th class="{align}">{html.escape(key)}</th>' if key in unsorted
-                   else _sort_heading(accounts.BoardColumn(key=key, heading=key,
-                                      align="right" if align == "right" else "left"),
-                                      default, descending, sort_field=sort_field) for key, align in columns)
+    head = "".join(f'<th class="{column["align"]}">{html.escape(column["heading"])}</th>' if column["key"] in unsorted
+                   else _sort_heading(column, default, descending, sort_field=sort_field) for column in columns)
     orders_json = html.escape(json.dumps(orders), quote=True)
     return (f'<section class="card" data-sort-table="{name}" data-sort-default="{default}" '
             f'data-sort-orders="{orders_json}"{attributes}><h2>{title}</h2><div class="scroll">'
@@ -493,6 +503,15 @@ def _pair_tint(colors: Mapping[str, str]) -> str:
     return f' style="background:color-mix(in srgb,{color.css} {PAIR_TINT_PERCENT}%,transparent)"'
 
 
+def _account_login_title(login: str) -> str:
+    fallback = "No email in the login record"
+    try:
+        _ = login.encode("utf-8")
+    except UnicodeEncodeError:
+        return fallback
+    return login or fallback
+
+
 def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, list[accounts.BoardRow]],
                     labels: dict[str, accounts.BoardSpan], alerts: Mapping[str, QuotaAlert],
                     colors: Mapping[str, str]) -> str:
@@ -513,6 +532,12 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
         left = _spans(cells["left"])
         if alert := alerts.get(label):
             left = _quota_button(label, alert) + left
+        fable = row.fable_left_percent if row.tool == "claude" and isinstance(row.fable_left_percent, (int, float)) else None
+        fable_text = DASH if fable is None else f'<span class="{"error" if fable == 0 else "default"}">{round(fable)}%</span>'
+        reset_count = row.limit_reset_count if row.tool == "codex" and isinstance(row.limit_reset_count, int) else None
+        reset_count_text = (
+            '<span class="next-muted" title="Claude does not give this count to our tools.">—</span>'
+            if row.tool == "claude" else DASH if reset_count is None else str(reset_count))
         reset = row.resets_at if isinstance(row.resets_at, datetime) else None
         forecast = (quota_alert.weekly_forecast(histories.get(label, []), reading.checked_at, reset,
                     current=run_out.Reading(row.read_at, 100 - row.weekly_left_percent))
@@ -533,7 +558,8 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
         account_values: SortValues = {
             "account": label.casefold(),
             "left": row.weekly_left_percent if isinstance(row.weekly_left_percent, (int, float)) else None,
-            "used / hour": rate, "empty at": _timestamp(empty), "resets": _timestamp(reset),
+            "Fable left": fable, "used / hour": rate, "empty at": _timestamp(empty),
+            "resets": _timestamp(reset), "reset count": reset_count,
             "credits": float("inf") if row.credits == "unlimited" else
             row.credits if isinstance(row.credits, (int, float)) else None,
             "enabled": 1 if row.use_credits else None,
@@ -542,13 +568,15 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
             color = accounts.account_color(labels[label].get("color", ""))
             targets.append((label, "".join(span["text"] for span in cells["left"]),
                             color.css if isinstance(color, accounts.AccountColor) else "", cells["left"][0]["tone"]))
+        name = _spans(cells["label"], title=_account_login_title(row.login))
         account_start = (
             _cell(f'<span title="{dot}" aria-label="{dot}">{_spans(cells["dot"])}</span>')
-            + f'<td class="left" data-account-name>{_spans(cells["label"])}</td>'
-            + _cell(_swatch(cells["label"])) + _cell(left, "right")
+            + f'<td class="left" data-account-name>{name}</td>'
+            + _cell(_swatch(cells["label"])) + _cell(left, "right") + _cell(fable_text, "right")
             + _cell(f"{rate:.1f}%" if rate is not None else no_rate, "right") + _cell(empty_text)
         )
-        account_end = (_cell(_spans(cells["resets"]), "right") + _cell(_spans(cells["credits"]), "right")
+        account_end = (_cell(_spans(cells["resets"]), "right")
+                       + _cell(reset_count_text, "right") + _cell(_spans(cells["credits"]), "right")
                        + _cell(_spans(cells["enabled"])))
         for index, line in enumerate(_shown_lines(lines)):
             spans = line["cells"]["roles"]
@@ -558,10 +586,10 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
             paired = pair_text and move == "auto"
             rows.append(f'<tr{pair_row if paired else ""} data-account-row="{html.escape(label, quote=True)}">'
                         + (account_start if index == 0 else _cell("") + '<td class="left" data-account-name></td>'
-                           + _cell("") + _cell("", "right") * 2 + _cell(""))
+                           + _cell("") + _cell("", "right") * 3 + _cell(""))
                         + _cell(_spans(visible_role)) + _cell(_swatch(visible_role))
                         + _cell(_tip_target(f"pair-auto-{label}", "next-muted", "", "auto", pair_text) if paired else _next_cell(line, move, labels), "left next-cell")
-                        + (account_end if index == 0 else _cell("", "right") * 2 + _cell("")) + "</tr>")
+                        + (account_end if index == 0 else _cell("", "right") * 3 + _cell("")) + "</tr>")
             values.append({**account_values, "role": role.casefold() or None, "next": _next_sort_value(move)})
             labels_in_row_order.append(label)
     problems = "".join(f"<li>{html.escape(note.removeprefix('* '))}</li>" for note in reading.notes)
@@ -786,8 +814,11 @@ def _model_cell(row: accounts.ModelsBoardRow, column: accounts.BoardColumn) -> s
 
 
 def models_board(reading: accounts.StatusReading) -> str:
-    table = accounts.models_board(reading, accounts.role_colors())
-    head = "".join(_sort_heading(column, "model", accounts.MODEL_COUNT_COLUMNS)
+    colors = accounts.role_colors()
+    table = accounts.models_board(reading, colors)
+    role_labels = {role: _spans([accounts.board_role_span(role, colors)]) for role in accounts.MODEL_ROLES}
+    head = "".join(_sort_heading(column, "model", accounts.MODEL_COUNT_COLUMNS,
+                                label_markup=role_labels.get(column["key"], ""))
                    + ('<th class="left"></th>' if column["key"] == "model" else "")
                    for column in accounts.MODEL_COLUMNS)
     rows = "".join(("<tr data-summary>" if index == len(table.rows) - 1 else "<tr>") + "".join(
@@ -913,6 +944,7 @@ def main() -> int:
 
 
 STYLE = "<style>\n" + console_theme.CSS + page_frame.STYLE + """
+main:has(>.page-status,>.page-heading>h1):not(.page-wide){max-width:1172px}
 h2{margin:16px 0 4px}
 [data-accounts] .card>h2:first-child{margin-top:0}
 .card{--column-gap:1.125rem;--table-font-size:.86rem;width:fit-content;max-width:100%;padding-right:var(--column-gap)}

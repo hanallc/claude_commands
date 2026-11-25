@@ -1116,7 +1116,14 @@ A cached Accounts response carries its render failure to the status line.
 
 The Accounts table has two swatch columns without a heading.
 The account swatch column is between **account** and **left**.
+Hover over an account name to see the email from its login record.
+When the record has no usable email, the title says **No email in the login record**.
+**Fable left** follows **left** and shows the cached weekly Fable percent for Claude accounts.
+It shows a dash for Codex accounts and when the cache has no current Fable window.
 The role swatch column is between **role** and **next**.
+After **next**, **weekly reset** shows the weekly reset time.
+**resets** shows the reset count from the Codex account note or a dash when the count is missing.
+Claude accounts show a dash in **resets**.
 Select a named header or press Enter to sort.
 The dot and swatch headers have no sort control.
 The arrow sits before a right-aligned label and after a left-aligned label.
@@ -1124,6 +1131,7 @@ The arrow uses the column gap without adding to the table width.
 The column gap and arrow scale with the root font size.
 The viewer's sort choice stays through refreshes.
 The Models card below the accounts table uses the same sort controls.
+Its role headings use the same colors as role labels in the Accounts table.
 It stores the viewer's sort choice separately and starts in model order.
 The card shows the model ID and its swatch at the start of each consecutive group of that model.
 The model ID and swatch use the theme ink color when no model color is set.

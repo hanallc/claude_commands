@@ -3,6 +3,7 @@ from __future__ import annotations
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import html
@@ -27,7 +28,7 @@ from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.review_links import accounts_page, console_theme, new_item_dialog, page_frame, serve
-from scripts.whoami import agent_accounts, quota_state, run_out, usage_store
+from scripts.whoami import agent_accounts, note_file, quota_state, run_out, usage_store
 from scripts.whoami.account_test_support import create_claude_account, stored_room
 
 AT = datetime(2026, 11, 15, 15, tzinfo=timezone.utc)
@@ -541,6 +542,94 @@ window.fetch=(url,options)=>options?.method==='POST'
         self.assertNotIn('Upcoming moves:', markup)
         self.assertNotIn('units → claude1', markup)
 
+    def test_account_name_titles_use_disk_logins_for_all_seven_accounts(self) -> None:
+        labels = ("claude1", "claude2", "claude3", "claude4", "claude5", "codex1", "codex2")
+        rows = tuple(replace(status_row(label), tool="claude" if label.startswith("claude") else "codex",
+                             login="" if label == "codex2" else f"{label}&fixture@example.invalid",
+                             roles=(), role_counts=()) for label in labels)
+        markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT))
+        titles = dict(re.findall(r'<td class="left" data-account-name><span title="([^"]*)"[^>]*>([^<]+)</span>', markup))
+        expected = {f"{label}&amp;fixture@example.invalid": label for label in labels[:-1]}
+        expected["No email in the login record"] = "codex2"
+        self.assertEqual(titles, expected)
+
+    def test_malformed_disk_login_shows_the_fallback_in_the_page(self) -> None:
+        directory = self.review_root.parent / ".claude1"
+        directory.mkdir()
+        _ = (directory / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "fixture\ud800@example.invalid"},
+        }))
+        login = agent_accounts.claude_on_disk(directory).email
+        self.assertTrue(login and "\ud800" in login)
+        row = replace(status_row("claude1"), login=login or "")
+        reading = accounts.StatusReading((row,), (), (), timezone.utc, AT)
+        with patch.object(accounts, "read_status", return_value=reading):
+            page = accounts_page.page()
+        self.assertIn(b'<td class="left" data-account-name><span title="No email in the login record"', page)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser colors")
+    def test_model_role_headings_use_the_accounts_role_colors(self) -> None:
+        config = Path(os.environ["CONF_DIR"]) / "statusline.conf"
+        colors = {"role.producer": "#112233", "role.showrunner": "#223344",
+                  "role.unit-director": "#334455", "role.worker": "#445566"}
+        _ = config.write_text("".join(f"{key}={value}\n" for key, value in colors.items()))
+        reading = sort_reading()
+        markup = accounts_page.models_board(reading)
+        for role, key in accounts.ROLE_COLOR_KEYS.items():
+            with self.subTest(role=role):
+                heading = markup.split(f'data-model-sort="{role}"', 1)[1].split("</th>", 1)[0]
+                self.assertIn(f'style="color:{colors[key]}" data-color-text="{key}">{role}</span>', heading)
+        probe = """<script>
+const failures=[];
+for(const theme of ['light','dark']){
+ document.documentElement.dataset.theme=theme;
+ for(const heading of document.querySelectorAll('[data-model-sort] [data-color-text^="role."]')){
+  const key=heading.dataset.colorText;
+  const cell=document.querySelector('.accounts-table [data-color-text="'+key+'"]');
+  if(!cell || getComputedStyle(cell).color!==getComputedStyle(heading).color)
+   failures.push(theme+' '+key+' has a different color.');
+ }
+}
+fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+</script>"""
+        page = ('<!doctype html><html><head>' + accounts_page.STYLE + '</head><body>'
+                + accounts_page.board(reading) + markup + probe + '</body></html>').encode()
+        self.assertEqual(firefox_probe_results(page), [[]])
+
+    def test_fable_left_and_codex_reset_count_use_stored_values_and_sort_numerically(self) -> None:
+        make_row = cast(Callable[..., accounts.StatusRow], getattr(accounts, "_status_row"))
+        reset_count = cast(Callable[[str], int | accounts.StatusUnavailable], getattr(accounts, "_codex_limit_reset_count"))
+        folder = self.review_root.parent
+        claude = accounts.AccountStatus("~/.claude1", folder / ".claude1", True, True, True,
+                                        "claude1", "claude1@example.invalid", "", (), (), accounts.McpServerDifferences())
+        weekly = usage_store.StoredWindow(left=60, at=AT.isoformat(), resets=(AT + timedelta(days=4)).isoformat())
+        fable = usage_store.StoredWindow(left=9, at=AT.isoformat(), resets=(AT + timedelta(days=2)).isoformat())
+        rows = [
+            make_row(claude, usage_store.StoredUsage(weekly=weekly, weekly_fable=fable), AT, ()),
+            make_row(replace(claude, label="claude2"),
+                     usage_store.StoredUsage(weekly=weekly, weekly_fable={**fable, "left": 100}), AT, ()),
+            make_row(replace(claude, label="claude3"),
+                     usage_store.StoredUsage(weekly=weekly, weekly_fable={**fable, "resets": AT.isoformat()}), AT, ()),
+        ]
+        with patch.object(note_file, "notes_dir", return_value=folder):
+            for label, value in (("codex1", "12"), ("codex2", "0"), ("codex3", "-1")):
+                _ = (folder / note_file.note_name(label)).write_text(f"---\nlimit_reset_count: {value}\n---\n")
+                rows.append(replace(status_row(label), tool="codex", fable_left_percent=25,
+                                    limit_reset_count=reset_count(label)))
+
+        markup = accounts_page.board(accounts.StatusReading(tuple(rows), (), (), timezone.utc, AT))
+        table = markup.split('aria-label="Accounts"', 1)[1].split("</table>", 1)[0]
+        lines = cast(list[str], re.findall(r'<tr[^>]+data-account-row="[^"]+">(.*?)</tr>', table, re.S))
+        cells = [cast(list[str], re.findall(r'<td[^>]*>(.*?)</td>', line, re.S)) for line in lines]
+        self.assertEqual([re.sub("<[^>]+>", "", row[4]) for row in cells], ["9%", "100%", "—", "—", "—", "—"])
+        self.assertEqual([re.sub("<[^>]+>", "", row[11]) for row in cells], ["—", "—", "—", "12", "0", "—"])
+        self.assertIn('title="Claude does not give this count to our tools."', cells[0][11])
+        orders = rendered_sort_orders(markup, "accounts")
+        self.assertEqual(orders["Fable left"], [0, 1, 2, 3, 4, 5])
+        self.assertEqual(orders["Fable left-reverse"], [1, 0, 2, 3, 4, 5])
+        self.assertEqual(orders["reset count"], [4, 3, 0, 1, 2, 5])
+        self.assertEqual(orders["reset count-reverse"], [3, 4, 0, 1, 2, 5])
+
     def test_account_and_role_sort_orders_use_full_values_and_keep_missing_values_last(self) -> None:
         reading = sort_reading()
         reading = replace(reading, rows=tuple(
@@ -576,12 +665,12 @@ window.fetch=(url,options)=>options?.method==='POST'
         lines = cast(list[str], re.findall(r'<tr data-account-row="[^"]+">(.*?)</tr>', table, re.S))
         first, added, spare = (cast(list[str], re.findall(r'<td[^>]*>(.*?)</td>', line, re.S)) for line in lines)
         self.assertIn(">claude1</span>", first[1])
-        self.assertIn('data-color-text="role.unit-director">units</span>', first[6])
-        self.assertIn(">producers</span>", added[6])
-        self.assertIn('data-move-account="claude1" data-move-group="producers"', added[8])
-        self.assertEqual(added[:6] + added[9:], [""] * 9)
+        self.assertIn('data-color-text="role.unit-director">units</span>', first[7])
+        self.assertIn(">producers</span>", added[7])
+        self.assertIn('data-move-account="claude1" data-move-group="producers"', added[9])
+        self.assertEqual(added[:7] + added[10:], [""] * 11)
         self.assertIn(">codex1</span>", spare[1])
-        self.assertEqual(spare[6:8], ["", ""])
+        self.assertEqual(spare[7:9], ["", ""])
         self.assertNotIn("spare", markup)
         self.assertNotIn("✓", markup)
         orders = rendered_sort_orders(markup, "accounts")
@@ -924,11 +1013,12 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
     def test_each_table_has_its_own_default_and_focusable_sort_headers(self) -> None:
         markup = accounts_page.board(sort_reading())
         self.assertEqual(re.findall(r'data-account-sort="([^"]+)"', markup),
-                         ["account", "left", "used / hour", "empty at", "role", "next", "resets", "credits", "enabled"])
+                         ["account", "left", "Fable left", "used / hour", "empty at", "role", "next",
+                          "resets", "reset count", "credits", "enabled"])
         self.assertEqual(re.findall(r'data-role-sort="([^"]+)"', markup),
                          ["role", "account", "next", "busy", "idle", "total"])
-        self.assertEqual(len(re.findall(r'<th [^>]*tabindex="0"', markup)), 15)
-        self.assertEqual(markup.count('class="sort-arrow"'), 15)
+        self.assertEqual(len(re.findall(r'<th [^>]*tabindex="0"', markup)), 17)
+        self.assertEqual(markup.count('class="sort-arrow"'), 17)
         self.assertIn('<th class="left">busy, last 24 h</th>', markup)
         self.assertIn('data-account-sort="account" tabindex="0" aria-sort="ascending"', markup)
         self.assertIn('data-role-sort="role" tabindex="0" aria-sort="ascending"', markup)
@@ -982,12 +1072,12 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
             with self.subTest(account=row.label):
                 cells = cast(list[str], re.findall(r'<td[^>]*>(.*?)</td>', line, re.S))
                 self.assertIn(f">{row.label}</span>", cells[1])
-                self.assertEqual(re.sub(r"<[^>]+>", "", cells[4]), rate)
-                self.assertEqual(re.sub(r"<[^>]+>", "", cells[5]), empty)
+                self.assertEqual(re.sub(r"<[^>]+>", "", cells[5]), rate)
+                self.assertEqual(re.sub(r"<[^>]+>", "", cells[6]), empty)
                 if row.label == "claude2":
-                    self.assertIn('title="Quota lasts until the weekly reset."', cells[5])
+                    self.assertIn('title="Quota lasts until the weekly reset."', cells[6])
                 if rate == "—":
-                    for cell in cells[4:6]:
+                    for cell in cells[5:7]:
                         self.assertIn('title="No usage rate is available."', cell)
         order = rendered_sort_orders(markup, "accounts")
         self.assertEqual(order["used / hour"], [5, 0, 1, 4, 2, 3])
@@ -1271,16 +1361,17 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
   check(rows()[0].cells[4].querySelector('.inactive').textContent==='0','zero has a muted tone');
   check(table().querySelectorAll('[data-color-key="model.claude-opus-5-5"]').length===1,'each model has one swatch');
   check(header('model').getAttribute('aria-sort')==='ascending','model ascending is the default');
+  const labelBox=span=>box(span.querySelector('span:not(.sort-arrow)') ??
+   [...span.childNodes].find(node=>node.nodeType===Node.TEXT_NODE));
   const layout=key=>{
    const cell=header(key), right=cell.classList.contains('right');
-   const label=box([...cell.querySelector('.sort-label').childNodes].find(node=>node.nodeType===Node.TEXT_NODE));
+   const label=labelBox(cell.querySelector('.sort-label'));
    const value=box(rows().map(row=>row.cells[cell.cellIndex]).find(item=>item.textContent));
    const arrow=cell.querySelector('.sort-arrow').getBoundingClientRect();
    const edge=right ? 'right' : 'left';
    check(Math.abs(label[edge]-value[edge])<=1,key+' header aligns with the values');
    check(right ? arrow.right<label.left : arrow.left>label.right,key+' arrow is on the correct side');
-   const labels=[...table().querySelectorAll('.sort-label')].map(span=>box(
-    [...span.childNodes].find(node=>node.nodeType===Node.TEXT_NODE)));
+   const labels=[...table().querySelectorAll('.sort-label')].map(labelBox);
    check(labels.every(other=>arrow.right<=other.left || arrow.left>=other.right),key+' arrow clears the labels');
    const scroll=table().parentElement;
    check(scroll.scrollWidth===scroll.clientWidth,key+' fits at 1280px');
@@ -1404,7 +1495,7 @@ window.fetch=async()=>({ok:true,text:async()=>FRESH_PAGE});
   const units=group('units'), showrunners=group('showrunners');
   check(target(units)==='claude2' && target(showrunners)==='claude3','the two roles have distinct next targets');
   const nextHeader=table().querySelector('[data-account-sort="next"]');
-  const details=row=>[...row.cells].filter(cell=>cell.cellIndex<6 || cell.cellIndex>8).map(cell=>cell.innerHTML);
+  const details=row=>[...row.cells].filter(cell=>cell.cellIndex<7 || cell.cellIndex>9).map(cell=>cell.innerHTML);
   const shown=details(units);
   const empty=Array(shown.length).fill('');
   check(JSON.stringify(details(showrunners))===JSON.stringify(empty),'the added row starts with no account data');
@@ -1423,7 +1514,7 @@ window.fetch=async()=>({ok:true,text:async()=>FRESH_PAGE});
   check(JSON.stringify(details(showrunners))===JSON.stringify(shown) &&
    JSON.stringify(details(units))===JSON.stringify(empty),'the account data moves to the first row of the group');
   const markup=new Map(original.map(row=>[row,next(row)?.innerHTML]));
-  for(const column of ['account','role','next','left','used / hour','empty at','resets','credits','enabled']){
+  for(const column of ['account','role','next','left','Fable left','used / hour','empty at','resets','reset count','credits','enabled']){
    const header=table().querySelector('[data-account-sort="'+column+'"]');
    for(let direction=0;direction<2;direction++){
     header.click();
@@ -1451,7 +1542,7 @@ window.fetch=async()=>({ok:true,text:async()=>FRESH_PAGE});
     def test_sort_reads_saved_choices_and_handles_unavailable_storage(self) -> None:
         with patch.object(accounts, "read_status", return_value=sort_reading()):
             content = accounts_page.AccountsRender(accounts_page.page(), .1, 200).with_recent_times((.1,)).decode()
-        for saved, denied in (("left", False), ("unknown", False), ("left", True)):
+        for saved, denied in (("left", False), ("resets", False), ("unknown", False), ("left", True)):
             with self.subTest(saved=saved, denied=denied):
                 setup = '''<script>
 Date.now=()=>200000;const realFetch=fetch;
@@ -1462,13 +1553,15 @@ if(DENIED) Object.defineProperty(window,'localStorage',{get:()=>{throw new Error
 const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
 try{
  const selected=document.querySelector('th[aria-sort="ascending"]');
- check(selected?.dataset.accountSort===EXPECTED_COLUMN,'the stored choice or default renders');
+ const key=EXPECTED_COLUMN;
+ check(selected?.dataset.accountSort===key,'the stored choice or default renders');
+ if(key==='resets') check(selected.textContent.includes('weekly reset'),'the saved reset sort still uses the date');
  document.querySelector('[data-role-sort="busy"]').click();
  check(document.querySelector('[data-role-sort="busy"]').getAttribute('aria-sort')==='descending',
   'sorting works when the storage write fails');
 }catch(error){failures.push(String(error));}
 realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
-</script>'''.replace("EXPECTED_COLUMN", json.dumps("left" if saved == "left" and not denied else "account"))
+</script>'''.replace("EXPECTED_COLUMN", json.dumps(saved if saved in ("left", "resets") and not denied else "account"))
                 page = content.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
                 self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
@@ -1531,7 +1624,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                     _ = config.write_text(f"account.claude1={value}\n" if value else "# no account key\n")
                     markup = accounts_page.board(reading)
                     style = f' style="color:{expected}" data-color-text="account.claude1"' if expected else ""
-                    self.assertIn(f'<span class="default bold"{style}>claude1</span>', markup)
+                    self.assertIn(f'<span title="fixture@example.invalid" class="default bold"{style}>claude1</span>', markup)
                     self.assertNotIn("position:fixed", markup)
                     self.assertNotIn("<script>", markup)
                     self.assertEqual('aria-label="Change claude1 color"' in markup, bool(expected))
@@ -1960,8 +2053,8 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   const heads=headings('Accounts'), roleHeads=headings('Roles');
   check(cell===row.cells[2] && row.cells[1].contains(label()) && heads[1]==='account' && heads[2]==='' && heads[3]==='left',
    'the swatch column without a heading sits between account and left');
-  check(heads.slice(4,10).join(',')==='used / hour,empty at,role,,next,resets',
-   'Accounts puts role and next after the forecast');
+  check(heads.slice(4,12).join(',')==='Fable left,used / hour,empty at,role,,next,weekly reset,resets',
+   'Accounts keeps the quota, role, and reset columns in order');
   check(roleHeads.join(',')==='role,,busy, last 24 h,account,next,busy,idle,total',
    'Roles shows the role, its busy line, account, next and counts');
   check(getComputedStyle(cell).textAlign==='left' && getComputedStyle(swatch).marginLeft==='0px' &&

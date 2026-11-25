@@ -55,7 +55,7 @@ def status_configuration() -> Generator[None]:
 
 
 def firefox_probe_results(page: bytes, *, window_size: tuple[int, int] | None = None,
-                          dark: bool = False) -> list[list[str]]:
+                          dark: bool = False, screenshot: Path | None = None) -> list[list[str]]:
     """Load the page in a headless Firefox frame and return the failure lists its probe posts."""
     results: list[list[str]] = []
     complete = threading.Event()
@@ -68,7 +68,9 @@ def firefox_probe_results(page: bytes, *, window_size: tuple[int, int] | None = 
             if self.path == "/complete":
                 _ = complete.wait(TEST_HANG_GUARD_SECS)
             elif self.path == "/":
-                _ = self.wfile.write(b'<iframe src="/accounts"></iframe><img hidden src="/complete">')
+                viewport = (b'<style>body{margin:0}iframe{display:block;border:0;width:100vw;height:100vh}</style>'
+                            if screenshot is not None else b"")
+                _ = self.wfile.write(viewport + b'<iframe src="/accounts"></iframe><img hidden src="/complete">')
             else:
                 _ = self.wfile.write(page)
 
@@ -97,8 +99,9 @@ def firefox_probe_results(page: bytes, *, window_size: tuple[int, int] | None = 
                 environment.update(MOZ_HEADLESS_WIDTH=str(width), MOZ_HEADLESS_HEIGHT=str(height))
             if dark:
                 _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
+            capture = screenshot if screenshot is not None else Path(temporary) / "page.png"
             run = run_process_group(["firefox", "--headless", "--no-remote", "--profile", str(profile), *options,
-                                     "--screenshot", str(Path(temporary) / "page.png"), f"http://127.0.0.1:{server.server_port}/"],
+                                     "--screenshot", str(capture), f"http://127.0.0.1:{server.server_port}/"],
                                     timeout=45, env=environment)
             if run.returncode:
                 raise AssertionError(run.stderr)
