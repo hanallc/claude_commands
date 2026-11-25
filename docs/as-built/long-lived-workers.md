@@ -1074,10 +1074,11 @@ When the pass is open, the `end` refusal names the next step: `worker.py answer 
 That command asks the worker for the DONE.
 When an ended pass still waits for DONE, `worker.py answer` checks the same receipt.
 This includes a canceled pass without a stopped hook outcome.
-If the worker still owes a reply to a result, the command names the result and keeps the wait.
-Otherwise, the command queues undelivered results for the director before it releases the wait.
-The command releases the wait for delivered results and keeps their saved delivery records.
-The command leaves the pass ended and sends no input to the worker.
+If the idle worker still owes a reply, `answer` sends the director's text and names the results that need replies.
+Each reply clears the results it names by run ID. A matching DONE follows the pass receipt rules.
+When no reply is due, `answer` queues undelivered results for the director before it releases the wait.
+The run ID identifies the notice across retries.
+The command keeps saved delivery records for results it releases.
 `end` gives no `answer` step while a detached run is live, while the pass waits only for reap, or after the pass is canceled.
 `worker.py end` also checks for a late reply after recorder cancellation, even when the pane is closed.
 If it finds a verified reply, it saves the reply and completes the hook before retirement.

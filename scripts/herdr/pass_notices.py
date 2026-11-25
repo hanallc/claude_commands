@@ -217,6 +217,26 @@ def stage_diagnostics(run: Path, route: Route, sender: str, messages: Collection
     return tuple(notices)
 
 
+def stage_ended_run_result(run: Path, route: Route, sender: str, run_id: str, message: str) -> str:
+    """Keep one director notice for a detached run after its pass ends."""
+    path = _path(run, route.instance_id)
+    key = f"detached-result:{run_id}"
+    ending = f"\n\nThe worker pass {route.instance_id} has ended."
+    with _locked(path, "record"):
+        saved = PassNotices.read(path)
+        if saved is not None:
+            if saved.route.director_id != route.director_id:
+                raise ValueError("the pass notice recipient changed")
+            if key in saved.notices:
+                return key
+            for old_key, notice in saved.notices.items():
+                if (old_key.startswith("diagnostic:") and notice.text.startswith(f"Detached run: {run_id}\n")
+                        and notice.text.endswith(ending)):
+                    return old_key
+        _publish(path, route, {key: Notice(message + ending, sender, NoticeKind.DIAGNOSTIC)})
+    return key
+
+
 def import_legacy_diagnostics(run: Path, route: Route, sender: str) -> None:
     path = _path(run, route.instance_id)
     legacy = path.with_name(path.name.replace(".pass-notices.jsonseq", ".completion-diagnostics.json"))

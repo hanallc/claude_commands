@@ -1808,8 +1808,8 @@ def stage_ended_pass_results(run: Path, row: staff.StaffRow, director: staff.Sta
                 record["ended_pass_result_released"] = True
                 _ = _write_record(path, record)
             else:
-                message = _worker_result_message(record, result) + f"\n\nThe worker pass {instance} has ended."
-                keys.extend(pass_notices.stage_diagnostics(run, route, sender, (message,)))
+                message = _worker_result_message(record, result)
+                keys.append(pass_notices.stage_ended_run_result(run, route, sender, record["run_id"], message))
                 _ = _save_delivery(path, ENDED_PASS_RESULT_QUEUED)
             count += 1
     return EndedPassResults(count, tuple(keys))
