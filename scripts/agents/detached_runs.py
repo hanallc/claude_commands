@@ -887,10 +887,9 @@ class OrphanReapResult:
                     except BlockingIOError:
                         continue
                     current = _read_record(path)
-                    pending = _needs_push_retry(current)
                     if _needs_completion(current):
-                        pending |= _replay_completion(path, current) == CompletionReplay.RETRY
-                if pending:
+                        _ = _replay_completion(path, current)
+                if _needs_push_retry(_read_record(path)):
                     _alert_failed_push(path, check_receipt=True)
             except (SystemExit, worker_lifecycle.WorkerStateUnreadable) as error:
                 print(" ".join(str(error).splitlines()), file=sys.stderr)
@@ -2711,7 +2710,8 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
     from scripts.herdr import worker_panes
 
     passed = worker_panes.worker_pass(worker, run)
-    for record in _registered_runs(run / DETACHED_RUNS_DIR, worker.id):
+    runs = run / DETACHED_RUNS_DIR
+    for record in _registered_runs(runs, worker.id):
         if (record["status"] != "finished" or record["staff_id"] != worker.id
                 or Path(record["session_dir"]).resolve() != run.resolve()
                 or not _worker_result_pending(record.get("delivery", ""))):
@@ -2720,12 +2720,20 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
         if _unconfirmed_pass_result(record) or (
                 ownership is ResultPassOwnership.OTHER_PASS and _result_push_failed(record.get("delivery", ""))):
             continue
-        delivery = _deliver(record, command_result(record), worker_input=worker_input,
-                            resume_parked=resume_parked, input_lock=input_lock)
+        path = runs / f"{record['run_id']}.json"
+        try:
+            delivery = _deliver(record, command_result(record), worker_input=worker_input,
+                                resume_parked=resume_parked, input_lock=input_lock)
+        except (Exception, SystemExit, KeyboardInterrupt):
+            _alert_failed_push(path, check_receipt=True)
+            raise
         if ownership is ResultPassOwnership.OTHER_PASS:
             continue
         if isinstance(delivery, ConfirmedPaneResult):
             return delivery
+        if _result_push_failed(delivery):
+            # This submission can run after the supervisor exits.
+            _alert_failed_push(path, check_receipt=True)
         if _worker_result_pending(delivery):
             return WorkerResultReplay.RETRY
         if delivery.startswith("already delivered: ") and not isinstance(resume_parked, ParkedWorkerDelivery):
