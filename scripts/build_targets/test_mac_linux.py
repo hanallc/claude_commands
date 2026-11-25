@@ -910,7 +910,7 @@ class MacLinuxRouteTests(unittest.TestCase):
     registry: Path = Path()
     placed: placement.PlacementAssignment = placement.PlacementAssignment(
         'gate-episode', 'gate-attempt', placement.PlacementDestination(
-            'ssh', mac_linux.TARGET, 'fixture-guest', claim_state.RepositoryScope('claude', slot=1), 1),
+            'ssh', mac_linux.TARGET, 'fixture-guest', claim_state.RepositoryScope('claude'), 1),
         execution_identity.SourceKeyUnavailable('fixture'), placement.SubmittingOwner('natedev', 1, 'start'),
         OwningSession('submitting-session'), 0.0)
     # Each consume request, the SSH trace at that moment, and whether the gate held the named Mac claim.
@@ -963,7 +963,7 @@ class MacLinuxRouteTests(unittest.TestCase):
         _ = (config / 'machines.conf').write_text(
             'aliases=natedev mac\nnatedev.platform=linux\nnatedev.hosts=natedev\n'
             + 'mac.platform=darwin\nmac.hosts=fixture-mac\n', encoding='utf-8')
-        _ = write_config_fixture(config / 'build_folders.conf', '# whole: 1..\nslots.fixture-mac.default_max=1\n')
+        _ = write_config_fixture(config / 'build_folders.conf')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             'GATE_STATE_DIR': str(self.root / 'gate-state'),
             'GATE_PASSED_DIR': str(self.root / 'gate-passes'),
@@ -2711,7 +2711,7 @@ with (patch.object(conf, 'read', read_config),
     def test_free_now_recovers_the_guest_enable_key_from_the_repository(self) -> None:
         paths = mac_test.state_paths(mac_linux.TARGET)
         configuration = self.registry.with_name('mac_linux.conf')
-        _ = write_config_fixture(configuration, 'slots=1\n')
+        _ = write_config_fixture(configuration, '')
         fallback = self.registry.parent / 'repository' / self.registry.name
         _ = write_config_fixture(fallback, 'enabled.mac-linux=on\n')
         _ = self.registry.write_text(self.registry.read_text().replace('enabled.mac-linux=on\n', ''))
@@ -2724,7 +2724,7 @@ with (patch.object(conf, 'read', read_config),
         _ = write_config_fixture(self.registry, 'pinned_targets=hana-gpu,mac-linux\n')
         paths = mac_test.state_paths(mac_linux.TARGET)
         configuration = self.registry.with_name('mac_linux.conf')
-        _ = write_config_fixture(configuration, 'slots=1\n')
+        _ = write_config_fixture(configuration, '')
         self.assertEqual(mac_test.free_now(paths, configuration, self.repo), 'free')
         now = time.time()
         with patch.object(mac_linux, 'time', return_value=now):
