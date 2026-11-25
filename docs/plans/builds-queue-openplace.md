@@ -111,7 +111,7 @@ Times start at nate's yes on this plan. All times are estimates, not proved. One
 | 1a. One reading per target: split `free_now` and the Hana adapter into a machine read and a run check. | 6 | `mac_test.py`, `eligibility.py`, `offload.py`, `build_targets.py`, `hana_placement_adapter.py`, `hana_placement.py`, their tests | nate's yes | with 1b |
 | 1b. The open-place pass, with the removal in section 4 and the item 389 port. Fixes tonight's fault. | 8 | `admission_service.py`, `placement.py`, `admission_records.py`, queue and verify tests in section 8 | nate's yes; uses 1a's read at the end | yes + 10.5 h (review 1 h, one test run 1.5 h); merges first and alone |
 | 2a. Bump removal outside the queue service: `/build:bump`, `/showrunner:bump`, the bump gate, checkpoint `--bump`, build log records, docs. | 8 | section 10D "Page, logs, and production workflow" and doc rows | nate's yes | yes + 10 h; tested with part 3 |
-| 2b. Bump removal in the queue: priority list, `bumps`, person-action bump records, queue pins, the page bump marks, state conversion. | 10 | section 10D "Controls, state, and order" and page rows | part 1 on main (same files) | part 1 + 12 h |
+| 2b. Bump removal in the queue: priority list, `bumps`, person-action bump records, queue pins, the page bump marks, state conversion. The natemerge bump goes in this step, when approved moves turn on. | 10 | section 10D "Controls, state, and order" and page rows | part 1 on main (same files) | part 1 + 12 h |
 | 3. The approved move and the period grant. | 10 | section 10E queue and page rows, new `commands/build/move.md`, `test_approved_move.py` | 2b (same files); runs with 2b on one tree | part 1 + 13 h; one test run with 2a and 2b |
 
 **Share no file:** 1a, 1b and 2a. They run at the same time, one worker each. 2b and 3 use the queue files of part 1, so they start when part 1 is on main.
@@ -187,7 +187,7 @@ nate's words decide each approval. Save the agent by staff ID, the approver, the
 
 ## 10D. Complete removal
 
-The dispatch reports that Bob cleared six unit bumps and left natemerge pending Nate's answer. Live state was not checked. Keep that operational decision separate from the code removal. The `max_runs.exempt_unit` setting controls a run limit in `config/build_admission.conf:26-36`. It is a separate rule.
+Bob removed six unit bumps at 21:53 PST. Nate's decision (22:12 PST, through bob): "okay keep the one bump until the approved change kicks in". The natemerge bump stays until approved moves are live. No session sets a new bump. Part 2b removes the natemerge bump in the same step that turns on approved moves (part 3 on the same tree). Live state was not checked. The `max_runs.exempt_unit` setting controls a run limit in `config/build_admission.conf:26-36`. It is a separate rule.
 
 ### Controls, state, and order
 
