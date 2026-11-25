@@ -876,7 +876,7 @@ Existing waits keep their place on natedev until then.
 Below the required floor, it runs one shared floor sweep.
 It reads free space again after a successful sweep.
 The per-host `floor-sweep-<host>.lock` serializes sweeps.
-A caller that finds a running sweep waits for its result.
+A direct caller that finds a running sweep waits for its result.
 The sweep uses a dedicated SSH terminal. The terminal sends `SIGHUP` when the SSH connection closes.
 Natedev uses the full `floor_sweep_timeout_s` for SSH.
 Natedev reserves the smaller of half that timeout and the sum of its `connect_timeout_s` and `probe_timeout_s`.
@@ -895,6 +895,16 @@ A later publication removes temporary files from writers that have exited.
 Both scans report a temporary file removal error and continue with publication, including when the list path stays the same.
 If the rename succeeds and the directory sync fails, a later publication by the same list keeps that path. A new SSH attempt starts a new list with a new path.
 Floor rows require manual review. The removal command refuses those rows.
+The evidence worker reads disk space and saved mirror processes in one SSH command per Mac probe cycle.
+The same command reports setup for each required mirror.
+Each step requires a successful setup result for its mirror.
+The worker reads local claims again after SSH.
+It attaches process evidence only to claims that match the records from before SSH.
+The keys that share the reading have the same observation time.
+The worker checks repository policy, session, and claim scope for each key.
+The worker reports pending disk recovery while a separate thread runs the sweep.
+The Mac stays excluded during recovery even when a probe reports enough free space.
+When the sweep ends, the worker probes all subscribed Mac keys again.
 The sweep holds no admission or claim lock while it lists output.
 `floor_claims.serve()` reads claims and mirror leases under `state.lock`.
 It builds the reply under the lock and prints after the lock closes.

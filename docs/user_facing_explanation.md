@@ -47,8 +47,7 @@ re-orients before it reports, or it does not land.
 
 Build from what the reader already holds toward what they do not.
 
-- **Within an item:** the triggering situation → what each choice makes the
-  system do → the type or API name, introduced only once its behavior is known.
+- **Within an item:** start with the user's situation. Use the template below for ad hoc review.
 - **Within a walk:** the model everything sits inside → the individual items.
 - **Within a report:** the readable summary → the technical reference.
 
@@ -61,27 +60,6 @@ Build from what the reader already holds toward what they do not.
   without saying what each one makes the system do. A list of names is not an
   explanation.
 - Mark an undecided name `(name TBD)` rather than letting it sound settled.
-
-This does **not** introduce a decision:
-
-```text
-The recovery variants are `Disabled`, `ApplicationControlled`, and
-`FallbackAndReturn`. Which should the primary use?
-```
-
-It assumes the names explain themselves. Introduce the same decision from what
-the application does:
-
-```text
-If the editor's monitor disappears, the application can do one of three things:
-- leave the editor absent;
-- notify application code and wait for it to create a replacement; or
-- create a temporary editor on another monitor and return it automatically when
-  the original physical display reconnects.
-
-For the main editor, should the application keep it usable automatically, wait
-for application code, or leave it absent?
-```
 
 ## Banned unless defined in the same sentence
 
@@ -103,6 +81,84 @@ for application code, or leave it absent?
 Test: if you cannot say what it means in behavior terms, you do not understand
 it well enough to present it. Read the code until you can.
 
+## Ad hoc review items
+
+Write a title that names the result for the user. Start the item body with the required **The point** block.
+Use three sentences or fewer. Name the user's request or what they see on screen in their words.
+State the one decision. Omit team names for the work.
+
+### Size
+
+After **The point**, give only the facts that can change the answer. Say each fact one time.
+Fit the length to the size of the decision:
+
+- A small yes or no is **The point**, three fact lines or fewer, and the choice line. `elaborate` gives the rest.
+- Use the full item template only for a design decision.
+- Keep the chain complete: cause, action, result. A short item drops detail, not a link of the chain.
+- When an item asks the user for an action, such as a command, one line says what the action changes and why that removes the fault.
+
+Put a fact for later use, such as steps after an install, in the report after the decision.
+
+### Item template
+
+1. **The point**
+2. **How the choices behave.** Describe the current behavior and what each choice changes.
+   Explain any relevant triggering event or task. Explain what can go wrong if the system chooses incorrectly.
+3. **Concrete scenario.** Include one when timing, lifecycle, ownership, state changes, or multiple actors matter.
+4. **Question.** Ask the user to decide in terms of behavior.
+5. **Recommendation.** Name the recommended outcome and the goal or failure it addresses. Include meaningful costs or restrictions.
+6. **Implementation mapping.** Add the proposed name or a short code example if it makes the decision more precise.
+7. **Still pending.** Name nearby decisions that could appear settled. Say where you will handle them if known.
+8. **Choices.** Follow the shared Choices rules below. Include the exact choices `elaborate / simplify` on every item.
+
+Labels after **The point** are optional.
+
+### Example
+
+```markdown
+### Keep the editor usable when its monitor disconnects
+
+**The point**
+
+The editor can disappear when you unplug its monitor.
+Should the editor move to another monitor or stay hidden, or should the application open a replacement?
+
+If the editor stays hidden, you cannot use it. A replacement depends on when the application opens it.
+I recommend moving the current editor automatically so you can keep editing.
+
+move automatically (recommended — you can keep editing) / leave hidden / let the application replace it / elaborate / simplify
+```
+
+### Small example
+
+```markdown
+### Do you bump the newer demo build for your Mac?
+
+**The point**
+
+A newer build of your demo comes to your Mac at about 12:15 PST.
+It adds one thing that you can see: a jack that a tool blocks shows no green outline for a held plug.
+A bump brings it only some minutes sooner, and other runs then wait longer.
+
+no bump (recommended — a bump saves only some minutes) / bump / elaborate / simplify
+```
+
+### Reader test
+
+The session that shows the items runs this test on each item before the user sees it.
+
+For one live item, the writer runs it alone:
+
+1. Read only the title and **The point** as a reader who knows none of the work.
+2. State why the item exists, and what happens after each choice and why.
+3. If you need more context to answer, rewrite the item and repeat the test.
+
+For a prepared batch, run it cold:
+
+1. Give a helper only the titles and **The point** blocks.
+2. The helper states why each item exists, and what happens after each choice and why.
+3. Rewrite each item where the helper cannot, and repeat the test for it.
+
 ## The comprehension gate
 
 Before presenting, a reader who has not seen the source must be able to answer:
@@ -114,10 +170,7 @@ Before presenting, a reader who has not seen the source must be able to answer:
 If any answer depends on an unexplained type, variant, acronym, file, or prior
 finding, rebuild from the user's situation.
 
-Brevity applies only after the gate passes — there is no sentence or bullet
-budget while context is still missing. Filling the headings of a template is not
-passing the gate: a response can carry every required section and still fail if
-the causal relationship between them stays implicit.
+Add missing context to the body until the gate passes. Make the causal relationships explicit.
 
 ## Which decisions reach the user
 

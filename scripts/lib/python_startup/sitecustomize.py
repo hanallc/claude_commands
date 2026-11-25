@@ -624,7 +624,8 @@ def _user_test_manager_available() -> bool:
 
 
 def _direct_test_limit_line(seconds: int) -> str:
-    return f"stopped at the {seconds}-second direct test limit; run longer tests with targeted_test.py --module"
+    return (f"stopped at the {seconds}-second direct test limit. "
+            "Run longer tests with copies.py run and gate.py --affected --module.")
 
 
 def _start_direct_test_watchdog(seconds: int) -> None:
