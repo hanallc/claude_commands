@@ -10,12 +10,13 @@ except FileNotFoundError:
 import argparse
 import ast
 from collections import Counter
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
 from enum import StrEnum
 import hashlib
+from importlib import import_module
 import io
 import json
 import os
@@ -56,10 +57,13 @@ class GitRange(NamedTuple):
         commit = self.git("rev-parse", "--verify", "--end-of-options", f"{self.commit}^{{commit}}")
         return GitRange(self.repo, base.decode("ascii").strip(), commit.decode("ascii").strip())
 
-    def command(self, action: str) -> str:
+    def command(self, action: str, *, production: str = "") -> str:
         scripts = Path(__file__).resolve().parents[1]
-        return shlex.join([str(scripts / "lib/py"), str(scripts / "production/behavior_check.py"), action,
-                           "--repo", str(self.repo.resolve()), "--base", self.base, "--commit", self.commit])
+        command = [str(scripts / "lib/py"), str(scripts / "production/behavior_check.py"), action,
+                   "--repo", str(self.repo.resolve()), "--base", self.base, "--commit", self.commit]
+        if production:
+            command.extend(("--production", production))
+        return shlex.join(command)
 
 
 class TestSpan(NamedTuple):
@@ -356,29 +360,51 @@ def require_review(change: GitRange, *, timeout: float | None = None) -> None:
 
 
 class BehaviorCommand(argparse.Namespace):
+    key: str = ""
+    production: str = ""
     action: str = ""
-    repo: Path = Path()
+    repo: Path | None = None
     base: str = ""
     commit: str = ""
 
 
-def add_range_arguments(parser: argparse.ArgumentParser) -> None:
-    _ = parser.add_argument("--repo", type=Path, required=True)
-    _ = parser.add_argument("--base", required=True)
-    _ = parser.add_argument("--commit", required=True)
+def add_range_arguments(parser: argparse.ArgumentParser, *, required: bool = True) -> None:
+    _ = parser.add_argument("--repo", type=Path, required=required)
+    _ = parser.add_argument("--base", required=required, default="")
+    _ = parser.add_argument("--commit", required=required, default="")
 
 
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     add_range_arguments(commands.add_parser("find", help="List altered or removed tests."))
+    run = commands.add_parser("run", help="Start or collect the independent review.")
+    add_range_arguments(run)
+    _ = run.add_argument("--production", default="", help="The owner of a Review question.")
+    status = commands.add_parser("status", help="Read the saved review or answer.")
+    _ = status.add_argument("--key", default="")
+    add_range_arguments(status, required=False)
     args = parser.parse_args(arguments, namespace=BehaviorCommand())
+    if args.action == "status" and (args.key and (args.repo is not None or args.base or args.commit)
+                                    or not args.key and not (args.repo is not None and args.base and args.commit)):
+        status.error("pass either --key or --repo, --base and --commit")
     try:
-        change = GitRange(args.repo, args.base, args.commit).pinned()
-        result = changed_tests(change)
-        if result.tests:
-            print(json.dumps({"key": result.key, "tests": [asdict(test) for test in result.tests]}, indent=2))
-        return 0
+        change = GitRange(args.repo or Path(), args.base, args.commit)
+        key = args.key
+        result = ChangedTests(())
+        if not key:
+            change = change.pinned()
+            result = changed_tests(change)
+            if not result.tests:
+                return 0
+            key = result.key
+        if args.action == "find":
+            print(json.dumps({"key": key, "tests": [asdict(test) for test in result.tests]}, indent=2))
+            return 0
+        # Load the review and question tools only when the range has changed tests.
+        execute = cast(Callable[[str, GitRange, ChangedTests, str, str], int],
+                       import_module("scripts.production.behavior_review").execute)
+        return execute(args.action, change, result, key, args.production)
     except (BehaviorCheckError, OSError) as error:
         print(f"behavior_check: {error}", file=sys.stderr)
         return 1

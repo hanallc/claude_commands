@@ -85,14 +85,14 @@ def tail(text: str) -> str:
     return "\n".join(text.strip().splitlines()[-ERROR_TAIL_LINES:])
 
 
-def _managed_review(review: Path, log: Path, target: str) -> int:
+def _managed_review(review: Path, log: Path, target: str, cwd: Path) -> int:
     """Run one managed review through assign.sh."""
     run = log.parent
     with log.open("w", encoding="utf-8") as output:
         result = subprocess.run([
             "bash", str(SCRIPTS / "direct/assign.sh"), "--role", "review", "--operation", "astra-review",
             "--target", target, "--policy", "astra-reviewer",
-            "--new-worker", f"astra-reviewer{os.getpid()}", "--session-dir", str(run), "--cwd", str(Path.cwd()),
+            "--new-worker", f"astra-reviewer{os.getpid()}", "--session-dir", str(run), "--cwd", str(cwd),
             "--prompt", str(run / "prompt.md"), "--reply-file", str(review.resolve()), "--log", str(run / "turn.log"),
             "--model", MODEL, "--effort", REASONING,
         ], stdout=output, stderr=subprocess.STDOUT, text=True, check=False)
@@ -101,7 +101,7 @@ def _managed_review(review: Path, log: Path, target: str) -> int:
     return result.returncode
 
 
-def run_review(review: Path, prompt: str, log: Path) -> int:
+def run_review(review: Path, prompt: str, log: Path, *, cwd: Path | None = None) -> int:
     """Run each review through its explicit assign.sh target."""
     manager = staff.runtime_id()
     caller = staff.snapshot().by_current_session(manager) if manager else None
@@ -109,7 +109,7 @@ def run_review(review: Path, prompt: str, log: Path) -> int:
     if caller is not None and caller.kind in ("unit", "showrunner"):
         target = "staff-worker"
     write_text_atomic(log.parent / "prompt.md", prompt)
-    return _managed_review(review, log, target)
+    return _managed_review(review, log, target, cwd if cwd is not None else Path.cwd())
 
 
 submitted_review = design_roles.submitted_review

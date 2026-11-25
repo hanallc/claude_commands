@@ -301,7 +301,11 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
         fields = cast(dict[str, object], entry)
         check_keys(fields, {"since", "text", "after", "question", "parts", "reviewed", "review_unavailable", "urgency",
                             "due", "marked", "follows", "asked_by", "followup", "followups", "review_id", "review_log", "waiting_why",
-                            "review_submission", "reply_log_positions", "answered_at"}, where)
+                            "review_submission", "reply_log_positions", "answered_at", "request_key"}, where)
+        if "request_key" in fields:
+            request_key = fields["request_key"]
+            if not isinstance(request_key, str) or not request_key.strip() or "question" not in fields:
+                raise InputError(f"{where}.request_key: expected a nonempty question request key")
         details: new_item_dialog.SubmissionOrigin = new_item_dialog.NoReviewSubmission()
         if "review_submission" in fields:
             try:
@@ -414,6 +418,7 @@ class FollowupExchange(TypedDict):
 
 
 class OutstandingItem(TypedDict):
+    request_key: NotRequired[str]
     waiting_why: NotRequired[str]
     review_id: NotRequired[str]
     review_log: NotRequired[str]
@@ -1923,7 +1928,27 @@ class QuestionFromStaff:
     pass
 
 
+@dataclass(frozen=True)
+class KeyedStaffQuestion:
+    """A caller can retry this question with the same request key."""
+
+    request_key: str
+
+
 _QUESTION_FROM_STAFF = QuestionFromStaff()
+
+
+def keyed_question(production: QuestionScope, identities: QuestionStaff, key: str) -> QuestionRecord | None:
+    matches = [record for record in native_question_records(production, identities, strict=True)
+               if record.item.get("request_key") == key]
+    if len(matches) > 1:
+        raise RegistrationFailure("ask", f"{key}: more than one question for this request")
+    return matches[0] if matches else None
+
+
+def numbered_question(owner: staff.StaffId, identity: str, folder: Path) -> QuestionRecord | None:
+    """Read one staff question by its fixed owner and number."""
+    return _find_question(owner, identity, "questions", folder)
 
 def _ask_recipient(production: QuestionScope, text: str, parts: QuestionParts,
                    identities: QuestionStaff, outgoing: QuestionFromReview) -> QuestionRecord:
@@ -1951,18 +1976,24 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
 
 @overload
 def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, rank: Ranking, *,
-        identities: QuestionStaff | None = None, outgoing: QuestionFromReview) -> QuestionRecord: ...
+        identities: QuestionStaff | None = None, outgoing: QuestionFromReview | KeyedStaffQuestion) -> QuestionRecord: ...
 
 
 def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, rank: Ranking, *,
         identities: QuestionStaff | None = None,
-        outgoing: QuestionFromReview | QuestionFromStaff = _QUESTION_FROM_STAFF) -> QuestionRecord | None:
+        outgoing: QuestionFromReview | QuestionFromStaff | KeyedStaffQuestion = _QUESTION_FROM_STAFF) -> QuestionRecord | None:
     """Review and file a question with its asker's fixed staff id; its parts keep their layout on the Questions page."""
     identities = identities if identities is not None else QuestionStaff.read()
     if isinstance(outgoing, QuestionFromReview):
         limit = conf.read_or_repository("production").whole("question_title_max_chars")
         title = text[:limit].rstrip()
         return _ask_recipient(production, title, {**parts, "ask": title}, identities, outgoing)
+    if isinstance(outgoing, KeyedStaffQuestion):
+        if not outgoing.request_key.strip():
+            raise RegistrationFailure("ask", "the request key is empty")
+        saved = keyed_question(production, identities, outgoing.request_key)
+        if saved is not None:
+            return saved
     asker = identities.asker(production, unit)
     for option, title in (("--text", text), ("--ask", parts["ask"])):
         checked = check_question_title(title)
@@ -1991,6 +2022,11 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
         entry["review_unavailable"] = accepted.reason
     store_ranking(entry, rank)
     with outstanding_lock(outstanding):
+        if isinstance(outgoing, KeyedStaffQuestion):
+            saved = keyed_question(production, identities, outgoing.request_key)
+            if saved is not None:
+                return saved
+            entry["request_key"] = outgoing.request_key
         entries = open_entries(production, identities)
         if any(stored["text"] == text for stored in entries):
             raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
@@ -2002,6 +2038,11 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
         with record_store.keep_file_on_error(outstanding.with_suffix(".history.jsonl")):
             write_open_entries(production, entries, identities, last=(entry,),
                                before_list=lambda: record_question_history(outstanding, [entry], now))
+        if isinstance(outgoing, KeyedStaffQuestion):
+            saved = keyed_question(production, identities, outgoing.request_key)
+            if saved is None:
+                raise RegistrationFailure("ask", f"{text}: cannot read the filed question")
+            return saved
     filed = accepted.reviewed if isinstance(accepted, ReviewedQuestion) else question
     print("filed question: " + filed)
     report("ask", "ok", f"{text}: on the open-questions list of {production.name}, not shown to the user")
@@ -2566,6 +2607,8 @@ def keep_layout_fields(entry: OutstandingItem, stored: OutstandingItem) -> None:
         entry["waiting_why"] = stored["waiting_why"]
     if "review_id" in stored:
         entry["review_id"] = stored["review_id"]
+    if "request_key" in stored:
+        entry["request_key"] = stored["request_key"]
 
 
 class HeldRegistrationQuestion(NamedTuple):

@@ -827,7 +827,8 @@ Promote the exact sha pushed by <CIPoint/> after these checks:
    is blocked passes. Add `macOS skipped (runner offline)` or `macOS skipped
    (Mac blocked)` to the log line. A macOS job that ran and failed blocks. User
    rule 2026-10-02.
-4. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/production_lifecycle.py
+4. Run the behavior check under <BehaviorCheck/> in `commands/unit/merge.md` before promotion.
+   Then run `~/.claude/scripts/lib/py ~/.claude/scripts/production/production_lifecycle.py
    promote-main --production <showrunner name> --ci-green <sha>
    --smoke-passed <sha>`. The command checks that main is not dirty, pushes
    and promotes the doc's **Promote:** destinations. A held main is a topic in
