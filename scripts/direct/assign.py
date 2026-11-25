@@ -743,10 +743,13 @@ def _execute_herdr(args: Arguments, run: Path, phase: str, role: staff.WorkerRol
     env["UNIT_TEAM_ROLE"] = slot
     claimed_cwd: Path | None = None
     if role != "review" and phase != pass_recorder.AS_BUILT_PHASE:
-        claimed_cwd = Path(args.cwd).expanduser().resolve()
-        if not assign_claude.claim_phase(run, phase, claimed_cwd, log,
+        requested = Path(args.cwd).expanduser().resolve()
+        if not assign_claude.claim_phase(run, phase, requested, log,
                                         assign_claude.UnclaimedPhaseStatus.PRESERVE, slot, env):
             return 1
+        claimed_cwd = phase_reservation.claimed_launch_directory(directory, requested)
+        if claimed_cwd != requested:
+            _ = authorized_paths(args, claimed_cwd)
     command = [PYTHON, str(SCRIPTS / "../production/worker.py"), "assign", role, str(message),
                "--session-dir", str(run), "--phase", phase, "--slot", slot, "--kind", "assign", "--reply", str(reply),
                "--lens", args.lens, "--fix-cause", args.fix_cause,
