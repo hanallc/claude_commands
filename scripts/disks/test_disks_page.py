@@ -120,6 +120,39 @@ class DisksPageTests(unittest.TestCase):
                 self.assertEqual(grid[5].text, "held · Task builds")
                 self.assertEqual((list(grid[4]), list(grid[5])), ([], []))
 
+    def test_a_refresh_colors_a_new_session_folder(self) -> None:
+        page = self.page_html()
+        registry = re.search(r"<script>(window\.staffNames=.*?)</script>", page, re.DOTALL)
+        assert registry is not None
+        name = "report-impl-2"
+        root = Path(os.environ[session_folder.ROOT_ENV])
+        path = root / name
+        path.mkdir()
+        session_folder.write_record(path, {"owner": "worker-id", "session_id": "worker-session"})
+        member = staff.StaffRow(staff.StaffId("worker-id"), "worker", "impl", staff.StaffRoot(),
+                                current_session=staff.StaffId("worker-session"))
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))):
+            answer = {"state": "current", "sessions": {"root": str(root), "sessions": [session(name, GIB, "running")]},
+                      "staff_names": disks_page.session_name_registry()}
+        rendered = cast(list[str], self.run_drive("globalThis.window = globalThis;" + registry[1] + """
+            const card = new Element();
+            document.getElementById = () => card;
+            const updateSessions = sessionsView(card);
+            const fetch = async () => ({ok: true, json: async () => input.answer});
+            const before = window.staffNames.html(input.name);
+            result = askMeasure(() => true).then(() => [
+                before, card.querySelector("tbody").innerHTML, tipFor("session:" + input.name)
+            ]);
+        """, extra={"answer": answer, "name": name}, page=page))
+        self.assertEqual(rendered[0], name)
+        row = ElementTree.fromstring(f"<tbody>{rendered[1]}</tbody>")[0]
+        tip = ElementTree.fromstring(rendered[2])
+        for label in (row[0], tip[0]):
+            span = label.find("span")
+            assert span is not None
+            self.assertEqual((span.text, span.get("data-color-text"), span.get("style")),
+                             (name, "role.worker", "color:#ff9898"))
+
     def test_publish_writes_the_frame_style_and_settings_into_the_page(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             page = disks_page.publish(Path(directory) / "page", SETTINGS).read_text()
@@ -1048,9 +1081,10 @@ with file_lock.exclusive(folder / disks_page.COORD_FILE):
         kept = self.run_page(f"[...knownFolders({json.dumps(drives)}, {json.dumps(paths)})]")
         self.assertEqual(kept, ["/build/cargo/project", "/build/|other", "other:/build", "/home/kept", "other:/"])
 
-    def run_drive(self, script: str, storage: str | None = None, extra: dict[str, object] | None = None) -> object:
+    def run_drive(self, script: str, storage: str | None = None, extra: dict[str, object] | None = None,
+                  page: str | None = None) -> object:
         """Run the page code on a fake document: each element counts its innerHTML writes and keeps its listeners."""
-        html = self.page_html()
+        html = self.page_html() if page is None else page
         functions = html[html.index("const GIB ="):html.index("const updateSessions =")]
         fake = ("""
             const input = JSON.parse(require("fs").readFileSync(0, "utf8"));
@@ -1072,7 +1106,7 @@ with file_lock.exclusive(folder / disks_page.COORD_FILE):
             const localStorage = {getItem: key => saved.has(key) ? saved.get(key) : null, setItem: (key, value) => saved.set(key, value)};
             let result = null;
         """)
-        javascript = fake + functions + script + "\nprocess.stdout.write(JSON.stringify(result));\n"
+        javascript = fake + functions + script + "\nPromise.resolve(result).then(value => process.stdout.write(JSON.stringify(value)));\n"
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
         completed = subprocess.run([executable, "-e", javascript], input=json.dumps({"tree": TREE, "settings": SETTINGS, "keep": KEEP, "storage": storage,
                                                                                 **(extra or {})}),

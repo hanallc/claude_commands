@@ -698,6 +698,7 @@ async function askMeasure(current,force=false) {
   const answer=await response.json();
   if(!current()) return;
   if(!response.ok) throw new Error(answer.reason || `HTTP ${response.status}`);
+  if(answer.staff_names) globalThis.staffNames?.set(answer.staff_names);
   sessionReport=answer.sessions || null;renderCards();
   if(force) measuring.target=answer.target;
   else if(answer.state!=="current" && !measuring)

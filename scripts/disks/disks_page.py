@@ -87,8 +87,9 @@ def shared_step_tip(source: str) -> StepTip:
     return StepTip(parts[0], parts[1])
 
 
-def _session_name_registry(names: staff_names.StaffNames) -> dict[str, str]:
-    """Color session folder names by their recorded owner."""
+def session_name_registry() -> dict[str, str]:
+    """Read current staff names and color session folders by their recorded owner."""
+    names = staff_names.read()
     registry = names.registry()
     try:
         root = session_folder.session_root()
@@ -121,8 +122,7 @@ def publish(folder: Path, settings: PageSettings) -> Path:
     page = (page_frame.template(source, "Disks", "disks")
             .replace("__STEP_TIP_STYLE__", tip.style).replace("__STEP_TIP_SCRIPT__", tip.script)
             .replace("__DISKS_SETTINGS__", json.dumps(settings).replace("</", "<\\/")))
-    names = staff_names.read()
-    page = page.replace('</head>', staff_names.script(_session_name_registry(names), names.role_labels()) + '</head>', 1)
+    page = page.replace('</head>', staff_names.script(session_name_registry()) + '</head>', 1)
     folder.mkdir(parents=True, exist_ok=True)
     page_path = folder / PAGE_NAME
     try:
