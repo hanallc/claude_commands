@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from scripts.buildlog.store import host_name
 from scripts.lib import conf_reads
-from scripts.lib.build_slots_test_support import write_private_build_roots
+from scripts.lib.build_copies_test_support import write_private_build_roots
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 

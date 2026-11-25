@@ -35,14 +35,14 @@ from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.copies import copies
 from scripts.lib import build_folders, conf, scratch
-from scripts.lib.build_slots import SlotQueuePosition
+from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.build_steps import (
     GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, gate_job_for_command,
 )
 from scripts.lib.process_start import Gone
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, gate, staff
-from scripts.production.gate_modules import GateRefused
+from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import (
     build_fixture_sessions, fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, source_environment,
@@ -147,7 +147,7 @@ class DirectGatePlacementTests(unittest.TestCase):
         assignment = replace(placed(target).assignment, owner=owner,
                              source_key=execution_identity.SourceKeyKnown(key))
         grant = admission_wire.Assignment(assignment)
-        position = SlotQueuePosition(assignment.episode, assignment.since)
+        position = CopyQueuePosition(assignment.episode, assignment.since)
         profile = admission_records.ProgramProfile("gate", str(source), str(source),
             admission_records.HistoryPeakSizing(1, admission_records.FirstProgramPeak(1), 0))
         constraints = placement.PlacementConstraints(assignment.source_key, command, str(source), "", assignment.session,
@@ -357,6 +357,9 @@ class DirectGatePlacementTests(unittest.TestCase):
     def test_named_gate_refuses_an_inherited_assignment_for_a_different_source(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             source = self.checkout(folder)
+            test = source / "scripts/lib/test_fixture.py"
+            test.parent.mkdir(parents=True)
+            test.touch()
             path = source / ".git" / "assignment.json"
             key = treekey.tree_key(str(source))
             assert key is not None
@@ -366,7 +369,7 @@ class DirectGatePlacementTests(unittest.TestCase):
             identity = build_hold.ProcessIdentity(owner.pid, owner.start_time)
             grant = admission_wire.Assignment(assignment)
             admission_client.write_assignment(path, grant)
-            inherited = first_step.FirstStepAdmission(SlotQueuePosition(assignment.episode, assignment.since),
+            inherited = first_step.FirstStepAdmission(CopyQueuePosition(assignment.episode, assignment.since),
                                                        first_step.InheritedGatePlacement(grant), path)
             _ = (source / "edit.txt").write_text("Changed since placement.\n")
             response = admission_wire.PlacementStatusReply(admission_wire.KnownPlacementStatus(
@@ -390,6 +393,37 @@ class DirectGatePlacementTests(unittest.TestCase):
                         self.assertEqual(result, 1)
                     self.assertIn("source does not match", errors.getvalue())
                     run.assert_not_called()
+
+    def test_direct_gate_refuses_a_missing_module_before_admission(self) -> None:
+        with (tempfile.TemporaryDirectory() as folder,
+              mock.patch.dict(os.environ, {}, clear=True),
+              mock.patch.object(first_step, "admitted_run") as admit,
+              mock.patch.object(gate, "run_tests_only") as run,
+              redirect_stderr(io.StringIO()) as errors):
+            status = gate.main(["--tests-only", "--repo", folder, "--module", "lib/test_missing.py"])
+        self.assertEqual(status, 1)
+        self.assertIn("--module 'lib/test_missing.py' does not name a test module", errors.getvalue())
+        admit.assert_not_called()
+        run.assert_not_called()
+
+    def test_direct_gate_accepts_a_symlinked_module_that_discovery_accepts(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            source = base / "checkout"
+            shared = base / "sibling/test_shared.py"
+            shared.parent.mkdir()
+            shared.touch()
+            module = "lib/test_shared.py"
+            link = source / "scripts" / module
+            link.parent.mkdir(parents=True)
+            link.symlink_to(shared)
+            self.assertEqual(discover_test_modules(source), [("lib", link)])
+            with (mock.patch.dict(os.environ, {}, clear=True),
+                  mock.patch.object(gate, "checked_gate_target", return_value="natedev"),
+                  mock.patch.object(gate, "run_tests_only", return_value=0) as run):
+                self.assertEqual(gate.main(["--tests-only", "--repo", str(source), "--module", module]), 0)
+            args, mode, target = cast(tuple[gate.GateArguments, gate.SuiteMode, gate.GateTarget], run.call_args.args)
+            self.assertEqual((args.modules, mode, target), ([module], gate.SuiteMode.GATE, "natedev"))
 
     def test_direct_gate_refuses_an_assignment_for_a_different_source(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -632,7 +666,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         @contextmanager
         def admit() -> Generator[first_step.FirstStepAdmission]:
             try:
-                position = SlotQueuePosition(assignment.episode, assignment.since)
+                position = CopyQueuePosition(assignment.episode, assignment.since)
                 yield first_step.FirstStepAdmission(position, first_step.OwnedGatePlacement(grant, request),
                                                    self.root / "assignment.json")
             finally:

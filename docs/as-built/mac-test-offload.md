@@ -26,6 +26,13 @@ The same episode can receive a Mac assignment after disk evidence recovers.
 The live step record keeps diagnostic disk evidence.
 Standalone fixed local callers retain their existing local admission path.
 
+The queue checks waiters in order for each remote place.
+For Mac places only, a lower step's newer free reading clears a higher step's busy result for the same destination.
+The higher step can take the place in that pass.
+The queue keeps each step's other eligibility results.
+A step that needs evidence can hold the place for one waiting pass interval plus the probe time limit.
+The remote claim checks the place again before the step starts.
+
 ## Mac Linux gate type checks
 
 A gate that runs in the Mac Linux guest runs its requested type checks and tests in the same numbered copy.
@@ -1017,7 +1024,7 @@ Unknown remote memory remains unknown and creates no local memory charge.
 One `mirror_busy_backoff_s` key in `mac_test.conf` serves both Mac and AWS targets.
 Each target stores `mirror-busy-<repository>.until` beside its unreachable backoff record.
 A mirror busy refusal during copy writes this time.
-A busy mirror lease also writes this time.
+If the mirror lease is busy, the caller also writes this time.
 A `mirror-use` busy refusal after copy becomes `BusyMacDecline`, without a lost run.
 A successful copy removes the repository's refusal time.
 `free-now` reads this local record without SSH or a lock.
