@@ -2879,6 +2879,15 @@ process.stdout.write(JSON.stringify(steps));
                         [["Dec 28 to Dec 31", "$0.10", 3], ["Dec 21 to Dec 27", "$0.20", 1]]],
         })
 
+    def test_the_running_pid_has_a_tip_when_no_stop_is_available(self) -> None:
+        data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "waiters": [],
+                "walk": [{"name": "test affected", "queued": True, "pid": 17}]}
+        html = cast(str, self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True))
+        cells = ElementTree.fromstring(f"<root>{html}</root>").findall(".//td[@class='pid']")
+        cell = next(cell for cell in cells if cell.text == "17")
+        self.assertEqual(cell.attrib.get("title"), "Kill is not available for this run yet")
+        self.assertIsNone(cell.find("button"))
+
     def page_expression(self, expression: str, data: object, *, walk: bool = False, swap: bool = False,
                         limits: bool = False, queue_move: bool = False, history: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
@@ -2915,6 +2924,7 @@ function fitLabels() {}
             functions += html[start:html.index('$("queue-action").addEventListener', start)]
             constants += """
 const document = {activeElement:null};
+function showKillResults() {}
 let painted;
 renderWalk = reading => { painted = reading; };
 """
