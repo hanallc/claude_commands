@@ -24,7 +24,7 @@ from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, tzinfo
 from enum import Enum, auto
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never, cast, final, overload
 
@@ -71,14 +71,15 @@ from scripts.build_queue.slot_wait import QueueRowName as QueueRowName
 from scripts.build_queue.slot_wait import (SHELLS, NoNamedStep, QueueKind, command_programs,
                                            public_queue_text, recorded_step, verify_value_options)
 from scripts.build_queue.scope_activity import (LiveBuildRun, NotServiceSlice,
-    RunningServiceJob, ScopeProcesses, environment_values)
+    RunningServiceJob, ScopeProcesses)
 from scripts.build_queue import admission_records, target_availability
 from scripts.build_queue.memory_files import DATA_NAME, PAGE_NAME, PAGE_SOURCE, configured_output_folder
 from scripts.build_targets import target_config
+from scripts.herdr import herdr
 from scripts.herdr.herdr import is_claude_process, is_codex_process
 from scripts.lint import memory_admit as gate
-from scripts.message import unit_labels
-from scripts.production import staff
+from scripts.message import sessions, unit_labels
+from scripts.production import staff, staff_sources
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.proc_text import read_proc_text
@@ -2817,13 +2818,12 @@ class OutsideCpuReadings:
         self.sampled_at = now
 
 
-DETACHED_OWNER_KEY = "BUILDLOG_OWNER_STAFF_ID"
-SESSION_OWNER_KEYS = ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "STAFF_ID")
+def is_codex_agent(command: Sequence[str]) -> bool:
+    return bool(command) and (is_codex_process(command) or Path(command[0]).name == "codex-real")
 
 
 def is_agent_command(command: Sequence[str]) -> bool:
-    return bool(command) and (is_claude_process(command) or is_codex_process(command)
-                              or Path(command[0]).name == "codex-real")
+    return is_claude_process(command) or is_codex_agent(command)
 
 
 @final
@@ -2831,15 +2831,17 @@ class OutsideQueueScan:
     """Read current placement for one feed refresh."""
 
     def __init__(self, inputs: admission_records.QueueInputs, processes: dict[int, OutsideProcess],
-                 staff_members: FeedStaff, *, for_table: bool) -> None:
+                 staff_members: FeedStaff, builds: Path, *, for_table: bool) -> None:
         self.processes = processes
         self.staff_members = staff_members
+        self.builds = builds
         self.ticks_per_second = os.sysconf("SC_CLK_TCK")
         self.boot_now = time.clock_gettime(time.CLOCK_BOOTTIME)
         self.groups: dict[int, Path | None] = {}
         self.for_table = for_table
         self.commands: dict[int, tuple[str, ...]] = {}
-        self.owners: dict[int, dict[str, staff.StaffRow]] = {}
+        self.native_sessions: dict[int, str] = {}
+        self.codex_threads = staff_sources.CodexProcessThreads()
         self.children: dict[int, list[int]] = {}
         for pid, process in processes.items():
             self.children.setdefault(process.parent, []).append(pid)
@@ -2876,21 +2878,28 @@ class OutsideQueueScan:
             self.commands[pid] = outside_command_line(pid)
         return self.commands[pid]
 
-    def read_owners(self, pid: int) -> dict[str, staff.StaffRow]:
-        owners = environment_values(PROC / str(pid) / "environ", (DETACHED_OWNER_KEY, *SESSION_OWNER_KEYS))
-        if not owners or (process := self.current_process(pid)) is None or process.zombie:
-            return {}
-        return {key: member for key, reference in owners.items() if reference
-                and (member := self.staff_members.members.by_member_reference(reference)) is not None}
+    @cached_property
+    def claude_sessions(self) -> dict[tuple[int, str], str]:
+        return {(record["pid"], start): record["sessionId"] for entry in sessions.read_registry().entries
+                if (start := (record := entry.record).get("procStart"))}
 
-    def owner(self, pids: Iterable[int], keys: tuple[str, ...] = SESSION_OWNER_KEYS) -> staff.StaffRow | None:
-        for pid in pids:
-            if pid not in self.owners:
-                self.owners[pid] = self.read_owners(pid)
-            for key in keys:
-                if (member := self.owners[pid].get(key)) is not None:
-                    return member
-        return None
+    def read_native_session(self, pid: int, command: tuple[str, ...]) -> str:
+        if is_claude_process(command):
+            native = self.claude_sessions.get((pid, self.processes[pid].start), "")
+        else:
+            if staff_sources.codex_thread_host(list(command)):
+                return ""
+            try:
+                environment = herdr.process_environment(pid)
+                if any(ancestor != pid and is_codex_agent(self.command(ancestor)) for ancestor in self.ancestors(pid)):
+                    # A nested Codex can inherit the thread ID of its parent.
+                    _ = environment.pop("CODEX_THREAD_ID", None)
+                result = self.codex_threads.thread(pid, environment)
+            except (OSError, ValueError):
+                return ""
+            native = result.owner if isinstance(result, herdr.ProvedMatch) else ""
+        process = self.current_process(pid)
+        return native if process is not None and not process.zombie else ""
 
     def parent_first(self, pids: set[int]) -> Iterable[int]:
         """Visit every member, with its parent first if the parent is also a member."""
@@ -2915,28 +2924,37 @@ class OutsideQueueScan:
             pid = process.parent
 
     def agent_owner(self, pid: int) -> staff.StaffRow | None:
-        return self.owner(ancestor for ancestor in self.ancestors(pid)
-                          if ancestor != pid and is_agent_command(self.command(ancestor)))
+        for ancestor in self.ancestors(pid):
+            if ancestor == pid or not is_agent_command(command := self.command(ancestor)):
+                continue
+            if ancestor not in self.native_sessions:
+                self.native_sessions[ancestor] = self.read_native_session(ancestor, command)
+            native = self.native_sessions[ancestor]
+            if not native:
+                return None
+            if (owner := self.staff_members.members.by_current_session(native)) is not None:
+                return owner
+        return None
 
     def group(self, pid: int) -> Path | None:
         if pid not in self.groups:
             self.groups[pid] = outside_process_group(pid)
         return self.groups[pid]
 
-    def command_tree(self, pid: int, scope: Path, allowed: set[int], seen: set[int]) -> list[int]:
-        """Keep scope members below the command. Stop at an agent or launcher."""
+    def command_tree(self, pid: int, launchers: set[int], seen: set[int]) -> list[int]:
+        """Keep descendants outside the builds slice. Stop at an agent or launcher."""
         tree: list[int] = []
         pending = [pid]
         while pending:
             child = pending.pop()
-            if child in seen:
+            if child in seen or child in launchers:
                 continue
-            if child not in allowed:
-                # A zombie can be absent from cgroup.procs until its parent reaps it.
-                if not self.processes[child].zombie:
-                    continue
+            if child != pid:
                 group = self.group(child)
-                if group is not None and not group.is_relative_to(scope):
+                if group is not None and group.is_relative_to(self.builds):
+                    continue
+                command = self.command(child)
+                if is_agent_command(command) or is_session_launcher(command):
                     continue
             seen.add(child)
             tree.append(child)
@@ -2996,7 +3014,7 @@ def outside_agent_rows(scope: Path, scan: OutsideQueueScan, limit: float) -> lis
     for pid in scan.parent_first(allowed):
         if pid in seen or is_outside_tree_wrapper(commands[pid]):
             continue
-        tree = scan.command_tree(pid, scope, allowed, seen)
+        tree = scan.command_tree(pid, launchers, seen)
         if scan.has_queue_work(tree, scan.admitted_scopes):
             continue
         root_process = scan.current_process(pid)
@@ -3051,7 +3069,7 @@ def outside_detached_row(scope: Path, scan: OutsideQueueScan, limit: float) -> O
     for pid in sorted(commands, key=lambda item: (scan.processes[item].parent in pids, int(scan.processes[item].start))):
         if (not is_outside_tree_wrapper(commands[pid])
                 and (process := scan.current_process(pid)) is not None and not process.zombie):
-            owner = scan.owner(scan.ancestors(pid), (DETACHED_OWNER_KEY, *SESSION_OWNER_KEYS)) if seconds > limit else None
+            owner = scan.agent_owner(pid) if seconds > limit else None
             return scan.command_row(pid, commands[pid], owner, seconds, seconds, over_limit=seconds > limit)
     return None
 
@@ -3080,7 +3098,7 @@ def outside_commands(inputs: admission_records.QueueInputs, staff_members: FeedS
         processes = outside_process_table()
     except OSError:
         return []
-    scan = OutsideQueueScan(inputs, processes, staff_members, for_table=for_table)
+    scan = OutsideQueueScan(inputs, processes, staff_members, builds, for_table=for_table)
     rows = [row for scope in agent_scopes for row in outside_agent_rows(scope, scan, limit)]
     rows.extend(row for scope in sorted(detached_scopes) if (row := outside_detached_row(scope, scan, limit)) is not None)
     return rows

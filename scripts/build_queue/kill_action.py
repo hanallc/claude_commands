@@ -217,6 +217,16 @@ def outside_stop_route(
     return NoStopRoute()
 
 
+def stable_outside_parent(pid: int, identity: memory_admit.ProcessIdentity) -> bool:
+    try:
+        with process_stop.pin_process(process_stop.ProcessLifetime(pid, identity.start)):
+            fields = (PROC / str(pid) / "stat").read_bytes().rsplit(b") ", 1)[1].split()
+            return (fields[0] not in (b"Z", b"X", b"x") and int(fields[1]) == identity.parent
+                    and fields[19] == identity.start.encode("ascii"))
+    except (FileNotFoundError, ProcessLookupError, IndexError, ValueError):
+        return False
+
+
 def outside_tree(known: set[process_stop.ProcessLifetime]) -> set[process_stop.ProcessLifetime]:
     """Find and retain live descendants of the observed processes."""
     observed = memory_admit.process_table(PROC)
@@ -226,8 +236,17 @@ def outside_tree(known: set[process_stop.ProcessLifetime]) -> set[process_stop.P
                  else identity for pid, identity in observed.items()}
     roots = {item.pid: item.start for item in known
              if (identity := processes.get(item.pid)) is not None and identity.start == item.start}
-    members = {process_stop.ProcessLifetime(pid, processes[pid].start)
-               for pid in memory_admit.process_tree(roots, processes)}
+    reachable = memory_admit.process_tree(roots, processes)
+    rejected: list[int] = []
+    for pid in reachable - roots.keys():
+        identity = processes[pid]
+        if processes[identity.parent].start == identity.start and not stable_outside_parent(pid, identity):
+            rejected.append(pid)
+    if rejected:
+        for pid in rejected:
+            processes[pid] = replace(processes[pid], parent=0)
+        reachable = memory_admit.process_tree(roots, processes)
+    members = {process_stop.ProcessLifetime(pid, processes[pid].start) for pid in reachable}
     # A process can leave the table during a scan. Check its identity before declaring it gone.
     for item in known - members:
         state = process_start.proc_table_start(item.pid, PROC)
@@ -268,12 +287,16 @@ class OutsideTreeEmpty:
 
 
 @dataclass(frozen=True)
-class OutsideStopUnconfirmed:
+class OutsideIdentityUnconfirmed:
+    reason: str
+
+
+@dataclass(frozen=True)
+class OutsideProcessSurvived:
     pid: int
-    reason: str = ""
 
 
-def stop_outside_tree(run: OutsideKillCandidate) -> OutsideTreeEmpty | OutsideStopUnconfirmed:
+def stop_outside_tree(run: OutsideKillCandidate) -> OutsideTreeEmpty | OutsideIdentityUnconfirmed | OutsideProcessSurvived:
     settings = conf.read("shutdown")
     grace = float(settings.text("STOP_GRACE_SECONDS"))
     kill_grace = float(settings.text("KILL_GRACE_SECONDS"))
@@ -283,7 +306,7 @@ def stop_outside_tree(run: OutsideKillCandidate) -> OutsideTreeEmpty | OutsideSt
         with process_stop.pin_process(root) as descriptor:
             members = outside_tree(known)
             if root not in members or not live(root.pid, root.start):
-                return OutsideStopUnconfirmed(root.pid, "The command ended before the tree could be checked.")
+                return OutsideIdentityUnconfirmed("The command ended before the tree could be checked.")
             for process in members - {root}:
                 signal_outside_process(process, signal.SIGTERM)
             try:
@@ -291,12 +314,12 @@ def stop_outside_tree(run: OutsideKillCandidate) -> OutsideTreeEmpty | OutsideSt
             except (ProcessLookupError, PermissionError):
                 pass
     except ProcessLookupError:
-        return OutsideStopUnconfirmed(root.pid, "The command PID changed before the stop.")
+        return OutsideIdentityUnconfirmed("The command PID changed before the stop.")
     remaining = wait_outside_tree(known, members, signal.SIGTERM, grace)
     if remaining:
         remaining = wait_outside_tree(known, set(), signal.SIGKILL, kill_grace)
     if remaining:
-        return OutsideStopUnconfirmed(min(process.pid for process in remaining))
+        return OutsideProcessSurvived(min(process.pid for process in remaining))
     return OutsideTreeEmpty()
 
 
@@ -728,7 +751,8 @@ class KillActions:
             else:
                 if isinstance(outcome, OutsideTreeEmpty):
                     return self._stopped(action)
-                reason = outcome.reason or f"Still running after Kill: pid {outcome.pid}"
+                reason = (outcome.reason if isinstance(outcome, OutsideIdentityUnconfirmed)
+                          else f"Still running after Kill: pid {outcome.pid}")
         return self._finish(action, {**action.result, "stop": StopState.UNCONFIRMED, "reason": reason})
 
     def _advance_detached(self, action: SavedKillAction, route: DetachedCommand, *,

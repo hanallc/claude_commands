@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 from collections.abc import Callable, Generator
-from contextlib import contextmanager, nullcontext, redirect_stdout, suppress
+from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout, suppress
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 import fcntl
@@ -21,12 +21,13 @@ import time
 from types import SimpleNamespace
 from typing import IO, cast, override
 import unittest
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, call, patch
 from zoneinfo import ZoneInfo
 
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 from scripts.build_queue import admission_client, admission_records as records, admission_wire, kill_action
 from scripts.build_queue.admission_jobs import VerifyCall
+from scripts.build_queue.queue_fixture import write_process
 from scripts.build_queue.test_memory_feed import reservation_reading
 from scripts.buildlog import store
 from scripts.direct import progress_history
@@ -157,8 +158,7 @@ class KillActionTests(unittest.TestCase):
                 self.install_outside_stop_graces()
                 with patch.object(signal, "pidfd_send_signal") as sent:
                     self.assertEqual(kill_action.stop_outside_tree(run),
-                                     kill_action.OutsideStopUnconfirmed(run.row_pid,
-                                                                       "The command PID changed before the stop."))
+                                     kill_action.OutsideIdentityUnconfirmed("The command PID changed before the stop."))
                 sent.assert_not_called()
                 self.assertIsNone(process.poll())
             finally:
@@ -173,13 +173,38 @@ class KillActionTests(unittest.TestCase):
         observed = {810: memory_admit.ProcessIdentity(1, "200"),
                     811: memory_admit.ProcessIdentity(810, "199"),
                     812: memory_admit.ProcessIdentity(811, "201"),
-                    813: memory_admit.ProcessIdentity(810, "200"),
+                    813: memory_admit.ProcessIdentity(810, "201"),
                     814: memory_admit.ProcessIdentity(813, "202")}
         known = {root}
         with patch.object(memory_admit, "process_table", return_value=observed):
             self.assertEqual(kill_action.outside_tree(known),
-                             {root, process_stop.ProcessLifetime(813, "200"),
+                             {root, process_stop.ProcessLifetime(813, "201"),
                               process_stop.ProcessLifetime(814, "202")})
+
+    def test_outside_tree_checks_equal_start_ticks_after_opening_the_pidfd(self) -> None:
+        root = process_stop.ProcessLifetime(810, "200")
+        stable = process_stop.ProcessLifetime(811, "200")
+        moved = process_stop.ProcessLifetime(812, "200")
+        observed = {810: memory_admit.ProcessIdentity(1, "200"),
+                    811: memory_admit.ProcessIdentity(810, "200"),
+                    812: memory_admit.ProcessIdentity(810, "200"),
+                    813: memory_admit.ProcessIdentity(812, "201")}
+        proc = self.root / "proc"
+        write_process(proc, 811, parent=810, start="200")
+        write_process(proc, 812, parent=810, start="200")
+
+        def pin(process: process_stop.ProcessLifetime) -> AbstractContextManager[int]:
+            if process == moved:
+                write_process(proc, 812, parent=1, start="200")
+            return nullcontext(42)
+
+        known = {root}
+        with (patch.object(kill_action, "PROC", proc),
+              patch.object(memory_admit, "process_table", return_value=observed),
+              patch.object(process_stop, "pin_process", side_effect=pin) as pinned):
+            self.assertEqual(kill_action.outside_tree(known), {root, stable})
+        pinned.assert_has_calls([call(stable), call(moved)], any_order=True)
+        self.assertEqual(known, {root, stable})
 
     def test_outside_tree_keeps_a_child_from_the_final_term_scan(self) -> None:
         self.install_outside_stop_graces()
