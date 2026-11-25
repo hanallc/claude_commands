@@ -1272,6 +1272,30 @@ class RoleTests(ConfiguredShellTests):
                     self.assertEqual(render(session, shell), expected)
                     self.assertEqual(len(launches.read_text(encoding="utf-8").splitlines()), index)
 
+    def test_shell_reuses_a_render_with_seven_thousand_sources_in_under_two_seconds(self) -> None:
+        render = self.cache_shell()
+        expected = render(UNIT.id, "/bin/sh")
+        cache = self.saved_render()
+        key, _, _, fields, *_ = cache.read_text(encoding="utf-8").splitlines()
+        sources = assignment.RenderSources()
+        sources.deadline = int(time.time()) + 60
+        sources.watch(self.runtime / "scripts/statusline/assignment.py")
+        for index in range(6999):
+            source = self.home / f"source '{index}\\file"
+            if index % 2 == 0:
+                source.touch()
+            sources.watch(source)
+        assignment.publish_render(cache, key, cast(dict[str, str], json.loads(fields)), sources)
+        lines = cache.read_text(encoding="utf-8").splitlines()
+        self.assertEqual((lines[2], len(lines) - 4), ("7000", 7000))
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                start = time.monotonic()
+                output = render(UNIT.id, shell)
+                self.assertLess(time.monotonic() - start, 2)
+                self.assertEqual(output, expected)
+                self.assertEqual((self.home / "python-invocations").read_text(encoding="utf-8"), "Python\n")
+
     def saved_render(self) -> Path:
         cache, = (self.home / ".local/state/showrunner/counts").glob(f"statusline-render-v*/s-{UNIT.id}")
         return cache
@@ -1282,10 +1306,25 @@ class RoleTests(ConfiguredShellTests):
         cache = self.saved_render()
         valid = cache.read_text(encoding="utf-8").splitlines(keepends=True)
         for index, bad in enumerate((
-                valid + [str(self.home / "partial-source")], valid[:-1], [*valid[:2], "0\n", valid[3]]), 2):
+                valid + [str(self.home / "partial-source")], [*valid[:-1], valid[-1].rstrip("\n")],
+                valid + ["\n"], valid[:-1], [*valid[:2], "0\n", valid[3]]), 2):
             _ = cache.write_text("".join(bad), encoding="utf-8")
             self.assertEqual(render(UNIT.id, "/bin/sh"), expected)
             self.assertEqual(len((self.home / "python-invocations").read_text().splitlines()), index)
+
+    def test_shell_rejects_a_missing_source_that_now_exists(self) -> None:
+        render = self.cache_shell()
+        expected = render(UNIT.id, "/bin/sh")
+        cache = self.saved_render()
+        lines = cache.read_text(encoding="utf-8").splitlines()
+        appeared = self.home / "new source"
+        lines.append(f"{appeared}\tmissing")
+        lines[2] = str(len(lines) - 4)
+        _ = cache.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.assertEqual(render(UNIT.id, "/bin/sh"), expected)
+        appeared.touch()
+        self.assertEqual(render(UNIT.id, "/bin/sh"), expected)
+        self.assertEqual((self.home / "python-invocations").read_text(encoding="utf-8"), "Python\nPython\n")
 
     def test_shell_rejects_invalid_render_fields_and_deadlines(self) -> None:
         render = self.cache_shell()
