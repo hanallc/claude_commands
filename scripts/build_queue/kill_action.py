@@ -218,8 +218,12 @@ def outside_stop_route(
 
 
 def outside_tree(known: set[process_stop.ProcessLifetime]) -> set[process_stop.ProcessLifetime]:
-    """Find live descendants of each process already observed."""
-    processes = memory_admit.process_table(PROC)
+    """Find and retain live descendants of the observed processes."""
+    observed = memory_admit.process_table(PROC)
+    # A parent PID can change lifetime between stat reads.
+    processes = {pid: replace(identity, parent=0)
+                 if (parent := observed.get(identity.parent)) is not None and int(parent.start) > int(identity.start)
+                 else identity for pid, identity in observed.items()}
     roots = {item.pid: item.start for item in known
              if (identity := processes.get(item.pid)) is not None and identity.start == item.start}
     members = {process_stop.ProcessLifetime(pid, processes[pid].start)
@@ -231,6 +235,7 @@ def outside_tree(known: set[process_stop.ProcessLifetime]) -> set[process_stop.P
             raise OSError(f"Cannot confirm whether pid {item.pid} is still running.")
         if state == process_start.Started(item.start):
             members.add(item)
+    known.update(members)
     return members
 
 
@@ -247,7 +252,6 @@ def wait_outside_tree(known: set[process_stop.ProcessLifetime], sent: set[proces
                       number: int, grace: float) -> set[process_stop.ProcessLifetime]:
     deadline = time.monotonic() + grace
     while members := outside_tree(known):
-        known.update(members)
         for process in members - sent:
             signal_outside_process(process, number)
         sent.update(members)
@@ -258,8 +262,18 @@ def wait_outside_tree(known: set[process_stop.ProcessLifetime], sent: set[proces
     return set()
 
 
-def stop_outside_tree(run: OutsideKillCandidate) -> str | None:
-    """Return a reason if the stop cannot confirm an empty tree."""
+@dataclass(frozen=True)
+class OutsideTreeEmpty:
+    """The last scan confirmed that the observed tree is empty."""
+
+
+@dataclass(frozen=True)
+class OutsideStopUnconfirmed:
+    pid: int
+    reason: str = ""
+
+
+def stop_outside_tree(run: OutsideKillCandidate) -> OutsideTreeEmpty | OutsideStopUnconfirmed:
     settings = conf.read("shutdown")
     grace = float(settings.text("STOP_GRACE_SECONDS"))
     kill_grace = float(settings.text("KILL_GRACE_SECONDS"))
@@ -269,8 +283,7 @@ def stop_outside_tree(run: OutsideKillCandidate) -> str | None:
         with process_stop.pin_process(root) as descriptor:
             members = outside_tree(known)
             if root not in members or not live(root.pid, root.start):
-                return "The command ended before the tree could be checked."
-            known.update(members)
+                return OutsideStopUnconfirmed(root.pid, "The command ended before the tree could be checked.")
             for process in members - {root}:
                 signal_outside_process(process, signal.SIGTERM)
             try:
@@ -278,14 +291,13 @@ def stop_outside_tree(run: OutsideKillCandidate) -> str | None:
             except (ProcessLookupError, PermissionError):
                 pass
     except ProcessLookupError:
-        return "The command PID changed before the stop."
+        return OutsideStopUnconfirmed(root.pid, "The command PID changed before the stop.")
     remaining = wait_outside_tree(known, members, signal.SIGTERM, grace)
     if remaining:
         remaining = wait_outside_tree(known, set(), signal.SIGKILL, kill_grace)
     if remaining:
-        pid = min(process.pid for process in remaining)
-        return f"Still running after Kill: pid {pid}"
-    return None
+        return OutsideStopUnconfirmed(min(process.pid for process in remaining))
+    return OutsideTreeEmpty()
 
 
 def detached_command(run: KillCandidate, recipient: staff.StaffId,
@@ -458,7 +470,7 @@ class SavedKillAction:
 
 
 def notification(run: KillCandidate | OutsideKillCandidate, at: datetime) -> str:
-    return f'nate killed your run "{run.step}" (pid {run.row_pid}) from the Builds page at {at:%H:%M %Z}'
+    return f'nate killed your run "{run.step}" (pid {run.row_pid}) from the Builds page at {at:%H:%M %Z}.'
 
 
 @dataclass(frozen=True)
@@ -709,13 +721,15 @@ class KillActions:
             reason = "The stop was interrupted before the tree could be confirmed empty."
         else:
             try:
-                reason = stop_outside_tree(action.run)
+                outcome = stop_outside_tree(action.run)
             except (OSError, ValueError) as error:
                 print(f"review-links build kill {action.run.reference}: {error}", file=sys.stderr)
                 reason = "The server could not check or signal the process tree."
-        if reason is not None:
-            return self._finish(action, {**action.result, "stop": StopState.UNCONFIRMED, "reason": reason})
-        return self._stopped(action)
+            else:
+                if isinstance(outcome, OutsideTreeEmpty):
+                    return self._stopped(action)
+                reason = outcome.reason or f"Still running after Kill: pid {outcome.pid}"
+        return self._finish(action, {**action.result, "stop": StopState.UNCONFIRMED, "reason": reason})
 
     def _advance_detached(self, action: SavedKillAction, route: DetachedCommand, *,
                           recover_orphan: bool) -> SavedKillAction:

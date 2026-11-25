@@ -238,7 +238,7 @@ def write_outside_queue_fixture(root: Path, *, siblings: tuple[int, ...] = ()) -
     for pid, state, parent, argv, cpu in (
         (8100, "S", 1, "/bin/bash\0--login\0--norc", (200, 0, 0, 0)),
         (8101, "S", 8100, "/bin/codex", (200, 0, 0, 0)),
-        (8102, "S", 1, "/bin/python3\0/fixture/scripts/production/targeted_test.py", (41, 17, 23, 7)),
+        (8102, "S", 8101, "/bin/python3\0/fixture/scripts/production/targeted_test.py", (41, 17, 23, 7)),
         (8103, "Z", 8105, "", (35, 13, 0, 0)),
         (8104, "S", 8101, "/bin/rustc", (80, 40, 0, 0)),
         (8105, "S", 8102, "/bin/python3", (44, 4, 0, 0)),
@@ -247,7 +247,8 @@ def write_outside_queue_fixture(root: Path, *, siblings: tuple[int, ...] = ()) -
     ):
         process = root / "proc" / str(pid)
         write_process(process.parent, pid, parent=parent)
-        fields = [state, str(parent), *(["0"] * 9), *(str(value * ticks) for value in cpu), *(["0"] * 4), str(pid)]
+        started = "8106" if pid == 8103 else str(pid)
+        fields = [state, str(parent), *(["0"] * 9), *(str(value * ticks) for value in cpu), *(["0"] * 4), started]
         _ = (process / "stat").write_text(f"{pid} (fixture ) command) {' '.join(fields)}\n")
         _ = (process / "cmdline").write_text(argv + "\0")
         _ = (process / "cgroup").write_text(f"0::/{scope}\n")
@@ -327,12 +328,29 @@ class MemoryFeedTests(unittest.TestCase):
         set_outside_launcher(self.root)
         set_outside_cpu(self.root, 8102, (60, 0, 0, 0), parent=8101)
         set_outside_cpu(self.root, 8105, (30, 0, 40, 0))
+        (self.root / "proc/8103/stat").unlink()
         inputs = captured_reading().explanation.decided_from
         with mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root)):
             row, = memory_feed.outside_queue_processes(inputs, owners, for_table=True)
             self.assertEqual((row["pid"], row["cpu_seconds"]), (8102, 90.0))
             set_outside_cpu(self.root, 8105, (30, 0, 30, 0))
             self.assertEqual(memory_feed.outside_queue_processes(inputs, owners, for_table=True), [])
+
+    def test_outside_cpu_limit_counts_unreaped_zombie_cpu(self) -> None:
+        owners = memory_feed.FeedStaff(write_outside_queue_fixture(self.root))
+        set_outside_launcher(self.root)
+        set_outside_cpu(self.root, 8102, (60, 0, 0, 0))
+        set_outside_cpu(self.root, 8105, (30, 0, 0, 0))
+        set_outside_cpu(self.root, 8103, (40, 0, 0, 0))
+        inputs = captured_reading().explanation.decided_from
+        cpu = memory_feed.OutsideCpuReadings()
+        with mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root)):
+            row, = memory_feed.outside_queue_processes(inputs, owners, cpu, sampled_at=10.0, for_table=True)
+            self.assertEqual((row["pid"], row["cpu_seconds"], row["current_cpu"]), (8102, 90.0, None))
+            (self.root / "proc/8103/stat").unlink()
+            set_outside_cpu(self.root, 8105, (30, 0, 40, 0))
+            row, = memory_feed.outside_queue_processes(inputs, owners, cpu, sampled_at=14.0, for_table=True)
+            self.assertEqual((row["pid"], row["cpu_seconds"], row["current_cpu"]), (8102, 90.0, 0.0))
 
     def test_outside_queue_shows_current_cpu_for_agent_and_detached_commands(self) -> None:
         owners = memory_feed.FeedStaff(write_outside_queue_fixture(self.root))
@@ -396,10 +414,11 @@ class MemoryFeedTests(unittest.TestCase):
         siblings = tuple(range(8200, 8212))
         owners = memory_feed.FeedStaff(write_outside_queue_fixture(self.root, siblings=siblings))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root))))
-        shell_env = self.root / "proc/8100/environ"
-        agent_env = self.root / "proc/8101/environ"
-        _ = shell_env.write_text("BUILDLOG_OWNER_STAFF_ID=test-worker\0")
-        _ = agent_env.write_text("CODEX_THREAD_ID=unknown-session\0")
+        outer_agent_env = self.root / "proc/8100/environ"
+        inner_agent_env = self.root / "proc/8101/environ"
+        _ = (self.root / "proc/8100/cmdline").write_text("/bin/codex\0")
+        _ = outer_agent_env.write_text("CODEX_THREAD_ID=worker-session\0")
+        _ = inner_agent_env.write_text("CODEX_THREAD_ID=unknown-session\0")
         reads: Counter[Path] = Counter()
         read_bytes = Path.read_bytes
 
@@ -414,9 +433,31 @@ class MemoryFeedTests(unittest.TestCase):
 
         self.assertEqual([(row["pid"], row["owner"]) for row in rows if row["pid"] in siblings],
                          [(pid, "test") for pid in siblings])
-        self.assertEqual(reads[agent_env], 1)
-        self.assertEqual(reads[shell_env], 1)
+        self.assertEqual(reads[inner_agent_env], 1)
+        self.assertEqual(reads[outer_agent_env], 1)
         self.assertEqual(max(reads.values()), 1)
+
+    def test_outside_kill_uses_the_nearest_registered_agent_for_each_row(self) -> None:
+        members = write_outside_queue_fixture(self.root, siblings=(8200, 8201))
+        set_outside_launcher(self.root)
+        _ = (self.root / "proc/8104/cmdline").write_text("/bin/claude\0")
+        _ = (self.root / "proc/8104/environ").write_text("CLAUDE_CODE_SESSION_ID=director-session\0")
+        set_outside_cpu(self.root, 8200, (121, 0, 0, 0), parent=8104)
+        set_outside_cpu(self.root, 8201, (122, 0, 0, 0), parent=1)
+        _ = (self.root / "proc/8201/environ").write_text("CODEX_THREAD_ID=worker-session\0")
+        reading = captured_reading()
+        with (mock.patch.dict(os.environ, outside_queue_fixture_groups(self.root)),
+              mock.patch.object(staff, "snapshot", return_value=members),
+              mock.patch.object(memory_feed, "host_name", return_value="natedev"),
+              mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(kill_action, "outside_stop_route", return_value=kill_action.OutsideCommandTree())):
+            targets = memory_feed.live_outside_kill_targets()
+            self.assertEqual({target.candidate.row_pid: target.recipient for target in targets.values()},
+                             {8102: staff.StaffId("test-worker"), 8200: staff.StaffId("queue")})
+            rows = memory_feed.outside_queue_processes(reading.explanation.decided_from,
+                                                       memory_feed.FeedStaff(members), for_table=True)
+            orphan = next(row for row in rows if row["pid"] == 8201)
+            self.assertNotIn("kill_ref", orphan)
 
     def test_outside_queue_scans_a_child_after_its_parent_leaves_the_scope(self) -> None:
         owners = memory_feed.FeedStaff(write_outside_queue_fixture(self.root, siblings=(8200,)))
@@ -517,7 +558,7 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual(byte_reads[self.root / "proc/8107/cmdline"], 2)
         self.assertEqual(byte_reads[self.root / "proc/8107/environ"], 0)
         self.assertEqual(byte_reads[self.root / "proc/8101/environ"], 0)
-        self.assertEqual(byte_reads[self.root / "proc/8102/stat"], 4)
+        self.assertEqual(byte_reads[self.root / "proc/8102/stat"], 6)
 
         reservation = fixture_reservation(8105, admission_records.GIB)
         self.assertEqual(memory_feed.outside_queue_processes(replace(inputs, reservations=(reservation,)), owners), [])

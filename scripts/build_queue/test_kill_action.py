@@ -156,7 +156,9 @@ class KillActionTests(unittest.TestCase):
                 run = kill_action.OutsideKillCandidate(process.pid, str(int(started.start) + 1), "test.py")
                 self.install_outside_stop_graces()
                 with patch.object(signal, "pidfd_send_signal") as sent:
-                    self.assertEqual(kill_action.stop_outside_tree(run), "The command PID changed before the stop.")
+                    self.assertEqual(kill_action.stop_outside_tree(run),
+                                     kill_action.OutsideStopUnconfirmed(run.row_pid,
+                                                                       "The command PID changed before the stop."))
                 sent.assert_not_called()
                 self.assertIsNone(process.poll())
             finally:
@@ -165,6 +167,37 @@ class KillActionTests(unittest.TestCase):
     def install_outside_stop_graces(self) -> None:
         _ = write_config_fixture(self.root / "shutdown.conf", "STOP_GRACE_SECONDS=1\nKILL_GRACE_SECONDS=1")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root)})))
+
+    def test_outside_tree_excludes_links_to_newer_parent_lifetimes(self) -> None:
+        root = process_stop.ProcessLifetime(810, "200")
+        observed = {810: memory_admit.ProcessIdentity(1, "200"),
+                    811: memory_admit.ProcessIdentity(810, "199"),
+                    812: memory_admit.ProcessIdentity(811, "201"),
+                    813: memory_admit.ProcessIdentity(810, "200"),
+                    814: memory_admit.ProcessIdentity(813, "202")}
+        known = {root}
+        with patch.object(memory_admit, "process_table", return_value=observed):
+            self.assertEqual(kill_action.outside_tree(known),
+                             {root, process_stop.ProcessLifetime(813, "200"),
+                              process_stop.ProcessLifetime(814, "202")})
+
+    def test_outside_tree_keeps_a_child_from_the_final_term_scan(self) -> None:
+        self.install_outside_stop_graces()
+        run = kill_action.OutsideKillCandidate(810, "200", "test.py")
+        root = {810: memory_admit.ProcessIdentity(1, "200")}
+        late = process_stop.ProcessLifetime(811, "201")
+        with (patch.object(memory_admit, "process_table", side_effect=(
+                  root, root, {**root, 811: memory_admit.ProcessIdentity(810, "201")},
+                  {811: memory_admit.ProcessIdentity(1, "201")}, {})),
+              patch.object(process_start, "proc_table_start", return_value=process_start.Gone()),
+              patch.object(process_stop, "pin_process", return_value=nullcontext(42)),
+              patch.object(kill_action, "live", return_value=True),
+              patch.object(signal, "pidfd_send_signal") as term,
+              patch.object(kill_action, "signal_outside_process") as escalate,
+              patch.object(time, "monotonic", side_effect=(0, 1, 2, 3))):
+            self.assertEqual(kill_action.stop_outside_tree(run), kill_action.OutsideTreeEmpty())
+        term.assert_called_once_with(42, signal.SIGTERM)
+        escalate.assert_called_once_with(late, signal.SIGKILL)
 
     @contextmanager
     def launch_outside_process(self, source: str) -> Generator[tuple[subprocess.Popen[bytes], IO[bytes]]]:
@@ -817,7 +850,7 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
         run = target.candidate
         actions = kill_action.KillActions(self.root)
         at = datetime(2026, 11, 19, 0, 41, 0, 900_000, tzinfo=timezone.utc)
-        reason = 'nate killed your run "nextest" (pid 17) from the Builds page at 16:41 PST'
+        reason = 'nate killed your run "nextest" (pid 17) from the Builds page at 16:41 PST.'
 
         class FixtureClock(datetime):
             @classmethod

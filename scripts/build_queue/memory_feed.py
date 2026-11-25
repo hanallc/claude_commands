@@ -2749,21 +2749,23 @@ class OutsideProcess:
     start: str
     ticks: int
     reaped_ticks: int
+    zombie: bool
 
 
 def read_outside_process(pid: int) -> OutsideProcess | None:
     try:
         fields = (PROC / str(pid) / "stat").read_bytes().rsplit(b") ", 1)[1].split()
-        if fields[0] not in (b"Z", b"X", b"x") and fields[19].isdigit():
+        if fields[0] not in (b"X", b"x") and fields[19].isdigit():
             return OutsideProcess(int(fields[1]), fields[19].decode("ascii"),
-                                  int(fields[11]) + int(fields[12]), int(fields[13]) + int(fields[14]))
+                                  int(fields[11]) + int(fields[12]), int(fields[13]) + int(fields[14]),
+                                  fields[0] == b"Z")
     except (OSError, ValueError, IndexError):
         pass
     return None
 
 
 def outside_process_table() -> dict[int, OutsideProcess]:
-    """Read the live processes and their CPU counters."""
+    """Read CPU counters for live processes and zombies."""
     return {int(name): process for name in os.listdir(PROC) if name.isdecimal()
             and (process := read_outside_process(int(name))) is not None}
 
@@ -2836,6 +2838,7 @@ class OutsideQueueScan:
         self.boot_now = time.clock_gettime(time.CLOCK_BOOTTIME)
         self.groups: dict[int, Path | None] = {}
         self.for_table = for_table
+        self.commands: dict[int, tuple[str, ...]] = {}
         self.owners: dict[int, dict[str, staff.StaffRow]] = {}
         self.children: dict[int, list[int]] = {}
         for pid, process in processes.items():
@@ -2864,12 +2867,19 @@ class OutsideQueueScan:
         commands: dict[int, tuple[str, ...]] = {}
         for pid in pids:
             group = self.group(pid)
-            if group is not None and group.is_relative_to(scope):
-                commands[pid] = outside_command_line(pid)
+            if group is not None and group.is_relative_to(scope) and not self.processes[pid].zombie:
+                commands[pid] = self.command(pid)
         return commands
+
+    def command(self, pid: int) -> tuple[str, ...]:
+        if pid not in self.commands:
+            self.commands[pid] = outside_command_line(pid)
+        return self.commands[pid]
 
     def read_owners(self, pid: int) -> dict[str, staff.StaffRow]:
         owners = environment_values(PROC / str(pid) / "environ", (DETACHED_OWNER_KEY, *SESSION_OWNER_KEYS))
+        if not owners or (process := self.current_process(pid)) is None or process.zombie:
+            return {}
         return {key: member for key, reference in owners.items() if reference
                 and (member := self.staff_members.members.by_member_reference(reference)) is not None}
 
@@ -2896,30 +2906,44 @@ class OutsideQueueScan:
 
     def ancestors(self, pid: int) -> Iterable[int]:
         visited: set[int] = set()
-        while pid in self.processes and pid not in visited:
+        while (process := self.processes.get(pid)) is not None and pid not in visited:
             visited.add(pid)
             yield pid
-            pid = self.processes[pid].parent
+            parent = self.processes.get(process.parent)
+            if parent is None or int(parent.start) > int(process.start):
+                break
+            pid = process.parent
+
+    def agent_owner(self, pid: int) -> staff.StaffRow | None:
+        return self.owner(ancestor for ancestor in self.ancestors(pid)
+                          if ancestor != pid and is_agent_command(self.command(ancestor)))
 
     def group(self, pid: int) -> Path | None:
         if pid not in self.groups:
             self.groups[pid] = outside_process_group(pid)
         return self.groups[pid]
 
-    def command_tree(self, pid: int, allowed: set[int], seen: set[int]) -> list[int]:
+    def command_tree(self, pid: int, scope: Path, allowed: set[int], seen: set[int]) -> list[int]:
         """Keep scope members below the command. Stop at an agent or launcher."""
         tree: list[int] = []
         pending = [pid]
         while pending:
             child = pending.pop()
-            if child in seen or child not in allowed:
+            if child in seen:
                 continue
+            if child not in allowed:
+                # A zombie can be absent from cgroup.procs until its parent reaps it.
+                if not self.processes[child].zombie:
+                    continue
+                group = self.group(child)
+                if group is not None and not group.is_relative_to(scope):
+                    continue
             seen.add(child)
             tree.append(child)
             pending.extend(self.children.get(child, ()))
         return tree
 
-    def live_process(self, pid: int) -> OutsideProcess | None:
+    def current_process(self, pid: int) -> OutsideProcess | None:
         process = read_outside_process(pid)
         return process if process is not None and process.start == self.processes[pid].start else None
 
@@ -2964,38 +2988,35 @@ def outside_agent_rows(scope: Path, scan: OutsideQueueScan, limit: float) -> lis
     rows: list[OutsideCommand] = []
     pids = outside_scope_pids(scope, scan.processes)
     commands = scan.scope_commands(scope, pids)
-    agents = sorted(pid for pid, command in commands.items() if is_agent_command(command))
+    agents = {pid for pid, command in commands.items() if is_agent_command(command)}
     launchers = {ancestor for pid in agents for ancestor in scan.ancestors(pid)}
     launchers.update(pid for pid, command in commands.items() if is_session_launcher(command))
     allowed = {pid for pid, command in commands.items() if command and pid not in launchers}
     seen: set[int] = set()
-    owner = None
     for pid in scan.parent_first(allowed):
         if pid in seen or is_outside_tree_wrapper(commands[pid]):
             continue
-        tree = scan.command_tree(pid, allowed, seen)
+        tree = scan.command_tree(pid, scope, allowed, seen)
         if scan.has_queue_work(tree, scan.admitted_scopes):
             continue
-        root_process = scan.live_process(pid)
-        if root_process is None:
+        root_process = scan.current_process(pid)
+        if root_process is None or root_process.zombie:
             continue
         # Read the root first so a child it reaps during the scan cannot count twice.
         members = {pid}
         live = root_process.ticks
-        reaped = root_process.reaped_ticks
+        limit_ticks = live + root_process.reaped_ticks
         for child in tree[1:]:
-            member = scan.live_process(child)
-            if member is not None and member.parent in members:
+            member = scan.current_process(child)
+            if (member is not None and member.parent in members
+                    and int(scan.processes[member.parent].start) <= int(member.start)):
                 members.add(child)
-                live += member.ticks
-                reaped += member.reaped_ticks
+                limit_ticks += member.ticks + member.reaped_ticks
+                if not member.zombie:
+                    live += member.ticks
         seconds = (live + root_process.reaped_ticks) / scan.ticks_per_second
-        over_limit = (live + reaped) / scan.ticks_per_second > limit
-        caller = None
-        if over_limit:
-            if owner is None:
-                owner = scan.owner(agents)
-            caller = owner or scan.owner(scan.ancestors(pid), (DETACHED_OWNER_KEY, *SESSION_OWNER_KEYS))
+        over_limit = limit_ticks / scan.ticks_per_second > limit
+        caller = scan.agent_owner(pid) if over_limit else None
         rows.append(scan.command_row(pid, commands[pid], caller, seconds, live / scan.ticks_per_second,
                                      over_limit=over_limit))
     return rows
@@ -3028,7 +3049,8 @@ def outside_detached_row(scope: Path, scan: OutsideQueueScan, limit: float) -> O
     if any(is_agent_command(command) or is_session_launcher(command) for command in commands.values()):
         return None
     for pid in sorted(commands, key=lambda item: (scan.processes[item].parent in pids, int(scan.processes[item].start))):
-        if not is_outside_tree_wrapper(commands[pid]) and scan.live_process(pid) is not None:
+        if (not is_outside_tree_wrapper(commands[pid])
+                and (process := scan.current_process(pid)) is not None and not process.zombie):
             owner = scan.owner(scan.ancestors(pid), (DETACHED_OWNER_KEY, *SESSION_OWNER_KEYS)) if seconds > limit else None
             return scan.command_row(pid, commands[pid], owner, seconds, seconds, over_limit=seconds > limit)
     return None

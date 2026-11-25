@@ -426,7 +426,7 @@ try {
     'from scripts.lib.user_zone import user_zone',
     'print(datetime.fromisoformat("2026-11-19T00:41:00+00:00").astimezone(user_zone()).strftime("%H:%M %Z"))',
   ].join('\n')], {cwd:repo, encoding:'utf8'}).trim() : '';
-  const killMessage = (step, pid) => `nate killed your run "${step}" (pid ${pid}) from the Builds page at ${killTime}`;
+  const killMessage = (step, pid) => `nate killed your run "${step}" (pid ${pid}) from the Builds page at ${killTime}.`;
   const killWarning = name => `The run stops at once and its work is lost. This message goes to ${name}:`;
   const killWordsLabel = 'Your own words, added to the message (optional)';
   const killPath = '/console/build-kill';
@@ -756,11 +756,13 @@ try {
             const top = document.querySelector('#walk-title').getBoundingClientRect();
             const dialog = document.querySelector('#kill-dialog');
             const pop = dialog.getBoundingClientRect();
+            const unit = dialog.querySelector('#kill-name strong [data-color-text="role.unit-director"]');
             return {
               icons:document.querySelectorAll('.walk-table .kill-run').length, icon:control.innerHTML,
               unavailable:document.querySelector('tr[data-tip="row:research-fixture"] .pid').title,
               labels:[...dialog.querySelectorAll('dt')].map(label => label.textContent),
               fields:[...dialog.querySelectorAll('dd')].map(field => field.textContent),
+              unit:unit?.textContent, unitWeight:unit ? getComputedStyle(unit).fontWeight : '',
               preview:document.querySelector('#kill-message').textContent,
               warning:document.querySelector('#kill-warning').textContent,
               wordsLabel:document.querySelector('label[for="kill-words"]').textContent,
@@ -792,6 +794,8 @@ try {
             assert.deepEqual(confirmation.labels,['Run','Pid','Progress','Started by']);
             assert.deepEqual(confirmation.fields,
               ['unit-board · check','2712994 and its child processes','6.5% done after 11 min','impl3, a worker of unit-board']);
+            assert.equal(confirmation.unit,'unit-board');
+            assert.equal(confirmation.unitWeight,'700');
             assert.equal(confirmation.preview,killOffer.message);
             assert.equal(confirmation.warning,killWarning(killOffer.recipient_name));
             assert.equal(confirmation.wordsLabel,killWordsLabel);
@@ -853,9 +857,11 @@ try {
               const dialog = document.querySelector('#kill-dialog');
               const box = dialog.getBoundingClientRect();
               const table = document.querySelector('#outside-queue table').getBoundingClientRect();
+              const unit = dialog.querySelector('#kill-name strong [data-color-text="role.unit-director"]');
               return {icons:document.querySelectorAll('#outside-queue .kill-run').length, icon:control.innerHTML,
                 pid:control.closest('.outside-pid')?.firstChild.textContent,
                 label:control.getAttribute('aria-label'), fields:[...dialog.querySelectorAll('dd')].map(field => field.textContent),
+                unit:unit?.textContent, unitWeight:unit ? getComputedStyle(unit).fontWeight : '',
                 labels:[...dialog.querySelectorAll('dt')].map(label => label.textContent),
                 warning:document.querySelector('#kill-warning').textContent,
                 wordsLabel:document.querySelector('label[for="kill-words"]').textContent,
@@ -864,6 +870,7 @@ try {
             })()`);
             assert.deepEqual(outside,{icons:2,icon:confirmation.icon,pid:'8102',label:'Kill this run',
               fields:['queue · targeted_test.py','8102 and its child processes','5 min','test, a worker of queue'],
+              unit:'queue',unitWeight:'700',
               labels:['Run','Pid','Age','Started by'],warning:killWarning(outsideRow.owner),wordsLabel:killWordsLabel,
               belowTable:true,fits:true,preview:outsideOffers[outsideRef].message,submit:'Kill the run'});
             const outsideState = () => evaluate(`document.querySelector('[data-kill-ref="${outsideRef}"]')
