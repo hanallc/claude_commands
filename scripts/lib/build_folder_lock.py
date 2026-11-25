@@ -12,9 +12,10 @@ import time
 from typing import Literal
 
 
-@contextmanager
-def folder_parent(path: Path, root: Path, *, create: bool) -> Generator[int]:
-    """Open each parent below the root without following directory links."""
+_LOCK_MARK = b"build-folder-lock\n"
+
+
+def _open_parent(path: Path, root: Path, *, create: bool) -> int:
     canonical = root.resolve()
     if create:
         canonical.mkdir(parents=True, exist_ok=True)
@@ -31,15 +32,31 @@ def folder_parent(path: Path, root: Path, *, create: bool) -> Generator[int]:
             previous = directory
             directory = child
             os.close(previous)
+        return directory
+    except BaseException:
+        os.close(directory)
+        raise
+
+
+@contextmanager
+def folder_parent(path: Path, root: Path, *, create: bool) -> Generator[int]:
+    """Open each parent without following links. Retry once if creation races with a move."""
+    try:
+        directory = _open_parent(path, root, create=create)
+    except FileNotFoundError:
+        if not create:
+            raise
+        directory = _open_parent(path, root, create=True)
+    try:
         yield directory
     finally:
         os.close(directory)
 
 
-def open_lock(path: Path, directory: int, *, create: bool) -> int:
+def open_lock(path: Path, directory: int, *, create: bool, exclusive: bool = False) -> int:
     flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
     if create:
-        flags |= os.O_CREAT
+        flags |= os.O_CREAT | (os.O_EXCL if exclusive else 0)
     descriptor = os.open(path.name + ".lock", flags, 0o600, dir_fd=directory)
     try:
         inode = os.fstat(descriptor)
@@ -51,6 +68,27 @@ def open_lock(path: Path, directory: int, *, create: bool) -> int:
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def mark_lock(descriptor: int) -> None:
+    """Mark the acquired lock before the allocator checks its parent."""
+    size = os.fstat(descriptor).st_size
+    if size:
+        if size != len(_LOCK_MARK) or os.pread(descriptor, len(_LOCK_MARK), 0) != _LOCK_MARK:
+            raise ValueError("a build folder lock must be empty or marked")
+    elif os.pwrite(descriptor, _LOCK_MARK, 0) != len(_LOCK_MARK):
+        raise OSError("could not mark a build folder lock")
+
+
+def is_marked_lock(name: str, directory: int, inode: os.stat_result) -> bool:
+    """Identify a protocol lock before its folder or lease record exists."""
+    if not stat.S_ISREG(inode.st_mode) or inode.st_size != len(_LOCK_MARK):
+        return False
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    try:
+        return os.path.samestat(inode, os.fstat(descriptor)) and os.read(descriptor, len(_LOCK_MARK)) == _LOCK_MARK
+    finally:
+        os.close(descriptor)
 
 
 @dataclass(frozen=True)
@@ -71,6 +109,15 @@ def take_lock(descriptor: int, mode: int, timing: ProbeTiming) -> bool:
             if remaining <= 0:
                 return False
             time.sleep(min(timing.retry_seconds, remaining))
+
+
+def parent_current(path: Path, directory: int) -> bool:
+    """A checked child lock exists before any later rename, so the second scan sees it.
+    An allocator abandons the child lock when the parent check fails."""
+    try:
+        return os.path.samestat(os.stat(path.parent), os.fstat(directory))
+    except FileNotFoundError:
+        return False
 
 
 def lock_current(path: Path, directory: int, descriptor: int) -> bool:

@@ -127,9 +127,6 @@ names.promote=promote
 names.ci=CI
 prose.gate=the gate
 prose.build=release build
-owned.default={unit} {step}
-owned.showrunner-default=showrunner {step}
-owned.ci-default=CI {step}
 about.integrate=Merges the checkpoint into the {branch} branch, runs every test module, then pushes {branch}
 about.test-all=Runs every test module
 about.test-modules=Runs {modules} named test modules
@@ -178,22 +175,12 @@ roots.temporary=${{TMPDIR}}/builds
 roots.gate={gate}
 roots.build={root / 'build'}
 roots.build.{host_name()}={root / 'build'}
-roots.slots={root / 'slots'}
-roots.slot_cargo={root / 'cargo'}
 roots.workspace={root / 'workspaces'}
 roots.session={root / 'session'}
 roots.copies={root / 'copies'}
 roots.scratch={root / 'scratch'}
 # whole: 1..
 folders.unused_days=2
-# whole: 1..
-slots.{host_name()}.default_max=2
-# whole: 1..
-slots.{host_name()}.origin.max=2
-# whole: 1..
-slots.unused_days=7
-# range: 5e-324..
-slots.wait_seconds=30
 # range: 0.001..1
 locks.probe_retry_seconds=0.005
 # range: 0.001..60
@@ -210,7 +197,6 @@ patterns.standing={{repository}}/{{owner}}-gate{{suffix}}
 patterns.scratch={{purpose}}-{{suffix}}
 patterns.legacy-unique={{purpose}}{{suffix}}
 patterns.legacy-stable={{purpose}}
-patterns.slot={{repository}}-slot{{slot}}
 patterns.tool={{purpose}}{{suffix}}
 prefixes.merge-gate=merge-gate-
 prefixes.merge-gate-nightly=merge-gate-nightly-

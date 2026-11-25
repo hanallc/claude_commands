@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Track whether the extra review workers pay for themselves.
+"""Record merged phases and compare their review results.
 
 Usage:
   review_regime.py add --unit <unit> --plan <plan path> --phase <N> --checkpoint <commit>
@@ -9,33 +9,24 @@ Usage:
                        [--ux-check-minutes <U>] [--ux-repair-minutes <R>]
                        [--excluded <reason>] [--note <text>]
   review_regime.py report [--since <ISO date>]
-  review_regime.py watch
-  review_regime.py ack
 
-The trial (user decision 2026-10-01) added a UX reviewer to every phase that
-changes the screen and a code-quality reviewer (the `craft` lens) to every
-phase, both judging by the three gods in ~/.claude/docs/decision_criteria.md.
-It ended 2026-10-04 (user decision): the code-quality reviewer was dropped, and
-a phase started after that is `after`. The showrunner adds one row per merged
-phase; `report` compares the phases before, under and after the trial:
+The review trial began on 2026-10-01. It added a UX reviewer to each phase
+with visible changes and a code-quality reviewer to each phase.
+The trial ended on 2026-10-04. The showrunner removed the extra code reviewer.
+Phases that began after the trial use the `after` regime.
 
-- better: fewer holds at merge and fewer defects found by the merge design check;
-- cost: longer phases (start to merge) and more review-worker minutes.
+The showrunner adds one row per merged phase. The report compares holds,
+defects, elapsed time, and review time across the three regimes.
+From 2026-10-07, the code finding count includes all code findings from the
+phase review. Earlier counts include only the code-quality reviewer's findings.
 
-From 2026-10-07, the code number is every code finding the phase's review
-raised; before that it was the code-quality reviewer's alone.
+`holds` counts the checkpoints that the showrunner held.
+`merge-defects` counts defects that merge design checks found in the phase's
+work. It includes moved defects and excludes defects older than the phase.
 
-`holds` counts the checkpoints of the phase the showrunner held; `merge-defects`
-counts the defect rows its merge design checks found in the phase's own work,
-moved ones included and rows the check calls older than the phase left out.
-
-A phase the comparison cannot use carries the reason in `excluded`: it changed
-nothing on screen (`--ux-check-minutes 0` records that), no merge design check
-judged it, or the log lacks the check's count. `report` and `watch` use only the
-rest (user, 2026-10-05: eleven build-tool phases made the first count bad; every
-row was marked from the production logs that day). Once `watch` counts
-WATCH_PHASES `after` phases it exits 3, the report waiting for the user, until
-`ack` records their acknowledgment.
+The report skips rows that have an `excluded` reason. Typical reasons include
+no visible change, no merge design check, and no defect count in the log.
+`--ux-check-minutes 0` records `no visible change` unless a reason is supplied.
 """
 
 import argparse
@@ -50,12 +41,7 @@ from pathlib import Path
 from typing import cast
 
 LEDGER = Path.home() / ".claude/data/review_regime.jsonl"
-WATCH = Path.home() / ".claude/data/review_regime_watch.json"
 REGIMES = ("before", "trial", "after")
-# User decision 2026-10-04: the `after` phases watched before the report goes to the user.
-WATCH_PHASES = 12
-# `watch` exits with this while the finished report waits for the user's acknowledgment.
-WAITING_FOR_ACKNOWLEDGMENT = 3
 # `add` records this reason for a phase whose screenshot check took no minutes.
 NO_VISIBLE_CHANGE = "no visible change"
 
@@ -217,40 +203,6 @@ def report(since: str | None) -> None:
     print("\n".join(lines))
 
 
-def watched_phases() -> int:
-    return sum(1 for row in read_rows() if row.regime == "after" and row.excluded is None)
-
-
-def acknowledged() -> str | None:
-    if not WATCH.exists():
-        return None
-    moment = cast(dict[str, object], json.loads(WATCH.read_text())).get("acknowledged")
-    return moment if isinstance(moment, str) else None
-
-
-def watch() -> int:
-    moment = acknowledged()
-    if moment is not None:
-        print(f"acknowledged {moment}")
-        return 0
-    merged = watched_phases()
-    if merged < WATCH_PHASES:
-        print(f"{merged} of {WATCH_PHASES} phases that change the screen merged without the extra code reviewer")
-        return 0
-    print(f"{WATCH_PHASES} of {WATCH_PHASES} phases that change the screen merged without the extra code reviewer: report ready, waiting for your acknowledgment")
-    return WAITING_FOR_ACKNOWLEDGMENT
-
-
-def ack() -> None:
-    merged = watched_phases()
-    if merged < WATCH_PHASES:
-        raise SystemExit(f"review_regime: the watch has {merged} of {WATCH_PHASES} phases; nothing to acknowledge yet")
-    moment = datetime.now().astimezone().isoformat(timespec="minutes")
-    WATCH.parent.mkdir(parents=True, exist_ok=True)
-    _ = WATCH.write_text(json.dumps({"acknowledged": moment}) + "\n")
-    print(f"acknowledged {moment}")
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -273,18 +225,12 @@ def main() -> int:
     _ = adding.add_argument("--note")
     reporting = commands.add_parser("report")
     _ = reporting.add_argument("--since", help="only phases merged on or after this ISO date; design checks began 2026-09-28")
-    _ = commands.add_parser("watch", help=f"count `after` phases toward {WATCH_PHASES}; exit {WAITING_FOR_ACKNOWLEDGMENT} while the report waits for the user")
-    _ = commands.add_parser("ack", help="record the user's acknowledgment of the finished watch")
     arguments = parser.parse_args()
     command = cast(str, arguments.command)
     if command == "add":
         add(arguments)
-    elif command == "report":
-        report(cast(str | None, arguments.since))
-    elif command == "watch":
-        return watch()
     else:
-        ack()
+        report(cast(str | None, arguments.since))
     return 0
 
 

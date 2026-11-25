@@ -24,6 +24,7 @@ from typing import Callable, Self, TextIO, cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, conf_reads, urgency
 from scripts.lib import user_zone as user_zone_config
+from scripts.lib.process_group import run_process_group, stop_process_group
 from scripts.lib.user_zone import user_zone
 import unittest
 from dataclasses import replace
@@ -234,6 +235,21 @@ class ReviewPageTests(unittest.TestCase):
     def question(self, title: str = 'Which layout should the page use?') -> str:
         return self.fixture.file_user_question(title)
 
+    def test_legacy_question_names_the_answer_relay_in_both_views(self) -> None:
+        asker = fixture_member('producer', name='question-asker')
+        key = self.fixture.file_user_question(asker=asker)
+        snapshot = review_page.build_snapshot(self.root)
+        review = snapshot.body(key).decode()
+        browser = self.fixture.browser('questions')[2]
+        for page in (review, browser):
+            labels = re.search(r'data-send-labels="([^"]+)"', page)
+            assert labels is not None
+            self.assertIn('"answer": "question-asker"', html.unescape(labels[1]))
+        delivery, _ = review_page.submit(self.root, self.card_body(snapshot, key, 'answer', 'Use wide cards.'),
+                                         self.status, snapshot=snapshot)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        self.assertEqual(delivery.recipients, (asker.id,))
+
     def ready_submission_recipient(self) -> staff.StaffRow:
         doc = self.fixture.production
         issues = doc.parent / 'native-proposals'
@@ -389,7 +405,7 @@ window.fetch=(url,options)=>{
  form.requestSubmit(form.querySelector('[value="'+action+'"]'));
  const motion=copy(id)?.getAnimations()[0];
  if(!motion || !posts.has(row.dataset.key)) throw new Error('The Response save must start the fade.');
- posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'saved',state,type:action==='read'?'response':'question',later:0})});
+ posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'saved',state,type:action==='read'?'response':'question',later:0})});
  motion.finish();await frame();
  check(postCount===1 && !rows().some(item=>item.dataset.type==='response'),
   'The Response leaves the view after one submit.');
@@ -2317,10 +2333,10 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
             thread.start()
             try:
                 with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                    result=subprocess.run(['firefox','--headless','--no-remote','--profile',profile,
+                    result=run_process_group(['firefox','--headless','--no-remote','--profile',profile,
                         '--window-size','1440,900','--screenshot',str(self.fixture.temporary/'window.png'),
                         f'http://127.0.0.1:{server.server_port}/#item=page-owner%2FC399'],
-                        capture_output=True,text=True,timeout=45)
+                        timeout=45)
                 self.assertEqual(result.returncode,0,result.stderr)
             finally:
                 server.shutdown()
@@ -2893,13 +2909,14 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         profile.mkdir()
         _ = (profile/'user.js').write_text('user_pref("marionette.port", 0);\n')
         with subprocess.Popen(['firefox', '--headless', '--no-remote', '--profile', str(profile), '--marionette',
-                               'about:blank'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as browser:
+                               'about:blank'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              start_new_session=True) as browser:
             try:
                 with self.marionette_commands(browser) as command:
                     _ = command('WebDriver:Navigate', url=page.as_uri())
                     yield command
             finally:
-                browser.kill()
+                stop_process_group(browser)
 
     @contextmanager
     def marionette_commands(self, browser: subprocess.Popen[bytes]) -> Generator[Callable[..., object]]:
@@ -3211,10 +3228,10 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
             thread.start()
             try:
                 with tempfile.TemporaryDirectory() as profile:
-                    done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                    done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', profile,
                         '--window-size', '1440,900', '--screenshot', str(Path(profile)/'page.png'),
                         f'http://127.0.0.1:{server.server_port}/console/?page=review'],
-                        capture_output=True, text=True, timeout=45)
+                        timeout=45)
                 self.assertEqual(done.returncode, 0, done.stderr)
             finally:
                 server.shutdown()
@@ -3786,7 +3803,7 @@ window.clearInterval=()=>{};
 window.refreshRequests=[];
 const showPages=PAGES;
 window.fetch=async(url,options)=>{
- if(options?.method==='POST') return {ok:true,json:async()=>({answer:'saved'})};
+ if(options?.method==='POST') return {headers:new Headers(),ok:true,json:async()=>({answer:'saved'})};
  window.refreshRequests.push(url);
  const show=new URL(url,location.href).searchParams.get('show') || 'open';
  return {ok:true,text:async()=>showPages[show]};
@@ -4104,9 +4121,9 @@ window.fetch=async(url,options)=>{
                     thread.start()
                     try:
                         with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                            done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', profile,
                                 '--window-size', f'{width},900', '--screenshot', str(self.fixture.temporary/'show-chips.png'),
-                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                                f'http://127.0.0.1:{server.server_port}/'], timeout=30)
                         self.assertEqual(done.returncode, 0, done.stderr)
                     finally:
                         server.shutdown()
@@ -4128,7 +4145,7 @@ const nativeFetch=fetch,nativeTimeout=setTimeout;
 window.setInterval=()=>0;window.clearInterval=()=>{};
 const showPages=PAGES;
 window.fetch=async(url,options)=>{
- if(options?.method==='POST'){window.didSave=true;return {ok:true,json:async()=>({answer:'saved'})};}
+ if(options?.method==='POST'){window.didSave=true;return {headers:new Headers(),ok:true,json:async()=>({answer:'saved'})};}
  const show=new URL(url,location.href).searchParams.get('show') || 'open';
  const page=new DOMParser().parseFromString(showPages[show],'text/html');
  if(window.didSave){const payload=page.querySelector('[data-review-index]'),entries=JSON.parse(payload.textContent);
@@ -4255,9 +4272,9 @@ window.fetch=async(url,options)=>{
                     thread.start()
                     try:
                         with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                            done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', profile,
                                 '--window-size', f'{width},900', '--screenshot', str(self.fixture.temporary/'show-chips.png'),
-                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                                f'http://127.0.0.1:{server.server_port}/'], timeout=30)
                         self.assertEqual(done.returncode, 0, done.stderr)
                     finally:
                         server.shutdown()
@@ -5624,9 +5641,8 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 card = orphan_snapshot.body(key).decode()
                 self.assertIn('value="read">Mark read</button>', card)
                 if record_type == 'Response':
-                    form = card.split('<form method="post" data-review-form>', 1)[1].split('</form>', 1)[0]
                     parser = test_change_page.SavedAnswerForm()
-                    parser.feed(form)
+                    parser.feed(card)
                     body = urlencode(parser.fields)
                 else:
                     body = self.card_body(orphan_snapshot, key, 'read')
@@ -5927,9 +5943,10 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
                                  doc=staff.WrappedDoc(local_machine(), self.fixture.temporary / 'wrapped.md'))
         snapshot = review_page.build_snapshot(self.root)
         expected = [
-            (runner.id, ' style="color:#a379fd"', runner.name),
-            (self.fixture.unit.id, ' style="color:#ffaf02"', self.fixture.unit.name),
-            (self.fixture.showrunner_id, ' style="color:#a379fd"', 'page-owner'),
+            (runner.id, f' data-send-receiver="{runner.name}" style="color:#a379fd"', runner.name),
+            (self.fixture.unit.id, f' data-send-receiver="{self.fixture.unit.name}" style="color:#ffaf02"',
+             self.fixture.unit.name),
+            (self.fixture.showrunner_id, ' data-send-receiver="page-owner" style="color:#a379fd"', 'page-owner'),
         ]
         for key in (proposal, efficiency):
             with self.subTest(key=key):
@@ -5998,8 +6015,9 @@ const nativeFetch=fetch;
 window.fetch=async(url,options={})=>{
  if(options.method!=='POST') return {ok:true,text:async()=>window.refreshMarkup};
  if(url==='/results') return nativeFetch(url,options);
+ if(String(url).endsWith('/undo')) return Response.json({});
  window.posts.push(new URLSearchParams(options.body));
- return {ok:true,json:async()=>({answer:'approved',state:'Done'})};
+ return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
 };
 </script>""".replace('MARKUP', json.dumps(source).replace('</', '<\\/'))
         page = source.replace('<script>', setup+'<script>', 1)
@@ -6014,7 +6032,7 @@ window.fetch=async(url,options={})=>{
   const panel=document.createElement('template');
   panel.innerHTML=text;
   panel.content.querySelector('[name="revision"]').value='fixture-'+revision;
-  if(revision===2){
+  if(revision===2 && __REMOVE_OPTION__){
    const option=[...panel.content.querySelectorAll('[name="assignee"] option')]
     .find(option=>option.value===ASSIGNEE);
    option.remove();
@@ -6044,16 +6062,28 @@ window.fetch=async(url,options={})=>{
   const name=form.elements.assignee.selectedOptions[0].textContent;
   const refreshed=await refresh();
   const unavailable=refreshed.elements.assignee.selectedOptions[0];
-  check(refreshed!==form && unavailable.value===ASSIGNEE && unavailable.textContent===name+' — not available',
-        'Refresh keeps the unavailable assignee selected.');
+  check(refreshed!==form && unavailable.value===ASSIGNEE &&
+        unavailable.textContent===(__REMOVE_OPTION__ ? name+' — not available' : name),
+        'Refresh keeps the assignee selected.');
   refreshed.requestSubmit(refreshed.querySelector('[value="approve"]'));
   check(window.posts.length===1 && window.posts[0].get('outcome')==='approve' &&
-        window.posts[0].get('assignee')===ASSIGNEE,'Approve sends the unavailable assignee ID.');
+        window.posts[0].get('assignee')===ASSIGNEE,'Approve sends the selected assignee ID.');
+  const until=performance.now()+8000,host=window.top.document;
+  while(!host.querySelector('[data-send-undo]')){
+   if(performance.now()>until) throw new Error('The Approve toast did not show.');
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+  const toast=host.querySelector('[data-send-undo]');
+  const expected=__REMOVE_OPTION__ ? 'Sending.' : 'Sent to '+name+'.';
+  check(toast.querySelector('span').textContent===expected,'The toast uses the current selected assignee.');
+  toast.querySelector('button').click();
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>""".replace('KEY', json.dumps(proposal)).replace('ASSIGNEE', json.dumps(self.fixture.unit.id))
-        self.assertEqual(firefox_probe_results((page+probe).encode()), [[]])
+        for removed in (False, True):
+            with self.subTest(removed=removed):
+                self.assertEqual(firefox_probe_results((page+probe.replace('__REMOVE_OPTION__', json.dumps(removed))).encode()), [[]])
 
     def test_approve_and_decline_close_proposals_and_efficiencies(self) -> None:
         _ = write_config_fixture(self.fixture.temporary / 'config/nightly_review.conf', 'state_folder=nightly-review\n')
@@ -6068,6 +6098,11 @@ window.fetch=async(url,options={})=>{
         body = review_page.build_snapshot(self.root).body(proposal).decode()
         self.assertIn('Run fewer checks.', body, 'The open card loads the issue text.')
         self.assertNotIn('proposal_id', body, 'The issue front matter stays off the card.')
+        efficiency_body = review_page.build_snapshot(self.root).body(efficiency).decode()
+        self.assertIn('&quot;decline&quot;: null', efficiency_body)
+        report = self.investigation()
+        report_body = review_page.build_snapshot(self.root).body(f'investigation/{report.owner}/{report.id}').decode()
+        self.assertIn('&quot;read&quot;: null', report_body)
         commands = {proposal:'proposal_issue.py approve', efficiency:"candidates.py outcome E1 accepted --applied '<repo> <sha>'"}
         for key, command in commands.items():
             with self.subTest(key=key, action='approve'):
@@ -6226,18 +6261,10 @@ window.fetch=async(url,options={})=>{
   words.value=fixture.words;
   words.dispatchEvent(new Event('input',{bubbles:true}));
   const refreshed=new Promise(resolve=>review.addEventListener('review-refreshed',resolve,{once:true}));
-  const confirmation=dialog.querySelector('#new-item-saved');
-  const confirmed=new Promise(resolve=>{
-   const observer=new MutationObserver(()=>{
-    if(!confirmation.hidden){observer.disconnect();resolve();}
-   });
-   observer.observe(confirmation,{attributes:true,attributeFilter:['hidden']});
-  });
+  const created=new Promise(resolve=>document.addEventListener('review-item-created',resolve,{once:true}));
   dialog.querySelector('[type="submit"]').click();
-  await confirmed;
-  check(dialog.open && confirmation.textContent==='Saved '+fixture.id+'.',
-        'The shared dialog shows the saved ID.');
-  dialog.querySelector('[data-done]').click();
+  const event=await created;
+  check(!dialog.open && event.detail.id===fixture.id,'Send closes the dialog and reports the saved ID.');
   await refreshed;
   const row=review.querySelector('[data-key="'+CSS.escape(fixture.key)+'"]');
   check(Object.entries(selection).every(([key,value])=>params().get(key)===value),
@@ -6506,9 +6533,9 @@ window.fetch=async(url)=>{
             thread.start()
             try:
                 with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                    done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                    done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', profile,
                         '--window-size', '390,900', '--screenshot', str(self.fixture.temporary/'review-titles.png'),
-                        f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                        f'http://127.0.0.1:{server.server_port}/'], timeout=30)
                 self.assertEqual(done.returncode, 0, done.stderr)
             finally:
                 server.shutdown()
@@ -6701,7 +6728,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  const clip=copy(panel),exit=clip.getAnimations()[0];
  halfway(exit);
  const position=top(clip);
- posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'later',state:'Open',later:Date.now()+3600000})});
+ posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'later',state:'Open',later:Date.now()+3600000})});
  await frame();
  check(selected()===owner && !owner.hidden,'The last owner stays selected and visible during the fade.');
  check(copy(panel)===clip && near(top(clip),position) && !rows().length,
@@ -6743,7 +6770,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  const staysOpen=['feedback','question'].includes(action.outcome);
  if(!posts.has(row.dataset.key) || (staysOpen ? !recordIsOpen(row) : !motion))
   throw new Error('The save did not start with the expected row state.');
- posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'saved',state:action.state,later:0})});
+ posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'saved',state:action.state,later:0})});
  motion?.finish();await frame();
  if(action.state==='Done') check(!rows().some(item=>item.dataset.key===row.dataset.key),
   'The completed item leaves Review.');
@@ -6757,6 +6784,67 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
 """)
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_undo_keeps_the_card_words_and_a_second_send_posts_again(self) -> None:
+        setup = r"""<script>
+const realFetch=fetch,posts=[];
+window.setInterval=()=>0;
+window.fetch=async(url,options)=>{
+ if(options?.method!=='POST') return realFetch(url,options);
+ if(String(url).endsWith('/undo')) return Response.json({outcome:'undone'});
+ posts.push(new URLSearchParams(options.body));
+ if(posts.length===1)
+  return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+ return Response.json({answer:'works',state:'Done',later:0});
+};
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const host=window.top.document,words='Keep these words.';
+ const until=async(test,label)=>{
+  const end=performance.now()+8000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>setTimeout(resolve,20));
+  }
+ };
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='820px';
+  const key=document.querySelector('[data-list-item][data-type="change"]').dataset.key;
+  const row=()=>document.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
+  row().querySelector('.list-toggle').click();
+  let form=await readyReviewCard(row());
+  form.elements.feedback.value=words;
+  form.requestSubmit(form.querySelector('[value="works"]'));
+  await until(()=>host.querySelector('[data-send-undo] button'),'The Undo toast did not show.');
+  check(host.querySelector('[data-send-undo] span').textContent==='Sent to page-owner and builder-unit.',
+        'The toast names every receiver of the verdict with words.');
+  host.querySelector('[data-send-undo] button').click();
+  const cardForm=()=>row()?.isConnected && !row().hidden ? recordDetails(row())?.querySelector('[data-review-form]') : null;
+  const undone=()=>cardForm()?.querySelector('[data-send-status]').textContent==='Undone. Edit and send again.';
+  await until(()=>undone() || (row()?.isConnected && !row().hidden && !cardForm()),'Undo did not return the item.');
+  if(!cardForm()) row().querySelector('.list-toggle').click();
+  await until(undone,'The card did not say that the send was undone.');
+  form=cardForm();
+  check(form.elements.feedback.value===words,'After Undo the card keeps the words.');
+  await until(()=>!form.querySelector('[value="works"]').disabled,'The card did not enable Send after Undo.');
+  // The row comes back with a short fade, and a Send during that fade does nothing, so Send again until it posts.
+  let next=0;
+  await until(()=>{
+   if(posts.length<2 && performance.now()>next){
+    next=performance.now()+250;cardForm()?.requestSubmit(cardForm().querySelector('[value="works"]'));
+   }
+   return posts.length===2;
+  },'The second Send did not post.');
+  check(posts.every(post=>post.get('outcome')==='works' && post.get('feedback')===words),
+   'The second Send posts the same words again.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = browser_markup(self.root).replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_refused_card_reverses_above_the_next_departing_card(self) -> None:
         self.check_card_motion(browser_markup(self.root), r"""
  const [first,second,next]=rows(),firstPanel=motionKey(first),secondPanel=motionKey(second);
@@ -6766,7 +6854,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  const secondClip=copy(secondPanel);halfway(secondClip.getAnimations()[0]);
  const height=firstClip.getBoundingClientRect().height,opacity=Number(getComputedStyle(firstClip).opacity);
  const following=top(next);
- posts.get(first.dataset.key)({ok:false,json:async()=>({reason:'Try again.'})});
+ posts.get(first.dataset.key)({headers:new Headers(),ok:false,json:async()=>({reason:'Try again.'})});
  await frame();
  const restored=copy(firstPanel);
  check(restored && restored!==firstClip,'The refused card reverses its fade.');
@@ -6789,7 +6877,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  send(await openCard(second));
  const secondClip=copy(secondPanel),secondExit=secondClip.getAnimations()[0];
  halfway(secondExit);
- posts.get(firstKey)({ok:false,json:async()=>({reason:'Try again.'})});
+ posts.get(firstKey)({headers:new Headers(),ok:false,json:async()=>({reason:'Try again.'})});
  await frame();
  const returning=copy(firstPanel),returnFade=returning.getAnimations()[0];
  check(returnFade!==firstExit,'The refused card starts its return fade.');
@@ -6818,7 +6906,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  halfway(exit);
  const position=top(clip),following=top(next);
  check(top(first)<position && position<following,'The departing card starts between its neighbors.');
- posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
+ posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
  await frame();
  check(copy(panel)===clip && near(top(clip),position),'The saved card keeps its position during the fade.');
  check(near(top(next),following),'The next card keeps its position when the save completes.');
@@ -6849,7 +6937,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  if(!remounted || remounted===row) throw new Error('The pending row must mount again.');
  const form=await readyReviewCard(remounted);
  check(form.dataset.sending==='true','The remounted form shows the pending save.');
- posts.get(key)({ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
+ posts.get(key)({headers:new Headers(),ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
  await frame();
  check(!current(),'The completed row leaves the table.');
  const exit=copy(panel)?.getAnimations()[0];
@@ -7447,7 +7535,7 @@ window.fetch=async(_url,options={})=>{
  if(options.method==='POST'){
   window.posts.push(new URLSearchParams(options.body));
   if(nextPost){const post=nextPost;nextPost=null;return post;}
-  return {ok:true,json:async()=>({answer:'works'})};
+  return {headers:new Headers(),ok:true,json:async()=>({answer:'works'})};
  }
  window.refreshRequests.push(_url);return {ok:true,text:async()=>window.refreshMarkup};
 };
@@ -7460,8 +7548,8 @@ window.fetch=async(_url,options={})=>{
  const shown=()=>rows().filter(row=>!row.hidden);
  const holdPost=()=>{
   let finish;nextPost=new Promise(resolve=>{finish=resolve;});
-  return {save:()=>finish({ok:true,json:async()=>({answer:'works'})}),
-   refuse:reason=>finish({ok:false,json:async()=>({reason})})};
+  return {save:()=>finish({headers:new Headers(),ok:true,json:async()=>({answer:'works'})}),
+   refuse:reason=>finish({headers:new Headers(),ok:false,json:async()=>({reason})})};
  };
  const visibleStatus=text=>[...document.querySelectorAll('[data-send-status],[data-hidden-action-status]')]
    .some(node=>node.textContent.includes(text) && node.getClientRects().length);
@@ -7772,9 +7860,9 @@ window.fetch=async(_url,options={})=>{
                     thread.start()
                     try:
                         with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done=subprocess.run(['firefox','--headless','--no-remote','--profile',profile,
+                            done=run_process_group(['firefox','--headless','--no-remote','--profile',profile,
                                 '--window-size',f'{width},900','--screenshot',str(self.fixture.temporary/f'review-{width}.png'),
-                                f'http://127.0.0.1:{server.server_port}/'],capture_output=True,text=True,timeout=30)
+                                f'http://127.0.0.1:{server.server_port}/'],timeout=30)
                         self.assertEqual(done.returncode,0,done.stderr)
                     finally:
                         server.shutdown()
@@ -7976,9 +8064,9 @@ Date.now=()=>Date.parse(SCENARIO==='gap' ? '2027-03-13T15:00:00Z' :
                     thread.start()
                     try:
                         with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
+                            done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', profile,
                                 '--window-size', '1440,900', '--screenshot', str(self.fixture.temporary/'later-time.png'),
-                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                                f'http://127.0.0.1:{server.server_port}/'], timeout=30)
                         self.assertEqual(done.returncode, 0, done.stderr)
                     finally:
                         server.shutdown()
@@ -7994,7 +8082,7 @@ Date.now=()=>Date.parse(SCENARIO==='gap' ? '2027-03-13T15:00:00Z' :
 const nativeFetch=fetch;
 window.setInterval=()=>0;
 Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
-window.fetch=async()=>({ok:true,text:async()=>MARKUP});
+window.fetch=async()=>({headers:new Headers(),ok:true,text:async()=>MARKUP});
 </script>""".replace('MARKUP', json.dumps(source).replace('</', '<\\/'))
         probe = r"""<script>
 (async()=>{

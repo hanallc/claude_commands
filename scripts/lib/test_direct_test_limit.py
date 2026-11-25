@@ -5,6 +5,7 @@ import contextlib
 import io
 import os
 from pathlib import Path
+import select
 import signal
 import subprocess
 import sys
@@ -22,7 +23,8 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 REPO = Path(__file__).resolve().parents[2]
 MODULE_RUN = REPO / "scripts/test_times/module_run.py"
 CASE_LIMIT = 2
-LIMIT_LINE = f"stopped at the {CASE_LIMIT}-second direct test limit; run longer tests with targeted_test.py --module"
+LIMIT_LINE = (f"stopped at the {CASE_LIMIT}-second direct test limit. "
+              "Run longer tests with copies.py run and gate.py --affected --module.")
 LIMIT_REQUEST = f"scope requested: {CASE_LIMIT}"
 FIXTURE_SCOPE = "claude-direct-test-" + "0" * 32 + ".scope"
 LIMIT_FIXTURE = STANDALONE_TEST_STARTUP + """
@@ -220,10 +222,16 @@ unittest.TextTestRunner().run(case)
         for name, expected in (("gate.py", True), ("merge_gate.py", True), ("targeted_test.py", True),
                                ("merge_checkpoint.py", True), ("other_tool.py", False)):
             entry = production / name
-            _ = entry.write_text("import sys\nsys.stdin.read()\n")
+            _ = entry.write_text("import sys\nprint('ready', flush=True)\nsys.stdin.read()\n")
             with self.subTest(entry=name):
-                process = subprocess.Popen([sys.executable, str(entry)], cwd=self.root, stdin=subprocess.PIPE)
+                process = subprocess.Popen([sys.executable, str(entry)], cwd=self.root,
+                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE)
                 try:
+                    # Popen can return before Linux publishes the child's command line.
+                    assert process.stdout is not None
+                    readable, _, _ = select.select([process.stdout], [], [], TEST_HANG_GUARD_SECS)
+                    self.assertTrue(readable, "the gate fixture did not report readiness")
+                    self.assertEqual(process.stdout.readline(), b"ready\n")
                     with mock.patch("pwd.getpwuid", return_value=mock.Mock(pw_dir=str(home))):
                         recognized = startup._gate_command(str(process.pid))  # pyright: ignore[reportPrivateUsage]
                     self.assertEqual(recognized, expected)
