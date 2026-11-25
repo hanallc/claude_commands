@@ -820,6 +820,7 @@ def render() -> str:
    <fieldset><legend>Type</legend><div class="new-item-chips">{chips}</div></fieldset>
    <fieldset data-recipient-group><legend>To</legend>
     <p data-owner-reason hidden><span id="review-new-item-owner-reason"></span>&nbsp;<span aria-hidden="true">&#x1F986;</span></p>
+    <p data-recipients-loading role="status" hidden>Loading recipients…</p>
     <p data-recipients-status role="status" hidden></p>
     <div class="new-item-chips" data-recipients></div>
    </fieldset>
@@ -913,14 +914,18 @@ STYLE = '''
 :is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
 :is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="enhancement"] { --item-icon: #efbd63; }
 :is(#review-new-item,[data-new-item-draft]) .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
-:is(#review-new-item,[data-new-item-draft]) [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
+:is(#review-new-item,[data-new-item-draft]) :is([data-recipients-status], [data-recipients-loading]) {
+ margin: 0; color: var(--ink-2, #c3c2b7);
+}
 :is(#review-new-item,[data-new-item-draft]) [data-recipient-group] { display: flow-root; }
 :is(#review-new-item,[data-new-item-draft]) [data-recipient-group] > legend { float: left; margin-right: 12px; }
 :is(#review-new-item,[data-new-item-draft]) [data-owner-reason] {
  margin: 0 0 8px; font-size: 12px; line-height: 1.2; text-align: right; text-wrap: balance; overflow-wrap: anywhere;
  color: var(--ink-3, #9a988f);
 }
-:is(#review-new-item,[data-new-item-draft]) [data-recipients-status], :is(#review-new-item,[data-new-item-draft]) [data-recipients] { clear: both; }
+:is(#review-new-item,[data-new-item-draft]) :is([data-recipients-status], [data-recipients-loading], [data-recipients]) {
+ clear: both;
+}
 :is(#review-new-item,[data-new-item-draft]) textarea {
  display: block; width: 100%; min-width: 0; margin: 0; padding: 10px 12px; resize: vertical;
  border: 1px solid var(--line, #34332f); border-radius: 8px;
@@ -1023,7 +1028,7 @@ STYLE = '''
 '''
 
 
-SCRIPT = r'''(() => {
+SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''(() => {
  const endpoint = '/console/review/new-item';
  const limits = __LIMITS__;
  const original = document.querySelector('#review-new-item');
@@ -1032,6 +1037,8 @@ SCRIPT = r'''(() => {
  const listSendKey = 'console.list.pending-send';
  const listDraftPrefix = listSendKey + '.';
  const listDraftId = /^r6-[0-9a-f]{32}$/;
+ const reportDraftPrefix = source => 'console.report.pending-send.' + source + '.';
+ const isReportKind = kind => kind === 'bug' || kind === 'enhancement';
  let nextDraft = 0;
 
  function storedListDraft() {
@@ -1059,12 +1066,28 @@ SCRIPT = r'''(() => {
   return null;
  }
 
+ function storedReportDraft(source) {
+  try {
+   const prefix = reportDraftPrefix(source);
+   for (let index = 0; index < sessionStorage.length; index++) {
+    const key = sessionStorage.key(index);
+    if (!key?.startsWith(prefix)) continue;
+    const id = key.slice(prefix.length);
+    if (!listDraftId.test(id) || drafts.some(draft => draft.id === id)) continue;
+    const item = JSON.parse(sessionStorage.getItem(key));
+    if (isReportKind(item?.kind)) return {id, kind: item.kind, recipient: item.recipient || null};
+   }
+  } catch (_) {}
+  return null;
+ }
+
 function bindDraft(dialog, fresh = false) {
  const heading = dialog.querySelector('h2');
  heading.tabIndex = -1;
  const form = dialog.querySelector('form'), body = dialog.querySelector('.new-item-body');
  const recipientChips = dialog.querySelector('[data-recipients]');
  const recipientStatus = dialog.querySelector('[data-recipients-status]');
+ const recipientLoading = dialog.querySelector('[data-recipients-loading]');
  const recipientGroup = dialog.querySelector('[data-recipient-group]');
  const ownerReason = dialog.querySelector('[data-owner-reason]');
  const ownerReasonText = ownerReason.querySelector('span');
@@ -1082,7 +1105,7 @@ function bindDraft(dialog, fresh = false) {
  const fields = [...form.querySelectorAll('fieldset'), words, includePage, dialog.querySelector('[data-close]'),
                  dialog.querySelector('[data-cancel]')];
  let launcher, opening, token, recipients, images = [], sending = false;
- let draftId, keepDraft = false, canRecoverFiling = false, ownerPage = '';
+ let draftId, reportDraftKind, keepDraft = false, canRecoverFiling = false, ownerPage = '';
  // Null means the user must choose again. An empty string means the page has no default.
  let selectedRecipient = '';
  let pageOwner = '';
@@ -1151,8 +1174,7 @@ function bindDraft(dialog, fresh = false) {
  }
 
  function setError(reason) {
-  error.textContent = reason;
-  error.hidden = !reason;
+  showActionFailure(error, reason);
  }
 
  function updateSend() {
@@ -1166,7 +1188,7 @@ function bindDraft(dialog, fresh = false) {
   const available = recipients.filter(recipient => !proposal || recipient.proposal);
   if (selectedRecipient && !available.some(recipient => recipient.id === selectedRecipient)) {
    selectedRecipient = null;
-   storeListDraft();
+   storePendingDraft();
   }
   recipientChips.replaceChildren();
   for (const recipient of available) {
@@ -1180,10 +1202,9 @@ function bindDraft(dialog, fresh = false) {
    chip.append(input, face);
    recipientChips.append(chip);
   }
-  recipientStatus.textContent = selectedRecipient === null
+  showActionFailure(recipientStatus, selectedRecipient === null
    ? 'The recipient you chose is not available. Choose a recipient.'
-   : available.length ? '' : 'No recipients are available.';
-  recipientStatus.hidden = !recipientStatus.textContent;
+   : available.length ? '' : 'No recipients are available.');
   showOwnerReason();
  }
 
@@ -1205,7 +1226,7 @@ function bindDraft(dialog, fresh = false) {
   }
   if (event?.target.name === 'recipient_id') {
    selectedRecipient = event.target.value;
-   storeListDraft();
+   storePendingDraft();
    recipientStatus.hidden = true;
    showOwnerReason();
   }
@@ -1232,11 +1253,11 @@ function bindDraft(dialog, fresh = false) {
   event.preventDefault();
   const total = [...images.map(image => image.file), ...files].reduce((sum, file) => sum + file.size, 0);
   if (files.some(file => !limits.types.includes(file.type))) {
-   setError('Paste PNG, JPEG, GIF or WebP images.'); return;
+   showActionFailure(error, 'Paste PNG, JPEG, GIF or WebP images.'); return;
   }
   if (images.length + files.length > limits.images || total > limits.totalImageBytes ||
       files.some(file => !file.size || file.size > limits.imageBytes)) {
-   setError('Paste up to four images, at most 5 MiB each and 12 MiB total.'); return;
+   showActionFailure(error, 'Paste up to four images, at most 5 MiB each and 12 MiB total.'); return;
   }
   addImagePreviews(files);
   editDraft();
@@ -1409,18 +1430,18 @@ function bindDraft(dialog, fresh = false) {
 
  function collectPageContext() {
   const filters = [];
-  for (const chip of document.querySelectorAll('[data-type-chip],[data-show-chip],[data-owner-chip],[data-filter-value]')) {
+  for (const chip of document.querySelectorAll('[data-filter-row] [data-filter-value]')) {
    if (chip.getAttribute('aria-pressed') !== 'true' || !visible(chip)) continue;
    const group = chip.closest('[role="group"]')?.getAttribute('aria-label');
    if (!group) continue;
    const label = chip.cloneNode(true);
    label.querySelector('b')?.remove();
-   filters.push((group === 'Show' ? 'State' : group) + ' ' + clip(label.textContent));
+   filters.push(group + ' ' + clip(label.textContent));
   }
   const search = document.querySelector('#list-search,[data-filter-words]');
   if (search?.value && visible(search)) filters.push('Search ' + clip(search.value));
   const notices = new Set();
-  const selector = '[data-review-source-notices] li,[data-review-notice],[data-missing-item],.notice,' +
+  const selector = '[data-review-source-notices] li,[data-review-notice],[data-hidden-action-status],[data-missing-item],.notice,' +
                    '[role="alert"],[data-page-status][data-state="Failed"] [data-status-reason]';
   for (const element of document.querySelectorAll(selector)) {
    if (!visible(element)) continue;
@@ -1563,22 +1584,28 @@ function bindDraft(dialog, fresh = false) {
   session.image = null;
  }
 
- function storeListDraft() {
-  if (ownerPage !== 'list' || !draftId || !canRecoverFiling) return;
+ function storePendingDraft() {
+  if (!draftId || !canRecoverFiling) return;
   try {
-   sessionStorage.setItem(listDraftPrefix + draftId, selectedRecipient || '');
+   if (ownerPage === 'list') {
+    sessionStorage.setItem(listDraftPrefix + draftId, selectedRecipient || '');
+   } else if (reportDraftKind) {
+    sessionStorage.setItem(reportDraftPrefix(source) + draftId,
+                           JSON.stringify({kind: reportDraftKind, recipient: selectedRecipient}));
+   }
   } catch (_) {}
  }
 
- function removeListDraft() {
-  if (ownerPage === 'list') {
-   try { sessionStorage.removeItem(listDraftPrefix + draftId); } catch (_) {}
-  }
+ function removePendingDraft() {
+  try {
+   const prefix = ownerPage === 'list' ? listDraftPrefix : reportDraftPrefix(source);
+   sessionStorage.removeItem(prefix + draftId);
+  } catch (_) {}
  }
 
- function finishDraft() {
-  removeListDraft();
-  draftId = deferredCapture = pendingItem = undefined;
+ function finishDraft({keepRecovery = false} = {}) {
+  if (!keepRecovery) removePendingDraft();
+  draftId = reportDraftKind = deferredCapture = pendingItem = undefined;
   canRecoverFiling = pendingEdited = false;
  }
 
@@ -1594,7 +1621,8 @@ function bindDraft(dialog, fresh = false) {
   if (dialog.open) hideDialog();
   keepDraft = !sent && Boolean(pendingItem || words.value || images.length);
   if (!keepDraft) {
-   if (ownerPage !== 'list' || !canRecoverFiling) finishDraft();
+   if (ownerPage !== 'list' || !canRecoverFiling)
+    finishDraft({keepRecovery: Boolean(canRecoverFiling && reportDraftKind)});
    for (const image of images) URL.revokeObjectURL(image.url);
    images = [];
    previews.replaceChildren();
@@ -1633,17 +1661,21 @@ function bindDraft(dialog, fresh = false) {
   pageContext = page ? collectPageContext() : null;
   launcher = trigger;
   token = '';
-  if (ownerPage === 'list' && !draftId && !keepDraft) {
-   const stored = storedListDraft();
+  if (!draftId && !keepDraft) {
+   const stored = ownerPage === 'list' ? storedListDraft() : storedReportDraft(source);
    if (stored) {
     draftId = stored.id;
     selectedRecipient = stored.recipient;
+    reportDraftKind = stored.kind;
+    if (reportDraftKind) kind = reportDraftKind;
     canRecoverFiling = true;
    }
   }
   const newDraft = !keepDraft && !draftId;
   if (newDraft) selectedRecipient = '';
+  // A refusal belongs to the page that sent it, so a new dialog starts without one.
   sendNotice.hidden = true;
+  sendNotice.textContent = '';
   includePage.closest('label').hidden = !pageContext;
   recipients = null;
   recipientChips.replaceChildren();
@@ -1654,8 +1686,8 @@ function bindDraft(dialog, fresh = false) {
    setError('');
    form.elements.kind.value = kind;
   }
-  recipientStatus.textContent = 'Loading recipients…';
-  recipientStatus.hidden = false;
+  showActionFailure(recipientStatus);
+  recipientLoading.hidden = false;
   showEvidence();
   showBugPage();
   showSentDetails();
@@ -1677,7 +1709,9 @@ function bindDraft(dialog, fresh = false) {
    startCapture();
    showSentDetails();
   } catch (failure) {
-   if (!controller.signal.aborted) recipientStatus.textContent = failure.message;
+   if (!controller.signal.aborted) showActionFailure(recipientStatus, failure.message);
+  } finally {
+   if (!controller.signal.aborted) recipientLoading.hidden = true;
   }
  }
 
@@ -1726,7 +1760,8 @@ function bindDraft(dialog, fresh = false) {
    const sendItem = () => {
     const receiver = canRecoverFiling ? undefined : recipients?.find(recipient => recipient.id === item.recipient_id)?.name;
     canRecoverFiling = true;
-    storeListDraft();
+    if (ownerPage !== 'list' && isReportKind(submittedKind)) reportDraftKind ||= submittedKind;
+    storePendingDraft();
     return post({...item, kind: submittedKind, token}, {hold: true, receiver});
    };
    let result;
@@ -1754,7 +1789,7 @@ function bindDraft(dialog, fresh = false) {
     pendingItem = undefined;
     pendingEdited = false;
     canRecoverFiling = couldRecoverFiling;
-    if (!canRecoverFiling) removeListDraft();
+    if (!canRecoverFiling) removePendingDraft();
    }
    if (failure?.filedId) {
     discardCapture();

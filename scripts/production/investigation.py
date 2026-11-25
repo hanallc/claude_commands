@@ -15,7 +15,7 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager, nullco
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from enum import StrEnum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import cast, override
 
@@ -45,6 +45,50 @@ class InvestigationKind(StrEnum):
     BUG = "bug"
 
 
+class InvestigationPurpose(StrEnum):
+    INVESTIGATE = "investigate"
+    BUG_REPORT = "bug report"
+    MOVING_LEGACY_BUG = "moving legacy bug"
+    ENHANCEMENT = "enhancement"
+
+
+_filing_purpose: ContextVar[InvestigationPurpose] = ContextVar(
+    "filing_purpose", default=InvestigationPurpose.INVESTIGATE)
+
+
+@contextmanager
+def file_for_list(purpose: InvestigationPurpose) -> Generator[None]:
+    """Keep the selected report type when the submission uses the investigation store."""
+    token = _filing_purpose.set(purpose)
+    try:
+        yield
+    finally:
+        _filing_purpose.reset(token)
+
+
+@dataclass(frozen=True)
+class ListDestination:
+    """The List row that owns the report workflow."""
+
+    keeper: staff.StaffId
+    number: int
+
+
+class NoListDestination(Enum):
+    ABSENT = "still on Review"
+
+
+def _read_list_destination(raw: str) -> ListDestination | NoListDestination:
+    if not raw:
+        return NoListDestination.ABSENT
+    data = cast(object, json.loads(raw))
+    match data:
+        case [str(keeper), int(number)] if keeper and number > 0:
+            return ListDestination(staff.StaffId(keeper), number)
+        case _:
+            raise InvestigationError("invalid List destination")
+
+
 @dataclass(frozen=True)
 class Investigation:
     id: str
@@ -60,6 +104,20 @@ class Investigation:
     waiting_why: str = ""
     kind: InvestigationKind = InvestigationKind.INVESTIGATION
     submission: new_item_dialog.SubmissionOrigin = new_item_dialog.NoReviewSubmission()
+    list_destination: ListDestination | NoListDestination = NoListDestination.ABSENT
+    purpose: InvestigationPurpose = InvestigationPurpose.INVESTIGATE
+
+    @property
+    def belongs_on_list(self) -> bool:
+        return (self.purpose is not InvestigationPurpose.INVESTIGATE
+                or isinstance(self.list_destination, ListDestination))
+
+    @property
+    def submission_scope(self) -> str:
+        if isinstance(self.submission, new_item_dialog.ReviewSubmission):
+            return new_item_dialog.submission_key(new_item_dialog.SubmissionKind(self.kind.value), self.owner,
+                                                  self.id, self.submission.request_id)
+        return ""
 
     @property
     def source_owner(self) -> staff.StaffId:
@@ -170,6 +228,10 @@ def _record_path(store: Investigations, identity: str, *, strict: bool = True) -
     return paths[0]
 
 
+def review_record_path(owner: staff.StaffId, identity: str) -> Path:
+    return _record_path(_store(owner), identity)
+
+
 def load(owner: staff.StaffId, identity: str, *, sources: list[Path] | None = None) -> Investigation:
     """Read the investigation with this owner and stored ID."""
     store = _store(owner)
@@ -230,7 +292,8 @@ def _load(store: Investigations, identity: str, path: Path, *, sources: list[Pat
                              InvestigationState(fields["state"]), fields["filed"], fields["answered"],
                              fields["read"], question, answer, review_events.decode(fields.get("review_log", "")),
                              review_events.waiting_why(fields.get("waiting_why", "")), kind,
-                             submission)
+                             submission, _read_list_destination(fields.get("list_destination", "")),
+                             InvestigationPurpose(fields.get("purpose", InvestigationPurpose.INVESTIGATE)))
         if not item.title.strip() or record_store.has_line_break(item.title):
             raise ValueError("title must have one line")
         for name, value, required in (
@@ -278,6 +341,11 @@ def _save(store: Investigations, item: Investigation, path: Path,
               "waiting_why": item.waiting_why, "kind": item.kind}
     if isinstance(item.submission, new_item_dialog.ReviewSubmission):
         fields["review_submission"] = json.dumps(new_item_dialog.stored_submission(item.submission))
+    if item.purpose is not InvestigationPurpose.INVESTIGATE:
+        fields["purpose"] = item.purpose
+    destination = item.list_destination
+    if isinstance(destination, ListDestination):
+        fields["list_destination"] = json.dumps((destination.keeper, destination.number))
     body = f"{item.question}{ANSWER_SECTION}{item.answer}"
     with investigation_numbers() if numbers is None else nullcontext(numbers) as sequence:
         with sequence.write(path, item.id, store.owner, folder=store.folder(), new_record=new_record,
@@ -358,7 +426,7 @@ def file(owner: staff.StaffId, title: str, question: str, *, waiting_why: str = 
         names: set[str] = set()
         while True:
             item = Investigation(identity, owner, title, InvestigationState.OPEN, _now(), "", "", question, "",
-                                 log, reason, kind, submission)
+                                 log, reason, kind, submission, purpose=_filing_purpose.get())
             path = record_store.free_record_path(store.path(identity), names)
             try:
                 saved = _save(store, item, path, numbers, new_record=True,
@@ -434,6 +502,48 @@ def _answer(store: Investigations, identity: str, text: str, question_id: str,
         return item, True
 
 
+def file_on_list(path: Path, write_list_item: Callable[[Investigation], ListDestination], *,
+                 move_from_review: bool = False) -> Investigation:
+    """Keep the native evidence and commit the List destination under the source lock."""
+    store = _store(review_owner(path))
+    with store.locked():
+        item = read_review_record(path)
+        if isinstance(item.list_destination, ListDestination) or (move_from_review and
+                                                                  item.state == InvestigationState.READ):
+            return item
+        if move_from_review and item.purpose is InvestigationPurpose.INVESTIGATE:
+            # Prevent Review actions before the List row becomes visible.
+            item = _save(store, replace(item, purpose=InvestigationPurpose.MOVING_LEGACY_BUG), path)
+        destination = write_list_item(item)
+        if move_from_review:
+            moment = datetime.now(timezone.utc)
+            stamp = moment.isoformat()
+            event = ReviewLog(moment, "nate", f"moved to List item {destination.number}")
+            item = replace(item, state=InvestigationState.READ, answered=item.answered or stamp, read=stamp,
+                           log=(*item.log, event))
+        return _save(store, replace(item, list_destination=destination), path)
+
+
+def list_destination_has_submission(destination: ListDestination, scope: str) -> bool:
+    """Check the saved report reference at the List destination."""
+    store = record_store.NumberedRecords(destination.keeper, "list", "L", "list item", InvestigationError)
+    fields, _ = store.read(f"L{destination.number}")
+    reference = cast(object, json.loads(fields.get("report", "null")))
+    match reference:
+        case [str(), str(), str(), str(saved_scope)]:
+            return saved_scope == scope
+        case _:
+            return False
+
+
+def list_evidence_record(key: str) -> Investigation:
+    """Read the original report for its List details."""
+    kind, owner, identity = key.split("/")
+    if kind != "investigation":
+        raise InvestigationError("invalid List report evidence key")
+    return load(staff.StaffId(owner), identity)
+
+
 def mark_read(owner: staff.StaffId, identity: str, words: str = "", *,
               check: Callable[[], object] | None = None) -> Investigation:
     """Mark an answer read once; accept an exact repeat without writing."""
@@ -443,6 +553,8 @@ def mark_read(owner: staff.StaffId, identity: str, words: str = "", *,
         item = _load(store, identity, path)
         if item.state == InvestigationState.READ:
             return item
+        if item.belongs_on_list:
+            raise InvestigationError("Open the report on the List.")
         if item.state != InvestigationState.ANSWER_READY:
             raise InvestigationError(f"{identity}: cannot read an investigation in state {item.state}")
         item = replace(item, state=InvestigationState.READ, read=_now(),
@@ -461,6 +573,8 @@ def review_action(owner: staff.StaffId, identity: str, action: str, words: str, 
     with store.locked(check=check):
         path = _record_path(store, identity)
         item = _load(store, identity, path)
+        if item.belongs_on_list:
+            raise InvestigationError("Open the report on the List.")
         replace_wait = (item.state == InvestigationState.OPEN and action == 'question'
                         and isinstance(new_reply_proof, reply_tokens.ReplyTokenProof)
                         and isinstance(item.submission, new_item_dialog.ReviewSubmission))
@@ -490,6 +604,8 @@ def record_review_log(owner: staff.StaffId, identity: str, words: str, *,
     with store.locked(check=check):
         path = _record_path(store, identity)
         item = _load(store, identity, path)
+        if item.belongs_on_list:
+            raise InvestigationError("Open the report on the List.")
         event = ReviewLog(datetime.now(timezone.utc), 'nate', words)
         _ = _save(store, replace(item, log=review_events.append(item.log, event)), path)
 
@@ -500,6 +616,8 @@ def change_waiting(record: Investigation, action: str, words: str, *, check: Cal
     with store.locked(check=check):
         path = _record_path(store, record.id)
         item = _load(store, record.id, path)
+        if item.belongs_on_list:
+            raise InvestigationError("Open the report on the List.")
         if item.submission != record.submission or item.state != InvestigationState.OPEN:
             raise InvestigationError("The selected investigation changed.")
         now = datetime.now(user_zone())

@@ -422,6 +422,18 @@ class RetiredProducer:
 
 
 @dataclass(frozen=True)
+class TopItem:
+    """The List item number that a producer names as its top priority."""
+
+    number: int
+
+
+@dataclass(frozen=True)
+class NoTopItem:
+    """The producer names no top priority item."""
+
+
+@dataclass(frozen=True)
 class StaffRow:
     id: StaffId
     kind: Kind
@@ -439,6 +451,7 @@ class StaffRow:
     run: OpenRun | NoRun = field(default_factory=NoRun, kw_only=True)
     unit_type: UnitDetails | NotUnit = field(default_factory=NotUnit, kw_only=True)
     retirement: RetiredProducer | Active = field(default_factory=Active, kw_only=True)
+    top_item: TopItem | NoTopItem = field(default_factory=NoTopItem, kw_only=True)
     resume_pending: ResumePending | NoPendingResume = field(default_factory=NoPendingResume, kw_only=True)
     unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
@@ -475,6 +488,8 @@ class StaffRow:
             value["resume_pending"] = self.resume_pending.to_json()
         if isinstance(self.retirement, RetiredProducer):
             value["retired_producer"] = self.retirement.profile
+        if isinstance(self.top_item, TopItem):
+            value["top_item"] = self.top_item.number
         return value
 
     @classmethod
@@ -510,14 +525,19 @@ class StaffRow:
                        if isinstance(role, str) and role in WORKER_ROLES else WorkerRoleUnknown())
         parsed_home = SessionHome(Path(home)) if isinstance(home, str) and Path(home).is_absolute() else HomeUnknown()
         known_fields = {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused", "exited", "run", "unit_type"}
-        known_fields.add("retired_producer")
-        known_fields.add("resume_pending")
+        known_fields.update(("retired_producer", "top_item", "resume_pending"))
         retirement: RetiredProducer | Active = Active()
         if "retired_producer" in fields:
             profile = fields["retired_producer"]
             if kind != "producer" or not isinstance(profile, str) or not profile:
                 raise StaffUnreadable("invalid retired producer profile")
             retirement = RetiredProducer(profile)
+        top_item: TopItem | NoTopItem = NoTopItem()
+        if "top_item" in fields:
+            number = fields["top_item"]
+            if kind != "producer" or not isinstance(number, int) or isinstance(number, bool) or number < 1:
+                raise StaffUnreadable("invalid producer top item")
+            top_item = TopItem(number)
         invalid: list[str] = []
         for key, fact in (("role", parsed_role), ("home", parsed_home)):
             if isinstance(fact, (KnownWorkerRole, SessionHome)):
@@ -531,7 +551,7 @@ class StaffRow:
         return cls(StaffId(staff_id), kind, name,
                    ReportsTo(StaffId(parent)) if isinstance(parent, str) else StaffRoot(), worktree, doc, current_session=StaffId(current),
                    role=parsed_role, home=parsed_home, unit_type=unit_type,
-                   run=OpenRun(Path(run)) if isinstance(run, str) else NoRun(), retirement=retirement,
+                   run=OpenRun(Path(run)) if isinstance(run, str) else NoRun(), retirement=retirement, top_item=top_item,
                    paused=Paused.from_json(fields["paused"]) if "paused" in fields else Active(),
                    exited=Exited.from_json(fields["exited"]) if "exited" in fields else Active(),
                    resume_pending=ResumePending.from_json(fields["resume_pending"])
@@ -2441,6 +2461,24 @@ def set_producer_retirement(identity: StaffId, state: RetiredProducer | Active) 
     return _transaction(edit)
 
 
+def set_producer_top_item(identity: StaffId, top_item: TopItem) -> StaffRow:
+    """Name a producer's top priority List item. The caller checks the item."""
+    if top_item.number < 1:
+        raise StaffRefused("a top item is a List item number from 1")
+    if not is_owner():
+        return _remote_row(["set-producer-top-item", identity, f"--number={top_item.number}"])
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, identity)
+        if row.kind != "producer" or isinstance(row.retirement, RetiredProducer):
+            raise StaffRefused(f"{row.name}: a top item requires an active producer")
+        changed = replace(row, top_item=top_item)
+        rows[rows.index(row)] = changed
+        return changed
+
+    return _transaction(edit)
+
+
 def retire(staff_id: StaffId) -> StaffRow | None:
     if not is_owner():
         value = _remote(["retire", staff_id])
@@ -2687,6 +2725,7 @@ class _Arguments:
     creation_action: str = ""
     marker: str = ""
     profile: str = ""
+    number: str = ""
     hold_record: str = ""
     resume_key: str = ""
     restore_pause: bool = False
@@ -2792,6 +2831,10 @@ def _parser() -> argparse.ArgumentParser:
     _ = producer_retirement.add_argument("target")
     _ = producer_retirement.add_argument("--profile", required=True)
     _ = producer_retirement.add_argument("--json", action="store_true")
+    producer_top_item = verbs.add_parser("set-producer-top-item", help=argparse.SUPPRESS)
+    _ = producer_top_item.add_argument("target")
+    _ = producer_top_item.add_argument("--number", required=True, help="a List item number")
+    _ = producer_top_item.add_argument("--json", action="store_true")
     creation = verbs.add_parser("producer-creation", help=argparse.SUPPRESS)
     _ = creation.add_argument("creation_action", choices=("read", "claim", "finish", "read-named"))
     _ = creation.add_argument("--name", required=True)
@@ -2882,6 +2925,10 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
     if arguments.verb == "set-producer-retirement":
         state = RetiredProducer(arguments.profile) if arguments.profile else Active()
         return set_producer_retirement(StaffId(arguments.target), state)
+    if arguments.verb == "set-producer-top-item":
+        if not (arguments.number.isascii() and arguments.number.isdecimal()):
+            raise StaffRefused("--number takes a List item number")
+        return set_producer_top_item(StaffId(arguments.target), TopItem(int(arguments.number)))
     if arguments.verb == "transfer-producer":
         return transfer_producer(StaffId(arguments.target), native_id(arguments.new_id),
                                  SessionHome(Path(arguments.home).absolute()),

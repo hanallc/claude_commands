@@ -26,14 +26,13 @@ from scripts.lib import atomic_file, file_lock, unit_runs
 from scripts.lib.process_failure import failure_detail
 from scripts.production import session_staff, staff
 from scripts.production.production_doc import Refusal, production_field
-from scripts.review_links import change_page, review_link
+from scripts.review_links import change_page, page_frame, review_link
 from scripts.review_links import staff_names
 
 MANIFEST = ".review-link-branches.json"
 PAGE_NAME = "branches.html"
 KEPT = ".branch-page-kept.json"
 USED = ".review-link-branches.used"
-SUBMITTED = "This page was submitted. The new link comes by message."
 
 
 @dataclass(frozen=True)
@@ -96,13 +95,13 @@ class BranchPage:
 class DeleteResult:
     name: str
     message: str
+    deleted: bool
 
 
 @dataclass(frozen=True)
 class BranchDeletion:
     page: BranchPage
     selected: tuple[str, ...]
-    publisher_name: str
 
 
 @dataclass(frozen=True)
@@ -112,7 +111,7 @@ class PublishedBranchPage:
 
 
 class PageSubmitted(ValueError):
-    pass
+    """An older marker has no address for the next branch page."""
 
 
 @dataclass(frozen=True)
@@ -379,9 +378,9 @@ def page_at(root: Path, request_path: str) -> BranchPage:
     match = re.fullmatch(r"/([a-z0-9]{6})/branches\.html", urlsplit(request_path).path)
     if match is None:
         raise FileNotFoundError("not a branch page")
-    folder = root / match[1]
+    folder = current_folder(root, match[1])
     manifest = folder / MANIFEST
-    if folder.is_symlink() or manifest.is_symlink():
+    if manifest.is_symlink():
         raise ValueError("not a regular branch manifest")
     value = cast(object, json.loads(manifest.read_text(encoding="utf-8")))
     if not isinstance(value, dict):
@@ -428,17 +427,52 @@ def page_at(root: Path, request_path: str) -> BranchPage:
         raise ValueError("invalid no-owner branch count")
     kept = kept_branches()
     available = tuple(row for row in rows if not isinstance(row, MergedUnownedBranch) or row.name not in kept)
-    if (folder / USED).exists():
-        raise PageSubmitted(SUBMITTED)
     return BranchPage(Path(repository), available, token, staff.StaffId(publisher), folder,
                       unowned_total - (len(rows) - len(available)))
+
+
+def current_folder(root: Path, slug: str) -> Path:
+    seen: set[str] = set()
+    while slug not in seen:
+        seen.add(slug)
+        folder = root / slug
+        marker = folder / USED
+        if folder.is_symlink() or marker.is_symlink():
+            raise ValueError("not a regular branch page")
+        try:
+            successor = marker.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            if len(seen) > 1 and not (folder / MANIFEST).is_file():
+                raise ValueError("The current branch list is unavailable.") from None
+            return folder
+        if successor == "submitted":
+            raise PageSubmitted()
+        if not re.fullmatch(r"[a-z0-9]{6}", successor):
+            raise ValueError("invalid next branch page")
+        slug = successor
+    raise ValueError("branch pages form a loop")
 
 
 def render_date(value: str, date_class: str) -> str:
     return f'<strong class="{date_class}">{html.escape(value[:10])}</strong>{html.escape(value[10:])}'
 
 
-def render(page: BranchPage) -> bytes:
+def branch_heading(failure: str) -> str:
+    return '<h1>Branches to delete</h1>' + page_frame.action_failure("branch-failure", failure)
+
+
+def unavailable_page() -> bytes:
+    return change_page.document(branch_heading("This branch page is not available."), "Branches to delete")
+
+
+def empty_page(failure: str = "") -> bytes:
+    return change_page.document(branch_heading(failure) + "<p>No branches are available to delete.</p>",
+                                "Branches to delete")
+
+
+def render(page: BranchPage, *, failure: str = "", action: str = "") -> bytes:
+    if not page.rows:
+        return empty_page(failure)
     names = staff_names.read()
     unit_rows: list[str] = []
     unowned_rows: list[str] = []
@@ -455,22 +489,19 @@ def render(page: BranchPage) -> bytes:
         rows.append(f'''<section><label><input type="checkbox" name="branch" value="{name}" checked>
 <strong>{name}</strong></label><p>{owner}Last commit: {render_date(row.commit_date, date_class)}
 Merged into main: {html.escape(row.merge[:12])} · {render_date(row.merge_date, date_class)}</p></section>''')
-    content = '<h1>Branches to delete</h1>'
-    if page.rows:
-        unowned_heading = f"Merged, no owner recorded ({len(unowned_rows)} of {page.unowned_total})"
-        content += f'''<p>Clear each branch that you want to keep.</p>
-<form method="post"><input type="hidden" name="token" value="{html.escape(page.token, quote=True)}">
+    content = branch_heading(failure)
+    action_attribute = f' action="{html.escape(action, quote=True)}"' if action else ""
+    unowned_heading = f"Merged, no owner recorded ({len(unowned_rows)} of {page.unowned_total})"
+    content += f'''<p>Clear each branch that you want to keep.</p>
+<form method="post"{action_attribute}><input type="hidden" name="token" value="{html.escape(page.token, quote=True)}">
 {"".join(unit_rows)}<h2>{unowned_heading}</h2>{"".join(unowned_rows)}<button>Delete</button></form>'''
-    else:
-        content += "<p>No branches are available to delete.</p>"
     styles = b"""
 :root{--date-in-order:#166534;--date-out-of-order:#b91c1c}
 @media(prefers-color-scheme:dark){:root{--date-in-order:#86efac;--date-out-of-order:#fca5a5}}
 .date-in-order{color:var(--date-in-order)}
 .date-out-of-order{color:var(--date-out-of-order)}
 """
-    return (change_page.document(content).replace(b"</style>", styles + b"</style>", 1)
-            .replace(b"<title>Changes to review</title>", b"<title>Branches to delete</title>", 1))
+    return change_page.document(content, "Branches to delete").replace(b"</style>", styles + b"</style>", 1)
 
 
 def submit(page: BranchPage, body: str) -> BranchDeletion:
@@ -491,7 +522,7 @@ def submit(page: BranchPage, body: str) -> BranchDeletion:
         with file_lock.exclusive(root / (KEPT + ".lock")):
             kept = kept_branches() | unchecked
             atomic_file.write_bytes_atomic(root / KEPT, json.dumps(sorted(kept)).encode("utf-8"), mode=0o600)
-    return BranchDeletion(page, selected, publisher.name)
+    return BranchDeletion(page, selected)
 
 
 def delete_selected(deletion: BranchDeletion) -> tuple[DeleteResult, ...]:
@@ -499,32 +530,56 @@ def delete_selected(deletion: BranchDeletion) -> tuple[DeleteResult, ...]:
     for name in deletion.selected:
         try:
             result = git(deletion.page.repository, "push", "origin", "--delete", "--", name)
-            message = "deleted" if result.returncode == 0 else failure_detail(result)
-            results.append(DeleteResult(name, message))
-        except OSError as error:
-            results.append(DeleteResult(name, str(error)))
+            deleted = result.returncode == 0
+            results.append(DeleteResult(name, "deleted" if deleted else failure_detail(result), deleted))
+        except (OSError, subprocess.SubprocessError) as error:
+            results.append(DeleteResult(name, str(error), False))
     return tuple(results)
 
 
-def deliver(deletion: BranchDeletion) -> None:
+def without_branches(page: BranchPage, names: set[str]) -> BranchPage:
+    rows = tuple(row for row in page.rows if row.name not in names)
+    removed_unowned = sum(isinstance(row, MergedUnownedBranch) and row.name in names for row in page.rows)
+    return replace(page, rows=rows, unowned_total=page.unowned_total - removed_unowned)
+
+
+def finish_deletion(deletion: BranchDeletion) -> tuple[set[str], str]:
+    page = deletion.page
     results = delete_selected(deletion)
     lines = [f"{result.name}: {' '.join(result.message.splitlines())}" for result in results]
+    failures = [line for result, line in zip(results, lines) if not result.deleted]
+    deleted = {result.name for result in results if result.deleted}
+    if deleted:
+        kept = {row.name for row in page.rows
+                if isinstance(row, MergedUnownedBranch) and row.name not in deletion.selected}
+        try:
+            write_manifest(without_branches(page, deleted | kept))
+        except OSError as error:
+            print(f"review-links branch manifest: {error}", file=sys.stderr)
+            failures.append("The original branch list could not be updated.")
     try:
-        published = publish_for(deletion.page.repository, deletion.page.publisher)
-        if published.page.rows:
-            shown = sum(isinstance(row, MergedUnownedBranch) for row in published.page.rows)
-            lines.append(f"Next page: {published.url} ({shown} of {published.page.unowned_total} no-owner branches)")
+        published = publish_for(page.repository, page.publisher)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, staff.StaffRefused, Refusal) as error:
+        lines.append("Next page failed: " + " ".join(str(error).splitlines()))
+        failures.append("The next branch page could not be prepared.")
+    else:
+        next_page = published.page
+        try:
+            atomic_file.write_text_atomic(page.folder / USED, next_page.folder.name + "\n", new_file_mode=0o600)
+        except OSError as error:
+            print(f"review-links branch marker: {error}", file=sys.stderr)
+            failures.append("The next list could not be saved at this address.")
+        if next_page.rows:
+            shown = sum(isinstance(row, MergedUnownedBranch) for row in next_page.rows)
+            lines.append(f"Next page: {published.url} ({shown} of {next_page.unowned_total} no-owner branches)")
         else:
             lines.append("No branches remain to delete.")
-    except (OSError, ValueError, subprocess.SubprocessError, staff.StaffRefused, Refusal) as error:
-        lines.append("Next page failed: " + " ".join(str(error).splitlines()))
-    change_page.send_to_staff(deletion.page.publisher, change_page.SENDER, "\n".join(lines))
-    mark = deletion.page.folder / USED
     try:
-        atomic_file.write_bytes_atomic(mark, b"submitted\n", mode=0o600)
-    except OSError:
-        mark.unlink(missing_ok=True)
-        raise
+        change_page.send_to_staff(page.publisher, change_page.SENDER, "\n".join(lines))
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f"review-links branch delivery: {error}", file=sys.stderr)
+        failures.append("The branch results could not be sent.")
+    return deleted, "\n".join(failures)
 
 
 def publish(repository: Path) -> str:
@@ -545,10 +600,14 @@ def publish_for(repository: Path, publisher: staff.StaffId) -> PublishedBranchPa
         url = review_link.snapshot_at(root, [source], new=True)[0]
     folder = root / urlsplit(url).path.split("/")[1]
     page = replace(page, folder=folder)
+    write_manifest(page)
+    return PublishedBranchPage(url, page)
+
+
+def write_manifest(page: BranchPage) -> None:
     manifest = {"repository": str(page.repository), "rows": [asdict(row) for row in page.rows],
                 "token": page.token, "unowned_total": page.unowned_total, "publisher": page.publisher}
-    atomic_file.write_bytes_atomic(folder / MANIFEST, json.dumps(manifest).encode("utf-8"), mode=0o600)
-    return PublishedBranchPage(url, page)
+    atomic_file.write_bytes_atomic(page.folder / MANIFEST, json.dumps(manifest).encode("utf-8"), mode=0o600)
 
 
 def main(arguments: list[str]) -> int:

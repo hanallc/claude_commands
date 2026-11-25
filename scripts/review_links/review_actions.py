@@ -8,7 +8,7 @@ import sys
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -16,7 +16,7 @@ from scripts.for_you.action import REVIEW_PATH
 from scripts.lib import atomic_file
 from scripts.lib.user_zone import user_zone
 from scripts.nightly_review import candidates
-from scripts.production import change_review, change_routing, investigation, proposal_issue, staff, the_list, update_registration
+from scripts.production import change_review, change_routing, investigation, proposal_issue, record_store, staff, the_list, update_registration
 from scripts.production.production_doc import Production
 from scripts.review_links import change_page, decision_store, efficiency_reviews, new_item_dialog, review_items, review_later, review_submissions
 from scripts.review_links import question_path, question_record, reply_tokens
@@ -208,22 +208,35 @@ def resume_efficiency(item: review_items.ReviewItem) -> None:
             atomic_file.write_text_atomic(source.path, '\n'.join(lines)+'\n')
 
 
-def later(item: review_items.ReviewItem, value: str, words: str, *,
-          verify_revision: Callable[[], object] | None = None, root: Path | None = None) -> str:
-    if isinstance(item.source, review_items.ChangeSource) and isinstance(
-            item.source.assignment.production, change_routing.UnavailableProduction):
-        raise question_record.AnswerRefused("the production document is not available")
-    zone = user_zone()
-    selected = question_path.read_later(value, lambda time: time.replace(tzinfo=zone))
-    if isinstance(selected, question_path.UntilDelivered):
+def save_timed_park[Result](value: str, zone: tzinfo,
+                           save: Callable[[datetime, Callable[[datetime], None]], Result], *,
+                           require_offset: bool = False) -> Result:
+    """Pass the selected deadline and its check to the item's writer."""
+    def local_time(time: datetime) -> datetime:
+        if require_offset:
+            raise ValueError('a time must have a time zone')
+        return time.replace(tzinfo=zone)
+
+    until = question_path.read_later(value, local_time)
+    if isinstance(until, question_path.UntilDelivered):
         raise question_record.AnswerRefused('Review Later requires a time.')
-    until = selected.astimezone(zone)
+
+    def check_deadline(moment: datetime) -> None:
+        the_list.require_active_parking(until, moment)
+
+    return save(until, check_deadline)
+
+
+def _save_review_park(item: review_items.ReviewItem, until: datetime, words: str, *,
+                      check_deadline: Callable[[datetime], None],
+                      verify_revision: Callable[[], object] | None, root: Path | None) -> str:
     event = 'Later until '+question_path.write_later(until)+(': '+words if words else '')
 
     def record_later(publish_deadline: Callable[[], None]) -> None:
         def check_and_publish() -> None:
             if verify_revision is not None:
                 _ = verify_revision()
+            check_deadline(datetime.now(UTC))
             publish_deadline()
 
         record_action(item, event, root=root, check=check_and_publish)
@@ -233,6 +246,16 @@ def later(item: review_items.ReviewItem, value: str, words: str, *,
           else nullcontext()):
         review_later.save(item.key, until, record_log=record_later)
     return 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
+
+
+def later(item: review_items.ReviewItem, value: str, words: str, *,
+          verify_revision: Callable[[], object] | None = None, root: Path | None = None) -> str:
+    if isinstance(item.source, review_items.ChangeSource) and isinstance(
+            item.source.assignment.production, change_routing.UnavailableProduction):
+        raise question_record.AnswerRefused("the production document is not available")
+    zone = user_zone()
+    return save_timed_park(value, zone, lambda until, check: _save_review_park(
+        item, until.astimezone(zone), words, check_deadline=check, verify_revision=verify_revision, root=root))
 
 
 def send(item: review_items.ReviewItem, path: Path, row: str, message: str, save: Callable[[], object],
@@ -272,9 +295,32 @@ def prepare_submission_delivery(saved: review_submissions.SavedSubmission, words
         return _claim_submission_delivery(saved.address, status, words=words, evidence_page=evidence_page)
 
 
+def ensure_submission_list_item(address: review_submissions.SubmissionAddress) -> None:
+    """Finish the List row under the current recipient locks."""
+    with review_submissions.submission_for_delivery(address) as filing:
+        if isinstance(filing, review_submissions.LocatedSubmission):
+            _ensure_list_filing(filing.saved())
+
+
 def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
     """Finish a staged List row before claiming its notice."""
+    record = saved.record
     route = review_submissions.list_filing_route(saved)
+    if isinstance(record, investigation.Investigation) and record.belongs_on_list:
+        if not isinstance(record.list_destination, investigation.ListDestination):
+            kind = the_list.investigation_report_kind(record)
+            if isinstance(kind, the_list.ReportKind):
+                members = staff.snapshot()
+                if isinstance(route, review_submissions.ListFilingUnavailable):
+                    route = review_submissions.retry_list_filing_route(saved, route, members)
+                try:
+                    _ = investigation.file_on_list(saved.path, lambda current: the_list.file_investigation_report(
+                        current, kind, members, route=route, reservation=review_submissions.list_filing_reservation(saved),
+                        source="nate via New item"),
+                        move_from_review=record.purpose is investigation.InvestigationPurpose.MOVING_LEGACY_BUG)
+                except the_list.ListError as error:
+                    raise OSError(f"Cannot file {saved.id} on the List: {error}") from error
+        return
     if isinstance(route, review_submissions.NoListFiling):
         return
     if isinstance(route, review_submissions.ListFilingUnavailable):
@@ -296,10 +342,7 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
                                words: str = "", evidence_page: str = ""
                                ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
     # Finish the List row under the recipient locks before taking the delivery lock.
-    with review_submissions.submission_for_delivery(address) as filing:
-        if isinstance(filing, review_submissions.NoNativeSubmission):
-            return change_page.NoMessageDelivery()
-        _ensure_list_filing(filing.saved())
+    ensure_submission_list_item(address)
 
     with status.locked(), review_submissions.submission_for_delivery(address) as located:
         if isinstance(located, review_submissions.NoNativeSubmission):
@@ -356,6 +399,33 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
         status.request_attempts[intent.attempt] = change_page.AttemptOwnership(status.path(page, row), 'claimed')
         review_submissions.clear_initial_delivery(address)
     return delivery
+
+
+def recover_interrupted_list_reports() -> None:
+    """Complete native reports even when a delivery claim has no first-message marker."""
+    pending = ([investigation.InvestigationPurpose.BUG_REPORT], [investigation.InvestigationPurpose.ENHANCEMENT])
+    try:
+        owners = record_store.store_owners(record_store.RecordKind.INVESTIGATION, strict=True)
+    except OSError as error:
+        print(f"List report recovery: {error}", file=sys.stderr)
+        return
+    for owner in owners:
+        try:
+            paths = tuple(investigation.review_record_paths(owner, strict=True))
+        except (OSError, ValueError) as error:
+            print(f"List report recovery for {owner}: {error}", file=sys.stderr)
+            continue
+        for path in paths:
+            try:
+                header = record_store.read_header(path, keys=frozenset(("purpose", "list_destination")), strict=True)
+                if header.get("purpose") not in pending or header.get("list_destination"):
+                    continue
+                record = investigation.read_review_record(path)
+                scoped = new_item_dialog.read_submission_key(record.submission_scope)
+                ensure_submission_list_item(review_submissions.SubmissionAddress(
+                    scoped.kind, scoped.recipient_id, scoped.request_id))
+            except (OSError, ValueError, RuntimeError, staff.StaffRefused) as error:
+                print(f"List report recovery {path}: {error}", file=sys.stderr)
 
 
 def recover_submission_deliveries(status: change_page.DeliveryStatus, review_path: str) -> None:
