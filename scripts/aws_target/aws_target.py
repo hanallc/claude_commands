@@ -561,7 +561,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                 output['failure_streak'] = {'since': streak.since, 'notice_claimed': False}
                 write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
                 print('aws_target: snapshot user notice remains pending', file=sys.stderr)
-        elif not access_failures:
+        elif not current_failures:
             status |= update_price_read_action((), now)
         # The stamp is the last scheduled read. A forced read leaves it, so the next hourly read still runs.
         if not force:

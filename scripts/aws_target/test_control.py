@@ -996,6 +996,20 @@ region_transfer_usd={"us-west-1":0.00015}
         self.assertEqual(actions.get(unrelated.key), unrelated)
         self.assertEqual(len(self.notices), 1)
 
+    def test_timeout_keeps_the_price_read_action_open(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        opened, = actions.list()
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+        self.failure = 'timeout'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        failure, = aws_target.snapshot_failures(aws_target.read_snapshot(self.state))
+        self.assertEqual(failure.error, 'TimeoutExpired')
+        self.assertEqual(actions.list(), (opened,))
+
     def test_action_store_errors_keep_the_snapshot_and_push(self) -> None:
         self.failure = 'describe-spot-price-history'
         with (mock.patch.object(action.ActionStore, 'add', side_effect=action.ActionStoreError('fixture\nadd failure')),
