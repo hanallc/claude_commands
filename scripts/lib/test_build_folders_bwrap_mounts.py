@@ -141,13 +141,19 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
         return live
 
     def busy_mount_diagnostics(self, mounts: list[Path], attempts: list[str]) -> None:
+        attempts.append("Open files (visible to this user only; root-owned processes can be missing):")
         if not mounts:
-            attempts.append("No verified mount path for lsof.")
+            attempts.append("No verified mount path for lsof or mdutil.")
         for mount in mounts:
             _ = self.cleanup_command(attempts, "/usr/sbin/lsof", "-n", "+f", "--", str(mount))
 
+        self.busy_child_diagnostics(attempts)
+        for mount in mounts:
+            _ = self.cleanup_command(attempts, "/usr/bin/mdutil", "-s", str(mount))
+
+    def busy_child_diagnostics(self, attempts: list[str]) -> None:
         test_pid = os.getpid()
-        attempts.append(f"Live children of test PID {test_pid}:")
+        attempts.append(f"Live children of test PID {test_pid} (visible to this user only; root-owned processes can be missing):")
         process_attempts: list[str] = []
         snapshot = self.cleanup_command(process_attempts, "/bin/ps", "-axo", "pid=,ppid=,state=,comm=")
         if snapshot is None or snapshot.returncode != 0:
@@ -348,6 +354,7 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
                   subprocess.CompletedProcess([], 0, mount_output, "mount diagnostic"),
                   subprocess.CompletedProcess([], 0, snapshot, ""),
                   subprocess.CompletedProcess([], 1, cwd_output, "cwd diagnostic"),
+                  subprocess.CompletedProcess([], 0, "Indexing enabled.", "Spotlight diagnostic"),
                   subprocess.CompletedProcess([], 0, info, ""),
               ]) as run, self.assertRaises(AssertionError) as failure):
             self.cleanup_image(image, device, [])
@@ -357,14 +364,19 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
             ["/usr/sbin/lsof", "-n", "+f", "--", str(mount)],
             ["/bin/ps", "-axo", "pid=,ppid=,state=,comm="],
             ["/usr/sbin/lsof", "-n", "-a", "-p", "101,106,102", "-d", "cwd", "-Fpn"],
+            ["/usr/bin/mdutil", "-s", str(mount)],
             ["/usr/bin/hdiutil", "info", "-plist"],
         ])
         self.assertTrue(all(call.kwargs["timeout"] == 20 for call in run.call_args_list))
         self.assertEqual(kill.call_args_list, [mock.call(pid, 0) for pid in (101, 104, 106, 102)])
         detail = str(failure.exception)
         self.assertIn(f"Disk device still attached: {device} for {image}", detail)
+        scope = "visible to this user only; root-owned processes can be missing"
+        self.assertIn(f"Open files ({scope}):\n/usr/sbin/lsof", detail)
+        self.assertIn(f"Live children of test PID 100 ({scope}):\n/usr/sbin/lsof", detail)
         self.assertIn(f"stdout:\n{mount_output}\nstderr:\nmount diagnostic", detail)
         self.assertIn(f"stdout:\n{cwd_output}\nstderr:\ncwd diagnostic", detail)
+        self.assertIn(f"/usr/bin/mdutil -s {mount}\nexit status: 0\nstdout:\nIndexing enabled.\nstderr:\nSpotlight diagnostic", detail)
         self.assertIn(f"PID 101 sandbox-exec cwd: {image.parent}", detail)
         self.assertIn(f"PID 102 sandbox child cwd: {mount}", detail)
         self.assertIn("PID 106 helper cwd: unavailable", detail)
@@ -384,6 +396,7 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
             subprocess.CompletedProcess([], 16, "", "Resource busy"),
             subprocess.TimeoutExpired(command, 20, output=b"partial lsof output", stderr=b"partial lsof error"),
             subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 1, "", "Unknown indexing state."),
             subprocess.CompletedProcess([], 0, info, ""),
         ]) as run, self.assertRaises(AssertionError) as failure):
             self.cleanup_image(image, device, [])
@@ -391,6 +404,7 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
         self.assertIn(f"timed out after 20 s: {shlex.join(command)}", detail)
         self.assertIn("stdout:\npartial lsof output\nstderr:\npartial lsof error", detail)
         self.assertIn("No live children.", detail)
+        self.assertIn(f"/usr/bin/mdutil -s {mount}\nexit status: 1\nstdout:\n\nstderr:\nUnknown indexing state.", detail)
         self.assertEqual(run.call_args.args[0], ["/usr/bin/hdiutil", "info", "-plist"])
 
     def test_reports_a_failed_detach_after_the_device_disappears(self) -> None:
