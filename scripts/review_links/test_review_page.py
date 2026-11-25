@@ -424,6 +424,8 @@ window.fetch=(url,options)=>{
  check([...form.querySelectorAll('.review-action-group')].map(group=>group.textContent.trim()).join('|')===
   'Closes the itemGot it|Sends to page-ownerAsk a follow-up' && form.elements.feedback.labels[0].textContent==='Your words',
   'The Response shows both labeled actions and Your words.');
+ check(form.querySelector('.review-action-group:last-child [data-color-text="role.showrunner"]')?.textContent==='page-owner',
+  'The Response action heading shows the showrunner color.');
  check(form.elements.feedback.placeholder==='Type your words for Ask a follow-up.',
   'The placeholder says which action sends the words.');
  const id=recordFromDetail(form).dataset.key;
@@ -686,7 +688,7 @@ window.fetch=(url,options)=>{
                 snapshot = review_page.build_snapshot(self.root)
                 self.assert_index_title(snapshot.records[key], title)
                 self.assertEqual(snapshot.title_limit, len(title))
-                detail = snapshot.body(key).decode().split('data-review-body>', 1)[1]
+                detail = snapshot.render_body(snapshot.records[key], snapshot.assets).decode().split('data-review-body>', 1)[1]
                 self.assertEqual(detail.count(title), 1)
                 self.assertNotIn('<h3>Item</h3>', detail)
 
@@ -706,11 +708,57 @@ window.fetch=(url,options)=>{
         source.record.item['parts'] = update_registration.QuestionParts(
             ask=ask, context='Choose the width.', items=[], choices=[], recommend='')
         update_registration.write_question_record(source.record)
-        detail = review_page.build_snapshot(self.root).body(key).decode()
+        snapshot = review_page.build_snapshot(self.root)
+        detail = snapshot.render_body(snapshot.records[key], snapshot.assets).decode()
         self.assertIn('<h3>Item</h3><p>'+title+'</p>', detail)
         self.assertEqual(detail.count(title), 1)
         self.assertEqual(detail.count(ask), 1)
         self.assertIn('Choose the width.', detail)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_card_shows_the_title_ask_and_feedback_once(self) -> None:
+        long_title = 'W'*100
+        equal = self.fixture.file_user_question(long_title, question=long_title)
+        title, ask = 'Layout choice', 'Which width should the page use?'
+        distinct = self.question(title)
+        source = next(item.source for item in review_items.read(self.root) if item.key == distinct)
+        assert isinstance(source, review_items.QuestionSource)
+        source.record.item['parts'] = update_registration.QuestionParts(
+            ask=ask, context='Choose the width.', items=[], choices=[], recommend='')
+        update_registration.write_question_record(source.record)
+        change, words = 'page-owner/C1', 'Adjust the spacing.'
+        _ = review_page.submit(self.root, self.body(change, 'feedback', words), self.status)
+
+        page = browser_markup(self.root)
+        cases = json.dumps([(equal, [long_title]), (distinct, [title, ask]), (change, [words])])
+        probe = r'''<script>
+(async()=>{
+ const failures=[];
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='820px';
+  document.querySelector('[data-filter-row="show"] [data-filter-value="all"]').click();
+  for(const [key,phrases] of CASES){
+   const row=document.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
+   if(!row) throw new Error('The row is missing: '+key);
+   row.querySelector('.list-toggle').click();
+   const end=performance.now()+8000;
+   while(!recordDetails(row)?.querySelector('.review-panel')){
+    if(performance.now()>end) throw new Error('The card did not load: '+key);
+    await new Promise(resolve=>requestAnimationFrame(resolve));
+   }
+   const detail=recordDetails(row);
+   if(!fixtureBodies[key].includes('data-review-summary') || detail.querySelector('[data-review-summary]'))
+    failures.push(key+': the response summary stays outside the card.');
+   const shown=detail.innerText;
+   for(const phrase of phrases){
+    if(shown.split(phrase).length!==2) failures.push(key+': the card shows '+phrase+' once.');
+   }
+  }
+ }catch(error){failures.push(String(error));}
+ await fixtureFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''.replace('CASES', cases)
+        markup = page.replace('</body>', probe+'</body>').encode()
+        self.assertEqual(firefox_probe_results(markup), [[]])
 
     def test_investigation_shows_its_question_title_once_in_details(self) -> None:
         title = 'Why did the gate stop?'
@@ -2142,8 +2190,9 @@ window.fetch=(url,options)=>{
   await fetch('/advance-again');
   location.hash=new URLSearchParams({item:'page-owner/C4'});
   check(await ready('page-owner/C4'),'The newer card body loads.');
-  check(document.querySelector('[data-review]').dataset.version!==previousVersion &&
-   row('page-owner/C4').dataset.title==='a newer summary','F004: the body version refreshes the summary.');
+  await until(()=>document.querySelector('[data-review]').dataset.version!==previousVersion,
+   'the index refresh after the body loads');
+  check(row('page-owner/C4').dataset.title==='a newer summary','F004: the body version refreshes the summary.');
   const openAddress=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
   location.hash=new URLSearchParams({show:'open',item:'page-owner/C4'});
   await openAddress;
@@ -2384,6 +2433,258 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
         return built.render(show='all').decode(), {
             'version': built.version, 'facts': built.facts(), 'index': built.index_response().decode(),
             'bodies': {key: built.body(key).decode() for key in built.records}}
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_loads_the_new_card_before_or_after_the_index(self) -> None:
+        _ = self.question()
+        items = review_items.read(self.root)
+        question = next(item for item in items if item.type == review_items.ReviewType.QUESTION)
+        change = next(item for item in items if item.type == review_items.ReviewType.CHANGE)
+        records = [replace(question, key='change-1'),
+                   *(replace(change, key=f'change-{number}', id=f'C{number}') for number in range(2, 5))]
+        with patch.object(review_page, 'user_zone', return_value=ZoneInfo('America/New_York')):
+            page, initial = self.browser_snapshot(records)
+        snapshots = {'initial': initial}
+        omitted = {'removed': {'C3'}, 'gone': {'C3', 'C4'}, 'closed': {'C2', 'C3', 'C4'}}
+        with patch.object(review_page, 'user_zone', return_value=ZoneInfo('UTC')):
+            for version in ('fresh', 'third', 'fourth', 'fifth', 'sixth', 'removed', 'gone', 'closed'):
+                _, snapshots[version] = self.browser_snapshot([
+                    replace(record, title=f'{version} {record.id}') for record in records
+                    if record.id not in omitted.get(version, ())])
+        page = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', page, count=1)
+        steps = r"""
+  const requests=[],content=document.querySelector('[data-review]'),fixtureFetch=window.fetch;
+  const response=(key,name)=>key in snapshots[name].bodies ? new Response(
+   snapshots[name].bodies[key]+'<span data-fixture-body="'+name+'"></span>',
+   {headers:{'X-Review-Version':snapshots[name].version}}) :
+   new Response(null,{status:404,headers:{'X-Review-Version':snapshots[name].version}});
+  let holdBody='',holdIndex=false,releaseBody,releaseIndex;
+  window.fetch=async(url,options)=>{
+   const query=new URL(url,location.href).searchParams,body=query.get('body');
+   if(body){
+    requests.push(body);
+    if(holdBody===body) return new Promise(resolve=>{releaseBody=name=>resolve(response(body,name));});
+    return response(body,shown);
+   }
+   if(query.has('index') && holdIndex)
+    return new Promise(resolve=>{releaseIndex=name=>resolve(new Response(snapshots[name].index));});
+   return fixtureFetch(url,options);
+  };
+  const form=number=>recordDetails(row(number))?.querySelector('[data-review-form]');
+  const marker=number=>recordDetails(row(number))?.querySelector('[data-fixture-body]')?.dataset.fixtureBody;
+  const reads=number=>requests.filter(key=>key==='change-'+number).length;
+  const at=name=>content.dataset.version===snapshots[name].version;
+  const reload=()=>dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  const click=async(number,ready)=>{
+   const start=performance.now();
+   summary(number).querySelector('.list-toggle').click();
+   while(!ready()){
+    if(performance.now()-start>=1000) throw new Error('Card '+number+' took more than one second.');
+    await new Promise(resolve=>requestAnimationFrame(resolve));
+   }
+   check(performance.now()-start<1000,'The card result shows in under one second.');
+  };
+  shown='fresh';holdIndex=true;
+  await click(1,()=>marker(1)==='fresh');
+  check(at('initial'),'The new body shows before the index arrives.');
+  const draft=form(1),words=draft.elements.feedback;
+  words.value='Keep these words.';words.dispatchEvent(new Event('input',{bubbles:true}));
+  await until(()=>releaseIndex,'the guarded index request');
+  const laterCases={
+   initial:{zone:'America/New_York',firstTime:'10:15',disabled:false},
+   fresh:{zone:'UTC',firstTime:'15:15',disabled:true},
+  };
+  const openLater=name=>{
+   const {zone,firstTime,disabled}=laterCases[name],now=Date.now;
+   Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
+   try{
+    draft.elements.later.value='2026-11-30T16:00';
+    draft.querySelector('[data-later-toggle]').click();
+    draft.querySelector('[data-later-choose]').click();
+    check(content.dataset.zone===zone && draft.querySelector('[data-later-times]').firstChild.textContent===firstTime,
+     'The retained Later picker offers times in '+zone+'.');
+    const time=draft.querySelector('[data-later-time]');
+    time.value='12:00';time.dispatchEvent(new Event('input',{bubbles:true}));
+    check(draft.querySelector('[value="later"]').disabled===disabled,
+     'Later checks whether noon is in the future in '+zone+'.');
+   }finally{Date.now=now;}
+  };
+  openLater('initial');
+  check(dateTimePickerOpen(draft),'The date picker opens while the index request waits.');
+  holdIndex=false;releaseIndex('fresh');releaseIndex=null;
+  await frame();
+  check(at('initial') && form(1)===draft && dateTimePickerOpen(draft),
+   'The pending index leaves the open date picker in place.');
+  closeDateTimePicker(draft.querySelector('[data-later-menu]'),false);
+  words.focus();words.setSelectionRange(2,6);
+  reload();
+  await until(()=>at('fresh') && marker(1)==='fresh','the matching index');
+  check(reads(1)===1 && recordIsOpen(row(1)),'A matching index reuses the first body and keeps the card open.');
+  check(form(1)===draft,'The matching index keeps the same form.');
+  const restored=form(1).elements.feedback;
+  check(restored.value===words.value && document.activeElement===restored &&
+   restored.selectionStart===2 && restored.selectionEnd===6,'The refresh keeps the draft, focus, and selection.');
+  openLater('fresh');
+  closeDateTimePicker(draft.querySelector('[data-later-menu]'),false);
+
+  shown='third';holdBody='change-2';
+  summary(2).querySelector('.list-toggle').click();
+  await until(()=>releaseBody,'the pending card request');
+  reload();
+  await until(()=>at('third'),'the index that arrives first');
+  holdBody='';releaseBody('third');releaseBody=null;
+  await until(()=>marker(2)==='third','the original card response');
+  check(reads(2)===1,'An index that arrives first keeps the pending body request.');
+
+  shown='fourth';holdIndex=true;
+  await click(3,()=>marker(3)==='fourth');
+  await until(()=>releaseIndex,'the index request after the fourth body');
+  check(at('third'),'A third version can arrive after the card already shows.');
+  shown='fifth';holdIndex=false;releaseIndex('fifth');releaseIndex=null;
+  await until(()=>at('fifth') && marker(3)==='fifth','the card from the later index');
+  check(reads(3)===2,'The later index requests its body once.');
+
+  shown='sixth';holdBody='change-4';
+  summary(4).querySelector('.list-toggle').click();
+  await until(()=>releaseBody,'the held reply from a different snapshot');
+  reload();
+  await until(()=>at('sixth'),'the newer index');
+  let staleDisplayed=false;
+  const bodyChanges=new MutationObserver(()=>{if(marker(4)==='fourth') staleDisplayed=true;});
+  bodyChanges.observe(content,{childList:true,subtree:true});
+  holdBody='';releaseBody('fourth');releaseBody=null;
+  await until(()=>marker(4)==='sixth','the body that matches the newer index');
+  bodyChanges.disconnect();
+  check(!staleDisplayed,'The old body never displays beside the newer index.');
+  check(reads(4)===2,'The refresh replaces the older reply with one request for the current body.');
+
+  holdBody='change-1';
+  summary(1).querySelector('.list-toggle').click();
+  await until(()=>releaseBody,'the body for the previous click');
+  await click(2,()=>marker(2)==='sixth');
+  const finishPrevious=releaseBody;releaseBody=null;holdBody='';
+  finishPrevious('fourth');await frame();
+  check(recordIsOpen(row(2)) && marker(2)==='sixth' && !recordIsOpen(row(1)),
+   'The response for the previous click leaves the current card open.');
+
+  shown='removed';holdIndex=true;
+  const notice=document.querySelector('[data-missing-item]');
+  await click(3,()=>!notice.hidden);
+  check(at('sixth') && !document.querySelector('[data-record-inline-view]'),
+   'The missing card closes before the index arrives.');
+  await until(()=>releaseIndex,'the index after the missing response');
+  holdIndex=false;releaseIndex('removed');
+  await until(()=>at('removed'),'the index without the item');
+  check(!row(3) && !notice.hidden && notice.textContent==='This review is no longer on the Review page.',
+   'The page keeps the missing item notice after the refresh.');
+
+  shown='gone';holdBody='change-4';
+  summary(4).querySelector('.list-toggle').click();
+  await until(()=>releaseBody,'the pending request for the removed card');
+  reload();
+  await until(()=>at('gone'),'the index that removes the loading card');
+  check(!notice.hidden && !document.querySelector('[data-record-inline-view]'),
+   'An index that removes the loading card closes it and shows the notice.');
+  holdBody='';releaseBody('gone');await frame();
+  check(reads(4)===3 && !notice.hidden,'The late missing response leaves the notice in place.');
+
+  await click(2,()=>marker(2)==='gone');
+  shown='closed';reload();
+  await until(()=>at('closed'),'the index that removes the loaded card');
+  check(!notice.hidden && !document.querySelector('[data-record-inline-view]'),
+   'An index that removes a loaded card closes it and shows the notice.');
+"""
+        self.assertEqual(firefox_probe_results(snapshot_probe_page(page, snapshots, steps)), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_loads_the_new_body_while_another_send_is_held(self) -> None:
+        _ = write_config_fixture(self.fixture.temporary / 'config/review_links.conf', 'undo_seconds=30\n')
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        first = replace(change, key='change-1', id='C1')
+        second = replace(change, key='change-2', id='C2')
+        page, initial = self.browser_snapshot([first, second])
+        _, fresh = self.browser_snapshot([replace(first, title='The updated Change'), second])
+        page = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', page, count=1)
+        steps = UNDO_ACTION_SCRIPT + r"""
+  const undo=fixtureUndo();
+  const fixtureFetch=window.fetch,content=document.querySelector('[data-review]');
+  let versionReads=0;
+  window.fetch=(url,options)=>{
+   const query=new URL(url,location.href).searchParams;
+   if(!query.has('body') && !query.has('index') && query.has('version')) versionReads++;
+   return fixtureFetch(url,options);
+  };
+  summary(2).querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row(2));
+  form.querySelector('[value="validate"]').click();
+  const toast=()=>window.top.document.querySelector('[data-send-undo]');
+  await until(()=>toast()?.querySelector('button'),'the held send');
+  const held=toast();
+  shown='fresh';
+  summary(1).querySelector('.list-toggle').click();
+  await readyReviewCard(row(1));await frame();
+  check(content.dataset.version===snapshots.initial.version && versionReads===0,
+   'The held send blocks the index refresh.');
+  check(toast()===held && undo.posts.length===1,'The new body leaves the other send held.');
+  await undo.undo();
+  await until(()=>content.dataset.version===snapshots.fresh.version,'the refresh after Undo');
+  check(recordIsOpen(row(1)) && undo.posts.length===1,'Undo keeps the other card open and sends no second action.');
+"""
+        self.assertEqual(firefox_probe_results(snapshot_probe_page(
+            page, {'initial': initial, 'fresh': fresh}, steps)), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_loads_a_saved_result_during_a_body_version_difference(self) -> None:
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        first = replace(change, key='change-1', id='C1', state=review_items.ReviewState.OPEN)
+        page, initial = self.browser_snapshot([first])
+        page = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', page, count=1)
+        steps = r"""
+  const fixtureFetch=window.fetch,reads=[],content=document.querySelector('[data-review]');
+  const validating=VALIDATING,action=validating ? 'question' : 'feedback';
+  let reply;
+  window.fetch=(url,options={})=>{
+   const query=new URL(url,location.href).searchParams;
+   if(options.method==='POST')
+    return new Promise(resolve=>{reply=()=>resolve(Response.json({answer:'saved',version:snapshots.fresh.version,
+     state:validating ? 'Validating' : 'Waiting',detail_revision:'saved',delivery_pending:false}));});
+   if(query.has('saved')){
+    reads.push(query.get('saved'));
+    const body=snapshots.fresh.bodies['change-1']+'<p data-saved-fixture>The saved result.</p>';
+    return Promise.resolve(new Response(body,{headers:{'X-Review-Version':snapshots.fresh.version}}));
+   }
+   if(!query.has('body') && query.has('version')) return new Promise(()=>{});
+   return fixtureFetch(url,options);
+  };
+  shown='fresh';
+  summary(1).querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row(1));
+  form.elements.feedback.value='The submitted draft.';
+  form.elements.feedback.dispatchEvent(new Event('input',{bubbles:true}));
+  await until(()=>!document.querySelector('[data-record-motion]'),'the opening animation');
+  const button=form.querySelector('[value="'+action+'"]');
+  if(validating)
+   check(content.dataset.version===snapshots.initial.version && row(1).dataset.state==='Validating' &&
+    summary(1).querySelector('.list-state').textContent==='Validating' && !button.disabled,
+    'The new body enables Ask with the Validating state before the index arrives.');
+  form.requestSubmit(button);
+  await until(()=>reply,'the submitted action');
+  if(validating)
+   check(!document.querySelector('[data-record-motion-key="change-1"]') && recordIsOpen(row(1)),
+    'Ask leaves the Validating card open while the send waits.');
+  reply();
+  await until(()=>recordDetails(row(1))?.querySelector('[data-saved-fixture]'),'the saved detail');
+  check(reads.join()==='1' && content.dataset.version===snapshots.initial.version && recordIsOpen(row(1)),
+   'The saved result uses its own body request while the index still has the earlier version.');
+"""
+        for state in (review_items.ReviewState.OPEN, review_items.ReviewState.VALIDATING):
+            with self.subTest(state=state):
+                validating = state == review_items.ReviewState.VALIDATING
+                _, fresh = self.browser_snapshot([replace(first, title='The updated Change', state=state,
+                    actions=('question',) if validating else first.actions)])
+                self.assertEqual(firefox_probe_results(snapshot_probe_page(
+                    page, {'initial': initial, 'fresh': fresh},
+                    steps.replace('VALIDATING', json.dumps(validating)))), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_refresh_keeps_the_open_row_at_the_same_pixel(self) -> None:
@@ -3290,9 +3591,10 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
         self.assertEqual(entry['ownerName'], 'page-owner')
         self.assertEqual(entry.get('handoff', ('', ''))[1], 'Nov 17 03:00 EST')
         card = snapshot.body(key).decode()
-        for text in ('How to check', 'Proof', 'Log · newest first', 'Your words', 'Sends to page-owner',
+        for text in ('How to check', 'Proof', 'Log · newest first', 'Your words',
                      'Ask a question', 'data-validating-age datetime="2026-11-17T03:00:00-05:00"'):
             self.assertIn(text, card)
+        self.assertRegex(card, r'Sends to <span[^>]*data-color-text="role.showrunner"[^>]*>page-owner</span>')
         self.assertNotIn('data-later-toggle', card)
         path = self.status.path(self.fixture.page, 'C1')
         fields = cast(dict[str, object], json.loads(path.read_text()))
@@ -3324,7 +3626,7 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
         question = 'What is holding up validation?'
         current = cache.get()
         self.assertEqual(next(entry['ownerName'] for entry in current.entries if entry['key'] == key), 'page-owner')
-        self.assertIn('Sends to page-owner', current.body(key).decode())
+        self.assertRegex(current.body(key).decode(), r'Sends to <span[^>]*data-color-text="role.showrunner"[^>]*>page-owner</span>')
         fields = self.card_body(current, key, 'question', question)
         sent = cache.save(fields, self.status)
         self.assertEqual(sent.answer, 'question saved')
@@ -3360,9 +3662,10 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
         pending, _ = cache.publish_record(cache.get(), key)
         self.assertEqual(pending.records[key].state, review_items.ReviewState.VALIDATING)
         pending_card = pending.body(key).decode()
-        self.assertIn('Question for page-owner', pending_card)
+        validator = r'<span[^>]*data-color-text="role.showrunner"[^>]*>page-owner</span>'
+        self.assertRegex(pending_card, 'Question for ' + validator)
         self.assertIn(question, pending_card)
-        self.assertNotIn('Answer from page-owner', pending_card)
+        self.assertNotRegex(pending_card, 'Answer from ' + validator)
         self.assertEqual([event.words for event in pending.records[key].log][-2:],
                          ['Asked page-owner to validate', 'Asked a question about validation'])
         retry = cache.save(self.card_body(pending, key, 'question', question), self.status)
@@ -3381,7 +3684,9 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
             with self.subTest(version=snapshot.version):
                 self.assertEqual(snapshot.records[key].state, review_items.ReviewState.VALIDATING)
                 card = snapshot.body(key).decode()
-                for text in ('Question for page-owner', 'Answer from page-owner', question, words):
+                for label in ('Question for ', 'Answer from '):
+                    self.assertEqual(len(re.findall(label + validator, card)), 1)
+                for text in (question, words):
                     self.assertIn(text, card)
                     self.assertEqual(card.count(text), 1)
                 self.assertEqual([event.words for event in snapshot.records[key].log][-3:],
@@ -3440,7 +3745,7 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
 
         snapshot = review_page.build_snapshot(self.root)
         self.assertEqual(snapshot.records[key].owner, validator.id)
-        self.assertIn('Sends to page-owner', snapshot.body(key).decode())
+        self.assertRegex(snapshot.body(key).decode(), r'Sends to <span[^>]*data-color-text="role.showrunner"[^>]*>page-owner</span>')
         body = self.card_body(snapshot, key, 'question', 'Which check is still running?')
         question, _ = review_page.submit(self.root, body, self.status, snapshot=snapshot)
         assert isinstance(question, change_page.MessageDelivery)
@@ -3585,7 +3890,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
         row = change_page.answer_row(page, 'C1')
         self.assertEqual(review_events.decode(row['Review log']), (entry,))
         waiting = review_page.build_snapshot(self.root)
-        self.assertEqual(waiting.body(key).count(words.encode()), 1)
+        self.assertEqual(waiting.render_body(waiting.records[key], waiting.assets).count(words.encode()), 1)
 
     def test_both_change_pages_refuse_a_second_handoff(self) -> None:
         key = 'page-owner/C1'
@@ -4945,8 +5250,12 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 self.assertEqual(item.actions,expected[item.key])
                 form = review_page.form(item,change_page.ReviewBrowser(token,initial),4,'fixture-revision')
                 self.assertIn('Closes the item',form)
-                heading = 'Sends to showrunner' if item.type == review_items.ReviewType.CHANGE else 'The item returns to you'
-                self.assertIn(heading,form)
+                if item.type == review_items.ReviewType.CHANGE:
+                    self.assertIn('<span>Sends to <span class="staff-name" data-color-text="role.showrunner"'
+                                  + ' style="color:#a379fd">showrunner</span></span>', form)
+                    self.assertIn('value="validate">Ask showrunner to check</button>', form)
+                else:
+                    self.assertIn('The item returns to you', form)
                 self.assertIn('aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later',form)
                 for label in ('1 hour','Tomorrow','Next week','Pick a date…'):
                     self.assertIn('<span>'+label+'</span>',form)
@@ -6094,9 +6403,21 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
                 self.assertEqual(body.count('name="assignee"'), 1)
                 options = body.partition('<select name="assignee">')[2].partition('</select>')[0]
                 self.assertEqual(re.findall(r'<option value="([^"]*)"([^>]*)>([^<]+)</option>', options),
-                                 [('', '', 'page-owner decides'), *expected])
+                                 [('', ' style="color:#a379fd"', 'page-owner decides'), *expected])
                 for member in (worker, wrapped):
                     self.assertNotIn(member.id, options)
+
+    def test_response_action_heading_colors_the_producer_name(self) -> None:
+        doc = self.fixture.temporary / 'producer.md'
+        _ = doc.write_text('# Producer\n')
+        producer = fixture_member('producer', name='fixture-producer', doc=staff.LiveDoc(local_machine(), doc))
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        self.addCleanup(cache.close)
+        created = cache.create_submission(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, producer.id))
+        self.assertTrue(review_submissions.answer(created.saved.key, 'The test passed.', created.saved.reply_token))
+        card = review_page.build_snapshot(self.root).body(created.key).decode()
+        self.assertRegex(card, r'Sends to <span[^>]*data-color-text="role.producer"'
+                         + r' style="color:#90fe42">fixture-producer</span>')
 
     def test_explicit_approval_delivers_and_records_the_assignee(self) -> None:
         proposal, efficiency = self.decisions()
@@ -7028,6 +7349,7 @@ window.fetch=async(url,options)=>{
   const row=()=>document.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
   row().querySelector('.list-toggle').click();
   let form=await readyReviewCard(row());
+  const version=document.querySelector('[data-review]').dataset.version;
   form.elements.feedback.value=words;
   form.requestSubmit(form.querySelector('[value="works"]'));
   await until(()=>host.querySelector('[data-send-undo] button'),'The Undo toast did not show.');
@@ -7042,6 +7364,9 @@ window.fetch=async(url,options)=>{
   await until(undone,'The card did not say that the send was undone.');
   form=cardForm();
   check(form.elements.feedback.value===words,'After Undo the card keeps the words.');
+  await until(()=>row()?.dataset.bodyVersion && row().dataset.bodyVersion!==version,
+   'The restored card did not receive the new snapshot.');
+  check(cardForm()===form,'A refresh with the same body keeps the restored form.');
   await until(()=>document.activeElement===form.elements.feedback,'Undo did not focus the feedback field.');
   await until(()=>!form.querySelector('[value="works"]').disabled,'The card did not enable Send after Undo.');
   // The row comes back with a short fade, and a Send during that fade does nothing, so Send again until it posts.
@@ -8383,15 +8708,17 @@ window.fetch=async()=>({headers:new Headers(),ok:true,text:async()=>MARKUP});
    ['2026-12-08T7',fallback],['2026-12-08T24:00',fallback],['2026-12-08T23:60',fallback],
    ['2026-12-08T',fallback],['2027-02-29T09:00',fallback],['2026-12-08T1730','2026-12-08T17:30']
   ]){
-   const original=row(),wall=recordDetails(original).querySelector('[name="later"]');
+   const original=row(),version=original.dataset.bodyVersion;
+   const wall=recordDetails(original).querySelector('[name="later"]');
    wall.value=draft;wall.dispatchEvent(new Event('input',{bubbles:true}));
    dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
    const end=performance.now()+8000;
-   while(recordDetails(row()).querySelector('[data-review-form]')===wall.form){
-    if(performance.now()>end) throw new Error('The new form did not load.');
+   while(row().dataset.bodyLoaded!=='true' || row().dataset.bodyVersion===version){
+    if(performance.now()>end) throw new Error('The card did not refresh.');
     await new Promise(resolve=>requestAnimationFrame(resolve));
    }
    const current=row(),form=await readyReviewCard(current);
+   check(form===wall.form,'Refresh keeps the Later form.');
    check(current!==original && form.elements.later.value===draft,'Refresh restores '+draft);
    const toggle=form.querySelector('[data-later-toggle]'),chooser=form.querySelector('[data-later-custom]');
    toggle.click();form.querySelector('[data-later-choose]').click();

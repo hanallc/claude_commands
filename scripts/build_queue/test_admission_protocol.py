@@ -277,7 +277,7 @@ class ProtocolTests(unittest.TestCase):
                 with self.subTest(reply=type(outcome).__name__):
                     self.assertEqual(wire.parse_reply(wire.encode_reply(outcome)), outcome)
 
-    def test_cloud_slot_wait_survives_the_reply_wire(self) -> None:
+    def test_cloud_capacity_wait_survives_the_reply_wire(self) -> None:
         reply = replace(wait_reply(records.NeedsMemory()),
             reason=wire.CloudSlotWait(9, 9), text="waits for a cloud slot: 9 of 9 in use")
         self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)

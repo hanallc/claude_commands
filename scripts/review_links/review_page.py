@@ -231,7 +231,10 @@ class ReviewSnapshot:
             raise LookupError('This item is not in the current snapshot.')
         body = self.render_body(item, self.assets)
         if view is ReviewBodyView.TABLE:
-            return body
+            if body == CARD_ERROR:
+                return body
+            summary = index_json([card_entry(item, self.members, self.names, self.zone)])
+            return body + f'<script type="application/json" data-review-summary>{summary}</script>'.encode()
         entry = next((entry for entry in self.entries if entry['key'] == key), None)
         if entry is None:
             entry = card_entry(item, self.members, self.names, self.zone)
@@ -1021,11 +1024,13 @@ def assign_menu(item: ReviewItem, names: staff_names.StaffNames) -> str:
                       + f'data-send-receiver="{html.escape(member.name, quote=True)}"{names.style(member.id)}>'
                       +f'{html.escape(member.name)}</option>'
                       for member in review_actions.approval_assignees(names.members))
-    return page_frame.action_select('assignee', 'Assign', f'<option value="">{html.escape(shown)} decides</option>'+options)
+    return page_frame.action_select('assignee', 'Assign',
+        f'<option value=""{names.style(item.owner)}>{html.escape(shown)} decides</option>'+options)
 
 
 def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *,
-         owner: str = '', validator: str = '', assignment: str = '', routes: str = '') -> str:
+         owner: str = '', validator: str = '', assignment: str = '', routes: str = '',
+         names: staff_names.StaffNames | None = None) -> str:
     if (report_belongs_on_list(item) or item.state == ReviewState.DONE
             or (item.type == ReviewType.FOR_YOU and not item.actions)):
         return ''
@@ -1056,8 +1061,6 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
          else closes).append(button)
         if action == 'approve':
             closes.append(assignment)
-    heading = (page_frame.ReturningActionHeading.SENDS_TO_SHOWRUNNER if item.type == ReviewType.CHANGE
-               else page_frame.ReturningActionHeading.ITEM_RETURNS)
     later = ''
     if (item.state not in (ReviewState.DONE, ReviewState.VALIDATING)
             and item.type not in (ReviewType.RESPONSE, ReviewType.FOR_YOU) and not waiting_change(item)):
@@ -1076,14 +1079,20 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
         words = (f'<label for="{field}">Your words</label><textarea id="{field}" name="feedback" rows="{words_rows}" '
                  + f'placeholder="{placeholder}"></textarea>')
     if item.type == ReviewType.RESPONSE:
+        shown_owner = names.html(item.owner, owner) if names is not None else html.escape(owner)
         groups = ('<div class="review-actions"><div class="review-action-group"><span>Closes the item</span><div>'
                   +''.join(closes)+'</div></div><div class="review-action-group"><span>Sends to '
-                  +html.escape(owner)+'</span><div>'+''.join(returns)+'</div></div></div>')
+                  +shown_owner+'</span><div>'+''.join(returns)+'</div></div></div>')
     elif validator:
+        shown_validator = names.html(item.owner, validator) if names is not None else html.escape(validator)
         groups = ('<div class="review-actions"><div class="review-action-group"><span>Sends to '
-                  +html.escape(validator)+'</span><div>'+''.join(returns)+'</div></div></div>')
+                  +shown_validator+'</span><div>'+''.join(returns)+'</div></div></div>')
     else:
-        groups = page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading=heading)
+        heading = ''
+        if item.type == ReviewType.CHANGE and returns:
+            names = names if names is not None else staff_names.StaffNames(staff.StaffSnapshot(()))
+            heading = 'Sends to ' + names.role_label('showrunner', 'showrunner')
+        groups = page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading_html=heading)
     return (f'<form method="post" data-review-form {routes}>'+hidden+words+groups+acknowledge
             +'<span role="status" data-send-status hidden></span></form>')
 
@@ -1212,13 +1221,13 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
         if validator:
             duration = (' · Validating for <time data-validating-age datetime="'
                         +source.handed_at.isoformat()+'"></time>') if source.handed_at is not None else ''
-            handoff = '<p class="review-handoff">With '+names.html(item.owner, validator)+duration+'</p>'
+            shown_validator = names.html(item.owner, validator)
+            handoff = '<p class="review-handoff">With '+shown_validator+duration+'</p>'
             if isinstance(question, (change_page.OpenQuestion, change_page.AnsweredQuestion)) and not isinstance(
                     question, (change_page.OpenFeedback, change_page.CompletedFeedback)):
-                escaped = html.escape(validator)
-                exchange = section('Question for '+escaped, question.text)
+                exchange = section('Question for '+shown_validator, question.text)
                 if isinstance(question, change_page.AnsweredQuestion):
-                    exchange += ('<section><h3>Answer from '+escaped+'</h3>'
+                    exchange += ('<section><h3>Answer from '+shown_validator+'</h3>'
                                  +change_browser.answer_html(question.answer)+'</section>')
         else:
             if isinstance(question, change_page.OpenQuestion) and not isinstance(question, change_page.OpenFeedback):
@@ -1252,7 +1261,7 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+handoff+'<div data-review-body>'+body+'</div></div>'
             +'<div class="review-log-column">'+record_table.log_panel(log_id, log_html(item, inputs, owner))+exchange+'</div>'
             +form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets),
-                  owner=owner, validator=validator, routes=review_toast_routes(item, inputs.members),
+                  owner=owner, validator=validator, routes=review_toast_routes(item, inputs.members), names=names,
                   assignment=assign_menu(item, names) if 'approve' in item.actions else '')+footer+'</div>')
 
 
@@ -1694,7 +1703,8 @@ function reviewCardSummary(entry,titleLimit,icon){
  const node=document.createElement('tbody'),panel=detailId(entry.key);
  Object.assign(node.dataset,{listItem:'',key:entry.key,number:entry.id.toLowerCase(),title:entry.title.toLowerCase(),
   owner:entry.owner,sourceOwner:entry.sourceOwner,sourceName:entry.sourceName,state:entry.state,type:entry.type,
-  order:entry.order,updated:entry.updated,parked:'false',sortValues:JSON.stringify(entrySortValues(entry))});
+  order:entry.order,updated:entry.updated,unreadAnswer:entry.unreadAnswer,parked:'false',
+  sortValues:JSON.stringify(entrySortValues(entry))});
  const first=entry.title.split(/\r?\n/)[0],short=first.slice(0,titleLimit);
  const stamp=entry.filed ? reviewAge(entry.filed*1000) : '';
  const typeLabel=entry.type==='for-you' ? 'For you' : entry.type[0].toUpperCase()+entry.type.slice(1);
@@ -1735,10 +1745,11 @@ function updateTitleFallback(panel){
  fallback.hidden=reviewBodyText(panel.querySelector('[data-review-body]'))
   .includes(plainReviewText(fallback.querySelector('p').textContent));
 }
-function installReviewBody(row,text){
+function installReviewBody(row,body){
  row.dataset.bodyLoaded='true';
  const detail=recordDetails(row);
- detail.innerHTML=text;
+ if(typeof body==='string') detail.innerHTML=body;
+ else detail.replaceChildren(body);
  const panel=detail.querySelector('.review-panel');
  if(panel) updateTitleFallback(panel);
  updateHandoffAges(detail);
@@ -1770,7 +1781,7 @@ function bindReviewForm(form,{zone,settings,remember=()=>rememberReviewDraft(for
   }
   submit(outcome);
  });
- if(later) bindDateTimePicker(form,{zone:zone(),settings,summaryPrefix:'Hides until '});
+ if(later) bindDateTimePicker(form,{zone,settings,summaryPrefix:'Hides until '});
 }
 function readReviewDraft(form){
  if(!form?.elements.feedback) return null;
@@ -2224,9 +2235,18 @@ const filterRow=name=>filterControl.row(content,name);
 const showValues=filterControl.buttons(filterRow('show')).map(button=>filterControl.value(button));
 const showsByType=new Map(''' + json.dumps(tuple(SHOWS_BY_TYPE.items())) + r''');
 const showChoices=type=>showsByType.get(type) ?? showValues;
+const mountReviewRow=entry=>reviewCardSummary(entry,Number(content.dataset.titleLimit),
+ filterRow('type').querySelector('[data-filter-value="'+entry.type+'"] .review-icon').outerHTML);
+const missingReview='This review is no longer on the Review page.';
+let missingCard=false;
 const view=createRecordTable({...reviewPlaceOptions,content:()=>content,
- entries:allEntries,mount:entry=>reviewCardSummary(entry,Number(content.dataset.titleLimit),
-  filterRow('type').querySelector('[data-filter-value="'+entry.type+'"] .review-icon').outerHTML),mounted:()=>loadBodies(),
+ entries:allEntries,mount:mountReviewRow,mounted:()=>loadBodies(),
+ retainDetailState:(previous,row)=>{
+  const version=previous.dataset.bodyVersion;
+  if(previous.dataset.bodyLoaded==='true' && version===content.dataset.version){
+   row.dataset.bodyVersion=version;row.dataset.bodyLoaded='true';
+  }
+ },
  focusKey:()=>focusAfterLoad?.key,
  pinOpenRow:key=>{
   const pending=pendingSaves.get(key);
@@ -2241,7 +2261,7 @@ const view=createRecordTable({...reviewPlaceOptions,content:()=>content,
  },
  selectShow:(show,type)=>showChoices(type).includes(show) ? show : 'open',
  persistLinkedTarget:true,
- missingItem:()=> 'This review is no longer on the Review page.',
+ missingItem:()=>missingReview,
  resolveOwner:owner=>{
   const button=filterControl.buttons(filterRow('owner')).find(button=>
    filterControl.ownerId(button)===owner || button.dataset.ownerName===owner);
@@ -2268,7 +2288,10 @@ const view=createRecordTable({...reviewPlaceOptions,content:()=>content,
     }
    })()
   });
-  content.dataset.show=show;loadBodies();
+  content.dataset.show=show;
+  if(view.openItem) missingCard=false;
+  if(missingCard) showActionFailure(content.querySelector('[data-missing-item]'),missingReview);
+  loadBodies();
   const actionNotices=content.querySelector('[data-for-you-notices]');
   actionNotices.hidden=type!=='for-you' || !actionNotices.children.length;
   updateReviewChips(rows,filters,matches,count);
@@ -2320,56 +2343,90 @@ function needsBody(row){
  const pending=saved.get(row.dataset.key);
  return !row.dataset.bodyLoaded && !pending?.retained && !(pending?.handed && pending.awaitingSnapshot);
 }
-function applyReviewDetail(key,row,detail,text){
- installReviewBody(row,text);
+function applyReviewSummary(row,entry){
+ const next=mountReviewRow({...entry,order:Number(row.dataset.order)});
+ const previous=row.querySelector('.list-row'),summary=next.querySelector('.list-row');
+ const focused=previous.querySelector('.list-toggle')===document.activeElement;
+ Object.assign(row.dataset,next.dataset);
+ summary.classList.add('open');
+ const toggle=summary.querySelector('.list-toggle');
+ toggle.setAttribute('aria-expanded','true');
+ previous.replaceWith(summary);
+ return focused ? toggle : null;
+}
+function applyReviewDetail(key,row,detail,text,bodyVersion=''){
+ const template=document.createElement('template');
+ template.innerHTML=text;
+ const summary=template.content.querySelector('[data-review-summary]');
+ let focus=null;
+ if(bodyVersion && bodyVersion!==content.dataset.version){
+  const entry=summary && readIndex(JSON.parse(summary.textContent)).get(key);
+  if(!entry) throw new Error('The item has no summary for its snapshot.');
+  focus=applyReviewSummary(row,entry);
+ }
+ summary?.remove();
+ installReviewBody(row,template.content);
  const departure=saved.get(key);
  if(departure?.closes && departure.awaitingSnapshot)
   detail.querySelector('[data-review-form]')?.remove();
  bindForm(row);
  view.showDraftCopy(reviewDrafts.get(key)?.draft.feedback,Boolean(detail.querySelector('[name="feedback"]')));
+ focus?.focus({preventScroll:true});
 }
 function loadBodies(){
  view.opened.forEach(key=>{
   const row=view.openItem;
   if(row?.dataset.key!==key || !index.has(key) || !needsBody(row)) return;
-  const install=text=>{
+  const install=({text,version})=>{
    const current=view.openItem;
    if(current?.dataset.key!==key || !index.has(key)) return;
    const detail=recordDetails(current);
-   const apply=(row,detail)=>applyReviewDetail(key,row,detail,text);
+   const apply=(row,detail)=>applyReviewDetail(key,row,detail,text,version);
    view.itemError('');
    current.dataset.bodyLoaded='true';
    view.preserveRecordRowTop(()=>{
-    view.presentItemRevision(current,text,apply,{initial:true});
+    view.presentItemRevision(current,text,apply,{force:version!==content.dataset.version});
+    current.dataset.bodyVersion=version;
     drawSaveControls(detail.querySelector('[data-review-form]'));
     restoreFocus(key);
    });
   };
-  if(bodies.has(key)){install(bodies.get(key));return;}
+  const cached=bodies.get(key);
+  if(cached){install(cached);return;}
   if(bodyRequests.has(key)) return;
   drawSaveControls(recordDetails(row).querySelector('[data-review-form]'));
+  const requestedIndex=index;
   const version=content.dataset.version;
   const prefetched=firstRequest?.key===key && firstRequest.version===version;
   const result=prefetched ? firstRequest.result : requestReviewCard(key,version);
   if(prefetched) firstRequest=null;
+  const current=()=>bodyRequests.get(key)===request && view.openItem?.dataset.key===key &&
+   view.opened.has(key) && index.has(key) && !pendingSaves.has(key);
   const request=result
    .then(({response,text})=>{
-    if(bodyRequests.get(key)!==request || content.dataset.version!==version) return;
+    if(!current()) return;
     const bodyVersion=response.headers.get('X-Review-Version');
-    if(bodyVersion && bodyVersion!==version){
-     bodyRequests.delete(key);
-     void pageRefresh.refresh(true);
+    const pageVersion=content.dataset.version;
+    if(requestedIndex!==index && bodyVersion!==pageVersion){
+     bodyRequests.delete(key);loadBodies();
+     return;
+    }
+    if(response.status===404){
+     missingCard=true;view.closeCard(key);view.applyAction();
+     if(bodyVersion && bodyVersion!==pageVersion) void pageRefresh.refresh(true);
      return;
     }
     if(!response.ok) throw new Error('HTTP '+response.status);
-    if(bodyVersion!==version) throw new Error('The item has no snapshot version.');
+    if(!bodyVersion) throw new Error('The item has no snapshot version.');
     if(text.includes(' data-review-card-unavailable>')) throw new Error('The item body is unavailable.');
-    bodies.set(key,text);install(text);
+    const body={version:bodyVersion,text};
+    install(body);bodies.set(key,body);
+    if(bodyVersion!==pageVersion) void pageRefresh.refresh(true);
    }).catch(error=>{
-    const current=view.openItem;
-    if(current?.dataset.key===key && index.has(key) && bodyRequests.get(key)===request){
-     current.dataset.bodyLoaded='failed';
-     const loading=recordDetails(current).querySelector('[data-record-loading]');
+    if(current()){
+     const item=view.openItem;
+     item.dataset.bodyLoaded='failed';
+     const loading=recordDetails(item).querySelector('[data-record-loading]');
      if(loading) loading.hidden=true;
      view.itemError('The item could not refresh: '+error.message);
     }
@@ -2460,6 +2517,7 @@ function bindForm(row){
    receiver:sendActionReceiver(form,data),
    confirmedSave:()=>{
     pending.saved=true;
+    bodies.delete(key);
     if(view.currentItemRequest(request) && reviewDrafts.get(key)?.stamp===draftAtSubmit?.stamp){
      reviewDrafts.delete(key);
      form.elements.feedback.value='';
@@ -2479,7 +2537,10 @@ function bindForm(row){
       text=body;
      }
      if(typeof text==='string' && view.currentItemRequest(request))
-      view.preserveRecordRowTop(()=>view.installOwnItemResult(request,text,(item,detail)=>applyReviewDetail(key,item,detail,text)));
+      view.preserveRecordRowTop(()=>view.installOwnItemResult(request,text,(item,detail)=>{
+       delete item.dataset.bodyVersion;
+       applyReviewDetail(key,item,detail,text);
+      }));
     }
     if(validationQuestion){
      hold.restore();
@@ -2490,9 +2551,9 @@ function bindForm(row){
      return;
     }
     const waitState=outcome==='validate' ? 'Validating' : 'Waiting';
-    const previous=index.get(key);
+    const previousUnreadAnswer=row.dataset.unreadAnswer==='true';
     const marker={updated:row.dataset.updated,previousState:row.dataset.state,
-     previousUnreadAnswer:previous?.unreadAnswer,readAnswer:outcome==='read' && previous?.unreadAnswer,
+     previousUnreadAnswer,readAnswer:outcome==='read' && previousUnreadAnswer,
      handed,state:result.state ?? (handed || outcome==='question' ? waitState : outcome==='later' ? row.dataset.state : 'Done'),
      type:result.type,
      later:result.later ?? (outcome==='later' ? Date.parse(data.get('later')) : 0),
@@ -2600,15 +2661,15 @@ async function refresh(_supersede=false,current=()=>true){
  }
 }
 async function refreshReview(current){
- if(pendingSaves.size || dateTimePickerOpen(document)) return;
- const canApply=()=>!pendingSaves.size && current();
+ const canApply=()=>!pendingSaves.size && !dateTimePickerOpen(document) && current();
+ if(!canApply()) return;
  const options={cache:'no-store',signal:reviewRequestSignal()};
  const delivery=view.deliveryRequest(),query=new URLSearchParams({version:'1'});
  if(delivery) query.set('delivery',delivery.delivery);
  const response=await fetch(location.pathname+'?'+query,options);
  if(!response.ok) throw new Error('HTTP '+response.status);
  const version=await response.json();
- if(!canApply() || dateTimePickerOpen(document)) return;
+ if(!canApply()) return;
  view.itemError('');
  const finishDelivery=async()=>{
   if(!delivery || version.delivery_pending!==false) return;
@@ -2627,7 +2688,6 @@ async function refreshReview(current){
  const fresh=await fetch(location.pathname+'?'+new URLSearchParams({index:'1',version:version.version,'for-you':'1'}),options);
  if(!fresh.ok) throw new Error('HTTP '+fresh.status);
  const payload=await fresh.json();
- if(!canApply() || dateTimePickerOpen(document)) return;
  return afterRowAnimations(async()=>{
   view.preserveRecordRowTop(()=>applyReviewIndex(payload));
   await finishDelivery();
@@ -2657,7 +2717,7 @@ function applyReviewIndex(payload){
  content.querySelector('[data-for-you-notices]').replaceChildren(...(payload.actionNotices || []).map(text=>{
   const line=document.createElement('li');line.textContent=text;return line;
  }));
- bodies.clear();bodyRequests.clear();
+ for(const [key,body] of bodies) if(body.version!==payload.version) bodies.delete(key);
  const ownerRow=filterRow('owner'),pairs=new Map();
  const focusedOwner=ownerRow.contains(document.activeElement);
  for(const entry of index.values()){
@@ -2680,6 +2740,10 @@ function applyReviewIndex(payload){
  }
  storeSavedVerdicts();
  for(const [key,result] of saved) savedEntry(key,result);
+ const openKey=view.openItem?.dataset.key;
+ if(view.opened.has(openKey) && !index.has(openKey)){
+  missingCard=true;view.closeCard(openKey);
+ }
  bind();
  const openedLink=view.retryItemLink();
  if(!openedLink) view.apply(false);

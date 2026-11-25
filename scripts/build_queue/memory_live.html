@@ -545,7 +545,7 @@ body.queue-unavailable [data-page-action^="builds-"] { display: none; }
 .aws-history { margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--line); }
 .aws-history h3 { margin: 0; font-size: 1rem; font-weight: 600; }
 #aws-costs .filter { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-#aws-costs .filter button { font: inherit; font-size: 0.86rem; color: var(--ink-2); background: transparent; border: 0; padding: 5px 12px; cursor: pointer; }
+#aws-costs .filter button { font: inherit; font-size: 0.86rem; color: var(--role-label-color, var(--ink-2)); background: transparent; border: 0; padding: 5px 12px; cursor: pointer; }
 #aws-costs .filter button + button { border-left: 1px solid var(--line); }
 #aws-costs .filter button[aria-pressed="true"] { background: var(--accent); color: #fff; }
 #aws-costs .filter button:focus-visible { outline: 2px solid var(--ink); outline-offset: -2px; }
@@ -752,8 +752,8 @@ let latest = null;
 function field(label, value, kind = 'field', group = false) {
   return {kind, label, value: String(value ?? ''), group};
 }
-function staffField(label, names) {
-  return {...field(label, names.join(', ')), valueStaffNames: names};
+function staffField(label, names, labelRole) {
+  return {...field(label, names.join(', ')), valueStaffNames: names, labelRole};
 }
 // Each bump line names the unit or the one run, the actor that asked, and the user's words.
 function priorityFields(entries, lines) {
@@ -762,14 +762,17 @@ function priorityFields(entries, lines) {
 function staffTitle(name, value, suffix = '') {
   return {...field(name + suffix, value, 'title'), labelStaffName: name, labelSuffix: suffix};
 }
-function staffName(text) {
-  return globalThis.staffNames?.html(text) ?? esc(text);
+function staffName(text, reference = text) {
+  return globalThis.staffNames?.html(text, reference) ?? esc(text);
 }
 function roleName(text) {
   return globalThis.staffNames?.parts(text) ?? esc(text);
 }
+function roleLabel(role, text) {
+  return globalThis.staffNames?.roleLabel(role, text) ?? esc(text);
+}
 function nameParts(parts) {
-  return parts.map(part => part.kind === 'staff' ? staffName(part.text)
+  return parts.map(part => part.kind === 'staff' ? staffName(part.text, part.reference)
     : part.kind === 'machine' ? machineName(part.text) : esc(part.text)).join('');
 }
 // A machine name shows in its machine color (the .machine rules).
@@ -1569,17 +1572,18 @@ function awsTable(headers, rows, numeric) {
     <tbody>${body}</tbody></table>`;
 }
 
-function awsRunTable(runs, estimated, extraRows, units) {
+function awsRunTable(runs, estimated, extraRows, units, group = "") {
   const columns = values => units ? values : values.filter((_, index) => index !== AWS_UNIT_COLUMN);
   const rows = runs.map(run => {
     const [job, unit, region, zone, machine, mode] = awsRunFields(run);
-    return {values:[awsDateTime(new Date(run.start * 1000)), esc(awsJob(job)), esc(awsUnit(unit)),
+    return {values:[awsDateTime(new Date(run.start * 1000)), esc(awsJob(job)), unit == null ? esc(awsUnit(unit)) : staffName(unit),
       ...[region, zone, machine, mode].map(value => value ? esc(value) : "—"),
       awsRunTime(run.seconds), awsMoney(awsCents(run.cost_usd), estimated)]};
   });
   const tableRows = [...rows, ...extraRows].map(row => ({...row, values:columns(row.values)}));
-  return `<div class="aws-scroll aws-run-scroll" tabindex="0" aria-label="Individual runs">
-    ${awsTable(columns(awsRunHeaders()), tableRows, units ? [7,8] : [6,7])}</div>`;
+  const headers = awsRunHeaders().map((label, index) => index === AWS_UNIT_COLUMN ? roleLabel("unit", label) : esc(label));
+  return `<div class="aws-scroll aws-run-scroll" tabindex="0" aria-label="Individual runs" data-aws-focus="runs:${esc(group)}">
+    ${awsTable(columns(headers), tableRows, units ? [7,8] : [6,7])}</div>`;
 }
 
 function awsRunGroups(runs, groupBy, hanaIdle) {
@@ -1628,13 +1632,13 @@ function awsDayRuns(day, view) {
 
   const rows = awsRunGroups(day.runs_list, groupBy, hanaIdle).map(group => {
     const open = openGroups.has(group.key), count = group.runs.length;
-    const name = `<button type="button" class="aws-toggle" aria-expanded="${open}"><span class="aws-chev"
+    const name = `<button type="button" class="aws-toggle" aria-expanded="${open}" data-aws-focus="group:${esc(group.key)}"><span class="aws-chev"
       aria-hidden="true"></span>${esc(group.name)}</button>`;
     const note = group.unitUnknown ?
       '<span class="aws-dim aws-hint">Run records before this release have no unit.</span>' : "";
     const time = count ? awsRunTime(group.seconds) : "—";
     const idleRows = group.idle ? [runCharge(idleCharge)] : [];
-    return {group:group.key, detail:open ? awsRunTable(group.runs, estimated, idleRows, units) : "",
+    return {group:group.key, detail:open ? awsRunTable(group.runs, estimated, idleRows, units, group.key) : "",
       values:[name + note, count ? awsCount(count) : "—", time,
         awsMoney(group.cents + group.idle, estimated),
         count && !group.idle ? awsMoney(group.cents / count, estimated, 3) : "—"]};
@@ -1643,8 +1647,9 @@ function awsDayRuns(day, view) {
   const seconds = day.runs_list.reduce((total, run) => total + run.seconds, 0);
   rows.push({total:true, values:["Total", day.runs ? awsCount(day.runs) : "—",
     day.runs_list.length ? awsRunTime(seconds) : "—", amount(day.amount_usd), ""]});
-  return `<div class="aws-scroll aws-group-scroll" tabindex="0" aria-label="Run groups">
-    ${awsTable([AWS_RUN_GROUPS[groupBy], "Runs", "Run time", "Cost", "For one run"], rows, [1,2,3,4])}</div>`;
+  const groupLabel = roleLabel(groupBy, AWS_RUN_GROUPS[groupBy]);
+  return `<div class="aws-scroll aws-group-scroll" tabindex="0" aria-label="Run groups" data-aws-focus="groups">
+    ${awsTable([groupLabel, "Runs", "Run time", "Cost", "For one run"], rows, [1,2,3,4])}</div>`;
 }
 
 function awsDayDetail(day, priceDay, view = awsNewRunView(), unitStart = null) {
@@ -1653,12 +1658,15 @@ function awsDayDetail(day, priceDay, view = awsNewRunView(), unitStart = null) {
   const estimate = day.state === "estimate" ? `<p class="aws-note">This amount is our estimate. It uses our run records${price}.
     AWS has no amount for this day yet.</p>` : "";
   const units = awsDayHasUnits(day);
-  const controls = Object.entries(AWS_RUN_GROUPS).filter(([group]) => units || group !== "unit").map(([group, label]) =>
-    `<button type="button" data-aws-group-by="${group}" aria-pressed="${group === view.groupBy}">${label}</button>`).join("");
+  const controls = Object.entries(AWS_RUN_GROUPS).filter(([group]) => units || group !== "unit").map(([group, label]) => {
+    const color = globalThis.staffNames?.roleLabels[group]?.css;
+    const style = color ? ` style="--role-label-color:${color}"` : '';
+    return `<button type="button" data-aws-focus="group-by:${group}" data-aws-group-by="${group}" aria-pressed="${group === view.groupBy}"${style}>${label}</button>`;
+  }).join("");
   return `<div class="aws-day-detail" data-aws-day="${day.day}">${estimate}
     <div class="aws-run-controls"><span class="aws-dim">Group by</span>
       <div class="filter" role="group" aria-label="Group by">${controls}</div>
-      <button type="button" class="aws-more" data-aws-csv>Download CSV</button></div>
+      <button type="button" class="aws-more" data-aws-focus="csv" data-aws-csv>Download CSV</button></div>
     <div class="aws-run-content">${awsDayRuns(day, view)}</div>${awsUnitNote(day, unitStart)}</div>`;
 }
 
@@ -1928,8 +1936,8 @@ function doneText(row) {
 }
 function ownerFields(row) {
   const showrunner = ownerText(row.showrunner);
-  const fields = [staffField('Showrunner', [showrunner])];
-  if (row.runner === 'worker') fields.push(staffField('Worker', [ownerText(row.worker)]));
+  const fields = [staffField('Showrunner', [showrunner], 'showrunner')];
+  if (row.runner === 'worker') fields.push(staffField('Worker', [ownerText(row.worker)], 'worker'));
   if (row.caller) fields.push(field('Caller', row.caller));
   return fields.filter(row => row.value);
 }
@@ -2090,7 +2098,8 @@ function tooltipRows(key, rawData) {
     const move = row?.last_move;
     if (move?.kind !== "bump") return [];
     const place = row.place ?? move.to_place;
-    return [field("Bump", `place ${place}`, "title"), field("Moved by", move.who),
+    const actor = {kind:"staff", text:move.who, reference:move.who_id};
+    return [field("Bump", `place ${place}`, "title"), {...field("Moved by", move.who), valueParts:[actor]},
       field("From", move.from_place > 0 ? `place ${move.from_place}` : "place not recorded"),
       field("To", "the top"), field("At", move.at)];
   }
@@ -2099,13 +2108,17 @@ function tooltipRows(key, rawData) {
     if (!row) return [];
     const unit = ownerText(row.unit);
     const match = row.match_rule ? ` (${row.match_rule})` : "";
+    const aboutUnit = (kind, lead, tail = '') => ({
+      ...field('', lead + unit + tail, kind),
+      valueParts:[{kind:'text', text:lead}, {kind:'staff', text:unit}, {kind:'text', text:tail}],
+    });
     return [field('Kept place', `place ${row.position}`, 'title'),
-      field('', `Kept for the next run of unit ${unit}`, 'caption'),
-      field('Unit', unit, 'field', true), field('Failed run', row.failed_run),
+      aboutUnit('caption', 'Kept for the next run of unit '),
+      {...staffField('Unit', [unit], 'unit'), group:true}, field('Failed run', row.failed_run),
       field('Failed step', row.failed_step || '—'), field(row.ended === 'no_result' ? 'Ended at' : 'Failed at', row.failed_at),
       field('Kept until', row.kept_until),
-      field('', `If the next run of unit ${unit}${match} arrives before ${row.kept_until}, ` +
-        `it starts from place ${row.position}. Runs behind place ${row.position} do not wait for it.`, 'long')];
+      aboutUnit('long', 'If the next run of unit ', `${match} arrives before ${row.kept_until}, ` +
+        `it starts from place ${row.position}. Runs behind place ${row.position} do not wait for it.`)];
   }
   if (kind === 'swap' && index !== undefined) return swapTip(data.swap_by[+index], data.swapDisplay);
   if (kind === 'swap-pool') return poolTip(index, data);
@@ -2118,10 +2131,10 @@ function tooltipHtml(key, data) {
   const rows = tooltipRows(key, data);
   return rows.length ? tipRowsHtml(rows) : '';
 }
-function bumpMark(who, tip = "") {
+function bumpMark(who, tip = "", whoId = who) {
   return `<span class="move-mark"${tip ? ` data-tip="${esc(tip)}" tabindex="0"` : ""}>` +
     '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 3h14M18 13l-6-6-6 6M12 7v14"/></svg>' +
-    `<span>${esc(who)}</span></span>`;
+    `<span>${tip ? staffName(who, whoId) : esc(who)}</span></span>`;
 }
 function tipRowsHtml(rows) {
   return '<dl class="tip">'+tipCellsHtml(rows)+'</dl>';
@@ -2132,10 +2145,13 @@ function tipCellsHtml(rows) {
     const attr=classes ? ` class="${classes}"` : '';
     const value = row.kind === 'call' ? `<div>${esc(row.value).replace(/\S+/g, '<span>$&</span>')}</div>`
       : row.kind === 'folder' ? row.value.split(/(?<=\/)(?=.)/).map(segment => `<span>${esc(segment)}</span>`).join('<wbr/>')
-      : row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(staffName).join(', ') : esc(row.value);
+      : row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(name => staffName(name)).join(', ') : esc(row.value);
     const cell = `<dd${attr}>${value}</dd>`;
-    return ['caption','long'].includes(row.kind) ? cell
-      : `<dt${attr}>${row.labelParts ? nameParts(row.labelParts) : row.labelStaffName ? staffName(row.labelStaffName) + esc(row.labelSuffix) : esc(row.label)}</dt>` + cell;
+    if (['caption','long'].includes(row.kind)) return cell;
+    const label = row.labelParts ? nameParts(row.labelParts)
+      : row.labelStaffName ? staffName(row.labelStaffName) + esc(row.labelSuffix)
+      : row.labelRole ? roleLabel(row.labelRole, row.label) : esc(row.label);
+    return `<dt${attr}>${label}</dt>` + cell;
   }).join('');
 }
 function tipText(key, data) {
@@ -2145,8 +2161,9 @@ function tipText(key, data) {
 }
 function sentence(text) { return text ? text[0].toUpperCase() + text.slice(1) : ""; }
 function targetOwner(row) {
-  const roles = [["Unit", ownerText(row.unit)], ["Showrunner", ownerText(row.showrunner)]].filter(([, name]) => name);
-  if (roles.length) return roles.map(([label, name]) => label + ' ' + staffName(name)).join(' · ');
+  const roles = [["unit", "Unit", ownerText(row.unit)], ["showrunner", "Showrunner", ownerText(row.showrunner)]]
+    .filter(([, , name]) => name);
+  if (roles.length) return roles.map(([role, label, name]) => roleLabel(role, label) + ' ' + staffName(name)).join(' · ');
   const holder = ownerText(row.holder);
   return holder ? 'Holder ' + staffName(holder) : '';
 }
@@ -2476,6 +2493,8 @@ function showQueueError(message) {
 function captureReportView() {
   const active = document.activeElement;
   const focus = active?.closest('[data-move-id], [data-tip], [data-owner-key], [id]');
+  const awsFocus = active?.dataset?.awsFocus;
+  const day = awsFocus && active.closest('[data-aws-day]');
   const selector = element => element?.dataset.moveId ? `.queue-grip[data-move-id="${CSS.escape(element.dataset.moveId)}"]`
     : element?.dataset.tip ? `${element.tagName.toLowerCase()}${element.classList.contains("wrow") ? ".wrow" : ""}[data-tip="${CSS.escape(element.dataset.tip)}"]`
     : element?.dataset.ownerKey ? `[data-owner-key="${CSS.escape(element.dataset.ownerKey)}"]`
@@ -2490,8 +2509,10 @@ function captureReportView() {
   const focusedRow = active?.closest('.wrow, tr[data-tip]');
   const candidates = [...document.querySelectorAll('.wrow[data-tip], main > section[id]')];
   const anchor = [tipRow, focusedRow].find(inView) || candidates.find(element => inView(element) && element.getBoundingClientRect().top >= 0);
+  const focusSelector = day ? `[data-aws-day="${CSS.escape(day.dataset.awsDay)}"] [data-aws-focus="${CSS.escape(awsFocus)}"]`
+    : active?.matches?.('.row-add') ? selector(focus) + ' .row-add' : active !== document.body ? selector(focus) : '';
   return {anchor: selector(anchor), top: anchor?.getBoundingClientRect().top,
-    focus: active?.matches?.('.row-add') ? selector(focus) + ' .row-add' : active !== document.body ? selector(focus) : '',
+    focus: focusSelector,
     details: [...document.querySelectorAll('details')].map(element => [selector(element), element.open])};
 }
 function restoreReportView(view) {
@@ -2513,11 +2534,11 @@ function restoreReportView(view) {
   }
 }
 function render(d) {
-  if (d.staff_names) globalThis.staffNames?.set(d.staff_names, d.unit_open);
   if (d.error || !d.ok) {
     throw new Error("The queue did not answer.");
   }
   const view = captureReportView();
+  refreshBuildStaffNames(d);
   for (const [theme, colors] of Object.entries(d.colors)) {
     document.documentElement.style.setProperty(`--remote-memory-${theme}`, colors.remote_memory);
     for (const [machine, color] of Object.entries(colors.machines)) {
@@ -2913,6 +2934,18 @@ function renderAwsHistory() {
   const older = $("aws-older"), extra = groups.day.length - AWS_HISTORY_DAYS;
   older.hidden = awsCostView !== "day" || extra <= 0;
   older.textContent = awsShowAll ? "Show fewer days" : `Show ${extra} older ${extra === 1 ? "day" : "days"}`;
+}
+function refreshBuildStaffNames(reading) {
+  const names = globalThis.staffNames;
+  if (!reading.staff_names || !names) return;
+  const color = names.roleLabels.unit?.css;
+  const previous = names.values;
+  names.set(reading.staff_names, reading.unit_open, reading.role_labels);
+  if (!awsCostReport) return;
+  const values = names.values;
+  const staffChanged = previous !== values && (Object.keys(previous).length !== Object.keys(values).length
+    || Object.entries(values).some(([name, markup]) => previous[name] !== markup));
+  if (staffChanged || color !== names.roleLabels.unit?.css) renderAwsHistory();
 }
 function renderAwsCosts(costs) {
   awsCostReport = costs?.limits && costs?.today ? costs : null;
@@ -3343,7 +3376,7 @@ function renderWalk(d) {
     : esc(step);
   const cells = (place, labels, duration, pid, target, vcpus, tip, className = "", done = "—", tokens = "—", move = null, actionName = "") => {
     const kept = className.startsWith("held"), waiting = kept || className.startsWith("wait");
-    const moved = move?.kind === "bump" ? bumpMark(move.who, `moved:${tip}`) : "—";
+    const moved = move?.kind === "bump" ? bumpMark(move.who, `moved:${tip}`, move.who_id) : "—";
     const hint = tip ? ` data-tip="${esc(tip)}" tabindex="0"` : "";
     tableRows.push(`<tr class="${className}"${hint}><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td>` +
       `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(labels.verify)}</td><th scope="row" class="step"><span class="cell-text">${stepText(labels.step, waiting)}</span></th><td class="pid">${kept ? "" : typeof pid === "number" ? pid : "—"}</td>` +

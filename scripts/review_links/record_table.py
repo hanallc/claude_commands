@@ -98,9 +98,11 @@ def identity_attribute(value: str) -> str:
     return html.escape(value, quote=True)
 
 
-def chip_row(name: str, chips: Iterable[Chip], selected: str, *, encode_values: bool = False) -> str:
+def chip_row(name: str, chips: Iterable[Chip], selected: str, *, encode_values: bool = False,
+             label_html: str = '') -> str:
     """Render a named filter with All as its first choice."""
-    key = html.escape(name.lower().replace(' ', '-'), quote=True)
+    key = name.lower().replace(' ', '-')
+    identity = html.escape(key, quote=True)
     choices = {chip.value: chip for chip in chips}
     all_chip = choices.pop('all', Chip('all', 'All'))
     selected = selected if selected in choices else 'all'
@@ -112,12 +114,23 @@ def chip_row(name: str, chips: Iterable[Chip], selected: str, *, encode_values: 
         owner = (f' data-owner-name="{html.escape(chip.owner_name, quote=True)}"'
                  if chip.owner_name is not None else '')
         hidden = ' hidden' if chip.hidden else ''
-        buttons.append(f'<button type="button"{owner}{hidden} id="filter-{key}-{quote(chip.value, safe="")}"'
+        buttons.append(f'<button type="button"{owner}{hidden} id="filter-{identity}-{quote(chip.value, safe="")}"'
                        + f' data-filter-value="{value}" aria-pressed="{pressed}" data-filter-count="{count}">'
                        + f'{chip.label_html} <b>{count}</b></button>')
+    return labelled_chip_row(name, ''.join(buttons), filter_key=key, chip_id=f"list-{key}", label_html=label_html)
+
+
+def labelled_chip_row(name: str, buttons: str, *, filter_key: str = '', chip_classes: str = '', chip_id: str = '',
+                      label_html: str = '') -> str:
+    """Render a visible label and a group of filter buttons."""
     label = html.escape(name, quote=True)
-    return (f'<div class="record-filter-row" role="group" aria-label="{label}" data-filter-row="{key}">'
-            + f'<span aria-hidden="true">{label}</span><div id="list-{key}">' + ''.join(buttons) + '</div></div>')
+    group = f' role="group" aria-label="{label}"'
+    key = f' data-filter-row="{html.escape(filter_key, quote=True)}"' if filter_key else ''
+    classes = f' class="{html.escape(chip_classes, quote=True)}"' if chip_classes else ''
+    identity = f' id="{html.escape(chip_id, quote=True)}"' if chip_id else ''
+    return (f'<div class="record-filter-row"{group + key if filter_key else ""}>'
+            + f'<span aria-hidden="true">{label_html or label}</span>'
+            + f'<div{classes}{identity}{"" if filter_key else group}>{buttons}</div></div>')
 
 
 def words_box(element_id: str, placeholder: str, *, value: str = '') -> str:
@@ -946,6 +959,7 @@ function syncOpenItem(){
  const incoming=recordDetails(item);
  const children=[...incoming.childNodes];
  if(keepBody){
+  options.retainDetailState?.(openItem,item);
   delete openItem.openDetails;
   }else{
   if(openItem) returnItemDetail();
@@ -1681,15 +1695,14 @@ function closeDateTimePicker(menu,focus){
  const toggle=menu.parentElement.querySelector('[data-later-toggle]');toggle.setAttribute('aria-expanded','false');
  if(focus) toggle.focus();
 }
-function pickerSummary(zone){
+function pickerSummary(zone,at){
  const date=new Intl.DateTimeFormat('en-GB',{timeZone:zone,weekday:'short',day:'numeric',month:'short'});
- return at=>{
-  const {hour,minute}=zoneParts(zone,at);
-  return date.format(at)+' '+dateTimeClock(hour*60+minute);
- };
+ const {hour,minute}=zoneParts(zone,at);
+ return date.format(at)+' '+dateTimeClock(hour*60+minute);
 }
 let parkTimeListId=0;
-function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary=pickerSummary(zone),retryTime=()=>NaN}){
+function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary,retryTime=()=>NaN}){
+ const currentZone=typeof zone==='function' ? zone : ()=>zone;
  const toggle=form.querySelector('[data-later-toggle]'),menu=form.querySelector('[data-later-menu]');
  const custom=menu.querySelector('[data-later-custom]'),chooseItem=menu.querySelector('[data-later-choose]');
  const items=()=>[...menu.querySelectorAll('[role=menuitem]')];
@@ -1710,8 +1723,9 @@ function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary=pick
  const monthText=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',month:'long',year:'numeric'});
  const dayLabel=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',dateStyle:'full'});
  let selected=new Date(),display=new Date();
- const today=()=>{const now=zoneParts(zone,Date.now());return new Date(Date.UTC(now.year,now.month-1,now.day));};
+ const today=zone=>{const now=zoneParts(zone,Date.now());return new Date(Date.UTC(now.year,now.month-1,now.day));};
  const update=(normalize=false)=>{
+  const zone=currentZone();
   const minutes=dateTimeMinutes(time.value),valid=Number.isFinite(minutes);
   const clock=valid ? dateTimeClock(minutes) : '';
   time.setAttribute('aria-invalid',String(!valid));
@@ -1721,7 +1735,7 @@ function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary=pick
   const retry=retryTime();
   const at=Number.isFinite(retry) ? retry : valid ? dateTimeEpoch(zone,selected,minutes) : NaN;
   custom.querySelector('[data-later-summary]').textContent=Number.isFinite(at)
-   ? summaryPrefix+formatSummary(at) : 'Choose a time';
+   ? summaryPrefix+(formatSummary ? formatSummary(at) : pickerSummary(zone,at)) : 'Choose a time';
   save.disabled=!Number.isFinite(retry) && !(at>Date.now());
  };
  const activeTime=()=>times.querySelector('[aria-selected="true"]');
@@ -1771,7 +1785,8 @@ function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary=pick
   }
  });
  const draw=()=>{
-  const current=today(),currentText=dayText(current),selectedText=dayText(selected);
+  const zone=currentZone();
+  const current=today(zone),currentText=dayText(current),selectedText=dayText(selected);
   const step=settings().step,now=zoneParts(zone,Date.now());
   const firstTime=(Math.floor((now.hour*60+now.minute)/step)+1)*step;
   const clockValues=[];
@@ -1816,14 +1831,14 @@ function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary=pick
   update();
  };
  function choose(){
-  const draft=parseDateTimeDraft(field.value);
+  const zone=currentZone(),draft=parseDateTimeDraft(field.value);
   if(draft && (Number.isFinite(retryTime()) || dateTimeEpoch(zone,draft.date,draft.minutes)>Date.now())){
    selected=draft.date;time.value=dateTimeClock(draft.minutes);
   }else{
-   selected=today();selected.setUTCDate(selected.getUTCDate()+1);
+   selected=today(zone);selected.setUTCDate(selected.getUTCDate()+1);
    time.value=dateTimeClock(settings().morning);
   }
-  const current=today();
+  const current=today(zone);
   display=new Date(selected<current ? current : selected);
   custom.hidden=false;menu.dataset.choosing='true';draw();
   focusCalendar();
@@ -1856,7 +1871,7 @@ function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary=pick
   event.preventDefault();
   const date=new Date(day+'T00:00:00Z');
   date.setUTCDate(date.getUTCDate()+days);
-  if(date<today()) return;
+  if(date<today(currentZone())) return;
   selected=date;display=new Date(date);draw();focusCalendar();
  });
  menu.addEventListener('keydown',event=>{

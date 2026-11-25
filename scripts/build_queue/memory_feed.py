@@ -67,8 +67,8 @@ from scripts.lib.build_steps import (GATE_PROGRAMS, RECORDED_STEP_NAMES,
                                      copies_run_command, live_process_arguments,
                                      gate_job_from_process, process_arguments, read_step_names)
 from scripts.lib.build_steps import CommandUnreadable as CommandUnreadable
-from scripts.build_queue.slot_wait import QueueRowName as QueueRowName
-from scripts.build_queue.slot_wait import (SHELLS, NoNamedStep, QueueKind, command_programs,
+from scripts.build_queue.queue_wait import QueueRowName as QueueRowName
+from scripts.build_queue.queue_wait import (SHELLS, NoNamedStep, QueueKind, command_programs,
                                            public_queue_text, recorded_step, verify_value_options)
 from scripts.build_queue.scope_activity import (LiveBuildRun, NotServiceSlice,
     RunningServiceJob, ScopeProcesses, environment_values)
@@ -565,6 +565,7 @@ class ConfirmedGuestRun(TypedDict):
 class LastMove(TypedDict):
     kind: Literal["bump"]
     who: str
+    who_id: NotRequired[staff.StaffId]
     from_place: int
     to_place: int
     at: str
@@ -1085,11 +1086,6 @@ class FeedStaff:
             member = self.worktree_owner(machine, folder)
         return self.labels_by_id.get(member.id) if member is not None else None
 
-    def member_name(self, reference: str) -> str:
-        """Find the staff name for a fixed ID or current session."""
-        member = self.members.by_member_reference(reference) if reference else None
-        return member.name if member is not None else ""
-
     def fixed_owner_labels(self, staff_id: staff.StaffId) -> unit_labels.UnitLabels | None:
         return self.labels_by_id.get(staff_id)
 
@@ -1335,6 +1331,7 @@ class MemoryPage(TypedDict):
     colors: PageColors
     staff_names: NotRequired[dict[str, str]]
     unit_open: NotRequired[str]
+    role_labels: NotRequired[dict[str, staff_names.RoleLabel]]
     ok: bool
     read_at: float
     fresh_until: float
@@ -3305,9 +3302,13 @@ def move_progress(directory: Path) -> person_actions.BumpProgress:
 def move_fields(move: person_actions.AppliedBump | None, members: FeedStaff, zone: tzinfo) -> MoveFields:
     if move is None:
         return {}
-    who = members.member_name(move.who) or ("user" if move.who == "user" else "name not recorded")
-    return {"last_move": {"kind": "bump", "who": who, "from_place": move.from_place,
-            "to_place": move.to_place, "at": datetime.fromtimestamp(move.at, zone).strftime("%H:%M %Z")}}
+    actor = members.members.by_member_reference(move.who) if move.who else None
+    who = actor.name if actor is not None else ("user" if move.who == "user" else "name not recorded")
+    last_move: LastMove = {"kind": "bump", "who": who, "from_place": move.from_place,
+                           "to_place": move.to_place, "at": datetime.fromtimestamp(move.at, zone).strftime("%H:%M %Z")}
+    if actor is not None:
+        last_move["who_id"] = actor.id
+    return {"last_move": last_move}
 
 
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
@@ -3895,6 +3896,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     page: MemoryPage = {
         "colors": configuration.colors,
         "staff_names": staff_display.registry(), "unit_open": staff_display.unit_open(),
+        "role_labels": staff_display.role_labels(),
         "ok": True, "read_at": published.written_at, "fresh_until": published.fresh_until,
         "render_seconds": 0.0, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety,

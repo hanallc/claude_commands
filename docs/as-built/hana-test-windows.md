@@ -12,6 +12,9 @@ starts from Terminal.
 `mac_run.sh` holds a numbered copy under `~/build/hana/<unit>/<n>` on the Mac.
 It uses the Mac source commit when available and sends a Git bundle when necessary.
 `hana-instances stop-checkout` stops Hana and checks for surviving processes before the run returns the copy.
+`hana-instances check-checkout <path>` checks local process use without stopping any process.
+It prints `hana-instances: checkout clear` and exits 0 when the checkout is clear.
+It prints the reason to standard error and exits 2 when it cannot confirm clearance.
 SSH input must close before the lease ends.
 If the process check fails, the run records the reason and keeps the copy.
 Purpose and owner reach the Terminal command.

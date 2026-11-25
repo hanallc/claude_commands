@@ -446,8 +446,8 @@ def phase_worktree(directory: Path) -> KnownPhaseWorktree:
 
 
 def claimed_launch_directory(directory: Path, requested: Path) -> Path:
-    """Select a start directory in the claimed checkout for `assign_claude.run`, the only caller."""
-    if not ((directory / BASELINE_FILE).is_file() or (directory / WORKTREE_FILE).is_file()):
+    """Select a start directory in the claimed checkout."""
+    if not _has_recorded_checkout(directory):
         return requested
     root = phase_worktree(directory).root.resolve()
     return requested if requested.resolve().is_relative_to(root) else root
@@ -586,6 +586,7 @@ def _recorded_checkout(directory: Path, home_root: Path) -> _NoRecordedCheckout 
 
 def _record_claim_checkout(
     directory: Path, requested: Path | None, home: _PhaseRunHome, *, repo_argument: str | None,
+    launch: bool,
 ) -> Path | None:
     """Select and record the checkout while the caller holds the phase lock."""
     recorded = _recorded_checkout(directory, home.root)
@@ -593,7 +594,7 @@ def _record_claim_checkout(
     if isinstance(recorded, _RecordedCheckout):
         if repo_argument is None and recorded.usable:
             root = recorded.root
-        elif root is None:
+        elif root is None or launch:
             if repo_argument is not None:
                 raise StateRefused(f"{repo_argument}: --repo does not name a Git checkout; recorded checkout is {recorded.root}")
             raise StateRefused(f"{recorded.root}: no usable checkout for this phase. Pass --repo with a valid checkout.")
@@ -1142,13 +1143,15 @@ def _record_active_from_changes_locked(session_dir: Path, directory: Path, reque
 def _claim_command(args: argparse.Namespace) -> int:
     """Choose the checkout and claim the phase's listed files before dispatch.
 
-    Use the recorded checkout when `--repo` is absent and the checkout is available.
+    A launch uses the recorded checkout if the phase has one.
     The first edit claims any paths listed as directories.
     """
     session_dir = Path(cast(str, args.session_dir))
     directory = phase_directory(session_dir, cast(str, args.phase))
     repo_argument = cast(str | None, args.repo)
-    start = Path(repo_argument) if repo_argument is not None else WORKING_DIRECTORY
+    launch_cwd = cast(str | None, args.launch_cwd)
+    start_argument = repo_argument if repo_argument is not None else launch_cwd
+    start = Path(start_argument) if start_argument is not None else WORKING_DIRECTORY
     try:
         unit, home_path = _phase_run_home(directory)
         home = _PhaseRunHome(unit, home_path.resolve())
@@ -1157,13 +1160,15 @@ def _claim_command(args: argparse.Namespace) -> int:
         if requested is not None or _has_recorded_checkout(directory):
             with phase_lock(directory):
                 root = _record_claim_checkout(directory, requested.resolve() if requested is not None else None, home,
-                                              repo_argument=repo_argument)
+                                              repo_argument=repo_argument, launch=launch_cwd is not None)
                 if root is not None:
                     return _claim_files_locked(session_dir, directory, root)
         if start.resolve().is_relative_to(copy_record.worktree_root()):
             raise StateRefused(f"{start}: Git cannot read this path inside the worktree model")
         if repo_argument is not None:
             raise StateRefused(f"{repo_argument}: --repo does not name a Git checkout")
+        if launch_cwd is not None:
+            raise StateRefused(f"{launch_cwd}: --launch-cwd does not name a Git checkout")
     except (StateRefused, OSError) as refused:
         print(f"phase_reservation: {refused}", file=sys.stderr)
         return 2
@@ -1209,7 +1214,9 @@ def main(argv: list[str]) -> int:
     claim = commands.add_parser("claim", help="acquire a phase's reservation over its files before its workers open")
     _ = claim.add_argument("--session-dir", required=True)
     _ = claim.add_argument("--phase", required=True)
-    _ = claim.add_argument("--repo")
+    checkout = claim.add_mutually_exclusive_group()
+    _ = checkout.add_argument("--repo")
+    _ = checkout.add_argument("--launch-cwd", help="use this checkout for the first launch")
     repair = commands.add_parser("repair", help="restore a lost record from berth's live reservation")
     _ = repair.add_argument("--session-dir", required=True)
     _ = repair.add_argument("--phase", required=True)

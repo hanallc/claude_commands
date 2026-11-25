@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.review_links.browser_test_support import assert_status_states
-from scripts.build_queue import admission_records, admission_service, execution_identity, limits_view, placement, queue_evidence, slot_wait
+from scripts.build_queue import admission_records, admission_service, execution_identity, limits_view, placement, queue_evidence, queue_wait
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
 
@@ -41,7 +41,7 @@ from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue import memory_trace
 from scripts.build_queue.test_program_memory_feed import TRACE_POLICY
 from scripts.build_queue.test_queue_view import cloud_reading
-from scripts.build_queue.slot_wait import NoNamedStep, recorded_step
+from scripts.build_queue.queue_wait import NoNamedStep, recorded_step
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
 from scripts.build_targets import build_targets, mac_linux, target_config, targets
 from scripts.build_queue.queue_view import refresh_mac_builds
@@ -54,7 +54,7 @@ from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, 
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lint.memory_test_support import write_pressure_reading
 from scripts.lib import atomic_file, build_folders, conf, test_hang_guard
-from scripts.lib.build_slots_test_support import write_private_build_roots
+from scripts.lib.build_copies_test_support import write_private_build_roots
 from scripts.lib.process_group import run_process_group
 from scripts.review_links import console_theme, page_frame, review_link, test_page_frame, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, HAND_MADE, GateJobNotRecorded, StepJob
@@ -462,10 +462,19 @@ class MemoryFeedTests(unittest.TestCase):
         runner = staff.StaffRow(staff.StaffId("fixture-runner"), "showrunner", "fixture-runner", staff.StaffRoot(),
                                 current_session=staff.StaffId("fixture-runner"))
         owner = unit_labels.make_labels("fixture-runner", unit_labels.RunsProduction("fixture-runner"), unit_labels.NoDirector())
+        settings = self.root / "statusline.conf"
+        _ = settings.write_text("role.showrunner=#123456\n")
         with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((runner,))):
             page = self.owner_machine_page(owner)
+            _ = settings.write_text("role.showrunner=#abcdef\n")
+            refreshed = self.owner_machine_page(owner)
         self.assertIn('data-color-text="role.showrunner"', page.get("staff_names", {}).get(runner.name, ""))
         self.assertNotIn("nate", page.get("staff_names", {}))
+        self.assertEqual(page.get("role_labels"), {"showrunner": {
+            "opening": '<span class="staff-name" data-color-text="role.showrunner" style="color:#123456">',
+            "css": "#123456"}})
+        assert "role_labels" in refreshed
+        self.assertEqual(refreshed["role_labels"]["showrunner"]["css"], "#abcdef")
 
     def test_feed_reads_the_staff_record_once_across_destinations(self) -> None:
         reading = cloud_reading(with_wait_reason(reservation_reading(), admission_records.NeedsMemory()))
@@ -622,23 +631,25 @@ class MemoryFeedTests(unittest.TestCase):
         reading = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
         step = replace(reading.view.running[0], folder=local_folder)
         reading = replace(reading, view=replace(reading.view, running=(step,)),
-                          explanation=replace(reading.explanation,
-                              running=(replace(reading.explanation.running[0], step=step),)))
-        build = queue_view.MacBuild(710001, mac_folder, reading.explanation.now - 30,
-                                    "cargo nextest run", "hana")
-        mac = queue_view.MacBuildReading(reading.explanation.now, (build,), home=str(mac_home))
-        with (mock.patch.dict(os.environ, {"HOME": str(local_home)}),
-              mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
-              mock.patch.object(memory_feed, "host_name", return_value="natedev"),
-              mock.patch.object(queue_view, "read_mac_builds", return_value=mac)):
-            page = memory_feed.reading()
-        for machine, folder, home in (("natedev", local_folder, local_home), ("mac", mac_folder, mac_home)):
-            with self.subTest(machine=machine):
-                row, = [row for row in page["walk"] if row.get("machine") == machine]
-                self.assertEqual(row.get("run_folder"), memory_feed.RecordedRunFolder(folder, str(home)))
-                self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), row["name"])
-        self.assertTrue(page["waiters"])
-        self.assertTrue(all("run_folder" not in row for row in page["waiters"]))
+            explanation=replace(reading.explanation, running=(replace(reading.explanation.running[0], step=step),)))
+        build = queue_view.MacBuild(710001, mac_folder, reading.explanation.now - 30, "cargo nextest run", "hana")
+        for home in (str(mac_home), ""):
+            with self.subTest(mac_home=home):
+                mac = queue_view.MacBuildReading(reading.explanation.now, (build,), home=home)
+                with (mock.patch.dict(os.environ, {"HOME": str(local_home)}),
+                      mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
+                      mock.patch.object(memory_feed, "host_name", return_value="natedev"),
+                      mock.patch.object(queue_view, "read_mac_builds", return_value=mac)):
+                    page = memory_feed.reading()
+                for machine, folder, folder_home in (("natedev", local_folder, str(local_home)),
+                                                     ("mac", mac_folder, home)):
+                    row, = [row for row in page["walk"] if row.get("machine") == machine]
+                    self.assertEqual(row.get("run_folder"), memory_feed.RecordedRunFolder(folder, folder_home))
+                    self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), row["name"])
+                self.assertTrue(page["waiters"])
+                for waiter in page["waiters"]:
+                    self.assertEqual(staff_names.parts_text(waiter.get("name_parts", [])), waiter["name"])
+                    self.assertNotIn("run_folder", waiter)
 
     def test_mac_reading_collects_and_preserves_the_remote_home(self) -> None:
         mac_home = str(self.root / "remote-home")
@@ -3001,8 +3012,8 @@ const refresh = createPageRefresh(tick);
         )
         for unit, command, arguments, call in cases:
             with (self.subTest(unit=unit),
-                  mock.patch.object(slot_wait, "verify_package", return_value=arguments[0]) as parse):
-                name, _, facts = slot_wait.command_slot_job(("bash", "-c", command), RECORDED_STEP_NAMES)
+                  mock.patch.object(queue_wait, "verify_package", return_value=arguments[0]) as parse):
+                name, _, facts = queue_wait.command_queue_job(("bash", "-c", command), RECORDED_STEP_NAMES)
                 assert isinstance(name, memory_feed.QueueRowName)
                 step = f"test {arguments[0]}"
                 row = memory_feed.queue_row_labels(name, name, unit=memory_feed.StaffUnitName(unit))
@@ -3206,6 +3217,7 @@ const refresh = createPageRefresh(tick);
         assert key
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         nate = fixture_member("showrunner", name="nate")
+        _ = fixture_member("unit", name="nate", parent=nate.id)
         person_actions.save_bump(fixture.state_dir, person_actions.Bump("move-201",
             person_actions.SetBump(key, 2), "report", str(nate.id), fixture.clock.now(), "urgent"))
         _ = fixture.server.run_pass()
@@ -3214,10 +3226,13 @@ const refresh = createPageRefresh(tick);
         _ = fixture.server.handle_request(request)
         _ = fixture.server.run_pass()
         expected: memory_feed.LastMove = {
-            "kind": "bump", "who": "nate", "from_place": 2, "to_place": 1, "at": "12:22 PST"}
+            "kind": "bump", "who": "nate", "who_id": nate.id, "from_place": 2, "to_place": 1, "at": "12:22 PST"}
         with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root), "USER_ZONE": "America/Los_Angeles"}):
             page = memory_feed.reading()
             waiting = page["waiters"]
+            registry = page.get("staff_names", {})
+            self.assertNotIn("nate", registry)
+            self.assertIn('data-color-text="role.showrunner"', registry.get(nate.id, ""))
             self.assertEqual(page["priority_text"], 'queue priority: report (nate: "urgent")')
             self.assertEqual(waiting[0].get("priority_lines"), ['report (nate: "urgent")'])
             self.assertEqual([(row["pid"], row.get("last_move")) for row in waiting],

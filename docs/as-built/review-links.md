@@ -96,10 +96,15 @@ The open row keeps its place on the screen, the draft, focus, and text selection
 The New item dialog uses the console dialog frame.
 Select **Close**, press Esc, or select the backdrop to close the dialog.
 
-Staff names use the current role colors from the Accounts reader.
+Staff names and explicit role labels use the current role colors from the Accounts reader.
+The reader gets the colors from `statusline.conf` through `accounts.role_colors()` and `accounts.role_color()`.
 `staff_names.StaffNames` shares one staff snapshot and one color reading across each server render.
 It resolves fixed IDs, session IDs, and unambiguous staff names.
 The shared renderer escapes unknown names and free text without a role color.
+`StaffNames.role_label(role, text)` escapes the label and applies the configured color.
+Unit, unit director, merge director, and style director use the same unit color.
+Without a valid color, the label uses plain text.
+Button text, accessible names, filter keys, sort keys, and exports stay plain.
 The owner corner shows the active unit, showrunner, or producer set in `page.<page>.owner`.
 It uses the owner's staff color.
 If the configured owner is unavailable, the corner shows the default recipient.
@@ -150,18 +155,24 @@ A migration marks the native record before it writes the List item.
 The command keeps the original words and attachments and records the List number on each completed Review record.
 Run the command again to finish an interrupted migration.
 The List colors Owner, Producer, supporting unit names, staff names in log sources, and showrunner names in the count strip.
+The Producer filter, table headers, and narrow card label use the producer color.
+The log colors Producer and Unit labels. The Go box colors the role phrase.
+The status colors Producer in Producer answering. The waiting note and Go box color staff names.
 List delivery notices and feedback log entries use role colors for the notice recipient.
 Delivery notices also color the showrunner who received an alert.
 They keep the notice words and time.
 Review colors Owner, Source, staff log names, and owner menu options.
+The Review action heading colors the word showrunner in Sends to showrunner.
+Review colors the staff names in Sends to, Question for, and Answer from headings.
 Proposal and efficiency cards show Assign next to Approve.
 The default shows the card owner's name and sends the approval to that owner.
 Assign lists current showrunners and unit directors by name in their role colors.
 Approve sends only to the selected assignee when you select a name.
-Images colors card owners and copies those colored names into the group links.
+Images colors card owners and their roles. The group links use the colored names.
+Legacy Changes and Questions color the Showrunner filter label. Changes also colors the feedback prefix.
 Legacy question pages color each source and its parent separately.
-Branch pages color unit names. Rebuilds colors recorded requesters.
-Builds shares the same rendered name spans in each current data reading.
+Branch pages color the Unit prefix and unit names. Rebuilds colors recorded requesters.
+Each Builds data reading shares the name spans and role colors with the page.
 Its tables, charts, target owners, queue priorities, and marked staff fields in tooltips use those spans.
 The tooltip renderer escapes other fields as plain text.
 The swap reader marks titles that name staff and keeps those markers in smaller-group members.
@@ -175,11 +186,18 @@ The reader marks each staff field before it joins the display text.
 The renderer colors marked staff parts and escapes paths, programs, and other context text.
 Old readings without marked parts stay plain.
 It renders each priority name before it joins the names.
-Empty target role labels use the recorded holder. Only the holder name can have a role color.
+Target availability and Builds tooltips color explicit staff role labels.
+When a target has no unit or showrunner, the page shows the recorded holder with a plain Holder label.
+The AWS costs table colors the Unit header and recorded staff names in the Unit column.
+The Unit group control uses the role color before selection.
+An open AWS day applies role and staff-name color changes on the next Builds data reading.
+The refresh keeps focus on the same control in the open day.
+The Builds page uses the saved staff ID to color the name in the bump mark and tooltip.
 Disks uses the same spans for slot holders, sessions, and shared tooltip fields.
+The slot tooltip colors the Showrunner label.
 Current Builds rows carry their name parts through `slotStep` to the Disks slot label.
-Its existing Builds refresh updates the name spans without a new timer.
-The AWS data and the console navigation show no staff name fields.
+Its Builds refresh updates the name spans and role colors without a new timer.
+The console navigation shows no staff name fields.
 The Units board emits Markdown through `unit_phases.py`; this checkout has no Units console route.
 
 Saved role colors apply after the next page render or Builds data reading.
@@ -747,7 +765,12 @@ The index contains summary values and shared staff labels.
 The server sends card bodies on demand.
 The server sends gzip when the browser accepts it with a positive quality.
 Each body response carries its snapshot version.
-If the versions differ, the browser refreshes the index before it displays the body.
+The browser displays an available body as soon as it arrives, even if its version differs from the index.
+The body supplies the row state before the browser enables its actions.
+A version difference starts the guarded page refresh.
+If the index changes during the request, the browser accepts only a body with the current index version.
+The refresh keeps the open form when its body has the same version as the new index.
+If the body request or index reports a missing item, the browser closes the card and shows the missing item notice.
 The Show chips replace the right count text.
 All includes active Review records and all For you actions.
 Done shows completed For you actions.
@@ -1863,7 +1886,8 @@ A repeated POST retries a pending request without adding another pending log ent
 Sent and alerted requests do not send again.
 A process claim prevents concurrent sends of one request without holding the List lock during delivery.
 Delivery is at least once; a crash after a send but before its saved result can cause another send.
-The Update cell shows `sent to <recipient>` and the time until the next item update outside the List page.
+The Update cell shows a notice only when delivery fails.
+The Log keeps the sent record.
 The log and retry use the original recipient after reassignment.
 The page retains draft words, dates, actions, request IDs, and tokens during a refresh.
 An unchanged retry uses its saved request ID and token after a lost response.

@@ -6,12 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.buildlog.store import host_name
+from scripts.lib import conf
 from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 @dataclass(frozen=True)
-class SlotTestConfiguration:
+class CopyTestConfiguration:
     settings: Path
     machine: str
     environment: Mapping[str, str]
@@ -28,7 +29,7 @@ def write_private_build_roots(settings: Path, root: Path, machine: str) -> None:
     _ = settings.write_text("\n".join(lines) + "\n")
 
 
-def private_slot_config(root: Path) -> SlotTestConfiguration:
+def private_copy_config(root: Path) -> CopyTestConfiguration:
     """Give direct calls and child commands private roots without a caller session."""
     environment = config_environment(root / "config")
     settings = Path(environment["CONF_DIR"]) / "build_folders.conf"
@@ -86,4 +87,4 @@ folders.unused_days=2"""
         "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
         "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
     })
-    return SlotTestConfiguration(settings, machine, environment)
+    return CopyTestConfiguration(settings, machine, environment)

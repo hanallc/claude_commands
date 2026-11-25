@@ -656,11 +656,6 @@ def verdict_button(item_type: VerdictItemType, action: VerdictAction, *,
     return f'<button {pressed}name="{item_type}" value="{action}"{style}{disabled}>{label}</button>'
 
 
-class ReturningActionHeading(StrEnum):
-    ITEM_RETURNS = "The item returns to you"
-    SENDS_TO_SHOWRUNNER = "Sends to showrunner"
-
-
 def console_dialog(dialog_id: str, title_id: str, title: str, body: str, *,
                    before_body: str = '', footer: str = '', form: bool = False, body_class: str = '') -> str:
     """Render a console dialog with its shared assets."""
@@ -730,11 +725,11 @@ CONSOLE_DIALOG_ASSETS = f'<style>{CONSOLE_DIALOG_STYLE}</style><script>{CONSOLE_
 
 
 def review_action_groups(closing_buttons: str, returning_buttons: str, later_controls: str = "", *,
-                         returning_heading: ReturningActionHeading = ReturningActionHeading.ITEM_RETURNS) -> str:
+                         returning_heading_html: str = "") -> str:
     """Render the Review action groups that have controls."""
     groups = (
         ("Closes the item", closing_buttons, ""),
-        (returning_heading, returning_buttons, ""),
+        (returning_heading_html or "The item returns to you", returning_buttons, ""),
         ("Hides it until", later_controls, " review-later"),
     )
     return '<div class="review-actions">' + "".join(

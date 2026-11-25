@@ -38,7 +38,7 @@ from scripts.buildlog.store import host_name
 from scripts.agents import remote
 from scripts.build_queue import mac_run
 from scripts.herdr import herdr, pane_launch
-from scripts.lib import build_folders, build_slots, cargo_output, conf, git_exclude, git_files, scratch
+from scripts.lib import build_folders, build_copies, cargo_output, conf, git_exclude, git_files, scratch
 from scripts.message import sessions
 from scripts.lint import folder_audit, sweep, tmp_sweep
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -151,14 +151,14 @@ REQUEST_COPY_WITH_UNIT_LOCK = """
 from contextlib import nullcontext
 from pathlib import Path
 import sys
-from scripts.lib import build_slots
+from scripts.lib import build_copies
 from scripts.worktree import worktrees
 
 source = Path(sys.argv[1])
 rename = worktrees.UnitFolderRename("origin", "demo", "renamed", source, source.with_name("renamed"))
 with rename.hold_copy_allocations() if "--same-process" in sys.argv else nullcontext():
     try:
-        with build_slots.take_copy(source, "HEAD", showrunner="demo", unit="demo",
+        with build_copies.take_copy(source, "HEAD", showrunner="demo", unit="demo",
                                    work="rename", purpose="fixture"):
             raise AssertionError("the copy bypassed the unit lock")
     except BlockingIOError as error:
@@ -3523,7 +3523,7 @@ raise SystemExit(2)
             path.mkdir(parents=True)
         _ = self.git(self.repository, "remote", "set-url", "origin", str(self.root / "other.git"))
         with patch.dict(os.environ, self.environment, clear=True):
-            with build_slots.take_copy(self.repository, self.base, showrunner="fixture", unit="demo",
+            with build_copies.take_copy(self.repository, self.base, showrunner="fixture", unit="demo",
                                        work="retire", purpose="fixture") as copy:
                 self.assertEqual(copy.path, root / "other/demo/1")
                 git_directory = git_files.at(copy.path).git_dir

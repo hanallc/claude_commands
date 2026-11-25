@@ -46,6 +46,7 @@ from typing import IO, Literal, TextIO, TypedDict, cast, override
 from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
+from xml.etree import ElementTree
 
 
 from scripts.aws_target import aws_page, machines_page
@@ -5236,7 +5237,13 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertIn(b'<template data-card-body><div class="list-panel review-panel change">', card.body)
         for body in (table.body, card.body):
             self.assertIn(b'<h3>How to check</h3>', body)
-            self.assertIn(b'Sends to page-owner', body)
+            heading_match = re.search(rb'<div class="review-action-group">(<span>.*?</span>)<div>', body)
+            assert heading_match is not None
+            heading = ElementTree.fromstring(heading_match[1])
+            self.assertEqual(''.join(heading.itertext()), 'Sends to page-owner')
+            name = heading.find('span')
+            assert name is not None
+            self.assertEqual((name.get('data-color-text'), name.get('style')), ('role.showrunner', 'color:#a379fd'))
             self.assertIn(b'value="question">Ask a question</button>', body)
             self.assertNotIn(b'value="works"', body)
             self.assertNotIn(b'data-later-toggle', body.split(b'</template>', 1)[0])
@@ -6996,9 +7003,10 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_list_go_keeps_the_go_when_the_save_cannot_confirm_durability(self) -> None:
         morty, unit, item, _ask, body = self.go_fixture()
-        save = cast(Callable[[object, the_list.ListItem], None], getattr(the_list, "_save"))
-        def save_then_fail(store: object, changed: the_list.ListItem) -> None:
-            save(store, changed)
+        save = the_list._save  # pyright: ignore[reportPrivateUsage]
+        def save_then_fail(store: record_store.NumberedRecords, changed: the_list.ListItem, *,
+                           previous_producer: staff.StaffId | None = None) -> None:
+            save(store, changed, previous_producer=previous_producer)
             raise atomic_file.AtomicDurabilityUnconfirmed("The folder sync is unconfirmed.")
         with patch.object(the_list, "_save", side_effect=save_then_fail):
             code, reply, delivery = self.post_go(body)
@@ -7022,11 +7030,12 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_list_go_keeps_the_ledger_record_when_the_reload_after_the_save_fails(self) -> None:
         morty, unit, item, _ask, body = self.go_fixture()
-        save = cast(Callable[[object, the_list.ListItem], None], getattr(the_list, "_save"))
+        save = the_list._save  # pyright: ignore[reportPrivateUsage]
         load = the_list.load
         saved = threading.Event()
-        def save_then_fail(store: object, changed: the_list.ListItem) -> None:
-            save(store, changed)
+        def save_then_fail(store: record_store.NumberedRecords, changed: the_list.ListItem, *,
+                           previous_producer: staff.StaffId | None = None) -> None:
+            save(store, changed, previous_producer=previous_producer)
             saved.set()
             raise atomic_file.AtomicDurabilityUnconfirmed("The folder sync is unconfirmed.")
         def load_fails_after_save(keeper: staff.StaffId, identity: str) -> the_list.ListItem:

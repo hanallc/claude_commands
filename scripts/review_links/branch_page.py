@@ -492,6 +492,7 @@ def render(page: BranchPage, *, failure: str = "", action: str = "") -> bytes:
     if not page.rows:
         return empty_page(failure)
     names = staff_names.read()
+    unit_label = names.role_label("unit", "Unit:")
     unit_rows: list[str] = []
     unowned_rows: list[str] = []
     for row in page.rows:
@@ -500,7 +501,7 @@ def render(page: BranchPage, *, failure: str = "", action: str = "") -> bytes:
         if isinstance(row, MergedUnitBranch):
             unit_status = (f"active, now on branch {html.escape(row.unit_status.branch)}"
                            if isinstance(row.unit_status, ActiveUnitBranch) else "not active")
-            owner = f"Unit: {names.html(row.unit)} — {unit_status}\n"
+            owner = f"{unit_label} {names.html(row.unit)} — {unit_status}\n"
         rows = unit_rows if isinstance(row, MergedUnitBranch) else unowned_rows
         dates_in_order = datetime.fromisoformat(row.commit_date) <= datetime.fromisoformat(row.merge_date)
         date_class = "date-in-order" if dates_in_order else "date-out-of-order"
