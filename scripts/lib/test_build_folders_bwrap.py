@@ -186,6 +186,8 @@ def _claim_after_other_owner(candidate: Path) -> None:
 
 def run_claim(candidate: Path, case: ClaimCase) -> None:
     """Run the real claim with the selected fixture state."""
+    if case is ClaimCase.NESTED_MOUNT:
+        assert not build_folders.may_remove_folder_tree(candidate), f"the mount table allowed removal of {candidate}"
     check_guard(candidate, case)
     lease = build_folders.lease_path(candidate)
     _ = lease.write_text(json.dumps({"pid": _lease_owner(case)}))
