@@ -151,17 +151,24 @@ def waiting_images(request: console.NewsRequest, *, status: change_page.Delivery
     return frozenset(waiting)
 
 
-def register(image: Path, caption: str, owner: staff.StaffId, subject: str,
-             *, before: Path | None = None, list_item: str | None = None) -> image_store.ImageRecord:
+def register(image: Path, title: str, owner: staff.StaffId, subject: str,
+             *, look_for: tuple[str, ...] = (), before: Path | None = None,
+             list_item: str | None = None) -> image_store.ImageRecord:
     """Register one image or a before and after pair for its staff owner."""
-    if not caption.strip():
-        raise ValueError("the caption is empty; say the change in the fewest plain words that stay accurate")
-    members = staff.snapshot()
-    if members.by_id(owner) is None:
+    title = title.strip()
+    if title.splitlines() != [title]:
+        raise ValueError("The image title must be one nonempty line.")
+    limit = conf.read("review_links").whole("max_chars.image_title")
+    if len(title) > limit:
+        raise ValueError(f"--title has {len(title)} characters. The limit is {limit}. Put the details in --look-for lines.")
+    lines = tuple(line.strip() for line in look_for)
+    if any(line.splitlines() != [line] for line in lines):
+        raise ValueError("Each --look-for value must be one nonempty line.")
+    if staff.snapshot().by_id(owner) is None:
         raise ValueError(f"no staff record for owner {owner}")
     keeper = the_list.image_list_keeper(list_item) if list_item is not None else None
     return image_store.register_file(image, images_root(review_link.review_root().resolve()),
-                                     caption, str(owner), subject, before=before,
+                                     title, str(owner), subject, look_for=lines, before=before,
                                      list_item=list_item, list_keeper=keeper)
 
 
@@ -203,7 +210,7 @@ def owner_names(record: staff.StaffSnapshot, identity: str) -> tuple[str, str]:
 def picture(record: image_store.ImageRecord, label: str, file: str) -> str:
     """Link one image to the shared zoom; show its pair label above it and in the zoom."""
     path = html.escape(image_path(record, file), quote=True)
-    alt = record["caption"].splitlines()[0]
+    alt, *_ = record["title"].splitlines() or [""]
     zoom_label = f' data-image-zoom-label="{html.escape(label, quote=True)}"' if label else ''
     linked = (f'<a data-image-zoom{zoom_label} href="{path}" target="_blank" rel="noopener"><img src="{path}" '
               + f'alt="{html.escape(f"{label}: {alt}" if label else alt, quote=True)}" loading="lazy"></a>')
@@ -232,13 +239,19 @@ def _answer_form(identity: str, token: str, round_id: str, feedback_rows: int, *
             + '<span role="status" data-image-status hidden></span></form>')
 
 
+def _card_heading(record: image_store.ImageHeading) -> str:
+    title = html.escape(record["title"])
+    lines = "".join(f"<li>{html.escape(line)}</li>" for line in record["look_for"])
+    look_for = f'<ul class="image-look-for">{lines}</ul>' if lines else ""
+    return f'<h2 class="image-title">{title}</h2>{look_for}'
+
+
 def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapshot, feedback_rows: int,
          names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT, *,
          open_questions: Mapping[str, QuestionSendState] = NO_OPEN_QUESTIONS) -> str:
-    """Show the caption as the title, then the aligned details, the image or pair, the feedback field and the answer buttons."""
+    """Render an image card with its title, details, and actions."""
     pair = "before" in record
     pictures = "".join(picture(record, label, file) for label, file in shown_files(record))
-    caption = record["caption"]
     added = datetime.fromisoformat(record["registered_at"])
     owner, name = owner_names(members, record["owner"])
     names = staff_names.for_page(names, members)
@@ -250,7 +263,7 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
     round_id = feedback_round(answered_question_ids(record))
     return (f'<article id="image-{record["id"]}"{' class="pair"' if pair else ''} data-image="{record["id"]}" '
             + f'data-owner="{html.escape(record["owner"], quote=True)}" data-owner-name="{html.escape(name, quote=True)}"{receiver}>'
-            + f'<h2 class="caption">{html.escape(caption)}</h2><dl class="image-details">'
+            + _card_heading(record) + '<dl class="image-details">'
             + f'<dt>Owner:</dt><dd>{shown_owner}</dd>'
             + f'<dt>For  :</dt><dd>{html.escape(record["subject"])}</dd>'
             + f'<dt>Added:</dt><dd><time datetime="{html.escape(record["registered_at"], quote=True)}">'
@@ -270,11 +283,15 @@ def _pending_answer_cards(root: Path, token: str) -> list[str]:
         except (OSError, ValueError) as error:
             print(f"review-links images: {error}", file=sys.stderr)
             continue
+        removed = f"Removed picture {identity}"
+        heading = saved.get("heading")
+        details = (_card_heading(heading) + f'<p>{removed}</p>' if heading is not None
+                   else _card_heading({"title": removed, "look_for": []}))
         for key, answer in saved["attempts"].items():
             if answer["recipients"] and set(answer["recipients"]) <= set(answer["confirmed"]):
                 continue
             words = html.escape(answer.get("words", answer["message"]))
-            cards.append(f'<article><h2 class="caption">Removed picture {identity}</h2>'
+            cards.append(f'<article>{details}'
                          + f'<p class="image-answer-words">{words}</p>'
                          + '<form method="post" data-image-form>'
                          + f'<input type="hidden" name="image" value="{identity}">'
@@ -318,7 +335,7 @@ def render(status: change_page.DeliveryStatus) -> bytes:
                + f' {card_motion.attributes()}'
                + f' data-answer-refresh-seconds="{answer_refresh_seconds}" data-waiting-images="{" ".join(waiting)}">'
                + f'{"".join(cards)}</div><p hidden data-empty></p></div></div>'
-               + '<template data-image-draft-template><article><h2 class="caption"></h2>'
+               + '<template data-image-draft-template><article><h2 class="image-title"></h2>'
                + _answer_form("", "", "", rows, question=False) + '</article></template>'
                + '<noscript>Enable JavaScript to answer on an image.</noscript>'
                + f'<script>{SCRIPT}</script>')
@@ -395,7 +412,7 @@ def answer_message(record: image_store.ImageRecord, answer: str, feedback: str) 
         ANSWER_PREFIX + ANSWERS[answer],
         *((f"Feedback: {feedback}",) if feedback else ()),
         *(f"{label or 'Image'}: {origin}{image_path(record, file)}" for label, file in shown_files(record)),
-        f"Caption: {record['caption']}", f"For: {record['subject']}",
+        f"Title: {record['title']}", *image_store.look_for_message_lines(record), f"For: {record['subject']}",
         *((f"List item: {record['list_item']}",) if "list_item" in record else ()),
         "After you act on it, delete the image: "
         + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))
@@ -416,6 +433,7 @@ def _image_answers(directory: Path, record: image_store.ImageRecord) -> image_st
         return image_store.new_answers(record)
     if answers["registered_at"] != record["registered_at"] or answers["owner"] != record["owner"]:
         raise ValueError("This picture has a different registration.")
+    answers["heading"] = {"title": record["title"], "look_for": record["look_for"]}
     return answers
 
 
@@ -561,7 +579,8 @@ STYLE = """<style>[hidden]{display:none!important}
 .image-pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:start}
 .image-pair figure{margin:0}.image-pair figcaption{margin:0 0 6px;font-weight:600}
 @container (max-width:599px){.image-pair{grid-template-columns:minmax(0,1fr)}}
-.caption{margin:0 0 8px;font-size:1.25rem;line-height:1.35;font-weight:600;white-space:pre-line}
+.image-title{margin:0 0 8px;font:inherit;white-space:pre-line;overflow-wrap:anywhere}
+.image-look-for{margin:0 0 12px;padding-inline-start:1.4em;color:var(--ink-2);font-size:.9rem}
 .image-details{display:grid;grid-template-columns:max-content 1fr;column-gap:1ch;margin:0 0 12px;font:14px/1.45 ui-monospace,monospace;opacity:.8}
 .image-details dt{white-space:pre}.image-details dd{margin:0}
 [data-images] form{display:grid;gap:8px;margin-top:12px}
@@ -915,7 +934,8 @@ def main(arguments: list[str]) -> int:
     _ = add.add_argument("--image", type=Path, help="the image file to copy")
     _ = add.add_argument("--before", type=Path, help="the before image of a pair; give --after with it")
     _ = add.add_argument("--after", type=Path, help="the after image of a pair; give --before with it")
-    _ = add.add_argument("--caption", required=True, help="the change in the fewest plain words that stay accurate")
+    _ = add.add_argument("--title", required=True, help="a short title on one line")
+    _ = add.add_argument("--look-for", action="append", default=[], help="one point to check; repeat for each point")
     _ = add.add_argument("--owner", required=True, help="the staff id that owns the image")
     subject = add.add_mutually_exclusive_group(required=True)
     _ = subject.add_argument("--change", help="the change id, such as sdlc/C12")
@@ -939,8 +959,9 @@ def main(arguments: list[str]) -> int:
                 shown = after
             else:
                 parser.error("give --image, or --before and --after")
-            record = register(shown, cast(str, args.caption), staff.StaffId(cast(str, args.owner)),
-                              f"Change {change}" if change is not None else f"Phase {phase}", before=before,
+            record = register(shown, cast(str, args.title), staff.StaffId(cast(str, args.owner)),
+                              f"Change {change}" if change is not None else f"Phase {phase}",
+                              look_for=tuple(cast(list[str], args.look_for)), before=before,
                               list_item=cast(str | None, args.list_item))
             origin = f"http://{review_link.link_host()}:{conf.read('review_links').whole('server_port')}"
             print(f"registered {record['id']}: "
