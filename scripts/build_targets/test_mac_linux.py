@@ -37,7 +37,7 @@ from scripts.build_targets.mac_linux import send_guest_execution
 from scripts.buildlog import store, treekey
 from scripts.copies import copies
 from scripts.lib import atomic_file, build_folders, conf, process_group, process_start, scratch
-from scripts.lib.build_slots import SlotQueuePosition
+from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test
@@ -910,7 +910,7 @@ class MacLinuxRouteTests(unittest.TestCase):
     registry: Path = Path()
     placed: placement.PlacementAssignment = placement.PlacementAssignment(
         'gate-episode', 'gate-attempt', placement.PlacementDestination(
-            'ssh', mac_linux.TARGET, 'fixture-guest', claim_state.RepositoryScope('claude', slot=1), 1),
+            'ssh', mac_linux.TARGET, 'fixture-guest', claim_state.RepositoryScope('claude'), 1),
         execution_identity.SourceKeyUnavailable('fixture'), placement.SubmittingOwner('natedev', 1, 'start'),
         OwningSession('submitting-session'), 0.0)
     # Each consume request, the SSH trace at that moment, and whether the gate held the named Mac claim.
@@ -963,7 +963,7 @@ class MacLinuxRouteTests(unittest.TestCase):
         _ = (config / 'machines.conf').write_text(
             'aliases=natedev mac\nnatedev.platform=linux\nnatedev.hosts=natedev\n'
             + 'mac.platform=darwin\nmac.hosts=fixture-mac\n', encoding='utf-8')
-        _ = write_config_fixture(config / 'build_folders.conf', '# whole: 1..\nslots.fixture-mac.default_max=1\n')
+        _ = write_config_fixture(config / 'build_folders.conf')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             'GATE_STATE_DIR': str(self.root / 'gate-state'),
             'GATE_PASSED_DIR': str(self.root / 'gate-passes'),
@@ -1091,7 +1091,9 @@ fi
         build = self.guest_home / 'build'
         self.assertLessEqual(set(self.guest_home.iterdir()), {main, build})
         self.assertFalse((main / '.git/mac-linux').exists())
-        self.assertEqual(list(build.rglob('mac-linux*')), [])
+        claim_locks = build / '.build-claim-locks'
+        self.assertEqual([path for path in build.rglob('mac-linux*')
+                          if not (path.name == 'mac-linux.lock' and path.is_relative_to(claim_locks))], [])
         self.assertEqual(self.trace.read_text(encoding='utf-8').splitlines(), list(events))
 
     def assert_bundle(self, run: mac_linux.MacLinuxGateRun, form: mac_linux.BundleForm,
@@ -1747,7 +1749,7 @@ fi
         path = self.root / 'assignment.json'
         grant = wire.Assignment(guest)
         admission_client.write_assignment(path, grant)
-        admitted = first_step.FirstStepAdmission(SlotQueuePosition(guest.episode, guest.since),
+        admitted = first_step.FirstStepAdmission(CopyQueuePosition(guest.episode, guest.since),
             first_step.OwnedGatePlacement(grant, submitted), path)
         pending = wire.DispatchStatus(guest, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
 
@@ -2711,7 +2713,7 @@ with (patch.object(conf, 'read', read_config),
     def test_free_now_recovers_the_guest_enable_key_from_the_repository(self) -> None:
         paths = mac_test.state_paths(mac_linux.TARGET)
         configuration = self.registry.with_name('mac_linux.conf')
-        _ = write_config_fixture(configuration, 'slots=1\n')
+        _ = write_config_fixture(configuration, '')
         fallback = self.registry.parent / 'repository' / self.registry.name
         _ = write_config_fixture(fallback, 'enabled.mac-linux=on\n')
         _ = self.registry.write_text(self.registry.read_text().replace('enabled.mac-linux=on\n', ''))
@@ -2724,7 +2726,7 @@ with (patch.object(conf, 'read', read_config),
         _ = write_config_fixture(self.registry, 'pinned_targets=hana-gpu,mac-linux\n')
         paths = mac_test.state_paths(mac_linux.TARGET)
         configuration = self.registry.with_name('mac_linux.conf')
-        _ = write_config_fixture(configuration, 'slots=1\n')
+        _ = write_config_fixture(configuration, '')
         self.assertEqual(mac_test.free_now(paths, configuration, self.repo), 'free')
         now = time.time()
         with patch.object(mac_linux, 'time', return_value=now):

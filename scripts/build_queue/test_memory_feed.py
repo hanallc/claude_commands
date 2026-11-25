@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.review_links.browser_test_support import assert_status_states
-from scripts.build_queue import admission_records, admission_service, execution_identity, limits_view, placement, queue_evidence, slot_wait
+from scripts.build_queue import admission_records, admission_service, execution_identity, limits_view, placement, queue_evidence, queue_wait
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
 
@@ -41,10 +41,9 @@ from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue import memory_trace
 from scripts.build_queue.test_program_memory_feed import TRACE_POLICY
 from scripts.build_queue.test_queue_view import cloud_reading
-from scripts.build_queue.slot_wait import NoNamedStep, recorded_step
+from scripts.build_queue.queue_wait import NoNamedStep, recorded_step
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
 from scripts.build_targets import build_targets, mac_linux, target_config, targets
-from scripts.disks.slots import lease_record
 from scripts.build_queue.queue_view import refresh_mac_builds
 from scripts.build_queue.admission_test_support import (
     AdmissionFixture, FixedSystemReader, NOW as ADMISSION_NOW, only_admitted, publish_fixture_view,
@@ -55,7 +54,7 @@ from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, 
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lint.memory_test_support import write_pressure_reading
 from scripts.lib import atomic_file, build_folders, conf, test_hang_guard
-from scripts.lib.build_slots_test_support import write_private_build_roots
+from scripts.lib.build_copies_test_support import write_private_build_roots
 from scripts.lib.process_group import run_process_group
 from scripts.review_links import console_theme, page_frame, review_link, test_page_frame, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, HAND_MADE, GateJobNotRecorded, StepJob
@@ -80,7 +79,11 @@ FIXTURE_MACHINE = "fixture"
 
 def needs_all_page_proof_views(repo: Path) -> bool:
     """Use all views when the checkout lease shows nightly work."""
-    return lease_record(repo).get("work") == "test-nightly"
+    try:
+        lease = cast(object, json.loads(build_folders.lease_path(repo).read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return False
+    return isinstance(lease, dict) and cast(dict[str, object], lease).get("work") == "test-nightly"
 
 
 class FeedStopped(Exception):
@@ -611,80 +614,33 @@ class MemoryFeedTests(unittest.TestCase):
             with self.subTest(expected=expected), mock.patch.object(subprocess, "run", return_value=result):
                 self.assertEqual(REQUEST_TOKEN_DUMP(), expected)
 
-    def test_run_slot_numbers_use_the_run_machine_root(self) -> None:
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root / "home")})))
-        mac_machine = "private-mac-host"
-        _ = (self.root / "machines.conf").write_text(f"mac.hosts={mac_machine}\n")
-        roots = {"natedev": self.root / "linux-slots", mac_machine: self.root / "mac-slots"}
-        roots["natedev"].mkdir()
-        linked_root = self.root / "linux-slot-link"
-        linked_root.symlink_to(roots["natedev"], target_is_directory=True)
+    def test_running_rows_keep_the_natedev_and_mac_run_folders(self) -> None:
+        local_home = self.root / "local-home"
         mac_home = self.root / "remote-home"
-        for label, machine, folder, configured, expected in (
-            ("natedev slot", "natedev", roots["natedev"] / "hana/unit/2", "machine", 2),
-            ("natedev common root", "natedev", roots["natedev"] / "hana/unit/2", "common", 2),
-            ("natedev symlink root", "natedev", roots["natedev"] / "hana/unit/2", "symlink", 2),
-            ("Mac host root", "mac", roots[mac_machine] / "hana/unit/3", "machine", 3),
-            ("Mac tilde root", "mac", mac_home / "build/hana/unit/3", "~", 3),
-            ("Mac HOME root", "mac", mac_home / "build/hana/unit/3", "$HOME", 3),
-            ("Mac braced HOME root", "mac", mac_home / "build/hana/unit/3", "${HOME}", 3),
-            ("local tilde root", "natedev", Path.home() / "build/hana/unit/2", "~", 2),
-            ("local HOME root", "natedev", Path.home() / "build/hana/unit/2", "$HOME", 2),
-            ("Mac home unavailable", "mac", Path.home() / "build/hana/unit/3", "unknown-home", "—"),
-            ("outside root", "natedev", self.root / "worktree", "machine", "—"),
-            ("lookalike outside root", "natedev", self.root / "hana/unit/2", "machine", "—"),
-            ("other machine root", "mac", roots["natedev"] / "hana/unit/2", "machine", "—"),
-            ("nested folder", "natedev", roots["natedev"] / "hana/unit/2" / "crate", "machine", "—"),
-            ("no roots", "natedev", roots["natedev"] / "hana/unit/2", "none", "—"),
-            ("Mac without roots", "mac", roots[mac_machine] / "hana/unit/3", "none", "—"),
-        ):
-            with self.subTest(label=label):
-                settings = ("".join(f"roots.build.{host}={path}\n" for host, path in roots.items())
-                            if configured == "machine" else f"roots.build={roots['natedev']}\n" if configured == "common" else "")
-                if configured in ("~", "$HOME", "${HOME}", "unknown-home"):
-                    selected_host = mac_machine if machine == "mac" else machine
-                    prefix = "~" if configured == "unknown-home" else configured
-                    settings = f"roots.build.{selected_host}={prefix}/build\n"
-                if configured == "symlink":
-                    settings = f"roots.build.natedev={linked_root}\n"
-                _ = (self.root / "build_folders.conf").write_text(settings)
-                reading = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
-                step = replace(reading.view.running[0], folder=str(folder))
-                waiter = replace(reading.view.waiting[0], folder=str(folder))
-                reading = replace(reading, view=replace(reading.view, running=(step,), waiting=(waiter,)),
-                    explanation=replace(reading.explanation,
-                        running=(replace(reading.explanation.running[0], step=step),)))
-                build = queue_view.MacBuild(710001, str(folder), reading.explanation.now - 30,
-                                           "cargo nextest run", "hana")
-                mac = queue_view.MacBuildReading(reading.explanation.now, (build,) if machine == "mac" else (),
-                                                home="" if configured == "unknown-home" else str(mac_home))
-                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
+        local_folder = str(local_home / "build/hana/unit/2")
+        mac_folder = str(mac_home / "build/hana/unit/3")
+        reading = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
+        step = replace(reading.view.running[0], folder=local_folder)
+        reading = replace(reading, view=replace(reading.view, running=(step,)),
+            explanation=replace(reading.explanation, running=(replace(reading.explanation.running[0], step=step),)))
+        build = queue_view.MacBuild(710001, mac_folder, reading.explanation.now - 30, "cargo nextest run", "hana")
+        for home in (str(mac_home), ""):
+            with self.subTest(mac_home=home):
+                mac = queue_view.MacBuildReading(reading.explanation.now, (build,), home=home)
+                with (mock.patch.dict(os.environ, {"HOME": str(local_home)}),
+                      mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
                       mock.patch.object(memory_feed, "host_name", return_value="natedev"),
                       mock.patch.object(queue_view, "read_mac_builds", return_value=mac)):
                     page = memory_feed.reading()
-                rows = [row for row in page["walk"] if row.get("machine") == machine]
-                self.assertEqual(len(rows), 1)
-                self.assertIn("run_folder", rows[0])
-                run_folder = rows[0].get("run_folder")
-                assert isinstance(run_folder, memory_feed.RecordedRunFolder)
-                self.assertEqual(run_folder.path, str(folder))
-                self.assertEqual(staff_names.parts_text(rows[0].get("name_parts", [])), rows[0]["name"])
-                # The feed sends no slot number; the slot folder ends with it.
-                self.assertNotIn("slot", rows[0])
-                self.assertEqual(rows[0].get("slot_folder", "—").rsplit("/", 1)[-1], str(expected))
-                # A run in a slot names the slot folder and its machine, so the Disks page finds the run.
-                self.assertEqual((rows[0].get("slot_folder"), rows[0].get("slot_machine")),
-                                 ("/".join(folder.parts[-3:]), mac_machine if machine == "mac" else "natedev") if expected != "—" else (None, None))
-                payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
-                shown_rows = cast(list[dict[str, object]], payload["walk"])
-                self.assertTrue(all("slot" not in row for row in shown_rows))
-                self.assertTrue(all("slot" not in row for row in page["waiters"]))
-                for waiting in page["waiters"]:
-                    self.assertEqual(staff_names.parts_text(waiting.get("name_parts", [])), waiting["name"])
-                # A natedev step that waits in a slot names it too; the waiting table shows no slot number.
-                in_slot = expected != "—" if machine == "natedev" else label == "other machine root"
-                self.assertEqual([(row.get("slot_folder"), row.get("slot_machine")) for row in page["waiters"]],
-                                 [("/".join(folder.parts[-3:]), "natedev") if in_slot else (None, None)])
+                for machine, folder, folder_home in (("natedev", local_folder, str(local_home)),
+                                                     ("mac", mac_folder, home)):
+                    row, = [row for row in page["walk"] if row.get("machine") == machine]
+                    self.assertEqual(row.get("run_folder"), memory_feed.RecordedRunFolder(folder, folder_home))
+                    self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), row["name"])
+                self.assertTrue(page["waiters"])
+                for waiter in page["waiters"]:
+                    self.assertEqual(staff_names.parts_text(waiter.get("name_parts", [])), waiter["name"])
+                    self.assertNotIn("run_folder", waiter)
 
     def test_mac_reading_collects_and_preserves_the_remote_home(self) -> None:
         mac_home = str(self.root / "remote-home")
@@ -1783,7 +1739,7 @@ process.stdout.write(JSON.stringify({
         build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo nextest run", "hana")
         identity = unit_labels.UnitLabels("mac caller", "unregistered session")
         row = memory_feed.mac_work_row(build, queue_view.MacBuildReading(1, (build,)), identity,
-                                      names=read_step_names(), slot_roots={}, slot_machine="private-mac-host")
+                                      names=read_step_names())
         self.assertEqual((row.get("caller"), row.get("owner_text")), ("mac caller", "mac caller"))
         self.assertEqual(row["name"], "mac caller: nextest")
 
@@ -1798,7 +1754,7 @@ process.stdout.write(JSON.stringify({
                     what="run 6 installs")
                 row = memory_feed.mac_work_row(build, queue_view.MacBuildReading(1, (build,)),
                                               unit_labels.UnitLabels(""), names=read_step_names(),
-                                              slot_roots={}, slot_machine="private-mac-host", placed_step=placed)
+                                              placed_step=placed)
                 self.assertEqual(row["name"], "hana: run 6 installs")
 
     def handler_mac_page(self, *, recorded_unit: str = "handler", caller_kind: str = "worker",
@@ -3153,8 +3109,8 @@ const refresh = createPageRefresh(tick);
         )
         for unit, command, arguments, call in cases:
             with (self.subTest(unit=unit),
-                  mock.patch.object(slot_wait, "verify_package", return_value=arguments[0]) as parse):
-                name, _, facts = slot_wait.command_slot_job(("bash", "-c", command), RECORDED_STEP_NAMES)
+                  mock.patch.object(queue_wait, "verify_package", return_value=arguments[0]) as parse):
+                name, _, facts = queue_wait.command_queue_job(("bash", "-c", command), RECORDED_STEP_NAMES)
                 assert isinstance(name, memory_feed.QueueRowName)
                 step = f"test {arguments[0]}"
                 row = memory_feed.queue_row_labels(name, name, unit=memory_feed.StaffUnitName(unit))
@@ -4353,8 +4309,7 @@ const refresh = createPageRefresh(tick);
                 build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo nextest run", "hana",
                     origin=queue_view.MacBuildOrigin.CI, ci_runner=runner, ci_job=job)
                 row = memory_feed.mac_work_row(build, queue_view.MacBuildReading(1, (build,)),
-                                              unit_labels.UnitLabels("unknown"), names=read_step_names(),
-                                              slot_roots={}, slot_machine="private-mac-host")
+                                              unit_labels.UnitLabels("unknown"), names=read_step_names())
                 self.assertEqual(row["name"], "hana CI: nextest")
                 self.assertEqual(row.get("ci_label"), label)
 

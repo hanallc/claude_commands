@@ -512,7 +512,7 @@ Record each wait and hold, so the units board names the reason. User, 2026-11-15
   `--reason` says until what: `the user checks the review page`. Use the `--kind` of whoever keeps it.
 - Close the record with `progress_history.py finish-wait --session-dir "${SESSION_DIR}" --wait-id <id>` when the reason ends.
   `start-phase` of the target and the end of the run close it.
-- A wait for a worker, a gate, a build slot or build memory needs no record here; its own tools record it.
+- The tools record waits for workers, gates, numbered copies, and build memory.
 </WaitRecord>
 
 A requested status check — `/unit:report`, or a user or showrunner asking —
