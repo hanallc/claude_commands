@@ -395,6 +395,14 @@ gate.run_suites(Path.cwd(), full=True)
     def test_gate_keeps_its_folder_and_record_when_removal_refuses(self) -> None:
         parent = self.root / "kept-gate"
         parent.mkdir()
+        expected_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, ())
+        self.assertNotIn(signal.SIGTERM, expected_mask)
+        original_report = gate.report_retained_gate_folder
+
+        def report_with_restored_mask(path: str, reason: str) -> None:
+            self.assertEqual(signal.pthread_sigmask(signal.SIG_UNBLOCK, ()), expected_mask)
+            original_report(path, reason)
+
         with mock.patch.dict(os.environ, self.environment, clear=True):
             for scope in ("shared", "private"):
                 with self.subTest(scope=scope):
@@ -402,6 +410,7 @@ gate.run_suites(Path.cwd(), full=True)
                                       else gate.private_gate_recovery(self.checkout, parent))
                     with (recovery_scope as recovery,
                           mock.patch.object(build_folders, "may_remove_build_path", return_value=False) as remove,
+                          mock.patch.object(gate, "report_retained_gate_folder", side_effect=report_with_restored_mask),
                           redirect_stderr(io.StringIO()) as report):
                         with gate.gate_temporary(recovery, "merge-gate", parent) as folder:
                             self.assertTrue(folder.is_dir())

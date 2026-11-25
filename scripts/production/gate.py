@@ -989,6 +989,7 @@ def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator
             yield folder
         finally:
             previous_signals = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+            report_retention: Callable[[], None] | None = None
             try:
                 try:
                     cleanup.close()
@@ -997,18 +998,23 @@ def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator
                         try:
                             remaining = build_folders.temporary_allocation_entries(folder)
                         except OSError:
-                            report_retained_gate_folder(str(folder), "the gate could not confirm removal")
+                            report_retention = partial(
+                                report_retained_gate_folder, str(folder), "the gate could not confirm removal")
                         else:
                             if folder in remaining:
-                                report_retained_gate_folder(str(folder), "the gate could not remove its folder")
+                                report_retention = partial(
+                                    report_retained_gate_folder, str(folder), "the gate could not remove its folder")
                             elif remaining:
-                                paths = ", ".join(map(str, remaining))
-                                report_retained_gate_folder(paths, "the gate could not remove its lease files")
+                                report_retention = partial(
+                                    report_retained_gate_folder, ", ".join(map(str, remaining)),
+                                    "the gate could not remove its lease files")
                             else:
                                 recovery.folders.remove(str(folder))
                                 recovery.save()
             finally:
                 _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous_signals)
+                if report_retention is not None:
+                    report_retention()
 
 
 def typecheck_venv_path() -> Path:
