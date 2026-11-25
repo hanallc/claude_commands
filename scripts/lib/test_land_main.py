@@ -1,6 +1,7 @@
 """Land commits and retry hooks against a private local origin."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import subprocess
@@ -10,6 +11,7 @@ from unittest import mock
 
 from scripts.lib import land_main, main_push_lock
 from scripts.lib.rerun_test_support import SCRIPTS, ScriptRepositoryTestCase
+from scripts.production import behavior_check
 
 
 class LandMainTests(ScriptRepositoryTestCase):
@@ -18,7 +20,8 @@ class LandMainTests(ScriptRepositoryTestCase):
         super().setUp()
         self.seed()
         self.environment.update(TEST_HOOK_LOG=str(self.root / "hook-runs"),
-                                TEST_HOOK_FAIL=str(self.root / "hook-fails"))
+                                TEST_HOOK_FAIL=str(self.root / "hook-fails"),
+                                SHOWRUNNER_STATE_DIR=str(self.root / "showrunner"))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment, clear=True)))
 
     def next_commit(self, text: str = "next\n") -> str:
@@ -213,3 +216,30 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
         self.assertEqual(self.git("rev-parse", "origin/main").stdout.strip(), commit)
         self.assertEqual(self.hook_runs(), [f"{self.repo}|{commit}|main"])
         self.assertEqual(len((self.repo / ".git" / main_push_lock.RECORD_NAME).read_text().splitlines()), 1)
+
+    def test_the_land_requires_clear_or_yes_for_an_altered_test(self) -> None:
+        test = self.write(self.repo / "test_approval.py", "def test_fixture():\n    assert 1\n")
+        _ = self.git("add", test.name)
+        base = self.next_commit("test base\n")
+        _ = self.git("push", "origin", "main")
+        _ = self.write(test, "def test_fixture():\n    assert 2\n")
+        head = self.next_commit("alter a test\n")
+        change = behavior_check.GitRange(self.repo, base, head)
+        key = behavior_check.changed_tests(change).key
+        no = behavior_check.Answered("Q1", behavior_check.Approval.NO, "No", datetime.now(timezone.utc))
+        waiting = behavior_check.Waiting("Q1", self.root / "question.md", "fixture-id")
+        for record in (behavior_check.NoReview.MISSING, waiting, no):
+            with self.subTest(record=record):
+                if record is not behavior_check.NoReview.MISSING:
+                    behavior_check.write_record(key, record)
+                with self.assertRaises(land_main.LandError) as refused:
+                    _ = land_main.land(self.repo, head)
+                self.assertIn("test_approval.py::test_fixture", str(refused.exception))
+                self.assertIn(change.command("run"), str(refused.exception))
+                self.assertEqual(self.git("ls-remote", "origin", "main").stdout.split()[0], base)
+        yes = behavior_check.Answered("Q1", behavior_check.Approval.YES, "Yes", datetime.now(timezone.utc))
+        for record in (behavior_check.Clear("No user decision found."), yes):
+            with self.subTest(record=record):
+                behavior_check.write_record(key, record)
+                self.assertIsInstance(land_main.land(self.repo, head).push, land_main.Pushed)
+                _ = self.git("push", "--force", "origin", f"{base}:refs/heads/main")

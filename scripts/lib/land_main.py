@@ -25,6 +25,7 @@ import sys
 
 from scripts.lib import main_push_lock
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.production import behavior_check
 
 
 class LandError(RuntimeError):
@@ -143,6 +144,11 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
         else:
             if git("merge-base", "--is-ancestor", origin, sha).returncode:
                 raise NotFastForward(f"origin/{branch} does not fast-forward to {sha}")
+            git_timeout = time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None
+            try:
+                behavior_check.require_review(behavior_check.GitRange(checkout, origin, sha), timeout=git_timeout)
+            except (behavior_check.BehaviorCheckError, OSError) as error:
+                raise LandError(str(error)) from error
             _ = checked("push", "origin", f"{sha}:refs/heads/{branch}")
             pushed = Pushed()
         default = git("symbolic-ref", "refs/remotes/origin/HEAD")
