@@ -2834,7 +2834,7 @@ class OutsideQueueScan:
     """Read current placement for one feed refresh."""
 
     def __init__(self, inputs: admission_records.QueueInputs, processes: dict[int, OutsideProcess],
-                 staff_members: FeedStaff) -> None:
+                 staff_members: FeedStaff, *, for_table: bool) -> None:
         self.processes = processes
         self.staff_members = staff_members
         self.ticks_per_second = os.sysconf("SC_CLK_TCK")
@@ -2849,11 +2849,14 @@ class OutsideQueueScan:
                                 and isinstance(source := step.measured.anonymous_source, admission_records.ScopeSource)]
         self.admitted_scopes = {source.directory for source in sources}
         self.queued: set[int] = set()
-        pending = [row["pid"] for row in (*inputs.reservations, *(row for _, row in inputs.ordered))
+        waiters = (row for _, row in inputs.ordered) if for_table else ()
+        pending = [row["pid"] for row in (*inputs.reservations, *waiters)
                    if (owner := processes.get(row["pid"])) is not None and owner.start == row["start_time"]]
-        scope_pids = {pid for source in sources for pid in source.members if pid in processes
-                      and (group := self.group(pid)) is not None and group.is_relative_to(source.directory)}
-        self.queue_ancestors = {ancestor for pid in (*pending, *scope_pids) for ancestor in self.ancestors(pid)}
+        self.queue_ancestors: set[int] = set()
+        if for_table:
+            scope_pids = {pid for source in sources for pid in source.members if pid in processes
+                          and (group := self.group(pid)) is not None and group.is_relative_to(source.directory)}
+            self.queue_ancestors = {ancestor for pid in (*pending, *scope_pids) for ancestor in self.ancestors(pid)}
         while pending:
             pid = pending.pop()
             if pid not in self.queued:
@@ -3041,7 +3044,8 @@ def detached_command_scope(scope: Path) -> bool:
     return match is not None and scope.parent.name == f"builds-detached-{match[1].replace('-', '')}.slice"
 
 
-def outside_commands(inputs: admission_records.QueueInputs, staff_members: FeedStaff, limit: float) -> list[OutsideCommand]:
+def outside_commands(inputs: admission_records.QueueInputs, staff_members: FeedStaff, limit: float, *,
+                     for_table: bool) -> list[OutsideCommand]:
     """Measure command trees in agent scopes and CPU use in detached scopes."""
     agents = gate.user_manager_cgroup() / "app.slice" / "app-agents.slice"
     builds = gate.builds_slice_cgroup()
@@ -3057,18 +3061,19 @@ def outside_commands(inputs: admission_records.QueueInputs, staff_members: FeedS
         processes = outside_process_table()
     except OSError:
         return []
-    scan = OutsideQueueScan(inputs, processes, staff_members)
+    scan = OutsideQueueScan(inputs, processes, staff_members, for_table=for_table)
     rows = [row for scope in agent_scopes for row in outside_agent_rows(scope, scan, limit)]
     rows.extend(row for scope in sorted(detached_scopes) if (row := outside_detached_row(scope, scan, limit)) is not None)
     return rows
 
 
 def outside_queue_processes(inputs: admission_records.QueueInputs, staff_members: FeedStaff,
-                            cpu: OutsideCpuReadings | None = None) -> list[OutsideQueueProcess]:
+                            cpu: OutsideCpuReadings | None = None, *, sampled_at: float | None = None,
+                            for_table: bool = False) -> list[OutsideQueueProcess]:
     limit = direct_test_time_limit_seconds()
-    commands = outside_commands(inputs, staff_members, limit) if limit is not None else []
+    commands = outside_commands(inputs, staff_members, limit, for_table=for_table) if limit is not None else []
     if cpu is not None:
-        cpu.update(commands, time.monotonic())
+        cpu.update(commands, time.monotonic() if sampled_at is None else sampled_at)
     rows = [command.row for command in commands if limit is not None and command.row["cpu_seconds"] > limit]
     return sorted(rows, key=lambda row: (-row["cpu_seconds"], row["pid"]))
 
@@ -3089,7 +3094,7 @@ def stop_outside_command(pid: int, start_time: str, read_queue: Callable[[], adm
     if limit is None:
         return "not a current row"
     inputs = outside_queue_inputs(read_queue())
-    command = next((command for command in outside_commands(inputs, staff_members, limit)
+    command = next((command for command in outside_commands(inputs, staff_members, limit, for_table=True)
                     if command.row["pid"] == pid and command.row["start_time"] == start_time
                     and command.row["cpu_seconds"] > limit), None)
     if command is None:
@@ -3108,7 +3113,7 @@ def stop_outside_command(pid: int, start_time: str, read_queue: Callable[[], adm
                     continue
                 descriptors.append((member_pid, descriptor))
             current_inputs = outside_queue_inputs(read_queue())
-            current_scan = OutsideQueueScan(current_inputs, outside_process_table(), staff_members)
+            current_scan = OutsideQueueScan(current_inputs, outside_process_table(), staff_members, for_table=True)
             if current_scan.has_queue_work(command.members, current_scan.admitted_scopes):
                 return "not a current row"
             for member_pid, _ in descriptors:
@@ -3472,6 +3477,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET,
             *, program_memory: program_memory_feed.ProgramMemoryFeed | None = None,
             outside_cpu: OutsideCpuReadings | None = None,
+            outside_sampled_at: float | None = None,
             limit_source: Callable[[admission_records.QueueRead], limits_view.Background] | None = None,
             mac_source: Callable[[target_availability.Snapshots], limits_view.MacReading | None] | None = None) -> MemoryPage:
     started = time.perf_counter()
@@ -4100,7 +4106,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit},
         "report_version": report_version,
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
-        "outside_queue": outside_queue_processes(outside_queue_inputs(parsed), members, outside_cpu),
+        "outside_queue": outside_queue_processes(
+            outside_queue_inputs(parsed), members, outside_cpu, sampled_at=outside_sampled_at, for_table=True),
     }
     if limit_source is not None:
         page["build_limits"] = limits_view.build_limits(parsed, snapshots, visible_waits, limit_cloud_names,
@@ -4197,7 +4204,8 @@ def main(argv: Sequence[str]) -> int:
                 # Count from after the request, so slow reads before it never shorten the interval.
                 next_tokens_at = time.monotonic() + configuration.token_dump_seconds
             payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report_version, holders,
-                program_memory=program_memory, outside_cpu=outside_cpu, limit_source=limit_source, mac_source=mac_source)
+                program_memory=program_memory, outside_cpu=outside_cpu, outside_sampled_at=now,
+                limit_source=limit_source, mac_source=mac_source)
             last_good = payload
         except (OSError, ValueError, KeyError, RuntimeError) as error:
             if isinstance(last_good, NoGoodReading):

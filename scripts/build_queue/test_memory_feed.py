@@ -648,7 +648,9 @@ class MemoryFeedTests(unittest.TestCase):
         source = admission_records.ScopeSource(queued, frozenset({8105}))
         memory = admission_records.MeasuredMemory(0, anonymous_source=source)
         step = admission_records.RunningStep("", "", "check", "/fixture", 0, memory, pid=8105)
-        self.assertEqual(memory_feed.outside_queue_processes(replace(inputs, running=(step,)), owners), rows)
+        admitted = replace(inputs, running=(step,))
+        self.assertEqual(memory_feed.outside_queue_processes(admitted, owners), rows)
+        self.assertEqual(memory_feed.outside_queue_processes(admitted, owners, for_table=True), [])
 
         dust_pid = 8108
         proc = self.root / "proc"
@@ -1058,7 +1060,9 @@ class MemoryFeedTests(unittest.TestCase):
         for removed in ('id="swap"', 'id="report-charts"', 'id="leftovers"', 'href="#swap"'):
             self.assertNotIn(removed, page)
         self.assertIn('id="pill" data-tip="pill" aria-haspopup="dialog" aria-controls="builds-swap-dialog"', main)
-        render = page[page.index("function renderLeftovers("):page.index("function reportCost(")]
+        start = page.index("function renderLeftovers(")
+        end = page.index("\n}\n", start) + len("\n}\n")
+        render = page[start:end]
         javascript = render + """
 const elements = {};
 const $ = id => (elements[id] ??= {innerHTML: ""});

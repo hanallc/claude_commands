@@ -1328,7 +1328,8 @@ It uses `pthread_sigmask` and installs no handler.
 
 The Builds page lists live commands above the direct test CPU limit.
 It scans agent and detached scopes and excludes session launchers, agents, bare shells, and queued work.
-The table shows Command, Owner, PID, Age, Current CPU, and CPU total.
+It also excludes commands with waiting or admitted descendants in a separate scope.
+The table shows Command, Owner, Pid, Age, Current CPU, and CPU total.
 The last column has a Stop button and an empty heading.
 An empty table shows “No test runs outside the queue now.”
 
