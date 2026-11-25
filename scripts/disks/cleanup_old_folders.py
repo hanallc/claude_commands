@@ -2787,7 +2787,7 @@ def apply(review: HostList, bounds: CleanupBounds) -> int:
 
 
 def run_remote(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    timeout = conf.read("disks").whole("cleanup.ssh_seconds")
+    timeout = conf.read("mac_test").number("floor_sweep_timeout_s")
     return subprocess.run(arguments, capture_output=True, text=True, timeout=timeout, check=False)
 
 
