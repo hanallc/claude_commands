@@ -94,10 +94,18 @@ class CleanupTests(unittest.TestCase):
         return self.list_digest(output)
 
     def list_digest(self, output: str) -> str:
-        digests = [line.removeprefix("Digest: ") for line in output.splitlines() if line.startswith("Digest: ")]
-        self.assertEqual(len(digests), 1, output)
-        self.assertRegex(digests[0], r"^[0-9a-f]{64}$")
-        return digests[0]
+        command = output.splitlines()[-1]
+        self.assertRegex(command, r" --go [0-9a-f]{64}$")
+        return command.rsplit(" --go ", 1)[-1]
+
+    def json_digest(self) -> str:
+        status, output, errors = self.command("--host-list", "--json")
+        self.assertEqual((status, errors), (0, ""))
+        record = cleanup_old_folders.message_object(cast(object, json.loads(output)))
+        value = record["digest"]
+        assert isinstance(value, str)
+        self.assertRegex(value, r"^[0-9a-f]{64}$")
+        return value
 
     def test_script_help_runs_with_a_private_home(self) -> None:
         result = subprocess.run((sys.executable, "-B", str(SCRIPT), "--help"), cwd=self.home,
@@ -346,9 +354,10 @@ for folder in masks:
         self.assertEqual((status, errors), (0, ""))
         self.assertRegex(output.splitlines()[0], rf"^1 folder, {LIST_SIZE}, would be removed$")
         self.assertRegex(output, rf"natedev\t{str(path)!r}\t{LIST_SIZE}\twould remove: no program use found")
-        self.assertIn("mac unreachable: connection refused\n", output)
+        self.assertIn("The Mac did not answer (connection refused). This list has no folders of the Mac.\n", output)
         self.assertNotIn("ssh debug detail", output)
-        self.assertRegex(output, r"(?m)^Digest: [0-9a-f]{64}$")
+        self.assertNotIn("Digest:", output)
+        _ = self.list_digest(output)
         self.assertEqual((path / "payload").read_text(), "old content\n")
         ssh.assert_called_once()
 
@@ -376,11 +385,14 @@ for folder in masks:
         self.assertIn("; no program use found;", cleanup.row_result(quiet, 0))
 
     def test_kept_rows_and_json_have_no_apply_command(self) -> None:
+        _ = self.candidate("sccache", home=self.build)
         self.write_settings("~/missing")
         status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        self.assertTrue(output.endswith(f"Digest: {self.list_digest(output)}\n"))
+        self.assertEqual(output.splitlines()[:2], ["No folders would be removed.", "1 folder stays"])
         self.assertNotIn(" these folders, run:", output)
+        self.assertNotIn(" --go ", output)
+        self.assertNotIn("Digest:", output)
 
         self.write_settings(str(self.candidate()))
         status, output, errors = self.command("--host-list", "--json")
@@ -397,7 +409,7 @@ for folder in masks:
             with self.subTest(stderr=stderr), mock.patch.object(subprocess, "run", side_effect=error) as ssh:
                 status, output, errors = self.command(runner=cleanup_old_folders.run_remote)
                 self.assertEqual((status, errors), (0, ""))
-                self.assertIn(f"mac unreachable: {detail}\n", output)
+                self.assertIn(f"The Mac did not answer ({detail}). This list has no folders of the Mac.\n", output)
                 self.assertNotIn("ssh debug detail", output)
                 ssh.assert_called_once_with(
                     ("ssh", "-o", "BatchMode=yes", "mac", cleanup_old_folders.REMOTE_COMMAND + " --json"),
@@ -516,7 +528,7 @@ assert not loaded, sorted(loaded)
         with mock.patch.object(cleanup_old_folders, "PROC_ROOT", str(proc)):
             status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        header = f"Use check: processes of {user} only; other users' processes are not checked."
+        header = f"Programs checked: {user} only. Programs of other users are not checked."
         self.assertEqual(output.splitlines().count(header), 1)
         self.assertIn("would remove", output)
 
@@ -622,7 +634,9 @@ assert not loaded, sorted(loaded)
         checked = cleanup.message_object(cast(object, json.loads(outgoing.getvalue())))
         self.assertEqual(checked["paths"], [[str(path), 42, tmp_sweep.WORKS_IN]])
         self.assertEqual(checked["unreadable"], [])
-        self.assertIn("Use check: processes of all users.", output.getvalue())
+        self.assertEqual(output.getvalue().splitlines()[0], "No folders would move from memory to disk.")
+        self.assertIn("Programs checked: all users.", output.getvalue())
+        self.assertNotIn(" --go ", output.getvalue())
         command = cast(tuple[str, ...], spawn.call_args.args[0])
         self.assertEqual(command[:9], (
             "/fixture/setpriv", f"--reuid={uid}", f"--regid={gid}", "--clear-groups", "--no-new-privs",
@@ -669,18 +683,45 @@ assert not loaded, sorted(loaded)
 
     def test_move_total_counts_only_the_moving_folders(self) -> None:
         cleanup = cleanup_old_folders
-        gib = 1 << 30
-        rows = (cleanup.Row(Path("/dev/shm/t-a"), 3 * gib // 2, cleanup.WouldMove(Path("/build/a"), "a")),
-                cleanup.Row(Path("/dev/shm/t-b"), gib // 2, cleanup.WouldMove(Path("/build/b"), "b")),
-                cleanup.Row(Path("/dev/shm/t-c"), None, cleanup.WouldMove(Path("/build/c"), "c")),
-                cleanup.Row(Path("/dev/shm/t-d"), 7 * gib, cleanup.GATE_IF_NAMED))
+        mib = 1 << 20
+        rows = (
+            cleanup.Row(self.gate / "t-a", 52 * mib, cleanup.WouldMove(self.build / "a", "a")),
+            cleanup.Row(self.gate / "t-b", 20 * mib, cleanup.WouldMove(self.build / "b", "b")),
+            cleanup.Row(self.gate / "t-c", mib, cleanup.WouldMove(self.build / "c", "c")),
+            cleanup.Row(self.gate / "t-d", None, cleanup.WouldMove(self.build / "d", "d")),
+            cleanup.Row(self.gate / "t-e", 7 << 30, cleanup.GATE_IF_NAMED),
+        )
         with redirect_stdout(io.StringIO()) as output:
-            cleanup.show_list_total((cleanup.HostList(cleanup.Machine.NATEDEV, rows),),
-                                    cleanup.CleanupMode.MOVE_GATE_GIT)
-        self.assertEqual(output.getvalue().splitlines(), [
-            "3 folders, 2.00 GiB, would move from memory to disk (1 with unknown size)",
+            cleanup.show(cleanup.HostList(cleanup.Machine.NATEDEV, rows), cleanup.LocalListOnly.REQUESTED,
+                         mode=cleanup.CleanupMode.MOVE_GATE_GIT)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(lines[:2], [
+            "4 folders, 0.07 GiB, would move from memory to disk (1 with unknown size)",
             "1 folder stays",
         ])
+        self.assertEqual([line.split("\t")[2] for line in lines if line.startswith("natedev\t")],
+                         ["0.05 GiB", "0.02 GiB", "<0.01 GiB", "unknown", "7.00 GiB"])
+
+    def test_standard_list_chooses_the_unit_at_the_gib_cutoff(self) -> None:
+        cleanup = cleanup_old_folders
+        last_mib = (1 << 30) // 100
+        for size, display, kept_size in (
+            (last_mib, "10.24 MiB", "2048.00 MiB"),
+            (last_mib + 1, "0.01 GiB", "2.00 GiB"),
+        ):
+            with self.subTest(size=size), redirect_stdout(io.StringIO()) as output:
+                rows = (
+                    cleanup.Row(self.home / "old", size, cleanup.WouldRemove("a")),
+                    cleanup.Row(self.home / "kept", 2 << 30, removal_guard.Kept("shared cache")),
+                    cleanup.Row(self.home / "link", 0, removal_guard.Kept("worktree link in use")),
+                )
+                cleanup.show(cleanup.HostList(cleanup.Machine.NATEDEV, rows), cleanup.LocalListOnly.REQUESTED)
+            lines = output.getvalue().splitlines()
+            self.assertEqual(lines[:2], [f"1 folder, {display}, would be removed", "2 folders stay"])
+            self.assertIn(f"natedev\t{str(self.home / 'old')!r}\t{display}\twould remove: no program use found", lines)
+            self.assertIn(f"natedev\t{str(self.home / 'kept')!r}\t{kept_size}\tstays: shared cache", lines)
+            unit = display.split()[-1]
+            self.assertIn(f"natedev\t{str(self.home / 'link')!r}\t<0.01 {unit}\tstays: worktree link in use", lines)
 
     @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
     def test_the_worker_applies_only_with_the_invoking_user_ids(self) -> None:
@@ -1215,7 +1256,7 @@ assert not loaded, sorted(loaded)
         decoded = cleanup.decode_cleanup_rows(cast(object, json.loads(json.dumps(worker_record["rows"]))), review.machine)
         self.assertEqual(decoded, review.rows)
         with redirect_stdout(io.StringIO()) as output:
-            cleanup.show(review, cleanup.LocalListOnly.REQUESTED, record["digest"], mode=mode)
+            cleanup.show(review, cleanup.LocalListOnly.REQUESTED, mode=mode)
         self.assertIn(f"would move to disk: new place {str(target)!r}", output.getvalue())
         self.assertTrue(path.is_dir())
         self.assertFalse(target.parent.exists())
@@ -1496,7 +1537,7 @@ assert not loaded, sorted(loaded)
         with mock.patch.object(time, "time_ns", return_value=1_700_259_202_000_000_000):
             status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        self.assertEqual(output.splitlines()[:2], ["0 folders, 0.00 MiB, would be removed", "6 folders stay"])
+        self.assertEqual(output.splitlines()[:2], ["No folders would be removed.", "6 folders stay"])
         self.assertRegex(output, rf"{str(large)!r}\t2\.[0-9]{{2}} MiB\tstays: .*last changed 3 days ago")
         self.assertNotRegex(output, r"\b(?:kind|newest|lease|use)=")
         self.assertRegex(output, rf"{str(unknown)!r}\t{LIST_SIZE}\tstays: unknown gate entry type")
@@ -1576,7 +1617,7 @@ assert not loaded, sorted(loaded)
                 self.assertIn(f"{str(path)!r}", output)
                 self.assertIn(f"\tstays: {reason}, list only\n", output)
                 self.assertNotIn("would remove", output)
-                self.assertEqual(self.command("--go", self.list_digest(output))[0], 0)
+                self.assertEqual(self.command("--host-list", "--go", self.json_digest())[0], 0)
                 self.assertTrue((path / "payload").is_file())
                 with mock.patch.object(cleanup_old_folders, "platform_mounts", return_value=lambda: (Path("/"), path)):
                     status, output, errors = self.command("--host-list")
@@ -2163,7 +2204,7 @@ assert not loaded, sorted(loaded)
         self.assertIn("no local source repository", preview[1])
         self.assertIn("dirty: no, unpushed: 0, stash: no", preview[1])
         self.assertNotIn("saved to refs/rescue on --go", preview[1])
-        approval = self.list_digest(preview[1])
+        approval = self.json_digest()
         self.assertEqual(self.command("--host-list", "--go", approval)[0], 0)
         self.assertEqual((path / "work").read_text(), "original\n")
         self.assertEqual(self.git(source, "for-each-ref", "refs/rescue"), "")
@@ -2401,7 +2442,8 @@ assert not loaded, sorted(loaded)
             self.assertEqual((status, errors), (0, ""))
             for name in ("dead", "free"):
                 self.assertRegex(output, rf"{str(links[name])!r}\t{LIST_SIZE}\twould remove")
-            self.assertIn("pid 42 fixture-shell uses the link in PWD", output)
+            self.assertRegex(output, rf"{str(links['in-pwd'])!r}\t{LIST_SIZE}\t"
+                             + "stays: pid 42 fixture-shell uses the link in PWD")
             self.assertIn("staff row fixture worker", output)
             approval = self.list_digest(output)
             status, output, errors = self.command("--host-list", "--go", approval)
@@ -2466,7 +2508,7 @@ assert not loaded, sorted(loaded)
             for path in (scratch, target, folder, link):
                 self.assertRegex(output, rf"{str(path)!r}\t(?:{LIST_SIZE}|unknown)\tstays: list only: no setting names it")
             self.assertNotIn("would remove", output)
-            approval = self.list_digest(output)
+            approval = self.json_digest()
             self.assertEqual(self.command("--host-list", "--go", approval)[0], 0)
         for path in (scratch, target, folder, link):
             self.assertTrue(os.path.lexists(path))
@@ -2501,7 +2543,7 @@ assert not loaded, sorted(loaded)
             for path in (link, orphan):
                 self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\t.*open file scan is incomplete: pid 42 unreadable-shell")
             self.assertNotIn("would remove", output)
-            approval = self.approval("--host-list")
+            approval = self.json_digest()
             with mock.patch.object(cleanup_old_folders, "apply", side_effect=apply_after_denial):
                 status, output, errors = self.command("--host-list", "--go", approval)
             self.assertEqual((status, errors), (1, ""))
@@ -2533,7 +2575,7 @@ assert not loaded, sorted(loaded)
             for path in (dead, lease_only, lock_only):
                 self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\tstays: list only: no setting names it")
             self.assertIn("lease PID 42 is still running", output)
-            approval = self.list_digest(output)
+            approval = self.json_digest()
             status, output, errors = self.command("--host-list", "--go", approval)
         self.assertEqual((status, errors), (0, ""), output)
         for path in (dead, lease_only, lock_only):
@@ -2578,7 +2620,7 @@ assert not loaded, sorted(loaded)
                                      + r" dirty: 1, unpushed: 1, branch: 'fixture-branch'")
             self.assertNotIn(str(model), output)
             self.assertNotIn("would remove", output)
-            approval = self.list_digest(output)
+            approval = self.json_digest()
             self.assertEqual(self.command("--host-list", "--go", approval)[0], 0)
         self.assertTrue(repo.is_dir())
         self.assertTrue(busy.is_dir())
@@ -2664,7 +2706,7 @@ assert not loaded, sorted(loaded)
             self.assertIn("lease PID 42 is still running", output)
             self.assertIn(lease.name, output)
             self.assertIn(lock.name, output)
-            approval = self.list_digest(output)
+            approval = self.json_digest()
             self.assertEqual(self.command("--host-list", "--go", approval)[0], 0)
         self.assertTrue(path.is_dir())
         self.assertTrue(lease.is_file())

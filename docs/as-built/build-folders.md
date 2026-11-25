@@ -291,7 +291,8 @@ On natedev, Nate runs the list by hand with sudo first.
 sudo "$(command -v python3)" -IB "$HOME/.claude/scripts/disks/cleanup_old_folders.py"
 ```
 
-With sudo, the parent checks processes of all users. Any unreadable process blocks removal.
+With sudo, the list says `Programs checked: all users.`
+Any unreadable program blocks removal.
 The parent starts only `setpriv`. The SSH child reads the time limit after it changes to the caller's user.
 The child uses `SUDO_UID` and `SUDO_GID` for all writes and removals.
 It starts with no supplementary groups or capabilities. The command refuses a root run without the sudo identity.
@@ -306,10 +307,17 @@ Other places found by the scans stay unless the cleanup settings name them.
 The standard list starts with the count and size of the folders it would remove.
 For example, it starts with `1 folder, 2.00 MiB, would be removed`.
 A second line gives a count when some folders stay.
-Each row shows the machine, the place, the size in MiB or GiB, and what happens to it.
+Each row shows the machine, the place, the size, and what happens to it.
+The list uses GiB for all sizes when the first total is at least 0.01 GiB.
+It uses MiB for all sizes when the total is smaller.
 For example, a result can read `would remove: no program use found; last changed 3 days ago`.
-The list ends with the digest. When it has approved removals, the lead line and full command follow the digest.
-On natedev it also reads the Mac list over SSH. When SSH fails, the command shows the first error line if available.
+When it has approved removals, the list ends with `To remove these folders, run:` and the complete command.
+The last word of the command is the digest.
+When the list has no approved rows, it starts with `No folders would be removed.`
+The sudo list starts with `No folders would move from memory to disk.` when it has no approved moves.
+These lists have no apply command.
+On natedev it also reads the Mac list over SSH.
+If the Mac does not answer, the list gives the cause when known and says it has no folders of the Mac.
 The Mac slot folder is list-only. Bob handles its removal by hand.
 `/build/sccache` is a shared tool cache from the system configuration. The cleanup lists it and keeps it.
 
@@ -383,7 +391,7 @@ The list checks each path, its identity, and mounts. It keeps model folders for 
 The list keeps folders with open files, a live lease, or a held lock. It also checks leases in child folders.
 The command reads `/proc` when it is available. Otherwise it uses `lsof`.
 Each machine checks processes of the user that runs the command.
-The list header names the local user and says it does not check other users' processes.
+The list names the local user and says `Programs of other users are not checked.`
 An incomplete process scan keeps configured folders, worktree links, and orphan side files.
 Missing file descriptor or environment data keeps the scan incomplete while the process still exists.
 The list header and keep reason name each unreadable process by PID and command.

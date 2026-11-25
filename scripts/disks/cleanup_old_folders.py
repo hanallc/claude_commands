@@ -3332,32 +3332,38 @@ def remove_remote(review: HostList, run_ssh: SshRunner) -> int:
     return answer.returncode
 
 
-def list_size(size: int | None) -> str:
+ListSizeUnit = Literal["MiB", "GiB"]
+
+
+def list_size(size: int | None, unit: ListSizeUnit) -> str:
     if size is None:
         return "unknown"
-    if size >= 1 << 30:
-        return f"{size / (1 << 30):.2f} GiB"
-    mib = size / (1 << 20)
-    return "<0.01 MiB" if 0 < mib < 0.01 else f"{mib:.2f} MiB"
+    unit_bytes = 1 << (30 if unit == "GiB" else 20)
+    return f"<0.01 {unit}" if size * 100 < unit_bytes else f"{size / unit_bytes:.2f} {unit}"
 
 
 def folder_count(count: int) -> str:
     return f"{count} folder" if count == 1 else f"{count} folders"
 
 
-def show_list_total(reviews: Sequence[HostList], mode: CleanupMode) -> None:
+def show_list_total(reviews: Sequence[HostList], mode: CleanupMode) -> ListSizeUnit:
     moving = mode is CleanupMode.MOVE_GATE_GIT
     approved = WouldMove if moving else WouldRemove
     verdict = "would move from memory to disk" if moving else "would be removed"
     rows = [row for review in reviews for row in review.rows]
     sizes = [row.size for row in rows if isinstance(row.outcome, approved)]
-    unknown = sizes.count(None)
-    size = list_size(sum(size for size in sizes if size is not None))
-    note = f" ({unknown} with unknown size)" if unknown else ""
-    print(f"{folder_count(len(sizes))}, {size}, {verdict}{note}")
+    total = sum(size for size in sizes if size is not None)
+    unit: ListSizeUnit = "GiB" if total * 100 >= 1 << 30 else "MiB"
+    if sizes:
+        unknown = sizes.count(None)
+        note = f" ({unknown} with unknown size)" if unknown else ""
+        print(f"{folder_count(len(sizes))}, {list_size(total, unit)}, {verdict}{note}")
+    else:
+        print(f"No folders {verdict}.")
     staying = len(rows) - len(sizes)
     if staying:
         print(f"{folder_count(staying)} {'stays' if staying == 1 else 'stay'}")
+    return unit
 
 
 def row_result(row: Row, now_ns: int) -> str:
@@ -3375,6 +3381,7 @@ def row_result(row: Row, now_ns: int) -> str:
         reason = outcome.reason.removeprefix("kept: ")
         if reason.startswith(GIT_KEEP_REASON):
             reason = "holds Git work; the owner saves it first" + reason[len(GIT_KEEP_REASON):]
+        reason = reason.replace("cannot read the process PWD list", "cannot read the working directories of programs")
         result = f"stays: {reason}"
     if row.git:
         result += f", {row.git}"
@@ -3391,19 +3398,19 @@ def row_result(row: Row, now_ns: int) -> str:
     return table_text(result)
 
 
-def show(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, approval: str, *,
+def show(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, *,
          mode: CleanupMode = CleanupMode.STANDARD) -> None:
     reviews = (local, mac) if isinstance(mac, HostList) else (local,)
-    show_list_total(reviews, mode)
+    unit = show_list_total(reviews, mode)
     uid = os.geteuid()
     if uid == 0:
-        print("Use check: processes of all users.")
+        print("Programs checked: all users.")
     else:
         try:
             user = pwd.getpwuid(uid).pw_name
         except KeyError:
             user = str(uid)
-        print(f"Use check: processes of {user} only; other users' processes are not checked.")
+        print(f"Programs checked: {user} only. Programs of other users are not checked.")
     if local.unreadable_processes:
         reason = incomplete_scan_reason(local.unreadable_processes)
         print(reason[0].upper() + reason[1:])
@@ -3411,10 +3418,10 @@ def show(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, ap
     now_ns = time.time_ns()
     for review in reviews:
         for row in review.rows:
-            print(f"{review.machine.value}\t{str(row.path)!r}\t{list_size(row.size)}\t{row_result(row, now_ns)}")
+            print(f"{review.machine.value}\t{str(row.path)!r}\t{list_size(row.size, unit)}\t{row_result(row, now_ns)}")
     if isinstance(mac, MacListUnavailable):
-        print(table_text(mac.message()))
-    print(f"Digest: {approval}")
+        detail = f" ({table_text(mac.detail)})" if mac.detail else ""
+        print(f"The Mac did not answer{detail}. This list has no folders of the Mac.")
 
 
 def table_text(text: str) -> str:
@@ -3496,7 +3503,7 @@ def finish_cleanup(args: Arguments, local: HostList, run_ssh: SshRunner, apply_l
     elif isinstance(mac, MacListUnavailable):
         approval = digest((approval, MAC_UNREACHABLE))
     if args.go is None:
-        show(local, mac, approval, mode=mode)
+        show(local, mac, mode=mode)
         show_apply_command(local, mac, approval, mode=mode, host_list=args.host_list)
         return 0
     if isinstance(mac, MacListUnavailable):

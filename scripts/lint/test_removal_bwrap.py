@@ -229,7 +229,7 @@ class RemovalProofTests(unittest.TestCase):
             self.assertIn(f"{str(candidate)!r}", busy.stdout)
             self.assertIn("pid 42 works in it", busy.stdout)
             self.assertNotIn("would remove", busy.stdout)
-            self.assertEqual(busy.stdout.splitlines()[0], "0 folders, 0.00 MiB, would be removed")
+            self.assertEqual(busy.stdout.splitlines()[0], "No folders would be removed.")
             shutil.rmtree(sandbox.host_path(pid))
 
         def run_cleanup(*arguments: str) -> subprocess.CompletedProcess[str]:
@@ -245,7 +245,9 @@ class RemovalProofTests(unittest.TestCase):
             self.assertRegex(preview.stdout, rf"{str(git_work)!r}\t<?[0-9]+\.[0-9]{{2}} MiB\tstays: holds Git work; the owner saves it first")
         self.assertIn(f"{model.parent.parent.as_posix()!r}\tunknown\tstays: contains a model folder", preview.stdout)
         self.assert_canaries(sandbox, (payload, *keep))
-        approval = next(line.removeprefix("Digest: ") for line in preview.stdout.splitlines() if line.startswith("Digest: "))
+        command = preview.stdout.splitlines()[-1]
+        self.assertRegex(command, r" --go [0-9a-f]{64}$")
+        approval = command.rsplit(" --go ", 1)[-1]
         refused = run_cleanup("--go", "0" * 64)
         self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
         self.assertIn("list digest changed", refused.stderr)
