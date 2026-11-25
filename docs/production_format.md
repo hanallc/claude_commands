@@ -297,6 +297,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
       the row adds. Add the key to each named fixture.
       It reports reads of removed keys and keys that no config file holds.
       It counts sources that it cannot scan. The advisory scan does not block the join.
+      A line inside a shell here-document can cause a false report.
 
    Send the notice only when both runs are green. Name the join hash and both
    results in it.

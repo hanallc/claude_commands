@@ -18,10 +18,10 @@ except FileNotFoundError:
 
 import argparse
 import ast
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from io import BytesIO
+from importlib.util import resolve_name
 from pathlib import Path, PurePosixPath
 import re
 import sys
@@ -30,7 +30,7 @@ from typing import final, override
 from scripts.lib import conf
 from scripts.production.affected_modules import GraphError, blob_texts, git_output, scope_nodes
 from scripts.production.gate_modules import is_test_module
-from scripts.style.git_process import GitBlob, GitReadFailed, parse_tree_listing, read_batch_blob, run_git
+from scripts.style.git_process import GitReadFailed, MissingBlob, blob_contents, parse_tree_listing
 
 
 @dataclass(frozen=True)
@@ -255,12 +255,11 @@ class ReadName(Enum):
     CONFIG_LOADER = auto()
     CONFIG_READER = auto()
     CONFIG_READER_TYPE = auto()
-    UNRESOLVED = auto()
 
 
-type ReadBinding = ReadName | str
-type ReadBindings = dict[str, ReadBinding]
+type ReadBindings = dict[str, set[ReadName]]
 type KeyOccurrence = tuple[str, int]
+type SourcePosition = tuple[int, int]
 
 
 @dataclass
@@ -275,16 +274,16 @@ def imported_name(item: ast.alias) -> str:
 
 def is_config_module(node: ast.expr, names: ReadBindings) -> bool:
     if isinstance(node, ast.Name):
-        return names.get(node.id) is ReadName.CONFIG_MODULE
+        return ReadName.CONFIG_MODULE in names.get(node.id, ())
     return (isinstance(node, ast.Attribute) and node.attr == "conf"
             and isinstance(node.value, ast.Attribute) and node.value.attr == "lib"
             and isinstance(node.value.value, ast.Name)
-            and names.get(node.value.value.id) is ReadName.SCRIPTS_PACKAGE_WITH_CONF)
+            and ReadName.SCRIPTS_PACKAGE_WITH_CONF in names.get(node.value.value.id, ()))
 
 
 def is_config_loader(node: ast.expr, names: ReadBindings) -> bool:
     if isinstance(node, ast.Name):
-        return names.get(node.id) is ReadName.CONFIG_LOADER
+        return ReadName.CONFIG_LOADER in names.get(node.id, ())
     return (isinstance(node, ast.Attribute) and node.attr in _LOADERS
             and is_config_module(node.value, names))
 
@@ -296,148 +295,276 @@ def config_reader_parameter(annotation: ast.expr | None, names: ReadBindings) ->
         except SyntaxError:
             return False
     if isinstance(annotation, ast.Name):
-        return names.get(annotation.id) is ReadName.CONFIG_READER_TYPE
+        return ReadName.CONFIG_READER_TYPE in names.get(annotation.id, ())
     return (isinstance(annotation, ast.Attribute) and annotation.attr == "ConfigRead"
             and is_config_module(annotation.value, names))
 
 
-def function_locals(nodes: Iterable[ast.AST]) -> Iterator[str]:
-    """Find local names that hide enclosing bindings before their first assignment."""
-    for node in nodes:
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-            yield node.name
-        elif isinstance(node, ast.Import | ast.ImportFrom):
-            yield from map(imported_name, node.names)
-        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del):
-            yield node.id
-        elif not isinstance(node, ast.Lambda | ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp):
-            yield from function_locals(ast.iter_child_nodes(node))
+@dataclass(frozen=True)
+class FixedReadCall:
+    receiver: ast.expr
+    keys: Sequence[ast.expr]
+
+
+@dataclass(frozen=True)
+class KeyAssignment:
+    position: SourcePosition
+    keys: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LoopKeyAssignment(KeyAssignment):
+    body_end: SourcePosition
+
+
+@dataclass(frozen=True)
+class LoopBody:
+    end: SourcePosition
+    known_empty: bool
+
+
+def source_end(node: ast.expr | ast.stmt) -> SourcePosition:
+    return node.end_lineno or node.lineno, node.end_col_offset or node.col_offset
+
+
+def literal_loop_keys(iterable: ast.expr) -> tuple[str, ...]:
+    if isinstance(iterable, ast.Constant) and isinstance(iterable.value, str):
+        return tuple(iterable.value)
+    if isinstance(iterable, ast.Dict):
+        items = iterable.keys
+    elif isinstance(iterable, ast.List | ast.Set | ast.Tuple):
+        items = iterable.elts
+    else:
+        return ()
+    return tuple(item.value for item in items if isinstance(item, ast.Constant) and isinstance(item.value, str))
+
+
+def empty_literal_iterable(iterable: ast.expr) -> bool:
+    if isinstance(iterable, ast.Dict):
+        return not iterable.keys
+    if isinstance(iterable, ast.List | ast.Set | ast.Tuple):
+        return not iterable.elts
+    return isinstance(iterable, ast.Constant) and iterable.value == ""
 
 
 @final
 class PythonKeyScan(ast.NodeVisitor):
-    """Collect key mentions and resolve fixed reads in statement order."""
+    """Collect bindings and reads in one scope before resolving any reads."""
 
-    def __init__(self, tokens: set[str], reads: SourceKeyReads, names: ReadBindings,
-                 closure_names: ReadBindings) -> None:
+    def __init__(self, package: str, tokens: set[str], reads: SourceKeyReads,
+                 outer: PythonKeyScan | None = None, *, class_scope: bool = False,
+                 comprehension_scope: bool = False) -> None:
+        self.package = package
         self.tokens = tokens
         self.reads = reads
-        self.names = names
-        self.closure_names = closure_names
+        self.outer = outer
+        self.class_scope = class_scope
+        self.comprehension_scope = comprehension_scope
+        self.local_names: set[str] = set()
+        self.global_names: set[str] = set()
+        self.nonlocal_names: set[str] = set()
+        self.imports: ReadBindings = {}
+        self.bindings: ReadBindings = {}
+        self.assignments: list[tuple[str, ast.Call]] = []
+        self.key_assignments: dict[str, list[KeyAssignment]] = {}
+        self.loop_bodies: list[LoopBody] = []
+        self.parameters: list[ast.arg] = []
+        self.calls: list[FixedReadCall] = []
+        self.children: list[PythonKeyScan] = []
+
+    def child(self, *, class_scope: bool = False, comprehension_scope: bool = False) -> PythonKeyScan:
+        scan = PythonKeyScan(self.package, self.tokens, self.reads, self, class_scope=class_scope,
+                             comprehension_scope=comprehension_scope)
+        self.children.append(scan)
+        return scan
+
+    def scopes(self) -> Iterator[PythonKeyScan]:
+        yield self
+        for child in self.children:
+            yield from child.scopes()
+
+    def enclosing(self) -> Iterator[PythonKeyScan]:
+        scope = self.outer
+        while scope is not None:
+            if not scope.class_scope:
+                yield scope
+            scope = scope.outer
+
+    def binding_scope(self, name: str) -> PythonKeyScan:
+        if name in self.global_names:
+            return next(scope for scope in (self, *self.enclosing()) if scope.outer is None)
+        if name in self.nonlocal_names:
+            for scope in self.enclosing():
+                if (scope.outer is not None and name in scope.local_names
+                        and name not in scope.global_names and name not in scope.nonlocal_names):
+                    return scope
+        return self
+
+    def visible_bindings(self) -> ReadBindings:
+        names: ReadBindings = {}
+        for scope in (self, *self.enclosing()):
+            for name, bindings in scope.bindings.items():
+                names.setdefault(name, set()).update(bindings)
+        return names
 
     @override
     def visit_Constant(self, node: ast.Constant) -> None:
-        if isinstance(node.value, str) and node.value in self.tokens:
+        if self.tokens and isinstance(node.value, str) and node.value in self.tokens:
             self.reads.mentions.add((node.value, node.lineno))
 
     @override
     def visit_Import(self, node: ast.Import) -> None:
         for item in node.names:
             name = imported_name(item)
+            self.local_names.add(name)
             if item.name == "scripts.lib.conf":
-                self.names[name] = (ReadName.CONFIG_MODULE if item.asname
-                                    else ReadName.SCRIPTS_PACKAGE_WITH_CONF)
-            elif item.asname or name != "scripts" or self.names.get(name) is not ReadName.SCRIPTS_PACKAGE_WITH_CONF:
-                self.names[name] = ReadName.UNRESOLVED
+                kind = ReadName.CONFIG_MODULE if item.asname else ReadName.SCRIPTS_PACKAGE_WITH_CONF
+                self.imports.setdefault(name, set()).add(kind)
 
     @override
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        module = node.module or ""
+        if node.level:
+            try:
+                module = resolve_name("." * node.level + module, self.package)
+            except ImportError:
+                module = ""
         for item in node.names:
-            binding = ReadName.UNRESOLVED
-            if node.level == 0:
-                if node.module == "scripts.lib" and item.name == "conf":
-                    binding = ReadName.CONFIG_MODULE
-                elif node.module == "scripts.lib.conf":
-                    if item.name in _LOADERS:
-                        binding = ReadName.CONFIG_LOADER
-                    elif item.name == "ConfigRead":
-                        binding = ReadName.CONFIG_READER_TYPE
-            self.names[imported_name(item)] = binding
+            name = imported_name(item)
+            self.local_names.add(name)
+            if module == "scripts.lib" and item.name == "conf":
+                self.imports.setdefault(name, set()).add(ReadName.CONFIG_MODULE)
+            elif module == "scripts.lib.conf":
+                if item.name in _LOADERS:
+                    self.imports.setdefault(name, set()).add(ReadName.CONFIG_LOADER)
+                elif item.name == "ConfigRead":
+                    self.imports.setdefault(name, set()).add(ReadName.CONFIG_READER_TYPE)
 
     @override
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Store | ast.Del):
-            self.names[node.id] = ReadName.UNRESOLVED
-
-    def assign(self, targets: Sequence[ast.expr], value: ast.expr) -> None:
-        self.visit(value)
-        binding: ReadBinding = ReadName.UNRESOLVED
-        if isinstance(value, ast.Constant) and isinstance(value.value, str):
-            binding = value.value
-        elif isinstance(value, ast.Call) and is_config_loader(value.func, self.names):
-            binding = ReadName.CONFIG_READER
-        for target in targets:
-            self.visit(target)
-            if isinstance(target, ast.Name):
-                self.names[target.id] = binding
+            self.local_names.add(node.id)
 
     @override
-    def visit_Assign(self, node: ast.Assign) -> None:
-        self.assign(node.targets, node.value)
+    def visit_Global(self, node: ast.Global) -> None:
+        self.global_names.update(node.names)
 
     @override
-    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        self.visit(node.annotation)
-        if node.value is not None:
-            self.assign((node.target,), node.value)
+    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+        self.nonlocal_names.update(node.names)
+
+    def visit_named_binding(self, node: ast.ExceptHandler | ast.MatchAs | ast.MatchStar) -> None:
+        if node.name is not None:
+            self.local_names.add(node.name)
+        self.generic_visit(node)
+
+    visit_ExceptHandler = visit_MatchAs = visit_MatchStar = visit_named_binding
 
     @override
-    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
-        self.assign((node.target,), node.value)
+    def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+        if node.rest is not None:
+            self.local_names.add(node.rest)
+        self.generic_visit(node)
+
+    def assign_key(self, target: ast.expr, assignment: KeyAssignment) -> None:
+        if isinstance(target, ast.Name):
+            if self.loop_bodies:
+                loop = self.loop_bodies[-1]
+                if loop.known_empty:
+                    return
+                assignment = LoopKeyAssignment(assignment.position, assignment.keys, loop.end)
+            self.key_assignments.setdefault(target.id, []).append(assignment)
+        elif isinstance(target, ast.Tuple | ast.List):
+            for part in target.elts:
+                self.assign_key(part, assignment)
+        elif isinstance(target, ast.Starred):
+            self.assign_key(target.value, assignment)
 
     @override
-    def visit_AugAssign(self, node: ast.AugAssign) -> None:
-        self.visit(node.value)
-        self.visit(node.target)
+    def visit_Assign(self, node: ast.Assign | ast.AnnAssign | ast.AugAssign | ast.NamedExpr) -> None:
+        scope = self
+        if isinstance(node, ast.NamedExpr):
+            while scope.comprehension_scope and scope.outer is not None:
+                scope = scope.outer
+            scope.visit(node.target)
+        value = node.value
+        if value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+            replaces_value = not isinstance(node, ast.AugAssign)
+            keys = ((value.value,) if replaces_value and isinstance(value, ast.Constant)
+                    and isinstance(value.value, str) else ())
+            assignment = KeyAssignment(source_end(value), keys)
+            for target in targets:
+                scope.assign_key(target, assignment)
+                if replaces_value and isinstance(target, ast.Name) and isinstance(value, ast.Call):
+                    scope.assignments.append((target.id, value))
+        if isinstance(node, ast.NamedExpr):
+            self.visit(node.value)
+        else:
+            self.generic_visit(node)
 
-    @override
-    def visit_For(self, node: ast.For | ast.AsyncFor) -> None:
-        self.visit(node.iter)
-        self.visit(node.target)
-        for statement in (*node.body, *node.orelse):
+    visit_AnnAssign = visit_AugAssign = visit_NamedExpr = visit_Assign
+
+    def visit_loop(self, node: ast.For | ast.AsyncFor | ast.While) -> None:
+        if isinstance(node, ast.While):
+            self.visit(node.test)
+            known_empty = isinstance(node.test, ast.Constant) and not node.test.value
+        else:
+            self.visit(node.iter)
+            self.visit(node.target)
+            known_empty = empty_literal_iterable(node.iter)
+        known_empty = known_empty or bool(self.loop_bodies and self.loop_bodies[-1].known_empty)
+        self.loop_bodies.append(LoopBody(source_end(node.body[-1]), known_empty))
+        if not isinstance(node, ast.While):
+            self.assign_key(node.target, KeyAssignment(source_end(node.iter), literal_loop_keys(node.iter)))
+        for statement in node.body:
+            self.visit(statement)
+        _ = self.loop_bodies.pop()
+        for statement in node.orelse:
             self.visit(statement)
 
-    visit_AsyncFor = visit_For
+    visit_For = visit_AsyncFor = visit_While = visit_loop
 
-    def function_scope(self, args: ast.arguments, body: Sequence[ast.AST]) -> PythonKeyScan:
-        names = self.closure_names | dict.fromkeys(function_locals(body), ReadName.UNRESOLVED)
-        for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg):
-            if arg is not None:
-                names[arg.arg] = (ReadName.CONFIG_READER if config_reader_parameter(arg.annotation, self.names)
-                                  else ReadName.UNRESOLVED)
-        return PythonKeyScan(self.tokens, self.reads, names, names)
+    def function_body(self, args: ast.arguments, body: Sequence[ast.AST]) -> None:
+        self.visit(args)
+        inner = self.child()
+        inner.parameters = [arg for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg)
+                            if arg is not None]
+        inner.local_names.update(arg.arg for arg in inner.parameters)
+        for statement in body:
+            inner.visit(statement)
 
     @override
     def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        for part in (*node.decorator_list, *node.type_params, node.args, node.returns):
+        self.local_names.add(node.name)
+        for part in (*node.decorator_list, *node.type_params, node.returns):
             if part is not None:
                 self.visit(part)
-        inner = self.function_scope(node.args, node.body)
-        for statement in node.body:
-            inner.visit(statement)
-        self.names[node.name] = ReadName.UNRESOLVED
+        self.function_body(node.args, node.body)
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
     @override
     def visit_Lambda(self, node: ast.Lambda) -> None:
-        self.visit(node.args)
-        self.function_scope(node.args, (node.body,)).visit(node.body)
+        self.function_body(node.args, (node.body,))
 
     @override
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.local_names.add(node.name)
         for part in (*node.decorator_list, *node.type_params, *node.bases, *node.keywords):
             self.visit(part)
-        inner = PythonKeyScan(self.tokens, self.reads, self.names.copy(), self.closure_names)
+        inner = self.child(class_scope=True)
         for statement in node.body:
             inner.visit(statement)
-        self.names[node.name] = ReadName.UNRESOLVED
 
     def visit_comprehension_read(self, node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp) -> None:
-        names = self.names.copy()
-        inner = PythonKeyScan(self.tokens, self.reads, names, names)
-        for generator in node.generators:
-            inner.visit(generator.iter)
+        first, *rest = node.generators
+        self.visit(first.iter)
+        inner = self.child(comprehension_scope=True)
+        for generator in (first, *rest):
+            if generator is not first:
+                inner.visit(generator.iter)
+            inner.assign_key(generator.target, KeyAssignment((0, 0), literal_loop_keys(generator.iter)))
             inner.visit(generator.target)
             for condition in generator.ifs:
                 inner.visit(condition)
@@ -452,31 +579,80 @@ class PythonKeyScan(ast.NodeVisitor):
     @override
     def visit_Call(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Attribute) and node.func.attr in _ACCESSORS:
-            receiver = node.func.value
-            if (isinstance(receiver, ast.Call) and is_config_loader(receiver.func, self.names)
-                    or isinstance(receiver, ast.Name) and self.names.get(receiver.id) is ReadName.CONFIG_READER):
-                arguments = node.args if node.func.attr == "values" else (
-                    node.args[:1] or [keyword.value for keyword in node.keywords if keyword.arg == "key"])
-                for arg in arguments:
-                    value = arg.value if isinstance(arg, ast.Constant) else (
-                        self.names.get(arg.id) if isinstance(arg, ast.Name) else None)
-                    if isinstance(value, str):
-                        self.reads.fixed.add((value, arg.lineno))
+            keys = node.args if node.func.attr == "values" else (
+                node.args[:1] or [keyword.value for keyword in node.keywords if keyword.arg == "key"])
+            if keys:
+                self.calls.append(FixedReadCall(node.func.value, keys))
         self.generic_visit(node)
+
+    def bind_imports(self) -> None:
+        for name, bindings in self.imports.items():
+            self.binding_scope(name).bindings.setdefault(name, set()).update(bindings)
+
+    def bind_readers(self) -> None:
+        annotations = self.outer.visible_bindings() if self.outer is not None and self.parameters else {}
+        for parameter in self.parameters:
+            if config_reader_parameter(parameter.annotation, annotations):
+                self.bindings.setdefault(parameter.arg, set()).add(ReadName.CONFIG_READER)
+        if self.assignments:
+            names = self.visible_bindings()
+            for name, call in self.assignments:
+                if is_config_loader(call.func, names):
+                    self.binding_scope(name).bindings.setdefault(name, set()).add(ReadName.CONFIG_READER)
+
+    def assigned_keys(self, key: ast.Name) -> set[str]:
+        scope = self
+        while scope.comprehension_scope and key.id not in scope.local_names and scope.outer is not None:
+            scope = scope.outer
+        position = key.lineno, key.col_offset
+        keys: set[str] = set()
+        for assignment in sorted(scope.key_assignments.get(key.id, ()), key=lambda item: item.position, reverse=True):
+            if assignment.position <= position:
+                keys.update(assignment.keys)
+                # A completed loop can leave the earlier value in place.
+                if not isinstance(assignment, LoopKeyAssignment) or position < assignment.body_end:
+                    break
+        return keys
+
+    def resolve_calls(self) -> None:
+        if not self.calls:
+            return
+        names = self.visible_bindings()
+        if not names:
+            return
+        for call in self.calls:
+            receiver = call.receiver
+            if (isinstance(receiver, ast.Call) and is_config_loader(receiver.func, names)
+                    or isinstance(receiver, ast.Name) and ReadName.CONFIG_READER in names.get(receiver.id, ())):
+                for key in call.keys:
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        self.reads.fixed.add((key.value, key.lineno))
+                    elif isinstance(key, ast.Name):
+                        self.reads.fixed.update((value, key.lineno) for value in self.assigned_keys(key))
 
 
 def python_key_reads(source: str, content: bytes, tokens: set[str]) -> SourceKeyReads:
     reads = SourceKeyReads()
-    names: ReadBindings = {}
-    PythonKeyScan(tokens, reads, names, names).visit(ast.parse(content, source))
+    package = ".".join(PurePosixPath(source).parts[:-1])
+    scan = PythonKeyScan(package, tokens, reads)
+    scan.visit(ast.parse(content, source))
+    scopes = tuple(scan.scopes())
+    for scope in scopes:
+        scope.bind_imports()
+    for scope in scopes:
+        scope.bind_readers()
+    for scope in scopes:
+        scope.resolve_calls()
     return reads
 
 
-_SHELL_PART = re.compile(r"""\\(?:\r?\n|[^\n])|\$\(|[ \t\r]+|[^\\$#;|&()<>"' \x60\t\r\n]+|[\s\S]""")
+_SHELL_REDIRECT = r"<<<|<<-?|<>|<&|&>>?|>>|>\||>&|[<>]"
+_SHELL_PART = re.compile(rf"""\\(?:\r?\n|[^\n])|\$\(|[ \t\r]+|(?P<redirect>{_SHELL_REDIRECT})|[^\\$#;|&()<>"' \x60\t\r\n]+|[\s\S]""")
 _SHELL_KEY = re.compile(r"[\w./-]+")
+_SHELL_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _SHELL_CONTROL = {"if", "then", "elif", "else", "while", "until", "do", "!"}
 _SHELL_BOUNDARY = {";", "&", "|", "(", ")", "\n"}
-_SHELL_REDIRECT = {"<", ">"}
+_SHELL_REDIRECT_WORD = re.compile(_SHELL_REDIRECT)
 
 
 def shell_commands(text: str) -> Iterator[list[tuple[str, int]]]:
@@ -519,16 +695,17 @@ def shell_commands(text: str) -> Iterator[list[tuple[str, int]]]:
                 continue
             if part == '"':
                 quote = "" if quote else part
-            if quote or (part not in _SHELL_BOUNDARY and part not in _SHELL_REDIRECT and not part.isspace()):
+            redirect = match["redirect"] is not None
+            if quote or (part not in _SHELL_BOUNDARY and not redirect and not part.isspace()):
                 word += part
                 continue
-            if word:
+            if word and not (redirect and word.isascii() and word.isdigit()):
                 words.append((word, word_line))
-                word = ""
+            word = ""
             if words and part in _SHELL_BOUNDARY:
                 yield words
                 words = []
-            if part in _SHELL_REDIRECT:
+            if redirect:
                 words.append((part, part_line))
         if word:
             words.append((word, word_line))
@@ -542,6 +719,20 @@ def shell_literal(word: str) -> str:
     return word[1:-1] if len(word) > 1 and word[0] == word[-1] and word[0] in "\"'" else word
 
 
+def shell_command_start(words: Sequence[tuple[str, int]]) -> int:
+    has_prefix = False
+    prefix = iter(enumerate(words))
+    for index, (word, _) in prefix:
+        if _SHELL_REDIRECT_WORD.fullmatch(word):
+            _ = next(prefix, None)
+            has_prefix = True
+        elif _SHELL_ASSIGNMENT.match(word):
+            has_prefix = True
+        elif has_prefix or word not in _SHELL_CONTROL:
+            return index
+    return len(words)
+
+
 def shell_key_reads(text: str, mentions: re.Pattern[str] | None) -> SourceKeyReads:
     reads = SourceKeyReads()
     for words in shell_commands(text):
@@ -549,32 +740,24 @@ def shell_key_reads(text: str, mentions: re.Pattern[str] | None) -> SourceKeyRea
             for word, line in words:
                 reads.mentions.update((match[0], line + word.count("\n", 0, match.start()))
                                       for match in mentions.finditer(word))
-        first = next((index for index, (word, _) in enumerate(words) if word not in _SHELL_CONTROL), len(words))
-        command = words[first:first + 4]
+        first = shell_command_start(words)
+        command = words[first:first + 5]
         if len(command) < 3:
             continue
         program = shell_literal(command[0][0])
         if program in ("conf_value", "conf_get"):
             key, line = command[2]
-        elif (program.rsplit("/", 1)[-1] == "conf.py" and len(command) == 4
-              and shell_literal(command[1][0]) == "get"):
-            key, line = command[3]
         else:
-            continue
+            executable = program.rsplit("/", 1)[-1]
+            cli = command[1:] if executable == "py" or executable.startswith("python") else command
+            if (len(cli) < 4 or shell_literal(cli[0][0]).rsplit("/", 1)[-1] != "conf.py"
+                    or shell_literal(cli[1][0]) != "get"):
+                continue
+            key, line = cli[3]
         key = shell_literal(key)
         if _SHELL_KEY.fullmatch(key):
             reads.fixed.add((key, line))
     return reads
-
-
-def advisory_source_contents(repo: Path, sources: dict[str, str]) -> Iterator[tuple[str, bytes]]:
-    """Yield source bytes from the batch replies that Git can read."""
-    command = ("git", "-C", str(repo), "cat-file", "--batch")
-    replies = BytesIO(run_git(command, input="".join(f"{blob}\n" for blob in sources.values()).encode()).stdout)
-    for source, blob in sources.items():
-        reply = read_batch_blob(replies)
-        if isinstance(reply, GitBlob) and reply.object_id == blob:
-            yield source, reply.content
 
 
 def tip_key_reads(repo: Path, tip_files: dict[str, str], removed: dict[str, set[str]],
@@ -600,7 +783,9 @@ def tip_key_reads(repo: Path, tip_files: dict[str, str], removed: dict[str, set[
     if not sources:
         return advisory
     try:
-        for source, content in advisory_source_contents(repo, sources):
+        for source, content in blob_contents(repo, sources, report_missing=True):
+            if isinstance(content, MissingBlob):
+                continue
             try:
                 reads = (python_key_reads(source, content, tokens) if source.endswith(".py")
                          else shell_key_reads(content.decode("utf-8"), shell_mentions))
@@ -617,8 +802,8 @@ def tip_key_reads(repo: Path, tip_files: dict[str, str], removed: dict[str, set[
                     reported.add((key, line))
             advisory.absent.extend(AbsentKeyRead(source, line, key) for key, line in reads.fixed - reported
                                    if key not in held)
-    except GitReadFailed:
-        return advisory
+    except (GitReadFailed, OSError):
+        pass
     return advisory
 
 
