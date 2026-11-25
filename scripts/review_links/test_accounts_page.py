@@ -1122,6 +1122,11 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
         self.assertEqual(orders["reset count"], [4, 3, 0, 1, 2, 5])
         self.assertEqual(orders["reset count-reverse"], [3, 4, 0, 1, 2, 5])
 
+    def test_weekly_reset_orange_weight(self) -> None:
+        for position, expected in ((0, 0), (0.125, 0.25), (0.25, 0.5), (0.5, 2 / 3), (1, 1)):
+            with self.subTest(position=position):
+                self.assertAlmostEqual(accounts_page.weekly_reset_orange_weight(position), expected)
+
     def test_weekly_reset_colors_use_the_stored_codex_work_rule(self) -> None:
         make_row = cast(Callable[..., accounts.StatusRow], getattr(accounts, "_status_row"))
         folder = self.review_root.parent / ".codex1"
@@ -1146,7 +1151,7 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 markup = accounts_page.board(reading)
                 self.assertIn(f'class="weekly-reset-{expected}"', markup)
                 if expected == "exhausted":
-                    self.assertIn('style="--reset-orange-weight:33%"', markup)
+                    self.assertIn('style="--reset-orange-weight:100%"', markup)
 
     def test_weekly_reset_colors_reject_future_codex_readings(self) -> None:
         make_row = cast(Callable[..., accounts.StatusRow], getattr(accounts, "_status_row"))
@@ -1194,6 +1199,136 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
         reading = accounts.StatusReading(rows, (), (), timezone.utc, AT)
         self.assertIn('class="weekly-reset-ready"', accounts_page.board(reading))
 
+    def test_weekly_reset_scale_excludes_accounts_with_a_role_or_weekly_quota_left(self) -> None:
+        exhausted = replace(status_row("claude1"), weekly_left_percent=0, roles=(), role_counts=())
+        later = AT + timedelta(days=4)
+        for excluded in (
+            replace(exhausted, label="claude2", roles=("units",), selected_roles=("units",),
+                    role_counts=(accounts.RoleSessionCounts(0, 0, 0, 0),), resets_at=later),
+            replace(exhausted, label="codex1", tool="codex", roles=("spare",), weekly_left_percent=20,
+                    role_counts=(accounts.NoRoleCount(),), resets_at=later,
+                    codex_work_readiness=agent_accounts.CodexWorkExhausted(),
+                    codex_weekly_freshness=accounts.CodexWeeklyFreshness.FRESH),
+        ):
+            with self.subTest(account=excluded.label):
+                reading = accounts.StatusReading((exhausted, excluded), (), (), timezone.utc, AT)
+                markup = accounts_page.board(reading)
+                self.assertEqual(re.findall(r'<span (class="weekly-reset-[^"]+"[^>]*)>', markup),
+                                 ['class="weekly-reset-exhausted" style="--reset-orange-weight:100%"'] * 2)
+
+    def test_weekly_reset_scale_end_is_independent_of_codex_work_readiness(self) -> None:
+        make_row = cast(Callable[..., accounts.StatusRow], getattr(accounts, "_status_row"))
+        folder = self.review_root.parent / ".codex1"
+        status = accounts.CodexStatus("~/.codex1", folder, True, True, "codex1", "fixture@example.invalid", "", (), ())
+        exhausted = replace(status_row("claude1"), weekly_left_percent=0, roles=(), role_counts=())
+        at = AT.isoformat()
+        weekly = usage_store.StoredWindow(left=0, at=at, resets=(AT + timedelta(days=4)).isoformat())
+        for usage, color in (
+            (usage_store.StoredUsage(weekly=weekly), "unknown"),
+            (usage_store.StoredUsage(weekly=weekly, credits=usage_store.StoredCredits(balance="10", at=at)), "ready"),
+        ):
+            with (self.subTest(color=color),
+                  patch.object(agent_accounts, "codex_credits_setting", return_value=agent_accounts.CreditsOn())):
+                codex = make_row(status, usage, AT, ("spare",))
+                reading = accounts.StatusReading((exhausted, codex), (), (), timezone.utc, AT)
+                markup = accounts_page.board(reading)
+                self.assertEqual(re.findall(r'<span (class="weekly-reset-[^"]+"[^>]*)>', markup), [
+                    'class="weekly-reset-exhausted" style="--reset-orange-weight:50%"',
+                    f'class="weekly-reset-{color}"',
+                ])
+
+    def test_weekly_reset_scale_end_requires_a_fresh_codex_weekly_reading(self) -> None:
+        age_limit = timedelta(minutes=7)
+        _ = write_config_fixture(conf.path("accounts"), "usage_stale_minutes=7\n")
+        make_row = cast(Callable[..., accounts.StatusRow], getattr(accounts, "_status_row"))
+        folder = self.review_root.parent / ".codex1"
+        status = accounts.CodexStatus("~/.codex1", folder, True, True, "codex1", "fixture@example.invalid", "", (), ())
+        exhausted = replace(status_row("claude1"), weekly_left_percent=0, roles=(), role_counts=())
+        five = usage_store.StoredWindow(left=40, at=(AT - timedelta(minutes=8)).isoformat(),
+                                       resets=(AT + timedelta(hours=2)).isoformat())
+        for observed, weight in (
+            (AT - age_limit, 50),
+            (AT - age_limit - timedelta(seconds=1), 100),
+            (AT + timedelta(seconds=1), 100),
+        ):
+            with (self.subTest(observed=observed),
+                  patch.object(agent_accounts, "codex_credits_setting", return_value=agent_accounts.CreditsOff())):
+                weekly = usage_store.StoredWindow(left=0, at=observed.isoformat(),
+                                                 resets=(AT + timedelta(days=4)).isoformat())
+                usage = usage_store.StoredUsage(weekly=weekly, five_hour=five)
+                codex = make_row(status, usage, AT, ("spare",))
+                reading = accounts.StatusReading((exhausted, codex), (), (), timezone.utc, AT)
+                markup = accounts_page.board(reading)
+                self.assertEqual(re.findall(r'<span (class="weekly-reset-[^"]+"[^>]*)>', markup), [
+                    f'class="weekly-reset-exhausted" style="--reset-orange-weight:{weight}%"',
+                    'class="weekly-reset-unknown"',
+                ])
+
+    def test_weekly_reset_scale_uses_status_after_usage_store_refresh(self) -> None:
+        home = self.review_root.parent / "home"
+        configuration = Path(os.environ["CONF_DIR"])
+        write_machine_config(configuration)
+        claude = accounts.AccountStatus("~/.claude1", home / ".claude1", True, True, True,
+                                       "claude1", "fixture-claude@example.invalid", "", (), (),
+                                       accounts.McpServerDifferences())
+        codex = accounts.CodexStatus("~/.codex2", home / ".codex2", True, True, "codex2",
+                                    "fixture-codex@example.invalid", "spare", (), ())
+        at = datetime.now(timezone.utc)
+        weekly_claude = usage_store.StoredWindow(left=0, at=at.isoformat(),
+                                                  resets=(at + timedelta(days=1)).isoformat())
+        weekly_codex = usage_store.StoredWindow(left=0, at=at.isoformat(),
+                                                 resets=(at + timedelta(days=4)).isoformat())
+        claude_key = usage_store.key("Claude", claude.login)
+        codex_key = usage_store.key("Codex", codex.login)
+        stored = {claude_key: usage_store.StoredUsage(weekly=weekly_claude),
+                  codex_key: usage_store.StoredUsage(weekly=weekly_codex)}
+
+        def refresh_store(reading: accounts.StatusReading) -> str:
+            refreshed_at = (reading.checked_at + timedelta(seconds=1)).isoformat()
+            updated = usage_store.StoredUsage(weekly={**weekly_codex, "at": refreshed_at})
+            with usage_store.read_lock():
+                usage_store.write({**stored, codex_key: updated})
+            return ""
+
+        with (scratch_account_home(home, {"USER_ZONE": "UTC"}, clear=False),
+              patch.dict(os.environ, {"CONF_DIR": str(configuration)}),
+              patch.object(role_map, "is_role_map_host", return_value=True),
+              patch.object(accounts, "account_statuses", return_value=[claude]),
+              patch.object(accounts, "codex_statuses", return_value=[codex]),
+              patch.object(accounts, "_status_workers_account",
+                           return_value=accounts.CodexWorkersAccount("codex1", home / ".codex1")),
+              patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts()),
+              patch.object(accounts, "_read_local_role_sessions",
+                           return_value=accounts.LocalRoleSessions({}, {}, (), (), (), False, frozenset())),
+              patch.object(accounts, "_start_session_counts_fetch", return_value=False),
+              patch.object(agent_accounts, "codex_credits_setting", return_value=agent_accounts.CreditsOff()),
+              patch.object(usage_store, "load", wraps=usage_store.load) as load,
+              patch.object(accounts_page, "logins_board", side_effect=refresh_store) as refresh):
+            with usage_store.read_lock():
+                usage_store.write(stored)
+            page = accounts_page.page()
+        refresh.assert_called_once()
+        load.assert_called_once_with()
+        weights = cast(list[bytes],
+                       re.findall(rb'class="weekly-reset-exhausted" style="--reset-orange-weight:([0-9.]+)%"', page))
+        self.assertEqual(len(weights), 2)
+        self.assertAlmostEqual(float(weights[0]), 50, delta=0.01)
+        self.assertEqual(float(weights[1]), 100)
+
+    def test_weekly_reset_colors_when_resets_tie_or_expire(self) -> None:
+        exhausted = replace(status_row("claude1"), weekly_left_percent=0, roles=(), role_counts=())
+        for days, expected in (
+            (1, 'class="weekly-reset-exhausted" style="--reset-orange-weight:100%"'),
+            (0, 'class="weekly-reset-unknown"'),
+            (-1, 'class="weekly-reset-unknown"'),
+        ):
+            with self.subTest(days=days):
+                first = replace(exhausted, resets_at=AT + timedelta(days=days))
+                second = replace(first, label="claude2")
+                reading = accounts.StatusReading((first, second), (), (), timezone.utc, AT)
+                markup = accounts_page.board(reading)
+                self.assertEqual(re.findall(r'<span (class="weekly-reset-[^"]+"[^>]*)>', markup), [expected] * 2)
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser contrast")
     def test_weekly_reset_colors_show_room_running_sessions_and_time_until_reset(self) -> None:
         statusline = Path(os.environ["CONF_DIR"]) / "statusline.conf"
@@ -1201,15 +1336,17 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
                                   encoding="utf-8")
         exhausted = replace(status_row("claude1"), weekly_left_percent=0, roles=(), role_counts=())
         rows = (
-            replace(exhausted, weekly_left_percent=1),
+            replace(exhausted, weekly_left_percent=1, resets_at=AT + timedelta(days=30)),
             replace(exhausted, label="claude2", roles=("units",), role_counts=(accounts.RoleSessionCounts(0, 1, 0, 0),)),
-            replace(exhausted, label="claude3", resets_at=AT + timedelta(days=4)),
-            replace(exhausted, label="claude4", resets_at=AT + timedelta(days=4, hours=6)),
-            replace(exhausted, label="claude5", resets_at=AT + timedelta(days=4, hours=18)),
+            replace(exhausted, label="claude3", resets_at=AT + timedelta(days=1)),
+            replace(exhausted, label="claude4", resets_at=AT + timedelta(days=4)),
+            replace(exhausted, label="claude5", resets_at=AT + timedelta(days=8)),
+            replace(exhausted, label="claude6", resets_at=AT + timedelta(days=13)),
             replace(exhausted, label="codex1", tool="codex", roles=("workers",), selected_roles=("workers",),
                     weekly_left_percent=1, codex_work_readiness=agent_accounts.CodexWorkAvailable()),
-            replace(exhausted, label="codex2", tool="codex", roles=("spare",), resets_at=AT + timedelta(days=5),
-                    codex_work_readiness=agent_accounts.CodexWorkExhausted()),
+            replace(exhausted, label="codex2", tool="codex", roles=("spare",), resets_at=AT + timedelta(days=20),
+                    codex_work_readiness=agent_accounts.CodexWorkExhausted(),
+                    codex_weekly_freshness=accounts.CodexWeeklyFreshness.FRESH),
             replace(exhausted, label="codex3", tool="codex", weekly_left_percent=accounts.StatusUnavailable()),
         )
         reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets())
@@ -1226,6 +1363,7 @@ const luminance=pixel=>{
  const linear=channels.map(value=>value<=0.04045 ? value/12.92 : ((value+0.055)/1.055)**2.4);
  return linear.reduce((sum,value,index)=>sum+value*[0.2126,0.7152,0.0722][index],0);
 };
+const contrast=(base,ink)=>(Math.max(base,ink)+0.05)/(Math.min(base,ink)+0.05);
 const background=node=>getComputedStyle(node).backgroundColor;
 const fill=cell=>pixel(background(cell.closest('.card')),background(cell.closest('tr')),background(cell.parentElement));
 try{
@@ -1234,17 +1372,19 @@ try{
  const exhausted=cells.filter(cell=>cell.matches('.weekly-reset-exhausted'));
  const labels=spans=>spans.map(cell=>cell.closest('tr').dataset.accountRow).join(',');
  check(labels(ready)==='claude1,claude2,codex1','Accounts with room or a running session use green.');
- check(labels(exhausted)==='claude3,claude4,claude5,codex2','Exhausted accounts use the gradient.');
+ check(labels(exhausted)==='claude3,claude4,claude5,claude6,codex2','Exhausted accounts use the gradient.');
  check(labels(cells.filter(cell=>cell.matches('.weekly-reset-unknown')))==='codex3','Unknown keeps the default color.');
- check(exhausted.map(cell=>cell.style.getPropertyValue('--reset-orange-weight')).join(',')==='33%,49.75%,83.25%,100%',
-  'The orange weight follows the time between the nearest and furthest resets.');
+ const weightProperty='--reset-orange-weight';
+ const weights=exhausted.map(cell=>cell.style.getPropertyValue(weightProperty));
+ check(weights.join(',')==='10%,40%,60%,76.666667%,100%',
+  'The orange weight follows the time from the reading to the furthest exhausted reset.');
  const paired=cells.filter(cell=>cell.closest('tr').matches('.auto-pair'));
  check(labels(paired)==='codex1,codex2','The pair includes an available account and an exhausted account.');
  for(const theme of ['light','dark']){
   document.documentElement.dataset.theme=theme;
   const inks=cells.map(cell=>getComputedStyle(cell.firstElementChild || cell).color);
   const readyInks=ready.map(cell=>inks[cells.indexOf(cell)]);
-  check(new Set(readyInks).size===1 && new Set(inks).size===6,theme+' has green and four distinct gradient colors.');
+  check(new Set(readyInks).size===1 && new Set(inks).size===7,theme+' has green and five distinct gradient colors.');
   check(fill(paired[0]).join(',')!==fill(cells[0]).join(','),theme+' has a tinted pair background.');
   for(const state of ['default','hover','limit']){
    for(const [index,cell] of cells.entries()){
@@ -1257,8 +1397,18 @@ try{
     }
     const base=luminance(fill(cell));
     const ink=luminance(pixel(inks[index]));
-    const contrast=(Math.max(base,ink)+0.05)/(Math.min(base,ink)+0.05);
-    check(contrast>=4.5,[theme,row.dataset.accountRow,state,contrast.toFixed(2)].join(' '));
+    const ratio=contrast(base,ink);
+    check(ratio>=4.5,[theme,row.dataset.accountRow,state,ratio.toFixed(2)].join(' '));
+    if(cell===paired[1]){
+     const savedWeight=cell.style.getPropertyValue(weightProperty);
+     for(let weight=0;weight<=100;weight++){
+      cell.style.setProperty(weightProperty,weight+'%');
+      const gradientInk=luminance(pixel(getComputedStyle(cell.firstElementChild || cell).color));
+      const gradientRatio=contrast(base,gradientInk);
+      check(gradientRatio>=4.5,[theme,state,weight+'%',gradientRatio.toFixed(2)].join(' '));
+     }
+     cell.style.setProperty(weightProperty,savedWeight);
+    }
     cell.parentElement.style.removeProperty('background-color');
     row.style.backgroundColor=tint;
    }

@@ -32,6 +32,7 @@ from collections.abc import Callable, Collection, Generator, Iterable, Mapping, 
 from contextlib import closing, contextmanager, nullcontext, redirect_stderr
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
+from enum import Enum, auto
 from functools import cached_property
 from pathlib import Path
 from threading import Lock
@@ -4682,6 +4683,13 @@ def stored_weekly_quotas(now: datetime) -> dict[str, WeeklyQuota]:
     )
 
 
+class CodexWeeklyFreshness(Enum):
+    """Whether the status read found a fresh Codex weekly window."""
+
+    FRESH = auto()
+    NO_FRESH_WINDOW = auto()
+
+
 @dataclass(frozen=True)
 class StatusRow:
     """One account's values, shared by the table and JSON renderers."""
@@ -4713,6 +4721,7 @@ class StatusRow:
     codex_work_readiness: agent_accounts.CodexWorkReadiness = field(
         default_factory=lambda: agent_accounts.CodexWorkUnknown("no stored Codex reading"))
     has_running_claude_session: bool = False
+    codex_weekly_freshness: CodexWeeklyFreshness = CodexWeeklyFreshness.NO_FRESH_WINDOW
 
 
 def weekly_quotas(rows: Iterable[StatusRow]) -> dict[str, WeeklyQuota]:
@@ -4852,9 +4861,17 @@ def _credit_reading(
     return ("no" if "weekly" in usage and len(current) == len(windows) else "unavailable", left)
 
 
-def _stored_codex_work_readiness(usage: usage_store.StoredUsage, now: datetime,
-                                 credits_setting: agent_accounts.CodexCreditsSetting, *,
-                                 account_config: conf.ConfigRead) -> agent_accounts.CodexWorkReadiness:
+@dataclass(frozen=True)
+class CodexUsageAssessment:
+    """Work readiness and weekly freshness from the same saved usage."""
+
+    work_readiness: agent_accounts.CodexWorkReadiness
+    weekly_freshness: CodexWeeklyFreshness
+
+
+def _assess_stored_codex_usage(usage: usage_store.StoredUsage, now: datetime,
+                               credits_setting: agent_accounts.CodexCreditsSetting, *,
+                               account_config: conf.ConfigRead) -> CodexUsageAssessment:
     stale_after = timedelta(minutes=account_config.whole("usage_stale_minutes"))
 
     def is_fresh(at: str) -> bool:
@@ -4866,11 +4883,14 @@ def _stored_codex_work_readiness(usage: usage_store.StoredUsage, now: datetime,
             return agent_accounts.Quota(label, 100 - window["left"], _stored_time(window["resets"]))
         return agent_accounts.Quota(label, None, None)
 
+    weekly = quota("Weekly", usage["weekly"]) if "weekly" in usage else None
+    weekly_freshness = (CodexWeeklyFreshness.FRESH if weekly is not None and weekly.used_percent is not None
+                        else CodexWeeklyFreshness.NO_FRESH_WINDOW)
     report = agent_accounts.Report("Codex",
-        quotas=[quota("Weekly", usage["weekly"])] if "weekly" in usage else [],
+        quotas=[weekly] if weekly is not None else [],
         five_hour=quota("5-hour", usage["five_hour"]) if "five_hour" in usage else None,
         credit_balance=usage["credits"]["balance"] if "credits" in usage and is_fresh(usage["credits"]["at"]) else None)
-    return agent_accounts.codex_can_work(report, now, credits_setting)
+    return CodexUsageAssessment(agent_accounts.codex_can_work(report, now, credits_setting), weekly_freshness)
 
 
 def _status_row(
@@ -4886,6 +4906,7 @@ def _status_row(
     on_credits = NO_VALUE
     fable_left: float | StatusUnavailable = StatusUnavailable()
     codex_readiness: agent_accounts.CodexWorkReadiness = agent_accounts.CodexWorkUnknown("no stored Codex reading")
+    codex_weekly_freshness = CodexWeeklyFreshness.NO_FRESH_WINDOW
     credits_setting = agent_accounts.codex_credits_setting(status.label) if tool == "codex" else agent_accounts.CreditsOff()
     login = status.login if status.is_set_up and status.account_is_safe_to_inspect else ""
     if login:
@@ -4906,7 +4927,9 @@ def _status_row(
                 weekly = WeeklyNotReadSince(read_at, usage_store.weekly_read_skip(held))
             if tool == "codex":
                 on_credits, credits = _credit_reading(held, now, account_config=account_config)
-                codex_readiness = _stored_codex_work_readiness(held, now, credits_setting, account_config=account_config)
+                codex_usage = _assess_stored_codex_usage(held, now, credits_setting, account_config=account_config)
+                codex_readiness = codex_usage.work_readiness
+                codex_weekly_freshness = codex_usage.weekly_freshness
             elif (fable := held.get("weekly_fable")) is not None and 0 <= fable["left"] <= 100 and _is_current(fable, now):
                 fable_left = fable["left"]
     return StatusRow(status.label, tool, status.folder, login, roles,
@@ -4917,7 +4940,8 @@ def _status_row(
         _stored_time((usage or {}).get("attempted_at", "")) or StatusUnavailable(),
         login_ends_at=agent_accounts.login_end_from_iso((usage or {}).get("login_ends_at"))
         if login and tool == "claude" else agent_accounts.LoginEndUnknown(),
-        fable_left_percent=fable_left, codex_work_readiness=codex_readiness)
+        fable_left_percent=fable_left, codex_work_readiness=codex_readiness,
+        codex_weekly_freshness=codex_weekly_freshness)
 
 
 def _codex_limit_reset_count(label: str) -> int | StatusUnavailable:
@@ -5968,9 +5992,11 @@ def _read_status(source: UsageSource, *, detail: bool, include_models: bool = Fa
     store_problems: list[StatusProblem] = []
     represented_stderr: set[str] = set()
     usage = _stored_usage(statuses, codex, now, source, problems=store_problems, represented_stderr=represented_stderr, account_config=account_config)
+    usage_rows: list[StatusRow] = []
     for status in [*statuses, *codex]:
         tool = "Codex" if isinstance(status, CodexStatus) else "Claude"
         row = _status_row(status, usage.get(usage_store.key(tool, status.login)), now, (), account_config=account_config)
+        usage_rows.append(row)
         for problem in _read_failure_problem(row, zone, status.startup if isinstance(status, CodexStatus) else NO_STARTUP_FAILURE, now=now, account_config=account_config):
             _observe_status_problem(_usage_problem_identity(problem, row, status))
     try:
@@ -6002,13 +6028,14 @@ def _read_status(source: UsageSource, *, detail: bool, include_models: bool = Fa
                 _observe_status_problem(_role_problem(error, tuple(str(note_file.note_path(status.label)) for status in statuses)))
                 # The folder's status reports its unreadable note without selecting it.
                 continue
-    rows = (
-        *(_status_row(status, usage.get(usage_store.key("Claude", status.login)), now,
-            tuple(group for group, directory in group_directories.items() if status.config_dir == directory), account_config=account_config)
-          for status in statuses),
-        *(replace(_status_row(status, usage.get(usage_store.key("Codex", status.login)), now,
-                  (status.role,) if status.role in (CODEX_ROLE, "spare") else (), account_config=account_config),
-                  limit_reset_count=_codex_limit_reset_count(status.label)) for status in codex),
+    all_statuses: list[AccountStatus | CodexStatus] = [*statuses, *codex]
+    rows = tuple(
+        replace(row, roles=(status.role,) if status.role in (CODEX_ROLE, "spare") else (),
+                limit_reset_count=_codex_limit_reset_count(status.label))
+        if isinstance(status, CodexStatus)
+        else replace(row, roles=tuple(group for group, directory in group_directories.items()
+                                      if status.config_dir == directory))
+        for row, status in zip(usage_rows, all_statuses, strict=True)
     )
     local_sessions = _read_local_role_sessions(groups, include_models=include_models)
     rows, session_inputs = _count_role_sessions(rows, local_sessions)
@@ -6019,7 +6046,6 @@ def _read_status(source: UsageSource, *, detail: bool, include_models: bool = Fa
         claude_registry_unreadable=local_sessions.claude_registry_unreadable)
     rows = counts.rows
     session_inputs = (*session_inputs, str(_session_counts_cache()))
-    all_statuses: list[AccountStatus | CodexStatus] = [*statuses, *codex]
     diagnostics_by_status = [_status_problems(status, detail=detail, zone=zone) for status in all_statuses]
     diagnostics = [problem for local in diagnostics_by_status for problem in local]
     problems: list[StatusProblem] = list(store_problems)

@@ -514,9 +514,23 @@ def _weekly_reset_ready(row: accounts.StatusRow) -> bool:
     return isinstance(row.weekly_left_percent, (int, float)) and row.weekly_left_percent > 0
 
 
+def weekly_reset_orange_weight(position: float) -> float:
+    """Return the orange weight for a reset position from zero to one."""
+    if position <= 0.25:
+        return 2 * position
+    return 0.5 + (position - 0.25) * (0.5 / 0.75)
+
+
 def _weekly_reset_attributes(reading: accounts.StatusReading) -> dict[str, str]:
+    scale_end = max(
+        (row.resets_at for row in reading.rows
+         if row.weekly_left_percent == 0 and all(role == "spare" for role in row.roles)
+         and isinstance(row.resets_at, datetime) and row.resets_at > reading.checked_at
+         and (row.tool == "claude" or row.codex_weekly_freshness is accounts.CodexWeeklyFreshness.FRESH)),
+        default=reading.checked_at,
+    )
+    span = scale_end - reading.checked_at
     attributes: dict[str, str] = {}
-    no_room: dict[str, datetime] = {}
     for row in reading.rows:
         if _weekly_reset_ready(row):
             attributes[row.label] = ' class="weekly-reset-ready"'
@@ -524,15 +538,10 @@ def _weekly_reset_attributes(reading: accounts.StatusReading) -> dict[str, str]:
             exhausted = (isinstance(row.codex_work_readiness, agent_accounts.CodexWorkExhausted) if row.tool == "codex"
                          else isinstance(row.weekly_left_percent, (int, float)) and row.weekly_left_percent <= 0)
             if exhausted:
-                no_room[row.label] = row.resets_at
-    if no_room:
-        nearest, furthest = min(no_room.values()), max(no_room.values())
-        span = furthest - nearest
-        for label, reset in no_room.items():
-            fraction = (reset - nearest) / span if span else 0
-            orange_weight = 33 + 67 * fraction
-            attributes[label] = (f' class="weekly-reset-exhausted"'
-                                 f' style="--reset-orange-weight:{orange_weight:.8g}%"')
+                position = min(1.0, (row.resets_at - reading.checked_at) / span) if span else 1.0
+                orange_weight = 100 * weekly_reset_orange_weight(position)
+                attributes[row.label] = (f' class="weekly-reset-exhausted"'
+                                         f' style="--reset-orange-weight:{orange_weight:.8g}%"')
     return attributes
 
 

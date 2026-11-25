@@ -1186,9 +1186,17 @@ After **next**, **weekly reset** shows the weekly reset time.
 A running account uses green. This includes a Claude account with an unassigned session.
 Claude accounts with weekly quota left use green. Codex accounts use green when current quota or enabled credits permit work.
 The color ignores Codex quota and credit readings from the future or older than the configured age limit.
-For exhausted accounts with no running session, the reset color changes with the time until reset.
-The nearest reset uses the first color after green. The furthest reset uses orange.
-If there is only one reset time, it uses the first color after green.
+For exhausted accounts with no running session, the reset color uses a scale from green to orange.
+The reading time is the start of the scale.
+The scale ends at the furthest future reset among accounts with no role and 0% quota in the current weekly window.
+A Codex weekly reading sets the end only if its age is zero through `usage_stale_minutes`.
+The page uses one status snapshot for the scale and the row colors.
+At one quarter of this time span, the color uses 50% orange.
+The orange weight changes linearly on each side of that point.
+A reset at or after the end of the scale uses 100% orange.
+When no account sets the end, future exhausted resets use 100% orange.
+An expired reset for an exhausted account uses the default text color.
+The reset colors keep at least 4.5:1 contrast in both themes.
 **resets** shows the reset count from the Codex account note or a dash when the count is missing.
 Claude accounts show a dash in **resets**.
 Select a named header or press Enter to sort.
