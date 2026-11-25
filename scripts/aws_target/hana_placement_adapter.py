@@ -406,12 +406,14 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
     controller = controller_for(transport, read_only=True)
     paths = claim_state.state_paths(target_name)
     with claim_state.locked(paths.lock):
+        blocked = not isinstance(mac_test.blocking_claim_block(paths, key.session), mac_test.NoMacBlock)
         snapshot = controller.inspect()
         resources_held = False
         if isinstance(snapshot, box.HanaResourcesHeld):
             snapshot = controller.inspect_for_settlement()
             if not isinstance(snapshot, box.HanaLifecycleEvidence):
-                return placement.FreshHostEvidence(key, now, '', placement.TemporaryExclusion('busy'))
+                return placement.FreshHostEvidence(key, now, '',
+                    placement.TemporaryExclusion('blocked' if blocked else 'busy'))
             resources_held = True
         if isinstance(snapshot, HanaUnprovisioned):
             return placement.FreshHostEvidence(key, now, '', placement.TemporaryExclusion('unprovisioned'))
@@ -452,8 +454,8 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
                         continue
             held.append(claim)
         if resources_held:
-            return placement.FreshHostEvidence(key, now, '', placement.TemporaryExclusion('busy'))
-        block = mac_test.blocking_claim_block(paths, key.session)
+            return placement.FreshHostEvidence(key, now, '',
+                placement.TemporaryExclusion('blocked' if blocked else 'busy'))
     adopted: list[placement.AdoptedProviderClaim] = []
     cleanup: list[placement.RetainedCleanupClaim] = []
     executions: list[tuple[placement.ProviderClaimReference, execution_identity.ExecutionEvidence]] = []
@@ -485,7 +487,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
     eligibility: placement.HostEligibility = placement.AllowedHost()
     if not controller.image_is_current(snapshot.deployment, workload=workload):
         eligibility = placement.FixedExclusion(placement.HANA_IMAGE_STALE)
-    elif not isinstance(block, mac_test.NoMacBlock):
+    elif blocked:
         eligibility = placement.TemporaryExclusion('blocked')
     elif (held or snapshot.claims) and not own_claim:
         eligibility = placement.TemporaryExclusion('busy')
