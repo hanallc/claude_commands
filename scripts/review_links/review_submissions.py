@@ -2269,13 +2269,17 @@ def answer(key: str, words: str, reply_token: str, *, members: staff.StaffSnapsh
         with scoped_submission(scoped, members=members) as located:
             path = located.destination.path
             owner = located.destination.owner
-            match scoped.kind:
-                case SubmissionKind.QUESTION:
-                    return update_registration.reply_to_submission(path, scoped, words, reply_token, owner=owner)
-                case SubmissionKind.PROPOSAL:
-                    return proposal_issue.reply_to_submission(path, scoped, words, reply_token, owner=owner)
-                case SubmissionKind.BUG | SubmissionKind.INVESTIGATION:
-                    return investigation.answer_submission(path, scoped, words, reply_token, owner=owner)
+        match scoped.kind:
+            case SubmissionKind.QUESTION:
+                save = update_registration.prepare_submission_reply(path, scoped, words, reply_token, owner=owner)
+            case SubmissionKind.PROPOSAL:
+                save = proposal_issue.prepare_submission_reply(path, scoped, words, reply_token, owner=owner)
+            case SubmissionKind.BUG | SubmissionKind.INVESTIGATION:
+                save = investigation.prepare_submission_reply(path, scoped, words, reply_token, owner=owner)
+        with scoped_submission(scoped, members=members) as current:
+            if (current.destination.path, current.destination.owner) != (path, owner):
+                raise SubmissionError("The selected item changed.")
+            return save()
     except (investigation.InvestigationError, proposal_issue.Refusal, update_registration.RegistrationFailure) as error:
         raise SubmissionError(str(error)) from error
 

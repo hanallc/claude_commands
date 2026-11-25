@@ -15,8 +15,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import cast
+from typing import cast, override
 from urllib.parse import parse_qs
+
+from scripts.console_text import check as console_text
+from scripts.notify.review import CaptionLayout
 
 from scripts.lib import atomic_file, conf, file_lock
 from scripts.lib.user_zone import shown_time
@@ -132,12 +135,20 @@ def waiting_images(request: console.NewsRequest, *, status: change_page.Delivery
 
 
 def register(image: Path, caption: str, owner: staff.StaffId, subject: str,
-             *, before: Path | None = None) -> image_store.ImageRecord:
+             *, before: Path | None = None, two_halves: bool = False) -> image_store.ImageRecord:
     """Register one image or a before and after pair for its staff owner."""
     if not caption.strip():
         raise ValueError("the caption is empty; say the change in the fewest plain words that stay accurate")
     if staff.snapshot().by_id(owner) is None:
         raise ValueError(f"no staff record for owner {owner}")
+    if two_halves and before is not None:
+        raise ValueError("Use two halves with a single image.")
+    layout: CaptionLayout = "single picture"
+    if before is not None:
+        layout = "before and after pair"
+    elif two_halves:
+        layout = "picture with two halves"
+    console_text.require(caption, "image caption", caption_layout=layout)
     return image_store.register_file(image, images_root(review_link.review_root().resolve()),
                                      caption, str(owner), subject, before=before)
 
@@ -300,8 +311,16 @@ def ask_question(root: Path, identity: str, words: str, status: change_page.Deli
     return page_question.ask(store, target, words, status)
 
 
+class ImageReplyStore(image_store.ImageQuestionStore):
+    @override
+    def set_answer(self, item: str, question_id: str, answer: question_record.Answer) -> None:
+        console_text.require(answer.text, "reply", identity=f"image/{item}/{question_id}",
+                             refusal=question_record.AnswerRefused)
+        super().set_answer(item, question_id, answer)
+
+
 def answer_question(root: Path, identity: str, question_id: str, text: str) -> None:
-    result = page_question.answer(image_store.ImageQuestionStore(images_root(root)), identity, question_id, text)
+    result = page_question.answer(ImageReplyStore(images_root(root)), identity, question_id, text)
     if isinstance(result, page_question.AnswerRefused):
         raise question_record.AnswerRefused(result.reason)
 
@@ -590,6 +609,7 @@ def main(arguments: list[str]) -> int:
     actions = parser.add_subparsers(dest="action", required=True)
     add = actions.add_parser("register", help="copy an image or a before and after pair to the Images page")
     _ = add.add_argument("--image", type=Path, help="the image file to copy")
+    _ = add.add_argument("--two-halves", action="store_true", help="the image shows two halves in one file")
     _ = add.add_argument("--before", type=Path, help="the before image of a pair; give --after with it")
     _ = add.add_argument("--after", type=Path, help="the after image of a pair; give --before with it")
     _ = add.add_argument("--caption", required=True, help="the change in the fewest plain words that stay accurate")
@@ -616,7 +636,8 @@ def main(arguments: list[str]) -> int:
             else:
                 parser.error("give --image, or --before and --after")
             record = register(shown, cast(str, args.caption), staff.StaffId(cast(str, args.owner)),
-                              f"Change {change}" if change is not None else f"Phase {phase}", before=before)
+                              f"Change {change}" if change is not None else f"Phase {phase}",
+                              before=before, two_halves=cast(bool, args.two_halves))
             origin = f"http://{review_link.link_host()}:{conf.read('review_links').whole('server_port')}"
             print(f"registered {record['id']}: "
                   + " ".join(f"{origin}{image_path(record, file)}" for _, file in shown_files(record)))

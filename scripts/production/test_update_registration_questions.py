@@ -738,7 +738,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertIn("questions: failed", result.stdout)
         self.assertEqual(outstanding.read_bytes(), before)
 
-    def test_a_stored_item_with_plumbing_is_named_and_a_new_one_is_refused(self) -> None:
+    def test_title_words_do_not_block_questions_or_the_model_review(self) -> None:
         outstanding = self.outstanding()
         _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"free the cargo-berth on the Mac"}]\n',
                                    encoding="utf-8")
@@ -747,17 +747,41 @@ class RegistrationTests(RegistrationFixture):
                              encoding="utf-8")
         kept = self.run_command("questions", "--state", str(state))
         self.assertEqual(kept.returncode, 0, kept.stdout + kept.stderr)
-        self.assertIn("questions: reword — free the cargo-berth on the Mac: 'berth' is the production's own plumbing",
-                      kept.stdout)
+        self.assertNotIn("questions: reword", kept.stdout)
         entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
         self.assertEqual([entry["text"] for entry in entries], ["free the cargo-berth on the Mac", "review colors"])
-        before = outstanding.read_bytes()
         _ = state.write_text(json.dumps({"open_for_user": ["review colors", "release the writers"]}), encoding="utf-8")
-        refused = self.run_command("questions", "--state", str(state))
-        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
-        self.assertIn("questions: failed — release the writers: 'writers' is the production's own plumbing",
-                      refused.stdout)
-        self.assertEqual(outstanding.read_bytes(), before)
+        replaced = self.run_command("questions", "--state", str(state))
+        self.assertEqual(replaced.returncode, 0, replaced.stdout + replaced.stderr)
+        entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
+        self.assertEqual([entry["text"] for entry in entries], ["review colors", "release the writers"])
+
+        title = "Do writers see the new button?"
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(title)) as reviewer:
+            filed = self.run_command("ask", "--ask", title)
+        self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
+        reviewer.assert_called_once_with(review.QuestionKey(self.fixture_owner_name(), title), title,
+                                         console_kind="question")
+
+    def test_questions_uses_the_console_check_before_filing_a_new_question(self) -> None:
+        title = "Keep the layout?"
+        body = "Read ../notes/proof. Keep the layout?"
+        state = self.question_state([{"text": title, "question": body}])
+        with mock.patch.object(review, "review_question") as reader:
+            result = self.run_command("questions", "--state", str(state))
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("omit-file-path: ../notes/proof", result.stdout)
+            reader.assert_not_called()
+        self.assertEqual(self.open_rows(), [])
+
+        body = "The labels stay visible. Keep the layout?"
+        state = self.question_state([{"text": title, "question": body}])
+        draft = f"## {title}\n\n{body}"
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(draft)) as reader:
+            result = self.run_command("questions", "--state", str(state))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        reader.assert_called_once_with(review.QuestionKey(self.fixture_owner_name(), title), draft, console_kind="question")
+        self.assertEqual(self.open_rows()[0]["question"], body)
 
     def test_questions_store_what_waits_on_the_user_and_print_one_line(self) -> None:
         outstanding = self.outstanding()

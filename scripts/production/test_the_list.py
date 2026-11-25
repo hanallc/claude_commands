@@ -22,6 +22,7 @@ from scripts.agents.remote import local_machine
 from scripts.herdr.place import HerdrPlace
 from scripts.lib import atomic_file, conf
 from scripts.message import send_result
+from scripts.notify import review
 from scripts.production import change_review, delivery_state, investigation, record_store, session_pane, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
 from scripts.review_links import change_page, list_page, question_record, review_items
@@ -72,6 +73,7 @@ class TheListTests(unittest.TestCase):
         self.list_config.parent.mkdir(parents=True)
         _ = self.list_config.write_text("".join(f"# whole: 1..\n{key}={limit}\n" for key, limit in LIST_TEXT_LIMITS.items()))
         _ = self.enterContext(patch.object(the_list, "now", return_value=START))
+        _ = self.enterContext(patch.object(review, "review_question", return_value=review.QuestionAccepted("")))
         _ = self.send_patch.start()
         self.addCleanup(self.send_patch.stop)
 
@@ -208,6 +210,31 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(item.log[1], the_list.ItemChange(START, the_list.MarkedRead(), "nate"))
         self.assertIn("| # | Owner | Producer | Item | State | Next step | ETA | Update |", self.command("list")[1])
         self.assertIn('| 106 | show | morty | The page: "List" | Delivered;', self.command("list")[1])
+
+    def test_add_and_update_check_visible_fields_before_writing(self) -> None:
+        add = ("add", "--source", "morty", "--owner", RUNNER.id, "--title", "Keep the display usable")
+        before = the_list.records(MORTY.id)
+        code, _, errors = self.command(*add, "--next-step", "Read /tmp/proof.txt.", "--latest-status", "Saved at 9ab82dea.")
+        self.assertEqual(code, 1)
+        self.assertIn("omit-file-path: /tmp/proof.txt", errors)
+        self.assertIn("omit-commit-hash: 9ab82dea", errors)
+        self.assertIn("Revise the list field draft.", errors)
+        self.assertEqual(the_list.records(MORTY.id), before)
+
+        code, output, errors = self.command(*add, "--next-step", "Check both labels.")
+        self.assertEqual(code, 0, errors)
+        identity = output.strip()
+        item = the_list.load(MORTY.id, identity)
+        self.assertEqual(item.next_step, "Check both labels.")
+        update = ("update", "--source", "morty", "--id", identity)
+        code, _, errors = self.command(*update, "--add-evidence", "Read /tmp/screen.png.")
+        self.assertEqual(code, 1)
+        self.assertIn("omit-file-path: /tmp/screen.png", errors)
+        self.assertEqual(the_list.load(MORTY.id, identity), item)
+
+        code, _, errors = self.command(*update, "--add-evidence", "Both labels are visible.")
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(the_list.load(MORTY.id, identity).evidence, "Both labels are visible.")
 
     def test_text_limits_on_add_and_update(self) -> None:
         cases = (
@@ -1237,6 +1264,78 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(self.command(*args), (0, f"{item.id} A2\n", ""))
         self.assertEqual([ask.ask_id for ask in the_list.load(MORTY.id, item.id).asks], ["A1", "A2"])
 
+    def test_withdraw_ask_requires_the_producer_or_morty(self) -> None:
+        item = self.add(changes={"producer": BOB.id})
+        args = ("withdraw-ask", item.id, "--reason", "The merge is complete.", "--ask")
+        for number, session in enumerate((BOB.current_session, MORTY.current_session), 1):
+            ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge.",
+                                   why="The merge needs nate's go.", config=False, requester=MORTY.id, source="morty")
+            self.assertEqual(ask.ask_id, f"A{number}")
+            with patch.object(staff, "runtime_id", return_value=OWNER.current_session):
+                code, output, error = self.command(*args, ask.ask_id)
+                self.assertEqual((code, output), (1, ""))
+                self.assertEqual(len(error.splitlines()), 1)
+            with patch.object(staff, "runtime_id", return_value=""):
+                self.assertEqual(self.command(*args, ask.ask_id),
+                                 (1, "", "the_list: the current session has no staff row\n"))
+            self.assertEqual(the_list.open_asks(the_list.load(MORTY.id, item.id)), (ask,))
+            with patch.object(staff, "runtime_id", return_value=session):
+                self.assertEqual(self.command(*args, ask.ask_id), (0, f"withdrew {item.id} {ask.ask_id}\n", ""))
+            self.assertEqual(the_list.open_asks(the_list.load(MORTY.id, item.id)), ())
+
+    def test_withdraw_ask_appends_one_log_entry(self) -> None:
+        item = self.add(changes={"producer": BOB.id})
+        ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.APPROVAL, target=OWNER.id, what="Publish.",
+                               why="The release needs approval.", config=False, requester=BOB.id, source=BOB.name)
+        before = the_list.load(MORTY.id, item.id)
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        earlier_log = path.read_bytes().split(b"## Log\n\n", 1)[1].splitlines()
+        reason = "The release is complete."
+        with patch.object(staff, "runtime_id", return_value=BOB.current_session):
+            self.assertEqual(self.command("withdraw-ask", item.id, "--ask", ask.ask_id, "--reason", reason),
+                             (0, f"withdrew {item.id} {ask.ask_id}\n", ""))
+        saved = the_list.load(MORTY.id, item.id)
+        closed = replace(ask, closed=START, withdrawn=True)
+        self.assertEqual(saved.asks, (closed,))
+        self.assertEqual(saved.log, (*before.log, the_list.ItemChange(START, the_list.AskWithdrawn(closed, reason), BOB.name)))
+        self.assertEqual(path.read_bytes().split(b"## Log\n\n", 1)[1].splitlines()[:-1], earlier_log)
+
+    def test_withdraw_ask_on_a_closed_item_keeps_it_closed_and_removes_its_go(self) -> None:
+        item = self.add()
+        ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge.",
+                               why="The merge needs nate's go.", config=False, requester=MORTY.id, source="morty")
+        closed = the_list.close(MORTY.id, item.id, "The merge is complete.", source="morty")
+        self.assertEqual(the_list.open_asks(closed), (ask,))
+        with patch.object(staff, "runtime_id", return_value=MORTY.current_session):
+            self.assertEqual(self.command("withdraw-ask", item.id, "--ask", ask.ask_id, "--reason", "The merge is complete."),
+                             (0, f"withdrew {item.id} {ask.ask_id}\n", ""))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual((saved.state, saved.closed, saved.closing_words),
+                         (the_list.ItemState.CLOSED, closed.closed, closed.closing_words))
+        self.assertEqual(the_list.open_asks(saved), ())
+        reopened = the_list.reopen(MORTY.id, item.id, source="morty")
+        self.assertEqual(the_list.answerable_asks(reopened, staff.snapshot()), ())
+
+    def test_withdraw_ask_refuses_closed_unknown_and_empty_reason(self) -> None:
+        item = self.add()
+        ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge.",
+                               why="The merge needs nate's go.", config=False, requester=MORTY.id, source="morty")
+        closed = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge.",
+                                  why="The merge needs nate's go.", config=False, requester=MORTY.id, source="morty")
+        _ = the_list.give_go(MORTY.id, item.id, closed.ask_id, "0" * 32, source="nate")
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        before = path.read_bytes()
+        with patch.object(staff, "runtime_id", return_value=MORTY.current_session):
+            for ask_id, reason, expected in (
+                (closed.ask_id, "The merge is complete.", f"{item.id} has no open ask {closed.ask_id}"),
+                ("A3", "The merge is complete.", f"{item.id} has no open ask A3"),
+                (ask.ask_id, "  ", "--reason must have one nonempty line"),
+            ):
+                with self.subTest(ask_id=ask_id):
+                    self.assertEqual(self.command("withdraw-ask", item.id, "--ask", ask_id, "--reason", reason),
+                                     (1, "", f"the_list: {expected}\n"))
+                    self.assertEqual(path.read_bytes(), before)
+
     def test_go_keeps_other_unread_changes_unread(self) -> None:
         def go(item: the_list.ListItem) -> the_list.ListItem:
             ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge.",
@@ -1460,6 +1559,28 @@ class TheListTests(unittest.TestCase):
         with patch.object(the_list, "now", return_value=START + timedelta(minutes=1)):
             changed = the_list.update(MORTY.id, item.id, {"latest_status": "Morty acts."}, source="owner report")
         self.assertIs(the_list.feedback_notice_time(changed), the_list.NoTimestamp.UNSET)
+
+    def test_list_reply_review_runs_before_the_write_lock(self) -> None:
+        item = self.add()
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        _ = the_list.ask_question(MORTY.id, item.id, the_list.PageRequest("request", "question", "Which check passed?"), status)
+        before = the_list.load(MORTY.id, item.id)
+        reply = "Step B passed."
+        failure = review.RuleFailure("console-standard-5", "Step B")
+        original_lock = record_store.NumberedRecords.locked
+        with (patch.object(record_store.NumberedRecords, "locked", autospec=True, side_effect=original_lock) as locked,
+              patch.object(review, "review_question") as reader):
+            def reject(*_args: object, **_kwargs: object) -> review.QuestionReviewFailed:
+                locked.assert_not_called()
+                return review.QuestionReviewFailed(reply, (), (failure,))
+
+            reader.side_effect = reject
+            result = self.command("answer", item.id, "--question", "Q1", "--text", reply)
+            self.assertEqual(result[0], 1)
+            self.assertIn("console-standard-5: Step B", result[2])
+            key = review.QuestionKey(f"reply/list/{MORTY.id}/{item.id}/Q1", "")
+            reader.assert_called_once_with(key, reply, console_kind="reply")
+            self.assertEqual(the_list.load(MORTY.id, item.id), before)
 
     def test_answer_refusals_leave_the_record_unchanged(self) -> None:
         item = self.add()

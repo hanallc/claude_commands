@@ -7341,6 +7341,27 @@ const change=async path=>{
         entry = next(entry for entry in list_page.records(include_closed=True) if entry.item.id == closed.id)
         self.assertEqual(list_page.ask_boxes(entry, "secret", names), "")
 
+    def test_withdrawn_ask_loses_its_button_and_cannot_grant_a_go(self) -> None:
+        item = self.add("Merge the needsme unit", number=1)
+        ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge.",
+                               why="The merge needs nate's go.", config=False, requester=MORTY.id, source="morty")
+        root = self.root / "reviews"
+        # Save the record as a click does before it closes the ask.
+        entry = go_ledger.record(root, ask=ask, item=f"{MORTY.id}/{item.id}", recipients=(OWNER.id,),
+                                 client="192.0.2.2", page="/console/list.html", moment=the_list.now())
+        with patch.object(list_page, "counts_strip", return_value=""):
+            self.assertIn('data-ask="A1"', list_page.render(root).decode())
+            the_list.withdraw_ask(MORTY.id, item.id, ask.ask_id, "The merge is complete.", caller=MORTY)
+            markup = list_page.render(root).decode()
+        self.assertNotIn('data-ask="A1"', markup)
+        self.assertIn("Ask A1 withdrawn", markup)
+        self.assertIn("The merge is complete.", markup)
+        with self.assertRaisesRegex(the_list.ListError, "This ask is no longer open"):
+            _ = the_list.give_go(MORTY.id, item.id, ask.ask_id, entry["go_id"], source="nate")
+        self.assertEqual(go_ledger.check(root, entry["go_id"], OWNER.id),
+                         {"ok": False, "text": "the List has no closed ask for this Go."})
+        self.assertFalse(go_ledger.read(root, entry["go_id"])["used"])
+
     def test_browser_go_closes_the_ask_and_the_item_leaves_needs_me(self) -> None:
         added = self.add("Merge the needsme unit", the_list.ItemState.WAITING_FOR_NATE, number=1)
         item = the_list.mark_read(MORTY.id, added.id, source="nate")

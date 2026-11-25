@@ -29,6 +29,7 @@ from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
+from scripts.notify import review
 from scripts.production import delivery_state, staff, unrouted_alert
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production.staff_test_support import fixture_member
@@ -69,6 +70,8 @@ class ImagesFixture(unittest.TestCase):
         self.shot = self.temporary / "before.png"
         _ = self.shot.write_bytes(PNG)
         self.sent = []
+        _ = self.enterContext(patch.object(
+            review, "review_question", return_value=review.QuestionAccepted("Fixture review passed.")))
         _ = self.enterContext(patch.object(change_page, "send_message", side_effect=self.capture))
         _ = self.enterContext(patch.object(change_page, "send_question", side_effect=self.capture_question))
 
@@ -239,6 +242,45 @@ class ImagesTests(ImagesFixture):
             with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
                 _ = images.register(image, caption, owner, "Change sdlc/C1")
         self.assertEqual(list((self.root / image_store.IMAGES_FOLDER).glob("*")) if (self.root / image_store.IMAGES_FOLDER).exists() else [], [])
+
+    def test_register_refuses_a_caption_and_stores_the_revision(self) -> None:
+        command = ["register", "--image", str(self.shot), "--owner", self.owner_id(), "--change", "sdlc/C9"]
+        errors = StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(images.main([*command, "--caption", "Read /tmp/proof.png."]), 1)
+        self.assertIn("Revise the image caption draft. omit-file-path: /tmp/proof.png", errors.getvalue())
+        self.assertEqual(images.records(self.root), [])
+
+        caption = "The larger cards show both labels."
+        with redirect_stdout(StringIO()):
+            self.assertEqual(images.main([*command, "--caption", caption]), 0)
+        self.assertEqual([record["caption"] for record in images.records(self.root)], [caption])
+
+    def test_caption_reader_gets_each_image_layout(self) -> None:
+        caption = "Here is the result."
+        after = self.temporary / "after.png"
+        _ = after.write_bytes(PNG)
+        failures = (review.RuleFailure("console-standard-11", caption),
+                    review.RuleFailure("console-standard-12", caption))
+        key = review.QuestionKey("image caption", caption)
+        with patch.object(review, "review_question", return_value=review.QuestionAccepted(caption)) as reader:
+            _ = self.register(caption)
+            reader.assert_called_once_with(key, caption, console_kind="image caption", caption_layout="single picture")
+            reader.reset_mock()
+            _ = images.register(after, caption, self.owner_id(), "Change sdlc/C9", before=self.shot)
+            reader.assert_called_once_with(key, caption, console_kind="image caption", caption_layout="before and after pair")
+
+        before = images.records(self.root)
+        command = ["register", "--image", str(self.shot), "--two-halves", "--owner", self.owner_id(),
+                   "--change", "sdlc/C9", "--caption", caption]
+        errors = StringIO()
+        with (patch.object(review, "review_question",
+                           return_value=review.QuestionReviewFailed(caption, (), failures)) as reader,
+              redirect_stderr(errors)):
+            self.assertEqual(images.main(command), 1)
+        self.assertRegex(errors.getvalue(), "console-standard-11: .*console-standard-12:")
+        reader.assert_called_once_with(key, caption, console_kind="image caption", caption_layout="picture with two halves")
+        self.assertEqual(images.records(self.root), before)
 
     def test_command_prints_the_image_and_console_links_and_deletes(self) -> None:
         output = StringIO()
@@ -719,6 +761,26 @@ class ImageQuestionTests(ImagesFixture):
         self.submit(urlencode({'image': record['id'],
             'token': images.request_token(images.console_token(self.root), record['id']),
             'action': 'question', 'feedback': words}))
+
+    def test_image_reply_review_runs_before_the_write_lock(self) -> None:
+        record = self.register()
+        self.ask(record)
+        identity = record["id"]
+        store = image_store.ImageQuestionStore(images.images_root(self.root))
+        before = store.questions(identity)
+        reply = "Step B passed."
+        failure = review.RuleFailure("console-standard-5", "Step B")
+        with (patch.object(file_lock, "exclusive", wraps=file_lock.exclusive) as locked,
+              patch.object(review, "review_question") as reader):
+            def reject(*_args: object, **_kwargs: object) -> review.QuestionReviewFailed:
+                locked.assert_not_called()
+                return review.QuestionReviewFailed(reply, (), (failure,))
+
+            reader.side_effect = reject
+            with self.assertRaisesRegex(question_record.AnswerRefused, "console-standard-5: Step B"):
+                images.answer_question(self.root, identity, "Q1", reply)
+            reader.assert_called_once_with(review.QuestionKey(f"reply/image/{identity}/Q1", ""), reply, console_kind="reply")
+        self.assertEqual(store.questions(identity), before)
 
     def test_feedback_completion_keeps_an_answer_received_during_delivery_visible_and_new(self) -> None:
         for action in ('feedback', 'approved'):

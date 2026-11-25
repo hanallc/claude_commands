@@ -1,6 +1,8 @@
 """Test page publication, HTTP forms, verdict calls and checkpoint routing."""
 from __future__ import annotations
 
+from scripts.console_text import check as console_text
+from scripts.notify import review
 from scripts.production.change_review_test_support import fixture_image, fixture_row_image, pictured_changes, registered_fixture_image
 
 import fcntl
@@ -51,6 +53,7 @@ from scripts.review_links import new_item_dialog, question_record, reply_tokens,
 from scripts.review_links.server_test_support import started_review_server
 from scripts.rebuild import need
 from scripts.statusline import rebuild_row
+from scripts.agents import remote
 from scripts.agents.remote import local_machine
 from scripts.production.production_doc import read_production
 
@@ -648,6 +651,256 @@ class ChangePageTests(unittest.TestCase):
             self.assertNotIn('<pre>', body)
         self.assertIn('p{white-space:pre-wrap;', selected)
 
+    def test_answer_question_holds_a_draft_before_saving_the_answer(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        question = status.ask(self.page, "C1", "What happens next?")
+        assert isinstance(question, change_page.QuestionDelivery)
+        arguments = ["answer-question", "--production", "page-owner", "--list", str(self.review_list),
+                     "--row", "C1", "--question", question.question_id, "--text"]
+        path = status.path(self.page, "C1")
+        before = path.read_bytes()
+        with (patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.temporary / "notify")}),
+              patch.object(review, "review_question",
+                           return_value=review.QuestionAccepted("The window stays open.")) as reader):
+            errors = StringIO()
+            with redirect_stderr(errors):
+                self.assertEqual(change_page.main([*arguments, "Read /tmp/report.txt."]), 1)
+            self.assertIn("Revise the reply draft. omit-file-path: /tmp/report.txt", errors.getvalue())
+            self.assertEqual(path.read_bytes(), before)
+            reader.assert_not_called()
+
+            self.assertEqual(change_page.main([*arguments, "The window stays open."]), 0)
+            saved = status.slots(self.page, "C1").question
+            self.assertEqual(saved, change_page.AnsweredQuestion(
+                question.question_id, question.text, "The window stays open."))
+            reader.assert_called_once()
+
+    def test_reply_reader_runs_before_the_delivery_lock_and_fits_the_ssh_timeout(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        question = status.ask(self.page, "C1", "What happens next?")
+        assert isinstance(question, change_page.QuestionDelivery)
+        words = "The window stays open."
+        with (patch.object(status, "locked", wraps=status.locked) as locked,
+              patch.object(review, "review_question") as reader):
+            def replace_question(*_args: object, **_kwargs: object) -> review.QuestionAccepted:
+                locked.assert_not_called()
+                slots = status.slots(self.page, "C1")
+                assert isinstance(slots.question, change_page.OpenQuestion)
+                replacement = replace(slots.question, question_id="new-question")
+                with status.locked():
+                    status.write_slots(self.page, "C1", replace(slots, question=replacement))
+                return review.QuestionAccepted(words)
+
+            reader.side_effect = replace_question
+            with self.assertRaisesRegex(question_record.AnswerRefused, "does not match"):
+                _ = status.answer_question(self.page, "C1", question.question_id, words)
+            saved = status.slots(self.page, "C1").question
+            assert isinstance(saved, change_page.OpenQuestion)
+            self.assertEqual(saved.question_id, "new-question")
+
+        config = self.temporary / "notify.conf"
+        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=113\n")
+        with (patch.object(review, "NOTIFY_CONFIG", config),
+              patch.object(remote, "local_machine", return_value="natedev"),
+              patch.object(remote, "machine_alias", return_value=remote.MachineAlias("mac")),
+              patch.object(remote, "this_machine", return_value="natedev"),
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as ssh):
+            self.assertEqual(change_page.main([
+                "answer-question", "--machine", "mac", "--item", "submission/question/owner/item/request",
+                "--question", question.question_id, "--text", words,
+            ]), 0)
+        self.assertEqual(ssh.call_args.kwargs["timeout"], 143)
+
+    def test_native_review_replies_release_the_delivery_lock_and_recheck_the_question(self) -> None:
+        from scripts.production import investigation
+
+        report = investigation.file(self.unit.id, "Why did it stop?", "Find the cause.",
+                                    waiting_why="The owner must find the cause.")
+        keys = (self.file_user_question(), f"investigation/{report.owner}/{report.id}")
+        status = change_page.DeliveryStatus(self.root)
+        words = "The new layout is ready."
+        for key in keys:
+            with self.subTest(key=key):
+                item = next(item for item in review_items.read(self.root) if item.key == key)
+                followup = "Check the new layout."
+                if isinstance(item.source, review_items.QuestionSource):
+                    delivery, _ = review_actions.question_action(item, "question", followup, status)
+                else:
+                    delivery, _ = review_actions.investigation_action(item, "question", followup, status)
+                assert isinstance(delivery, change_page.MessageDelivery)
+                delivery = review_actions.track_question(delivery, key, followup, status)
+                change_page.deliver(delivery, status)
+                page, row = delivery.page, delivery.row
+                slots = status.slots(page, row)
+                assert isinstance(slots.question, change_page.OpenQuestion)
+                original = slots.question
+                source = page.review_list
+                before = source.read_bytes()
+
+                def read_draft(*_args: object, **_kwargs: object) -> review.QuestionAccepted:
+                    with (self.root / ".review-link-delivery.lock").open("r") as handle:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with status.locked():
+                        replacement = replace(original, question_id="replacement")
+                        status.write_slots(page, row, replace(slots, question=replacement))
+                    return review.QuestionAccepted(words)
+
+                with patch.object(review, "review_question", side_effect=read_draft) as reader:
+                    with self.assertRaisesRegex(question_record.AnswerRefused, "does not match"):
+                        _ = change_page.answer_item(key, words, original.question_id, status)
+                reader.assert_called_once()
+                self.assertEqual(source.read_bytes(), before)
+                self.assertEqual(status.slots(page, row).question, replace(original, question_id="replacement"))
+
+                with status.locked():
+                    status.write_slots(page, row, slots)
+                with patch.object(review, "review_question", return_value=review.QuestionAccepted(words)) as reader:
+                    self.assertTrue(change_page.answer_item(key, words, original.question_id, status))
+                    self.assertFalse(change_page.answer_item(key, words, original.question_id, status))
+                reader.assert_called_once()
+                self.assertIn(words, source.read_text())
+                self.assertEqual(status.slots(page, row).question,
+                                 change_page.AnsweredQuestion(original.question_id, original.text, words))
+
+    def test_native_decision_replies_refuse_a_record_closed_during_review(self) -> None:
+        from scripts.lib.user_zone import user_zone
+        from scripts.production import proposal_issue
+        from scripts.production.issues import Issue, frontmatter
+        from scripts.review_links import efficiency_reviews
+
+        members = staff.snapshot()
+        owner = self.showrunner_id
+        filed = datetime.now(user_zone())
+        path = self.temporary / "proposal.md"
+        _ = path.write_text("---\nstatus: open\nstage: backlog\nreview_state: waiting\n---\nThe layout.\n")
+        proposal = review_items.proposal_item("proposal", Issue(path, frontmatter(path)), owner, owner,
+                                              "The layout", filed, members)
+        ledger = self.temporary / "efficiency.md"
+        line = "- 2026-11-25 The layout — proposed"
+        _ = ledger.write_text(line + "\n")
+        efficiency = review_items.efficiency_item(ledger, 0, line, efficiency_reviews.EfficiencyReview(
+            mark=review_events.ReviewMark.WAITING), owner, members, user_zone())
+        marks = efficiency_reviews.path(ledger)
+        _ = marks.write_text('{"E1":{"log":[],"mark":"waiting"}}')
+        status = change_page.DeliveryStatus(self.root)
+        answer = "Use the new layout."
+        for item, target, row in ((proposal, path, path.stem), (efficiency, marks, "E1")):
+            with self.subTest(kind=item.type):
+                page = change_page.ReviewPage(target, target.parent, (row,), "")
+                slots = change_page.DeliverySlots(change_page.NoDelivery(), change_page.NoDelivery(),
+                                                  change_page.OpenQuestion("Q1", "Which layout?", change_page.NoDelivery()))
+                with status.locked():
+                    status.write_slots(page, row, slots)
+
+                def read_draft(*_args: object, **_options: object) -> review.QuestionAccepted:
+                    if item == proposal:
+                        with proposal_issue.issue_lock(path):
+                            _ = path.write_text(path.read_text().replace("status: open", "status: closed"))
+                    else:
+                        with efficiency_reviews.ledger_lock(ledger):
+                            _ = ledger.write_text(line.replace("proposed", "accepted") + "\n")
+                    return review.QuestionAccepted(answer)
+
+                with (patch.object(review_items, "read", return_value=[item]),
+                      patch.object(review, "review_question", side_effect=read_draft) as reader,
+                      self.assertRaisesRegex(question_record.AnswerRefused, "The item is not Waiting")):
+                    _ = change_page.answer_item(item.key, answer, "Q1", status)
+                reader.assert_called_once()
+                self.assertNotIn(answer, target.read_text())
+                self.assertEqual(status.slots(page, row), slots)
+
+    def test_native_decision_replies_refuse_a_waiting_record_replaced_during_review(self) -> None:
+        from scripts.lib.user_zone import user_zone
+        from scripts.production import proposal_issue
+        from scripts.production.issues import Issue, frontmatter
+        from scripts.review_links import efficiency_reviews
+
+        members = staff.snapshot()
+        owner = self.showrunner_id
+        path = self.temporary / "proposal.md"
+        original = "---\nproposal_id: P1\nstatus: open\nstage: backlog\nreview_state: waiting\n---\nUse the layout.\n"
+        _ = path.write_text(original)
+        proposal = review_items.proposal_item("proposal", Issue(path, frontmatter(path)), owner, owner,
+                                              "The layout", datetime.now(user_zone()), members)
+        ledger = self.temporary / "efficiency.md"
+        line = "- 2026-11-25 Use the layout — proposed"
+        _ = ledger.write_text(line + "\n")
+        efficiency = review_items.efficiency_item(ledger, 0, line, efficiency_reviews.EfficiencyReview(
+            mark=review_events.ReviewMark.WAITING), owner, members, user_zone())
+        marks = efficiency_reviews.path(ledger)
+        _ = marks.write_text('{"E1":{"log":[],"mark":"waiting"}}')
+        status = change_page.DeliveryStatus(self.root)
+        answer = "Use the new layout."
+        for item, target, row in ((proposal, path, path.stem), (efficiency, marks, "E1")):
+            with self.subTest(kind=item.type):
+                page = change_page.ReviewPage(target, target.parent, (row,), "")
+                slots = change_page.DeliverySlots(change_page.NoDelivery(), change_page.NoDelivery(),
+                                                  change_page.OpenQuestion("Q1", "Which layout?", change_page.NoDelivery()))
+                with status.locked():
+                    status.write_slots(page, row, slots)
+
+                def read_draft(*_args: object, **_options: object) -> review.QuestionAccepted:
+                    if item == proposal:
+                        with proposal_issue.issue_lock(path):
+                            _ = path.write_text(original.replace("P1", "P2"))
+                    else:
+                        with efficiency_reviews.ledger_lock(ledger):
+                            _ = ledger.write_text(line.replace("layout", "menu") + "\n")
+                    return review.QuestionAccepted(answer)
+
+                with (patch.object(review_items, "read", return_value=[item]),
+                      patch.object(review, "review_question", side_effect=read_draft) as reader,
+                      self.assertRaisesRegex(question_record.AnswerRefused, "The selected item changed")):
+                    _ = change_page.answer_item(item.key, answer, "Q1", status)
+                reader.assert_called_once()
+                self.assertNotIn(answer, target.read_text())
+                self.assertEqual(status.slots(page, row), slots)
+
+    def test_native_reply_refuses_an_unnumbered_proposal_changed_during_review(self) -> None:
+        from scripts.lib.user_zone import user_zone
+        from scripts.production import proposal_issue
+        from scripts.production.issues import Issue, frontmatter
+
+        members = staff.snapshot()
+        owner = self.showrunner_id
+        path = self.temporary / "proposal.md"
+        header = b"---\nstatus: open\nstage: backlog\nreview_state: waiting\n---\n"
+        original = header + b"Use the layout.\n"
+        replacement = header + b"Use the menu.\n"
+        _ = path.write_bytes(original)
+        proposal = review_items.proposal_item("proposal", Issue(path, frontmatter(path)), owner, owner,
+                                              "The layout", datetime.now(user_zone()), members)
+        row = path.stem
+        page = change_page.ReviewPage(path, path.parent, (row,), "")
+        status = change_page.DeliveryStatus(self.root)
+        slots = change_page.DeliverySlots(change_page.NoDelivery(), change_page.NoDelivery(),
+                                          change_page.OpenQuestion("Q1", "Which layout?", change_page.NoDelivery()))
+        with status.locked():
+            status.write_slots(page, row, slots)
+        answer = "Use the new layout."
+
+        def read_draft(*_args: object, **_options: object) -> review.QuestionAccepted:
+            with proposal_issue.issue_lock(path):
+                _ = path.write_bytes(replacement)
+            return review.QuestionAccepted(answer)
+
+        with (patch.object(review_items, "read", return_value=[proposal]),
+              patch.object(review, "review_question", side_effect=read_draft) as reader,
+              self.assertRaisesRegex(question_record.AnswerRefused, "The selected item changed")):
+            _ = change_page.answer_item(proposal.key, answer, "Q1", status)
+        reader.assert_called_once()
+        self.assertEqual(path.read_bytes(), replacement)
+        self.assertEqual(status.slots(page, row), slots)
+
+        _ = path.write_bytes(original)
+        with (patch.object(review_items, "read", return_value=[proposal]),
+              patch.object(review, "review_question", return_value=review.QuestionAccepted(answer)) as reader):
+            self.assertTrue(change_page.answer_item(proposal.key, answer, "Q1", status))
+        reader.assert_called_once()
+        self.assertIn(answer.encode(), path.read_bytes())
+        self.assertEqual(status.slots(page, row).question,
+                         change_page.AnsweredQuestion("Q1", "Which layout?", answer))
+
     def test_answer_question_keeps_internal_line_breaks_and_an_identical_rerun_changes_nothing(self) -> None:
         status = change_page.DeliveryStatus(self.root)
         question = status.ask(self.page, 'C1', 'Which steps?')
@@ -749,6 +1002,9 @@ class ChangePageTests(unittest.TestCase):
 
     def set_up_review(self, *, changes: int, legacy_links: bool = False) -> None:
         self.temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="change-page-test-")))
+        _ = self.enterContext(patch.object(
+            review, "review_question", return_value=review.QuestionAccepted("Fixture review passed.")))
+        self.enterContext(patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.temporary / "notify")}))
         if legacy_links:
             cache_home = self.temporary / "cache"
             seed_interpreter_cache(cache_home)
@@ -1709,11 +1965,12 @@ class ChangePageTests(unittest.TestCase):
             ):
                 with self.subTest(kind=kind, block=name):
                     title = f'{kind}: {name}'
-                    result = self.command(change_review, change_review.main, [
-                        'add', '--repo', str(self.repo), '--production', 'page-owner',
-                        '--list', str(self.review_list), '--change', title,
-                        '--check', before + block + after, '--see', 'The command stays exact', '--image', fixture_image(),
-                    ])
+                    with patch.object(console_text, "require"):
+                        result = self.command(change_review, change_review.main, [
+                            'add', '--repo', str(self.repo), '--production', 'page-owner',
+                            '--list', str(self.review_list), '--change', title,
+                            '--check', before + block + after, '--see', 'The command stays exact', '--image', fixture_image(),
+                        ])
                     self.assertEqual(result.returncode, 0, result.stderr)
                     row = next(row for row in change_review.pending(self.review_list) if row['Change'] == title)
                     self.assertEqual(row[change_review.CHECK], before + block + after + ' You see: The command stays exact')

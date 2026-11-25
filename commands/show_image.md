@@ -22,9 +22,10 @@ Check the light mode and phone width yourself when the change needs them.
    `~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py get <your worktree path>` prints the row.
 3. Register each image or pair:
    ```sh
-   ~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image <path> | --before <path> --after <path>) --caption "<caption>" --owner <your staff id> (--change <id> | --phase <id>)
+   ~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image <path> [--two-halves] | --before <path> --after <path>) --caption "<caption>" --owner <your staff id> (--change <id> | --phase <id>)
    ```
    - A pair shows its two images side by side on one card, with one caption, one Feedback field and one set of answer buttons. On a narrow window the before image is on top.
+   - Use `--two-halves` for one file with two halves other than a before and after pair.
    - Use `--change` for a change review row, such as `sdlc/C12`. Use `--phase` for phase work.
    - The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files.
    - It copies the images, so you can delete the source files after it prints `registered`.
