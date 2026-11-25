@@ -899,7 +899,8 @@ with mock.patch.object(scratch.time, "sleep", side_effect=announce_wait):
 
         with mock.patch.object(gate, "test_module_environment", side_effect=hold_child):
             result = self.run_gate("--tests-only", "--full")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("UNRESOLVED: could not remove", result.stderr)
         self.assertTrue(children)
         self.assertTrue(all(child.is_dir() for child in children), children)
 

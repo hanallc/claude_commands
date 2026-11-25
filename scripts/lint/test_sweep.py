@@ -8009,11 +8009,12 @@ class BudgetTests(unittest.TestCase):
     def test_sweep_uses_recent_minutes_from_the_private_file(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = write_config_fixture(root / "lint.conf", "recent_minutes=60")
-        _ = write_config_fixture(root / "send.conf")
+        target = root / "target"
+        target.mkdir()
         with (mock.patch.dict(os.environ, {"CONF_DIR": str(root)}),
               mock.patch.object(sweep, "sweep_workspace", return_value=0) as workspace,
               redirect_stderr(io.StringIO())):
-            self.assertEqual(sweep.main([]), 0)
+            self.assertEqual(sweep.main(["--target-dir", str(target)]), 0)
         self.assertEqual(workspace.call_args.args[3], 60.0)
 
     def test_sweep_refuses_a_live_lint_file_without_recent_minutes(self) -> None:

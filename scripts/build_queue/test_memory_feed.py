@@ -684,6 +684,7 @@ class MemoryFeedTests(unittest.TestCase):
         proc = self.root / "proc"
         proc.mkdir()
         _ = (proc / "meminfo").write_text("SwapTotal: 8388608 kB\nSwapFree: 8388608 kB\n")
+        _ = write_config_fixture(self.root / "test_times.conf")
         _ = (self.root / "buildlog.conf").write_text("# whole: 1..\nTOP_COST_RECENT_DAYS=3\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.root),
@@ -4444,7 +4445,10 @@ const refresh = createPageRefresh(tick);
             self.assertEqual((row["pid"], row["name"], row["title"]["step"]), (pid, "panes", "panes"))
 
     def test_detached_and_systemd_cloud_rows_use_the_fixed_staff_owner(self) -> None:
-        with isolated_staff_file(self.root / "staff.json", {}):
+        home = self.root / "home"
+        home.mkdir()
+        with (mock.patch.dict(os.environ, {"HOME": str(home), "CODEX_HOME": str(home / ".codex")}),
+              isolated_staff_file(self.root / "staff.json", {})):
             runner = fixture_member("showrunner", name="hana")
             unit = fixture_member("unit", name="panes", parent=runner.id)
             worker = fixture_member("worker", name="impl", parent=unit.id)

@@ -1,7 +1,7 @@
 """Check cancellation masks and interruption of hung cleanup."""
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 import os
 from pathlib import Path
 import select
@@ -83,19 +83,20 @@ class CancellationTests(unittest.TestCase):
                         _, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
                         self.fail(errors)
                     self.assertEqual(answer, "ready\n")
-                    paths: list[Path] = []
-                    if fixture is not None:
-                        with fixture.loop_turn():
+                    # Check what the child kept before admission processes its exit.
+                    with fixture.loop_turn() if fixture is not None else nullcontext():
+                        paths: list[Path] = []
+                        if fixture is not None:
                             reservations = [record for record in fixture.server.reservations.values()
                                             if record.owner.pid == child.pid]
                             self.assertTrue(reservations)
                             paths = [Path(record.sidecar) for record in reservations]
-                    if sidecar:
-                        self.assertTrue(any(path.name == sidecar and path.is_file() for path in paths), paths)
-                    child.terminate()
-                    self.assertEqual(child.wait(timeout=STOP_SECONDS + TERM_MARGIN_SECONDS), status)
-                    if sidecar:
-                        self.assertTrue(any(path.name == sidecar and path.is_file() for path in paths), paths)
+                        if sidecar:
+                            self.assertTrue(any(path.name == sidecar and path.is_file() for path in paths), paths)
+                        child.terminate()
+                        self.assertEqual(child.wait(timeout=STOP_SECONDS + TERM_MARGIN_SECONDS), status)
+                        if sidecar:
+                            self.assertTrue(any(path.name == sidecar and path.is_file() for path in paths), paths)
                 finally:
                     if child.poll() is None:
                         child.kill()

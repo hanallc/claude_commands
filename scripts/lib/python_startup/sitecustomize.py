@@ -43,6 +43,7 @@ TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "script
                      "scripts/production/gate_modules.py",
                      "scripts/lib/conf_reads.py", "scripts/lib/build_folders.py", "scripts/lib/build_folder_lock.py",
                      "scripts/lib/removal_guard.py", "scripts/buildlog/repository.py", "scripts/buildlog/store.py",
+                     "scripts/lib/file_lock.py",
                      "scripts/production/staff.py",
                      "scripts/lib/boot_identity.py", "scripts/lib/process_start.py",
                      "scripts/lib/conf.py", "scripts/lib/git_files.py", "scripts/lib/testing_folders.py",

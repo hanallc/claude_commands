@@ -1000,7 +1000,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             self.assertFalse(record.exists())
 
     def test_release_deadline_keeps_the_sidecar_and_reservation(self) -> None:
-        with QueuePlaceFixture() as fixture, ExitStack() as holder:
+        with QueuePlaceFixture(program_stop_seconds="0.2") as fixture, ExitStack() as holder:
             place = holder.enter_context(queue.queue_place("rust-analyzer", fixture.root))
             path, row = fixture.reservation()
             self.assertEqual(Path(row["sidecar"]), place.sidecar)
@@ -1767,8 +1767,9 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                             scope_at_return = place.sidecar.read_text().strip()
                             os.close(program_ready_write)
                             place.observe(GIB, GIB)
+                            status = child.wait(timeout=TEST_HANG_GUARD_SECS) if leader_exits else child.poll()
                             _ = os.write(write_fd, json.dumps({"pid": child.pid, "scope": scope_at_return,
-                                                               "status": child.poll()}).encode())
+                                                               "status": status}).encode())
                             _ = os.read(fixture.lifeline_read, 1)
                     finally:
                         os._exit(99)

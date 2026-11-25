@@ -33,7 +33,7 @@ from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.production import gate, gate_suites_test_support
 from scripts.production.gate_modules import GateRefused
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.production.gate_test_support import gate_suites
+from scripts.production.gate_test_support import gate_suites, pin_gate_root
 from scripts.production.gate_suites_test_support import GateSuitesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -223,6 +223,12 @@ class GateProcessStateTests(unittest.TestCase):
 
 @final
 class MergeGateSignalsTests(GateSuitesFixture):
+    def private_recovery_root(self) -> Path:
+        root = self.root / "recovery"
+        root.mkdir()
+        pin_gate_root(Path(self.environment["CONF_DIR"]) / "build_folders.conf", root)
+        return root
+
     def abandoned_gate(self, recovery: gate.GateRecovery) -> Path:
         folder = self.root / "gate" / "merge-gate-abandoned"
         folder.mkdir(parents=True, exist_ok=True)
@@ -654,8 +660,8 @@ sys.stdin.read(1)
 
     @gate_suites("hooks")
     def test_both_gate_modes_recover_the_private_run_record(self) -> None:
+        root = self.private_recovery_root()
         with mock.patch.dict(os.environ, self.environment, clear=True):
-            root = build_folders.configured_gate_root()
             for index, machine in enumerate((gate.SHARED_MACHINE, gate.WholeMachine()), start=1):
                 with self.subTest(machine=type(machine).__name__):
                     tool = build_folders.GATE_RECOVERY_TOOL
@@ -687,8 +693,8 @@ sys.stdin.read(1)
                     )
 
     def test_private_recovery_keeps_and_reports_finished_and_unfinished_folders(self) -> None:
+        root = self.private_recovery_root()
         with mock.patch.dict(os.environ, self.environment, clear=True):
-            root = build_folders.configured_gate_root()
             tool = build_folders.GATE_RECOVERY_TOOL
             folders = (root / tool, root / f"{tool}-2")
             earlier = [
@@ -850,6 +856,7 @@ gate.run_suites(Path.cwd(), full=True)
             _ = self.assert_unresolved_folder_cleanup([folder.parent, folder])
 
     def test_gate_keeps_its_folder_and_record_when_removal_refuses(self) -> None:
+        _ = self.private_recovery_root()
         parent = self.root / "kept-gate"
         parent.mkdir()
         with mock.patch.dict(os.environ, self.environment, clear=True):
