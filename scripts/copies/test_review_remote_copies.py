@@ -22,6 +22,8 @@ from typing import ClassVar, TextIO, cast, final, override
 import unittest
 from unittest import mock
 
+from scripts.build_hold.owning_session import NoOwningSession
+from scripts.build_queue import admission_client, admission_wire as wire, execution_identity, placement
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.copies import copies
@@ -684,7 +686,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         _ = write_config_fixture(settings, "offload=on\n", template="mac_test")
         target = target_config.SshTarget("linux", "linux", settings)
         config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
-                                      1, 1, 1, "1", {})
+                                      1, 1, 1, "1", {"mirror_busy_backoff_s": "120"})
         request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
                                         target="linux", owner="new-owner", holder_session="new-session")
         controller = offload.ProcessController()
@@ -743,18 +745,72 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         ):
             yield controller, config, request
 
-    def test_admission_selects_a_leased_slot_and_keeps_the_other_owner(self) -> None:
+    def test_admission_refuses_a_busy_mirror_and_keeps_both_owners(self) -> None:
         first = self.mirror_record("first-owner", self.mirror.parent / "slot-1")
         second = self.mirror_record("second-owner", self.mirror.parent / "slot-2")
         self.assertEqual(publish_mirror(first), 0)
         self.assertEqual(publish_mirror(second), 0)
         with self.admission() as (controller, config, request), copies.remote_lease(first):
             result = offload.run_offload(controller, config, request, 0)
+        self.assertIsInstance(result, offload.BusyMacDecline)
+        self.assertEqual(copies.owned_remote_mirrors("first-owner"), [first])
+        self.assertEqual(copies.owned_remote_mirrors("second-owner"), [second])
+        self.assertEqual(copies.owned_remote_mirrors("new-owner"), [])
+        self.assertEqual(json.loads((Path(first.path) / ".copy-record.json").read_text())["owner"], "first-owner")
+        self.assertEqual(json.loads((Path(second.path) / ".copy-record.json").read_text())["owner"], "second-owner")
+
+    def test_admission_adopts_a_saved_second_mirror_while_the_first_is_busy(self) -> None:
+        first = self.mirror_record("first-owner", self.mirror.parent / "slot-1")
+        second = self.mirror_record("second-owner", self.mirror.parent / "slot-2")
+        self.assertEqual(publish_mirror(first), 0)
+        self.assertEqual(publish_mirror(second), 0)
+        with self.admission() as (controller, config, request), copies.remote_lease(first):
+            pid = os.getpid()
+            process = process_identity.process_start(pid)
+            assert isinstance(process, process_identity.Started)
+            session = NoOwningSession()
+            owner = placement.SubmittingOwner("local", pid, process.start)
+            scope = mac_test.RepositoryScope("repository", "key")
+            destination = placement.PlacementDestination("ssh", request.target, config.host, scope, 2)
+            assignment = placement.PlacementAssignment("episode", "attempt", destination,
+                execution_identity.SourceKeyKnown("tree"), owner, session, 0)
+            identity = claim_state.ClaimIdentity(
+                execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
+                assignment.episode, assignment.attempt)
+            args = mac_test.parser().parse_args([
+                "claim", "--target", request.target, "--pid", str(pid), "--what", "nextest package",
+                "--worktree", str(self.source), "--claim-id", identity.claim_id,
+                "--episode", identity.episode, "--attempt", identity.attempt,
+            ], namespace=mac_test.CliArguments())
+            paths = mac_test.state_paths(request.target)
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(mac_test.command_claim(args, paths, session=session), 0)
+            reservation, = claim_state.read_claims(paths)
+            legacy_path = reservation.path.rename(reservation.path.with_name(reservation.path.stem + ".slot-2.json"))
+            command_claim = mac_test.command_claim
+
+            def claim_with_mirror_lease(args: mac_test.CliArguments, state: claim_state.StatePaths) -> int:
+                self.assertEqual(args.from_pid, pid)
+                with self.assertRaises(copies.BusyRemoteMirror), copies.remote_lease(second):
+                    self.fail("The assigned mirror lease is free before the claim transfer")
+                return command_claim(args, state)
+
+            def authorize(permission: wire.ConsumePermission) -> wire.FirstAuthorization:
+                adopted, = claim_state.read_claims(paths)
+                self.assertEqual(adopted.path, legacy_path)
+                self.assertEqual(adopted.record.get("remote_host"), config.host)
+                return wire.FirstAuthorization(permission.assignment, permission.claim)
+
+            with (mock.patch.object(mac_test, "command_claim", side_effect=claim_with_mirror_lease),
+                  mock.patch.object(admission_client, "consume_permission", side_effect=authorize)):
+                result = offload.run_offload(controller, config, replace(request,
+                    admission=offload.MacClaimFromWait(pid, identity, session),
+                    placement=offload.AssignedOffloadRequest(assignment)), 0)
+
         self.assertIsInstance(result, offload.PassedOnTarget)
+        self.assertEqual(controller.attempt_evidence.slot, 2)
         self.assertEqual(copies.owned_remote_mirrors("first-owner"), [first])
         self.assertEqual([record.path for record in copies.owned_remote_mirrors("new-owner")], [second.path])
-        self.assertEqual(json.loads((Path(first.path) / ".copy-record.json").read_text())["owner"], "first-owner")
-        self.assertEqual(json.loads((Path(second.path) / ".copy-record.json").read_text())["owner"], "new-owner")
 
     def test_busy_refusal_names_the_session_from_the_unit_owner_chain(self) -> None:
         run = self.root / "unit-run"

@@ -574,12 +574,12 @@ class LocalVersionPreflightTests(unittest.TestCase):
                     if later_match:
                         _ = (root / "box-tools.json").write_text('{"versions":{"rustc":"rustc 1.99.0"}}')
                         _ = offload.run_offload(controller, config, request, 1)
-                        claim.assert_called_once_with(controller, config, request, HANA, mock.ANY,
+                        claim.assert_called_once_with(controller, config, request, HANA,
                                                       mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
                                                       retire_wait=False)
                         self.assertFalse(eligibility.linux_version_decline_path("linux", HANA.name).exists())
                 else:
-                    claim.assert_called_once_with(controller, config, request, HANA, mock.ANY,
+                    claim.assert_called_once_with(controller, config, request, HANA,
                                                   mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
                                                   retire_wait=False)
                     self.assertFalse(offload.linux_version_declined_recently("linux", HANA.name, 60, 100))

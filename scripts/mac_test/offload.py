@@ -3851,13 +3851,16 @@ def run_offload(
             return DeclinedMacRun("state", elapsed_seconds(started), detail)
         decline_path.unlink(missing_ok=True)
 
+    admission_slot = 1
+    if linux and isinstance(request.placement, AssignedOffloadRequest):
+        admission_slot = request.placement.assignment.destination.slot or 1
     try:
         with ExitStack() as admission_leases:
             if not linux:
                 root_token = offload_mirror_root.set(mac_mirror_root())
                 _ = admission_leases.callback(offload_mirror_root.reset, root_token)
             try:
-                mirror = request_mirror(config, replace(request, slot=1), repository)
+                mirror = request_mirror(config, replace(request, slot=admission_slot), repository)
                 admission_leases.enter_context(copies.remote_lease(mirror))
             except copies.BusyRemoteHost:
                 return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
@@ -3865,7 +3868,7 @@ def run_offload(
                 write_mirror_busy(config, repository.name, request.target)
                 return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
             result = leased_offload(controller, config, request, repository, started, linux, admission_leases,
-                                    mac_repository=mac_repository, retire_wait=retire_wait,
+                                    admission_slot=admission_slot, mac_repository=mac_repository, retire_wait=retire_wait,
                                     cleanup_takeover=cleanup_takeover)
         if isinstance(result, ClaimReleaseConfirmed):
             if isinstance(request.placement, AssignedOffloadRequest):
@@ -3964,7 +3967,7 @@ def claim_refusal(controller: ProcessController, request: OffloadRequest, claim:
 
 def leased_offload(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
                    repository: KnownRepository, started: float, linux: bool,
-                   lease: ExitStack, *,
+                   lease: ExitStack, *, admission_slot: int = 1,
                    mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository
                    = claim_state.NO_SAVED_MAC_REPOSITORY,
                    retire_wait: bool = False,
@@ -3986,7 +3989,7 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
                     return cleanup_taken_over_claim(controller, config, request, claim, repository, started)
             return cleanup_taken_over_claim(controller, config, request, claim, repository, started)
         with ExitStack() as cleanup_lease:
-            if isinstance(claim, TakenOverMacClaim) and (claim.slot != 1 or claim.host != config.host):
+            if isinstance(claim, TakenOverMacClaim) and (claim.slot != admission_slot or claim.host != config.host):
                 connection = replace(config.connection, host=claim.host)
                 mirror = request_mirror(replace(config, connection=connection), replace(request, slot=claim.slot), repository)
                 try:
@@ -4006,7 +4009,7 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
         controller.attempt_evidence.provider = placement.NoProviderClaim()
         return DeclinedMacRun("source_changed", elapsed_seconds(started),
                               "the current repository differs from the retired reservation's assignment")
-    if linux and claim.slot != 1:
+    if linux and claim.slot != admission_slot:
         mirror = request_mirror(config, replace(request, slot=claim.slot), repository)
         try:
             lease.enter_context(copies.remote_lease(mirror))

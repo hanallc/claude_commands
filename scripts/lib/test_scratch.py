@@ -236,15 +236,18 @@ class ScratchTests(unittest.TestCase):
         self.assertFalse(scratch.removal_mark(checkout).exists())
 
     def test_removal_intent_rechecks_current_and_legacy_sources_before_retry(self) -> None:
+        self.enterContext(mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(self.base.parent)}))
         for version in ("current", "legacy"):
             for state in ("unchanged", "new-work", "partial-git", "partial-new-work"):
-                with self.subTest(version=version, state=state):
+                with self.subTest(version=version, state=state), ExitStack() as cleanup:
                     task = f"gate:recovery-{version}-{state}"
                     path = self.copy(name=f"{version}-{state}", task=task)
+                    mark = scratch.removal_mark(path)
+                    _ = cleanup.callback(shutil.rmtree, path, ignore_errors=True)
+                    _ = cleanup.callback(mark.unlink, missing_ok=True)
                     with mock.patch.object(scratch, "remove", side_effect=OSError("stopped after intent")):
                         with self.assertRaisesRegex(OSError, "stopped after intent"):
                             _ = scratch.remove_task_copy(path, task, time.time())
-                    mark = scratch.removal_mark(path)
                     fields = cast(dict[str, object], json.loads(mark.read_text()))
                     self.assertEqual(fields["removal_version"], scratch.REMOVAL_VERSION)
                     if version == "legacy":
@@ -1302,7 +1305,7 @@ for descriptor in descriptors:
 
         def open_during_swap(name: str | Path, flags: int, mode: int = 0o777, *,
                              dir_fd: int | None = None) -> int:
-            if name == namespace.name and dir_fd is not None and flags & os.O_DIRECTORY:
+            if name == namespace.name and dir_fd is not None and flags & os.O_NONBLOCK:
                 parent = namespace.parent.stat()
                 descriptor = os.fstat(dir_fd)
                 self.assertEqual((parent.st_dev, parent.st_ino), (descriptor.st_dev, descriptor.st_ino))
@@ -1356,7 +1359,7 @@ for descriptor in descriptors:
 
         def open_during_swap(name: str | Path, flags: int, mode: int = 0o777, *,
                              dir_fd: int | None = None) -> int:
-            if name in (refs, refs.name) and flags & os.O_DIRECTORY:
+            if name in (refs, refs.name) and flags & os.O_DIRECTORY and flags & os.O_NONBLOCK:
                 if dir_fd is not None:
                     self.assertTrue(os.path.samestat(metadata.stat(), os.fstat(dir_fd)))
                 _ = metadata.rename(moved)
@@ -2328,6 +2331,52 @@ print(scratch.target('gate:proof', 'tree'))
         assert isinstance(state, scratch.Unknown)
         self.assertIn(str(source), state.reason)
         self.assertIn(str(alternates), state.reason)
+
+    def test_removal_keeps_a_source_when_a_borrower_has_no_object_store_or_removal_record(self) -> None:
+        source = self.copy("source")
+        borrower = self.copy("borrower", task="gate:borrower")
+        objects = borrower / ".git/objects"
+        shutil.rmtree(objects)
+
+        result = scratch.remove_task_copy(source, "gate:copy", time.time())
+
+        self.assertIsInstance(result, scratch.KeptFolder)
+        assert isinstance(result, scratch.KeptFolder)
+        self.assertIn("cannot rule out a borrower", result.reason)
+        self.assertIn(str(objects), result.reason)
+        self.assertTrue(source.is_dir())
+
+    def test_missing_object_store_with_a_removal_record_requires_an_idle_checkout(self) -> None:
+        source = self.copy("source")
+        borrower = self.copy("borrower", task="gate:borrower")
+        self.stop_removal_after_intent(borrower, "current")
+        settings = conf.read("scratch")
+        with scratch.busy_locks(borrower, create=True) as idle:
+            self.assertTrue(idle)
+            shutil.rmtree(borrower / ".git/objects")
+            self.assertIsInstance(scratch.borrow_lifetime(source, scratch_settings=settings), scratch.Unknown)
+        self.assertIsInstance(scratch.borrow_lifetime(source, scratch_settings=settings), scratch.Ended)
+
+    def test_removal_keeps_a_source_when_a_borrower_restores_its_object_store_before_locking(self) -> None:
+        source = self.copy("source")
+        borrower = self.copy("borrower", task="gate:borrower")
+        self.stop_removal_after_intent(borrower, "current")
+        objects = borrower / ".git/objects"
+        _ = (objects / "info/alternates").write_text(f"{source / '.git/objects'}\n")
+        saved_store = objects.rename(self.base / "saved-objects")
+        busy = scratch.busy_path(borrower)
+
+        def restore_store(mark: Path, *, create: bool, exclusive: bool = False) -> int:
+            if mark == busy and saved_store.exists():
+                _ = saved_store.rename(objects)
+            return build_folders.open_busy_mark(mark, create=create, exclusive=exclusive)
+
+        with mock.patch.object(scratch, "open_busy_mark", side_effect=restore_store):
+            result = scratch.remove_task_copy(source, "gate:copy", time.time())
+
+        self.assertTrue(objects.is_dir())
+        self.assertEqual(result, scratch.KeptFolder(source, f"borrowed: {borrower} still uses its git objects"))
+        self.assertTrue(source.is_dir())
 
     def test_an_unrecorded_shared_clone_in_a_second_pair_keeps_its_source(self) -> None:
         root = copy_record.worktree_root()

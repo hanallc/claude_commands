@@ -80,7 +80,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1249,6 +1249,24 @@ class BorrowerIndex:
         return Ended("no copy borrows from it")
 
 
+def _removed_default_store(path: Path, objects: Path) -> bool:
+    """Check that a missing local store belongs to an idle checkout with a removal record."""
+    if objects != path / ".git/objects":
+        return False
+    with suppress(FileNotFoundError):
+        _ = objects.lstat()
+        return False
+    with collector_lease(path, wait=False) as free, busy_locks(path, create=False) as idle:
+        if not free or not idle:
+            return False
+        with suppress(FileNotFoundError):
+            _ = objects.lstat()
+            return False
+        removal = checked_removal(path)
+        return isinstance(removal, copy_record.Registered) and (
+            removal.fields.get("removal_version") == REMOVAL_VERSION or copy_record.copy_folder(path) == path)
+
+
 def borrower_index(*, scratch_settings: conf.ConfigRead,
                    intent: RemovalIntentAccess = RemovalIntentAccess.READ_ONLY,
                    exclude: tuple[Path, ...] = (), include_numbered: bool = False) -> BorrowerIndex:
@@ -1289,10 +1307,11 @@ def borrower_index(*, scratch_settings: conf.ConfigRead,
             git_paths = _borrower_git_paths(child, registry, links.add)
             if git_paths is not None:
                 git_directory, objects = git_paths
-                alternates, files, reason = git_files.object_stores(objects, cache, deadline)
-                stores.update(alternates)
-                if reason:
-                    unreadable = unreadable or f"{child}: {reason}"
+                if git_directory != objects.parent or not _removed_default_store(child, objects):
+                    alternates, files, reason = git_files.object_stores(objects, cache, deadline)
+                    stores.update(alternates)
+                    if reason:
+                        unreadable = unreadable or f"{child}: {reason}"
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             unreadable = unreadable or f"{child}: {error}"
         return _Borrower(child, frozenset(stores), frozenset(files), unreadable,

@@ -1571,7 +1571,7 @@ print('signals')
         with self.subTest(request="persistent unique"):
             config = self.root / "persistent-config"
             config.mkdir()
-            _ = (config / "build_folders.conf").write_text("""\
+            _ = (config / "build_folders.conf").write_text(f"roots.build={self.root / 'build'}\n" + """\
 # whole: 1..
 names.suffix_length=12
 names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_

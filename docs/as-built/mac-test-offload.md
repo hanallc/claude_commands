@@ -828,6 +828,7 @@ An old live claim holds the repository.
 When a local owner ends, the reader releases its local claim.
 For each remote claim, the runner checks the saved mirror before release.
 New Linux claims use the first mirror.
+Adoption of a saved Linux assignment takes the lease for its assigned mirror before it transfers the claim.
 
 The Terminal launcher enters the numbered copy before it checks its per-run token.
 Cleanup removes the token before `stop-checkout` scans the copy.

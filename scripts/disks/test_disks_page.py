@@ -285,7 +285,7 @@ START
  check(!parts.age.hidden && parts.age.textContent==='70 min ago',
   'The first measure must record the old data age.');
  stalled=true;void pageRefresh.refresh();
- check(pendingReads.length===2,'The Disks and Builds reads must have separate pending resolvers.');
+ check(pendingReads.length===1,'The Disks read must remain pending.');
  const ageLimit=JSON.parse(line.dataset.statusOptions).ageLimit;
  now+=(Math.max(settings.wait_seconds,ageLimit)+1)*1000;pageRefresh.changed();
  check(line.dataset.state==='Late' && parts.reason.textContent==='The feed has stopped.',

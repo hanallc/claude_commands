@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 from typing import Literal, cast, override
+from unittest import mock
 from unittest.mock import patch
 
 from scripts.buildlog.store import host_name
@@ -462,16 +463,26 @@ class RegisteredCopyTests(GitNixFixture):
                 self.assertEqual(build_folders.build_folder_state(checkout), "held")
                 return proof(envrc)
 
+            root = build_folders.build_root()
+            lease_lock = checkout.with_name(checkout.name + ".lock")
+            claim_lock = root / ".build-claim-locks" / lease_lock.relative_to(root)
+
+            def check_locks(command: list[str], **options: object) -> object:
+                if command[0] == "direnv":
+                    descriptors = cast(tuple[int, ...], options["pass_fds"])
+                    held = [os.fstat(descriptor) for descriptor in descriptors]
+                    locks = [path.stat() for path in (lease_lock, claim_lock)]
+                    self.assertCountEqual([(entry.st_dev, entry.st_ino) for entry in held],
+                                          [(entry.st_dev, entry.st_ino) for entry in locks])
+                return cast(object, mock.DEFAULT)
+
             with (patch.object(nix_env, "trusted_envrc", side_effect=check_proof) as checked,
-                  patch.object(subprocess, "run", wraps=subprocess.run) as run):
+                  patch.object(subprocess, "run", wraps=subprocess.run, side_effect=check_locks) as run):
                 outcome = nix_env.ensure(checkout, {**self.env, "DIRENV_DENY": "1"})
                 self.assertIsInstance(outcome, nix_env.Loaded)
                 checked.assert_called_once_with(checkout / ".envrc")
                 direnv = [call for call in run.call_args_list if call.args[0][0] == "direnv"]
                 self.assertEqual([call.args[0][1] for call in direnv], ["allow", "export"])
-                descriptors = cast(tuple[int, ...], direnv[0].kwargs["pass_fds"])
-                self.assertEqual(len(descriptors), 1)
-                self.assertEqual(direnv[1].kwargs["pass_fds"], descriptors)
             self.assertEqual(build_folders.build_folder_state(checkout), "free")
             with build_folders.numbered_copy_use_lease(checkout) as lease:
                 self.assertIsInstance(lease, build_folders.NumberedCopyUseLease)

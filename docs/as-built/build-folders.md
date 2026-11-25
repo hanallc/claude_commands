@@ -235,6 +235,8 @@ Git source setup takes the shared lock for the folders that hold the source's ob
 The SSH source holds the shared lock through its fetch.
 The claim checks lease locks, lease owners, busy marks, mounts, and current borrowers under the exclusive lock.
 The borrower scan checks Git directories, Git directory links, and alternates for scratch and numbered copies.
+If a scratch checkout has no default object store, the scan keeps any Git objects it could use.
+The scan accepts a missing local store if a removal record identifies the checkout and the checkout is idle.
 One walk checks child leases and busy marks, including marks in external Git directories.
 The claim releases these checks' locks before it yields.
 The claim raises `BuildFolderInUse` with a reason when it cannot verify a folder.
