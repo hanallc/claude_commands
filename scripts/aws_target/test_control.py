@@ -966,8 +966,9 @@ region_transfer_usd={"us-west-1":0.00015}
         self.assertEqual((opened.machine, opened.cwd), ('natedev', '/home/natepiano'))
         self.assertEqual((opened.status, opened.requested_by, opened.concerns, opened.dedupe_key),
                          ('open', 'aws-unit', 'aws', 'aws-price-read'))
+        self.assertEqual(opened.completion, 'automatic')
         self.assertEqual(opened.reason, 'AWS refused the price read in us-west-1, us-east-1. '
-                         + 'After 2 hours without the read, test runs on AWS try that region last. '
+                         + 'After 2 hours without the read, test runs on AWS can pick a region that costs more. '
                          + 'The command allows the read, costs nothing, and asks for your AWS admin passphrase.')
         self.assertEqual(opened.waits, 'Test runs on AWS in us-west-1, us-east-1')
         self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))

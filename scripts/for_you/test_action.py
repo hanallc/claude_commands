@@ -55,6 +55,14 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(first.created_at, first.updated_at)
         self.assertEqual((self.folder / (action.action_id(first.key) + ".json")).stat().st_mode & 0o777, 0o600)
 
+    def test_add_and_read_an_automatic_action(self) -> None:
+        opened = self.store.add(title="Restore access", command="github-warmup", machine="natedev",
+                                cwd="/fixture/repo", requested_by="staff-a", reason="The login requires the user.",
+                                waits="The release check", concerns="admin-console", dedupe_key="access",
+                                completion="automatic")
+        self.assertEqual(opened.completion, "automatic")
+        self.assertEqual(self.store.list(), (opened,))
+
     def test_an_unresolved_home_raises_an_action_store_error(self) -> None:
         folder = "~missing-fixture-user/actions"
         with (patch.dict(os.environ, {"FOR_YOU_ACTIONS_DIR": folder}),

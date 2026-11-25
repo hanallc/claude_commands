@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 from scripts.lib import atomic_file, file_lock
 
 ActionStatus = Literal["open", "done", "withdrawn"]
+ActionCompletion = Literal["manual", "automatic"]
 REVIEW_PATH = "/console/review.html"
 
 
@@ -62,7 +63,7 @@ class UserAction:
     created_at: str
     updated_at: str
     completed_at: str = ""
-    completion: Literal["manual"] = "manual"
+    completion: ActionCompletion = "manual"
     evidence: str = ""
     withdraw_reason: str = ""
 
@@ -78,7 +79,7 @@ class UserAction:
                 raise ActionStoreError(f"{name}: provide a value.")
         if not Path(self.cwd).is_absolute():
             raise ActionStoreError("cwd: provide an absolute path on the target machine.")
-        if self.status not in ("open", "done", "withdrawn") or self.completion != "manual":
+        if self.status not in ("open", "done", "withdrawn") or self.completion not in ("manual", "automatic"):
             raise ActionStoreError("Unsupported action status or completion method.")
         created, updated = self._time(self.created_at), self._time(self.updated_at)
         if updated < created:
@@ -120,7 +121,7 @@ class UserAction:
                    text_fields["cwd"], text_fields["requested_by"], text_fields["reason"], text_fields["waits"],
                    text_fields["concerns"], text_fields["dedupe_key"], cast(ActionStatus, text_fields["status"]),
                    text_fields["created_at"], text_fields["updated_at"], text_fields["completed_at"],
-                   cast(Literal["manual"], text_fields["completion"]), text_fields["evidence"], text_fields["withdraw_reason"])
+                   cast(ActionCompletion, text_fields["completion"]), text_fields["evidence"], text_fields["withdraw_reason"])
 
 
 @dataclass(frozen=True)
@@ -159,12 +160,13 @@ class ActionStore:
 
     def add(self, *, title: str, command: str, machine: str, cwd: str, requested_by: str,
             reason: str, waits: str, concerns: str, dedupe_key: str, key: str = "",
+            completion: ActionCompletion = "manual",
             before_reuse: Callable[[str], None] | None = None) -> UserAction:
         """Call before_reuse under the lock before returning an open request with a different key."""
         now = datetime.now(timezone.utc).isoformat()
         identifier = action_id(key) if key else str(uuid4())
         record = UserAction(f"action/{identifier}", 1, title, command, machine, cwd, requested_by,
-                            reason, waits, concerns, dedupe_key, "open", now, now)
+                            reason, waits, concerns, dedupe_key, "open", now, now, completion=completion)
         self.folder.mkdir(parents=True, exist_ok=True)
         with file_lock.exclusive(self.folder / ".lock"):
             records = self.list()

@@ -171,9 +171,10 @@ def update_price_read_action(failures: Sequence[SnapshotFailure], now: int, *, k
                 command='~/.claude/scripts/lib/py ~/.claude/scripts/aws_target/deploy.py up --approve-resources',
                 machine='natedev', cwd='/home/natepiano', requested_by=PRICE_READ_REQUESTER,
                 reason=f'AWS refused the price read in {regions}. '
-                       + 'After 2 hours without the read, test runs on AWS try that region last. '
+                       + 'After 2 hours without the read, test runs on AWS can pick a region that costs more. '
                        + 'The command allows the read, costs nothing, and asks for your AWS admin passphrase.',
                 waits=f'Test runs on AWS in {regions}', concerns='aws', dedupe_key=PRICE_READ_ACTION_KEY, key=key,
+                completion='automatic',
             )
             if record.key != key:
                 raise ActionStoreError('Another open action appeared before the new action could be added.')
