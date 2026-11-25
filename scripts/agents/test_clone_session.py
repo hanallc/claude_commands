@@ -16,7 +16,6 @@ from scripts.lib import copy_record, scratch, session_folder
 from scripts.message import roster, send, sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase
-from scripts.whoami.account import named_account_environment
 
 SOURCE = "019b3a40-4250-7000-8000-000000000201"
 FORK = "019b3a40-4250-7000-8000-000000000202"
@@ -80,19 +79,23 @@ class CloneCommandTests(StaffTestCase):
         self.prepare = cast(Mock, self.enterContext(patch.object(herdr, "prepare_agent_environment",
                                                                side_effect=prepare_fixture_environment)))
         self.launch = cast(Mock, self.enterContext(patch.object(herdr, "launch_prepared_agent", return_value=
-            herdr.AgentLaunched(FORK_PANE, herdr.PromptSubmissionNotRequired()))))
+            herdr.ForkLaunched(FORK_PANE, herdr.PromptSubmissionNotRequired(), "fixture-terminal"))))
 
         def native_session(pane: str, _kind: str, _timeout: float) -> str:
             return SOURCE if pane == PANE else FORK
 
         self.native = cast(Mock, self.enterContext(patch.object(self.client, "native_session", side_effect=native_session)))
         self.remember = cast(Mock, self.enterContext(patch.object(self.client, "remember_row_tab")))
+        _ = self.enterContext(patch.object(self.client, "close_terminal_pane", return_value=True))
 
     def source(self, kind: Literal["claude", "codex"], home: Path, args: list[str], *,
-               footer: str = "", clone_home: Path | None = None) -> None:
+               footer: str = "", clone_home: Path | None = None, implicit_account: bool = False,
+               clone_uses_explicit_account: bool = False) -> None:
         key = "CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME"
-        origin = herdr.NativeAgentProcess(herdr.PaneSessionReport(SOURCE), "source-start", {key: str(home), "STAFF_ID": SOURCE})
-        fork = herdr.NativeAgentProcess(herdr.PaneSessionReport(FORK), "fork-start", {key: str(clone_home or home)})
+        account = {"HOME": str(home.parent)} if implicit_account else {key: str(home)}
+        clone_account = {key: str(clone_home or home)} if clone_home or clone_uses_explicit_account else account
+        origin = herdr.NativeAgentProcess(herdr.PaneSessionReport(SOURCE), "source-start", {**account, "STAFF_ID": SOURCE})
+        fork = herdr.NativeAgentProcess(herdr.PaneSessionReport(FORK), "fork-start", clone_account)
 
         def foreground_launch(pane: str, _kind: str) -> herdr.ForegroundLaunch:
             if pane == PANE:
@@ -121,6 +124,11 @@ class CloneCommandTests(StaffTestCase):
         self.assertEqual(shutdown_record.row_folder(new, record), ("natedev", self.folder))
         cast(Mock, self.remember).assert_called_once_with(FORK, FORK_PANE)
 
+    def launched_environment(self) -> herdr.PreparedAgentEnvironment:
+        call = cast(Mock, self.launch).call_args
+        assert call is not None
+        return cast(herdr.PreparedAgentEnvironment, call.args[2])
+
     def test_claude_clone_uses_live_settings_and_admits_an_ordinary_session(self) -> None:
         home = self.clone_scratch / ".claude4"
         unit = staff.ensure("unit", name="unit", parent=staff.ReportsTo(self.owner.id), runtime_id=THIRD,
@@ -131,10 +139,12 @@ class CloneCommandTests(StaffTestCase):
         data = json.dumps({"type": "assistant", "message": {"model": "fable"}, "effort": "high"}) + "\n"
         _ = transcript.write_text(data)
         self.assertEqual(shutdown.main(["clone", "alpha", "--as", "alpha-copy"]), 0)
-        environment = named_account_environment(home)
-        cast(Mock, self.prepare).assert_called_once_with(str(self.folder), environment)
+        environment = {"CLAUDE_CONFIG_DIR": str(home)}
+        cast(Mock, self.prepare).assert_called_once_with(str(self.folder), environment, ANY)
+        prepared = self.launched_environment()
+        self.assertEqual(prepared.env, environment)
         cast(Mock, self.launch).assert_called_once_with("fixture", herdr.ForkTab(PANE, "alpha-copy"),
-            herdr.PreparedAgentEnvironment(self.folder, environment), "claude",
+            prepared, "claude",
             ["--resume", SOURCE, "--fork-session", "-n", "alpha-copy", "--remote-control", "alpha-copy",
              "--model", "claude-opus-4-8", "--effort", "xhigh", "--settings", '{"disableAgentView": true}', "--", ANY],
             herdr.NoOpeningPrompt(), 90_000, agent="alpha-copy", client=self.client)
@@ -170,11 +180,29 @@ class CloneCommandTests(StaffTestCase):
         _ = transcript.write_text(json.dumps({"type": "turn_context", "payload": {
             "model": "gpt-6", "effort": "high"}}) + "\n")
         self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 0)
+        prepared = self.launched_environment()
+        self.assertEqual(prepared.env, {"CODEX_HOME": str(home)})
         cast(Mock, self.launch).assert_called_once_with("fixture", herdr.ForkTab(PANE, "alpha-copy"),
-            herdr.PreparedAgentEnvironment(self.folder, {"CODEX_HOME": str(home)}), "codex",
+            prepared, "codex",
             ["fork", SOURCE, "--model", "gpt-5.6-luna", "-c", 'model_reasoning_effort="high"', "--", ANY],
             herdr.NoOpeningPrompt(), 90_000, agent="alpha-copy", client=self.client)
         self.assert_new_row(home)
+
+    def test_codex_clone_passes_the_live_ultra_effort(self) -> None:
+        self.source("codex", self.clone_scratch / ".codex", ["codex"], footer="gpt-6.1-sol ultra")
+        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 0)
+        call = cast(Mock, self.launch).call_args
+        assert call is not None
+        self.assertIn('model_reasoning_effort="ultra"', cast(list[str], call.args[4]))
+
+    def test_clone_refuses_an_unstaffed_label_and_names_the_native_id_route(self) -> None:
+        self.source("claude", self.clone_scratch / ".claude", ["claude"], footer="Opus 4.8 high")
+        diagnostic = io.StringIO()
+        with redirect_stderr(diagnostic):
+            self.assertEqual(shutdown.main(["clone", "only-a-tab-label", "--as", "alpha-copy"]), 2)
+        self.assertIn("Use the native session ID", diagnostic.getvalue())
+        cast(Mock, self.launch).assert_not_called()
+        cast(Mock, self.client_factory).assert_not_called()
 
     def test_clone_refuses_an_existing_staff_name_before_launch(self) -> None:
         self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "ALPHA"]), 2)
@@ -229,12 +257,30 @@ class CloneCommandTests(StaffTestCase):
         cast(Mock, self.prepare).side_effect = None
         cast(Mock, self.prepare).return_value = herdr.PreparedAgentEnvironment(self.folder, {"CLAUDE_CONFIG_DIR": str(wrong)})
         self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
-        call = cast(Mock, self.launch).call_args
-        assert call is not None
-        prepared = cast(herdr.PreparedAgentEnvironment, call.args[2])
-        self.assertEqual(prepared.env["CLAUDE_CONFIG_DIR"], str(home))
+        self.assertEqual(self.launched_environment().env["CLAUDE_CONFIG_DIR"], str(home))
         self.assertEqual(staff.initial_snapshot().rows, (self.owner,))
         cast(Mock, self.publication).assert_not_called()
+
+    def test_clone_preserves_an_implicit_claude_account_after_environment_loading(self) -> None:
+        home = self.clone_scratch / ".claude"
+        self.source("claude", home, ["claude"], footer="Opus 4.8 high", implicit_account=True)
+        cast(Mock, self.prepare).side_effect = None
+        cast(Mock, self.prepare).return_value = herdr.PreparedAgentEnvironment(
+            self.folder, {"HOME": "/another/home", "CLAUDE_CONFIG_DIR": str(home), "PATH": "/bin"})
+        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 0)
+        prepared = self.launched_environment()
+        self.assertEqual(prepared.env, {"HOME": str(home.parent), "PATH": "/bin"})
+        self.assertIn("CLAUDE_CONFIG_DIR", prepared.unset_environment)
+        self.assert_new_row(home)
+
+    def test_clone_refuses_an_explicit_account_for_an_implicit_source(self) -> None:
+        home = self.clone_scratch / ".claude"
+        self.source("claude", home, ["claude"], footer="Opus 4.8 high", implicit_account=True,
+                    clone_uses_explicit_account=True)
+        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
+        self.assertEqual(staff.initial_snapshot().rows, (self.owner,))
+        cast(Mock, self.publication).assert_not_called()
+        cast(Mock, self.client.close_terminal_pane).assert_called_once_with(FORK_PANE, "fixture-terminal")
 
     def test_clone_refuses_reserved_message_addresses(self) -> None:
         for name in ("user", "USER", "staff:alpha", "session:alpha", "codex:alpha", "uds:alpha", "worker:alpha"):
@@ -264,7 +310,7 @@ class CloneCommandTests(StaffTestCase):
         def competing_writer(*_args: object, **_kwargs: object) -> herdr.AgentLaunched:
             _ = staff.create_session("Alpha-Copy", THIRD, staff.SessionLaunchFolder("natedev", self.folder),
                                      staff.SessionHome(home))
-            return herdr.AgentLaunched(FORK_PANE, herdr.PromptSubmissionNotRequired())
+            return herdr.ForkLaunched(FORK_PANE, herdr.PromptSubmissionNotRequired(), "fixture-terminal")
 
         cast(Mock, self.launch).side_effect = competing_writer
         self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
@@ -272,6 +318,47 @@ class CloneCommandTests(StaffTestCase):
         self.assertIsNotNone(record.by_current_session(THIRD))
         self.assertIsNone(record.by_current_session(FORK))
         cast(Mock, self.publication).assert_not_called()
+        cast(Mock, self.client.close_terminal_pane).assert_called_once_with(FORK_PANE, "fixture-terminal")
+
+    def test_staff_rejects_later_casefold_name_collisions_with_a_session(self) -> None:
+        _ = staff.create_session("alpha-copy", FORK, staff.SessionLaunchFolder("natedev", self.folder),
+                                 staff.SessionHome(self.clone_scratch / ".claude"))
+        with self.assertRaisesRegex(staff.StaffRefused, "another staff row"):
+            _ = staff.ensure("showrunner", name="Alpha-Copy", runtime_id=THIRD)
+        with self.assertRaisesRegex(staff.StaffRefused, "another staff row"):
+            _ = staff.rename(self.owner.id, "ALPHA-COPY")
+        self.assertEqual(staff.initial_snapshot().by_id(self.owner.id), self.owner)
+
+    def test_clone_removes_its_launch_and_terminal_when_staff_rejects_admission(self) -> None:
+        self.source("claude", self.clone_scratch / ".claude", ["claude"], footer="Opus 4.8 high")
+        with patch.object(staff, "create_session", side_effect=staff.StaffRefused("name taken")):
+            self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
+        cast(Mock, self.publication).assert_called_once()
+        self.assertIsNone(pane_record.publication_for_session(FORK))
+        cast(Mock, self.client.close_terminal_pane).assert_called_once_with(FORK_PANE, "fixture-terminal")
+
+    def test_clone_does_not_admit_staff_if_the_launch_cannot_be_saved(self) -> None:
+        self.source("claude", self.clone_scratch / ".claude", ["claude"], footer="Opus 4.8 high")
+        cast(Mock, self.publication).side_effect = OSError("launch file unavailable")
+        self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
+        self.assertEqual(staff.initial_snapshot().rows, (self.owner,))
+        cast(Mock, self.client.close_terminal_pane).assert_called_once_with(FORK_PANE, "fixture-terminal")
+
+    def test_clone_keeps_the_launch_if_staff_commits_before_its_reply_fails(self) -> None:
+        self.source("claude", self.clone_scratch / ".claude", ["claude"], footer="Opus 4.8 high")
+        create = staff.create_session
+
+        def lose_reply(name: str, identity: str, folder: staff.SessionLaunchFolder, home: staff.SessionHome) -> staff.StaffRow:
+            _ = create(name, identity, folder, home)
+            raise staff.StaffUnreadable("lost staff reply")
+
+        diagnostic = io.StringIO()
+        with patch.object(staff, "create_session", side_effect=lose_reply), redirect_stderr(diagnostic):
+            self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "alpha-copy"]), 2)
+        self.assertIn("staff admission is unconfirmed", diagnostic.getvalue())
+        self.assertIsNotNone(staff.initial_snapshot().by_current_session(FORK))
+        self.assertIsNotNone(pane_record.publication_for_session(FORK))
+        cast(Mock, self.client.close_terminal_pane).assert_not_called()
 
     def test_create_session_validates_name_and_identity_on_the_staff_owner(self) -> None:
         with patch.object(staff, "is_owner", return_value=False):
@@ -311,5 +398,6 @@ class CloneCommandTests(StaffTestCase):
         self.assertEqual(transcript.read_text(), "source transcript\n")
 
 
-def prepare_fixture_environment(cwd: str, environment: dict[str, str]) -> herdr.PreparedAgentEnvironment:
-    return herdr.PreparedAgentEnvironment(Path(cwd), environment)
+def prepare_fixture_environment(cwd: str, environment: dict[str, str],
+                                unset: frozenset[str]) -> herdr.PreparedAgentEnvironment:
+    return herdr.PreparedAgentEnvironment(Path(cwd), environment, unset)

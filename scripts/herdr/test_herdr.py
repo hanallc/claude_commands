@@ -3411,19 +3411,83 @@ class LaunchDestinationTests(StaffTestCase):
         client = Mock(spec=herdr.Herdr)
         opened = cast(Mock, client.open_tab)
         opened.return_value = "w1:p2"
-        prepared = herdr.PreparedAgentEnvironment(self.root, {})
+        cast(Mock, client.command_terminal).return_value = "fork-terminal"
+        started = cast(Mock, client.start_agent)
+        started.return_value = herdr.PromptSubmissionNotRequired()
+        prepared = herdr.PreparedAgentEnvironment(self.root, {"HOME": str(self.root)},
+                                                  frozenset({"CLAUDE_CONFIG_DIR"}))
         arguments = ["--resume", source, "--fork-session", "-n", "clone"]
         with (patch.object(herdr, "trust_claude_launch"),
-              patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (1,))) as live,
-              patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired()) as start):
+              patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (1,))) as live):
             launched = herdr.launch_prepared_agent("agents", herdr.ForkTab("w1:p1", "clone"),
                 prepared, "claude", arguments, herdr.NoOpeningPrompt(), 5000, agent="clone", client=client)
         self.assertEqual(launched.pane, "w1:p2")
         live.assert_not_called()
         opened.assert_called_once()
         self.assertEqual(cast(str, opened.call_args.kwargs["after_pane"]), "w1:p1")
-        start.assert_called_once_with("agents", "w1:p2", "claude", arguments, herdr.NoOpeningPrompt(), 5000,
-                                      agent="clone")
+        setup = cast(Mock, client.run_in_pane).call_args
+        assert setup is not None
+        self.assertEqual(setup.kwargs["terminal"], "fork-terminal")
+        command = shlex.join(cast(list[str], setup.args[1]))
+        result = subprocess.run([BASH_BINARY, "-c", command + '\nprintf "%s" "${CLAUDE_CONFIG_DIR-unset}"'],
+                                env={"CLAUDE_CONFIG_DIR": "/server/account"}, text=True,
+                                capture_output=True, check=True)
+        self.assertEqual(result.stdout, "unset")
+        started.assert_called_once_with("clone", "w1:p2", "claude", arguments, herdr.NoOpeningPrompt(), 5000,
+                                        publication=herdr.LaunchPublicationTiming.AFTER_FORK_CHECKS)
+
+    def test_failed_fork_closes_only_its_terminal_on_the_source_server(self) -> None:
+        client = herdr.Herdr("private")
+        source = "w1:p1"
+        fork = "w1:p2"
+        panes: dict[str, herdr.PaneIdentity] = {
+            source: {"pane_id": source, "terminal_id": "source-terminal", "workspace_id": "w1", "session_id": "source"},
+            fork: {"pane_id": fork, "terminal_id": "fork-terminal", "workspace_id": "w1", "session_id": None},
+        }
+
+        def run(*arguments: str) -> str:
+            self.assertEqual(arguments, ("pane", "close", fork))
+            del panes[fork]
+            return ""
+
+        failure = herdr.AgentNotStarted("fixture start failed")
+        with (patch.object(herdr, "trust_claude_launch"),
+              patch.object(herdr, "shared_session", return_value="shared"),
+              patch.object(herdr, "stop_session") as stop,
+              patch.object(herdr, "start_agent", return_value=failure),
+              patch.object(client, "open_tab", return_value=fork),
+              patch.object(client, "pane_row", side_effect=panes.__getitem__),
+              patch.object(client, "panes", side_effect=lambda: list(panes.values())),
+              patch.object(client, "run_in_pane"),
+              patch.object(client, "start_agent", return_value=failure),
+              patch.object(client, "run", side_effect=run) as closed):
+            result = herdr.launch_prepared_agent(client.session, herdr.ForkTab(source, "clone"),
+                herdr.PreparedAgentEnvironment(self.root, {}), "claude", [], herdr.NoOpeningPrompt(),
+                1_000, agent="clone", client=client)
+        self.assertIs(result.outcome, failure)
+        closed.assert_called_once_with("pane", "close", fork)
+        stop.assert_not_called()
+        self.assertEqual(list(panes), [source])
+
+    def test_codex_fork_leaves_its_source_launch_untouched_until_verification(self) -> None:
+        client = herdr.Herdr("private")
+        source = fixture_runtime_id("codex-source")
+        fork = "w1:p2"
+        arguments = ["fork", source]
+        wrong = pane_launch.launch(fork, source, str(self.root), {}, ["codex", *arguments], kind="codex")
+        with (patch.object(herdr, "Herdr", return_value=client),
+              patch.object(client, "open_tab", return_value=fork),
+              patch.object(client, "command_terminal", return_value="fork-terminal"),
+              patch.object(client, "run_in_pane"),
+              patch.object(client, "start_command", return_value=subprocess.CompletedProcess([], 0, "", "")) as start,
+              patch.object(client, "codex_launch", return_value=wrong),
+              patch.object(pane_launch, "write") as publish):
+            result = herdr.launch_prepared_agent(client.session, herdr.ForkTab("w1:p1", "clone"),
+                herdr.PreparedAgentEnvironment(self.root, {}), "codex", arguments, herdr.NoOpeningPrompt(),
+                1_000, agent="clone", client=client)
+        self.assertIsInstance(result.outcome, herdr.PromptSubmissionNotRequired)
+        start.assert_called_once()
+        publish.assert_not_called()
 
     def test_every_launch_keeps_the_shell_after_the_agent_returns(self) -> None:
         for kind in ("claude", "codex"):

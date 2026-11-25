@@ -39,6 +39,7 @@ All lifecycle scripts use `scripts/agents/`.
 
 `agents clone NAME --as NEW` forks a live conversation on the source machine.
 Use a staff name, staff ID, or native session ID.
+For a session without a staff row, use its native session ID.
 The command requires one proved pane and opens the clone after its source tab on the same Herdr server.
 The live pane must show the current model and effort.
 For Codex, show Model with Reasoning in the status line.
@@ -46,7 +47,11 @@ Claude uses `--resume --fork-session`.
 Codex uses `codex fork`.
 The first prompt names both sessions and asks the clone to wait for a request addressed to it.
 The command refuses occupied names and reserved message addresses.
-It checks the clone's native ID, folder, and account before it adds a root `session` row.
+The fork uses the source account environment.
+An absent `CLAUDE_CONFIG_DIR` stays absent.
+The command verifies the fork before it saves the launch or adds a root `session` row.
+It saves the launch before the staff write.
+A definite refusal closes only the fork terminal.
 The staff owner checks the name and ID together before it creates the row.
 The row stores the launch folder and account for ordinary restart and resume.
 Messages to each name resolve to that session's native ID.

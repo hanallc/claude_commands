@@ -4,21 +4,31 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 from time import monotonic
 from typing import Literal, cast
 
 from scripts.agents import pane_record, producer_creation, producer_lifecycle, remote, set_model, stop_resume
-from scripts.herdr import herdr, pane_launch
+from scripts.herdr import herdr, herdr_types, pane_launch
 from scripts.lib import codex_models_cache
 from scripts.message import sessions
 from scripts.production import staff
-from scripts.whoami.account import named_account_environment
+from scripts.whoami.account import NAMED_ACCOUNT_VARIABLES
 
 
 AgentKind = Literal["claude", "codex"]
 _ACCOUNT_VARIABLE = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
+_ACCOUNT_KEYS = {
+    "claude": frozenset(("HOME", *NAMED_ACCOUNT_VARIABLES, "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
+                         "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")),
+    "codex": frozenset(("HOME", "CODEX_HOME", "CODEX_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL")),
+}
+
+
+def _account_environment(kind: AgentKind, process: herdr.NativeAgentProcess) -> dict[str, str]:
+    return {key: process.environment[key] for key in _ACCOUNT_KEYS[kind] if key in process.environment}
 
 
 def _account_home(kind: AgentKind, process: herdr.NativeAgentProcess) -> Path:
@@ -54,19 +64,8 @@ def _source_id(reference: str, record: staff.StaffSnapshot) -> str:
         return named[0].current_session
     try:
         return staff.native_id(reference)
-    except staff.StaffRefused:
-        selected = stop_resume.stop_target(reference)
-    if isinstance(selected, stop_resume.StopFailed):
-        raise ValueError(selected.reason)
-    if isinstance(selected, stop_resume.SessionNotFound):
-        tabs = herdr.Herdr(herdr.shared_session()).tab_sessions()
-        matches = [tab.session_id for tab in tabs if tab.label == reference and tab.session_id]
-        if len(matches) > 1:
-            raise ValueError(f"{reference}: several tabs match")
-        if not matches:
-            raise ValueError(f"{reference}: no live session on this machine")
-        return matches[0]
-    return selected
+    except staff.StaffRefused as error:
+        raise ValueError(f"{reference}: no staff name matches. Use the native session ID.") from error
 
 
 def _source(reference: str, record: staff.StaffSnapshot) -> tuple[CloneSource, herdr.Herdr]:
@@ -104,8 +103,7 @@ def _source(reference: str, record: staff.StaffSnapshot) -> tuple[CloneSource, h
 
 
 _CODEX_MODEL = r"gpt-[a-z0-9][a-z0-9.-]*"
-_CODEX_EFFORT = r"none|minimal|low|medium|high|xhigh|max"
-_CODEX_MODEL_AND_EFFORT = re.compile(rf"(.+?) ({_CODEX_EFFORT})(?: (?:fast|standard|flex))?")
+_CODEX_MODEL_AND_EFFORT = re.compile(rf"(.+?) (none|minimal|{set_model.DISPLAY_EFFORT})(?: (?:fast|standard|flex))?")
 
 
 @dataclass(frozen=True)
@@ -155,10 +153,6 @@ def _live_settings(source: CloneSource, client: herdr.Herdr, home: Path) -> Live
         if len(pairs) > 1:
             raise ValueError(f"{source.name}: the live pane reports conflicting model and effort")
         model, effort = next(iter(pairs), ("", ""))
-        if not model:
-            models = {model for part in fields if (model := _codex_model(part, catalog))}
-            if len(models) == 1:
-                model = models.pop()
     if not model or not effort:
         missing = "model and effort" if not (model or effort) else "effort" if model else "model"
         raise ValueError(f"{source.name}: cannot prove the current {missing} from the live pane")
@@ -179,6 +173,56 @@ def _arguments(source: CloneSource, settings: LiveForkSettings, name: str) -> li
     return [*arguments, "--", prompt]
 
 
+def _admit_clone(name: str, source: CloneSource, client: herdr.Herdr, launched: herdr.ForkLaunched,
+                 prepared: herdr.PreparedAgentEnvironment, environment: dict[str, str], home: Path) -> str:
+    pane, terminal = launched.pane, launched.terminal
+    try:
+        native = stop_resume.wait_for_native_session(client, pane,
+            monotonic() + herdr.PROGRAM_TIMEOUT_SECONDS, kind=source.kind)
+        clone = client.foreground_launch(pane, source.kind)
+        if native == source.identity or native != clone.process.current_identity:
+            raise ValueError(f"{name}: pane {pane} did not start a separate session")
+        if _account_environment(source.kind, clone.process) != environment:
+            raise ValueError(f"{name}: pane {pane} did not use the source account environment")
+        if Path(clone.cwd).resolve() != prepared.directory:
+            raise ValueError(f"{name}: pane {pane} did not start in the source folder")
+        if client.command_terminal(pane) != terminal:
+            raise ValueError(f"{name}: pane {pane} changed terminals")
+        record = staff.initial_snapshot()
+        if any(row.name.casefold() == name.casefold() for row in record.all_rows):
+            raise ValueError(f"{name}: another staff row has this name")
+        if any(native in (row.id, row.current_session) for row in record.all_rows):
+            raise ValueError(f"{name}: the fork identity already belongs to another session")
+        entry = pane_record.launch(pane, native, clone.cwd, clone.process.environment, clone.arguments, kind=source.kind)
+        entry.update(name=name, pid=clone.pid, proc_start=clone.process.started, config_dir=str(home))
+        try:
+            pane_record.write(client.session, entry)
+            try:
+                row = staff.create_session(name, native, staff.SessionLaunchFolder(remote.local_machine(), prepared.directory),
+                                           staff.SessionHome(home))
+            except staff.StaffUnreadable as error:
+                # A lost reply can follow a committed staff write.
+                raise _AdmissionUnconfirmed(
+                    f"{name}: staff admission is unconfirmed. Pane {pane} and its launch are retained."
+                ) from error
+        except (OSError, ValueError, staff.StaffRefused):
+            pane_launch.retire_launch(pane_record.record_path(client.session), pane, entry)
+            raise
+    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError, staff.StaffRefused) as error:
+        if not client.close_terminal_pane(pane, terminal):
+            raise ValueError(f"{name}: fork pane {pane} closure is unconfirmed ({error})") from error
+        raise ValueError(f"{name}: fork pane {pane} closed after refusal ({error})") from error
+    try:
+        client.remember_row_tab(row.id, pane)
+    except (herdr_types.HerdrFailure, OSError, ValueError) as error:
+        print(f"{name}: clone admitted. Cannot save the tab position ({error}).", file=sys.stderr)
+    return native
+
+
+class _AdmissionUnconfirmed(RuntimeError):
+    """Staff may have committed the row before its reply failed."""
+
+
 def run(reference: str, name: str) -> int:
     staff.validate_name("session", name)
     producer_lifecycle.check_name(name)
@@ -189,12 +233,14 @@ def run(reference: str, name: str) -> int:
             raise ValueError(f"{name}: producer creation is pending")
         source, client = _source(reference, record)
         home = _account_home(source.kind, source.launch.process)
-        environment = named_account_environment(home) if source.kind == "claude" else {"CODEX_HOME": str(home)}
-        prepared = herdr.prepare_agent_environment(source.launch.cwd, environment)
+        environment = _account_environment(source.kind, source.launch.process)
+        unset = _ACCOUNT_KEYS[source.kind].difference(environment)
+        prepared = herdr.prepare_agent_environment(source.launch.cwd, environment, unset)
         if isinstance(prepared, herdr.nix_env.Refused):
             raise ValueError(prepared.reason)
-        prepared = replace(prepared, env={**prepared.env, **environment},
-                           unset_environment=prepared.unset_environment - environment.keys())
+        prepared = replace(prepared, env={**{key: value for key, value in prepared.env.items() if key not in unset},
+                                          **environment},
+                           unset_environment=(prepared.unset_environment | unset).difference(environment))
         settings = _live_settings(source, client, home)
         if client.foreground_launch(source.pane, source.kind) != source.launch:
             raise ValueError(f"{reference}: source changed before the fork")
@@ -203,24 +249,11 @@ def run(reference: str, name: str) -> int:
             source.kind, arguments, herdr.NoOpeningPrompt(), 90_000, agent=name, client=client)
         if isinstance(launched.outcome, herdr.PromptNotSubmitted):
             raise ValueError(f"{name}: {launched.outcome.reason}")
+        if not isinstance(launched, herdr.ForkLaunched):
+            raise ValueError(f"{name}: cannot prove the fork terminal")
         try:
-            native = stop_resume.wait_for_native_session(client, launched.pane,
-                monotonic() + herdr.PROGRAM_TIMEOUT_SECONDS, kind=source.kind)
-            clone = client.foreground_launch(launched.pane, source.kind)
-        except subprocess.SubprocessError as error:
-            raise ValueError(f"{name}: cannot prove the clone in pane {launched.pane}: {error}") from error
-        if native == source.identity or native != clone.process.current_identity:
-            raise ValueError(f"{name}: pane {launched.pane} did not start a separate session")
-        if _account_home(source.kind, clone.process) != home:
-            raise ValueError(f"{name}: pane {launched.pane} did not start on the source account")
-        if Path(clone.cwd).resolve() != prepared.directory:
-            raise ValueError(f"{name}: pane {launched.pane} did not start in the source folder")
-        row = staff.create_session(name, native, staff.SessionLaunchFolder(remote.local_machine(), prepared.directory),
-                                   staff.SessionHome(home))
-        entry = pane_launch.launch(launched.pane, native, clone.cwd, clone.process.environment,
-                                   clone.arguments, kind=source.kind)
-        entry.update(name=name, pid=clone.pid, proc_start=clone.process.started)
-        pane_record.write(client.session, entry)
-        client.remember_row_tab(row.id, launched.pane)
+            native = _admit_clone(name, source, client, launched, prepared, environment, home)
+        except _AdmissionUnconfirmed as error:
+            raise ValueError(str(error)) from error
     print(f"{name}: cloned {source.name} as {native} in pane {launched.pane}")
     return 0

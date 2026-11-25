@@ -102,7 +102,7 @@ def default_changes(role: Role, word: str, target: models_registry.LaunchSetting
 
 
 _CLAUDE_MODEL = r"(?:claude-)?[a-zA-Z]+[ -]\d+(?:[.-]\d+)*"
-_EFFORT = r"(low|medium|high|xhigh|max|ultra)"
+DISPLAY_EFFORT = r"low|medium|high|xhigh|max|ultra"
 
 
 class CodexRolloutResult(StrEnum):
@@ -196,7 +196,7 @@ def current_claude_model(footer: tuple[str, ...]) -> ScreenModel:
     """Read the model and effort that Claude displays now."""
     for line in footer:
         for field in line.split("|"):
-            if status := re.fullmatch(rf"\s*({_CLAUDE_MODEL})(?:\s+{_EFFORT})?(?:\s+·.*)?\s*", field):
+            if status := re.fullmatch(rf"\s*({_CLAUDE_MODEL})(?:\s+({DISPLAY_EFFORT}))?(?:\s+·.*)?\s*", field):
                 return ScreenModel(_claude_model_key(status[1]), status[2] or "")
     return ScreenModel()
 

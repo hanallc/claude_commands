@@ -1832,6 +1832,11 @@ class CodexArgumentsSource(Enum):
     FOREGROUND = "arguments from the selected foreground process"
 
 
+class LaunchPublicationTiming(Enum):
+    ON_START = "publish on start"
+    AFTER_FORK_CHECKS = "publish after fork checks"
+
+
 class Herdr:
     def __init__(self, session: str) -> None:
         self.binary: str = herdr_binary()
@@ -2883,13 +2888,16 @@ class Herdr:
         return entry
 
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
-                    opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
+                    opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int, *,
+                    publication: LaunchPublicationTiming = LaunchPublicationTiming.ON_START,
+                    ) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
         """Start once, then prove the opening prompt arrived as this session's user turn."""
         with reboot_lock():
-            return self._start_agent(name, pane, kind, agent_arguments, opening, timeout_ms)
+            return self._start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, publication)
 
     def _start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
-                     opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
+                     opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int, publication: LaunchPublicationTiming,
+                     ) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
         forget_pane_evidence(self.session, pane)
         _check_agent_arguments(kind, agent_arguments)
         _timeout(timeout_ms)
@@ -2928,7 +2936,7 @@ class Herdr:
             if screen:
                 print(screen, file=sys.stderr)
             return _without_prompt_transport(opening, launched_at, AgentNotStarted(str(error)))
-        if kind == "codex":
+        if kind == "codex" and publication is LaunchPublicationTiming.ON_START:
             try:
                 entry = self.codex_launch(pane, agent_arguments)
                 entry["name"] = name
@@ -6921,6 +6929,13 @@ class AgentLaunched:
 
 
 @dataclass(frozen=True)
+class ForkLaunched(AgentLaunched):
+    """The terminal opened for this fork."""
+
+    terminal: str
+
+
+@dataclass(frozen=True)
 class PreparedAgentEnvironment:
     """An environment already proved for the exact directory to be opened."""
 
@@ -7079,7 +7094,8 @@ def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane 
     if kind == "claude":
         agent_arguments = models_registry.claude_arguments(agent_arguments, prepared.env)
         try:
-            trust_claude_launch(prepared.directory, Path(prepared.env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"))
+            default_home = Path(prepared.env.get("HOME") or Path.home()) / ".claude"
+            trust_claude_launch(prepared.directory, Path(prepared.env.get("CLAUDE_CONFIG_DIR") or default_home))
         except HerdrFailure as error:
             print(str(error), file=sys.stderr)
             return AgentLaunched("", _without_prompt_transport(opening, launched_at, ClaudeTrustNotWritten(str(error))))
@@ -7112,9 +7128,13 @@ def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane 
             conversation_note(observed)
     if kind == "claude" and folder_member is not None:
         prepared = in_session_folder(prepared, folder_member, session_id)
+    terminal = ""
     if isinstance(destination, ForkTab):
         pane = client.open_tab("", destination.title, str(prepared.directory), prepared.env,
                                after_pane=destination.source_pane)
+        if pane == destination.source_pane:
+            raise HerdrFailure(f"{pane}: the fork did not open a separate pane", "wrong_target")
+        terminal = client.command_terminal(pane)
     elif isinstance(destination, NewTab):
         pane = (client.open_tab(destination.space, destination.title, str(prepared.directory), prepared.env,
                                **({"member": member} if member else {})) if reuse_client else
@@ -7135,12 +7155,13 @@ def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane 
         moved = next((row for row in panes if destination.terminal
                       and row.get("terminal_id") == destination.terminal), None)
         pane = moved["pane_id"] if moved is not None else destination.pane
+        terminal = destination.terminal
     try:
         if isinstance(destination, SplitPane):
             client.label_pane(pane, destination.label)
         script = agent_alias_script(kind)
-        if isinstance(destination, ExistingPane):
-            # Set the environment in the existing shell before the agent starts.
+        if isinstance(destination, (ExistingPane, ForkTab)):
+            # Set the environment in the selected shell before the agent starts.
             environment = _pane_environment(prepared.env)
             exports = shlex.join([f"{key}={value}" for key, value in environment.items()
                                   if not key.startswith("HERDR_") or key == "HERDR_AGENT_PANE"])
@@ -7152,12 +7173,17 @@ def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane 
                       'unset "${legacy_label%%=*}";; esac; done; '
                       f"cd -- {shlex.quote(str(prepared.directory))} && "
                       f"unset {shlex.join(sorted(key for key in removals if not key.startswith('HERDR_') and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)))} && export {exports}")
-        client.run_in_pane(pane, ["eval", script],
-                           terminal=destination.terminal if isinstance(destination, ExistingPane) else "")
+        client.run_in_pane(pane, ["eval", script], terminal=terminal)
         server_name = agent_name if isinstance(agent_name, str) else agent
         forget_pane_evidence(name, pane)
         try:
-            outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=server_name)
+            if isinstance(destination, ForkTab):
+                if client.command_terminal(pane) != terminal:
+                    raise HerdrFailure(f"{pane}: the fork terminal changed", "wrong_target")
+                outcome = client.start_agent(server_name, pane, kind, agent_arguments, opening, timeout_ms,
+                                             publication=LaunchPublicationTiming.AFTER_FORK_CHECKS)
+            else:
+                outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=server_name)
         finally:
             forget_pane_evidence(name, pane)
     except (HerdrFailure, OSError, subprocess.SubprocessError) as error:
@@ -7168,7 +7194,13 @@ def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane 
         outcome = _without_prompt_transport(opening, launched_at, failure)
     if (isinstance(outcome, AgentNotStarted) and outcome.state == "not_sent"
             and not isinstance(destination, ExistingPane)):
-        if isinstance(destination, (NewTab, ForkTab)):
+        if isinstance(destination, ForkTab):
+            if client.close_terminal_pane(pane, terminal):
+                print(f"herdr {name}:{pane}: fork pane closed after start failed ({outcome.reason})", file=sys.stderr)
+            else:
+                print(f"herdr {name}:{pane}: fork terminal closure is unconfirmed", file=sys.stderr)
+            return ForkLaunched(pane, outcome, terminal)
+        if isinstance(destination, NewTab):
             close_agent(name, pane)
         else:
             _ = client.close_retained_pane(pane)
@@ -7176,6 +7208,8 @@ def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane 
     if (resuming_with_prompt and isinstance(outcome, PromptNotSubmitted)
             and (isinstance(destination, ExistingPane) or not isinstance(outcome, AgentNotStarted))):
         outcome = _resume_prompt_failure(outcome, pane)
+    if isinstance(destination, ForkTab):
+        return ForkLaunched(pane, outcome, terminal)
     return AgentLaunched(pane, outcome)
 
 

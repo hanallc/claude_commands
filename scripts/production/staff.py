@@ -1353,6 +1353,8 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
     unknown = {cast(str, row["id"]) for row in unknown_rows}
     sessions = {cast(str, row.get("current_session", row["id"])) for row in unknown_rows}
     names: set[tuple[Kind, ReportsTo | StaffRoot | None, str]] = set()
+    folded_names: set[str] = set()
+    standalone_names: set[str] = set()
     worktrees: set[tuple[str, Path]] = set()
     for row in rows:
         if row.id in indexed or row.id in unknown:
@@ -1378,6 +1380,12 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
         if row.kind not in _KINDS:
             raise StaffRefused(f"invalid staff kind: {row.kind}")
         validate_name(row.kind, row.name)
+        folded = row.name.casefold()
+        if folded in standalone_names or (row.kind == "session" and folded in folded_names):
+            raise StaffRefused(f"{row.name}: another staff row has this name")
+        if row.kind == "session":
+            standalone_names.add(folded)
+        folded_names.add(folded)
         key = (row.kind, None if row.kind == "showrunner" else row.parent, row.name)
         if key in names:
             raise StaffRefused(f"{row.kind} name already exists: {row.name}")
@@ -2059,8 +2067,6 @@ def create_session(name: str, identity: str, folder: SessionLaunchFolder, home: 
                             "--path", str(folder.path), "--home", str(home.path)])
 
     def edit(rows: list[StaffRow]) -> StaffRow:
-        if any(row.name.casefold() == name.casefold() for row in rows):
-            raise StaffRefused(f"{name}: another staff row has this name")
         if any(session_id in (row.id, row.current_session) for row in rows):
             raise StaffRefused(f"{session_id}: runtime identity already belongs to another member")
         row = StaffRow(session_id, "session", name, STAFF_ROOT,
