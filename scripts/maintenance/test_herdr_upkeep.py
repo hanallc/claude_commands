@@ -17,6 +17,7 @@ from scripts.agents import pane_record, remote, restart, shutdown, shutdown_reco
 from scripts.maintenance import herdr_upkeep as job
 from scripts.herdr import herdr, detection_rules, herdr_types
 from scripts.lib import operation_deadline
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
 from scripts.message import sessions
 from scripts.production import gate, staff
@@ -51,7 +52,8 @@ class UpkeepTests(unittest.TestCase):
             "GATE_STATE_DIR": str(self.root / "merge-gate"),
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
             "HERDR_UPKEEP_CONFIG": str(self.root / "config.toml")}))
-        _ = (self.root / "config.toml").write_text("[job]\ninterval_seconds=120\ntimeout_seconds=0.2\n")
+        _ = (self.root / "config.toml").write_text(
+            f"[job]\ninterval_seconds=120\ntimeout_seconds={TEST_HANG_GUARD_SECS}\n")
 
     def test_runtime_interval_skips_completed_work_without_changing_state(self) -> None:
         script = self.root / "worker.py"
@@ -65,13 +67,16 @@ class UpkeepTests(unittest.TestCase):
             self.assertEqual(job.run_job(), 0)
         self.assertFalse(script.with_suffix(".ran").exists())
         self.assertEqual((completed.read_bytes(), completed.stat().st_mtime_ns), before)
-        _ = (self.root / "config.toml").write_text("[job]\ninterval_seconds=0.001\ntimeout_seconds=0.2\n")
+        _ = (self.root / "config.toml").write_text(
+            f"[job]\ninterval_seconds=0.001\ntimeout_seconds={TEST_HANG_GUARD_SECS}\n")
         time.sleep(0.002)
         with patch.object(job, "__file__", str(script)):
             self.assertEqual(job.run_job(), 0)
         self.assertTrue(script.with_suffix(".ran").exists())
 
     def test_hung_worker_is_killed_and_remains_due_for_retry(self) -> None:
+        config = self.root / "config.toml"
+        _ = config.write_text("[job]\ninterval_seconds=120\ntimeout_seconds=0.2\n")
         script = self.root / "worker.py"
         _ = script.write_text("import signal\nsignal.pause()\n")
         started = time.monotonic()
@@ -79,6 +84,7 @@ class UpkeepTests(unittest.TestCase):
             self.assertEqual(job.run_job(), 124)
         self.assertLess(time.monotonic() - started, 2)
         self.assertFalse((self.root / "herdr-upkeep/completed").exists())
+        _ = config.write_text(f"[job]\ninterval_seconds=120\ntimeout_seconds={TEST_HANG_GUARD_SECS}\n")
         _ = script.write_text("pass\n")
         with patch.object(job, "__file__", str(script)):
             self.assertEqual(job.run_job(), 0)
