@@ -657,13 +657,15 @@ class ReviewSubmissionTests(unittest.TestCase):
 
     def test_f003_proposal_requires_the_recipients_native_folder(self) -> None:
         eligible = {option["id"]: option["proposal"] for option in submissions.recipient_options(self.members)}
-        self.assertEqual(eligible, {OWNER: True, PRODUCER: False})
+        self.assertEqual(eligible, {OWNER: True, PRODUCER: True})
         _ = self.doc.write_text("# Builds\n> **Status: PRODUCTION — running.**\n")
         with self.assertRaisesRegex(submissions.SubmissionError, "native proposal folder"):
             _ = submissions.submit(request(submissions.SubmissionKind.PROPOSAL))
         self.assertFalse((self.root / "rust" / "hanadocs" / "issues").exists())
         eligible = {option["id"]: option["proposal"] for option in submissions.recipient_options(self.members)}
-        self.assertEqual(eligible, {OWNER: False, PRODUCER: False})
+        self.assertEqual(eligible, {OWNER: False, PRODUCER: True})
+        saved = submissions.submit(request(submissions.SubmissionKind.PROPOSAL, recipient=PRODUCER))
+        self.assertEqual(saved.path.parent, self.root / "state" / PRODUCER / "proposals")
 
     def test_f004_lookup_requires_one_selector(self) -> None:
         for lookup in (update_registration.find_review_question_in_folder, proposal_issue.find_review_proposal):
