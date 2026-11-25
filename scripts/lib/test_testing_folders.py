@@ -20,6 +20,7 @@ from scripts.lib.checkout_test_support import (STANDALONE_TEST_STARTUP, copy_tes
                                               direct_test_fixture_environment, run_gate_test_fixture,
                                               without_user_test_manager)
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 SHIM = Path(__file__).with_name("py")
@@ -214,7 +215,10 @@ class Child(unittest.TestCase):
         _ = case.write_text(source)
         environment = {**self.environment(), "PYTHONPATH": str(self.root)}
         arguments = [str(shim), str(checkout / "scripts/test_times/module_run.py"), str(checkout), case.name]
-        run = run_gate_test_fixture(case, arguments, environment)
+        config = Path(environment["CONF_DIR"])
+        _ = write_config_fixture(config / "build_admission.conf")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+            run = run_gate_test_fixture(case, arguments, environment)
         self.assertEqual(run.returncode, 0, run.stdout)
         self.assertIn(f"TMPDIR={self.root}\n", run.stdout)
         self.assertFalse((self.root / "test-runs").exists())

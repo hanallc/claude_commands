@@ -1619,8 +1619,13 @@ class PlacementTests(unittest.TestCase):
         self.assertEqual(readings["tuned"], readings["pinned"])
 
     def test_a_placement_fixture_refuses_settings_outside_its_root(self) -> None:
-        with TemporaryDirectory() as outside, mock.patch.object(conf, "directory", return_value=Path(outside)):
-            with self.assertRaisesRegex(AssertionError, "must not read the live settings"):
+        original = conf.path
+        with TemporaryDirectory() as outside:
+            def fixture_path(file: str | Path) -> Path:
+                return Path(outside) / "mac_test.conf" if file == "mac_test" else original(file)
+
+            with (mock.patch.object(conf, "path", side_effect=fixture_path),
+                  self.assertRaisesRegex(AssertionError, "must not read the live settings")):
                 with PlacementFixture():
                     pass
             self.assertEqual(list(Path(outside).iterdir()), [])
@@ -5292,7 +5297,8 @@ class MacProbeFixture(PlacementFixture):
             return super().read_provider(key)
         answer = self.answers[key.session]
         capacity = answer if answer in ("busy", "blocked", "backoff", "state") else "free"
-        probe = offload.UNAVAILABLE_PROBE if answer == "unreachable" else offload.ProbeSnapshot(100, "fixture")
+        free_gib = 1 if answer == "disk" else 100
+        probe = offload.UNAVAILABLE_PROBE if answer == "unreachable" else offload.ProbeSnapshot(free_gib, "fixture")
         disk = offload.MacDiskShort(1, 100) if answer == "disk" else offload.MacDiskReady(100)
         identity = claim_state.MacMirrorIdentity("fixture-hana", "hana", "hana.json", "hana")
         policy = (mock.patch.object(eligibility, "mac_step_eligibility", return_value=eligibility.IneligibleMacStep("off"))
@@ -5382,14 +5388,20 @@ class MacOrderTests(unittest.TestCase):
         return request
 
     def configure_mac_probe(self, fixture: MacProbeFixture) -> None:
+        from scripts.build_targets import build_targets
+
         fixture.enter_context(mock.patch.dict(os.environ, {
             "MAC_TEST_STATE_DIR": str(fixture.root / "mac-probe-state"),
         }))
         fixture.configure(waiting_pass_seconds=1)
+        # Test placement order after the disk sweep ends.
+        _ = fixture.enter_context(mock.patch.object(fixture.server, "_request_mac_disk_recovery",
+                                                    return_value=build_targets.MacDiskRecoveryInactive()))
         _ = (fixture.root / "build_targets.conf").write_text(
             "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
-        _ = write_config_fixture(fixture.root / "mac_test.conf", "probe_timeout_s=5\n", template="mac_test")
+        _ = write_config_fixture(fixture.root / "mac_test.conf", "probe_timeout_s=5\nfree_floor_gib=100\n",
+                                 template="mac_test")
         _ = fixture.run_pass()
 
     def probe_mac_order(self, fixture: MacProbeFixture, answer: MacProbeAnswer,

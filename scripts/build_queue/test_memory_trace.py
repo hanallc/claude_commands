@@ -77,7 +77,7 @@ class MemoryTraceTests(unittest.TestCase):
     def test_policy_uses_the_shared_reader_with_injected_settings(self) -> None:
         stored = POLICY_SETTINGS
         path = self.root / "fixture.conf"
-        settings = conf.ConfigRead(path, path, conf.settings(stored), repository_allowed=False)
+        settings = conf.ConfigRead(path, conf.settings(stored))
         self.assertEqual(traces.read_policy(settings), POLICY)
         for key, invalid in (("sample.seconds", "bad"), ("feed.points_per_phase", "2"),
                              ("feed.past_run_max_age_days", "-1"), ("seal.replay_bytes", "0"),
@@ -100,7 +100,7 @@ class MemoryTraceTests(unittest.TestCase):
         for value in (1023, 4_194_305, 10**20):
             with self.subTest(value=value):
                 stored = POLICY_SETTINGS.replace("sample.max_bytes_per_run=8192", f"sample.max_bytes_per_run={value}")
-                settings = conf.ConfigRead(path, path, conf.settings(stored), repository_allowed=False)
+                settings = conf.ConfigRead(path, conf.settings(stored))
                 self.assertIsInstance(traces.read_policy(settings), traces.TracesOff)
         with self.assertRaisesRegex(ValueError, "max_bytes_per_run"):
             _ = replace(POLICY, max_bytes_per_run=10**20)

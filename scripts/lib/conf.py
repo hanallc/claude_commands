@@ -924,14 +924,14 @@ def _git(folder: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
 
 
 def _committed_files(source: Path) -> Iterator[str]:
-    folder = next((parent for parent in source.absolute().parents if parent.is_dir()), source.parent)
-    root = _git(folder, "rev-parse", "--show-toplevel")
-    if root.returncode:
-        return
-    checkout = Path(root.stdout.strip())
     try:
+        folder = next((parent for parent in source.absolute().parents if parent.is_dir()), source.parent)
+        root = _git(folder, "rev-parse", "--show-toplevel")
+        if root.returncode:
+            return
+        checkout = Path(root.stdout.strip())
         relative = source.resolve().relative_to(checkout.resolve()).as_posix()
-    except ValueError:
+    except (OSError, ValueError):
         return
     history = _git(checkout, "log", "--format=%H", "--", relative)
     for revision in history.stdout.splitlines() if history.returncode == 0 else ():

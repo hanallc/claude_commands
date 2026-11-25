@@ -5202,6 +5202,12 @@ const refresh = createPageRefresh(tick);
             read_text = Path.read_text
             readlink = Path.readlink
             iterdir = Path.iterdir
+            read_record = build_folders.read_program_record
+
+            def read_event(path: Path) -> str:
+                if path.is_relative_to(builds) and path.name == "cgroup.events":
+                    reads["cgroup.events"] += 1
+                return read_record(path)
 
             def read_process(path: Path) -> bytes:
                 if path.parent.parent == proc and path.name in ("status", "cmdline", "environ"):
@@ -5229,11 +5235,13 @@ const refresh = createPageRefresh(tick);
                 return iterdir(path)
 
             with (mock.patch.object(Path, "read_bytes", read_process), mock.patch.object(Path, "read_text", read_group),
-                  mock.patch.object(Path, "readlink", read_folder), mock.patch.object(Path, "iterdir", list_groups)):
+                  mock.patch.object(Path, "readlink", read_folder), mock.patch.object(Path, "iterdir", list_groups),
+                  mock.patch.object(build_folders, "read_program_record", read_event)):
                 evidence = admission_service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
             # The scope with no recorded caller reads its oldest process command line once for its owner name.
             self.assertEqual(dict(reads), {"status": 3, "cmdline": 2, "environ": 1, "cwd": 1,
-                                           "cgroup.procs": 2, "cgroup listings": 2, "memory counters": 3,
+                                           "cgroup.procs": 1, "cgroup.events": 1,
+                                           "cgroup listings": 2, "memory counters": 3,
                                            "compiler probe": 1})
             self.assertEqual(evidence.unowned, ())
             tracked, = evidence.between

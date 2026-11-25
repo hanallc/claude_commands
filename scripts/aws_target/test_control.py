@@ -1235,9 +1235,9 @@ class HoursCheckTests(CostFixture):
 
     def notice_run(self, *, code: int = 0, stdout: str = 'SENT: fixture\n', sender_times_out: bool = False) -> int:
         def run(arguments: Sequence[str], *, capture_output: bool, text: bool, check: bool,
-                timeout: float = 0) -> subprocess.CompletedProcess[str]:
+                timeout: float = 0, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
             if arguments[0] == 'git':
-                return git_only(arguments, check=check)
+                return git_only(arguments, check=check, env=env)
             self.assertEqual((capture_output, text, check, timeout), (True, True, False, send_budget.seconds(5)))
             self.assertGreater(timeout, 5)
             self.notice_commands.append(tuple(arguments))

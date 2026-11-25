@@ -132,6 +132,8 @@ class GateDefaultPlacementTests(unittest.TestCase):
                         key.configuration_generation, placement.AllowedHost())
 
                 fixture.server.host_probe = available
+                if target == "mac-linux":
+                    _ = write_config_fixture(fixture.root / "build_targets.conf", "enabled.mac-linux=on\n")
                 ready = fixture.root / 'gate-ready'
                 source = fixture.root / 'checkout'
                 source.mkdir()

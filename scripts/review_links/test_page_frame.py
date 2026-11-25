@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TextIO, cast, override
 from unittest.mock import patch
 
-from scripts.lib import conf
+from scripts.lib import conf, process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.review_links import page_frame, review_submissions, serve
@@ -60,7 +60,7 @@ with ModuleFirefox().page("about:blank", 800, 600) as browser:
                         self.assertEqual(root.parent, Path(run_tmp))
                         self.assertTrue((root / "profile").is_dir())
                         if stop_group:
-                            os.killpg(child.pid, signal.SIGKILL)
+                            process_group.send_process_group(child.pid, signal.SIGKILL)
                         else:
                             child.kill()
                         # The reaper closes the inherited output pipe when cleanup finishes.

@@ -79,7 +79,8 @@ class HoldEnforcerTests(unittest.TestCase):
         _ = boot.write_text("test-boot\n")
         configuration = self.root / "config"
         environment = config_environment(configuration)
-        _ = write_config_fixture(configuration / "build_targets.conf", "default_target=natedev\n")
+        _ = write_config_fixture(configuration / "build_targets.conf",
+            "default_target=natedev\n# whole: 1..604800\nrestart_notice.max_age_seconds=86400\n")
         self.enterContext(mock.patch.dict(os.environ, {
             **environment,
             "HOME": str(self.root), "BUILD_HOLD_DIR": str(self.holders),

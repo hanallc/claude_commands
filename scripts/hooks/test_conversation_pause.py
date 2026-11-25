@@ -624,7 +624,7 @@ class ConversationPauseTests(ConversationPauseFixture):
     def test_disabled_review_passes_native_prompts_with_an_open_count(self) -> None:
         self.open_review()
         for value in ("off", "invalid"):
-            with self.subTest(value=value):
+            with self.subTest(value=value), patch.object(self, "run_in_subprocess", True):
                 self.write_review_config(value)
                 reply = self.run_prompt(cross_session("Review peer", "The work is done."), now=101)
                 self.assertEqual((reply.returncode, reply.stdout, reply.stderr), (0, "", ""))

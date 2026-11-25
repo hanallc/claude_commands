@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.lib import models_registry
 from scripts.notify import pushover
 from scripts.notify import review
 from scripts.notify import push_texts
@@ -846,6 +847,7 @@ class PushoverTests(unittest.TestCase):
             return REAL_REVIEW(draft, revision, runner=runner)
         with (mock.patch.object(review, "GUIDE", self.keys.parent),
               mock.patch.object(review, "reviewer_environment", return_value=({}, "default")),
+              mock.patch.object(models_registry, "claude_model", return_value="opus"),
               mock.patch.object(review, "review", side_effect=read)):
             self.assertEqual(self.run_send(self.arguments(answerable=True)), (6, {}))
         with mock.patch.object(time, "time", return_value=time.time() + review.claim_stale_seconds() + 600):
@@ -1179,6 +1181,7 @@ class PushoverTests(unittest.TestCase):
 
         with (mock.patch.object(review, "GUIDE", self.keys.parent),
               mock.patch.object(review, "reviewer_environment", return_value=({}, "default")),
+              mock.patch.object(models_registry, "claude_model", return_value="opus"),
               mock.patch.object(time, "monotonic", side_effect=lambda: elapsed[0]),
               mock.patch.object(review, "review", side_effect=read),
               mock.patch.object(review, "review_timeout_seconds", return_value=90)):

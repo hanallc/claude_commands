@@ -29,6 +29,7 @@ from unittest.mock import patch
 
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import conf
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -937,11 +938,12 @@ class ModuleRunnerTests(unittest.TestCase):
     def test_config_reads_include_python_and_shell_children(self) -> None:
         from scripts.lib import build_folders
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as configured:
             root = Path(directory).resolve()
             _ = (root / "fixture_root.py").write_text("VALUE = 42\n")
             config = root / "config"
-            config.mkdir()
+            _ = write_config_fixture(config / "build_admission.conf")
+            configured.enter_context(patch.dict(os.environ, {"CONF_DIR": str(config)}))
             repository = RUNNER.parents[2]
             source = f"""import os, subprocess, sys, unittest
 from pathlib import Path
@@ -1459,6 +1461,7 @@ class ModuleProcessCleanupTests(unittest.TestCase):
                 root = Path(cleanup.enter_context(tempfile.TemporaryDirectory())).resolve()
                 processes = OwnedTestProcesses()
                 environment = processes.environment(direct_test_fixture_environment(root))
+                _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_admission.conf")
                 environment.update({**interpreter_cache_environment(root / "cache"),
                                     "HOME": str(root / "home"), "BUILDLOG_DIR": str(root / "buildlog"),
                                     "PYTHONPATH": str(root)})

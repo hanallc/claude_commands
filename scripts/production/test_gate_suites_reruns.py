@@ -168,7 +168,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
     @gate_suites("lib", "hooks")
     def test_failed_modules_pass_alone_and_keep_first_output_and_times(self) -> None:
         self.write(self.state / "fail-first-lib", "fail")
-        self.environment["BUILDLOG_SCOPE"] = "1"
+        self.environment.update(BUILDLOG_SCOPE="1", DETACHED_RUN_SLICE="builds.slice")
         output = io.StringIO()
         first_results: list[gate.GateJobResult] = []
         reservation_scopes: set[Path] = set()
@@ -257,6 +257,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
 
     def fail_scope_probe(self, manager_exit: int) -> None:
         _ = self.environment.pop("BUILDLOG_SCOPE", None)
+        self.environment["DETACHED_RUN_SLICE"] = "builds.slice"
         self.write(self.state / "scope-fails", "fail")
         systemctl = self.bin / "systemctl"
         self.write(systemctl, f'''#!/bin/sh

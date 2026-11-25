@@ -142,7 +142,9 @@ subprocess.run = fail_log_put
                 _ = aws_trial.checked_git(fixture.repo, 'add', '.')
                 _ = aws_trial.checked_git(fixture.repo, 'commit', '-qm', 'Fail the candidate stage writer')
                 fixture.changed = aws_trial.checked_git(fixture.repo, 'rev-parse', 'HEAD')
-                _ = aws_trial.checked_git(fixture.repo, 'push', str(fixture.origin), 'HEAD:refs/heads/stage')
+                _ = subprocess.run(['git', '-C', str(fixture.repo), 'push',
+                                    str(fixture.origin), 'HEAD:refs/heads/stage'],
+                                   check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
                 reply, traces = fixture.guest()
                 self.assertIn(' stage=' + name + '\n', (fixture.root / 'box/failed-stage-write').read_text())
                 self.assertEqual(len(traces), 8)

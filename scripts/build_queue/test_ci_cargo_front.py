@@ -328,7 +328,7 @@ class CargoLifetimeTests(unittest.TestCase):
 
     def test_cargo_release_waits_until_a_surviving_descendant_stops(self) -> None:
         with AdmissionFixture() as fixture:
-            fixture.configure(program_sample_seconds=0.01, program_stop_seconds=0.2)
+            fixture.configure(program_sample_seconds=0.01)
             with fixture.serving():
                 child = self.start_front(fixture, "build", "--descendant")
                 data = self.started(child)

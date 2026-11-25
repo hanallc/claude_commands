@@ -584,6 +584,7 @@ class MergeGateAdmissionTests(unittest.TestCase):
         for error in (subprocess.TimeoutExpired("systemd-run", 10), FileNotFoundError("systemd-run")):
             with self.subTest(error=type(error).__name__), mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1", "DETACHED_RUN_SLICE": ""}), \
                     mock.patch.object(queue, "in_builds_slice", return_value=False), \
+                    mock.patch.object(gate, "in_builds_slice", return_value=False), \
                     mock.patch("scripts.production.gate.subprocess.run", side_effect=error) as probe, \
                     redirect_stdout(io.StringIO()) as output:
                 with self.assertRaisesRegex(GateRefused, "the systemd scope probe failed"):

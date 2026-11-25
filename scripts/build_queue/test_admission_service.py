@@ -7151,6 +7151,7 @@ class ServiceTests(unittest.TestCase):
                         if isinstance(captured, gate.PopulatedStepScope):
                             captures += 1
                             _ = (scope / "cgroup.procs").write_text("")
+                            _ = (scope / "cgroup.events").write_text("populated 0\n")
                         return captured
                     with mock.patch.object(fixture.proc, "lifetime", side_effect=empty_after_capture):
                         if stage == "restore":
@@ -8106,8 +8107,8 @@ class ServiceTests(unittest.TestCase):
             request = replace(fixture.request(owner=owner), sidecar=str(sidecar))
             guard = gate.check_memory_reading
             def membership_only(path: Path) -> None:
-                # cgroup.procs is lifecycle evidence; no live memory file is allowed.
-                if path != scope / "cgroup.procs":
+                # Read lifecycle evidence for this scope. Keep the guard on memory files.
+                if path not in (scope / "cgroup.procs", scope / "cgroup.events"):
                     guard(path)
             def supplied_scope_memory(_path: Path, row: records.Reservation, _now: object,
                                       _processes: object, _proc: Path, policy: records.AdmissionPolicy) -> records.StepMemory:

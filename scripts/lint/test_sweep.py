@@ -8008,6 +8008,7 @@ class BudgetTests(unittest.TestCase):
     def test_sweep_uses_recent_minutes_from_the_private_file(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = write_config_fixture(root / "lint.conf", "recent_minutes=60")
+        _ = write_config_fixture(root / "send.conf")
         with (mock.patch.dict(os.environ, {"CONF_DIR": str(root)}),
               mock.patch.object(sweep, "sweep_workspace", return_value=0) as workspace,
               redirect_stderr(io.StringIO())):

@@ -23,7 +23,7 @@ from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint import folder_audit, tmp_sweep
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import scratch
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
@@ -254,7 +254,8 @@ class MacGateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(
-            os.environ, {'GATE_STATE_DIR': str(self.root / 'gate-state')})))
+            os.environ, {**config_environment(self.root / 'config'),
+                         'GATE_STATE_DIR': str(self.root / 'gate-state')})))
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         _ = gate.checked_git(self.repo, 'init', '-q')

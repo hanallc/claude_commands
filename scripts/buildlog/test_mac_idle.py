@@ -1019,8 +1019,8 @@ done
             mac_idle.watch_once(self.paths, 1180)
             mac_idle.watch_once(self.paths, 1240)
         line = mac_idle_alert.alert_line(self.paths.state / "alert.json", 1240, ZoneInfo("UTC")) or ""
-        self.assertIn("admission query failed: invalid admission message", line)
-        self.assertIn("admission query failed: invalid admission message", errors.getvalue())
+        self.assertIn("admission query failed: invalid snapshot integer", line)
+        self.assertIn("admission query failed: invalid snapshot integer", errors.getvalue())
         mac_idle.watch_once(self.paths, 1300)
         self.assertNotIn("admission query failed", mac_idle_alert.alert_line(
             self.paths.state / "alert.json", 1300, ZoneInfo("UTC")) or "")

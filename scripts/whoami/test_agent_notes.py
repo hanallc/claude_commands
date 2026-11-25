@@ -1344,6 +1344,7 @@ class AgentNotesTests(unittest.TestCase):
             with (self.subTest(verb=verb),
                   patch.object(sys, "argv", ["agent_notes.py", *verb]),
                   patch.object(agent_notes, "live_reports", side_effect=collect),
+                  patch.object(codex_pacer, "MODELS_CONF", self.root / "models.conf"),
                   patch.object(five_hour, "watch", side_effect=receive),
                   patch.object(agent_notes, "alert", side_effect=receive),
                   patch.object(agent_notes, "refresh", side_effect=receive),

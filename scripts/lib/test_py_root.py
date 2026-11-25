@@ -11,6 +11,7 @@ import unittest
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import conf
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 COPY_IMPORT_AUDIT = '''import json, os, sys
@@ -357,6 +358,7 @@ class PythonRootTests(unittest.TestCase):
                                     ignore=shutil.ignore_patterns("__pycache__"))
                 _ = (checkout / "scripts/build_targets/test_copy_imports.py").write_text(COPY_IMPORT_TEST)
             _ = conf.copy_for_test(repository / "config", selected / "config")
+            _ = write_config_fixture(selected / "config/build_admission.conf")
             wrapper = selected / "targeted_probe.py"
             _ = wrapper.write_text(COPY_TARGETED_RUN)
             detached = other / "detached_probe.py"

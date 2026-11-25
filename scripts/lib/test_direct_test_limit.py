@@ -17,6 +17,7 @@ from scripts.lib.checkout_test_support import (STANDALONE_TEST_STARTUP, copy_tes
                                               run_gate_test_fixture, without_user_test_manager, write_stdlib_tool)
 from scripts.lib.python_startup import sitecustomize as startup
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -146,6 +147,13 @@ class DirectTestLimitTests(unittest.TestCase):
         hooks.mkdir()
         _ = (hooks / "sitecustomize.py").write_text(LIMIT_FIXTURE)
         self.environment["PYTHONPATH"] = startup.startup_pythonpath(str(hooks))
+
+    def run_gate_fixture(self, case: Path, arguments: list[str],
+                         environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        config = Path(environment["CONF_DIR"])
+        _ = write_config_fixture(config / "build_admission.conf")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+            return run_gate_test_fixture(case, arguments, environment)
 
     def invoke(self, *arguments: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(arguments, cwd=cwd or self.root, env=self.environment, stdin=subprocess.DEVNULL,
@@ -314,7 +322,7 @@ unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromModule(mod
                           f"from pathlib import Path\nPath({str(manager_query)!r}).touch()\nraise SystemExit(1)\n")
         self.environment["PATH"] = os.pathsep.join((str(self.root), self.environment["PATH"]))
         self.environment["PYTHONPATH"] = startup.startup_pythonpath(str(self.root))
-        result = run_gate_test_fixture(
+        result = self.run_gate_fixture(
             case, [str(REPO / "scripts/lib/py"), str(MODULE_RUN), str(self.root), case.name], self.environment)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertFalse(manager_query.exists())
@@ -490,7 +498,7 @@ runpy.run_module("unittest", run_name="__main__", alter_sys=True)
         write_stdlib_tool(self.root / "busctl", f"from pathlib import Path\nPath({str(manager_query)!r}).touch()\n")
         environment = {**self.environment, "PYTHONPATH": startup.startup_pythonpath(""),
                        "PATH": os.pathsep.join((str(self.root), self.environment["PATH"]))}
-        run = run_gate_test_fixture(
+        run = self.run_gate_fixture(
             case, [shim, "-c", GATE_FIXTURE, shim, str(MODULE_RUN), str(self.root), case.name], environment)
         result = run.stdout
         self.assertEqual(run.returncode, 0, result)
@@ -511,7 +519,7 @@ class GateChild(unittest.TestCase):
         run_nested(Path({str(self.root)!r}), {shim!r}, {NESTED_TEST_PROBE!r}, {TEST_HANG_GUARD_SECS!r})
 """)
         environment = {**self.environment, "PYTHONPATH": str(self.root)}
-        result = run_gate_test_fixture(case, [shim, str(MODULE_RUN), str(self.root), case.name], environment)
+        result = self.run_gate_fixture(case, [shim, str(MODULE_RUN), str(self.root), case.name], environment)
         self.assertEqual(result.returncode, 0, result.stdout)
 
     @unittest.skipUnless(sys.platform == "linux", "Direct test scopes use Linux systemd")

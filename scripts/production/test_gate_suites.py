@@ -32,7 +32,7 @@ from scripts.copies import copies
 from scripts.lib import git_index, process_group
 from scripts.test_times import gate_record
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
-from scripts.production.gate_test_support import SUITE_MODULE, gate_suites, install_test_runner, wait_for_file
+from scripts.production.gate_test_support import SUITE_MODULE, gate_suites, install_test_runner
 from scripts.production.gate_suites_test_support import GateSuitesFixture
 from scripts.production.test_gate_default_placement import placed
 
@@ -104,7 +104,11 @@ class MergeGateSuitesTests(GateSuitesFixture):
             suite, path, log = cast(str, arguments[0]), cast(Path, arguments[1]), cast(Path, arguments[5])
             process = cast(subprocess.Popen[str], cast(object, SimpleNamespace(pid=987654321, returncode=None)))
             self.write(log, "fixture attempt output\n")
-            return gate.RunningGateJob(suite, path, process, now, 0, log.open("r+"), log, path.name)
+            job = gate.RunningGateJob(suite, path, process, now, 0, log.open("r+"), log, path.name)
+            recovery = gate.ACTIVE_GATE_RECOVERY.get()
+            assert isinstance(recovery, gate.GateRecovery) and recovery.register_job is not None
+            recovery.register_job(job)
+            return job
 
         def reap(pid: int, _options: int) -> tuple[int, int, resource.struct_rusage]:
             ready = attempts == 1 or now >= 10.01
@@ -169,6 +173,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         reader, writer = os.pipe()
         self.addCleanup(os.close, reader)
         self.addCleanup(os.close, writer)
+        self.configure_gate("program_sample_seconds=3")
         pool = gate.SharedCPUPool(reader, reader, deadline=12)
         now = 10.0
         waits: list[float | None] = []
@@ -177,8 +182,10 @@ class MergeGateSuitesTests(GateSuitesFixture):
             waits.append(cast(float, arguments[3]))
             now = 13.0
             return [], [], []
-        with mock.patch.object(time, "monotonic", side_effect=lambda: now), \
-                mock.patch.object(select, "select", side_effect=wait), contextlib.redirect_stdout(io.StringIO()):
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(time, "monotonic", side_effect=lambda: now),
+              mock.patch.object(select, "select", side_effect=wait),
+              contextlib.redirect_stdout(io.StringIO())):
             with self.assertRaisesRegex(TimeoutError, "gate time limit"):
                 _ = pool.acquire()
         self.assertEqual(waits, [2.0])
@@ -1108,7 +1115,7 @@ patch.object(gate, "shared_cpu_pool", side_effect=AssertionError("child requeste
         def fail_publication(recovery: gate.GateRecovery) -> None:
             if recovery.groups:
                 launched.extend(recovery.groups)
-                wait_for_file(self.state / "module-held")
+                self.assertFalse((self.state / "module-held").exists())
                 raise OSError("fixture journal write failed")
             save(recovery)
 

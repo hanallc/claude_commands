@@ -53,6 +53,10 @@ class GateProcessStateTests(unittest.TestCase):
             _ = stack.callback(copies.COMMAND_LOCKS.reset, token)
             _ = stack.enter_context(mock.patch.object(gate, "_gate_program_source", return_value=source))
             _ = stack.enter_context(mock.patch.object(gate, "python_shim", return_value=Path(sys.executable)))
+            config = root / "config"
+            _ = write_config_fixture(config / "build_admission.conf")
+            stack.enter_context(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
+            stop_seconds = admission_records.read_memory_config().program_stop_seconds
             environment = {
                 "BUILDLOG_CALLER": "gate",
                 build_folders.NUMBERED_COPY_LOCK_ENV: str(lease.fileno()),
@@ -83,8 +87,12 @@ class GateProcessStateTests(unittest.TestCase):
                         passed += (source.fileno(),)
                         expected[GATE_PARENT_SOURCE_FD] = str(source.fileno())
                     launch.assert_called_once()
-                    self.assertEqual(cast(tuple[int, ...], launch.call_args.kwargs["pass_fds"]), passed)
-                    self.assertEqual(cast(dict[str, str], launch.call_args.kwargs["env"]), expected)
+                    child = cast(dict[str, str], launch.call_args.kwargs["env"])
+                    permission = int(child["GATE_START_FD"])
+                    self.assertNotIn(permission, (*leases, source.fileno(), omitted.fileno()))
+                    self.assertEqual(cast(tuple[int, ...], launch.call_args.kwargs["pass_fds"]), (*passed, permission))
+                    self.assertEqual(child, {**expected, "GATE_START_FD": str(permission),
+                                             "GATE_START_SECONDS": str(stop_seconds)})
 
     def test_recovery_keeps_canaries_and_saved_gate_folders(self) -> None:
         root = Path(tempfile.mkdtemp(prefix="gate-recovery-test-")).resolve()
@@ -1056,7 +1064,7 @@ gate.start_gate_job = interrupt_after_start
     def test_unresolved_module_cleanup_keeps_scope_and_folders(self) -> None:
         self.supply_jobserver(b"Q")
         self.configure_gate("program_stop_seconds=1\nprogram_sample_seconds=0.05")
-        self.environment["BUILDLOG_SCOPE"] = "1"
+        self.environment.update(BUILDLOG_SCOPE="1", DETACHED_RUN_SLICE="builds.slice")
         processes = OwnedTestProcesses()
         self.addCleanup(processes.finish)
         environment = processes.environment(self.environment)

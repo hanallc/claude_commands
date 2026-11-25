@@ -16,3 +16,4 @@ scripts/lib/conf.py
 scripts/lib/conf_reads.py
 scripts/lib/process_stat.py
 scripts/mac_test/mirror_root.py
+scripts/production/gate_modules.py

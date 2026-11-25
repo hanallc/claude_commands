@@ -249,7 +249,7 @@ class PrivateSliceSweepTests(unittest.TestCase):
 class QueuePlaceFixture(ExitStack):
     """Private config, ledger and memory files shared by all helper scenarios."""
 
-    def __init__(self, *, private_slice: str = "", program_stop_seconds: str = "0.2") -> None:
+    def __init__(self, *, private_slice: str = "", program_stop_seconds: str | None = None) -> None:
         super().__init__()
         self.private_slice: str = private_slice or private_slice_name()
         self.enter_context(LauncherHangGuard("queue place fixture").protect())
@@ -264,9 +264,9 @@ class QueuePlaceFixture(ExitStack):
         self.proc: Path = self.root / "proc"
         self.proc.mkdir()
         self.config: Path = self.root / "build_admission.conf"
-        # A short stop grace and sample interval: a test waits seconds on each with the live values.
-        write_memory_config(self.config, program_stop_seconds=program_stop_seconds, program_sample_seconds="0.1",
-                            **{"program_first_peak_gib.rust-analyzer": "18"})
+        timing = {"program_stop_seconds": program_stop_seconds} if program_stop_seconds is not None else {}
+        write_memory_config(self.config, program_sample_seconds="0.1",
+                            **{"program_first_peak_gib.rust-analyzer": "18", **timing})
         self.enter_context(mock.patch.dict(os.environ, {
             **gate_isolation_environment(self.root), **fake_memory_readings(self.root),
             "LINT_CONFIG_FILE": str(self.config.with_name("lint.conf")), "BUILDLOG_DIR": str(self.log),
@@ -1178,7 +1178,8 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
 
     def test_invalid_config_warns_once_and_does_not_corrupt_child_protocol(self) -> None:
         with QueuePlaceFixture() as fixture:
-            commit_config_fixture(fixture.config)
+            with mock.patch.object(tempfile, "tempdir", str(fixture.root.parent)):
+                commit_config_fixture(fixture.config)
             write_memory_config(fixture.config, estimate_refresh_seconds="abc", **{"program_first_peak_gib.rust-analyzer": "18"})
             diagnostics, output = io.StringIO(), io.StringIO()
             with redirect_stderr(diagnostics), redirect_stdout(output):
@@ -1828,7 +1829,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             with self.assertRaisesRegex(program_start.ProgramStartRefused, "the queue place holder exited during program publication"):
                 guard.result(startup)
             execute.assert_not_called()
-            self.assertFalse(record.exists())
+            self.assertEqual(record.read_text(), wire.encode_record(expected))
 
     def test_holder_death_before_scope_publication_prevents_program_execution(self) -> None:
         self.require_transient_scope()

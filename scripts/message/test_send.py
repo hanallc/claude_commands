@@ -1298,6 +1298,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         )
         (self.root / "config").mkdir()
         _ = write_send_config(self.root / "config/send.conf", "")
+        _ = write_config_fixture(self.root / "config/send_repeat_guard.conf", "repeat_count=3\n")
         _ = self.enterContext(mock.patch.object(staff, "runtime_id", return_value=""))
         _ = self.enterContext(mock.patch.object(unit_lookup, "checked_conversation", side_effect=self.checked_recipient))
         _ = self.enterContext(mock.patch.object(unit_lookup, "current_claude_record", side_effect=self.current_fixture_record))
@@ -7182,7 +7183,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 
     def test_mac_locked_push_reads_the_committed_offload_when_the_live_value_is_missing(self) -> None:
         _, mac_test_conf, _ = self.mac_in_use()
-        _ = write_config_fixture(mac_test_conf, "offload=off\n")
+        _ = write_config_fixture(mac_test_conf, "offload=on\n")
         # CONF_DIR is a Git checkout here, so conf reads the committed copy.
         for arguments in (("init", "-q"), ("add", mac_test_conf.name), ("commit", "-qm", "committed settings")):
             _ = subprocess.run(["git", "-C", str(mac_test_conf.parent), "-c", "user.name=Send test",

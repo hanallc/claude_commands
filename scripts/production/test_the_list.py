@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from scripts.agents.remote import local_machine
 from scripts.herdr.place import HerdrPlace
 from scripts.lib import atomic_file, conf
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
 from scripts.production import change_review, delivery_state, investigation, record_store, session_pane, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
@@ -70,6 +71,8 @@ class TheListTests(unittest.TestCase):
         _ = os.environ.pop("CONF_DIR", None)
         self.list_config = self.root / ".claude/config/the_list.conf"
         self.list_config.parent.mkdir(parents=True)
+        for name in ("change_review", "console", "review_links", "statusline"):
+            _ = write_config_fixture(self.list_config.with_name(f"{name}.conf"))
         _ = self.list_config.write_text("".join(f"# whole: 1..\n{key}={limit}\n" for key, limit in LIST_TEXT_LIMITS.items()))
         _ = self.enterContext(patch.object(the_list, "now", return_value=START))
         _ = self.send_patch.start()

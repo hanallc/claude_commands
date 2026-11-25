@@ -16,6 +16,7 @@ from typing import override
 from unittest import mock
 
 from scripts.lib import mac_wake, main_publish
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 def _done(code: int) -> subprocess.CompletedProcess[str]:
@@ -33,6 +34,10 @@ class MacWakeTests(unittest.TestCase):
         environment = {key: value for key, value in os.environ.items()
                        if key not in ("MAC_WAKE_PROGRAM", "ZONE_SSH")}
         environment["ZONE_STATE"] = str(self.root / "zone")
+        config = self.root / "config"
+        _ = write_config_fixture(config / "live_settings.conf",
+                                 "mac_wake_pause_seconds=10\nmac_wake_probe_seconds=5\n")
+        environment["CONF_DIR"] = str(config)
         self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
         _ = self.enterContext(mock.patch.object(platform, "system", return_value="Linux"))
         self.launched = []

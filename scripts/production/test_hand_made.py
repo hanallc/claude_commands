@@ -29,7 +29,7 @@ from scripts.build_targets import mac_linux
 from scripts.buildlog import record, treekey
 from scripts.lib import build_steps, conf, conf_reads, models_registry, nix_env
 from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
-from scripts.lint.memory_test_support import shifted_config_lines
+from scripts.lint.memory_test_support import config_environment, shifted_config_lines
 from scripts.notify import review
 from scripts.mac_test.claim_state import WholeMacScope
 from scripts.production import hand_made, hand_made_limit
@@ -1245,7 +1245,8 @@ class BuildsPageTests(unittest.TestCase):
                 yield queue_place.PlaceSetup(folder, folder / "sidecar", step_estimator.memory_config(),
                                              queue_place.ProgramPurpose.BATCH, (), request)
 
-            with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(folder / "buildlog"),
+            with mock.patch.dict(os.environ, {**config_environment(folder / "config"),
+                                              "BUILDLOG_DIR": str(folder / "buildlog"),
                                               "CLAUDE_SESSION_NAME": FIXTURE_OWNER}), \
                     mock.patch.object(queue_place, "place_setup", side_effect=setup):
                 for machines in (("natedev", "mac"), ("mac",), ("natedev", "mac-linux")):

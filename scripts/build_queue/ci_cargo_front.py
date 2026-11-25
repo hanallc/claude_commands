@@ -135,7 +135,11 @@ def cargo_folder(prefix: str, parent: Path | None, keep: Callable[[], bool]) -> 
         yield folder
     finally:
         if not keep():
-            queue_place.remove_program_folder(Path(folder))
+            # This folder belongs to the Cargo call. Its cleanup needs no build settings.
+            try:
+                shutil.rmtree(folder)
+            except FileNotFoundError:
+                pass
 
 
 def stop_progress_reader(reader: threading.Thread, timeout: float) -> None:

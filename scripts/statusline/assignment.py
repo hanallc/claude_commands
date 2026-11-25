@@ -407,7 +407,7 @@ def render_status(*, remote: bool) -> None:
     if cacheable:
         from scripts.lib import user_zone
 
-        sources.watch(Path(user_zone.CONF))
+        sources.watch(Path(user_zone.settings_path()))
     counts = read_counts(members.value, session_id)
     fields = dict(assignment=label, role=role, counts=counts.value, branch=branch.value,
                   adhoc=adhoc.value, for_you=actions.value.other_count, rebuild=actions.value.waiting_rebuilds)

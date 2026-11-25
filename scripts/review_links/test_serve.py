@@ -988,7 +988,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_a_held_new_item_waits_for_undo_time_then_files_once(self) -> None:
         case, other, body = self.held_new_item()
-        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=1\n")
+        _ = write_config_fixture(conf.path("review_links"), "# whole: 0..60\nundo_seconds=1\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
@@ -1013,7 +1013,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_a_closed_page_sends_a_held_new_item_at_once(self) -> None:
         case, other, body = self.held_new_item()
-        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        _ = write_config_fixture(conf.path("review_links"), "# whole: 0..60\nundo_seconds=60\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
@@ -1031,7 +1031,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_an_undone_new_item_is_never_filed_or_sent(self) -> None:
         case, other, body = self.held_new_item()
-        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        _ = write_config_fixture(conf.path("review_links"), "# whole: 0..60\nundo_seconds=60\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
@@ -1064,7 +1064,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         owner = case.ready_submission_recipient()
         morty = fixture_member("producer", name="morty")
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\n")
-        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        _ = write_config_fixture(conf.path("review_links"), "# whole: 0..60\nundo_seconds=60\n")
         _ = conf.path("producer_map").write_text(f"{owner.id} = {morty.id}\n", encoding="utf-8")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         self.addCleanup(cache.close)
@@ -1103,7 +1103,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_each_console_send_path_holds_a_marked_send_and_no_other_path_does(self) -> None:
         marked = {send_hold.HOLD_HEADER: "1"}
-        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        _ = write_config_fixture(conf.path("review_links"), "# whole: 0..60\nundo_seconds=60\n")
         _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
         _ = self.enterContext(patch.object(change_browser, "browser_manifest", return_value=("token", "")))
         browser = f"/{change_page.CONSOLE_FOLDER}/changes.html"
@@ -1137,7 +1137,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         return answer
 
     def test_a_marked_send_without_one_exact_size_is_refused_and_not_held(self) -> None:
-        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        _ = write_config_fixture(conf.path("review_links"), "# whole: 0..60\nundo_seconds=60\n")
         _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
         # The first three are refused before the body is read, so they send no body.
         for case, headers, body, reason in (
@@ -1156,7 +1156,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         case = self.review_fixture(changes=1)
         key = "page-owner/C1"
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
-        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=1\n")
+        _ = write_config_fixture(conf.path("review_links"), "# whole: 0..60\nundo_seconds=1\n")
         form = case.card_body(cache.get(), key, "works", "The held answer.")
         marked = {send_hold.HOLD_HEADER: "1", "Content-Type": "application/x-www-form-urlencoded"}
         with (patch.object(self.server, "review_cache", cache),
@@ -1179,7 +1179,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         case = self.review_fixture(changes=1)
         key = "page-owner/C1"
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
-        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=1\n")
+        _ = write_config_fixture(conf.path("review_links"), "# whole: 0..60\nundo_seconds=1\n")
         form = case.card_body(cache.get(), key, "not works", "The proof failed.")
         marked = {send_hold.HOLD_HEADER: "1", "Content-Type": "application/x-www-form-urlencoded"}
         with (patch.object(self.server, "review_cache", cache),

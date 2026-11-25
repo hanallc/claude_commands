@@ -91,7 +91,10 @@ class GateModuleOwnerTests(unittest.TestCase):
             environment = {"PATH": os.defpath, "BUILDLOG_PLACEMENT_FILE": "/fixture/placement",
                            "BUILDLOG_PLACEMENT_EPISODE": "fixture-episode",
                            "BUILDLOG_PLACEMENT_SIDECAR": "/fixture/placement.cgroup"}
-            with mock.patch.object(subprocess, "Popen") as start:
+            config = root / "config"
+            _ = write_config_fixture(config / "build_admission.conf")
+            with (mock.patch.dict(os.environ, {"CONF_DIR": str(config)}),
+                  mock.patch.object(subprocess, "Popen") as start):
                 job = gate.start_gate_job("hooks", Path("test_fixture.py"), (), root, environment, root / "module.log")
             job.output.close()
             child = cast(dict[str, str], start.call_args.kwargs["env"])
@@ -313,7 +316,9 @@ class DirectGatePlacementTests(unittest.TestCase):
             source = self.checkout(folder)
             arguments = ("--tests-only", "--repo", str(source))
             admitted = self.admission(source, ("gate.py", *arguments), target="mac-linux")
-            with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
+            config = source / ".git" / "config-fixture"
+            _ = write_config_fixture(config / "copies.conf")
+            with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"], "CONF_DIR": str(config)}, clear=True),
                   mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)),
                   mock.patch.object(gate, "run_tests_only", return_value=GATE_PRELAUNCH_REFUSED_STATUS) as run,
                   redirect_stderr(io.StringIO()) as errors):

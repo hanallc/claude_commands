@@ -2571,6 +2571,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         job.cpu_slot = cpu_slot
                         running.append(job)
                         job_started = True
+                        if job.kind is GateJobKind.TEST_MODULE:
+                            _ = suite_started.setdefault(job.suite, job.started)
+                            _ = suite_finished.setdefault(job.suite, job.started)
 
                     recovery.register_job = register_job
                     try:
@@ -2582,8 +2585,6 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         recovery.register_job = None
                     if not shared:
                         print(f"Starting module: {job.suite}/{job.module}", flush=True)
-                    if job.kind is GateJobKind.TEST_MODULE:
-                        _ = suite_started.setdefault(suite, job.started)
                     if admission is not None:
                         admission.reserve(job.process.pid, recorded_peaks.reservation_mib(request))
                 if rerun_failed_modules and not time_limit_report and not pending and not running:

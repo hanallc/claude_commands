@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout, suppress
+from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from functools import partial
 import io
@@ -95,7 +95,6 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
 TERM_PROBE = """
 import os
 from pathlib import Path
-import signal
 import sys
 from threading import Event
 from unittest.mock import patch
@@ -108,20 +107,19 @@ state = Path(sys.argv[1])
 
 with start_mac_gate(sys.argv[3], state, mode=SuiteMode.TARGETED, full=False,
                     module_time_limit_s=1, selected=TreeSelection(('scripts/lib/test_first.py',), 'tree')):
-    if sys.argv[2] == 'protected':
+    if sys.argv[2] == 'recording':
         reader, writer = os.pipe()
         os.write(writer, b'Q')
         recovery = GateRecovery(state / 'recovery.json', str(state), os.getpid(), 'fixture')
         ACTIVE_GATE_RECOVERY.set(recovery)
         save = recovery.save
 
-        def pause_before_save():
-            (state / 'protected').touch()
-            assert sys.stdin.buffer.read(1) == b'r'
-            assert signal.SIGTERM in signal.sigpending()
+        def pause_after_save():
             save()
+            (state / 'recording').touch()
+            Event().wait()
 
-        with patch.object(recovery, 'save', pause_before_save):
+        with patch.object(recovery, 'save', pause_after_save):
             SharedCPUPool(reader, reader).try_acquire()
     Event().wait()
 """
@@ -951,7 +949,8 @@ class MacGateSuitesTests(GateSuitesFixture):
                 self.assertEqual(os.environ["BUILDLOG_PLACEMENT_EPISODE"], local_grant.assignment.episode)
             self.assert_reservation_ended(local_grant)
         self.assertEqual(result.returncode, 0)
-        released.assert_called_once_with(local_grant.grant.reservation, 0, local_grant.grant.cleanup_timing, "result")
+        released.assert_called_once_with(local_grant.grant.reservation, 0, local_grant.grant.cleanup_timing,
+                                         deadline=mock.ANY)
         guest.assert_called_once()
         local.assert_called_once()
         settled.assert_called_once()
@@ -1204,21 +1203,16 @@ class MacGateSuitesTests(GateSuitesFixture):
                     assert isinstance(result, mac_gate_process.MacGateMiss)
                     self.assertIn(reason, result.reason)
 
-    def assert_sigterm_closes_the_mac_pipe(self, *, protected: bool) -> None:
+    def assert_sigterm_closes_the_mac_pipe(self, *, recording: bool) -> None:
         source = Path(__file__).resolve().parents[2]
-        mode = "protected" if protected else "idle"
+        mode = "recording" if recording else "idle"
         self.set_mac_result("fixture cancelled", action="cancel")
-        with subprocess.Popen([sys.executable, "-c", TERM_PROBE, str(self.state), mode, MAC_MODULE], cwd=source,
-                              stdin=subprocess.PIPE) as gate:
+        with subprocess.Popen([sys.executable, "-c", TERM_PROBE, str(self.state), mode, MAC_MODULE], cwd=source) as gate:
             try:
                 wait_until((self.state / "mac-call.json").exists, self.state, processes=(gate,))
-                if protected:
-                    wait_until((self.state / "protected").exists, self.state, processes=(gate,))
+                if recording:
+                    wait_until((self.state / "recording").exists, self.state, processes=(gate,))
                 gate.terminate()
-                if protected:
-                    assert gate.stdin is not None
-                    with suppress(BrokenPipeError):
-                        _ = os.write(gate.stdin.fileno(), b"r")
                 self.assertEqual(gate.wait(timeout=10), -signal.SIGTERM)
                 wait_until((self.state / "cancelled").exists, self.state)
             finally:
@@ -1227,25 +1221,26 @@ class MacGateSuitesTests(GateSuitesFixture):
 
     @gate_suites("lib")
     def test_sigterm_closes_the_mac_cancellation_pipe_on_process_exit(self) -> None:
-        self.assert_sigterm_closes_the_mac_pipe(protected=False)
+        self.assert_sigterm_closes_the_mac_pipe(recording=False)
 
     @gate_suites("lib")
     def test_sigterm_leaves_no_mac_result_folder(self) -> None:
         temp_root = self.state / "mac-route-temp"
         temp_root.mkdir()
         with mock.patch.dict(os.environ, {"TMPDIR": str(temp_root)}):
-            self.assert_sigterm_closes_the_mac_pipe(protected=False)
+            self.assert_sigterm_closes_the_mac_pipe(recording=False)
         pid = ledger.instant(cloud_gate.read(self.state / "mac-call.json"), "pid")
         self.assert_process_stopped(pid)
         self.assertEqual(list(temp_root.glob("mac-gate-result-*")), [])
 
     @gate_suites("lib")
-    def test_sigterm_waits_for_linux_to_record_its_cpu_slot(self) -> None:
-        self.assert_sigterm_closes_the_mac_pipe(protected=True)
+    def test_sigterm_keeps_an_interrupted_cpu_slot_record(self) -> None:
+        self.assert_sigterm_closes_the_mac_pipe(recording=True)
         path = self.state / "recovery.json"
         self.assertTrue(path.exists(), "Linux lost its CPU slot record")
         token, = ledger.rows(cloud_gate.read(path), "tokens")
-        self.assertEqual(token["value"], b"Q".hex())
+        self.assertEqual(token["operation"], "acquiring")
+        self.assertEqual(token["value"], "")
 
     @gate_suites("lib")
     def test_only_linux_writes_recovery_during_concurrent_registration(self) -> None:

@@ -317,6 +317,7 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         config.mkdir(parents=True, exist_ok=True)
         _ = write_config_fixture(config / "machines.conf")
         _ = write_config_fixture(config / "codex_daemon.conf")
+        _ = write_config_fixture(config / "accounts.conf", f"notes_directory={self.folder / 'notes'}\n")
         self.directory = self.folder / "sessions"
         self.directory.mkdir()
         binaries = self.folder / "bin"
