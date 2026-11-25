@@ -147,23 +147,43 @@ gate.gate_temporary = arm_after_suite
         self.assertEqual(kinds.count("gate_folder_end"), 0)
 
     def test_sigterm_during_cleanup_error_unwind_writes_one_end(self) -> None:
-        preamble = """from contextlib import contextmanager
+        self.assert_cleanup_error_stop(signal.SIGTERM, -signal.SIGTERM, "sigterm")
+
+    def test_sigint_and_sighup_during_cleanup_error_unwind_write_one_end(self) -> None:
+        for signum, status, python_sigint in (
+            (signal.SIGINT, 1, True),
+            (signal.SIGINT, -signal.SIGINT, False),
+            (signal.SIGHUP, -signal.SIGHUP, False),
+        ):
+            with self.subTest(signum=signum, python_sigint=python_sigint):
+                self.assert_cleanup_error_stop(signum, status, "red", python_sigint=python_sigint)
+
+    def assert_cleanup_error_stop(self, signum: signal.Signals, status: int, end: gate_record.GateEnd, *,
+                                  python_sigint: bool = False) -> None:
+        preamble = f"""from contextlib import ExitStack, contextmanager
 from scripts.lib import build_folders
+from unittest.mock import patch
 allocate = gate.gate_temporary
 remove = build_folders._remove_build_folder
 sigmask = signal.pthread_sigmask
+stop = signal.Signals({int(signum)})
+signal.signal(stop, signal.default_int_handler if {python_sigint!r} else signal.SIG_DFL)
+sigmask(signal.SIG_UNBLOCK, (stop,))
 
 def stop_before_mask(how, signals):
     if how == signal.SIG_BLOCK and signal.SIGTERM in signals:
         signal.pthread_sigmask = sigmask
-        assert signal.SIGTERM not in sigmask(signal.SIG_BLOCK, ())
-        signal.raise_signal(signal.SIGTERM)
+        assert stop not in sigmask(signal.SIG_BLOCK, ())
+        signal.raise_signal(stop)
     return sigmask(how, signals)
 
 @contextmanager
 def fail_suite_cleanup(recovery, tool, parent):
     try:
-        with allocate(recovery, tool, parent) as folder:
+        with ExitStack() as cleanup:
+            # Keep a detached helper from changing the fixture after the gate exits.
+            with patch.object(os, "pidfd_open", create=True, side_effect=PermissionError("fixture pidfd refusal")):
+                folder = cleanup.enter_context(allocate(recovery, tool, parent))
             yield folder
 
             def refuse_removal(path, **options):
@@ -182,14 +202,15 @@ def fail_suite_cleanup(recovery, tool, parent):
 
 gate.gate_temporary = fail_suite_cleanup
 """
-        result = self.run_gate("--tests-only", "--full", own_process=True, preamble=preamble)
-        self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
-        rows = [row for path in Path(self.environment["BUILDLOG_DIR"]).glob("*/*.jsonl")
-                for row in store.locked_rows(path)]
+        buildlog = self.root / f"records-{signum.name}-{status}"
+        with mock.patch.dict(self.environment, {"BUILDLOG_DIR": str(buildlog)}):
+            result = self.run_gate("--tests-only", "--full", own_process=True, preamble=preamble)
+        self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+        rows = [row for path in buildlog.glob("*/*.jsonl") for row in store.locked_rows(path)]
         start, = [row for row in rows if row.get("kind") == "gate_folder_start"]
         ends = [row for row in rows if row.get("kind") in ("gate_run", "gate_folder_end")]
         self.assertEqual([(row.get("end"), row.get("suite_folders")) for row in ends],
-                         [("sigterm", [start["folder"]])])
+                         [(end, [start["folder"]])])
 
     def test_sigterm_during_the_timing_append_writes_one_end(self) -> None:
         preamble = """from scripts.buildlog import store

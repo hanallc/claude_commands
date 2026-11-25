@@ -1769,42 +1769,66 @@ _GATE_RECEIVED_SIGTERM: ContextVar[bool] = ContextVar("gate_received_sigterm", d
 
 @contextmanager
 def unwind_gate_on_sigterm() -> Generator[None]:
-    """Finish test cleanup before the default SIGTERM action."""
-    if (threading.current_thread() is not threading.main_thread()
-            or signal.getsignal(signal.SIGTERM) != signal.SIG_DFL):
+    """Finish test cleanup before the default action for a stop signal."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    handlers = {
+        signum: handler
+        for signum in cancellation.CANCELLATION_SIGNALS
+        if (handler := signal.getsignal(signum)) is signal.SIG_DFL
+        or (signum is signal.SIGINT and handler is signal.default_int_handler)
+    }
+    if not handlers:
         yield
         return
     token = _GATE_RECEIVED_SIGTERM.set(False)
+    stopped_by: signal.Signals | None = None
     interrupted_journal: GateFolderJournal | None = None
 
     def terminate(number: int, _frame: object) -> None:
-        nonlocal interrupted_journal
-        if not _GATE_RECEIVED_SIGTERM.get():
-            _ = _GATE_RECEIVED_SIGTERM.set(True)
-            interrupted_journal = _ACTIVE_GATE_FOLDER_JOURNAL.get()
-            raise SystemExit(128 + number)
+        nonlocal stopped_by, interrupted_journal
+        if stopped_by is not None:
+            return
+        stopped_by = signal.Signals(number)
+        _ = _GATE_RECEIVED_SIGTERM.set(stopped_by is signal.SIGTERM)
+        interrupted_journal = _ACTIVE_GATE_FOLDER_JOURNAL.get()
+        if handlers[stopped_by] is signal.default_int_handler:
+            raise KeyboardInterrupt
+        if stopped_by is not signal.SIGTERM:
+            # Preserve the operating system's immediate exit for these signals.
+            try:
+                write_interrupted_end()
+            finally:
+                _ = signal.signal(stopped_by, signal.SIG_DFL)
+                signal.raise_signal(stopped_by)
+        raise SystemExit(128 + number)
 
     def write_interrupted_end() -> None:
         if interrupted_journal is not None and not interrupted_journal.end_write_finished:
             start = interrupted_journal.start
             if not isinstance(start, GateFolderAllocation):
                 with cancellation.defer_cleanup_signals():
-                    gate_record.write_gate_folder_event(gate_folder_end(start, "sigterm"))
+                    gate_record.write_gate_folder_event(gate_folder_end(start, gate_run_end(1)))
                     interrupted_journal.end_write_finished = True
 
+    def restore_handlers() -> None:
+        for signum, handler in handlers.items():
+            _ = signal.signal(signum, handler)
+        _GATE_RECEIVED_SIGTERM.reset(token)
+        if stopped_by is not None and handlers[stopped_by] is signal.SIG_DFL:
+            signal.raise_signal(stopped_by)
+
     try:
-        _ = signal.signal(signal.SIGTERM, terminate)
+        for signum in handlers:
+            _ = signal.signal(signum, terminate)
         yield
     finally:
-        # The handler ignores later SIGTERM signals until the fallback ends.
+        # The handler ignores later stop signals until the fallback ends.
         try:
             write_interrupted_end()
         finally:
-            _ = signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            terminated = _GATE_RECEIVED_SIGTERM.get()
-            _GATE_RECEIVED_SIGTERM.reset(token)
-            if terminated:
-                signal.raise_signal(signal.SIGTERM)
+            restore_handlers()
 
 
 @unwind_gate_on_sigterm()
