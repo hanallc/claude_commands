@@ -51,7 +51,7 @@ Each producer loads the common command and reads its job and current work from i
 The commands live in `commands/producer/`.
 Morty's operations document is `docs/producer/morty-operations.md`.
 The Codex command sync names the common skill `producer-produce` and the List skill `producer-morty`.
-`PRODUCER_FOLDER_ROOT` in `config/staff.conf` selects the document root, with default `~/rust/hanadocs`.
+`producer_folder_root` in `config/staff.conf` selects the document root, with default `~/rust/hanadocs`.
 Each producer uses `<root>/<name>/README.md`.
 The [shared resume path](shutdown-and-restart.md#producer-launch-and-admission) admits a first conversation through `staff.ensure`.
 A producer's `worktree` is its launch folder and owns no path.
@@ -119,7 +119,7 @@ A joined child leaves that record intact.
 The busy-row error includes the PID and command when it can read the record.
 `staff.child_environment` removes inherited row-lock proofs and the staff ID before an agent starts.
 It also removes the [operation configuration](agent-registry.md#agent-environment-boundary).
-Staff lock and remote waits read `OPERATION_LOCK_SECONDS` and `REMOTE_SECONDS` from `config/staff.conf` at use.
+Staff lock and remote waits read `operation_lock_seconds` and `remote_seconds` from `config/staff.conf` at use.
 Each wait uses the smaller configured limit or remaining operation deadline.
 
 ## Production document lookup
@@ -218,6 +218,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/herdr/worker_panes.py` | write | snapshot, runtime_id, row_operation, slot_operation; worker_admission.publish |
 | `scripts/hooks/conversation_pause.py` | read | local_by_current_session; StaffSnapshot, LiveDoc, WrappedDoc |
 | `scripts/hooks/conversation_pause_test_support.py` | write | LiveDoc; fixture_member calls ensure |
+| `scripts/hooks/goal_card.py` | read | Reads staff.json for the current session. StaffRow.from_json, StaffSnapshot, active |
 | `scripts/hooks/herdr_tab_title.py` | read | snapshot |
 | `scripts/hooks/idle_update.py` | read | StaffSnapshot and Kind (types); the prompt hook passes the row |
 | `scripts/hooks/post-tool-use-sendmessage-miss.py` | read | snapshot |
@@ -228,6 +229,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/hooks/stop-direct-continue.py` | read | local_by_current_session, unit_command, local_snapshot; active_dispatch reads the worker's fixed staff ID |
 | `scripts/hooks/user-prompt-submit-conversation-pause.py` | read | StaffSnapshot (type); conversation_pause.session_staff reads the row |
 | `scripts/lib/build_copies.py` | read | local_snapshot, RemovedWorktree, StaffUnreadable |
+| `scripts/lib/origin_deletion.py` | read | operation_fds; retains the operation locks during the Git command |
 | `scripts/lib/python_startup/sitecustomize.py` | read | `TEST_RUNNER_FILES` lists `staff.py` for the removal guard in test checkouts. |
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/removal_guard.py` | read | snapshot, all_rows, StaffRefused, PresentWorktree, RemovedWorktree; known_names reads unit and repository names |
@@ -285,11 +287,14 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/gate.py` | read | snapshot, initial_snapshot, doc_owner |
 | `scripts/production/merge_gate.py` | read | snapshot, initial_snapshot, doc_owner |
 | `scripts/production/gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
+| `scripts/production/goal.py` | read | StaffId type for the producer and List owner |
 | `scripts/production/next_item.py` | read | snapshot |
+| `scripts/production/production_admission.py` | write | record_path, snapshot, authority_snapshot, set_doc; checks and records a change to the document binding |
 | `scripts/production/production_doc.py` | read | StaffRow, StaffSnapshot, LiveDoc, WrappedDoc |
 | `scripts/production/production_lifecycle.py` | write | defer_retire, operation, retire_pending, set_doc, set_worktree, snapshot |
 | `scripts/production/production_lifecycle_test_support.py` | read | find, pane, register_production, session_transcript |
 | `scripts/production/promote_showrunner.py` | read | cli_result, find, native_id, operation, promote_unit, runtime_id, snapshot |
+| `scripts/production/promotion.py` | read | snapshot, LiveDoc; identifies the owner of the live document |
 | `scripts/production/proposal_issue.py` | read | snapshot, StaffId |
 | `scripts/production/proposals_folder.py` | read | initial_snapshot |
 | `scripts/production/proposals_table.py` | read | none (StaffSnapshot type) |
@@ -393,7 +398,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-The table has 241 accessor rows (41 write, 199 read, and 1 owner).
+The table has 247 accessor rows (43 write, 203 read, and 1 owner).
 
 ## Approved copies
 

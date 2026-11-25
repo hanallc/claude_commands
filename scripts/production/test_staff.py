@@ -24,6 +24,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.production import demote_showrunner, promote_showrunner, staff
+from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
 from scripts.accounts import role_map
 from scripts.agents import remote, shutdown, status_entry, stop_resume, restart_support
 from scripts.agents.inventory import Inventory
@@ -32,6 +33,7 @@ from scripts.herdr import worker_panes
 from scripts.lib import transcripts, unit_runs
 from scripts.message import sessions, session_records
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase, isolated_staff_file
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.transcript_test_support import compressed_copy
 
@@ -46,10 +48,12 @@ class StaffCommandTestCase(StaffTestCase):
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            **fixture_git_environment(self.root),
+            "GIT_CONFIG_SYSTEM": os.devnull,
             "ROSTER_RUN_ROOT": str(self.root / "unit"),
             "UNIT_RUN_ROOT": str(self.root / "unit"),
             "SCRATCH_ROOT": str(self.root / "scratch"),
-        })))
+        }, clear=True)))
         _ = self.enterContext(mock.patch.object(unit_runs, "RUN_ROOT", self.root / "unit"))
 
     @override
@@ -793,6 +797,22 @@ class DocumentLookupTests(StaffCommandTestCase):
         record = staff.snapshot()
         self.assertEqual(record.by_doc("natedev", owner / relative), exact)
         self.assertIsNone(record.by_doc("natedev", unit / "docs/other-production.md"))
+
+        with self.subTest(documents="enrolled in the same checkout"):
+            first = main / "docs/plans" / f"example-production{LIVE_DOCUMENT_SUFFIX}"
+            second = main / "docs/plans" / f"other-production{LIVE_DOCUMENT_SUFFIX}"
+            for document in (first, second):
+                _ = document.write_text(f"- **{MERGE_CHECKOUT_FIELD}:** `{main}`\n")
+            bound = fixture_member("showrunner", name="enrolled-example", doc=staff.LiveDoc("natedev", first))
+            other = fixture_member("showrunner", name="enrolled-other", doc=staff.LiveDoc("natedev", second))
+            pointer = unit / relative
+            _ = pointer.write_text(f"Staff: {bound.id}\n")
+            record = staff.StaffSnapshot((bound, other))
+            self.assertEqual(record.by_doc("natedev", first), bound)
+            self.assertEqual(record.by_doc("natedev", second), other)
+            self.assertIsNone(record.by_doc("natedev", pointer))
+            self.assertIsNone(record.by_doc("natedev", unit / first.relative_to(main)))
+            self.assertEqual(record.by_member_reference(bound.id), bound)
 
 
 class StaffTests(StaffCommandTestCase):
@@ -1670,6 +1690,32 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual(staff.snapshot().by_worktree("natedev", path), claimed)
         wrapped = staff.set_doc(runner.id, staff.WrappedDoc("natedev", doc))
         self.assertEqual(staff.StaffRow.from_json(wrapped.to_json()), wrapped)
+        _ = doc.write_text("- **Merge checkout:** /fixture/main\n")
+        alias = self.root / "alias.md"
+        alias.symlink_to(doc)
+        another = fixture_member("showrunner", name="another")
+        for scenario in ("local alias", "missing local alias", "missing Mac live", "missing Mac wrapped"):
+            if scenario == "missing local alias":
+                doc.unlink()
+            if scenario.startswith("missing Mac"):
+                self.assertFalse(doc.exists())
+                location = staff.LiveDoc("mac", doc) if scenario == "missing Mac live" else staff.WrappedDoc("mac", doc)
+                _ = staff.set_doc(runner.id, location)
+                binding = staff.LiveDoc("mac", doc)
+            else:
+                binding = staff.LiveDoc("natedev", alias)
+            before = self.staff_file.read_bytes()
+            for action, claim in (
+                ("set", lambda: staff.set_doc(another.id, binding)),
+                ("ensure", lambda: staff.ensure("showrunner", name="new", doc=binding,
+                                                runtime_id=fixture_runtime_id("duplicate-doc"))),
+                ("promote", lambda: staff.promote_unit(other.id, name="other", parent=runner.id, doc=binding)),
+            ):
+                with (self.subTest(action=action, scenario=scenario),
+                      self.assertRaisesRegex(staff.StaffRefused, "already owns this document")):
+                    _ = claim()
+            self.assertEqual(self.staff_file.read_bytes(), before)
+
 
     def test_snapshot_finds_present_worktrees_by_machine_and_containing_path(self) -> None:
         runner, unit, _ = self.tree()

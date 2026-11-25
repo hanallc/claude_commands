@@ -430,6 +430,20 @@ def ensure_submission_list_item(address: review_submissions.SubmissionAddress) -
             _ensure_list_filing(filing.saved())
 
 
+def submission_report_row(saved: review_submissions.SavedSubmission) -> the_list.ListItem | the_list.NoListReport:
+    """Read the published List row for a filed report."""
+    if not isinstance(saved.record, investigation.Investigation) or not saved.record.belongs_on_list:
+        return the_list.NoListReport.ABSENT
+    with review_submissions.submission_for_delivery(saved.address) as located:
+        if isinstance(located, review_submissions.LocatedSubmission):
+            record = located.record
+            if isinstance(record, investigation.Investigation) and isinstance(
+                    record.list_destination, investigation.ListDestination):
+                destination = record.list_destination
+                return the_list.load(destination.keeper, f"L{destination.number}")
+    raise OSError(f"Cannot read the List filing for {saved.id}.")
+
+
 def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
     """Finish a staged List row before claiming its notice."""
     record = saved.record
@@ -508,7 +522,20 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
             if evidence_page:
                 key = review_items.submission_review_key(saved)
                 evidence = "\n\nEvidence in Review\n" + evidence_page + '#' + urlencode({'item': key})
-            message = (f'New {saved.kind} {saved.id} from Review.\n\n{words or saved.words}{evidence}\n\n'
+            notice = saved.details.notice
+            label = saved.kind.value
+            source = " from Review"
+            if isinstance(notice, new_item_dialog.SubmissionNotice):
+                if not isinstance(notice.kind, new_item_dialog.SubmissionKind):
+                    label = notice.kind.capitalize()
+                if notice.from_command:
+                    source = ""
+            assignee = ""
+            assignment = saved.details.assignment
+            if isinstance(assignment, new_item_dialog.ChosenAssignee):
+                name = review_items.name(assignment.id, staff.snapshot())
+                assignee = f"\n{name} is the assignee."
+            message = (f'New {label} {saved.id}{source}.{assignee}\n\n{words or saved.words}{evidence}\n\n'
                        + change_page.reply_command(saved.key))
             record: change_page.StoredReviewMessage = {
                 'source': str(path), 'row': row, 'saved': True, 'owner': saved.owner,

@@ -20,7 +20,7 @@ from typing import Literal, cast
 
 from scripts.lib import atomic_file, conf, main_publish
 from scripts.lib.file_lock import exclusive
-from scripts.production import investigation, producer_map, staff
+from scripts.production import producer_map, staff
 from scripts.review_links import change_page, for_you, new_item_dialog, review_page
 
 OPTIONS_TARGET = f"{review_page.NEW_ITEM_PATH}?page=list"
@@ -169,7 +169,8 @@ def exchange(address: for_you.ConsoleAddress, method: Literal["GET", "POST"], ta
     origin = f"http://{address.host}:{address.port}"
     sent = False
     try:
-        headers = {"Content-Type": "application/json"} if method == "POST" else {}
+        headers = ({"Content-Type": "application/json"} if method == "POST"
+                   else {"X-New-Item-Route": "producer"})
         connection.request(method, target, body=body if method == "POST" else None, headers=headers)
         sent = method == "POST"
         response = connection.getresponse()
@@ -218,22 +219,23 @@ def _names(rows: tuple[Recipient, ...]) -> str:
     return ", ".join(row.name for row in rows) or "none"
 
 
-def recipient_for(member: staff.StaffRow, options: Options, members: staff.StaffSnapshot) -> Recipient | Refusal:
-    """The member, or the first owner above it, that is in the To row receives the item."""
-    by_id = {row.id: row for row in options.recipients}
-    found = next((by_id[identity] for identity in investigation.owner_chain(member.id, members) if identity in by_id), None)
+def recipient_for(producer: staff.StaffRow, options: Options) -> Recipient | Refusal:
+    """Find the mapped producer in the To row."""
+    found = next((row for row in options.recipients if row.id == producer.id), None)
     if found is None:
-        return Refusal(f"{member.name}: neither it nor an owner above it is in the To row: {_names(options.recipients)}")
+        return Refusal(f"{producer.name} is not in the To row: {_names(options.recipients)}")
     return found
 
 
-def request_body(options: Options, kind: _NewItemRequestKind, recipient: staff.StaffId, words: str,
-                 assignee: staff.StaffId, request_id: str) -> bytes:
+def request_body(options: Options, item_type: ItemType, recipient: staff.StaffId, words: str,
+                 assignee: staff.StaffId, request_id: str, routing: new_item_dialog.PageRecipient) -> bytes:
     """Send the List window fields for a new List draft."""
     return json.dumps({
-        "token": options.token, "request_id": request_id, "kind": kind,
+        "token": options.token, "request_id": request_id, "kind": FILED_KINDS[item_type],
+        "notice": {"kind": item_type, "from_command": True},
         "recipient_id": recipient, "words": words, "evidence": {"kind": "none"}, "images": [],
-        "page": "list", "page_recipient": new_item_dialog.PageRecipient.SELECTED.value, "list_assignee": assignee,
+        "page": "list", "page_recipient": routing,
+        ("assignee_id" if routing == new_item_dialog.PageRecipient.PRODUCER else "list_assignee"): assignee,
     }).encode()
 
 
@@ -243,6 +245,7 @@ class PendingListDraft:
 
     request_id: str
     recipient: staff.StaffId
+    routing: new_item_dialog.PageRecipient
 
 
 @dataclass(frozen=True)
@@ -251,10 +254,12 @@ class NoPendingListDraft:
 
 
 def draft_path(address: for_you.ConsoleAddress, session: str, assignee: staff.StaffId,
-               kind: _NewItemRequestKind, words: str) -> Path:
+               item_type: ItemType, words: str, *, legacy: bool = False) -> Path:
     state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "new-item"
-    scope = json.dumps([address.host, address.port, session, assignee, kind, words])
-    return state / hashlib.sha256(scope.encode()).hexdigest()
+    scope: list[object] = [address.host, address.port, session, assignee, FILED_KINDS[item_type], words]
+    if not legacy:
+        scope.append(item_type)
+    return state / hashlib.sha256(json.dumps(scope).encode()).hexdigest()
 
 
 def read_pending_draft(path: Path) -> PendingListDraft | NoPendingListDraft:
@@ -262,24 +267,26 @@ def read_pending_draft(path: Path) -> PendingListDraft | NoPendingListDraft:
         fields = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
         return NoPendingListDraft()
-    if (len(fields) != 2 or not re.fullmatch(r"r6-[0-9a-f]{32}", fields[0])
-            or not fields[1]):
+    if len(fields) == 2:
+        fields.append(new_item_dialog.PageRecipient.SELECTED.value)
+    if (len(fields) != 3 or not re.fullmatch(r"r6-[0-9a-f]{32}", fields[0]) or not fields[1]
+            or fields[2] not in (new_item_dialog.PageRecipient.SELECTED, new_item_dialog.PageRecipient.PRODUCER)):
         raise OSError("Cannot read the pending New item draft.")
-    return PendingListDraft(fields[0], staff.StaffId(fields[1]))
+    return PendingListDraft(fields[0], staff.StaffId(fields[1]), new_item_dialog.PageRecipient(fields[2]))
 
 
 def save_pending_draft(path: Path, recipient: staff.StaffId) -> PendingListDraft:
-    draft = PendingListDraft("r6-" + secrets.token_hex(16), recipient)
-    atomic_file.write_text_atomic(path, f"{draft.request_id}\n{draft.recipient}\n", new_file_mode=0o600)
+    draft = PendingListDraft("r6-" + secrets.token_hex(16), recipient, new_item_dialog.PageRecipient.PRODUCER)
+    atomic_file.write_text_atomic(path, f"{draft.request_id}\n{draft.recipient}\n{draft.routing}\n", new_file_mode=0o600)
     return draft
 
 
-def post_item(address: for_you.ConsoleAddress, options: Options, kind: _NewItemRequestKind,
+def post_item(address: for_you.ConsoleAddress, options: Options, item_type: ItemType,
               draft: PendingListDraft, words: str, assignee: staff.StaffId) -> ServerReply:
     """Retry an unconfirmed POST with the same draft ID and recipient."""
     def send(current: Options) -> ServerReply:
         return exchange(address, "POST", review_page.NEW_ITEM_PATH,
-                        request_body(current, kind, draft.recipient, words, assignee, draft.request_id))
+                        request_body(current, item_type, draft.recipient, words, assignee, draft.request_id, draft.routing))
 
     try:
         reply = send(options)
@@ -373,7 +380,6 @@ def main(arguments: list[str] | None = None) -> int:
             print(unknown_name(member, members))
             return Outcome.UNKNOWN_NAME
         producer = ""
-        kind = FILED_KINDS[item_type]
         words = words_text(item_type, args.description, args.extra)
         try:
             address = console_address()
@@ -383,17 +389,22 @@ def main(arguments: list[str] | None = None) -> int:
                 print(producer_question(member, mapped, members))
                 return Outcome.NO_PRODUCER
             raise
-        path = draft_path(address, args.session, member.id, kind, words)
+        path = draft_path(address, args.session, member.id, item_type, words)
+        legacy_path = draft_path(address, args.session, member.id, item_type, words, legacy=True)
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with exclusive(path.with_suffix(".lock")):
+        with exclusive(legacy_path.with_suffix(".lock")):
             draft = read_pending_draft(path)
+            if isinstance(draft, NoPendingListDraft):
+                legacy_draft = read_pending_draft(legacy_path)
+                if isinstance(legacy_draft, PendingListDraft):
+                    path, draft = legacy_path, legacy_draft
             if isinstance(draft, NoPendingListDraft):
                 mapped = producer_map.producer_for(member.id, members)
                 if isinstance(mapped, producer_map.NoProducer):
                     print(producer_question(member, mapped, members))
                     return Outcome.NO_PRODUCER
                 options = read_options(address)
-                recipient = recipient_for(member, options, members)
+                recipient = recipient_for(mapped.producer, options)
                 if isinstance(recipient, Refusal):
                     print(f"new_item: {recipient.reason}", file=sys.stderr)
                     return Outcome.REFUSED
@@ -401,7 +412,7 @@ def main(arguments: list[str] | None = None) -> int:
                 producer = producer_line(member, mapped)
             else:
                 options = read_options(address)
-            reply = post_item(address, options, kind, draft, words, member.id)
+            reply = post_item(address, options, item_type, draft, words, member.id)
             refused = reply.status == 400 or reply.status == 409 and reply.fields.get("code") != "already_filed"
             if reply.status == 200 or refused:
                 path.unlink()
@@ -411,16 +422,18 @@ def main(arguments: list[str] | None = None) -> int:
     except (ServerUnavailable, OSError, ValueError, staff.StaffRefused) as error:
         print(f"new_item: {error}", file=sys.stderr)
         return Outcome.FAILED
+    owner = reply.fields.get("reply_owner")
+    reply_owner = staff.StaffId(owner) if isinstance(owner, str) and owner else draft.recipient
     caller = members.by_current_session(session) if session else None
-    session_label = ", this session" if caller is not None and caller.id == draft.recipient else ""
+    session_label = ", this session" if caller is not None and caller.id == reply_owner else ""
     assignee = unit_of(member, members)
     delivery = ""
-    if draft.recipient == member.id:
+    if reply_owner == member.id:
         assignee += session_label
-    else:
-        recipient_row = members.by_id(draft.recipient)
+    elif session_label or reply_owner != draft.recipient:
+        recipient_row = members.by_id(reply_owner)
         recipient_name = recipient_row.name if recipient_row is not None else next(
-            (row.name for row in options.recipients if row.id == draft.recipient), draft.recipient)
+            (row.name for row in options.recipients if row.id == reply_owner), reply_owner)
         delivery = f" Reply command goes to {recipient_name}{session_label}."
     number = reply.fields.get("list_number")
     if type(number) is int and number > 0:
@@ -429,7 +442,7 @@ def main(arguments: list[str] | None = None) -> int:
         review_id = reply.fields.get("id")
         shown = review_id if isinstance(review_id, str) and review_id else "a Review item"
         filed = f"Filed as {shown}. The console server returned no List number."
-    print(f"{item_type.value.capitalize()} → {assignee}.{producer}{delivery} {filed}")
+    print(f"{item_type.value.capitalize()} → {assignee}.{producer} {filed}{delivery}")
     return Outcome.FILED
 
 

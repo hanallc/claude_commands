@@ -21,7 +21,7 @@ from scripts.herdr import herdr_types
 from scripts.herdr import herdr, pane_launch
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import add_unit, production_lifecycle, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_lookup, update_registration
-from scripts.production.production_doc import DEMOTED, Production, Refusal, read_new_production, read_production
+from scripts.production.production_doc import DEMOTED, EnrolledPaths, Production, Refusal, read_new_production, read_production
 from scripts.agents import pane_record, remote, stop_resume
 from scripts.whoami.account import named_account_environment
 
@@ -103,6 +103,9 @@ def checked(parent: Production, name: str, plan: Path | unit_config.PlanDefault,
     if row.parent != staff.ReportsTo(parent.owner.id):
         raise Refusal(f"{name} is not attached to {parent.name}")
     child = read_production(row, record=record)
+    paths = add_unit.document_paths(child)
+    if isinstance(paths, EnrolledPaths):
+        child = replace(child, checkout=paths.integration)
     if isinstance(plan, unit_config.PlanDefault):
         saved_plan = unit_config.default_plan(child.checkout, child.doc)
         if not isinstance(saved_plan, unit_config.PlanFile):
@@ -214,7 +217,8 @@ def unit_document(request: Demotion) -> None:
     text = "\n".join(lines) + "\n"
     if text != parent.doc.read_text(encoding="utf-8"):
         write_text_atomic(parent.doc, text)
-    _ = add_unit.commit_paths(parent, [parent.doc], f"production({parent.name}): add unit {request.child.name}")
+    if not staff.declares_merge_checkout(lines):
+        _ = add_unit.commit_paths(parent, [parent.doc], f"production({parent.name}): add unit {request.child.name}")
 
 
 def launch(request: Demotion) -> int:
@@ -287,7 +291,8 @@ def finish_demotion(child: staff.StaffRow, doc: Path, parent: Production, plan: 
         else:
             lines[1:1] = ["", status]
         write_text_atomic(doc, "\n".join(lines) + "\n")
-    _ = add_unit.commit_paths(production, [doc], f"production({child.name}): record the completed demotion")
+    if not staff.declares_merge_checkout(lines):
+        _ = add_unit.commit_paths(production, [doc], f"production({child.name}): record the completed demotion")
     update_registration.remove_updates(child)
 
 
@@ -314,7 +319,7 @@ def apply(request: Demotion, path: Path, fields: dict[str, object]) -> int:
             return 1
         save(path, fields, Step.STOPPED)
     if completed < Step.CONVERTED:
-        _ = add_unit.git(request.child, "switch", request.branch)
+        _ = add_unit.git(replace(request.child, checkout=request.worktree), "switch", request.branch)
         _ = staff.change_director(request.child.owner.id, staff.UnitRole(request.child.name, request.parent.owner.id,
                                  staff.PresentWorktree(remote.local_machine(), request.worktree), request.unit_type))
         save(path, fields, Step.CONVERTED)

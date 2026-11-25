@@ -667,7 +667,11 @@ document.body.append(result);
     def test_exact_window_retry_returns_the_first_item_and_closes(self) -> None:
         self.check_live_window_send(lose_reply=True)
 
-    def check_live_window_send(self, *, lose_reply: bool) -> None:
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_window_bug_receipt_shows_the_saved_number_owner_and_producer(self) -> None:
+        self.check_live_window_send(lose_reply=False, kind="bug")
+
+    def check_live_window_send(self, *, lose_reply: bool, kind: str = "investigation") -> None:
         root = self.root / "reviews"
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={MORTY.id}\n")
         _ = write_config_fixture(conf.path("producer_map"))
@@ -696,10 +700,14 @@ document.body.append(result);
   document.querySelector('[data-owner-new]').click();
   const includePage=dialog.querySelector('[name="include_page"]');
   if(includePage.checked) includePage.click();
-  await until(dialog,()=>dialog.querySelector('[name="recipient_id"]:checked'));
-  dialog.querySelector('[name="kind"][value="investigation"]').click();
+  const producer=()=>[...dialog.querySelectorAll('[name="recipient_id"]')]
+   .find(input=>input.value===__PRODUCER__);
+  await until(dialog,producer);
+  dialog.querySelector('[name="kind"][value="'+__KIND__+'"]').click();
   words.value=__WORDS__;
   words.dispatchEvent(new Event('input',{bubbles:true}));
+  if(!send.disabled) throw new Error('Send is available before a producer is selected.');
+  producer().click();
   let filed=false;
   document.addEventListener('review-item-created',()=>{filed=true;},{once:true});
   const settled=()=>filed || dialog.open && !error.hidden && !send.disabled;
@@ -712,13 +720,18 @@ document.body.append(result);
    await until(document.body,settled);
   }
   if(!filed || dialog.open) throw new Error(error.textContent || 'The List did not confirm the item.');
+  const receipt = document.querySelector('[data-report-receipt]')?.textContent;
+  if(__KIND__==='bug' && receipt !== 'List item 1. Owner morty. Producer morty.')
+   throw new Error('The report receipt shows: ' + receipt);
   result.textContent=JSON.stringify([]);
  } catch(error){
   result.textContent=JSON.stringify([String(error)]);
  }
  document.body.append(result);
 })();
-</script>""".replace("__WORDS__", json.dumps(words)).replace("__RETRY__", json.dumps(lose_reply))
+</script>"""
+        probe = probe.replace("__WORDS__", json.dumps(words)).replace("__RETRY__", json.dumps(lose_reply))
+        probe = probe.replace("__KIND__", json.dumps(kind)).replace("__PRODUCER__", json.dumps(MORTY.id))
 
         @final
         class Probe(serve.ReviewLinksHandler):
@@ -768,7 +781,10 @@ document.body.append(result);
             self.assertEqual(notice["rows"], [row.id])
             first_status, first = saved[0]
             self.assertEqual(first_status, 200)
-            self.assertEqual((first["id"], first["list_number"], row.reviews), (record.id, row.number, (first["key"],)))
+            self.assertEqual((first["id"], first["list_number"]), (record.id, row.number))
+            assert isinstance(row.report, the_list.ListReport)
+            report_kind = the_list.ReportKind.BUG if kind == "bug" else the_list.ReportKind.INVESTIGATION
+            self.assertEqual((row.report.kind, row.report.evidence_key), (report_kind, first["key"]))
             if lose_reply:
                 _, fallback, retry = saved
                 for status, receipt in (fallback, retry):
@@ -2419,11 +2435,14 @@ frame.addEventListener('load',async()=>{
         self.assertIn('<td data-label="Owner"><span class="list-owner-name"><span>nate</span></span></td>', body)
 
     def test_added_log_shows_staff_colors_local_eta_and_field_labels(self) -> None:
-        _ = self.add("Log labels")
+        item = self.add("Log labels")
+        _ = the_list.update(MORTY.id, item.id, {"unit": "fixture-unit"}, source="morty")
         body = list_page.render(self.root / "reviews").decode()
         log = body.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
         self.assertRegex(log, r'Owner</dt><dd><span[^>]*data-color-text="role.showrunner"[^>]*>sdlc</span>')
-        self.assertRegex(log, r'Producer</dt><dd><span[^>]*data-color-text="role.producer"[^>]*>morty</span>')
+        self.assertRegex(log, r'<dt><span[^>]*data-color-text="role.producer" style="color:#90fe42">Producer</span></dt>'
+                         + r'<dd><span[^>]*data-color-text="role.producer"[^>]*>morty</span>')
+        self.assertRegex(log, r'<dt><span[^>]*data-color-text="role.unit-director" style="color:#ffaf02">Unit</span></dt>')
         self.assertIn("ETA</dt><dd>14:00 EST – 15:00 EST</dd>", log)
         self.assertIn("State</dt><dd>Working</dd>", log)
         self.assertIn("Next step</dt><dd>", log)
@@ -2431,6 +2450,19 @@ frame.addEventListener('load',async()=>{
         shown = re.sub(r"<[^>]+>", "", log)
         for text in (OWNER.id, MORTY.id, "EtaRange(", "next_step", "latest_status"):
             self.assertNotIn(text, shown)
+
+    def test_producer_filter_and_both_tables_show_the_producer_label_color(self) -> None:
+        _ = self.add("Producer labels")
+        body = list_page.render(self.root / "reviews", include_counts=False).decode()
+        label = '<span class="staff-name" data-color-text="role.producer" style="color:#90fe42">Producer</span>'
+        self.assertIn(f'aria-label="Producer" data-filter-row="producer"><span aria-hidden="true">{label}</span>', body)
+        self.assertIn('<th scope="col" aria-sort="none" data-list-producer>'
+                      + '<button type="button" id="list-sort-2" data-sort="2">Producer', body)
+        self.assertIn('th[data-list-producer] button{color:var(--producer-label-color,inherit)}', body)
+        self.assertIn(f'<th scope="col">{label}</th>', body.split('<section data-linked-item', 1)[1])
+        self.assertIn('--producer-label-color:#90fe42', body)
+        self.assertIn('td[data-label="Producer"]::before{color:var(--producer-label-color,var(--ink-3))}', body)
+        self.assertIn('<td data-label="Producer">', body)
 
     def test_updated_log_shows_full_eta_and_shares_the_next_step_renderer(self) -> None:
         item = self.add("Log an update")
@@ -2647,7 +2679,8 @@ frame.addEventListener('load',async()=>{
         note = "; ".join(f"{key}: {json.dumps(value)}" for key, value in fields.items())
         log = self.legacy_log("- 2026-11-16 18:00:00+00:00 Added; " + note + " — nate")
         self.assertRegex(log, r'Owner</dt><dd><span[^>]*data-color-text="role.showrunner"[^>]*>sdlc</span>')
-        self.assertRegex(log, r'Producer</dt><dd><span[^>]*data-color-text="role.producer"[^>]*>morty</span>')
+        self.assertRegex(log, r'data-color-text="role.producer"[^>]*>Producer</span></dt>'
+                         + r'<dd><span[^>]*data-color-text="role.producer"[^>]*>morty</span>')
         self.assertIn("State</dt><dd>Working</dd>", log)
         self.assertIn("ETA</dt><dd>14:00 EST – 15:00 EST</dd>", log)
         self.assertIn("Next step</dt><dd>", log)
@@ -2736,7 +2769,7 @@ frame.addEventListener('load',async()=>{
         _ = self.long_log_item()
         self.set_log_max_height(9)
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
-        self.assertIn('style="--list-log-max-height:9rem"', markup)
+        self.assertRegex(markup, r'\bstyle="(?:[^"]*;)?--list-log-max-height:9rem[;"]')
         probe = r'''<script>
 document.querySelector('.list-toggle').click();
 const panel=document.querySelector('.list-panel'),[left,right]=panel.children;
@@ -6107,7 +6140,10 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
             delivery = list_page.submit(root, urlencode(fields), status)
             opened = without_scripts(list_page.render(root, status=status).decode())
             self.assertIn('data-waiting-for-answer="true"', opened)
-            self.assertIn('<p data-waiting-note>morty will answer.</p>', opened)
+            self.assertRegex(opened, r'<p data-waiting-note><span[^>]*data-color-text="role.producer"[^>]*>morty</span> will answer.</p>')
+            status_cell = opened.split('<td data-label="State">', 1)[1].split('</td>', 1)[0]
+            self.assertRegex(status_cell, r'<small data-open-question-note><span[^>]*data-color-text="role.producer"'
+                             + r' style="color:#90fe42">Producer</span> answering</small>')
             self.assertIn('Question Q1 — waiting for an answer</h3>' + asked_time, opened)
             self.assertIn("What changed in &lt;List&gt;?", opened)
             self.assertNotIn('name="action" value="question"', opened)
@@ -6548,7 +6584,12 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         self.assertEqual(saved.recipient, question_record.KeeperForUnavailableProducer(MORTY.id, DWIGHT.id))
         markup = without_scripts(list_page.render(root, include_counts=False, status=status).decode())
         self.assertIn(words, markup)
-        self.assertIn("dwight is not live, so morty will answer.", markup)
+        note_match = re.search(r'<p data-waiting-note(?: hidden)?>(.*?)</p>', markup)
+        assert note_match is not None
+        note = ElementTree.fromstring(f"<p>{note_match[1]}</p>")
+        self.assertEqual("".join(note.itertext()), "dwight is not live, so morty will answer.")
+        self.assertEqual([(name.text, name.get("data-color-text"), name.get("style")) for name in note],
+                         [("dwight", "role.producer", "color:#90fe42"), ("morty", "role.producer", "color:#90fe42")])
         for text in ("Resend question", "ready to send", "may not have reached", "Question not delivered."):
             self.assertNotIn(text, markup)
         assert isinstance(submission, list_page.ListQuestionDelivery)
@@ -6735,7 +6776,9 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
                     self.assertEqual(edited.questions[0].recipient,
                                      question_record.KeeperForUnavailableProducer(MORTY.id, DWIGHT.id))
                     note = '<p data-waiting-note>dwight is not live, so morty will answer.</p>'
-                    self.assertIn(note, saved.get("waiting_details_html", ""))
+                    waiting_html = saved.get("waiting_details_html", "")
+                    self.assertIn(note, without_role_colors(waiting_html))
+                    self.assertRegex(waiting_html, r'data-color-text="role.producer"[^>]*>morty</span> will answer.')
                 body = without_scripts(list_page.render(root, include_counts=False, status=status).decode())
                 self.assertIn(f'data-key="{MORTY.id}/{item.id}"', body)
                 self.assertNotIn('value="resend-Q1"', body)
@@ -6875,6 +6918,9 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
  check(!row.hidden,'The saved row stays in All.');
  const note=row.querySelector('[data-open-question-note]');
  check(note?.getClientRects().length && note.textContent==='Producer answering' &&
+  note.firstElementChild?.textContent==='Producer' &&
+  note.firstElementChild?.dataset.colorText==='role.producer' &&
+  note.firstElementChild?.style.color==='rgb(144, 254, 66)' &&
   row.querySelector('.list-state').textContent==='Waiting for nate','The note appears below the saved state.');
  check(changes.join()==='POST','The chip changes without a refresh.');
  check(count.textContent==='2 of 2 items shown · 0 need you · 1 unread','All counts the saved row.');
@@ -9003,6 +9049,10 @@ const change=async path=>{
             return " ".join(re.sub(r"<[^>]+>", " ", markup).split()).replace(" :", ":")
         self.assertEqual(text(list_page.staff_role_html(merge, names)), "the merge director of sdlc")
         self.assertEqual(text(list_page.staff_role_html(MORTY, names)), "the List producer")
+        self.assertRegex(list_page.staff_role_html(merge, names),
+                         r'data-color-text="role.unit-director" style="color:#ffaf02">merge director</span>')
+        self.assertRegex(list_page.staff_role_html(MORTY, names),
+                         r'data-color-text="role.producer" style="color:#90fe42">List producer</span>')
         item = self.add("Merge the needsme unit", number=1)
         ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=merge.id, what="Merge needsme to main.",
                                why="The merge needs nate's go.", config=False, requester=MORTY.id, source="morty")
@@ -9015,6 +9065,7 @@ const change=async path=>{
             markup = list_page.render(self.root / "reviews").decode()
         self.assertEqual(markup.count("data-ask="), 1)
         self.assertIn("natemerge, the merge director of sdlc", text(without_role_colors(markup)))
+        self.assertRegex(markup, r'Pressing Go sends your go to <span[^>]*data-color-text="role.unit-director"[^>]*>natemerge</span>\.')
         _ = the_list.give_go(MORTY.id, item.id, ask.ask_id, "0" * 32, source="nate")
         with patch.object(list_page, "counts_strip", return_value=""):
             markup = list_page.render(self.root / "reviews").decode()
@@ -9227,11 +9278,11 @@ window.fetch=async(path,options={})=>{
     def test_delivery_notices_color_staff_names_and_keep_the_recorded_words(self) -> None:
         item = self.add("Delivery notice")
         _ = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
-        cases: tuple[tuple[the_list.PageFeedback, str, tuple[str, ...]], ...] = (
-            (the_list.PageFeedback("request", "Words"), "sent to morty", ("morty",)),
-            (the_list.PageFeedback("request", "Words", "sent"), "sent to morty", ("morty",)),
-            (the_list.PageFeedback("request", "Words", action="read", recipient=DWIGHT.id), "sent to dwight", ("dwight",)),
-            (the_list.PageFeedback("request", "Words", action="read", recipient=MORTY.id), "sent to morty", ("morty",)),
+        cases: tuple[tuple[the_list.PageFeedback, str | None, tuple[str, ...]], ...] = (
+            (the_list.PageFeedback("request", "Words"), None, ()),
+            (the_list.PageFeedback("request", "Words", "sent"), None, ()),
+            (the_list.PageFeedback("request", "Words", action="read", recipient=DWIGHT.id), None, ()),
+            (the_list.PageFeedback("request", "Words", action="read", recipient=MORTY.id), None, ()),
             (the_list.PageFeedback("request", "Words", "alerted", "sdlc"), "not sent to morty; sdlc told", ("morty", "sdlc")),
             (the_list.PageFeedback("request", "Words", "alerted", "<unknown>"), "not sent to morty; <unknown> told", ("morty",)),
             (the_list.PageFeedback("request", "Words", "alerted"), "not sent to morty; no showrunner for alert", ("morty",)),
@@ -9243,6 +9294,9 @@ window.fetch=async(path,options={})=>{
                 body = list_page.render(self.root / "reviews").decode()
                 cell = body.split('<td data-label="Update">', 1)[1].split('</td>', 1)[0]
                 notice = ElementTree.fromstring('<root>' + cell + '</root>').find('small')
+                if text is None:
+                    self.assertIsNone(notice)
+                    continue
                 assert notice is not None
                 self.assertEqual(''.join(notice.itertext()), text + ", 13:00 EST")
                 self.assertEqual(tuple(span.text for span in notice.findall('span')), colored)
@@ -9612,7 +9666,8 @@ window.fetch=async(path,options={})=>{
         body = without_role_colors(list_page.render(root, include_counts=False).decode())
         self.assertIn('>Tell morty</button>', body)
         self.assertIn('Feedback sent to dwight', body)
-        self.assertIn('sent to dwight, 13:00 EST', body)
+        update = body.split('<td data-label="Update">', 1)[1].split('</td>', 1)[0]
+        self.assertNotIn('<small>', update)
 
     def test_tell_log_keeps_the_recipient_after_reassignment(self) -> None:
         root = self.root / "reviews"

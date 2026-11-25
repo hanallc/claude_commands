@@ -65,22 +65,31 @@ class DisksPageTests(unittest.TestCase):
     def setUp(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = (configuration / "disks.conf").write_text("# whole: 1..\ncache_seconds=600\n")
-        # The page reads staff names, and staff reads the machine list.
+        _ = (configuration / "statusline.conf").write_text("role.unit-director=#ffaf02\nrole.showrunner=#a379fd\n")
+        staff_file = configuration / "staff.json"
+        _ = staff_file.write_text('{"schema": 1, "rows": []}')
+        # Staff reads the machine list.
         _ = shutil.copy(Path(__file__).parents[2] / "config" / "machines.conf", configuration)
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(configuration), "STAFF_FILE": str(staff_file)})))
 
     def test_session_tooltip_keeps_held_folder_names_plain(self) -> None:
         runner = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
                                 current_session=staff.StaffId("builds"))
         names = staff_names.StaffNames(staff.StaffSnapshot((runner,)))
         page = self.page_html()
+        self.assertIn('"roleLabels": {"showrunner"', page)
         session_tip = page[page.index("const SESSION_TIP_FOLDER_LIMIT"):page.index("function fitSessionTip(")]
-        setup = "globalThis.window=globalThis;" + staff_names.script(names.registry())[8:-9] + session_tip
+        setup = "globalThis.window=globalThis;" + staff_names.script(names.registry(), names.role_labels())[8:-9] + session_tip
         session_body = str(self.run_page("(()=>{" + setup
             + "return stepTip.tipRowsHtml(sessionTip({name:'builds',state:'running',size:0,"
             + "held:[{name:'builds',task:'builds'}]},0));})()"))
         session_grid = ElementTree.fromstring(session_body)
-        self.assertEqual(session_grid[0].findtext("span"), "builds")
+        name = session_grid[0].find("span")
+        assert name is not None
+        self.assertEqual(name.text, "builds")
+        self.assertEqual(name.get("data-color-text"), "role.showrunner")
+        self.assertEqual(name.get("style"), "color:#a379fd")
         folder = next(cell for cell in session_grid if cell.tag == "dt" and cell.text == "builds")
         self.assertEqual(list(folder), [])
 

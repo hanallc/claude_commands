@@ -1693,6 +1693,83 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
 
 
 class NewItemDialogTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_producer_route_and_assignee_change_in_the_browser(self) -> None:
+        script = r"""
+const failures = [], check = (ok, message) => { if (!ok) failures.push(message); };
+const list = __LIST__, nativeFetch = window.fetch;
+const dialog = document.querySelector('dialog'), route = dialog.querySelector('[data-route]');
+const trigger = document.querySelector('[data-owner-new]'), send = dialog.querySelector('[type="submit"]');
+const words = dialog.querySelector('textarea'), hint = dialog.querySelector('[data-producer-hint]');
+const change = route.querySelector('[data-route-change]');
+const text = name => route.querySelector('[data-route-' + name + ']').textContent;
+const posts = [];
+if (list) trigger.closest('[data-page-owner]').dataset.pageOwner = 'list';
+window.fetch = (path, options) => {
+ if (!String(path).startsWith('/console/review/new-item')) return nativeFetch(path, options);
+ if (!options.body) {
+  check(options.headers['X-New-Item-Route'] === 'producer', 'The dialog asks for producer routes.');
+  return Promise.resolve(Response.json({
+   token:'fixture', page_owner:list ? '' : 'dwight', page_assignee:list ? '' : 'spacetime',
+   page_owner_reason:list ? '' : 'dwight is the producer of spacetime, the owner of this page.',
+   recipients:[{id:'bob',name:'bob',proposal:true},{id:'dwight',name:'dwight',proposal:true}],
+   assignees:[{id:'spacetime',name:'spacetime'},{id:'fps',name:'fps'}],
+  }));
+ }
+ const payload = JSON.parse(options.body);
+ if (payload.page_capture) return Promise.resolve(Response.json({}, {status:503}));
+ if (payload.discard_capture) return Promise.resolve(Response.json({}));
+ posts.push(payload);
+ return Promise.resolve(Response.json({id:'I1',key:'investigation/dwight/I1'}));
+};
+(async () => {
+ try {
+  const opened = new Promise(resolve => {
+   const observer = new MutationObserver(() => {
+    if (!route.hidden) { observer.disconnect(); resolve(); }
+   });
+   observer.observe(route, {attributes:true});
+  });
+  trigger.click();
+  await opened;
+  words.value = 'Check the rows.';
+  words.dispatchEvent(new Event('input', {bubbles:true}));
+  check([...dialog.querySelectorAll('[data-recipients] input')].map(input => input.value).join() === 'bob,dwight',
+        'To shows only producers.');
+  if (list) {
+   dialog.querySelector('[data-kind="investigation"] input').click();
+   check(text('producer') === 'a producer' && text('assignee') === 'the producer assigns it', 'The List has no default route.');
+   check(send.disabled && !hint.hidden && hint.textContent === 'Pick a producer', 'The List requires a producer.');
+   send.click();
+   check(posts.length === 0, 'A disabled Send makes no request.');
+   dialog.querySelector('[name="recipient_id"][value="dwight"]').click();
+   check(!send.disabled && hint.hidden, 'The producer enables Send.');
+  } else {
+   check(text('copy') === 'dwight tracks this bug and gives it to spacetime.', 'The page sets the producer and assignee.');
+   check(!dialog.querySelector('[data-kind="enhancement"]').hidden, 'The dialog still shows Enhancement.');
+   check(dialog.querySelector('[data-assignees]').closest('fieldset').hidden, 'The assignees start collapsed.');
+   change.click();
+   check(change.getAttribute('aria-expanded') === 'true', 'Change opens the assignee choices.');
+   dialog.querySelector('[name="assignee_id"][value="fps"]').click();
+   check(text('copy') === 'dwight tracks this bug and gives it to fps.', 'The new assignee appears in the route.');
+   check(dialog.querySelector('[name="recipient_id"]:checked').value === 'dwight', 'The producer stays selected.');
+  }
+  const saved = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
+  send.click();
+  await saved;
+  check(posts.length === 1 && posts[0].page_recipient === 'producer' && posts[0].recipient_id === 'dwight' &&
+        posts[0].assignee_id === (list ? null : 'fps'), 'Send carries the producer and assignee.');
+ } catch (error) {
+  failures.push(String(error));
+ }
+ await nativeFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+})();
+"""
+        for page in ("review", "list"):
+            with self.subTest(page=page):
+                probe = script.replace("__LIST__", json.dumps(page == "list"))
+                self.assertEqual(firefox_probe_results(bug_fixture_page(script=probe)), [[]])
+
     def test_legacy_reply_token_has_the_same_digest_as_the_stored_proof(self) -> None:
         token = "a" * 43
         details = new_item_dialog.ReviewSubmission("fixture", "b" * 64, new_item_dialog.NoEvidence(), (),
@@ -1959,6 +2036,7 @@ class NewItemDialogTests(unittest.TestCase):
                 for report, title in zip(records[-2:], ("First queue state", "Second queue state"), strict=True):
                     self.assertEqual(report.question, "Show the queue state.")
                     assert isinstance(report.submission, new_item_dialog.ReviewSubmission)
+                    self.assertEqual(report.submission.notice, new_item_dialog.SubmissionNotice("feedback"))
                     evidence = report.submission.evidence
                     assert isinstance(evidence, new_item_dialog.PageDataEvidence)
                     self.assertEqual(evidence.title, title)

@@ -43,7 +43,7 @@ from scripts.build_queue import admission_client, admission_protocol as admissio
 from scripts.lib import atomic_file, conf, scratch
 from scripts.lib.file_lock import exclusive
 from scripts.lib.process_group import run_process_group
-from scripts.production import change_routing, change_review, investigation, staff, the_list, tidy_wrapped
+from scripts.production import change_routing, change_review, staff, the_list, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import console_tune, go_ledger, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, send_hold, staff_names, studio_page
 from scripts.review_links.review_link import private_name, tailscale_ip as tailscale_ip
@@ -1573,23 +1573,26 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             fields: dict[str, object] = {"token": server.new_item_token}
             with server.list_store_access(), server.staff_read_scope():
                 members = staff.snapshot()
-                if selected:
+                if self.headers.get("X-New-Item-Route") == "producer":
+                    fields.update(review_submissions.new_item_routing(
+                        selected[0] if selected else "", conf.read_or_repository("console"), members))
+                elif selected:
                     route = review_submissions.page_owners(selected[0], conf.read_or_repository("console"), members).route
                     if isinstance(route, review_submissions.PageOwnerRoute):
                         fields.update(page_owner=route.row.id, page_owner_reason=route.reason)
-                        recipients = review_submissions.recipient_options(members, owner=route.row)
+                        fields["recipients"] = review_submissions.recipient_options(members, owner=route.row)
                     else:
                         fields.update(page_owner="", page_owner_reason="")
-                        recipients = review_submissions.recipient_options(members, owner=route)
+                        fields["recipients"] = review_submissions.recipient_options(members, owner=route)
                 else:
-                    recipients = review_submissions.recipient_options(members)
+                    fields["recipients"] = review_submissions.recipient_options(members)
         except (OSError, ValueError) as error:
             print(f"review-links New item recipients: {error}", file=sys.stderr)
             self.json_response(503, {"error": "The recipients are unavailable."})
             return None
         if server.mode is ServerMode.LIST_FIXTURE:
             fields.update(token="", send_disabled="Sending is off on a practice List.")
-        self.json_response(200, {**fields, "recipients": recipients})
+        self.json_response(200, fields)
         return None
 
     def new_item_preview(self, capture_key: str) -> BinaryIO | None:
@@ -1737,7 +1740,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             list_assignee: review_submissions.ListCommandAssignee | review_submissions.ListWindowAssignee
             list_assignee = review_submissions.ListWindowAssignee.RECIPIENT
             if "list_assignee" in fields:
-                if not list_draft_id:
+                if not list_draft_id or fields.get("page_recipient") == new_item_dialog.PageRecipient.PRODUCER:
                     raise new_item_dialog.SubmissionError("Send a List assignee with a List draft.")
                 list_assignee = review_submissions.list_command_assignee(fields["list_assignee"])
             initial_delivery = review_submissions.InitialDelivery(site if has_evidence else "", list_assignee)
@@ -1799,11 +1802,20 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 status = server.delivery_status
                 # Concurrent Sends wait for the delivery of the same item.
                 with exclusive(review_submissions.image_folder(saved).parent / ".lock"):
+                    report_row = review_actions.submission_report_row(saved)
                     delivery = review_actions.prepare_submission_delivery(
                         saved, saved.words, status, evidence_page=evidence_page, members=created.members)
+                    response["reply_owner"] = (
+                        delivery.page.saved["owner"] if isinstance(delivery, change_page.MessageDelivery)
+                        and isinstance(delivery.page, change_page.ReviewMessagePage) else saved.owner)
                     outcome = self.deliver_review(server, delivery, report_outcome=True)
-                    if on_list or (isinstance(saved.record, investigation.Investigation)
-                                   and saved.record.belongs_on_list):
+                    if isinstance(report_row, the_list.ListItem):
+                        response["list_number"] = report_row.number
+                        response["list_owner"] = (report_row.owner.value if isinstance(report_row.owner, the_list.UnassignedOwner)
+                                                  else review_items.name(report_row.owner, created.members))
+                        response["list_producer"] = review_items.name(report_row.producer, created.members)
+                    elif on_list or isinstance(request, new_item_dialog.NewItemRequest) and (
+                            request.page_recipient == new_item_dialog.PageRecipient.PRODUCER):
                         number = the_list.reserved_review_number(review_submissions.list_filing_reservation(saved))
                         if isinstance(number, int):
                             response["list_number"] = number

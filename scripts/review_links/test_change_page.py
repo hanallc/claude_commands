@@ -556,6 +556,8 @@ class ChangePageTests(unittest.TestCase):
         key = self.file_user_question("Read this result?", asker=self.unit)
         body = self.browser("questions")[2]
         self.assertIn(key, body)
+        self.assertIn('<label for="review-showrunner"><span class="staff-name" data-color-text="role.showrunner"'
+                      + ' style="color:#a379fd">Showrunner:</span></label>', body)
         self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>page-owner</span>')
         self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>builder-unit</span>')
         self.assertNotRegex(body, r'class="staff-name"[^>]*>nate</span>')
@@ -632,7 +634,8 @@ class ChangePageTests(unittest.TestCase):
                         self.assertEqual(body.count(page_frame.COPY_BUTTON), len(blocks))
                         self.assertEqual(body.count('<pre>'), len(blocks))
                         if answer != fenced:
-                            prefix = 'Showrunner: ' if feedback else ''
+                            prefix = ('<span class="staff-name" data-color-text="role.showrunner" style="color:#a379fd">'
+                                      'Showrunner:</span> ') if feedback else ''
                             self.assertIn('<p>' + prefix + answer + '</p>', body)
                     status.write_slots(self.page, row_id, change_page.DeliverySlots(change_page.NoDelivery(), change_page.NoDelivery()))
 
@@ -758,6 +761,8 @@ class ChangePageTests(unittest.TestCase):
         configuration.mkdir()
         for stem in ("change_review", "nix_env"):
             _ = write_config_fixture(configuration / f'{stem}.conf')
+        _ = write_config_fixture(configuration / "statusline.conf",
+                                 f'role.showrunner=#a379fd\nrebuild.cache={self.temporary / "rebuild-cache"}\n')
         self.write_delivery_config()
         _ = self.enterContext(patch.object(unrouted_alert, "send_message"))
         _ = self.enterContext(patch.object(reply_tokens, "platform", "linux"))
@@ -1926,11 +1931,17 @@ class ChangePageTests(unittest.TestCase):
                 self.assertIn(footer, without_role_colors(section))
                 self.assertLess(without_role_colors(section).index('No showrunner owns this question.'), without_role_colors(section).index(footer))
 
+    def production_copy(self, name: str) -> Path:
+        document = self.temporary / f"{name}-production.md"
+        _ = shutil.copyfile(self.production, document)
+        return document
+
     def file_other_change(self) -> Path:
         other = self.temporary / "change-review - another.md"
-        owner = fixture_member("showrunner", name="another", doc=staff.LiveDoc(local_machine(), self.production))
+        document = self.production_copy("another")
+        owner = fixture_member("showrunner", name="another", doc=staff.LiveDoc(local_machine(), document))
         _ = change_review.append_rows(other, pictured_changes([change_review.Visible("Other change", "Read the proof", "It agrees")]),
-                                      date(2026, 11, 2), "", self.production, producers=[owner.id], record=staff.snapshot())
+                                      date(2026, 11, 2), "", document, producers=[owner.id], record=staff.snapshot())
         return other
 
     def test_all_lists_load_once_and_the_browser_contains_the_whole_waiting_queue(self) -> None:
@@ -2042,7 +2053,7 @@ class ChangePageTests(unittest.TestCase):
 
             with self.subTest(rebuilds="status line comparison"):
                 configuration = Path(os.environ["CONF_DIR"]) / "statusline.conf"
-                cache = self.temporary / "rebuild-cache"
+                cache = rebuild_row.cache_path(configuration)
                 _ = configuration.write_text(f"rebuild.cache={cache}\n")
                 expected = rebuild_row.ExpectedSystems(
                     "d" * 40, ("/etc/nixos", "main", "natedev", "MacBook-Pro"),
@@ -2438,7 +2449,7 @@ class ChangePageTests(unittest.TestCase):
             self.assertIn("<h2>Follow-up</h2><p>Which file holds it?</p><h2>Reply</h2><p>The file is layout.toml.</p>", body)
 
     def test_staff_moves_the_unit_changes_to_its_current_showrunner_tab(self) -> None:
-        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production))
+        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production_copy("sdlc")))
         _ = staff.move(self.unit.id, staff.ReportsTo(runner.id))
         path, forms, body = self.browser()
         self.assertEqual(forms.tabs["page-owner/C1"], "sdlc")
@@ -2478,9 +2489,10 @@ class ChangePageTests(unittest.TestCase):
 
     def test_tabs_with_waiting_changes_keep_their_order_before_empty_tabs(self) -> None:
         other = self.temporary / "change-review - zeta.md"
-        owner = fixture_member("showrunner", name="zeta", doc=staff.LiveDoc(local_machine(), self.production))
+        document = self.production_copy("zeta")
+        owner = fixture_member("showrunner", name="zeta", doc=staff.LiveDoc(local_machine(), document))
         _ = change_review.append_rows(other, pictured_changes([change_review.Visible("Other change", "Read", "Proof")]),
-                                      date(2026, 11, 2), "", self.production, producers=[owner.id], record=staff.snapshot())
+                                      date(2026, 11, 2), "", document, producers=[owner.id], record=staff.snapshot())
         path, forms, body = self.browser()
         browser = change_browser.page_at(self.root, path)
         prepared = change_browser.prepare(browser, change_page.DeliveryStatus(self.root))
@@ -2515,8 +2527,14 @@ class ChangePageTests(unittest.TestCase):
                 self.assertEqual(list(prepared.queues), ["page-owner", "alpha", "demo"])
 
     def test_production_aliases_share_one_document_read_per_page_request(self) -> None:
-        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production))
+        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production_copy("sdlc")))
         _ = staff.move(self.unit.id, staff.ReportsTo(runner.id))
+        aliases = ("legacy-page-owner", "former-page-owner")
+        listings = [change_review.list_file(alias) for alias in aliases]
+        for listing in listings:
+            _ = listing.write_text(f"---\nproductions:\n  - {self.production}\n---\n" + change_review.BODY)
+        routing = change_page.list_routing({listing: change_review.review_snapshot(listing) for listing in listings})
+        self.assertEqual([routing.production(alias) for alias in aliases], [self.production, self.production])
         reads: list[Path] = []
         read_text = Path.read_text
 
@@ -2528,6 +2546,7 @@ class ChangePageTests(unittest.TestCase):
             path, forms, body = self.browser()
         del path, body
         self.assertEqual(reads.count(self.production), 1)
+        self.assertEqual([forms.counts[alias] for alias in aliases], [0, 0])
         self.assertEqual(forms.counts["sdlc"], 3)
         self.assertEqual(set(forms.save_urls), {"page-owner/C1", "page-owner/C2", "page-owner/C3"})
 
@@ -2663,7 +2682,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(len(change_review.pending(self.review_list)), 3)
 
     def test_an_earlier_lists_prerequisites_keep_qualified_ids_in_the_embedded_tab_order(self) -> None:
-        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production))
+        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production_copy("sdlc")))
         _ = staff.move(self.unit.id, staff.ReportsTo(runner.id))
         earlier = self.temporary / "change-review - earlier.md"
         _ = change_review.append_rows(earlier, pictured_changes([change_review.Visible("First", "Read", "Proof")]),
@@ -2720,8 +2739,8 @@ class ChangePageTests(unittest.TestCase):
                 self.assertLess(keys.index("sdlc/C41"), keys.index("page-owner/C4"))
 
     def test_rows_from_two_units_use_their_producer_ids_for_their_staff_tabs(self) -> None:
-        first = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production))
-        second = fixture_member("showrunner", name="other", doc=staff.LiveDoc(local_machine(), self.production))
+        first = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production_copy("sdlc")))
+        second = fixture_member("showrunner", name="other", doc=staff.LiveDoc(local_machine(), self.production_copy("other")))
         _ = staff.move(self.unit.id, staff.ReportsTo(first.id))
         second_unit = fixture_member("unit", name="second-unit", parent=second.id)
         _ = change_review.append_rows(self.review_list,
@@ -3103,7 +3122,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(refreshed.counts["page-owner"], 3)
         self.assertEqual(footer_counts.changes(self.production), 3)
         self.assertEqual(refreshed.outcomes["page-owner/C1"], ["works", "not works", "validate", "question", "feedback"])
-        self.assertIn("Showrunner: The &lt;proof&gt; now has three steps.", content)
+        self.assertIn("Showrunner: The &lt;proof&gt; now has three steps.", without_role_colors(content))
         self.assertIsInstance(status.slots(self.page, "C1").question, change_page.CompletedFeedback)
         self.assertEqual(self.http_request(path, self.browser_fields(refreshed, "page-owner/C1", "works")).status, 200)
         self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
@@ -3199,7 +3218,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(record.read_bytes(), before[0])
 
     def test_answer_question_accepts_current_and_list_ids_without_changing_delivery_keys(self) -> None:
-        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production))
+        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production_copy("sdlc")))
         _ = staff.move(self.unit.id, staff.ReportsTo(runner.id))
         status = change_page.DeliveryStatus(self.root)
         question = status.ask(self.page, "C1", "Which groups?")
@@ -3213,7 +3232,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertFalse(status.path(self.page, "sdlc/C1").exists())
 
     def test_selected_row_links_accept_current_and_list_ids_with_local_storage_keys(self) -> None:
-        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production))
+        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production_copy("sdlc")))
         _ = staff.move(self.unit.id, staff.ReportsTo(runner.id))
         before = self.review_list.read_bytes()
         for identity in ("sdlc/C1", "page-owner/C1"):
@@ -3230,7 +3249,7 @@ class ChangePageTests(unittest.TestCase):
         legacy = self.review_list.with_name("legacy-review.md")
         _ = self.review_list.rename(legacy)
         _ = self.production.write_text(self.production.read_text().replace(str(self.review_list), str(legacy)))
-        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production))
+        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production_copy("sdlc")))
         _ = staff.move(self.unit.id, staff.ReportsTo(runner.id))
         before = legacy.read_bytes()
         result = self.command(change_page, change_page.main, ["--production", "sdlc", "sdlc/C1"])
@@ -3792,7 +3811,8 @@ class ChangePageTests(unittest.TestCase):
             self.assertIn("tab==='' || r.dataset.tab===tab", body)
             self.assertIn("runnerMenu.value=tab", body)
         with self.subTest(controls="labels and action groups"):
-            self.assertIn('<label for="review-showrunner">Showrunner:</label>', body)
+            self.assertIn('<label for="review-showrunner"><span class="staff-name" data-color-text="role.showrunner"'
+                          + ' style="color:#a379fd">Showrunner:</span></label>', body)
             self.assertIn('>Comment, question or feedback</label>', body)
             self.assertIn('value="validate">Ask showrunner to check</button>', body)
             self.assertIn('<div class="answer-actions"><button name="outcome" value="works">Works</button>'
@@ -4301,16 +4321,17 @@ class ChangePageTests(unittest.TestCase):
     def test_validate_yourself_moves_the_qualified_row_from_an_earlier_list(self) -> None:
         earlier = self.temporary / "change-review - demo.md"
         demo = fixture_member("showrunner", name="demo")
-        _ = staff.set_doc(demo.id, staff.LiveDoc(local_machine(), self.production))
+        document = self.production_copy("demo")
+        _ = staff.set_doc(demo.id, staff.LiveDoc(local_machine(), document))
         _ = change_review.append_rows(earlier, pictured_changes([change_review.Visible("Earlier change", "Run it", "Proof")]),
-                                      date(2026, 11, 1), "", self.production, producers=[demo.id], record=staff.snapshot())
-        _ = change_review.set_row_kind(earlier, "C1", "Read only", self.production)
-        path = urlsplit(change_page.publish(self.production, earlier, ["C1"])).path
+                                      date(2026, 11, 1), "", document, producers=[demo.id], record=staff.snapshot())
+        _ = change_review.set_row_kind(earlier, "C1", "Read only", document)
+        path = urlsplit(change_page.publish(document, earlier, ["C1"])).path
         page = change_page.page_at(self.root, path)
         fields = dict(self.answer(outcome="validate"), token=page.token)
         self.assertEqual(self.request(path, fields).status, 303)
         self.assertFalse(change_page.answer_row(page, "C1").get("Verdict"))
-        queue = next_item.change_queue(self.production)
+        queue = next_item.change_queue(document)
         self.assertEqual(set(urgency.ended(queue.name)), {"demo/C1"})
         self.assertNotIn("demo/C1", [entry.key for entry in urgency.queue_order(queue.entries, queue.name)])
         self.assertEqual([recipient for recipient, _, _ in self.messages], ["demo"])

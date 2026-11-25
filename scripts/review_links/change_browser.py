@@ -265,17 +265,19 @@ def verdict_toast_labels(owner: change_routing.ChangeOwner, members: staff.Staff
     return labels
 
 
-def section(change: WaitingChange, feedback_rows: int, members: staff.StaffSnapshot | None = None) -> str:
+def section(change: WaitingChange, feedback_rows: int, members: staff.StaffSnapshot | None = None, *,
+            names: staff_names.StaffNames | None = None) -> str:
     page, row = change.page, change.row
     shown = change_review.display_id(row, change.tab)
     anomaly = f"<p>{html.escape(change.anomaly)}</p>" if change.anomaly else ""
+    question = change_page.question_html(change.question, names=names)
     attributes = (f'hidden data-type="changes" data-key="{html.escape(change.key)}" '
                   + f'data-shown="{html.escape(shown)}" data-tab="{html.escape(change.tab)}" '
                   + f'data-pending="{str(change.waiting).lower()}"')
     if isinstance(page, UnavailableProduction):
         content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>Proof</h2>{change_page.review_html(row.get(change_review.CHECK, ''))}
-{anomaly}{change_page.question_html(change.question)}<p>{html.escape(page.reason)}</p>
+{anomaly}{question}<p>{html.escape(page.reason)}</p>
 {change_page.change_details(row, shown)}'''
     else:
         form = change_page.answer_form(page, change_page.AnswerNotice(row["#"]), feedback_rows).replace(
@@ -288,7 +290,7 @@ def section(change: WaitingChange, feedback_rows: int, members: staff.StaffSnaps
         content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
 {change_page.review_html(row.get(change_review.CHECK, ''))}
-{anomaly}{change_page.question_html(change.question)}<p role="status" data-save-state hidden></p>{form}
+{anomaly}{question}<p role="status" data-save-state hidden></p>{form}
 {change_page.change_details(row, shown, validating=change.slots.validation_requested)}'''
     return f'<section {attributes}>' + change_page.change_content(row, content) + '</section>'
 
@@ -649,12 +651,14 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
         label = "Owner unavailable" if name == "unrouted" else name
         menus.append(f'<option data-showrunner="{html.escape(name)}" '
                      + f'data-count="{count}"{names_read.style(name)} value="{html.escape(name)}">{html.escape(label)} ({count})</option>')
-    cards = (''.join(section(item, feedback_rows, prepared.record) for item in prepared.changes) if kind == "changes"
+    cards = (''.join(section(item, feedback_rows, prepared.record, names=names_read) for item in prepared.changes)
+             if kind == "changes"
              else ''.join(question_section(item, browser, feedback_rows, names_read) for item in prepared.questions))
     content = (PAGE_STYLE + page_frame.title(change_page.TITLES[kind], "review")
                + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}"'
                + f' data-script="{SCRIPT_VERSION}" {card_motion.attributes()}>'
-               + '<div data-showrunner-filter><label for="review-showrunner">Showrunner:</label>'
+               + '<div data-showrunner-filter><label for="review-showrunner">'
+               + names_read.role_label("showrunner", "Showrunner:") + '</label>'
                + '<select id="review-showrunner" aria-label="Showrunner"><option value="">All</option></select></div>'
                + '<template data-runner-options>' + ''.join(menus) + '</template>'
                + '<script type="application/json" data-change-orders>'
