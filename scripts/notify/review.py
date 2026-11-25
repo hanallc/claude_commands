@@ -677,7 +677,11 @@ def supported_failures(value: object, draft: Draft, *, reply: bool = False,
     failures: list[RuleFailure] = []
     for item in cast(list[object], value):
         record = _object(item)
+        if console and record.keys() != {"rule", "quote"}:
+            raise ValueError("The reviewer returned invalid failed rule fields.")
         rule, quote = _text(record, "rule"), _text(record, "quote")
+        if console and not rule.strip():
+            raise ValueError("A failed rule needs a name.")
         matched = bool(quote) and any(quote in text for text in original)
         if console and not matched:
             raise UnmatchedConsoleQuote("The reviewer gave a quote that does not match the draft.")
@@ -698,6 +702,8 @@ def validate(value: object, draft: Draft, revision: bool,
     try:
         record = _object(value)
         if console:
+            if record.keys() != SCHEMA["properties"].keys():
+                raise ValueError("The reviewer returned invalid verdict fields.")
             failures = supported_failures(record.get("failed_rules"), draft, reply=True, console=True)
         verdict = _text(record, "verdict")
         if verdict not in ("send", "rewrite", "ask", "withhold") or (content_only and verdict == "withhold"):

@@ -345,6 +345,30 @@ class LocalReviewTests(unittest.TestCase):
                         console_text.require(draft.body, "reply", identity="layout")
                         self.assertEqual(self.entries()[-1]["verdict"], "unreviewed: timeout")
 
+    def test_console_filing_holds_send_with_extra_fields_or_blank_rule_names(self) -> None:
+        from scripts.console_text import check as console_text
+
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Use the new layout.", False)
+        real_review = review.review_question
+        for value, reason in (
+            (verdict(draft, extra=True), "verdict fields"),
+            (verdict(draft, failed_rules=[{"rule": "reader", "quote": draft.body, "extra": True}]), "failed rule fields"),
+            (verdict(draft, failed_rules=[{"rule": "", "quote": draft.body}]), "failed rule needs a name"),
+            (verdict(draft, failed_rules=[{"rule": " \t", "quote": draft.body}]), "failed rule needs a name"),
+        ):
+            with self.subTest(value=value):
+                runner = FakeReviewer(value)
+
+                def run(key: review.QuestionKey, text: str, *, console_kind: str) -> review.QuestionOutcome:
+                    return real_review(key, text, runner=runner, console_kind=console_kind)
+
+                with (mock.patch.object(review, "review_question", side_effect=run),
+                      self.assertRaisesRegex(ValueError, reason)):
+                    console_text.require(draft.body, "reply", identity="layout")
+                key = review.QuestionKey("reply/layout", "")
+                hold = review.state_path() / "questions" / f"{key.digest}.json"
+                self.assertIn(draft.body, hold.read_text())
+
     def test_unavailable_question_review_preserves_original_and_logs_reason(self) -> None:
         draft = review.Draft("demo", "0", "", NoActionRequired(), "Retry build 42?", False)
         runner = FakeReviewer(verdict(draft), failure="timeout")

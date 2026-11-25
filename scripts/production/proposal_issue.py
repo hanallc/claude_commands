@@ -409,25 +409,27 @@ def _numbering_input(path: Path, source: Path) -> tuple[Issue, str, str]:
     return Issue(path, {}), text, ""
 
 
-def number(paths: list[Path], today: date, *, draft_file: Path | None = None) -> list[str]:
-    """Review proposal drafts before taking the locks that assign numbers."""
-    if draft_file is not None and len(paths) != 1:
-        raise Refusal("--draft-file needs one destination.")
-    paths = sorted({path.resolve() for path in paths}) if draft_file is None else [
-        paths[0].parent.resolve() / paths[0].name]
-    sources = {path: path if draft_file is None else draft_file for path in paths}
+def _review_numbering_body(path: Path, body: str) -> None:
+    title = path.stem
+    console_text.require(f"## {title}\n\n{body}", "proposal", identity=str(path), title=title, refusal=Refusal)
+
+
+def _numbered_proposal(issue: Issue, text: str, identity: str, today: date) -> ProposalNumbering:
+    owner = proposal_owner(issue, "") or _proposal_owner(issue.path.parent, issue.value("proposed_by"))
+    numbered, _ = set_fields(text, {NUMBER_FIELD: identity, "production_id": owner,
+                                    "date_modified": _vault_date(today)}, issue.path)
+    return ProposalNumbering(issue.path, owner, identity, numbered)
+
+
+def number(paths: list[Path], today: date) -> list[str]:
+    """Review and number existing proposal records."""
+    paths = sorted({path.resolve() for path in paths})
     reviewed: dict[Path, str] = {}
-    for path, source in sources.items():
-        issue, text, body = _numbering_input(path, source)
-        proposal = PROPOSAL_TAG in issue.fields.get("tags", [])
-        taken = NUMBER.fullmatch(issue.value(NUMBER_FIELD))
-        if draft_file is not None and (not proposal or issue.value(NUMBER_FIELD)):
-            raise Refusal("The draft must be an unnumbered proposal.")
-        if proposal and not taken:
-            title = path.stem
-            console_text.require(f"## {title}\n\n{body}", "proposal", identity=str(path),
-                                 title=title, refusal=Refusal)
-            reviewed[path] = body if draft_file is None else text
+    for path in paths:
+        issue, _, body = _numbering_input(path, path)
+        if PROPOSAL_TAG in issue.fields.get("tags", []) and not NUMBER.fullmatch(issue.value(NUMBER_FIELD)):
+            _review_numbering_body(path, body)
+            reviewed[path] = body
 
     folders = sorted({path.parent for path in paths})
     with ExitStack() as locks:
@@ -435,17 +437,13 @@ def number(paths: list[Path], today: date, *, draft_file: Path | None = None) ->
             _ = locks.enter_context(_folder_lock(folder))
         for path in paths:
             _ = locks.enter_context(issue_lock(path))
-            if draft_file is not None and (path.exists() or path.is_symlink()):
-                raise FileExistsError(f"The proposal already exists: {path}")
         numbers = locks.enter_context(proposal_numbers())
-        inputs = (_numbering_input(path, source) for path, source in sources.items())
+        inputs = (_numbering_input(path, path) for path in paths)
         issues = sorted(inputs, key=lambda item: (item[0].value("date_created"), item[0].path.name))
         writes: list[ProposalNumbering] = []
         lines: list[str] = []
         ceiling = numbers.floor(*folders)
         for issue, text, body in issues:
-            if draft_file is not None and text != reviewed.get(issue.path):
-                raise Refusal(f"{issue.path}: the reviewed proposal draft changed.")
             if PROPOSAL_TAG not in issue.fields.get("tags", []):
                 lines.append(f"number {issue.path.name}: not a proposal")
                 continue
@@ -453,25 +451,39 @@ def number(paths: list[Path], today: date, *, draft_file: Path | None = None) ->
             if taken:
                 lines.append(f"number {issue.path.name}: P{taken[1]}")
                 continue
-            if draft_file is None and body != reviewed.get(issue.path):
+            if body != reviewed.get(issue.path):
                 raise Refusal(f"{issue.path}: the reviewed proposal draft changed.")
-            owner = proposal_owner(issue, "") or _proposal_owner(issue.path.parent, issue.value("proposed_by"))
             ceiling += 1
             identity = f"P{ceiling}"
-            numbered, _ = set_fields(text, {NUMBER_FIELD: identity, "production_id": owner,
-                                            "date_modified": _vault_date(today)}, issue.path)
-            writes.append(ProposalNumbering(issue.path, owner, identity, numbered))
+            writes.append(_numbered_proposal(issue, text, identity, today))
             lines.append(f"number {issue.path.name}: {identity}")
         with ExitStack() as rollback:
             for write in writes:
-                if draft_file is None:
-                    _ = rollback.enter_context(record_store.keep_file_on_error(write.path))
-                    with numbers.write(write.path, write.identity, write.owner):
-                        _replace_issue(write.path, write.text)
-                else:
-                    with numbers.write(write.path, write.identity, write.owner, new_record=True):
-                        record_store.create_record_text(write.path, _hash_legacy_reply(write.path, write.text))
+                _ = rollback.enter_context(record_store.keep_file_on_error(write.path))
+                with numbers.write(write.path, write.identity, write.owner):
+                    _replace_issue(write.path, write.text)
         return lines
+
+
+def publish_numbered_draft(path: Path, draft_file: Path, today: date) -> str:
+    """Review a private draft and publish it with a proposal number."""
+    path = path.parent.resolve() / path.name
+    issue, selected_text, body = _numbering_input(path, draft_file)
+    if PROPOSAL_TAG not in issue.fields.get("tags", []) or issue.value(NUMBER_FIELD):
+        raise Refusal("The draft must be an unnumbered proposal.")
+    _review_numbering_body(path, body)
+
+    with _folder_lock(path.parent), issue_lock(path):
+        if path.exists() or path.is_symlink():
+            raise FileExistsError(f"The proposal already exists: {path}")
+        with proposal_numbers() as numbers:
+            issue, text, _ = _numbering_input(path, draft_file)
+            if text != selected_text:
+                raise Refusal(f"{path}: the reviewed proposal draft changed.")
+            write = _numbered_proposal(issue, text, numbers.next_id(path.parent), today)
+            with numbers.write(write.path, write.identity, write.owner, new_record=True):
+                record_store.create_record_text(write.path, _hash_legacy_reply(write.path, write.text))
+    return f"number {path.name}: {write.identity}"
 
 
 def review_submission(issue: Issue) -> new_item_dialog.SubmissionOrigin:
@@ -1316,7 +1328,12 @@ def main(argv: list[str]) -> int:
         try:
             paths = [path.expanduser() for path in cast(list[Path], args.issues)]
             draft = cast(Path | None, args.draft_file)
-            print("\n".join(number(paths, today, draft_file=draft.expanduser() if draft is not None else None)))
+            if draft is None:
+                print("\n".join(number(paths, today)))
+            else:
+                if len(paths) != 1:
+                    raise Refusal("--draft-file needs one destination.")
+                print(publish_numbered_draft(paths[0], draft.expanduser(), today))
         except (ValueError, OSError, UnicodeError) as error:
             print(f"proposal_issue: {error}", file=sys.stderr)
             return 2

@@ -38,17 +38,23 @@ def require_current_waiting(item: review_items.ReviewItem) -> None:
     """Check the current canonical record while its writer holds the lock."""
     source = item.source
     if isinstance(source, review_items.ProposalSource):
-        state = review_items.proposal_state(Issue(source.record.path, frontmatter(source.record.path)))
+        current = Issue(source.record.path, frontmatter(source.record.path))
+        number = source.record.value(proposal_issue.NUMBER_FIELD)
+        same_record = current.value(proposal_issue.NUMBER_FIELD) == number if number else current == source.record
+        state = review_items.proposal_state(current)
     else:
         assert isinstance(source, review_items.EfficiencySource)
         identity = efficiency_identity(item)
         lines = source.path.read_text(encoding='utf-8').splitlines()
         index = int(identity.removeprefix('E')) - 1
-        result = lines[index].partition(' — ')[2] if 0 <= index < len(lines) else ''
+        line = lines[index] if 0 <= index < len(lines) else ''
+        same_record = line == source.line
         review = efficiency_reviews.read(source.path).get(identity, efficiency_reviews.EfficiencyReview())
-        state = review_items.efficiency_state(result, review)
+        state = review_items.efficiency_state(line.partition(' — ')[2], review)
     if state != review_items.ReviewState.WAITING:
         raise NoOpenQuestion('The item is not Waiting.')
+    if not same_record:
+        raise NoOpenQuestion('The selected item changed.')
 
 
 def stored_mark(item: review_items.ReviewItem) -> ReviewMark | NoMark:
