@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from importlib import import_module
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, ReadOnly, TypedDict, Protocol, cast, override, assert_never
@@ -191,6 +191,92 @@ class MoveMember:
 
 
 @dataclass(frozen=True)
+class HandMoveSession:
+    name: str
+
+
+class MoveInitiator(Enum):
+    AUTOMATIC = "automatic"
+    CONSOLE = "console page"
+    HAND = "terminal"
+
+
+@dataclass(frozen=True)
+class MoveQueued:
+    """The move has not started this member."""
+
+
+@dataclass(frozen=True)
+class MoveDestinationUnselected:
+    """The move has no recorded destination."""
+
+
+MoveDestination = str | MoveDestinationUnselected
+
+
+@dataclass(frozen=True)
+class MemberMoving:
+    started: datetime
+    target: MoveDestination = field(default_factory=MoveDestinationUnselected)
+
+
+@dataclass(frozen=True)
+class MemberMoved:
+    ended: datetime
+    elapsed: timedelta
+    recovered_holder: str = ""
+    target: MoveDestination = field(default_factory=MoveDestinationUnselected)
+
+
+@dataclass(frozen=True)
+class MemberAlreadyOnTarget:
+    ended: datetime
+    elapsed: timedelta
+    target: str
+
+
+@dataclass(frozen=True)
+class MemberMoveFailed:
+    ended: datetime
+    elapsed: timedelta
+    reason: str
+    target: MoveDestination = field(default_factory=MoveDestinationUnselected)
+    stopped: bool = False
+
+
+MoveMemberState = MoveQueued | MemberMoving | MemberMoved | MemberAlreadyOnTarget | MemberMoveFailed
+
+
+class MoveMemberKind(Enum):
+    NATIVE = "native"
+    STAFF = "staff"
+    REQUEST = "request"
+
+
+@dataclass(frozen=True)
+class MoveMemberProgress:
+    member: MoveMember
+    state: MoveMemberState
+    kind: MoveMemberKind = MoveMemberKind.NATIVE
+
+
+@dataclass(frozen=True)
+class MoveProgress:
+    batch_id: str
+    group: str
+    target: MoveDestination
+    reason: str
+    initiator: HandMoveSession | MoveInitiator
+    started: datetime
+    members: tuple[MoveMemberProgress, ...]
+    cause: MoveCause = "by hand"
+
+    @property
+    def active(self) -> bool:
+        return any(isinstance(row.state, (MoveQueued, MemberMoving)) for row in self.members)
+
+
+@dataclass(frozen=True)
 class MoveBatchResult:
     target: str | FollowGroupAccount
     pending: tuple[MoveMember, ...]
@@ -206,6 +292,209 @@ class ClaimOwner:
 
     pid: int
     start: str
+
+
+@dataclass(frozen=True)
+class MoveNotEnded:
+    """The writer has not marked the end of the batch."""
+
+
+@dataclass(frozen=True)
+class TrackedMove:
+    progress: MoveProgress
+    owner: ClaimOwner
+    updated: datetime
+    ended: datetime | MoveNotEnded = field(default_factory=MoveNotEnded)
+
+
+def _progress_path(batch_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{32}", batch_id):
+        raise ValueError("invalid move batch id")
+    return store_file().parent / "move-progress" / f"{batch_id}.json"
+
+
+EARLIER_MOVE_LIMIT = 3
+
+
+def move_destination(target: object) -> MoveDestination:
+    return target if isinstance(target, str) and _numbered_target(target) else MoveDestinationUnselected()
+
+
+def move_display_reason(cause: MoveCause, why: str) -> str:
+    """Use only the safe parts of a recorded cause in the console."""
+    if cause == "by hand":
+        return ""
+    quota = re.fullmatch(r"(?:claude|codex)[1-9][0-9]* at ([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?)%", why)
+    if quota and 0 <= float(quota[1]) <= 100:
+        return quota[0]
+    if cause == "refusal":
+        refusal = re.match(r"^((?:claude|codex)[1-9][0-9]*) refused: (weekly_fable|five_hour|weekly|unknown|five-hour|Fable weekly) limit\b", why)
+        if refusal:
+            window = {"weekly_fable": "Fable weekly", "five_hour": "five-hour"}.get(refusal[2], refusal[2])
+            return f"{refusal[1]} refused: {window} limit"
+        return "quota refusal"
+    return "credits off" if cause == "credits off" else "scheduled quota limit"
+
+
+def move_failure_reason(reason: str) -> str:
+    """Keep a single line and remove email addresses from the console reason."""
+    return re.sub(r"[\w.!#$%&'*+/=?^_`{|}~-]+@[\w-]+(?:\.[\w-]+)*", "[account identity]", " ".join(reason.splitlines()))
+
+
+def _progress_reason(reason: object, origin: HandMoveSession | MoveInitiator) -> str:
+    if origin is not MoveInitiator.AUTOMATIC:
+        return ""
+    detail = reason if isinstance(reason, str) else ""
+    if detail == "credits off":
+        return detail
+    cause = "refusal" if detail in ("refusal", "quota refusal") or " refused: " in detail else "auto"
+    return move_display_reason(cause, detail)
+
+
+def _progress_time(value: object) -> datetime:
+    if isinstance(value, str):
+        at = datetime.fromisoformat(value)
+        if at.tzinfo is not None:
+            return at
+    raise ValueError("move progress time needs a zone")
+
+
+def _progress_member(value: object, target: MoveDestination) -> MoveMemberProgress:
+    if not isinstance(value, dict):
+        raise ValueError("invalid member progress")
+    fields = cast(dict[str, object], value)
+    reference, name = fields.get("reference"), fields.get("name")
+    if not isinstance(reference, str) or not reference or not isinstance(name, str) or not name:
+        raise ValueError("invalid move member")
+    member = MoveMember(reference, name)
+    kind = MoveMemberKind(fields.get("kind", MoveMemberKind.NATIVE.value))
+    state = fields.get("state")
+    destination = move_destination(fields["target"]) if "target" in fields else target
+    if state == "queued":
+        return MoveMemberProgress(member, MoveQueued(), kind)
+    if state == "moving":
+        return MoveMemberProgress(member, MemberMoving(_progress_time(fields.get("started")), destination), kind)
+    elapsed = fields.get("elapsed")
+    if not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool) or not 0 <= elapsed < timedelta.max.total_seconds():
+        raise ValueError("invalid move duration")
+    ended, duration = _progress_time(fields.get("ended")), timedelta(seconds=elapsed)
+    if state == "moved" and isinstance(holder := fields.get("recovered_holder", ""), str):
+        return MoveMemberProgress(member, MemberMoved(ended, duration, holder, destination), kind)
+    if state == "already on target" and isinstance(destination, str):
+        return MoveMemberProgress(member, MemberAlreadyOnTarget(ended, duration, destination), kind)
+    if state == "failed" and isinstance(reason := fields.get("reason"), str):
+        return MoveMemberProgress(member, MemberMoveFailed(ended, duration, move_failure_reason(reason), destination,
+                                                            stopped=fields.get("stopped") is True), kind)
+    raise ValueError("invalid move member state")
+
+
+def _encode_member(row: MoveMemberProgress) -> dict[str, object]:
+    fields: dict[str, object] = {"reference": row.member.reference, "name": row.member.name, "kind": row.kind.value}
+    state = row.state
+    if isinstance(state, MoveQueued):
+        return fields | {"state": "queued"}
+    fields["target"] = state.target if isinstance(state.target, str) else None
+    if isinstance(state, MemberMoving):
+        return fields | {"state": "moving", "started": state.started.isoformat()}
+    fields |= {"ended": state.ended.isoformat(), "elapsed": state.elapsed.total_seconds()}
+    if isinstance(state, MemberMoved):
+        return fields | {"state": "moved", "recovered_holder": state.recovered_holder}
+    if isinstance(state, MemberAlreadyOnTarget):
+        return fields | {"state": "already on target"}
+    return fields | {"state": "failed", "reason": move_failure_reason(state.reason), "stopped": state.stopped}
+
+
+def _numbered_target(target: str) -> bool:
+    return re.fullmatch(r"(?:claude|codex)[1-9][0-9]*", target) is not None
+
+
+def read_tracked_move(batch_id: str) -> TrackedMove:
+    value = cast(object, json.loads(_progress_path(batch_id).read_text(encoding="utf-8")))
+    if not isinstance(value, dict):
+        raise ValueError("invalid move progress")
+    fields = cast(dict[str, object], value)
+    group, target = fields.get("group"), move_destination(fields.get("target"))
+    pid, start = fields.get("pid"), fields.get("start")
+    members, initiator, session = fields.get("members"), fields.get("initiator"), fields.get("session")
+    if (not isinstance(group, str) or not group or not isinstance(pid, int) or isinstance(pid, bool)
+            or pid <= 0 or not isinstance(start, str) or not isinstance(members, list) or not members):
+        raise ValueError("invalid move progress fields")
+    if initiator == "session" and isinstance(session, str) and session:
+        origin: HandMoveSession | MoveInitiator = HandMoveSession(session)
+    elif initiator in tuple(source.value for source in MoveInitiator):
+        origin = MoveInitiator(initiator)
+    else:
+        raise ValueError("invalid move initiator")
+    reason = _progress_reason(fields.get("reason", fields.get("cause")), origin)
+    rows = tuple(_progress_member(row, target) for row in cast(list[object], members))
+    if len({row.member.reference for row in rows}) != len(rows):
+        raise ValueError("duplicate move member")
+    raw_cause = fields.get("cause")
+    cause: MoveCause = (raw_cause if raw_cause in ("by hand", "auto", "refusal", "credits off")
+                       else "auto" if origin is MoveInitiator.AUTOMATIC else "by hand")
+    progress = MoveProgress(batch_id, group, target, reason, origin, _progress_time(fields.get("started")), rows, cause)
+    updated = _progress_time(fields.get("updated"))
+    ended = fields.get("ended", updated.isoformat() if not progress.active else None)
+    return TrackedMove(progress, ClaimOwner(pid, start), updated,
+                       _progress_time(ended) if ended is not None else MoveNotEnded())
+
+
+def write_move_progress(record: TrackedMove) -> None:
+    progress, owner = record.progress, record.owner
+    origin = progress.initiator
+    path = _progress_path(progress.batch_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = {"group": progress.group, "target": progress.target if isinstance(progress.target, str) else None,
+              "reason": _progress_reason(progress.reason, origin), "cause": progress.cause,
+              "initiator": "session" if isinstance(origin, HandMoveSession) else origin.value,
+              "session": origin.name if isinstance(origin, HandMoveSession) else "",
+              "started": progress.started.isoformat(), "updated": record.updated.isoformat(),
+              "ended": record.ended.isoformat() if isinstance(record.ended, datetime) else None,
+              "pid": owner.pid, "start": owner.start, "members": [_encode_member(row) for row in progress.members]}
+    write_text_atomic(path, json.dumps(fields), new_file_mode=0o600)
+
+
+def finish_move_progress(record: TrackedMove) -> None:
+    """Save the end mark before pruning only ended files."""
+    write_move_progress(replace(record, ended=record.updated))
+    completed: list[tuple[datetime, Path]] = []
+    for path in _progress_path(record.progress.batch_id).parent.glob("*.json"):
+        try:
+            ending = read_tracked_move(path.stem).ended
+        except (OSError, ValueError, RecursionError):
+            continue
+        if isinstance(ending, datetime):
+            completed.append((ending, path))
+    completed.sort(reverse=True)
+    for _, path in completed[EARLIER_MOVE_LIMIT:]:
+        path.unlink(missing_ok=True)
+
+
+def visible_move_progress(record: TrackedMove) -> MoveProgress:
+    progress = record.progress
+    if not progress.active or _claim_owner_is_live(record.owner):
+        return progress
+    members: list[MoveMemberProgress] = []
+    for row in progress.members:
+        if isinstance(row.state, (MoveQueued, MemberMoving)):
+            began = row.state.started if isinstance(row.state, MemberMoving) else progress.started
+            state = MemberMoveFailed(record.updated, max(timedelta(), record.updated - began),
+                                     "The move ended before it recorded a result.",
+                                     row.state.target if isinstance(row.state, MemberMoving) else progress.target)
+            row = replace(row, state=state)
+        members.append(row)
+    return replace(progress, members=tuple(members))
+
+
+def read_move_progress() -> tuple[MoveProgress, ...]:
+    directory = store_file().parent / "move-progress"
+    records: list[MoveProgress] = []
+    for path in directory.glob("*.json"):
+        try:
+            records.append(visible_move_progress(read_tracked_move(path.stem)))
+        except (OSError, ValueError):
+            continue
+    return tuple(sorted(records, key=lambda move: (move.started, move.batch_id), reverse=True))
 
 
 @dataclass(frozen=True)
@@ -307,6 +596,13 @@ def queue_hand_move(identity: str, request_id: str, owner: ClaimOwner) -> None:
             _save_hand_queue(identity, queued)
 
 
+def move_holds_session(identity: str) -> bool:
+    """Read live claims and hand moves without changing the queue."""
+    claim = read_latest_request(identity)
+    return ((isinstance(claim, LatestMoveRequest) and claim_is_live(claim))
+            or hand_move_ahead(identity, "") is not None)
+
+
 def hand_move_ahead(identity: str, request_id: str) -> ClaimOwner | None:
     """Read the oldest live hand move before this request. The caller holds the claim lock."""
     for queued_id, owner in _hand_queue(identity).items():
@@ -394,12 +690,16 @@ MOVE_COMMAND = "~/.claude/scripts/lib/py ~/.claude/scripts/agents/stop_resume.py
 RETRY_COMMAND = f"{MOVE_COMMAND} retry"
 
 
-def batch_move_command(reference: str, destination: str | FollowGroupAccount, *, user_command: bool = False) -> str:
+def batch_move_arguments(reference: str, destination: str | FollowGroupAccount, *, user_command: bool = False) -> list[str]:
     options = (["--group", destination.group] if isinstance(destination, FollowGroupAccount)
                else ["--target", destination])
     if user_command:
         options.append("--user-command")
-    return f"{MOVE_COMMAND} batch {shlex.join([*options, '--', reference])}"
+    return ["batch", *options, "--", reference]
+
+
+def batch_move_command(reference: str, destination: str | FollowGroupAccount, *, user_command: bool = False) -> str:
+    return f"{MOVE_COMMAND} {shlex.join(batch_move_arguments(reference, destination, user_command=user_command))}"
 
 
 def remove_latest_request(native_session: str, request_id: str) -> None:

@@ -65,6 +65,19 @@ STALE_NEW_ITEM_TOKEN = "The New item token expired. Try Send again."
 ATTACHMENT_MEDIA = {f"image.{extension}": media for media, extension in new_item_dialog.IMAGE_FORMATS.items()}
 
 
+def retry_account_move(batch_id: str, member: str) -> accounts_page.Saved | accounts_page.Refused | accounts_page.SaveFailed:
+    from scripts.agents import stop_resume
+
+    try:
+        result = stop_resume.start_console_retry(batch_id, member)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"review-links: could not start the move retry ({type(error).__name__})", file=sys.stderr)
+        return accounts_page.SaveFailed("The move retry could not start.")
+    if isinstance(result, stop_resume.ConsoleRetryRefused):
+        return accounts_page.Refused(result.reason)
+    return accounts_page.Saved()
+
+
 def published_console_page(root: Path, path: str) -> str:
     """Recognize the decoded path of a published console page."""
     leaf = path.rsplit("/", 1)[-1]
@@ -2176,12 +2189,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
     def accounts_post(self) -> None:
         """Apply one Accounts page action."""
         quota_fields = {"quota_account", "quota_level", "quota_reset"}
+        retry_fields = {"retry_move", "member"}
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 4096:
                 raise ValueError("Invalid accounts request size.")
             fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
-            if (set(fields) not in ({"key", "value"}, {"group", "to"}, {"group", "clear"}, quota_fields)
+            if (set(fields) not in ({"key", "value"}, {"group", "to"}, {"group", "clear"}, quota_fields, retry_fields)
                     or any(len(values) != 1 for values in fields.values())
                     or ("clear" in fields and fields["clear"] != ["first"])):
                 raise ValueError("Send one Accounts action with its required fields.")
@@ -2189,17 +2203,23 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(400, {"reason": str(error)})
             return
         server = cast(ReviewLinksServer, self.server)
-        result = (accounts_page.clear_quota(server.root, fields["quota_account"][0], fields["quota_level"][0],
-                                            fields["quota_reset"][0]) if set(fields) == quota_fields
-                  else accounts_page.save_color(fields["key"][0], fields["value"][0]) if "key" in fields
-                  else accounts_page.clear_next_move(fields["group"][0]) if "clear" in fields
-                  else accounts_page.save_next_move(fields["group"][0], fields["to"][0]))
+        if set(fields) == retry_fields:
+            if not self.same_origin(required=True):
+                self.json_response(403, {"reason": "Open the retry button on this console."})
+                return
+            result = retry_account_move(fields["retry_move"][0], fields["member"][0])
+        else:
+            result = (accounts_page.clear_quota(server.root, fields["quota_account"][0], fields["quota_level"][0],
+                                                fields["quota_reset"][0]) if set(fields) == quota_fields
+                      else accounts_page.save_color(fields["key"][0], fields["value"][0]) if "key" in fields
+                      else accounts_page.clear_next_move(fields["group"][0]) if "clear" in fields
+                      else accounts_page.save_next_move(fields["group"][0], fields["to"][0]))
         if isinstance(result, accounts_page.Refused):
             self.json_response(400, {"reason": result.reason})
         elif isinstance(result, accounts_page.SaveFailed):
             self.json_response(503, {"reason": result.reason})
         else:
-            cast(ReviewLinksServer, self.server).accounts_cache = AccountsPageCache()
+            server.accounts_cache = AccountsPageCache()
             self.json_response(200, {"state": "saved"})
 
     def list_counts(self, *, include_linked_reviews: bool) -> None:

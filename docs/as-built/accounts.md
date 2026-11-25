@@ -281,7 +281,20 @@ Account moves use the shared stop and resume API.
 Each recorded session attempt writes a request and one confirmed or failed outcome to `~/.local/state/accounts/moves.jsonl`.
 If the request append fails, the batch reports the error and refuses that member before any stop.
 Each attempt has its own move ID and cause.
-A session proved live on the target writes nothing.
+A session proved live on the target writes no request or outcome to the journal.
+The batch progress record in `~/.local/state/accounts/move-progress/` starts with the selected members in queue order.
+It records the initiator and a safe display reason once.
+The CLI records target and live process refusals through the batch recorder.
+Each result keeps the requested account before the row and process checks.
+The timer records its rule's account and threshold apart from its initiator.
+Each batch file has one writer. The parent can record a launch failure only after a confirmed refusal.
+The child adopts the same file and keeps the roster and earlier results.
+Each write replaces the file atomically. A failed write logs one line and the move continues.
+The writer prunes after it saves the end mark. It keeps unended batches and the three newest end marks.
+If an unended batch loses its writer, unfinished members show as interrupted.
+The Accounts page starts a standard hand move of one failed member to its recorded destination.
+The retry uses the same queue and wait limit as a hand move from a terminal.
+A hand move on the target returns "already on" without stopping the member.
 A failed live source read stops the move before it records a source or sends a signal.
 The stop checks that the live source PID and process start time still match.
 A Claude target needs a real account directory and a matching local sign-in.
@@ -358,6 +371,9 @@ A user command waits for the row, and at its limit it prints a fresh `batch --ta
 For a group request, it prints `batch --group` so the batch reads the current group target under the session lock.
 `retry` can run only a saved request.
 The detached child checks its request ID before it reports a member outcome.
+If the launcher fails before startup, the parent records the failure for each unfinished member and ends the batch.
+This includes a refusal from `systemd-run`.
+If the launcher cannot confirm whether the child started, the parent leaves the record for the child.
 The mover checks the request ID under the locks before stopping the member.
 It removes its file after success and leaves it after failure.
 A failed journal append restores the prior journal contents under the journal lock.

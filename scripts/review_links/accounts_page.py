@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from enum import StrEnum
@@ -16,7 +16,9 @@ import sys
 import time
 from typing import Literal, TypedDict, cast
 
-from scripts.accounts import accounts, next_moves, role_activity
+from scripts.accounts import accounts, moves, next_moves, role_activity
+from scripts.agents import shutdown_record
+from scripts.production import staff
 from scripts.lib import atomic_file, conf, file_lock, waiting_rows
 from scripts.review_links import change_page, console_theme, page_frame, page_version, review_link
 from scripts.whoami import agent_accounts, mac_fallback_token, quota_alert, run_out, token_expiry
@@ -931,6 +933,213 @@ def tokens_board(reading: accounts.StatusReading) -> str:
             f'<tbody>{"".join(rows)}</tbody></table></div>{steps}</section>')
 
 
+def _move_duration(elapsed: timedelta) -> str:
+    minutes, seconds = divmod(max(0, round(elapsed.total_seconds())), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} h {minutes} min"
+    if minutes:
+        return f"{minutes} min" + (f" {seconds} s" if seconds else "")
+    return f"{seconds} s"
+
+
+def _move_time(at: datetime, zone: tzinfo) -> str:
+    return html.escape(at.astimezone(zone).strftime("%a %H:%M %Z"))
+
+
+def _move_cause(move: moves.MoveProgress) -> str:
+    origin = move.initiator
+    if origin is moves.MoveInitiator.AUTOMATIC:
+        return "automatic" + (f" · {html.escape(move.reason)}" if move.reason else "")
+    source = f"{origin.name} session" if isinstance(origin, moves.HandMoveSession) else origin.value
+    return f"by hand · {html.escape(source)}"
+
+
+def _move_result(moved: int, total: int, failed: int, already: int) -> str:
+    counts = f"{moved} of {total} moved"
+    if moved == total:
+        return f'<span class="success bold">{counts}</span>'
+    return (f'<span class="bold">{counts}</span>'
+            + (f' · <span class="error">{failed} failed</span>' if failed else "")
+            + (f' · <span class="next-muted">{already} already on target</span>' if already else ""))
+
+
+def _retryable_members(history: Sequence[moves.MoveProgress], reading: accounts.StatusReading) -> set[tuple[str, str]]:
+    failed = [(move.batch_id, row, row.state.target) for move in history for row in move.members
+              if row.kind is not moves.MoveMemberKind.REQUEST and isinstance(row.state, moves.MemberMoveFailed)
+              and isinstance(row.state.target, str)]
+    if not failed:
+        return set()
+    try:
+        try:
+            record = staff.local_snapshot()
+        except staff.StaffAbsent:
+            record = staff.StaffSnapshot(())
+        restarting: set[str] = set(shutdown_record.read()) if shutdown_record.active() else set()
+    except (OSError, ValueError, staff.StaffRefused):
+        return set()
+    live = reading.live_claude_accounts.union((observed["session"], account.label)
+        for account in reading.rows for observed in account.sessions if observed["state"] in ("busy", "idle"))
+    retryable: set[tuple[str, str]] = set()
+    for batch_id, row, target in failed:
+        reference = row.member.reference
+        owner = record.by_id(staff.StaffId(reference)) if row.kind is moves.MoveMemberKind.STAFF else None
+        try:
+            if row.kind is moves.MoveMemberKind.STAFF and owner is None:
+                continue
+            identity = str(owner.current_session if owner is not None else staff.native_id(reference))
+            owner = owner or record.by_current_session(identity)
+            if ((identity, target) in live or not isinstance(staff.row_activity(moves.native_row_key(identity)), staff.RowAvailable)
+                    or (owner is not None and (owner.id in restarting
+                        or not isinstance(staff.row_activity(owner.id), staff.RowAvailable)))
+                    or moves.move_holds_session(identity)):
+                continue
+        except (OSError, ValueError, staff.StaffRefused):
+            continue
+        retryable.add((batch_id, reference))
+    return retryable
+
+
+def _move_failure(move: moves.MoveProgress, member: moves.MoveMember,
+                  failure: moves.MemberMoveFailed, retryable: Collection[tuple[str, str]]) -> str:
+    name = html.escape(member.name)
+    action = "did not start on" if failure.stopped else "did not move to"
+    message = (f"{name} {action} {html.escape(failure.target)}." if isinstance(failure.target, str)
+               else f"{name} did not move.")
+    stopped = f" {name} is stopped." if failure.stopped else ""
+    retry = ""
+    if (move.batch_id, member.reference) in retryable:
+        retry = (f' <button type="button" data-retry-move="{html.escape(move.batch_id, quote=True)}"'
+                 + f' data-move-member="{html.escape(member.reference, quote=True)}">Move {name} again</button>')
+    return f'<p class="mv-line mv-fault"><span class="error">{message}</span> {html.escape(failure.reason)}{stopped}{retry}</p>'
+
+
+def _move_members(move: moves.MoveProgress) -> str:
+    rows: list[str] = []
+    for row in move.members:
+        if row.kind is moves.MoveMemberKind.REQUEST:
+            continue
+        state = row.state
+        elapsed = ""
+        if isinstance(state, moves.MemberMoved):
+            destination = f" to {html.escape(state.target)}" if isinstance(state.target, str) and state.target != move.target else ""
+            word = f'<span class="success">moved{destination}</span>'
+            if state.recovered_holder:
+                word += f' <span class="next-muted">after a hung {html.escape(state.recovered_holder)}</span>'
+            elapsed = _move_duration(state.elapsed)
+        elif isinstance(state, moves.MemberAlreadyOnTarget):
+            word = f'<span class="next-muted">already on {html.escape(state.target)}</span>'
+            elapsed = _move_duration(state.elapsed)
+        elif isinstance(state, moves.MemberMoveFailed):
+            word = f'<span class="error">{"did not start" if state.stopped else "did not move"}</span>'
+            elapsed = _move_duration(state.elapsed)
+        elif isinstance(state, moves.MemberMoving):
+            label = state.target if isinstance(state.target, str) else move.target
+            word = (f'<span class="mv-starting">starts on {html.escape(label)}</span>' if isinstance(label, str)
+                    else '<span class="mv-starting">moving</span>')
+        else:
+            word = '<span class="next-muted">next</span>'
+        rows.append("<tr>" + _cell(html.escape(row.member.name)) + _cell(word) + _cell(elapsed, "right") + "</tr>")
+    if not rows:
+        return ""
+    return (f'<details class="mv-units" data-move-details="{html.escape(move.batch_id, quote=True)}">'
+            + f'<summary>All {len(rows)} units</summary><div class="scroll"><table aria-label="Units of this move">'
+            + '<thead><tr><th class="left">unit</th><th class="left">state</th><th class="right">time</th></tr></thead>'
+            + "<tbody>" + "".join(rows) + "</tbody></table></div></details>")
+
+
+def _move_current(move: moves.MoveProgress, now: datetime, zone: tzinfo, wait_seconds: float | Literal["configured"],
+                  retryable: Collection[tuple[str, str]]) -> str:
+    moved = [row.state for row in move.members if isinstance(row.state, moves.MemberMoved)]
+    already = [row.state for row in move.members if isinstance(row.state, moves.MemberAlreadyOnTarget)]
+    failed = [(row.member, row.state) for row in move.members if isinstance(row.state, moves.MemberMoveFailed)]
+    moving = [row for row in move.members if isinstance(row.state, moves.MemberMoving)]
+    queued = [row.member.name for row in move.members if isinstance(row.state, moves.MoveQueued)]
+    ended = [state.ended for state in (*moved, *already)] + [state.ended for _, state in failed]
+    total = len(move.members)
+    target = html.escape(move.target) if isinstance(move.target, str) else "destination unavailable"
+    if move.active:
+        if ended:
+            rate = (max(ended) - move.started) / len(ended)
+            remaining = max(rate, rate * total - (now - move.started))
+            timing = f"about {_move_duration(remaining)} left"
+        else:
+            timing = "time left unknown"
+    else:
+        finished = max(ended, default=move.started)
+        timing = f"done {_move_time(finished, zone)} · {_move_duration(finished - move.started)}"
+    cause = _move_cause(move)
+    head = (f'<p class="mv-head"><span class="bold">{html.escape(move.group)} → {target}</span>'
+            + f'<span class="next-muted"> · {cause} · started {_move_time(move.started, zone)}</span></p>')
+    lines = [head]
+    if any(row.kind is not moves.MoveMemberKind.REQUEST for row in move.members):
+        segments = (("done", len(moved)), ("now", len(moving)), ("failed", len(failed)))
+        bar = "".join(f'<span class="mv-{state}" style="width:{count / total:.3%}"></span>'
+                      for state, count in segments if count)
+        lines.extend((f'<div class="mv-bar" role="img" aria-label="{len(moved)} of {total} moved">{bar}</div>',
+                      f'<p class="mv-line">{_move_result(len(moved), total, len(failed), len(already))}'
+                      + f'<span class="next-muted"> · {timing}</span></p>'))
+    else:
+        lines.append(f'<p class="mv-line"><span class="next-muted">{timing}</span></p>')
+    if moving:
+        names = html.escape(_joined([row.member.name for row in moving]))
+        verb = "starts" if len(moving) == 1 else "start"
+        targets = {row.state.target if isinstance(row.state.target, str) else move.target
+                   for row in moving if isinstance(row.state, moves.MemberMoving)}
+        destination = next(iter(targets)) if len(targets) == 1 else moves.MoveDestinationUnselected()
+        motion = f"{verb} on {html.escape(destination)}" if isinstance(destination, str) else (
+            "is moving" if len(moving) == 1 else "are moving")
+        lines.append(f'<p class="mv-line"><span class="next-muted">Now:</span> {names} {motion}.</p>')
+    if queued:
+        lines.append(f'<p class="mv-line"><span class="next-muted">Next:</span> {html.escape(queued[0])}.</p>')
+    lines.extend(_move_failure(move, member, failure, retryable) for member, failure in failed)
+    for row in move.members:
+        if isinstance(row.state, moves.MemberMoved) and row.state.recovered_holder:
+            if wait_seconds == "configured":
+                wait_seconds = conf.read("shutdown").number("move.stuck_seconds")
+            name, holder = html.escape(row.member.name), html.escape(row.state.recovered_holder)
+            limit = _move_duration(timedelta(seconds=wait_seconds))
+            lines.append(f'<p class="mv-line"><span class="next-muted">Note:</span> a hung {holder} held {name}. '
+                         + f'The move ended it after {limit} and moved {name}.</p>')
+    return "".join(lines) + _move_members(move)
+
+
+def _move_history(history: Sequence[moves.MoveProgress], zone: tzinfo,
+                  retryable: Collection[tuple[str, str]]) -> str:
+    rows: list[str] = []
+    for move in history:
+        moved = [row.state for row in move.members if isinstance(row.state, moves.MemberMoved)]
+        already = [row.state for row in move.members if isinstance(row.state, moves.MemberAlreadyOnTarget)]
+        failed = [(row.member, row.state) for row in move.members if isinstance(row.state, moves.MemberMoveFailed)]
+        result = _move_result(len(moved), len(move.members), len(failed), len(already))
+        ended = [state.ended for state in (*moved, *already)] + [state.ended for _, state in failed]
+        if all(row.kind is moves.MoveMemberKind.REQUEST for row in move.members):
+            result = "".join(_move_failure(move, member, failure, retryable) for member, failure in failed)
+        elif failed:
+            result = (f'<details data-move-details="{html.escape(move.batch_id, quote=True)}"><summary>{result}</summary>'
+                      + "".join(_move_failure(move, member, failure, retryable) for member, failure in failed) + "</details>")
+        target = move.target if isinstance(move.target, str) else "destination unavailable"
+        rows.append("<tr>" + _cell(_move_time(move.started, zone)) + _cell(html.escape(f"{move.group} → {target}"))
+                    + _cell(_move_cause(move)) + _cell(result)
+                    + _cell(_move_duration(max(ended, default=move.started) - move.started), "right") + "</tr>")
+    return ('<details class="mv-earlier" data-move-details="earlier" open><summary>Earlier moves</summary>'
+            + '<div class="scroll"><table aria-label="Earlier moves"><thead><tr><th class="left">started</th>'
+            + '<th class="left">move</th><th class="left">cause</th><th class="left">result</th>'
+            + '<th class="right">time</th></tr></thead><tbody>' + "".join(rows) + "</tbody></table></div></details>")
+
+
+def moves_board(history: Sequence[moves.MoveProgress], now: datetime, zone: tzinfo,
+                wait_seconds: float | Literal["configured"] = "configured",
+                retryable: Collection[tuple[str, str]] = ()) -> str:
+    active = [move for move in history if move.active]
+    earlier = [move for move in history if not move.active]
+    if not active and earlier:
+        active.append(earlier.pop(0))
+    current = ("".join(f'<div class="mv-current">{_move_current(move, now, zone, wait_seconds, retryable)}</div>' for move in active)
+               or '<p class="mv-line"><span class="next-muted">No move in progress.</span></p>')
+    return '<section class="card mv-card" aria-label="Moves"><h2>Moves</h2>' + current + _move_history(earlier, zone, retryable) + "</section>"
+
+
 def page() -> bytes:
     """Read the stored accounts status, then render the page."""
     reading = accounts.read_status(source=accounts.StoredUsageOnly(), include_models=True)
@@ -940,7 +1149,9 @@ def page() -> bytes:
     except (UnreadableQuotaState, InvalidQuotaThresholds) as error:
         reading = replace(reading, notes=(*reading.notes, str(error)))
         alerts = {}
-    body = board(reading, alerts) + models_board(reading) + tokens_board(reading)
+    history = moves.read_move_progress()
+    body = (moves_board(history, reading.checked_at, reading.zone, retryable=_retryable_members(history, reading))
+            + board(reading, alerts) + models_board(reading) + tokens_board(reading))
     settings = conf.read("review_links")
     refresh_seconds = settings.number("page_refresh_seconds")
     request_timeout = settings.whole("page_request_timeout_seconds")
@@ -982,6 +1193,21 @@ def main() -> int:
 STYLE = "<style>\n" + console_theme.CSS + page_frame.STYLE + """
 h2{margin:16px 0 4px}
 [data-accounts] .card>h2:first-child{margin-top:0}
+.mv-card.card{width:895px;box-sizing:border-box}
+.mv-head,.mv-line{margin:0 0 6px;font-size:.93rem}
+.mv-head{margin-bottom:8px}
+.mv-bar{display:flex;height:10px;margin:0 0 8px;border-radius:5px;overflow:hidden;background:var(--line)}
+.mv-done{background:var(--room)}
+.mv-now{background:color-mix(in srgb,var(--room) 45%,var(--line))}
+.mv-failed{background:var(--error)}
+.mv-current+.mv-current,.mv-units,.mv-earlier{margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
+.mv-fault button{margin-left:8px;border:0;border-radius:7px;padding:3px 12px;background:var(--filter-selected-bg);
+color:var(--filter-selected-ink);font:inherit;font-weight:600;cursor:pointer}
+.mv-fault button:disabled{opacity:.5;cursor:default}
+.mv-card summary{width:fit-content;margin-left:-6px;padding:2px 6px;border-radius:4px;font-weight:700;cursor:pointer}
+.mv-card :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.mv-units summary,.mv-earlier>summary{font-size:.93rem}
+.mv-earlier .mv-fault{white-space:normal;min-width:16ch}
 .card{--column-gap:1.125rem;--table-font-size:.86rem;width:fit-content;max-width:100%;padding-right:var(--column-gap)}
 .models-card,.tokens-card{margin-top:24px}
 .token-steps{margin-top:12px;padding-top:12px;border-top:1px solid var(--line);font-size:var(--table-font-size)}
@@ -1338,6 +1564,12 @@ function keepOpenSteps(fresh){
  const open=new Set([...view.querySelectorAll('details[data-token][open]')].map(node=>node.dataset.token));
  for(const node of fresh.querySelectorAll('details[data-token]')) node.open=open.has(node.dataset.token);
 }
+function keepMoveDetails(fresh){
+ const open=new Map([...view.querySelectorAll('[data-move-details]')].map(node=>[node.dataset.moveDetails,node.open]));
+ for(const node of fresh.querySelectorAll('[data-move-details]')){
+  if(open.has(node.dataset.moveDetails)) node.open=open.get(node.dataset.moveDetails);
+ }
+}
 // A refresh keeps focus on the same summary or command of a token's renewal steps.
 function keepStepFocus(){
  const steps=document.activeElement?.closest('details[data-token]');
@@ -1357,8 +1589,9 @@ async function refresh(supersede=false,current=()=>true) {
   if (newer || hold()) return newer;
   if (!fresh) throw new Error('The page has no accounts.');
   const top = scrollY;
-  const restoreFocus = countCell(document.activeElement) ? restoreFocusAfterRefresh() : keepStepFocus();
+  const restoreFocus = countCell(document.activeElement) ? restoreFocusAfterRefresh() : keepStepFocus() || keepMoveFocus();
   keepOpenSteps(fresh);
+  keepMoveDetails(fresh);
   view.replaceWith(fresh);view = fresh;
   applySorts();
   scrollTo({top, behavior: 'instant'});
@@ -1486,8 +1719,23 @@ function openMenu(button){
  (menuItems.querySelector('button') || menu).focus({preventScroll:true});
  updates.abandon();
 }
-async function saveMove(form){
- const group=form.group, save={form};
+function keepMoveFocus(){
+ const focused=document.activeElement;
+ if(focused?.matches('[data-retry-move]')){
+  const {retryMove,moveMember}=focused.dataset;
+  return ()=>[...view.querySelectorAll('[data-retry-move]')].find(button=>button.dataset.retryMove===retryMove
+    && button.dataset.moveMember===moveMember)?.focus({preventScroll:true});
+ }
+ if(focused?.matches('[data-move-details]>summary')){
+  const key=focused.parentElement.dataset.moveDetails;
+  return ()=>[...view.querySelectorAll('[data-move-details]')].find(node=>node.dataset.moveDetails===key)
+    ?.querySelector('summary')?.focus({preventScroll:true});
+ }
+ return null;
+}
+async function saveMove(form,label=form.group,button=null){
+ const save={form};
+ if(button){button.disabled=true;updates.abandon();}
  pendingMoves.add(save);message.textContent='';message.hidden=true;
  try{
   const response=await fetch(location.pathname,{method:'POST',signal:pageRequestSignal(),
@@ -1496,12 +1744,18 @@ async function saveMove(form){
   const result=await response.json();
   if(!response.ok) throw new Error(result.reason || 'The move could not be saved.');
  }catch(error){
-  message.textContent=group+': '+(saveTimeoutWords(error) || error.message || 'The move could not be saved.');message.hidden=false;
+  message.textContent=label+': '+(saveTimeoutWords(error) || error.message || 'The move could not be saved.');message.hidden=false;
  }finally{
+  if(button) button.disabled=false;
   pendingMoves.delete(save);updates.changed();
   if(!hold()) void updates.refresh(true);
  }
 }
+document.addEventListener('click',event=>{
+ const button=event.target instanceof Element ? event.target.closest('[data-retry-move]') : null;
+ if(!button || button.disabled) return;
+ void saveMove({retry_move:button.dataset.retryMove,member:button.dataset.moveMember},button.textContent,button);
+});
 document.addEventListener('click',event=>{
  const button=event.target instanceof Element ? event.target.closest('[data-next-button]') : null;
  if(!button) return;

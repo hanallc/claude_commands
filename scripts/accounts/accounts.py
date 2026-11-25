@@ -3039,7 +3039,8 @@ class SessionBatchMove(Protocol):
                  intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget =
                  moves.ExplicitMoveTarget.REQUESTED_ACCOUNT,
                  staff_members: Collection[staff.StaffId] = (),
-                 user_command: bool = False) -> list[stop_results.MoveResult]: ...
+                 user_command: bool = False,
+                 refused_members: Mapping[str, str] = ...) -> list[stop_results.MoveResult]: ...
 
 
 def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", live: Sequence[ListedSession] | None = None, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS,
@@ -3060,13 +3061,20 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
     else:
         inventory = import_module("scripts.agents.inventory")
 
+    selected = list(dict.fromkeys(ids))
+    if not selected:
+        return ()
+    batch = cast(SessionBatchMove, import_module("scripts.agents.stop_resume").move_sessions)
+    staff_ids = frozenset(row.id for row in staff_members)
     if isinstance(intent, moves.ExplicitMoveTarget) and check_target:
         checked = check_move_target(target, datetime.now(timezone.utc), account_config=account_config)
         if isinstance(checked, MoveRefused):
-            return tuple(SessionMoveRefused(identity, checked.reason) for identity in ids)
+            _ = batch(selected, target, why=why, cause=cause, source_accounts={}, intent=intent,
+                      staff_members=staff_ids, user_command=user_command,
+                      refused_members=dict.fromkeys(selected, checked.reason))
+            return tuple(SessionMoveRefused(identity, checked.reason) for identity in selected)
         target = checked.destination.label
     live = inventory.listing() if live is None else live
-    selected = list(dict.fromkeys(ids))
     refused: dict[str, SessionMoveRefused] = {}
     eligible: list[str] = []
     sources: dict[str, str] = {}
@@ -3081,16 +3089,21 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
             if matches:
                 sources[identity] = claude_config_label(matches[0].config_dir)
     outcomes: dict[str, SessionMoveOutcome] = dict(refused)
-    batch = cast(SessionBatchMove, import_module("scripts.agents.stop_resume").move_sessions)
-    if staff_members:
+    if refused:
+        results = batch(selected, target, why=why, cause=cause, source_accounts=sources, intent=intent,
+                        staff_members=staff_ids, user_command=user_command,
+                        refused_members={identity: result.reason for identity, result in refused.items()})
+    elif staff_members:
         results = batch(eligible, target, why=why, cause=cause, source_accounts=sources,
-                        intent=intent, staff_members=frozenset(row.id for row in staff_members), user_command=user_command)
+                        intent=intent, staff_members=staff_ids, user_command=user_command)
     elif isinstance(intent, moves.FollowGroupAccount):
         results = batch(eligible, target, why=why, cause=cause, source_accounts=sources, intent=intent,
                         user_command=user_command)
     else:
         results = batch(eligible, target, why=why, cause=cause, source_accounts=sources, user_command=user_command)
-    for identity, result in zip(eligible, results):
+    for identity, result in zip(selected if refused else eligible, results):
+        if identity in refused:
+            continue
         if isinstance(result, stop_results.SessionNotFound):
             if isinstance(intent, moves.FollowGroupAccount) or cause != "by hand":
                 outcomes[identity] = SessionMoveRefused(identity, "no saved session was found")
@@ -3527,6 +3540,16 @@ def _move_output(results: tuple[SessionMoveOutcome, ...],
                                int(isinstance(item, (stop_results.ResumePending, moves.MoveWaitingForRow))) for item in results), default=0)
 
 
+def _record_hand_refusal(member: str, target: str, refusal: MoveRefused, *, dry_run: bool,
+                         group: ClaudeGroup | Literal["single"] = "single", ambiguous: bool = False) -> MoveRefused:
+    if not dry_run:
+        intent = moves.ExplicitMoveTarget.REQUESTED_ACCOUNT if group == "single" else moves.FollowGroupAccount(group)
+        record = cast(Callable[[str, str, str, moves.FollowGroupAccount | moves.ExplicitMoveTarget, bool], None],
+                      import_module("scripts.agents.stop_resume").record_refused_hand_move)
+        record(member, target, refusal.reason, intent, ambiguous or group != "single")
+    return refusal
+
+
 @role_map.role_map_command
 def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: str = "", alerts: MoveAlerts = "user", account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
     """Select the group after target checks, then stop and resume each owner."""
@@ -3538,7 +3561,7 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     now = datetime.now(timezone.utc)
     checked = check_move_target(target, now, repair=not dry_run, account_config=account_config)
     if isinstance(checked, MoveRefused):
-        return checked
+        return _record_hand_refusal(group, target, checked, dry_run=dry_run, group=group)
     reason = why or f"{group} moved by hand"
     transition = NoGroupTransition() if dry_run else group_transition(group)
     if not dry_run and (isinstance(transition, NoGroupTransition) or group_label(group_accounts(), group) != target):
@@ -3620,7 +3643,7 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         except (inventory.InvalidInventory, OSError, ValueError):
             checked = check_move_target(target, datetime.now(timezone.utc), repair=not dry_run, account_config=account_config)
             if isinstance(checked, MoveRefused):
-                return checked
+                return _record_hand_refusal(session, target, checked, dry_run=dry_run)
             raise
         matches = [item for item in live if item.session_id == session]
         if not matches:
@@ -3643,11 +3666,14 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
                 # Another operation holds the row: the move below waits while the row is held.
                 # The session is on the target, so it skips the quota check, the same as on a free row.
                 on_target = True
+        identities = {item.session_id for item in matches}
+        refused_member = next(iter(identities)) if len(identities) == 1 else session
+        ambiguous = len(identities) > 1
         notices: tuple[str, ...] = ()
         if not on_target:
             checked = check_move_target(target, datetime.now(timezone.utc), repair=not dry_run, account_config=account_config)
             if isinstance(checked, MoveRefused):
-                return checked
+                return _record_hand_refusal(refused_member, target, checked, dry_run=dry_run, ambiguous=ambiguous)
             notices = checked.notices
         if not matches:
             if dry_run:
@@ -3660,7 +3686,8 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
             outcome = MoveStartFailed if code else MoveStarted
             return outcome(session, target, stdout, stderr, code)
         if len(matches) != 1:
-            return MoveRefused(f"{session} names multiple live sessions: " + ", ".join(item.session_id for item in matches))
+            refusal = MoveRefused(f"{session} names multiple live sessions: " + ", ".join(item.session_id for item in matches))
+            return _record_hand_refusal(refused_member, target, refusal, dry_run=dry_run, ambiguous=ambiguous)
         owner = matches[0]
         group = session_group(owner)
         return_notice: tuple[str, ...] = ()
@@ -3680,7 +3707,7 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         outcome = MoveStartFailed if code else MoveStarted
         return outcome(owner.session_id, target, stdout, stderr, code)
     except (AccountsError, inventory.InvalidInventory, OSError, ValueError) as error:
-        return MoveRefused(str(error))
+        return _record_hand_refusal(session, target, MoveRefused(str(error)), dry_run=dry_run)
 
 
 def _codex_move_target(label: str) -> SelectableCodexAccount:
@@ -4724,6 +4751,7 @@ class StatusReading:
     upcoming_moves: tuple[str, ...] = ()
     first_next_moves: FirstNextMoveTargets | NextMovesUnavailable = field(default_factory=NextMovesUnavailable)
     claude_registry_unreadable: bool = False
+    live_claude_accounts: frozenset[tuple[str, str]] = frozenset()
 
 
 class StatusAccountDocument(TypedDict):
@@ -6031,7 +6059,8 @@ def _read_status(source: UsageSource, *, detail: bool, include_models: bool = Fa
         detail_lines = (*(f"{row.label}: {_role_count_text(row, role)}" for row in rows for role in row.roles if role != "spare"), *live_lines,
             *_move_status_lines(moves.account_moves(journal), zone, account_config=account_config), *_routing_status_lines(journal, zone))
     return StatusReading(rows, tuple(notes), detail_lines, zone, now, tuple(represented_stderr), session_inputs,
-                         claude_registry_unreadable=counts.claude_registry_unreadable)
+                         claude_registry_unreadable=counts.claude_registry_unreadable,
+                         live_claude_accounts=local_sessions.live_claude_accounts)
 
 
 @dataclass
@@ -6242,6 +6271,7 @@ class LocalRoleSessions:
     models: dict[tuple[Path, str], ObservedSessionModel] = field(default_factory=dict)
     model_session_names: dict[tuple[Path, str], str] = field(default_factory=dict)
     running_claude_folders: frozenset[Path] = frozenset()
+    live_claude_accounts: frozenset[tuple[str, str]] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -6921,12 +6951,16 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
             names[directory, identity] = " ".join(name.splitlines()).strip() or identity[:8]
 
     registry = sessions.read_registry(dependencies=inputs.add)
-    live = {session["sessionId"]: session for session in sessions.running_sessions(registry=registry)}
+    running = sessions.running_sessions(registry=registry)
+    settings_by_pid = {pid: _session_config_dir(pid) for pid in dict.fromkeys(session["pid"] for session in running)}
+    live = {session["sessionId"]: session for session in running}
+    live_claude_accounts = frozenset((session["sessionId"], claude_config_label(setting.path)) for session in running
+                                    if isinstance(setting := settings_by_pid[session["pid"]], account.ConfiguredClaudeFolder))
     running_claude_folders: set[Path] = set()
     session_lines: list[str] = []
     members: dict[ClaudeGroup, list[LiveGroupMember]] = {group: [] for group in CLAUDE_GROUPS}
     for identity, session in live.items():
-        setting = _session_config_dir(session["pid"])
+        setting = settings_by_pid[session["pid"]]
         directory = setting.path if isinstance(setting, account.ConfiguredClaudeFolder) else None
         if directory is not None:
             running_claude_folders.add(directory)
@@ -7057,7 +7091,7 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
             record_codex_model(directory, member.current_session, process.pid if process else 0)
     return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
                              tuple(session_lines), (), bool(registry.unreadable), frozenset(live), models, names,
-                             frozenset(running_claude_folders))
+                             frozenset(running_claude_folders), live_claude_accounts)
 
 
 def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSessions) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:

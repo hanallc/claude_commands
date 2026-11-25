@@ -7208,6 +7208,71 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual((status, json.loads(content)), (200, {"state": "saved"}))
             clear.assert_called_once_with("producers", next_moves.FIRST_GROUP_POSITION)
 
+    def test_accounts_post_launches_the_standard_hand_move_for_a_failed_member(self) -> None:
+        from scripts.accounts import moves
+        from scripts.agents import member_account, pane_record, stop_resume
+        from scripts.agents.stop_results import ClaudeStartState
+        from scripts.herdr import herdr
+
+        _ = write_config_fixture(self.root.parent / "config" / "shutdown.conf", "move.stuck_seconds=75\n")
+        parent = fixture_member("showrunner", name="fixture-production")
+        row = fixture_member("unit", name="fixture", parent=parent.id)
+        now = datetime.now(timezone.utc)
+        failed = moves.MoveMemberProgress(moves.MoveMember(row.id, row.name),
+            moves.MemberMoveFailed(now, timedelta(), "Fixture start failed.", "claude2"), moves.MoveMemberKind.STAFF)
+        completed = moves.MoveMemberProgress(moves.MoveMember("other", "other"), moves.MemberMoved(now, timedelta()))
+        batch = moves.MoveProgress("b" * 32, "units", "claude3", "scheduled quota limit", moves.MoveInitiator.AUTOMATIC,
+                                   now, (failed, completed))
+        origin = f"http://127.0.0.1:{self.port}"
+        form = urlencode({"retry_move": batch.batch_id, "member": row.id})
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(moves, "store_file", return_value=self.root / "moves.jsonl"),
+              patch.object(stop_resume, "shutdown_state_root", return_value=self.root / "shutdown"),
+              patch.object(stop_resume, "_detach", return_value=self.root / "move.log") as detach):
+            moves.finish_move_progress(moves.TrackedMove(batch, moves.own_claim_owner(), now))
+            self.assertEqual(self.post(accounts_page.PAGE_PATH, form)[0], 403)
+            for batch_id, member in (("c" * 32, row.id), (batch.batch_id, "unknown"), (batch.batch_id, "other")):
+                with self.subTest(batch=batch_id, member=member):
+                    invalid = urlencode({"retry_move": batch_id, "member": member})
+                    status, content = self.post(accounts_page.PAGE_PATH, invalid, origin=origin)
+                    self.assertEqual(status, 400)
+                    self.assertIn("reason", cast(dict[str, object], json.loads(content)))
+            detach.assert_not_called()
+            detach.side_effect = OSError("fixture launch failed")
+            self.assertEqual(self.post(accounts_page.PAGE_PATH, form, origin=origin)[0], 503)
+            detach.side_effect = None
+            detach.reset_mock()
+            with (patch.object(staff, "session_operation", side_effect=AssertionError("POST checked a row lock")),
+                  patch.object(moves, "queue_hand_move", side_effect=AssertionError("POST admitted the move"))):
+                for _attempt in range(2):
+                    status, content = self.post(accounts_page.PAGE_PATH, form, origin=origin)
+                    self.assertEqual((status, json.loads(content)), (200, {"state": "saved"}))
+            arguments = ["batch", "--target", "claude2", "--user-command", "--", str(row.id)]
+            self.assertEqual(detach.call_args_list, [call(arguments, "move", initiator=moves.MoveInitiator.CONSOLE)] * 2)
+            up = stop_resume.ClaudeUp(row.current_session, "fixture-pane", "claude2",
+                                     start_state=ClaudeStartState.ALREADY_RUNNING)
+            source = stop_resume.LiveMoveSource(up, 100, "fixture")
+            with (patch.object(stop_resume, "_restart_holds", return_value=False),
+                  patch.object(stop_resume, "_load_batch_modules"),
+                  patch.object(pane_record, "read_strict", return_value={}),
+                  patch.object(herdr, "shared_session", return_value="fixture"),
+                  patch.object(stop_resume, "_read_move_source", return_value=source),
+                  patch.object(member_account, "repair_home"),
+                  patch.object(stop_resume, "_stop") as stop,
+                  patch.object(stop_resume, "_send_move_push")):
+                for _attempt in range(2):
+                    with patch.dict(os.environ, {"ACCOUNTS_MOVE_INITIATOR": moves.MoveInitiator.CONSOLE.value}):
+                        self.assertEqual(stop_resume.main(["batch", "--log", str(self.root / "retry.log"), *arguments[1:]]), 0)
+            stop.assert_not_called()
+            self.assertFalse(moves.move_holds_session(row.current_session))
+            original = moves.read_tracked_move(batch.batch_id)
+            self.assertEqual(original.progress.members[0], failed)
+            confirmed = [move for move in moves.read_move_progress() if move.batch_id != batch.batch_id]
+            self.assertEqual(len(confirmed), 2)
+            for move in confirmed:
+                self.assertEqual(move.initiator, moves.MoveInitiator.CONSOLE)
+                self.assertIsInstance(move.members[0].state, moves.MemberAlreadyOnTarget)
+
     def test_accounts_color_rejects_an_unpublished_host_before_tune(self) -> None:
         tune = Mock(return_value=subprocess.CompletedProcess((), 0, "", ""))
         body = "key=role.worker&value=%23af875f"

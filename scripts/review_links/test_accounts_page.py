@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import html
+from http.client import HTTPConnection
 import json
 import os
 import re
@@ -15,19 +16,23 @@ import shutil
 import subprocess
 import tempfile
 import time
+import threading
 import unittest
 from typing import cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results, newer_script_reload_results
-from scripts.accounts import accounts, next_moves, role_activity, role_map
+from scripts.accounts import accounts, moves, next_moves, role_activity, role_map
+from scripts.agents import shutdown_record
 from scripts.accounts.home_test_support import scratch_account_home
+from scripts.agents import stop_resume
 from scripts.agents.test_support import write_machine_config
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.review_links import accounts_page, console_theme, new_item_dialog, page_frame, serve
+from scripts.review_links.server_test_support import started_review_server
 from scripts.whoami import account, agent_accounts, note_file, quota_state, run_out, usage_store
 from scripts.whoami.account_test_support import create_claude_account, stored_room
 
@@ -45,6 +50,20 @@ def status_row(label: str) -> accounts.StatusRow:
         roles=("units",), role_counts=(accounts.RoleSessionCounts(1, 0, 0, 0),), weekly_left_percent=60,
         resets_at=AT + timedelta(days=1), credits=0, on_credits="no", use_credits=False, read_at=AT,
         read_outcome=agent_accounts.UsageReadOutcome.OK, attempted_at=AT)
+
+
+def move_progress_fixture() -> moves.MoveProgress:
+    minute = timedelta(minutes=1)
+    return moves.MoveProgress(
+        "d" * 32, "units", "claude1", "", moves.HandMoveSession("brain"), AT,
+        tuple(moves.MoveMemberProgress(moves.MoveMember(key, name), state) for key, name, state in (
+            ("member-1", "lfo", moves.MemberMoved(AT + minute, minute, "start", "claude1")),
+            ("member-2", "praxis", moves.MemberMoveFailed(AT + minute, minute, "Claude gave no prompt in 90 s.",
+                                                        "claude1", stopped=True)),
+            ("member-3", "fastest", moves.MemberMoving(AT + minute, "claude1")),
+            ("member-4", "report", moves.MoveQueued()),
+        )),
+    )
 
 
 def sort_reading() -> accounts.StatusReading:
@@ -100,6 +119,132 @@ class ProducerRoleColorTests(unittest.TestCase):
         self.assertIn('data-color-text="role.producer"', body)
         self.assertIn('>producers</span>', body)
         self.assertNotRegex(body, r'data-color-text="role\.[^"]+"[^>]*>plain-account</span>')
+
+
+class MovesBoardTests(unittest.TestCase):
+    def test_interrupted_moves_show_unfinished_units_as_failures(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(patch.object(moves, "store_file", return_value=scratch / "moves.jsonl"))
+        move = move_progress_fixture()
+        moves.write_move_progress(moves.TrackedMove(move, moves.ClaimOwner(21, "start"), AT))
+        with patch.object(moves, "_claim_owner_is_live", return_value=False):
+            interrupted, = moves.read_move_progress()
+        self.assertFalse(interrupted.active)
+        self.assertEqual(interrupted.members[:2], move.members[:2])
+        failures = [row.state.reason for row in interrupted.members[2:] if isinstance(row.state, moves.MemberMoveFailed)]
+        self.assertEqual(failures, ["The move ended before it recorded a result."] * 2)
+
+    def test_current_move_shows_its_origin_progress_order_and_failures(self) -> None:
+        move = move_progress_fixture()
+        board = accounts_page.moves_board((move,), AT + timedelta(seconds=60), ZoneInfo("America/Los_Angeles"), 75,
+                                         {(move.batch_id, "member-2")})
+        self.assertIn("units → claude1", board)
+        self.assertIn("by hand · brain session · started Sun 07:00 PST", board)
+        self.assertIn('aria-label="1 of 4 moved"', board)
+        self.assertIn("about 1 min left", board)
+        self.assertIn('<span class="next-muted">Now:</span> fastest starts on claude1.', board)
+        self.assertIn('<span class="next-muted">Next:</span> report.', board)
+        self.assertIn("<summary>All 4 units</summary>", board)
+        self.assertIn("praxis did not start on claude1.", board)
+        self.assertIn("Claude gave no prompt in 90 s.", board)
+        self.assertIn("praxis is stopped.", board)
+        self.assertIn(f'data-retry-move="{move.batch_id}" data-move-member="member-2">Move praxis again', board)
+        self.assertIn("The move ended it after 1 min 15 s and moved lfo.", board)
+
+    def test_pruning_keeps_unended_batches_and_the_three_newest_end_marks(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(patch.object(moves, "store_file", return_value=scratch / "moves.jsonl"))
+        move = move_progress_fixture()
+        owner = moves.ClaimOwner(21, "gone")
+        unended = moves.TrackedMove(move, owner, AT)
+        moves.write_move_progress(unended)
+        finished = moves.MemberMoved(AT, timedelta(), target="claude2")
+        for index in range(1, 6):
+            at = AT + timedelta(minutes=index)
+            earlier = replace(move, batch_id=f"{index:032x}", started=AT - timedelta(days=index),
+                              members=(replace(move.members[0], state=finished),))
+            ending = moves.TrackedMove(earlier, owner, at, ended=at)
+            moves.write_move_progress(ending)
+        with patch.object(moves, "_claim_owner_is_live", return_value=False):
+            self.assertEqual(len(moves.read_move_progress()), 6)
+        moves.finish_move_progress(moves.read_tracked_move(f"{5:032x}"))
+        with patch.object(moves, "_claim_owner_is_live", return_value=False):
+            records = moves.read_move_progress()
+        self.assertEqual([item.batch_id for item in records], [move.batch_id, *(f"{index:032x}" for index in (3, 4, 5))])
+        self.assertIsInstance(moves.read_tracked_move(move.batch_id).ended, moves.MoveNotEnded)
+
+    def test_member_destinations_survive_a_new_target_and_unknown_failures_have_no_retry(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(patch.object(moves, "store_file", return_value=scratch / "moves.jsonl"))
+        move = move_progress_fixture()
+        owner = moves.own_claim_owner()
+        failed = moves.MemberMoveFailed(AT, timedelta(), "Fixture target refusal.")
+        changed = replace(move, target=moves.MoveDestinationUnselected(),
+                          members=(*move.members[:2], replace(move.members[2], state=failed), move.members[3]))
+        moves.write_move_progress(moves.TrackedMove(changed, owner, AT))
+        current = moves.read_tracked_move(move.batch_id).progress
+        self.assertEqual(current.members[0].state, move.members[0].state)
+        self.assertEqual(current.members[2].state, failed)
+        board = accounts_page.moves_board((current,), AT, ZoneInfo("America/Los_Angeles"), 75)
+        self.assertIn("units → destination unavailable", board)
+        self.assertIn("moved to claude1", board)
+        self.assertIn("fastest did not move.", board)
+        self.assertNotIn("Move fastest again", board)
+
+    def test_now_uses_moving_when_the_destination_is_unknown(self) -> None:
+        move = move_progress_fixture()
+        row = replace(move.members[2], state=moves.MemberMoving(AT))
+        move = replace(move, target=moves.MoveDestinationUnselected(), members=(row,))
+        board = accounts_page.moves_board((move,), AT, timezone.utc, 75)
+        self.assertIn('<span class="next-muted">Now:</span> fastest is moving.', board)
+
+    def test_group_refusal_has_no_unit_details_or_progress_count(self) -> None:
+        move = move_progress_fixture()
+        refusal = moves.MoveMemberProgress(moves.MoveMember("units", "units"),
+            moves.MemberMoveFailed(AT, timedelta(), "Fixture target refused.", "claude1"), moves.MoveMemberKind.REQUEST)
+        refused = replace(move, batch_id="e" * 32, members=(refusal,))
+        board = accounts_page.moves_board((refused,), AT, timezone.utc, 75)
+        self.assertIn("Fixture target refused.", board)
+        self.assertNotIn("All 1 units", board)
+        self.assertNotIn('class="mv-bar"', board)
+        self.assertNotIn("0 of 1 moved", board)
+        self.assertNotIn("1 failed", board)
+        archive = accounts_page.moves_board((move, refused), AT, timezone.utc, 75)
+        earlier = archive.split("Earlier moves", 1)[1]
+        self.assertIn("Fixture target refused.", earlier)
+        self.assertNotIn("0 of 1 moved", earlier)
+        self.assertNotIn("1 failed", earlier)
+
+    def test_timer_cause_uses_a_safe_display_reason_and_next_names_one_member(self) -> None:
+        move = move_progress_fixture()
+        move = replace(move, initiator=moves.MoveInitiator.AUTOMATIC,
+                       reason=moves.move_display_reason("refusal", "claude3 refused: weekly limit until fixture@example.invalid"),
+                       members=(*move.members, moves.MoveMemberProgress(moves.MoveMember("member-5", "second"), moves.MoveQueued())))
+        board = accounts_page.moves_board((move,), AT, ZoneInfo("America/Los_Angeles"), 75)
+        self.assertIn("automatic · claude3 refused: weekly limit", board)
+        self.assertNotIn("fixture@example.invalid", board)
+        self.assertIn('<span class="next-muted">Next:</span> report.', board)
+        self.assertEqual(moves.move_display_reason("auto", "auto: fixture@example.invalid"), "scheduled quota limit")
+        self.assertEqual(moves.move_display_reason("auto", "claude3 at 1e-05%"), "claude3 at 1e-05%")
+
+    def test_completed_moves_show_the_end_and_earlier_origins(self) -> None:
+        move = move_progress_fixture()
+        ended = tuple(row for row in move.members if isinstance(row.state, (moves.MemberMoved, moves.MemberMoveFailed)))
+        finished = replace(move, members=ended)
+        earlier = replace(finished, batch_id="a" * 32, group="producers", target="claude2",
+                          initiator=moves.MoveInitiator.CONSOLE)
+        automatic = replace(earlier, batch_id="b" * 32, group="units", target="claude4",
+                            initiator=moves.MoveInitiator.AUTOMATIC, reason="claude3 at 0%")
+        zone = ZoneInfo("America/Los_Angeles")
+        board = accounts_page.moves_board((finished, earlier, automatic), AT, zone, 75)
+        self.assertIn("done Sun 07:01 PST · 1 min", board)
+        self.assertIn("<summary>Earlier moves</summary>", board)
+        self.assertIn("producers → claude2", board)
+        self.assertIn("by hand · console page", board)
+        self.assertIn("automatic · claude3 at 0%", board)
+        self.assertNotIn(">Now:", board)
+        self.assertNotIn(">Next:", board)
+        self.assertIn("No move in progress.", accounts_page.moves_board((), AT, zone, 75))
 
 
 MENU_SETUP = '''<script>
@@ -205,17 +350,144 @@ class AccountsPageTests(unittest.TestCase):
         configuration = scratch / "config"
         self.review_root = scratch / "review"
         _ = self.enterContext(patch.object(usage_store, "store_file", return_value=scratch / "home" / "usage.json"))
+        _ = self.enterContext(patch.object(moves, "store_file", return_value=scratch / "moves.jsonl"))
         _ = copy_config_fixture(Path(__file__).resolve().parents[2] / "config", configuration)
         _ = write_config_fixture(configuration / "accounts.conf", ACCOUNT_SETTINGS)
         _ = write_config_fixture(configuration / "console.conf", PAGE_STATUS_SETTINGS)
         _ = write_config_fixture(configuration / "review_links.conf", "page_refresh_seconds=15\naccounts_page_seconds=30\n")
+        _ = write_config_fixture(configuration / "shutdown.conf", "move.stuck_seconds=75\n")
         _ = (configuration / "statusline.conf").write_text(
             "account.claude1=#af875f\naccount.claude2=#b294bb\naccount.codex2=#123456\nrole.unit-director=#d7af00\n"
             + "model.claude-opus-5-5=#e08a5c\n",
             encoding="utf-8")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "REVIEW_LINKS_ROOT": str(self.review_root),
+            "AGENT_NOTES_DIR": str(scratch / "notes"),
         })))
+
+    def test_page_reads_move_progress_above_accounts_and_uses_the_configured_wait(self) -> None:
+        move = move_progress_fixture()
+        moves.write_move_progress(moves.TrackedMove(move, moves.own_claim_owner(), AT))
+        with (patch.object(accounts, "read_status", return_value=sort_reading()),
+              patch.object(shutdown_record, "active", return_value=False),
+              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())),
+              patch.object(staff, "row_activity", return_value=staff.RowAvailable())):
+            page = accounts_page.page()
+        self.assertLess(page.index(b'aria-label="Moves"'), page.index(b'aria-label="Accounts"'))
+        self.assertIn(b"The move ended it after 1 min 15 s and moved lfo.", page)
+
+    def test_moves_page_hides_retry_on_the_target_or_while_an_operation_holds_the_member(self) -> None:
+        from scripts.agents import inventory
+
+        move = move_progress_fixture()
+        identity = "c278a59b-8f28-4b73-9e28-32dbfca17648"
+        failed = replace(move.members[1], member=moves.MoveMember(identity, "praxis"))
+        move = replace(move, members=(move.members[0], failed, *move.members[2:]))
+        moves.write_move_progress(moves.TrackedMove(move, moves.own_claim_owner(), AT))
+        cases: tuple[tuple[frozenset[tuple[str, str]], staff.RowAvailable | staff.RowBusy, bool, bool], ...] = (
+            (frozenset(), staff.RowAvailable(), False, True),
+            (frozenset({(identity, "claude2")}), staff.RowAvailable(), False, True),
+            (frozenset({(identity, "claude1")}), staff.RowAvailable(), False, False),
+            (frozenset(), staff.RowBusy(), False, False),
+            (frozenset(), staff.RowAvailable(), True, False),
+        )
+        for sessions, activity, claimed, visible in cases:
+            reading = replace(sort_reading(), live_claude_accounts=sessions)
+            with (self.subTest(activity=activity, claimed=claimed, visible=visible),
+                  patch.object(accounts, "read_status", return_value=reading),
+                  patch.object(inventory, "listing", side_effect=AssertionError("second session scan")),
+                  patch.object(shutdown_record, "active", return_value=False),
+                  patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())),
+                  patch.object(staff, "row_activity", return_value=activity),
+                  patch.object(moves, "move_holds_session", return_value=claimed)):
+                page = accounts_page.page()
+            self.assertEqual(b"Move praxis again</button>" in page, visible)
+            self.assertIn(b"praxis did not start on claude1.", page)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required")
+    def test_retry_posts_one_batch_member_and_refresh_keeps_move_details_open(self) -> None:
+        move = move_progress_fixture()
+        identity = "c278a59b-8f28-4b73-9e28-32dbfca17648"
+        failed = replace(move.members[1], member=moves.MoveMember(identity, "praxis"))
+        move = replace(move, members=(move.members[0], failed, *move.members[2:]))
+        moves.write_move_progress(moves.TrackedMove(move, moves.own_claim_owner(), AT))
+        with (patch.object(accounts, "read_status", return_value=sort_reading()),
+              patch.object(shutdown_record, "active", return_value=False),
+              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())),
+              patch.object(staff, "row_activity", return_value=staff.RowAvailable())):
+            page = accounts_page.page().decode()
+        setup = """<script>
+const realMoveFetch=fetch, retryPosts=[];
+let completeRetry;
+window.fetch=(path,options)=>{
+ if(options?.method==='POST' && path===location.pathname){
+  retryPosts.push(Object.fromEntries(new URLSearchParams(options.body)));
+  const response=realMoveFetch(path,options);
+  return new Promise(resolve=>{completeRetry=()=>resolve(response);});
+ }
+ return realMoveFetch(path,options);
+};
+</script>"""
+        probe = """<script>
+(async()=>{
+ const failures=[];
+ const check=(good,meaning)=>{if(!good) failures.push(meaning);};
+ const details=()=>document.querySelector('.mv-units');
+ const before=details();
+ before.open=true;
+ const button=document.querySelector('[data-retry-move]');
+ button.click();
+ button.click();
+ check(button.disabled && retryPosts.length===1,'send only one retry while it is pending');
+ check(retryPosts[0]?.retry_move===before.dataset.moveDetails &&
+       retryPosts[0]?.member===button.dataset.moveMember,'post the batch and the failed member');
+ const refreshed=new Promise((resolve,reject)=>{
+  const observer=new MutationObserver(()=>{if(details()!==before){observer.disconnect();resolve();}});
+  observer.observe(document.querySelector('main'),{childList:true});
+  setTimeout(()=>{observer.disconnect();reject(new Error('The page did not refresh.'));},4000);
+ });
+ completeRetry?.();
+ try{
+  await refreshed;
+  check(details().open,'keep All units open');
+  check(document.querySelector('[data-color-save-error]').hidden,'the server accepts the retry');
+ }catch(error){failures.push(String(error));}
+ await realMoveFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        page = page.replace("</head>", setup + "</head>").replace("</body>", probe + "</body>")
+        self.review_root.mkdir()
+        fixture = self.review_root.parent
+        staff_file = fixture / "staff.json"
+        _ = staff_file.write_text('{"schema":2,"rows":[]}', encoding="utf-8")
+        with (patch.dict(os.environ, {"STAFF_FILE": str(staff_file)}),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(stop_resume, "shutdown_state_root", return_value=fixture / "shutdown"),
+              patch.object(stop_resume, "_detach", return_value=fixture / "move.log") as detach,
+              started_review_server(("127.0.0.1", 0), self.review_root) as server):
+            worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            worker.start()
+
+            def post_page(body: bytes) -> tuple[int, bytes]:
+                connection = HTTPConnection("127.0.0.1", server.server_port, timeout=TEST_HANG_GUARD_SECS)
+                try:
+                    connection.request("POST", accounts_page.PAGE_PATH, body, {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Origin": f"http://127.0.0.1:{server.server_port}",
+                    })
+                    response = connection.getresponse()
+                    return response.status, response.read()
+                finally:
+                    connection.close()
+
+            try:
+                self.assertEqual(firefox_probe_results(page.encode(), post_page=post_page), [[]])
+            finally:
+                server.shutdown()
+                worker.join(TEST_HANG_GUARD_SECS)
+            detach.assert_called_once_with(["batch", "--target", "claude1", "--user-command", "--", identity],
+                                           "move", initiator=moves.MoveInitiator.CONSOLE)
 
     def test_page_reads_quota_clear_state_from_the_fixture_root(self) -> None:
         reading = accounts.StatusReading((replace(status_row("claude1"), weekly_left_percent=4),),

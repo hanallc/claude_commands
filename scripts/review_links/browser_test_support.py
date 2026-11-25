@@ -7,7 +7,7 @@ import re
 import tempfile
 import threading
 import unittest
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -55,7 +55,8 @@ def status_configuration() -> Generator[None]:
 
 
 def firefox_probe_results(page: bytes, *, window_size: tuple[int, int] | None = None,
-                          dark: bool = False, screenshot: Path | None = None) -> list[list[str]]:
+                          dark: bool = False, screenshot: Path | None = None,
+                          post_page: Callable[[bytes], tuple[int, bytes]] | None = None) -> list[list[str]]:
     """Load the page in a headless Firefox frame and return the failure lists its probe posts."""
     results: list[list[str]] = []
     complete = threading.Event()
@@ -76,6 +77,13 @@ def firefox_probe_results(page: bytes, *, window_size: tuple[int, int] | None = 
 
         def do_POST(self) -> None:
             payload = self.rfile.read(int(self.headers["Content-Length"]))
+            if self.path == "/accounts" and post_page is not None:
+                status, body = post_page(payload)
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                _ = self.wfile.write(body)
+                return
             results.append(cast(list[str], json.loads(payload)))
             complete.set()
             self.send_response(204)

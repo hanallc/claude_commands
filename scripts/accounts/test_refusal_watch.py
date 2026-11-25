@@ -3120,6 +3120,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual({identity for command in self.moves.calls
                           for identity in command.session_id.split(",")}, {"unit", "runner"})
         self.assertEqual({command.target for command in self.moves.calls}, {"claude2"})
+        self.assertEqual({command.why for command in self.moves.calls}, {"claude1 at 1%", "claude3 at 1%"})
         self.assertEqual(self.notifications, [])
 
     def test_automatic_move_commits_while_the_refusal_watch_lock_is_held(self) -> None:

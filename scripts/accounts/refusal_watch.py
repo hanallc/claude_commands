@@ -1755,7 +1755,8 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         _remove_auto_move_entries(frozenset({rule.entry_id}))
         _save_state(state)
         ids = tuple(member.session_id for member in members.get(rule.group, ()))
-        outcomes = accounts.move_sessions(ids, rule.to, why=why, cause="auto",
+        percent = str(rule.when.percent).removesuffix(".0")
+        outcomes = accounts.move_sessions(ids, rule.to, why=f"{selection.account} at {percent}%", cause="auto",
                                          intent=moves.FollowGroupAccount(rule.group)) if ids else ()
         lines.extend(accounts.move_result_line(outcome) for outcome in outcomes)
     if not dry_run and state != original:

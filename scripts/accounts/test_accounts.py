@@ -1369,6 +1369,22 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(observed, account.ConfiguredClaudeFolder(Path("/fixture/.claude4")))
         kernel.assert_called_once_with(990001)
 
+    def test_status_keeps_live_account_evidence_outside_counted_roles(self) -> None:
+        session = sessions.SessionRecord(pid=990001, sessionId="fixture-session", name="standalone",
+                                         messagingSocketPath="", updatedAt=2, tmux="", formerNames=[])
+        other = sessions.SessionRecord(pid=990002, sessionId=session["sessionId"], name=session["name"],
+                                       messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+        with (patch.object(sessions, "running_sessions", return_value=[session, other]) as running,
+              patch.object(accounts, "_session_config_dir", side_effect=[
+                  account.ConfiguredClaudeFolder(self.home / ".claude2"),
+                  account.ConfiguredClaudeFolder(self.home / ".claude4")]) as account_read):
+            reading = accounts.read_status(source=accounts.StoredUsageOnly())
+        running.assert_called_once()
+        self.assertEqual(account_read.call_args_list, [call(session["pid"]), call(other["pid"])])
+        self.assertEqual(reading.live_claude_accounts,
+                         frozenset({(session["sessionId"], "claude2"), (session["sessionId"], "claude4")}))
+        self.assertFalse(any(row.sessions for row in reading.rows))
+
     def test_peer_members_do_not_add_a_role_to_an_unselected_account(self) -> None:
         now = datetime.now(timezone.utc)
         row = replace(SharedStatusDocumentTests().row(), label="claude4", tool="claude", roles=(), role_counts=())
@@ -2112,6 +2128,91 @@ class AccountsTests(unittest.TestCase):
             + f"Run {command}, then /login",
         ])
         moved.assert_not_called()
+
+    def test_move_cli_records_single_group_and_ambiguous_refusals(self) -> None:
+        from scripts.agents import inventory, pane_record
+
+        owner = inventory.ListedSession("fixture-id", 998071, "fixture", "fixture", "top-level",
+                                        self.home / ".claude1", "", "", "")
+        target = accounts.MoveTargetReady(accounts.NamedAccount("claude2", self.home / ".claude2"))
+        with (patch.object(moves, "store_file", return_value=self.root / "moves.jsonl"),
+              patch.object(pane_record, "read_strict", side_effect=AssertionError("read panes on refusal")),
+              patch.object(stop_resume, "_run_moves", side_effect=AssertionError("started a refused move")),
+              patch.object(accounts, "check_move_target",
+                           side_effect=[accounts.MoveRefused("Fixture target refused.")] * 2 + [target]),
+              patch.object(inventory, "listing", side_effect=[
+                  [owner], [owner, replace(owner, session_id="other-id", pid=998072)]])):
+            self.assertEqual(self.run_cli("move", owner.name, "claude2")[0], 1)
+            self.assertEqual(self.run_cli("move", "units", "claude2")[0], 1)
+            self.assertEqual(self.run_cli("move", owner.name, "claude2")[0], 1)
+            ambiguous, group, single = moves.read_move_progress()
+        for batch in (single, group, ambiguous):
+            self.assertEqual(batch.target, "claude2")
+            self.assertEqual(batch.cause, "by hand")
+            self.assertIsInstance(batch.members[0].state, moves.MemberMoveFailed)
+        self.assertEqual(single.members[0].member.reference, owner.session_id)
+        self.assertEqual(group.group, "units")
+        self.assertEqual(group.members[0].kind, moves.MoveMemberKind.REQUEST)
+        self.assertEqual(ambiguous.members[0].kind, moves.MoveMemberKind.REQUEST)
+        failure = ambiguous.members[0].state
+        assert isinstance(failure, moves.MemberMoveFailed)
+        self.assertIn("names multiple live sessions", failure.reason)
+
+    def test_move_cli_records_the_native_id_for_two_processes_with_one_session(self) -> None:
+        from scripts.agents import inventory
+
+        owner = inventory.ListedSession("fixture-id", 998071, "fixture", "fixture", "top-level",
+                                        self.home / ".claude1", "", "", "")
+        target = accounts.MoveTargetReady(accounts.NamedAccount("claude2", self.home / ".claude2"))
+        with (patch.object(moves, "store_file", return_value=self.root / "moves.jsonl"),
+              patch.object(stop_resume, "_run_moves", side_effect=AssertionError("started a refused move")),
+              patch.object(accounts, "check_move_target",
+                           side_effect=[accounts.MoveRefused("Fixture target refused."), target]),
+              patch.object(inventory, "listing", return_value=[owner, replace(owner, pid=998072)])):
+            for _attempt in range(2):
+                self.assertEqual(self.run_cli("move", owner.name, "claude2")[0], 1)
+            target_ready, target_refused = moves.read_move_progress()
+        for batch, reason in ((target_ready, "names multiple live sessions"), (target_refused, "Fixture target refused.")):
+            row, = batch.members
+            self.assertEqual(row.member.reference, owner.session_id)
+            self.assertIs(row.kind, moves.MoveMemberKind.NATIVE)
+            self.assertIsInstance(row.state, moves.MemberMoveFailed)
+            assert isinstance(row.state, moves.MemberMoveFailed)
+            self.assertIn(reason, row.state.reason)
+
+    def test_progress_keeps_target_and_multiple_process_refusals_in_selection_order(self) -> None:
+        from scripts.agents import pane_record
+        from scripts.agents.inventory import ListedSession
+
+        selection = ("fixture-first", "fixture-second", "fixture-third")
+        live = tuple(ListedSession(selection[1], pid, "fixture", "fixture session", "top-level",
+                                   self.home / ".claude1", "", "", "") for pid in (998071, 998072))
+        accepted = accounts.MoveTargetReady(accounts.NamedAccount("claude2", self.home / ".claude2"))
+        with (patch.object(moves, "store_file", return_value=self.root / "moves.jsonl"),
+              patch.object(herdr, "shared_session", return_value="fixture"),
+              patch.object(pane_record, "read_strict", return_value={}),
+              patch.object(stop_resume, "_run_moves", return_value=[
+                  stop_results.ClaudeUp(selection[0], "fixture", "claude2"),
+                  stop_results.ClaudeUp(selection[2], "fixture", "claude2")]) as run,
+              patch.object(accounts, "check_move_target", side_effect=[accounts.MoveRefused("Target refused."), accepted])):
+            rejected = accounts.move_sessions(selection, "claude2", why="fixture", live=live)
+            run.assert_not_called()
+            outcome = accounts.move_sessions(selection, "claude2", why="fixture", live=live)
+        self.assertEqual(rejected, tuple(accounts.SessionMoveRefused(identity, "Target refused.") for identity in selection))
+        self.assertEqual(outcome[1], accounts.SessionMoveRefused(selection[1], "session has several live processes"))
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], [selection[0], selection[2]])
+        with patch.object(moves, "store_file", return_value=self.root / "moves.jsonl"):
+            current, refused = moves.read_move_progress()
+        for batch in (current, refused):
+            self.assertEqual(tuple(row.member.reference for row in batch.members), selection)
+        self.assertEqual([row.state.reason for row in refused.members if isinstance(row.state, moves.MemberMoveFailed)],
+                         ["Target refused."] * 3)
+        failure = current.members[1].state
+        self.assertIsInstance(failure, moves.MemberMoveFailed)
+        assert isinstance(failure, moves.MemberMoveFailed)
+        self.assertEqual(failure.reason, "session has several live processes")
+        self.assertEqual(failure.target, "claude2")
 
     def test_move_refuses_missing_credentials_before_stop(self) -> None:
         from scripts.agents import inventory
