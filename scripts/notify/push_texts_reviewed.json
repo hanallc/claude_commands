@@ -105,15 +105,28 @@
   "aws.snapshot_failed": {
     "permission": {
       "objections": [],
-      "reviewer": "user-spec: user 2026-11-14: the message is approved; reviewer: claude-opus-5-5",
-      "sha256": "aa77f0f9dcc20d36a47be050a09c1a2bf8f560f2e4e6e9a155f384eceb18f32a",
-      "time": "2026-11-14T09:44:39.593642-05:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (image 96ba073cc79b), 2026-11-24 21:44 PST; reviewer: claude-opus-5-5",
+      "sha256": "d4f7f63d31d1c0666cc9e1a9c1ea83ea080b00689e4324743e961b44b77cf3a5",
+      "time": "2026-11-25T02:58:21.508867-05:00"
     },
     "regional_permissions": {
-      "objections": [],
-      "reviewer": "user-spec: user 2026-11-14: the message is approved; reviewer: claude-opus-5-5",
-      "sha256": "aa77f0f9dcc20d36a47be050a09c1a2bf8f560f2e4e6e9a155f384eceb18f32a",
-      "time": "2026-11-14T09:44:48.290566-05:00"
+      "objections": [
+        {
+          "quote": "AWS refused 2 reads",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "AWS refused the Standard quota read in us-west-2, because our AWS setup does not allow it yet.",
+          "rule": "short-plain-sentences"
+        },
+        {
+          "quote": "The step adds the permission. After 2 hours without the reads, test runs on AWS can pick a region that costs more.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: nate: Approved on the Images page (image 96ba073cc79b), 2026-11-24 21:44 PST; reviewer: claude-opus-5-5",
+      "sha256": "d4f7f63d31d1c0666cc9e1a9c1ea83ea080b00689e4324743e961b44b77cf3a5",
+      "time": "2026-11-25T02:58:30.463923-05:00"
     }
   },
   "build_hold.blocking": {

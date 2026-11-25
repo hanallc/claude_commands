@@ -116,6 +116,26 @@ class Draft:
     session: NotificationSession = NO_SESSION_LINE
     due: str = ""
     reference: push_reference.PushReference = field(default_factory=lambda: push_reference.NO_REFERENCE)
+    header: bool = True
+
+    @property
+    def message(self) -> str:
+        if self.header:
+            return first_line(self.action, self.session) + "\n" + self.body
+        return self.body
+
+    @property
+    def phone_message_length(self) -> int:
+        if self.header:
+            action_end = push_texts.KnownActionEnd(len(first_line(self.action, self.session)))
+        else:
+            action_end = push_texts.NoHeader()
+        return len(push_texts.format_phone_body(self.message, action_end, length=push_texts.FULL_PHONE_MESSAGE))
+
+
+@dataclass(frozen=True)
+class DeliveredDraft(Draft):
+    """A draft reconstructed from a sent log record."""
 
 
 @dataclass(frozen=True)
@@ -361,6 +381,7 @@ class MessageRecord(TypedDict):
 
 class DraftRecord(MessageRecord):
     due: NotRequired[str]
+    header: NotRequired[Literal[False]]
     source: str
     priority: str
     answerable: bool
@@ -573,6 +594,8 @@ def draft_record(draft: Draft) -> DraftRecord:
                          priority=draft.priority, answerable=draft.answerable)
     if draft.due:
         record["due"] = draft.due
+    if not draft.header:
+        record["header"] = False
     return record
 
 
@@ -627,14 +650,15 @@ def _draft(value: object) -> Draft:
     return Draft(_text(record, "source"), priority, _text(record, "title"),
                  _action(record), _text(record, "body"), answerable, _session(record),
                  _text(record, "due") if "due" in record else "",
-                 push_reference.read_reference(record.get("reference")))
+                 push_reference.read_reference(record.get("reference")),
+                 header=record.get("header") is not False)
 
 
 def length_failures(draft: Draft) -> list[str]:
     failures: list[str] = []
     if len(draft.title) >= 45:
         failures.append("push-title-under-45")
-    if len(first_line(draft.action, draft.session) + "\n" + draft.body) >= 500:
+    if draft.phone_message_length >= 500:
         failures.append("push-body-under-500")
     return failures
 
@@ -646,8 +670,7 @@ CODE_RULES = ("push-title-under-45", "push-body-under-500", ONE_ACTION_RULE)
 
 def code_failures(draft: Draft) -> list[RuleFailure]:
     """The length failures, and push-one-action when the body gives a second action."""
-    message = first_line(draft.action, draft.session) + "\n" + draft.body
-    failures = [RuleFailure(rule, draft.title if rule == "push-title-under-45" else message)
+    failures = [RuleFailure(rule, draft.title if rule == "push-title-under-45" else draft.message)
                 for rule in length_failures(draft)]
     conflicts = action_conflicts(draft.action, draft.body)
     if conflicts:
@@ -658,7 +681,7 @@ def code_failures(draft: Draft) -> list[RuleFailure]:
 def supported_failures(value: object, draft: Draft, *, reply: bool = False) -> list[RuleFailure]:
     if not isinstance(value, list):
         raise ValueError("failed_rules")
-    original = [draft.body] if reply else [draft.title, first_line(draft.action, draft.session) + "\n" + draft.body]
+    original = [draft.body] if reply else [draft.title, draft.message]
     if isinstance(draft.action, ActionRequired):
         original.append(draft.action.text)
     failures: list[RuleFailure] = []
@@ -690,13 +713,19 @@ def validate(value: object, draft: Draft, revision: bool,
         if content_only and title:
             raise ValueError("reply added a title")
         action_text = record.get("action")
-        if isinstance(action_text, str) and action_text.startswith("Action: "):
-            record = record | {"action": action_text.removeprefix("Action: ")}
-        action = _action(record)
+        draft_action_text = draft.action.text if isinstance(draft.action, ActionRequired) else None
+        unchanged_delivery = (isinstance(draft, DeliveredDraft) and "action" in record
+                              and (title, action_text, body) == (draft.title, draft_action_text, draft.body))
+        if unchanged_delivery:
+            action = draft.action
+        else:
+            if isinstance(action_text, str) and action_text.startswith("Action: "):
+                record = record | {"action": action_text.removeprefix("Action: ")}
+            action = _action(record)
         if isinstance(action, ActionRequired) != isinstance(draft.action, ActionRequired):
             raise ValueError("action form changed")
         session = draft.session
-        if not content_only:
+        if not content_only and draft.header and not unchanged_delivery:
             body_session, remaining = split_session(body)
             if isinstance(body_session, SessionLine):
                 if body_session != session:
@@ -705,10 +734,12 @@ def validate(value: object, draft: Draft, revision: bool,
             body_first_line, _, remaining_body = body.partition("\n")
             if body_first_line == first_line(action):
                 body = remaining_body.removeprefix("\n")
-        if not content_only and len(title) > 250:
-            raise ValueError("title exceeds 250")
-        if not content_only and len(first_line(action, session) + "\n" + body) > 1024:
-            raise ValueError("message exceeds 1024")
+        version = replace(draft, title=title, action=action, body=body)
+        if not content_only and not unchanged_delivery:
+            if len(title) > 250:
+                raise ValueError("title exceeds 250")
+            if len(version.message) > push_texts.MESSAGE_MAX:
+                raise ValueError("message exceeds 1024")
         questions = _strings(record.get("questions"), "questions")
         failures = supported_failures(record.get("failed_rules"), draft, reply=content_only)
         failed = [failure.rule for failure in failures]
@@ -716,7 +747,6 @@ def validate(value: object, draft: Draft, revision: bool,
             raise ValueError("questions exceeds 3")
         if verdict != "ask" and questions:
             raise ValueError("questions without ask")
-        version = replace(draft, title=title, action=action, body=body)
         if verdict == "withhold":
             if not failed:
                 raise ValueError("withhold needs a supported failure")
@@ -843,9 +873,14 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
         elif isinstance(context, QuestionReview):
             draft_prompt = f"Question:\n{draft.body}\nRevision: {str(revision).lower()}"
         else:
-            action_line = first_line(draft.action, draft.session) if isinstance(draft.action, ActionRequired) or isinstance(draft.session, SessionLine) else "no action"
-            draft_prompt = (f"Title: {draft.title}\n{action_line}\n"
-                            f"Body (text after the action line; never repeat it): {draft.body}\n"
+            header = ""
+            body_label = "Body"
+            if draft.header:
+                action_line = first_line(draft.action, draft.session) if isinstance(draft.action, ActionRequired) or isinstance(draft.session, SessionLine) else "no action"
+                header = action_line + "\n"
+                body_label = "Body (text after the action line; never repeat it)"
+            draft_prompt = (f"Title: {draft.title}\n{header}"
+                            f"{body_label}: {draft.body}\n"
                             f"Priority: {draft.priority}\nRevision: {str(revision).lower()}\n"
                             f"Code-counted length failures: {', '.join(length_failures(draft)) or 'none'}\n"
                             f"Code-found second actions: {'; '.join(action_conflicts(draft.action, draft.body)) or 'none'}")
@@ -1093,7 +1128,7 @@ def _read_hold(path: Path) -> HoldLookup:
         if (isinstance(held.draft.action, ActionRequired)
                 != isinstance(held.best_version.action, ActionRequired)):
             raise ValueError("hold action form changed")
-        if len(held.best_version.title) > 250 or len(first_line(held.best_version.action, held.best_version.session) + "\n" + held.best_version.body) > 1024:
+        if len(held.best_version.title) > 250 or len(held.best_version.message) > push_texts.MESSAGE_MAX:
             raise ValueError("hold transport limits")
         if not 1 <= len(held.questions) <= 3 or any(not question.strip() for question in held.questions):
             raise ValueError("hold questions")
@@ -1347,7 +1382,7 @@ def print_review(draft: Draft, outcome: ReviewOutcome, stamp: str = "", *, heade
     print(f"{stamp + ' ' if stamp else ''}{verdict}; failed rules: {', '.join(failed) or 'none'}")
     if version.title:
         print(version.title)
-    if header:
+    if header and version.header:
         print(first_line(version.action, version.session))
     if version.body:
         print(version.body)
@@ -1373,16 +1408,32 @@ def replay(limit: int = 0) -> int:
             if not _text(record, "outcome").startswith("sent"):
                 continue
             message = _text(record, "message")
-            session, message_body = split_session(message)
-            action_line, _, body = message_body.partition("\n")
-            if action_line.startswith("Action: "):
-                action: UserAction = ActionRequired(action_line.removeprefix("Action: "))
-            elif action_line == "No action needed.":
-                action = NoActionRequired()
+            action_end = push_texts.read_action_end(record.get("action_end"), message)
+            action: UserAction = NoActionRequired()
+            if isinstance(action_end, push_texts.KnownActionEnd):
+                index = action_end.index
+                session, action_line = split_session(message[:index])
+                if action_line.startswith("Action: "):
+                    action = ActionRequired(action_line.removeprefix("Action: "))
+                body = message[index + 1:]
+                body_prefix = record.get("body_prefix")
+                if isinstance(body_prefix, str):
+                    body = body.removeprefix("\n")
+                    restored = body_prefix + body
+                    if index + 1 + len(restored) <= push_texts.MESSAGE_MAX:
+                        body = restored
+            elif isinstance(action_end, push_texts.NoHeader):
+                session, body = NO_SESSION_LINE, message
             else:
-                action, body = NoActionRequired(), message_body
-            draft = Draft(_text(record, "source"), _text(record, "priority"),
-                          _text(record, "title"), action, body, False, session)
+                session, message_body = split_session(message)
+                action_line, _, body = message_body.partition("\n")
+                if action_line.startswith("Action: "):
+                    action = ActionRequired(action_line.removeprefix("Action: "))
+                elif action_line != "No action needed.":
+                    body = message_body
+            draft = DeliveredDraft(_text(record, "source"), _text(record, "priority"),
+                                   _text(record, "title"), action, body, False, session,
+                                   header=not isinstance(action_end, push_texts.NoHeader))
             stamp = _text(record, "time")
         except ValueError:
             continue
@@ -1598,11 +1649,12 @@ def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_
         for example in entry.examples:
             rendered = push_texts.render_entry(entry, example.values)
             draft = Draft(rendered.sender, {"note": "0", "decision": "1", "blocked": "2"}[rendered.need],
-                          rendered.posted_title, rendered.action, rendered.posted_body, False, rendered.session)
+                          rendered.posted_title, rendered.action, rendered.posted_body, False, rendered.session,
+                          header=rendered.header and not rendered.one_line)
             if timeout_seconds is None:
                 timeout_seconds = review_timeout_seconds()
             outcome = _review(draft, False, runner, timeout_seconds=timeout_seconds, check_template_fit=False)
-            print_review(draft, outcome, f"{entry.id}/{example.name}", header=rendered.header and not rendered.one_line)
+            print_review(draft, outcome, f"{entry.id}/{example.name}")
             log_review(draft, outcome, dry=True, text_id=entry.id)
             passed = isinstance(outcome, Approved) and outcome.draft == draft
             failed |= not passed
