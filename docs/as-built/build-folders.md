@@ -225,6 +225,7 @@ The inventory is a read-only snapshot.
 
 `build_copies.claim_unused_build_folder(path)` takes one exclusive lock without waiting.
 It accepts free numbered copies and ownerless temporary folders that pass the removal checks.
+The inventory and the claim treat a numbered copy with a keep file as in use.
 The lock file is `<build root>/.build-claim-locks/<relative folder path>.lock`.
 The lock file stays outside the folder during removal.
 Code that starts work inside a claimable folder takes the lock in shared mode.

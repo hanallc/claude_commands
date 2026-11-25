@@ -317,6 +317,7 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 yield LeasedCopy(path, name, number, MappingProxyType({
                     "CARGO_TARGET_DIR": str(target), "CARGO_BUILD_BUILD_DIR": str(target),
                     build_folders.NUMBERED_COPY_LOCK_ENV: str(descriptor),
+                    build_folders.COPY_KEEP_ENV: str(build_folders.copy_keep_file(path)),
                 }), (descriptor, *claims))
                 return
         if isinstance(selection, ExactCopyRequest):
@@ -487,6 +488,8 @@ def _claim_unused_folder(path: Path, root: Path, *, snapshot: BorrowerIndex | No
             numbered = _numbered_candidate(path, root)
             _ = claim.enter_context(build_folders.build_folder_claim_lock(
                 path, root, exclusive=True, create=snapshot is None))
+            if numbered and os.path.lexists(build_folders.copy_keep_file(path)):
+                raise BuildFolderInUse(f"{path}: the numbered copy has a keep file")
             _check_unused_folder(path, root, numbered=numbered, snapshot=snapshot)
         except BuildFolderInUse:
             raise

@@ -262,6 +262,52 @@ source_check_seconds=1
         return self.cli("run", "--repo", str(self.source),
                         "--commit", "HEAD", *options, "--", *(command or ("true",)))
 
+    def test_run_keeps_a_numbered_copy_with_the_childs_reason(self) -> None:
+        reason = "checkout exit is unconfirmed"
+        result = self.run_cli(command=(
+            sys.executable, "-c",
+            "import os, pathlib, sys; pathlib.Path(os.environ['COPIES_KEEP_FILE']).write_text(sys.argv[1])",
+            reason,
+        ))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        first = self.gates / "1"
+        self.assertEqual(build_folders.build_folder_state(first), "kept")
+        self.assertEqual(first.with_name("1.keep").read_text(), reason)
+        self.assertIs(build_folders.folder_lease_fields(first)["released"], False)
+        listing = self.cli("list")
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        row = next(line.split("\t") for line in listing.stdout.splitlines() if str(first) in line)
+        self.assertEqual(row[7], "kept")
+        with build_folders.folder_removal_lease(first) as lease:
+            self.assertIsInstance(lease, build_folders.RefusedRemovalLease)
+        location = self.base / "command-location"
+        next_run = self.run_cli(command=(
+            sys.executable, "-c", "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text(str(pathlib.Path.cwd()))",
+            str(location),
+        ))
+        self.assertEqual(next_run.returncode, 0, next_run.stderr)
+        self.assertEqual(Path(location.read_text()), self.gates / "2")
+        self.assertTrue(first.is_dir())
+
+    def test_run_reuses_a_numbered_copy_when_the_child_leaves_no_reason(self) -> None:
+        result = self.run_cli(command=(
+            sys.executable, "-c",
+            "import os, pathlib; path = pathlib.Path(os.environ['COPIES_KEEP_FILE']); "
+            + "assert path.is_absolute() and not path.exists(); path.touch(); raise SystemExit(7)",
+        ))
+        self.assertEqual(result.returncode, 7, result.stderr)
+        first = self.gates / "1"
+        self.assertEqual(build_folders.build_folder_state(first), "free")
+        self.assertFalse(first.with_name("1.keep").exists())
+        self.assertIs(build_folders.folder_lease_fields(first)["released"], True)
+        location = self.base / "command-location"
+        next_run = self.run_cli(command=(
+            sys.executable, "-c", "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text(str(pathlib.Path.cwd()))",
+            str(location),
+        ))
+        self.assertEqual(next_run.returncode, 0, next_run.stderr)
+        self.assertEqual(Path(location.read_text()), first)
+
     def test_claude_and_codex_workers_use_their_unit_owner(self) -> None:
         unit = next(row for row in staff.local_snapshot().rows if row.kind == "unit")
         worker = fixture_worker("builds-impl", unit.id)

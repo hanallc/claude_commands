@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import ClassVar, Literal, cast, final, override
+from typing import ClassVar, cast, final, override
 import unittest
 from unittest.mock import patch
 
@@ -381,7 +381,7 @@ owner.verify=verify
             lines.append(f"{FAST_TRACK_LIMITS[key]}{key} = {rendered}\n")
         _ = self.config.write_text("".join(lines))
 
-    def build_folder_state(self, path: Path) -> Literal["held", "free"]:
+    def build_folder_state(self, path: Path) -> build_folders.BuildFolderState:
         with patch.dict(os.environ, {"CONF_DIR": self.env["CONF_DIR"]}):
             return build_folders.build_folder_state(path)
 

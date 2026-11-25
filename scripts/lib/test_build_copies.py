@@ -241,6 +241,21 @@ class BuildCopiesTests(unittest.TestCase):
                     build_copies.claim_unused_build_folder(copy.path)):
                 self.fail("The claim admitted a held copy")
 
+    def test_keep_file_excludes_a_numbered_copy_from_inventory_and_claims(self) -> None:
+        with self.take_queue_copy() as copy:
+            path = copy.path
+        marker = build_folders.copy_keep_file(path)
+        self.assertIn(path, [row.path for row in self.unused_build_folders()])
+
+        for reason, state in (("", "free"), ("checkout cleanup remains unconfirmed\n", "kept")):
+            with self.subTest(state=state):
+                _ = marker.write_text(reason)
+                self.assertEqual(build_folders.build_folder_state(path), state)
+                self.assertNotIn(path, [row.path for row in self.unused_build_folders()])
+                with self.assertRaisesRegex(build_copies.BuildFolderInUse, "has a keep file"), (
+                        build_copies.claim_unused_build_folder(path)):
+                    self.fail("The claim admitted a numbered copy with a keep file")
+
     def test_claim_keeps_a_copy_and_blocks_another_take(self) -> None:
         with self.take_queue_copy() as copy:
             artifact = copy.cargo_dir / "artifact"

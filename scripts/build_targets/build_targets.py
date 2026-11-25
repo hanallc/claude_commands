@@ -43,6 +43,7 @@ CONFIGURED_PROVIDER_SETTINGS = ConfiguredProviderSettings()
 
 
 if TYPE_CHECKING:
+    from scripts.mac_test import offload
     from scripts.build_hold import build_hold
     from scripts.build_queue.placement import SubmittingSession
     from scripts.build_queue import placement
@@ -770,6 +771,75 @@ class CapacityNotRead:
 CAPACITY_NOT_READ = CapacityNotRead()
 
 
+@dataclass(frozen=True)
+class MacDiskRecoveryPending(ExcludedTarget):
+    """The disk reading excludes the Mac while its sweep runs."""
+
+    disk: offload.MacDiskShort
+
+
+@dataclass(frozen=True)
+class MacDiskSweep:
+    """Start a sweep for this disk shortage."""
+
+    disk: offload.MacDiskShort
+    run: Callable[[], None]
+
+
+@dataclass(frozen=True)
+class MacDiskRecoveryQuery:
+    """Read the recovery state without starting a sweep."""
+
+
+@dataclass(frozen=True)
+class MacDiskRecoveryActive:
+    """The sweep keeps the Mac excluded."""
+
+    disk: offload.MacDiskShort
+
+
+@dataclass(frozen=True)
+class MacDiskRecoveryInactive:
+    """The host has no active sweep."""
+
+
+type MacDiskRecoveryRequest = MacDiskSweep | MacDiskRecoveryQuery
+type MacDiskRecoveryState = MacDiskRecoveryActive | MacDiskRecoveryInactive
+type RequestMacDiskRecovery = Callable[[str, MacDiskRecoveryRequest], MacDiskRecoveryState]
+
+
+def _sweep_mac_disk(controller: offload.ProcessController,
+                    config: eligibility.OffloadConfig | eligibility.SshProbeSettings,
+                    repository: eligibility.KnownRepository, probe: offload.ProbeSnapshot, name: str
+                    ) -> offload.MacDiskReady | offload.SweepShort | offload.SweepFailed:
+    from scripts.mac_test import offload
+
+    result = offload.ensure_mac_disk_floor(controller, config, repository, probe, name)
+    if isinstance(result, offload.SweepFailed):
+        print(f"build targets: Mac disk exclusion: {result.cause}", file=sys.stderr)
+    return result
+
+
+def mac_disk_recovery_eligibility(target: LocalTarget | SshTarget,
+                                  config: eligibility.OffloadConfig | eligibility.SshProbeSettings,
+                                  repository: eligibility.KnownRepository, probe: offload.ProbeSnapshot,
+                                  request_disk_recovery: RequestMacDiskRecovery) -> EligibleTarget | ExcludedTarget:
+    """Apply the disk floor to a Mac reading and request a sweep if necessary."""
+    from scripts.mac_test import offload
+
+    reading = offload.check_mac_disk_floor(probe, offload.mac_disk_floor(config))
+
+    def recover_disk() -> None:
+        name = target.name if isinstance(target, SshTarget) else "mac"
+        _ = _sweep_mac_disk(offload.ProcessController(), config, repository, probe, name)
+
+    request = MacDiskSweep(reading, recover_disk) if isinstance(reading, offload.MacDiskShort) else MacDiskRecoveryQuery()
+    recovery = request_disk_recovery(config.host, request)
+    if isinstance(recovery, MacDiskRecoveryActive):
+        return MacDiskRecoveryPending(target, "disk", recovery.disk)
+    return EligibleTarget(target) if isinstance(request, MacDiskRecoveryQuery) else ExcludedTarget(target, "disk")
+
+
 def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                            package: str, kind: StepKind, routing: Routing, *,
                            answer: mac_test.FreeNowAnswer | CapacityNotRead = CAPACITY_NOT_READ,
@@ -777,6 +847,7 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                            session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
                            mac_scope: claim_state.ClaimScope | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY,
                            recover_mac_backoff: bool = False,
+                           request_disk_recovery: RequestMacDiskRecovery | None = None,
                            ) -> EligibleTarget | ExcludedTarget:
 
     from scripts.mac_test import eligibility, mac_test
@@ -805,6 +876,10 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
     if answer in ("blocked", "backoff"):
         return ExcludedTarget(target, answer)
     if answer == "bad" and not recover_mac_backoff:
+        if request_disk_recovery is not None:
+            recovery = request_disk_recovery(config.host, MacDiskRecoveryQuery())
+            if isinstance(recovery, MacDiskRecoveryActive):
+                return MacDiskRecoveryPending(target, "disk", recovery.disk)
         return EligibleTarget(target)
     # Only an eligible step pays for the offload runner's import.
     from scripts.mac_test import offload
@@ -821,12 +896,14 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                      else config.configuration.number("unreachable_backoff_s"))
             offload.write_backoff(time.time() + delay, name, wait=not recover_mac_backoff)
             return ExcludedTarget(target, "unreachable")
+
+        if request_disk_recovery is not None:
+            return mac_disk_recovery_eligibility(target, config, repository, probe, request_disk_recovery)
+
         handlers = (offload.interrupt_handlers(controller)
                     if threading.current_thread() is threading.main_thread() else nullcontext())
         with handlers:
-            disk = offload.ensure_mac_disk_floor(controller, config, repository, probe, name)
-        if isinstance(disk, offload.SweepFailed):
-            print(f"build targets: Mac disk exclusion: {disk.cause}", file=sys.stderr)
+            disk = _sweep_mac_disk(controller, config, repository, probe, name)
         if not isinstance(disk, offload.MacDiskReady):
             return ExcludedTarget(target, "disk")
     except offload.OffloadInterrupted as interrupted:
@@ -844,6 +921,7 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
                            session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
                            mac_scope: claim_state.ClaimScope | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY,
                            recover_mac_backoff: bool = False,
+                           request_disk_recovery: RequestMacDiskRecovery | None = None,
                            ) -> EligibleTarget | ExcludedTarget:
     """Read SSH target policy and capacity without evaluating a Linux development shell."""
 
@@ -898,7 +976,8 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         if target.platform == "macos":
             return mac_target_eligibility(target, repo_root, package, kind, routing, answer=answer,
                                           configuration=configuration, session=session, mac_scope=mac_scope,
-                                          recover_mac_backoff=recover_mac_backoff)
+                                          recover_mac_backoff=recover_mac_backoff,
+                                          request_disk_recovery=request_disk_recovery)
         return ExcludedTarget(target, cast(LocalRequired, routing).reason)
     config = configuration if isinstance(configuration, conf.ConfigRead) else ssh_target_config(target)
     if isinstance(config, ExcludedTarget):
