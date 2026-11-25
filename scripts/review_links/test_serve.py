@@ -6520,9 +6520,10 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_list_go_keeps_the_go_when_the_save_cannot_confirm_durability(self) -> None:
         morty, unit, item, _ask, body = self.go_fixture()
-        save = cast(Callable[[object, the_list.ListItem], None], getattr(the_list, "_save"))
-        def save_then_fail(store: object, changed: the_list.ListItem) -> None:
-            save(store, changed)
+        save = the_list._save  # pyright: ignore[reportPrivateUsage]
+        def save_then_fail(store: record_store.NumberedRecords, changed: the_list.ListItem, *,
+                           previous_producer: staff.StaffId | None = None) -> None:
+            save(store, changed, previous_producer=previous_producer)
             raise atomic_file.AtomicDurabilityUnconfirmed("The folder sync is unconfirmed.")
         with patch.object(the_list, "_save", side_effect=save_then_fail):
             code, reply, delivery = self.post_go(body)
@@ -6546,11 +6547,12 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_list_go_keeps_the_ledger_record_when_the_reload_after_the_save_fails(self) -> None:
         morty, unit, item, _ask, body = self.go_fixture()
-        save = cast(Callable[[object, the_list.ListItem], None], getattr(the_list, "_save"))
+        save = the_list._save  # pyright: ignore[reportPrivateUsage]
         load = the_list.load
         saved = threading.Event()
-        def save_then_fail(store: object, changed: the_list.ListItem) -> None:
-            save(store, changed)
+        def save_then_fail(store: record_store.NumberedRecords, changed: the_list.ListItem, *,
+                           previous_producer: staff.StaffId | None = None) -> None:
+            save(store, changed, previous_producer=previous_producer)
             saved.set()
             raise atomic_file.AtomicDurabilityUnconfirmed("The folder sync is unconfirmed.")
         def load_fails_after_save(keeper: staff.StaffId, identity: str) -> the_list.ListItem:
