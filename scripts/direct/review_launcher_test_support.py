@@ -123,9 +123,9 @@ class ReviewLauncherFixture(LauncherFixture):
         self.prepare_project(
             "feature/review", "review_prompt.md", "Review the diff.\n",
             (
-                "UNIT_PROGRESS_INTERVAL_SECONDS=180",
-                "UNIT_COMPACT_ABOVE_TOKENS=100000",
-                "ROUTING_FROM_ROUND=4", "ASTRA_AFTER_FAILED_FIXES=2",
+                "unit_progress_interval_seconds=180",
+                "unit_compact_above_tokens=100000",
+                "routing_from_round=4", "astra_after_failed_fixes=2",
                 "",
             ), MODELS_REGISTRY,
         )

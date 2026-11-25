@@ -501,6 +501,16 @@ clear_check() {
   log_error "clear-check: ${output//$'\n'/ / }"
 }
 
+ensure_production_backup() {
+  [[ -z ${NOTIFIER_STATE_DIR:-} && $(hostname -s) == natedev ]] || return 0
+  local name=production-backup timeout command backup_script="${SCRIPT:h:h}/production/log_backup.py"
+  [[ ! -r $STATE_DIR/$name/conf || ! -r $STATE_DIR/$name/state ]] || return 0
+  timeout=$("$PY" "${SCRIPT:h:h}/lib/conf.py" get production_backup timeout_seconds) || return 1
+  # The first successful hourly run ends the legacy LOG backup route.
+  command="${(q)PY} ${(q)backup_script} --hourly"
+  cmd_new "$name" --every 60 --run "$command" --timeout "$timeout" >/dev/null
+}
+
 cmd_tick() {
   local tick_fd dir name fired
   local -a deferred_runs
@@ -509,6 +519,7 @@ cmd_tick() {
   [[ -e $STATE_DIR/.tick.lock ]] || : > "$STATE_DIR/.tick.lock"
   zsystem flock -t 0 -f tick_fd "$STATE_DIR/.tick.lock" || return 0
   print -r -- "$NOW" > "$STATE_DIR/.last_tick"
+  ensure_production_backup || log_error "cannot register the production backup job"
   for dir in "$STATE_DIR"/*(/N); do
     [[ -r $dir/conf && -r $dir/state ]] || continue
     read_state
@@ -531,6 +542,9 @@ cmd_tick() {
   for name in "${deferred_runs[@]}"; do
     run_due "$name"
   done
+  if [[ -z ${NOTIFIER_STATE_DIR:-} ]]; then
+    launch_job "unit-run-end-recovery" "$PY" "${SCRIPT:h:h}/direct/progress_history.py" recover-run-ends
+  fi
   # After the unlock, so a slow check never holds the scheduled messages back.
   local repeat_state=${NOTIFIER_REPEAT_STATE:-}
   if [[ -z $repeat_state && -z ${NOTIFIER_STATE_DIR:-} ]]; then

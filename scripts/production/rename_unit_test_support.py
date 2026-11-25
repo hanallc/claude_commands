@@ -381,8 +381,17 @@ class FolderRenameFixture(StaffTestCase):
         self.source.parent.mkdir(parents=True)
         self.records.mkdir()
         copy_folder_repositories(self.git_seed, self.root, self.old_name)
+        document = self.checkout / "production.md"
+        _ = document.write_text(
+            "# Folder production\n"
+            + f"- **Repository:** `{self.checkout}`\n"
+            + "- **Merge branch:** `main`\n"
+            + f"- **Showrunner checkout:** `{self.checkout}`\n"
+            + "- **Log:** `production.log`\n")
+        with (self.checkout / ".git/info/exclude").open("a") as excludes:
+            _ = excludes.write("\n/production.md\n")
         owner = fixture_member("showrunner", name="folder-production",
-            doc=staff.LiveDoc(remote.local_machine(), self.checkout / "production.md"))
+            doc=staff.LiveDoc(remote.local_machine(), document))
         row = fixture_member("unit", name=self.old_name, parent=owner.id,
             worktree=staff.PresentWorktree(remote.local_machine(), self.source))
         _ = staff.update_current_session(row.current_session,

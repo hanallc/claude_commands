@@ -36,9 +36,15 @@ class IdleUpdateContextTests(unittest.TestCase):
         idle_update.typed("fixture", 1000)
         self.assertEqual(idle_update.context("fixture", 1299, LIMITS), "")
         text = idle_update.context("fixture", 1300, LIMITS)
-        self.assertIn("for 5 min", text)
-        self.assertIn("what you last had on deck with him", text)
-        self.assertIn("only after he says yes", text)
+        expected = (
+            "Idle update mode: nate typed nothing in this session for 5 min. Keep doing all your work. "
+            "Your text to nate this turn is one short update: the open point you last had with him, "
+            "in one full sentence in his words, so he knows it with no memory of the item. "
+            'Ask one question with one answer word, for example: Say "show it". '
+            "Never repeat the choice words of an item that is not on the screen. "
+            f"Show it in full only after he says the word. With nothing on deck, {idle_update.NO_TEXT}. "
+            f"Rule: {idle_update.RULE}.")
+        self.assertEqual(text, expected)
 
     def test_turns_before_the_renewal_end_with_a_dash_alone(self) -> None:
         idle_update.typed("fixture", 1000)
@@ -53,7 +59,13 @@ class IdleUpdateContextTests(unittest.TestCase):
         idle_update.typed("fixture", 1000)
         _ = idle_update.context("fixture", 1300, LIMITS)
         text = idle_update.context("fixture", 1950, LIMITS)
-        self.assertIn("only the news since your last update", text)
+        expected = (
+            "Idle update mode: nate typed nothing in this session for 15 min. Keep doing all your work. "
+            "Your text to nate this turn is one short update with only the news since your last update. "
+            "Then name the open point in one full sentence and ask one question with one answer word, "
+            'for example: Say "show it". '
+            f"With no news, {idle_update.NO_TEXT}. Rule: {idle_update.RULE}.")
+        self.assertEqual(text, expected)
         self.assertIn("This turn has no text for nate", idle_update.context("fixture", 1960, LIMITS))
 
     def test_a_typed_prompt_ends_the_mode(self) -> None:
@@ -61,7 +73,7 @@ class IdleUpdateContextTests(unittest.TestCase):
         _ = idle_update.context("fixture", 1300, LIMITS)
         idle_update.typed("fixture", 1400)
         self.assertEqual(idle_update.context("fixture", 1500, LIMITS), "")
-        self.assertIn("what you last had on deck", idle_update.context("fixture", 1700, LIMITS))
+        self.assertIn("the open point you last had with him", idle_update.context("fixture", 1700, LIMITS))
 
     def test_the_sweep_deletes_only_records_past_the_retention_time(self) -> None:
         idle_update.typed("old", 1000)
@@ -122,7 +134,7 @@ class IdleUpdateRoleTests(StaffTestCase):
         with mock.patch.object(idle_update, "limits", return_value=LIMITS):
             self.assertEqual(helper("fixture", True, 1000, snapshot), "")
             self.assertEqual(helper("fixture", False, 1200, snapshot), "")
-            self.assertIn("what you last had on deck", helper("fixture", False, 1300, snapshot))
+            self.assertIn("the open point you last had with him", helper("fixture", False, 1300, snapshot))
             self.assertEqual(helper("fixture", False, 1300, staff.StaffSnapshot(())), "")
 
     def test_the_prompt_hook_gives_a_held_director_no_idle_text(self) -> None:

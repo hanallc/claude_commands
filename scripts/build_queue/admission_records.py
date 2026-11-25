@@ -125,10 +125,10 @@ class SavedPlacementAssignment:
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
     placement_candidates: tuple[placement.CandidateEligibility, ...] = ()
-    guest_start: execution_identity.GuestExecution | GuestStartNotReported = GuestStartNotReported()
     guest_execution_observed: bool = False
     guest_proof_required: bool = False
     confirmed_guest_start: ConfirmedGuestStart | GuestStartNotRecorded = GuestStartNotRecorded()
+    guest_start: execution_identity.GuestExecution | GuestStartNotReported = GuestStartNotReported()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
@@ -213,7 +213,7 @@ class RepositoryRunLimits:
         return self.for_repository(machine, repository)
 
     def for_repository(self, machine: str, repository: str) -> RepositoryRunLimit | NoRepositoryRunLimit:
-        key = f"{machine}.{repository}"
+        key = f"{conf.host_key_name(machine)}.{repository}"
         if key not in self.by_machine_and_repository:
             return NoRepositoryRunLimit()
         return RepositoryRunLimit(self.by_machine_and_repository[key])

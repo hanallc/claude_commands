@@ -50,9 +50,7 @@ from scripts.production.delivery_state import (
 )
 from scripts.lib import atomic_file, conf, urgency
 from scripts.lib.user_zone import user_zone
-from scripts.production.production_doc import (
-    Refusal as Refusal, production_field, read_production,
-)
+from scripts.production.production_doc import Refusal as Refusal, production_field, read_production
 from scripts.feature_log import feature_log
 from scripts.review_links.question_path import AnswerTime, NO_ANSWER_TIME, answer_log_id
 from scripts.review_links import (console_theme, image_store, new_item_dialog, page_frame, question_record, review_events,
@@ -2300,7 +2298,14 @@ def send_message(recipient: str, sender: str, message: str, *, key: str = "",
 def feature_review_id(page: ReviewPage, doc: Path, row_id: str) -> str:
     """Find the feature-log proposal for a Change row."""
     lines = doc.read_text(encoding="utf-8").splitlines()
-    repo = Path(production_field(lines, "Showrunner checkout")).expanduser()
+    try:
+        paths = change_review.enrolled_review_checkouts(doc, lines)
+    except Refusal as error:
+        raise RuntimeError(str(error)) from error
+    if isinstance(paths, change_review.EnrolledReviewCheckouts):
+        repo = paths.main
+    else:
+        repo = Path(production_field(lines, "Showrunner checkout")).expanduser()
     project = feature_log.project_of(str(repo))
     if project not in {name for name, spec in feature_log.PROJECTS.items() if spec.closes_by_change_review}:
         return ""

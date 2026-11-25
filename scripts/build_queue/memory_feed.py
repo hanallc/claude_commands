@@ -1086,6 +1086,7 @@ class FeedStaff:
         return self.labels_by_id.get(member.id) if member is not None else None
 
     def member_name(self, reference: str) -> str:
+        """Find the staff name for a fixed ID or current session."""
         member = self.members.by_member_reference(reference) if reference else None
         return member.name if member is not None else ""
 
@@ -2030,9 +2031,9 @@ def tokens_by_run(holders: TokenHolders, run_pids: set[int]) -> dict[int, int]:
 def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
     """Read the top costs from one provider result."""
     try:
-        recent_days = conf.read("buildlog").whole("TOP_COST_RECENT_DAYS")
+        recent_days = conf.read("buildlog").whole("top_cost_recent_days")
         if days < recent_days:
-            raise conf.Unusable(f"history_days={days} must be at least TOP_COST_RECENT_DAYS={recent_days}")
+            raise conf.Unusable(f"history_days={days} must be at least top_cost_recent_days={recent_days}")
         report = charts.page_data(days, n=3)
         if isinstance(report, charts.IndexUnavailable):
             return report

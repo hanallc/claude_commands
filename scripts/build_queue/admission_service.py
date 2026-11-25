@@ -5602,8 +5602,8 @@ done
             evidence = self.execution_evidence.get(key)
             host_key = self.placement_host_keys.get((request.episode, saved.assignment.destination))
             host_evidence = self.host_evidence(host_key) if host_key is not None else None
-            if (isinstance(saved.guest_start, execution_identity.GuestExecution)
-                    or isinstance(saved.confirmed_guest_start, records.ConfirmedGuestStart)
+            if (isinstance(saved.confirmed_guest_start, records.ConfirmedGuestStart)
+                    or isinstance(saved.guest_start, execution_identity.GuestExecution)
                     or isinstance(evidence, execution_identity.ObservedExecution)
                     or isinstance(host_evidence, placement.FreshHostEvidence)
                     and any(reference == saved.provider and isinstance(execution, execution_identity.ObservedExecution)
@@ -6866,9 +6866,9 @@ done
                 self._record_caller_version(request, connection, persist_change=False)
             evidence = request.evidence
             confirmed = (current
-                    and isinstance(saved.state, placement.CurrentAssignment)
-                    and isinstance(saved.permission, placement.PermissionConsumed)
-                    and confirmed_guest_run(assignment, evidence) is not None)
+                         and isinstance(saved.state, placement.CurrentAssignment)
+                         and isinstance(saved.permission, placement.PermissionConsumed)
+                         and confirmed_guest_run(assignment, evidence) is not None)
             if (isinstance(evidence, execution_identity.ObservedExecution)
                     and isinstance(evidence.identity, execution_identity.GuestExecution)):
                 if confirmed:

@@ -16,21 +16,167 @@ from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import cast, override
 from unittest.mock import call, patch
 
-from scripts.agents import pane_record, restart, restart_support, shutdown, shutdown_record, stop_resume, test_stop_resume
+from scripts.agents import (
+    pane_record, remote, restart, restart_support, shutdown, shutdown_record, stop_resume, test_stop_resume,
+)
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr.test_herdr import codex_foreground_cases
 from scripts.herdr.test_worker_panes import PaneWorld
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, conf, git_exclude, waiting_rows
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.message import roster, send as message_send, sessions
-from scripts.production import staff, worker
+from scripts.production import production_admission, production_doc, record_store, showrunners, staff, worker
+from scripts.production.add_showrunner_test_support import write_guard_proof
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
+from scripts.production.test_production_doc import enrolled_document
 from scripts.whoami import quota_state
 
 
 NATIVE_PROCESS = herdr.native_process
+
+
+class EnrolledProductionShutdownTests(StaffTestCase):
+    repository: Path = Path()
+    integration: Path = Path()
+    document: Path = Path()
+    owner_id: staff.StaffId = staff.StaffId("")
+    environment: dict[str, str] = {}
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.repository = self.root / "main"
+        self.integration = self.root / "integration"
+        self.environment = {**fixture_git_environment(self.root), "GIT_CONFIG_SYSTEM": os.devnull,
+                            "XDG_STATE_HOME": str(self.root / "state"),
+                            "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}
+        self.enterContext(patch.dict(os.environ, self.environment, clear=True))
+        _ = subprocess.run(["git", "init", "-qb", "main", str(self.repository)], env=self.environment, check=True)
+        _ = commit_repository(self.repository, "Fixture", allow_empty=True, env=self.environment)
+        _ = self.git("worktree", "add", "-qb", "integration", str(self.integration))
+        self.document = self.repository / "docs/plans/fixture-production-live.md"
+        enrolled_document(self.document, self.repository, self.integration, "integration", log="docs/plans/fixture-log.md")
+        owner = fixture_member(
+            "showrunner", name="fixture", doc=staff.LiveDoc(remote.local_machine(), self.document))
+        self.owner_id = owner.id
+
+    @property
+    def owner(self) -> staff.StaffRow:
+        owner = staff.by_id(self.owner_id)
+        assert owner is not None
+        return owner
+
+    def git(self, *arguments: str) -> str:
+        return subprocess.run(["git", "-C", str(self.repository), *arguments], env=self.environment, check=True,
+                              text=True, capture_output=True).stdout
+
+    def test_retirement_preserves_integration_and_waits_for_worktree_removal(self) -> None:
+        origin = self.root / "origin.git"
+        _ = subprocess.run(["git", "init", "-q", "--bare", str(origin)], env=self.environment, check=True)
+        _ = self.git("remote", "add", "origin", str(origin))
+        staging = self.root / "staging"
+        _ = self.git("worktree", "add", "-qb", "staging", str(staging))
+        _ = self.git("push", "-q", "origin", "main", "integration", "staging")
+        unit = fixture_member("unit", name="fixture-merges", parent=self.owner.id,
+                              worktree=staff.PresentWorktree(remote.local_machine(), staging))
+        production = production_doc.read_production(self.owner)
+        settings_path = self.root / "production.conf"
+        _ = settings_path.write_text("# range: 0.01..\nretire_command_timeout_seconds=5\n")
+        settings = conf.read(settings_path)
+        collision = self.root / "collision"
+        _ = self.git("worktree", "add", "-qb", "collision", str(collision))
+        _ = self.git("push", "-q", "origin", "collision")
+        peer = self.root / "peer"
+        _ = self.git("clone", "-qb", "collision", str(origin), str(peer))
+        other_doc = peer / "other-production.md"
+        _ = other_doc.write_text(f"- **Merge branch:** collision\n- **Showrunner checkout:** `{peer}`\n")
+        _ = fixture_member("showrunner", name="other", doc=staff.LiveDoc(remote.local_machine(), other_doc))
+        for target, branch, kept, keep_origin in (
+            (self.integration, "integration", True, True),
+            (staging, "staging", False, False),
+            (collision, "collision", False, True),
+        ):
+            with self.subTest(branch=branch):
+                retiring = shutdown.RetiringUnit(production, unit.name, target, branch, unit)
+                with redirect_stderr(io.StringIO()) as notices:
+                    result = shutdown.retirement_remove(retiring, settings=settings)
+                if kept:
+                    self.assertIn("protected production", result[0])
+                    self.assertEqual(notices.getvalue(), "")
+                else:
+                    self.assertEqual(result, [])
+                    self.assertIn(f"kept for a manual removal list: {target}", notices.getvalue())
+                self.assertTrue(target.is_dir())
+                self.assertTrue(self.git("branch", "--list", branch))
+                self.assertTrue(self.git("ls-remote", "--heads", "origin", branch))
+                if not kept:
+                    _ = self.git("worktree", "remove", str(target))
+                    self.assertEqual(shutdown.retirement_remove(retiring, settings=settings), [])
+                self.assertEqual(target.exists(), kept)
+                self.assertEqual(bool(self.git("branch", "--list", branch)), kept)
+                self.assertEqual(bool(self.git("ls-remote", "--heads", "origin", branch)), keep_origin)
+        self.assertTrue(self.integration.is_dir())
+        self.assertTrue(self.git("branch", "--list", "integration"))
+        self.assertTrue(self.git("ls-remote", "--heads", "origin", "integration"))
+
+    def test_live_rename_resumes_an_interrupted_branch_rename_without_changing_main(self) -> None:
+        state = self.root / "showrunner"
+        excludes = self.repository / ".git/info/exclude"
+        with excludes.open("a", encoding="utf-8") as output:
+            _ = output.write(f"\n/{self.document.relative_to(self.repository).as_posix()}\n/docs/plans/fixture-log.md\n")
+        write_guard_proof(self.root, state, self.repository)
+        with (patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state),
+              patch.object(production_doc, "GUARD_REPOSITORY", self.repository)):
+            production_admission.require_admission(production_doc.read_production(self.owner))
+        tracked = production_doc.legacy_document_path(self.document)
+        historical = self.repository / "former-proposals"
+        _ = tracked.write_text("- **Proposals:** former-proposals\n")
+        _ = commit_repository(self.repository, "Record former proposals", str(tracked), env=self.environment)
+        index = self.repository / ".git/index"
+        head, before = self.git("rev-parse", "HEAD"), index.read_bytes()
+        destination = self.document.with_name("renamed-production-live.md")
+        request = shutdown.rename_plan(self.owner.id, "renamed", to_doc=str(destination), to_branch="renamed-integration")
+        move = request.move
+        assert isinstance(move, shutdown.LiveDocBranchMove)
+        with self.subTest(stage="interrupted exclusion removal"):
+            def interrupt(checkout: Path, source: str) -> None:
+                self.assertEqual(checkout / source, self.document)
+                locks = (production_doc.live_paths_lock_file(self.integration),
+                         waiting_rows.journal_path().with_suffix(".lock"))
+                for path in locks:
+                    with path.open("r") as lock, self.assertRaises(BlockingIOError):
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                raise OSError("interrupted exclusion removal")
+
+            with (patch.object(git_exclude, "remove_exact_exclusion", side_effect=interrupt),
+                  self.assertRaisesRegex(OSError, "interrupted exclusion removal")):
+                _ = shutdown.rename_move_doc(request, move)
+            self.assertEqual(self.owner.doc, staff.LiveDoc(remote.local_machine(), self.document))
+            self.assertTrue(destination.is_file())
+            with self.assertRaises(production_doc.ProductionPathsError):
+                _ = production_doc.live_file_conflicts(self.repository, "HEAD")
+            retry_doc = shutdown.rename_plan(self.owner.id, "renamed", to_doc=str(destination), to_branch=move.branch)
+            assert isinstance(retry_doc.move, shutdown.LiveDocBranchMove)
+            self.assertTrue(shutdown.rename_move_doc(retry_doc, retry_doc.move))
+        _ = self.git("-C", str(self.integration), "branch", "-m", move.branch)
+        retry = shutdown.rename_plan(self.owner.id, "renamed", to_doc=str(destination), to_branch=move.branch)
+        assert isinstance(retry.move, shutdown.LiveDocBranchMove)
+        self.assertTrue(shutdown.rename_move_branch(retry.move))
+        row = staff.by_id(self.owner.id)
+        assert row is not None and isinstance(row.doc, staff.LiveDoc)
+        self.assertEqual(row.doc.path, destination)
+        self.assertFalse(self.document.exists())
+        git_exclude.require_untracked_ignored(self.repository, destination.relative_to(self.repository).as_posix())
+        self.assertEqual(production_doc.read_production(row).merge_branch, move.branch)
+        old_pattern = "/" + self.document.relative_to(self.repository).as_posix()
+        self.assertNotIn(old_pattern, (self.repository / ".git/info/exclude").read_text().splitlines())
+        self.assertIn(historical, record_store.known_folders(record_store.RecordKind.PROPOSAL, row.id,
+                                                            document=destination, strict=True))
+        self.assertEqual((self.git("branch", "--show-current"), self.git("rev-parse", "HEAD"), index.read_bytes()),
+                         ("main\n", head, before))
 
 
 def pending_resume_row(row: staff.StaffRow) -> staff.StaffRow:

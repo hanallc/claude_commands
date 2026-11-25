@@ -3100,7 +3100,7 @@ def free_bytes(path: str) -> int:
 
 
 def floor_setting_key(keys: Collection[str], base: str, host: str) -> str:
-    override_key = f"{base}.{host}"
+    override_key = f"{base}.{conf.host_key_name(host)}"
     return override_key if override_key in keys else base
 
 

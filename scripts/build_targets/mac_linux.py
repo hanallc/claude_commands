@@ -274,7 +274,7 @@ def consume_launch_permission(launch: GuestLaunchRecovery,
         if isinstance(permission.permission, placement.PermissionConsumed):
             raise GuestPermissionUnknown(reason, reference)
         raise GuestTookNoRun(reason)
-    return reference
+    return permission.claim
 
 
 @dataclass
@@ -1787,7 +1787,7 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
     def send(deadline: float, timeout: float) -> None:
         report_guest_start(armed, dispatch, deadline=deadline, timeout=timeout, folder_payload=folder_payload)
 
-    # A Folder report can run through stream processing and cleanup. Collect it before reporting completion.
+    # Collect the Folder report after the stream ends and before the completion report.
     _start_guest_queue_report(send, transfer_deadline, dispatch.folder_start_reports if folder_payload else reports,
                               warn_guest_report, collect_in_background=bool(folder_payload))
 

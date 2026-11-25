@@ -28,7 +28,7 @@ from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAU
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
-from scripts.lib import build_folders, copy_record, nix_env, process_start, scratch, session_folder
+from scripts.lib import build_folders, conf, copy_record, nix_env, process_start, scratch, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.lint import folder_audit, tmp_sweep
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, write_config_fixture
@@ -161,7 +161,8 @@ prefixes.admit-sock=admit-sock-
 prefixes.copies-index=copies-index-
 roots.system=/tmp
 roots.temporary=${TMPDIR}/builds
-""" + f"roots.scratch={self.base / 'scratch'}\nroots.scratch.{host_name()}={self.base / 'scratch'}\n")
+""" + f"roots.scratch={self.base / 'scratch'}\n"
+            + f"roots.scratch.{conf.local_host_key_name()}={self.base / 'scratch'}\n")
         _ = write_config_fixture(configuration / "scratch.conf", f"""\
 default_life_seconds=86400
 record_lock_attempts=3

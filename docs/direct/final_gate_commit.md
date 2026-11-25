@@ -77,6 +77,8 @@ verbose, or a finished `single` task. Skip it on a user stop, an open pending
 decision, or an error — a partial project has no settled surface to describe —
 and state the skip in <RunSummary/>.
 
+After all phases finish, launch the worker with `assign.sh --role implement --phase as-built --prompt <prompt> --paths <paths>`.
+
 Read `~/.claude/commands/plan/to_as_built.md` in full and follow it completely,
 with these arguments:
 

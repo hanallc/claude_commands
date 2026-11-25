@@ -20,11 +20,11 @@ SECONDS_TO_WAIT="${2:-}"
 DIRECT_CONF="${HOME}/.claude/config/direct.conf"
 INTERVAL_ORIGIN="argument"
 if [[ -z "${SECONDS_TO_WAIT}" ]]; then
-  INTERVAL_ORIGIN="UNIT_PROGRESS_INTERVAL_SECONDS in ${DIRECT_CONF}"
+  INTERVAL_ORIGIN="unit_progress_interval_seconds in ${DIRECT_CONF}"
   SECONDS_TO_WAIT="$(
     # shellcheck source=scripts/lib/conf.sh
     source "${BASH_SOURCE[0]%/*}/../lib/conf.sh"
-    conf_value direct UNIT_PROGRESS_INTERVAL_SECONDS
+    conf_value direct unit_progress_interval_seconds
   )"
 fi
 # No default interval: an unconfigured timer would run at a length nobody chose,
