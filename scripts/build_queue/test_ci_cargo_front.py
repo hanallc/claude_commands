@@ -136,7 +136,12 @@ class CargoLifetimeTests(unittest.TestCase):
                 prefix = f"build-admission-ci-{os.getuid()}-"
                 if use_shared:
                     with subprocess.Popen([sys.executable, "-c", "pass"]) as finished:
-                        self.assertEqual(finished.wait(timeout=3), 0)
+                        try:
+                            status = finished.wait(timeout=TEST_HANG_GUARD_SECS)
+                        except subprocess.TimeoutExpired:
+                            finished.kill()
+                            self.fail("The stale Cargo fixture process did not exit.")
+                        self.assertEqual(status, 0)
                     live_start = records.process_start_time(os.getpid())
                     self.assertIsNotNone(live_start)
                     live_folder = shared / f"{prefix}{os.getpid()}-{live_start}-live"

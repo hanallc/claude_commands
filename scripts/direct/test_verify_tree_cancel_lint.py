@@ -198,12 +198,14 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         release = self.control / "cleanup-release"
         self.addCleanup(release.touch)
         process = self.start_verify("lint", TEST_BLOCK_STAGE="mend")
-        wait_until((self.control / "cleanup-started").exists, self.control, timeout=10,
-                   processes=(process,))
+        self.wait_for_cleanup(process)
         self.assertTrue(list((self.root / "verify-steps").glob(".step-*")))
         process.send_signal(signal.SIGTERM)
         _ = release.touch()
-        output, errors = process.communicate(timeout=10)
+        try:
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        except subprocess.TimeoutExpired:
+            self.fail("Lint did not exit after SIGTERM during state publication.")
         self.assertEqual(process.returncode, 143, output + errors)
         self.wait_for_group_exit(process.pid)
         records = self.root / "verify-steps"
