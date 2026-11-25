@@ -8611,11 +8611,11 @@ window.fetch=async(path,options={})=>{
     def test_delivery_notices_color_staff_names_and_keep_the_recorded_words(self) -> None:
         item = self.add("Delivery notice")
         _ = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
-        cases: tuple[tuple[the_list.PageFeedback, str, tuple[str, ...]], ...] = (
-            (the_list.PageFeedback("request", "Words"), "sent to morty", ("morty",)),
-            (the_list.PageFeedback("request", "Words", "sent"), "sent to morty", ("morty",)),
-            (the_list.PageFeedback("request", "Words", action="read", recipient=DWIGHT.id), "sent to dwight", ("dwight",)),
-            (the_list.PageFeedback("request", "Words", action="read", recipient=MORTY.id), "sent to morty", ("morty",)),
+        cases: tuple[tuple[the_list.PageFeedback, str | None, tuple[str, ...]], ...] = (
+            (the_list.PageFeedback("request", "Words"), None, ()),
+            (the_list.PageFeedback("request", "Words", "sent"), None, ()),
+            (the_list.PageFeedback("request", "Words", action="read", recipient=DWIGHT.id), None, ()),
+            (the_list.PageFeedback("request", "Words", action="read", recipient=MORTY.id), None, ()),
             (the_list.PageFeedback("request", "Words", "alerted", "sdlc"), "not sent to morty; sdlc told", ("morty", "sdlc")),
             (the_list.PageFeedback("request", "Words", "alerted", "<unknown>"), "not sent to morty; <unknown> told", ("morty",)),
             (the_list.PageFeedback("request", "Words", "alerted"), "not sent to morty; no showrunner for alert", ("morty",)),
@@ -8627,6 +8627,9 @@ window.fetch=async(path,options={})=>{
                 body = list_page.render(self.root / "reviews").decode()
                 cell = body.split('<td data-label="Update">', 1)[1].split('</td>', 1)[0]
                 notice = ElementTree.fromstring('<root>' + cell + '</root>').find('small')
+                if text is None:
+                    self.assertIsNone(notice)
+                    continue
                 assert notice is not None
                 self.assertEqual(''.join(notice.itertext()), text + ", 13:00 EST")
                 self.assertEqual(tuple(span.text for span in notice.findall('span')), colored)
@@ -8996,7 +8999,8 @@ window.fetch=async(path,options={})=>{
         body = without_role_colors(list_page.render(root, include_counts=False).decode())
         self.assertIn('>Tell morty</button>', body)
         self.assertIn('Feedback sent to dwight', body)
-        self.assertIn('sent to dwight, 13:00 EST', body)
+        update = body.split('<td data-label="Update">', 1)[1].split('</td>', 1)[0]
+        self.assertNotIn('<small>', update)
 
     def test_tell_log_keeps_the_recipient_after_reassignment(self) -> None:
         root = self.root / "reviews"

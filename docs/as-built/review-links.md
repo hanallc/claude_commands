@@ -1834,7 +1834,8 @@ A repeated POST retries a pending request without adding another pending log ent
 Sent and alerted requests do not send again.
 A process claim prevents concurrent sends of one request without holding the List lock during delivery.
 Delivery is at least once; a crash after a send but before its saved result can cause another send.
-The Update cell shows `sent to <recipient>` and the time until the next item update outside the List page.
+The Update cell shows a notice only when delivery fails.
+The Log keeps the sent record.
 The log and retry use the original recipient after reassignment.
 The page retains draft words, dates, actions, request IDs, and tokens during a refresh.
 An unchanged retry uses its saved request ID and token after a lost response.
