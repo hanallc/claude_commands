@@ -22,6 +22,7 @@ import unittest
 from unittest import mock
 
 from scripts.lib import build_folders, removal_guard
+from scripts.lib.process_start import Gone, Started, Unreadable, proc_table_start
 from scripts.lib.removal_bwrap_test_support import BuildMount, LINUX_CHECKOUT, RemovalSandbox, mac_profile
 from scripts.lint.test_removal_bwrap import CANARY, PROBE_OUTSIDE
 
@@ -328,6 +329,21 @@ class ToolFolderRemovalTests(ToolFolderRemovalFixture):
     def test_keeps_a_folder_with_a_live_lease_owner(self) -> None:
         self.assert_kept(ClaimCase.LIVE_OWNER)
 
+    def foreign_lease_identity(self, process: Path) -> tuple[str, int]:
+        pid = int(process.name)
+        identity = proc_table_start(pid, process.parent)
+        if isinstance(identity, Gone):
+            self.fail(f"Foreign lease owner PID {pid} disappeared")
+        if isinstance(identity, Unreadable):
+            self.fail(f"Cannot read the start time for foreign lease owner PID {pid}: {identity.reason}")
+        if not isinstance(identity, Started):
+            self.fail(f"Foreign lease owner PID {pid} exited")
+        try:
+            owner = process.stat().st_uid
+        except OSError as error:
+            self.fail(f"Cannot read the UID for foreign lease owner PID {pid}: {error}")
+        return identity.start, owner
+
     def test_keeps_a_folder_with_a_foreign_lease_owner(self) -> None:
         sandbox = self.sandbox()
         candidate = self.candidate(sandbox)
@@ -345,11 +361,16 @@ class ToolFolderRemovalTests(ToolFolderRemovalFixture):
                 except (FileNotFoundError, PermissionError, ProcessLookupError):
                     continue
                 if owner != uid:
-                    foreign_pid = int(process.name)
                     break
             else:
                 self.skipTest("not run: the guest sandbox shows no process of another owner")
+            foreign_pid = int(process.name)
+            start, before_owner = self.foreign_lease_identity(process)
+            self.assertEqual(before_owner, owner, f"Foreign lease owner PID {foreign_pid} changed UID before the claim")
             result = self.claim_with_host_pids(sandbox, sandbox.host_path(candidate), foreign_pid)
+            after_start, after_owner = self.foreign_lease_identity(process)
+            self.assertEqual(after_start, start, f"Foreign lease owner PID {foreign_pid} changed start time during the claim")
+            self.assertEqual(after_owner, before_owner, f"Foreign lease owner PID {foreign_pid} changed UID during the claim")
             self.assert_claim(result, "proof-2")
         self.assert_canary(sandbox.host_path(candidate / "old" / "output"))
 
