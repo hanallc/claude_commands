@@ -16,7 +16,7 @@ from scripts.for_you.action import REVIEW_PATH
 from scripts.lib import atomic_file
 from scripts.lib.user_zone import user_zone
 from scripts.nightly_review import candidates
-from scripts.production import change_review, change_routing, investigation, proposal_issue, staff, the_list, update_registration
+from scripts.production import change_review, change_routing, investigation, proposal_issue, record_store, staff, the_list, update_registration
 from scripts.production.production_doc import Production
 from scripts.review_links import change_page, decision_store, efficiency_reviews, new_item_dialog, review_items, review_later, review_submissions
 from scripts.review_links import question_path, question_record, reply_tokens
@@ -295,9 +295,32 @@ def prepare_submission_delivery(saved: review_submissions.SavedSubmission, words
         return _claim_submission_delivery(saved.address, status, words=words, evidence_page=evidence_page)
 
 
+def ensure_submission_list_item(address: review_submissions.SubmissionAddress) -> None:
+    """Finish the List row under the current recipient locks."""
+    with review_submissions.submission_for_delivery(address) as filing:
+        if isinstance(filing, review_submissions.LocatedSubmission):
+            _ensure_list_filing(filing.saved())
+
+
 def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
     """Finish a staged List row before claiming its notice."""
+    record = saved.record
     route = review_submissions.list_filing_route(saved)
+    if isinstance(record, investigation.Investigation) and record.belongs_on_list:
+        if not isinstance(record.list_destination, investigation.ListDestination):
+            kind = the_list.investigation_report_kind(record)
+            if isinstance(kind, the_list.ReportKind):
+                members = staff.snapshot()
+                if isinstance(route, review_submissions.ListFilingUnavailable):
+                    route = review_submissions.retry_list_filing_route(saved, route, members)
+                try:
+                    _ = investigation.file_on_list(saved.path, lambda current: the_list.file_investigation_report(
+                        current, kind, members, route=route, reservation=review_submissions.list_filing_reservation(saved),
+                        source="nate via New item"),
+                        move_from_review=record.purpose is investigation.InvestigationPurpose.MOVING_LEGACY_BUG)
+                except the_list.ListError as error:
+                    raise OSError(f"Cannot file {saved.id} on the List: {error}") from error
+        return
     if isinstance(route, review_submissions.NoListFiling):
         return
     if isinstance(route, review_submissions.ListFilingUnavailable):
@@ -319,10 +342,7 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
                                words: str = "", evidence_page: str = ""
                                ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
     # Finish the List row under the recipient locks before taking the delivery lock.
-    with review_submissions.submission_for_delivery(address) as filing:
-        if isinstance(filing, review_submissions.NoNativeSubmission):
-            return change_page.NoMessageDelivery()
-        _ensure_list_filing(filing.saved())
+    ensure_submission_list_item(address)
 
     with status.locked(), review_submissions.submission_for_delivery(address) as located:
         if isinstance(located, review_submissions.NoNativeSubmission):
@@ -379,6 +399,33 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
         status.request_attempts[intent.attempt] = change_page.AttemptOwnership(status.path(page, row), 'claimed')
         review_submissions.clear_initial_delivery(address)
     return delivery
+
+
+def recover_interrupted_list_reports() -> None:
+    """Complete native reports even when a delivery claim has no first-message marker."""
+    pending = ([investigation.InvestigationPurpose.BUG_REPORT], [investigation.InvestigationPurpose.ENHANCEMENT])
+    try:
+        owners = record_store.store_owners(record_store.RecordKind.INVESTIGATION, strict=True)
+    except OSError as error:
+        print(f"List report recovery: {error}", file=sys.stderr)
+        return
+    for owner in owners:
+        try:
+            paths = tuple(investigation.review_record_paths(owner, strict=True))
+        except (OSError, ValueError) as error:
+            print(f"List report recovery for {owner}: {error}", file=sys.stderr)
+            continue
+        for path in paths:
+            try:
+                header = record_store.read_header(path, keys=frozenset(("purpose", "list_destination")), strict=True)
+                if header.get("purpose") not in pending or header.get("list_destination"):
+                    continue
+                record = investigation.read_review_record(path)
+                scoped = new_item_dialog.read_submission_key(record.submission_scope)
+                ensure_submission_list_item(review_submissions.SubmissionAddress(
+                    scoped.kind, scoped.recipient_id, scoped.request_id))
+            except (OSError, ValueError, RuntimeError, staff.StaffRefused) as error:
+                print(f"List report recovery {path}: {error}", file=sys.stderr)
 
 
 def recover_submission_deliveries(status: change_page.DeliveryStatus, review_path: str) -> None:

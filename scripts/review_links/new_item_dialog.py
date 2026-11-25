@@ -1037,6 +1037,8 @@ SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''(() => {
  const listSendKey = 'console.list.pending-send';
  const listDraftPrefix = listSendKey + '.';
  const listDraftId = /^r6-[0-9a-f]{32}$/;
+ const reportDraftPrefix = source => 'console.report.pending-send.' + source + '.';
+ const isReportKind = kind => kind === 'bug' || kind === 'enhancement';
  let nextDraft = 0;
 
  function storedListDraft() {
@@ -1059,6 +1061,21 @@ SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''(() => {
     const id = key.slice(listDraftPrefix.length);
     if (!listDraftId.test(id) || drafts.some(draft => draft.id === id)) continue;
     return {id, recipient: sessionStorage.getItem(key) || null};
+   }
+  } catch (_) {}
+  return null;
+ }
+
+ function storedReportDraft(source) {
+  try {
+   const prefix = reportDraftPrefix(source);
+   for (let index = 0; index < sessionStorage.length; index++) {
+    const key = sessionStorage.key(index);
+    if (!key?.startsWith(prefix)) continue;
+    const id = key.slice(prefix.length);
+    if (!listDraftId.test(id) || drafts.some(draft => draft.id === id)) continue;
+    const item = JSON.parse(sessionStorage.getItem(key));
+    if (isReportKind(item?.kind)) return {id, kind: item.kind, recipient: item.recipient || null};
    }
   } catch (_) {}
   return null;
@@ -1088,7 +1105,7 @@ function bindDraft(dialog, fresh = false) {
  const fields = [...form.querySelectorAll('fieldset'), words, includePage, dialog.querySelector('[data-close]'),
                  dialog.querySelector('[data-cancel]')];
  let launcher, opening, token, recipients, images = [], sending = false;
- let draftId, keepDraft = false, canRecoverFiling = false, ownerPage = '';
+ let draftId, reportDraftKind, keepDraft = false, canRecoverFiling = false, ownerPage = '';
  // Null means the user must choose again. An empty string means the page has no default.
  let selectedRecipient = '';
  let pageOwner = '';
@@ -1171,7 +1188,7 @@ function bindDraft(dialog, fresh = false) {
   const available = recipients.filter(recipient => !proposal || recipient.proposal);
   if (selectedRecipient && !available.some(recipient => recipient.id === selectedRecipient)) {
    selectedRecipient = null;
-   storeListDraft();
+   storePendingDraft();
   }
   recipientChips.replaceChildren();
   for (const recipient of available) {
@@ -1209,7 +1226,7 @@ function bindDraft(dialog, fresh = false) {
   }
   if (event?.target.name === 'recipient_id') {
    selectedRecipient = event.target.value;
-   storeListDraft();
+   storePendingDraft();
    recipientStatus.hidden = true;
    showOwnerReason();
   }
@@ -1567,22 +1584,28 @@ function bindDraft(dialog, fresh = false) {
   session.image = null;
  }
 
- function storeListDraft() {
-  if (ownerPage !== 'list' || !draftId || !canRecoverFiling) return;
+ function storePendingDraft() {
+  if (!draftId || !canRecoverFiling) return;
   try {
-   sessionStorage.setItem(listDraftPrefix + draftId, selectedRecipient || '');
+   if (ownerPage === 'list') {
+    sessionStorage.setItem(listDraftPrefix + draftId, selectedRecipient || '');
+   } else if (reportDraftKind) {
+    sessionStorage.setItem(reportDraftPrefix(source) + draftId,
+                           JSON.stringify({kind: reportDraftKind, recipient: selectedRecipient}));
+   }
   } catch (_) {}
  }
 
- function removeListDraft() {
-  if (ownerPage === 'list') {
-   try { sessionStorage.removeItem(listDraftPrefix + draftId); } catch (_) {}
-  }
+ function removePendingDraft() {
+  try {
+   const prefix = ownerPage === 'list' ? listDraftPrefix : reportDraftPrefix(source);
+   sessionStorage.removeItem(prefix + draftId);
+  } catch (_) {}
  }
 
- function finishDraft() {
-  removeListDraft();
-  draftId = deferredCapture = pendingItem = undefined;
+ function finishDraft({keepRecovery = false} = {}) {
+  if (!keepRecovery) removePendingDraft();
+  draftId = reportDraftKind = deferredCapture = pendingItem = undefined;
   canRecoverFiling = pendingEdited = false;
  }
 
@@ -1598,7 +1621,8 @@ function bindDraft(dialog, fresh = false) {
   if (dialog.open) hideDialog();
   keepDraft = !sent && Boolean(pendingItem || words.value || images.length);
   if (!keepDraft) {
-   if (ownerPage !== 'list' || !canRecoverFiling) finishDraft();
+   if (ownerPage !== 'list' || !canRecoverFiling)
+    finishDraft({keepRecovery: Boolean(canRecoverFiling && reportDraftKind)});
    for (const image of images) URL.revokeObjectURL(image.url);
    images = [];
    previews.replaceChildren();
@@ -1637,11 +1661,13 @@ function bindDraft(dialog, fresh = false) {
   pageContext = page ? collectPageContext() : null;
   launcher = trigger;
   token = '';
-  if (ownerPage === 'list' && !draftId && !keepDraft) {
-   const stored = storedListDraft();
+  if (!draftId && !keepDraft) {
+   const stored = ownerPage === 'list' ? storedListDraft() : storedReportDraft(source);
    if (stored) {
     draftId = stored.id;
     selectedRecipient = stored.recipient;
+    reportDraftKind = stored.kind;
+    if (reportDraftKind) kind = reportDraftKind;
     canRecoverFiling = true;
    }
   }
@@ -1734,7 +1760,8 @@ function bindDraft(dialog, fresh = false) {
    const sendItem = () => {
     const receiver = canRecoverFiling ? undefined : recipients?.find(recipient => recipient.id === item.recipient_id)?.name;
     canRecoverFiling = true;
-    storeListDraft();
+    if (ownerPage !== 'list' && isReportKind(submittedKind)) reportDraftKind ||= submittedKind;
+    storePendingDraft();
     return post({...item, kind: submittedKind, token}, {hold: true, receiver});
    };
    let result;
@@ -1762,7 +1789,7 @@ function bindDraft(dialog, fresh = false) {
     pendingItem = undefined;
     pendingEdited = false;
     canRecoverFiling = couldRecoverFiling;
-    if (!canRecoverFiling) removeListDraft();
+    if (!canRecoverFiling) removePendingDraft();
    }
    if (failure?.filedId) {
     discardCapture();

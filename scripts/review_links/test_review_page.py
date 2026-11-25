@@ -5,6 +5,8 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.change_review_test_support import pictured_changes
 
 import shutil
+import io
+from contextlib import redirect_stdout
 import html
 import json
 import re
@@ -40,6 +42,7 @@ from scripts.nightly_review import candidates
 from scripts.production.production_doc import read_production
 from scripts.production.issues import Issue
 from scripts.production import issues as issue_store
+from scripts.production import the_list
 from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, record_store, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_page
@@ -457,6 +460,7 @@ window.fetch=(url,options)=>{
         from scripts.review_links.test_review_submissions import PNG
 
         owner = self.ready_submission_recipient()
+        _ = fixture_member("producer", name="morty")
         _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\n")
         cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
         evidence = new_item_dialog.PageDataEvidence("Review", (("Page", "Console"),))
@@ -4636,6 +4640,76 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 owner_menu = source.partition('id="list-owner"')[2].partition('</div>')[0]
                 self.assertIn(f'data-filter-value="staff:{waiting.owner}"', owner_menu,
                               'F002: the unit Owner option remains when its Show view has no rows')
+
+    def test_move_review_bugs_keeps_the_original_words_and_image(self) -> None:
+        from base64 import b64decode
+
+        from scripts.review_links.test_review_submissions import IMAGE, PNG
+
+        owner = self.ready_submission_recipient()
+        keeper = fixture_member("producer", name="morty")
+        words = "The menu clips its final choice.\n\nClose it and open it again."
+        request = replace(self.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id),
+                          words=words, images=(IMAGE,))
+        old = review_submissions.submit(request)
+        key = review_items.submission_review_key(old)
+        self.assertTrue(any(entry["key"] == key for entry in review_page.build_snapshot(self.root).entries))
+        save = investigation._save  # pyright: ignore[reportPrivateUsage]
+
+        def fail_archive(store: investigation.Investigations, item: investigation.Investigation,
+                         path: Path) -> investigation.Investigation:
+            if isinstance(item.list_destination, investigation.ListDestination):
+                raise OSError("The fixture interrupted the archive write.")
+            return save(store, item, path)
+
+        scoped = new_item_dialog.read_submission_key(old.key)
+        self.assertTrue(investigation.answer_submission(old.path, scoped, "Check the final choice.", old.reply_token,
+                                                        owner=owner.id))
+        with patch.object(investigation, "_save", side_effect=fail_archive):
+            with self.assertRaisesRegex(OSError, "interrupted the archive write"):
+                _ = the_list.move_review_bugs(staff.snapshot())
+        partial, = the_list.records(keeper.id)
+        self.assertEqual(partial.number, 1)
+        with self.assertRaisesRegex(investigation.InvestigationError, "Open the report on the List"):
+            _ = investigation.mark_read(owner.id, old.id)
+        during = review_page.build_snapshot(self.root)
+        self.assertIn(key, during.records)
+        origin = review_items.submission_origin(during.records[key])
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        picture, = origin.images
+        self.assertIn(review_page.attachment_url(key, picture), list_page.render(self.root).decode())
+        self.assertEqual((review_submissions.image_folder(origin) / picture.id / picture.file).read_bytes(),
+                         b64decode(PNG))
+        with patch.object(staff, "caller_identity", return_value=keeper.current_session):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(the_list.main(["move-review-bugs"]), 0)
+            self.assertEqual(output.getvalue(), "moved to List item 1\n")
+            moved, = the_list.records(keeper.id)
+            done = investigation.load(owner.id, old.id)
+            self.assertEqual(done.state, investigation.InvestigationState.READ)
+            self.assertEqual(done.log[-1].words, "moved to List item 1")
+            self.assertEqual(done.question, words)
+            self.assertIsInstance(moved.report, the_list.ListReport)
+            assert isinstance(moved.report, the_list.ListReport)
+            self.assertEqual(moved.report.words, words)
+            after = review_page.build_snapshot(self.root)
+            self.assertFalse(any(entry["key"] == key for entry in after.entries))
+            origin = review_items.submission_origin(after.records[key])
+            assert isinstance(origin, new_item_dialog.ReviewSubmission)
+            image, = origin.images
+            folder = review_submissions.image_folder(origin)
+            self.assertEqual((folder / image.id / image.file).read_bytes(), b64decode(PNG))
+            page = list_page.render(self.root, include_counts=False).decode()
+            self.assertIn(review_page.attachment_url(key, image), page)
+            self.assertIn("The menu clips its final choice.", page)
+            self.assertIn("Close it and open it again.", page)
+            second = io.StringIO()
+            with redirect_stdout(second):
+                self.assertEqual(the_list.main(["move-review-bugs"]), 0)
+            self.assertEqual(second.getvalue(), "")
+            self.assertEqual(the_list.records(keeper.id), [moved])
+            self.assertEqual(investigation.load(owner.id, old.id), done)
 
     def test_completed_bug_stays_in_its_store_and_out_of_review(self) -> None:
         producer = fixture_member('producer', name='builds')

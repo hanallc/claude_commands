@@ -1108,6 +1108,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             result = f"{send_hold.HOLD_PATH}/{hold_id}"
             self.assertEqual(self.held_http("GET", result, headers={"Origin": "https://elsewhere.invalid"})[0], 403)
             self.assertEqual(self.held_http("GET", result)[::2], (404, {"reason": "This send was undone."}))
+            self.assertEqual(self.request(result).headers.get("x-send-hold-outcome"), "undone")
+            missing = self.request(f"{send_hold.HOLD_PATH}/{send_hold.new_hold_id()}")
+            self.assertEqual((missing.status, missing.headers.get("x-send-hold-outcome")), (404, "missing"))
             send.assert_not_called()
         self.assertEqual(investigation.records(other.id), [])
         self.assertEqual(self.hold_states(), ["undone"])
@@ -6369,6 +6372,17 @@ class ReviewLinksServerTests(unittest.TestCase):
             fields = {"keeper": morty.id, "id": item.id, "request": request,
                     "token": list_page.request_token(self.root, morty.id, item.id, request),
                     "action": "read", "words": "Explain this simply.", "until": "2026-12-03"}
+            for invalid_words in ("", "\x85", "\x1c\t\u2028\u3000", "x" * 10001):
+                with self.subTest(invalid_words=len(invalid_words), action="not works"):
+                    verdict = {**fields, "action": "not works", "words": invalid_words}
+                    code, body = self.post(list_page.PAGE_PATH, urlencode(verdict))
+                    self.assertEqual(code, 400)
+                    self.assertEqual(json.loads(body), {
+                        "reason": "Enter your words for the owner and the producer.",
+                        "not_fixed_receipt": {"request": request, "state": "refused"},
+                    })
+                    self.assertEqual(the_list.load(morty.id, item.id), item)
+                    delivery.assert_not_called()
             for action in ("read", "park", "tell", "remove"):
                 fields["action"] = action
                 with self.subTest(action=action):
