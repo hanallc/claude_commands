@@ -16,7 +16,7 @@ import sys
 import time
 from typing import Literal, TypedDict, cast
 
-from scripts.accounts import accounts, moves, next_moves, role_activity
+from scripts.accounts import accounts, login_sittings, moves, next_moves, role_activity
 from scripts.agents import shutdown_record
 from scripts.production import staff
 from scripts.lib import atomic_file, conf, file_lock, waiting_rows
@@ -1140,6 +1140,40 @@ def moves_board(history: Sequence[moves.MoveProgress], now: datetime, zone: tzin
     return '<section class="card mv-card" aria-label="Moves"><h2>Moves</h2>' + current + _move_history(earlier, zone, retryable) + "</section>"
 
 
+def logins_board(reading: accounts.StatusReading) -> str:
+    heading = '<section class="card lg-card"><h2>Logins</h2>'
+    try:
+        settings = conf.read("accounts")
+        requests = login_sittings.login_requests(reading, settings)
+        if not requests.current:
+            return heading + '<p class="lg-next next-muted">No login request.</p></section>'
+        thresholds = login_sittings.LoginCardThresholds.read(settings)
+    except (OSError, ValueError):
+        return heading + '<p class="lg-next next-muted">Login requests unavailable.</p></section>'
+    colors = accounts.role_colors()
+    rows: list[str] = []
+    for end in requests.current:
+        account = _spans([accounts.account_label_span(end.account, colors)])
+        machine = html.escape(end.machine)
+        at = end.at.astimezone(reading.zone)
+        remaining = end.at - reading.checked_at
+        tone = "error" if remaining < thresholds.error else "warning" if remaining < thresholds.warning else "default"
+        when = f'<time datetime="{end.at.isoformat()}"><span class="{tone}">{at:%a %m-%d %H:%M %Z}</span></time>'
+        action = f"/login in a {html.escape(end.account)} session on {machine}"
+        rows.append("<tr>" + _cell(account) + _cell(machine) + _cell(when) + _cell(action) + "</tr>")
+    upcoming = ""
+    if isinstance(requests.upcoming, login_sittings.ScheduledLoginRequest):
+        next_end = min(requests.upcoming.batch.ends, key=lambda end: (end.at, end.account, end.machine))
+        at = requests.upcoming.at.astimezone(reading.zone)
+        upcoming = (f'<p class="lg-next next-muted">Next request: {html.escape(next_end.account)} '
+                    f'on {html.escape(next_end.machine)}, {at:%a %m-%d}</p>')
+    headers = "".join(f'<th class="left" scope="col">{name}</th>'
+                      for name in ("account", "machine", "login ends", "action"))
+    return (heading + '<div class="scroll"><table aria-label="Logins">'
+            + f'<thead><tr>{headers}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+            + upcoming + "</section>")
+
+
 def page() -> bytes:
     """Read the stored accounts status, then render the page."""
     reading = accounts.read_status(source=accounts.StoredUsageOnly(), include_models=True)
@@ -1151,7 +1185,7 @@ def page() -> bytes:
         alerts = {}
     history = moves.read_move_progress()
     body = (moves_board(history, reading.checked_at, reading.zone, retryable=_retryable_members(history, reading))
-            + board(reading, alerts) + models_board(reading) + tokens_board(reading))
+            + logins_board(reading) + board(reading, alerts) + models_board(reading) + tokens_board(reading))
     settings = conf.read("review_links")
     refresh_seconds = settings.number("page_refresh_seconds")
     request_timeout = settings.whole("page_request_timeout_seconds")
@@ -1209,6 +1243,8 @@ color:var(--filter-selected-ink);font:inherit;font-weight:600;cursor:pointer}
 .mv-units summary,.mv-earlier>summary{font-size:.93rem}
 .mv-earlier .mv-fault{white-space:normal;min-width:16ch}
 .card{--column-gap:1.125rem;--table-font-size:.86rem;width:fit-content;max-width:100%;padding-right:var(--column-gap)}
+.lg-card{box-sizing:border-box;width:895px;max-width:100%}
+.lg-next{margin:10px 0 0;font-size:.93rem}
 .models-card,.tokens-card{margin-top:24px}
 .token-steps{margin-top:12px;padding-top:12px;border-top:1px solid var(--line);font-size:var(--table-font-size)}
 .token-steps summary{width:fit-content;margin-left:-6px;padding:2px 6px;border-radius:4px;

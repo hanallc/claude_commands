@@ -5059,7 +5059,8 @@ def _colored_span(text: str, key: str, colors: dict[str, str], kind: Literal["fa
     return span
 
 
-def _account_label(label: str, colors: dict[str, str]) -> BoardSpan:
+def account_label_span(label: str, colors: dict[str, str]) -> BoardSpan:
+    """Use the configured account label color on both boards."""
     return _colored_span(label, f"account.{label}", colors, kind="bold")
 
 
@@ -5113,7 +5114,7 @@ def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_confi
     for index, role in sorted(enumerate(roles), key=lambda item: (
             ACCOUNT_ROLE_ORDER.index(item[1]) if item[1] in ACCOUNT_ROLE_ORDER else len(ACCOUNT_ROLE_ORDER))):
         counts = _count_cells(row.role_counts[index] if index < len(row.role_counts) else None)
-        cells = {"dot": [_span("●", dot)], "label": [_account_label(row.label, colors)],
+        cells = {"dot": [_span("●", dot)], "label": [account_label_span(row.label, colors)],
                  "left": [_span(left, tone)], "roles": _role_spans(role, role in row.selected_roles, colors),
                  **{key: [_span(value)] for key, value in counts.items()},
                  "resets": [_span(reset)], "credits": [_span(balance)],
@@ -5609,7 +5610,7 @@ def _render_table(rows: list[tuple[str, ...]], *, colors: dict[str, str]) -> str
     def rendered(cells: tuple[str, ...], *, account: bool = False) -> str:
         padded = [cell.ljust(width) for cell, width in zip(cells, widths)]
         if account and cells[1]:
-            span = _account_label(cells[1], colors)
+            span = account_label_span(cells[1], colors)
             color = account_color(span.get("color", ""))
             if isinstance(color, AccountColor):
                 padded[1] = color.escape + cells[1] + "\x1b[0m" + " " * (widths[1] - len(cells[1]))

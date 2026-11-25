@@ -107,9 +107,14 @@ It reads local dates through `accounts.read_status(source=StoredUsageOnly())`.
 It uses the same numbered Claude rows and `login_ends_at` values that stored status exports.
 Removed accounts cannot retain a date through an old usage-store directory link.
 This shared status path inspects account readiness but does not refresh usage.
-The peer command is `accounts.py status --stored --json` through `ssh -o BatchMode=yes` and `remote.other_machine()`.
-An attempt time limits peer reads, including failed reads.
-The last successful peer read time and dates remain available after a failed attempt.
+The timer runs `login_sittings exchange` through `ssh -o BatchMode=yes` and `remote.other_machine()`.
+One call sends the current reminder state and returns the peer's stored login dates.
+The peer writes and flushes the date record before it tries to save the copy.
+It writes `copy_status` on a separate last line.
+The timer saves a complete date record even if the copy status misses the deadline.
+It logs one line when the copy status indicates a problem.
+An attempt time limits peer calls, including failed calls.
+The last successful peer read time and dates remain available after a failed date read.
 
 `config/accounts.conf` supplies all reminder settings:
 
@@ -119,7 +124,7 @@ The last successful peer read time and dates remain available after a failed att
 | `login_sitting_first` | `2026-11-17T10:00:00-05:00` | The first sitting. |
 | `login_sitting_interval_days` | `5` | The interval between sittings. |
 | `login_safety_margin_days` | `3` | The immediate reminder margin. |
-| `login_peer_read_minutes` | `60` | The minimum interval between peer attempts. |
+| `login_peer_read_minutes` | `60` | The minimum interval between peer calls. |
 | `login_peer_read_timeout_seconds` | `30` | The peer command limit. |
 
 Each pass reads these settings through `conf.read`.
@@ -129,13 +134,15 @@ An accepted push marks its dates as reported.
 When a login renews, the old end leaves the list and the new end takes its place in date order.
 When all current dates are reported, the sitting sends no push.
 The latest sitting replaces any missed sittings.
-`_next_login_request` returns the account, machine, login end, and sitting date for each unreported date of the selected account.
+`next_login_request` selects the next batch and its due time for the timer and the Logins card.
+The safety margin can make a batch due before the next sitting.
+A due sitting takes precedence over a safety batch on the same pass.
 Safety pushes include only machine, account, and end-date combinations that no accepted push has named.
 Only a safety push can name more than one account.
 An unknown date never enters either list.
 
 The atomic state file is `accounts_home()/.local/state/accounts/login_sittings.json`.
-It holds the latest completed sitting, named login dates, peer dates, peer read times, and peer attempt times.
+It holds the latest completed sitting, named login dates, local and peer dates, peer read times, and peer attempt times.
 It also holds the last observed end for each machine and account, plus the key and dates of each accepted batch.
 When an end moves later, it saves the observation time and the new end.
 The difference gives the login lifetime from the observation time.
@@ -143,6 +150,16 @@ The probe attempt file `login_renewals.json` tracks attempts to recover expired 
 An observation removes a named record only when the same machine and account have a different known end date.
 A missing date keeps the named record.
 Cached peer dates remain current evidence until the next successful peer read replaces them.
+The peer command validates all timestamps before it saves `login_sittings_copy.json`.
+A rejected copy or failed file replacement leaves the last good copy in place.
+If the directory sync fails after replacement, the reply marks the new copy's durability as unconfirmed.
+The copy reflects the sending machine's state at the start of the call.
+The next call sends reminders that the timer records after the previous call starts.
+The Accounts page uses the timer's next request selector and reads only local data for the Logins card.
+The other machine uses the copied dates for the next request.
+The timer and card match login dates by SSH alias.
+A changed local date can clear its own reported row before the next copy.
+The copy expires after two peer intervals plus the peer timeout.
 The module saves each peer attempt and its result before it reads local dates.
 It contains no credential or login identity.
 `locked_history` holds the lock in `login_sittings/` beside the state file throughout each pass.

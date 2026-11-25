@@ -1136,6 +1136,17 @@ A failed render keeps the last good page and writes one line to stderr.
 Failed renders add no render time.
 A cached Accounts response carries its render failure to the status line.
 
+The Logins card appears before Accounts. When Moves is present, it appears after Moves.
+It lists reported login ends in date order, with one row per account and machine.
+The card matches each row by SSH alias and account.
+A row clears when its stored end changes. Each row gives the `/login` action.
+The card uses account colors and formats dates in the user's zone.
+`login_card.error_days` and `login_card.warning_days` set the color limits.
+The card uses the timer's selector for the next sitting or safety request.
+On the other machine, the card reads the copy from the sending machine's timer.
+It shows **Login requests unavailable.** if the copy is missing or older than two peer intervals plus the peer timeout.
+It shows **No login request.** when no requested date remains.
+
 The Accounts table has two swatch columns without a heading.
 The account swatch column is between **account** and **left**.
 Hover over an account name to see the email from its login record.

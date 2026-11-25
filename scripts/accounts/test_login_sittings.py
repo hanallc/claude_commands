@@ -1,19 +1,27 @@
 """Exercise login sittings with scratch state and injected transports."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from contextlib import nullcontext, redirect_stdout
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast, override
 from unittest import mock
 
 from scripts.accounts import accounts, login_sittings as sittings
-from scripts.lib import conf
+from scripts.agents import remote
+from scripts.agents.test_support import write_machine_config
+from scripts.lib import atomic_file, conf
+from scripts.maintenance import agent_notes_job
 from scripts.maintenance.schedule import ScheduleBusy, locked_history
+from scripts.maintenance.settings import Part
 from scripts.notify import push_texts, review
 from scripts.message import send_budget
 from scripts.whoami import agent_accounts, usage_store
@@ -39,6 +47,7 @@ class LoginSittingsTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "USER_ZONE": "America/New_York"})))
+        _ = self.enterContext(mock.patch.object(remote, "this_machine", return_value="natedev"))
         self.config = self.root / "accounts.conf"
         _ = self.config.write_text(
             "login_sitting_machine=natedev\nlogin_sitting_first=2026-11-17T10:00:00-05:00\n"
@@ -50,9 +59,11 @@ class LoginSittingsTests(unittest.TestCase):
     def end(self, label: str, days: int, machine: str = "natedev") -> sittings.LoginEnd:
         return sittings.LoginEnd(machine, label, self.now + timedelta(days=days))
 
-    def read_peer(self, machine: str, timeout: int) -> tuple[sittings.LoginEnd, ...] | sittings.PeerReadFailed:
+    def read_peer(self, machine: str, timeout: int,
+                  _copy: sittings.ReminderStateCopy) -> sittings.PeerLoginDates | sittings.PeerReadFailed:
         self.peer_calls.append((machine, timeout))
-        return self.peer
+        return (self.peer if isinstance(self.peer, sittings.PeerReadFailed)
+                else sittings.PeerLoginDates(self.peer, sittings.ReminderCopyStatus.SAVED))
 
     def send(self, batch: sittings.ReminderBatch) -> PushSent | PushFailed:
         self.sent.append((sittings.reminder_push(batch.ends), batch.kind))
@@ -88,11 +99,12 @@ class LoginSittingsTests(unittest.TestCase):
         read_peer = self.read_peer
         send = self.send
 
-        def overlap(machine: str, timeout: int) -> tuple[sittings.LoginEnd, ...] | sittings.PeerReadFailed:
+        def overlap(machine: str, timeout: int,
+                    reminder_copy: sittings.ReminderStateCopy) -> sittings.PeerLoginDates | sittings.PeerReadFailed:
             if not nested:
                 nested.append([])
                 nested[0] = self.run_pass(self.now)
-            return read_peer(machine, timeout)
+            return read_peer(machine, timeout, reminder_copy)
 
         def send_claimed(batch: sittings.ReminderBatch) -> PushSent | PushFailed:
             with locked_history(self.root / ".local/state/accounts/login_sittings") as held:
@@ -159,11 +171,30 @@ class LoginSittingsTests(unittest.TestCase):
         policy = sittings.SittingPolicy.read(conf.read(self.config))
         state = self.state()
         at = self.now + timedelta(hours=1)
-        rows = sittings._next_login_request(at, policy, state, self.local)  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual([(row.account, row.machine, row.login_end, row.sitting) for row in rows], [
-            ("claude2", "mac", self.peer[0].at, self.now + timedelta(days=5)),
-            ("claude2", "natedev", self.local[1].at, self.now + timedelta(days=5)),
-        ])
+        request = sittings.next_login_request(at, policy, state, (*self.local, *state.peer))
+        self.assertEqual(request, sittings.ScheduledLoginRequest(
+            self.now + timedelta(days=5), sittings.ReminderBatch("sitting", (self.peer[0], self.local[1]))))
+
+    def test_next_request_matches_safety_and_sitting_delivery(self) -> None:
+        policy = sittings.SittingPolicy.read(conf.read(self.config))
+        cases: tuple[tuple[int, int, sittings.PushKind], ...] = (
+            (2, 0, "safety"), (5, 2, "safety"), (8, 5, "sitting"))
+        for ends_in, request_in, kind in cases:
+            with self.subTest(ends_in=ends_in):
+                self.sent.clear()
+                early = self.end("claude2", ends_in)
+                same_account = self.end("claude2", 10, "mac")
+                simultaneous = self.end("claude3", ends_in, "mac")
+                self.local, self.peer = (early,), (same_account, simultaneous)
+                dates = (*self.local, *self.peer)
+                state = sittings.ReminderState(sitting=self.now, peer=self.peer)
+                sittings.save_state(sittings.reminder_state_path(), state)
+                request = sittings.next_login_request(self.now, policy, state, dates)
+                expected = (early, simultaneous) if kind == "safety" else (same_account, early)
+                self.assertEqual(request, sittings.ScheduledLoginRequest(
+                    self.now + timedelta(days=request_in), sittings.ReminderBatch(kind, expected)))
+                _ = self.run_pass(self.now + timedelta(days=request_in))
+                self.assertEqual(self.sent[0], (sittings.reminder_push(expected), kind))
 
     def test_repository_config_has_no_sitting_window(self) -> None:
         config = Path(__file__).resolve().parents[2] / "config" / "accounts.conf"
@@ -422,12 +453,177 @@ class LoginSittingsTests(unittest.TestCase):
         _ = self.run_pass(self.now - timedelta(hours=12))
         self.assertEqual([kind for _, kind in self.sent], ["safety", "safety"])
 
-    def test_other_machine_reads_no_dates_and_creates_no_state(self) -> None:
-        before = sorted(self.root.rglob("*"))
-        self.assertEqual(self.run_pass(self.now, "mac"), [])
+    def test_other_machine_timer_skips_state_reads_and_transport(self) -> None:
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("unexpected process")):
+            self.assertEqual(self.run_pass(self.now, "mac"), [])
         self.assertEqual(self.peer_calls, [])
         self.assertEqual(self.sent, [])
-        self.assertEqual(sorted(self.root.rglob("*")), before)
+        self.assertEqual(self.retire_calls, [])
+        self.assertFalse(sittings.reminder_state_path().parent.exists())
+
+    def test_scheduled_leader_exchanges_state_and_dates_in_one_peer_call(self) -> None:
+        write_machine_config(self.root)
+        leader_end = self.end("claude1", 2)
+        mac_end = self.end("claude2", 5, "mac")
+        sittings.save_state(sittings.reminder_state_path(), sittings.ReminderState(
+            sitting=self.now, named={leader_end, mac_end}, local=(leader_end,)))
+        mac_state = self.root / "mac" / "login_sittings.json"
+        mac_copy = mac_state.with_name("login_sittings_copy.json")
+        command = '"$HOME/.claude/scripts/lib/py" -m scripts.accounts.login_sittings exchange'
+
+        at = self.now
+
+        def scheduled_now(_zone: tzinfo) -> datetime:
+            return at
+
+        def exchange(argv: list[str], *, input: str, timeout: int, **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(argv, ["ssh", "-o", "BatchMode=yes", "mac", command])
+            self.assertEqual(timeout, 30)
+            minutes = (at - self.now) // timedelta(minutes=1)
+            if minutes == 240:
+                return subprocess.CompletedProcess(argv, 255, "", "")
+            sent = cast(dict[str, object], json.loads(input))
+            self.assertEqual(sent["source"], "natedev")
+            self.assertEqual(sent["copied_at"], at.isoformat())
+            state = cast(dict[str, object], sent["state"])
+            self.assertEqual(state["sitting"], self.now.isoformat())
+            if minutes == 0:
+                self.assertEqual(len(cast(list[object], state["named"])), 2)
+            if minutes == 60:
+                sent["copied_at"] = "invalid"
+            date = self.end("claude2", 5 + minutes // 60, "mac")
+            output, errors = io.StringIO(), io.StringIO()
+            flushed: list[bytes] = []
+
+            def fail_write(_source: Path, _target: Path) -> None:
+                if minutes == 180:
+                    raise subprocess.TimeoutExpired(argv, timeout, output=b"".join(flushed))
+                raise OSError("fixture write failed")
+
+            writer = mock.patch("os.replace", side_effect=fail_write) if minutes in (120, 180) else nullcontext()
+            with (mock.patch.object(remote, "local_machine", return_value="fixture-mac-host"),
+                  mock.patch.object(sittings, "reminder_state_path", return_value=mac_state),
+                  mock.patch.object(accounts, "read_status", return_value=self.status_reading(date)),
+                  mock.patch.object(output, "flush", side_effect=lambda: flushed.append(output.getvalue().encode())),
+                  writer):
+                code = sittings.main(["exchange"], io.StringIO(json.dumps(sent)), output, errors)
+            return subprocess.CompletedProcess(argv, code, output.getvalue(), errors.getvalue())
+
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}),
+              mock.patch("socket.gethostname", return_value="natedev"),
+              mock.patch.object(accounts, "read_status", return_value=self.status_reading(leader_end)),
+              mock.patch.object(agent_notes_job, "datetime", SimpleNamespace(now=scheduled_now)),
+              mock.patch.object(subprocess, "run", side_effect=exchange) as transport,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(agent_notes_job._perform(Part.LOGINS), 0)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(transport.call_count, 1)
+            self.assertEqual(self.state().peer, (mac_end,))
+            original = mac_copy.read_bytes()
+            for minutes, calls, days in ((59, 1, 5), (60, 2, 6), (61, 2, 6), (120, 3, 7), (180, 4, 8), (240, 5, 8)):
+                at = self.now + timedelta(minutes=minutes)
+                self.assertEqual(agent_notes_job._perform(Part.LOGINS), 0)  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(transport.call_count, calls)
+                self.assertEqual(self.state().peer, (self.end("claude2", days, "mac"),))
+                self.assertEqual(mac_copy.read_bytes(), original)
+        self.assertEqual(output.getvalue().splitlines(), [
+            "login sittings: mac reminder copy rejected",
+            "login sittings: mac reminder copy unsaved",
+            "login sittings: mac reminder copy status unavailable",
+            "login sittings: peer dates unavailable: mac account read exited 255",
+        ])
+        self.assertEqual(self.state().peer_read, self.now + timedelta(minutes=180))
+        self.assertFalse(mac_state.exists())
+
+    def test_exchange_command_rejects_malformed_timestamps_and_keeps_the_copy(self) -> None:
+        leader_end = self.end("claude1", 2)
+        renewal = sittings.LoginRenewal(self.now, leader_end.at)
+        state = sittings.ReminderState(sitting=self.now, named={leader_end}, peer=(leader_end,),
+            peer_read=self.now, peer_attempt=self.now, local=(leader_end,),
+            observed={("natedev", "claude1"): sittings.ObservedLogin(leader_end, renewal)},
+            accepted_batches={"fixture-batch": (leader_end,)})
+        encoded = sittings.ReminderStateCopy("natedev", self.now, state).encode()
+        paths: tuple[tuple[str | int, ...], ...] = (
+            ("copied_at",), ("state", "sitting"), ("state", "peer_read"), ("state", "peer_attempt"),
+            ("state", "named", 0, "login_ends_at"), ("state", "local", 0, "login_ends_at"),
+            ("state", "peer", 0, "login_ends_at"), ("state", "observed", 0, "login_ends_at"),
+            ("state", "observed", 0, "renewed_at"), ("state", "observed", 0, "renewed_login_end"),
+            ("state", "accepted_batches", "fixture-batch", 0, "login_ends_at"),
+        )
+        copy_path = sittings.reminder_state_path().with_name("login_sittings_copy.json")
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}),
+              mock.patch.object(remote, "local_machine", return_value="mac"),
+              mock.patch.object(accounts, "read_status", return_value=self.status_reading(leader_end)) as read):
+            output, errors = io.StringIO(), io.StringIO()
+            self.assertEqual(sittings.main(["exchange"], io.StringIO(encoded), output, errors), 0)
+            self.assertEqual(errors.getvalue(), "")
+            dates = [{"label": "claude1", "login_ends_at": leader_end.at.isoformat()}]
+            self.assertEqual([json.loads(line) for line in output.getvalue().splitlines()],
+                             [{"accounts": dates}, {"copy_status": "saved"}])
+            original = copy_path.read_bytes()
+            for path in paths:
+                with self.subTest(path=path):
+                    document = cast(object, json.loads(encoded))
+                    parent = document
+                    for key in path[:-1]:
+                        parent = cast(dict[str, object], parent)[key] if isinstance(key, str) else cast(list[object], parent)[key]
+                    final_key = path[-1]
+                    assert isinstance(final_key, str)
+                    cast(dict[str, object], parent)[final_key] = "2026-11-18T12:00:00"
+                    output, errors = io.StringIO(), io.StringIO()
+                    self.assertEqual(sittings.main(["exchange"], io.StringIO(json.dumps(document)), output, errors), 0)
+                    self.assertEqual([json.loads(line) for line in output.getvalue().splitlines()],
+                                     [{"accounts": dates}, {"copy_status": "rejected"}])
+                    self.assertEqual(errors.getvalue(), "")
+                    self.assertEqual(copy_path.read_bytes(), original)
+            self.assertEqual(read.call_count, 1 + len(paths))
+
+    def test_exchange_command_rejects_deeply_nested_copy_and_keeps_dates(self) -> None:
+        local_end = self.end("claude2", 9, "mac")
+        copy_path = sittings.reminder_state_path().with_name("login_sittings_copy.json")
+        old = sittings.ReminderStateCopy("natedev", self.now, sittings.ReminderState()).encode()
+        atomic_file.write_text_atomic(copy_path, old)
+        depth = sys.getrecursionlimit() + 10
+        nested = "[" * depth + "]" * depth
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}),
+              mock.patch.object(remote, "local_machine", return_value="fixture-mac-host"),
+              mock.patch.object(accounts, "read_status", return_value=self.status_reading(local_end)),
+              mock.patch.object(json, "load", side_effect=RecursionError("fixture JSON nesting"))):
+            output, errors = io.StringIO(), io.StringIO()
+            self.assertEqual(sittings.main(["exchange"], io.StringIO(nested), output, errors), 0)
+        dates = [{"label": "claude2", "login_ends_at": local_end.at.isoformat()}]
+        self.assertEqual([json.loads(line) for line in output.getvalue().splitlines()],
+                         [{"accounts": dates}, {"copy_status": "rejected"}])
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(copy_path.read_text(), old)
+
+    def test_exchange_command_returns_dates_when_copy_write_fails(self) -> None:
+        local_end = self.end("claude2", 9, "mac")
+        copy_path = sittings.reminder_state_path().with_name("login_sittings_copy.json")
+        old = sittings.ReminderStateCopy("natedev", self.now - timedelta(hours=1), sittings.ReminderState())
+        atomic_file.write_text_atomic(copy_path, old.encode())
+        new = sittings.ReminderStateCopy("natedev", self.now, sittings.ReminderState())
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}),
+              mock.patch.object(remote, "local_machine", return_value="fixture-mac-host"),
+              mock.patch.object(accounts, "read_status", return_value=self.status_reading(local_end)) as read):
+            def reject_replace(_source: Path, _target: Path) -> None:
+                read.assert_called_once_with(source=accounts.StoredUsageOnly())
+                raise OSError("fixture write failed")
+
+            with mock.patch("os.replace", side_effect=reject_replace):
+                output, errors = io.StringIO(), io.StringIO()
+                self.assertEqual(sittings.main(["exchange"], io.StringIO(new.encode()), output, errors), 0)
+            dates = [{"label": "claude2", "login_ends_at": local_end.at.isoformat()}]
+            self.assertEqual([json.loads(line) for line in output.getvalue().splitlines()],
+                             [{"accounts": dates}, {"copy_status": "unsaved"}])
+            self.assertEqual(errors.getvalue(), "")
+            self.assertEqual(copy_path.read_text(), old.encode())
+            with mock.patch.object(atomic_file, "sync_folder", side_effect=OSError("fixture folder sync failed")):
+                output, errors = io.StringIO(), io.StringIO()
+                self.assertEqual(sittings.main(["exchange"], io.StringIO(new.encode()), output, errors), 0)
+            self.assertEqual([json.loads(line) for line in output.getvalue().splitlines()],
+                             [{"accounts": dates}, {"copy_status": "durability unconfirmed"}])
+            self.assertEqual(errors.getvalue(), "")
+            self.assertEqual(copy_path.read_text(), new.encode())
 
     def test_local_dates_use_the_same_stored_rows_as_account_status(self) -> None:
         reports = [agent_accounts.Report("Claude", email="fixture-one",
@@ -460,19 +656,31 @@ class LoginSittingsTests(unittest.TestCase):
         read.assert_called_once_with(source=accounts.StoredUsageOnly())
 
     def test_peer_reader_uses_stored_json_and_excludes_unknown_or_non_claude_rows(self) -> None:
+        reminder_copy = sittings.ReminderStateCopy("natedev", self.now, sittings.ReminderState())
         rows = [{"label": "claude1", "login_ends_at": self.end("claude1", 4).at.isoformat()},
                 {"label": "claude2", "login_ends_at": None},
                 {"label": "codex1", "login_ends_at": self.now.isoformat()}]
+        date_line = json.dumps({"accounts": rows}) + "\n"
         with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
-                [], 0, json.dumps({"accounts": rows}), "")) as read:
-            self.assertEqual(sittings.peer_dates("mac", 37), (self.end("claude1", 4, "mac"),))
+                [], 0, date_line + '{"copy_status": "saved"}\n', "")) as read:
+            self.assertEqual(sittings.peer_dates("mac", 37, reminder_copy), sittings.PeerLoginDates(
+                (self.end("claude1", 4, "mac"),), sittings.ReminderCopyStatus.SAVED))
         self.assertEqual(read.call_args.args[0], ["ssh", "-o", "BatchMode=yes", "mac",
-            '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/accounts/accounts.py" status --stored --json'])
+            '"$HOME/.claude/scripts/lib/py" -m scripts.accounts.login_sittings exchange'])
         self.assertEqual(read.call_args.kwargs["timeout"], 37)
-        for stdout, code in (("bad json", 0), ('{"accounts": null}', 0), ("", 255)):
+        self.assertEqual(read.call_args.kwargs["input"], reminder_copy.encode())
+        for status_line in ("", '{"copy_status": "unexpected"}\n', '{"copy_status": "saved"}'):
+            with self.subTest(status_line=status_line), mock.patch.object(subprocess, "run", side_effect=
+                    subprocess.TimeoutExpired("fixture ssh", 37, output=(date_line + status_line).encode())):
+                self.assertEqual(sittings.peer_dates("mac", 37, reminder_copy), sittings.PeerLoginDates(
+                    (self.end("claude1", 4, "mac"),), sittings.ReminderCopyStatus.UNREPORTED))
+        with mock.patch.object(subprocess, "run", side_effect=
+                subprocess.TimeoutExpired("fixture ssh", 37, output=date_line.rstrip("\n").encode())):
+            self.assertIsInstance(sittings.peer_dates("mac", 37, reminder_copy), sittings.PeerReadFailed)
+        for stdout, code in (("bad json\n", 0), ('{"accounts": null}\n', 0), ("", 255)):
             with self.subTest(stdout=stdout, code=code), mock.patch.object(subprocess, "run",
                     return_value=subprocess.CompletedProcess([], code, stdout, "")):
-                self.assertIsInstance(sittings.peer_dates("mac", 37), sittings.PeerReadFailed)
+                self.assertIsInstance(sittings.peer_dates("mac", 37, reminder_copy), sittings.PeerReadFailed)
 
     def test_sender_uses_the_batch_key_and_keeps_silence_enabled(self) -> None:
         ends = (self.end("claude1", 3), self.end("claude1", 4, "mac"))

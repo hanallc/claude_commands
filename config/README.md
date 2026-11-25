@@ -34,6 +34,7 @@ to config needs no approval and does not use `/tune`.
 Each sitting selects the account with the earliest unreported login end.
 `login_safety_margin_days` sets the number of days before a login end that requires a safety reminder.
 Only the safety reminder can name more than one account.
+`login_card.error_days` and `login_card.warning_days` set the Logins card color limits.
 
 ## machines.conf
 

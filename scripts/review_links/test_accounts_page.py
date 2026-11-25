@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import html
 from http.client import HTTPConnection
+import io
 import json
 import os
 import re
@@ -18,15 +19,15 @@ import tempfile
 import time
 import threading
 import unittest
+from types import SimpleNamespace
 from typing import cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results, newer_script_reload_results
-from scripts.accounts import accounts, moves, next_moves, role_activity, role_map
-from scripts.agents import shutdown_record
+from scripts.accounts import accounts, login_sittings, moves, next_moves, role_activity, role_map
 from scripts.accounts.home_test_support import scratch_account_home
-from scripts.agents import stop_resume
+from scripts.agents import remote, shutdown_record, stop_resume
 from scripts.agents.test_support import write_machine_config
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -41,6 +42,15 @@ ACCOUNT_SETTINGS = "next_move_percent=1\nusage_stale_minutes=10\n"
 PAGE_STATUS_SETTINGS = (
     "status.round_trip_limit_seconds=1\nstatus.render_limit_seconds=1\n"
     + "status.reading_delay_seconds=1\nstatus.accounts.age_limit_seconds=45\n"
+)
+LOGIN_CARD_SETTINGS = (
+    "login_sitting_machine=natedev\nlogin_sitting_first=2026-11-15T07:00:00-08:00\n"
+    "# whole: 1..\nlogin_sitting_interval_days=5\n"
+    "# whole: 1..\nlogin_safety_margin_days=3\n"
+    "# whole: 1..\nlogin_peer_read_minutes=60\n"
+    "# whole: 1..\nlogin_peer_read_timeout_seconds=30\n"
+    "# whole: 1..\nlogin_card.error_days=2\n"
+    "# whole: 1..\nlogin_card.warning_days=6\n"
 )
 
 
@@ -342,6 +352,7 @@ MENU_PROBE = '''<script>
 
 class AccountsPageTests(unittest.TestCase):
     review_root: Path = Path()
+    reminder_state: Path = Path()
 
     @override
     def setUp(self) -> None:
@@ -349,10 +360,14 @@ class AccountsPageTests(unittest.TestCase):
         use_fixture_history(self, scratch)
         configuration = scratch / "config"
         self.review_root = scratch / "review"
+        self.reminder_state = scratch / "login_sittings.json"
+        _ = self.enterContext(patch.object(login_sittings, "reminder_state_path", return_value=self.reminder_state))
+        _ = self.enterContext(patch.object(remote, "local_machine", return_value="natedev"))
+        _ = self.enterContext(patch.object(remote, "sys", SimpleNamespace(platform="linux")))
         _ = self.enterContext(patch.object(usage_store, "store_file", return_value=scratch / "home" / "usage.json"))
         _ = self.enterContext(patch.object(moves, "store_file", return_value=scratch / "moves.jsonl"))
         _ = copy_config_fixture(Path(__file__).resolve().parents[2] / "config", configuration)
-        _ = write_config_fixture(configuration / "accounts.conf", ACCOUNT_SETTINGS)
+        _ = write_config_fixture(configuration / "accounts.conf", ACCOUNT_SETTINGS + LOGIN_CARD_SETTINGS)
         _ = write_config_fixture(configuration / "console.conf", PAGE_STATUS_SETTINGS)
         _ = write_config_fixture(configuration / "review_links.conf", "page_refresh_seconds=15\naccounts_page_seconds=30\n")
         _ = write_config_fixture(configuration / "shutdown.conf", "move.stuck_seconds=75\n")
@@ -362,7 +377,7 @@ class AccountsPageTests(unittest.TestCase):
             encoding="utf-8")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "REVIEW_LINKS_ROOT": str(self.review_root),
-            "AGENT_NOTES_DIR": str(scratch / "notes"),
+            "HOME": str(scratch / "fixture-home"), "AGENT_NOTES_DIR": str(scratch / "agents"),
         })))
 
     def test_page_reads_move_progress_above_accounts_and_uses_the_configured_wait(self) -> None:
@@ -488,6 +503,118 @@ window.fetch=(path,options)=>{
                 worker.join(TEST_HANG_GUARD_SECS)
             detach.assert_called_once_with(["batch", "--target", "claude1", "--user-command", "--", identity],
                                            "move", initiator=moves.MoveInitiator.CONSOLE)
+
+    def login_card_reading(self) -> accounts.StatusReading:
+        urgent = login_sittings.LoginEnd("mac", "claude2", AT + timedelta(days=1, hours=2))
+        warning = login_sittings.LoginEnd("natedev", "claude1", AT + timedelta(days=2))
+        default = login_sittings.LoginEnd("mac", "claude1", AT + timedelta(days=6))
+        next_mac = login_sittings.LoginEnd("mac", "claude3", AT + timedelta(days=9))
+        login_sittings.save_state(self.reminder_state, login_sittings.ReminderState(
+            sitting=AT, named={default, warning, urgent}, peer=(default, next_mac, urgent)))
+        rows = (
+            replace(status_row("claude3"), login_ends_at=agent_accounts.LoginEndKnown(AT + timedelta(days=10))),
+            replace(status_row("claude1"), login_ends_at=agent_accounts.LoginEndKnown(warning.at)),
+        )
+        return accounts.StatusReading(rows, (), (), ZoneInfo("America/Los_Angeles"), AT)
+
+    def test_login_card_shows_reported_dates_in_end_order_and_the_following_request(self) -> None:
+        reading = self.login_card_reading()
+        with (patch.object(remote, "local_machine", return_value="natedev"),
+              patch.object(accounts, "read_status", return_value=reading) as status):
+            page = accounts_page.page().decode()
+        start = page.index('<h2>Logins</h2>')
+        card = page[start:page.index("</section>", start)]
+        self.assertLess(start, page.index('<h2>Accounts</h2>'))
+        self.assertEqual(re.findall(r'<th class="left" scope="col">(.*?)</th>', card),
+                         ["account", "machine", "login ends", "action"])
+        self.assertEqual(re.findall(r'/login in a [^<]+', card), [
+            "/login in a claude2 session on mac",
+            "/login in a claude1 session on natedev",
+            "/login in a claude1 session on mac",
+        ])
+        self.assertIn('style="color:#b294bb" data-color-text="account.claude2">claude2</span>', card)
+        self.assertIn('Next request: claude3 on mac, Fri 11-20', card)
+        self.assertNotIn("fixture@example.invalid", card)
+        self.assertNotIn("<button", card)
+        status.assert_called_once_with(source=accounts.StoredUsageOnly(), include_models=True)
+
+    def test_login_card_uses_configured_tones_and_the_user_zone(self) -> None:
+        reading = self.login_card_reading()
+        with patch.object(remote, "local_machine", return_value="natedev"):
+            card = accounts_page.logins_board(reading)
+        self.assertEqual(re.findall(r'<time datetime="[^"]+"><span class="([^"]+)">([^<]+)</span>', card), [
+            ("error", "Mon 11-16 09:00 PST"),
+            ("warning", "Tue 11-17 07:00 PST"),
+            ("default", "Sat 11-21 07:00 PST"),
+        ])
+
+    def test_login_card_removes_only_the_machine_date_that_changes(self) -> None:
+        reading = self.login_card_reading()
+        original = self.reminder_state.read_bytes()
+        renewed = replace(reading.rows[1], login_ends_at=agent_accounts.LoginEndKnown(AT + timedelta(days=30)))
+        with patch.object(remote, "local_machine", return_value="natedev"):
+            card = accounts_page.logins_board(replace(reading, rows=(reading.rows[0], renewed)))
+        self.assertNotIn("/login in a claude1 session on natedev", card)
+        self.assertIn("/login in a claude1 session on mac", card)
+        self.assertIn("/login in a claude2 session on mac", card)
+        self.assertEqual(self.reminder_state.read_bytes(), original)
+
+    def test_login_card_shows_the_empty_line_without_a_table(self) -> None:
+        reading = accounts.StatusReading((), (), (), timezone.utc, AT)
+        card = accounts_page.logins_board(reading)
+        self.assertIn('<p class="lg-next next-muted">No login request.</p>', card)
+        self.assertNotIn("<table", card)
+        self.assertNotIn("Next request:", card)
+
+    def test_login_card_shows_safety_before_the_next_sitting(self) -> None:
+        reading = self.login_card_reading()
+        for ends_in, requests_on in ((2, "Sun 11-15"), (5, "Tue 11-17")):
+            with self.subTest(ends_in=ends_in):
+                row = replace(status_row("claude4"), login_ends_at=agent_accounts.LoginEndKnown(AT + timedelta(days=ends_in)))
+                card = accounts_page.logins_board(replace(reading, rows=(*reading.rows, row)))
+                self.assertIn(f"Next request: claude4 on natedev, {requests_on}", card)
+
+    def test_login_card_uses_account_label_fallback_for_missing_and_invalid_colors(self) -> None:
+        reading = self.login_card_reading()
+        with patch.object(accounts, "role_colors", return_value={"account.claude2": "invalid"}):
+            card = accounts_page.logins_board(reading)
+        self.assertEqual(card.count('<span class="default bold">claude1</span>'), 2)
+        self.assertIn('<span class="default bold">claude2</span>', card)
+        self.assertNotIn("data-color-text", card)
+
+    def test_mac_login_card_reads_the_local_copy_until_it_is_stale(self) -> None:
+        leader_reading = self.login_card_reading()
+        state = login_sittings.load_state(self.reminder_state)
+        state.local = tuple(login_sittings.LoginEnd("natedev", row.label, row.login_ends_at.at)
+                            for row in leader_reading.rows
+                            if isinstance(row.login_ends_at, agent_accounts.LoginEndKnown))
+        mac_rows = tuple(replace(status_row(end.account), login_ends_at=agent_accounts.LoginEndKnown(end.at))
+                         for end in state.peer)
+        with (patch.object(remote, "local_machine", return_value="fixture-mac-host"),
+              patch.object(remote, "sys", SimpleNamespace(platform="darwin")),
+              patch.object(accounts, "read_status", return_value=replace(leader_reading, rows=mac_rows)),
+              patch.object(subprocess, "run", side_effect=AssertionError("unexpected process"))):
+            self.assertEqual(remote.local_machine(), "fixture-mac-host")
+            self.assertEqual(remote.this_machine(), "mac")
+            mac_reading = replace(leader_reading, rows=mac_rows)
+            self.assertIn("Login requests unavailable.", accounts_page.logins_board(mac_reading))
+            copy = login_sittings.ReminderStateCopy("natedev", AT, state)
+            self.assertEqual(login_sittings.main(["exchange"], io.StringIO(copy.encode()), io.StringIO(), io.StringIO()), 0)
+            card = accounts_page.logins_board(mac_reading)
+            self.assertEqual(accounts_page.logins_board(replace(mac_reading, rows=())), card)
+            renewed = tuple(replace(row, login_ends_at=agent_accounts.LoginEndKnown(AT + timedelta(days=30)))
+                            if row.label == "claude1" else row for row in mac_rows)
+            renewed_card = accounts_page.logins_board(replace(mac_reading, rows=renewed))
+            self.assertNotIn("/login in a claude1 session on mac", renewed_card)
+            self.assertIn("/login in a claude1 session on natedev", renewed_card)
+            boundary = AT + timedelta(hours=2, seconds=30)
+            boundary_card = accounts_page.logins_board(replace(mac_reading, checked_at=boundary))
+            self.assertIn("Next request: claude3 on mac, Fri 11-20", boundary_card)
+            self.assertIn("/login in a claude1 session on natedev", boundary_card)
+            stale = accounts_page.logins_board(replace(mac_reading, checked_at=boundary + timedelta(seconds=1)))
+            self.assertIn("Login requests unavailable.", stale)
+            self.assertNotIn("<table", stale)
+        self.assertEqual(card, accounts_page.logins_board(leader_reading))
 
     def test_page_reads_quota_clear_state_from_the_fixture_root(self) -> None:
         reading = accounts.StatusReading((replace(status_row("claude1"), weekly_left_percent=4),),
@@ -2285,8 +2412,10 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         reading = accounts.StatusReading((), (), (), timezone.utc, AT)
         with tempfile.TemporaryDirectory() as temporary:
             settings = Path(temporary) / "review_links.conf"
-            _ = write_config_fixture(Path(temporary) / "accounts.conf", ACCOUNT_SETTINGS)
+            _ = write_config_fixture(Path(temporary) / "accounts.conf", ACCOUNT_SETTINGS + LOGIN_CARD_SETTINGS)
             _ = write_config_fixture(Path(temporary) / "console.conf", PAGE_STATUS_SETTINGS)
+            _ = write_config_fixture(Path(temporary) / "showrunners.conf", "mac_token.account=\n")
+            write_machine_config(Path(temporary))
             for seconds in (15, 37):
                 with self.subTest(refresh_seconds=seconds):
                     _ = write_config_fixture(settings, f"page_refresh_seconds={seconds}\n")
@@ -2320,8 +2449,10 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         reading = accounts.StatusReading((), (), (), timezone.utc, AT)
         with tempfile.TemporaryDirectory() as temporary:
             settings = Path(temporary) / "review_links.conf"
-            _ = write_config_fixture(Path(temporary) / "accounts.conf", ACCOUNT_SETTINGS)
+            _ = write_config_fixture(Path(temporary) / "accounts.conf", ACCOUNT_SETTINGS + LOGIN_CARD_SETTINGS)
             _ = write_config_fixture(Path(temporary) / "console.conf", PAGE_STATUS_SETTINGS)
+            _ = write_config_fixture(Path(temporary) / "showrunners.conf", "mac_token.account=\n")
+            write_machine_config(Path(temporary))
             for seconds in (15, 37):
                 with self.subTest(refresh_seconds=seconds):
                     _ = write_config_fixture(settings, f"page_refresh_seconds={seconds}\n")
