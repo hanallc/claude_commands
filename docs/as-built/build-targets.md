@@ -640,9 +640,22 @@ Each step checks its package when it runs.
 The first failure ends either list with its status.
 A step list reports the command and exit status for each step it runs, including the package of a failed test step.
 On Linux, the parent initializes `BUILDLOG_RUN` once. Each step inherits it and uses its own call record.
-Both list forms keep the queue place during checkout for steps that share the numbered copy.
-A `doc` step with its own copy uses `NO_RUN` in its placement request.
-A standalone step with its own copy also uses `NO_RUN`.
+Both list forms keep the queue place during checkout, including for `doc`.
+The `doc` step acquires its own checkout and uses ordinary memory admission.
+It releases its grant without a memory handoff.
+The repository's Verify run limit exempts the `doc` step.
+A busy Mac leaves a mend step at its existing queue rank for the next placement.
+The Cargo token report uses the existing `wait_s` field to locate the end of the token wait.
+The `admission_wait_s` field totals the waits for memory, routing, holds, and the Cargo token.
+The `step_wait_s` field gives the wait for each step, including separate waits for mend and clippy.
+Verify counts the placement samples after it receives a grant, a refusal, or a confirmed cancellation.
+A confirmed cancellation includes the cancellation that Verify requests before lint formatting.
+The mend wait ends at the last queue reply before Verify cancels and starts formatting.
+The cancellation call takes about one second and adds no time to that wait.
+If Verify stops before it reads a final reply or a sample is missing, it records null for the step and admission totals.
+A skipped hold check records zero in `hold_wait_s`.
+A hold check without a valid sample records null.
+A standalone step with its own numbered copy uses `NO_RUN`.
 Steps with `NO_RUN` can leave their grants without a memory handoff.
 
 `parse_routing_arguments` removes routing flags into named shell values and returns the remaining `ARGS`.
