@@ -3172,11 +3172,11 @@ def run_remote(arguments: Sequence[str], *,
         )
         command = user.command((sys.executable, "-IB", "-c", child, str(checkout), *arguments))
         return subprocess.run(command, capture_output=True, text=True, check=False, env=user.environment())
-    return run_ssh_with_config(arguments, "disks")
+    return run_ssh_with_config(arguments, "mac_test")
 
 
 def run_ssh_with_config(arguments: Sequence[str], config: str | Path) -> subprocess.CompletedProcess[str]:
-    timeout = conf.read(config).whole("cleanup.ssh_seconds")
+    timeout = conf.read(config).number("floor_sweep_timeout_s")
     return subprocess.run(arguments, capture_output=True, text=True, timeout=timeout, check=False)
 
 
@@ -3190,7 +3190,7 @@ def ssh_timeout_detail(error: subprocess.TimeoutExpired) -> str:
 def run_remote_after_drop(arguments: Sequence[str]) -> int:
     try:
         require_sudo_caller()
-        config = "disks" if "CONF_DIR" in os.environ else Path.home() / ".claude/config/disks.conf"
+        config = "mac_test" if "CONF_DIR" in os.environ else Path.home() / ".claude/config/mac_test.conf"
         result = run_ssh_with_config(arguments, config)
     except subprocess.TimeoutExpired as error:
         print(ssh_timeout_detail(error), file=sys.stderr)
