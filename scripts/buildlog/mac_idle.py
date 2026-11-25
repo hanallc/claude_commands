@@ -324,7 +324,7 @@ def mac_work(paths: MacIdlePaths, now: float, *, waiting_for_mac: bool = False
             until = 0.0
         if not math.isfinite(until):
             return MacStateUnreadable("unreachable_until is not finite")
-        if until > now:
+        if until > now or (paths.mac_state / "failed_probe").exists():
             return MacUnreachable(until)
         if not isinstance(block, mac_test.NoMacBlock):
             return IdleReservation("blocked", block.holder, block.reason, block.delivery, live)

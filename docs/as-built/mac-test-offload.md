@@ -275,7 +275,8 @@ The check writes `~/.local/state/mac-idle/alert.json` on each pass.
 The hub `scripts/buildlog/mac_idle_alert.py` owns the path, record validation, and alert text.
 The views read the saved file and local configuration.
 Before a view shows a `MAC BLOCKED`, `MAC IDLE` or `MAC UNREACHABLE` line, it reads the live Mac state with `mac_idle.mac_work` (`mac_idle.view_alert_line`).
-That read uses only the local block, claim and `unreachable_until` files, and `/proc` for the claim holder's process.
+That read uses the local block, claim, `unreachable_until` and `failed_probe` files.
+It uses `/proc` to check the claim holder's process.
 It does not look for a CI job on the Mac, so a saved `free` line can show for one sample beside a CI job that just started.
 It compares the cause, not the holder, so a block or idle claim that replaces another one of the same cause shows the old holder until the next sample.
 The view shows the saved line only when the live state and cause agree with the saved reading.
@@ -329,7 +330,9 @@ It resolves the address with `showrunners.py address builds`.
 The message names the block, idle claim, free Mac, disk exclusion, or unreachable Mac.
 It lists the waiting steps and their wait evidence.
 The views place the same `MAC IDLE` alert first.
-`MAC UNREACHABLE` identifies a future connection backoff.
+`MAC UNREACHABLE` shows the retry deadline while the connection backoff is active.
+After the deadline, the `failed_probe` mark keeps the alert visible.
+The line says that the last probe failed.
 `MAC IDLE WATCH` identifies unreadable or stale state.
 The unreachable state sends the message after `alert_seconds` while eligible steps wait.
 The unreadable state sends no message or phone push.
@@ -337,6 +340,8 @@ The unreadable state sends no message or phone push.
 The machine watch, `scripts/buildlog/machine_watch.py`, sends the phone push. See [build-targets.md](build-targets.md).
 It reads the saved alert of the same pass.
 The unreachable state uses `mac_idle.unreachable` with `need=blocked` after `excluded_notice_seconds.mac` (600 s) while eligible steps wait.
+The failed probe mark keeps the same outage across retry deadlines.
+A successful probe clears the mark.
 A free Mac, an idle claim or a disk exclusion with waiting steps sends no phone push.
 `mac_idle` counts a waiting step only after `alert_seconds`.
 The machine watch sends one message to bob and the builds showrunner 600 s after it first sees the waiting steps.
