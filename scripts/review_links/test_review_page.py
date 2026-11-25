@@ -708,6 +708,51 @@ window.fetch=(url,options)=>{
         self.assertEqual(detail.count(ask), 1)
         self.assertIn('Choose the width.', detail)
 
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_card_shows_the_title_ask_and_feedback_once(self) -> None:
+        long_title = 'W'*100
+        equal = self.fixture.file_user_question(long_title, question=long_title)
+        title, ask = 'Layout choice', 'Which width should the page use?'
+        distinct = self.question(title)
+        source = next(item.source for item in review_items.read(self.root) if item.key == distinct)
+        assert isinstance(source, review_items.QuestionSource)
+        source.record.item['parts'] = update_registration.QuestionParts(
+            ask=ask, context='Choose the width.', items=[], choices=[], recommend='')
+        update_registration.write_question_record(source.record)
+        change, words = 'page-owner/C1', 'Adjust the spacing.'
+        _ = review_page.submit(self.root, self.body(change, 'feedback', words), self.status)
+
+        page = browser_markup(self.root)
+        cases = json.dumps([(equal, [long_title]), (distinct, [title, ask]), (change, [words])])
+        probe = r'''<script>
+(async()=>{
+ const failures=[];
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='820px';
+  document.querySelector('[data-filter-row="show"] [data-filter-value="all"]').click();
+  for(const [key,phrases] of CASES){
+   const row=document.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
+   if(!row) throw new Error('The row is missing: '+key);
+   row.querySelector('.list-toggle').click();
+   const end=performance.now()+8000;
+   while(!recordDetails(row)?.querySelector('.review-panel')){
+    if(performance.now()>end) throw new Error('The card did not load: '+key);
+    await new Promise(resolve=>requestAnimationFrame(resolve));
+   }
+   const detail=recordDetails(row);
+   if(!fixtureBodies[key].includes('data-review-summary') || detail.querySelector('[data-review-summary]'))
+    failures.push(key+': the response summary stays outside the card.');
+   const shown=detail.innerText;
+   for(const phrase of phrases){
+    if(shown.split(phrase).length!==2) failures.push(key+': the card shows '+phrase+' once.');
+   }
+  }
+ }catch(error){failures.push(String(error));}
+ await fixtureFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''.replace('CASES', cases)
+        markup = page.replace('</body>', probe+'</body>').encode()
+        self.assertEqual(firefox_probe_results(markup), [[]])
+
     def test_investigation_shows_its_question_title_once_in_details(self) -> None:
         title = 'Why did the gate stop?'
         filed = investigation.file(self.fixture.unit.id, title, title, waiting_why='The owner must complete the investigation.')
