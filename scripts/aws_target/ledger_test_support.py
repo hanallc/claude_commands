@@ -235,6 +235,7 @@ class AwsSettingsFixture(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **self.fixture_environment(), "HOME": str(self.root),
             "AWS_TARGET_CONFIG": str(self.settings),
+            "FOR_YOU_ACTIONS_DIR": str(self.root / "actions"),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })))
         # Remove inherited AWS paths and credentials. The patch restores them when the test ends.

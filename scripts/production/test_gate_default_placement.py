@@ -102,6 +102,7 @@ def run_held_direct_gate(ready: Path, arguments: list[str]) -> int:
     # The tests-only route still has a legacy SIGTERM handler. Test owner exit without it.
     with (mock.patch.object(gate, 'unwind_gate_on_sigterm', nullcontext),
           mock.patch.object(gate, 'run_tests_only', side_effect=hold),
+          mock.patch.object(gate, 'gate_production', return_value=ready.parent),
           mock.patch.object(gate, 'merge_checkpoint', side_effect=hold_placed),
           mock.patch.object(gate, 'nightly', side_effect=hold_placed),
           mock.patch.object(gate, '_nightly_unit', return_value='fixture'),
@@ -222,6 +223,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                       mock.patch.object(gate, 'current_gate_placement',
                                         side_effect=[gate.NO_GATE_ASSIGNMENT, placed('natedev')]),
                       mock.patch.object(gate, 'run_tests_only', side_effect=interrupt),
+                      mock.patch.object(gate, 'gate_production', return_value=Path.cwd()),
                       mock.patch.object(gate, 'merge_checkpoint', side_effect=interrupt_placed),
                       mock.patch.object(gate, 'nightly', side_effect=interrupt_placed),
                       mock.patch.object(gate, '_nightly_unit', return_value='fixture'),
@@ -437,6 +439,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                       mock.patch.object(gate, 'current_gate_placement',
                                         side_effect=[gate.NO_GATE_ASSIGNMENT, placed('natedev')]),
                       mock.patch.object(gate, 'run_tests_only', side_effect=run),
+                      mock.patch.object(gate, 'gate_production', return_value=Path.cwd()),
                       mock.patch.object(gate, 'merge_checkpoint', side_effect=merge),
                       mock.patch.object(gate, 'test_run_folder', return_value=nullcontext()),
                       mock.patch.object(scratch, 'copy_lock', return_value=nullcontext()),

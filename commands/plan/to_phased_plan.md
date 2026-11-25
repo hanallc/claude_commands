@@ -141,9 +141,9 @@ rest of the block untouched. Then skip to `<Restructure/>`.
 **Goal:** produce the **Delegation Context** block without spending orchestrator
 tokens on exploration.
 
-Dispatch ONE `Explore` (or `general-purpose`) subagent with a self-contained
-prompt. Its job is to return the codebase facts every phase needs, as a compact
-block — nothing else. The prompt must include:
+Assign one read-only worker through `/showrunner:worker` when enrolled.
+Keep its order and reply in the existing run directory. Before enrollment, use one built-in helper.
+Ask for the codebase facts each phase needs. Include:
 
 - The absolute plan-doc path (the subagent reads it to learn which files/areas
   the phases touch).
@@ -176,7 +176,8 @@ block — nothing else. The prompt must include:
   omitting `Project started` until `/unit:direct`'s progress recorder resolves
   it. No prose, no findings list.
 
-The subagent does not edit anything. Capture its block as ${DELEGATION_CONTEXT}.
+Use the read-only reply as ${DELEGATION_CONTEXT}.
+When enrolled, send the plan edits to the unit that owns the plan.
 </GatherContext>
 
 ---

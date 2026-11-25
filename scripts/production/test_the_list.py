@@ -38,6 +38,14 @@ LIST_TEXT_LIMITS = {
 }
 
 
+def copy_list_item(identity: str, *, source_keeper: staff.StaffId, destination_keeper: staff.StaffId) -> None:
+    """Copy a List fixture into another keeper's folder."""
+    filename = f"{identity}.md"
+    destination = the_list.folder(destination_keeper)
+    destination.mkdir(parents=True, exist_ok=True)
+    _ = shutil.copyfile(the_list.folder(source_keeper) / filename, destination / filename)
+
+
 class ProducerScopedUpdate(Protocol):
     def __call__(self, keeper: staff.StaffId, identity: str, changes: the_list.ItemChanges, *,
                  source: str, assigned_to: staff.StaffRow) -> the_list.ListEdit: ...
@@ -88,6 +96,77 @@ class TheListTests(unittest.TestCase):
             changes: the_list.ItemChanges | None = None) -> the_list.ListItem:
         return the_list.add(MORTY.id, title, owner=RUNNER.id, source="nate", number=number,
                             changes=changes if changes is not None else {})
+
+    def test_image_answer_retry_keeps_the_original_producer_and_a_later_state(self) -> None:
+        item = self.add(changes={"producer": BOB.id, "state": the_list.ItemState.WAITING_FOR_NATE,
+                                 "eta": the_list.EtaStatus.WAITING_FOR_NATE, "next_step": "Check the results."})
+        key = "review:" + "a" * 64
+        words = "Image 000000000001 approved.\nKeep the first row."
+        self.assertEqual(the_list.save_image_answer(
+            MORTY.id, item.id, key, words, image_id="000000000001", approved=True), BOB.id)
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertIs(saved.state, the_list.ItemState.WORKING)
+        self.assertIs(saved.eta, the_list.EtaStatus.NO_TIME_YET)
+        self.assertEqual(saved.next_step, "bob: act on nate's answer to picture 000000000001")
+        self.assertIs(the_list.unread_update(saved), the_list.NoUnreadUpdate.ABSENT)
+        self.assertEqual(saved.log[-1].what, words)
+        later = the_list.update(MORTY.id, item.id, {"producer": MORTY.id,
+                                "state": the_list.ItemState.WAITING_FOR_NATE}, source="morty")
+        self.assertEqual(the_list.save_image_answer(
+            MORTY.id, item.id, key, words, image_id="000000000001", approved=True), BOB.id)
+        self.assertEqual(the_list.load(MORTY.id, item.id), later)
+
+    def test_image_answer_replaces_the_next_step(self) -> None:
+        image = "000000000001"
+        item = self.add(changes={"producer": BOB.id, "next_step": f"nate reviews picture {image}."})
+        _ = the_list.save_image_answer(MORTY.id, item.id, "review:next", f"Image {image}: Approved.",
+                                       image_id=image, approved=True)
+        self.assertEqual(the_list.load(MORTY.id, item.id).next_step,
+                         f"bob: act on nate's answer to picture {image}")
+
+    def test_image_answer_marks_read_and_keeps_open_questions(self) -> None:
+        image = "000000000001"
+        item = self.add()
+        question = question_record.Question("Q1", START.isoformat(), "Which check passed?")
+        self.write_legacy_question(item, question)
+        self.assertIsInstance(the_list.unread_update(the_list.load(MORTY.id, item.id)), the_list.UnreadUpdate)
+        _ = the_list.save_image_answer(MORTY.id, item.id, "review:read", f"Image {image}: Feedback.",
+                                       image_id=image, approved=False)
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertIs(saved.unread_since, the_list.NoTimestamp.UNSET)
+        self.assertEqual(saved.questions, (question,))
+        self.assertTrue(any(isinstance(entry.what, the_list.MarkedRead) for entry in saved.log))
+
+    def test_image_answer_marks_read_and_closes_only_the_matching_ask(self) -> None:
+        image = "000000000001"
+        item = self.add()
+        picture_ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.APPROVAL, target=OWNER.id,
+            what=f"Review picture {image}.", why="The layout changed.", config=False, requester=MORTY.id, source="morty")
+        other_ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id,
+            what=f"Check picture f{image}.", why="Another layout changed.", config=False, requester=MORTY.id, source="morty")
+        _ = the_list.save_image_answer(MORTY.id, item.id, "review:read", f"Image {image}: Feedback.",
+                                       image_id=image, approved=False)
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertIs(saved.unread_since, the_list.NoTimestamp.UNSET)
+        self.assertEqual(the_list.open_asks(saved), (other_ask,))
+        self.assertEqual(saved.asks[0].ask_id, picture_ask.ask_id)
+        self.assertTrue(any(isinstance(entry.what, the_list.MarkedRead) for entry in saved.log))
+
+    def test_image_answer_uses_the_state_and_verdict_for_the_eta(self) -> None:
+        image = "000000000001"
+        for state in (the_list.ItemState.WAITING_FOR_NATE, the_list.ItemState.DELIVERED, the_list.ItemState.WORKING):
+            for approved in (True, False):
+                with self.subTest(state=state, approved=approved):
+                    item = self.add(changes={"state": state, "eta": the_list.EtaStatus.WAITING_FOR_NATE})
+                    words = f"Image {image}: " + ("Approved." if approved else "Feedback.")
+                    _ = the_list.save_image_answer(MORTY.id, item.id, "review:state", words,
+                                                   image_id=image, approved=approved)
+                    saved = the_list.load(MORTY.id, item.id)
+                    keeps_delivery = state is the_list.ItemState.DELIVERED and approved
+                    self.assertEqual(saved.state, state if keeps_delivery else the_list.ItemState.WORKING)
+                    self.assertEqual(saved.eta, the_list.EtaStatus.WAITING_FOR_NATE if keeps_delivery
+                                     else the_list.EtaStatus.NO_TIME_YET)
+                    self.assertEqual(saved.log[-1].what, words)
 
     def test_log_field_changes_replays_linked_delivery(self) -> None:
         item = self.add(changes={"state": the_list.ItemState.WORKING})
@@ -752,6 +831,43 @@ class TheListTests(unittest.TestCase):
             _ = scoped_update(MORTY.id, item.id, {"state": the_list.ItemState.WORKING},
                               source=retired.name, assigned_to=retired)
         self.assertEqual(the_list.load(MORTY.id, item.id), item)
+
+    def top_items(self) -> tuple[staff.TopItem | staff.NoTopItem, ...]:
+        record = staff.snapshot()
+        return tuple(row.top_item for row in (record.by_id(OTHER.id), record.by_id(BOB.id)) if row is not None)
+
+    def test_make_top_priority_replaces_the_producers_top_item(self) -> None:
+        first = self.add(changes={"producer": OTHER.id})
+        second = self.add("Second item", changes={"producer": OTHER.id})
+        self.assertEqual(the_list.make_top_priority(MORTY.id, first.id, assigned_to=OTHER.id), first)
+        _ = the_list.make_top_priority(MORTY.id, second.id)
+        self.assertEqual(self.top_items(), (staff.TopItem(second.number), staff.NoTopItem()))
+        self.assertEqual(the_list.load(MORTY.id, second.id), second)
+
+    def test_make_top_priority_refuses_a_closed_unknown_or_other_producer_item(self) -> None:
+        closed = self.add(changes={"producer": OTHER.id})
+        _ = the_list.close(MORTY.id, closed.id, "Done", source="fixture")
+        other = self.add("Bob item", changes={"producer": BOB.id})
+        cases: tuple[tuple[str, staff.StaffId | the_list.AllItems, str], ...] = (
+            (closed.id, the_list.AllItems.INCLUDED, "is Closed"),
+            (other.id, OTHER.id, "assigned to another producer"),
+            ("L999", the_list.AllItems.INCLUDED, "L999: no list item"))
+        for identity, assigned_to, message in cases:
+            with self.subTest(identity=identity), self.assertRaisesRegex(the_list.ListError, message):
+                _ = the_list.make_top_priority(MORTY.id, identity, assigned_to=assigned_to)
+        self.assertEqual(self.top_items(), (staff.NoTopItem(), staff.NoTopItem()))
+
+    def test_top_priority_command_names_a_producers_own_item_and_morty_names_any(self) -> None:
+        own = self.add(changes={"producer": OTHER.id})
+        other = self.add("Bob item", changes={"producer": BOB.id})
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            self.assertEqual(self.command("top-priority", "--id", str(own.number)),
+                             (0, f"{own.id} is the top priority item of dwight\n", ""))
+            refused, _, errors = self.command("top-priority", "--id", other.id)
+        self.assertEqual((refused, errors), (1, f"the_list: {other.id} is assigned to another producer\n"))
+        self.assertEqual(self.command("top-priority", "--id", other.id),
+                         (0, f"{other.id} is the top priority item of bob\n", ""))
+        self.assertEqual(self.top_items(), (staff.TopItem(own.number), staff.TopItem(other.number)))
 
     def test_producer_cli_update_reads_staff_once(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
@@ -1568,9 +1684,7 @@ class TheListTests(unittest.TestCase):
     def test_morty_can_select_the_keeper_when_list_ids_match(self) -> None:
         first = self.add(number=1)
         # Only morty's folder allocates numbers, so a legacy keeper's L1 is a copy of morty's record.
-        legacy = the_list.folder(OTHER.id)
-        legacy.mkdir(parents=True)
-        _ = shutil.copyfile(the_list.folder(MORTY.id) / f"{first.id}.md", legacy / f"{first.id}.md")
+        copy_list_item(first.id, source_keeper=MORTY.id, destination_keeper=OTHER.id)
         second = the_list.load(OTHER.id, first.id)
         status = change_page.DeliveryStatus(self.root / "reviews")
         for keeper, item in ((MORTY.id, first), (OTHER.id, second)):
@@ -2075,9 +2189,7 @@ class TheListTests(unittest.TestCase):
         """Add an item to morty's folder and copy it into bob's legacy folder."""
         # Only morty's folder allocates numbers, so morty keeps an item with the same number.
         item = self.add(changes={"state": state, "producer": producer.id})
-        legacy = the_list.folder(BOB.id)
-        legacy.mkdir(parents=True, exist_ok=True)
-        _ = shutil.copyfile(the_list.folder(MORTY.id) / f"{item.id}.md", legacy / f"{item.id}.md")
+        copy_list_item(item.id, source_keeper=MORTY.id, destination_keeper=BOB.id)
         return the_list.load(BOB.id, item.id)
 
     def test_page_mark_read_notice_command_names_a_legacy_keeper(self) -> None:

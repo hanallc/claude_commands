@@ -31,7 +31,7 @@
     "probe_timeout_s": 26
   },
   "gate": {
-    "GATE_TIME_LIMIT_FACTOR": 5
+    "gate_time_limit_factor": 5
   },
   "send": {
     "review_hold": 16,
