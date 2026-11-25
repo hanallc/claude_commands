@@ -2435,7 +2435,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return False
 
     def disks_measure_post(self) -> None:
-        """Start a Disks page measure and return its state and the current sessions."""
+        """Start a measure and return its state, the current sessions and the staff names."""
         now = time.time()
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -2449,7 +2449,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except (OSError, ValueError) as error:
             print(f"review-links disks sessions: {error}", file=sys.stderr)
             folders = None
-        self.json_response(200, {"state": started.state.value, "target": started.target, "sessions": folders})
+        try:
+            names = disks_page.session_name_registry()
+        except (OSError, ValueError) as error:
+            print(f"review-links disks staff names: {error}", file=sys.stderr)
+            names = None
+        self.json_response(200, {"state": started.state.value, "target": started.target, "sessions": folders,
+                                 "staff_names": names})
 
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)
