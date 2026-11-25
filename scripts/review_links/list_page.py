@@ -559,8 +559,9 @@ def review_summary(item: the_list.ListItem, reviews: Mapping[str, review_items.R
     if not item.reviews:
         return ""
     linked = [reviews[identity] for identity in item.reviews if identity in reviews]
-    ready = [review for review in linked if review.for_you(today)]
-    waiting = [review for review in linked if review.state != review_items.ReviewState.DONE and not review.for_you(today)]
+    ready = [review for review in linked if review.queue_at(today) is question_path.Queue.NEEDS_ME]
+    waiting = [review for review in linked if review.state != review_items.ReviewState.DONE
+               and review.queue_at(today) is not question_path.Queue.NEEDS_ME]
     if ready:
         kind = "change" if all(review.type == review_items.ReviewType.CHANGE for review in ready) else "review"
         text = footer_counts.plural(len(ready), kind) + " for you"
@@ -763,6 +764,12 @@ def review_links(item: the_list.ListItem, reviews: ReviewDisplay, today: datetim
     if item.reviews and reviews is not LinkedReviewRead.AFTER_RENDER:
         cards = (review_card(identity, reviews) for identity in item.reviews)
         links = '<p>' + review_summary(item, reviews, today) + '</p><p>' + ' · '.join(cards) + '</p>'
+        if isinstance(item.report, the_list.ListReport) and (review := reviews.get(item.report.evidence_key)):
+            if words := review_items.list_reply(review):
+                links += review_page.answer_section(words)
+            if item.report.kind is the_list.ReportKind.VALIDATION and (
+                    problem := review_items.validation_problem(review, item.number, item.report.validation_log)):
+                links += review_page.section('Validation result', problem)
     return '<div data-list-review-links>' + links + '</div>'
 
 

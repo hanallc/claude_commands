@@ -21,6 +21,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
 from enum import Enum, StrEnum
+from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 from zoneinfo import ZoneInfo
@@ -31,10 +32,11 @@ from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
 from scripts.production import delivery_state, investigation, producer_map, record_store, session_pane, staff
 from scripts.review_links import change_page, page_frame, page_question, question_path, question_record
+from scripts.review_links.review_items import LegacyValidationLog, ValidationLogStart
 
 
 if TYPE_CHECKING:
-    from scripts.review_links import review_submissions
+    from scripts.review_links import review_items, review_submissions
 
 
 class ListError(ValueError):
@@ -64,6 +66,12 @@ class ItemState(StrEnum):
 class ReportKind(StrEnum):
     BUG = "Bug"
     ENHANCEMENT = "Enhancement"
+    INVESTIGATION = "Investigation"
+    CHANGE = "Change"
+    VALIDATION = "Validation"
+    QUESTION = "Question"
+    PROPOSAL = "Proposal"
+    EFFICIENCY = "Efficiency"
 
 
 class NoReportScope(StrEnum):
@@ -78,10 +86,16 @@ class ListReport:
     evidence_key: str
     words: str
     submission_scope: str | NoReportScope = NoReportScope.NATIVE_RECORD
+    validation_log: ValidationLogStart | LegacyValidationLog = LegacyValidationLog.MOVE_MARKER
 
 
 class NoListReport(Enum):
     ABSENT = "ordinary List item"
+
+
+class ReportRetry(Enum):
+    KEEP = "keep the filed report"
+    UPDATE = "update the report before the action saves"
 
 
 ReportVerdict = page_frame.VerdictAction
@@ -900,9 +914,14 @@ def _validate(item: ListItem) -> None:
         _line(item.report.evidence_key, "report evidence key")
         if not item.report.words.strip():
             raise ListError("a List report needs the original words")
+        start = item.report.validation_log
+        if isinstance(start, ValidationLogStart) and (
+                item.report.kind is not ReportKind.VALIDATION or item.report.submission_scope
+                or start.first_result_index < 0):
+            raise ListError("invalid validation log position")
     if item.state == ItemState.REPAIRED:
         if not isinstance(item.report, ListReport):
-            raise ListError("only a Bug or Enhancement can be Repaired")
+            raise ListError("only a List report can be Repaired")
         _line(item.next_step, "how to try the repair")
     for name, value in (("next_step", item.next_step), ("latest_status", item.latest_status),
                         ("evidence", item.evidence), ("done_when", item.done_when)):
@@ -1292,6 +1311,8 @@ def _read_report(value: str) -> ListReport | NoListReport:
             return ListReport(ReportKind(kind), key, words)
         case [str(kind), str(key), str(words), str(scope)] if scope:
             return ListReport(ReportKind(kind), key, words, scope)
+        case [ReportKind.VALIDATION, str(key), str(words), int(index)] if type(index) is int:
+            return ListReport(ReportKind.VALIDATION, key, words, validation_log=ValidationLogStart(index))
         case _:
             raise ListError("invalid List report")
 
@@ -1372,8 +1393,10 @@ def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
         fields["asks"] = json.dumps([_stored_ask(ask) for ask in item.asks], ensure_ascii=False)
     if isinstance(item.report, ListReport):
         report = item.report
-        values: tuple[str, ...] = (report.kind, report.evidence_key, report.words)
-        if report.submission_scope:
+        values: tuple[str | int, ...] = (report.kind, report.evidence_key, report.words)
+        if isinstance(report.validation_log, ValidationLogStart):
+            values += (report.validation_log.first_result_index,)
+        elif report.submission_scope:
             values += (report.submission_scope,)
         fields["report"] = json.dumps(values, ensure_ascii=False)
     body = "## Next step\n\n" + item.next_step
@@ -1630,6 +1653,8 @@ def investigation_report_kind(record: investigation.Investigation) -> ReportKind
             return ReportKind.BUG
         case investigation.InvestigationPurpose.ENHANCEMENT:
             return ReportKind.ENHANCEMENT
+        case investigation.InvestigationPurpose.LIST_INVESTIGATION:
+            return ReportKind.INVESTIGATION
         case investigation.InvestigationPurpose.INVESTIGATE:
             return NoListReport.ABSENT
 
@@ -1644,26 +1669,57 @@ def file_investigation_report(
     route: review_submissions.ListFilingRoute | review_submissions.NoListFiling,
     reservation: Path | NextNumber, source: str,
 ) -> investigation.ListDestination:
-    from scripts.review_links import review_items, review_submissions
+    from scripts.review_links import review_items
 
     if isinstance(route, dict):
         keeper, owner, producer, unit = route['keeper'], route['owner'], route['producer'], route['unit']
         source = route['source']
     else:
-        keeper = producer_id(members, 'morty')
         owner = record.owner
-        member = members.by_id(owner)
-        unit = member.name if member is not None and member.kind == "unit" else ""
-        mapped = producer_map.producer_for(owner, members)
-        if isinstance(mapped, producer_map.MappedProducer):
-            producer = mapped.producer.id
-        else:
-            fallback = review_submissions.list_producer(conf.read("console"), members)
-            producer = fallback.id if isinstance(fallback, staff.StaffRow) else keeper
+        report_recipients = report_route(owner, members)
+        keeper, producer, unit = report_recipients.keeper, report_recipients.producer, report_recipients.unit
     report = report_from_investigation(record, report_kind, review_items.investigation_record_key(record))
     number = file_report(keeper, report, record.title, owner=owner, producer=producer,
                          unit=unit, source=source, reservation=reservation)
     return investigation.ListDestination(keeper, number)
+
+
+@dataclass(frozen=True)
+class ReportRoute:
+    keeper: staff.StaffId
+    producer: staff.StaffId
+    unit: str
+
+
+def report_route(owner: staff.StaffId, members: staff.StaffSnapshot) -> ReportRoute:
+    """Find the keeper, producer and unit for a report without a saved route."""
+    from scripts.review_links import review_submissions
+
+    keeper = producer_id(members, 'morty')
+    member = members.by_id(owner)
+    unit = member.name if member is not None and member.kind == "unit" else ""
+    mapped = producer_map.producer_for(owner, members)
+    fallback = (mapped.producer if isinstance(mapped, producer_map.MappedProducer)
+                else review_submissions.list_producer(conf.read("console"), members))
+    return ReportRoute(keeper, fallback.id if isinstance(fallback, staff.StaffRow) else keeper, unit)
+
+
+@contextmanager
+def file_cli_investigation(owner: staff.StaffId, title: str, words: str, reason: str,
+                           members: staff.StaffSnapshot) -> Generator[str]:
+    """File the List report and retain its native ID until the CLI prints it."""
+    _ = report_route(owner, members)
+    with investigation.cli_filing(owner, title, words, reason) as (path, report):
+        finish_cli_investigation(path, members)
+        yield report.id
+
+
+def finish_cli_investigation(path: Path, members: staff.StaffSnapshot) -> None:
+    from scripts.review_links import review_submissions
+
+    _ = investigation.file_on_list(path, lambda current: file_investigation_report(
+        current, ReportKind.INVESTIGATION, members, route=review_submissions.NoListFiling(),
+        reservation=NextNumber.AVAILABLE, source="nate via investigation file"))
 
 
 def move_review_bugs(members: staff.StaffSnapshot) -> list[investigation.ListDestination]:
@@ -1689,18 +1745,61 @@ def move_review_bugs(members: staff.StaffSnapshot) -> list[investigation.ListDes
                 moved.append(destination)
                 return destination
 
-            _ = investigation.file_on_list(path, file_moved, move_from_review=True)
+            _ = investigation.file_on_list(path, file_moved, mode=investigation.ListFilingMode.MOVE_BUG)
     return moved
 
 
-def file_report(keeper: staff.StaffId, report: ListReport, title: str, *, owner: staff.StaffId,
+def move_review_waits(root: Path, members: staff.StaffSnapshot) -> list[investigation.ListDestination]:
+    """File open Review waits and leave a destination in each source log."""
+    from scripts.review_links import review_items
+
+    move_wait = cast(Callable[[Path, review_items.ReviewItem, staff.StaffSnapshot],
+                             investigation.ListDestination | investigation.NoListDestination],
+                     import_module('scripts.review_links.review_actions').move_wait_to_list)
+    moved: list[investigation.ListDestination] = []
+    for item in review_items.read(root, members=members):
+        if review_items.can_move_wait(item):
+            destination = move_wait(root, item, members)
+            if isinstance(destination, investigation.ListDestination):
+                moved.append(destination)
+    return moved
+
+
+@dataclass(frozen=True)
+class ReservedReportNumber:
+    number: int
+
+
+def reserve_moved_report(keeper: staff.StaffId, evidence_key: str) -> ReservedReportNumber:
+    """Select the number for a source marker before the source writer runs."""
+    store = _store(keeper)
+    with store.list_allocation():
+        items = records(keeper, include_closed=True)
+        for item in items:
+            if isinstance(item.report, ListReport) and item.report.evidence_key == evidence_key:
+                return ReservedReportNumber(item.number)
+        for item in items:
+            if (isinstance(item.report, NoListReport) and item.state != ItemState.CLOSED
+                    and evidence_key in item.reviews):
+                return ReservedReportNumber(item.number)
+        number = store.next_number()
+        store.reserve_number(number)
+        return ReservedReportNumber(number)
+
+
+def file_report(keeper: staff.StaffId, report: ListReport, title: str, *, owner: ItemOwner,
                 producer: staff.StaffId, unit: str, source: str,
-                reservation: Path | NextNumber = NextNumber.AVAILABLE) -> int:
+                reservation: Path | NextNumber | ReservedReportNumber = NextNumber.AVAILABLE,
+                state: ItemState = ItemState.NEW,
+                retry: ReportRetry = ReportRetry.KEEP) -> int:
     """File a report once, or add its evidence to an existing linked List item."""
     store = _store(keeper)
     with store.list_allocation():
         reserved = reserved_review_number(reservation) if isinstance(reservation, Path) else reservation
-        if isinstance(reserved, int) and store.path(f"L{reserved}").is_file():
+        if isinstance(reserved, ReservedReportNumber):
+            reserved = reserved.number
+            candidates = records(keeper, include_closed=True)
+        elif isinstance(reserved, int) and store.path(f"L{reserved}").is_file():
             candidates = (load(keeper, f"L{reserved}"),)
         else:
             candidates = records(keeper, include_closed=True)
@@ -1712,22 +1811,33 @@ def file_report(keeper: staff.StaffId, report: ListReport, title: str, *, owner:
                     or report.submission_scope and item.report.submission_scope == report.submission_scope):
                 if isinstance(reservation, Path) and isinstance(reserved, NextNumber):
                     write_text_atomic(reservation, f"{item.number}\n", new_file_mode=0o600)
+                if (retry is ReportRetry.UPDATE and item.report.kind is report.kind
+                        and item.report.evidence_key == report.evidence_key):
+                    updated_report = replace(item.report, words=report.words, validation_log=report.validation_log)
+                    if updated_report != item.report:
+                        _save(store, replace(item, report=updated_report, updated=now()))
                 sync_folder(store.folder())
                 return item.number
         if linked is not None:
-            reviews = tuple(key for key in linked.reviews if key != report.evidence_key)
-            if linked.state in (ItemState.NEW, ItemState.WORKING):
-                item = replace(linked, report=report, reviews=reviews)
-            else:
+            reviews = (linked.reviews if not report.evidence_key.startswith('investigation/')
+                       else tuple(key for key in linked.reviews if key != report.evidence_key))
+            changes: ItemChanges = {}
+            if report.kind is ReportKind.VALIDATION and linked.owner != owner:
+                changes['owner'] = owner
+            if linked.state not in (ItemState.NEW, ItemState.WORKING):
+                changes['state'] = ItemState.WORKING
+            item = replace(linked, report=report, reviews=reviews, **changes)
+            if changes:
                 moment = now()
-                change = ItemChange(moment, _WORKING_CHANGE, source)
-                item = replace(linked, report=report, reviews=reviews, state=ItemState.WORKING,
-                               updated=moment, log=(*linked.log, change))
-        elif isinstance(reserved, int) and candidates and candidates[0].number == reserved:
+                change = ItemChange(moment, FieldChange('Updated', {**changes}), source)
+                item = replace(item, updated=moment, log=(*linked.log, change))
+        elif isinstance(reserved, int) and any(item.number == reserved for item in candidates):
             raise ListError(f"L{reserved}: the report reservation names a different item")
         else:
             chosen = store.next_number() if isinstance(reserved, NextNumber) else reserved
-            item = replace(_new_item(chosen, title, owner, keeper, source, {"producer": producer, "unit": unit}),
+            reviews = () if report.evidence_key.startswith('investigation/') else (report.evidence_key,)
+            item = replace(_new_item(chosen, title, owner, keeper, source,
+                                     {"producer": producer, "unit": unit, "state": state}, reviews=reviews),
                            report=report)
             _require_active_open_producers((item,))
             if isinstance(reserved, NextNumber):
@@ -2994,6 +3104,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = ask.add_argument("--why", required=True, help="why the session needs nate's word")
     _ = ask.add_argument("--config", action="store_true", help="the change is a settings.json, CLAUDE.md or config change")
     _ = commands.add_parser("move-review-bugs", help="move open Review bugs to the List")
+    _ = commands.add_parser("move-review-waits", help="move Waiting and Validating Review records to the List")
     top = commands.add_parser("top-priority", help="make an open item the top priority item of its producer")
     _ = top.add_argument("--id", required=True, help="the List item ID, such as L1")
     for name in ("add", "update", "park", "unpark", "close", "reopen", "mark-read", "clean-evidence", "link", "unlink", "list"):
@@ -3075,10 +3186,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         # Only morty updates every field of every item, in each keeper's folder.
         assigned_to = AllItems.INCLUDED if caller.id == morty else caller.id
-        if name == "move-review-bugs":
+        if name in ("move-review-bugs", "move-review-waits"):
             if caller.id != morty:
-                raise ListError("only morty can run move-review-bugs")
-            for destination in move_review_bugs(record):
+                raise ListError(f"only morty can run {name}")
+            if name == "move-review-bugs":
+                destinations = move_review_bugs(record)
+            else:
+                from scripts.review_links import review_link
+
+                destinations = move_review_waits(review_link.review_root(), record)
+            for destination in destinations:
                 print(f"moved to List item {destination.number}")
             return 0
         if name == "list":

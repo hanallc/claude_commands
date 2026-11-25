@@ -23,6 +23,7 @@ import time
 import unicodedata
 from collections.abc import Callable, Generator, Iterable
 from contextlib import ExitStack, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from functools import partial
@@ -60,7 +61,7 @@ from scripts.review_links import (console_theme, image_store, new_item_dialog, p
 from scripts.review_links.question_record import AnswerRefused as AnswerRefused
 from scripts.review_links.review_items import (
     CompletedFeedback as CompletedFeedback, OpenFeedback as OpenFeedback,
-    decode_change_delivery, read_change_delivery, validation_recipients,
+    change_on_list, decode_change_delivery, read_change_delivery, validation_recipients, validation_request_words,
 )
 
 MANIFEST = ".review-link-changes.json"
@@ -302,6 +303,25 @@ class AssignedReviewPage(ReviewPage):
     """The staff record supplies this row's current showrunner."""
 
     owner: change_routing.ChangeOwner
+
+
+type ChangeWorkFiling = Callable[[ReviewPage, dict[str, str], change_routing.ChangeAssignment, str, str],
+                                 investigation.ListDestination | investigation.NoListDestination]
+
+
+_change_work_filing: ContextVar[ChangeWorkFiling] = ContextVar(
+    "change_work_filing", default=lambda _page, _row, _assignment, _outcome, _words:
+    investigation.NoListDestination.ABSENT)
+
+
+@contextmanager
+def file_change_actions(filing: ChangeWorkFiling) -> Generator[None]:
+    """Use the same List filing path for live change forms."""
+    token = _change_work_filing.set(filing)
+    try:
+        yield
+    finally:
+        _change_work_filing.reset(token)
 
 
 @dataclass(frozen=True)
@@ -2142,7 +2162,8 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
             warning = "Not saved: " + notice.reason
         alert = page_frame.action_failure("change-save-failure", warning) if warning else ""
         form_notice = notice if notice.row == row["#"] else AnswerNotice(row["#"])
-        answer = answer_form(page, form_notice, feedback_rows) if slots.waits_for_user(bool(verdict)) else ""
+        answer = (answer_form(page, form_notice, feedback_rows)
+                  if slots.waits_for_user(bool(verdict)) and not change_on_list(row) else "")
         proof_title = "Try it · What you should see" if row[change_review.KIND] == "See in action" else "Proof"
         content = f'''{alert}
 <h1>{html.escape(row["Change"])}</h1>
@@ -2385,9 +2406,23 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         raise question_record.AnswerRefused("the production document is not available")
     message_page = replace(page, production=assignment.production)
     recipients = owner.showrunner_recipients
+    filing = _change_work_filing.get()
+
+    def file_work(current: dict[str, str]) -> investigation.ListDestination | investigation.NoListDestination:
+        if outcome not in ("validate", "feedback", "not works"):
+            return investigation.NoListDestination.ABSENT
+        return filing(page, current, assignment, outcome, feedback)
+
+    def mark_moved(destination: investigation.ListDestination | investigation.NoListDestination) -> None:
+        if isinstance(destination, investigation.ListDestination):
+            change_review.record_review_log(page.review_list, row_id, f"moved to List item {destination.number}",
+                                            message_page.production)
+
     if outcome in CHANGE_HANDOFFS:
-        with status.locked():
+        with change_review.checked_review_write(page.review_list, status.root, lambda: None):
             current = answer_row(page, row_id)
+            if change_on_list(current):
+                raise ChangeHandoffRefused("Open the report on the List.")
             if current.get("Verdict"):
                 raise ChangeHandoffRefused("this row already has a saved answer")
             slots = status.slots(page, row_id)
@@ -2411,10 +2446,11 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
             if during_validation and sender is None:
                 raise question_record.AnswerRefused("the saved validator is unavailable")
             _ = row_production(page, row)
+            destination = file_work(current)
             if outcome == "validate":
                 _ = next_item.move_to_end(next_item.CHANGE, page.production, key=queue_key(page, row_id), prepared=prepared)
                 change_review.record_review_log(page.review_list, row_id,
-                    "validate" + (": " + feedback if feedback else ""), message_page.production)
+                    validation_request_words(feedback), message_page.production)
                 attempt = status.begin_locked(page, row_id, slots, "validation", feedback, recipients=recipients,
                     waiting_why=feedback.strip() or "The user asked the showrunner to validate this change.")
                 message = validation_message(message_page, row, attempt, feedback)
@@ -2438,6 +2474,11 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
                 attempt = intent.attempt
                 message = _request_message(message_page, row, intent.question_id, intent.text, request_feedback,
                                            sender=sender)
+            try:
+                mark_moved(destination)
+            except (OSError, ValueError, RuntimeError):
+                _ = status.request_attempts.pop(attempt, None)
+                raise
         return MessageDelivery(message_page, row_id, recipients, message, attempt, recipients)
 
     if row.get("Verdict"):
@@ -2457,6 +2498,7 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         with status.locked():
             if attempt and status.slots(page, row_id).verdict != slots.verdict:
                 status.write_slots(page, row_id, slots)
+            _ = status.request_attempts.pop(attempt, None)
 
     if recipients and not defer_verdict_cleanup:
         attempt = status.begin(page, row_id, "verdict", recipients=recipients, user_verdict=True)
@@ -2467,14 +2509,18 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         production_name = unit_lookup.doc_owner(page.production, staff.snapshot()).name
         production = change_review.production_doc(production_name)
         with change_review.checked_review_write(page.review_list, status.root, lambda: None):
-            recorded = answer_row(page, row_id).get('Verdict')
+            current = answer_row(page, row_id)
+            recorded = current.get('Verdict')
             if recorded == verdict:
                 cancel_preparation()
                 return NoMessageDelivery()
             if recorded:
                 raise AnswerRefused("this row already has a different saved answer")
+            if change_on_list(current):
+                raise ChangeHandoffRefused("Open the report on the List.")
             cleanup = replace(change_review.PendingVerdictCleanup.for_row(status.root, page.review_list, row_id),
                               verdict=verdict, feature_review=review, require_git_commit=defer_verdict_cleanup or bool(review))
+            destination = file_work(current)
             try:
                 cleanup.save()
                 result = change_review.save_verdict(page.review_list, row_id, verdict, production, cleanup=cleanup)
@@ -2483,6 +2529,11 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
                 raise
             if isinstance(result, change_review.VerdictRefused) or isinstance(result.cleanup, change_review.NoVerdictCleanup):
                 cleanup.intent.unlink(missing_ok=True)
+            if not isinstance(result, change_review.VerdictRefused):
+                try:
+                    mark_moved(destination)
+                except (OSError, ValueError, RuntimeError) as error:
+                    print(f"review-links {row_id}: the List report is saved. Source log: {error}", file=sys.stderr)
     except change_review.VerdictDurabilityUnconfirmed:
         with status.locked():
             _ = status.request_attempts.pop(attempt, None)

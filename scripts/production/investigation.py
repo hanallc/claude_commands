@@ -16,13 +16,14 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum, StrEnum
+from importlib import import_module
 from pathlib import Path
 from typing import cast, override
 
 from scripts.lib import atomic_file
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_routing, delivery_state, record_store, staff
-from scripts.production.issues import Issue
+from scripts.production.issues import Issue, header_fields
 from scripts.review_links import new_item_dialog, reply_tokens, review_events
 from scripts.review_links.review_events import ReviewLog
 from scripts.production.record_store import state_root as state_root
@@ -47,6 +48,7 @@ class InvestigationKind(StrEnum):
 
 class InvestigationPurpose(StrEnum):
     INVESTIGATE = "investigate"
+    LIST_INVESTIGATION = "List investigation"
     BUG_REPORT = "bug report"
     MOVING_LEGACY_BUG = "moving legacy bug"
     ENHANCEMENT = "enhancement"
@@ -78,6 +80,11 @@ class NoListDestination(Enum):
     ABSENT = "still on Review"
 
 
+class CliFilingOutput(StrEnum):
+    PENDING = "awaiting native ID output"
+    NONE = ""
+
+
 def _read_list_destination(raw: str) -> ListDestination | NoListDestination:
     if not raw:
         return NoListDestination.ABSENT
@@ -106,6 +113,7 @@ class Investigation:
     submission: new_item_dialog.SubmissionOrigin = new_item_dialog.NoReviewSubmission()
     list_destination: ListDestination | NoListDestination = NoListDestination.ABSENT
     purpose: InvestigationPurpose = InvestigationPurpose.INVESTIGATE
+    cli_output: CliFilingOutput = CliFilingOutput.NONE
 
     @property
     def belongs_on_list(self) -> bool:
@@ -190,8 +198,26 @@ def folder(owner: staff.StaffId) -> Path:
     return _store(owner).folder()
 
 
+def _header_lines(path: Path) -> list[str]:
+    """Decode the header without reading the body as text."""
+    try:
+        with path.open("rb") as stream:
+            if stream.readline().decode("utf-8").strip() == "---":
+                lines: list[str] = []
+                for raw in stream:
+                    line = raw.decode("utf-8").rstrip("\r\n")
+                    if line.strip() == "---":
+                        return lines
+                    lines.append(line)
+    except (OSError, UnicodeError) as error:
+        raise OSError(f"Cannot read record {path}: {error}") from error
+    return []
+
+
 def _record_id(path: Path, *, strict: bool = False) -> str:
-    fields = record_store.read_header(path, keys=frozenset(("id", "owner")), strict=strict)
+    keys = frozenset(("id", "owner"))
+    fields = (header_fields(_header_lines(path), keys) if strict
+              else record_store.read_header(path, keys=keys))
     issue = Issue(path, fields)
     identity = issue.value("id")
     return identity if re.fullmatch(r"I[1-9][0-9]*", identity) else ""
@@ -293,7 +319,8 @@ def _load(store: Investigations, identity: str, path: Path, *, sources: list[Pat
                              fields["read"], question, answer, review_events.decode(fields.get("review_log", "")),
                              review_events.waiting_why(fields.get("waiting_why", "")), kind,
                              submission, _read_list_destination(fields.get("list_destination", "")),
-                             InvestigationPurpose(fields.get("purpose", InvestigationPurpose.INVESTIGATE)))
+                             InvestigationPurpose(fields.get("purpose", InvestigationPurpose.INVESTIGATE)),
+                             CliFilingOutput(fields.get("cli_output", "")))
         if not item.title.strip() or record_store.has_line_break(item.title):
             raise ValueError("title must have one line")
         for name, value, required in (
@@ -346,6 +373,8 @@ def _save(store: Investigations, item: Investigation, path: Path,
     destination = item.list_destination
     if isinstance(destination, ListDestination):
         fields["list_destination"] = json.dumps((destination.keeper, destination.number))
+    if item.cli_output is CliFilingOutput.PENDING:
+        fields["cli_output"] = item.cli_output
     body = f"{item.question}{ANSWER_SECTION}{item.answer}"
     with investigation_numbers() if numbers is None else nullcontext(numbers) as sequence:
         with sequence.write(path, item.id, store.owner, folder=store.folder(), new_record=new_record,
@@ -408,13 +437,19 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _filing_title(title: str) -> str:
+    normalized = title.strip()
+    if not normalized or record_store.has_line_break(title):
+        raise InvestigationError("title must have one nonempty line")
+    return normalized
+
+
 def file(owner: staff.StaffId, title: str, question: str, *, waiting_why: str = "",
          kind: InvestigationKind = InvestigationKind.INVESTIGATION,
          submission: new_item_dialog.SubmissionOrigin = _NO_REVIEW_SUBMISSION,
          before_write: Callable[[str, Path], None] = lambda _id, _path: None) -> Investigation:
     """File an Investigation with the next number on this machine."""
-    if not title.strip() or record_store.has_line_break(title):
-        raise InvestigationError("title must have one nonempty line")
+    _ = _filing_title(title)
     if not question.strip():
         raise InvestigationError("question must not be empty")
     reason = review_events.require_waiting_why(waiting_why)
@@ -438,6 +473,58 @@ def file(owner: staff.StaffId, title: str, question: str, *, waiting_why: str = 
             if saved is not item:
                 before_write(saved.id, path)
             return saved
+
+
+@dataclass(frozen=True)
+class CliFilingWords:
+    title: str
+    question: str
+    waiting_why: str
+
+
+def _cli_filing_words(title: str, question: str, reason: str) -> CliFilingWords:
+    return CliFilingWords(_filing_title(title), question, review_events.waiting_why(reason))
+
+
+@contextmanager
+def cli_filing(owner: staff.StaffId, title: str, question: str, reason: str
+               ) -> Generator[tuple[Path, Investigation]]:
+    """Resume an unfinished CLI filing with the same words."""
+    reason = review_events.require_waiting_why(reason)
+    requested = _cli_filing_words(title, question, reason)
+    store = _store(owner)
+    with store.locked():
+        roots = record_store.known_folders(record_store.RecordKind.INVESTIGATION, owner, strict=True)
+        for path in record_store.stored_paths(roots, strict=True):
+            header = _header_lines(path)
+            fields = header_fields(header, frozenset({
+                "id", "purpose", "review_submission", "list_destination", "cli_output",
+            }))
+            identity = Issue(path, fields).value("id")
+            if (not store.valid_id(identity)
+                    or fields.get("purpose") != [InvestigationPurpose.LIST_INVESTIGATION]
+                    or fields.get("review_submission")
+                    or (fields.get("list_destination")
+                        and fields.get("cli_output") != [CliFilingOutput.PENDING])):
+                continue
+            try:
+                report = _load(store, identity, path)
+            except (OSError, InvestigationError) as error:
+                raw_title = next((line.removeprefix("title: ") for line in header if line.startswith("title: ")), "null")
+                stored_title = cast(object, json.loads(raw_title))
+                if not isinstance(stored_title, str) or _filing_title(stored_title) == requested.title:
+                    raise
+                print(f"investigation: {path}: {str(error).replace(chr(10), ' ')}", file=sys.stderr)
+                continue
+            if _cli_filing_words(report.title, report.question, report.waiting_why) == requested:
+                break
+        else:
+            with file_for_list(InvestigationPurpose.LIST_INVESTIGATION):
+                report = file(owner, title, question, waiting_why=reason)
+            path = _record_path(store, report.id)
+        yield path, report
+        current = read_review_record(path)
+        _ = _save(store, replace(current, cli_output=CliFilingOutput.NONE), path)
 
 
 def answer(owner: staff.StaffId, identity: str, text: str, *, question_id: str = '') -> Investigation:
@@ -502,25 +589,37 @@ def _answer(store: Investigations, identity: str, text: str, question_id: str,
         return item, True
 
 
+class ListFilingMode(Enum):
+    NEW_REPORT = "new report"
+    MOVE_BUG = "move and close the old Bug"
+    MOVE_WAIT = "move and keep the native reply open"
+
+
 def file_on_list(path: Path, write_list_item: Callable[[Investigation], ListDestination], *,
-                 move_from_review: bool = False) -> Investigation:
+                 mode: ListFilingMode = ListFilingMode.NEW_REPORT) -> Investigation:
     """Keep the native evidence and commit the List destination under the source lock."""
     store = _store(review_owner(path))
     with store.locked():
         item = read_review_record(path)
-        if isinstance(item.list_destination, ListDestination) or (move_from_review and
+        if isinstance(item.list_destination, ListDestination) or (mode is not ListFilingMode.NEW_REPORT and
                                                                   item.state == InvestigationState.READ):
             return item
-        if move_from_review and item.purpose is InvestigationPurpose.INVESTIGATE:
+        if mode is ListFilingMode.MOVE_WAIT and item.state != InvestigationState.OPEN:
+            return item
+        if mode is ListFilingMode.MOVE_BUG and item.purpose is InvestigationPurpose.INVESTIGATE:
             # Prevent Review actions before the List row becomes visible.
             item = _save(store, replace(item, purpose=InvestigationPurpose.MOVING_LEGACY_BUG), path)
         destination = write_list_item(item)
-        if move_from_review:
+        if (mode is ListFilingMode.NEW_REPORT and item.purpose is InvestigationPurpose.LIST_INVESTIGATION
+                and isinstance(item.submission, new_item_dialog.NoReviewSubmission)):
+            item = replace(item, cli_output=CliFilingOutput.PENDING)
+        if mode is not ListFilingMode.NEW_REPORT:
             moment = datetime.now(timezone.utc)
             stamp = moment.isoformat()
             event = ReviewLog(moment, "nate", f"moved to List item {destination.number}")
-            item = replace(item, state=InvestigationState.READ, answered=item.answered or stamp, read=stamp,
-                           log=(*item.log, event))
+            item = replace(item, log=(*item.log, event))
+            if mode is ListFilingMode.MOVE_BUG:
+                item = replace(item, state=InvestigationState.READ, answered=item.answered or stamp, read=stamp)
         return _save(store, replace(item, list_destination=destination), path)
 
 
@@ -671,7 +770,11 @@ def main(argv: list[str] | None = None) -> int:
                 raise InvestigationError("owner has no staff row")
             owner = target.id
         if command == "file":
-            print(file(owner, cast(str, args.title), cast(str, args.question), waiting_why=cast(str, args.waiting_why)).id)
+            file_report = cast(Callable[[staff.StaffId, str, str, str, staff.StaffSnapshot], AbstractContextManager[str]],
+                               import_module("scripts.production.the_list").file_cli_investigation)
+            with file_report(owner, cast(str, args.title), cast(str, args.question), cast(str, args.waiting_why),
+                             record) as identity:
+                print(identity, flush=True)
         elif command == "answer":
             _ = answer(owner, cast(str, args.id), cast(str, args.text))
         elif command == "read":
