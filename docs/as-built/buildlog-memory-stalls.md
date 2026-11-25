@@ -53,6 +53,11 @@ Launches skip memory admission by design. Their `mem_wait_s` is null and the rep
 
 The one admission sampler `buildlog_sample_anon` in `scripts/lint/invoke.sh` opens a test-phase window on the first tick when a running executable in the step's scope has a direct parent folder named `deps` (`/deps/[^/]+$`), under any target folder name. Build scripts run from `<profile>/build/<pkg>-<hash>/` and do not open it. The peak is the scope's `memory.stat` `anon`, so it counts all parallel tests. The sampler writes the anon peak, the start time and the context from `record.py test-phase-context RESERVATION ARGV...` to `$BUILDLOG_PEAK.test-phase.json` (temp + `mv`). The same loop still writes admission's `.max` and `.wave` files.
 
+The sampler waits up to one second on a pipe between readings.
+Step cleanup closes the pipe and waits for the sampler before it releases memory.
+The sampler finishes its current reading and exits when it reads EOF.
+The stop pipe also closes if the step shell exits before cleanup.
+
 `record.py step` reads `BUILDLOG_TEST_PHASE_FILE` and validates the sidecar before it saves `PendingStep.test_phase`. An absent sidecar records null. An unreadable sidecar retains the sources and the pending record for a retry. The recorder writes one `pending record <path>` line to `errors.log`. The JSON row contains `test_phase_peak_bytes`, `test_phase_started_at`, and the selection fields from `TestPhaseContext`. The selection fields are `repo_identity`, `test_scope`, `package`, `filters`, `call_id`, and `test_threads`. The recorder and admission use `parse.test_threads` to read the width.
 
 The row keeps the sidecar's `reservation_id` when the sampler records one.

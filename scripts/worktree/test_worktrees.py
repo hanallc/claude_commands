@@ -1510,6 +1510,25 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertFalse(target.is_symlink())
         self.assertEqual((other / "target").readlink(), self.root / "build/other/main")
 
+    def test_target_migration_marks_the_lock_before_checking_the_parent(self) -> None:
+        self.layout_fixture()
+        checkout, _ = self.real_main_target()
+        previous = checkout / "target"
+        output = self.root / "build/origin/main"
+        check_parent = build_folders.allocation_parent_current
+
+        def try_removal(path: Path, parent: int) -> bool:
+            self.assertEqual(path, output)
+            self.assertFalse(path.exists())
+            self.assertFalse(build_folders.remove_build_folder(path.parent, wait=False))
+            return check_parent(path, parent)
+
+        with (patch.dict(os.environ, self.environment, clear=True),
+              patch.object(build_folders, "allocation_parent_current", try_removal)):
+            worktrees._link_with_previous_target(checkout, output, previous)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(previous.readlink(), output)
+        self.assertEqual((output / "debug/artifact").read_text(), "warm")
+
     def test_failed_link_moves_the_output_back_to_the_previous_target(self) -> None:
         self.layout_fixture()
         checkout = self.migration_main()
@@ -3562,6 +3581,24 @@ raise SystemExit(2)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Rerun when idle", result.stdout)
         self.assertFalse((self.root / "build/origin/demo").exists())
+
+    def test_output_creation_retries_when_the_parent_moves_during_mkdir(self) -> None:
+        self.layout_fixture()
+        parent = self.root / "build/origin/demo"
+        parent.mkdir(parents=True)
+        output, former = parent / "probe", parent.with_name("former")
+        mkdir = os.mkdir
+
+        def move_parent(path: str | os.PathLike[str], mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+            mkdir(path, mode, dir_fd=dir_fd)
+            if path == output.name and dir_fd is not None and not former.exists():
+                _ = parent.rename(former)
+
+        with (patch.dict(os.environ, self.environment, clear=True),
+              patch.object(os, "mkdir", side_effect=move_parent)):
+            worktrees.ensure_output_folder(output)
+        self.assertTrue(former.is_dir())
+        self.assertTrue(output.is_dir())
 
     def test_rename_keeps_a_nonempty_old_output_parent(self) -> None:
         self.layout_fixture()
