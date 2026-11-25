@@ -319,7 +319,9 @@ def load_firefox(case: unittest.TestCase, destination: str, complete: Event | No
     return subprocess.CompletedProcess(destination, 0, "", "")
 
 
-def firefox_probe_results(case: unittest.TestCase, page: bytes) -> list[list[str]]:
+def firefox_probe_results(case: unittest.TestCase, page: bytes, *,
+                          window_size: tuple[int, int] = DEFAULT_VIEWPORT,
+                          dark: bool = False) -> list[list[str]]:
     """Load the page in a headless Firefox frame and return the failure lists its probe posts."""
     results: list[list[str]] = []
     complete = Event()
@@ -351,7 +353,8 @@ def firefox_probe_results(case: unittest.TestCase, page: bytes) -> list[list[str
         thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         try:
-            run = load_firefox(case, f"http://127.0.0.1:{server.server_port}/", complete)
+            run = load_firefox(case, f"http://127.0.0.1:{server.server_port}/", complete,
+                               size=window_size, dark=dark)
             if run.returncode:
                 raise AssertionError(run.stderr)
         finally:

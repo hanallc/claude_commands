@@ -21,7 +21,8 @@ A task, and what ends it:
   * `gate:worker-<staff id>`: the worker's assignment; the worker close path ends it;
   * `landed:<unit>/<branch>`: the branch is in its recorded land target and all work is saved;
   * `row:<showrunner>-C<n>`: change_review.py verdict;
-  * `until:<YYYY-MM-DDTHHMMZ>/<id>`: the hourly temporary sweep ends the task when its time passes.
+  * `until:<YYYY-MM-DDTHHMMZ>/<id>`: the deadline ends the task.
+    The hourly sweep lists eligible folders for vetted manual removal.
     `--until` takes `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` in the user's zone.
     Each call makes a random id with scratch.conf suffix_length characters.
     With no task, a folder gets a separate deadline task for scratch.conf default_life_seconds from now.
@@ -37,9 +38,9 @@ scratch.conf suffix_length sets the suffix length.
 Worker folders live under TMPDIR as `<showrunner>-<unit>-<worker>-<suffix>[-<word>]`.
 The holds record lists their paths, so task end can find them.
 Each folder holds copy_record.RECORD with its task, maker and
-times. The hourly tmp sweep (scripts/lint/tmp_sweep.py) keeps a folder in ROOT while its task is
-open, and removes it when its until: time passes, or after 7 idle days whatever its task, since an
-ender can fail. A row's folder waits for its verdict. A git
+times. The hourly sweep (scripts/lint/tmp_sweep.py) checks each folder in ROOT.
+After its until: deadline or 7 idle days, the sweep lists it for vetted manual removal if the other checks pass.
+A row's folder waits for its verdict. A git
 worktree goes through `git worktree remove`, so its source repo keeps no stale entry.
 Removal writes versioned deletion intent to `.scratch-removing-<folder>.json` beside the source.
 The intent preserves the task and source evidence across interruptions.
@@ -1552,7 +1553,7 @@ FOLDER_REMOVAL = FolderRemoval()
 
 @dataclass(frozen=True)
 class ExpiredFolderRemoval:
-    """Recheck a copy's expired lifetime before a sweep removes its folder."""
+    """Recheck an expired copy before the sweep lists it for vetted manual removal."""
     now: float
 
 

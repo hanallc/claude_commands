@@ -241,23 +241,23 @@ def _check_name(name: str) -> None:
 
 
 BuildFolderKind = Literal["temporary", "gate", "standing", "editable", "main", "mirror", "target",
-                          "scratch", "legacy-unique", "legacy-stable", "tool", "slot", "copy"]
+                          "scratch", "legacy-unique", "legacy-stable", "tool", "copy"]
 
 
 @dataclass(frozen=True)
 class SlotCheckout:
-    """The checkout holds the source repository and required commit for a slot."""
+    """The checkout holds the source repository and required commit for a numbered copy."""
     source: Path
     commit: str
 
 
 class SlotSourceBusy(BlockingIOError):
-    """The source lock prevents creation of a slot checkout."""
+    """The source lock prevents creation of a numbered copy checkout."""
 
 
 @dataclass(frozen=True)
 class NoSlotCheckout:
-    """The folder does not contain a repository slot."""
+    """The folder does not contain a numbered copy checkout."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -578,7 +578,7 @@ def test_runs_parent(checkout: Path) -> Path:
 
 
 def repository_git_timeout() -> float:
-    """Keep the copies Git deadline when the maker creates a slot."""
+    """Keep the copies Git deadline when the maker creates a numbered copy."""
     from scripts.lib import conf
 
     path = os.environ.get("COPIES_CONFIG")
@@ -615,9 +615,6 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
     settings = _settings()
     if spec.kind == "copy":
         return copy_path(spec.repository, spec.unit, spec.slot)
-    if spec.kind == "slot":
-        _check_name(spec.repository)
-        return spec.parent / f"{spec.repository}-slot{spec.slot}"
     for component in (spec.repository, spec.owner, spec.purpose, spec.suffix, spec.showrunner, spec.unit, spec.work):
         _check_name(component)
     if spec.suffix_length < 0:
@@ -664,9 +661,39 @@ def _take_lock(descriptor: int, mode: int, *, wait: bool = True) -> bool:
     return build_folder_lock.take_lock(descriptor, mode, _probe_timing(wait=wait))
 
 
-def build_folder_state(path: Path) -> Literal["held", "free"]:
-    """Check the lock with the host configuration."""
-    return build_folder_lock.probe(path, path.parent, _probe_timing)
+COPY_KEEP_ENV = "COPIES_KEEP_FILE"
+
+
+def copy_keep_file(path: Path) -> Path:
+    """Return the path where the child can record a reason to keep the copy."""
+    return path.with_name(path.name + ".keep")
+
+
+def _copy_is_kept(path: Path, directory: int | None = None) -> bool:
+    marker = copy_keep_file(path)
+    try:
+        info = os.stat(marker if directory is None else marker.name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 0
+
+
+def _kept_build_copy(path: Path, directory: int | None = None) -> bool:
+    return (_DECIMAL_NAME.fullmatch(path.name) is not None and _copy_is_kept(path, directory)
+            and isinstance(parse_form(path), BuildCopy))
+
+
+BuildFolderState = Literal["held", "free", "kept"]
+
+
+def build_folder_state(path: Path) -> BuildFolderState:
+    """Check the lock and the numbered copy keep file."""
+    state = build_folder_lock.probe(path, path.parent, _probe_timing)
+    if state == "free" and _kept_build_copy(path):
+        return "kept"
+    return state
 
 
 def build_folder_lock_fd(path: Path) -> int:
@@ -1091,6 +1118,8 @@ def _copy_creation_fields(path: Path, info: os.stat_result, source: Path, fields
 
 def _prepare_copy_reuse(path: Path, directory: int, spec: BuildFolderSpec, fields: dict[str, object]) -> bool:
     form = BuildCopy(spec.repository, spec.unit, spec.slot)
+    if _copy_is_kept(path, directory):
+        raise FileExistsError(f"{path}: numbered copy is kept")
     assert isinstance(spec.slot_checkout, SlotCheckout)
     try:
         record = _numbered_copy_record(path, form, directory)
@@ -1190,15 +1219,18 @@ def numbered_copy_use_lease(path: Path) -> Generator[NumberedCopyUseLease | Numb
                              os.environ.get(NUMBERED_COPY_LOCK_ENV, ""))
             descriptor = build_folder_lock.open_lock(path, directory, create=False)
             _ = stack.callback(os.close, descriptor)
+            has_inherited_lock = False
             if inherited.isdecimal():
                 with suppress(OSError, OverflowError):
                     if build_folder_lock.lock_current(path, directory, int(inherited)):
                         descriptor = os.dup(int(inherited))
                         _ = stack.callback(os.close, descriptor)
+                        has_inherited_lock = True
             if not _take_lock(descriptor, fcntl.LOCK_EX, wait=False) or not build_folder_lock.lock_current(path, directory, descriptor):
                 raise BlockingIOError(f"{path}: numbered copy is busy")
             record = _numbered_copy_record(path, form, directory)
             if (not isinstance(record, NumberedCopySource)
+                    or (not has_inherited_lock and _copy_is_kept(path, directory))
                     or _read_copy_lease(path, directory).get("ready") is not True):
                 raise ValueError(f"{path}: no available numbered copy source")
             result = NumberedCopyUseLease(record, (descriptor,))
@@ -1388,18 +1420,17 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released:
     record: dict[str, object] = {"showrunner": spec.showrunner, "unit": spec.unit or spec.owner,
               "work": spec.work, "purpose": spec.purpose, "pid": spec.owner_pid or os.getpid(),
               "start_time": now}
-    if spec.kind in ("copy", "slot") and isinstance(spec.slot_checkout, SlotCheckout):
+    if spec.kind == "copy" and isinstance(spec.slot_checkout, SlotCheckout):
         if released:
             record = _read_copy_lease(path, directory)
-        elif spec.kind == "copy":
+        else:
             started = process_start.process_start(spec.owner_pid or os.getpid())
             if isinstance(started, (process_start.Started, process_start.Zombie)):
                 record["process_start"] = started.start
-        if spec.kind == "copy":
-            record["released"] = released
+        record["released"] = released and not _copy_is_kept(path, directory)
         record.update(machine=spec.machine, repository=spec.repository, slot=spec.slot,
                       last_use=now)
-        if spec.kind != "copy" or not released:
+        if not released:
             record.update(commit=spec.slot_checkout.commit, ready=ready)
             record.update(copy_fields)
     _publish_lease(path, directory, record)
@@ -1465,7 +1496,7 @@ def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFold
 
 
 def _stable_folder(spec: BuildFolderSpec) -> bool:
-    return spec.kind in ("standing", "editable", "main", "mirror", "target", "legacy-stable", "slot", "copy")
+    return spec.kind in ("standing", "editable", "main", "mirror", "target", "legacy-stable", "copy")
 
 
 FolderCreationNotice = Callable[[Path, os.stat_result], None] | Literal["untracked"]
@@ -1505,7 +1536,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
             directories: dict[Path, int] = {}
             while True:
                 allocation = (replace(spec, work=_new_suffix(spec.suffix_length, _settings()))
-                              if spec.kind not in ("copy", "slot") and (spec.showrunner or spec.unit) and not spec.work else spec)
+                              if spec.kind != "copy" and (spec.showrunner or spec.unit) and not spec.work else spec)
                 path = (original.path.expanduser().absolute()
                         if isinstance(original, (LinkedEditableRepository, RemoteEditableRepository))
                         else build_folder_path(allocation))
@@ -1525,8 +1556,8 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                 allocated: os.stat_result | None = None
                 new_folder = False
                 try:
-                    if not _take_lock(descriptor, fcntl.LOCK_SH if stable and spec.kind not in ("copy", "slot") and not editable_repository else fcntl.LOCK_EX,
-                                      wait=spec.kind not in ("copy", "slot") and not isinstance(original, UniqueBuildFolder)):
+                    if not _take_lock(descriptor, fcntl.LOCK_SH if stable and spec.kind != "copy" and not editable_repository else fcntl.LOCK_EX,
+                                      wait=spec.kind != "copy" and not isinstance(original, UniqueBuildFolder)):
                         if renamed:
                             continue
                         raise BlockingIOError(errno.EWOULDBLOCK, "build folder is held", str(path))
@@ -1551,39 +1582,26 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                             raise FileExistsError(errno.EEXIST, "build folder is not a directory", str(path))
                     copy_fields: dict[str, object] = {}
                     checkout_ready = False
-                    if isinstance(spec.slot_checkout, SlotCheckout):
-                        if spec.kind == "copy":
-                            if existing is not None:
-                                checkout_ready = _prepare_copy_reuse(path, directory, spec, copy_fields)
-                            else:
-                                try:
-                                    lease = _read_copy_lease(path, directory)
-                                except FileNotFoundError:
-                                    lease = {}
-                                except (OSError, ValueError) as error:
-                                    raise FileExistsError(f"{path}: copy lease cannot be read") from error
-                                if "source_path" in lease or "removing" in lease:
-                                    raise FileExistsError(f"{path}: a recorded copy checkout is missing")
+                    if spec.kind == "copy" and isinstance(spec.slot_checkout, SlotCheckout):
+                        if existing is not None:
+                            checkout_ready = _prepare_copy_reuse(path, directory, spec, copy_fields)
                         else:
                             try:
                                 lease = _read_copy_lease(path, directory)
-                            except (OSError, ValueError):
+                            except FileNotFoundError:
                                 lease = {}
-                            checkout_ready = lease.get("ready") is True
+                            except (OSError, ValueError) as error:
+                                raise FileExistsError(f"{path}: copy lease cannot be read") from error
+                            if "source_path" in lease or "removing" in lease or _copy_is_kept(path, directory):
+                                raise FileExistsError(f"{path}: a recorded copy checkout is missing")
                         if existing is None or not checkout_ready:
                             try:
                                 source_descriptors = allocation_scope.enter_context(_linked_source_locks(spec.slot_checkout.source))
                             except BlockingIOError as error:
                                 raise SlotSourceBusy(errno.EWOULDBLOCK, f"slot source is busy: {error}",
                                                      str(spec.slot_checkout.source)) from error
-                        if existing is not None and not checkout_ready and spec.kind != "copy":
-                            print(f"kept for a manual removal list: {path} (build_folders, incomplete slot)",
-                                  file=sys.stderr)
-                            raise FileExistsError(f"{path}: the slot checkout is incomplete")
                     new_folder = existing is None
-                    if spec.kind == "slot":
-                        _write_lease(path, directory, allocation, ready=not new_folder)
-                    elif spec.kind != "copy":
+                    if spec.kind != "copy":
                         _write_lease(path, directory, allocation)
                     if existing is None:
                         mode = original.mode if isinstance(original, StableOwnerFolder) else 0o777 if stable and spec.kind != "main" else 0o700
@@ -1624,23 +1642,20 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                         if not checkout_ready:
                             _copy_creation_fields(path, allocated, spec.slot_checkout.source, copy_fields)
                         _write_lease(path, directory, allocation, ready=False, copy_fields=copy_fields.items())
-                    if (isinstance(spec.slot_checkout, SlotCheckout)
-                            and (new_folder or (spec.kind == "copy" and not checkout_ready))):
+                    if (spec.kind == "copy" and isinstance(spec.slot_checkout, SlotCheckout)
+                            and (new_folder or not checkout_ready)):
                         _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "add", "--detach",
                                             str(path), spec.slot_checkout.commit], check=True,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                             pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors),
                                            timeout=repository_git_timeout())
-                        if spec.kind == "copy":
-                            form = BuildCopy(spec.repository, spec.unit, spec.slot)
-                            record = _numbered_copy_record(path, form, directory)
-                            if not isinstance(record, NumberedCopySource):
-                                raise ValueError(f"{path}: copy registration has no source record")
-                            fields = _read_copy_lease(path, directory)
-                            _copy_identity_fields(fields, record)
-                            _publish_lease(path, directory, fields)
-                        else:
-                            _write_lease(path, directory, allocation)
+                        form = BuildCopy(spec.repository, spec.unit, spec.slot)
+                        record = _numbered_copy_record(path, form, directory)
+                        if not isinstance(record, NumberedCopySource):
+                            raise ValueError(f"{path}: copy registration has no source record")
+                        fields = _read_copy_lease(path, directory)
+                        _copy_identity_fields(fields, record)
+                        _publish_lease(path, directory, fields)
                     if made_inode is not None and callable(on_create):
                         on_create(path, made_inode)
                     os.set_inheritable(descriptor, True)
@@ -1871,6 +1886,8 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
     try:
         descriptor = build_folder_lock.open_lock(path, directory, create=create)
     except FileNotFoundError:
+        if _kept_build_copy(path, directory):
+            return RefusedRemovalLease()
         return UnreservedRemovalFolder()
     _ = stack.callback(os.close, descriptor)
     acquired = _take_lock(descriptor, fcntl.LOCK_EX, wait=wait)
@@ -1878,6 +1895,8 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
         return RefusedRemovalLease()
     if not acquired:
         return RemovalLockHeld(path.with_name(path.name + ".lock"))
+    if _kept_build_copy(path, directory):
+        return RefusedRemovalLease()
     _ = stack.callback(_locks.pop, descriptor, None)
     _locks[descriptor] = path
     return HeldFolderRemovalLease(path, directory, descriptor)
@@ -1980,6 +1999,8 @@ def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True,
             if stem and stem != name and current / stem not in separately_checked:
                 if _recovery_marker_present(name, directory):
                     return RefusedRemovalLease()
+            if name.endswith(".keep") and _kept_build_copy(current / name.removesuffix(".keep"), directory):
+                return RefusedRemovalLease()
             stem = name.removesuffix(".lock")
             if stem != name and current / stem not in separately_checked:
                 info = os.stat(name, dir_fd=directory, follow_symlinks=False)
@@ -2062,6 +2083,9 @@ def slot_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
             if spec.kind == "copy":
                 mark_folder_use(path)
             with build_folder_lock.folder_parent(path, spec.parent, create=False) as directory:
+                if spec.kind == "copy" and not _copy_is_kept(path, directory):
+                    with suppress(FileNotFoundError):
+                        os.unlink(copy_keep_file(path).name, dir_fd=directory)
                 _write_lease(path, directory, spec, released=True)
         finally:
             _release_build_folder(path)
@@ -2100,6 +2124,8 @@ def _remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary
                 return _FolderRemoval.LOCK_HELD
             if not build_folder_lock.lock_current(path, directory, descriptor):
                 return _FolderRemoval.LOCK_CHANGED
+            if _kept_build_copy(path, directory):
+                return _FolderRemoval.PROTECTED
             try:
                 if cleanup() is False:
                     return _FolderRemoval.CLEANUP_KEPT
@@ -2367,7 +2393,7 @@ def run_build_command(command: Sequence[str], *, path: Path, environment: Mappin
             pass
         _ = child.wait()
         if sys.platform == "darwin":
-            # A descendant outside the group still holds the slot if it inherits the lock descriptor.
+            # A descendant outside the group still holds the folder if it inherits the lock descriptor.
             try:
                 send_process_group(child.pid, signal.SIGKILL)
             except ProcessLookupError:
