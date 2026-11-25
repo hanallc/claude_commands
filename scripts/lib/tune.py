@@ -11,15 +11,12 @@ import os
 from pathlib import Path
 import platform
 import re
-import shlex
 import sys
 
 from scripts.lib import conf, live_settings, main_publish
-from scripts.lib.conf import Unusable
 from scripts.build_hold.override_guard import refuse_overrides
 
 SUBJECT = "tune("
-FORWARD_LIMIT = main_publish.CommandTimeLimit(55)
 
 
 class RequestedValueChange(argparse.Namespace):
@@ -33,18 +30,6 @@ class RequestedValueChange(argparse.Namespace):
 def _one_line(name: str, value: str) -> None:
     if not value.strip() or "\n" in value or "\r" in value:
         raise main_publish.Refusal(f"{name} must be one nonempty line")
-
-
-def _forward(arguments: list[str], ssh_program: str) -> int:
-    command = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/tune.py" '
-               + shlex.join(arguments))
-    done = main_publish.ssh(command, ssh_program=ssh_program, host="natedev", time_limit=FORWARD_LIMIT)
-    if isinstance(done, str):
-        print(f"tune: natedev: {done}", file=sys.stderr)
-        return 1
-    print(done.stdout, end="")
-    print(done.stderr, end="", file=sys.stderr)
-    return done.returncode
 
 
 def change(args: RequestedValueChange) -> int:
@@ -102,11 +87,11 @@ def main(arguments: list[str] | None = None) -> int:
         if re.search(r"\s#", args.value) or args.value != args.value.strip():
             raise main_publish.Refusal("value must have no whitespace comment marker or outer whitespace")
         if platform.system() == "Darwin":
-            return _forward(argv, os.environ.get("ZONE_SSH") or "ssh")
+            return main_publish.forward("lib/tune.py", argv, label="tune", ssh_program=os.environ.get("ZONE_SSH") or "ssh")
         return change(args)
     except SystemExit as error:
         return error.code if isinstance(error.code, int) else 2
-    except (Unusable, main_publish.Refusal, OSError, UnicodeError) as error:
+    except (conf.InvalidKey, conf.Unusable, main_publish.Refusal, OSError, UnicodeError) as error:
         print(f"tune: {error}", file=sys.stderr)
         return 2
 

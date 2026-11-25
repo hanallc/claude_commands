@@ -41,6 +41,36 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
         common = self.git("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
         return Path(common) / "post-push-completed"
 
+    def test_fetches_the_symbolic_remote_head_without_updating_local_refs(self) -> None:
+        writer = self.root / "writer"
+        _ = self.git("clone", str(self.remote), str(writer))
+        _ = self.git("-C", str(writer), "switch", "-c", "trunk", "origin/main")
+        _ = self.git("-C", str(writer), "commit", "--allow-empty", "-m", "Publish trunk.")
+        commit = self.git("-C", str(writer), "rev-parse", "HEAD").stdout.strip()
+        _ = self.git("-C", str(writer), "push", "origin", "trunk")
+        _ = self.git("-C", str(self.remote), "symbolic-ref", "HEAD", "refs/heads/trunk")
+        old_head = self.run_in_repo("git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+        if old_head.returncode == 0:
+            _ = self.git("symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+        fetch_head = self.write(self.repo / ".git/FETCH_HEAD", "saved fetch state\n")
+        columns = ("--format=%(refname) %(objectname) %(symref)",)
+        refs = self.git("for-each-ref", *columns).stdout
+        self.assertNotEqual(self.run_in_repo("git", "cat-file", "-e", commit).returncode, 0)
+
+        tip = land_main.remote_branch_tip(self.repo, "origin", land_main.RemoteDefaultBranch.HEAD,
+                                         time_limit=land_main.CommandTimeLimit(10))
+
+        self.assertEqual((tip.branch, tip.commit), ("trunk", commit))
+        self.assertEqual(self.git("cat-file", "-t", commit).stdout.strip(), "commit")
+        self.assertEqual(self.git("for-each-ref", *columns).stdout, refs)
+        self.assertEqual(fetch_head.read_text(), "saved fetch state\n")
+
+    def test_uses_the_advertised_local_commit_when_fetch_would_fail(self) -> None:
+        local = self.git("rev-parse", "HEAD").stdout.strip()
+        self.fail_git("-C", str(self.repo), "-c", "remote.origin.followRemoteHEAD=never", "fetch")
+
+        self.assertEqual(land_main.remote_branch_commit(self.repo, "origin", "main"), local)
+
     def test_push_runs_the_hook_from_the_checkout_root_with_the_full_commit(self) -> None:
         self.install_hook()
         expected: list[str] = []
@@ -73,6 +103,37 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
         self.assertEqual((self.completion().read_bytes(), self.completion().stat().st_mtime_ns), saved)
         self.assertFalse(any("push" in cast(list[str], call.args[0]) for call in commands.call_args_list))
 
+    def test_landing_git_commands_use_only_the_requested_config(self) -> None:
+        inherited = "'core.fsync'='none'"
+        settings = ("Core.Fsync=committed",)
+        appended = "'Core.Fsync'='committed'"
+        for use_config in (True, False):
+            with self.subTest(use_config=use_config), mock.patch.dict(os.environ, {"GIT_CONFIG_PARAMETERS": inherited}):
+                commit = self.next_commit(f"Config {use_config}\n")
+                expected_environment = ({**os.environ, "GIT_CONFIG_PARAMETERS": f"{inherited} {appended}"}
+                                        if use_config else None)
+                with mock.patch.object(subprocess, "run", wraps=subprocess.run) as commands:
+                    if use_config:
+                        result = land_main.land(self.repo, commit, git_config=settings)
+                    else:
+                        result = land_main.land(self.repo, commit)
+                self.assertIsInstance(result.push, land_main.Pushed)
+                prefix = ["git", "-C", str(self.repo)]
+                for command in ([*prefix, "ls-remote", "--refs", "--", "origin", "refs/heads/main"],
+                                [*prefix, "push", "origin", f"{commit}:refs/heads/main"]):
+                    commands.assert_any_call(command, capture_output=True, text=True, check=False,
+                                             timeout=None, env=expected_environment)
+                self.assertEqual(os.environ["GIT_CONFIG_PARAMETERS"], inherited)
+
+    def test_landing_refuses_hook_settings_before_running_git(self) -> None:
+        for key in ("core.hooksPath", "hook.secret-check.event"):
+            with self.subTest(key=key), mock.patch.object(subprocess, "run") as commands:
+                with self.assertRaises(land_main.LandError) as error:
+                    _ = land_main.land(self.repo, "HEAD", git_config=(f"{key}=invalid",))
+                self.assertIn(key, str(error.exception))
+                self.assertIn("core.fsync", str(error.exception))
+                commands.assert_not_called()
+
     def test_a_failed_hook_keeps_the_cli_successful_and_retries_on_the_same_tip(self) -> None:
         self.install_hook()
         _ = self.write(Path(self.environment["TEST_HOOK_FAIL"]), "fail\n")
@@ -98,6 +159,26 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
         self.assertIsInstance(repeated.hook, land_main.HookDone)
         self.assertEqual(self.hook_runs(), [f"{self.repo}|{commit}|main"] * 3)
         self.assertEqual(self.completion().read_text(), commit + "\n")
+
+    def test_a_failed_hook_rerun_keeps_the_requested_git_config(self) -> None:
+        self.install_hook()
+        _ = self.write(Path(self.environment["TEST_HOOK_FAIL"]), "fail\n")
+        commit = self.next_commit()
+        settings = ("core.fsync=committed",)
+        failed = land_main.land(self.repo, commit, git_config=settings)
+        assert isinstance(failed.hook, land_main.HookFailed)
+        self.assertIn(" --git-config core.fsync=committed", failed.hook.rerun_command)
+
+        Path(self.environment["TEST_HOOK_FAIL"]).unlink()
+        # The lock path read in main_push_lock is outside the landing Git calls.
+        with mock.patch.object(land_main, "run_git", wraps=land_main.run_git) as commands:
+            self.assertIsInstance(land_main.retry_hook(self.repo, commit, "main", "", git_config=settings),
+                                  land_main.HookDone)
+        self.assertTrue(commands.call_args_list)
+        for call in commands.call_args_list:
+            environment = cast(dict[str, str] | None, call.kwargs.get("environment"))
+            assert environment is not None, call
+            self.assertEqual(environment["GIT_CONFIG_PARAMETERS"], "'core.fsync'='committed'")
 
     def test_a_commit_behind_origin_skips_the_push_and_hook(self) -> None:
         self.install_hook()

@@ -9,7 +9,8 @@ from dataclasses import replace
 
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
-from scripts.lint.memory_test_support import config_environment, write_pressure_reading, write_config_fixture
+from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, config_environment, write_pressure_reading,
+                                              write_config_fixture)
 
 
 import json
@@ -160,6 +161,7 @@ exit 97
 case " $* " in
     *"rev-parse --show-toplevel"*) printf "%s\n" "$PACKAGE_ROOT" ;;
     *"rev-parse HEAD^{tree}"*) printf "fixed-tree\n" ;;
+    *"rev-list --max-parents=0"*) printf "fixture-root-commit\n" ;;
     *"status --porcelain"*|*" ls-tree "*) : ;;
     *) exit 1 ;;
 esac
@@ -448,7 +450,7 @@ esac
         if wait_status == 75:
             _ = (self.root / "build_targets.conf").write_text(
                 "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
-                + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac-settings\n")
+                + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac-settings\n" + UNREACHABLE_WAIT_FIXTURE)
             _ = write_config_fixture(self.root / "mac-settings",
                 f"offload=on\nlinux_only.{self.root.name}=\n", template="mac_test")
             from scripts.direct.verify_step_routes_test_support import RUNNER
@@ -512,8 +514,8 @@ BOARD_HELPER=$TEST_BOARD_HELPER BOARD_DIR=$UNIT_RUN_DIR BOARD_SLOT=$UNIT_TEAM_RO
 STEP_RECORD_SCRIPT=$TEST_STEP_RECORD_SCRIPT
 PY=$TEST_REAL_PYTHON
 source "${STEP_RECORD_SCRIPT%/*}/../lib/conf.sh"
-TOKEN_HOLD_S=$(conf_value direct VERIFY_TOKEN_HOLD_SECONDS)
-TOKEN_RENEW_S=$(conf_value direct VERIFY_TOKEN_RENEW_SECONDS)
+TOKEN_HOLD_S=$(conf_value direct verify_token_hold_seconds)
+TOKEN_RENEW_S=$(conf_value direct verify_token_renew_seconds)
 TOKEN_HELD=0 TOKEN_WAIT_FILE=""
 HOLD_WAIT_DIR=$TEST_HOLD_DIRECTORY
 mkdir -p "$HOLD_WAIT_DIR"

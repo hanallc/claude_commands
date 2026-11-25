@@ -11,8 +11,6 @@ import argparse
 import json
 import os
 import re
-import shutil
-import signal
 import sqlite3
 import stat
 import subprocess
@@ -22,12 +20,11 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.lib import build_folders
-from types import FrameType, MappingProxyType
-from typing import Literal, cast
+from scripts.lib import build_folders, process_group
+from types import MappingProxyType
+from typing import Literal, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-from scripts.lib import process_group
 
 from scripts.style.add_style import NoStyleProduction, standing_style_production
 from scripts.production.production_doc import Refusal
@@ -52,15 +49,12 @@ TOOLS: tuple[style_ledger.LintTool, ...] = ("clippy", "mend", "rustfmt")
 # Each lint run owns one `style-sync-lint-*` dir here; a later run removes the dir of a run that was killed.
 LINT_TEMP_PARENT: Path | build_folders.InheritedTemporaryParent = build_folders.InheritedTemporaryParent()
 OWNER_FILE = "owner.json"
-# Written by the verifier itself, so a SIGKILL of the owner right after Popen still leaves its group recorded.
+# The verifier records its group before it starts verify.sh.
 VERIFIER_FILE = "verifier.pgid"
 # Publishes its group, then runs verify.sh only while the owner lives: a sweep that found the owner dead
 # either reads the group (and keeps the dir) or this check stops the wrapper before verify.sh starts.
 VERIFIER_WRAPPER = ('printf %s "$$" > "$1.part" && mv "$1.part" "$1" && kill -0 "$2" 2>/dev/null'
                     ' && shift 2 && exec "$@"')
-STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
-# Held everywhere in a run except its work, so no signal lands between the dir, its record and its cleanup.
-HELD_SIGNALS = {*STOP_SIGNALS, signal.SIGINT}
 CHILD_STOP_SECONDS = 5.0
 # send.py's QUEUED (exit 1) keeps the notice for the parent's session, so it arrives later.
 HandoffDelivery = Literal["sent", "queued"]
@@ -221,7 +215,8 @@ def lint_records(output: str, checkout: Path) -> tuple[ToolLintRecord, ...]:
 
 
 def git(repo: Path, *arguments: str) -> str:
-    result = subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=False)
+    result = subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=False,
+                            pass_fds=copies.COMMAND_LOCKS.get())
     if result.returncode:
         raise Refusal(result.stderr.strip() or f"git {' '.join(arguments)} failed")
     return result.stdout.strip()
@@ -261,39 +256,6 @@ def own_handoff(repo: Path, tip: str, style_branch: str, unit: str = "") -> int:
         ledger.tip_done(tip, "own hand-off")
     print("seen (own hand-off: synced with no lint run)")
     return 0
-
-
-class LintStopped(BaseException):
-    """SIGTERM or SIGHUP reached a lint run; like KeyboardInterrupt, no `except Exception` catches it."""
-
-    def __init__(self, signum: int) -> None:
-        super().__init__(f"lint stopped by {signal.Signals(signum).name}")
-        self.signum: int = signum
-
-
-@contextmanager
-def stop_signals_raise() -> Generator[None]:
-    """SIGTERM and SIGHUP raise LintStopped, as SIGINT raises KeyboardInterrupt, so `finally` runs."""
-    def stop(signum: int, _frame: FrameType | None) -> None:
-        raise LintStopped(signum)
-
-    previous = {signum: signal.signal(signum, stop) for signum in STOP_SIGNALS}
-    try:
-        yield
-    finally:
-        for signum, handler in previous.items():
-            _ = signal.signal(signum, handler)
-
-
-@contextmanager
-def signal_mask(how: int) -> Generator[None]:
-    """Block or unblock HELD_SIGNALS for the enclosed code; a held signal raises once it is unblocked."""
-    previous = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-    try:
-        _ = signal.pthread_sigmask(how, HELD_SIGNALS)
-        yield
-    finally:
-        _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 def probe(send: Callable[[int, int], None], target: int) -> bool:
@@ -345,95 +307,121 @@ def lint_run_running(directory: Path, owner_record: OwnerRecord) -> bool:
     return probe(process_group.send_process_group, group)
 
 
-def stop_lint_child(child: subprocess.Popen[str]) -> None:
-    """Stop verify.sh and every process it started, so no cargo build writes into a removed checkout."""
-    with suppress(ProcessLookupError):
-        process_group.send_process_group(child.pid, signal.SIGTERM)
-    with suppress(subprocess.TimeoutExpired):
-        _ = child.wait(CHILD_STOP_SECONDS)
-    with suppress(ProcessLookupError):
-        process_group.send_process_group(child.pid, signal.SIGKILL)
-    _ = child.wait()
-
-
-def unblock_held_signals() -> None:
-    """The child starts with the parent's held mask; preexec_fn is safe here, a lint run starts no threads."""
-    _ = signal.pthread_sigmask(signal.SIG_UNBLOCK, HELD_SIGNALS)
-
-
-def verifier_command(directory: Path, owner: int) -> list[str]:
+def verifier_command(directory: Path, owner: int, *, verify: Path) -> list[str]:
     return ["sh", "-c", VERIFIER_WRAPPER, "sh", str(directory / VERIFIER_FILE), str(owner),
-            "bash", str(VERIFY), "lint", "--check", "--no-cache"]
+            "bash", str(verify), "lint", "--check", "--no-cache"]
 
 
-def verify_lint(directory: Path, checkout: Path) -> tuple[int, str]:
-    environment = {**os.environ, "UNIT_DETACHED_RUN": "1"}
-    # Hold signals from Popen until the child cleanup is active.
-    with signal_mask(signal.SIG_BLOCK), subprocess.Popen(
-        verifier_command(directory, os.getpid()), cwd=checkout, env=environment,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        start_new_session=True, preexec_fn=unblock_held_signals, pass_fds=copies.COMMAND_LOCKS.get()) as child:
+@dataclass(frozen=True)
+class LintSession:
+    start: Callable[[], None]
+    read: Callable[[], str]
+
+
+class LintCompleted(TypedDict):
+    status: int
+    output: str
+    rewritten: bool
+    checkout: str
+
+
+class LintPreparationFailed(TypedDict):
+    error: str
+
+
+@contextmanager
+def lint_session(common_dir: Path, checkout: Path, tip: str, owner: str) -> Generator[LintSession]:
+    locks = copies.COMMAND_LOCKS.get()
+    command = [sys.executable, "-m", "scripts.style.lint_keeper", str(os.getpid()), str(common_dir),
+               str(lint_temp_parent()), str(checkout), tip, owner, str(VERIFY), str(CHILD_STOP_SECONDS),
+               *map(str, locks)]
+    with subprocess.Popen(command, cwd=SCRIPTS.parent, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          text=True, start_new_session=True, pass_fds=locks) as keeper:
+        writer, reader = keeper.stdin, keeper.stdout
+        assert writer is not None and reader is not None
+
+        def start() -> None:
+            _ = writer.write("\n")
+            writer.flush()
+
         try:
-            with signal_mask(signal.SIG_UNBLOCK):
-                output, _ = child.communicate()
-        except BaseException:
-            stop_lint_child(child)
-            raise
-    return child.returncode, output
+            yield LintSession(start, reader.readline)
+        finally:
+            with suppress(BrokenPipeError):
+                writer.close()
 
 
-def remove_lint_dir(repo: Path, directory: Path) -> bool:
-    """Delete the checkout, then its registration; the owner record goes last, once nothing is registered.
+def verify_lint(session: LintSession) -> LintCompleted:
+    reply = session.read()
+    if reply == "ready\n":
+        session.start()
+        reply = session.read()
+    if not reply:
+        raise Refusal("lint keeper exited before it returned a result")
+    result = cast(LintCompleted | LintPreparationFailed, json.loads(reply))
+    if "error" in result:
+        raise Refusal(result["error"])
+    return result
 
-    git removes the registration of a deleted checkout, also one without its `.git` file, which it
-    refuses to validate while the checkout exists. `--force` twice also removes a locked registration,
-    which a killed `worktree add` leaves and `git worktree prune` keeps. When either step fails,
-    the dir keeps its owner record, so the next sweep retries it. rmtree unlinks checkout/target
-    without following it, keeping the repo's warm target.
-    """
+
+def _remove_lint_registration(repo: Path, directory: Path) -> bool:
+    """Clear the checkout and its Git registration at the original path."""
     snapshot = directory / "checkout"
     # git lists the real path of the dir it was given; only the lint dir is resolved, never the checkout.
     listed = directory.resolve() / "checkout"
-    try:
-        if snapshot.is_symlink():
-            snapshot.unlink()
-        elif (snapshot.is_dir() or scratch.removal_mark(snapshot).exists()
-              or scratch.cargo_removal_mark(snapshot).exists()):
-            scratch.remove_with_cargo_output(snapshot)
+
+    def clear_registration() -> None:
         registered = {Path(line.removeprefix("worktree "))
                       for line in git(repo, "worktree", "list", "--porcelain").splitlines()
                       if line.startswith("worktree ")}
         if listed in registered:
+            if os.path.lexists(snapshot):
+                raise Refusal(f"{snapshot}: the checkout path is occupied")
             _ = git(repo, "worktree", "remove", "--force", "--force", str(listed))
+
+    try:
+        with scratch.removal_lock(snapshot, reserve_name=True) as idle:
+            if not idle:
+                return False
+            if snapshot.is_symlink():
+                snapshot.unlink()
+            if snapshot.is_dir():
+                scratch.remove_with_cargo_output(snapshot, prepare_staged=clear_registration)
+            else:
+                clear_registration()
+                if scratch.removal_mark(snapshot).exists() or scratch.cargo_removal_mark(snapshot).exists():
+                    scratch.remove_with_cargo_output(snapshot)
     except (Refusal, OSError, scratch.ScratchError) as error:
         print(f"style_sync: kept {directory} for the next lint run; worktree registration: "
               + " ".join(str(error).splitlines()))
         return False
-    record = directory / OWNER_FILE
-    for entry in directory.iterdir():
-        if entry == record:
-            continue
-        if entry.is_dir() and not entry.is_symlink():
-            shutil.rmtree(entry)
-        else:
-            entry.unlink()
-    record.unlink(missing_ok=True)
-    directory.rmdir()
     return True
+
+
+def remove_lint_dir(repo: Path, directory: Path, *, expected: os.stat_result | None = None) -> bool:
+    """Remove the lint folder after Git accepts its checkout cleanup."""
+    return build_folders.remove_build_folder(
+        directory, expected=expected, prepare=lambda: _remove_lint_registration(repo, directory))
 
 
 def remove_if_stale(directory: Path) -> None:
     # A link or another user's entry in a shared temp dir would aim the deletes below at its target.
-    if directory.is_symlink() or not directory.is_dir() or directory.stat().st_uid != os.getuid():
-        return
     try:
+        status = directory.lstat()
+        if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid():
+            return
         owner_record = OwnerRecord.read(directory)
         if lint_run_running(directory, owner_record):
             return
     except (OSError, ValueError):
         return
-    if build_folders.remove_build_folder(directory, lambda: remove_lint_dir(owner_record.repo, directory)):
-        print(f"style_sync: removed stale lint checkout {directory} (owner {owner_record.owner} not running)")
+    try:
+        if remove_lint_dir(owner_record.repo, directory, expected=status):
+            print(f"style_sync: removed stale lint checkout {directory} (owner {owner_record.owner} not running)")
+    except FileNotFoundError:
+        # The keeper may finish cleanup while the sweep waits for the lock.
+        if directory.exists():
+            raise
 
 
 def sweep_stale_lint_dirs() -> None:
@@ -445,7 +433,6 @@ def sweep_stale_lint_dirs() -> None:
     for directory in sorted(lint_temp_parent().glob(f"{lint_prefix()}*")):
         try:
             remove_if_stale(directory)
-        # Any failure of one dir's sweep; LintStopped and KeyboardInterrupt are not an Exception.
         except Exception as error:
             print(f"style_sync: sweep {directory}: " + " ".join(str(error).splitlines()))
 
@@ -476,34 +463,20 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
     if common_dir != Path(git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve():
         raise Refusal("--repo and --checkout must belong to the same repository")
     sweep_stale_lint_dirs()
-    # Signals stay held outside the work, so the dir never exists without its record and its cleanup path.
-    with (stop_signals_raise(),
-          copies.standing(gate_owner(repo), checkout, copies.CommittedSource(tip), step="lint") as snapshot,
-          signal_mask(signal.SIG_BLOCK),
-          build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-              lint_prefix(), build_folders.ExplicitBuildParent(lint_temp_parent()))) as directory):
-        OwnerRecord(os.getpid(), common_dir).write(directory)
-        with signal_mask(signal.SIG_UNBLOCK):
-            target = snapshot / "target"
-            retained_identity = target_identity(target)
-            (directory / "checkout").symlink_to(snapshot, target_is_directory=True)
-            returncode, output = verify_lint(directory, snapshot)
-            print(output, end="")
-            rewritten = bool(git(snapshot, "status", "--porcelain", "--", ".", ":(exclude)target"))
-            try:
-                rewritten |= target_identity(target) != retained_identity
-            except (OSError, Refusal):
-                rewritten = True
-            records = lint_records(output, snapshot)
-            if records:
-                with style_ledger.open_ledger(repo) as ledger:
-                    for record in records:
-                        passed = record.passed and not rewritten
-                        ledger.lint_record(tip, record.tool, passed, dict(record.diagnostics))
-            if rewritten:
-                print("style_sync: lint rewrote the checked tree; no successful coverage recorded")
-            return int(returncode != 0 or rewritten
-                       or not all(record.passed and not record.diagnostics for record in records))
+    with lint_session(common_dir, checkout.resolve(), tip, gate_owner(repo)) as session:
+        result = verify_lint(session)
+    print(result["output"], end="")
+    rewritten = result["rewritten"]
+    records = lint_records(result["output"], Path(result["checkout"]))
+    if records:
+        with style_ledger.open_ledger(repo) as ledger:
+            for record in records:
+                passed = record.passed and not rewritten
+                ledger.lint_record(tip, record.tool, passed, dict(record.diagnostics))
+    if rewritten:
+        print("style_sync: lint rewrote the checked tree; no successful coverage recorded")
+    return int(result["status"] != 0 or rewritten
+               or not all(record.passed and not record.diagnostics for record in records))
 
 
 def runner_value(action: str, name: str) -> str:
@@ -722,9 +695,6 @@ def main(argv: list[str] | None = None) -> int:
         if cast(str, args.command) == "send-handoff":
             return send_handoff(cast(Path, args.repo), cast(str, args.production), cast(str, args.checkpoint))
         return lint(cast(Path, args.repo), cast(Path, args.checkout), cast(str, args.tip))
-    except LintStopped as stopped:
-        print(f"style_sync: {stopped}", file=sys.stderr)
-        return 128 + stopped.signum
     except (copies.CopyError, Refusal, style_ledger.LedgerError, rule_catalog.RuleValidationError,
             scratch.ScratchError, OSError, sqlite3.Error, ValueError, subprocess.TimeoutExpired) as error:
         print("style_sync: " + " ".join(str(error).splitlines()), file=sys.stderr)

@@ -47,7 +47,7 @@ ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
 REPO_NAME = re.compile(r"(?:^|[_.])(?:repo|repository|checkout|worktree|clone)(?:$|[_.])")
 RUNNERS = frozenset({"run", "Popen", "check_call", "check_output", "call", "system", "command"})
 TREE_COMMAND = re.compile(r"\bgit\b.*\b(?:clone|worktree\s+add)\b|\b(?:cp|rsync)\b.*-[a-zA-Z]*[arR]")
-GIT_MODULES = frozenset({"bulk_run", "scripts.style.bulk_run", "copies", "scripts.copies.copies"})
+GIT_MODULES = frozenset({"copies", "scripts.copies.copies"})
 
 
 @dataclass(frozen=True)

@@ -23,12 +23,13 @@ from typing import NamedTuple, TypedDict, cast, override
 from scripts.lib.atomic_file import write_bytes_atomic
 
 from scripts.lib import conf as tunables
+from scripts.lib.showrunner_state import state_root
 from scripts.message import session_send
 
 CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or tunables.path("showrunners"))
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
 SESSIONS = Path(os.environ.get("SHOWRUNNERS_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
-SHOWRUNNER_STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
+SHOWRUNNER_STATE_DIR = state_root()
 # Where Claude Code keeps each session scratchpad, as /tmp/claude-<uid>/<project>/<session id>/scratchpad.
 SCRATCH_ROOT = Path(os.environ.get("SHOWRUNNER_SCRATCH_ROOT") or "/tmp")
 SEND = Path(os.environ.get("SHOWRUNNERS_SEND") or session_send.SEND_SCRIPT)
@@ -239,6 +240,8 @@ def _source(instance: Path, *, dependencies: Callable[[Path], None] | None = Non
     owner = owner_for_timer(instance, record)
     if not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
         raise ValueError(f"{owner.name}: no production document")
+    if owner.doc.machine != remote.local_machine():
+        raise ValueError(f"{owner.name}: production document is on {owner.doc.machine}")
     path = owner.doc.path
     if dependencies is not None:
         dependencies(path)
@@ -349,10 +352,11 @@ def registered_showrunners(
     return ShowrunnerDiscovery(found, tuple(failures))
 
 
-def production_of(session_id: str, state_dir: Path | None = None) -> Path | None:
+def production_of(session_id: str, state_dir: Path | None = None, *,
+                  record: staff.StaffSnapshot | None = None) -> Path | None:
     """Read the current session's production document from staff."""
     del state_dir
-    owner = staff.snapshot().by_current_session(session_id)
+    owner = (staff.snapshot() if record is None else record).by_current_session(session_id)
     if (owner is not None and owner.kind == "showrunner"
             and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
             and owner.doc.machine == remote.local_machine()):

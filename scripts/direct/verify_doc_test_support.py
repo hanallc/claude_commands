@@ -9,10 +9,10 @@ from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.copies import copies
 from scripts.lib import conf
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from unittest import mock
 
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture
 
 import json
 import os
@@ -195,12 +195,12 @@ class VerifyDocFixture(unittest.TestCase):
             "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })
-        private = private_slot_config(self.root, repository=self.repo.name)
-        slot_settings = private.settings.read_text().splitlines(keepends=True)
+        private = private_copy_config(self.root)
+        copy_settings = private.settings.read_text().splitlines(keepends=True)
         for key, value in (("locks.probe_wait_seconds", "0.25"), ("locks.probe_retry_seconds", "1")):
             line, _ = conf.editable_line(private.settings, key)
-            slot_settings[line] = f"{key}={value}\n"
-        _ = private.settings.write_text("".join(slot_settings))
+            copy_settings[line] = f"{key}={value}\n"
+        _ = private.settings.write_text("".join(copy_settings))
         _ = write_config_fixture(Path(private.environment["COPIES_CONFIG"]), "git_timeout_seconds=600\n")
         configuration = Path(self.environment["CONF_DIR"])
         _ = shutil.copy2(private.settings, configuration / "build_folders.conf")
@@ -244,7 +244,7 @@ class VerifyDocFixture(unittest.TestCase):
         _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.repo.name}=\n", template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
-            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n")
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         self.environment["MAC_TEST_CONFIG"] = str(settings)
         self.environment["CONF_DIR"] = str(Path(settings).parent)
         self.environment["MAC_IDLE_STATE_DIR"] = str(self.root / "mac-idle")

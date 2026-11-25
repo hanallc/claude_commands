@@ -197,9 +197,9 @@ class FindingsLedgerTests(FindingsLedgerFixture):
     def test_changed_config_is_read_on_the_next_command_with_comments(self) -> None:
         _ = self.open_finding("blocker", "needs a repair")
         self.close_round(["F001"])
-        self.write_config("MIN_REPAIR_BUDGET=4 # current floor\n")
+        self.write_config("min_repair_budget=4 # current floor\n")
         first = self.gate()
-        self.write_config("MIN_REPAIR_BUDGET=8 # revised floor\n")
+        self.write_config("min_repair_budget=8 # revised floor\n")
         second = self.gate()
         self.assertEqual(first["repair_budget"], 4)
         self.assertEqual(second["repair_budget"], 8)
@@ -275,6 +275,43 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         result = self.run_failing_command("landed", "--phase", "14")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Phase 14 is not open (open phases: 15, 16)", result.stderr)
+
+    def closed_phase_beside_an_open_one(self) -> str:
+        """Phase 62 started and closed with no ledger; phase 63 is open and owns the live ledger."""
+        self.history_file.parent.mkdir(parents=True, exist_ok=True)
+        _ = self.history_file.write_text(json.dumps(
+            {"event_type": "phase_started", "phase_id": "62", "phase_instance_id": "phase-sixty-two"}) + "\n")
+        self.write_progress_state("phase-sixty-three", "63")
+        return self.open_finding("blocker", "sixty-three's finding")
+
+    def test_a_late_finding_goes_into_a_closed_phase_and_its_trial_ledger(self) -> None:
+        _ = self.closed_phase_beside_an_open_one()
+        live = self.ledger()
+        late = ("open", "--phase", "62", "--caught-by", "main", "--severity")
+        self.assertEqual(self.run_command(*late, "nit", "--title", "late nit", at=2_000), "F001")
+        self.assertEqual(self.run_command(*late, "minor", "--title", "late fix", "--accepted", at=2_010), "F002")
+        self.assertEqual(self.ledger(), live)
+        ledger = findings.read_phase_ledger(self.session_dir, "phase-sixty-two", "62", 2_020)
+        rows = cast(dict[str, dict[str, object]], ledger["findings"])
+        self.assertEqual([(row["title"], row["state"]) for row in rows.values()],
+                         [("late nit", "open"), ("late fix", "accepted")])
+        opened, verdict = self.events()[-2:]
+        self.assertEqual((opened["event_type"], opened["phase_instance_id"], opened["state"]),
+                         ("finding_opened", "phase-sixty-two", "accepted"))
+        self.assertEqual((verdict["event_type"], verdict["finding_id"], verdict["resulting_state"]),
+                         ("finding_verdict", "F002", "accepted"))
+
+    def test_accepted_is_refused_outside_a_closed_phase(self) -> None:
+        _ = self.closed_phase_beside_an_open_one()
+        for phase in (("--phase", "63"), ()):
+            with self.subTest(phase=phase):
+                self.assert_refused("--accepted records a late finding in a closed phase", "open", *phase,
+                                    "--severity", "nit", "--title", "fixed", "--caught-by", "main", "--accepted")
+
+    def test_a_finding_for_a_phase_the_run_never_started_is_refused(self) -> None:
+        _ = self.closed_phase_beside_an_open_one()
+        self.assert_refused("Phase 14 is not open (open phases: 63)", "open", "--phase", "14",
+                            "--severity", "nit", "--title", "typo", "--caught-by", "main")
 
     def test_an_unnamed_finding_ignores_the_last_finished_phase(self) -> None:
         state: dict[str, object] = {
@@ -453,7 +490,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertEqual(payload["consecutive_same_kind"], {"kind": "fix", "count": 1})
 
     def test_refunded_launch_starts_spend_no_round_or_attempt(self) -> None:
-        self.write_config("MAX_CONSECUTIVE_SAME_KIND_PASSES=2\n")
+        self.write_config("max_consecutive_same_kind_passes=2\n")
         self.history_file = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
         self.write_progress_state("instance-a")
         _ = self.open_finding("blocker", "retry fails")
@@ -562,7 +599,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertEqual(payload["advisory"], "3 consecutive fix passes ran without the phase advancing")
 
     def test_refunded_dispatches_do_not_reach_the_runaway_advisory(self) -> None:
-        self.write_config("RUNAWAY_ROUNDS=2\n")
+        self.write_config("runaway_rounds=2\n")
         _ = self.open_finding("blocker", "retry fails")
         for _ in range(2):
             _ = self.run_command("dispatch", "--covers", "F001")
@@ -675,7 +712,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
 
     def test_the_repair_budget_floor_is_configurable(self) -> None:
         """direct.conf raises the floor, and the extra round is authorized."""
-        self.write_config("MIN_REPAIR_BUDGET=4\n")
+        self.write_config("min_repair_budget=4\n")
         for index in range(3):
             batch: list[str] = []
             for _ in range(2 if index % 2 == 0 else 1):
@@ -963,7 +1000,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertIn("F002", partial.stderr)
 
     def test_no_history_does_not_count_a_ledger_dispatch_for_routing(self) -> None:
-        self.write_config("ROUTING_FROM_ROUND=2\n")
+        self.write_config("routing_from_round=2\n")
         _ = self.open_finding("blocker", "first")
         self.close_round(["F001"])
         (self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl").unlink()
@@ -1031,7 +1068,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         self.assertFalse(any(row["event_type"] == "finding_astra_review" for row in self.events()))
 
     def test_the_failed_fix_trigger_uses_the_configured_limit(self) -> None:
-        self.write_config("ASTRA_AFTER_FAILED_FIXES=1\n")
+        self.write_config("astra_after_failed_fixes=1\n")
         _ = self.open_finding("blocker", "retry")
         self.close_round(["F001"], verdict="still_open")
         self.assertEqual(self.gate()["astra_review_due"], ["F001"])

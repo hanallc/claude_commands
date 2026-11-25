@@ -7,6 +7,7 @@ import json
 import os
 import pwd
 import runpy
+import secrets
 import shlex
 import shutil
 import signal
@@ -34,6 +35,7 @@ from uuid import NAMESPACE_URL, uuid5
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
 from scripts.herdr import pane_launch
@@ -86,6 +88,7 @@ FIXTURE_GIT: str = shutil.which("git") or "git"
 CHECKOUT = Path(__file__).resolve().parents[2]
 STAFF_SCRIPT = Path(__file__).with_name("staff.py")
 SOURCES_SCRIPT = Path(__file__).with_name("staff_sources.py")
+STAFF_OWNER_PARENT_CHECK_SECONDS = 1.0
 FixtureMachine = Literal["natedev", "mac"]
 UNFILLED_WORKTREE = staff.WorktreeUnfilled()
 UNFILLED_DOC = staff.DocUnfilled()
@@ -433,7 +436,7 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
     with ExitStack() as contexts:
         if Path(environment["STAFF_CONFIG"]) == CHECKOUT / "config/staff.conf":
             configuration = Path(contexts.enter_context(tempfile.TemporaryDirectory(prefix="staff-config-", dir="/tmp"))) / "staff.conf"
-            _ = write_config_fixture(configuration, "PRODUCER_WORKSPACE=producers\n")
+            _ = write_config_fixture(configuration, "producer_workspace=producers\n")
             environment["STAFF_CONFIG"] = str(configuration)
         _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "STAFF_FILE": str(path),
@@ -732,36 +735,94 @@ def run_staff_owner_request(connection: socket.socket, request: StaffOwnerReques
 STAFF_OWNER_SERVER = r'''
 import json
 import os
+import select
+import signal
 import socket
 import sys
+from contextlib import suppress
 from pathlib import Path
 
+parent_pid = int(sys.argv[1])
+if os.getppid() != parent_pid:
+    raise SystemExit
+close_token = os.environ.pop('STAFF_TEST_OWNER_CLOSE_TOKEN')
 with open(Path(os.environ['STAFF_TEST_CHECKOUT']) / "scripts/lib/package_root.py") as package_root:
     exec(package_root.read(), {"__file__": package_root.name})
-children = []
-with socket.socket() as listener:
-    listener.bind(('127.0.0.1', 0))
-    listener.listen()
-    print(listener.getsockname()[1], flush=True)
-    while True:
-        with listener.accept()[0] as connection:
-            with connection.makefile('rb') as channel:
-                request = json.loads(channel.readline())
-            if request is None:
-                break
-            from scripts.production.staff_test_support import run_staff_owner_request
-            from scripts.production import staff_sources
-            pid = os.fork()
-            if pid == 0:
-                listener.close()
+from scripts.production.staff_test_support import STAFF_OWNER_PARENT_CHECK_SECONDS, run_staff_owner_request
+from scripts.production import staff_sources
+
+# Report a matching close request through the request child's exit status.
+STOP_REQUEST_EXIT_STATUS = 75
+
+def fork_request(listener, connection, notices, wake):
+    pid = os.fork()
+    if pid:
+        return pid
+    status = 0
+    try:
+        signal.set_wakeup_fd(-1)
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        notices.close()
+        wake.close()
+        listener.close()
+        connection.setblocking(True)
+        with connection.makefile('rb') as channel:
+            line = channel.readline()
+        if line:
+            request = json.loads(line)
+            if request == {'close': close_token}:
+                status = STOP_REQUEST_EXIT_STATUS
+            elif isinstance(request, dict) and 'close' not in request:
+                run_staff_owner_request(connection, request)
+    finally:
+        connection.close()
+        os._exit(status)
+
+children = set()
+notices, wake = socket.socketpair()
+closing = False
+with notices, wake:
+    # Wake select when a request exits, including during a normal close.
+    wake.setblocking(False)
+    signal.signal(signal.SIGCHLD, lambda *_: None)
+    signal.set_wakeup_fd(wake.fileno(), warn_on_full_buffer=False)
+    try:
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen()
+            listener.setblocking(False)
+            print(listener.getsockname()[1], flush=True)
+            while os.getppid() == parent_pid:
+                for pid in tuple(children):
+                    finished, status = os.waitpid(pid, os.WNOHANG)
+                    if not finished:
+                        continue
+                    children.remove(pid)
+                    if os.waitstatus_to_exitcode(status) == STOP_REQUEST_EXIT_STATUS:
+                        listener.close()
+                        closing = True
+                if closing and not children:
+                    break
+                readers = [notices] if closing else [listener, notices]
+                ready, _, _ = select.select(readers, [], [], STAFF_OWNER_PARENT_CHECK_SECONDS)
+                if notices in ready:
+                    notices.recv(4096)
+                    continue
+                if listener not in ready or os.getppid() != parent_pid:
+                    continue
                 try:
-                    run_staff_owner_request(connection, request)
-                finally:
-                    connection.close()
-                    os._exit(0)
-            children.append(pid)
-for pid in children:
-    os.waitpid(pid, 0)
+                    connection, _ = listener.accept()
+                except BlockingIOError:
+                    continue
+                with connection:
+                    children.add(fork_request(listener, connection, notices, wake))
+    finally:
+        signal.set_wakeup_fd(-1)
+        for pid in children:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        for pid in children:
+            os.waitpid(pid, 0)
 '''
 
 
@@ -771,25 +832,30 @@ class SharedStaffOwner:
     def __init__(self, root: Path) -> None:
         self.root: Path = root
         self.lifetime: ExitStack = ExitStack()
+        self.pid: int | None = None
 
     @cached_property
     def port(self) -> str:
+        close_token = secrets.token_hex()
         script = self.root / "fake-staff-owner.py"
         write_text_atomic(script, STAFF_OWNER_SERVER)
         errors = self.lifetime.enter_context((self.root / "fake-staff-owner.log").open("w"))
         process = self.lifetime.enter_context(start_staff_owner(
-            [sys.executable, str(script)], cwd=self.root,
-            env={**os.environ, "TMPDIR": str(self.root)},
+            [sys.executable, str(script), str(os.getpid())], cwd=self.root,
+            env={**os.environ, "TMPDIR": str(self.root), "STAFF_TEST_OWNER_CLOSE_TOKEN": close_token},
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errors, text=True,
             start_new_session=True,
         ))
-        port = cast(TextIO, process.stdout).readline().strip()
+        self.pid = process.pid
+        port = ""
 
         def stop() -> None:
             deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             try:
-                with socket.create_connection(("127.0.0.1", int(port)), timeout=TEST_HANG_GUARD_SECS) as connection:
-                    connection.sendall(b"null\n")
+                if port:
+                    with socket.create_connection(("127.0.0.1", int(port)), timeout=TEST_HANG_GUARD_SECS) as connection:
+                        connection.settimeout(max(0, deadline - time.monotonic()))
+                        connection.sendall(json.dumps({"close": close_token}).encode() + b"\n")
                 _ = process.wait(timeout=max(0, deadline - time.monotonic()))
             except (OSError, subprocess.TimeoutExpired):
                 try:
@@ -799,6 +865,9 @@ class SharedStaffOwner:
                 _ = process.wait()
 
         _ = self.lifetime.callback(stop)
+        port = cast(TextIO, process.stdout).readline().strip()
+        if not port:
+            raise RuntimeError(f"The staff owner did not report its port. See {errors.name}.")
         return port
 
     def close(self) -> None:
@@ -839,6 +908,7 @@ class StaffTestCase(unittest.TestCase):
         write_text_atomic(ssh, f"#!{sys.executable}\n{FAKE_SSH}")
         ssh.chmod(0o755)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            **fixture_git_environment(self.root),
             "HOME": str(self.root / "home"),
             **interpreter_cache_environment(self.root / "cache"),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
@@ -854,7 +924,7 @@ class StaffTestCase(unittest.TestCase):
             "STAFF_TEST_LOCK_NOTICE": "",
             "PYTHONDONTWRITEBYTECODE": "1",
             "STAFF_CONFIG": str(CHECKOUT / "config/staff.conf"),
-        })))
+        }, clear=True)))
         _ = os.environ.pop("CLAUDE_PYTHON", None)
         _ = self.enterContext(isolated_staff_file(self.staff_file, {}))
         _ = self.enterContext(self.machine("natedev"))
@@ -921,8 +991,8 @@ class StaffTestCase(unittest.TestCase):
         path = self.root / "staff.conf"
         write_text_atomic(path, "".join(
             f"# range: 5e-324..\n{key}={value}\n" for key, value in (
-                ("OPERATION_LOCK_SECONDS", lock_seconds),
-                ("REMOTE_SECONDS", remote_seconds),
+                ("operation_lock_seconds", lock_seconds),
+                ("remote_seconds", remote_seconds),
             )
         ))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"STAFF_CONFIG": str(path)})))

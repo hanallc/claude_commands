@@ -32,16 +32,16 @@ from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
-from scripts.lib import build_folders
+from scripts.lib import build_folders, conf
 from scripts.lib.git_test_support import fixture_git_environment, write_fixture_git_config
 from scripts.lint import memory_admit, sweep
 from scripts.lint.memory_test_support import config_environment, fake_memory_readings, write_config_fixture
-from scripts.production import gate, staff
+from scripts.production import change_review, gate, showrunners, staff, unit_lookup
+from scripts.production.checkpoint_gate import PromotionCiPolicy
 from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
 from scripts.production.cli_fixture import invoke_cli
 from scripts.test_times.gate_record import GateRunRecord
 from scripts.buildlog import index
-from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 
@@ -53,7 +53,7 @@ FIXTURE_FOLDERS = ("lib", "hooks", "message", "notify", "direct", "fixture_a", "
 # Each folder holds test_first.py, and lib also holds test_second.py.
 
 GATE_TEST_SETTINGS = """# range: 1..
-GATE_TIME_LIMIT_FACTOR=100
+gate_time_limit_factor=100
 # whole: 0..
 memory_stop_reruns=1
 """
@@ -291,7 +291,7 @@ def suites_for_case(case: unittest.TestCase) -> tuple[str, ...]:
 
 def pin_gate_root(configuration: Path, root: Path) -> None:
     """Keep the fixture gate in its private folder."""
-    _ = write_config_fixture(configuration, f"roots.gate={root}\nroots.gate.{host_name()}={root}\n")
+    _ = write_config_fixture(configuration, f"roots.gate={root}\nroots.gate.{conf.local_host_key_name()}={root}\n")
 
 
 def wait_for_file(path: Path) -> None:
@@ -466,6 +466,7 @@ class MergeGateFixture(unittest.TestCase):
             "GIT_CONFIG_GLOBAL": str(git_config),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
             "GATE_TEST_STATE": str(self.state),
+            "CLAUDE_DISABLE_DATACLASS_CODE_CACHE": "1",
             "GATE_FIXTURE_TMP": str(self.fixture_root.parent),
             "GATE_TEST_REPO": str(SCRIPT.parents[2]),
             "GATE_PYTHON": str(self.bin / "suite-python"),
@@ -477,13 +478,17 @@ class MergeGateFixture(unittest.TestCase):
             "MAC_TEST_STATE_DIR": str(self.state / "mac-test"),
             "GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
             "BUILDLOG_SCOPE": "0",
+            # A gate that runs as a detached run has its own slice; the fixture gate never has one.
+            "DETACHED_RUN_SLICE": "",
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
             # The calling showrunner is found from these update timers, never the live ones.
-            "NOTIFIER_STATE_DIR": str(home / "notifier"), **build_fixture_sessions("fixture-showrunner"),
+            "NOTIFIER_STATE_DIR": str(home / "notifier"),
+            "SHOWRUNNER_STATE_DIR": str(home / ".local/state/showrunner"),
+            **build_fixture_sessions("fixture-showrunner"),
         }
         for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
             _ = self.environment.pop(key, None)
@@ -609,7 +614,7 @@ class MergeGateFixture(unittest.TestCase):
         (self.root / "home").mkdir()
         # A production with no Change review line: a gate always names one, and these write no rows.
         self.quiet_production = self.root / "quiet-production.md"
-        self.write(self.quiet_production, "# quiet\n")
+        self.write(self.quiet_production, "# quiet\n\n- **Merge branch:** `integration`\n")
         with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
             _ = fixture_member("showrunner", name="quiet", doc=staff.LiveDoc(remote.local_machine(), self.quiet_production))
         _ = self.git(self.root, "init", "--bare", str(self.origin))
@@ -706,16 +711,23 @@ class MergeGateFixture(unittest.TestCase):
                 [*self.gate_command(ignored_signals=ignored_signals, preamble=preamble), *arguments], cwd=self.root,
                 env=self.environment, stdin=subprocess.DEVNULL, capture_output=True,
                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-        from scripts.production import showrunners
-
-        # Restore the registry's HOME-derived paths after each call.
-        home = Path(self.environment["HOME"])
+        # Restore the registry's state paths after each call.
         with contextlib.ExitStack() as scope:
             for name, value in {
                 "NOTIFIER_STATE_DIR": Path(self.environment["NOTIFIER_STATE_DIR"]),
-                "SHOWRUNNER_STATE_DIR": home / ".local/state/showrunner",
+                "SHOWRUNNER_STATE_DIR": Path(self.environment["SHOWRUNNER_STATE_DIR"]),
             }.items():
                 _ = scope.enter_context(mock.patch.object(showrunners, name, value))
+            if "--promote" in arguments:
+                promote = gate.promote
+
+                def promote_after_collection(args: gate.GateArguments) -> None:
+                    if not args.legacy_direct_main:
+                        tip = self.git(self.origin, "rev-parse", f"refs/heads/{args.merge_branch}")
+                        _ = self.save_ci_receipt(tip, production=args.production)
+                    promote(args)
+
+                _ = scope.enter_context(mock.patch.object(gate, "promote", side_effect=promote_after_collection))
             entry = gate
             return invoke_cli(entry, lambda: entry.main(arguments), arguments,
                               self.environment, self.root)
@@ -802,14 +814,27 @@ class MergeGateFixture(unittest.TestCase):
                    + f"- **Repository:** `{self.checkout}`\n- **Showrunner checkout:** `{self.checkout}`\n"
                    + "- **Merge branch:** `integration`\n")
         with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
-            _ = fixture_member("showrunner", name="fixture-showrunner", doc=staff.LiveDoc("natedev", doc))
+            _ = fixture_member("showrunner", name="fixture-showrunner", doc=staff.LiveDoc(remote.local_machine(), doc))
         return review, doc
+
+    def save_ci_receipt(self, tip: str, *, production: str = "quiet",
+                        policy: PromotionCiPolicy = "standard") -> Path:
+        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), dict(self.environment)):
+            record = staff.snapshot()
+            document = change_review.production_doc(production, record=record)
+            owner = unit_lookup.doc_owner(document, record)
+        state = Path(self.environment["SHOWRUNNER_STATE_DIR"]) / owner.id / "session/waiting_state"
+        receipt = state / "ci_points.json"
+        self.write(receipt, json.dumps({"count": 1, "tip": tip, "policy": policy}))
+        return receipt
 
     def publish_for_promotion(self) -> gate.GateArguments:
         _ = self.git(self.checkout, "merge", "--ff-only", "unit-phase")
         _ = self.git(self.checkout, "push", "origin", "integration")
+        tip = self.git(self.origin, "rev-parse", "refs/heads/integration")
+        _ = self.save_ci_receipt(tip)
         return gate.GateArguments(
-            main_repo=str(self.main), merge_branch="integration",
+            main_repo=str(self.main), merge_branch="integration", production="quiet",
             ssh=str(self.bin / "ssh"), mac_repo="~/fixture", mac_host="fixture")
 
     @contextlib.contextmanager

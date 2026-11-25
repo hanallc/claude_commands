@@ -1,19 +1,16 @@
-"""Render staff names with the current Accounts role colors."""
+"""Render staff names and role labels with the current Accounts role colors."""
 from __future__ import annotations
 
 import html
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-from string import Formatter
 from typing import Literal, TypedDict
 
 from scripts.accounts import accounts
-from scripts.build_queue.snapshot_codec import format_queue_name, public_queue_text, UNKNOWN_CALLER
+from scripts.build_queue.snapshot_codec import public_queue_text, row_text, select_queue_name
 from scripts.production import staff
-from scripts.lib.build_steps import StepNames
-from scripts.message.owner_role import OwnerRole
 
 
 @dataclass(frozen=True)
@@ -34,6 +31,22 @@ class ContextTextPart(TypedDict):
 
 
 NamePart = StaffNamePart | ContextTextPart
+
+
+ROLE_GROUPS = {
+    "producer": "producers",
+    "showrunner": "showrunners",
+    "unit": "units",
+    "unit director": "units",
+    "merge director": "units",
+    "style director": "units",
+    "worker": "workers",
+}
+
+
+class RoleLabel(TypedDict):
+    opening: str
+    css: str
 
 
 def text_parts(*values: str | StaffReference) -> list[NamePart]:
@@ -57,38 +70,12 @@ def parts_text(parts: Sequence[NamePart]) -> str:
     return "".join(part["text"] for part in parts)
 
 
-def template_parts(template: str, fields: Mapping[str, str | int | StaffReference]) -> list[NamePart]:
-    """Mark template fields at their source without reading names from the result."""
-    values: list[str | StaffReference] = []
-    for literal, field, spec, conversion in Formatter().parse(template):
-        values.append(literal)
-        if field is not None:
-            value = fields[field]
-            text = value.name if isinstance(value, StaffReference) else value
-            pattern = "{value" + ("!" + conversion if conversion else "") + (":" + spec if spec else "") + "}"
-            shown = pattern.format(value=text)
-            values.append(StaffReference(shown) if isinstance(value, StaffReference) else shown)
-    return text_parts(*values)
-
-
-def owned_step_parts(names: StepNames, step: str, unit: str, role: OwnerRole, *,
-                     ci: bool = False, current: Sequence[NamePart] = ()) -> list[NamePart]:
-    """Keep staff fields separate in the configured step name."""
-    unit = public_queue_text(unit)
-    shown = public_queue_text(names.shown(step))
-    template = names.owner_template(step, unit, role, ci=ci)
-    label = format_queue_name(template, unit=unit, step=shown)
-    if label:
-        try:
-            parts = template_parts(template, {"unit": unit if ci else StaffReference(unit), "step": shown})
-        except (KeyError, ValueError):
-            return text_parts(label)
-        return parts if parts_text(parts) == label else text_parts(label)
-    if public_queue_text(parts_text(current)):
-        return list(current)
-    if template and role is OwnerRole.UNIT and not ci:
-        return text_parts(StaffReference(unit), " " if unit and shown else "", shown)
-    return text_parts(shown or UNKNOWN_CALLER)
+def row_parts(owner: str, what: str, unit: str) -> list[NamePart]:
+    """The parts of `<owner>: <what>`; an owner that is the staff unit is a staff reference."""
+    text = row_text(owner, what)
+    shown_owner = select_queue_name(owner)
+    owner_part = StaffReference(shown_owner) if shown_owner == public_queue_text(unit) else shown_owner
+    return text_parts(owner_part, text.removeprefix(shown_owner))
 
 
 class NameReading(Enum):
@@ -134,7 +121,23 @@ class StaffNames:
         color = accounts.staff_role_color(member, self.colors)
         if not isinstance(color, accounts.StaffRoleColor):
             return label
-        return f'<span class="staff-name" data-color-text="{color.key}" style="color:{color.css}">{label}</span>'
+        return _role_span_open(color) + label + "</span>"
+
+    def label_color(self, role: str) -> accounts.StaffRoleColor | accounts.NoAccountColor:
+        """Resolve the configured color for an explicit role label."""
+        group = ROLE_GROUPS.get(role)
+        return accounts.NoAccountColor() if group is None else accounts.role_color(group, self.colors)
+
+    def role_label(self, role: str, text: str) -> str:
+        """Render a role label with escaped text."""
+        label = html.escape(text)
+        color = self.label_color(role)
+        return _role_span_open(color) + label + "</span>" if isinstance(color, accounts.StaffRoleColor) else label
+
+    def role_labels(self) -> dict[str, RoleLabel]:
+        """Supply validated label colors and spans to JavaScript."""
+        return {role: {"opening": _role_span_open(color), "css": color.css}
+                for role in ROLE_GROUPS if isinstance(color := self.label_color(role), accounts.StaffRoleColor)}
 
     def source(self, identity: staff.StaffId) -> str:
         """Keep a unit's parent and name separate, with their own role colors."""
@@ -145,9 +148,22 @@ class StaffNames:
         lead = self.html(parent.id, parent.name) + " · " if parent is not None else ""
         return lead + self.html(member.id, member.name)
 
+    def unit_open(self) -> str:
+        """Open the span of a unit name in the unit role color, or return "" when the setting has no valid color.
+
+        A page shows a unit in the unit color with this span also when the unit has no staff entry.
+        """
+        color = accounts.role_color("units", self.colors)
+        return _role_span_open(color) if isinstance(color, accounts.StaffRoleColor) else ""
+
     def registry(self) -> dict[str, str]:
         """Supply the same escaped name spans to pages that render in JavaScript."""
         return {alias: self.html(member.id, alias) for alias, member in self.rows.items()}
+
+
+def _role_span_open(color: accounts.StaffRoleColor) -> str:
+    """Open a span in the role color."""
+    return f'<span class="staff-name" data-color-text="{color.key}" style="color:{color.css}">'
 
 
 def read() -> StaffNames:
@@ -159,14 +175,29 @@ def read() -> StaffNames:
     return StaffNames(members)
 
 
-def script(registry: dict[str, str]) -> str:
-    """Share the Python name spans with a page's JavaScript renderer."""
-    return '<script>' + SCRIPT.replace('STAFF_NAMES_DATA', json.dumps(registry).replace('<', '\\u003c')) + '</script>'
+def script(registry: dict[str, str], role_labels: dict[str, RoleLabel] | None = None) -> str:
+    """Share the name spans and role labels with JavaScript."""
+    values = json.dumps({"values": registry, "roleLabels": role_labels or {}}).replace('<', '\\u003c')
+    return '<script>' + SCRIPT.replace('STAFF_NAMES_DATA', values) + '</script>'
 
 
 SCRIPT = r'''window.staffNames={
- values:STAFF_NAMES_DATA,
- set(values){this.values=values;},
- html(text){return this.values[text] ?? String(text).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#x27;'}[c]));},
+ ...STAFF_NAMES_DATA,
+ unitOpen:'',
+ set(values,unitOpen='',roleLabels=this.roleLabels){this.values=values;this.unitOpen=unitOpen;this.roleLabels=roleLabels;},
+ escape(text){return String(text).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#x27;'}[c]));},
+ html(text,reference=text){
+  const value=this.values[reference];
+  if(typeof value!=='string') return this.escape(text);
+  if(text===reference) return value;
+  const label=this.escape(text);
+  return value.startsWith('<span ') ? value.slice(0,value.indexOf('>')+1)+label+'</span>' : label;
+ },
+ roleLabel(role,text){
+  const opening=this.roleLabels[role]?.opening;
+  const label=this.escape(text);
+  return opening ? opening+label+'</span>' : label;
+ },
+ unit(text){return this.unitOpen ? this.unitOpen+this.escape(text)+'</span>' : this.html(text);},
  parts(text){return String(text).split(' · ').map(part=>this.html(part)).join(' · ');}
 };'''

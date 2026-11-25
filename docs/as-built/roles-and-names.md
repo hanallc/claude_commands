@@ -18,7 +18,7 @@ Staff records a worker's current role through `KnownWorkerRole` and `set_worker_
 The agents log keeps dated attribution for usage reports, not the current role.
 An addressed reviewer's lens comes from dispatch evidence.
 
-**Names that can change.** `config/names.toml` has `[jobs]` and `[audiences]`. Each stable key holds an ordered list of display names: the current name first, retired names after it. A rename is one edit. `scripts/lib/names.py` is the one loader: `load_names(path)` returns `Names` or a `NamesError`, and `runtime_names()` loads once per process. Record keys, addresses, session names and pane labels keep the key.
+**Names that can change.** `config/names.toml` has `[jobs]` and `[audiences]`. Each stable key holds an ordered list of display names: the current name first, retired names after it. A rename is one edit. `scripts/lib/names.py` is the one loader: `load_names(path)` returns `Names` or a `NamesError`, and `runtime_names()` loads again only when the `config/names.toml` file stamp changes. It reports a load error once per command. Record keys, addresses, session names and pane labels keep the key.
 
 **Shown names.** `ShownName` renders `production · unit · job` in roster output, broadcast lines and Codex thread titles. `send.py` resolves the shown sender once, on the sending machine. A herdr tab title is the session name, with no role word and no production.
 
@@ -29,7 +29,7 @@ An addressed reviewer's lens comes from dispatch evidence.
 **The retired-name check.** `scripts/production/roles_audit.py check` exits non-zero and names the file and line of each retired name outside a kept context. It also fails on a printed fixed-display label. On a clean tree it prints nothing and exits 0. `check --prose` also prints `role words in sentences: N` and the list.
 
 - `scripts/production/role_terms.toml` holds the terms: `name`, `kind`, `defined_in`, `other_names`, `kept`, `other_meaning_files` and each term's retired and inflected forms.
-- `test_repository_sources_have_no_unkept_retired_names` in `test_roles_audit.py` runs the check on repository sources, so each merge gate runs it. It reads no home-state records.
+- `test_repository_sources_have_no_unkept_retired_names` in `test_roles_audit.py` runs the check on repository sources, so each gate runs it. It reads no home-state records.
 - `parse_terms` validates `kind`, `defined_in` and `other_meaning_files` and keeps none of them.
 
 **Speed of the check.**
@@ -53,12 +53,12 @@ An addressed reviewer's lens comes from dispatch evidence.
 - A reword of a file with a kept context fails the repository test until that file's kept text in `role_terms.toml` is refreshed.
 - Stored record fields and addresses that hold a retired word are kept contracts. `role_terms.toml` lists each one, and a change to one adds a kept context in the same change.
 - `Job` values equal their first display name, so key and display text look the same. Code uses the key.
-- The broadcast line is a contract with its readers: `zone.py` counts ` - sent\b`, and the Codex winddown tests parse it. Change them together.
+- `zone.py` counts broadcast lines that match ` - sent\b`. Update both files if the line format changes.
 - A config edit does not retitle a live tab. Fixtures pass a config path or patch `runtime_names`, and never read the live config.
 
 ## Why
 
-- **A merge-gate check, not a periodic review.** A retired name that returns fails at once, in the change that brought it back.
+- **A gate check, not a periodic review.** A retired name that returns fails at once, in the change that brought it back.
 - **Per-file kept contexts.** Global path masking would hide a returning name in a kept file.
 - **Explicit inflected forms.** A general English plural rule would match words with other meanings.
 - **No count in a plain check.** The sentence count is not a finding, and it sets a floor of about 2.5 s.

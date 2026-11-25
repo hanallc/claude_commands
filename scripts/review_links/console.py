@@ -13,9 +13,14 @@ from typing import Literal, TypedDict, cast
 from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 
 from scripts.lib import atomic_file, conf, file_lock
+from scripts.production import staff
 from scripts.production.change_review import ChangeReviewError
 from scripts.production.production_doc import Refusal
-from scripts.review_links import accounts_page, change_page, console_theme, for_you, page_frame, review_link, review_legacy
+from scripts.review_links import (
+    accounts_page, change_page, console_theme, for_you, new_item_dialog, page_frame, record_table, review_link,
+    review_legacy, review_submissions,
+)
+from scripts.for_you.action import review_place
 
 PHONE_QUERY = "(max-width:680px)"
 
@@ -31,7 +36,7 @@ REVIEW_PLACE_SCRIPT = review_legacy.SCRIPT + r"""function legacyReviewPlace(para
 }
 """
 ICON_NAMES = frozenset(("list-checks", "inbox", "hammer", "cloud", "server", "hard-drive", "image", "message-circle-question", "panel-left-close",
-                        "panel-left-open", "menu", "refresh-cw", "sparkle", "users", "search"))
+                        "panel-left-open", "menu", "refresh-cw", "sparkle", "users", "search", "torus", "clapperboard"))
 REFERENCE = re.compile(r"python:([a-zA-Z_][\w.]*)\:([a-zA-Z_]\w*)")
 # The console folder keeps the items each page held when the user last opened it, for every browser.
 SEEN_NAME = ".review-link-seen.json"
@@ -230,6 +235,19 @@ def for_you_count(snapshot: for_you.ForYouSnapshot) -> ForYouCountPayload:
     return {"available": True, "count": count.value}
 
 
+def for_you_count_view(snapshot: for_you.ForYouSnapshot) -> dict[str, object]:
+    """Send the counts, rebuild machines, and short reasons."""
+    status = snapshot.status_line_actions()
+    payload: dict[str, object] = {**for_you_count(snapshot), "rebuild_machines": status.rebuild_machines}
+    if status.rebuild_reasons:
+        payload["rebuild_reasons"] = dict(status.rebuild_reasons)
+    if isinstance(status.other_count, int):
+        payload["other_count"] = status.other_count
+    if status.partial:
+        payload["partial"] = True
+    return payload
+
+
 def for_you_payload() -> ForYouPayload:
     """Read the shared action sources without changing their stores."""
     snapshot = for_you.read()
@@ -240,10 +258,43 @@ def for_you_payload() -> ForYouPayload:
     for row in (row for row in snapshot.rows if row.status == "open"):
         if len(entries) == 2:
             break
-        place = "/console/review.html?" + urlencode({"type": "for-you", "show": "open", "item": row.key})
+        place = review_place(row.key)
         entries.append({"key": row.key, "kind": row.kind, "title": row.title, "command": row.command,
                         "machine": row.machine, "requested_by": row.requested_by, "href": place_query("review", place)})
     return {**count, "entries": entries}
+
+
+def _unavailable_owner_controls(pages: tuple[str, ...]) -> str:
+    """Use the configured owners in the console's unavailable view."""
+    if not pages:
+        return ""
+    try:
+        members = staff.local_snapshot()
+        settings = conf.read_or_repository("console")
+    except (OSError, ValueError):
+        return ""
+    controls: list[str] = []
+    show_dialog = False
+    for page in pages:
+        if page not in page_frame.OWNER_PAGES:
+            continue
+        owners = review_submissions.page_owners(page, settings, members)
+        if isinstance(owners.route, review_submissions.PageOwnerRoute):
+            recipient = owners.route.row.name
+        elif review_submissions.has_recipient_choice(members):
+            recipient = page_frame.OwnerNewItem.CHOOSE_RECIPIENT
+        elif isinstance(owners.shown, staff.StaffRow):
+            recipient = page_frame.OwnerNewItem.UNAVAILABLE
+        else:
+            continue
+        shown = owners.shown if isinstance(owners.shown, staff.StaffRow) else page_frame.NoShownOwner()
+        control = page_frame.owner_control(page, shown, members, recipient=recipient)
+        controls.append(f'<div data-unavailable-owner="{page}" hidden>{control}</div>')
+        show_dialog |= recipient is not page_frame.OwnerNewItem.UNAVAILABLE
+    if not controls:
+        return ""
+    dialog = new_item_dialog.render() if show_dialog else ""
+    return '<div class="unavailable-owners">' + "".join(controls) + "</div>" + dialog
 
 
 def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | UnavailablePage) -> bytes:
@@ -279,20 +330,28 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
               + icon_svg("inbox") + '<span class="for-you-label">For you</span><b data-for-you-count>?</b>'
               + '<span class="for-you-state" data-for-you-state>Unavailable</span></button>')
     content = content.replace("<!-- FOR YOU BUTTON -->", button)
+    content = content.replace("<!-- FOR YOU LINK -->", html.escape(place_query("review", review_place()), quote=True))
     content = content.replace("<!-- SHARED STYLES -->", page_frame.BUTTON_STATES + page_frame.COPY_STYLE + FOR_YOU_STYLE)
     notifier = FOR_YOU_SCRIPT
     if any(page.identity == "accounts" and isinstance(page.destination, AvailablePage) for page in pages):
         icons = {level: accounts_page.quota_icon(level)
                  for level in (accounts_page.QuotaLevel.WARNING, accounts_page.QuotaLevel.URGENT)}
         notifier = notifier.replace("/* Quota icons. */ {}", json.dumps(icons))
-    content = content.replace("<!-- FOR YOU SCRIPT -->", page_frame.COPY_SCRIPT + notifier)
+    content = content.replace("<!-- FOR YOU SCRIPT -->", page_frame.COPY_SCRIPT + page_frame.ACTION_STATUS_SCRIPT + notifier)
     content = content.replace("<!-- FOR YOU COPY -->", page_frame.COPY_BUTTON)
     content = content.replace("<!-- FOR YOU REBUILD -->", icon_svg("refresh-cw"))
     content = content.replace("<!-- FOR YOU ACTION -->", icon_svg("list-checks"))
     content = content.replace("<!-- CLOSE -->", icon_svg("panel-left-close"))
     content = content.replace("<!-- OPEN -->", icon_svg("panel-left-open"))
     content = content.replace("<!-- MENU -->", icon_svg("menu") + '<span class="new-mark" id="menu-new" hidden>' + new_mark + '</span>')
-    content = content.replace('<script>', '<script>'+REVIEW_PLACE_SCRIPT, 1)
+    content = content.replace('<script>', '<script>'+record_table.PLACE_SCRIPT+REVIEW_PLACE_SCRIPT, 1)
+    unavailable = tuple(page.identity for page in pages if isinstance(page.destination, UnavailablePage))
+    if isinstance(rebuilds, UnavailablePage):
+        unavailable += ("rebuilds",)
+    controls = _unavailable_owner_controls(unavailable)
+    content = content.replace("<!-- UNAVAILABLE OWNERS -->", controls)
+    if controls:
+        content = content.replace("</head>", page_frame.OWNER_STYLE + page_frame.PAGE_SCRIPT_ERRORS + "</head>", 1)
     return content.replace("/* Phone query */", PHONE_QUERY).encode("utf-8")
 
 
@@ -339,7 +398,9 @@ font:14px/1.4 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere
 FOR_YOU_SCRIPT = r'''
 function createForYouNotifier(openCard){
  const triggers=[...document.querySelectorAll('[data-for-you-toggle]')],panel=document.getElementById('action-popover');
- const entries=panel.querySelector('[data-for-you-entries]'),note=panel.querySelector('[data-for-you-note]');
+ const entries=panel.querySelector('[data-for-you-entries]');
+ const failure=panel.querySelector('[data-for-you-failure]'),empty=panel.querySelector('[data-for-you-empty]');
+ const summary=panel.querySelector('[data-for-you-summary]');
  let last=null,stale=false,reading=false,completionPending=false,opener=null,displayed='';
  function selectionIntersects(node){
   const selection=getSelection();
@@ -381,8 +442,9 @@ function createForYouNotifier(openCard){
   if(selectionIntersects(panel)) return;
   const heading=panel.querySelector('[data-panel-count]');
   if(heading.textContent!==count) heading.textContent=count;
-  const message=!last ? 'The action count is unavailable.' : stale ? 'Stale. The action read failed.' : last.count===0 ? 'No actions required.' : 'These actions require you now.';
-  if(note.textContent!==message) note.textContent=message;
+  showActionFailure(failure,!last ? 'The action count is unavailable.' : stale ? 'Stale. The action read failed.' : '');
+  empty.hidden=!last || stale || last.count!==0;
+  summary.hidden=!last || stale || last.count===0;
   showEntries(last?.entries ?? []);
  }
  function draw(){
@@ -394,7 +456,7 @@ function createForYouNotifier(openCard){
    if(badge.textContent!==count) badge.textContent=count;
    const label=button.querySelector('[data-for-you-state]');
    const message=state==='stale' ? 'Stale' : state==='unavailable' ? 'Unavailable' : '';
-   if(label.textContent!==message) label.textContent=message;
+   showActionFailure(label,message);
    button.setAttribute('aria-label','For you: '+(last ? count+(stale ? ', stale' : '') : 'Unavailable'));
   }
   drawPanel(count);
@@ -471,7 +533,8 @@ DOCUMENT = """<!doctype html>
 /* Quota tokens. */
 :root{color-scheme:light dark;font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 --nav:#f8f9fc;--page:#fff;--text:#192339;--muted:#525c6e;--border:#e1e5ed;--active:#e8edfd;--accent:#2849a3;--hover:#edf0f6;
---notice:#fdf1dc;--notice-text:#7a4300;--notice-hover:#fae6c3}
+--notice:#fdf1dc;--notice-text:#7a4300;--notice-hover:#fae6c3;
+--bg:var(--page);--card:var(--nav);--line:var(--border);--ink:var(--text);--ink-2:var(--muted);--ink-3:var(--muted)}
 @media(prefers-color-scheme:dark){:root{--nav:#141b28;--page:#10151e;--text:#e4eaf4;--muted:#a4afc2;
 --border:#2d3748;--active:#253758;--accent:#c2d4ff;--hover:#202b3c;--notice:#3a2b12;--notice-text:#ffd28f;--notice-hover:#4a3718}}
 *{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--text);overflow:hidden}
@@ -510,6 +573,10 @@ background:var(--text);color:var(--page);border-radius:6px;font-size:12px;font-w
 .frame-area{flex:1;min-height:0;position:relative}
 .frame-area iframe{position:absolute;inset:0;display:block;border:0;width:100%;height:100%;background:var(--page)}
 .frame-area iframe[hidden]{display:block!important;visibility:hidden;pointer-events:none}
+#page-unavailable{height:100%}
+#page-unavailable #review-new-item .new-item-page-capture{display:none}
+.unavailable-owners{position:absolute;inset:16px 24px auto;display:flex;justify-content:flex-end}
+.unavailable-owners>[data-unavailable-owner]{min-width:0}
 .empty{height:100%;display:grid;place-content:center;text-align:center;padding:24px;color:var(--muted)}
 .empty h3{font-size:20px;color:var(--text);margin:0 0 8px}.empty p{max-width:30ch;margin:0}
 .rebuild-slot{position:fixed;left:0;bottom:0;width:244px;padding:12px;z-index:4}.collapsed .rebuild-slot{width:72px}
@@ -550,13 +617,17 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
 <button class="dismiss" id="nav-dismiss" type="button" aria-label="Collapse navigation" tabindex="-1"></button>
 <main class="workspace">
 <div class="frame-area">
-<section class="empty" id="page-unavailable" hidden><h3>Not available</h3><p>This page is not available. Try another page or open a new console link.</p></section></div></main>
+<section id="page-unavailable" hidden>
+<div class="empty"><h3>Not available</h3><p>This page is not available. Try another page or open a new console link.</p></div>
+<!-- UNAVAILABLE OWNERS --></section></div></main>
 </div>
 <section id="action-popover" aria-label="For you actions" hidden>
 <header><strong>For you <span data-panel-count>?</span></strong><button type="button" id="close-actions" aria-label="Close actions">×</button></header>
-<p class="panel-note" role="status" data-for-you-note>The action count is unavailable.</p>
+<p class="panel-note" role="status" data-for-you-failure>The action count is unavailable.</p>
+<p class="panel-note" role="status" data-for-you-empty hidden>No actions required.</p>
+<p class="panel-note" data-for-you-summary hidden>These actions require you now.</p>
 <div data-for-you-entries></div>
-<footer><a data-for-you-card href="?page=review&amp;at.review=%2Fconsole%2Freview.html%3Ftype%3Dfor-you%26show%3Dopen">Open For you →</a></footer>
+<footer><a data-for-you-card href="<!-- FOR YOU LINK -->">Open For you →</a></footer>
 </section>
 <template id="for-you-entry"><article>
 <div class="short-head"><span data-entry-rebuild><!-- FOR YOU REBUILD --></span><span data-entry-action><!-- FOR YOU ACTION --></span><strong></strong></div>
@@ -574,9 +645,16 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
   // The rebuild link opens its page as a navigation entry does, so it is one of the pages.
   const pages = [...entries, rebuildLink];
   const frameArea = document.querySelector('.frame-area');
+  const unavailable = document.getElementById('page-unavailable');
+  const unavailableOwners = unavailable.querySelectorAll('[data-unavailable-owner]');
+  const unavailableScreenshot = unavailable.querySelector('input[name="include_page"]');
+  if (unavailableScreenshot) unavailableScreenshot.defaultChecked = false;
   // Each opened page keeps a live frame, so a page keeps its filter, card, scroll and typed text.
   const frames = new Map();
+  const frameNavigation = new WeakMap();
   const placeKey = identity => 'at.' + identity;
+  const legacyTypes = new Map([['changes','change'],['questions','question'],['investigations','investigation']]);
+  const reviewEntry = entries.find(entry => entry.dataset.page === 'review');
   const storageKey = 'admin-console.navigation-collapsed';
   let desktopCollapsed = false;
   try { desktopCollapsed = localStorage.getItem(storageKey) === 'true'; } catch (_) {}
@@ -610,7 +688,9 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
   function record(entry) {
     let place, state = history.state;
     try {
-      const child = frames.get(entry.dataset.page).contentWindow;
+      const frame = frames.get(entry.dataset.page);
+      if (!frameNavigation.get(frame)?.canRecord()) return;
+      const child = frame.contentWindow;
       const at = child.location;
       place = placeOf(entry, at.pathname + at.search + at.hash);
       if (entry.dataset.page === 'review') {
@@ -634,19 +714,61 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     const target = savedPlace();
     const restored = history.state?.reviewPlace;
     if (entry.dataset.page === 'review' && restored?.place === target) frame.reviewPlace = restored;
-    frame.src = target;
+    let pendingPlace, readyDocument, retry;
+    let reloading = false;
+    const recordPlace = () => record(entry);
+    function applyPlace() {
+      const doc = frame.contentDocument;
+      if (!pendingPlace || !doc || doc !== readyDocument || reloading) return;
+      const child = frame.contentWindow;
+      const place = pendingPlace;
+      pendingPlace = undefined;
+      if (typeof child.consoleNavigate === 'function' && child.location.pathname === new URL(place, location.href).pathname) {
+        child.consoleNavigate(place);
+      } else {
+        reloading = true;
+        child.history.replaceState(null, '', place);
+        child.location.reload();
+      }
+    }
+    function connectDocument() {
+      const doc = frame.contentDocument;
+      if (!doc || doc === readyDocument) return;
+      clearTimeout(retry);
+      readyDocument = doc;
+      reloading = false;
+      doc.addEventListener('click', openFrameLink);
+      frame.contentWindow.addEventListener('hashchange', recordPlace);
+      frame.contentWindow.addEventListener('keydown', actions.escape, true);
+      if (pendingPlace) applyPlace();
+      else record(entry);
+    }
+    frameNavigation.set(frame, {
+      request(place) {
+        pendingPlace = place;
+        applyPlace();
+      },
+      canRecord() {
+        const doc = frame.contentDocument;
+        return !pendingPlace && !reloading && doc === readyDocument;
+      }
+    });
+    frame.addEventListener('console-document-ready', connectDocument);
     frame.addEventListener('load', () => {
       let loaded = false;
       try { loaded = frame.contentWindow.location.origin === location.origin; } catch (_) {}
       if (!loaded) {
-        // A refused load, such as during a server restart, shows the browser's error page; load the page again.
-        setTimeout(() => { frame.src = savedPlace(); }, Number(shell.dataset.frameRetrySeconds) * 1000);
+        // Retry a browser error page at the latest place.
+        clearTimeout(retry);
+        retry = setTimeout(() => {
+          frame.src = pendingPlace || savedPlace();
+          pendingPlace = undefined;
+        }, Number(shell.dataset.frameRetrySeconds) * 1000);
         return;
       }
-      record(entry);
-      frame.contentWindow.addEventListener('hashchange', () => record(entry));
-      frame.contentWindow.addEventListener('keydown', actions.escape, true);
+      connectDocument();
     });
+    frame.src = target;
     frames.set(entry.dataset.page, frame);
     frameArea.prepend(frame);
     return frame;
@@ -682,16 +804,16 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
       showNews();
     } catch (_) {}
   }
-  function select(identity, navigate = false) {
-    if (['changes','questions','investigations'].includes(identity) && entries.some(entry=>entry.dataset.page==='review')) {
-      const kind={changes:'change',questions:'question',investigations:'investigation'}[identity];
+  function select(identity, navigate = false, destination) {
+    const kind = legacyTypes.get(identity);
+    if (kind && reviewEntry) {
       const url=new URL(location.href);
-      const previous=new URL(url.searchParams.get('at.'+identity) || '/console/changes.html',location.origin);
-      const filters=new URLSearchParams(previous.search);
-      for(const [key,value] of new URLSearchParams(previous.hash.slice(1))) filters.set(key,value);
+      const previous=new URL((destination ?? url).searchParams.get(placeKey(identity)) || '/console/changes.html',location.origin);
+      const filters=recordPlaceParams(reviewPlaceOptions,previous);
       filters.set('type',kind);legacyReviewPlace(filters,kind);
       url.searchParams.set('at.review','/console/review.html#'+filters);
-      history.replaceState(null,'',url);identity='review';
+      openConsolePlace(reviewEntry, url, navigate);
+      return;
     }
     const selected = pages.find(entry => entry.dataset.page === identity) || entries[0];
     if (!selected) return;
@@ -707,7 +829,8 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     actions.syncLinks();
     const path = selected.dataset.url;
     frames.forEach((frame, page) => { if (page !== selected.dataset.page) frame.hidden = true; });
-    document.getElementById('page-unavailable').hidden = Boolean(path);
+    unavailable.hidden = Boolean(path);
+    unavailableOwners.forEach(owner => { owner.hidden = owner.dataset.unavailableOwner !== selected.dataset.page; });
     if (path) {
       const opened = frames.has(selected.dataset.page);
       const frame = frameFor(selected);
@@ -722,6 +845,36 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     showNews();
     loadNews();
     if (navigate && phone.matches) collapse(true);
+  }
+  function openConsolePlace(entry, destination, navigate = true) {
+    const identity = entry.dataset.page;
+    const key = placeKey(identity);
+    const requested = destination.searchParams.get(key);
+    if (requested && entry.dataset.url) {
+      const place = placeOf(entry, requested);
+      const url = new URL(location.href);
+      url.searchParams.set(key, place);
+      history.replaceState(history.state, '', url);
+      frameNavigation.get(frames.get(identity))?.request(place);
+    }
+    select(identity, navigate);
+  }
+  function openFrameLink(event) {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const link = event.target.closest?.('a[target="_top"][href]');
+    if (!link || link.hasAttribute('download')) return;
+    const url = new URL(link.href);
+    if (url.origin !== location.origin || url.pathname !== '/console/') return;
+    const identity = url.searchParams.get('page');
+    if (reviewEntry && legacyTypes.has(identity)) {
+      event.preventDefault();
+      select(identity, true, url);
+      return;
+    }
+    const entry = pages.find(page => page.dataset.page === identity);
+    if (!entry) return;
+    event.preventDefault();
+    openConsolePlace(entry, url);
   }
   collapse(collapsed);
   pages.forEach(entry => entry.addEventListener('click', event => {
@@ -765,10 +918,8 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     } catch (_) {}
   }
   const actions = createForYouNotifier(url => {
-    history.replaceState(null, '', url);
-    const place = url.searchParams.get('at.review');
-    if (frames.has('review') && place) frames.get('review').src = place;
-    select('review', true);
+    const review = pages.find(entry => entry.dataset.page === 'review');
+    if (review) openConsolePlace(review, url);
   });
   select(new URL(location.href).searchParams.get('page'));
   function refresh() { loadRebuilds(); loadNews(); actions.refresh(); }

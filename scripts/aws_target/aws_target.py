@@ -23,13 +23,15 @@ import sys
 import time
 from time import monotonic
 from typing import cast, final
+from uuid import uuid4
 
-from scripts.aws_target import hana_spend, ledger, measurement, price_days, quota_requests, run_cost
-from scripts.aws_target.aws_cli import aws_error_code
+from scripts.aws_target import hana_spend, key_refusal, ledger, measurement, price_days, quota_requests, run_cost
+from scripts.aws_target.aws_cli import KEY_REFUSED_CODES, aws_error_code
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
-from scripts.aws_target.config import read_settings
+from scripts.aws_target.config import AwsOff, AwsOn, aws_switch, read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
 from scripts.build_targets.target_config import ssh_target_state_directory
+from scripts.for_you.action import ActionStore, ActionStoreError, action_id
 from scripts.lib import conf
 from scripts.message import send_budget, send_result
 from scripts.message.session_send import send_argv
@@ -50,6 +52,13 @@ SNAPSHOT_DUMP_LINE = re.compile(
     r'(?i)^(?:(?:request|response|headers?)\b|'
     + r'(?:[a-z0-9]+(?:-[a-z0-9]+)+|authorization|host|date|connection|cookie)\s*:|[{\[<])')
 HOURS_GAP_RECIPIENT = 'staff:a898cb38-dbac-4751-b72b-d0b14ab9c38d'
+PRICE_READ_REQUESTER = 'aws-unit'
+PRICE_READ_ACTION_KEY = 'aws-price-read'
+
+
+def machine_settings() -> tuple[conf.ConfigRead, conf.ConfigRead]:
+    """Read the cloud gate and Hana settings, whose enabled keys switch the two AWS machines."""
+    return conf.read_or_repository('cloud_gate'), conf.read_or_repository('hana_aws')
 
 
 def largest_gate_vcpus(instance_types: tuple[str, ...]) -> int:
@@ -95,6 +104,14 @@ class SnapshotFailure:
 class SnapshotFailureStreak:
     since: int
     notice_claimed: bool
+    action_key: str
+    action_created: bool
+
+    def record(self) -> dict[str, object]:
+        output: dict[str, object] = {'since': self.since, 'notice_claimed': self.notice_claimed}
+        if self.action_key:
+            output.update(action_key=self.action_key, action_created=self.action_created)
+        return output
 
 
 @dataclass(frozen=True)
@@ -131,6 +148,35 @@ def snapshot_failure_push(failures: Sequence[SnapshotFailure]) -> push_texts.Ren
     for failure in failures:
         lines.append(f'AWS refused the {failure.region} {failure.read} read.')
     return push_texts.render('aws.snapshot_failed', failures='\n'.join(lines))
+
+
+def withdraw_price_read_action(actions: ActionStore, *, reason: str, keep_key: str = '') -> None:
+    """Withdraw the open price read action unless its key matches keep_key."""
+    for record in actions.list():
+        if (record.status == 'open' and record.requested_by == PRICE_READ_REQUESTER
+                and record.dedupe_key == PRICE_READ_ACTION_KEY and record.key != keep_key):
+            _ = actions.withdraw(record.key, requested_by=PRICE_READ_REQUESTER, reason=reason)
+            return
+
+
+def file_price_read_action(failures: Sequence[SnapshotFailure], *, key: str) -> None:
+    """File the action for a permission refusal with the saved key."""
+    key = f'action/{action_id(key)}'
+    actions = ActionStore()
+    withdraw_price_read_action(actions, reason='A new refused read replaced this action.', keep_key=key)
+    regions = ', '.join(failure.region for failure in failures)
+    record = actions.add(
+        title='Allow AWS price reads',
+        command='~/.claude/scripts/lib/py ~/.claude/scripts/aws_target/deploy.py up --approve-resources',
+        machine='natedev', cwd='/home/natepiano', requested_by=PRICE_READ_REQUESTER,
+        reason=f'AWS refused the price read in {regions}. '
+               + 'After 2 hours without the read, test runs on AWS can pick a region that costs more. '
+               + 'The command allows the read, costs nothing, and asks for your AWS admin passphrase.',
+        waits=f'Test runs on AWS in {regions}', concerns='aws', dedupe_key=PRICE_READ_ACTION_KEY, key=key,
+        completion='automatic',
+    )
+    if record.key != key:
+        raise ActionStoreError('Another open action appeared before the new action could be added.')
 
 
 def gpu_price_sizes(values: conf.ConfigRead) -> tuple[str, ...]:
@@ -498,30 +544,55 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
             {'region': row.region, 'standard': quota_requests.request_record(row.standard),
              'gpu': quota_requests.request_record(row.gpu)}
             for row in request_readings]
-        # Success drops an unsent notice because no user action remains.
+        access_failures = tuple(row for row in current_failures if snapshot_permission_failure(row))
         streak: SnapshotFailureStreak | SnapshotHealthy = SnapshotHealthy()
         if current_failures:
             previous = ledger.mapping(document['failure_streak']) if 'failure_streak' in document else {}
             since = ledger.instant(previous, 'since') if previous else now
             notice_claimed = previous.get('notice_claimed', previous.get('notified')) is True
-            streak = SnapshotFailureStreak(since, notice_claimed)
-            output['failure_streak'] = {'since': streak.since, 'notice_claimed': streak.notice_claimed}
-        write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
+            action_key = ledger.text(previous, 'action_key') if 'action_key' in previous else ''
+            if access_failures and not action_key:
+                # Save the key before creating the action so a retry uses the same key.
+                action_key = f'action/{uuid4()}'
+            streak = SnapshotFailureStreak(since, notice_claimed, action_key,
+                                           previous.get('action_created') is True)
+
+        def save_snapshot() -> None:
+            if isinstance(streak, SnapshotFailureStreak):
+                output['failure_streak'] = streak.record()
+            write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
+
+        save_snapshot()
         try:
             price_days.record(directory, read_prices, now, configuration.whole('spot_price_days_keep'))
         except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
             print(f'aws_target: daily Spot prices not saved: {type(error).__name__}: {error}', file=sys.stderr)
             status = 1
-        access_failures = tuple(row for row in current_failures if snapshot_permission_failure(row))
-        if access_failures and isinstance(streak, SnapshotFailureStreak) and not streak.notice_claimed:
-            # Save the claim before delivery because note keys alone do not suppress repeats.
-            output['failure_streak'] = {'since': streak.since, 'notice_claimed': True}
-            write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
-            if not notify(f'aws-spot-snapshot:{streak.since}', snapshot_failure_push(access_failures),
-                          configuration.number('snapshot_notification_timeout_s')):
-                output['failure_streak'] = {'since': streak.since, 'notice_claimed': False}
-                write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
-                print('aws_target: snapshot user notice remains pending', file=sys.stderr)
+        action_filed = False
+        try:
+            if isinstance(streak, SnapshotHealthy):
+                stamp = datetime.fromtimestamp(now, UTC).isoformat()
+                withdraw_price_read_action(ActionStore(), reason=f'The hourly read succeeded at {stamp}.')
+            elif access_failures and not streak.action_created:
+                file_price_read_action(access_failures, key=streak.action_key)
+                action_filed = True
+        except (ActionStoreError, OSError) as error:
+            detail = ' '.join(str(error).split())
+            print(f'aws_target: cannot update the AWS price read action: {detail}', file=sys.stderr)
+            status = 1
+        if access_failures and isinstance(streak, SnapshotFailureStreak):
+            if action_filed:
+                streak = replace(streak, action_created=True)
+                save_snapshot()
+            if not streak.notice_claimed:
+                # Save the claim before delivery because note keys alone do not suppress repeats.
+                streak = replace(streak, notice_claimed=True)
+                save_snapshot()
+                if not notify(f'aws-spot-snapshot:{streak.since}', snapshot_failure_push(access_failures),
+                              configuration.number('snapshot_notification_timeout_s')):
+                    streak = replace(streak, notice_claimed=False)
+                    save_snapshot()
+                    print('aws_target: snapshot user notice remains pending', file=sys.stderr)
         # The stamp is the last scheduled read. A forced read leaves it, so the next hourly read still runs.
         if not force:
             _ = lock.seek(0)
@@ -593,6 +664,8 @@ class AccountRefresh:
         self.clock = clock
 
     def tick(self) -> None:
+        if not isinstance(aws_switch(*machine_settings()), AwsOn):
+            return
         now = int(self.clock())
         configuration = conf.read(self.settings_path)
         api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'),
@@ -608,11 +681,43 @@ class AccountRefresh:
         return measurement.read_charges(self.settings_path, self.directory, now, fetch)
 
 
+def refused_key_code(error: Exception) -> str:
+    """Name the AWS code when AWS refused the key itself; empty for every other failure."""
+    from scripts.aws_target.hana_provider import ProviderKeyRefused, ProviderStartRefused
+    if isinstance(error, ProviderKeyRefused):
+        return error.code
+    if isinstance(error, ProviderStartRefused):
+        return error.code if error.code in KEY_REFUSED_CODES else ''
+    code = aws_error_code(error) if isinstance(error, AwsUnavailable) else ''
+    return code if code in KEY_REFUSED_CODES else ''
+
+
+def key_refusal_holds(directory: Path) -> bool:
+    """Hold every AWS call after a refused key until a tick sees all AWS machines off and a later tick sees one on."""
+    refusal = key_refusal.read(directory)
+    if isinstance(refusal, key_refusal.NoKeyRefusal):
+        return False
+    switch = aws_switch(*machine_settings())
+    if not isinstance(switch, AwsOn):
+        # An unusable value is no proof that a person turned the machines off.
+        if isinstance(switch, AwsOff) and not refusal.off_seen:
+            key_refusal.write(directory, replace(refusal, off_seen=True))
+        return True
+    if not refusal.off_seen:
+        return True
+    key_refusal.clear(directory)
+    print('aws_target: an AWS machine is on again after a refused key; AWS calls start again', file=sys.stderr)
+    return False
+
+
 def controller_tick(settings_path: Path, directory: Path, workload_path: Path, *,
-                    lifecycle: Callable[[], object] | None = None, refresh: Callable[[], object] | None = None) -> int:
-    """Recover lifecycle state before an independent account refresh attempt."""
+                    lifecycle: Callable[[], object] | None = None, refresh: Callable[[], object] | None = None,
+                    clock: Callable[[], float] = time.time) -> int:
+    """Recover lifecycle state before an independent account refresh attempt; make no call after a refused key."""
     from scripts.aws_target.hana_box import HanaController
     from scripts.aws_target.hana_provider import AwsHanaProvider
+    if key_refusal_holds(directory):
+        return 0
     status = 0
     controller = HanaController(directory, settings_path, workload_path,
         AwsHanaProvider.from_settings(settings_path, directory, workload_path))
@@ -623,6 +728,11 @@ def controller_tick(settings_path: Path, directory: Path, workload_path: Path, *
         except (OSError, ValueError, RuntimeError, ArithmeticError, subprocess.SubprocessError) as error:
             detail = f'{type(error).__name__}: {error}' if name == 'Hana lifecycle' else type(error).__name__
             print(f'aws_target: {name} unavailable: {detail}', file=sys.stderr)
+            code = refused_key_code(error)
+            if code:
+                key_refusal.write(directory, key_refusal.KeyRefused(code, int(clock()), off_seen=False))
+                print(f'aws_target: {key_refusal.REFUSED_REASON} ({code})', file=sys.stderr)
+                return 1
             status = 1
     return status
 
@@ -645,7 +755,14 @@ def serve(settings_path: Path, directory: Path, workload_path: Path, *,
 
 
 def hourly(settings_path: Path, directory: Path, *, allow_aws_unavailable: bool = False) -> int:
-    """Read prices and placement scores and check billed hours."""
+    """Read prices and placement scores and check billed hours, only while AWS is on."""
+    cloud_gate_settings, hana_settings = machine_settings()
+    # With AWS off, no charge refresh runs, so a provisional bill would give false hours-gap notices.
+    if not isinstance(aws_switch(cloud_gate_settings, hana_settings), AwsOn):
+        return 0
+    # After a refused key, each call is refused too; only the controller tick clears the record.
+    if isinstance(key_refusal.read(directory), key_refusal.KeyRefused):
+        return 0
     status = 0
     read_prices = partial(snapshot, allow_aws_unavailable=True) if allow_aws_unavailable else snapshot
     for label, operation in (('price snapshot', read_prices), ('hours-gap check', hours_gap_notices)):
@@ -657,6 +774,8 @@ def hourly(settings_path: Path, directory: Path, *, allow_aws_unavailable: bool 
                 continue
             print(f'aws_target: {label} failed: {type(error).__name__}', file=sys.stderr)
             status = max(status, 1)
+    if not isinstance(aws_switch(cloud_gate_settings), AwsOn):
+        return status
     try:
         placement_snapshot(settings_path, directory)
     except Exception as error:

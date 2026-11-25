@@ -6,7 +6,6 @@ import json
 import os
 import re
 import signal
-import socket
 import stat
 import subprocess
 import tomllib
@@ -22,7 +21,7 @@ from scripts.lib import process_group
 
 from scripts.build_hold import override_guard
 from scripts.copies import copies
-from scripts.lib import cargo_output, conf_reads, scratch
+from scripts.lib import cargo_output, conf, conf_reads, scratch
 from scripts.notify import review
 from scripts.notify.push_texts import RenderedPush
 
@@ -205,14 +204,18 @@ def mapping(value: object) -> dict[str, object]:
 def free_floor_gib() -> float:
     values: dict[str, str] = {}
     try:
-        for raw in conf_reads.read_text(LINT_CONFIG).splitlines():
+        contents = conf_reads.read_text(LINT_CONFIG)
+        for raw in contents.splitlines():
             line = raw.split("#", 1)[0].strip()
             if line and not (line.startswith("[") and line.endswith("]")) and "=" in line:
                 key, _, value = line.partition("=")
                 _ = values.setdefault(key.strip(), value.strip())
     except OSError:
         return 0
-    raw = values.get(f"sweep_free_floor_gib.{socket.gethostname()}", values.get("sweep_free_floor_gib", "0"))
+    selected = f"sweep_free_floor_gib.{conf.local_host_key_name()}"
+    if selected not in values:
+        selected = "sweep_free_floor_gib"
+    raw = conf_reads.trace_values(LINT_CONFIG, contents, values).get(selected, "0")
     try:
         return max(0.0, float(raw))
     except ValueError:

@@ -12,19 +12,21 @@ import fcntl
 import json
 import shutil
 import os
+from pathlib import Path
 import subprocess
 import sys
 from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states
 from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledger, run_cost, spend, spot_table
 from scripts.aws_target import config as aws_config
 from scripts.aws_target import plan_identity, quota_requests
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, git_only, text_setting
 from scripts.buildlog import aws_report
+from scripts.for_you import action
 from scripts.lib import atomic_file, conf
 from scripts.message import send_budget
 from scripts.notify import push_texts
@@ -950,6 +952,249 @@ region_transfer_usd={"us-west-1":0.00015}
         self.assertEqual(len(self.notices), 2)
         self.assertNotEqual(self.notices[-1][0], key)
 
+    def test_permission_refusal_files_one_price_read_action(self) -> None:
+        self.configure_gate('spot_candidate_regions=us-west-1 us-east-1 us-west-1\n')
+        self.failure = 'all'
+        self.notice_accepted = False
+        actions = action.ActionStore()
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        opened, = actions.list()
+        self.assertEqual(opened.title, 'Allow AWS price reads')
+        self.assertEqual(opened.command,
+                         '~/.claude/scripts/lib/py ~/.claude/scripts/aws_target/deploy.py up --approve-resources')
+        self.assertEqual((opened.machine, opened.cwd), ('natedev', '/home/natepiano'))
+        self.assertEqual((opened.status, opened.requested_by, opened.concerns, opened.dedupe_key),
+                         ('open', 'aws-unit', 'aws', 'aws-price-read'))
+        self.assertEqual(opened.completion, 'automatic')
+        self.assertEqual(opened.reason, 'AWS refused the price read in us-west-1, us-east-1. '
+                         + 'After 2 hours without the read, test runs on AWS can pick a region that costs more. '
+                         + 'The command allows the read, costs nothing, and asks for your AWS admin passphrase.')
+        self.assertEqual(opened.waits, 'Test runs on AWS in us-west-1, us-east-1')
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+        self.notice_accepted = True
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), (opened,))
+        self.assertEqual(len(self.notices), 2)
+
+    def test_clean_read_withdraws_the_price_read_action(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        opened, = actions.list()
+        unrelated = actions.add(title='Other action', command='true', machine='natedev', cwd='/fixture',
+                                requested_by='other-unit', reason='Fixture.', waits='Fixture',
+                                concerns='aws', dedupe_key=opened.dedupe_key)
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+        self.failure = ''
+        self.assertEqual(self.snapshot(), 0)
+        withdrawn = actions.get(opened.key)
+        stamp = datetime.fromtimestamp(self.clock.now, UTC).isoformat()
+        self.assertEqual((withdrawn.status, withdrawn.withdraw_reason),
+                         ('withdrawn', f'The hourly read succeeded at {stamp}.'))
+        self.assertEqual(actions.get(unrelated.key), unrelated)
+        self.assertEqual(len(self.notices), 1)
+
+    def test_clean_snapshot_ends_the_streak_before_a_failed_withdrawal(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        opened, = actions.list()
+
+        def fail_withdrawal(key: str, *, requested_by: str, reason: str) -> action.UserAction:
+            self.assertEqual((key, requested_by), (opened.key, opened.requested_by))
+            self.assertTrue(reason.startswith('The hourly read succeeded at '))
+            saved = aws_target.read_snapshot(self.state)
+            self.assertEqual(aws_target.snapshot_failures(saved), ())
+            self.assertNotIn('failure_streak', saved)
+            raise OSError('Fixture withdrawal failure.')
+
+        interval = conf.read(self.settings).whole('price_refresh_seconds')
+        self.clock.advance(interval)
+        self.failure = ''
+        with (mock.patch.object(action.ActionStore, 'withdraw', side_effect=fail_withdrawal) as withdraw,
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(self.snapshot(), 1)
+        withdraw.assert_called_once()
+        self.assertIn('Fixture withdrawal failure.', errors.getvalue())
+        self.assertNotIn('failure_streak', aws_target.read_snapshot(self.state))
+        self.assertEqual(actions.list(), (opened,))
+
+        self.clock.advance(interval)
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(len(self.notices), 2)
+        self.assertNotEqual(self.notices[0][0], self.notices[1][0])
+        streak = ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])
+        replacement, = (record for record in actions.list() if record.status == 'open')
+        self.assertNotEqual(replacement.key, opened.key)
+        self.assertEqual((streak['action_key'], streak['action_created']), (replacement.key, True))
+        self.clock.advance(interval)
+        self.failure = ''
+        self.assertEqual(self.snapshot(), 0)
+        self.assertEqual(actions.get(replacement.key).status, 'withdrawn')
+
+    def test_timeout_keeps_the_price_read_action_open(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        opened, = actions.list()
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+        self.failure = 'timeout'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        failure, = aws_target.snapshot_failures(aws_target.read_snapshot(self.state))
+        self.assertEqual(failure.error, 'TimeoutExpired')
+        self.assertEqual(actions.list(), (opened,))
+
+    def test_new_price_read_streak_replaces_the_open_action_after_failed_withdrawal(self) -> None:
+        self.configure_gate('spot_candidate_regions=us-east-2\n')
+        self.failure = 'all'
+        actions = action.ActionStore()
+        interval = conf.read(self.settings).whole('price_refresh_seconds')
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        old, = actions.list()
+        self.assertEqual(old.waits, 'Test runs on AWS in us-east-2')
+
+        self.clock.advance(interval)
+        self.failure = ''
+        with (mock.patch.object(action.ActionStore, 'withdraw', side_effect=OSError('Fixture withdrawal failure.')),
+              redirect_stderr(StringIO())):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), (old,))
+
+        self.clock.advance(interval)
+        self.configure_gate('spot_candidate_regions=us-west-2\n')
+        self.failure = 'all'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        opened, = (record for record in actions.list() if record.status == 'open')
+        self.assertNotEqual(opened.key, old.key)
+        self.assertTrue(opened.reason.startswith('AWS refused the price read in us-west-2. '))
+        self.assertNotIn('us-east-2', opened.reason)
+        self.assertEqual(opened.waits, 'Test runs on AWS in us-west-2')
+        withdrawn = actions.get(old.key)
+        self.assertEqual((withdrawn.status, withdrawn.withdraw_reason),
+                         ('withdrawn', 'A new refused read replaced this action.'))
+
+    def test_action_store_errors_keep_the_snapshot_and_push(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        with (mock.patch.object(action.ActionStore, 'add', side_effect=action.ActionStoreError('fixture\nadd failure')),
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(aws_target.snapshot(self.settings, self.state, execute=self.execute, clock=self.clock,
+                                                 notify=self.notify, allow_aws_unavailable=True), 1)
+        self.assertEqual([line for line in errors.getvalue().splitlines() if 'action:' in line],
+                         ['aws_target: cannot update the AWS price read action: fixture add failure'])
+        self.assertTrue(aws_target.snapshot_failures(aws_target.read_snapshot(self.state)))
+        self.assertEqual(len(self.notices), 1)
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+        self.failure = ''
+        with (mock.patch.object(action.ActionStore, 'list', side_effect=OSError('fixture list failure')),
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(errors.getvalue().splitlines(),
+                         ['aws_target: cannot update the AWS price read action: fixture list failure'])
+        self.assertEqual(aws_target.snapshot_failures(aws_target.read_snapshot(self.state)), ())
+        self.assertNotIn('failure_streak', aws_target.read_snapshot(self.state))
+        self.assertEqual(len(self.notices), 1)
+
+    def test_failed_price_read_action_retries_after_a_successful_notice(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        actions = action.ActionStore()
+        with (mock.patch.object(action.ActionStore, 'add', side_effect=action.ActionStoreError('Fixture failure.')),
+              redirect_stderr(StringIO())):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), ())
+        previous = ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])
+        self.assertTrue(previous['notice_claimed'])
+        self.assertFalse(previous['action_created'])
+
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        opened, = actions.list()
+        self.assertEqual((opened.key, opened.status), (previous['action_key'], 'open'))
+        self.assertTrue(ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])['action_created'])
+        self.assertEqual(len(self.notices), 1)
+
+    def test_done_price_read_action_stays_done_when_the_notice_retries(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        self.notice_accepted = False
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        opened, = actions.list()
+        done = actions.mark_done(opened.key, evidence='The user completed the action.')
+        document = aws_target.read_snapshot(self.state)
+        streak = ledger.mapping(document['failure_streak'])
+        self.assertTrue(streak['action_created'])
+        self.assertFalse(streak['notice_claimed'])
+
+        interval = conf.read(self.settings).whole('price_refresh_seconds')
+        self.clock.advance(interval)
+        self.notice_accepted = True
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), (done,))
+        self.assertEqual(len(self.notices), 2)
+        self.assertEqual(self.notices[0][0], self.notices[1][0])
+
+        # Replay the saved state from before the card creation was recorded.
+        document = aws_target.read_snapshot(self.state)
+        ledger.mapping(document['failure_streak'])['action_created'] = False
+        _ = (self.state / 'spot-prices.json').write_text(json.dumps(document))
+        self.clock.advance(interval)
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), (done,))
+        self.assertTrue(ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])['action_created'])
+        self.assertEqual(len(self.notices), 2)
+
+        self.failure = ''
+        self.clock.advance(interval)
+        self.assertEqual(self.snapshot(), 0)
+        self.assertNotIn('failure_streak', aws_target.read_snapshot(self.state))
+        self.failure = 'describe-spot-price-history'
+        self.clock.advance(interval)
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(sorted(record.status for record in actions.list()), ['done', 'open'])
+
+    def test_saved_price_read_action_key_survives_a_stop_before_the_success_save(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        actions = action.ActionStore()
+
+        def stop_before_success(path: Path, text: str) -> None:
+            output = ledger.mapping(cast(object, json.loads(text)))
+            if ledger.mapping(output['failure_streak']).get('action_created') is True:
+                raise RuntimeError('Fixture stop before the success save.')
+            atomic_file.write_text_atomic(path, text)
+
+        interval = conf.read(self.settings).whole('price_refresh_seconds')
+        with (mock.patch.object(aws_target, 'write_text_atomic', side_effect=stop_before_success),
+              redirect_stderr(StringIO()),
+              self.assertRaisesRegex(RuntimeError, 'Fixture stop before the success save')):
+            _ = self.snapshot()
+        opened, = actions.list()
+        pending = ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])
+        self.assertFalse(pending['action_created'])
+        self.assertEqual(pending['action_key'], opened.key)
+        self.assertEqual(self.notices, [])
+
+        done = actions.mark_done(opened.key, evidence='The user completed the action.')
+        self.clock.advance(interval)
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), (done,))
+        self.assertTrue(ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])['action_created'])
+        self.assertEqual(len(self.notices), 1)
+
     def test_crash_after_notice_delivery_does_not_repeat_the_streak_notice(self) -> None:
         self.failure = 'describe-spot-price-history'
 
@@ -968,8 +1213,11 @@ region_transfer_usd={"us-west-1":0.00015}
 
     def test_previous_notified_field_still_suppresses_the_streak_notice(self) -> None:
         self.failure = 'describe-spot-price-history'
-        with redirect_stderr(StringIO()):
+        with (mock.patch.object(action.ActionStore, 'add', side_effect=action.ActionStoreError('Fixture failure.')),
+              redirect_stderr(StringIO())):
             self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        self.assertEqual(actions.list(), ())
         path = self.state / 'spot-prices.json'
         document = aws_target.read_snapshot(self.state)
         streak = ledger.mapping(document['failure_streak'])
@@ -979,7 +1227,23 @@ region_transfer_usd={"us-west-1":0.00015}
         with redirect_stderr(StringIO()):
             self.assertEqual(self.snapshot(), 1)
         self.assertEqual(len(self.notices), 1)
-        self.assertTrue(ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])['notice_claimed'])
+        saved = ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])
+        self.assertTrue(saved['notice_claimed'])
+        opened, = actions.list()
+        self.assertEqual(opened.status, 'open')
+        self.assertEqual(saved['action_key'], opened.key)
+
+    def test_file_price_read_action_rejects_an_empty_key_before_withdrawal(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        opened, = actions.list()
+        failures = aws_target.snapshot_failures(aws_target.read_snapshot(self.state))
+
+        with self.assertRaises(action.ActionStoreError):
+            aws_target.file_price_read_action(failures, key='')
+        self.assertEqual(actions.list(), (opened,))
 
     def test_failed_notice_retries_without_changing_its_key(self) -> None:
         self.failure = 'describe-spot-price-history'

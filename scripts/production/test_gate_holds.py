@@ -13,13 +13,14 @@ import signal
 import sys
 import time
 from types import SimpleNamespace
-from typing import final, override
+from typing import cast, final, override
 from contextlib import redirect_stdout
 from unittest import mock
-from scripts.production import gate
+from scripts.production import gate, showrunners
 from scripts.production.gate_modules import GateRefused
-from scripts.direct.local_release_wait import IntervalReleasePolling
+from scripts.lib.release_waiter import IntervalReleasePolling
 from scripts.build_hold.test_hold_applies import TemporaryHoldTest
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.production.gate_test_support import MergeGateFixture, gate_suites, suites_for_case, wait_for_file
 
 
@@ -39,6 +40,8 @@ class MergeGateHoldTests(TemporaryHoldTest):
     @override
     def setUp(self) -> None:
         super().setUp()
+        environment = {**fixture_git_environment(self.root), "GIT_CONFIG_SYSTEM": os.devnull}
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
         hold_environment = {name: os.environ[name] for name in (
             "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "MAC_TEST_STATE_DIR",
             "NOTIFIER_SESSIONS_DIR", "CLAUDE_CODE_SESSION_ID",
@@ -56,6 +59,8 @@ class MergeGateHoldTests(TemporaryHoldTest):
         _ = (process / "stat").write_bytes(Path(f"/proc/{os.getpid()}/stat").read_bytes())
         self.environment = {**self.gate.environment, **hold_environment}
         self.enterContext(mock.patch.dict(os.environ, self.environment))
+        _ = self.enterContext(mock.patch.object(
+            showrunners, "SHOWRUNNER_STATE_DIR", Path(self.environment["SHOWRUNNER_STATE_DIR"])))
 
     def record(self, event: str) -> None:
         with (self.gate.state / "modules.jsonl").open("a") as output:
@@ -79,6 +84,9 @@ class MergeGateHoldTests(TemporaryHoldTest):
                 self.hold()
                 before_merge = self.gate.git(self.gate.checkout, "rev-parse", "HEAD")
                 before_main = self.gate.git(self.gate.main, "rev-parse", "HEAD")
+                if mode == ["--promote-only"]:
+                    tip = self.gate.git(self.gate.origin, "rev-parse", "refs/heads/integration")
+                    _ = self.gate.save_ci_receipt(tip)
 
                 def release(_seconds: float) -> None:
                     self.assertEqual(self.gate.module_events(), [])

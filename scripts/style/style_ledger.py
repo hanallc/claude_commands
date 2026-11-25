@@ -18,6 +18,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 import tomllib
 import uuid
 from collections import Counter, defaultdict, deque
@@ -49,7 +50,6 @@ from scripts.style import declarations
 from scripts.style import finding_sites
 from scripts.style.finding_sites import (FilingEligibleWithoutHistory as FilingEligibleWithoutHistory,
                            FindingAnchor as FindingAnchor, NeedsJudgment as NeedsJudgment,
-                           RenameJudgmentSite as RenameJudgmentSite,
                            SiteEvidence as SiteEvidence, UnchangedSite as UnchangedSite)
 from scripts.style import style_rules
 from scripts.style import style_config
@@ -2677,7 +2677,7 @@ MIGRATIONS = {
     23: """
         ALTER TABLE processed_tips ADD COLUMN reason TEXT NOT NULL DEFAULT 'linted';
     """,
-    # Findings a bulk rename batch released to ordinary tickets, with the refusal reason (bulk_rename.py).
+    # Record each released finding and its refusal reason.
     24: """
         CREATE TABLE IF NOT EXISTS bulk_refusals (
             finding_id TEXT NOT NULL, ticket TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL,
@@ -4380,21 +4380,6 @@ class Ledger:
                         pending.append(identity)
         return tuple(YieldedFinding(identity, reason) for identity, reason in reasons.items())
 
-    def bulk_ticket(self, id: str) -> TicketRecord:
-        """The assigned proposal ticket a bulk batch may edit."""
-        ticket = self._ticket(id)
-        if ticket["kind"] != "proposal" or ticket["state"] != "assigned":
-            raise LedgerError(f"{id}: bulk rename requires an assigned proposal ticket")
-        return ticket
-
-    def bulk_findings(self, id: str) -> tuple[HeldFinding, ...]:
-        """The bulk ticket's findings, each still filed and held by this ticket."""
-        ticket = self.bulk_ticket(id)
-        findings = tuple(self._held(identity) for identity in ticket["finding_ids"])
-        if any(not isinstance(finding.state, Filed) or finding.build_ticket != BuildTicket(id) for finding in findings):
-            raise LedgerError(f"{id}: a bulk finding is no longer filed under this build ticket")
-        return findings
-
     def bulk_refusals(self, ticket: str) -> tuple[BulkRefusal, ...]:
         rows = cast(list[tuple[str, str, str, str]], self._connection.execute(
             "SELECT finding_id,ticket,reason,at FROM bulk_refusals WHERE ticket=? ORDER BY finding_id", (ticket,),
@@ -5111,7 +5096,7 @@ class Ledger:
         )
 
     def _record_build_checks(self, checks: tuple[tuple[str, BuiltEntryEvidence], ...]) -> tuple[FindingNotBuilt, ...]:
-        """Apply merge check outcomes inside the caller's transaction."""
+        """Record the build evidence inside the caller's transaction."""
         now = _now()
         not_built: list[FindingNotBuilt] = []
         for finding_id, evidence in checks:
@@ -5526,7 +5511,7 @@ class Ledger:
         return tuple(self._held(finding_id) for (finding_id,) in rows)
 
     def recheck_merged_findings(self) -> tuple[FindingNotBuilt, ...]:
-        """Apply current merge checks to filed findings with merged proposal tickets."""
+        """Check the build evidence for filed findings with merged proposal tickets."""
         with self.git_operation("held recheck-merged"), self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             rows = cast(list[tuple[str, str]], self._connection.execute(
@@ -6105,7 +6090,7 @@ class Ledger:
         return OuterBindingBlocked(f"rename blocked by outer binding {name!r} at line {line}", name, line, text)
 
     def judged_commit(self, finding: HeldFinding) -> JudgedCommit | NoJudgedCommit:
-        """Judging-ticket completion for merge checks; use finding_anchor to read source coordinates."""
+        """Read the judging result for build verification. Use finding_anchor to read source coordinates."""
         return self._judged_from(self._judging_ticket(finding.ticket))
 
     def _finding_history(self, finding: HeldFinding) -> FindingSourceHistory:
@@ -8099,38 +8084,6 @@ class Ledger:
                   asdict(finding.follow), asdict(self._finding_history(finding)))
         return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
 
-    def rename_judgment_site(self, finding: HeldFinding, at: str) -> RenameJudgmentSite | NeedsJudgment:
-        """Offer only changed owners/lines for a fresh proof, preserving every history barrier.
-
-        This does not judge a rename. The shared executor must still prove rule applicability,
-        references and all safety constraints before publishing fresh evidence.
-        """
-        evidence = self._site_proof(finding, at)
-        if not isinstance(evidence, NeedsJudgment):
-            return NeedsJudgment("site does not require a fresh judgment")
-        if evidence.reason not in {"unchanged source site not proved",
-                                   "enclosing item, owner, imports or original inputs changed"}:
-            return evidence
-        definition = next((rule for rule in self._load_rules() if rule.rule_id == base_rule(finding.rule)), None)
-        if definition is None or definition.blob != finding.rule_blob:
-            return NeedsJudgment("rule changed since judged")
-        if definition.name != "prefer-type-named-fields-and-bindings" or finding.kind != "rename":
-            return NeedsJudgment("rule applicability is not machine-checkable")
-        tip = self._tip(at)
-        try:
-            self._check_cell_path(definition, finding.path, tip)
-        except LedgerError as error:
-            return NeedsJudgment(str(error))
-        anchor = self.finding_anchor(finding)
-        if isinstance(anchor, NeedsJudgment):
-            return anchor
-        # Use the shared diff mapper, including replacement hunks. A location is only a
-        # candidate: no coordinate mapping by itself licenses changed code.
-        mapped = self._outside_mapping(anchor.commit, tip.commit, finding.path, anchor.line)
-        if not isinstance(mapped, declarations.MappedDeclaration):
-            return NeedsJudgment("current declaration location is unproved")
-        return RenameJudgmentSite(FindingAnchor(tip.commit, mapped.path, mapped.line))
-
     def _declaration_outcome(self, finding: HeldFinding, tip: RepositoryTip, rust_files: frozenset[str],
                              approved: Callable[[Path], bool], renames: tuple[BuiltRename, ...],
                              built_findings: tuple[HeldFinding, ...]) -> DeclarationOutcome:
@@ -10050,28 +10003,72 @@ class NoSplitRecorded:
     """The unit has no completed split scan."""
 
 
-def require_split_table(repo: Path) -> None:
+def require_split_table(database: Path) -> None:
     """Refuse an old stored schema before a split scans its backup."""
-    database = ledger_location(repo).database
-    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True,
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True,
                                 timeout=BUSY_TIMEOUT_SECONDS)) as connection:
         if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='refill_results'").fetchone():
             raise LedgerError("ledger has no refill_results (schema below 25)")
 
 
-def record_split(repo: Path, unit: str, split: RecordedSplit, *,
-                 busy_timeout_seconds: float = BUSY_TIMEOUT_SECONDS) -> None:
-    """Save a complete split without changing the last refill result."""
-    database = ledger_location(repo).database
-    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=rw", uri=True,
-                                timeout=busy_timeout_seconds)) as connection, connection:
-        _ = connection.execute(
-            "INSERT INTO refill_results(unit,at,outcome,split_at,ready,changed,structure,other) "
-            + "VALUES (?,'','',?,?,?,?,?) ON CONFLICT(unit) DO UPDATE SET "
-            + "split_at=excluded.split_at,ready=excluded.ready,changed=excluded.changed,"
-            + "structure=excluded.structure,other=excluded.other",
-            (unit, split.measured_at, split.ready, split.changed, split.structure, split.other),
-        )
+class SplitTimedOut(TimeoutError):
+    """The split has used all of its time."""
+
+
+@dataclass(frozen=True)
+class SplitDeadline:
+    at: float
+    timeout_minutes: float
+    clock: Callable[[], float] = time.monotonic
+
+    def timeout_error(self) -> SplitTimedOut:
+        return SplitTimedOut(f"time limit of {self.timeout_minutes:g} min reached")
+
+    def remaining_seconds(self) -> float:
+        remaining = self.at - self.clock()
+        if remaining <= 0:
+            raise self.timeout_error()
+        return remaining
+
+
+def record_split(repo: Path, unit: str, split: RecordedSplit) -> None:
+    """Save a complete split for a repository."""
+    database = ledger_location(repo).database.resolve()
+    with closing(sqlite3.connect(database.as_uri() + "?mode=rw", uri=True,
+                                timeout=BUSY_TIMEOUT_SECONDS)) as connection, connection:
+        _upsert_split(connection, unit, split)
+
+
+def record_split_at(database: Path, unit: str, split: RecordedSplit, *, deadline: SplitDeadline) -> None:
+    """Use the deadline until commit starts, then report the commit result."""
+    _ = deadline.remaining_seconds()
+    with closing(sqlite3.connect(database.as_uri() + "?mode=rw", uri=True, timeout=0)) as connection:
+        remaining = deadline.remaining_seconds()
+        busy_ms = int(1000 * min(BUSY_TIMEOUT_SECONDS, remaining))
+        _ = connection.execute(f"PRAGMA busy_timeout = {busy_ms}")
+        # The ledger uses rollback journaling. An exclusive lock covers both the write and commit.
+        try:
+            _ = connection.execute("BEGIN EXCLUSIVE")
+        except sqlite3.OperationalError as error:
+            # SQLite rounds the busy timeout to milliseconds.
+            if remaining <= BUSY_TIMEOUT_SECONDS and error.sqlite_errorcode == sqlite3.SQLITE_BUSY:
+                raise deadline.timeout_error() from error
+            raise
+        _ = deadline.remaining_seconds()
+        _ = connection.execute("PRAGMA busy_timeout = 0")
+        _upsert_split(connection, unit, split)
+        _ = deadline.remaining_seconds()
+        connection.commit()
+
+
+def _upsert_split(connection: sqlite3.Connection, unit: str, split: RecordedSplit) -> None:
+    _ = connection.execute(
+        "INSERT INTO refill_results(unit,at,outcome,split_at,ready,changed,structure,other) "
+        + "VALUES (?,'','',?,?,?,?,?) ON CONFLICT(unit) DO UPDATE SET "
+        + "split_at=excluded.split_at,ready=excluded.ready,changed=excluded.changed,"
+        + "structure=excluded.structure,other=excluded.other",
+        (unit, split.measured_at, split.ready, split.changed, split.structure, split.other),
+    )
 
 
 def publication_path(repo: Path, name: str) -> Path:

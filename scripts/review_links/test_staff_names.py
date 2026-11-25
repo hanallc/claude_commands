@@ -12,8 +12,6 @@ from unittest.mock import patch
 from scripts.accounts import accounts
 from scripts.production import staff
 from scripts.review_links import staff_names
-from scripts.lib.build_steps import StepNames
-from scripts.message.owner_role import OwnerRole
 
 
 def without_role_colors(markup: str) -> str:
@@ -24,33 +22,30 @@ def without_role_colors(markup: str) -> str:
 
 
 class StaffNameTests(unittest.TestCase):
-    def test_step_parts_preserve_configured_templates_and_mark_only_staff_fields(self) -> None:
-        for template in ("{unit} {step}", "builder: {step} for {unit}", "{unit}: {unit}; {step}"):
-            names = StepNames({"owned.default": template, "names.build": "builder"})
-            parts = staff_names.owned_step_parts(names, "build", "builder", OwnerRole.UNIT)
-            self.assertEqual(staff_names.parts_text(parts), names.for_owner("build", "builder", OwnerRole.UNIT))
-            self.assertEqual(sum(part["kind"] == "staff" for part in parts), template.count("{unit}"))
-
-    def test_owned_step_parts_check_the_configured_step_and_owner(self) -> None:
-        for unit, shown, expected in (("panes", "type check", "panes type check"),
-                                      ("panes", "—", "panes"),
-                                      ("—", "type check", "type check"),
-                                      ("—", "—", "unregistered session")):
-            with self.subTest(unit=unit, shown=shown):
-                names = StepNames({"owned.default": "{unit} {step}", "names.check": shown})
-                parts = staff_names.owned_step_parts(names, "check", unit, OwnerRole.UNIT)
-                self.assertEqual(staff_names.parts_text(parts), expected)
-                self.assertEqual([part["text"] for part in parts if part["kind"] == "staff"],
-                                 ["panes"] if unit == "panes" else [])
-
-    def test_owner_step_name_checks_the_configured_step_and_owner(self) -> None:
-        for unit, shown, expected in (("panes", "type check", "panes type check"),
-                                      ("panes", "—", "panes"),
-                                      ("—", "type check", "type check"),
-                                      ("—", "—", "unregistered session")):
-            with self.subTest(unit=unit, shown=shown):
-                names = StepNames({"owned.default": "{unit} {step}", "names.check": shown})
-                self.assertEqual(names.for_owner("check", unit, OwnerRole.UNIT), expected)
+    def test_role_labels_use_accounts_colors_and_escape_the_text(self) -> None:
+        colors = {"role.showrunner": "#123456", "role.unit-director": "yellow",
+                  "role.worker": "bright-blue", "role.producer": "pink"}
+        with patch.object(accounts, "role_colors", return_value=colors):
+            names = staff_names.StaffNames(staff.StaffSnapshot(()))
+        for role, group in (("producer", "producers"), ("showrunner", "showrunners"), ("unit", "units"),
+                            ("unit director", "units"), ("merge director", "units"), ("style director", "units"),
+                            ("worker", "workers")):
+            with self.subTest(role=role):
+                color = accounts.role_color(group, colors)
+                assert isinstance(color, accounts.StaffRoleColor)
+                self.assertEqual(names.role_label(role, '<Role & "text">'),
+                    f'<span class="staff-name" data-color-text="{color.key}" style="color:{color.css}">'
+                    + '&lt;Role &amp; &quot;text&quot;&gt;</span>')
+        self.assertEqual(names.role_label("unlisted", "<Role>"), "&lt;Role&gt;")
+        with patch.object(accounts, "role_colors", return_value={"role.worker": "invalid"}):
+            uncolored = staff_names.StaffNames(staff.StaffSnapshot(()))
+        self.assertIsInstance(uncolored.label_color("unlisted"), accounts.NoAccountColor)
+        no_color = accounts.NoAccountColor()
+        with patch.object(accounts, "role_color", return_value=no_color):
+            self.assertIs(uncolored.label_color("worker"), no_color)
+        self.assertEqual(uncolored.role_label("worker", "Worker"), "Worker")
+        self.assertEqual(uncolored.role_label("unit", "Unit"), "Unit")
+        self.assertEqual(uncolored.role_labels(), {})
 
     def test_every_role_uses_the_accounts_keys_and_current_config(self) -> None:
         kinds: tuple[staff.Kind, ...] = ("showrunner", "unit", "worker", "producer")
@@ -67,6 +62,8 @@ class StaffNameTests(unittest.TestCase):
                 self.assertEqual(color.key, accounts.ROLE_COLOR_KEYS[group])
                 self.assertIn(f'data-color-text="{color.key}" style="color:{color.css}"', names.html(row.id, row.name))
             self.assertEqual(names.html("nate"), "nate")
+            # A unit with no staff entry gets the same span as a registered unit, from the one copy of the markup.
+            self.assertEqual(names.unit_open() + rows[1].name + "</span>", names.html(rows[1].id, rows[1].name))
             self.assertEqual(names.html("<unknown>"), "&lt;unknown&gt;")
             _ = path.write_text(path.read_text().replace("#123456", "#abcdef"))
             self.assertIn('color:#abcdef', staff_names.StaffNames(staff.StaffSnapshot(rows)).html(rows[0].id))

@@ -139,7 +139,7 @@ A size limit covers the build-dir and the workspace `target/` together. The budg
 
 | Machine | Repository | Peak | Count | Largest folder | Size limit | Sum |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| natedev | hana (all natepiano/hana worktrees and gate caches) | 7 | 7 | 74.1 GiB | 78 GiB | 546 GiB |
+| natedev | hana (all hanallc/hana worktrees and gate caches) | 7 | 7 | 74.1 GiB | 78 GiB | 546 GiB |
 | natedev | cargo-liner | 5 | 5 | 30.2 GiB | 32 GiB | 160 GiB |
 | natedev | bevy_brp | 0 | 1 | 18.4 GiB | 20 GiB | 20 GiB |
 | natedev | nateroids | 0 | 1 | 16.7 GiB | 18 GiB | 18 GiB |
@@ -336,7 +336,9 @@ Steps:
 8. The Builds page Running table shows the slot number in a Slot column after vCPU (the user, 2026-11-15). The unit column already names the holder. The lock, not the lease, proves a holder.
 9. One small private-config helper for tests that call the maker directly.
 
-`/build/slot` needs a nixos tmpfiles line and a user rebuild; that line is part of the migration item. Until then, tests and proof point `roots.slots.<machine>` at a test root. Merge gates, targeted tests and copies.py clones move to slots in Phase 4.
+The old design required a NixOS tmpfiles line and a rebuild for `/build/slot`.
+Its tests used a private root for `roots.slots.<machine>`.
+Current builds use the numbered folders in [Build folders](../as-built/build-folders.md#numbered-copies-and-removal).
 
 **Acceptance gate:** Test the lowest free number, growth to the maximum, the wait at the maximum, the default maximum, source reset with only changed files rewritten, Cargo output retention, one delete above the size limit, the 7-day delete with rescue, and a failed rescue that keeps the slot.
 Verify queue attribution for every held slot without using metadata as proof of life.

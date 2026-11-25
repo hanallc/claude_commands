@@ -14,7 +14,7 @@ from unittest.mock import call, patch
 from scripts.lib import atomic_file, process_start
 from scripts.message import send_result
 from scripts.production import delivery_state, staff
-from scripts.review_links import change_page, image_store, page_question, question_record
+from scripts.review_links import change_page, image_store, page_question, question_path, question_record
 
 
 def question_outcome(outcome: send_result.Outcome = "sent", detail: str = "fixture receipt"
@@ -82,6 +82,23 @@ class PageQuestionTests(unittest.TestCase):
         target = change_page.QuestionDeliveryTarget(self.root / item, item, staff.StaffId('fixture-owner'),
             'Images '+item, 'The gate', 'images.py answer --id {item} --question {question_id} --text "<answer>"')
         return page_question.ask(self.store, target, words, self.status)
+
+    def test_queue_places_an_unread_answer_before_later(self) -> None:
+        queue = question_path.Queue
+        cases = {
+            queue.NEEDS_ME: (queue.NEEDS_ME, queue.LATER, queue.NEEDS_ME, queue.NEEDS_ME),
+            queue.WAITING_FOR_ANSWER: (queue.WAITING_FOR_ANSWER, queue.LATER, queue.NEEDS_ME, queue.NEEDS_ME),
+            queue.WORKING: (queue.WORKING, queue.LATER, queue.NEEDS_ME, queue.NEEDS_ME),
+            queue.BLOCKED: (queue.BLOCKED, queue.LATER, queue.NEEDS_ME, queue.NEEDS_ME),
+            queue.VALIDATING: (queue.VALIDATING, queue.LATER, queue.NEEDS_ME, queue.NEEDS_ME),
+            queue.DONE: (queue.DONE, queue.LATER, queue.NEEDS_ME, queue.NEEDS_ME),
+            queue.CLOSED: (queue.CLOSED, queue.CLOSED, queue.CLOSED, queue.CLOSED),
+        }
+        flags = ((False, False), (False, True), (True, False), (True, True))
+        for base, expected in cases.items():
+            for (answer, later), shown in zip(flags, expected, strict=True):
+                with self.subTest(base=base, answer=answer, later=later):
+                    self.assertEqual(question_path.queue(base, unread_answer=answer, later=later), shown)
 
     def test_question_ids_start_at_one_for_each_item_and_increase_after_answers(self) -> None:
         _ = self.ask()
@@ -240,7 +257,7 @@ class PageQuestionTests(unittest.TestCase):
                 item = f"{number:012x}"
                 folder = store.root / item
                 folder.mkdir(parents=True)
-                image: image_store.ImageRecord = {"id": item, "file": "gate.png", "caption": "The gate",
+                image: image_store.ImageRecord = {"id": item, "file": "gate.png", "title": "The gate", "look_for": [],
                     "owner": "fixture-owner", "subject": "Test", "registered_at": "2026-11-20T12:00:00+00:00"}
                 image_store.write_record(folder, image)
                 target = change_page.image_question_target(folder / image_store.RECORD, image)

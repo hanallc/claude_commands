@@ -19,10 +19,13 @@ from enum import StrEnum
 from pathlib import Path
 from typing import cast, override
 
+from scripts.console_text import check as console_text
+
+from scripts.lib import atomic_file
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_routing, delivery_state, record_store, staff
 from scripts.production.issues import Issue
-from scripts.review_links import new_item_dialog, review_events
+from scripts.review_links import new_item_dialog, reply_tokens, review_events
 from scripts.review_links.review_events import ReviewLog
 from scripts.production.record_store import state_root as state_root
 
@@ -269,7 +272,8 @@ def records(owner: staff.StaffId, *, include_read: bool = False,
 
 
 def _save(store: Investigations, item: Investigation, path: Path,
-          numbers: record_store.LockedRecordNumbers | None = None, *, new_record: bool = False) -> Investigation:
+          numbers: record_store.LockedRecordNumbers | None = None, *, new_record: bool = False,
+          before_write: Callable[[], None] = lambda: None) -> Investigation:
     fields = {"id": item.id, "owner": item.owner, "title": item.title, "state": item.state,
               "filed": item.filed, "answered": item.answered, "read": item.read,
               "question_length": str(len(item.question)), "review_log": review_events.encode(item.log),
@@ -278,12 +282,60 @@ def _save(store: Investigations, item: Investigation, path: Path,
         fields["review_submission"] = json.dumps(new_item_dialog.stored_submission(item.submission))
     body = f"{item.question}{ANSWER_SECTION}{item.answer}"
     with investigation_numbers() if numbers is None else nullcontext(numbers) as sequence:
-        with sequence.write(path, item.id, store.owner, folder=store.folder(), new_record=new_record):
+        with sequence.write(path, item.id, store.owner, folder=store.folder(), new_record=new_record,
+                            before_write=before_write):
             try:
                 store.write(item.id, fields, body, path=path, new_record=new_record)
             except record_store.ReusedReviewRecord:
                 return read_review_record(path)
     return item
+
+
+def write_review_submission(path: Path, item: Investigation, details: new_item_dialog.ReviewSubmission) -> None:
+    """Update the submission fields while the caller holds the record lock."""
+    store = _store(item.owner)
+    _write_submission_fields(store, item.id, path, new_item_dialog.stored_submission(details))
+
+
+def _write_submission_fields(store: Investigations, identity: str, path: Path,
+                             fields: dict[str, object]) -> None:
+    """Replace the submission field without rewriting the rest of the note."""
+    with path.open(encoding="utf-8", newline="") as stream:
+        lines = record_store.lines_with_endings(stream.read())
+    for index, line in enumerate(lines[1:], 1):
+        if line.rstrip("\r\n") == "---":
+            break
+        if line.startswith("review_submission:"):
+            newline = line[len(line.rstrip("\r\n")):]
+            lines[index] = "review_submission: " + json.dumps(json.dumps(fields), ensure_ascii=False) + newline
+            with investigation_numbers() as numbers, numbers.write(path, identity, store.owner, folder=store.folder()):
+                atomic_file.write_text_atomic(path, "".join(lines))
+            return
+    raise InvestigationError(f"{path}: the Review submission field is missing")
+
+
+def renew_reply_proof(path: Path, item: Investigation, proof: reply_tokens.ReplyTokenProof) -> None:
+    """Replace the proof under the Investigation lock."""
+    store = _store(item.owner)
+    fields, _ = store.read(item.id, path=path)
+    value = cast(dict[str, object], json.loads(fields["review_submission"]))
+    _write_submission_fields(store, item.id, path, new_item_dialog.renewed_submission_fields(value, proof))
+
+
+def scrub_reply_token(path: Path, owner: staff.StaffId, identity: str) -> bool:
+    store = _store(owner)
+    with store.locked():
+        fields, _ = store.read(identity, path=path)
+        raw = fields.get("review_submission", "")
+        if not raw:
+            return False
+        value = cast(dict[str, object], json.loads(raw))
+        details = new_item_dialog.read_submission(value)
+        updated = new_item_dialog.hashed_submission_fields(value, details)
+        if updated is value:
+            return False
+        _write_submission_fields(store, identity, path, updated)
+        return True
 
 
 def _now() -> str:
@@ -310,9 +362,9 @@ def file(owner: staff.StaffId, title: str, question: str, *, waiting_why: str = 
             item = Investigation(identity, owner, title, InvestigationState.OPEN, _now(), "", "", question, "",
                                  log, reason, kind, submission)
             path = record_store.free_record_path(store.path(identity), names)
-            before_write(identity, path)
             try:
-                saved = _save(store, item, path, numbers, new_record=True)
+                saved = _save(store, item, path, numbers, new_record=True,
+                              before_write=lambda: before_write(identity, path))
             except record_store.OccupiedRecordPath:
                 names.add(path.name)
                 identity = numbers.next_id_after_collision(identity, path)
@@ -324,8 +376,14 @@ def file(owner: staff.StaffId, title: str, question: str, *, waiting_why: str = 
 
 def answer(owner: staff.StaffId, identity: str, text: str, *, question_id: str = '') -> Investigation:
     """Save an answer and refuse a stale Review exchange ID."""
-    item, _ = _answer(_store(owner), identity, text, question_id)
-    return item
+    return prepare_answer(owner, identity, text, question_id=question_id)()
+
+
+def prepare_answer(owner: staff.StaffId, identity: str, text: str, *,
+                   question_id: str = '') -> Callable[[], Investigation]:
+    """Review the answer and return a function that checks and saves it."""
+    save = _prepare_answer(_store(owner), identity, text, question_id)
+    return lambda: save()[0]
 
 
 @dataclass(frozen=True)
@@ -343,45 +401,69 @@ _NATIVE_REPLY = NativeReply()
 
 def answer_submission(path: Path, key: new_item_dialog.ScopedSubmissionKey, text: str, token: str, *,
                       owner: staff.StaffId) -> bool:
-    _, changed = _answer(_store(owner), key.item_id, text, "", SubmissionReply(key, token), source=path)
-    return changed
+    return prepare_submission_reply(path, key, text, token, owner=owner)()
 
 
-def _answer(store: Investigations, identity: str, text: str, question_id: str,
-            reply: SubmissionReply | NativeReply = _NATIVE_REPLY, *, source: Path | None = None) -> tuple[Investigation, bool]:
+def prepare_submission_reply(path: Path, key: new_item_dialog.ScopedSubmissionKey, text: str, token: str, *,
+                             owner: staff.StaffId) -> Callable[[], bool]:
+    """Review the scoped reply and return a function that checks and saves it."""
+    save = _prepare_answer(_store(owner), key.item_id, text, "", SubmissionReply(key, token), source=path)
+    return lambda: save()[1]
+
+
+def _answer_target(store: Investigations, identity: str, text: str, question_id: str,
+                   reply: SubmissionReply | NativeReply, source: Path | None) -> tuple[Path, Investigation, bool]:
+    path = _record_path(store, identity) if source is None else source
+    item = _load(store, identity, path)
+    if isinstance(reply, SubmissionReply):
+        key = reply.key
+        if (item.kind.value != key.kind.value
+                or not isinstance(item.submission, new_item_dialog.ReviewSubmission)
+                or item.submission.request_id != key.request_id):
+            raise InvestigationError("The selected investigation changed.")
+        new_item_dialog.require_reply_token(item.submission, reply.token)
+    else:
+        if isinstance(item.submission, new_item_dialog.ReviewSubmission):
+            raise InvestigationError("Use the scoped reply from the Review item.")
+        delivery = change_routing.delivery_path(change_routing.review_root(), store.path(identity), identity)
+        question = change_routing.delivery_slots(delivery).question
+        if question_id or isinstance(question, delivery_state.OpenQuestion):
+            try:
+                _ = delivery_state.question_exchange_for_reply(question, question_id, text.strip())
+            except delivery_state.StaleQuestionExchange as error:
+                raise InvestigationError(str(error)) from None
+    repeated = item.state == InvestigationState.ANSWER_READY and item.answer == text
+    if item.state != InvestigationState.OPEN and not repeated:
+        if isinstance(reply, SubmissionReply):
+            raise InvestigationError("This item no longer accepts this reply.")
+        raise InvestigationError(f"{identity}: cannot answer an investigation in state {item.state}")
+    return path, item, repeated
+
+
+def _prepare_answer(store: Investigations, identity: str, text: str, question_id: str,
+                    reply: SubmissionReply | NativeReply = _NATIVE_REPLY, *,
+                    source: Path | None = None) -> Callable[[], tuple[Investigation, bool]]:
     if not text.strip():
         raise InvestigationError("answer must not be empty")
-    with store.locked():
-        path = _record_path(store, identity) if source is None else source
-        item = _load(store, identity, path)
-        if isinstance(reply, SubmissionReply):
-            key = reply.key
-            if (item.kind.value != key.kind.value
-                    or not isinstance(item.submission, new_item_dialog.ReviewSubmission)
-                    or item.submission.request_id != key.request_id):
+    selected_path, selected, repeated = _answer_target(store, identity, text, question_id, reply, source)
+    if not repeated:
+        exchange = reply.key.request_id if isinstance(reply, SubmissionReply) else question_id
+        console_text.require(text, "investigation answer", identity=f"{selected_path}/{exchange}",
+                             refusal=InvestigationError)
+
+    def save() -> tuple[Investigation, bool]:
+        with store.locked():
+            path, item, same_answer = _answer_target(store, identity, text, question_id, reply, source)
+            if same_answer:
+                return item, False
+            if (path, item) != (selected_path, selected):
                 raise InvestigationError("The selected investigation changed.")
-            new_item_dialog.require_reply_token(item.submission, reply.token)
-        else:
-            if isinstance(item.submission, new_item_dialog.ReviewSubmission):
-                raise InvestigationError("Use the scoped reply from the Review item.")
-            delivery = change_routing.delivery_path(change_routing.review_root(), store.path(identity), identity)
-            question = change_routing.delivery_slots(delivery).question
-            if question_id or isinstance(question, delivery_state.OpenQuestion):
-                try:
-                    _ = delivery_state.question_exchange_for_reply(question, question_id, text.strip())
-                except delivery_state.StaleQuestionExchange as error:
-                    raise InvestigationError(str(error)) from None
-        repeated = item.state == InvestigationState.ANSWER_READY and item.answer == text
-        if item.state != InvestigationState.OPEN and not repeated:
-            if isinstance(reply, SubmissionReply):
-                raise InvestigationError("This item no longer accepts this reply.")
-            raise InvestigationError(f"{identity}: cannot answer an investigation in state {item.state}")
-        if repeated:
-            return item, False
-        item = replace(item, state=InvestigationState.ANSWER_READY, answered=_now(), answer=text,
-                       log=(*item.log, ReviewLog(datetime.now(timezone.utc), str(store.owner), "Answer: "+text)))
-        _ = _save(store, item, path)
-        return item, True
+            item = replace(item, state=InvestigationState.ANSWER_READY, answered=_now(), answer=text,
+                           log=(*item.log, ReviewLog(datetime.now(timezone.utc), str(store.owner), "Answer: "+text)))
+            _ = _save(store, item, path)
+            return item, True
+
+    return save
 
 
 def mark_read(owner: staff.StaffId, identity: str, words: str = "", *,
@@ -401,7 +483,8 @@ def mark_read(owner: staff.StaffId, identity: str, words: str = "", *,
         return item
 
 
-def review_action(owner: staff.StaffId, identity: str, action: str, words: str, *, reply_token: str = "",
+def review_action(owner: staff.StaffId, identity: str, action: str, words: str, *,
+                  new_reply_proof: reply_tokens.ReplyTokenProof | reply_tokens.MintReplyProof = reply_tokens.MINT_REPLY_PROOF,
                   check: Callable[[], object] | None = None) -> Investigation:
     """Record feedback or a question and keep each previous answer in the log."""
     if not words.strip():
@@ -410,7 +493,8 @@ def review_action(owner: staff.StaffId, identity: str, action: str, words: str, 
     with store.locked(check=check):
         path = _record_path(store, identity)
         item = _load(store, identity, path)
-        replace_wait = (item.state == InvestigationState.OPEN and action == 'question' and bool(reply_token)
+        replace_wait = (item.state == InvestigationState.OPEN and action == 'question'
+                        and isinstance(new_reply_proof, reply_tokens.ReplyTokenProof)
                         and isinstance(item.submission, new_item_dialog.ReviewSubmission))
         if item.state != InvestigationState.ANSWER_READY and not replace_wait:
             raise InvestigationError(f"{identity}: the answer is no longer ready")
@@ -422,8 +506,8 @@ def review_action(owner: staff.StaffId, identity: str, action: str, words: str, 
         if action == 'question':
             submission = item.submission
             if isinstance(submission, new_item_dialog.ReviewSubmission):
-                token = reply_token or new_item_dialog.new_reply_token()
-                submission = replace(submission, reply_token=token)
+                proof = new_reply_proof if isinstance(new_reply_proof, reply_tokens.ReplyTokenProof) else reply_tokens.mint()
+                submission = submission.with_reply_proof(proof)
             item = replace(item,state=InvestigationState.OPEN,answered='',read='',log=(*item.log,event),
                            waiting_why=review_events.require_waiting_why(words),submission=submission)
         else:

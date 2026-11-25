@@ -11,9 +11,9 @@ import io
 import fcntl
 import json
 import os
+from errno import EACCES, EIO
 import select
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -83,6 +83,18 @@ def fake_process(proc: Path, pid: int, *, cwd: str = "/", fds: tuple[str, ...] =
     for number, target in enumerate(fds):
         (entry / "fd" / str(number)).symlink_to(target)
     _ = (entry / "maps").write_text(maps)
+    fake_process_status(entry, "S")
+
+
+def fake_process_status(process: Path, state: str, *, capabilities: int = 0, threads: int = 1) -> None:
+    uid = os.geteuid()
+    _ = (process / "status").write_text(
+        f"State:\t{state}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
+        + f"CapPrm:\t{capabilities:016x}\nThreads:\t{threads}\n")
+
+
+def fake_caller_capabilities(proc: Path, capabilities: int = 0) -> None:
+    _ = write(proc / "self" / "status", f"CapPrm:\t{capabilities:016x}\n")
 
 
 BOOT = 1000
@@ -90,6 +102,7 @@ BOOT = 1000
 
 def fake_start(proc: Path, pid: int, start: float, *arguments: str) -> None:
     """A /proc/<pid> entry that started at start with arguments, as verify_running reads it."""
+    fake_process(proc, pid)
     _ = write(proc / "stat", f"cpu 0\nbtime {BOOT}\n")
     ticks = round((start - BOOT) * os.sysconf("SC_CLK_TCK"))
     _ = write(proc / str(pid) / "stat", f"{pid} (a b) S " + "0 " * 18 + f"{ticks} 0 0\n")
@@ -136,7 +149,7 @@ class TmpSweepCase(unittest.TestCase):
             + "patterns.legacy-unique={purpose}{suffix}\n"
             + f"roots.build={base / 'build'}\nroots.build.natedev={base / 'build'}\n"
             + f"roots.workspace={base / 'worktrees'}\n"
-            + f"removal.path_templates.{os.uname().nodename.partition('.')[0]}={base / 'build'}/<repo>/<unit>/<short>\n")
+            + f"removal.path_templates.{conf.local_host_key_name()}={base / 'build'}/<repo>/<unit>/<short>\n")
         (base / "build").mkdir()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "NOTIFIER_SESSIONS_DIR": str(registry), "SHUTDOWN_STATE_DIR": str(base / "shutdown"),
@@ -704,7 +717,7 @@ class NextestLogRetentionTests(TmpSweepCase):
         old = self.now - 3 * DAY
         for path in (expired, opened, unrelated, linked, folder):
             os.utime(path, (old, old), follow_symlinks=False)
-        host = socket.gethostname().partition(".")[0]
+        host = conf.local_host_key_name()
         _ = conf.path("mac_test").write_text(f"# whole: 1..\n{nextest_log.RETENTION_DAYS}.{host}=2\n")
         scan = ("printf", "%s", f"p41\nf4\naw\nn{opened}\n")
         with mock.patch.object(tmp_sweep, "LSOF", scan):
@@ -725,9 +738,9 @@ class NextestLogRetentionTests(TmpSweepCase):
     def test_mac_sweep_keeps_a_log_locked_after_the_process_scan(self) -> None:
         logs = Path.home() / nextest_log.DIRECTORY
         expired = write(logs / "nextest.00000001")
-        old = self.now - 8 * DAY
-        os.utime(expired, (old, old))
         _ = write_config_fixture(conf.path("mac_test"))
+        old = self.now - nextest_log.retention_days() * DAY - 1
+        os.utime(expired, (old, old))
         self.plan: removal_guard.RemovalList = removal_guard.RemovalList(removal_guard.Tool.TEMPORARY)
         result = tmp_sweep.Sweep()
         with ExitStack() as readers:
@@ -748,9 +761,9 @@ class NextestLogRetentionTests(TmpSweepCase):
     def test_incomplete_mac_process_scan_keeps_expired_logs(self) -> None:
         logs = Path.home() / nextest_log.DIRECTORY
         expired = write(logs / "nextest.00000001")
-        old = self.now - 8 * DAY
-        os.utime(expired, (old, old))
         _ = write_config_fixture(conf.path("mac_test"))
+        old = self.now - nextest_log.retention_days() * DAY - 1
+        os.utime(expired, (old, old))
         incomplete = subprocess.CompletedProcess(tmp_sweep.LSOF, 1, "p41\nf4\nn/other\n", "")
         result = tmp_sweep.Sweep()
         with mock.patch.object(subprocess, "run", return_value=incomplete):
@@ -892,6 +905,316 @@ class ProcessUseTests(TmpSweepCase):
         used = tmp_sweep.process_paths(str(self.proc), str(self.tmp) + os.sep)
         assert isinstance(used, tmp_sweep.ProcessUsesKnown)
         self.assertEqual(used.paths, [(str(self.tmp / "used"), 17, "works in it")])
+
+    def test_process_scan_can_include_root_and_executable(self) -> None:
+        fake_caller_capabilities(self.proc)
+        root = self.tmp / "root"
+        executable = self.tmp / "bin/tool"
+        fake_process(self.proc, 17)
+        process = self.proc / "17"
+        fake_process_status(process, "S")
+        (process / "root").symlink_to(root)
+        (process / "exe").symlink_to(executable)
+        used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+        self.assertIsInstance(used, tmp_sweep.ProcessUsesKnown)
+        assert isinstance(used, tmp_sweep.ProcessUsesKnown)
+        self.assertEqual(used.paths, [(str(root), 17, tmp_sweep.ROOTS_IN), (str(executable), 17, tmp_sweep.MAPS_FILE)])
+        self.assertEqual(used.unreadable_process_pids, ())
+
+    def test_process_scan_skips_a_zombie(self) -> None:
+        fake_caller_capabilities(self.proc)
+        fake_process(self.proc, 17, cwd=str(self.tmp))
+        process = self.proc / "17"
+        fake_process_status(process, "Z")
+        leader = process / "task/17"
+        leader.mkdir(parents=True)
+        fake_process_status(leader, "Z")
+        with mock.patch.object(os, "readlink", side_effect=AssertionError("read a zombie path")):
+            used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+        self.assertEqual(used, tmp_sweep.ProcessUsesKnown([]))
+
+    def test_process_scan_reads_the_working_directories_of_live_threads(self) -> None:
+        fake_caller_capabilities(self.proc)
+        process = self.proc / "17"
+        (process / "fd").mkdir(parents=True)
+        (process / "cwd").symlink_to("/")
+        (process / "root").symlink_to("/")
+        targets = [self.tmp / "worker-18", self.tmp / "worker-19"]
+        for tid, state, cwd in ((17, "Z", self.tmp / "leader"), (18, "S", targets[0]), (19, "R", targets[1])):
+            task = process / "task" / str(tid)
+            (task / "fd").mkdir(parents=True)
+            fake_process_status(task, state)
+            (task / "cwd").symlink_to(cwd)
+            (task / "root").symlink_to("/")
+        for leader_state in ("Z", "S"):
+            with self.subTest(leader_state=leader_state):
+                fake_process_status(process, leader_state, threads=3)
+                used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+                assert isinstance(used, tmp_sweep.ProcessUsesKnown)
+                self.assertEqual(sorted(used.paths), [(str(cwd), 17, tmp_sweep.WORKS_IN) for cwd in targets])
+                self.assertEqual(used.unreadable_process_pids, ())
+
+    def test_process_scan_reads_a_live_threads_own_root_and_descriptors(self) -> None:
+        fake_caller_capabilities(self.proc)
+        folder = self.tmp / "old"
+        unrelated = self.tmp / "old-backup"
+        fake_process(self.proc, 17, fds=(str(unrelated),))
+        process = self.proc / "17"
+        (process / "root").symlink_to("/")
+        fake_process_status(process, "S", threads=3)
+        fake_process(process / "task", 18, fds=(str(folder / "held"),))
+        fake_process(process / "task", 19)
+        for tid in (18, 19):
+            task = process / "task" / str(tid)
+            fake_process_status(task, "S")
+            (task / "root").symlink_to(self.tmp / "separate-root" if tid == 19 else "/")
+        uses = tmp_sweep.process_paths(
+            str(self.proc), (str(folder), str(self.tmp / "separate-root")), require_readable_user_processes=True)
+        assert isinstance(uses, tmp_sweep.ProcessUsesKnown)
+        self.assertEqual(uses.unreadable_process_pids, ())
+        self.assertCountEqual(uses.paths, [
+            (str(unrelated), 17, tmp_sweep.HOLDS_FILE),
+            (str(folder / "held"), 17, tmp_sweep.HOLDS_FILE),
+            (str(self.tmp / "separate-root"), 17, tmp_sweep.ROOTS_IN),
+        ])
+        with mock.patch.object(os, "readlink", wraps=os.readlink) as readlink:
+            first_use = tmp_sweep.process_paths(str(self.proc), str(folder), require_readable_user_processes=True,
+                                                stop_after_first_use=True)
+        self.assertEqual(first_use, tmp_sweep.ProcessUsesKnown([
+            (str(folder / "held"), 17, tmp_sweep.HOLDS_FILE),
+        ]))
+        matching_read = mock.call(os.fsencode(process / "task/18/fd/0"))
+        self.assertEqual(readlink.call_args_list.count(matching_read), 1)
+        self.assertEqual(readlink.call_args_list[-1], matching_read)
+
+    def test_failed_thread_descriptor_read_makes_the_process_scan_incomplete(self) -> None:
+        fake_caller_capabilities(self.proc)
+        fake_process(self.proc, 17)
+        process = self.proc / "17"
+        (process / "root").symlink_to("/")
+        fake_process_status(process, "S", threads=2)
+        fake_process(process / "task", 18)
+        task = process / "task/18"
+        fake_process_status(task, "S")
+        (task / "root").symlink_to("/")
+        (task / "fd/3").touch()
+        uses = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+        self.assertEqual(uses, tmp_sweep.ProcessUsesKnown([], unreadable_process_pids=(17,)))
+
+    def test_process_scan_reports_a_cwd_link_owned_by_another_user(self) -> None:
+        fake_caller_capabilities(self.proc)
+        fake_process(self.proc, 17, cwd=str(self.tmp))
+        process = self.proc / "17"
+        fake_process_status(process, "S")
+        _ = (process / "comm").write_text("fixture-monitor\n")
+        with (mock.patch.object(os, "lstat", return_value=mock.Mock(st_uid=os.geteuid() + 1)) as ownership,
+              mock.patch.object(os, "readlink", side_effect=PermissionError(EACCES, "denied"))):
+            used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+        ownership.assert_called_once_with(str(process / "cwd"))
+        self.assertEqual(used, tmp_sweep.ProcessUsesKnown(
+            [], unreadable_cwd_pids=(17,), kernel_hidden=(tmp_sweep.KernelHiddenProcess(17, "fixture-monitor"),)))
+        self.assertEqual(tmp_sweep.process_paths(str(self.proc), str(self.tmp)),
+                         tmp_sweep.ProcessUsesKnown([(str(self.tmp), 17, tmp_sweep.WORKS_IN)]))
+
+    def test_process_scan_checks_readable_paths_of_a_non_dumpable_process(self) -> None:
+        fake_caller_capabilities(self.proc)
+        fake_process(self.proc, 17, cwd=str(self.tmp))
+        fake_process_status(self.proc / "17", "S")
+        with mock.patch.object(os, "lstat", return_value=mock.Mock(st_uid=os.geteuid() + 1)) as ownership:
+            used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+        ownership.assert_not_called()
+        self.assertEqual(used, tmp_sweep.ProcessUsesKnown([(str(self.tmp), 17, tmp_sweep.WORKS_IN)]))
+
+    def test_process_scan_preserves_readable_paths_when_the_kernel_hides_other_paths(self) -> None:
+        fake_caller_capabilities(self.proc)
+        mapped = self.tmp / "mapped"
+        fake_process(self.proc, 17, cwd=str(self.tmp), maps=f"00-01 r--p 0 00:1 1 {mapped}\n")
+        process = self.proc / "17"
+        fake_process_status(process, "S")
+        _ = (process / "comm").write_text("fixture-monitor\n")
+        with (mock.patch.object(os, "lstat", return_value=mock.Mock(st_uid=os.geteuid() + 1)),
+              mock.patch.object(os, "readlink", side_effect=PermissionError(EACCES, "denied"))):
+            used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+        self.assertEqual(used, tmp_sweep.ProcessUsesKnown(
+            [(str(mapped), 17, tmp_sweep.MAPS_FILE)], unreadable_cwd_pids=(17,),
+            kernel_hidden=(tmp_sweep.KernelHiddenProcess(17, "fixture-monitor"),)))
+
+    def test_process_scan_matches_invalid_utf8_in_mapped_paths_and_link_targets(self) -> None:
+        fake_caller_capabilities(self.proc)
+        folder = os.fsencode(self.tmp / "cache") + b"-\xff"
+        mapped = folder + b"/library.so"
+        held = folder + b"/data"
+        fake_process(self.proc, 17, fds=(os.fsdecode(held),))
+        process = self.proc / "17"
+        fake_process_status(process, "S")
+        _ = (process / "maps").write_bytes(b"00-01 r--p 0 00:1 1 " + mapped + b"\n")
+        used = tmp_sweep.process_paths(str(self.proc), os.fsdecode(folder), require_readable_user_processes=True)
+        self.assertEqual(used, tmp_sweep.ProcessUsesKnown([
+            (os.fsdecode(held), 17, tmp_sweep.HOLDS_FILE),
+            (os.fsdecode(mapped), 17, tmp_sweep.MAPS_FILE),
+        ]))
+
+    def test_process_scan_matches_newlines_and_literal_escapes_in_mapped_paths(self) -> None:
+        fake_caller_capabilities(self.proc)
+        newline = self.tmp / "first\nsecond"
+        literal = self.tmp / r"first\012second"
+        fake_process(self.proc, 17)
+        process = self.proc / "17"
+        fake_process_status(process, "S")
+        mixed = self.tmp / ("first\nsecond" + r"\012third")
+        mixed_reverse = self.tmp / (r"first\012second" + "\nthird")
+        for target, printed in ((newline, literal), (literal, literal),
+                                (mixed, self.tmp / r"first\012second\012third"),
+                                (mixed_reverse, self.tmp / r"first\012second\012third")):
+            with self.subTest(target=target):
+                _ = (process / "maps").write_bytes(
+                    b"00-01 r--p 0 00:1 1 " + os.fsencode(printed / "library.so") + b"\n")
+                self.assertEqual(
+                    tmp_sweep.process_paths(str(self.proc), str(target), require_readable_user_processes=True),
+                    tmp_sweep.ProcessUsesKnown([(str(target / "library.so"), 17, tmp_sweep.MAPS_FILE)]),
+                )
+
+    def test_process_scan_keeps_both_meanings_of_the_deleted_suffix(self) -> None:
+        fake_caller_capabilities(self.proc)
+        live = self.tmp / "port-gate-tree-old (deleted)"
+        stripped = self.tmp / "port-gate-tree-old"
+        fake_process(self.proc, 17, cwd=str(live), fds=(str(live),))
+        process = self.proc / "17"
+        fake_process_status(process, "S")
+        (process / "root").symlink_to(live)
+        uses = tmp_sweep.process_paths(str(self.proc), str(stripped), require_readable_user_processes=True)
+        self.assertEqual(uses, tmp_sweep.ProcessUsesKnown([
+            (str(path), 17, how)
+            for how in (tmp_sweep.WORKS_IN, tmp_sweep.ROOTS_IN, tmp_sweep.HOLDS_FILE)
+            for path in (live, stripped)
+        ]))
+
+    def test_process_scan_reports_unexpanded_escape_sequences(self) -> None:
+        fake_caller_capabilities(self.proc)
+        raw = self.tmp / ("start" + r"\012end" * 5)
+        fake_process(self.proc, 17, fds=(str(raw),))
+        fake_process_status(self.proc / "17", "S")
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                self.assertEqual(
+                    tmp_sweep.process_paths(str(self.proc), str(self.tmp / "old"),
+                                            require_readable_user_processes=strict),
+                    tmp_sweep.ProcessUsesKnown([], unreadable_process_pids=(17,)),
+                )
+
+    def test_process_scan_reports_a_process_with_an_extra_permitted_capability(self) -> None:
+        fake_caller_capabilities(self.proc, 0b1010)
+        fake_process(self.proc, 17, cwd=str(self.tmp))
+        process = self.proc / "17"
+        fake_process_status(process, "S", capabilities=0b0011)
+        _ = (process / "comm").write_text("fixture-capable\n")
+        with mock.patch.object(os, "readlink", side_effect=PermissionError(EACCES, "denied")):
+            used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+        self.assertEqual(used, tmp_sweep.ProcessUsesKnown(
+            [], unreadable_cwd_pids=(17,), kernel_hidden=(tmp_sweep.KernelHiddenProcess(17, "fixture-capable"),)))
+
+    def test_process_scan_distinguishes_denied_paths_from_vanished_paths(self) -> None:
+        fake_caller_capabilities(self.proc, 0b1010)
+        fake_process(self.proc, 17)
+        process = self.proc / "17"
+        fake_process_status(process, "S", capabilities=0b0010)
+        for failure, unreadable in ((PermissionError(EACCES, "denied"), (17,)), (FileNotFoundError("gone"), ())):
+            with self.subTest(failure=failure), mock.patch.object(os, "readlink", side_effect=failure):
+                used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+            self.assertIsInstance(used, tmp_sweep.ProcessUsesKnown)
+            assert isinstance(used, tmp_sweep.ProcessUsesKnown)
+            self.assertEqual(used.unreadable_process_pids, unreadable)
+            self.assertEqual(used.kernel_hidden, ())
+        (process / "maps").unlink()
+        (process / "maps").mkdir()
+        used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+        self.assertIsInstance(used, tmp_sweep.ProcessUsesKnown)
+        assert isinstance(used, tmp_sweep.ProcessUsesKnown)
+        self.assertEqual(used.unreadable_process_pids, (17,))
+
+    def test_missing_descriptor_data_keeps_a_live_process_incomplete(self) -> None:
+        fake_caller_capabilities(self.proc)
+        fake_process(self.proc, 17)
+        fake_process(self.proc, 18, fds=(str(self.tmp / "held"),))
+        fake_process(self.proc, 19, fds=(str(self.tmp / "closed"),))
+        fake_process(self.proc, 20, fds=(str(self.tmp / "unreadable"),))
+        for pid in (17, 18, 19, 20):
+            fake_process_status(self.proc / str(pid), "S")
+        (self.proc / "17/fd").rmdir()
+        readlink = os.readlink
+
+        def read_descriptor(path: bytes) -> bytes:
+            if path == os.fsencode(self.proc / "18/fd/0"):
+                raise FileNotFoundError("descriptor cannot be read")
+            if path == os.fsencode(self.proc / "19/fd/0"):
+                _ = (self.proc / "19").rename(self.proc / "exited")
+                raise FileNotFoundError("the process exited")
+            if path == os.fsencode(self.proc / "20/root"):
+                raise OSError(EIO, "cannot read the process root")
+            if path == os.fsencode(self.proc / "20/fd/0"):
+                _ = (self.proc / "20").rename(self.proc / "exited-with-error")
+                raise FileNotFoundError("the process exited")
+            return readlink(path)
+
+        with mock.patch.object(os, "readlink", side_effect=read_descriptor):
+            used = tmp_sweep.process_paths(str(self.proc), str(self.tmp), require_readable_user_processes=True)
+        self.assertEqual(used, tmp_sweep.ProcessUsesKnown([], unreadable_process_pids=(17, 18, 20)))
+
+    def test_worker_removal_descriptors_are_ignored_only_for_the_worker(self) -> None:
+        fake_caller_capabilities(self.proc)
+        held = str(self.tmp / "held")
+        for pid in (17, 18):
+            fake_process(self.proc, pid, fds=(held,))
+            fake_process_status(self.proc / str(pid), "S")
+        used = tmp_sweep.process_paths(
+            str(self.proc), str(self.tmp), require_readable_user_processes=True,
+            worker_fds=tmp_sweep.WorkerRemovalDescriptors(17, frozenset((0,))),
+        )
+        self.assertEqual(used, tmp_sweep.ProcessUsesKnown([(held, 18, tmp_sweep.HOLDS_FILE)]))
+
+    def test_failed_proc_scan_and_partial_lsof_keep_every_entry(self) -> None:
+        self.now = time.time() + 8 * DAY
+        idle = write(self.tmp / "idle" / "a")
+        used = write(self.tmp / "used" / "a")
+        with mock.patch.object(os, "scandir", side_effect=PermissionError("proc scan failed")):
+            incomplete = tmp_sweep.process_paths(str(self.proc), str(self.tmp))
+        self.assertIsInstance(incomplete, tmp_sweep.ProcessUsesIncomplete)
+        with (mock.patch.object(tmp_sweep, "process_paths", return_value=incomplete),
+              mock.patch.object(tmp_sweep, "lsof_paths", side_effect=AssertionError("unexpected fallback"))):
+            unavailable = self.sweep()
+        self.assertIn(str(idle.parent), unavailable.kept[tmp_sweep.NO_PROC])
+        self.assertIn(str(used.parent), unavailable.kept[tmp_sweep.NO_PROC])
+        self.proc.rmdir()
+        with mock.patch.object(tmp_sweep, "LSOF", ("sh", "-c", "printf 'p42\\nfcwd\\nn/elsewhere\\n'; exit 1")):
+            partial = self.sweep()
+        self.assertIn(str(idle.parent), partial.kept[tmp_sweep.NO_PROC])
+        self.assertIn(str(used.parent), partial.kept[tmp_sweep.NO_PROC])
+
+    def test_sweep_keeps_an_idle_entry_when_a_process_path_is_ambiguous(self) -> None:
+        self.now = time.time() + 8 * DAY
+        idle = write(self.tmp / "idle" / "a").parent
+        fake_process(self.proc, 17, fds=(str(self.tmp / (r"\012name" * 5)),))
+        result = self.sweep()
+        self.assertIn(str(idle), result.kept["process use scan is incomplete"])
+        self.assertNotIn(idle, self.plan.rows)
+
+    def test_live_entry_use_reports_an_incomplete_scan_of_process_paths(self) -> None:
+        candidate = write(self.tmp / "idle" / "a").parent
+        fake_process(self.proc, 17, fds=(str(self.tmp / (r"\012name" * 5)),))
+        with mock.patch.object(tmp_sweep, "PROC_DIR", str(self.proc)):
+            self.assertEqual(tmp_sweep.live_entry_use(candidate), "process use scan is incomplete")
+
+    def test_live_entry_use_reports_a_file_held_only_by_another_thread(self) -> None:
+        held = write(self.tmp / "candidate" / "data")
+        fake_process(self.proc, 17)
+        leader = self.proc / "17"
+        fake_process_status(leader, "S", threads=2)
+        (leader / "root").symlink_to("/")
+        fake_process(leader / "task", 18, fds=(str(held),))
+        thread = leader / "task/18"
+        (thread / "root").symlink_to("/")
+        with mock.patch.object(tmp_sweep, "PROC_DIR", str(self.proc)):
+            self.assertEqual(tmp_sweep.live_entry_use(held.parent), f"pid 17 holds a file open in it {held}")
 
     def test_lsof_scan_has_explicit_known_and_unavailable_results(self) -> None:
         for output in ("p17\nfcwd\nn/tmp/used\n", "p17\nfcwd\nn/elsewhere\n"):
@@ -2102,7 +2425,8 @@ class PaneSweepOwnerTests(StaffTestCase):
         error = io.StringIO()
         with self.machine("mac"), mock.patch.dict(os.environ, {"STAFF_TEST_SSH_FAIL": "1"}), mock.patch.object(
                 tmp_sweep, "running_session_ids", return_value=frozenset()), mock.patch.object(
-                tmp_sweep, "process_paths", return_value=tmp_sweep.ProcessUsesKnown([])), redirect_stderr(error):
+                tmp_sweep, "process_paths", return_value=tmp_sweep.ProcessUsesKnown([])), mock.patch.object(
+                copy_record, "build_root", return_value=self.root / "build"), redirect_stderr(error):
             entries = list(tmp_sweep.judge_entries(roots, time.time() + 8 * DAY, str(self.root / "proc")))
         self.assertTrue(payload.exists())
         self.assertIn("natedev not reached", error.getvalue())

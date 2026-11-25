@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Count production CI points, verify their runs, and send one review alert."""
+"""Count production CI points and verify their runs."""
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -7,13 +7,11 @@ except FileNotFoundError:
     pass
 
 import argparse
-import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
@@ -21,9 +19,18 @@ from typing import NamedTuple, cast
 from scripts.buildlog.repository import remote_identity
 from scripts.copies import copies
 from scripts.lib.process_failure import failure_detail
+from scripts.production import promotion
+from scripts.production.checkpoint_gate import CiRecord as CiRecord, InvalidCiRecord, NoCiRecord, read_ci_record
 from scripts.production.production_doc import Production, Refusal, read_production
-from scripts.production.merge_checkpoint import git, merged_checkpoints, merge_lock
+from scripts.production.production_names import CARGO_LINER_PRODUCTION
+from scripts.production.merge_checkpoint import git, live_file_refusal, merged_checkpoints, merge_lock
 
+
+# These job names come from cargo-liner's CI workflow. The change filters
+# control only the jobs in CARGO_LINER_CONDITIONAL_JOBS.
+CARGO_LINER_REQUIRED_JOBS = frozenset({"Detect Changes", "Format Check", "Taplo Check", "Clippy", "Mend Check"})
+CARGO_LINER_CONDITIONAL_JOBS = frozenset({"Build Check", "Test Suite", "cargo-mend Build Check", "cargo-mend Test Suite",
+                                         "Stable Without Bootstrap", "macOS cargo-tile", "Windows Build Check"})
 
 REQUIRED_CI_JOB = "Test Suite"
 
@@ -38,28 +45,6 @@ class CiNotDue(NamedTuple):
 
 class CiNotUsed(NamedTuple):
     pass
-
-
-class CiRecord(NamedTuple):
-    merges_collected: int
-    tip: str
-
-
-class NoCiRecord(NamedTuple):
-    pass
-
-
-class WatchFirstAlert(NamedTuple):
-    line: str
-    table: str
-
-
-class WatchRepeat(NamedTuple):
-    line: str
-
-
-class WatchBelowThreshold(NamedTuple):
-    line: str
 
 
 class CiRun(NamedTuple):
@@ -119,7 +104,7 @@ def required(result: subprocess.CompletedProcess[str], step: str) -> str:
 
 
 def branch_tip(production: Production) -> str:
-    return required(git(production.checkout, "rev-parse", production.merge_branch), "ci collect")
+    return required(git(production.checkout, "rev-parse", f"refs/heads/{production.merge_branch}"), "ci collect")
 
 
 def ci_push_remote(checkout: Path) -> CiPushRemote:
@@ -137,17 +122,10 @@ def ci_push_remote(checkout: Path) -> CiPushRemote:
 
 
 def ci_record(state_dir: Path) -> CiRecord | NoCiRecord:
-    path = state_dir / "ci_points.json"
-    if not path.exists():
-        return NoCiRecord()
-    raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    if not isinstance(raw, dict):
-        raise PointFailure("due", f"invalid {path}")
-    fields = cast(dict[str, object], raw)
-    count, tip = fields.get("count"), fields.get("tip")
-    if not isinstance(count, int) or isinstance(count, bool) or count < 0 or not isinstance(tip, str):
-        raise PointFailure("due", f"invalid {path}")
-    return CiRecord(count, tip)
+    try:
+        return read_ci_record(state_dir)
+    except InvalidCiRecord as error:
+        raise PointFailure("due", str(error)) from error
 
 
 def due(production: Production, state_dir: Path, no_ci: bool) -> CiDue | CiNotDue | CiNotUsed:
@@ -392,15 +370,18 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
     validated = saved.validated_commit
     push = ("env", f"PUSH_TARGET_BRANCH={production.merge_branch}", f"CI_VALIDATED_BASE={tip}",
             f"CI_PUSH_ORIGIN={remote.url}", f"CI_PUSH_REPO={remote.repo}",
+            f"PRODUCTION_INTEGRATION_PUSH={promotion.integration_push_script(production)}",
             f"CANCEL_PRIOR={str(cancel_prior).lower()}", "bash", str(script.with_name("push_direct.sh")))
     with merge_lock(production.checkout, production.name):
         if ci_push_remote(production.checkout) != remote:
             raise PointFailure("ci start", "origin push URL changed during validation")
+        if refusal := live_file_refusal(production.checkout, validated):
+            raise PointFailure("validation", refusal)
         if validated != tip:
             current_branch = required(git(production.checkout, "branch", "--show-current"), "validation")
             if branch_tip(production) != tip or current_branch != production.merge_branch:
                 raise PointFailure("validation", "merge branch moved during validation")
-            _ = required(git(production.checkout, "merge", "--ff-only", validated), "validation")
+            _ = required(git(production.checkout, "merge", "--no-overwrite-ignore", "--ff-only", validated), "validation")
         published = required(command("validation", *push, "--publish-only", validated,
                                      cwd=production.checkout), "validation")
         publication = published.splitlines()[-1].split() if published else []
@@ -440,7 +421,16 @@ def run_view(run: CiRun, checkout: Path) -> dict[str, object]:
 
 
 def ci_collect(production: Production, state_dir: Path, no_ci: bool) -> None:
+    from scripts.production.production_doc import EnrolledPaths, ProductionPathsError, resolve_production_paths
+
+    try:
+        paths = resolve_production_paths(production.doc)
+    except ProductionPathsError as error:
+        raise PointFailure("ci collect", str(error)) from error
+    cargo_liner = isinstance(paths, EnrolledPaths) and production.name == CARGO_LINER_PRODUCTION
     if no_ci:
+        if cargo_liner:
+            raise PointFailure("ci collect", "cargo-liner requires CI on its integration tip")
         report("ci collect", "ok", "skipped: no CI")
         return
     run = read_run(state_dir)
@@ -461,6 +451,7 @@ def ci_collect(production: Production, state_dir: Path, no_ci: bool) -> None:
     if not isinstance(raw_jobs, list):
         raise PointFailure("ci collect", f"rerun CI on {tip}: CI on {ran_on} has no job results")
     jobs = cast(list[object], raw_jobs)
+    seen: set[str] = set()
     required_linux = False
     for item in jobs:
         if not isinstance(item, dict):
@@ -468,39 +459,33 @@ def ci_collect(production: Production, state_dir: Path, no_ci: bool) -> None:
         job = cast(dict[str, object], item)
         name = job.get("name")
         conclusion = job.get("conclusion")
+        if cargo_liner:
+            if (not isinstance(name, str) or name in seen or job.get("status") != "completed"
+                    or (conclusion != "success" and (conclusion != "skipped" or name not in CARGO_LINER_CONDITIONAL_JOBS))):
+                raise PointFailure("ci collect", f"rerun {name or 'job'} on {tip}: CI ran on {ran_on} ({conclusion or 'unfinished'})")
+            seen.add(name)
+            continue
         if name == REQUIRED_CI_JOB:
             required_linux = conclusion == "success"
         if conclusion not in ("success", "skipped") or (name == REQUIRED_CI_JOB and not required_linux):
             raise PointFailure("ci collect", f"rerun {name if isinstance(name, str) else 'job'} on {tip}: CI ran on {ran_on} ({conclusion or 'unfinished'})")
-    if not required_linux or view.get("conclusion") != "success":
+    if cargo_liner:
+        missing = (CARGO_LINER_REQUIRED_JOBS | CARGO_LINER_CONDITIONAL_JOBS) - seen
+        if missing:
+            raise PointFailure("ci collect", f"rerun CI on {tip}: missing jobs {', '.join(sorted(missing))}")
+        if view.get("conclusion") != "success":
+            raise PointFailure("ci collect", f"rerun CI on {tip}: CI on {ran_on} did not succeed")
+        with merge_lock(production.checkout, production.name):
+            current = branch_tip(production)
+            if current != tip:
+                raise PointFailure("ci collect", f"rerun CI on {current}: integration moved during collection")
+            write_json(state_dir / "ci_points.json", {"count": count, "tip": tip, "policy": "cargo-liner"})
+    elif not required_linux or view.get("conclusion") != "success":
         raise PointFailure("ci collect", f"rerun {REQUIRED_CI_JOB if not required_linux else 'CI'} on {tip}: CI ran on {ran_on} ({view.get('conclusion') or 'unfinished'})")
-    write_json(state_dir / "ci_points.json", {"count": count, "tip": tip})
+    else:
+        write_json(state_dir / "ci_points.json", {"count": count, "tip": tip})
     report("ci collect", "ok", f"run {run.run_id} green on {tip}; {count} code merges recorded")
     print(f"--ci-green {tip}")
-
-
-def review_watch(production: Production, state_dir: Path) -> WatchFirstAlert | WatchRepeat | WatchBelowThreshold:
-    review_script = Path(os.environ.get("CI_POINTS_REVIEW_REGIME", str(Path(__file__).with_name("review_regime.py"))))
-    state_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = state_dir / "review_watch.lock"
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        watch_result = command("watch", sys.executable, str(review_script), "watch")
-        if watch_result.returncode not in (0, 3):
-            raise PointFailure("watch", failure_detail(watch_result))
-        line = watch_result.stdout.strip()
-        if watch_result.returncode != 3:
-            return WatchBelowThreshold(line)
-        record = state_dir / "review_watch.json"
-        if record.exists():
-            return WatchRepeat(line)
-        table = required(command("watch", sys.executable, str(review_script), "report", "--since", "2026-09-28"), "watch")
-        moment = datetime.now(production.zone).strftime("%H:%M %Z")
-        production.log.parent.mkdir(parents=True, exist_ok=True)
-        with production.log.open("a", encoding="utf-8") as log:
-            _ = log.write(f"- {moment}: review watch: {line}\n{table}\n")
-        write_json(record, {"alerted": datetime.now(production.zone).isoformat(timespec="seconds"), "line": line})
-        return WatchFirstAlert(line, table)
 
 
 def main() -> int:
@@ -512,12 +497,9 @@ def main() -> int:
     start_parser = ci_commands.add_parser("start")
     _ = start_parser.add_argument("--cancel-prior", action="store_true")
     collect_parser = ci_commands.add_parser("collect")
-    watch_parser = commands.add_parser("watch")
-    for subparser in (due_parser, start_parser, collect_parser, watch_parser):
-        _ = subparser.add_argument("--production", required=True)
-    for subparser in (due_parser, start_parser, collect_parser, watch_parser):
-        _ = subparser.add_argument("--state-dir", required=True, type=Path)
     for subparser in (due_parser, start_parser, collect_parser):
+        _ = subparser.add_argument("--production", required=True)
+        _ = subparser.add_argument("--state-dir", required=True, type=Path)
         _ = subparser.add_argument("--no-ci", action="store_true")
     args = parser.parse_args()
     action = cast(str, args.action)
@@ -532,18 +514,12 @@ def main() -> int:
                 report("due", "ok", "CI point due")
             else:
                 report("due", "ok", f"{state.merges_since} of 5 code merges since last CI point")
-        elif action == "ci":
+        else:
             if cast(str, args.ci_action) == "start":
                 ci_start(production, cast(Path, args.state_dir), cast(bool, args.no_ci),
                          cast(bool, args.cancel_prior))
             else:
                 ci_collect(production, cast(Path, args.state_dir), cast(bool, args.no_ci))
-        elif action == "watch":
-            state = review_watch(production, cast(Path, args.state_dir))
-            detail = f"repeat: {state.line}" if isinstance(state, WatchRepeat) else state.line
-            report("watch", "ok", detail or "no open review watch")
-            if isinstance(state, WatchFirstAlert):
-                print(state.table)
         return 0
     except (copies.CopyError, PointFailure, Refusal, OSError, ValueError, json.JSONDecodeError) as error:
         report(error.step if isinstance(error, PointFailure) else step, "failed", str(error))

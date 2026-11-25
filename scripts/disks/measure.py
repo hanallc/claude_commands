@@ -13,6 +13,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -24,7 +25,7 @@ from typing import NotRequired, TypedDict, cast
 from scripts.buildlog import disk, filesystem
 from scripts.disks import disks_page
 from scripts.disks.disks_page import DATA_FILE, LOCK_FILE
-from scripts.lib import conf, file_lock
+from scripts.lib import conf, file_lock, process_stop
 from scripts.lib.atomic_file import write_text_atomic
 
 LOCK_BUSY_EXIT = 3
@@ -68,7 +69,9 @@ class Mount:
 
 
 def read_mounts(table: Path = MOUNT_TABLE) -> tuple[Mount, ...]:
-    """This machine's mounts in mount order, or none where the system has no mount table, as on the Mac."""
+    """Read the mounts in mount order from the Linux table or a supplied file."""
+    if sys.platform != "linux" and table == MOUNT_TABLE:
+        return ()
     try:
         lines = table.read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -82,7 +85,7 @@ def read_mounts(table: Path = MOUNT_TABLE) -> tuple[Mount, ...]:
 
 def drive_path(path: PurePath, mounts: Sequence[Mount]) -> PurePath:
     """Where the measure finds a path. A path under a mount of a subfolder, such as /session on natedev,
-    is measured under the mount of its whole file system, such as /build/session."""
+    is measured under the mount of its whole file system, such as /home/natepiano/session."""
     # The last mount at a point covers the earlier ones.
     holding = max(((len(mount.point.parts), index, mount) for index, mount in enumerate(mounts)
                    if mount.point == path or mount.point in path.parents), default=None)
@@ -153,7 +156,8 @@ def run_command(argv: Sequence[str], timeout_seconds: int) -> subprocess.Complet
 
 def dust_command(mount: str, settings: MeasureSettings) -> list[str]:
     """Walk one filesystem with dust under a memory cap at the lowest CPU priority."""
-    return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "-p", f"MemoryMax={settings.memory_max}", "--",
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+            *process_stop.scope_slice_args(), "-p", f"MemoryMax={settings.memory_max}", "--",
             "nice", "-n", "19", "dust", "-x", "-D", "-j", "-P", "-o", "b",
             "-z", str(settings.keep_bytes - 1),  # Dust keeps sizes above this value, so include the floor.
             "-d", str(settings.max_depth), "-n", str(settings.max_lines),

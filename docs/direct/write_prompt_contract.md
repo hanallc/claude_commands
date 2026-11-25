@@ -41,7 +41,7 @@ Codex review prompts also include section 3's command block.
    To limit memory, use `systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>`.
    Include `--collect` in each `systemd-run` command that starts a transient unit.
    A successful start returns at once with the run, its pid and its log.
-   A live twin takes priority over config/detached_runs.conf LIVE_RUN_LIMIT.
+   A live twin takes priority over config/detached_runs.conf live_run_limit.
    Exit 4 refuses a new run at that limit and names the live runs.
    Wait for a run's result, or put more files in one run. Never run attached after exit 4.
    Exit 3 means the caller has no registered worker route; run attached only for that exit.
@@ -94,10 +94,11 @@ Codex review prompts also include section 3's command block.
 
       Keep every main-path test.
 
-   For tests, include this instruction verbatim: "Never commit a test project to the repo. A test makes the project it needs in a tempdir at run time (Rust tempfile::TempDir, Python tempfile.TemporaryDirectory), which removes it after."
+   For tests, include this instruction verbatim: "Never commit a test project to the repo. Create it inside the test run's allocated model folder. Use Rust `tempfile::TempDir` or Python `tempfile.TemporaryDirectory` to remove it when the test ends."
    Every implementation, fix, test, research and review prompt carries this instruction verbatim:
-   "Make every folder you need for your own work (a clone, a copy, a download, a trial project) with `~/.claude/scripts/lib/scratch.py new --worker [--name <word>]`. It prints the path, and the folder is removed when your assignment ends. Never make a folder under `/tmp` or `~/rust` by hand."
-   "A folder or file you make on another machine (the Mac) follows the same rule. Make it in a `with` block or a `scratch.py` task with an end. Never use a fixed path such as `~/.cache`."
+   "Use a numbered copy for a test or proof that needs a clone or copy of source. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_copies.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`. Ask the director to make a model worktree for a trial project."
+   "Use `~/.claude/scripts/lib/scratch.py new --worker [--name <word>]` only for downloads and other files unrelated to builds, tests, gates, or source copies. It prints the path. The folder is removed when your assignment ends."
+   "Apply the same rules on the Mac. Avoid fixed paths such as `~/.cache`."
    Include these repair rules:
    - Remove dead code and unused bindings. Do not suppress warnings or prefix unused names with `_`.
    - Before a rename or signature change, use LSP `findReferences`. Update all references and reread the changed body.
@@ -130,7 +131,8 @@ Codex review prompts also include section 3's command block.
     3. While editing, use `verify.sh check`. Lint runs once, at the phase gate.
     ```
 
-    Run `targeted_test.py` for a unit. Run `merge_gate.py` for a merge. Require each worker's listed tests before its checkpoint.
+    For a `claude_commands` unit, use the `copies.py run` command in `<FinalGate/>` in `docs/direct/final_gate_commit.md`.
+    Run `merge_gate.py` for a merge. Require each worker's listed tests before its checkpoint.
 </WritePromptContract>
 
 <MergeWorkerCommands>

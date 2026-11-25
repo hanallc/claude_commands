@@ -15,7 +15,7 @@ import sys
 import time
 import tempfile
 import unittest
-from collections.abc import Generator, Iterator
+from collections.abc import Collection, Generator, Iterator
 from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from scripts.lib.transcript_test_support import compressed_copy
@@ -60,6 +60,18 @@ def folder(path: Path, age_days: float = 2) -> Path:
     _ = (path / "file").write_text("x")
     age(path, age_days)
     return path
+
+
+def process_working_in(proc: Path, pid: int, cwd: Path) -> Path:
+    process = proc / str(pid)
+    (process / "fd").mkdir(parents=True)
+    (process / "cwd").symlink_to(cwd)
+    (process / "root").symlink_to("/")
+    (process / "exe").symlink_to(sys.executable)
+    _ = (process / "maps").write_text("")
+    uid = os.geteuid()
+    _ = (process / "status").write_text(f"State:\tS\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nThreads:\t1\n")
+    return process
 
 
 def git(repo: Path, *arguments: str) -> None:
@@ -138,7 +150,6 @@ class FolderAuditTests(unittest.TestCase):
         self.enterContext(unittest.mock.patch.dict(os.environ, {"FOLDER_SWEEP_STATE_DIR": str(state),
                                                                 "SCRATCH_HOLDS": str(state / "holds.json"),
                                                                 "SCRATCH_ROOT": str(self.root / "scratch"),
-                                                                "SCRATCH_VISIBLE_ROOT": str(self.root / "repro"),
                                                                 "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
                                                                 # An absent session root: a run without the
                                                                 # test-run folder must not reach the live root.
@@ -192,8 +203,8 @@ class FolderAuditTests(unittest.TestCase):
     def test_mirror_cleanup_keeps_home_folders_outside_the_build_root(self) -> None:
         build = self.home / "build"
         configuration = self.root / "config/build_folders.conf"
-        key = conf.read("build_folders").effective_key("roots.slot_cargo")
-        _ = write_config_fixture(configuration, f"{key}={build / 'cargo'}\n")
+        key = conf.read("build_folders").effective_key("roots.build")
+        _ = write_config_fixture(configuration, f"{key}={build}\n")
         checkout = self.root / "job"
         workspace = checkout / "checkout"
         for prefix in (self.home / "nixos", build):
@@ -481,15 +492,6 @@ class FolderAuditTests(unittest.TestCase):
         self.assertEqual(self.judge_clones([young])[young], folder_audit.REMOVED)
         self.assertFalse(young.exists())
 
-    def test_candidates_keep_the_configured_visible_root_under_rust(self) -> None:
-        visible = folder(self.rust / "private-visible")
-        loose = folder(self.rust / "loose")
-        _ = write_config_fixture(self.root / "config/scratch.conf", f"visible_root={visible}\n")
-        with unittest.mock.patch.dict(os.environ):
-            del os.environ["SCRATCH_VISIBLE_ROOT"]
-            found = folder_audit.candidates(self.rust, [], frozenset())
-            self.assertEqual([entry.path for entry in found], [loose])
-
     def test_workspace_root_does_not_make_home_folders_candidates(self) -> None:
         private = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/var/tmp"))).resolve()
         home = private / "home"
@@ -746,9 +748,7 @@ class FolderAuditTests(unittest.TestCase):
         held = self.clone_folder("held-clone", 3)
         listening = self.clone_folder("socket-clone", 3)
         busy = self.clone_folder("busy-clone", 3)
-        pid = self.root / "proc" / "12"
-        pid.mkdir(parents=True)
-        (pid / "cwd").symlink_to(used)
+        _ = process_working_in(self.root / "proc", 12, used)
         _ = scratch.hold(held, "gate:keep-clone", "test")
         server = socket.socket(socket.AF_UNIX)
         self.addCleanup(server.close)
@@ -883,12 +883,15 @@ class FolderAuditTests(unittest.TestCase):
         clone = self.clone_folder("partial-git-removal", 3)
         checkout = clone
 
-        def stop_during_git_delete(path: str) -> None:
-            self.assertEqual(Path(path), clone)
-            (checkout / ".git" / "HEAD").unlink()
+        expected = clone.stat()
+
+        def stop_during_git_delete(tree: build_folders.CheckedRemovalTree, *, repair_access: bool = False) -> None:
+            self.assertTrue(os.path.samestat(tree.info, expected))
+            self.assertTrue(repair_access)
+            (tree.path / ".git" / "HEAD").unlink()
             raise RuntimeError("stopped during git deletion")
 
-        with unittest.mock.patch.object(scratch, "delete_sweep_tree", side_effect=stop_during_git_delete):
+        with unittest.mock.patch.object(build_folders.CheckedRemovalTree, "remove", stop_during_git_delete):
             with self.assertRaisesRegex(RuntimeError, "stopped during git deletion"):
                 _ = self.judge_clones([clone])
         self.assertIsInstance(scratch.pending_removal(clone), copy_record.Registered)
@@ -898,13 +901,11 @@ class FolderAuditTests(unittest.TestCase):
         self.assertEqual(outcomes[clone], folder_audit.HELD)
         self.assertTrue(clone.exists())
         _ = scratch.release(clone)
-        pid = self.root / "proc" / "42"
-        pid.mkdir()
-        (pid / "cwd").symlink_to(checkout)
+        process = process_working_in(self.root / "proc", 42, checkout)
         outcomes = self.judge_clones([clone], mac=True, free_space=0)
         self.assertEqual(outcomes[clone], "pid 42 works in it")
         self.assertTrue(clone.exists())
-        (pid / "cwd").unlink()
+        _ = process.rename(process.with_name("exited"))
         found = folder_audit.audit(
             self.rust, [], frozenset[str](), time.time(), files=[], removing=True,
             proc=str(self.root / "proc"), sockets=str(self.root / "unix"),
@@ -996,7 +997,7 @@ class FolderAuditTests(unittest.TestCase):
         idle = folder(self.temp / "idle", 8)
         now = time.time()
         output = f"p42\nfcwd\nn{used}\n"
-        completed = subprocess.CompletedProcess(tmp_sweep.LSOF, 1, output, "")
+        completed = subprocess.CompletedProcess(tmp_sweep.LSOF, 0, output, "")
         with unittest.mock.patch.object(subprocess, "run", return_value=completed):
             outcomes = folder_audit.judge([(used, now - 8 * DAY), (idle, now - 8 * DAY)], now, False,
                                          proc=str(self.root / "no-proc"), sockets=str(self.root / "no-sockets"))
@@ -1011,7 +1012,7 @@ class FolderAuditTests(unittest.TestCase):
     def test_only_unexpected_idle_folders_are_loose(self) -> None:
         _ = write_config_fixture(self.root / "config/lint.conf", "folder_remove_after_seconds=518400\n")
         _ = folder(self.rust / "hana")
-        _ = folder(self.rust / "repro")
+        repro = folder(self.rust / "repro")
         stray = folder(self.rust / "hana_p34d_alone")
         _ = folder(self.rust / "fresh_try", age_days=0.1)
         _ = (self.rust / "notes.md").write_text("a file, not a folder")
@@ -1023,7 +1024,7 @@ class FolderAuditTests(unittest.TestCase):
         loose_temp = folder(self.temp / "my-repro")
         in_scratch = folder(self.rust / "scratch" / "berth-phase1")
         loose = folder_audit.audit(self.rust, [self.temp], frozenset({"hana"}), time.time(), files=[])
-        self.assertEqual([entry.path for entry in loose], [stray, in_scratch, loose_temp])
+        self.assertEqual([entry.path for entry in loose], [stray, repro, in_scratch, loose_temp])
         self.assertEqual({(entry.maker, entry.outcome) for entry in loose}, {("", "idle less than 6 days")})
         unread = folder_audit.audit(self.rust, [], None, time.time(), files=[])
         self.assertEqual([entry.path for entry in unread], [in_scratch])
@@ -1067,8 +1068,7 @@ class FolderAuditTests(unittest.TestCase):
         _ = scratch.hold(held / "sub", "until:2099-01-01T0000Z", "test", time.time())
         used = folder(self.rust / "used", 8)
         proc = self.root / "proc"
-        (proc / "12").mkdir(parents=True)
-        (proc / "12" / "cwd").symlink_to(used)
+        _ = process_working_in(proc, 12, used)
         listening = folder(self.rust / "listening", 8)
         server = socket.socket(socket.AF_UNIX)
         self.addCleanup(server.close)
@@ -1111,11 +1111,14 @@ class FolderAuditTests(unittest.TestCase):
         git(source, "commit", "-q", "--allow-empty", "-m", "c")
         worktree = self.rust / "stopped-worktree"
         git(source, "worktree", "add", "-q", "--detach", str(worktree), "HEAD")
-        delete = scratch.delete_sweep_tree
-        def stop(path: str) -> None:
-            delete(path)
+        delete = build_folders.CheckedRemovalTree.remove
+
+        def stop(tree: build_folders.CheckedRemovalTree, *, repair_access: bool = False,
+                 metadata_last: Collection[str] = ()) -> None:
+            delete(tree, repair_access=repair_access, metadata_last=metadata_last)
             raise RuntimeError("stopped before prune")
-        with unittest.mock.patch.object(scratch, "delete_sweep_tree", side_effect=stop):
+
+        with unittest.mock.patch.object(build_folders.CheckedRemovalTree, "remove", stop):
             with self.assertRaisesRegex(RuntimeError, "stopped before prune"):
                 _ = folder_audit.remove(worktree, 0, 1000)
         self.assertFalse(worktree.exists())

@@ -72,7 +72,7 @@ Each operation is a short list of plain steps. A rerun with nothing to change pr
    Codex uses `resume <id>`.
    Producers use their configured family, model, and effort from `[producers]` in `config/models.conf`.
    Codex producers use the workers account; Claude producers use the showrunners account.
-   Each producer uses its own tab in `PRODUCER_WORKSPACE`, normally `producers`.
+   Each producer uses its own tab in `producer_workspace`, normally `producers`.
    A configured producer without a row uses the shared first-admission path.
    [Producer launch and admission](../as-built/shutdown-and-restart.md#producer-launch-and-admission) defines its reservation and identity checks.
 3. **Stop all, restart all** (user, 2026-10-08): one loop. Stop each live row, then start each.

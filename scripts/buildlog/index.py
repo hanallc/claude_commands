@@ -525,7 +525,7 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
     "gate_tests": (
         GATE_TEST_COLUMNS,
         "PRIMARY KEY (run_id, suite, module, attempt, test)",
-        "per-test rows of a gate module, kept only for tests that failed or took at least SLOW_TEST_S (config/test_times.conf)",
+        "per-test rows of a gate module, kept only for tests that failed or took at least slow_test_s (config/test_times.conf)",
     ),
     "ssh_attempts": (SSH_ATTEMPT_COLUMNS, "", "SSH attempts, including retained capacity after completion"),
     "queue_bumps": (QUEUE_BUMP_COLUMNS, "", "one row per user or session move to the head of the memory queue"),
@@ -536,14 +536,14 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
     "tests": (
         TEST_COLUMNS,
         "PRIMARY KEY (step_id, binary, test)",
-        "nextest rows that failed, were retried, took over NEXTEST_SLOW_TEST_S (config/test_times.conf), or hit SLOW",
+        "nextest rows that failed, were retried, took over nextest_slow_test_s (config/test_times.conf), or hit SLOW",
     ),
     "calls": (
         CALL_COLUMNS,
         "",
         "one row per verify.sh call (its steps carry call_id), and per port-lint call that ran nothing",
     ),
-    "ci_runs": (CI_RUN_COLUMNS, "PRIMARY KEY (run_id, attempt)", "GitHub Actions run attempts of natepiano/hana"),
+    "ci_runs": (CI_RUN_COLUMNS, "PRIMARY KEY (run_id, attempt)", "GitHub Actions run attempts of hanallc/hana"),
     "ci_jobs": (CI_JOB_COLUMNS, "", "their jobs"),
     "ci_steps": (CI_STEP_COLUMNS, "PRIMARY KEY (job_id, number)", "the jobs' steps"),
     "samples": (SAMPLE_COLUMNS, "", "one 60 s machine memory sample; counters reset on reboot"),
@@ -658,7 +658,7 @@ def complete_gate_index_in(root: Path) -> Path | NoCompleteGateIndex:
                 if statement.startswith("CREATE TABLE ") and statement.split()[2] in GATE_TABLES}
     current = index_path_in(root)
     candidates: list[tuple[float, Path]] = []
-    read_wait = conf.read("buildlog").number("INDEX_READ_WAIT_SECONDS")
+    read_wait = conf.read("buildlog").number("index_read_wait_seconds")
     for path in root.glob(f"{INDEX_PREFIX}-*{INDEX_SUFFIX}"):
         try:
             connection = sqlite3.connect(read_only_path_uri(path), uri=True, timeout=read_wait)
@@ -771,7 +771,7 @@ def open_for_update(path: Path) -> sqlite3.Connection:
     for statement in schema_statements():
         if statement.startswith("CREATE INDEX") and statement.split(" ON ", 1)[0].split()[-1] not in indexes:
             _ = connection.execute(statement)
-    spill_pages = conf.read("buildlog").whole("INDEX_SPILL_PAGES")
+    spill_pages = conf.read("buildlog").whole("index_spill_pages")
     connection.execute(f"PRAGMA cache_spill = {spill_pages}").close()
     # SQLite reads the flag through 8 bits; ON enables spill and keeps the threshold.
     connection.execute("PRAGMA cache_spill = ON").close()
@@ -1252,7 +1252,7 @@ def cleanup_unused_indexes(root: Path, current: Path, settings: conf.ConfigRead)
             candidates.add(path)
     if not candidates:
         return
-    unused_days = settings.number("INDEX_UNUSED_DAYS")
+    unused_days = settings.number("index_unused_days")
     cutoff = time.time() - unused_days * 24 * 60 * 60
     for path in candidates:
         try:
@@ -1312,7 +1312,7 @@ def update_in(root: Path) -> int:
         try:
             now = time.time()
             settings = conf.read("buildlog")
-            touch_minutes = settings.number("INDEX_TOUCH_MINUTES")
+            touch_minutes = settings.number("index_touch_minutes")
             if now - current.stat().st_mtime > touch_minutes * 60:
                 os.utime(current, (now, now))
             _ = connection.execute("BEGIN IMMEDIATE")

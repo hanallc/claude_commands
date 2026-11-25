@@ -8,14 +8,15 @@ import unittest
 from pathlib import Path
 from typing import Literal, cast
 
-from scripts.review_links import record_table, review_page
-from scripts.review_links.test_accounts_page import firefox_probe_results
+from scripts.review_links import console, record_table, review_page
+from scripts.review_links.browser_test_support import firefox_probe_results
 
 
 def save_notice_failures(page: bytes, action: Literal['works', 'remove']) -> list[list[str]]:
     """Check the status region during sequential and overlapping saves."""
     setup = b'''<script>
 const realFetch=fetch;
+const lostReplies=new Map();
 let finishPost;
 window.setInterval=()=>0;
 window.fetch=(path,options={})=>{
@@ -25,10 +26,21 @@ window.fetch=(path,options={})=>{
   }
   return new Promise(()=>{});
  }
+ const request=new Headers(options.headers).get('X-Undo-Request');
+ if(!options.keepalive && lostReplies.has(request)){
+  const reason=lostReplies.get(request);
+  lostReplies.delete(request);
+  return Promise.reject(new Error(reason));
+ }
  return new Promise((resolve,reject)=>{
-  finishPost=reason=>reason ? reject(new Error(reason)) : resolve({ok:true,json:async()=>({
-   answer:'works',request:'a'.repeat(32),token:'b'.repeat(64),item_state:'Closed'
-  })});
+  finishPost=reason=>{
+   if(reason){
+    if(options.keepalive) lostReplies.set(request,reason);
+    reject(new Error(reason));
+   }else resolve({headers:new Headers(),ok:true,json:async()=>({
+    answer:'works',request:'a'.repeat(32),token:'b'.repeat(64),item_state:'Closed'
+   })});
+  };
  });
 };
 </script>'''
@@ -50,7 +62,7 @@ window.fetch=(path,options={})=>{
   const liveRow=row=>document.querySelector('[data-list-item][data-key="'+CSS.escape(row.dataset.key)+'"]');
   const open=row=>{
    row=liveRow(row);
-   if(row.querySelector('[data-detail]').hidden) row.querySelector('.list-toggle').click();
+   if(!recordIsOpen(row)) row.querySelector('.list-toggle').click();
    return row;
   };
   const startSave=async row=>{
@@ -58,7 +70,7 @@ window.fetch=(path,options={})=>{
    for(const animation of animations) animation.finish();
    await Promise.allSettled(animations.map(animation=>animation.finished));
    row=open(row);
-   const form=action==='works' ? await readyReviewCard(row) : row.querySelector('form');
+   const form=action==='works' ? await readyReviewCard(row) : recordDetails(row).querySelector('form');
    const settled=new Promise(resolve=>{
     const observe=new MutationObserver(()=>{
      if(!form.dataset.sending){observe.disconnect();resolve();}
@@ -87,7 +99,7 @@ window.fetch=(path,options={})=>{
   };
   const failure=(row,reason)=>{
    // A lost Remove restores the row. Collapse it to check the table notice.
-   if(action==='remove' && !row.querySelector('[data-detail]').hidden) row.querySelector('.list-toggle').click();
+   if(action==='remove' && recordIsOpen(row)) row.querySelector('.list-toggle').click();
    const label=action==='works' ? row.dataset.key : 'Item '+row.dataset.number;
    const prefix=action==='works' ? 'Not saved: ' : 'Save not confirmed: ';
    check(!status.hidden && status.textContent===label+': '+prefix+reason,
@@ -136,18 +148,18 @@ class FilterControlTests(unittest.TestCase):
         self.assertIn('role="group" aria-label="Owner" data-filter-row="owner"', row)
         self.assertEqual([part.split('"', 1)[0] for part in row.split('data-filter-value="')[1:]],
                          ['all', 'one', 'two'])
-        self.assertIn('aria-pressed="false" data-filter-count="2">All<b>2</b>', row)
-        self.assertIn('aria-pressed="true" data-filter-count="0"><span>One</span><b>0</b>', row)
-        self.assertIn('data-filter-count="">Two<b></b>', row)
+        self.assertIn('aria-pressed="false" data-filter-count="2">All <b>2</b>', row)
+        self.assertIn('aria-pressed="true" data-filter-count="0"><span>One</span> <b>0</b>', row)
+        self.assertIn('data-filter-count="">Two <b></b>', row)
         self.assertEqual(row,
                          '<div class="record-filter-row" role="group" aria-label="Owner" data-filter-row="owner">'
-                         + '<span aria-hidden="true">Owner</span><div>'
-                         + '<button type="button" id="filter-owner-all" data-filter-value="all" aria-pressed="false"'
-                         + ' data-filter-count="2">All<b>2</b></button>'
-                         + '<button type="button" id="filter-owner-one" data-filter-value="one" aria-pressed="true"'
-                         + ' data-filter-count="0"><span>One</span><b>0</b></button>'
-                         + '<button type="button" id="filter-owner-two" data-filter-value="two" aria-pressed="false"'
-                         + ' data-filter-count="">Two<b></b></button></div></div>')
+                         + '<span aria-hidden="true">Owner</span><div id="list-owner">'
+                         + '<button type="button" id="filter-owner-all" data-filter-value="all"'
+                         + ' aria-pressed="false" data-filter-count="2">All <b>2</b></button>'
+                         + '<button type="button" id="filter-owner-one" data-filter-value="one"'
+                         + ' aria-pressed="true" data-filter-count="0"><span>One</span> <b>0</b></button>'
+                         + '<button type="button" id="filter-owner-two" data-filter-value="two"'
+                         + ' aria-pressed="false" data-filter-count="">Two <b></b></button></div></div>')
         self.assertIn('aria-label="Filter by &quot;words&quot;"',
                       record_table.words_box('review-search', 'Filter by "words"'))
 
@@ -159,7 +171,7 @@ const buttons=['all','one','two'].map(value=>{
  const button=new EventTarget(),attributes={},count={};
  Object.assign(button,{dataset:{filterValue:value},hidden:false,
   setAttribute:(name,text)=>attributes[name]=text,getAttribute:name=>attributes[name],
-  querySelector:()=>count});
+  querySelector:()=>count,closest:()=>button});
  return button;
 });
 Object.assign(row,{querySelectorAll:()=>buttons,hasAttribute:()=>false});
@@ -168,7 +180,9 @@ filterControl.setCounts(row,{all:2,one:2});
 assert.equal(buttons[2].dataset.filterCount,'0');
 assert.equal(buttons[2].querySelector('b').textContent,'0');
 assert.equal(buttons[2].hidden,false);
-buttons[2].dispatchEvent(new Event('click'));
+const click=new Event('click');
+Object.defineProperty(click,'target',{value:buttons[2]});
+row.dispatchEvent(click);
 assert.deepEqual(changes,['two']);
 assert.equal(buttons[2].getAttribute('aria-pressed'),'true');
 assert.equal(filterControl.setVisible(row,['one']),'all');
@@ -182,39 +196,44 @@ assert.deepEqual(changes,['two']);
 
 
 class LinkedTableTests(unittest.TestCase):
-    def render(self, fragment: str, *, closed_item: str = '', park_open_card: bool = False) -> dict[str, object]:
+    def render(self, fragment: str, *, query: str = '', closed_item: str = '',
+               park_open_card: bool = False) -> dict[str, object]:
         node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
         _, start, rest = review_page.SCRIPT.partition('function allEntries(){')
         table_script = start + rest.partition('\nasync function afterRowAnimations(')[0]
         source = ('const fragment=' + json.dumps(fragment) + ';\n'
+                  + 'const queryString=' + json.dumps(query) + ';\n'
                   + 'const closedItem=' + json.dumps(closed_item) + ';\n'
                   + 'const parkOpenCard=' + json.dumps(park_open_card) + ';\n') + r'''
 const element=()=>({hidden:false,textContent:'',dataset:{},value:'',
- setAttribute(key,value){this[key]=value;},
+ hasAttribute(key){return Object.hasOwn(this,key);},
+ setAttribute(key,value){this[key]=value;},getAttribute(key){return this[key] ?? null;},
  toggleAttribute(key,present){if(present)this[key]='';else delete this[key];return present;},
  classList:{toggle(){}},
  addEventListener(type,listener){this[type]=listener;}});
 let notice=null;
 const empty=element();empty.after=value=>{notice=value;};
 const search=element();
-const makeChips=(group,values)=>values.map(value=>{
+const actionNotices={...element(),children:[]};
+const makeChips=values=>values.map(filterValue=>{
  const count=element();
- return {...element(),dataset:{[group+'Chip']:value},
-  getAttribute:name=>name==='data-'+group+'-chip' ? value : null,
+ return {...element(),dataset:{filterValue},
+  getAttribute(name){return this[name] ?? null;},
   querySelector:selector=>selector==='b' ? count : null};
 });
-const owners=makeChips('owner',['','one','two']);
-const chips=makeChips('type',['','change','question']);
-const shows=makeChips('show',['open','Waiting','Done','all']);
+const owners=makeChips(['all','staff:one','staff:two']);
+const chips=makeChips(['all','change','question','investigations']);
+const shows=makeChips(['open','Waiting','Done','all']);
 const owner={...element(),matches:()=>false,querySelectorAll:()=>owners};
 const show={...element(),matches:()=>false,querySelectorAll:()=>shows};
+const type={...element(),querySelectorAll:()=>chips,querySelector:()=>chips[3]};
 const rows=[
  {key:'sdlc/C1830',state:'Open',type:'change',owner:'one',parked:'false'},
  {key:'hana/Q10',state:'Open',type:'question',owner:'two',parked:'true'},
  {key:'other/C9',state:'Done',type:'change',owner:'two',parked:'false'},
 ].map((data,index)=>{
  const detail=element(),toggle=element(),row=element();
- const dataset={...data,id:data.key,hiddenUntil:data.parked==='true' ? Date.now()+60000 : 0,
+ const dataset={...data,id:data.key,unreadAnswer:false,hiddenUntil:data.parked==='true' ? Date.now()+60000 : 0,
   order:String(index),sortValues:'[]',title:'fixture',number:data.key.toLowerCase()};
  return {...element(),dataset,
   querySelector:selector=>selector==='[data-detail]' ? detail : selector==='.list-toggle' ? toggle : row};
@@ -223,20 +242,21 @@ const index=new Map(rows.map(({dataset})=>[dataset.key,dataset]));
 const table={append(){},addEventListener(){},getAttribute:()=> 'Review'};
 const content={
  dataset:{},addEventListener(){},
- querySelector:selector=>({'#list-owner':owner,'#list-show':show,'#list-search':search,
-  '[data-empty]':empty,'table':table,'[data-missing-keys]':notice})[selector],
- querySelectorAll:selector=>({'[data-list-item]':rows,'[data-owner-chip]':owners,'[data-type-chip]':chips,'[data-show-chip]':shows})[selector] || [],
+ querySelector:selector=>({'[data-filter-row="owner"]':owner,'[data-filter-row="show"]':show,
+  '[data-filter-row="type"]':type,'#list-search':search,
+  '[data-empty]':empty,'table':table,'[data-missing-keys]':notice,'[data-for-you-notices]':actionNotices})[selector],
+ querySelectorAll:selector=>selector==='[data-list-item]' ? rows : [],
 };
-const document={createElement:element};
-const location={search:'',hash:fragment,pathname:'/console/review.html'};
+const document={createElement:element,getElementById:()=>null};
+const location={search:queryString,hash:fragment,pathname:'/console/review.html'};
 const history={replaceState(_state,_title,url){this.url=url;}};
 const window={},parent=window,pendingSaves=new Map(),saved=new Map();
-const reviewPlace=()=>{},loadBodies=()=>{};
-''' + record_table.SCRIPT + r'''
+const loadBodies=()=>{},rememberItem=()=>{};
+''' + record_table.SCRIPT + console.REVIEW_PLACE_SCRIPT + r'''
 const createTable=createRecordTable;
 {
 const createRecordTable=options=>createTable({...options,entries:undefined,mount:undefined});
-''' + table_script + r'''
+''' + review_page.REVIEW_QUEUE_SCRIPT + table_script + r'''
 view.place();view.apply(false);
 if(parkOpenCard){
  view.opened.add('sdlc/C1830');view.apply(false);
@@ -251,12 +271,13 @@ if(closedItem){
 console.log(JSON.stringify({
  itemInUrl:new URLSearchParams(history.url?.split('#')[1]).get('item'),
  shown:rows.filter(row=>!row.hidden).map(row=>row.dataset.key),
- expanded:rows.filter(row=>!row.querySelector('[data-detail]').hidden).map(row=>row.dataset.key),
+ expanded:rows.filter(recordIsOpen).map(row=>row.dataset.key),
  missing:notice && !notice.hidden ? notice.textContent : '',
- counts:Object.fromEntries(shows.map(chip=>[chip.dataset.showChip,chip.querySelector('b').textContent])),
- chips:Object.fromEntries(chips.map(chip=>[chip.dataset.typeChip,chip.querySelector('b').textContent])),
+ selectedType:chips.find(chip=>chip.getAttribute('aria-pressed')==='true')?.dataset.filterValue,
+ counts:Object.fromEntries(shows.map(chip=>[chip.dataset.filterValue,chip.querySelector('b').textContent])),
+ chips:Object.fromEntries(chips.map(chip=>[chip.dataset.filterValue,chip.querySelector('b').textContent])),
  owners:Object.fromEntries(owners.map(chip=>{
-  const value=chip.dataset.ownerChip;
+  const value=filterControl.ownerId(chip);
   return [value,(value || 'All')+' ('+chip.querySelector('b').textContent+')'];
  })),
 }));
@@ -276,6 +297,13 @@ console.log(JSON.stringify({
         self.assertEqual(result['shown'], ['sdlc/C1830', 'hana/Q10'])
         self.assertEqual(result['expanded'], ['hana/Q10'])
 
+    def test_review_query_aliases_win_and_fragment_supplies_the_type(self) -> None:
+        result = self.render('#state=Waiting&owner=two&item=hana%2FQ10&q=absent&type=change',
+                             query='?show=all&showrunner=one&row=sdlc%2FC1830&q=fixture')
+        self.assertEqual(result['shown'], ['sdlc/C1830'])
+        self.assertEqual(result['expanded'], ['sdlc/C1830'])
+        self.assertEqual(result['selectedType'], 'change')
+
     def test_search_does_not_write_a_closed_review_row_to_the_address(self) -> None:
         result = self.render('#show=all&item=hana%2FQ10', closed_item='hana/Q10')
         self.assertEqual(result['expanded'], [])
@@ -293,8 +321,8 @@ console.log(JSON.stringify({
     def test_linked_counts_include_selected_parked_cards_and_exclude_other_rows(self) -> None:
         result = self.render('#show=all&key=hana%2FQ10')
         self.assertEqual(result['shown'], ['hana/Q10'])
-        self.assertEqual(result['counts'], {'open': 1, 'Waiting': 0, 'Done': 0, 'all': 1})
-        self.assertEqual(result['chips'], {'': 1, 'change': 0, 'question': 1})
+        self.assertEqual(result['counts'], {'open': '1', 'Waiting': '0', 'Done': '0', 'all': '1'})
+        self.assertEqual(result['chips'], {'all': '1', 'change': '0', 'question': '1', 'investigations': '0'})
         self.assertEqual(result['owners'], {'': 'All (1)', 'one': 'one (0)', 'two': 'two (1)'})
 
 

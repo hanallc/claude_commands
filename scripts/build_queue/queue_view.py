@@ -18,7 +18,7 @@ from typing import cast
 
 from scripts.build_queue.scope_activity import ScopeProcesses, LiveBuildRun, NotServiceSlice
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
-from scripts.build_queue.admission_wire import cloud_queue_order
+from scripts.build_queue.admission_wire import WaitingForCloudSlot, cloud_queue_time
 from scripts.build_queue.admission_records import (reason_phrase as reason_phrase, behind_place as behind_place,
     eligible_head_position as eligible_head_position)
 from scripts.build_queue.queue_evidence import step_labels as step_labels
@@ -26,7 +26,7 @@ from scripts.build_queue.queue_lines import Line, Span
 from scripts.buildlog.parse import cargo_subcommand
 from scripts.lib import cargo_target_config, conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import RECORDED_STEP_NAMES, StepNames, command_script, read_step_names
+from scripts.lib.build_steps import StepNames, command_script, read_step_names
 from scripts.build_queue import admission_records
 from scripts.message.unit_labels import UnitLabels
 from scripts.message import unit_labels
@@ -71,9 +71,6 @@ class MacBuildOrigin(Enum):
     UNKNOWN = "unknown"
 
 
-UNRECORDED_OWNER = UnitLabels("")
-
-
 class MacGateLabel(Enum):
     USER = "user"
     PLACEMENT = "placement"
@@ -106,6 +103,7 @@ class MacBuild:
     ci_job: str = ""
     gate_label: MacGateLabel = MacGateLabel.UNAVAILABLE
     gate_placement: str = ""
+    verify_call_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -181,15 +179,6 @@ def mac_command_step(build: MacBuild) -> tuple[str, str]:
     return step, package
 
 
-def mac_step_name(build: MacBuild, *, names: StepNames = RECORDED_STEP_NAMES,
-                  identity: UnitLabels = UNRECORDED_OWNER) -> str:
-    step, package = mac_command_step(build)
-    step = step or "cargo"
-    current_name = " ".join(part for part in (package or build.repository, step) if part)
-    return names.for_owner(step, identity.unit if identity.unit != "—" else "", identity.role,
-                           ci=build.origin is MacBuildOrigin.CI, current_name=current_name)
-
-
 def gate_label_text(build: MacBuild) -> str:
     """Serialize the gate identity for records. Keep placement ids out of visible names."""
     if build.gate_label == MacGateLabel.PLACEMENT and build.gate_placement:
@@ -206,13 +195,15 @@ def mac_build_record(build: MacBuild) -> dict[str, object]:
             "counter": {"phase": build.counter.phase, "done": build.counter.done, "total": build.counter.total}
                 if isinstance(build.counter, progress_profile.ProgressCounter) else {},
             "recorded_unit": build.recorded_unit, "session": build.session, "origin": build.origin.value,
-            "ci_runner": build.ci_runner, "ci_job": build.ci_job, "gate_label": gate_label_text(build)}
+            "ci_runner": build.ci_runner, "ci_job": build.ci_job, "gate_label": gate_label_text(build),
+            "verify_call_id": build.verify_call_id}
 
 
 def mac_build_from_record(row: dict[str, object]) -> MacBuild:
     test_pid = int(cast(int, row["test_pid"]))
     resident = int(cast(int, row["resident_bytes"]))
     command = str(row["command"])
+    session = str(row.get("session") or row.get("launcher_session") or "")
     counter_data = cast(dict[str, object], row["counter"])
     counter = progress_profile.ProgressCounter(str(counter_data["phase"]), int(cast(int, counter_data["done"])),
         int(cast(int, counter_data["total"]))) if counter_data else progress_profile.NoCounter()
@@ -222,12 +213,13 @@ def mac_build_from_record(row: dict[str, object]) -> MacBuild:
     return MacBuild(int(cast(int, row["pid"])), str(row["folder"]), float(cast(float, row["started_at"])),
                     command, str(row["repository"]), stage,
                     resident if resident >= 0 else MacMemoryUnavailable(), mac_command_jobs(command), counter,
-                    str(row["recorded_unit"]), str(row["session"]),
+                    str(row["recorded_unit"]), session,
                     MacBuildOrigin(str(row.get("origin", MacBuildOrigin.UNKNOWN.value))),
                     str(row.get("ci_runner", "")), str(row.get("ci_job", "")),
                     parse_gate_label(str(row.get("gate_label", ""))),
                     str(row.get("gate_label", "")).removeprefix("placement ")
-                    if str(row.get("gate_label", "")).startswith("placement ") else "")
+                    if str(row.get("gate_label", "")).startswith("placement ") else "",
+                    str(row.get("verify_call_id", "")))
 
 
 def read_mac_builds() -> MacBuildReading:
@@ -257,6 +249,7 @@ def mac_build_script() -> str:
     """Read cargo tile registrations and process trees in one SSH call."""
     return "python3 - <<'MAC_READING'\n" + inspect.getsource(cargo_target_config) + r'''
 import ctypes
+from functools import cache
 import json
 import re
 import struct
@@ -269,7 +262,6 @@ import time
 import tomllib
 
 CAPTURE_ROOT = Path("/tmp/cargo-tile")
-
 
 def output(arguments):
     return subprocess.check_output(arguments, text=True, stderr=subprocess.DEVNULL,
@@ -440,16 +432,22 @@ def cargo_environment(data):
             break
         key, separator, value = field.partition(b"=")
         if separator and key in (b"CARGO_TARGET_DIR", b"CARGO_BUILD_TARGET_DIR", b"CARGO_HOME", b"HOME",
-                                 b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT"):
+                                 b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT", b"BUILDLOG_CALL_ID",
+                                 b"CODEX_THREAD_ID", b"CLAUDE_CODE_SESSION_ID"):
             selected[os.fsdecode(key)] = os.fsdecode(value)
     return selected
 
 
-def test_output_directories(pid, folder, command, members, processes):
+@cache
+def observed_environment(pid):
+    """Read each process environment once per Mac reading."""
+    return process_environment(pid)
+
+
+def test_output_directories(folder, command, environment, members, processes):
     """Resolve target settings and observed compiler output directories."""
     try:
         arguments = shlex.split(command)
-        environment = process_environment(pid)
         settings = cargo_folder_settings(arguments, folder, environment)
         if "target-dir" in settings:
             setting = settings["target-dir"]
@@ -474,8 +472,8 @@ def test_output_directories(pid, folder, command, members, processes):
     return targets, outputs
 
 
-def running_test_pid(pid, folder, command, members, processes):
-    targets, outputs = test_output_directories(pid, folder, command, members, processes)
+def running_test_pid(pid, folder, command, environment, members, processes):
+    targets, outputs = test_output_directories(folder, command, environment, members, processes)
     for member in members:
         try:
             executable = Path(processes[member]["executable"]).resolve()
@@ -488,17 +486,23 @@ def running_test_pid(pid, folder, command, members, processes):
     return 0
 
 
+def runner_process(process):
+    """Match a GitHub Actions runner by its program name."""
+    try:
+        words = shlex.split(process["command"])
+    except ValueError:
+        words = []
+    return any(re.sub(r"-[0-9][0-9.-]*$", "", name) in ("Runner.Worker", "Runner.Listener")
+               for name in (Path(words[0]).name if words else "", Path(process["executable"]).name))
+
+
 def build_origin(pid, processes):
     """Identify a build with a GitHub Actions runner ancestor."""
     cursor = pid
     seen = set()
     while cursor in processes and cursor not in seen:
         seen.add(cursor)
-        try:
-            words = shlex.split(processes[cursor]["command"])
-        except ValueError:
-            return "unknown"
-        if words and Path(words[0]).name in ("Runner.Worker", "Runner.Listener"):
+        if runner_process(processes[cursor]):
             return "ci"
         cursor = processes[cursor]["parent"]
     return "non-ci"
@@ -531,7 +535,7 @@ def gate_label(pid, processes, records, ci_uid):
         if record and record[0] == process["started_at"]:
             return record[1]
         # offload.py and mac_queue_run.py set MAC_PLACEMENT; sccache passes it on to the compiler.
-        placement = process_environment(pid).get("MAC_PLACEMENT", "")
+        placement = observed_environment(pid).get("MAC_PLACEMENT", "")
         if PLACEMENT_FORM.fullmatch(placement):
             return "placement " + placement
         pid = process["parent"]
@@ -616,8 +620,9 @@ def read_builds(processes=None, records=None, captures=None):
         except Exception:
             record = dict(recorded_unit="", session="", repository="")
         command = capture.get("command", processes[pid]["command"])
+        environment = observed_environment(pid)
         try:
-            test_pid = running_test_pid(pid, folder, command, members, processes)
+            test_pid = running_test_pid(pid, folder, command, environment, members, processes)
         except Exception:
             test_pid = -1
         try:
@@ -628,7 +633,8 @@ def read_builds(processes=None, records=None, captures=None):
             origin = build_origin(pid, processes)
         except Exception:
             origin = "unknown"
-        ci_environment = process_environment(pid) if origin == "ci" else {}
+        ci_environment = environment if origin == "ci" else {}
+        session = record["session"] or environment.get("CODEX_THREAD_ID") or environment.get("CLAUDE_CODE_SESSION_ID", "")
         try:
             folder = str(Path(folder).resolve())
         except OSError:
@@ -640,10 +646,11 @@ def read_builds(processes=None, records=None, captures=None):
                            command=command, test_pid=test_pid,
                            resident_bytes=sum(processes[member]["resident_bytes"] for member in members),
                            progress_tail=tail, repository=repository,
-                           recorded_unit=record["recorded_unit"], session=record["session"],
+                           recorded_unit=record["recorded_unit"], session=session,
                            origin=origin, ci_runner=ci_environment.get("RUNNER_NAME", ""),
                            ci_job=ci_environment.get("GITHUB_JOB", ""),
-                           gate_label=gate_label(pid, processes, records, ci_uid)))
+                           gate_label=gate_label(pid, processes, records, ci_uid),
+                           verify_call_id=environment.get("BUILDLOG_CALL_ID", "")))
     return sorted(builds, key=lambda build: (build["started_at"], build["pid"]))
 
 
@@ -780,13 +787,16 @@ def cloud_update_age(seconds: float) -> str:
     return f"{int(seconds)} s"
 
 
+def cloud_location(progress: cloud_progress.CloudProgress) -> str:
+    zone = progress.zone.removeprefix(progress.region) if progress.region else progress.zone
+    return ", ".join(filter(None, (progress.region, f"zone {zone}" if zone else "")))
+
+
 def cloud_detail(row: wire.CloudRow) -> str:
     progress = row.progress
     if not isinstance(progress, cloud_progress.CloudProgress):
         return ""
-    zone = progress.zone.removeprefix(progress.region) if progress.region else progress.zone
-    location = ", ".join(filter(None, (progress.region, f"zone {zone}" if zone else "")))
-    return " · ".join(filter(None, (progress.stage, location)))
+    return " · ".join(filter(None, (progress.stage, cloud_location(progress))))
 
 
 def cloud_status(row: wire.CloudRow, work: CloudWork) -> Line:
@@ -806,11 +816,7 @@ def cloud_failed_modules(work: CloudWork) -> str:
 def cloud_page_status(row: wire.CloudRow, work: CloudWork) -> Line:
     if isinstance(row.wait, wire.CloudSlotWait):
         return cloud_status(row, work)
-    parts = (work.state if work.state != "running" else "",
-             cloud_detail(row),
-             work.modules if isinstance(row.counter, progress_profile.ProgressCounter) else "",
-             cloud_failed_modules(work))
-    return (Span(" · ".join(filter(None, parts))),)
+    return (Span(cloud_failed_modules(work)),)
 
 
 @dataclass(frozen=True)
@@ -819,21 +825,28 @@ class WaitingBuild:
     step: admission_records.WaitingStep
 
 
-def waiting_builds(model: QueueModel) -> list[WaitingBuild | wire.CloudRow | wire.RepositorySlotRow]:
-    """Insert cloud waits in admission order. Keep the local queue order."""
-    rows: list[WaitingBuild | wire.CloudRow | wire.RepositorySlotRow] = [WaitingBuild(index, step)
+def waiting_builds(model: QueueModel) -> list[WaitingBuild | wire.CloudRow]:
+    """Keep the queue order within each machine."""
+    rows: list[WaitingBuild | wire.CloudRow] = [WaitingBuild(index, step)
         for index, step in enumerate(model.reading.view.waiting, 1)]
-    slot_rows = model.reading.repository_slots if isinstance(model.reading, wire.CloudQueueRead) else ()
 
-    def order(row: wire.CloudRow | wire.RepositorySlotRow) -> tuple[float, int, str]:
-        return cloud_queue_order(row.place, row.since) if isinstance(row, wire.CloudRow) else (row.since, 1, "")
+    def time_key(row: wire.CloudRow) -> tuple[float, int, str]:
+        return cloud_queue_time(row.place, row.since)
 
-    for cloud in sorted([*(row for row in cloud_rows(model) if isinstance(row.wait, wire.CloudSlotWait)), *slot_rows],
-                        key=order):
-        order_time = order(cloud)[0]
+    cloud_waits = [row for row in cloud_rows(model) if isinstance(row.wait, wire.CloudSlotWait)]
+    for cloud in sorted(cloud_waits, key=time_key):
+        order_time = time_key(cloud)[0]
         position = next((index for index, row in enumerate(rows)
-                         if (row.step.since if isinstance(row, WaitingBuild) else order(row)[0]) > order_time), len(rows))
+                         if (row.step.since if isinstance(row, WaitingBuild) else time_key(row)[0]) > order_time),
+                        len(rows))
         rows.insert(position, cloud)
+
+    # Keep the positions of the local waits and the waits with a reserved cloud slot.
+    cloud_order = (row for row in cloud_waits if isinstance(row.wait, wire.CloudSlotWait)
+                   and isinstance(row.wait.state, WaitingForCloudSlot))
+    for index, row in enumerate(rows):
+        if isinstance(row, wire.CloudRow) and isinstance(row.wait, wire.CloudSlotWait) and isinstance(row.wait.state, WaitingForCloudSlot):
+            rows[index] = next(cloud_order)
     return rows
 
 

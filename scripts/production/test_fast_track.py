@@ -18,18 +18,18 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import ClassVar, Literal, cast, final, override
+from typing import ClassVar, cast, final, override
 import unittest
 from unittest.mock import patch
 
-from scripts.buildlog.store import host_name
-from scripts.lib import build_folders, build_slots, conf, zone
+from scripts.lib import build_folders, zone
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture
 from scripts.production import fast_track, merge_checkpoint
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -70,7 +70,7 @@ from scripts.sample import item
 class ChangedValueTests(unittest.TestCase):
     def test_changed_value(self):
         self.assertEqual(item.VALUE, "after")
-        self.assertEqual(os.environ["HERDR_BIN"], "/nonexistent/herdr")
+        self.assertEqual(os.environ["HERDR_BIN"], ''' + repr(MISSING_HERDR_BIN) + ''')
         for name in ("PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY", "STAFF_OPERATION_FD"):
             self.assertNotIn(name, os.environ)
         self.assertIn("BUILDLOG_DIR", os.environ)
@@ -334,7 +334,6 @@ class FastTrackTests(MergeCheckpointFixture):
 
     def pin_configuration(self) -> None:
         config = self.config.parent
-        machine = host_name()
         self.env.update(CONF_DIR=str(config), USER_ZONE="UTC")
         _ = (config / "build_folders.conf").write_text(
             f"""# whole: 1..
@@ -348,27 +347,14 @@ roots.build={self.root / 'build'}
 roots.temporary=${{TMPDIR}}/builds
 roots.scratch={self.root / 'scratch'}
 roots.copies={self.root / 'copies'}
-roots.slot_cargo={self.root / 'cargo'}
-roots.slot_cargo.{machine}={self.root / 'cargo'}
-roots.slots={self.root / 'slots'}
-roots.slots.{machine}={self.root / 'slots'}
 roots.workspace={self.root / 'workspaces'}
 roots.session={self.root / 'session'}
 patterns.tool={{purpose}}{{suffix}}
 patterns.named={{showrunner}}-{{unit}}/{{work}}-{{purpose}}
-patterns.slot={{repository}}-slot{{slot}}
 # range: 0.001..60
 locks.probe_wait_seconds=0.25
 # range: 0.001..1
 locks.probe_retry_seconds=1
-# whole: 1..
-slots.{machine}.default_max=2
-# whole: 1..
-slots.{machine}.origin.max=2
-# whole: 1..
-slots.unused_days=7
-# range: 5e-324..
-slots.wait_seconds=30
 """,
         )
         _ = write_config_fixture(Path(self.env["COPIES_CONFIG"]),
@@ -383,7 +369,7 @@ owner.verify=verify
         _ = (config / "build_steps.conf").write_text("names.fast-track=fast track\n")
         _ = (config / "main_push_lock.conf").write_text("# whole: 1..\nrecord_days=14\n")
         _ = (config / "merge_checkpoint.conf").write_text(
-            "# whole: 1..\nMAC_PULL_TRIES=3\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n",
+            "# whole: 1..\nmac_pull_tries=3\n# range: 0..\nmac_pull_retry_seconds=0\n",
         )
 
     def save_config(self) -> None:
@@ -395,15 +381,9 @@ owner.verify=verify
             lines.append(f"{FAST_TRACK_LIMITS[key]}{key} = {rendered}\n")
         _ = self.config.write_text("".join(lines))
 
-    def build_folder_state(self, path: Path) -> Literal["held", "free"]:
+    def build_folder_state(self, path: Path) -> build_folders.BuildFolderState:
         with patch.dict(os.environ, {"CONF_DIR": self.env["CONF_DIR"]}):
             return build_folders.build_folder_state(path)
-
-    def test_fast_track_slot_roots_are_private(self) -> None:
-        with patch.dict(os.environ, {"CONF_DIR": self.env["CONF_DIR"]}):
-            self.assertEqual(build_slots.configured_slot_root(), self.root.resolve() / "slots")
-            settings = conf.read_or_repository("build_folders")
-            self.assertEqual(build_slots.slot_cargo_root(settings), self.root.resolve() / "cargo")
 
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         if process_boundary_for_case(self):

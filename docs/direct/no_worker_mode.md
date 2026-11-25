@@ -51,6 +51,18 @@ Run them from `${WORKING_DIR}` with the normal phase ID and paths.
    Include the `rerun` lens when <DualReview/> requires it.
    Save each review result under `${PHASE_DIR}` and record review activities with `start-activity` and `finish-activity`.
    These are director reviews, with no claim of independent worker review.
+   Before you dispatch a subagent review, note the time with `date -Iseconds`.
+   That time is its `--started-at` value.
+   Record the review after it returns, with its real start and end times:
+
+   ```sh
+   "$PY" "$DIRECT/progress_history.py" start-activity --session-dir "${SESSION_DIR}" --label "Subagent review" --activity "<what it reviewed>" --started-at "<its start, ISO with zone>"
+   "$PY" "$DIRECT/progress_history.py" finish-activity --session-dir "${SESSION_DIR}" --finished-at "<its end, ISO with zone>" --result "<result>"
+   ```
+
+   The back-dated `start-activity` closes the open director activity.
+   If that work continues, start its activity again.
+   Record each subagent finding with `findings.py open ... --caught-by worker`.
 4. Record findings through <FindingsLedger/> and run its existing commands:
 
    ```sh
@@ -83,6 +95,8 @@ Run them from `${WORKING_DIR}` with the normal phase ID and paths.
    Stage the final tree and run `verify.sh doc` immediately before each Cargo checkpoint.
    Record the successful commit with `progress_history.py checkpoint --session-dir "${SESSION_DIR}" --phase "<id>" --commit "<full hash>"`.
    This command requires the open phase and commit hash, with no worker pass requirement.
+   It refuses a hash that is not a commit in the phase's working dir, and it prints the checkpoint event id.
+   To cancel a wrong checkpoint event, run `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py void-checkpoint --session-dir "${SESSION_DIR}" --event-id "<event id>" --reason "<reason>"`.
    Complete reservation release and push through <CheckpointCommit/>.
 7. Finish the phase with `progress_history.py finish-phase --session-dir "${SESSION_DIR}" --phase-id "<id>" --status completed`.
    Keep broadcast-on mode through later phases until the workers-back notice arrives.

@@ -11,18 +11,33 @@ The guard permits only original worktrees, the external upstream clone, and this
 The CLI converts its flags into these policies.
 
 Staged copies use a private source index and a synthetic commit without changing source refs.
-Local gates take a detached numbered copy through `build_slots.take_copy()`.
+Local gates take a detached numbered copy through `build_copies.take_copy()`.
 The repo word and unit select the parent folder under the host's build root.
 `copies.standing()` uses the caller's staff unit name when it finds the staff row.
 The maker takes the lowest free existing number or creates the smallest missing number.
 An identical nested committed proof can reuse its held copy.
 A run can still wait for normal build admission.
-The AWS gate uses its separate slot path.
+The AWS gate takes its assigned numbered copy under `~/build/hana/aws-hana`.
+
+The Hana AWS guest uses its main checkout at `~/rust/hana` for bundle fetches.
+The sender accepts the main checkout or a model worktree linked to it.
+The sender stages the capture index, Git bundle, and archive in the main checkout's Git directory.
+The guest downloads the archive inside the main checkout.
+The guest stages the runtime in a per-command mount at `~/rust/hana/.git/hana-payload`.
+The guest stages the verified bundle inside the main checkout's Git directory.
+The runner takes the assigned copy number under `~/build/hana/aws-hana`.
+The receiver probes that numbered copy's lock before it reports lease release.
+The shell cache lives at `~/build/hana/main/shells`.
 
 The caller holds the copy lease through preparation and execution.
 The lease records the source checkout, commit, Git directory identities, and holder.
 Python callers pass the lock descriptor and its environment setting to build and test children.
-The copy becomes free when the kernel lock is free.
+The lease gives the child a `COPIES_KEEP_FILE` path beside the copy.
+A nonempty file keeps the copy after the kernel lock is free.
+The file contains the reason. The collector and copy allocator skip kept copies.
+Remove the keep file only after a manual check confirms that the copy is clear.
+The Mac smoke run uses this lease and keeps the copy if its process check fails.
+The smoke run passes its owner to the Mac with `copies.py run --owner`.
 A lease release failure after use raises `PostUseError` and retains the caller error.
 
 The maker rescues source work before Git resets the copy to the requested commit.
@@ -47,6 +62,16 @@ When no local source remains, removal exports the rescue into a sibling bare rep
 Removal verifies the exported rescue before it deletes the workspace.
 `clone()` keeps its task-owned return-a-path API and uses the maker outside the numbered copy root.
 Its Git children inherit the destination lease and busy lock.
+Before `copies.py clone` creates a checkout, it selects clone folders by the owner's prefix.
+The task record ties each clone path to its owner, repository, and session.
+The guard checks that identity against the local mirror record and any readable registry record for that path.
+A clone without `--owner` uses the caller's owner when available and needs no remote registry write.
+The maker marks its setup lease as released when setup completes.
+The clone record stays for later leases.
+The guard probes the folder lock without delay.
+It refuses only when the folder lease proves that the holder ended or the PID was reused.
+The refusal lists each path and gives one `copies.py mirror-remove` command for it.
+Removal uses the scratch coordinator for clones in both the scratch root and session folders.
 The saved-work check trusts cached remote-tracking refs when they cover all local commits.
 Otherwise, removal runs `git ls-remote` in the clone once per named remote.
 Git uses the named remote's configured transport.
@@ -140,8 +165,8 @@ The Mac floor sweep acquires idle mirror leases before it reads claims.
 It retains these leases through removal.
 It reads claims again before each removal group outside the acquired leases.
 The Linux floor sweep holds mirror leases while it checks and removes idle output.
-Admission takes available slot leases before it selects a claim.
-It releases unused slot leases after claim selection.
+Admission takes available mirror leases before it selects a claim.
+It releases unused mirror leases after claim selection.
 It skips busy mirrors and preserves their records.
 Cancellation closes its acquired descriptors.
 The lock files retain their inodes.
@@ -158,7 +183,7 @@ A successful retry removes the record.
 Removal requires a zero status marker from the remote command before it deletes the local record.
 Authentication failures and remote removal refusals still raise `RemoteMirrorKept` and prevent retirement.
 A kept local tree prints one line, and retirement continues.
-The sweep removes the local tree later.
+The tmp sweep lists eligible local trees for vetted manual removal.
 Another owner's records remain.
 
 Local mirror rows display the machine name while their records retain `localhost`.

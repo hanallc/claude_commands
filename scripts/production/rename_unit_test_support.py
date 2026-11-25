@@ -19,7 +19,7 @@ from unittest import mock
 
 
 from scripts.herdr import fake_herdr
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import copy_config_file_fixture, config_environment
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase
@@ -31,6 +31,7 @@ from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.agents import shutdown
 from scripts.agents import pane_record
 from scripts.style import style_ledger
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 SLUG = "demo"
@@ -366,7 +367,7 @@ class FolderRenameFixture(StaffTestCase):
         self.configuration = self.root / "production.conf"
         self.env = {
             **config_environment(self.root),
-            "HOME": str(self.home), "HERDR_BIN": "/nonexistent/herdr",
+            "HOME": str(self.home), "HERDR_BIN": MISSING_HERDR_BIN,
             "HERDR_PROC": str(self.root / "proc"), "HERDR_PLATFORM": "linux",
             "CODEX_HOME": str(self.home / ".codex"), "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
             "HERDR_PANE_RECORD_DIR": str(self.records),
@@ -380,13 +381,22 @@ class FolderRenameFixture(StaffTestCase):
         self.source.parent.mkdir(parents=True)
         self.records.mkdir()
         copy_folder_repositories(self.git_seed, self.root, self.old_name)
+        document = self.checkout / "production.md"
+        _ = document.write_text(
+            "# Folder production\n"
+            + f"- **Repository:** `{self.checkout}`\n"
+            + "- **Merge branch:** `main`\n"
+            + f"- **Showrunner checkout:** `{self.checkout}`\n"
+            + "- **Log:** `production.log`\n")
+        with (self.checkout / ".git/info/exclude").open("a") as excludes:
+            _ = excludes.write("\n/production.md\n")
         owner = fixture_member("showrunner", name="folder-production",
-            doc=staff.LiveDoc(remote.local_machine(), self.checkout / "production.md"))
+            doc=staff.LiveDoc(remote.local_machine(), document))
         row = fixture_member("unit", name=self.old_name, parent=owner.id,
             worktree=staff.PresentWorktree(remote.local_machine(), self.source))
         _ = staff.update_current_session(row.current_session,
             staff.native_id(fixture_runtime_id("folder-current-after-clear")))
-        _ = self.configuration.write_text((Path(__file__).resolve().parents[2] / "config/production.conf").read_text())
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/production.conf", self.configuration)
         self.transcript("claude")
 
     def git(self, *arguments: str, cwd: Path | None = None) -> str:

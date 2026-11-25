@@ -90,7 +90,7 @@ The showrunner staff row gives its path. The row's `name` is the production name
 
 - **Source plans:** <path(s)> — split on <date> by /producer:to_production
 - **Repository:** <main checkout path>
-- **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
+- **Merge branch:** `<branch>` — every unit merges here
 - **Kind:** style — optional; absent means a product production. A style production
   reads `~/.claude/docs/style_production.md`
 - **Branch point:** `<branch>` — style productions only: the parent's merge branch
@@ -98,8 +98,9 @@ The showrunner staff row gives its path. The row's `name` is the production name
 - **Parent production:** <path to parent production doc> — style productions only:
   the hand-off destination and the doc used to merge hand-offs while a root
 - **Showrunner checkout:** <path, on the merge branch>
+- **Merge checkout:** <absolute main checkout path> — add for an enrolled production
 - **Log:** <repo-relative path> — git-excluded; one line per event
-- **Merge tests:** <backticked commands for the showrunner checkout on every merge,
+- **Merge tests:** <backticked commands for the integration checkout on every merge,
   in addition to the changed packages' tests. The nightly run checks types.
   Exclude type checks from Merge tests.
   Use `bash ~/.claude/scripts/direct/verify.sh test app`, for example.
@@ -178,6 +179,15 @@ Direct units use `style_sync.py` for normal main merges; see `docs/style_product
 - <standing rules the user set for this production or project, each with its
   source; omit the section if none>
 ```
+
+An enrolled production uses `Repository` for the showrunner session directory.
+`Merge checkout` names the same main checkout as an absolute path.
+`Showrunner checkout` names the integration worktree on `Merge branch`.
+The serving merge unit uses a separate staging worktree.
+The live production document uses the name `<old-stem>-live.md`.
+Resolve its relative `Log` path from the main checkout.
+Keep both files and the production notes untracked and ignored.
+A document without `Merge checkout` uses the legacy layout.
 
 A production doc has no list of units. A unit is its staff row.
 The row gives its name, parent and worktree; git there gives the repository and branch.
@@ -265,12 +275,29 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    `~/.claude/docs/direct/phase_end.md` → <PhaseEnd/>.
 
    When several small changes are coming, hold their notices and send them together.
-   The merge gate lands them in one batch run.
+   The integrate job lands them in one batch.
 
    Before sending a checkpoint notice, record its next-phase ETA:
    `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta --session-dir <SESSION_DIR> --phase-id <next> --time <HH:MM> --basis checkpoint`.
    `<HH:MM>` means today in the user's zone; an ETA on a later day takes
    `<YYYY-MM-DDTHH:MM>`. State the time the recorder printed.
+
+   In the `~/.claude` repository, prove each row on its tip joined with main
+   before the notice goes to the merge unit:
+
+   1. Run `git fetch origin`, then `git merge --no-ff origin/main` on the tip.
+      Push the join commit. Do not fetch again before step 3.
+   2. Run the affected tests of the join through the queue, with no `--module`:
+      `~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --repo ~/.claude --commit <join> -- ./scripts/lib/py scripts/production/gate.py --affected`.
+      The selector finds each module that imports, embeds, copies or reads a
+      changed file. Do not choose the modules by hand. Single cases do not
+      replace this run.
+   3. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/fixture_conf_keys.py --repo ~/.claude --base origin/main --tip <join>`.
+      It names each literal test fixture of a config file that lacks a key
+      the row adds. Add the key to each named fixture.
+
+   Send the notice only when both runs are green. Name the join hash and both
+   results in it.
 
    ```
    phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
@@ -324,9 +351,13 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    minutes in 2.6 days; with a fresh pass the merge followed in 1–2 minutes.
 
    At plan start and at each <PhaseEnd/>, map which phases depend on which.
-   Run each independent phase beside the current one under berth, with its own
-   checkpoint (`/showrunner:produce` → Rules, parallel by default). A phase
-   better run as its own unit goes to the showrunner as a proposed split
+   Give each independent phase its own berth reservation and checkpoint
+   (`/showrunner:produce` → Rules, parallel by default).
+   Use `worktrees.py make <repo word> <unit> p<phase id>` for a phase that runs beside the current phase.
+   Run `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py remove <path>` after its checkpoint reaches origin.
+   Send the reported checkout and output paths to the showrunner as a removal list.
+   Use a distinct short name `p<phase id>` for each phase.
+   A phase better run as its own unit goes to the showrunner as a proposed split
    (phases, files, shared files, merge order), never to the user.
 4. **The merge branch is the showrunner's.** Never merge into it or push it.
    Push only your own branch except <FastTrack/> (`commands/unit/fast_track.md`);
@@ -435,12 +466,12 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
 13. **Waiting on another unit** (user, 2026-09-29). Only code you need that
     exists only in another unit's unmerged work blocks you. Reservations, shared
     files and "to avoid conflicts" do not; the showrunner clears those and names
-    the cargo-berth commands you run. Before reporting a code block, test it: in
-    a scratch worktree, merge the merge branch without that work and run your
-    tests. Green means you are not blocked; continue. A real block ends the turn
-    with item 10's line. While it lasts, take the work the showrunner names, or:
-    parts of your next phase in files nobody holds, your fix built in a scratch
-    copy, tests, docs or research.
+    the cargo-berth commands you run. Merge the merge branch into a model
+    worktree and test without the other unit's change.
+    Continue if the tests pass. If the code blocks you, use item 10's line.
+    While you wait, take the work the showrunner names.
+    You can also start independent phase work, tests, docs, or research.
+    Build a fix in a numbered copy. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_copies.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
 15. **A failed lint** (user, 2026-10-01: 12 lint runs in a row on an
     unchanged tree failed on the same error; 60 failed lints in one day cost
     about 75 minutes). Lint covers the whole workspace. When it fails, fix

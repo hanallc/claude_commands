@@ -25,11 +25,11 @@ The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Workers compact between assignments when their recorded context exceeds the configured limit.
 The launcher returns when a child accepts that dispatch through `scripts.lib.detached.start_detached`.
 The child uses a separate session, so a signal to the caller's process group does not stop it.
-`WORKER_COMPACT_SECONDS` sets the deadline for `/compact --wait --timeout` and the following turn-end wait.
+`worker_compact_seconds` sets the deadline for `/compact --wait --timeout` and the following turn-end wait.
 Only a new compaction record in the transcript proves completion.
 If the deadline expires, the worker checks for this record before it reports a timeout.
 A complete compaction record lets the worker send the assignment.
-The child then sends the prompt and confirms its transcript receipt within `WORKER_SETTLE_SECONDS`.
+The child then sends the prompt and confirms its transcript receipt within `worker_settle_seconds`.
 It writes its output to `compact-<dispatch id>.log` in the run folder.
 A compaction failure sends no prompt and clears only matching `/compact` composer text.
 A detached delivery failure ends the pass with `error` and reports through the existing completion hook.
@@ -56,11 +56,13 @@ The early return prints `compaction runs detached; the prompt follows` with the 
 The pass stays active while the child completes delivery.
 An assignment with no compaction due keeps its attached delivery path.
 Codex dispatch also requires the prompt in its transcript before it reports submission.
-Codex dispatch waits up to `WORKER_SETTLE_SECONDS` for the receipt.
+Codex dispatch waits up to `worker_settle_seconds` for the receipt.
 An unproved Codex prompt returns uncertain when this bound passes or the process exits.
 A recorded prompt remains submitted after a process exit.
 Claude can record the prompt later.
 A failed delivery command returns an error.
+The launcher copies captured worker output to stderr on a nonzero exit.
+Assignment recovery prints the reason if pending pane cleanup prevents submission.
 The transcript prevents replay.
 A matching final transcript reply proves completion.
 A matching dispatch prompt also permits completion from the hook's own DONE reply before the final transcript record appears.
@@ -101,21 +103,25 @@ With an active pass, changed content returns busy and names that pass without pr
 This refusal applies when the launcher arguments change.
 The recorder repeats the content check under its lock before it changes the pass.
 The intentional second review stage keeps its existing pass across its separate prompt path.
-An identical rerun of a completed dispatch sends one completion message through the hook's notice code.
+An identical rerun of a completed dispatch uses the saved pass notice.
 It saves the reply without typing another prompt.
 This rule also applies to a completed managed Astra review.
 The saved completion includes the reason and pane for a close anomaly.
-A successful completed rerun sets its status file to `done` after it sends the notice.
-Native duplicate hook events still send no second message.
+A completed rerun sets its status file to `done` before it checks the notice.
+A replay of a settled hook event sends no second message.
+This includes a legacy status replay that arrives after a different status.
 Each completion notice ends its first line with `; pass <dispatch instance id>`.
-An explicit rerun repeats the saved completion text with the same pass id.
+An explicit rerun can retry a pending notice with its original delivery key.
+An explicit rerun leaves settled notices alone.
 Each notice uses the worker's native identity and name, including a notice from the director's rerun.
 The saved completion supplies the sender identity for a retired managed Astra reviewer.
 The sender identity remains the same after a session change and retirement.
-Turn and run events send no notice when the outcome, reply, and run ids match the last notice.
-A changed waiting outcome, reply, or run ID sends one notice.
-The completion notice records delivery separately from the reply text.
-After delivery, recovery can replace the saved reply without sending another completion notice.
+Each status transition gets a sequence ID and a delivery key.
+A repeated native turn ID uses its existing event.
+Without a native turn ID, an unchanged status uses the current event.
+A transition back to an earlier status gets a new event.
+The pass keeps notices separately from the saved reply.
+Recovery can replace the saved reply after the notice settles.
 Waiting notices add `; runs <run ids>` to the first line.
 The run ids include received results that still await a worker reply.
 An empty turn reply writes no reply file and adds no `; reply <path>` text.
@@ -171,17 +177,56 @@ The hook records delivery before it tries to close the pane.
 A later matching DONE updates the saved reply even after a completion action fails.
 The hook preserves the action error and notice record.
 
-`worker.dispatch_receipt` reads the transcript and detached run evidence.
+A native Stop asks the hook to read the current worker transcript.
+The hook needs a matching DONE in the transcript to complete the pass.
+The hook verifies the worker, pass, and stage under the worker lock.
+The reply evidence file saves the transcript stream, record position, and prefix digest for the verified DONE.
+Recovery keeps the greatest verified position for that pass stage.
+An older prefix or a different stream cannot replace the saved occurrence.
+A later occurrence can replace it with the same text, the same timestamp, or no timestamp.
+Completion, result delivery, pane closure, and acknowledgement use that occurrence.
+The selected occurrence covers explicit result receipts that precede it.
+The transcript timestamp can prove additional run coverage.
+Acknowledgement selects the evidence once for all pending results.
+The exact prompt and pass marker checks use separate receipt states and consume the same transcript stream.
+Both checks identify a detached run delivery by its first line before they check for a dispatch prompt.
+The parser discards each decoded record after both states read it.
+The evidence file preserves outstanding results when the transcript becomes unavailable.
+A later reply updates an unfinished completion without repeating its actions or notice.
+
+A Stop with unresolved transcript evidence saves pending verification under the worker lock.
+The pending record identifies the pass and stage.
+The next turn event or a detached-run reap can retry the transcript read.
+Reap uses `result_push_retry_seconds` in `detached_runs.conf` as the minimum interval between attempts.
+Reap also checks pending verification for workers that have no detached runs.
+The hook can submit a finished result while verification remains pending.
+Verification continues until completion or a pass or stage change.
+The `worker.py list` command shows `transcript verification` while the pass waits.
+Recovery requires an occurrence cursor before it accepts a saved DONE.
+The hook checks command exits separately from result delivery.
 A live detached run holds DONE.
-If the transcript omits the result, completion requires proof that delivery preceded the matching DONE.
-That completion records an anomaly.
-A later assistant message preserves the matching DONE.
-Delivery after DONE or unknown delivery order requires a new matching reply.
-A reply without the matching DONE keeps the earlier DONE and the pending reply requirement.
-The hook, restore, assign, and close keep the pane while that requirement remains.
+A finished run with no delivery record can still hold DONE.
+A matching DONE covers a run that finished before DONE.
+A DONE at the next second covers a finish time that an old run record saved with seconds only.
+DONE also covers an ordinary run that started before DONE and names the exact pass.
+The hook waits for those live runs to finish.
+It adds their late results above the DONE line in the saved reply.
+The result can arrive later without requiring a new DONE.
+The delivery command records coverage and sends no result if it finds a covering DONE.
+The delivery command defers the result when transcript evidence is uncertain.
+If the run has no usable finish time, the receipt can use a recorded delivery before DONE.
+The receipt reports an anomaly if that delivery is absent from the transcript.
+A result without proof of coverage requires another matching DONE.
+If an open pass has a DONE that does not cover the result, the worker's result message ends with this line.
+`End your final reply with this line alone: DONE <dispatch id>`
+The hook, restore, assign, and close keep the pane while that requirement remains on an active pass.
 A pending run reply keeps the pass active without another prompt.
 Run events preserve the last worker reply while a result awaits a reply.
 A live run reports `waiting on runs`, including when an earlier result awaits a reply.
+A finished run stays out of the live run list while its completion flag is pending.
+Completion clears the pending flags for settled results of the pass.
+A covering DONE leaves an unconfirmed delivery and its alert eligibility in the run record.
+Reap retries pending completion under the run's completion lock.
 The sender submits a detached result to an idle worker pane.
 The sender confirms delivery only when the transcript contains the run ID.
 The run record retains a result until the transcript confirms delivery or the holder receives it.
@@ -190,24 +235,45 @@ A run event uses the stable staff ID to find the worker's current session.
 A session change during the hook keeps the run event pending.
 A worker puts its question in its reply and ends the turn.
 The turn hook sends that reply to the director.
+A `no DONE` notice can reach the director while verification remains pending.
+The latest transcript turn after the prompt supplies the notice text and position.
+An unavailable transcript or a missing prompt defers the notice.
+The hook records the latest notice position that it accepts and the latest position that it delivers.
+Within the same stream, the transcript must preserve the accepted prefix.
+A stream change requires a different session or transcript path and a verified prompt.
+The hook carries matching notice positions into the new stream.
+The hook starts a new notice order when the new stream has no matching notice positions.
+The callback checks the current session, path, and notice position under the worker lock before delivery.
+The notice leaves the pass active and runs no completion actions.
 An unexpected screen prompt ends no turn, and the director finds it only when it reads the pane.
 A turn without DONE reports `no DONE` when no pending work explains it.
+An empty turn also reports `no DONE` after prompt acceptance if the pane is idle or the transcript records compaction.
+The hook reports an empty turn only when no pending work explains it.
+During verification, the transcript must identify the empty turn at its own position.
+A startup turn before prompt acceptance sends no notice.
+A final reply without a staff row goes to the showrunner only if the recorder confirms that thread accepted a worker prompt.
 The notice includes the worker's last reply and leaves the pass active.
-A turn without an assistant reply reports `no DONE` when the transcript records compaction after the accepted dispatch prompt.
-An empty turn without that compaction evidence stays ignored.
 Resubmit that work with `worker.py answer <name> --text "Read the assigned prompt and do the work."`.
 `answer` takes the same worker lock as `assign`.
 It requires an active pass, a saved delivery, and transcript proof that the worker accepted the delivery.
 If compaction holds the lock or the pass lacks proof, `answer` refuses to send input.
-A matching DONE in the transcript blocks input before the completion hook updates the pass.
+A working pane or an uncertain pane state prevents input.
+A matching DONE blocks input when it covers every result of the pass.
 Use `assign.sh` for new work.
 A blocked Codex question receives only the supplied answer text.
 Other answers include the saved completion ID in the DONE instruction.
+`answer` records the pending submission for the worker, pass, stage, and transcript position before it sends input.
+A retry for the same request sends no input.
+A transport error keeps the submission pending if input could have reached the pane.
+The transcript must show acceptance and a new question or an ended turn before the next answer.
 The normal hook handles DONE for the same pass.
 If the reply ends with a different DONE ID, the no DONE notice names both IDs.
 The pass stays active and the pane stays open until the reply contains the matching DONE.
-A saved stage ID controls pane closure and reuse.
+The saved stage ID controls pane closure and reuse when the pass requires a reply.
 The reply on disk must match the completed receipt.
+If the report path resolves to the reply path, the hook keeps the raw reply there.
+If the caller requests a distinct report path, the hook writes the report there.
+The report includes the heading when the assignment has a summary.
 The completion hook saves the reply and records the pending notice for the exact pass.
 Live detached work delays normal and late DONE notices.
 Restart restores a selected live worker before it removes the worker from the restart record.
@@ -231,11 +297,32 @@ Completion removes the entry after it saves the final result.
 Restore reports incomplete recovery if pane closure fails.
 Restore reports the worker name and reason when completion recovery keeps its pane.
 The next restore retries closure without sending the completion notice again.
-The hook records closure diagnostic delivery separately from the diagnostic text.
-A later recovery retries an undelivered diagnostic with the same delivery key.
-The hook ends `scratch.worker_task(row.id)` before it closes the pane.
-This removes the worker's `scratch.py new --worker` folders and keeps other workers' folders.
+Each pass keeps an append-only notice record in its run directory.
+The record holds each event ID, notice, route, and settlement.
+The record retains event IDs so a retry can recognize a duplicate.
+The first notice for a pass with a legacy stamp imports the stamp as one settled event.
+The record keeps the stamp for that status even if a different status arrives first.
+The progress recorder keeps the stopped pass receipt for late reply recovery.
+The hook saves pending diagnostics in the completion checkpoint before it writes the notice record.
+The hook sets `recording_done` after all pending diagnostics are durable in the notice record.
+If the notice write fails, the next hook publishes the saved diagnostics.
+A new assignment can use an open, stopped, or closed idle worker while the old notice remains pending.
+The new assignment still requires valid completion evidence and safe pane reuse.
+A new assignment can append notices without reading the notice record or taking a message lock.
+A later hook or reap retries the pending notices with their original delivery keys.
+The stopped pass can retry its diagnostics while it waits for a matching DONE.
+The retry checks for a director receipt with the same delivery key.
+A matching receipt settles the notice without a send.
+A receipt lookup failure leaves the notice pending.
+A repeat-guard hold settles the notice after the guard queues a notice for the owner.
+Peer delivery preserves the repeat-guard hold reason. Other holds leave the notice pending.
+The hook marks `scratch.worker_task(row.id)` ended before it closes the pane.
+The worker's scratch folders remain for manual removal.
 A failed cleanup adds a diagnostic to the director notice and permits pane closure.
+The hook saves each retained scratch path and reason separately from the notice text.
+Each send checks the saved paths and omits confirmed missing folders.
+The notice omits legacy scratch details that have only text.
+A failure to read or check the saved paths leaves the notice pending without a send.
 `progress_history.complete_dispatch` records both completed passes and failed managed Astra review passes.
 It matches the slot and dispatch instance id before it records an outcome.
 A refused launcher retry retains the existing pass and its run, including a run with one worker.
@@ -260,6 +347,7 @@ Uncertain ownership or failed closure produces a retained-pane diagnostic.
 
 Event producers call `handle(WorkerEvent(thread_id, EventKind.RUN_FINISHED))` after a run record reaches `finished`.
 The final diff event uses `EventKind.STAGE_READY` for a review with two stages.
+The hook saves the first stage's DONE reply and any results it covers before the second stage starts.
 `detached_runs.py` calls the handler after supervisor completion and orphan completion.
 The director sends the final-diff event with `turn_end.py stage-ready <worker>`.
 
@@ -403,7 +491,7 @@ The launcher retains its original prompt identity and its dispatch record.
 The retained `scripts/direct/claude_worker.py` API runs Claude coordinator steps within its caller's process.
 `assign_claude._run` calls its functions directly.
 The module has no command line or shell protocol.
-It reads `CLAUDE_WORKER_REGISTER_WAIT_SECS` before it stops a source.
+It reads `claude_worker_register_wait_secs` before it stops a source.
 It verifies the destination against the running Claude registry before staff publication.
 It records the role before delivery.
 Delivery starts one Python child through `scripts/lib/py`.
@@ -416,11 +504,11 @@ The child calls `send.py --to session:<id> --from launcher --file <prompt>`.
 The launch returns `Delivered(native_id, turns_before, launch_environment)`, `Unchanged`, or `NotDelivered(code)`.
 `TurnsNotCounted` represents a new session without an earlier turn count.
 `wait_for_turn` reads Claude agent listings and logs in the same process.
-`CLAUDE_WORKER_POLL_SECS` sets its interval; `UNIT_WORKER_POLL_SECS` overrides it.
+`claude_worker_poll_secs` sets its interval; `UNIT_WORKER_POLL_SECS` overrides it.
 One `nix_env.ensure` supplies the settings and start environment.
 The account step uses `accounts.account_for_unscoped_launch`.
 The banner's `backgrounded` line supplies the native id.
-The registry lookup resolves that id within `CLAUDE_WORKER_REGISTER_WAIT_SECS`.
+The registry lookup resolves that id within `claude_worker_register_wait_secs`.
 `assign_claude._run` records published workers in `finally` before it starts the heartbeat watch.
 The watch follows the coordinator process during the wait.
 A signal after the banner stops an unpublished session through `claude stop`.
@@ -694,10 +782,13 @@ The supervisor records the command exit before it starts delivery.
 After the first delivery attempt, it marks the run finished and keeps the latest delivery outcome.
 A failed push saves the send error as pending delivery.
 The finished run leaves the live-run limit and keeps its record and log.
+The start lock serializes orphan scans.
 The reaper saves an ended orphan as finished before it makes one delivery attempt.
 The reaper alerts the director if a finished run still has a failed push and its supervisor is gone.
 Before the reaper alerts for an unconfirmed push, it checks for a receipt.
-A failed turn-end replay waits for the next start or launcher reap to send its alert.
+After the supervisor exits, a worker event records a delivery error even if it occurs before pane input.
+The worker event checks for a receipt and alerts the director if delivery fails or remains unconfirmed.
+A live supervisor retains control of retries and alerts.
 A deferred replay keeps a saved push failure.
 The supervisor uses the retry count and delay in `detached_runs.conf` after it releases the completion lock.
 The supervisor sends again only when the previous attempt sent nothing.
@@ -708,33 +799,82 @@ The next reap can recover an alert if the process exits before the record saves 
 A rare exit or a retirement can repeat the alert once. It never repeats the result.
 The alert for an unconfirmed push says that the result may have arrived.
 If an alert fails, the sender prints one anomaly and keeps the result pending.
-The command runs in its own session, including through a systemd scope prefix.
+The command runs in its own session.
+On natedev, the launcher starts the command scope in `builds-detached-<id>.slice`.
+The slice name uses the run ID without dashes.
+Each run slice is under `builds-detached.slice`, which is under `builds.slice`.
+The limits and anonymous memory totals of `builds.slice` include the nested scopes.
+The queue charges each unowned scope inside a run slice.
+The launcher indexes the run record and saves the slice identity before it starts the command.
+It exports `DETACHED_RUN_SLICE` to the command.
+The index lets the live-run reader find the slice after its supervisor exits.
+The reader also checks records named by live supervisors and legacy stop markers.
+It matches older records without an index to their slice names.
+An index without its record gives a read error.
+The supervisor or reaper removes the slice index after it saves the finished record.
+The scope launchers use the run slice when the variable is set.
+Transient services keep their usual placement.
 `detached_runs.py start` requires `systemd-run --scope` or `systemd-run --user --scope` when the program is `systemd-run`.
 Other `systemd-run` forms return exit 2.
+With a run slice, the launcher uses the user manager and adds `--slice-inherit` to this scope wrapper.
 The guard skips `env` assignments and the two-word `-u` and `--unset` options.
 If `env` uses another option, the guard refuses the start when a later argument contains `systemd-run`.
 To limit memory, use `systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>`.
 The record saves the command's process group as `command_group`.
-The supervisor installs no signal handler.
-`detached_runs.py stop` and a build hold stop send TERM to the command group.
-Each checks the supervisor and the command leader identity before it signals the group.
-Each stages the stop reason before it sends TERM.
+
+1. Wait for the stop lock.
+2. Read the current run record.
+3. Check whether the slice is populated.
+4. Check that the caller's stop route still applies.
+5. Save the stop reason and pane cancellation if both checks pass.
+6. Send TERM through pidfds to processes that still belong to the run slice.
+7. Give the processes the stop grace to exit.
+8. Write `1` to the slice's `cgroup.kill` if the slice is still populated.
+9. Confirm that `cgroup.events` reports `populated 0` or that the kernel removed the empty slice.
+
+An unreadable slice, a replacement directory, or a slice that stays populated after KILL produces an error.
+The record stays running until the supervisor or recovery can confirm that the slice is empty.
+The supervisor saves the exit code and cleanup intent before it releases the watcher.
+The run record saves `finished_at` when it records the confirmed end of the slice.
+The caller saves the stop commit before it sends a signal. The stop commit is final.
+Recovery syncs the record directory before it signals a slice for a saved stop commit.
+A sync error leaves the record available for another attempt.
+A read error before the commit leaves the run record unchanged.
+After supervisor loss, the watcher retries slice reads within the stop grace.
+The hold enforcer checks the active holder set again after it acquires the stop lock.
+If pruning removes the run during the lock wait, the stop returns a refusal.
+Builds Kill recovery uses the same locked route check for a first commit.
+It can finish the commit for its action.
+The stop commit saves the notice ID in the run record.
+Pruning keeps a finished run while its notice ID is present.
+Builds acknowledges the notice ID after it saves `SendingNotice` or confirms that the action was abandoned.
+Builds recovery uses the saved run path to acknowledge notices after either event.
+An acknowledgment confirms the run directory sync even when the notice ID is absent.
+An acknowledgment error does not block notice delivery.
+After acknowledgment, the usual pruning rules apply.
+A run that ends by itself just after the stop commit reports as stopped.
+Recovery finishes committed stops and the pending cleanup of runs without a supervisor.
+On Linux with pidfds, a run without a saved slice can receive TERM and reports an unconfirmed stop.
+On systems without pidfds, the stop checks the saved leader identity and sends TERM to the group.
+The watcher confirms the command group from its own membership before it leaves the group.
+It can send TERM to surviving members after the leader exits.
+The watcher waits for the saved leader and the group to end before it reaps the run.
+The stop grace limits this wait.
+After a normal command exit, the supervisor gives the slice members the stop grace to exit.
+It stops any processes that remain and reports them as a cleanup in the result.
+A build hold records the run as stopped after the same slice stop confirms the end.
 The supervisor stays alive to record the exit status and deliver the result.
 A run with a saved stop reason reports `STOPPED` and includes the reason.
 The result includes the command's exit status.
 Exits 76 and 77 also include instructions for the next action.
-A self-stop requires a native Claude session record or Codex pane report for the caller.
-The caller's worker staff ID must match the run's owner.
-Missing records, unreadable records, and conflicting identities prevent a self-stop.
-The self-stop saves `self_stop: true` with the stop reason.
-The supervisor keeps the pass active and sends the result to the owning worker.
+A committed slice stop cancels the verified owning pass.
+A group stop with `self_stop: true` keeps the pass active and sends the result to the owning worker.
 Delivery stays pending if the worker cannot receive the result.
 If the worker's staff row is gone, the director receives the run result.
-A stop from another caller can cancel the owning pass.
 New worker runs save the recorder pass ID or the reason the lookup failed.
 An unavailable pass ID prevents cancellation of the pass.
 For older runs, the stop checks the fixed worker ID, run folder, and pass start time.
-For either stop kind, the supervisor records the leader's exit status.
+The supervisor records the leader's exit status.
 The supervisor waits for the entire group to end.
 The supervisor starts delivery once the group ends.
 The run stays pending for completion readers until delivery or the reaper confirms that the group ended.
@@ -746,14 +886,16 @@ The stop holds the worker lock, then the admission lock, then the recorder lock.
 The stop checks the shared receipt for DONE before it cancels the pass.
 The recorder saves a verified DONE through normal completion.
 The recorder saves the canceled status, stopped outcome, reason, and notice in one state write.
-Assign can reuse the idle worker while the stopped pass waits for another DONE.
-Restore keeps the stopped pane open while a detached result waits for another DONE.
+After the stop or recorder cancellation, the normal close path closes the idle pane if no live run holds it.
+Restore can close the same idle pane while a stopped reply remains pending.
+The pane close keeps the staff row and native conversation.
+The close checks the current pass under the worker lock after the recorder releases its lock.
 `worker.py answer` reports `no active pass`.
 The turn hook sends the director one stopped notice with the worker name and phase.
 The recorder retains the notice for delivery after another pass replaces the stopped pass.
 The turn hook uses the shared receipt to save a late DONE reply and keep the stopped outcome.
 The receipt checks detached results that belong to the stopped pass.
-A result received after DONE requires another matching DONE.
+A fallback delivery keeps the pass waiting when its DONE precedes the confirmed run finish.
 The turn hook records the saved reply path when the stopped pass is still current.
 After the notice is recorded, the hook locks the worker and checks the pass again.
 It refreshes the saved file from the latest verified reply.
@@ -904,12 +1046,47 @@ Detached command records retain their own process and working directory checks.
 
 The completion hook closes a worker pane after DONE.
 An immediate repair or phase dispatch can retain the pane.
-A canceled or interrupted submission keeps its open or stopped pane until the saved stage receipt and reply match.
+A canceled pass permits closure when the agent is idle and no live run holds the pane.
+An interrupted pass keeps its pane until the saved stage receipt and reply match.
 Pruning uses the same receipt and reply for results from the current pass.
-A live detached run keeps the pass active, so the hook closes no pane until that run ends.
+A finished hook permits closure of an idle pane after pruning removes the detached run records.
+An idle worker parks when its pass waits only on live runs that name the pass.
+Parking closes the pane and keeps the pass, launch settings, and conversation.
+A failed close keeps the park marker while the pass waits only on live runs.
+A later event retries the close.
+A finished result restores the parked worker when the worker still needs the result.
+Restore uses the saved conversation and launch settings. It sends no new assignment.
+An account move also uses the saved conversation and launch settings for a parked worker.
+An explicit restore account applies when reap opens the pane during restore.
+The transcript receipt prevents repeated result input.
 A live detached run also keeps a stopped worker's pane at the shell, so the Codex capacity stop cannot close it.
 When that run ends, its run-end event checks whether the stopped pane can close.
+A run with a dead supervisor and a dead command stays live only if its saved group still has live members.
+Reap recovers the run after its group ends.
+A failed close keeps completion pending for the next event.
+A repeated `finish-pass --status canceled` can retry closure for the same pass.
 The stop report names each pane that stays open.
+`worker.py end` recovers a matching DONE before it retires the worker.
+It also retries a saved unfinished completion.
+It keeps the staff row if the notice or role release remains pending.
+`worker.py end` and `worker.py answer` read the same receipt, `dispatch_receipt`, for the active pass.
+A detached run result that arrives after the DONE needs a new matching DONE.
+Until that DONE, `end` keeps the worker and `answer` sends input with the DONE instruction.
+When the pass is open, the `end` refusal names the next step: `worker.py answer <name> --text TEXT` from the parent session.
+That command asks the worker for the DONE.
+When an ended pass still waits for DONE, `worker.py answer` checks the same receipt.
+This includes a canceled pass without a stopped hook outcome.
+If the idle worker still owes a reply, `answer` sends the director's text and names the results that need replies.
+If Codex aborts that turn after it accepts the prompt, the director can repeat `answer`.
+Each reply clears the results it names by run ID. A matching DONE follows the pass receipt rules.
+When no reply is due, `answer` queues undelivered results for the director before it releases the wait.
+The run ID identifies the notice across retries.
+The command keeps saved delivery records for results it releases.
+`end` gives no `answer` step while a detached run is live, while the pass waits only for reap, or after the pass is canceled.
+`worker.py end` also checks for a late reply after recorder cancellation, even when the pane is closed.
+If it finds a verified reply, it saves the reply and completes the hook before retirement.
+A canceled pass requires no future DONE.
+A delivered STOPPED notice permits retirement if no verified late reply exists.
 The close reads no process. It closes the pane at once.
 Closure keeps the staff row and thread.
 The next assign resumes that thread in a new pane.
@@ -937,16 +1114,18 @@ It stores none of these three fields.
 Unavailable backend evidence gives `account` the `AccountUnavailable` state and its cause.
 That row has no `home` field.
 
-`worker.py list [open|closed|all]` defaults to open panes.
+`worker.py list [open|closed|all]` defaults to open panes and parked workers.
 `list closed` shows closed panes. `list all` includes uncertain rows too.
 The positional filter uses `WorkerFilter`; `--all-parents` replaces the old `--all` flag.
 The flag still selects saved dispatches from every parent.
-`list all --json --all-parents` needs no caller staff row or live pane read.
+`list all --json --all-parents` needs no caller staff row.
+It reads pane evidence for a worker with a park record.
 Open and closed filters use current pane evidence, including with `--all-parents`.
 
 Text output has aligned headers: `#`, `Name`, `Account`, `Activity`, `Pane`, `State`, and `Waiting on`.
 Activity uses the active dispatch kind, then the worker's role when no dispatch is active.
 Waiting on uses existing live detached run labels and shows `-` without a specific run.
+A parked worker shows `parked` with its live run labels.
 Text rows place open panes first and retain the current order inside each group.
 `_worker_pane_state` maps each observed worker to its pane and state words.
 

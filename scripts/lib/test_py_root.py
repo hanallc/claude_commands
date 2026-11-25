@@ -5,8 +5,8 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
-import tarfile
 import unittest
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -45,8 +45,10 @@ def load_tests(loader, tests, pattern):
 COPY_TARGETED_RUN = COPY_IMPORT_AUDIT + '''
 import runpy
 from unittest import mock
+from scripts.copies import copies
 from scripts.production import gate
 root = Path(os.environ['EXPECTED_CHECKOUT'])
+os.environ['BUILDLOG_PREPARED_COPY'] = str(root.resolve())
 os.environ['GATE_STATE_DIR'] = str(root / 'gate-state')
 os.environ['GATE_PASSED_DIR'] = str(root / 'gate-passes')
 def selected_suite(repo, *args, **kwargs):
@@ -55,29 +57,32 @@ def selected_suite(repo, *args, **kwargs):
         selected=gate.SelectedModules(('scripts/build_targets/test_copy_imports.py',)),
         mode=kwargs['mode'])
 sys.argv = [str(root / 'scripts/production/targeted_test.py'), '--repo', str(root)]
-with mock.patch.object(gate, 'run_gate_suites', side_effect=selected_suite):
+with (mock.patch.object(copies, 'take_prepared_gate_handoff', return_value=True),
+      mock.patch.object(gate, 'run_gate_suites', side_effect=selected_suite)):
     try:
         runpy.run_path(sys.argv[0], run_name='__main__')
     finally:
         audit()
 '''
-COPY_DETACHED_RUN = '''import argparse, os, sys
+COPY_DETACHED_RUN = '''import json, os, sys, time
 from pathlib import Path
 from unittest import mock
 from scripts.agents import detached_runs
 
 root = Path(os.environ['EXPECTED_CHECKOUT'])
 record_path = root / 'detached.json'
-record = dict(status='running', pid=os.getpid(), session_dir=str(root), worker='fixture-test',
-              staff_id='fixture-staff', log=str(root / 'detached.log'),
-              command=[sys.executable, *sys.argv[1:]])
+# The supervisor saves the record itself, so the probe keeps a real record file.
+_ = record_path.write_text(json.dumps(dict(
+    run_id='detached', status='running', session_dir=str(root), worker='fixture-test',
+    staff_id='fixture-staff', label='copy imports', command=[sys.executable, *sys.argv[1:]],
+    log=str(root / 'detached.log'), started_at=time.time(), pid=os.getpid(),
+    director_dir=str(root), done_message_file=str(root / 'done.md'))))
 # Simulate a supervisor that inherited the root from an older launcher.
 os.environ['PYTHONPATH'] = str(Path(__file__).parent)
-with (mock.patch.object(detached_runs, '_read_record', side_effect=lambda path: record.copy()),
-      mock.patch.object(detached_runs, '_write_record', side_effect=lambda path, value: record.update(value) or value),
-      mock.patch.object(detached_runs, '_finish_record'),
+with (mock.patch.object(detached_runs, '_finish_record'),
       mock.patch.object(detached_runs, 'deliver_in_fresh_process', return_value=0)):
     status = detached_runs.main(['supervise', str(record_path)])
+record = json.loads(record_path.read_text())
 print(Path(record['log']).read_text())
 assert status == 0 and record['exit_code'] == 0, record
 '''
@@ -108,20 +113,22 @@ class PythonRootTests(unittest.TestCase):
 
     def test_old_revision_uses_its_own_scripts_with_the_new_shim(self) -> None:
         repository = Path(__file__).resolve().parents[2]
+        shim = Path("scripts/lib/py")
+        module = Path("scripts/build_targets/execution_transport.py")
         with tempfile.TemporaryDirectory() as directory:
-            folder = Path(directory)
-            archive = folder / "HEAD.tar"
-            _ = subprocess.run(["git", "archive", "847e0da3f", "-o", str(archive)],
-                               cwd=repository, check=True, timeout=30)
-            checkout = folder / "HEAD"
-            checkout.mkdir()
-            with tarfile.open(archive) as source:
-                source.extractall(checkout, filter="data")
-            self.assertFalse((checkout / "scripts/lib/python_startup/sitecustomize.py").exists())
-            output = self.run_shim(repository / "scripts/lib/py", ["-c",
-                "from scripts.build_targets import test_aws_status; print(test_aws_status.__file__)"],
+            checkout = Path(directory).resolve() / "old-checkout"
+            for relative in (shim, module):
+                destination = checkout / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                _ = shutil.copy2(repository / relative, destination)
+            self.assertTrue((checkout / shim).is_file())
+            self.assertFalse((checkout / "scripts/lib/python_startup").exists())
+            for package in ("scripts", "scripts/lib", "scripts/build_targets"):
+                self.assertFalse((checkout / package / "__init__.py").exists(), package)
+            output = self.run_shim(repository / shim, ["-c",
+                "from scripts.build_targets import execution_transport; print(execution_transport.__file__)"],
                 checkout, dict(os.environ))
-            self.assertEqual(Path(output).resolve(), checkout / "scripts/build_targets/test_aws_status.py")
+            self.assertEqual(Path(output).resolve(), checkout / module)
 
     def test_separator_preserves_a_filename_that_starts_with_a_dash(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -208,6 +215,30 @@ class PythonRootTests(unittest.TestCase):
                     output = self.run_shim(shim, ["-c", "import os; print(os.environ['ROOT_HOOK'])"],
                                            Path("/"), environment)
                     self.assertEqual(output, "loaded")
+
+    def test_chained_hook_and_callback_do_not_import_typing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            shim = self.checkout(base / "selected", "selected")
+            hook = base / "hook"
+            hook.mkdir()
+            _ = (hook / "sitecustomize.py").write_text(
+                "from sitecustomize import after_startup\n"
+                + "after_startup(lambda: print('callback ran'))\n",
+                encoding="utf-8",
+            )
+            startup = shim.parent / "python_startup"
+            result = subprocess.run(
+                [sys.executable, "-c", "import sys; print('typing' in sys.modules)"],
+                cwd=shim.parents[2],
+                env={"PYTHONPATH": os.pathsep.join((str(startup), str(hook))), "PYTHONNOUSERSITE": "1"},
+                capture_output=True,
+                text=True,
+                timeout=TEST_HANG_GUARD_SECS,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.splitlines(), ["callback ran", "False"])
 
     def test_isolated_script_loads_the_root_without_inherited_paths_or_user_site(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

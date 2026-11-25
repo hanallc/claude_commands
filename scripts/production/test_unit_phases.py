@@ -30,6 +30,7 @@ from scripts.production import census, display_cells, land_queue, land_runs, liv
 from scripts.accounts import session_state
 from scripts.lib import conf, unit_runs
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
+from scripts.message import send as message_send
 from scripts.production import showrunners
 from scripts.production import unit_lookup
 from scripts.production import session_staff, unit_config
@@ -450,7 +451,7 @@ class UnitPhasesTests(unittest.TestCase):
             event.update(schema_version=progress_history.SCHEMA_VERSION, run_id=run.name, working_dir=str(self.root))
         _ = history.write_text("".join(json.dumps(event) + "\n" for event in events))
         _ = state.write_text(json.dumps(converted))
-        commit = "a" * 40
+        commit = self.repository()
         checkpoint = progress("checkpoint", "--commit", commit, "--phase-id", "visible")
         self.assertEqual(checkpoint.returncode, 0, checkpoint.stderr)
         history_before = history.read_bytes()
@@ -505,12 +506,14 @@ class UnitPhasesTests(unittest.TestCase):
             with (patch.object(session_staff, "pane_parents", return_value=[member]),
                   patch.object(worker_panes, "observe_parents", return_value={member.id: [opened]}),
                   patch.object(worker_panes, "observe", side_effect=[[opened], [closed]]) as observed,
+                  patch.object(worker_panes, "observe_worker", return_value=closed),
+                  patch.object(worker_panes, "close", return_value=worker_panes.Closed()),
                   patch.object(worker_panes, "parent_run_index", return_value={member.current_session: [str(run)]}),
-                  patch.object(worker_panes, "worker_lock", return_value=contextlib.nullcontext()),
                   patch.object(herdr, "Herdr"), patch.object(herdr, "shared_session", return_value="fixture"),
                   patch.object(restart, "stop_row", return_value=True) as stop_row,
                   patch.object(detached_runs, "live_runs_for_staff", return_value=[]),
                   patch.object(worker_panes, "forget_restart"),
+                  patch.object(message_send, "send", return_value=message_send.Result("sent", "fixture")),
                   patch.object(worker_capacity, "_send", return_value=True) as send,
                   patch.object(showrunners, "load_settings_from", return_value={"faults_to": "fixture-faults"}),
                   contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors)):
@@ -747,6 +750,25 @@ class UnitPhasesTests(unittest.TestCase):
                                   detail_rows(rendered, "roles"))
                     self.assertNotIn("— working", rendered)
 
+    def test_board_shows_active_run_as_built_worker_work(self) -> None:
+        member = self.member("document")
+        worker = census_worker("writer", member.id)
+        events: list[dict[str, object]] = [
+            self.phase_event("phase_finished", "1", status="completed"),
+            {"event_type": "pass_started", "phase_id": "as-built", "phase_title": "Run as-built",
+             "phase_instance_id": "", "pass_instance_id": "writer", "pass_kind": "impl", "worker_id": worker.staff_id},
+        ]
+        plan = typed_record(self.root / "plan.md", "done")
+        _ = self.write_run(member, "document", [("1", "Delivery 1")], events)
+
+        rendered = self.blocks([member], {member.name: plan}, workers=[worker])
+
+        self.assertIn("**document** — working", rendered)
+        self.assertIn(("Now", "Run as-built", "Implementation worker runs it"), detail_rows(rendered, member.name))
+        events.append({"event_type": "pass_finished", "phase_id": "as-built", "pass_instance_id": "writer"})
+        _ = self.write_run(member, "document", [("1", "Delivery 1")], events)
+        self.assertNotIn("Run as-built", self.blocks([member], {member.name: plan}, workers=[worker]))
+
     def test_task_is_the_newest_open_activity_before_the_open_pass(self) -> None:
         member = self.member("activity")
         tail = [self.phase_event("pass_started", "board", pass_instance_id="pass", pass_kind="impl"),
@@ -971,6 +993,35 @@ class UnitPhasesTests(unittest.TestCase):
                                      else "Waits for build queue; holder not recorded")
                         self.assertIn(("Now", "Check delivery (work)", state + "; since 17:58"), detail_rows(rendered, "style"))
 
+    def test_partial_census_identity_does_not_join_shell_work(self) -> None:
+        machine = remote.local_machine()
+        now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
+        units: list[live_units.LiveUnit] = []
+        rows: list[dict[str, object]] = []
+        for name, pid, command in (("verified", 321, "Verified command"), ("partial", 322, "Unverified command")):
+            member = self.member(name)
+            generation = session_staff.ProvedProcessGeneration(pid, "30352793")
+            claude = live(name)._replace(session_id=member.current_session, pid=pid, activity="idle")
+            units.append(unit(name, claude)._replace(owner=unit_lookup.ProvedLiveUnit(claude, generation)))
+            rows.append({"session": member.current_session, "machine": machine, "pid": pid,
+                         "process_start": generation.started, "shells": [{"name": command}]})
+        verified, partial = rows
+
+        for missing in ("machine", "pid", "process_start"):
+            with self.subTest(missing=missing):
+                read = census.parse(json.dumps({
+                    "schema": 2, "machines": [{"name": machine, "reachable": True}], "workers": [],
+                    "sessions": [verified, {key: value for key, value in partial.items() if key != missing}],
+                }))
+                output = unit_phases.table(units, {}, repository=self.root, now=now, zone=ZoneInfo("UTC"),
+                                           census_read=read)
+                self.assertIn("working 1", output.splitlines()[0])
+                self.assertIn("idle 0 · unknown 1", output.splitlines()[0])
+                self.assertIn(("Now", "Verified command", "Runs in the background"), detail_rows(output, "verified"))
+                self.assertIn(("Now", "Not recorded", "Director shell work cannot be verified"),
+                              detail_rows(output, "partial"))
+                self.assertNotIn("Unverified command", output)
+
     def test_notes_name_verified_background_commands_and_a_sent_checkpoint(self) -> None:
         member = self.member("shells")
         now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
@@ -992,13 +1043,12 @@ class UnitPhasesTests(unittest.TestCase):
         codex = unit_lookup.LabeledSession("shells", unit_lookup.ClaudeUnknown("no Claude registry record"),
             HerdrPlace("codex", "w1:p1"), process=session_staff.ProvedCodexPaneProcess(generation.pid, "codex"),
             identity=unit_lookup.LiveSession(member.current_session), generation=generation)
-        verified = read.sessions[0]._replace(machine=machine,
-            process=census.CensusProcessIdentity(generation.pid, generation.started))
-        pid_mismatch = verified._replace(process=census.CensusProcessIdentity(322, generation.started))
-        start_mismatch = verified._replace(process=census.CensusProcessIdentity(generation.pid, "30352794"))
+        verified = read.sessions[0]._replace(machine=machine, pid=generation.pid, process_start=generation.started)
+        pid_mismatch = verified._replace(pid=322)
+        start_mismatch = verified._replace(process_start="30352794")
         machine_mismatch = verified._replace(machine=other_machine)
         stale_shell = machine_mismatch._replace(shells=(census.CensusShell("Old command", None),))
-        pair_absent = verified._replace(process=census.CensusProcessUnreported())
+        pair_absent = verified._replace(pid=census.CensusProcessUnreported(), process_start=census.CensusProcessUnreported())
         for owner in (unit_lookup.ProvedLiveUnit(claude, generation), unit_lookup.ProvedLiveUnit(codex)):
             for case, sessions, matches in (
                     ("match", (verified,), True),
@@ -1062,15 +1112,15 @@ class UnitPhasesTests(unittest.TestCase):
             self.assertIn(("Now", "Unnamed background command", "Runs in the background"),
                           detail_rows(output, "shells"))
 
-        # A half pair fails parsing before the board can use any shell rows.
-        half_pair = census.parse(json.dumps({
+        # A malformed start prevents the board from using the census.
+        malformed = census.parse(json.dumps({
             "schema": 2, "machines": [], "workers": [],
             "sessions": [{"session": member.current_session, "machine": machine, "pid": generation.pid,
-                          "shells": [{"name": "Run the AWS gate"}]}],
+                          "process_start": None, "shells": [{"name": "Run the AWS gate"}]}],
         }))
-        self.assertIsInstance(half_pair, census.CensusFailed)
+        self.assertIsInstance(malformed, census.CensusFailed)
         output = unit_phases.table([selected._replace(owner=unit_lookup.ProvedLiveUnit(claude, generation))], {},
-            repository=self.root, now=now, zone=ZoneInfo("UTC"), census_read=half_pair)
+            repository=self.root, now=now, zone=ZoneInfo("UTC"), census_read=malformed)
         self.assertIn("idle 0 · unknown 1", output.splitlines()[0])
         self.assertNotIn("Run the AWS gate", output)
         self.assertNotIn("Nothing to do", output)
@@ -1078,7 +1128,7 @@ class UnitPhasesTests(unittest.TestCase):
         paused = replace(member, paused=staff.Paused("2026-11-15T17:00:00+00:00", "showrunner", "review the board"))
         idle_owner = unit_lookup.ProvedLiveUnit(claude._replace(activity="idle"), generation)
         paused_unit = selected._replace(member=paused, owner=idle_owner, lifecycle="paused")
-        for evidence, count in ((tiles(sessions=(empty_match,)), "idle 1"), (half_pair, "idle 0 · unknown 1")):
+        for evidence, count in ((tiles(sessions=(empty_match,)), "idle 1"), (malformed, "idle 0 · unknown 1")):
             with self.subTest(case="paused with live owner", census_failed=isinstance(evidence, census.CensusFailed)):
                 output = unit_phases.table([paused_unit], {}, repository=self.root, now=now, zone=ZoneInfo("UTC"),
                     census_read=evidence)
@@ -1287,6 +1337,35 @@ class UnitPhasesTests(unittest.TestCase):
                     queue_rows = detail_rows(rendered, dependent.name)
                     self.assertEqual(any(row.state == "Ready" for row in queue_rows), not expected, queue_rows)
                     self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
+
+    def test_late_checkpoint_updates_pending_merges_and_dependencies_for_the_latest_attempt(self) -> None:
+        member = self.member("finished")
+        dependent = self.member("dependent")
+        _ = self.queue(dependent, unit_queue.QueuedItem("Review delivery", "finished/delivery"))
+        older_commit = self.repository()
+        commit = commit_repository(self.root, "Finished delivery", allow_empty=True)
+        at = datetime(2026, 11, 15, 17, 50, tzinfo=UTC).timestamp()
+        _ = self.write_run(member, "late-checkpoint", [("delivery", "Delivery")], [
+            self.phase_event("phase_finished", "delivery", status="completed"),
+            self.phase_event("phase_started", "delivery", phase_title="Delivery", phase_instance_id="retry"),
+            self.phase_event("phase_finished", "delivery", phase_instance_id="retry", status="completed"),
+            self.phase_event("checkpoint", "delivery", phase_instance_id="retry",
+                             checkpoint_commit=commit, timestamp_epoch=at),
+            self.phase_event("activity_started", "delivery", phase_instance_id="retry",
+                             activity_text="writes the phase report"),
+            self.phase_event("checkpoint", "delivery", checkpoint_commit=older_commit, timestamp_epoch=at + 60),
+        ])
+
+        rendered = self.blocks([member, dependent], {})
+        self.assertIn(("Now", "Delivery (delivery)", f"Checkpoint {commit[:9]} at 17:50; not in sdlc's merge line"),
+                      detail_rows(rendered, member.name))
+        self.assertIn(("Now", "Review delivery", "After finished phase delivery; merge position not recorded"),
+                      detail_rows(rendered, dependent.name))
+
+        _ = self.git("update-ref", "refs/remotes/origin/main", commit)
+        rendered = self.blocks([member, dependent], {})
+        self.assertNotIn("Delivery (delivery)", [row.work for row in detail_rows(rendered, member.name)])
+        self.assertIn(("Next", "Review delivery", "Ready"), detail_rows(rendered, dependent.name))
 
     def test_finished_checkpoint_copies_share_main_and_checkpoint_reads(self) -> None:
         member = self.member("copies")
@@ -1751,6 +1830,108 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertIn(("Now", "Delivery (delivery)",
                     "Checkpoint aaaaaaaaa at time not recorded; not in sdlc's merge line"), detail_rows(rendered, member.name))
                 self.assertIn("**waiting** — waiting to merge", rendered)
+
+    def test_late_checkpoint_does_not_clear_the_retry_eta(self) -> None:
+        now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
+        events = [
+            self.phase_event("phase_started", "work"),
+            self.phase_event("eta_stated", "work", eta_phase_id="work", eta_at=now + 300),
+            self.phase_event("phase_finished", "work", status="stopped"),
+            self.phase_event("phase_started", "other"),
+            self.phase_event("eta_stated", "other", eta_phase_id="work", eta_at=now + 600),
+            self.phase_event("checkpoint", "work", checkpoint_commit="a" * 40),
+        ]
+        land = land_queue.LandView({}, {}, {}, frozenset(), {})
+        pending = unit_phases.pending_eta_cell(events, ("other",), land, unit="eta", now=now, zone=ZoneInfo("UTC"))
+        self.assertEqual(pending, "phase work: 18:10")
+
+        events.extend([
+            self.phase_event("phase_started", "work", phase_instance_id="retry"),
+            self.phase_event("phase_finished", "work", phase_instance_id="retry", status="stopped"),
+        ])
+        pending = unit_phases.pending_eta_cell(events, ("other",), land, unit="eta", now=now, zone=ZoneInfo("UTC"))
+        self.assertEqual(pending, display_cells.NONE)
+
+    def test_late_merge_result_does_not_clear_the_retry_eta(self) -> None:
+        now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
+        old_commit, retry_commit = "a" * 40, "b" * 40
+        stated = now - 120
+        events = [
+            self.phase_event("phase_started", "work"),
+            self.phase_event("phase_finished", "work", status="stopped"),
+            self.phase_event("eta_stated", "other", eta_phase_id="work", eta_at=now + 600, timestamp_epoch=stated),
+            self.phase_event("checkpoint", "work", checkpoint_commit=old_commit, timestamp_epoch=stated + 10),
+        ]
+        result: land_runs.LandResult = {"commit": old_commit, "production": "sdlc", "unit": "eta", "phase": "work",
+            "landed": True, "step": "push", "state": "done", "detail": "",
+            "time": datetime.fromtimestamp(now - 60, UTC).isoformat()}
+        land = land_queue.LandView({}, {}, {old_commit: result}, frozenset(), {})
+        zone = ZoneInfo("UTC")
+        self.assertEqual(unit_phases.pending_eta_cell(events, (), land, unit="eta", now=now, zone=zone),
+                         "phase work: 18:10")
+
+        retry = [
+            self.phase_event("phase_started", "work", phase_instance_id="retry"),
+            self.phase_event("checkpoint", "work", phase_instance_id="retry", checkpoint_commit=retry_commit),
+            self.phase_event("eta_stated", "work", phase_instance_id="retry", eta_phase_id="work",
+                             eta_at=now + 600, timestamp_epoch=stated),
+        ]
+        self.assertEqual(unit_phases.pending_eta_cell(events + retry, (), land, unit="eta", now=now, zone=zone),
+                         "phase work: 18:10")
+        both = land._replace(results={old_commit: result, retry_commit: {**result, "commit": retry_commit}})
+        self.assertEqual(unit_phases.pending_eta_cell(events + retry, (), both, unit="eta", now=now, zone=zone),
+                         display_cells.NONE)
+        retry[1]["checkpoint_commit"] = old_commit
+        self.assertEqual(unit_phases.pending_eta_cell(events + retry, (), land, unit="eta", now=now, zone=zone),
+                         "phase work: 18:10")
+
+    def test_failed_merge_with_a_short_hash_preserves_the_retry_eta(self) -> None:
+        now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
+        commit = "0123456789" * 4
+        events = [
+            self.phase_event("phase_started", "work"),
+            self.phase_event("phase_finished", "work", status="stopped"),
+            self.phase_event("eta_stated", "other", eta_phase_id="work", eta_at=now + 600, timestamp_epoch=now - 120),
+            self.phase_event("checkpoint", "work", checkpoint_commit=commit, timestamp_epoch=now - 90),
+        ]
+        short = commit[:9]
+        result: land_runs.LandResult = {"commit": short, "production": "sdlc", "unit": "eta", "phase": "work",
+            "landed": False, "step": "tests", "state": "failed", "detail": "Test failed",
+            "time": datetime.fromtimestamp(now - 60, UTC).isoformat()}
+        land = land_queue.LandView({}, {}, {short: result}, frozenset(), {})
+        self.assertEqual(unit_phases.pending_eta_cell(events, (), land, unit="eta", now=now, zone=ZoneInfo("UTC")),
+                         "phase work: 18:10")
+
+    def test_merge_result_clears_eta_without_a_recorded_checkpoint(self) -> None:
+        now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
+        stated = now - 120
+        events = [self.phase_event("eta_stated", "other", eta_phase_id="work", eta_at=now + 600,
+                                   timestamp_epoch=stated)]
+        commit = "a" * 40
+        result: land_runs.LandResult = {"commit": commit, "production": "sdlc", "unit": "eta", "phase": "work",
+            "landed": True, "step": "push", "state": "done", "detail": "",
+            "time": datetime.fromtimestamp(now - 60, UTC).isoformat()}
+        land = land_queue.LandView({}, {}, {commit: result}, frozenset(), {})
+        zone = ZoneInfo("UTC")
+        for other_result in ({**result, "unit": "other"},
+                             {**result, "time": datetime.fromtimestamp(stated, UTC).isoformat()}):
+            other_land = land._replace(results={commit: other_result})
+            self.assertEqual(unit_phases.pending_eta_cell(events, (), other_land, unit="eta", now=now, zone=zone),
+                             "phase work: 18:10")
+        self.assertEqual(unit_phases.pending_eta_cell(events, (), land, unit="eta", now=now, zone=zone),
+                         display_cells.NONE)
+
+    def test_stopped_finish_clears_eta_without_a_recorded_start(self) -> None:
+        now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
+        events = [self.phase_event("eta_stated", "other", eta_phase_id="work", eta_at=now + 600)]
+        land = land_queue.LandView({}, {}, {}, frozenset(), {})
+        zone = ZoneInfo("UTC")
+        self.assertEqual(unit_phases.pending_eta_cell(events, (), land, unit="eta", now=now, zone=zone),
+                         "phase work: 18:10")
+
+        events.append(self.phase_event("phase_finished", "work", status="stopped"))
+        self.assertEqual(unit_phases.pending_eta_cell(events, (), land, unit="eta", now=now, zone=zone),
+                         display_cells.NONE)
 
     def test_eta_uses_the_latest_promise_and_local_calendar_time(self) -> None:
         member = self.member("eta")
@@ -2678,7 +2859,7 @@ class UnitPhasesTests(unittest.TestCase):
         config = self.root / "config"
         config.mkdir()
         _ = write_config_fixture(config / "production.conf",
-                                 "UNIT_ANOMALIES_TO=fixture-director\nunits_anomaly_repeat_minutes=60\n")
+                                 "unit_anomalies_to=fixture-director\nunits_anomaly_repeat_minutes=60\n")
         def observed(*, record: staff.StaffSnapshot, running: object = None) -> tuple[session_staff.LabeledSession, ...]:
             self.assertEqual(record.by_id(member.id), member)
             self.assertIsNone(running)

@@ -11,6 +11,7 @@ import textwrap
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
@@ -166,7 +167,7 @@ class RealHookEquivalenceTests(IsolatedHookTests):
     def test_context_deferral_block_reaches_the_caller(self) -> None:
         config = self.root / "config"
         config.mkdir()
-        _ = (config / "context_deferral.conf").write_bytes((ROOT / "config/context_deferral.conf").read_bytes())
+        _ = copy_config_file_fixture(ROOT / "config/context_deferral.conf", config / "context_deferral.conf")
         self.environment["CONF_DIR"] = str(config)
         result = self.run_python([str(DISPATCH), "stop"], {
             "last_assistant_message": "I will do it after the context reset.",
@@ -397,20 +398,136 @@ class FakeHookTests(IsolatedHookTests):
                     }, "not JSON\n" if detail == "exit 0" else ""))
 
     def test_timeout_discards_partial_output_and_runs_later_hook(self) -> None:
+        later: dict[str, object] = {"custom": "later", "systemMessage": "later hook ran"}
+        for stalled in ("hook", "preload"):
+            with self.subTest(stalled=stalled):
+                if stalled == "hook":
+                    outcome = self.run_fakes("post_tool_use", [
+                        FakeHook("import time\nprint('{\"custom\": \"discarded\"}', flush=True)\ntime.sleep(0.5)", 0.04),
+                        FakeHook(emit(later)),
+                    ])
+                else:
+                    entered = self.root / "preload-entered"
+                    finished = self.root / "preload-finished"
+                    for name, source in (("stop-context-deferral.py", "pass"), ("herdr_tab_title.py", emit(later))):
+                        _ = (self.root / name).write_text(source)
+                    driver = (
+                        "import sys, time\nfrom pathlib import Path\n"
+                        + "from scripts.hooks import hook_dispatch as dispatch\n"
+                        + "def preload(modules):\n"
+                        + f"    Path({str(entered)!r}).touch()\n"
+                        + "    time.sleep(1.5)\n"
+                        + f"    Path({str(finished)!r}).touch()\n"
+                        + "dispatch.HOOK_SETUP_SECONDS = 0.5\ndispatch._preload_shared_dependencies = preload\n"
+                        + f"dispatch.HOOKS = Path({str(self.root)!r})\n"
+                        + "dispatch.EVENTS['stop'] = tuple(dispatch.HookSpec(name, None) for name in "
+                        + "('stop-context-deferral.py', 'herdr_tab_title.py'))\n"
+                        + "sys.argv = ['hook_dispatch.py', 'stop']\ndispatch.main()\n"
+                    )
+                    outcome = self.event_outcome(self.run_python(["-c", driver], {}))
+                    self.assertTrue(entered.exists())
+                    self.assertFalse(finished.exists())
+                self.assertEqual(outcome, EventOutcome(0, later, ""))
+
+    def test_deadline_kills_and_reaps_a_blocked_hook(self) -> None:
+        with self.subTest(cancelled="hook"):
+            self.check_blocked_hook_deadline()
+        with self.subTest(cancelled="dispatcher"):
+            self.check_dispatcher_exit_after_approval()
+
+    def check_blocked_hook_deadline(self) -> None:
+        pid_file = self.root / "blocked-pid"
+        unwound = self.root / "blocked-finally"
         outcome = self.run_fakes("post_tool_use", [
-            FakeHook("import time\nprint('{\"custom\": \"discarded\"}', flush=True)\ntime.sleep(0.5)", 0.04),
-            FakeHook(emit({"custom": "later", "systemMessage": "later hook ran"})),
+            FakeHook("import os, sys, time\nfrom pathlib import Path\n"
+                     + f"Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+                     + "print('{\"custom\": \"discarded\"}', flush=True)\n"
+                     + "print('discarded stderr', file=sys.stderr, flush=True)\n"
+                     + "try:\n    time.sleep(60)\nfinally:\n"
+                     + f"    Path({str(unwound)!r}).touch()\n", 0.5),
+            FakeHook("import os\nfrom pathlib import Path\n"
+                     + f"pid = int(Path({str(pid_file)!r}).read_text())\n"
+                     + "try:\n    os.kill(pid, 0)\nexcept ProcessLookupError:\n"
+                     + "    print('{\"reaped\": true}')\n"),
         ])
-        self.assertEqual(outcome, EventOutcome(0, {"custom": "later", "systemMessage": "later hook ran"}, ""))
+        self.assertEqual(outcome, EventOutcome(0, {"reaped": True}, ""))
+        self.assertFalse(unwound.exists())
+
+    def check_dispatcher_exit_after_approval(self) -> None:
+        later = self.root / "later-hook-ran"
+        _ = (self.root / "stop-context-deferral.py").write_text(
+            "import os, socket\n"
+            + "with socket.socket(fileno=int(os.environ['DISPATCH_TEST_CONTROL_FD'])) as control:\n"
+            + "    control.sendall(b'1')\n"
+            + "    assert control.recv(1) == b'1'\n",
+        )
+        _ = (self.root / "herdr_tab_title.py").write_text(
+            "from pathlib import Path\n" + f"Path({str(later)!r}).touch()\n",
+        )
+        driver = textwrap.dedent(f"""
+            import os, signal, socket, sys
+            from pathlib import Path
+            from scripts.hooks import hook_dispatch as dispatch
+
+            supervisor, hook = socket.socketpair()
+            with supervisor, hook:
+                pid = os.fork()
+                if pid == 0:
+                    supervisor.close()
+                    os.environ['DISPATCH_TEST_CONTROL_FD'] = str(hook.fileno())
+                    dispatch.HOOKS = Path({str(self.root)!r})
+                    dispatch.EVENTS['stop'] = tuple(dispatch.HookSpec(name, None, 5) for name in
+                                                    ('stop-context-deferral.py', 'herdr_tab_title.py'))
+                    sys.argv = ['hook_dispatch.py', 'stop']
+                    dispatch.main()
+                hook.close()
+                supervisor.settimeout(5)
+                try:
+                    assert supervisor.recv(1) == b'1'
+                finally:
+                    os.kill(pid, signal.SIGKILL)
+                    assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == -signal.SIGKILL
+                supervisor.sendall(b'1')
+                assert supervisor.recv(1) == b''
+            """)
+        result = self.run_python(["-c", driver], {})
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertFalse(later.exists())
 
     def test_hook_can_install_and_receive_its_own_alarm(self) -> None:
         outcome = self.run_fakes("stop", [FakeHook(
-            "import json, signal, time\n"
-            + "def alarm(signum, frame):\n    print(json.dumps({'alarm_received': True}))\n"
-            + "signal.signal(signal.SIGALRM, alarm)\n"
-            + "signal.setitimer(signal.ITIMER_REAL, 0.02)\ntime.sleep(0.06)\n"
+            "import json, signal\n"
+            + "alarms = {signal.SIGALRM}\nsignal.pthread_sigmask(signal.SIG_BLOCK, alarms)\n"
+            + "signal.setitimer(signal.ITIMER_REAL, 0.02)\n"
+            + "print(json.dumps({'alarm_received': signal.sigwait(alarms) == signal.SIGALRM}))\n"
         )])
         self.assertEqual(outcome, EventOutcome(0, {"alarm_received": True}, ""))
+
+    def test_alarm_handler_stays_in_the_hook_child(self) -> None:
+        rows = self.fake_files([
+            FakeHook("import signal\n"
+                     + "alarms = {signal.SIGALRM}\nsignal.pthread_sigmask(signal.SIG_BLOCK, alarms)\n"
+                     + "signal.raise_signal(signal.SIGALRM)\n"
+                     + "if signal.sigwait(alarms) == signal.SIGALRM: print('alarm received')\n"),
+            FakeHook("import signal\nprint(signal.SIGALRM not in signal.pthread_sigmask(signal.SIG_BLOCK, set()))\n"),
+        ])
+        driver = (
+            "import json, signal\nfrom pathlib import Path\n"
+            + "from scripts.hooks.hook_dispatch import run_hook\n"
+            + "before = signal.getsignal(signal.SIGALRM)\nmask = signal.pthread_sigmask(signal.SIG_BLOCK, set())\n"
+            + "installs = []\n"
+            + "def track(signum, handler):\n    installs.append(signum)\n    raise AssertionError('signal handler')\n"
+            + "signal.signal = track\n"
+            + f"results = [run_hook(Path(path), '{{}}', limit) for path, _, limit in {rows!r}]\n"
+            + "print(json.dumps({'outputs': [r.stdout for r in results], 'installs': installs,\n"
+            + "                  'parent_unchanged': signal.getsignal(signal.SIGALRM) == before and "
+            + "signal.pthread_sigmask(signal.SIG_BLOCK, set()) == mask}))\n"
+        )
+        result = self.run_python(["-c", driver], {})
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(parsed_output(result.stdout), {
+            "outputs": ["alarm received\n", "True\n"], "installs": [], "parent_unchanged": True,
+        })
 
     def test_process_environment_argv_and_directory_are_restored(self) -> None:
         self.environment["DISPATCH_FIXTURE"] = "original"
@@ -447,6 +564,43 @@ class FakeHookTests(IsolatedHookTests):
 
 
 class SettingsRegistrationTests(IsolatedHookTests):
+    def test_matching_hooks_share_parent_imports_and_frozen_objects(self) -> None:
+        copy_modules = ["scripts.copies.copies", "scripts.copies.copy_guard", "scripts.lib.conf",
+                        "scripts.production.staff"]
+        stop_modules = ["scripts.lib.conf", "scripts.lib.script_prompts", "scripts.production.staff"]
+        rows: tuple[tuple[str, str, list[str]], ...] = (
+            ("pre_tool_use", "Bash", sorted([*copy_modules, "scripts.hooks.checkpoint_gate"])),
+            ("pre_tool_use", "Write", copy_modules),
+            ("post_tool_use", "Bash", []),
+            ("stop", "", stop_modules),
+        )
+        driver = (
+            "import gc, json, sys\nfrom pathlib import Path\n"
+            + "from scripts.hooks import hook_dispatch as dispatch\n"
+            + f"modules = {sorted({*copy_modules, *stop_modules, 'scripts.hooks.checkpoint_gate'})!r}\n"
+            + "record = Path(sys.argv.pop())\ninitial = gc.get_freeze_count()\nenabled = gc.isenabled()\n"
+            + "def run_hook(path: Path, payload: str, timeout) -> dispatch.HookResult:\n"
+            + "    observation = ([name for name in modules if name in sys.modules], "
+            + "gc.get_freeze_count() > 0, gc.isenabled() == enabled)\n"
+            + "    with record.open('a') as output: print(json.dumps(observation), file=output)\n"
+            + "    return dispatch.HookResult(path.name, 0, '', '')\n"
+            + "dispatch.run_hook = run_hook\n"
+            + "try: dispatch.main()\nexcept SystemExit as result: assert result.code == 0\n"
+            + "restored = gc.get_freeze_count() == initial and gc.isenabled() == enabled\n"
+            + "print(json.dumps({'observations': [json.loads(line) for line in record.read_text().splitlines()], "
+            + "'restored': restored}))\n"
+        )
+        for event, tool, modules in rows:
+            with self.subTest(event=event, tool=tool):
+                record = self.root / f"observations-{event}-{tool}.jsonl"
+                result = self.run_python(["-c", driver, event, str(record)], {"tool_name": tool})
+                self.assertEqual((result.returncode, result.stderr), (0, ""))
+                document = parsed_output(result.stdout)
+                observed = cast(list[object], document["observations"])
+                self.assertTrue(observed)
+                self.assertEqual(observed, [[modules, True, True]] * len(observed))
+                self.assertIs(document["restored"], True)
+
     def test_push_delivery_hook_runs_only_for_push_notifications(self) -> None:
         driver = (
             "import sys, json\n"
@@ -689,17 +843,29 @@ class DispatcherRepairTests(IsolatedHookTests):
     def test_f003_non_alarm_signal_handlers_are_restored(self) -> None:
         inspect = (
             "import json, signal\n"
-            + "signals = (signal.SIGTERM, signal.SIGUSR1, signal.SIGHUP, signal.SIGPIPE)\n"
-            + "handlers = {item.name: int(signal.getsignal(item)) for item in signals}\n"
+            + "signals = {signal.SIGTERM, signal.SIGUSR1, signal.SIGHUP, signal.SIGPIPE}\n"
+            + "def state():\n"
+            + "    mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())\n"
+            + "    dispositions = {item.name: int(signal.getsignal(item)) for item in signals}\n"
+            + "    return [dispositions, sorted(int(item) for item in mask & signals)]\n"
         )
-        outcome = self.run_repair_fakes("stop", [
-            FakeHook(inspect + "print(json.dumps({'before': handlers}))\n"
-                     + "for item in signals:\n"
-                     + "    signal.signal(item, signal.SIG_IGN if handlers[item.name] == signal.SIG_DFL else signal.SIG_DFL)"),
-            FakeHook(inspect + "print(json.dumps({'after': handlers}))"),
-        ])
-        self.assertEqual((outcome.code, outcome.stderr), (0, ""))
-        self.assertEqual(outcome.output["before"], outcome.output["after"])
+        mutations = (
+            ("dispositions", "for item in signals:\n"
+             + "    new = signal.SIG_IGN if signal.getsignal(item) == signal.SIG_DFL else signal.SIG_DFL\n"
+             + "    signal.signal(item, new)\n"),
+            ("mask", "mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())\n"
+             + "signal.pthread_sigmask(signal.SIG_SETMASK, mask ^ signals)\n"),
+        )
+        for changed, mutate in mutations:
+            with self.subTest(changed=changed):
+                outcome = self.run_repair_fakes("stop", [
+                    FakeHook(inspect + "before = state()\n" + mutate
+                             + "print(json.dumps({'before': before, 'during': state()}))"),
+                    FakeHook(inspect + "print(json.dumps({'after': state()}))"),
+                ])
+                self.assertEqual((outcome.code, outcome.stderr), (0, ""))
+                self.assertNotEqual(outcome.output["before"], outcome.output["during"])
+                self.assertEqual(outcome.output["before"], outcome.output["after"])
 
     def test_f004_error_message_retains_whole_stripped_stderr(self) -> None:
         outcome = self.run_repair_fakes("post_tool_use", [
@@ -732,6 +898,19 @@ class DispatcherRepairTests(IsolatedHookTests):
 
 
 class CopyGuardDispatchTests(IsolatedHookTests):
+    def test_copy_policy_child_uses_the_module_loaded_for_its_budget(self) -> None:
+        driver = (
+            "from scripts.hooks import hook_dispatch as dispatch\n"
+            + "from scripts.copies import copy_guard\n"
+            + "copy_guard.main = lambda: print('inherited entry point')\n"
+            + "hook = dispatch.CopyPolicyHook()\n"
+            + "result = dispatch.run_hook(dispatch.HOOKS / hook.filename, '{}', lambda: hook.timeout)\n"
+            + "assert result.exit_code == 0 and not result.stderr, result\n"
+            + "print(result.stdout, end='')\n"
+        )
+        result = self.run_python(["-c", driver], {})
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "inherited entry point\n", ""))
+
     def dispatch_cases(self, commands: Sequence[str | list[str]], cwd: str) -> list[subprocess.CompletedProcess[str]]:
         """Run each real dispatcher entry in one isolated main-thread driver."""
         driver = (
@@ -772,9 +951,13 @@ class CopyGuardDispatchTests(IsolatedHookTests):
             + f"dispatch.EVENTS['pre_tool_use'] = (dispatch.CopyPolicyHook(), dispatch.HookSpec({str(later)!r}, None))\n"
             + "sys.argv = ['hook_dispatch.py', 'pre_tool_use']\ndispatch.main()\n"
         )
-        result = self.run_python(["-c", driver], {"tool_name": "Bash", "tool_input": {"command": "true"}})
-        self.assertEqual((result.returncode, result.stderr), (2, "later refusal\n"))
-        self.assertTrue(marker.exists())
+        for config in (ROOT / "config/copies.conf", self.root / "missing-copies.conf"):
+            with self.subTest(config=config.name):
+                marker.unlink(missing_ok=True)
+                self.environment["COPIES_CONFIG"] = str(config)
+                result = self.run_python(["-c", driver], {"tool_name": "Bash", "tool_input": {"command": "true"}})
+                self.assertEqual((result.returncode, result.stderr), (2, "later refusal\n"))
+                self.assertTrue(marker.exists())
 
     def test_copy_guard_deadline_is_enforced_by_the_normal_runner(self) -> None:
         completion = self.root / "timed-body-completed"

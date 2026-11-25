@@ -605,8 +605,9 @@ def _log_relative_path(host: str, epoch: float, record_id: str) -> str:
     return f"{host}/{store.LOGS_DIR}/{store.month(epoch)}/{record_id}.log.gz"
 
 
-def keep_log(data: bytes, host: str, epoch: float, record_id: str) -> str:
-    return _keep_compressed(data, _log_relative_path(host, epoch, record_id))
+def keep_log(source: bytes | Path, host: str, epoch: float, record_id: str) -> str:
+    """Keep a log from its bytes, or from a file that is copied in parts."""
+    return _keep_compressed(source, _log_relative_path(host, epoch, record_id))
 
 
 def keep_result(data: bytes, host: str, epoch: float, record_id: str) -> str:
@@ -614,8 +615,9 @@ def keep_result(data: bytes, host: str, epoch: float, record_id: str) -> str:
     return _keep_compressed(data, f"{host}/{store.RESULTS_DIR}/{store.month(epoch)}/{record_id}.json.gz")
 
 
-def _keep_compressed(data: bytes, relative: str) -> str:
+def _keep_compressed(source: bytes | Path, relative: str) -> str:
     import gzip
+    import shutil
 
     target = store.root() / relative
     if target.is_file():
@@ -626,7 +628,11 @@ def _keep_compressed(data: bytes, relative: str) -> str:
     try:
         with partial.open("wb") as handle:
             with gzip.GzipFile(fileobj=handle, mode="wb") as compressed:
-                _ = compressed.write(data)
+                if isinstance(source, Path):
+                    with source.open("rb") as data:
+                        shutil.copyfileobj(data, compressed)
+                else:
+                    _ = compressed.write(source)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(partial, target)
@@ -1251,6 +1257,68 @@ def write_call(started: float, fields: dict[str, object], record_id: str | None 
     store.append_line(store.host_file(host, started), record)
 
 
+def wait_lines(path: Path) -> list[str]:
+    try:
+        return path.read_text().splitlines()
+    except OSError:
+        return []
+
+
+def call_waits(directory: Path, verb: str, token_wait: int, skipped_hold_can_be_zero: bool) -> dict[str, object]:
+    """Read the wait totals before Verify removes its wait directory."""
+    token_file = os.environ.get("BUILDLOG_TOKEN_WAIT_FILE", "")
+    token_directory = Path(os.environ.get("BUILDLOG_TOKEN_WAIT_DIR") or directory)
+    step_waits: dict[str, int | None] = {}
+    wait_total = 0.0
+    hold_total: float | None = None
+    invalid_hold_sample = False
+    token_total = 0
+    for folder in (directory, *sorted(directory.glob("wait-*"))):
+        label = verb if folder == directory else folder.name.removeprefix("wait-")
+        hold_path = folder / "seconds"
+        hold_samples = [seconds for line in wait_lines(hold_path)
+                        if (seconds := optional_nonnegative_number(line)) is not None]
+        hold = sum(hold_samples)
+        if hold_samples:
+            hold_total = (hold_total or 0.0) + hold
+        elif hold_path.exists():
+            invalid_hold_sample = True
+        token_path = Path(token_file) if folder == directory and token_file else folder / "token-seconds"
+        token = sum(optional_int(line) or 0 for line in wait_lines(token_path))
+        if folder == token_directory:
+            token += token_wait
+        memory = sum(optional_int(line) or 0 for line in wait_lines(folder / "memory-seconds"))
+        measured = True
+        for path in folder.glob("placement-call-*"):
+            if path.suffix == ".pending":
+                measured = False
+                continue
+            samples = path.glob("sample-*") if path.is_dir() else (path,)
+            for sample in samples:
+                if sample.suffix == ".tmp":
+                    continue
+                lines = wait_lines(sample)
+                elapsed = optional_int(lines[0]) if lines else None
+                if elapsed is None:
+                    measured = False
+                else:
+                    memory += elapsed
+        total = memory + token + hold
+        if total or label != verb or not measured:
+            step_waits[label] = int(total) if measured else None
+        wait_total += total
+        token_total += token
+    if not step_waits:
+        step_waits[verb] = 0
+    admission_measured = None not in step_waits.values()
+    # Verify skips the sample file when the hold check is unnecessary.
+    if (hold_total is None and skipped_hold_can_be_zero and admission_measured
+            and not invalid_hold_sample and directory.is_dir()):
+        hold_total = 0.0
+    return {"admission_wait_s": int(wait_total) if admission_measured else None,
+            "hold_wait_s": hold_total, "token_wait_s": token_total, "step_wait_s": step_waits}
+
+
 def call(args: list[str]) -> None:
     from scripts.direct.step_record import NamedPackage, WorkspacePackages
 
@@ -1258,9 +1326,11 @@ def call(args: list[str]) -> None:
     words = args[9:]
     package_name = os.environ.get("BUILDLOG_PACKAGE", words[0] if words and not words[0].startswith("-") else "")
     selection = NamedPackage(package_name) if package_name else WorkspacePackages()
+    hold_wait = optional_nonnegative_number(os.environ.get("BUILDLOG_HOLD_WAIT_S", ""))
     fields: dict[str, object] = {
         "tool": "verify.sh",
         "caller": os.environ.get("BUILDLOG_CALLER") or "verify",
+        "run_id": os.environ.get("BUILDLOG_RUN") or None,
         "command": " ".join([verb, *words]),
         "verb": verb,
         "package": selection.name if isinstance(selection, NamedPackage) else "workspace",
@@ -1276,7 +1346,7 @@ def call(args: list[str]) -> None:
         "mac_s": optional_nonnegative_number(os.environ.get("BUILDLOG_MAC_S", "")),
         "target": os.environ.get("BUILDLOG_TARGET", ""),
         "pinned": bool(os.environ.get("BUILDLOG_PINNED_TARGET")),
-        "hold_wait_s": optional_nonnegative_number(os.environ.get("BUILDLOG_HOLD_WAIT_S", "")),
+        "hold_wait_s": hold_wait,
         "copy": os.environ.get("BUILDLOG_MAC_COPY", ""),
         "copy_s": optional_nonnegative_number(os.environ.get("BUILDLOG_MAC_COPY_S", "")),
         "copy_count": optional_int(os.environ.get("BUILDLOG_MAC_COPY_COUNT", "")),
@@ -1287,6 +1357,10 @@ def call(args: list[str]) -> None:
         "mem_kills": int(os.environ.get("BUILDLOG_MEM_KILLS", "0")),
         "mem_kill_stopped": os.environ.get("BUILDLOG_MEM_KILL_STOPPED") == "1",
     }
+    if wait_directory := os.environ.get("BUILDLOG_WAIT_DIR"):
+        token_wait = optional_int(os.environ.get("BUILDLOG_TOKEN_WAIT_S", "")) or 0
+        fields.update(call_waits(Path(wait_directory), verb, token_wait,
+                                 skipped_hold_can_be_zero=hold_wait == 0 and outcome != "interrupted"))
     write_call(time.time() - float(elapsed or 0), fields, os.environ.get("BUILDLOG_CALL_ID"))
 
 
@@ -1439,6 +1513,81 @@ def sweep_trim(folder: str, bytes_freed: int, extent: Literal["whole", "partial"
     })
 
 
+class HandMadeFile(TypedDict):
+    """A file that the model check read, with its sha256 at the check and at run start."""
+    path: str
+    sha256_check: str
+    sha256_run: str | None
+
+
+class HandMadeFields(TypedDict):
+    """What hand_made.py knows about one attempt. Each time is UTC ISO 8601, or None when not reached.
+
+    The row, not the exit code, tells a refusal from a program exit: a program can exit with any code.
+    A refusal has a refusal text and no status; a program exit has a status.
+    """
+    why: str
+    argv: list[str]
+    cwd: str
+    machines: list[str]
+    machine: str | None
+    files: list[HandMadeFile]
+    verdict: Literal["yes", "no"] | None
+    reason: str | None
+    refusal: str | None
+    status: int | None
+    check_model: str
+    check_effort: str
+    check_account: str | None
+    check_started_at: str | None
+    check_ended_at: str | None
+    placed_at: str | None
+    sha_checked_at: str | None
+    run_started_at: str | None
+    run_ended_at: str | None
+    # Each machine that failed before the run, in order; the run went back to the other named machines.
+    failed_machines: list[str]
+    queue_wait_s: float | None
+    log: str | None
+    step: str
+    test_width: int | None
+    peak_mem_bytes: int | None
+
+
+def caller_account() -> str | None:
+    """The account folder name of the calling session, when it has one."""
+    folder = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CODEX_HOME")
+    return Path(folder).name if folder else None
+
+
+def hand_made(record_id: str, started: float, fields: HandMadeFields, *, tree_start: str | None) -> None:
+    """Append one hand made attempt; this adds where, when, for whom and the checkout facts.
+
+    The checkout is not trusted, so its git facts and tree key run no program that it names. tree_start
+    must come from treekey.tree_key with checkout_programs=False.
+    """
+    from scripts.buildlog import treekey
+
+    host = store.host_name()
+    directory = fields["cwd"]
+    record: dict[str, object] = {
+        "kind": "hand_made",
+        "v": RECORD_VERSION,
+        "id": record_id,
+        "host": host,
+        "target": recorded_target(host),
+        "started_at": store.utc_iso(started),
+        "ended_at": store.utc_iso(time.time()),
+        **fields,
+        **git_facts(directory),
+        **tree_facts(tree_start, treekey.tree_key(directory, checkout_programs=False)),
+        "caller": caller(sys.stdout.isatty()),
+        "account": caller_account(),
+        **who(),
+    }
+    store.append_line(store.host_file(host, started), record)
+
+
 def hold_build(args: list[str]) -> None:
     import hashlib
 
@@ -1555,7 +1704,6 @@ def main(argv: list[str]) -> int:
         return 0
     try:
         if command == "step":
-            detach()
             step(rest)
         elif command == "test-phase-context":
             print(json.dumps(test_phase_context(rest[0], rest[1:]), separators=(",", ":")))
@@ -1578,4 +1726,8 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     _ = sys.modules.setdefault("scripts.buildlog.record", sys.modules[__name__])
+    # A detach changes the whole process, so only the process of a step may do it.
+    # A caller that runs main in its own process (verify_helper.py) keeps its session and pipes.
+    if sys.argv[1:2] == ["step"]:
+        detach()
     sys.exit(main(sys.argv[1:]))

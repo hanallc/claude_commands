@@ -26,7 +26,7 @@ it joins; a tier A or E rule, local or global, has no family.
 | --- | --- | --- | --- |
 | `names` | dont-repeat-type-name-in-fields, dont-repeat-enum-domain-in-variant-names, avoid-repeated-field-affixes | spell-out-names, name-bindings-to-match-parameters, prefer-type-named-fields-and-bindings, comments-name-code-constructs | — |
 | `values` | never-prefix-unused-fields-or-variables-with, import-constants-at-the-top, derive-test-values-from-production-constants, test-module-allow-boilerplate, agent-must-review-allows, always-use-nextest | no-magic-values, constants-file-organization, prefer-functional-patterns, tests-live-with-the-type-under-test, prefer-observers-over-polling, system-params-carry-their-behavior | — |
-| `types` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates | make-invalid-states-unrepresentable, uncovered components of its partial B rules | — |
+| `types` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates, world-arguments-need-a-reason | make-invalid-states-unrepresentable, uncovered components of its partial B rules | — |
 | `modules` | — | — | module-roots-as-table-of-contents, name-submodules-after-anchor-types, workspace-dependencies, module-structure, when-to-split-a-module, split-by-type-ownership, types-live-with-their-behavior |
 
 Every partial B rule also has a C read in its own family.
@@ -149,16 +149,7 @@ give the same result when run again. mend runs after layer 3, because a module
 move changes every path and visibility that mend reads. agent-must-review-allows
 deletes an allow and runs clippy, so clippy follows it.
 
-**Pilot data.** `order_waste.py` on the cargo-liner pilot (ledger copy of
-2026-10-27, 1,182 merged tickets, 133 with code changes) counts two kinds of
-waste for a rule pair (A, B). A ticket's change is its net change from its base
-to its checkpoint. Work that its merges brought in is not part of it. A stale
-finding is a finding of B that ended because its file changed: withdrawn as
-judged again, withdrawn as declaration gone, or waived by the ledger, with a
-merged fix of A to its file between its creation and its end. A reworked hunk
-is a hunk of A that changed lines a merged fix of B wrote earlier. Person, unit
-and unrecorded waives, exception withdrawals and bare rename duplicates are
-decisions or bookkeeping, so they do not count.
+The table records the 2026-10-27 cargo-liner pilot.
 
 | A first | then B | stale | reworked | analysis |
 | --- | --- | ---: | ---: | --- |
@@ -214,18 +205,6 @@ no rule for most changes, so their waste counts as `names read`.
 6. public-failures-return-named-errors changes a public signature each time, so
    each fix needs approval under public-api-changes-require-explicit-approval.
 
-**Each roll-out checks the order.** After the pilot of every new repository,
-run:
-
-```bash
-~/.claude/scripts/lib/py ~/.claude/scripts/style/order_waste.py --ledger <copy of the ledger> --repo <checkout> [--json]
-```
-
-It reads both and writes nothing. It prints one row per rule pair, sorted by
-total waste, with where the analysis puts A, then the analysis edges with no
-observed waste, split into seen and not seen. Add an order only when that
-repository's data supports it, and record the counts here.
-
 ## Ticket queue
 
 One ticket per phase:
@@ -264,7 +243,7 @@ Reconciliation processes predecessors first.
 The ledger repeats the disjoint-footprint proof inside the assignment transaction.
 Widening, finding follow or replace, base or tip changes, and checkpoint writes revalidate the footprints under the same write lock.
 A conflict or unreadable footprint cancels the write. Resume and the gate recheck before publishing
-work. Merge checks again, including after the predecessor has merged. These
+work. The ledger checks again at merge time, including after the predecessor merges. These
 checks include both bases and checkpoints, the live unit and style tips, and
 the tickets' actual committed paths, so later references and unplanned edits
 cannot bypass the original check. An existing overlapping pair waits for
@@ -278,12 +257,14 @@ Standing plans carry `> **Standing:** style_plan.py` and live under
 and checkpoint and shrink never commit or shrink them. Keep production
 instructions and plans out of `docs/style/` and `docs/<member>/style/`, which
 `rules.load_rules` reads as local rules.
-`add_unit.py` launches a standing plan from the showrunner checkout and copies
-it into the unit worktree, where the unit's copy is its own. Refill, ticket
-phases and pinned rule files live in that unit copy; the showrunner copy is
-only the first-launch template. Edit a launched unit's copy for changes meant
-for it. Checkpoint stages only code paths and never the plan or anything under
-`docs/style-production/`; standing plans skip shrink and every closing gate.
+`add_unit.py` copies the standing plan from the integration checkout into the unit worktree.
+The unit owns its copy. Refill, ticket phases, and pinned rule files use that copy.
+Edit that copy to change a launched unit's plan.
+Read production policy from the live staff document.
+Publish code through the integration checkout.
+Use item 143 test copies for verification.
+Checkpoint stages only code paths. It excludes the plan and `docs/style-production/`.
+Standing plans skip shrink and the closing gates.
 Run refill at startup, after restart or compaction, and after each ticket.
 Use `style_plan.py checkpoint` under <StyleCheckpoint/> in `docs/direct/style_unit.md`.
 It gates and publishes one ticket, records its checkpoint and confirms reservation release before another publication.
@@ -307,7 +288,7 @@ contains main nor is its ancestor, a rename or copy anywhere in the range, or
 an unknown crate for a selected file holds refill closed. The pushed tip is `origin/<branch point>`, or the
 local branch when the repository has no `origin`. The checkouts share one
 repository, so the local branch can hold a parent merge whose gate is still
-running. Reconcile and the hand-off merge check read the same pushed tip.
+running. Reconcile and handoff verification read the same pushed tip.
 Report a waiting state once and end the turn blocked until sync, a board retry
 message, or `ticket <id> merged; refill.` wakes the director. `ticket merge`
 sends that wake to every unit waiting for sync. Refill records its wait before
@@ -558,20 +539,20 @@ Exit 1 means the trees differ; run the five steps:
    Without a package, lint checks the workspace with mend, rustfmt, and Clippy.
    Clippy uses `--all-targets --all-features` and the workspace lint config.
    Nothing rewrites the tree: mend runs in report mode and rustfmt with `--check`.
-   `copies.standing` holds a repository slot through lint and cleanup.
-   The machine shares the repository pool across owners.
-   Each `<repository>-slot<N>` checkout keeps its own `target/`.
+   `copies.standing` holds a numbered copy through lint and cleanup.
+   Each copy at `<roots.build>/<repository>/<unit>/<N>` keeps its own `target/`.
    A missing or swept cache builds cold. Lint leaves `CARGO_TARGET_DIR` unset.
-   `config/build_folders.conf` sets the slot root and the repository or machine default limit.
    See [Standing gate checkouts](as-built/gate-checkouts.md).
    It records per-file diagnostics once per tool; disabled or incomplete checks
    grant no successful coverage. Exit 0 means clean, every tool recorded passing;
    continue the sync. Exit 1 means diagnostics recorded or a tool did not pass;
    continue to `set-tip` and `tip done`. Exit 2 means an error (refusal, failed
-   `lint-record` or unreadable checkout); stop the sync. Exit 143 or 129 means
-   SIGTERM or SIGHUP stopped the run; stop the sync.
-   Every exit the run can catch stops verify.sh and its processes, removes
-   its temporary supervision metadata, and releases the standing checkout.
+   `lint-record` or unreadable checkout); stop the sync. SIGTERM, SIGHUP or
+   SIGINT ends the run by the default signal action (a shell reads 143, 129 or
+   130); stop the sync. The run installs no signal handler.
+   A keeper process sees the run end for any cause. It then stops verify.sh and
+   its processes, removes the temporary supervision metadata, and releases the
+   standing checkout.
    Each `style-sync-lint-*` dir holds `owner.json`, `verifier.pgid`, and a link
    to the checkout. Recovery keeps the metadata while its owner or verifier
    group runs; stale legacy worktree registrations are removed on recovery.

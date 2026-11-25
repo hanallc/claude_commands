@@ -26,7 +26,7 @@ from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
 from scripts.lib import conf, file_lock, scratch
@@ -38,6 +38,7 @@ from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS
 
 
 def expected_remote_lease_columns(state: str, session: str, holder_pid: str) -> tuple[str, str, str]:
@@ -59,7 +60,7 @@ class RemoteCopiesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
-        private = private_slot_config(self.root, repository="repository", maximum=2)
+        private = private_copy_config(self.root)
         self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.source = ImmutableGitSeed.create(self.root, "main", "Copy Tests", "copy@example.invalid",
                                              {"Cargo.toml": "[workspace]\n", "source.txt": "committed\n", "stable.txt": "stable\n"}).checkout
@@ -426,7 +427,7 @@ class RemoteCopiesTests(unittest.TestCase):
         )
         for cause, status, remote_output, detail in cases:
             with self.subTest(cause=cause), mock.patch.dict(os.environ, {**copies_environment(self.root / cause),
-                    **private_slot_config(self.root / cause, repository="repository").environment}):
+                    **private_copy_config(self.root / cause).environment}):
                 mirrors = [self.remote(path=f"mirror/{cause}-{index}") for index in range(2)]
                 for mirror in mirrors:
                     copies.register_remote(mirror)
@@ -458,7 +459,7 @@ class RemoteCopiesTests(unittest.TestCase):
             root = self.root / action
             root.mkdir()
             with self.subTest(action=action), local_remote_transport(root), \
-                    mock.patch.dict(os.environ, private_slot_config(root, repository="repository").environment), \
+                    mock.patch.dict(os.environ, private_copy_config(root).environment), \
                     warm_claim_servers(), ExitStack() as contexts:
                 mirror = self.remote(path=str(root / "mirror"))
                 self.assertEqual(publish_mirror(mirror), 0)
@@ -659,7 +660,7 @@ class RemoteCopiesTests(unittest.TestCase):
                 return_value=target_config.SshTarget(name, platform, self.root / "settings")):
                 request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
                                                 target=name, owner="alpha", holder_session="session")
-                config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1), 1, 1, 1, "1", {})
+                config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS), 1, 1, 1, "1", {})
                 mirror = offload.request_mirror(config, request, eligibility.KnownRepository("repository"))
                 self.assertEqual(mirror.owner, "alpha")
                 self.assertEqual(mirror.repository, copies.SelectedRepository("repository"))
@@ -719,14 +720,16 @@ class RemoteCopiesTests(unittest.TestCase):
         self.mirror.mkdir(parents=True)
         with self.open_file_process(self.root / "outside/output") as child:
             copies.mark_mirror(self.mirror, "alpha", "repository", "group-session", process_group=os.getpgid(child.pid))
-            cwd = Path("/proc") / str(child.pid) / "cwd"
+            cwd = f"/proc/{child.pid}/cwd"
+            cwd_paths = (cwd, os.fsencode(cwd))
             readlink = os.readlink
 
-            def unreadable_readlink(path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
-                                    *, dir_fd: int | None = None) -> str:
-                if os.fsdecode(path) == str(cwd):
+            def unreadable_readlink[PathText: (str, bytes)](
+                path: PathText | os.PathLike[PathText], *, dir_fd: int | None = None,
+            ) -> PathText:
+                if os.fspath(path) in cwd_paths:
                     raise PermissionError(str(path))
-                return readlink(os.fsdecode(path), dir_fd=dir_fd)
+                return readlink(path, dir_fd=dir_fd)
 
             with mock.patch.object(os, "readlink", unreadable_readlink):
                 with self.assertRaisesRegex(copies.CopyError, "busy.*group-session"):
@@ -802,7 +805,7 @@ class RemoteCopiesTests(unittest.TestCase):
         _ = python.write_text(f"#!{sys.executable}\n" + f"""import sys
 from pathlib import Path
 from scripts.copies import copies
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.mac_test import floor_claims
 log = Path({str(log)!r})
 with log.open('a') as output:

@@ -35,7 +35,7 @@ from scripts.aws_target import ledger, cloud_gate
 from scripts.aws_target.s3_presign import SigningKey as SigningKey, presign as presign
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
-from scripts.lib import conf
+from scripts.lib import conf, origin_deletion
 from scripts.build_queue import snapshot_codec
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.process_group import send_process_group
@@ -149,11 +149,14 @@ def delete_trial_branches(repo: Path, clone_url: str, prefix: str, expires: int,
         fields = line.split()
         if len(fields) != 2 or not fields[1].startswith(namespace):
             continue
-        branch = fields[1]
-        try:
-            _ = checked_git(repo, 'push', clone_url, '--delete', branch)
-        except (OSError, ValueError, subprocess.SubprocessError):
-            print(f'paired trial: could not delete branch {branch.removeprefix("refs/heads/")}', file=sys.stderr)
+        delete_trial_ref(repo, clone_url, fields[1], fields[0])
+
+
+def delete_trial_ref(repo: Path, clone_url: str, ref: str, commit: str) -> None:
+    result = origin_deletion.delete(repo, clone_url, ref, commit,
+                                    timeout=cloud_gate.settings().number('git_network_timeout_s'))
+    if isinstance(result, origin_deletion.Kept):
+        print(f'paired trial: kept {ref}: {result.reason}', file=sys.stderr)
 
 
 def sweep_trial_branches(repo: Path, clone_url: str, prefix: str, now: int) -> None:
@@ -168,7 +171,7 @@ def sweep_trial_branches(repo: Path, clone_url: str, prefix: str, now: int) -> N
             name = fields[1].removeprefix(namespace)
             match = re.fullmatch(r'([0-9]{1,12})-([0-9a-f]{32})-(base|changed)', name)
             if match and int(match[1]) < now:
-                _ = checked_git(repo, 'push', clone_url, '--delete', fields[1])
+                delete_trial_ref(repo, clone_url, fields[1], fields[0])
     except (OSError, ValueError, subprocess.SubprocessError):
         print(f'paired trial: could not sweep old branches for {prefix}', file=sys.stderr)
 
@@ -271,8 +274,7 @@ def cleanup_trial(folder: Path, worker: cloud_gate.GateWorker) -> bool:
 
 def sweep_trial_resources(folder: Path, worker: cloud_gate.GateWorker) -> None:
     """Clean expired trials before a new trial reserves boxes."""
-    unresolved = {row.attempt for row in worker.book.read_snapshot().gate_reservations
-                  if not isinstance(row.state, (ledger.GateAbsent, ledger.GateTerminated)) and worker.cleanup_due(row)}
+    unresolved = {row.attempt for row in worker.book.read_snapshot().gate_reservations if worker.cleanup_due(row)}
     for previous in sorted(folder.parent.iterdir()):
         if previous == folder or not previous.is_dir():
             continue

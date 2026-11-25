@@ -18,6 +18,7 @@ from scripts.bevy_upgrade import upgrade_record
 from scripts.bevy_upgrade import upgrade_schedule
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 @final
@@ -54,7 +55,7 @@ class ScheduleTests(unittest.TestCase):
             "STATUS_EXIT": "0", "SEND_OUTCOME": "SENT: test recipient", "SEND_EXIT": "0",
             "RETIRE_OUTCOME": "retired 1 queued message", "RETIRE_EXIT": "0",
             "PYTHONDONTWRITEBYTECODE": "1", "HOME": str(self.root),
-            "HERDR_BIN": "/nonexistent/herdr",
+            "HERDR_BIN": MISSING_HERDR_BIN,
         })))
 
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))

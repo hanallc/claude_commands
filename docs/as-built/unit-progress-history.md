@@ -36,7 +36,7 @@ The warning gives the path to the state file and names no command.
 
 ## Configuration digest
 
-`_config_digest` hashes the exact model registry text and `direct.conf` bytes once per recorder process.
+`config_digest` hashes the exact model registry text and `direct.conf` bytes at each call. A call costs about 30 microseconds, and verify_helper.py can run many recorder commands in one process.
 It uses the inherited [launch configuration](agent-registry.md#configuration-lifetimes) when present.
 Without that configuration, it reads the registry through `registry_text` without catalog synchronization or publication.
 The same text and direct settings produce the same digest.
@@ -241,7 +241,12 @@ command takes `--phase <id>`: a named older open phase reads and writes its
 parked file, so its repair never moves the newest phase's ledger. A named phase
 that is not open exits with `Phase <id> is not open (open phases: …)`; with two
 or more open and none named, `<N> phases are open (<ids>); name one with
---phase`. `assign_claude.py` passes the assigned phase to `landed` and `abandon`. Findings get stable
+--phase`. `decision` and `status` also take a closed phase by its newest ledger.
+`open` takes a late finding for a closed phase: it writes the parked ledger of
+the newest instance that the run started, which `review-trial` reads.
+`open --accepted` records a late finding that is already fixed, with the
+`finding_verdict` event that `verdict` writes. It refuses an open or unnamed
+phase and `--held-for-decision`. `assign_claude.py` passes the assigned phase to `landed` and `abandon`. Findings get stable
 ids (`F001…`) that survive across rounds, so "the same finding came back" is a
 fact the script can check rather than a judgment the unit director has to make.
 Repair states are `open`, `repair_in_flight`, `fixed_pending_review`, `accepted`, and `routed`.
@@ -270,12 +275,12 @@ The ledger enforces these batch rules:
   naming the hunk that invalidated it.
 
 Advisories, checked in this order and reported in `advisory` beside a `dispatch`
-verdict: a finding reopened `MAX_REOPENS` times after being accepted; a finding
-that failed to close after `MAX_FIX_ATTEMPTS` repair attempts; `STALLED_ROUNDS`
+verdict: a finding reopened `max_reopens` times after being accepted; a finding
+that failed to close after `max_fix_attempts` repair attempts; `stalled_rounds`
 consecutive rounds with no decrease in the gating-open count;
-`MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind in a row; more than
-`MAX_REVIEW_CANCELLATIONS` review cancellations; a spent repair budget; the
-`RUNAWAY_ROUNDS` backstop.
+`max_consecutive_same_kind_passes` passes of one kind in a row; more than
+`max_review_cancellations` review cancellations; a spent repair budget; the
+`runaway_rounds` backstop.
 
 These advisories describe repair cost and progress.
 They do not stop the phase.
@@ -283,11 +288,11 @@ The director reports the advisory and continues through the repair rules.
 An unchanged open count can describe new findings or repeated failed repairs, so the count alone cannot decide when to stop.
 
 The repair budget is the first round's gating count times
-`REPAIR_ROUNDS_PER_FINDING`, never below `MIN_REPAIR_BUDGET`. All of these
+`repair_rounds_per_finding`, never below `min_repair_budget`. All of these
 limits are set in `~/.claude/config/direct.conf` and read by `findings.py` at startup.
 An absent or unusable required value exits 2.
 The budget and convergence limits control advisories.
-`ROUTING_FROM_ROUND=4` and `ASTRA_AFTER_FAILED_FIXES=2` enforce repair evidence.
+`routing_from_round=4` and `astra_after_failed_fixes=2` enforce repair evidence.
 From round four, each kept finding needs its category and evidence.
 A due Astra record applies to the finding's current fix-attempt count.
 Every dispatch records affected accepted checks or an explicit reason for none.
@@ -314,7 +319,7 @@ The parser requires three parts and nonblank run and finding ids.
 It accepts an empty phase instance id and preserves the `finding_route_closed` event format.
 
 ```text
-findings.py open --session-dir <dir> [--phase <id>] --severity blocker|minor|nit --title <text> --caught-by worker|main|both [--file <path>] [--line <N>] [--detail <text>]
+findings.py open --session-dir <dir> [--phase <id>] --severity blocker|minor|nit --title <text> --caught-by worker|main|both [--file <path>] [--line <N>] [--detail <text>] [--accepted]
 findings.py verdict --session-dir <dir> [--phase <id>] --id <F00N> --state accepted|still_open|reopened [--evidence <hunk>]
 findings.py gate --session-dir <dir> [--phase <id>]
 findings.py dispatch --session-dir <dir> [--phase <id>] --covers F001,F002,... --accepted-checks "<checks or none: reason>" [--keep F001=<category>:<evidence>]
@@ -326,12 +331,13 @@ progress_history.py start-run --session-dir <dir> --working-dir <dir> [--plan-do
 progress_history.py start-phase --session-dir <dir> --phase-id <id> --phase-title <title> [--work-order-file <path>] [--started-at <ISO with zone>]
 pass_record.py start-pass ...        # launcher only
 pass_record.py finish-pass ...       # launcher only, or --orphaned-launcher --status canceled
-progress_history.py start-activity --session-dir <dir> --label <label> --activity <text>
-progress_history.py finish-activity --session-dir <dir> [--status completed|error|canceled|interrupted] [--result <outcome>]
+progress_history.py start-activity --session-dir <dir> --label <label> --activity <text> [--started-at <ISO with zone>]
+progress_history.py finish-activity --session-dir <dir> [--status completed|error|canceled|interrupted] [--result <outcome>] [--finished-at <ISO with zone>]
 progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
 progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>] [--tables]
 progress_history.py eta --session-dir <dir> --time <t> [--phase-id <id>] [--earliest <t> --latest <t>] --basis stated|checkpoint|eta-command
 progress_history.py finish-phase --session-dir <dir> --status completed|stopped|error [--phase-id <id>] [--finished-at <ISO with zone>]
+progress_history.py checkpoint --session-dir <dir> --phase-id <id> --commit <full hash> --closed  # Record a missed checkpoint for a finished phase.
 progress_history.py drop-phase --session-dir <dir> --phase-id <id> --reason <text>
 progress_history.py finish-run ...
 progress_history.py review-trial --session-dir <dir> [--phase-id <id>]
@@ -376,6 +382,9 @@ Both events carry `backfilled: true` and `recorded_at`.
 The time must be in the past or present.
 The finish must follow the start.
 The phase table excludes those events from gap samples.
+`start-activity --started-at` and `finish-activity --finished-at` follow the same rules.
+An activity cannot start before its phase starts.
+A back-dated start closes the active activity as `interrupted` at that time, or at the present time if the active activity started later.
 
 For production plans, `start-phase`, every `progress` report, `finish-phase`,
 and `finish-run` end by asking `phase_table.py refresh` to rewrite the unit's

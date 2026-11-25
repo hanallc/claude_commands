@@ -12,7 +12,9 @@ import tempfile
 from typing import override
 import unittest
 
+from scripts.lib import conf
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SHELL_READER = Path(__file__).with_name("conf.sh")
@@ -41,6 +43,7 @@ class ShellConfTests(unittest.TestCase):
         cache = self.root / "cache"
         seed_interpreter_cache(cache, interpreter=python)
         self.env = {
+            **fixture_zsh_environment(),
             "PATH": str(programs), "HOME": str(self.root / "home"),
             "XDG_CACHE_HOME": str(cache),
             "CONF_DIR": str(self.config), "HOSTNAME": socket.gethostname(),
@@ -52,7 +55,7 @@ class ShellConfTests(unittest.TestCase):
     def write(self, contents: str) -> None:
         _ = (self.config / "example.conf").write_text(contents)
 
-    def run_reader(self, key: str, *, trace: bool = False) -> subprocess.CompletedProcess[str]:
+    def run_reader(self, key: str, *, trace: bool = False, reader: Path = SHELL_READER) -> subprocess.CompletedProcess[str]:
         script = 'PATH="$CONF_TEST_PATH"\n'
         if trace:
             script += (
@@ -63,7 +66,7 @@ class ShellConfTests(unittest.TestCase):
             )
         script += 'source "$1"\nconf_value example "$2"\n'
         return subprocess.run(
-            [*self.shell, "-c", script, "conf-test", str(SHELL_READER), key],
+            [*self.shell, "-c", script, "conf-test", str(reader), key],
             env={**self.env, "CONF_TEST_PATH": self.env["PATH"]},
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
@@ -126,7 +129,7 @@ class ShellConfTests(unittest.TestCase):
         self.assertFalse((self.root / "subshell.log").exists())
 
     def test_sections_comments_first_value_and_short_host_match_the_python_format(self) -> None:
-        host = socket.gethostname().split(".", 1)[0]
+        host = conf.local_host_key_name()
         self.write(f"[section]\ncount=1\ncount=2\ncount.{host}=7 # here\ncount.{host}=8\n")
         result = self.run_reader("count", trace=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -135,7 +138,7 @@ class ShellConfTests(unittest.TestCase):
         self.assertFalse((self.root / "subshell.log").exists())
 
     def test_host_override_ignores_inherited_host_names(self) -> None:
-        host = socket.gethostname().split(".", 1)[0]
+        host = conf.local_host_key_name()
         self.write(f"count=1\ncount.{host}=7\n")
         self.env.update(HOSTNAME=host + "-other", HOST=host + "-other")
         result = self.run_reader("count", trace=True)
@@ -143,6 +146,41 @@ class ShellConfTests(unittest.TestCase):
         self.assertEqual(result.stdout, "7\n")
         self.assertFalse((self.root / "python.log").exists())
         self.assertFalse((self.root / "subshell.log").exists())
+
+    def reader_with_hostname_file(self, hostname_file: Path) -> Path:
+        reader = self.root / "conf.sh"
+        _ = reader.write_text(SHELL_READER.read_text().replace("/proc/sys/kernel/hostname", shlex.quote(str(hostname_file))))
+        (reader.parent / "conf_record.sh").symlink_to(SHELL_READER.with_name("conf_record.sh"))
+        return reader
+
+    def test_mixed_case_proc_hostname_uses_no_child_process(self) -> None:
+        supports_lower_case = subprocess.run(
+            [*self.shell, "-c", '[[ -n "${ZSH_VERSION:-}" ]] || (( BASH_VERSINFO[0] >= 4 ))'],
+            env=self.env, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+        if supports_lower_case.returncode:
+            self.skipTest("Bash 3 uses tr to convert the host name")
+        hostname_file = self.root / "proc-hostname"
+        _ = hostname_file.write_text("Mixed-Host.Example\n")
+        self.write("count.mixed-host=7\n")
+        result = self.run_reader("count", trace=True, reader=self.reader_with_hostname_file(hostname_file))
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "7\n", ""))
+        self.assertFalse((self.root / "python.log").exists())
+        self.assertFalse((self.root / "subshell.log").exists())
+
+    def test_mixed_case_hostname_without_proc_uses_the_lower_case_override(self) -> None:
+        reader = self.reader_with_hostname_file(self.root / "no-proc-hostname")
+        programs = self.root / "bin"
+        uname = programs / "uname"
+        _ = uname.write_text('#!/bin/bash\nprintf "%s\\n" "Mixed-Host.Example"\n')
+        uname.chmod(0o755)
+        tr = shutil.which("tr")
+        assert tr is not None
+        (programs / "tr").symlink_to(tr)
+        self.write("count=1\ncount.mixed-host=7\n")
+        result = self.run_reader("count", reader=reader)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "7\n", ""))
+        self.assertFalse((self.root / "python.log").exists())
 
     def test_cr_only_lines_delegate_to_the_python_reader(self) -> None:
         self.write("count=7\rother=9\r")
@@ -218,8 +256,8 @@ class ShellConfTests(unittest.TestCase):
         self.write("# whole: 1..4\ncount=1.5\n")
         result = subprocess.run(
             [*self.shell, "-c",
-             'PATH="$CONF_TEST_PATH"; source conf.sh; conf_value example count'],
-            cwd=SHELL_READER.parent, env={**self.env, "CONF_TEST_PATH": self.env["PATH"]},
+             'source conf.sh; conf_value example count'],
+            cwd=SHELL_READER.parent, env=self.env,
             capture_output=True, text=True,
             check=False, timeout=TEST_HANG_GUARD_SECS,
         )
@@ -232,14 +270,15 @@ class ShellConfTests(unittest.TestCase):
     def test_next_read_observes_changed_file_in_the_same_shell(self) -> None:
         self.write("count=2\n")
         result = subprocess.run(
-            [*self.shell, "-c", 'PATH="$CONF_TEST_PATH"; source "$1"; conf_value example count; '
+            [*self.shell, "-c", 'source "$1"; conf_value example count; '
              + 'printf "count=7\\n" > "$CONF_DIR/example.conf"; conf_value example count',
              "conf-test", str(SHELL_READER)],
-            env={**self.env, "CONF_TEST_PATH": self.env["PATH"]},
+            env=self.env,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "2\n7\n")
+        self.assertFalse((self.root / "python.log").exists())
 
     def test_default_folder_uses_the_private_home(self) -> None:
         folder = Path(self.env["HOME"]) / ".claude/config"
@@ -256,7 +295,7 @@ class ZshShellConfTests(ShellConfTests):
     shell: tuple[str, ...] = (shutil.which("zsh") or "/bin/zsh", "-f")
 
     def test_host_override_uses_the_zsh_host_without_hostname(self) -> None:
-        host = socket.gethostname().split(".", 1)[0]
+        host = conf.local_host_key_name()
         self.write(f"count=1\ncount.{host}=7\n")
         del self.env["HOSTNAME"]
         self.env["HOST"] = socket.gethostname()

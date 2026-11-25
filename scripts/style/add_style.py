@@ -12,28 +12,31 @@ import os
 import sqlite3
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 
 from typing import cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
-from scripts.production import showrunners, staff
-from scripts.lib import build_folders
-from scripts.worktree import worktrees
-from scripts.lib.git_exclude import ensure_excluded
+from scripts.production import session_staff, showrunners, staff
+from scripts.lib import build_folders, git_files
+from scripts.worktree import worktree_records, worktrees
+from scripts.lib.git_exclude import ensure_excluded, require_untracked_ignored
 from scripts.production import showrunner_tree
+from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
 from scripts.production.add_showrunner import NoEndingTab, herdr_tab_open
 from scripts.herdr import herdr
-from scripts.production.production_doc import Production, Refusal, production_field, read_production, read_new_production, optional_field, FieldPresent
+from scripts.production.production_doc import LegacyProduction, Production, Refusal, production_field, read_production, read_new_production, optional_field, FieldPresent
 
 from scripts.style import rules, style_config
 from scripts.style import style_ledger
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
 
 FAMILIES: tuple[rules.Family, ...] = ("names", "values", "types", "modules")
 PLAN_DIRECTORY = Path("docs/style-production/units")
+LEGACY_STYLE_BRANCH_PREFIX = "style/"
 LAUNCHER = Path(os.environ.get("ADD_STYLE_LAUNCHER") or SCRIPTS / "production/add_showrunner.py")
 SHOWRUNNERS = Path(os.environ.get("ADD_STYLE_SHOWRUNNERS") or SCRIPTS / "production/showrunners.py")
 
@@ -99,12 +102,23 @@ class NoStyleProduction:
     name: str
 
     @property
-    def checkout(self) -> Path:
-        return build_folders.worktree_path(build_folders.repo_word(self.repository), self.name, "production")
-
-    @property
     def doc(self) -> Path:
-        return self.checkout / "docs" / f"{self.name}-production.md"
+        return self.repository / "docs" / f"{self.name}-production{LIVE_DOCUMENT_SUFFIX}"
+
+
+class LegacyStyleEnrollmentNotNeeded(Enum):
+    CURRENT_DOCUMENT = "no legacy files need publication"
+
+
+@dataclass(frozen=True)
+class LegacyStyleEnrollment:
+    relative_log: Path
+    files: tuple[tuple[Path, str], ...]
+
+    def publish(self) -> None:
+        for path, text in self.files:
+            if not create_text_atomic(path, text) and path.read_bytes() != text.encode("utf-8"):
+                raise Refusal(f"{path}: conflicts with the legacy style bootstrap")
 
 
 @dataclass(frozen=True)
@@ -119,9 +133,12 @@ class StyleProduction:
     doc: Path
     proposals: str
     merge_tests: tuple[str, ...]
+    enrollment: LegacyStyleEnrollment | LegacyStyleEnrollmentNotNeeded = LegacyStyleEnrollmentNotNeeded.CURRENT_DOCUMENT
 
     @property
     def log(self) -> Path:
+        if isinstance(self.enrollment, LegacyStyleEnrollment):
+            return self.enrollment.relative_log
         return (Path(production_field(self.doc.read_text().splitlines(), "Log")) if self.doc.is_file()
                 else Path("docs") / f"{self.name}-log.md")
 
@@ -157,11 +174,70 @@ def _style_production(repo_dir: Path, *, include_direct: bool) -> StandingStyleP
         lines = doc.read_text().splitlines()
         if optional_field(lines, "Kind") == FieldPresent("style"):
             branch_point = production_field(lines, "Branch point").removeprefix("refs/heads/")
+            if staff.declares_merge_checkout(lines):
+                checkout = read_production(row).checkout
             return StandingStyleProduction(repository, row.name, checkout, doc, branch_point)
         if include_direct and style_config.has_style_units(lines):
             config = style_config.read_config(doc)
-            return StandingStyleProduction(repository, row.name, checkout, doc, config.route.branch_point)
+            return StandingStyleProduction(repository, row.name, config.route.checkout, doc, config.route.branch_point)
     return NoStyleProduction(repository, f"{repository.name}-style")
+
+
+def style_production_branch(name: str) -> str:
+    return f"{name}-{worktrees.UNIT_WORKTREE_NAME}"
+
+
+def _integration_style_branch(branch: str, production: str) -> bool:
+    return branch.endswith(f"-integration-{production}")
+
+
+def is_style_production_branch(branch: str, production: str) -> bool:
+    return (branch.startswith(LEGACY_STYLE_BRANCH_PREFIX) or branch == style_production_branch(production)
+            or _integration_style_branch(branch, production))
+
+
+@dataclass(frozen=True)
+class UnfinishedStyleCheckout:
+    checkout: Path
+    doc: Path
+    branch: str
+
+
+def _enrolled_style_checkout(standing: NoStyleProduction) -> UnfinishedStyleCheckout:
+    from scripts.production.production_admission import require_guard_ready
+
+    _require_bootstrap_destination(standing.doc, standing.repository)
+    try:
+        document = read_new_production(standing.doc, standing.name)
+    except Refusal as error:
+        raise Refusal(f"{standing.doc}: conflicts with the legacy style bootstrap. {error}") from error
+    if document.merge_checkout != standing.repository:
+        raise Refusal(f"{standing.doc}: Merge checkout must name {standing.repository}")
+    try:
+        _ = session_staff.production_session_directory(document.doc, document.checkout)
+    except ValueError as error:
+        raise Refusal(f"{standing.doc}: {error}") from error
+    _require_bootstrap_destination(document.log, standing.repository)
+    require_guard_ready()
+    return UnfinishedStyleCheckout(document.checkout, document.doc, document.merge_branch)
+
+
+def _unfinished_style_checkout(standing: NoStyleProduction) -> UnfinishedStyleCheckout | None:
+    repository, name = standing.repository, standing.name
+    checkout = build_folders.worktree_path(build_folders.repo_word(repository), name, worktrees.UNIT_WORKTREE_NAME)
+    branches = worktree_records.worktree_branches(repository)
+    for candidate in (checkout, checkout.with_name("production")):
+        doc = candidate / "docs" / f"{name}-production.md"
+        if doc.is_file():
+            branch = production_field(doc.read_text().splitlines(), "Merge branch")
+            return UnfinishedStyleCheckout(candidate, doc, branch)
+        branch = branches.get(candidate.resolve(), "")
+        if not branch and (record := worktree_records.checkout_record(candidate)) is not None:
+            if Path(record.repo) == repository:
+                branch = record.branch
+        if is_style_production_branch(branch, name):
+            return UnfinishedStyleCheckout(candidate, standing.doc, branch)
+    return None
 
 
 def _request(name: str) -> StyleProduction:
@@ -174,27 +250,84 @@ def _request(name: str) -> StyleProduction:
     branch_point = parent.merge_branch.removeprefix("refs/heads/")
     _ = _git(repository, "check-ref-format", f"refs/heads/{branch_point}")
     branch_tip = _git(repository, "rev-parse", "--verify", f"refs/heads/{branch_point}^{{commit}}")
+    if isinstance(standing, StandingStyleProduction):
+        checkout, doc = standing.checkout, standing.doc
+        branch = read_production(standing.name).merge_branch
+    else:
+        route = (_enrolled_style_checkout(standing) if standing.doc.exists() or standing.doc.is_symlink()
+                 else _unfinished_style_checkout(standing))
+        if route is not None:
+            checkout, doc, branch = route.checkout, route.doc, route.branch
+        else:
+            from scripts.production.production_lifecycle import require_guard_ready
+
+            require_guard_ready()
+            merge_unit = staff.serving_merge_unit(parent.owner.id)
+            if merge_unit is None:
+                raise Refusal(f"{parent.name}: add a serving merge unit before creating the style production")
+            suffix = f"integration-{name}"
+            checkout = build_folders.worktree_path(build_folders.repo_word(repository), merge_unit.name, suffix)
+            doc = standing.doc
+            branch = f"{merge_unit.name}-{suffix}"
     return StyleProduction(
-        parent, repository, name, branch_point, branch_tip,
-        "style/" + branch_point.replace("/", "-"), standing.checkout,
-        standing.doc, proposals,
+        parent, repository, name, branch_point, branch_tip, branch, checkout, doc, proposals,
         tuple(line for line in lines if line.startswith("- **Merge tests:** ")),
     )
 
 
+def _require_branch_point(style: StyleProduction, branch_point: str) -> None:
+    if branch_point != style.branch_point:
+        raise StyleBranchPointTaken(
+            f"{style.repository.name} already has style production {style.name} on branch point {branch_point}; "
+            + "one branch point per repository",
+        )
+
+
+def _legacy_branch_point(style: StyleProduction) -> str:
+    suffix = style.merge_branch.removeprefix(LEGACY_STYLE_BRANCH_PREFIX)
+    branches = _git(style.repository, "for-each-ref", "--format=%(refname:lstrip=2)", "refs/heads").splitlines()
+    matches = [branch for branch in branches if branch.replace("/", "-") == suffix]
+    if len(matches) > 1:
+        raise Refusal(f"{style.merge_branch}: more than one branch point matches: {', '.join(matches)}")
+    return matches[0] if matches else suffix
+
+
+def _branch_description_key(style: StyleProduction) -> str:
+    return f"branch.{style.merge_branch}.description"
+
+
+def _recorded_branch_point(style: StyleProduction) -> str:
+    result = worktree_records.git(style.repository, "config", "--local", "--get", _branch_description_key(style), check=False)
+    if result.returncode not in (0, 1):
+        raise Refusal(result.stderr.strip() or f"cannot read the description for {style.merge_branch}")
+    return result.stdout.rstrip("\n")
+
+
+def _record_branch_point(style: StyleProduction) -> None:
+    with worktrees.move_lock():
+        branch_point = _recorded_branch_point(style)
+        if branch_point:
+            _require_branch_point(style, branch_point)
+        else:
+            _ = _git(style.repository, "config", "--local", _branch_description_key(style), style.branch_point)
+
+
 def _check_existing(style: StyleProduction) -> bool:
-    standing = standing_style_production(style.repository)
-    if isinstance(standing, StandingStyleProduction):
-        existing = read_production(standing.name)
-        lines = existing.doc.read_text().splitlines()
-        branch_point = standing.branch_point
-        if branch_point != style.branch_point:
-            raise StyleBranchPointTaken(
-                f"{style.repository.name} already has style production {style.name} on branch point {branch_point}; "
-                + "one branch point per repository",
-            )
+    if style.doc.is_file():
+        lines = style.doc.read_text().splitlines()
+        _require_branch_point(style, production_field(lines, "Branch point").removeprefix("refs/heads/"))
+        existing = read_new_production(style.doc, style.name)
         if production_field(lines, "Kind") != "style" or existing.merge_branch != style.merge_branch:
             raise Refusal(f"{style.doc}: does not describe {style.name} on {style.merge_branch}")
+    elif style.merge_branch.startswith(LEGACY_STYLE_BRANCH_PREFIX):
+        _require_branch_point(style, _legacy_branch_point(style))
+    else:
+        branch_point = _recorded_branch_point(style)
+        if branch_point:
+            _require_branch_point(style, branch_point)
+        elif (style.merge_branch == style_production_branch(style.name)
+              and ((style.checkout / ".git").exists() or worktree_records.checkout_record(style.checkout) is not None)):
+            raise Refusal(f"{style.checkout}: no recorded branch point for {style.merge_branch}")
     if (style.checkout / ".git").exists():
         common = _git(style.checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
         if common != _git(style.repository, "rev-parse", "--path-format=absolute", "--git-common-dir"):
@@ -204,6 +337,78 @@ def _check_existing(style: StyleProduction) -> bool:
     elif style.checkout.exists() and any(style.checkout.iterdir()):
         raise Refusal(f"{style.checkout}: is not an empty directory or a style worktree")
     return style.doc.exists() and style.name in showrunners.timer_names()
+
+
+def _require_bootstrap_destination(path: Path, repository: Path) -> None:
+    if path.resolve() != path or path.is_symlink() or (path.exists() and not path.is_file()):
+        raise Refusal(f"{path}: conflicts with the legacy style bootstrap")
+    parent = next(folder for folder in path.parents if folder.exists())
+    if git_files.locate(parent) != git_files.at(repository):
+        raise Refusal(f"{path}: expected a file in {repository}")
+    relative = path.relative_to(repository).as_posix()
+    require_untracked_ignored(repository, relative, planned_pattern=f"/{relative}")
+
+
+def _enroll_legacy_bootstrap(style: StyleProduction, standing: NoStyleProduction) -> StyleProduction:
+    """Plan publication of the unregistered bootstrap in the main checkout."""
+    from scripts.production.production_admission import require_guard_ready
+
+    if any(row.name == style.name
+           or isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))
+           and row.doc.path.resolve() in (style.doc, standing.doc)
+           for row in staff.snapshot().find(kind="showrunner")):
+        raise Refusal(f"{style.name}: the legacy style bootstrap already has a staff row")
+    require_guard_ready()
+    legacy = read_new_production(style.doc, style.name)
+    if (not isinstance(legacy.merge_checkout, LegacyProduction) or legacy.checkout != style.checkout
+            or legacy.doc != style.doc or not worktree_records.registered_checkout(style.checkout, style.repository, style.merge_branch)):
+        raise Refusal(f"{style.doc}: expected an unregistered style bootstrap on {style.merge_branch}")
+    main = git_files.at(style.repository)
+    if git_files.head(main) != git_files.OnBranch("main"):
+        raise Refusal(f"{style.repository}: expected the main checkout on main")
+
+    source = style.doc.read_bytes().decode("utf-8")
+    lines = source.splitlines(keepends=True)
+    repository = optional_field(source.splitlines(), "Repository")
+    if isinstance(repository, FieldPresent):
+        declared = production_field(source.splitlines(), "Repository")
+        if Path(declared).expanduser().resolve() != style.repository:
+            raise Refusal(f"{style.doc}: Repository must name {style.repository}")
+    log = legacy.log.resolve()
+    if (legacy.log != log or not log.is_relative_to(style.checkout) or log == style.checkout or log == legacy.doc):
+        raise Refusal(f"{legacy.log}: expected a separate log below {style.checkout}")
+    relative_log = log.relative_to(style.checkout)
+    live_log = style.repository / relative_log
+    if standing.doc == live_log:
+        raise Refusal(f"{live_log}: the live document and log need separate files")
+    for path in (standing.doc, live_log):
+        _require_bootstrap_destination(path, style.repository)
+
+    files: list[tuple[Path, str]] = []
+    if log.exists():
+        if not log.is_file():
+            raise Refusal(f"{log}: expected a log file")
+        log_text = log.read_bytes().decode("utf-8")
+        if live_log.exists():
+            if live_log.read_bytes() != log_text.encode("utf-8"):
+                raise Refusal(f"{live_log}: conflicts with the legacy style log")
+        else:
+            files.append((live_log, log_text))
+    elif live_log.exists():
+        raise Refusal(f"{live_log}: conflicts with the missing legacy style log")
+
+    index = next(index for index, line in enumerate(lines) if line.startswith("- **Showrunner checkout:**"))
+    newline = "\r\n" if lines[index].endswith("\r\n") else "\n"
+    lines.insert(index, f"- **{MERGE_CHECKOUT_FIELD}:** {style.repository}{newline}")
+    repository_line = f"- **Repository:** {style.repository}{newline}"
+    for repository_index, line in enumerate(lines):
+        if line.startswith("- **Repository:**"):
+            lines[repository_index] = repository_line
+            break
+    else:
+        lines.insert(index, repository_line)
+    files.append((standing.doc, "".join(lines)))
+    return replace(style, doc=standing.doc, enrollment=LegacyStyleEnrollment(relative_log, tuple(files)))
 
 
 def _production_text(style: StyleProduction) -> str:
@@ -216,6 +421,7 @@ def _production_text(style: StyleProduction) -> str:
         "- **Kind:** style",
         f"- **Branch point:** {style.branch_point}",
         f"- **Showrunner checkout:** {style.checkout}",
+        f"- **{MERGE_CHECKOUT_FIELD}:** {style.repository}",
         f"- **Log:** {style.log}",
         f"- **Proposals:** {style.proposals}",
         "- **Updates:** on demand", "- **Push:** git", *style.merge_tests, "",
@@ -303,7 +509,8 @@ def _pilot_steps(steps: tuple[str, ...], pilot: AllStyleUnits | PilotUnits, name
 
 
 def _exclude(style: StyleProduction) -> None:
-    patterns = ("/docs/style-production/", f"/docs/{style.doc.name}", f"/{style.log.as_posix()}")
+    relative_doc = style.doc.relative_to(style.repository if style.doc.is_relative_to(style.repository) else style.checkout)
+    patterns = ("/docs/style-production/", f"/{relative_doc.as_posix()}", f"/{style.log.as_posix()}")
     for pattern in patterns:
         ensure_excluded(style.repository, pattern)
 
@@ -371,10 +578,12 @@ def _steps(style: StyleProduction, existing: bool) -> tuple[str, ...]:
         f"read {style.parent.doc}; repository {style.repository}; Proposals {style.proposals}",
         f"find standing {style.name} under {style.parent.name}; branch point {style.branch_point}",
         f"ensure {style.merge_branch} from {style.branch_tip} and worktree {style.checkout}",
-        (f"set Proposals in existing production doc {style.doc}"
+        (f"publish the legacy production document at {style.doc}"
+         if isinstance(style.enrollment, LegacyStyleEnrollment)
+         else f"set Proposals in existing production doc {style.doc}"
          if style.doc.exists() else f"write missing production doc {style.doc}"),
         f"write missing standing plans for the configured units under {style.checkout / PLAN_DIRECTORY}",
-        f"exclude docs/style-production/, {style.doc.relative_to(style.checkout)} and {style.log} in shared info/exclude",
+        f"exclude docs/style-production/, {style.doc} and {style.log} in shared info/exclude",
         f"initialize ledger at {style.branch_tip} with {style.merge_branch}; launch via add_showrunner.py",
     )
 
@@ -390,6 +599,12 @@ def main(argv: list[str]) -> int:
     try:
         style = _request(cast(str, args.production))
         existing = _check_existing(style)
+        standing = standing_style_production(style.repository)
+        if isinstance(standing, NoStyleProduction) and style.doc != standing.doc:
+            style = _enroll_legacy_bootstrap(style, standing)
+        if (isinstance(standing, NoStyleProduction) and not (style.checkout / ".git").exists()
+                and not worktrees.pending_checkout(style.checkout, style.repository, style.merge_branch)):
+            raise Refusal(f"the serving merge unit must prepare {style.checkout} on {style.merge_branch}")
         pilot_arguments = cast(list[str], args.pilot)
         if existing and pilot_arguments:
             raise Refusal(f"--pilot applies only while creating {style.name}")
@@ -407,12 +622,24 @@ def main(argv: list[str]) -> int:
         branch = (build_folders.ExistingWorktreeBranch(style.merge_branch)
                   if worktrees.has_branch(style.repository, style.merge_branch)
                   else build_folders.NewWorktreeBranch(style.merge_branch, style.branch_tip))
-        layout = worktrees.output_record(build_folders.repo_word(style.repository), style.name, "production")
+        repo_word = build_folders.repo_word(style.repository)
+        record = worktree_records.checkout_record(style.checkout)
+        if _integration_style_branch(style.merge_branch, style.name):
+            layout = (record.layout if record is not None else
+                      worktrees.output_record(repo_word, style.checkout.parent.name, style.checkout.name))
+        else:
+            layout = worktrees.unit_checkout_output(style.checkout, repo_word, style.name)
+        if (not style.doc.is_file() and not isinstance(style.enrollment, LegacyStyleEnrollment)
+                and not style.merge_branch.startswith(LEGACY_STYLE_BRANCH_PREFIX)):
+            _record_branch_point(style)
         _ = worktrees.create_checkout(style.checkout, style.repository, branch, layout, owner=style.name,
                                       allow_empty=True, allow_existing=True)
         if existing:
             _attach(style)
             return 0
+        _exclude(style)
+        if isinstance(style.enrollment, LegacyStyleEnrollment):
+            style.enrollment.publish()
         _write_missing(style.doc, _production_text(style))
         _update_destination(style)
         config = style_config.read_config(style.doc)
@@ -420,7 +647,6 @@ def main(argv: list[str]) -> int:
             _write_missing(style.checkout / PLAN_DIRECTORY / f"{assignment.unit}-unit.md", _plan_text(style, assignment, catalog))
         if isinstance(pilot, PilotUnits):
             _configure_pilot(style, pilot)
-        _exclude(style)
         style_tip = _git(style.repository, "rev-parse", "--verify", f"refs/heads/{style.merge_branch}^{{commit}}")
         with style_ledger.open_ledger(style.checkout) as ledger:
             ledger.ensure_synced_tip(style_tip, style.merge_branch)
@@ -441,7 +667,7 @@ def main(argv: list[str]) -> int:
             raise Refusal(f"{LAUNCHER.name} exited {result.returncode}; rerun add_style to continue")
         _attach_parent(style)
         return 0
-    except (Refusal, worktrees.Refused, rules.RuleValidationError, style_ledger.LedgerError,
+    except (Refusal, worktree_records.Refused, rules.RuleValidationError, style_ledger.LedgerError,
             OSError, ValueError, sqlite3.Error) as error:
         print("add_style: " + " ".join(str(error).splitlines()), file=sys.stderr)
         return 2

@@ -13,6 +13,20 @@
 // Use --verify-call as the third argument for the Verify column proof.
 // Use --headcount to compare the Running and Queued headers.
 // Use --build-tools as the third argument for the Build tools proof.
+// Use --outside-queue after the output folder to check the outside command table.
+// Add a published page from main to save the before image.
+// Use --queue-rows to capture the dark queue card, its tooltips, and its right edge.
+// Use the fourth argument to select the older page.
+// Use --guest-tip after the output folder for the guest row tooltip screenshot.
+// Use --standing-orders as the third argument for nate's standing orders on real-shape rows; a fourth argument names a rendered page to check.
+
+// Use --rowask to capture the rows and the New item dialog.
+// Use <output-folder> --tip-design for the six dark tooltip captures.
+// Use <output-folder> --aws-cost-shots to capture the approved AWS costs example.
+// Add a folder with live memory.json, report.json, and memory_live.html for the Day images.
+// Add --awscosts as the fourth argument for the AWS costs proof and images.
+// Use --kill-shot or --kill-control as the third argument for the Kill fixture.
+// Use --kill-both-shot with an output PNG path for the full Builds page.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {accessSync, constants, statSync} from 'node:fs';
@@ -24,6 +38,8 @@ import {inflateSync} from 'node:zlib';
 import {delimiter, join, dirname, resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 import {fileURLToPath} from 'node:url';
+
+const memoryTenths = text => text.startsWith("<") ? 1 : Math.round(parseFloat(text) * 10);
 
 function chromeExecutable() {
   if (process.env.CHROME) return process.env.CHROME;
@@ -48,25 +64,221 @@ const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const args = process.argv.slice(2);
 const gateMode = args[0] === '--gate';
 if (gateMode) args.shift();
-const [callerFolder, previousPage, comparison] = args;
+const [callerFolder, ...comparisonArgs] = args;
+const tipDesignComparison = !gateMode && comparisonArgs[0] === '--tip-design';
+const awsCostShots = !gateMode && comparisonArgs[0] === '--aws-cost-shots';
+const liveAwsCostSource = awsCostShots ? comparisonArgs[1] : undefined;
+const approvedAwsCostShot = awsCostShots && !liveAwsCostSource;
+const [previousPage, comparison] = tipDesignComparison || awsCostShots ? [] : comparisonArgs;
+const requestedShot = gateMode ? undefined : process.env.MEMORY_PAGE_SHOT;
 const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
-const focusedProof = verifyCallProof || buildToolsProof;
+const outsideQueueProof = previousPage === '--outside-queue';
+const queueDragProof = previousPage === '--queue-drag';
+const queueRowsProof = previousPage === '--queue-rows';
+const guestTipProof = previousPage === '--guest-tip';
+const standingProof = previousPage === '--standing-orders';
+const killShot = previousPage === '--kill-shot';
+const killControlProof = previousPage === '--kill-control';
+const killBothShot = previousPage === '--kill-both-shot';
+const killProof = killShot || killControlProof || killBothShot;
+const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || guestTipProof
+  || standingProof || outsideQueueProof || killProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
-const runningHeaders = ['Stage','Done','Step','Dur','Verify','Unit','Pid','Target','vCPU','Slot','Tokens'];
-const queuedHeaders = ['#','Done','Step','Waiting','Verify','Unit','Pid','Target','vCPU'];
+const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Machine','vCPU','Tokens','Moved'];
+const queuedHeaders = ['#','Done','Waiting','Verify','Step','Pid','Machine','vCPU','Moved'];
+
+function waitForMoveHandle(evaluate, rowId) {
+  return evaluate(`new Promise((resolve, reject) => {
+    const walk = document.querySelector('#walk');
+    const selector = '.queue-grip[data-move-id="' + CSS.escape(${JSON.stringify(rowId)}) + '"]';
+    if (walk.querySelector(selector)) return resolve(true);
+    const observer = new MutationObserver(() => {
+      if (!walk.querySelector(selector)) return;
+      observer.disconnect();
+      clearTimeout(timeout);
+      resolve(true);
+    });
+    const timeout = setTimeout(() => {
+      observer.disconnect();
+      reject(new Error('The waiting row has no move handle: ' + selector));
+    }, 3000);
+    observer.observe(walk, {childList:true, subtree:true});
+  })`);
+}
+
+// nate's standing orders for the Builds page (docs/plans/builds-page-standing-orders.md), checked at 1440 px and 900 px
+// on the served reading, which has rows in the shape of the live feed. The path names the page to check.
+// With a shot folder, the check first saves the Running and Queued card at each width as real-<width>.png.
+async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
+  await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+  for (const width of [1440, 900]) {
+    await call('Emulation.setDeviceMetricsOverride', {width,height:1100,deviceScaleFactor:1,mobile:false});
+    await navigate(path);
+    const shown = await evaluate(`(async () => {
+      // The handles draw when the page has its queue-move token.
+      for (const start = Date.now(); !document.querySelector('.queue-grip') && Date.now() - start < 3000;)
+        await new Promise(done => setTimeout(done, 20));
+      const walk = document.querySelector('#walk');
+      const card = walk.closest('.card').getBoundingClientRect();
+      const center = box => (box.top + box.bottom) / 2;
+      const firstLine = element => {
+        const nodes = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+        for (let node = nodes.nextNode(); node; node = nodes.nextNode()) {
+          if (!node.textContent.trim()) continue;
+          const range = document.createRange();
+          range.selectNodeContents(node);
+          const line = range.getClientRects()[0];
+          if (line) return line;
+        }
+      };
+      const rows = [...walk.querySelectorAll('tbody tr[data-tip]:not(.room)')].map(table => {
+        const key = table.dataset.tip;
+        const [kind, id] = key.split(':');
+        const data = (kind === 'row' ? latest.walk : kind === 'wait' ? latest.waiters : []).find(row => row.key === id);
+        const chart = walk.querySelector('.wrow[data-tip="' + key + '"]');
+        const name = chart.querySelector('.name');
+        const unit = name.querySelector('[data-color-text="role.unit-director"]');
+        const title = center(firstLine(name));
+        const grip = chart.querySelector('.queue-grip');
+        // The last character of each line of the Step text, to find a word broken at its hyphen.
+        const stepEnds = [];
+        let last = null;
+        const stepText = document.createTreeWalker(table.querySelector('.step'), NodeFilter.SHOW_TEXT);
+        for (let node = stepText.nextNode(); node; node = stepText.nextNode()) {
+          for (let index = 0; index < node.length; index++) {
+            const range = document.createRange();
+            range.setStart(node, index);
+            range.setEnd(node, index + 1);
+            const box = range.getClientRects()[0];
+            if (!box) continue;
+            if (last && Math.abs(box.top - last.top) > 2) stepEnds.push(last.text);
+            last = {top:box.top, text:node.data[index]};
+          }
+        }
+        return {key, kind, unit:data?.title?.unit || '', machine:data?.machine || '', targets:data?.targets || [],
+          runner:data?.runner || '', why:data?.why || '', stepEnds, nameLeft:name.getBoundingClientRect().left,
+          nameRole:name.querySelector('[data-color-text]')?.dataset.colorText || '',
+          memoryBox:chart.querySelector('.track')?.childElementCount > 0,
+          smallLines:[...chart.querySelectorAll('.row-label :is(.owner, .wait-note)')].filter(line => line.textContent.trim())
+            .map(line => [line.className, Math.round(line.getBoundingClientRect().height / parseFloat(getComputedStyle(line).lineHeight))]),
+          movable:kind === 'wait' && data?.move?.movable !== false, title:name.textContent, titleCut:name.scrollWidth > name.clientWidth,
+          grip:!!grip, gripOverlap:grip ? grip.getBoundingClientRect().right > name.getBoundingClientRect().left : false,
+          owner:chart.querySelector('.owner')?.textContent || '',
+          nameLines:Math.round(name.getBoundingClientRect().height / parseFloat(getComputedStyle(name).lineHeight)),
+          unitName:unit?.textContent || '', unitColor:unit ? getComputedStyle(unit).color : '', rowColor:getComputedStyle(chart).color,
+          // A Machine icon has no text, so its box stands for its first line.
+          offsets:[...table.cells].flatMap(cell => {
+            const line = cell.querySelector('.machine-icon')?.getBoundingClientRect() ?? firstLine(cell);
+            return line ? [[cell.className, Math.round((center(line) - title) * 10) / 10]] : [];
+          }),
+          icons:[...table.querySelectorAll('td.machine .machine-icon')].map(icon =>
+            [icon.getAttribute('aria-label'), ['run', 'dim'].find(state => icon.classList.contains(state)) || '']),
+          hover:kind === 'row' || kind === 'wait' ? tipText(key, latest).join('\\n').toLowerCase() : ''};
+      });
+      return {rows, headers:[...walk.querySelectorAll('thead th, tr.queue-head th')].map(cell => cell.textContent),
+        clip:{x:card.left+scrollX,y:card.top+scrollY,width:card.width,height:card.height,scale:1}};
+    })()`);
+    if (shotFolder) {
+      const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:shown.clip});
+      await writeFile(join(shotFolder, `real-${width}.png`), Buffer.from(shot.data,'base64'));
+    }
+    const kinds = new Set(shown.rows.map(row => row.kind));
+    assert.ok(kinds.has('tools') && kinds.has('row') && kinds.has('wait'), `The real-shape rows did not all show at ${width} px.`);
+    assert.deepEqual(shown.headers.filter(header => ['Unit', 'Slot'].includes(header)), [],
+      `Orders 2 and 4: the table has a Unit or Slot column at ${width} px.`);
+    const word = name => new RegExp('(^|[^a-z-])' + name.toLowerCase() + '([^a-z-]|$)');
+    assert.ok(shown.rows.some(row => row.smallLines.some(([kind]) => kind === 'wait-note')),
+      `The real-shape rows show no waiting note at ${width} px.`);
+    const waitLefts = new Set(shown.rows.filter(row => row.kind === 'wait').map(row => Math.round(row.nameLeft)));
+    assert.equal(waitLefts.size, 1, `Order 9: the waiting row titles do not line up at ${width} px: ${[...waitLefts]}`);
+    for (const row of shown.rows) {
+      const where = `${row.key} at ${width} px`;
+      if (row.unit) {
+        assert.notEqual(row.owner, '', `Order 6: ${where} has no showrunner line under its title.`);
+        assert.equal(row.unitName, row.unit, `Order 2: the title of ${where} does not start with the unit name.`);
+        assert.notEqual(row.unitColor, row.rowColor, `Order 2: the unit name of ${where} has no unit color.`);
+      } else assert.ok(!row.title.includes(': '), `Order 2: ${where} does not start with its owner: ${row.title}`);
+      if (row.runner === 'showrunner' && !row.unit) {
+        assert.equal(row.nameRole, 'role.showrunner', `Order 2: the showrunner that owns ${where} has no showrunner color.`);
+        // Form with a reason: the small line would repeat the owner.
+        assert.equal(row.owner, '', `Form: ${where}, a showrunner's own run, has a small line.`);
+      }
+      assert.deepEqual(row.stepEnds.filter(end => end === '-'), [], `Order 7: the Step of ${where} breaks at a hyphen.`);
+      // Form with a reason: a Mac-only waiting step has no memory box, because the chart shows natedev memory.
+      if (row.why === 'target') assert.equal(row.memoryBox, false, `Form: ${where}, a Mac-only step, has a memory box.`);
+      assert.equal(row.nameLines, 1, `Order 7: the title of ${where} wraps.`);
+      assert.deepEqual(row.smallLines.filter(([, lines]) => lines !== 1), [], `Order 13: a small line of ${where} wraps.`);
+      if (width === 1440) assert.equal(row.titleCut, false, `Order 7: the title of ${where} is cut.`);
+      assert.equal(row.grip, row.movable, `Order 9: ${where} has the wrong reorder handle state.`);
+      assert.equal(row.gripOverlap, false, `Order 9: the reorder handle of ${where} covers its title.`);
+      assert.deepEqual(row.offsets.filter(([, offset]) => Math.abs(offset) > 2), [],
+        `Order 8: a table cell of ${where} is not in line with the first line of the row title.`);
+      if (row.kind === 'tools') continue;
+      const machines = row.kind === 'row' ? [row.machine] : row.targets;
+      assert.deepEqual(row.icons, machines.map(machine => [machine, row.kind === 'row' ? 'run' : 'dim']),
+        `Orders 3 and 5: the Machine cell of ${where} does not show its machines.`);
+      for (const machine of machines)
+        assert.match(row.hover, word(machine), `Orders 3 and 5: the hover of ${where} does not name ${machine}.`);
+    }
+  }
+}
+
+async function assertRowCenters(evaluate) {
+  const rows = await evaluate(`(() => {
+    const center = box => (box.top + box.bottom) / 2;
+    const firstText = element => {
+      const nodes = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+      for (let node = nodes.nextNode(); node; node = nodes.nextNode()) {
+        if (!node.textContent.trim()) continue;
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const line = range.getClientRects()[0];
+        if (line) return line;
+      }
+    };
+    return [...document.querySelectorAll('.walk-table tbody tr[data-tip]:not(.room)')].map(table => {
+      const key = table.dataset.tip;
+      const chart = document.querySelector('.wrow[data-tip="' + key + '"]');
+      const track = chart.querySelector('.track');
+      const held = key.startsWith('held:');
+      const marks = Object.fromEntries([...table.cells].flatMap(cell => {
+        const line = firstText(cell);
+        return line ? [['column ' + cell.className, center(line)]] : [];
+      }));
+      for (const [index, bar] of [...(held ? [] : track.querySelectorAll('.b, .progress-track'))].entries()) {
+        marks['bar ' + index] = center(bar.getBoundingClientRect());
+      }
+      marks.name = center(firstText(chart.querySelector('.name')));
+      const detailTops = [...chart.querySelectorAll('.owner, .amounts')].flatMap(element => {
+        const line = firstText(element);
+        return line ? [line.top] : [];
+      });
+      return {key, track: held ? marks.name : center(track.getBoundingClientRect()), marks, detailTops};
+    });
+  })()`);
+  assert.ok(rows.some(row => row.key.startsWith('row:')));
+  assert.ok(rows.some(row => row.key.startsWith('wait:')));
+  for (const row of rows) {
+    for (const [label, center] of Object.entries(row.marks)) {
+      assert.ok(Math.abs(center - row.track) <= 1, `${row.key} ${label} is off center: ${JSON.stringify(row)}`);
+    }
+    assert.ok(row.detailTops.every(top => top > row.track), `${row.key} has detail on the center line`);
+  }
+}
 const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(), 'memory-page-proof-'));
 try {
   await mkdir(folder, {recursive:true});
-  const fixtureOutput = execFileSync(process.env.PYTHON || 'python3', ['-c',
-    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE))' + (focusedProof ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
+  const fixtureOutput = liveAwsCostSource ? '' : execFileSync(process.env.PYTHON || 'python3', ['-c',
+    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE, aws_cost_fixture; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE)); (Path(sys.argv[1]) / "aws_cost_fixture.json").write_text(json.dumps(aws_cost_fixture())); from scripts.review_links import new_item_dialog, page_frame; from scripts.production import staff; page = Path(sys.argv[1]) / "memory_live.html"; page.write_bytes(page_frame.with_owner(page.read_bytes(), "builds", page_frame.NoShownOwner(), staff.StaffSnapshot(()), new_item_dialog.render))' + (focusedProof || awsCostShots ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
-  const systemTemporaryRoot = focusedProof ? tmpdir() : fixtureOutput;
-  const page = await readFile(join(folder, 'memory_live.html'));
-  const beforePage = previousPage && !focusedProof ? (await readFile(previousPage, 'utf8'))
+  const systemTemporaryRoot = focusedProof || awsCostShots ? tmpdir() : fixtureOutput;
+  const page = await readFile(join(liveAwsCostSource ?? folder, 'memory_live.html'));
+  const beforePath = queueRowsProof || standingProof || outsideQueueProof ? comparison : focusedProof ? null : previousPage;
+  const beforePage = beforePath ? (await readFile(beforePath, 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
-  const swapBeforePage = process.env.SWAP_BEFORE_PAGE
+  const swapBeforePage = !gateMode && process.env.SWAP_BEFORE_PAGE
     ? (await readFile(process.env.SWAP_BEFORE_PAGE, 'utf8')).replace('__MEMORY_FEED_INTERVAL_SECONDS__','0.125') : null;
   const queuedComparison = comparison === '--queued';
   const consoleComparison = comparison === '--console';
@@ -78,44 +290,100 @@ try {
   const waitTipComparison = comparison === '--wait-tip';
   const macrouteComparison = comparison === '--macroute';
   const headcountComparison = comparison === '--headcount';
-  const comparisonImages = Boolean(comparison || beforePage || swapBeforePage || process.env.MEMORY_PAGE_SHOT);
-  const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
-  const fixtureTime = readings.good.read_at;
-  for (const reading of Object.values(readings)) {
-    const shift = fixtureTime - reading.read_at;
-    for (const row of reading.walk) {
-      if (row.started_at) row.started_at += shift;
-      if (row.read_at) row.read_at += shift;
-      for(const part of row.parts || []) if(part.started_at) part.started_at += shift;
-    }
-    for (const waiter of reading.waiters) waiter.since += shift;
-    reading.read_at = fixtureTime;
-  }
+  const rowAskComparison = comparison === '--rowask';
+  const awsCostsComparison = comparison === '--awscosts';
+  const comparisonImages = Boolean(comparison || beforePage || swapBeforePage || requestedShot);
+  const readings = liveAwsCostSource
+    ? {good: JSON.parse(await readFile(join(liveAwsCostSource, 'memory.json'), 'utf8'))}
+    : JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const base = readings.good;
-  base.waiters = structuredClone(readings.spacing.waiters);
-  base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
-  base.walk.find(row => row.queued).unit = 'handler';
-  base.walk.find(row => row.queued).showrunner = 'sdlc';
-  const swapRow = (name, kind, bytes, pool='outside', extra={}) => ({name, detail:'fixture owner', kind, pool,
-    category:'', members:[], owner_count:0, bytes, swap:bytes/1024**3, ...extra});
-  const swapOwners = Array.from({length:31}, (_, index) => swapRow('group '+index, 'owner', (31-index)*1024**3/64,
-    'outside', {owner_count:1}));
-  const smaller = swapOwners.slice(base.swap_rows);
-  const groupedBytes = smaller.reduce((sum,row)=>sum+row.bytes,0);
-  const swapUsed = swapOwners.reduce((sum,row)=>sum+row.bytes,0)+1031;
-  base.swap = {used_bytes:swapUsed, capacity_bytes:8*1024**3, builds_ci_bytes:0, outside_bytes:swapUsed,
-    reserve_share_percent:50};
-  base.swap_by = [...swapOwners.slice(0,base.swap_rows),
-    swapRow(smaller.length+' smaller groups', 'smaller', groupedBytes, 'outside',
-      {members:smaller.map(row=>({name:row.name, bytes:row.bytes})), owner_count:smaller.length}),
-    swapRow('Unclassified groups', 'ungrouped', 1024),
-    swapRow('Not attributed', 'unattributed', 7),
-    swapRow('All swap used', 'total', swapUsed, 'all')];
-  readings.shrink = structuredClone(base);
-  const extra = structuredClone(base.walk.find(row => row.queued));
-  extra.name = 'second nextest'; extra.pid = 222; extra.key += '-second';
-  readings.shrink.walk.unshift(extra);
-  readings.shrink.waiters = [];
+  const queueShot = queueRowsProof && !beforePage;
+  const liveFixtureTime = queueShot || guestTipProof;
+  const fixtureTime = approvedAwsCostShot ? Date.parse('2026-11-23T20:00:00Z') / 1000
+    : liveFixtureTime ? Math.floor(Date.now() / 1000) : base.read_at;
+  const clockTime = liveAwsCostSource ? Date.now() : fixtureTime * 1000;
+  if (liveAwsCostSource) {
+    base.report = JSON.parse(await readFile(join(liveAwsCostSource, 'report.json'), 'utf8'));
+  } else {
+    await prepareFixtures();
+  }
+
+  async function prepareFixtures() {
+    const costs = JSON.parse(await readFile(join(folder, 'aws_cost_fixture.json'), 'utf8'));
+    if (approvedAwsCostShot) prepareApprovedAwsCosts(costs);
+    readings.aws_costs = {...structuredClone(readings.good), report_version:'aws-cost-proof',
+      report:{...readings.good.report, aws_costs:costs}};
+    for (const reading of Object.values(readings)) {
+      const shift = fixtureTime - reading.read_at;
+      for (const row of reading.walk) {
+        if (row.started_at) row.started_at += shift;
+        if (row.read_at) row.read_at += shift;
+        for(const part of row.parts || []) if(part.started_at) part.started_at += shift;
+      }
+      for (const waiter of reading.waiters) waiter.since += shift;
+      if (liveFixtureTime) reading.fresh_until += shift;
+      reading.read_at = fixtureTime;
+    }
+    base.waiters = structuredClone(readings.spacing.waiters);
+    base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
+    base.walk.find(row => row.queued).unit = 'handler';
+    base.walk.find(row => row.queued).showrunner = 'sdlc';
+    const swapRow = (name, kind, bytes, pool='outside', extra={}) => ({name, detail:'fixture owner', kind, pool,
+      category:'', members:[], owner_count:0, bytes, swap:bytes/1024**3, ...extra});
+    const swapOwners = Array.from({length:31}, (_, index) => swapRow('group '+index, 'owner', (31-index)*1024**3/64,
+      'outside', {owner_count:1}));
+    const smaller = swapOwners.slice(base.swap_rows);
+    const groupedBytes = smaller.reduce((sum,row)=>sum+row.bytes,0);
+    const swapUsed = swapOwners.reduce((sum,row)=>sum+row.bytes,0)+1031;
+    base.swap = {used_bytes:swapUsed, capacity_bytes:8*1024**3, builds_ci_bytes:0, outside_bytes:swapUsed,
+      reserve_share_percent:50};
+    base.swap_by = [...swapOwners.slice(0,base.swap_rows),
+      swapRow(smaller.length+' smaller groups', 'smaller', groupedBytes, 'outside',
+        {members:smaller.map(row=>({name:row.name, bytes:row.bytes})), owner_count:smaller.length}),
+      swapRow('Unclassified groups', 'ungrouped', 1024),
+      swapRow('Not attributed', 'unattributed', 7),
+      swapRow('All swap used', 'total', swapUsed, 'all')];
+    readings.shrink = structuredClone(base);
+    const extra = structuredClone(base.walk.find(row => row.queued));
+    extra.name = 'second nextest'; extra.pid = 222; extra.key += '-second';
+    readings.shrink.walk.unshift(extra);
+    readings.shrink.waiters = [];
+  }
+  function prepareApprovedAwsCosts(costs) {
+    Object.assign(costs, {zone:'America/Los_Angeles', today:'2026-11-23', price_day:'2026-11-18',
+      read_at:Date.parse('2026-11-19T18:43:00Z') / 1000,
+      next_read_at:Date.parse('2026-11-20T18:43:00Z') / 1000, read_error:'AWS refuses the key'});
+    const daysWithoutRuns = [23,22,21,20].map(day => {
+      const amount = day === 20 ? '2.00' : '0.94';
+      return {day:'2026-11-' + day, state:'estimate', amount_usd:amount, runs:0, jobs:[], hana:null,
+        units:[], unrecorded_compute_usd:'0.00', no_run_usd:amount, runs_list:[]};
+    });
+    const [nov19, nov18] = costs.days;
+    Object.assign(nov18, {state:'billed', amount_usd:'7.73'});
+    Object.assign(nov19, {amount_usd:'5.53', runs:194, no_run_usd:'1.71'});
+    Object.assign(nov19.hana, {cost_usd:'0.70', idle_usd:'0.69', idle_seconds:8572});
+    const attempts = nov19.runs_list.filter(run => run.kind === 'hana');
+    const gates = nov19.runs_list.filter(run => run.kind === 'gate');
+    gates.push({...gates.at(-1), id:'fixture-extra'});
+    function setGroup(runs, job, cents) {
+      const share = Math.floor(cents / runs.length), extra = cents % runs.length;
+      runs.forEach((run, index) => {
+        run.job = job;
+        run.cost_usd = ((share + Number(index < extra)) / 100).toFixed(2);
+      });
+    }
+    setGroup(gates.slice(0,66), 'test affected', 107);
+    setGroup(gates.slice(66), 'test all', 205);
+    setGroup(attempts, null, 1);
+    attempts.forEach((run, index) => Object.assign(run, {
+      seconds:[0,0,0,44,47,41,50][index], region:'us-east-2', machine:'m7a.4xlarge',
+    }));
+    nov19.runs_list = [...gates, ...attempts];
+    for (const day of costs.days) {
+      for (const run of day.runs_list) run.unit = null;
+    }
+    costs.days.unshift(...daysWithoutRuns);
+  }
   function pngPixels(buffer) {
     let width, height, channels;
     const chunks = [];
@@ -153,10 +421,165 @@ try {
 
   let servedReading = base;
   let currentFixture = base;
-  const server = createServer((req, res) => {
+  const killTime = killProof ? execFileSync(process.env.PYTHON || 'python3', ['-c', [
+    'from datetime import datetime',
+    'from scripts.lib.user_zone import user_zone',
+    'print(datetime.fromisoformat("2026-11-19T00:41:00+00:00").astimezone(user_zone()).strftime("%H:%M %Z"))',
+  ].join('\n')], {cwd:repo, encoding:'utf8'}).trim() : '';
+  const killMessage = (step, pid) => `nate killed your run "${step}" (pid ${pid}) from the Builds page at ${killTime}.`;
+  const killWarning = name => `The run stops at once and its work is lost. This message goes to ${name}:`;
+  const killWordsLabel = 'Your own words, added to the message (optional)';
+  const killPath = '/console/build-kill';
+  const killRef = 'a'.repeat(64);
+  const killOffer = {handle:'b'.repeat(64),pid:2712994,started_by:'impl3, a worker of unit-board',
+    recipient_name:'impl3',step:'check',
+    message:killMessage('check', 2712994)};
+  const researchRef = 'c'.repeat(64);
+  const researchOffer = {handle:'e'.repeat(64),pid:2637799,started_by:'test, a worker of research',
+    recipient_name:'test',step:'nextest',
+    message:killMessage('nextest', 2637799)};
+  const killedResult = {reference:killRef,step:'check',pid:killOffer.pid,stop:'Stopped',delivery:'Message sent',
+    time:killTime,recipient_role:'worker',recipient_name:'impl3'};
+  const killToken = 'fixture-token';
+  const killRefreshSeconds = 17;
+  const stoppingResult = {...killedResult,stop:'Stopping',delivery:''};
+  const outsideRows = readings.outside_queue?.outside_queue ?? [];
+  const outsideRow = outsideRows.find(row => row.pid === 8102);
+  const outsideRef = outsideRow?.kill_ref;
+  const outsideOffers = Object.fromEntries(outsideRows.map(row => [row.kill_ref, {
+    handle:'d'.repeat(64), pid:row.pid, started_by:row.pid === 8102 ? 'test, a worker of queue' : 'builds, a showrunner',
+    recipient_name:row.owner, step:row.command,
+    message:killMessage(row.command, row.pid),
+  }]));
+  const outsideStopped = {reference:outsideRef,step:outsideRow?.command,pid:outsideRow?.pid,
+    stop:'Stopped',delivery:'Message sent',time:killTime,recipient_role:'worker',recipient_name:outsideRow?.owner};
+  let killPost;
+  let killPostReply;
+  let killResults = [];
+  let submittedItem;
+  let queueFixture = null;
+  let unnamedPlace = -1;
+  let confirmedQueueLine = null;
+  const undoAnchors = new Map();
+  function setQueueWaiters(rows) {
+    let place = 0;
+    queueFixture.waiters = rows.map(row => row.kind === 'cloud' ? row : {...row, place:++place});
+  }
+  const unnamed = {row_id:'unnamed-wait'};
+  const fixtureMoveLine = reading => {
+    const members = reading.waiters.filter(row => row.move).map(row => row.move);
+    if (unnamedPlace >= 0) members.splice(unnamedPlace, 0, unnamed);
+    return {revision:reading.move_revision, members, kept_runs:[]};
+  };
+  const server = createServer(async (req, res) => {
+    if (req.url.split('?', 1)[0] === '/console/review/new-item') {
+      res.writeHead(200, {'Content-Type':'application/json'});
+      if (req.method === 'POST') {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        const payload = JSON.parse(Buffer.concat(chunks));
+        if (payload.page_capture) {
+          server.emit('page-capture', payload.page_capture);
+          res.end('{}');
+        } else {
+          submittedItem = payload;
+          res.end(JSON.stringify({id:'Q1'}));
+        }
+      } else {
+        res.end(JSON.stringify({token:'proof-token',recipients:[
+          {id:'fixture-hana',name:'hana',proposal:true}, {id:'fixture-builds',name:'builds',proposal:true}
+        ]}));
+      }
+      return;
+    }
+    if (req.url === '/console/builds/queue-move') {
+      const json = (status, result) => {
+        res.writeHead(status, {'Content-Type':'application/json'});
+        res.end(JSON.stringify(result));
+      };
+      if (!queueFixture) return json(403, {});
+      if (req.method === 'GET') return json(200, {token:'fixture-token', highlight_seconds:20});
+      req.setEncoding('utf8');
+      let body = '';
+      for await (const part of req) body += part;
+      const request = JSON.parse(body);
+      const {revision, row_id, destination} = request;
+      const rows = queueFixture.waiters;
+      const ordered = rows.filter(row => row.move);
+      const {members} = fixtureMoveLine(queueFixture);
+      const line = () => ({revision:queueFixture.move_revision, members, kept_runs:[]});
+      if (revision !== queueFixture.move_revision) return json(409, {reason:'The queue changed.', line:line()});
+      const undo = request.kind === 'QueueUndoRequest';
+      if (!undo) assert.equal(request.kind, 'QueueMoveRequest');
+      assert.deepEqual(Object.keys(request).sort(), undo
+        ? ['kind', 'move_request_id', 'request_id', 'revision', 'row_id', 'token']
+        : ['destination', 'kind', 'request_id', 'revision', 'row_id', 'token']);
+      const previous = undoAnchors.get(request.move_request_id);
+      const drop = undo
+        ? previous === null ? {kind:'QueueHeadDrop'} : {kind:'QueueDrop', neighbor:previous, side:'after'}
+        : destination;
+      if (drop.kind !== 'QueueHeadDrop' && !members.some(item => item.row_id === drop.neighbor)) {
+        return json(409, {reason:'The old neighbor left the queue.', line:line()});
+      }
+      const index = members.findIndex(item => item.row_id === row_id);
+      undoAnchors.set(request.request_id, members[index - 1]?.row_id ?? null);
+      const [member] = members.splice(index, 1);
+      const next = drop.kind === 'QueueHeadDrop' ? 0
+        : members.findIndex(item => item.row_id === drop.neighbor) + (drop.side === 'after' ? 1 : 0);
+      members.splice(next, 0, member);
+      unnamedPlace = members.indexOf(unnamed);
+      const byId = new Map(ordered.map(row => [row.move.row_id, row]));
+      const shown = members.filter(item => byId.has(item.row_id)).map(item => byId.get(item.row_id));
+      let indexShown = 0;
+      setQueueWaiters(rows.map(item => item.move ? shown[indexShown++] : item));
+      queueFixture.move_revision += '1';
+      confirmedQueueLine = line();
+      return json(200, {line:confirmedQueueLine});
+    }
+    if (req.url === killPath) {
+      res.setHeader('Content-Type','application/json');
+      if (!killProof) {
+        res.writeHead(403).end('{}');
+      } else if (req.method === 'POST') {
+        if (killShot || killBothShot) {
+          res.writeHead(405).end('{}');
+          return;
+        }
+        const fields = [];
+        req.setEncoding('utf8');
+        req.on('data', part => fields.push(part));
+        req.on('end', () => {
+          killPost = Object.fromEntries(new URLSearchParams(fields.join('')));
+          killPostReply = (reason, accepted) => {
+            if (reason) {
+              res.writeHead(409).end(JSON.stringify({reason}));
+              return;
+            }
+            const result = accepted ?? (killPost.reference === outsideRef
+              ? {...outsideStopped,stop:'Stopping',delivery:''} : stoppingResult);
+            killResults = [result];
+            res.end(JSON.stringify({result}));
+          };
+          server.emit('kill-post');
+        });
+      } else {
+        const offers = {[killRef]:killOffer, ...(killShot ? {} : outsideOffers)};
+        if (killBothShot) offers[researchRef] = researchOffer;
+        for (const result of killResults) if (result.stop !== 'Stop unconfirmed') delete offers[result.reference];
+        res.end(JSON.stringify({token:killToken,offers,results:killResults,refresh_seconds:killRefreshSeconds}));
+      }
+      return;
+    }
     const isData = req.url.startsWith('/memory.json'), isReport = req.url.startsWith('/report.json');
     res.writeHead(200, {'Content-Type':isData || isReport ? 'application/json' : 'text/html; charset=utf-8'});
-    res.end(isData ? JSON.stringify(servedReading) : isReport ? JSON.stringify(base.report)
+    let reading = servedReading;
+    if (isData && reading.move_revision?.startsWith('fixture')) {
+      const move_line = fixtureMoveLine(reading);
+      const places = new Map(move_line.members.map((member, index) => [member.row_id, index + 1]));
+      reading = {...reading, move_line, waiters:reading.waiters.map(row =>
+        row.move ? {...row, place:places.get(row.move.row_id)} : row)};
+    }
+    res.end(isData ? JSON.stringify(reading) : isReport ? JSON.stringify(awsCostShots ? servedReading.report : base.report)
       : req.url === '/before.html' ? beforePage : req.url === '/swap-before.html' ? swapBeforePage : page);
   });
   try {
@@ -168,7 +591,7 @@ try {
       const temporary = join(profile, 'tmp');
       await mkdir(temporary);
       const chrome = spawn(chromePath, [
-        '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars',
+        '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
         '--no-first-run', '--disable-extensions', '--disable-background-networking',
         '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank',
       ], {env:{...process.env,TMPDIR:temporary},stdio:['ignore','ignore','pipe']});
@@ -232,12 +655,15 @@ try {
           return result.result.value;
         };
         await call('Page.enable');
+        // The checks see no scrollbars; only the scrollbar check shows them.
+        await call('Emulation.setScrollbarsHidden', {hidden:true});
         await call('Page.addScriptToEvaluateOnNewDocument', {
           source:'window.proofSetInterval = window.setInterval; window.setInterval = () => 0;'
-            + 'Date.now = () => ' + fixtureTime * 1000 + ';'});
+            + 'Date.now = () => ' + clockTime + ';'});
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-        await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
-        const navigate = async path => {
+        const desktopWidth = gateMode ? 1400 : 1600;
+        await call('Emulation.setDeviceMetricsOverride', {width:desktopWidth,height:1200,deviceScaleFactor:1,mobile:false});
+        const navigate = async (path, freezeRender = true) => {
           currentFixture = servedReading;
           const loaded = new Promise((resolve, reject) => events.set(`${sessionId}:Page.loadEventFired`, {resolve,reject}));
           await Promise.all([loaded, call('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/${path}`})]);
@@ -250,7 +676,7 @@ try {
           window.proofRun = index => latest.walk[index].key;
           window.renderReading = render;
           window.proofData = structuredClone(latest);
-          window.render = () => {};
+          if (${freezeRender}) window.render = () => {};
           await document.fonts.ready;
           const legend = document.querySelector('.legend-box');
           if (${JSON.stringify(path)} === 'memory_live.html' && legend.open) throw new Error('The legend starts open.');
@@ -259,6 +685,324 @@ try {
           fitLabels();
           })()`);
         };
+        if (awsCostShots) {
+          servedReading = liveAwsCostSource ? base : readings.aws_costs;
+          await navigate('memory_live.html');
+          const shots = approvedAwsCostShot ? await captureApprovedAwsCosts(evaluate, call)
+            : await captureAwsCosts(evaluate, call, base.report.aws_costs.today);
+          console.log(JSON.stringify({shots,output:folder}));
+          break browserProof;
+        }
+        if (killProof) {
+          const source = structuredClone(base.walk.find(row => row.queued && !row.ci));
+          source.progress = {kind:'RowProgress',phase:'testing',done:13,total:200,percent:6.5,unit:'tests'};
+          const local = {...source,key:'kill-fixture',machine:'natedev',pid:killOffer.pid,
+            name:'unit-board check',unit:'unit-board',kill_ref:killRef,started_at:fixtureTime - 660};
+          const other = {...source,key:'research-fixture',machine:'natedev',pid:researchOffer.pid,
+            name:'research nextest',unit:'research',kill_ref:researchRef,started_at:fixtureTime - 1200};
+          servedReading = {...(killBothShot ? readings.outside_queue : base),
+            psi:{some:0,full:0}, pressure:'none',
+            walk:[other,local], waiters:[], queued_priority_units:[], outside_queue:killShot ? [] : outsideRows};
+          await call('Emulation.setDeviceMetricsOverride',{width:1600,height:1200,deviceScaleFactor:1,mobile:false});
+          await navigate('memory_live.html');
+          if (killBothShot) {
+            const width = 1600;
+            const height = await evaluate(`(async () => {
+              document.querySelector('.legend-box').open = false;
+              await refreshKill();
+              document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run').click();
+              return Math.max(1400, document.documentElement.scrollHeight);
+            })()`);
+            await call('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+            await evaluate('scrollTo(0, 0)');
+            // The modal blocks pointer input. Force the hover style for the comparison image.
+            await call('DOM.enable');
+            await call('CSS.enable');
+            const {root} = await call('DOM.getDocument');
+            const hoverTarget = 'tr[data-tip="row:kill-fixture"] .kill-run';
+            const {nodeId} = await call('DOM.querySelector', {nodeId:root.nodeId, selector:hoverTarget});
+            await call('CSS.forcePseudoState',{nodeId,forcedPseudoClasses:['hover']});
+            const shown = await evaluate(`(() => {
+              const queue = document.querySelectorAll('.walk-table .kill-run');
+              const outside = document.querySelectorAll('#outside-queue .kill-run');
+              const dialog = document.querySelector('#kill-dialog');
+              const box = dialog.getBoundingClientRect();
+              return {queue:queue.length,outside:outside.length,open:dialog.open,
+                belowTable:box.top >= document.querySelector('#outside-queue table').getBoundingClientRect().bottom,
+                fits:box.top >= 0 && box.bottom <= innerHeight && dialog.scrollHeight <= dialog.clientHeight,
+                label:getComputedStyle(document.querySelector(${JSON.stringify(hoverTarget)}),'::after').content,
+                dark:matchMedia('(prefers-color-scheme: dark)').matches,
+                pressure:document.querySelector('#pill-t').textContent,height:document.documentElement.scrollHeight};
+            })()`);
+            assert.deepEqual(shown,{queue:servedReading.walk.length,outside:outsideRows.length,open:true,
+              belowTable:true,fits:true,label:'"Kill this run"',dark:true,pressure:'no memory pressure',height});
+            const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,
+              clip:{x:0,y:0,width,height,scale:1}});
+            const path = comparison ? resolve(comparison) : join(folder,'kill-both-tables-dark.png');
+            await writeFile(path,Buffer.from(shot.data,'base64'));
+            console.log(JSON.stringify({pass:true,path,width,height}));
+            break browserProof;
+          }
+          const confirmation = await evaluate(`(async () => {
+            document.querySelector('.legend-box').open = false;
+            for (const section of document.querySelectorAll('#leftovers, #swap, #report-charts')) section.hidden = true;
+            document.body.style.paddingBottom = '520px';
+            await refreshKill();
+            document.querySelector('#walk-title').scrollIntoView({block:'start'});
+            const control = document.querySelector('.kill-run');
+            control.click();
+            document.querySelector('#kill-words').value = 'Start it again after 21:50.';
+            const rect = document.querySelector('#walk').getBoundingClientRect();
+            const top = document.querySelector('#walk-title').getBoundingClientRect();
+            const dialog = document.querySelector('#kill-dialog');
+            const pop = dialog.getBoundingClientRect();
+            const unit = dialog.querySelector('#kill-name strong [data-color-text="role.unit-director"]');
+            return {
+              icons:document.querySelectorAll('.walk-table .kill-run').length, icon:control.innerHTML,
+              unavailable:document.querySelector('tr[data-tip="row:research-fixture"] .pid').title,
+              labels:[...dialog.querySelectorAll('dt')].map(label => label.textContent),
+              fields:[...dialog.querySelectorAll('dd')].map(field => field.textContent),
+              unit:unit?.textContent, unitWeight:unit ? getComputedStyle(unit).fontWeight : '',
+              preview:document.querySelector('#kill-message').textContent,
+              warning:document.querySelector('#kill-warning').textContent,
+              wordsLabel:document.querySelector('label[for="kill-words"]').textContent,
+              clip:{x:Math.max(0,rect.left-8)+scrollX,y:Math.max(0,Math.min(top.top,pop.top)-8)+scrollY,
+                width:Math.min(innerWidth,rect.right+8)-Math.max(0,rect.left-8),
+                height:Math.max(rect.bottom,pop.bottom)+8-Math.max(0,Math.min(top.top,pop.top)-8),scale:1}
+            };
+          })()`);
+          if (killShot) {
+            const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:confirmation.clip});
+            await writeFile(join(folder,'kill-dark.png'),Buffer.from(shot.data,'base64'));
+            killResults = [killedResult];
+            const killedClip = await evaluate(`(async () => {
+              document.querySelector('#kill-dialog').close();
+              await refreshKill();
+              const walk = document.querySelector('#walk').getBoundingClientRect();
+              const heading = document.querySelector('#walk-title').getBoundingClientRect();
+              const left = Math.max(0,walk.left-8), top = Math.max(0,heading.top-8);
+              return {x:left+scrollX,y:top+scrollY,width:Math.min(innerWidth,walk.right+8)-left,
+                height:walk.bottom+8-top,scale:1};
+            })()`);
+            const killed = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:killedClip});
+            await writeFile(join(folder,'killed-row-dark.png'),Buffer.from(killed.data,'base64'));
+            console.log(join(folder,'kill-dark.png'));
+            console.log(join(folder,'killed-row-dark.png'));
+          } else {
+            assert.equal(confirmation.icons,1);
+            assert.equal(confirmation.unavailable,'Kill is not available for this run yet');
+            assert.deepEqual(confirmation.labels,['Run','Pid','Progress','Started by']);
+            assert.deepEqual(confirmation.fields,
+              ['unit-board · check','2712994 and its child processes','6.5% done after 11 min','impl3, a worker of unit-board']);
+            assert.equal(confirmation.unit,'unit-board');
+            assert.equal(confirmation.unitWeight,'700');
+            assert.equal(confirmation.preview,killOffer.message);
+            assert.equal(confirmation.warning,killWarning(killOffer.recipient_name));
+            assert.equal(confirmation.wordsLabel,killWordsLabel);
+            killResults = [{...killedResult,stop:'Run already ended',delivery:''}];
+            assert.deepEqual(await evaluate(`(async () => {
+              await refreshKill();
+              return [document.querySelector('.kill-state').textContent, document.querySelectorAll('.walk-table .kill-run').length];
+            })()`),['Run already ended',0]);
+            killResults = [{...killedResult,delivery:''}];
+            assert.equal(await evaluate(`(async () => {
+              await refreshKill();
+              return document.querySelector('.kill-state').textContent;
+            })()`),`Killed by you at ${killTime} · Message pending`);
+            killResults = [];
+            await evaluate(`refreshKill()`);
+            await evaluate(`document.querySelector('#kill-submit').click()`);
+            assert.equal(await evaluate(`document.querySelector('.kill-state').textContent`),'Stopping');
+            // Remove the fixture row while the action is pending.
+            await evaluate(`renderReading({...latest,walk:latest.walk.filter(row => !row.kill_ref)})`);
+            assert.match(await evaluate(`document.querySelector('#kill-results').textContent`),/Stopping/);
+            const received = await new Promise(resolve => {
+              if (killPostReply) resolve(killPost);
+              else server.once('kill-post', () => resolve(killPost));
+            });
+            assert.deepEqual(received,{reference:killRef,token:killToken,handle:killOffer.handle,
+              words:'Start it again after 21:50.'});
+            killPostReply();
+            servedReading = {...servedReading,walk:servedReading.walk.filter(row => !row.kill_ref)};
+            const refresh = await evaluate(`(async () => {
+              await refreshKill();
+              return {interval:killRefreshSeconds,text:document.querySelector('#kill-results').textContent};
+            })()`);
+            assert.deepEqual(refresh,{interval:killRefreshSeconds,text:'check (pid 2712994) · Stopping'});
+            killResults = [killedResult];
+            const returned = await evaluate(`(async () => {
+              await tick();
+              const early = document.querySelector('#kill-results').textContent;
+              const read = refreshKill;
+              let reply;
+              refreshKill = () => reply = read();
+              try {
+                nextKillRead = performance.now();
+                await tick();
+                await reply;
+                return {early,finished:document.querySelector('#kill-results').textContent};
+              } finally {
+                refreshKill = read;
+              }
+            })()`);
+            assert.deepEqual(returned,{early:'check (pid 2712994) · Stopping',
+              finished:`check (pid 2712994) · Killed by you at ${killTime} · worker impl3 informed`});
+            assert.ok(outsideRef, 'The outside feed must publish a Kill reference for a registered owner.');
+            killResults = [];
+            killPost = killPostReply = undefined;
+            const outside = await evaluate(`(async () => {
+              await refreshKill();
+              const control = document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run');
+              control.click();
+              const dialog = document.querySelector('#kill-dialog');
+              const box = dialog.getBoundingClientRect();
+              const table = document.querySelector('#outside-queue table').getBoundingClientRect();
+              const unit = dialog.querySelector('#kill-name strong [data-color-text="role.unit-director"]');
+              return {icons:document.querySelectorAll('#outside-queue .kill-run').length, icon:control.innerHTML,
+                pid:control.closest('.outside-pid')?.firstChild.textContent,
+                label:control.getAttribute('aria-label'), fields:[...dialog.querySelectorAll('dd')].map(field => field.textContent),
+                unit:unit?.textContent, unitWeight:unit ? getComputedStyle(unit).fontWeight : '',
+                labels:[...dialog.querySelectorAll('dt')].map(label => label.textContent),
+                warning:document.querySelector('#kill-warning').textContent,
+                wordsLabel:document.querySelector('label[for="kill-words"]').textContent,
+                belowTable:box.top >= table.bottom, fits:box.top >= 0 && box.bottom <= innerHeight,
+                preview:document.querySelector('#kill-message').textContent, submit:document.querySelector('#kill-submit').textContent};
+            })()`);
+            assert.deepEqual(outside,{icons:2,icon:confirmation.icon,pid:'8102',label:'Kill this run',
+              fields:['queue · targeted_test.py','8102 and its child processes','5 min','test, a worker of queue'],
+              unit:'queue',unitWeight:'700',
+              labels:['Run','Pid','Age','Started by'],warning:killWarning(outsideRow.owner),wordsLabel:killWordsLabel,
+              belowTable:true,fits:true,preview:outsideOffers[outsideRef].message,submit:'Kill the run'});
+            const outsideState = () => evaluate(`document.querySelector('[data-kill-ref="${outsideRef}"]')
+              ?.closest('tr').querySelector('.kill-state')?.textContent`);
+            const submitOutside = async () => {
+              await evaluate("document.querySelector('#kill-submit').click()");
+              assert.equal(await outsideState(),'Stopping');
+              const request = await new Promise(resolve => {
+                if (killPostReply) resolve(killPost);
+                else server.once('kill-post', () => resolve(killPost));
+              });
+              assert.deepEqual(request,{reference:outsideRef,token:killToken,handle:outsideOffers[outsideRef].handle,words:''});
+            };
+            await submitOutside();
+            killPostReply('The run or its stop route changed.');
+            await evaluate(`(async () => {
+              while (pendingKills.size) await new Promise(resolve => setTimeout(resolve, 10));
+              await refreshKill();
+              document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run').click();
+            })()`);
+            assert.equal(await outsideState(),'Not stopped: The run or its stop route changed.');
+            killPost = killPostReply = undefined;
+            await submitOutside();
+            killPostReply(undefined, {...outsideStopped,stop:'Stop unconfirmed',delivery:'',
+              reason:'Still running after Kill: pid 8105'});
+            await evaluate(`(async () => {
+              while (pendingKills.size) await new Promise(resolve => setTimeout(resolve, 10));
+              await refreshKill();
+              document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run').click();
+            })()`);
+            assert.equal(await outsideState(),'Not stopped: Still running after Kill: pid 8105');
+            killPost = killPostReply = undefined;
+            await submitOutside();
+            killPostReply();
+            await evaluate('refreshKill()');
+            assert.equal(await outsideState(),'Stopping');
+            killResults = [outsideStopped];
+            await evaluate('refreshKill()');
+            assert.equal(await outsideState(),`Killed by you at ${killTime} · worker test informed`);
+            servedReading = {...servedReading,outside_queue:outsideRows.filter(row => row.kill_ref !== outsideRef)};
+            await evaluate('(async () => { window.render = renderReading; await pageRefresh.refresh(true); })()');
+            assert.equal(await outsideState(),undefined);
+            const unavailable = await evaluate(`(() => {
+              const rows = latest.outside_queue.map(row => ({...row,kill_ref:undefined}));
+              renderReading({...latest,outside_queue:rows});
+              const row = document.querySelector('.outside-queue-row');
+              return {label:row.querySelector('.outside-pid').title, icon:!!row.querySelector('.kill-run')};
+            })()`);
+            assert.deepEqual(unavailable,{label:'Kill is not available for this run yet',icon:false});
+            console.log(JSON.stringify({pass:true,proof:'Kill control'}));
+          }
+          break browserProof;
+        }
+        if (outsideQueueProof || !focusedProof) {
+          const inspectOutside = () => evaluate(`(() => {
+            const section = document.querySelector('#outside-queue');
+            section.scrollIntoView({block:'center'});
+            return {heading:section.querySelector('.section-head').textContent,
+              previousCard:section.previousElementSibling?.id, nextCard:section.nextElementSibling?.id,
+              headers:Array.from(section.querySelectorAll('thead th'), cell => cell.textContent),
+              rows:Array.from(section.querySelectorAll('.outside-queue-row'), row => ({
+                cells:Array.from(row.children, cell => cell.textContent),
+                color:row.querySelector('[data-color-text]')?.getAttribute('data-color-text'),
+                clipped:Array.from(row.children).some(cell => cell.scrollWidth > cell.clientWidth),
+              })),
+              emptyText:section.querySelector('#outside-queue-rows').textContent,
+              visible:!section.hidden};
+          })()`);
+          const saveOutside = async name => {
+            await evaluate("scrollTo(0, 0); document.querySelector('.legend-box').open = false;");
+            const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:false});
+            await writeFile(join(folder, name), Buffer.from(shot.data, 'base64'));
+          };
+          servedReading = readings.outside_first;
+          await navigate('memory_live.html');
+          assert.deepEqual((await inspectOutside()).rows.map(row => row.cells[4]), ['—', '—']);
+          servedReading = readings.outside_queue;
+          await navigate('memory_live.html', false);
+          const result = await inspectOutside();
+          assert.equal(result.visible, true);
+          assert.equal(result.heading, 'Tests outside the queue');
+          assert.equal(result.previousCard, 'build-limits', 'Tests outside the queue must follow Build limits.');
+          assert.equal(result.nextCard, 'aws-costs', 'AWS costs must follow Tests outside the queue.');
+          assert.deepEqual(result.headers, ['Command', 'Owner', 'Pid', 'Age', 'Current CPU', 'CPU total']);
+          assert.deepEqual(result.rows, [
+            {cells:['verify_cache_test.py', 'builds', '8112', '5 min', '25%', '153 s'],
+              color:'role.showrunner', clipped:false},
+            {cells:['targeted_test.py', 'queue · test', '8102', '5 min', '75%', '139 s'],
+              color:'role.unit-director', clipped:false},
+          ]);
+          assert.equal(await evaluate(`(() => {
+            const row = document.querySelector('.outside-queue-row');
+            const box = row.getBoundingClientRect();
+            row.dispatchEvent(new PointerEvent('pointermove', {bubbles:true, pointerType:'mouse',
+              clientX:box.left + 10, clientY:box.top + 10}));
+            const values = [...document.querySelectorAll('#tip dd:not(.title)')];
+            return values.length === 4 && values.every(cell => getComputedStyle(cell).textAlign === 'right');
+          })()`), true);
+          if (outsideQueueProof) {
+            await evaluate('hideTip()');
+            await saveOutside('i390-page-after-dark.png');
+          }
+          servedReading = {...readings.outside_queue, outside_queue:readings.outside_queue.outside_queue
+            .filter(row => row.pid !== 8102)};
+          await evaluate('pageRefresh.refresh(true)');
+          assert.deepEqual((await inspectOutside()).rows.map(row => row.cells[2]), ['8112']);
+          servedReading = readings.outside_empty;
+          await evaluate('pageRefresh.refresh(true)');
+          const empty = await inspectOutside();
+          assert.equal(empty.visible, true);
+          assert.equal(empty.emptyText, 'No test runs outside the queue now.');
+          assert.deepEqual(empty.rows, []);
+          servedReading = {...readings.outside_queue, outside_queue:[
+            {command:'older_test.py', owner:'builds', pid:8112, cpu_seconds:153},
+            {command:'missing_pid.py', owner:'builds', cpu_seconds:139},
+          ]};
+          await evaluate('pageRefresh.refresh(true)');
+          assert.deepEqual((await inspectOutside()).rows.map(row => row.cells.slice(2)),
+            [['8112', '—', '—', '153 s'], ['—', '—', '—', '139 s']]);
+          if (outsideQueueProof) {
+            if (beforePage) {
+              servedReading = readings.outside_queue;
+              await navigate('before.html');
+              const before = await inspectOutside();
+              assert.equal(before.rows.length, result.rows.length);
+              assert.deepEqual(before.headers, []);
+              await saveOutside('i390-page-before-dark.png');
+            }
+            console.log(JSON.stringify({pass:true, rows:result.rows.length}));
+            break browserProof;
+          }
+        }
         if (buildToolsProof) {
           const ram = JSON.parse(await readFile(join(folder, 'legend_ram.json'), 'utf8'));
           const gib = 1024**3;
@@ -341,7 +1085,7 @@ try {
                 const tipBounds = tooltip.getBoundingClientRect();
                 const role = '[data-color-text="role.unit-director"]';
                 const titleStaff = tooltip.querySelector(role);
-                const unitStaff = waiterCell.closest('tr').querySelector('.unit ' + role);
+                const unitStaff = chart.querySelector('.name ' + role);
                 const staffBounds = titleStaff?.getBoundingClientRect();
                 const staffColor = titleStaff && getComputedStyle(titleStaff).color;
                 const fields = Array.from(tooltip.querySelectorAll('dt')).map(label => {
@@ -403,6 +1147,425 @@ try {
           console.log(JSON.stringify({pass:true,views}));
           break browserProof;
         }
+        if (queueRowsProof || guestTipProof || !focusedProof) {
+          // nate, 2026-11-21 and 2026-11-23: the unit starts the row with the showrunner under it. The Machine column
+          // shows icons: one bright icon where a step runs, and one dim icon for each machine that can take a waiting step.
+          // The gate checks these rows too; only --queue-rows takes the shot.
+          // A fourth argument names a published page to shoot as the before view.
+          // The good reading gives a live-like cap; the verify reading gives the rows and the staff names.
+          const shootBefore = queueRowsProof && beforePage;
+          const guestTipShot = join(folder, 'guesttip-dark-4.png');
+          const reading = {...structuredClone(readings.good), staff_names:readings.verify_calls.staff_names};
+          const rust = structuredClone(readings.verify_calls.walk.find(row => row.queued && row.verify));
+          const waiting = structuredClone(readings.verify_calls.waiters.find(row => !row.verify));
+          const mac = readings.mac_three.walk.find(row => row.kind === 'mac-build' && row.unit === 'trunk');
+          Object.assign(rust, {unit:'natest',showrunner:'builds',machine:'natedev',caller:'test',
+            title:{unit:'natest',step:'nextest'}});
+          const {verify:_verify, ...unverified} = rust;
+          const guest = {...unverified, key:'shot-guest', pid:rust.pid + 1, name:'queue: gate', unit:'queue', caller:'impl3',
+            changes:'report/keep-all-long-tooltip-values-inside-the-builds-page-at-desktop-and-narrow-widths',
+            machine:'mac-linux', guest_run:{target:'mac-linux',attempt:'82ba556d347749b08184ad3ab38ea22a'},
+            targets:['natedev','mac-linux','hana-aws'], runs_on:'natedev or mac-linux or hana-aws', title:{unit:'queue',step:'gate'}};
+          // admin-console is longer than every running label, so its widest word sets the label column.
+          Object.assign(waiting, {unit:'admin-console',showrunner:'builds',caller:'impl3',
+            title:{unit:'admin-console',step:'test affected'},targets:['natedev','hana-aws']});
+          const ci = {key:'shot-ci',name:'hana CI',ci:true,admitted:true,started_at:reading.read_at-120,
+            machine:'natedev',used:0.5,reserved:0,counted:0.5,ci_runners:[{state:'busy',job:'doctests'}]};
+          reading.walk = [rust, guest, mac, ci];
+          reading.waiters = [waiting];
+          const runAgeMinutes = 3;
+          const pacificTime = new Intl.DateTimeFormat('en-US', {
+            timeZone:'America/Los_Angeles', hourCycle:'h23', hour:'2-digit', minute:'2-digit', timeZoneName:'short',
+          });
+          const clock = seconds => pacificTime.format(seconds * 1000);
+          const runStart = reading.read_at - runAgeMinutes * 60;
+          const bumpTime = clock(runStart - 3 * 60);
+          const keptUntil = clock(reading.read_at + 12 * 60);
+          if (!shootBefore) {
+            reading.move_revision = 'shot-queue';
+            rust.started_at = runStart;
+            rust.last_move = {kind:'bump', who:'nate', from_place:31, to_place:1, at:bumpTime};
+            waiting.place = 2;
+            waiting.move = {row_id:'shot-admin-console', movable:true, kept_before:1};
+            reading.held_places = [{kind:'held', key:'proof-kept', unit:'admin-console',
+              position:1, failed_step:'test affected', kept_until:keptUntil, targets:['natedev','hana-aws']}];
+            reading.move_line = {revision:reading.move_revision, members:[waiting.move], kept_runs:['proof-kept']};
+          }
+          reading.queued_priority_units = [];
+          if (guestTipProof) {
+            guest.started_at = reading.read_at - 4 * 60;
+            reading.walk[2] = {...mac, started_at:reading.read_at - 3 * 60, read_at:reading.read_at};
+            waiting.since = reading.read_at - 90;
+            await call('Emulation.setTimezoneOverride', {timezoneId:'America/Los_Angeles'});
+          }
+          servedReading = reading;
+          const navigateQueueRows = async width => {
+            const showHandle = !shootBefore && width === 1440;
+            // The narrow layout checks use the read-only view.
+            queueFixture = showHandle ? reading : null;
+            await navigate(shootBefore ? 'before.html' : 'memory_live.html');
+            if (showHandle) await waitForMoveHandle(evaluate, waiting.move.row_id);
+          };
+          const machineGraphics = {
+            'natedev':['🐧', null],
+            'mac':['#machine-apple', null],
+            'mac-linux':['#machine-apple', '🐧'],
+            'aws':['#machine-cloud', '🐧'],
+            'hana-aws':['#machine-cloud', '🌸'],
+            'hana-gpu':['#machine-cloud', '⚡'],
+          };
+          const expectedIcon = name => [name, name, ...machineGraphics[name]];
+          const runningIcon = name => [...expectedIcon(name), 'img', 'run'];
+          const waitingIcons = ['natedev','hana-aws'].map(name => [...expectedIcon(name), 'img', 'dim']);
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          // At 800 px the walk uses compact gaps. At 900 px the font metrics determine the gaps.
+          let rows;
+          for (const width of shootBefore ? [1440] : [1440, 900, 800]) {
+            await call('Emulation.setDeviceMetricsOverride', {width,height:1100,deviceScaleFactor:1,mobile:false});
+            await navigateQueueRows(width);
+            rows = await evaluate(`(() => {
+              const walk = document.querySelector('#walk');
+              const name = row => row.querySelector('.name').textContent;
+              const owner = row => row.querySelector('.owner').textContent;
+              const chart = key => walk.querySelector('.wrow[data-tip="' + key + '"]');
+              const table = key => walk.querySelector('tr[data-tip="' + key + '"]');
+              const keys = [...latest.walk.map(row => 'row:' + row.key), 'wait:' + latest.waiters[0].key];
+              const lines = element => Math.round(element.getBoundingClientRect().height / parseFloat(getComputedStyle(element).lineHeight));
+              const box = walk.closest('.card').getBoundingClientRect();
+              const keptChart = chart('held:proof-kept'), keptTable = table('held:proof-kept');
+              const keptDeadline = keptTable?.querySelector('.duration');
+              const deadlineRange = document.createRange();
+              if (keptDeadline) deadlineRange.selectNodeContents(keptDeadline);
+              const scroll = walk.closest('.walk-scroll');
+              const waitingName = chart(keys[4]).querySelector('.name');
+              const handle = chart(keys[4]).querySelector('.queue-grip');
+              const iconDetails = icon => [icon?.getAttribute('aria-label'), icon?.dataset.machine,
+                icon?.querySelector('svg use')?.getAttribute('href') ?? icon?.querySelector('.machine-emoji')?.textContent,
+                icon?.getAttribute('data-badge')];
+              return {headers:[...walk.querySelectorAll('thead th:not(.row-action)')].map(cell => cell.textContent),
+                tight:walk.classList.contains('tight'),
+                keptCut:keptChart ? [...keptChart.querySelectorAll('.name, .owner'), ...keptTable.cells]
+                  .filter(cell => cell.scrollWidth > cell.clientWidth).map(cell => cell.textContent) : [],
+                keptDeadline:keptDeadline?.textContent,
+                keptDeadlineLines:deadlineRange.getClientRects().length,
+                runAge:table(keys[0]).querySelector('.duration').textContent,
+                heading:walk.querySelector('.walk-chart .queue-title').firstElementChild.textContent,
+                walkOverflow:scroll.scrollWidth - scroll.clientWidth,
+                trackWidth:walk.querySelector('.track').getBoundingClientRect().width,
+                names:keys.map(key => [name(chart(key)),owner(chart(key)),table(key).querySelector('.verify').textContent,
+                  table(key).querySelector('.step').textContent]),
+                icons:keys.map(key => [...table(key).querySelectorAll('td.machine .machine-icon')].map(icon =>
+                  [...iconDetails(icon), icon.getAttribute('role'), ['run', 'dim'].find(state => icon.classList.contains(state))])),
+                wrappedIcons:[...walk.querySelectorAll('tbody td.machine')].filter(cell =>
+                  new Set([...cell.querySelectorAll('.machine-icon')].map(icon => Math.round(icon.getBoundingClientRect().top))).size > 1)
+                  .map(cell => cell.closest('tr').dataset.tip),
+                legend:[...document.querySelectorAll('#machine-key .key')].map(key =>
+                  [key.lastChild.textContent, ...iconDetails(key.querySelector('.machine-icon'))]),
+                colors:[chart(keys[0]),chart(keys[2]),chart(keys[4])].map(row => [
+                  row.querySelector('.name [data-color-text]')?.dataset.colorText,
+                  row.querySelector('.owner [data-color-text]')?.dataset.colorText]),
+                waitingNameLines:lines(waitingName),
+                waitingNameCut:waitingName.scrollWidth > waitingName.clientWidth,
+                handleFits:handle?.getBoundingClientRect().right <= waitingName.getBoundingClientRect().left,
+                headingCut:(() => {
+                  const label = walk.querySelector('.walk-chart .queue-title').firstElementChild;
+                  return label.scrollWidth > label.clientWidth;
+                })(),
+                cutSteps:[...walk.querySelectorAll('tbody .step .cell-text')]
+                  .filter(text => text.scrollWidth > text.clientWidth).map(text => text.textContent),
+                machineColors:[...walk.querySelectorAll('tbody td.machine .machine')].map(icon => [icon.dataset.machine,
+                  getComputedStyle(icon).color, getComputedStyle(icon.closest('tr')).color]),
+                clip:{x:box.left+scrollX,y:box.top+scrollY,width:box.width,height:box.height,scale:1}};
+            })()`);
+            if (!shootBefore) {
+              await assertRowCenters(evaluate);
+              assert.deepEqual(rows.headers, runningHeaders);
+              assert.deepEqual(rows.names, [['natest','builds',rust.verify.verb,'nextest'],
+                ['queue','builds','','gate'],['trunk','hana','','nextest'],['hana CI','','',''],
+                ['admin-console','builds','','test affected']]);
+              assert.deepEqual(rows.icons, [[runningIcon('natedev')],[runningIcon('mac-linux')],[runningIcon('mac')],
+                [runningIcon('natedev')],waitingIcons]);
+              assert.deepEqual(rows.wrappedIcons, [], `A Machine icon row wraps at ${width} px.`);
+              assert.deepEqual(rows.legend, Object.keys(machineGraphics).map(name => [name, ...expectedIcon(name)]));
+              assert.deepEqual(rows.colors, Array.from({length:3},()=>['role.unit-director','role.showrunner']));
+              assert.equal(rows.heading, 'Waiting, in queue order');
+              assert.equal(rows.runAge, `${runAgeMinutes} min`);
+              assert.equal(rows.keptDeadline, `until ${keptUntil.split(' ', 1)[0]}`);
+              if (width === 1440) {
+                assert.equal(rows.keptDeadlineLines, 1, 'The kept place deadline wraps at 1440 px.');
+                assert.ok(rows.handleFits && !rows.waitingNameCut, 'The move handle or waiting name is cut at 1440 px.');
+              }
+              if (width === 900) {
+                const pidLayouts = await evaluate(`(() => {
+                  const walk = document.querySelector('#walk');
+                  const scroll = walk.closest('.walk-scroll');
+                  const layouts = [[999999,999999], [999999,4194304], [4194304,4194304]].map(([runningPid,waitingPid]) => {
+                    renderWalk({...latest, walk:latest.walk.map(row => ({...row,pid:runningPid})),
+                      waiters:latest.waiters.map(row => ({...row,pid:waitingPid}))});
+                    fitLabels();
+                    return {
+                      runningPid, waitingPid, pidWidth:walk.querySelector('thead .pid').getBoundingClientRect().width,
+                      overflow:scroll.scrollWidth - scroll.clientWidth,
+                      trackWidth:walk.querySelector('.track').getBoundingClientRect().width,
+                    };
+                  });
+                  renderWalk(latest);
+                  fitLabels();
+                  return layouts;
+                })()`);
+                assert.ok(pidLayouts.every(({overflow, trackWidth}) => overflow <= 1 && trackWidth >= 159),
+                  'The 900 px walk does not fit both PID widths. ' + JSON.stringify(pidLayouts));
+                assert.deepEqual(rows.keptCut, [], 'A kept place value is cut at 900 px.');
+                assert.ok(rows.walkOverflow <= 1, `The walk overflows by ${rows.walkOverflow} px at 900 px.`);
+                assert.ok(rows.trackWidth >= 159, `The chart track is only ${rows.trackWidth} px at 900 px.`);
+                assert.equal(rows.waitingNameCut, false, 'The waiting unit name is cut at 900 px.');
+              } else {
+                assert.equal(rows.tight, width === 800, `The walk at ${width} px has the wrong tight state.`);
+              }
+              assert.equal(rows.waitingNameLines, 1, `The waiting unit name breaks at ${width} px.`);
+              assert.deepEqual(rows.cutSteps, [], `A Step cell is cut at ${width} px.`);
+              assert.deepEqual(rows.machineColors.filter(([, color, row]) => color === row).map(([name]) => name), [],
+                'A Machine icon has no machine color.');
+              const macColor = 'rgb(' + reading.colors.dark.machines.mac.slice(1).match(/../g)
+                .map(part => parseInt(part, 16)).join(', ') + ')';
+              assert.equal(rows.machineColors.find(([name]) => name === 'mac-linux')[1], macColor,
+                'The mac-linux icon has no mac color.');
+              if (width === 1440) assert.equal(rows.headingCut, false, 'The queued heading is cut.');
+              if (width >= 900) {
+                const pointer = await evaluate(`(() => {
+                  const icon = document.querySelector('tr[data-tip="row:shot-guest"] .machine-icon');
+                  icon.scrollIntoView({block:'center',inline:'nearest'});
+                  const box = icon.getBoundingClientRect();
+                  return {x:box.left + box.width/2, y:box.top + box.height/2};
+                })()`);
+                await call('Input.dispatchMouseEvent', {type:'mouseMoved', ...pointer});
+                const hover = await evaluate(`(() => {
+                  const tooltip = document.querySelector('#tip.on > .tip');
+                  const box = tooltip.getBoundingClientRect();
+                  const viewport = document.documentElement;
+                  const range = document.createRange();
+                  const clipped = Array.from(tooltip.children).filter(cell => {
+                    range.selectNodeContents(cell);
+                    const bounds = cell.getBoundingClientRect();
+                    return [...range.getClientRects()].some(rect =>
+                      rect.left < Math.max(box.left, bounds.left) - 1 || rect.right > Math.min(box.right, bounds.right) + 1
+                      || rect.top < bounds.top - 1 || rect.bottom > bounds.bottom + 1);
+                  }).map(cell => cell.textContent);
+                  const labels = [...tooltip.querySelectorAll('dt')];
+                  const fields = Object.fromEntries(labels.map(cell => [cell.textContent, cell.nextElementSibling.textContent]));
+                  range.selectNodeContents(labels.find(cell => cell.textContent === 'Changes').nextElementSibling);
+                  const changesLines = range.getClientRects().length;
+                  const card = document.querySelector('#walk').closest('.card').getBoundingClientRect();
+                  const left = Math.min(card.left, box.left), top = Math.min(card.top, box.top);
+                  const right = Math.max(card.right, box.right), bottom = Math.max(card.bottom, box.bottom);
+                  return {fields, clipped, changesLines,
+                    visible:box.left >= 0 && box.right <= viewport.clientWidth
+                      && box.top >= 0 && box.bottom <= viewport.clientHeight,
+                    clip:{x:left+scrollX,y:top+scrollY,width:right-left,height:bottom-top,scale:1}};
+                })()`);
+                assert.equal(hover.fields.Changes, guest.changes);
+                assert.ok(hover.changesLines > 1, `Changes does not wrap at ${width} px.`);
+                assert.equal(hover.fields.Showrunner, guest.showrunner);
+                assert.equal(hover.fields['Runs on'], guest.machine);
+                assert.ok(hover.visible, `The guest row tooltip is outside the viewport at ${width} px.`);
+                assert.deepEqual(hover.clipped, [], `The guest row tooltip clips text at ${width} px.`);
+                if (guestTipProof && width === 1440) {
+                  const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:hover.clip});
+                  await writeFile(guestTipShot, Buffer.from(shot.data,'base64'));
+                }
+                await evaluate('hideTip()');
+              }
+              if (width === 1440) {
+                const {guest_run:_guestRun, ...pending} = guest;
+                pending.pid = {kind:'PidNotRecorded'};
+                pending.vcpus = {kind:'UnknownCpuCount'};
+                const guestStates = [
+                  {...pending, guest_unconfirmed:'starting'},
+                  {...pending, guest_unconfirmed:'not confirmed'},
+                  guest,
+                ];
+                const guestCells = await evaluate(`(() => {
+                  const data = latest;
+                  const cells = ${JSON.stringify(guestStates)}.map(state => {
+                    renderWalk({...data, walk:data.walk.map(row => row.key === state.key ? state : row)});
+                    const row = document.querySelector('tr[data-tip="row:shot-guest"]');
+                    const machine = row.querySelector('td.machine');
+                    return [machine.querySelector('.machine-icon.run')?.dataset.machine, machine.textContent.trim(),
+                      row.querySelector('td.pid').textContent, row.querySelector('td.vcpus').textContent];
+                  });
+                  renderWalk(data);
+                  return cells;
+                })()`);
+                assert.deepEqual(guestCells, [
+                  ['mac-linux','starting','—','—'],
+                  ['mac-linux','not confirmed','—','—'],
+                  ['mac-linux','',String(guest.pid),String(guest.vcpus)],
+                ]);
+              }
+            }
+            if (queueRowsProof) {
+              const output = join(folder, shootBefore ? 'before.png' : width === 1440 ? 'after.png' : `after-${width}.png`);
+              const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:rows.clip});
+              await writeFile(output, Buffer.from(shot.data,'base64'));
+              if (!shootBefore && width === 1440) {
+                const bump = await evaluate(`(() => {
+                  const card = document.querySelector('#walk').closest('.card');
+                  card.scrollIntoView({block:'center'});
+                  const mark = card.querySelector('td.moved .move-mark');
+                  showTip(mark.dataset.tip, 0, 0, mark);
+                  const tip = document.querySelector('#tip');
+                  const box = card.getBoundingClientRect(), bounds = tip.getBoundingClientRect();
+                  return {text:tip.innerText, fits:bounds.left >= box.left && bounds.right <= box.right &&
+                    bounds.top >= box.top && bounds.bottom <= box.bottom,
+                    clip:{x:box.left+scrollX,y:box.top+scrollY,width:box.width,height:box.height,scale:1}};
+                })()`);
+                assert.match(bump.text, /Moved by\s+nate/);
+                assert.ok(bump.text.includes(bumpTime), 'The bump tooltip shows the wrong time.');
+                assert.ok(bump.fits, 'The bump tooltip extends outside the card.');
+                const withBump = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:bump.clip});
+                await writeFile(join(folder, 'moved-dark-5.png'), Buffer.from(withBump.data,'base64'));
+              }
+            }
+          }
+          if (guestTipProof) {
+            console.log(JSON.stringify({pass:true,shot:guestTipShot,captureClock:new Date(fixtureTime * 1000).toISOString()}));
+            break browserProof;
+          }
+          // nate, 2026-11-23: a white bar showed at the right edge of the Running/Queued card. The other checks hide
+          // scrollbars, so one more load shows them. At 1440 px the sideways scroll box has no scrollbar and no overflow.
+          await call('Emulation.setScrollbarsHidden', {hidden:false});
+          try {
+            await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+            await navigateQueueRows(1440);
+            const scroll = await evaluate(`(() => {
+              const box = document.querySelector('.walk-scroll');
+              const card = box.closest('.card').getBoundingClientRect();
+              return {bars:{right:box.offsetWidth - box.clientWidth, bottom:box.offsetHeight - box.clientHeight,
+                  down:box.scrollHeight - box.clientHeight, sideways:box.scrollWidth - box.clientWidth},
+                clip:{x:card.right+scrollX-160,y:card.top+scrollY,width:160,height:card.height,scale:1}};
+            })()`);
+            // The shot comes first, so a failed check still leaves a picture of the bar.
+            if (queueRowsProof) {
+              const shot = await call('Page.captureScreenshot', {format:'png',clip:scroll.clip});
+              await writeFile(join(folder, shootBefore ? 'before-edge.png' : 'after-edge.png'), Buffer.from(shot.data,'base64'));
+            }
+            if (!shootBefore) assert.deepEqual(scroll.bars, {right:0, bottom:0, down:0, sideways:0},
+              'The Running/Queued scroll box shows a scrollbar.');
+            if (!shootBefore) {
+              const pointer = await evaluate(`(() => {
+                const style = document.createElement('style');
+                style.textContent = 'html { overflow-y: scroll; } html::-webkit-scrollbar { width: 15px; }';
+                document.head.append(style);
+                const icon = document.querySelector('tr[data-tip="row:shot-guest"] .machine-icon');
+                icon.scrollIntoView({block:'center', inline:'nearest'});
+                const box = icon.getBoundingClientRect();
+                return {x:box.left+box.width/2, y:box.top+box.height/2};
+              })()`);
+              await call('Input.dispatchMouseEvent', {type:'mouseMoved', ...pointer});
+              const before = await evaluate("document.querySelector('#tip.on > .tip').getBoundingClientRect().toJSON()");
+              await call('Emulation.setDeviceMetricsOverride', {width:390,height:300,deviceScaleFactor:1,mobile:false});
+              const resized = await evaluate(`(async () => {
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                const viewport = document.documentElement;
+                const box = document.querySelector('#tip.on > .tip');
+                return {box:box.getBoundingClientRect().toJSON(), viewport:{width:viewport.clientWidth,height:viewport.clientHeight},
+                  innerWidth, overflow:box.scrollHeight-box.clientHeight, key:tips.key()};
+              })()`);
+              const {box, viewport} = resized;
+              assert.equal(resized.key, 'row:shot-guest');
+              assert.ok(before.right > viewport.width && box.left < before.left,
+                'The tooltip did not move after resize with a stationary pointer.');
+              assert.ok(resized.innerWidth > viewport.width, 'The proof needs a classic scrollbar.');
+              assert.ok(box.left >= 8 && box.right <= viewport.width-8, 'The tooltip exceeds the visible width.');
+              assert.ok(box.top >= 8 && box.bottom <= viewport.height-8, 'The tooltip exceeds the visible height.');
+              assert.ok(resized.overflow > 0, 'The tooltip has no content below its visible area.');
+
+              const rowPoint = await evaluate(`(() => {
+                const row = document.querySelector('tr[data-tip="row:shot-guest"]');
+                row.scrollIntoView({block:'center', inline:'nearest'});
+                const bounds = row.getBoundingClientRect();
+                const x = Math.max(bounds.left, ${box.left}) + 12;
+                const y = bounds.top + bounds.height/2;
+                row.addEventListener('click', () => { row.dataset.proofClicked = 'yes'; }, {once:true});
+                return {x, y};
+              })()`);
+              assert.ok(rowPoint.x > box.left && rowPoint.x < box.right && rowPoint.y > box.top && rowPoint.y < box.bottom,
+                'The guest row click is outside the tooltip.');
+              const click = async point => {
+                await call('Input.dispatchMouseEvent', {type:'mousePressed', ...point, button:'left', clickCount:1});
+                await call('Input.dispatchMouseEvent', {type:'mouseReleased', ...point, button:'left', clickCount:1});
+              };
+              await click(rowPoint);
+              assert.equal(await evaluate(`document.querySelector('tr[data-tip="row:shot-guest"]').dataset.proofClicked`),
+                'yes', 'The tooltip blocks the guest row click.');
+              assert.equal(await evaluate('Boolean(tips.key())'), false, 'The trigger click did not close the tooltip.');
+
+              await click(rowPoint);
+              assert.deepEqual(await evaluate("[tips.key(), getComputedStyle(document.querySelector('#tip')).pointerEvents]"),
+                ['row:shot-guest', 'none'], 'The click should open a pointer-transparent tooltip.');
+              await call('Input.dispatchKeyEvent', {type:'keyDown', key:'Escape', code:'Escape', windowsVirtualKeyCode:27});
+              await call('Input.dispatchKeyEvent', {type:'keyUp', key:'Escape', code:'Escape', windowsVirtualKeyCode:27});
+              assert.equal(await evaluate('Boolean(tips.key())'), false, 'Escape did not close the tooltip.');
+
+              await call('Emulation.setDeviceMetricsOverride', {width:800,height:1100,deviceScaleFactor:1,mobile:false});
+              const bumpBefore = await evaluate(`(async () => {
+                setPaused(true);
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                const mark = document.querySelector('#walk td.moved .move-mark');
+                mark.scrollIntoView({block:'center', inline:'nearest'});
+                mark.focus({preventScroll:true});
+                return {left:mark.getBoundingClientRect().left, key:mark.dataset.tip,
+                  open:tips.key(), tight:document.querySelector('#walk').classList.contains('tight')};
+              })()`);
+              assert.equal(bumpBefore.open, bumpBefore.key, 'Focus did not open the bump tooltip.');
+              assert.ok(bumpBefore.tight, 'The bump resize proof needs compact gaps at 800 px.');
+
+              await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+              const bumpAfter = await evaluate(`(async () => {
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                const mark = document.querySelector('#walk td.moved .move-mark').getBoundingClientRect();
+                const tip = document.querySelector('#tip.on > .tip').getBoundingClientRect();
+                return {left:mark.left, gap:Math.max(mark.left - tip.right, tip.left - mark.right),
+                  topDifference:tip.top - mark.top, open:tips.key(),
+                  tight:document.querySelector('#walk').classList.contains('tight')};
+              })()`);
+              assert.equal(bumpAfter.open, bumpBefore.key, 'Resize closed the bump tooltip.');
+              assert.ok(!bumpAfter.tight && Math.abs(bumpAfter.left - bumpBefore.left) > 8,
+                'Resize did not move the bump mark out of the compact layout.');
+              assert.ok(Math.abs(bumpAfter.gap - 8) <= 1 && Math.abs(bumpAfter.topDifference + 4) <= 1,
+                'The tooltip is outside the expected position beside the resized bump mark.');
+            }
+          } finally {
+            queueFixture = null;
+            await call('Emulation.setScrollbarsHidden', {hidden:true});
+          }
+          if (queueRowsProof) {
+            console.log(JSON.stringify({pass:true,rows:rows.names}));
+            break browserProof;
+          }
+          await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
+        }
+        if (standingProof || !focusedProof) {
+          const real = JSON.parse(await readFile(join(repo, 'scripts/build_queue/builds_page_real_rows.json'), 'utf8'));
+          servedReading = {...structuredClone(readings.good), staff_names:real.staff_names, walk:real.walk, waiters:real.waiters,
+            queued_priority_units:real.queued_priority_units, move_revision:real.move_revision};
+          servedReading.ram = {...servedReading.ram, build_tools_bytes:real.build_tools_bytes};
+          // The queue-move stub gives the page a token, so the reorder handles draw.
+          queueFixture = servedReading;
+          await checkStandingOrders(navigate, evaluate, call, standingProof && beforePage ? 'before.html' : 'memory_live.html',
+            standingProof ? folder : '');
+          queueFixture = null;
+          if (standingProof) {
+            console.log(JSON.stringify({pass:true}));
+            break browserProof;
+          }
+          await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
+        }
+        await checkQueueDrag(navigate, evaluate, call);
+        if (queueDragProof) {
+          console.log(JSON.stringify({shot:join(folder, 'drag-dark.png')}));
+          break browserProof;
+        }
         await checkHeadcounts(navigate, evaluate, call);
         if (headcountComparison) console.log(JSON.stringify({pass:true,comparison:'headcount'}));
         else {
@@ -410,9 +1573,209 @@ try {
           await checkPage(navigate, evaluate, call);
         }
       } finally {
-        if(ws) ws.close();
-        chrome.kill('SIGTERM');
+        if (killProof && ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({id:0,method:'Browser.close'}));
+        } else {
+          if (ws) ws.close();
+          chrome.kill('SIGTERM');
+        }
         await exited;
+      }
+
+      async function checkQueueDrag(navigate, evaluate, call) {
+        const template = readings.spacing.waiters.find(row => row.kind !== 'cloud');
+        const units = ['natemerge', 'unit-board', 'aws', 'postmaster', 'typesafe'];
+        unnamedPlace = -1;
+        queueFixture = {...structuredClone(readings.spacing), move_revision:'fixture',
+          waiters:units.map((unit, index) => ({...template, key:unit, unit, detail:unit,
+            name:queueDragProof ? 'test affected' : `${unit} test affected`, title:{unit, step:'test affected'},
+            showrunner:['sdlc','sdlc','builds','natedev','natedev'][index],
+            since:fixtureTime - (14 - index * 3) * 60, pid:500 + index,
+            need:1.2 + index / 10, machine:'natedev', place:index + 1,
+            move:{row_id:unit}}))};
+        if (!queueDragProof) {
+          const cloud = readings.cloud.waiters.find(row => row.kind === 'cloud');
+          queueFixture.waiters.push({...cloud, kind:'cloud', name:'cloud fixture', pid:600});
+        }
+        servedReading = queueFixture;
+        await navigate('memory_live.html');
+        await evaluate('window.render = window.renderReading; true');
+        await waitForMoveHandle(evaluate, 'typesafe');
+        const snapshot = () => evaluate(`({
+          handles:[...document.querySelectorAll('.queue-grip')].map(button => button.dataset.moveId),
+          lifted:document.querySelector('.wrow.queue-lift .queue-grip')?.dataset.moveId,
+          places:[...document.querySelectorAll('tr.wait td.place')].map(cell => cell.textContent),
+          line:document.querySelector('#queue-status').textContent,
+          action:document.querySelector('#queue-action').hidden ? '' : document.querySelector('#queue-action').textContent
+        })`);
+        await evaluate("document.querySelector('#walk .queue-title').scrollIntoView({block:'center'}); true");
+        const point = selector => evaluate(`(() => {
+          const box = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
+          return {x:box.left+box.width/2, y:box.top+box.height/2};
+        })()`);
+        const grip = unit => point(`.queue-grip[data-move-id="${unit}"]`);
+        const cell = (unit, name) => point(`tr[data-tip="wait:${unit}"] .${name}`);
+        const start = await grip('typesafe');
+        const target = await cell('unit-board', 'place');
+        await call('Input.dispatchMouseEvent',{type:'mousePressed', ...start, button:'left', buttons:1, clickCount:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...target, button:'left', buttons:1});
+        const preview = await snapshot();
+        assert.deepEqual(preview.handles,['natemerge','typesafe','unit-board','aws','postmaster']);
+        assert.equal(preview.lifted,'typesafe');
+        assert.ok(await evaluate(`(() => {
+          const bounds = selector => document.querySelector(selector).getBoundingClientRect();
+          const emphasis = bounds('.queue-emphasis.lift');
+          const chart = bounds('.wrow.queue-lift');
+          const table = bounds('tr.queue-lift');
+          return emphasis.left === chart.left && emphasis.right >= table.right &&
+            emphasis.top === chart.top && Math.abs(emphasis.top - table.top) < 1;
+        })()`));
+        assert.deepEqual(preview.places, queueDragProof ? ['1','2','3','4','5'] : ['1','2','3','4','5','cloud']);
+        await evaluate('renderReading({...latest, read_at:latest.read_at+1}); true');
+        assert.deepEqual(await snapshot(),preview);
+        await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...target, button:'left', buttons:0, clickCount:1});
+        const waitForLine = line => evaluate(`new Promise(resolve => {
+          const node = document.querySelector('#queue-status');
+          const ready = () => node.textContent === ${JSON.stringify(line)};
+          if (ready()) return resolve(true);
+          const observer = new MutationObserver(() => {
+            if (ready()) { observer.disconnect(); resolve(true); }
+          });
+          observer.observe(node, {childList:true, characterData:true, subtree:true});
+        })`);
+        await waitForLine('typesafe · test affected moved from 5 to 2');
+        assert.equal((await snapshot()).action,'Undo');
+        await evaluate("document.querySelector('#queue-action').click(); true");
+        await waitForLine('typesafe · test affected moved from 2 to 5');
+        assert.deepEqual((await snapshot()).handles, units);
+        unnamedPlace = 0;
+        queueFixture.move_revision += 'head';
+        await evaluate('pageRefresh.refresh(true)');
+        await evaluate(`(() => {
+          const button = document.querySelector('[data-move-id="unit-board"]');
+          button.focus();
+          button.dispatchEvent(new KeyboardEvent('keydown', {key:' ', bubbles:true}));
+          document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowUp', bubbles:true}));
+          return true;
+        })()`);
+        assert.equal((await snapshot()).line, 'Place 1');
+        await evaluate(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}))`);
+        await waitForLine('unit-board · test affected moved from 3 to 1');
+        assert.deepEqual(confirmedQueueLine.members.slice(0, 3).map(member => member.row_id),
+          ['unit-board', 'unnamed-wait', 'natemerge']);
+        assert.deepEqual((await snapshot()).handles, ['unit-board', 'natemerge', 'aws', 'postmaster', 'typesafe']);
+        await evaluate("document.querySelector('#queue-action').click(); true");
+        await waitForLine('unit-board · test affected moved from 1 to 3');
+        unnamedPlace = -1;
+        queueFixture.move_revision += 'named';
+        await evaluate('pageRefresh.refresh(true)');
+        await evaluate(`(() => {
+          const button = document.querySelector('[data-move-id="unit-board"]');
+          button.focus();
+          button.dispatchEvent(new KeyboardEvent('keydown', {key:' ', bubbles:true}));
+          document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowDown', bubbles:true}));
+          document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));
+          return true;
+        })()`);
+        await waitForLine('unit-board · test affected moved from 2 to 3');
+        assert.deepEqual((await snapshot()).handles, ['natemerge', 'aws', 'unit-board', 'postmaster', 'typesafe']);
+        const moveStart = await grip('typesafe');
+        const moveTarget = await cell('aws', 'machine');
+        await call('Input.dispatchMouseEvent',{type:'mousePressed', ...moveStart, button:'left', buttons:1, clickCount:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...moveTarget, button:'left', buttons:1});
+        queueFixture = structuredClone(queueFixture);
+        queueFixture.move_revision += 'joined';
+        setQueueWaiters([{...template, key:'remote-start', pid:651,
+          name:'remote startup', machine:'mac', targets:['mac'], reason:'remote startup',
+          move:{row_id:'remote-start', movable:false}}, ...queueFixture.waiters]);
+        await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...moveTarget, button:'left', buttons:0, clickCount:1});
+        await waitForLine('The queue changed.');
+        assert.deepEqual((await snapshot()).handles, []);
+        assert.ok(await evaluate('queueReading(latest).move_revision !== ' + JSON.stringify(queueFixture.move_revision)));
+        servedReading = queueFixture;
+        await evaluate('pageRefresh.refresh(true)');
+        assert.deepEqual((await snapshot()).handles, ['natemerge', 'aws', 'unit-board', 'postmaster', 'typesafe']);
+        queueFixture.move_revision += 'new-unit';
+        setQueueWaiters(queueFixture.waiters.toSpliced(2, 0, {...template, key:'new-unit', unit:'new-unit', pid:650,
+          name:'test affected', since:fixtureTime - 60, title:{unit:'new-unit', step:'test affected'},
+          move:{row_id:'new-unit'}}));
+        await evaluate('pageRefresh.refresh(true)');
+        const retryStart = await grip('typesafe');
+        const retryTarget = await cell('new-unit', 'machine');
+        await call('Input.dispatchMouseEvent',{type:'mousePressed', ...retryStart, button:'left', buttons:1, clickCount:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...retryTarget, button:'left', buttons:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...retryTarget, button:'left', buttons:0, clickCount:1});
+        await waitForLine('typesafe · test affected moved from 7 to 3');
+        assert.deepEqual((await snapshot()).handles, ['natemerge', 'typesafe', 'new-unit', 'aws', 'unit-board', 'postmaster']);
+        assert.deepEqual(await evaluate(`['remote-start', 'typesafe'].map(key =>
+          document.querySelector('tr[data-tip="wait:' + key + '"] .place').textContent)`), ['1', '3']);
+        const nextStart = await grip('typesafe');
+        const nextTarget = await cell('postmaster', 'machine');
+        await call('Input.dispatchMouseEvent',{type:'mousePressed', ...nextStart, button:'left', buttons:1, clickCount:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...nextTarget, button:'left', buttons:1});
+        queueFixture = {...queueFixture, move_revision:queueFixture.move_revision + 'left'};
+        setQueueWaiters(queueFixture.waiters.filter(row => row.key !== 'remote-start'));
+        servedReading = queueFixture;
+        await evaluate('pageRefresh.refresh(true)');
+        assert.ok(await evaluate('!latest.waiters.some(row => row.key === "remote-start")'));
+        assert.ok(await evaluate(`Boolean(document.querySelector('tr[data-tip="wait:remote-start"]'))`));
+        await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...nextTarget, button:'left', buttons:0, clickCount:1});
+        await waitForLine('The queue changed.');
+        assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:typesafe"] .place').textContent`), '2');
+
+        queueFixture.move_revision += 'mac-only';
+        // The waiting row uses its eligible targets to select the dim icons.
+        setQueueWaiters(queueFixture.waiters.toSpliced(3, 0, {...template, key:'mac-only', pid:652,
+          name:'Speculative Mac copy', since:fixtureTime - 75, machine:'mac', targets:['mac'], reason:'waiting for mac', why:'target',
+          order_note:'Newest eligible copy starts first',
+          move:{row_id:'mac-only', movable:false}}));
+        await evaluate('pageRefresh.refresh(true)');
+        const macStart = await grip('typesafe');
+        const macTarget = await cell('natemerge', 'machine');
+        await call('Input.dispatchMouseEvent',{type:'mousePressed', ...macStart, button:'left', buttons:1, clickCount:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...macTarget, button:'left', buttons:1});
+        await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...macTarget, button:'left', buttons:0, clickCount:1});
+        await waitForLine('typesafe · test affected moved from 2 to 1');
+        assert.deepEqual(await evaluate(`['typesafe', 'natemerge', 'new-unit', 'mac-only'].map(key =>
+          document.querySelector('tr[data-tip="wait:' + key + '"] .place').textContent)`), ['1', '2', '3', '4']);
+        assert.deepEqual(await evaluate(`[...document.querySelectorAll('tr[data-tip="wait:mac-only"] td.machine .machine')]
+          .map(icon => [icon.dataset.machine, icon.classList.contains('dim')])`), [['mac', true]]);
+        assert.ok(!(await snapshot()).handles.includes('mac-only'));
+        assert.ok(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"]').textContent.includes('Newest eligible copy starts first')`));
+        assert.equal(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"] .amounts').textContent`), '');
+
+        unnamedPlace = 1;
+        queueFixture.move_revision += 'head-undo';
+        await evaluate('pageRefresh.refresh(true)');
+        await evaluate(`(() => {
+          const button = document.querySelector('[data-move-id="typesafe"]');
+          button.focus();
+          button.dispatchEvent(new KeyboardEvent('keydown', {key:' ', bubbles:true}));
+          document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowDown', bubbles:true}));
+          document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));
+          return true;
+        })()`);
+        await waitForLine('typesafe · test affected moved from 1 to 3');
+        assert.deepEqual(confirmedQueueLine.members.slice(0, 3).map(member => member.row_id),
+          ['unnamed-wait', 'natemerge', 'typesafe']);
+        await evaluate("document.querySelector('#queue-action').click(); true");
+        await waitForLine('typesafe · test affected moved from 3 to 1');
+        assert.deepEqual(confirmedQueueLine.members.slice(0, 3).map(member => member.row_id),
+          ['typesafe', 'unnamed-wait', 'natemerge']);
+        assert.deepEqual((await snapshot()).handles.slice(0, 2), ['typesafe', 'natemerge']);
+
+        if (queueDragProof) {
+          const clip = await evaluate(`(() => {
+            const walk = document.querySelector('#walk').getBoundingClientRect();
+            const top = document.querySelector('#walk .queue-title').getBoundingClientRect().top + scrollY - 10;
+            const bottom = document.querySelector('#queue-feedback').getBoundingClientRect().bottom + scrollY + 12;
+            return {x:Math.max(0,walk.left-10),y:top,width:Math.min(innerWidth-walk.left,walk.width+20),height:bottom-top,scale:1};
+          })()`);
+          const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+          await writeFile(join(folder, 'drag-dark.png'), Buffer.from(shot.data,'base64'));
+        }
+        queueFixture = null;
+        servedReading = base;
       }
 
       async function checkHeadcounts(navigate, evaluate, call) {
@@ -487,14 +1850,258 @@ try {
         }
       }
 
+      async function captureApprovedAwsCosts(evaluate, call) {
+        await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+        await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1400,deviceScaleFactor:1,mobile:false});
+        const shown = await evaluate(`(() => {
+          const pane = document.querySelector('#aws-costs');
+          const row = date => pane.querySelector('tr[data-period="day-' + date + '"]');
+          row('2026-11-23').querySelector('button').click();
+          row('2026-11-19').querySelector('button').click();
+          const detail = pane.querySelector('[data-aws-day="2026-11-19"]');
+          const hana = [...detail.querySelectorAll('[data-aws-group] button')]
+            .find(button => button.textContent.trim() === 'Hana check and lint');
+          hana.click();
+          const box = pane.getBoundingClientRect();
+          return {text:pane.innerText, counts:[23,22,21].map(day =>
+            [...row('2026-11-' + day).cells].slice(1,3).map(cell => cell.textContent.trim())),
+            fits:[...pane.querySelectorAll('.aws-scroll')].every(box => box.scrollWidth <= box.clientWidth + 1),
+            clip:{x:0,y:Math.floor(box.top+scrollY)-16,width:innerWidth,height:Math.ceil(box.height)+32,scale:1}};
+        })()`);
+        assert.match(shown.text, /In Pacific time, a day starts at 4:00 PM/);
+        assert.match(shown.text, /No AWS read since Nov 19: AWS refuses the key/);
+        assert.deepEqual(shown.counts, Array.from({length:3}, () => ['0','~$0.94']));
+        assert.match(shown.text, /Hana machine with no run[^\n]*\s+2 h 22 min 52 s/);
+        assert.ok(shown.fits, 'The AWS tables fit inside the pane.');
+        const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:shown.clip});
+        const name = 'awscosts-main-dark.png';
+        await writeFile(join(folder,name), Buffer.from(shot.data,'base64'));
+        return [name];
+      }
+
+      async function captureAwsCosts(evaluate, call, liveDay = null) {
+        await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+        await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1400,deviceScaleFactor:1,mobile:false});
+        const capture = async name => {
+          const clip = await evaluate(`(() => {
+            const r = document.querySelector('#aws-costs').getBoundingClientRect();
+            return {x:r.left+scrollX, y:r.top+scrollY, width:r.width, height:r.height, scale:1};
+          })()`);
+          const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+          await writeFile(join(folder,name+'.png'),Buffer.from(shot.data,'base64'));
+        };
+        if (liveDay) {
+          const result = await evaluate(`(() => {
+            const pane = document.querySelector('#aws-costs');
+            const detail = pane.querySelector('[data-aws-day="' + ${JSON.stringify(liveDay)} + '"]');
+            const day = awsCostReport.days.find(day => day.day === detail.dataset.awsDay);
+            const dayCents = awsCents(day.amount_usd);
+            const select = group => detail.querySelector('[data-aws-group-by="' + group + '"]').click();
+            const tableTotal = group => {
+              select(group);
+              const rows = [...detail.querySelectorAll('.aws-group-scroll > table > tbody > tr')];
+              const total = rows.pop();
+              const cents = row => awsCents(row.cells[3].textContent.replace(/[~$,]/g, ''));
+              const sum = rows.reduce((amount, row) => amount + cents(row), 0);
+              return {sum, displayed:cents(total)};
+            };
+            const totals = Object.fromEntries(['region', 'machine', 'job'].map(group => [group, tableTotal(group)]));
+            const hana = [...detail.querySelectorAll('tr[data-aws-group] button')]
+              .find(button => button.textContent.trim() === 'Hana check and lint');
+            const hanaCells = hana.closest('tr').cells;
+            const groupTime = hanaCells[2].textContent;
+            const hanaRuns = day.runs_list.filter(run => run.kind === 'hana');
+            const expectedGroupTime = hanaRuns.length
+              ? awsRunTime(hanaRuns.reduce((total, run) => total + run.seconds, 0)) : '—';
+            const perRun = hanaCells[4].textContent;
+            const totalTime = detail.querySelector('.aws-total-row').cells[2].textContent;
+            hana.click();
+            const expanded = detail.querySelector('.aws-group-detail');
+            const rows = [...expanded.querySelectorAll('.aws-run-scroll > table > tbody > tr')];
+            const idle = rows.filter(row => row.cells[0].textContent === 'Hana machine with no run');
+            const csv = awsRunsCsv(awsCostReport.days).split('\\r\\n');
+            const ids = awsCostReport.days.flatMap(day => day.runs_list.map(run => run.id));
+            pane.scrollIntoView({block:'start'});
+            return {group:hana.textContent.trim(), runs:rows.length - idle.length, expectedRuns:day.hana.runs,
+              groupTime, expectedGroupTime, perRun, totalTime, idleTimes:idle.map(row => row.cells[row.cells.length - 2].textContent),
+              expectedIdleTime:day.hana.idle_seconds == null ? '—' : awsRunTime(day.hana.idle_seconds),
+              idleRows:idle.length, expectedIdleRows:Number(awsCents(day.hana.idle_usd) !== 0), dayCents, totals,
+              csvHeader:csv[0], csvRows:csv.length - 2,
+              recordedRuns:new Set(ids).size, hasRunIds:ids.every(Boolean),
+              fits:[...pane.querySelectorAll('.aws-scroll')].every(box => box.scrollWidth <= box.clientWidth + 1)};
+          })()`);
+          const reconciled = Object.values(result.totals).every(({sum, displayed}) =>
+            sum === result.dayCents && displayed === result.dayCents);
+          if (!reconciled || !result.fits || result.runs !== result.expectedRuns || result.idleRows !== result.expectedIdleRows ||
+              result.groupTime !== result.expectedGroupTime || result.idleTimes.some(time => time !== result.expectedIdleTime) ||
+              !result.hasRunIds || result.csvRows !== result.recordedRuns) {
+            throw new Error('The live Day image or CSV is incomplete. ' + JSON.stringify(result));
+          }
+          const name = 'aws-cost-day-live-dark-6';
+          await capture(name);
+          console.log(JSON.stringify({day:liveDay, ...result}));
+          const historical = await evaluate(`(() => {
+            const current = ${JSON.stringify(liveDay)};
+            const day = '2026-11-07';
+            const periodButton = date => document.querySelector('tr[data-period="day-' + date + '"] button');
+            periodButton(current).click();
+            if (!periodButton(day)) document.querySelector('#aws-older').click();
+            periodButton(day).click();
+            const detail = document.querySelector('[data-aws-day="' + day + '"]');
+            return [...detail.querySelectorAll('.aws-group-scroll > table > tbody > tr')].map(row =>
+              [row.cells[0].textContent.trim(), row.cells[3].textContent]);
+          })()`);
+          const historicalName = 'aws-cost-nov7-dark';
+          await capture(historicalName);
+          console.log(JSON.stringify({day:'2026-11-07', charges:historical}));
+          return [name + '.png', historicalName + '.png'];
+        }
+        await evaluate(`(() => {
+          const pane = document.querySelector('#aws-costs');
+          pane.scrollIntoView({block:'start'});
+          const date = pane.querySelector('[data-tip="aws-cost:day-2026-11-16"]');
+          const bounds = date.getBoundingClientRect();
+          showTip(date.dataset.tip, bounds.right, bounds.top);
+          const tip = document.querySelector('#tip');
+          showTip(date.dataset.tip, bounds.right + 22 + tip.offsetWidth / 2, bounds.bottom + tip.offsetHeight);
+        })()`);
+        await capture('aws-cost-day-dark');
+        await evaluate(`(() => {
+          const pane = document.querySelector('#aws-costs');
+          pane.querySelector('[data-aws-view="month"]').click();
+          pane.querySelector('tr[data-period^="week-"] button').click();
+          pane.querySelector('[data-tip="aws-cost:day-2026-11-17"]').click();
+        })()`);
+        await capture('aws-cost-month-open-dark');
+        return ['aws-cost-day-dark.png', 'aws-cost-month-open-dark.png'];
+      }
+
+      async function checkAwsCosts(evaluate, drillDown) {
+        const summary = await evaluate(`(() => {
+          const pane = document.querySelector('#aws-costs');
+          const lines = [...pane.querySelectorAll('.aws-total-value')].map(tile => tile.textContent.trim());
+          const body = pane.innerText.replace(/\\s+/g, ' ');
+          return {lines, body, fits:pane.scrollWidth <= pane.clientWidth,
+            days:pane.querySelectorAll('tr[data-period]').length, open:pane.querySelector('.aws-toggle').getAttribute('aria-expanded')};
+        })()`);
+        assert.deepEqual(summary.lines, ['~$5.25 of $35.00 limit','~$9.03','~$104.47 of $400.00 limit']);
+        assert.equal(summary.days,14);
+        assert.equal(summary.open,'true');
+        assert.ok(summary.fits, 'The AWS history scrolls inside the pane.');
+        assert.match(summary.body, /AWS amounts read Wed Nov 18, 1:43 PM EST/);
+        assert.match(summary.body, /Thu Nov 19 · started Wed 7:00 PM EST · ends Thu 7:00 PM EST/);
+        assert.match(summary.body, /In Eastern time, a day starts at 7:00 PM on the day before and ends at 7:00 PM\./);
+        assert.match(summary.body, /The next AWS read is due Thu Nov 19, 12:43 PM EST/);
+        assert.match(summary.body, /Group by.*Download CSV.*Hana check and lint.*Costs with no run.*Total 193/);
+        assert.match(summary.body, /Kept resources now cost \$28.20 each month/);
+        assert.doesNotMatch(summary.body, /\bgate\b|targeted test/i);
+        if (!drillDown) return;
+        const result = await evaluate(`(async () => {
+          const pane = document.querySelector('#aws-costs');
+          const select = view => pane.querySelector('[data-aws-view="' + view + '"]').click();
+          const content = pane.querySelector('.aws-rule');
+          renderReport(structuredClone(latest.report));
+          const sameContent = content === pane.querySelector('.aws-rule');
+          const row = id => pane.querySelector('tr[data-period="' + id + '"]');
+          const open = id => row(id).querySelector('button').click();
+          const fields = key => {
+            const trigger = pane.querySelector('[data-tip="aws-cost:' + key + '"]');
+            const box = trigger.getBoundingClientRect();
+            showTip(trigger.dataset.tip, box.left, box.bottom);
+            return [...document.querySelectorAll('#tip dl.tip dt')].map(term => [term.textContent, term.nextElementSibling.textContent]);
+          };
+          const dayLimit = fields('day-limit');
+          const monthLimit = fields('month-limit');
+          const dayTip = fields('day-2026-11-19');
+          hideTip();
+          pane.querySelector('#aws-older').click();
+          const count = pane.querySelectorAll('tr[data-period]').length;
+          const missing = row('day-2026-11-03').cells[2].textContent.trim();
+          const zero = [row('day-2026-11-02').cells[2], row('day-2026-11-02').cells[4]].map(cell => cell.textContent.trim());
+          pane.querySelector('#aws-older').click();
+          const detail = pane.querySelector('[data-aws-day="2026-11-19"]');
+          const groupBy = group => detail.querySelector('[data-aws-group-by="' + group + '"]').click();
+          const groupButton = label => [...detail.querySelectorAll('tr[data-aws-group] button')]
+            .find(button => button.textContent.trim() === label);
+          groupButton('integrate').click();
+          const runCount = detail.querySelectorAll('.aws-group-detail tbody tr').length;
+          const runFields = [...detail.querySelector('.aws-group-detail tbody tr').cells].slice(1).map(cell => cell.textContent);
+          groupButton('integrate').click();
+          groupButton('Hana check and lint').click();
+          const hanaCells = groupButton('Hana check and lint').closest('tr').cells;
+          const hanaTime = hanaCells[2].textContent;
+          const hanaPerRun = hanaCells[4].textContent;
+          const totalTime = detail.querySelector('.aws-total-row').cells[2].textContent;
+          const hanaDetails = [...detail.querySelectorAll('.aws-group-detail tbody tr')].map(row => row.cells[7].textContent);
+          const groupNames = () => [...detail.querySelectorAll('tr[data-aws-group] button')].map(button => button.textContent.trim());
+          const idleCharge = () => [...detail.querySelectorAll('.aws-group-scroll > table > tbody > tr')]
+            .find(row => row.cells[0].textContent === 'Hana machine with no run').cells[2].textContent;
+          groupBy('region');
+          const regions = groupNames();
+          const idleTimes = [idleCharge()];
+          groupBy('machine');
+          const machines = groupNames();
+          idleTimes.push(idleCharge());
+          groupBy('unit');
+          const units = groupNames();
+          idleTimes.push(idleCharge());
+          groupBy('none');
+          const rawRows = detail.querySelectorAll('.aws-run-scroll tbody tr').length;
+          groupBy('job');
+          open('day-2026-11-19');
+          select('week');
+          const week = [...row('week-2026-11-16').cells].slice(1,3).map(cell => cell.textContent);
+          select('month');
+          const month = [...row('month-2026-11-01').cells].slice(1,3).map(cell => cell.textContent);
+          open('week-2026-11-16');
+          open('day-2026-11-17');
+          const billed = pane.querySelector('.aws-day-detail').innerText.replace(/\\s+/g, ' ');
+          select('year');
+          const year = [...row('year-2026-01-01').cells].slice(1,3).map(cell => cell.textContent);
+          select('day');
+          const savedDay = row('day-2026-11-19').querySelector('button').getAttribute('aria-expanded');
+          select('month');
+          const savedMonthDay = row('day-2026-11-17').querySelector('button').getAttribute('aria-expanded');
+          select('day');
+          open('day-2026-11-19');
+          return {sameContent,dayLimit,monthLimit,dayTip,count,missing,zero,runCount,runFields,hanaTime,hanaPerRun,hanaDetails,
+            totalTime,regions,machines,units,idleTimes,rawRows,week,month,year,billed,savedDay,savedMonthDay};
+        })()`);
+        assert.equal(result.sameContent,true);
+        assert.deepEqual(result.dayLimit, [['Daily limit',''],['Limit','$35.00'],['New work stops at','$32.00'],
+          ['Starts again','Thu Nov 19, 7:00 PM EST']]);
+        assert.deepEqual(result.monthLimit, [['Monthly limit',''],['Limit','$400.00'],['New work stops at','$397.00'],
+          ['Starts again','Mon Nov 30, 7:00 PM EST']]);
+        assert.deepEqual(result.dayTip, [['Thu Nov 19 (UTC)',''],['Starts','Wed Nov 18, 7:00 PM EST'],
+          ['Ends','Thu Nov 19, 7:00 PM EST']]);
+        assert.deepEqual([result.count,result.missing,result.runCount,result.rawRows], [18,'no record',84,196]);
+        assert.deepEqual(result.zero, ['$0.00','Billed, not final']);
+        assert.deepEqual(result.runFields, ['integrate','report','us-east-1','us-east-1a','c7i.8xlarge','Spot','9 min 34 s','~$0.02']);
+        assert.equal(result.hanaTime, '21 s');
+        assert.equal(result.hanaPerRun, '—');
+        assert.equal(result.totalTime, '29 h 39 min 45 s');
+        assert.deepEqual(result.hanaDetails, ['0 s','1 s','2 s','3 s','4 s','5 s','6 s','2 h 22 min 55 s']);
+        assert.deepEqual(result.idleTimes, Array(3).fill('2 h 22 min 55 s'));
+        assert.deepEqual(result.regions, ['us-east-1','us-west-2']);
+        assert.deepEqual(result.machines, ['c7i.8xlarge','m7a.8xlarge']);
+        assert.deepEqual(result.units, ['report','Unit not recorded']);
+        assert.deepEqual(result.week,['934','~$19.87']);
+        assert.deepEqual(result.month,['2,986','~$104.47']);
+        assert.deepEqual(result.year,result.month);
+        assert.match(result.billed,/Job not recorded/);
+        assert.match(result.billed,/Runs before Thu Nov 19 have no unit record\./);
+        assert.doesNotMatch(result.billed,/Our estimate before the AWS amount/);
+        assert.deepEqual([result.savedDay,result.savedMonthDay],['false','true']);
+      }
+
       async function checkPage(navigate, evaluate, call) {
         const readPixel = async (x, y) => {
           const clip = {x:Math.floor(x),y:Math.floor(y),width:1,height:1,scale:1};
           const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip});
           return pngPixels(Buffer.from(shot.data,'base64'))(0,0);
         };
-        const saveScreenshot = async (name, options = {}) => {
-          if (!comparisonImages) return;
+        const saveScreenshot = async (name, options = {}, enabled = comparisonImages) => {
+          if (!enabled) return;
           const shot = await call('Page.captureScreenshot', {format:'png', ...options});
           await writeFile(join(folder,name+'.png'),Buffer.from(shot.data,'base64'));
         };
@@ -600,23 +2207,23 @@ try {
           })()`);
           for(const group of legendSums?totals:[]) {
             if(group.total==='unavailable') continue;
-            const amount=text=>text==='unavailable'?0:Number.parseFloat(text.replace('<',''));
+            const amount=text=>text==='unavailable' ? 0 : memoryTenths(text);
             const sum=group.rows.reduce((total,text)=>total+amount(text),0);
-            // Every displayed total is the sum of its displayed leaves.
-            assert.ok(Math.abs(amount(group.total)-sum)<=1e-9,
+            assert.equal(amount(group.total),sum,
               'A legend total differs from its rows: '+JSON.stringify(group));
           }
           return true;
         };
         // The same step keeps its screen position and hover after work above it changes.
+        // The last twelve steps stay below the moved ones, so the page can scroll to keep the viewed step in place.
         const steady = structuredClone(base);
-        steady.waiters = Array.from({length: 12}, (_, index) => ({...steady.waiters[0],
+        steady.waiters = Array.from({length: 24}, (_, index) => ({...steady.waiters[0],
           key: 'steady-wait-' + index, pid: 8000 + index, name: 'steady waiting ' + index}));
         servedReading = steady;
         await call('Emulation.setDeviceMetricsOverride', {width:1400,height:700,deviceScaleFactor:1,mobile:false});
-        await navigate(process.env.STEADY_BASELINE ? 'before.html' : 'memory_live.html');
+        await navigate(!gateMode && process.env.STEADY_BASELINE ? 'before.html' : 'memory_live.html');
         const beforeSteady = await evaluate(`(() => {
-          const row = [...document.querySelectorAll('.wrow.wait')].find(row => row.querySelector('.name').textContent === 'steady waiting 3');
+          const row = document.querySelector('.wrow[data-tip="wait:steady-wait-3"]');
           window.scrollBy(0, row.getBoundingClientRect().top - 200);
           const key = row.dataset.tip;
           const table = document.querySelector('tr[data-tip="'+key+'"]');
@@ -630,12 +2237,13 @@ try {
         const changedSteady = structuredClone(steady);
         changedSteady.walk.unshift(...[1,2].map(index => ({...changedSteady.walk.find(row=>row.queued),
           key:'steady-new-'+index, pid:9000+index, name:'new running '+index})));
-        changedSteady.waiters = [...changedSteady.waiters.slice(6), ...changedSteady.waiters.slice(0,6)];
+        changedSteady.waiters = [...changedSteady.waiters.slice(6,12), ...changedSteady.waiters.slice(0,6),
+          ...changedSteady.waiters.slice(12)];
         servedReading = changedSteady;
         const afterSteady = await evaluate(`(async () => {
           await tick();
           await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
-          const row=[...document.querySelectorAll('.wrow.wait')].find(row=>row.querySelector('.name').textContent==='steady waiting 3');
+          const row = document.querySelector('.wrow[data-tip="wait:steady-wait-3"]');
           return {top:row.getBoundingClientRect().top,key:row.dataset.tip,readAt:latest.read_at,tip:document.querySelector('#tip').innerText,
             tipTop:document.querySelector('#tip').style.top,tipLeft:document.querySelector('#tip').style.left,
             focus:document.activeElement.dataset.tip,details:document.querySelector('#swaprows .smaller details').open};
@@ -660,7 +2268,7 @@ try {
           await tick();
           hideTip();
           // The reorder moves step 6 up six places and step 0 down six places.
-          const viewed=[...document.querySelectorAll('.wrow.wait')].find(row=>row.querySelector('.name').textContent==='steady waiting 6');
+          const viewed = document.querySelector('.wrow[data-tip="wait:steady-wait-6"]');
           window.scrollBy(0, viewed.getBoundingClientRect().top - 10);
           const far=document.querySelector('tr[data-tip="wait:steady-wait-0"]');
           far.focus({preventScroll:true});
@@ -678,13 +2286,23 @@ try {
         assert.ok(Math.abs(outOfViewTop-outOfView.top)<1, 'A focused row out of view moves the rows in view: '+JSON.stringify({outOfView,outOfViewTop}));
         servedReading = base;
         await navigate('memory_live.html');
+        for (const width of [600, 800, 1200, 1600]) {
+          await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
+          await show(readings.step_unknown);
+          const text = await evaluate("document.querySelector('#walk').textContent");
+          assert.ok(!text.includes('owner not recorded'), `The walk shows an unknown owner at ${width} px.`);
+        }
         // A reload of the same page keeps its scroll; the pixel checks below read the page from its top.
         await evaluate('scrollTo(0,0)');
         for (const theme of themes) {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
           for (const width of widths) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
+            await show(readings.aws_costs);
+            await checkAwsCosts(evaluate, theme === 'dark' && width === 1400);
             await show(base);
+            await evaluate(`renderAwsCosts(undefined)`);
+            assert.equal(await evaluate(`document.querySelector('#aws-cost-content').textContent`), 'no record');
             // A render keeps the viewed row in place, so the scroll of the last width stays; the pixel checks read from the top.
             await evaluate('scrollTo(0,0)');
             const timeCells = await evaluate(`({
@@ -725,6 +2343,8 @@ try {
                 return values[0]*0.2126+values[1]*0.7152+values[2]*0.0722;
               };
               const contrast = (a,b) => (Math.max(luminance(a),luminance(b))+0.05)/(Math.min(luminance(a),luminance(b))+0.05);
+              // The swap rows and gauges have a layout only while their dialog is open.
+              document.querySelector('[data-page-action="builds-swap"]').click();
               const swap = [...document.querySelectorAll('#swaprows .row')];
               const small = swap.find(row => row.classList.contains('owner'))?.querySelector('small');
               // A long detail wraps at phone width, so compare the first text lines, not the boxes.
@@ -737,11 +2357,10 @@ try {
               const owner = row.querySelector('.owner');
               const card = document.querySelector('#walk').closest('.card');
               const metrics = {
-                headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
-                runningSlots:[...table.querySelectorAll('tr[data-tip^="row:"] .slot')].map(cell=>cell.textContent),
-                queuedSlots:table.querySelectorAll('tr[data-tip^="wait:"] .slot,tr.queue-head .slot').length,
+                headings:[...table.querySelectorAll('thead th:not(.row-action)')].map(e=>e.textContent),
+                slotCells:table.querySelectorAll('.slot').length,
                 answer:text('#answer'),
-                queueHeaders:[...table.querySelectorAll('tbody tr.queue-head th')].map(e=>e.textContent),
+                queueHeaders:[...table.querySelectorAll('tbody tr.queue-head th:not(.row-action)')].map(e=>e.textContent),
                 queueHeaderHeight:table.querySelector('tr.queue-head')?.getBoundingClientRect().height,
                 queueSpacerHeight:document.querySelector('.walk-chart .queue-head')?.getBoundingClientRect().height,
                 stages:[...table.querySelectorAll('tbody tr[data-tip^="row:"] .place')].map(e=>e.textContent),
@@ -760,8 +2379,8 @@ try {
                     Object.assign(probe.style,{position:'absolute',whiteSpace:'nowrap',width:'auto',visibility:'hidden'});
                     walk.append(probe);const result=probe.getBoundingClientRect().width;probe.remove();return result;
                   };
-                  const widths=[...walk.querySelectorAll('.row-label .name, .row-label .owner')].flatMap(label=>
-                    label.closest('.wrow.wait') ? label.textContent.split(/\s+/).map(word=>width(label,word)) : [width(label,label.textContent)]);
+                  const widths=[...walk.querySelectorAll('.row-label .name, .row-label .owner')].map(label=>width(label,label.textContent)
+                    +parseFloat(getComputedStyle(label.closest('.row-label')).paddingInlineStart));
                   const room=walk.querySelector('.wrow.room .row-heading');
                   widths.push(width(room,room.textContent.replace(/(Free)/,'$1 '))+8);
                   return {column:parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--amt')),
@@ -773,13 +2392,13 @@ try {
                   return room.getClientRects().length?room.textContent:null;
                 })(),
                 machine:table.querySelector('td.machine')?.textContent,
-                capText:text('#cap-value'), room:text('#v-room'),
+                capText:text('#cap-value'), legendCap:text('#v-cap'), room:text('#v-room'),
                 roomBar:rect(document.querySelector('#s-room')), roomColor:color('--room'),
                 rowLeft:rect(row.querySelector('.row-label')).left,
                 headingLeft:rect(card.querySelector('.section-head')).left,
                 reservedAmount:getComputedStyle(row.querySelector('.reserved-amount')).color,
                 dimColor:color('--ink-2'),
-                leftover:text('#leftover-rows'), history:text('#report-charts'), top:text('#report-top'),
+                leftover:text('#leftover-rows'), history:text('#builds-costs-dialog'), top:text('#report-top'),
                 costWindow:text('#cost-window'), pressureReason:text('#pressure-reason'),
                 charts:document.querySelectorAll('#history-charts svg').length,
                 progress:progress?rect(progress):null, capLine:rect(cap),
@@ -794,15 +2413,15 @@ try {
                 name:row.querySelector('.name').textContent, owner:owner?.textContent||'',
                 walk:rect(document.querySelector('#walk')), card:rect(card),
                 amountHeader:document.querySelector('.walk-amount-head')?.textContent||document.querySelector('#walk').textContent,
-                swapBars:document.querySelectorAll('#swap .gt').length,
-                legacySwapBar:!!document.querySelector('#swap .swapbar'),
+                swapBars:document.querySelectorAll('#builds-swap-dialog .gt').length,
+                legacySwapBar:!!document.querySelector('#builds-swap-dialog .swapbar'),
                 scroll:document.documentElement.scrollWidth, client:document.documentElement.clientWidth,
               };
+              document.querySelector('#builds-swap-dialog [data-close]').click();
               return metrics;
             })()`);
             assert.deepEqual(proof.headings, runningHeaders);
-            assert.ok(proof.runningSlots.length>0 && proof.runningSlots.every(slot=>slot==='—'));
-            assert.equal(proof.queuedSlots,0);
+            assert.equal(proof.slotCells,0,'The step table has no Slot column.');
             assert.equal(proof.answer,'Free for the next step');
             assert.deepEqual(proof.queueHeaders, queuedHeaders);
             assert.equal(proof.queueHeaderHeight,proof.queueSpacerHeight);
@@ -812,6 +2431,7 @@ try {
             assert.equal(proof.layout,'beside','The table moved under the chart at '+width+' px.');
             for(const offsets of proof.rowOffsets)
               assert.ok(Math.abs(offsets.chart-offsets.table)<=1,'The chart and table rows differ. '+JSON.stringify({theme,width,offsets,all:proof.rowOffsets}));
+            await assertRowCenters(evaluate);
             assert.equal(proof.roomRow,'','The table room row is empty beside the chart.');
             assert.deepEqual(proof.stageCut,[],'A Stage value is wider than its column at '+width+' px.');
             assert.ok(proof.labelColumn.column<=Math.min(proof.labelColumn.needed,proof.labelColumn.cap)+2,
@@ -841,7 +2461,7 @@ try {
             assert.match(proof.swapText.at(-1), /All swap used7\.8 GiB/);
             assert.equal(proof.swapBytes.slice(0,-1).reduce((sum,bytes)=>sum+bytes,0),proof.swapBytes.at(-1));
             assert.equal(proof.swapBytes.at(-1),base.swap.used_bytes);
-            assert.equal(proof.capText,'Queue cap '+base.cap.toFixed(1)+' GiB');
+            assert.equal(proof.capText,'Queue cap '+proof.legendCap);
             assert.ok(!proof.legacySwapBar, 'The page repeats the swap bar.');
             assert.equal(proof.swapBars, 3);
             for (const ratio of proof.reservedRatios) assert.ok(ratio >= 3, 'The reservation contrast is below 3:1.');
@@ -869,24 +2489,109 @@ try {
             await checkPixel(proof.roomBar.left+5,proof.roomBar.top+4,proof.roomColor,
               'The room pixels differ at '+theme+' '+width+' px.');
             if (comparisonImages) proofs.push({theme,width,metrics:proof});
-            const slotReview=structuredClone(base);
-            const running=slotReview.walk.find(row=>row.queued&&!row.ci);
-            slotReview.walk=[
-              {...running,name:'hana nextest',unit:'queue',machine:'natedev',slot:2,tokens:6},
-              {...running,name:'tools nextest',unit:'tests',machine:'natedev',pid:51,slot:'—'},
+            // The user, 11-22: each section opens from its heading button in a dialog; Escape closes it and returns focus.
+            for (const action of ['builds-swap','builds-costs','builds-leftovers']) {
+              const button=await evaluate(`(() => {
+                const box=document.querySelector('[data-page-action="${action}"]').getBoundingClientRect();
+                return {x:box.left+box.width/2,y:box.top+box.height/2};
+              })()`);
+              await call('Input.dispatchMouseEvent',{type:'mousePressed',...button,button:'left',buttons:1,clickCount:1});
+              await call('Input.dispatchMouseEvent',{type:'mouseReleased',...button,button:'left',buttons:0,clickCount:1});
+              const opened=await evaluate(`(() => {
+                const dialog=document.querySelector('#${action}-dialog'), body=dialog.querySelector('.console-dialog-body');
+                return {modal:dialog.matches(':modal'),right:dialog.getBoundingClientRect().right,
+                  capturePlace:pageCapturePlace(),
+                  sideways:body.scrollWidth-body.clientWidth};
+              })()`);
+              assert.ok(opened.modal, action+' does not open its dialog.');
+              assert.equal(opened.capturePlace, '/memory_live.html#console-window=' + action + '-dialog');
+              assert.ok(opened.right<=width, action+' leaves the window at '+width+' px.');
+              assert.ok(opened.sideways<=0, action+' scrolls sideways at '+width+' px.');
+              if (action==='builds-swap') {
+                // Closed, the page does not place the limit labels; the ResizeObserver places them when the dialog opens.
+                const limits=await evaluate(`(async () => {
+                  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                  const lefts=() => ['some','full'].map(key => document.querySelector('#limit-'+key).style.left);
+                  const observed=lefts();
+                  placeLimitLabels();
+                  return {observed,placed:lefts()};
+                })()`);
+                assert.deepEqual(limits.observed,limits.placed,'The swap dialog opens with its limit labels out of place.');
+                assert.ok(limits.placed.every(left => left!==''),'The swap dialog opens with no limit label place.');
+              }
+              for (const type of ['keyDown','keyUp'])
+                await call('Input.dispatchKeyEvent',{type,key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+              // The dialog close event returns focus after the close, so read it one frame later.
+              const closed=await evaluate(`(async () => {
+                await new Promise(resolve => requestAnimationFrame(resolve));
+                return {open:document.querySelector('#${action}-dialog').open,focus:document.activeElement.dataset.pageAction};
+              })()`);
+              assert.deepEqual(closed,{open:false,focus:action},action+' does not close or return focus.');
+            }
+            // The pressure pill opens Swap without its tooltip. Escape returns focus to the pill.
+            for (const input of ['mouse', 'keyboard', 'touch']) {
+              if (input === 'touch') await call('Emulation.setTouchEmulationEnabled', {enabled:true});
+              const pill=await evaluate(`(() => {
+                hideTip();
+                const button = document.querySelector('#pill');
+                button.focus({preventScroll:true});
+                const box = button.getBoundingClientRect();
+                return {x:box.left+box.width/2,y:box.top+box.height/2};
+              })()`);
+              if (input === 'mouse') {
+                await call('Input.dispatchMouseEvent',{type:'mouseMoved',...pill});
+                await call('Input.dispatchMouseEvent',{type:'mousePressed',...pill,button:'left',buttons:1,clickCount:1});
+                await call('Input.dispatchMouseEvent',{type:'mouseReleased',...pill,button:'left',buttons:0,clickCount:1});
+              } else if (input === 'keyboard') {
+                await pressSpace();
+              } else {
+                await call('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[pill]});
+                await call('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
+              }
+              const pillOpened = await evaluate(`({open:document.querySelector('#builds-swap-dialog').open,
+                tip:document.querySelector('#tip').classList.contains('on')})`);
+              assert.deepEqual(pillOpened,{open:true,tip:false},'Swap or its tooltip is wrong for '+input+'.');
+              for (const type of ['keyDown','keyUp'])
+                await call('Input.dispatchKeyEvent',{type,key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+              const pillClosed=await evaluate(`(async () => {
+                await new Promise(resolve => requestAnimationFrame(resolve));
+                return {open:document.querySelector('#builds-swap-dialog').open,focus:document.activeElement.id};
+              })()`);
+              assert.deepEqual(pillClosed,{open:false,focus:'pill'},'The swap dialog does not return focus to the pressure pill.');
+              if (input === 'touch') await call('Emulation.setTouchEmulationEnabled', {enabled:false});
+            }
+            // A queue outage closes an open section dialog and hides the section buttons with the cards.
+            const outage=await evaluate(`(async () => {
+              document.querySelector('[data-page-action="builds-swap"]').click();
+              showQueueError('The queue did not answer.');
+              await new Promise(resolve => requestAnimationFrame(resolve));
+              const shown=[...document.querySelectorAll('[data-page-action^="builds-"]')].filter(button=>button.getClientRects().length).length;
+              const open=document.querySelectorAll('dialog[id^="builds-"][open]').length;
+              document.body.classList.remove('queue-unavailable');
+              return {shown,open};
+            })()`);
+            assert.deepEqual(outage,{shown:0,open:0},'A queue outage leaves a section button or dialog on the page.');
+            const tokenReview=structuredClone(base);
+            const running=tokenReview.walk.find(row=>row.queued&&!row.ci);
+            tokenReview.walk=[
+              {...running,name:'hana nextest',unit:'queue',machine:'natedev',tokens:6},
+              {...running,name:'tools nextest',unit:'tests',machine:'natedev',pid:51},
             ];
-            slotReview.tokens={kind:'TokenPool',total:31,free:4,memory_floor_bytes:12*2**30,paused:false};
-            slotReview.token_counts='';
-            slotReview.waiters=[];
-            slotReview.ram.build_tools_bytes=0;
-            await show(slotReview);
-            const slotColumn=await evaluate(`(()=>{
+            tokenReview.tokens={kind:'TokenPool',total:31,free:4,memory_floor_bytes:12*2**30,paused:false};
+            tokenReview.token_counts='';
+            tokenReview.waiters=[];
+            tokenReview.ram.build_tools_bytes=0;
+            await show(tokenReview);
+            const tokenColumn=await evaluate(`(()=>{
               const table=document.querySelector('.walk-table');
               const rows=[...table.querySelectorAll('tr[data-tip^="row:"]')];
+              const tokensIndex=table.querySelector('thead th.tokens').cellIndex;
               const box=${comparisonImages} ? table.getBoundingClientRect() : null;
               const bottom=box ? rows.at(-1).getBoundingClientRect().bottom : 0;
-              return {slots:rows.map(row=>row.querySelector('.slot').textContent),
-                tokens:rows.map(row=>row.querySelector('.tokens').textContent),
+              return {tokens:rows.map(row=>{
+                  const cell=row.cells[tokensIndex];
+                  return cell?.matches('td.tokens') ? cell.textContent : null;
+                }),
                 pool:[...document.querySelectorAll('#walk-tokens dt')].map(label=>[label.textContent,label.nextElementSibling.textContent]),
                 poolAlignment:[...document.querySelectorAll('#walk-tokens dd')].map(value=>getComputedStyle(value).textAlign),
                 lastColumns:rows.map(row=>[...row.children].slice(-3).map(cell=>cell.className)),
@@ -894,17 +2599,16 @@ try {
                 clip:box ? {x:Math.floor(box.left)-4,y:Math.floor(box.top+scrollY)-4,
                   width:Math.ceil(box.width)+8,height:Math.ceil(bottom-box.top)+8,scale:1} : undefined};
             })()`);
-            assert.deepEqual(slotColumn.slots,['2','—']);
-            assert.deepEqual(slotColumn.tokens,['6','—']);
-            assert.deepEqual(slotColumn.pool,[['Total','31'],['Available','4']]);
-            assert.deepEqual(slotColumn.poolAlignment,['right','right']);
-            assert.deepEqual(slotColumn.lastColumns,[['vcpus','slot','tokens'],['vcpus','slot','tokens']]);
-            assert.equal(slotColumn.overflow,false);
+            assert.deepEqual(tokenColumn.tokens,['6','—']);
+            assert.deepEqual(tokenColumn.lastColumns, [['tokens','moved','row-action'],['tokens','moved','row-action']]);
+            assert.deepEqual(tokenColumn.pool,[['Total','31'],['Available','4']]);
+            assert.deepEqual(tokenColumn.poolAlignment,['right','right']);
+            assert.equal(tokenColumn.overflow,false);
             if(comparisonImages&&theme==='dark'&&width===1400) {
-              await saveScreenshot('slot-column-dark-desktop',{captureBeyondViewport:true,clip:slotColumn.clip});
+              await saveScreenshot('token-column-dark-desktop',{captureBeyondViewport:true,clip:tokenColumn.clip});
             }
             for(const state of ['active','paused','unavailable']) {
-              const tokenReading=structuredClone(slotReview);
+              const tokenReading=structuredClone(tokenReview);
               if(state==='paused') {
                 tokenReading.tokens.free=0;
                 tokenReading.tokens.paused=true;
@@ -921,17 +2625,16 @@ try {
                   clipped:box.left<0||box.right>innerWidth||box.top<0||box.bottom>innerHeight};
               })()`);
               const fields=Object.fromEntries(tokenView.rows.map(row=>[row.label,row.value]));
-              assert.equal(fields.Tokens,'');
+              assert.equal(fields.Tokens,state==='unavailable'?'unavailable':'');
               assert.equal(tokenView.grids,1);
               assert.ok(tokenView.values.every(value=>value==='right'));
               assert.equal(tokenView.clipped,false);
               if(state==='unavailable') {
-                assert.equal(fields.Status,'unavailable');
-                assert.equal(fields.Because,'steve exited 1');
+                assert.deepEqual(fields,{Tokens:'unavailable'});
               } else {
                 assert.equal(fields.Total,'31');
                 assert.equal(fields.Available,state==='paused'?'0':'4');
-                assert.equal(fields['Pause below free RAM'],'12.0 GiB');
+                assert.equal(fields['Pause below'],'12.0 GiB');
                 assert.equal(fields.Pool,state);
                 assert.equal(fields['Per-build counts'],state==='paused'?'unavailable':'known');
                 if(state==='paused') assert.equal(fields.Because,'steve cannot be asked');
@@ -980,22 +2683,24 @@ try {
             assert.match(await evaluate("document.querySelector('#top-costs').textContent"), /Updated cost action/);
             await show(base);
 
-            // A disagree reading hides the memory bar; the Running chart keeps the layout of the agree reading.
+            // The Running chart keeps its layout when the RAM readings disagree.
             const disagreeReading=structuredClone(readings.cloud_region);
             disagreeReading.ram.agreement='disagree';
             const detailLayouts={};
-            for(const [name,detail,reading] of [
-              ['cloud_stage','tools ready',readings.cloud_stage],
-              ['cloud_region','tests start · eu-south-2, zone a',readings.cloud_region],
-              ['cloud_region_disagree','tests start · eu-south-2, zone a',disagreeReading],
-              ['cloud_zone','eu-south-2, zone us-east-1b',readings.cloud_zone],
-              ['cloud_empty','',readings.cloud_empty]]) {
+            for(const [name,stage,location,reading] of [
+              ['cloud_stage','tools ready','',readings.cloud_stage],
+              ['cloud_region','tests start','eu-south-2, zone a',readings.cloud_region],
+              ['cloud_region_disagree','tests start','eu-south-2, zone a',disagreeReading],
+              ['cloud_zone','testing','eu-south-2, zone us-east-1b',readings.cloud_zone],
+              ['cloud_empty','testing','',readings.cloud_empty]]) {
               await show(reading);
               const detailProof=await evaluate(`(() => {
                 const row=[...document.querySelectorAll('.walk-table tbody tr')].find(row=>row.textContent.includes('700001'));
                 const chart=document.querySelector('.wrow[data-tip="'+row.dataset.tip+'"]');
                 const amounts=chart.querySelector('.amounts');
-                return {text:amounts.textContent,font:getComputedStyle(amounts).fontSize,
+                const fields=Object.fromEntries(tooltipRows(row.dataset.tip,latest).map(({label,value})=>[label,value]));
+                return {stage:row.querySelector('.place').textContent,fields,
+                  text:amounts.textContent,font:getComputedStyle(amounts).fontSize,
                   ownerFont:getComputedStyle(chart.querySelector('.owner')).fontSize,
                   rootFont:getComputedStyle(document.documentElement).fontSize,
                   beside:document.querySelector('#walk').classList.contains('beside'),
@@ -1008,8 +2713,11 @@ try {
                   chartHeight:chart.getBoundingClientRect().height,rowHeight:row.getBoundingClientRect().height,
                   scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
               })()`);
-              const expected=[detail,'7 of 12 modules','1 failed module','no update for 2 min'].filter(Boolean).join(' · ');
-              assert.equal(detailProof.text,expected,'The AWS detail text differs.');
+              assert.equal(detailProof.stage,stage,'The AWS Stage differs.');
+              assert.equal(detailProof.text,'1 failed module · no update for 2 min','The AWS detail text differs.');
+              assert.equal(detailProof.fields.Where,location || undefined,'The AWS tooltip location differs.');
+              const stageLabel=stage[0].toUpperCase()+stage.slice(1);
+              assert.equal(detailProof.fields[stageLabel],'7 of 12 modules','The AWS tooltip module count differs.');
               assert.equal(detailProof.font,detailProof.ownerFont,'The AWS detail font differs from the owner font.');
               assert.equal(parseFloat(detailProof.font),parseFloat(detailProof.rootFont)*0.75);
               if(detailProof.beside) assert.ok(detailProof.detailRight<detailProof.tableLeft,
@@ -1024,7 +2732,7 @@ try {
                   assert.equal(detailProof[key],agree[key],'The disagree note changes the Running chart '+key+'.');
                 assert.deepEqual(detailProof.bars,agree.bars,'The disagree note changes the Running chart bars.');
               }
-              if(name.startsWith('cloud_region') && process.env.MEMORY_PAGE_SHOT) {
+              if(name.startsWith('cloud_region') && requestedShot) {
                 const clip=await evaluate(`(() => {
                   const r=document.querySelector('#walk').closest('.card').getBoundingClientRect();
                   return {x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1};
@@ -1050,13 +2758,16 @@ try {
               const cloudText=(running?.textContent || '')+' '+(runningDetails?.textContent || '');
               const stale=[...(runningDetails?.querySelectorAll('*') || [])].find(element=>
                 element.childElementCount===0 && element.textContent.includes('no update for'));
-              return {headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
+              return {headings:[...table.querySelectorAll('thead th:not(.row-action)')].map(e=>e.textContent),
                 running:cloudText,waiting:(waiting?.textContent || '')+' '+(waitingDetails?.textContent || ''),
-                machine:running?.querySelector('.machine')?.textContent,
+                stage:running?.querySelector('.place')?.textContent,
+                moduleCount:tooltipRows(running.dataset.tip,latest).find(row=>row.label==='Testing')?.value,
+                machine:running?.querySelector('td.machine .machine')?.dataset.machine,
                 place:waiting?.querySelector('.place')?.textContent,
-                waitingMachine:waiting?.querySelector('.machine')?.textContent,
+                waitingMachine:waiting?.querySelector('td.machine .machine')?.dataset.machine,
                 localWaiting:(() => {const index=latest.waiters.findIndex(row=>row.kind!=='cloud');
-                  return index<0?null:{shown:table.querySelector('tr[data-tip="'+proofTip('wait',index)+'"] .machine')?.textContent,
+                  return index<0?null:{shown:[...table.querySelectorAll('tr[data-tip="'+proofTip('wait',index)+'"] td.machine .machine')]
+                    .map(icon=>icon.dataset.machine).join(' or '),
                     targets:(latest.waiters[index].targets||[]).join(' or ')};})(),
                 beside:document.querySelector('#walk').classList.contains('beside'),
                 statusHeight:runningDetails?.querySelector('.amounts')?.getBoundingClientRect().height,
@@ -1088,19 +2799,19 @@ try {
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
             assert.ok(!/\brunning\b/.test(cloudProof.running),'The cloud row repeats the running state.');
-            for(const value of [modules,failed,'no update for '+cloudRow.late_age])
-              assert.ok(cloudProof.running.includes(value),value+' is absent from the cloud row.');
+            assert.equal(cloudProof.stage,'testing');
+            assert.equal(cloudProof.amounts,`${failed} · no update for ${lateAge}`,'The AWS detail text differs.');
+            assert.equal(cloudProof.moduleCount,modules,'The AWS tooltip module count differs.');
             assert.ok(cloudProof.progressInTrack,'The cloud progress line is absent from the track.');
             assert.ok(Math.abs(cloudProof.progressWidth-cloudProof.progressTrackWidth*cloudRow.progress.percent/100)<1,
               'The cloud progress width differs from its percent.');
-            assert.ok(cloudProof.amounts.includes(modules),'The cloud module count is absent from the amounts.');
             assert.equal(cloudProof.trackText,'','The cloud track contains text.');
             assert.ok(!cloudProof.waitingBar,'The waiting cloud row has a progress line.');
             assert.ok(Math.abs(cloudProof.height-cloudProof.tableHeight)<1,'The cloud row heights differ.');
             assert.ok(cloudProof.tipsMatch,'The cloud hover keys differ from the local row keys.');
             assert.equal(cloudProof.place,'cloud');
             assert.equal(cloudProof.waitingMachine,'aws');
-            // The user, 11-15: a queued row names the machines that can take it in the Target column.
+            // The user, 11-15: a queued row shows the machines that can take it in the Machine column.
             assert.ok(cloudProof.localWaiting && cloudProof.localWaiting.targets,'The fixture has no local waiting row with targets.');
             assert.equal(cloudProof.localWaiting.shown,cloudProof.localWaiting.targets);
             // The user, 11-15: a cloud status wraps one letter to a line when its room before the cap is narrow.
@@ -1114,14 +2825,14 @@ try {
             assert.ok(cloudProof.localMemory,'The local memory bar is absent.');
             assert.equal(cloudProof.staleColor,cloudProof.errorColor,'The stale age is not red.');
             assert.ok(cloudProof.scroll<=cloudProof.client,'Cloud rows overflow the page.');
-            if(process.env.MEMORY_PAGE_SHOT && theme==='light' && width===1400 && name==='cloud') {
+            if(requestedShot && theme==='light' && width===1400 && name==='cloud') {
               const clip=await evaluate(`(() => {
                 const r=document.querySelector('#walk').closest('.card').getBoundingClientRect();
                 return {x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1};
               })()`);
               const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
-              await mkdir(dirname(process.env.MEMORY_PAGE_SHOT),{recursive:true});
-              await writeFile(process.env.MEMORY_PAGE_SHOT,Buffer.from(shot.data,'base64'));
+              await mkdir(dirname(requestedShot),{recursive:true});
+              await writeFile(requestedShot,Buffer.from(shot.data,'base64'));
             }
             proof[name]=cloudProof;
             }
@@ -1278,56 +2989,62 @@ try {
             Object.assign(shortReading.ram,{build_covered_bytes:shortReading.ram.build_covered_bytes+shortReading.ram.room_bytes,room_bytes:0});
             Object.assign(shortReading.ram,{build_target_bytes:shortReading.ram.build_covered_bytes+4*gib,build_missing_bytes:4*gib,shortfall_bytes:4*gib});
             Object.assign(shortReading,{room:0,taken:shortReading.cap,shortfall:4});
+            delete shortReading.build_reserve;
             await show(shortReading);
             if(comparisonImages&&theme==='dark'&&width===1400) {
               const shortClip=await evaluate(`(()=>{
-                const memory=document.querySelector('#barwrap').getBoundingClientRect();
+                const alert=document.getElementById('mac-idle-alert').getBoundingClientRect();
                 const running=document.querySelector('#walk').closest('.card').getBoundingClientRect();
-                return {x:running.left,y:memory.top+scrollY,width:running.width,height:running.bottom-memory.top,scale:1};
+                return {x:running.left,y:alert.top+scrollY,width:running.width,height:running.bottom-alert.top,scale:1};
               })()`);
               await saveScreenshot('over-cap-dark-desktop',{captureBeyondViewport:true,clip:shortClip});
             }
-            // The bar draws the uncovered reserve past the cap line, with a dashed brace and a tooltip.
+            // The user, 11-17: a short reserve has a red outline, one alert line names it, and its tooltip names the missing part.
             const overBar=await evaluate(`(() => {
-              const box=id=>{const r=document.getElementById(id).getBoundingClientRect();return {left:r.left,right:r.right,width:r.width};};
-              const tip=Object.fromEntries(tooltipRows('over',latest).map(row=>[row.label,row.value]));
-              return {hidden:document.getElementById('b-overlay').hidden,overlay:box('b-overlay'),cap:box('b-cap'),over:box('b-over'),
-                brace:document.getElementById('b-over').textContent,reserved:document.getElementById('b-reserved').textContent,tip};
+              const outline=id=>({short:document.getElementById(id).classList.contains('short-reserve'),
+                shadow:getComputedStyle(document.getElementById(id)).boxShadow});
+              const probe=document.createElement('i');
+              probe.style.color='var(--error)';
+              document.body.append(probe);
+              const errorColor=getComputedStyle(probe).color;
+              probe.remove();
+              const alert=document.getElementById('mac-idle-alert');
+              return {reserved:outline('s-reserved'),safety:outline('s-safety'),swap:outline('s-swap'),errorColor,
+                alert:alert.hidden?'':alert.textContent,old:['b-overlay','b-over','bc-reserved'].filter(id=>document.getElementById(id)),
+                tip:Object.fromEntries(tooltipRows('reserved',latest).map(row=>[row.label,row.value]))};
             })()`);
-            assert.equal(overBar.hidden,false,'The bar draws no over-cap box.');
+            assert.equal(overBar.reserved.short,true,'Build reserved has no red outline when it is short.');
+            assert.ok(overBar.reserved.shadow.includes(overBar.errorColor),'The short outline is not the error color. '+JSON.stringify(overBar));
+            assert.equal(overBar.safety.short,false);
+            assert.equal(overBar.swap.short,false);
+            assert.deepEqual(overBar.old,[],'The old over-cap drawing is still on the page.');
+            assert.match(overBar.alert,/Free RAM is short by 4\.0 GiB\. Build reserved holds [0-9.]+ of [0-9.]+ GiB\./);
+            assert.equal(overBar.tip['Not covered'],'4.0 GiB');
             // A small hana CI part stays visible, so the builds parts add up on screen.
             assert.equal(await evaluate(`getComputedStyle(document.getElementById('s-ci')).minWidth`),'3px');
-            assert.ok(Math.abs(overBar.overlay.left-overBar.cap.right)<=3,'The over-cap box does not start at the cap line. '+JSON.stringify(overBar));
-            assert.ok(Math.abs(overBar.overlay.width-overBar.over.width)<=1,'The over-cap box and its brace differ in width. '+JSON.stringify(overBar));
-            assert.equal(overBar.brace,'over cap 4.0');
-            assert.match(overBar.reserved,/^build reserved [0-9.]+ · [0-9.]+ covered$/);
-            assert.equal(overBar.tip['Over cap'],'4.0 GiB');
-            assert.equal(overBar.tip['= Over cap'],'4.0 GiB');
-            assert.ok(Math.abs(parseFloat(overBar.tip['Build reserved (full)'])-parseFloat(overBar.tip['− Free RAM after safety net and swap'])-4)<=0.1+1e-9,
-              'Build reserved (full) − covered is not the amount over the cap. '+JSON.stringify(overBar.tip));
             proof.overBar=overBar;
             const overHeader=await evaluate(`(() => ({sum:document.querySelector('#walk-sum').textContent,
               sumColor:getComputedStyle(document.querySelector('#walk-sum')).color,hover:tipText('walksum',latest)[1],rows:tooltipRows('walksum',latest),
               cap:getComputedStyle(document.querySelector('#walk .walk-bud .cap-part')||document.querySelector('#walk .walk-bud')).borderLeftColor}))()`);
             // Taken counts the full reserve, so it reads 4 GiB more than the cap.
-            assert.equal(overHeader.sum,(shortReading.cap+4).toFixed(1)+' of '+shortReading.cap.toFixed(1)+' GiB taken · 4.0 GiB over cap');
+            assert.match(overHeader.sum,/ · 4\.0 GiB over cap$/);
             assert.equal(overHeader.sumColor,overHeader.cap,'The over-cap total is not in the cap color.');
             const fields=Object.fromEntries(overHeader.rows.map(row=>[row.label,row.value]));
-            assert.equal(fields.Taken,(shortReading.cap+4).toFixed(1)+' GiB');
-            assert.equal(fields['Queue cap'],shortReading.cap.toFixed(1)+' GiB');
+            assert.equal(overHeader.sum,`${fields.Taken.split(' ')[0]} of ${fields['Queue cap']} taken · 4.0 GiB over cap`);
             assert.equal(fields['Over cap'],'4.0 GiB');
-            assert.ok('+ Build reserved (full)' in fields,overHeader.hover);
+            assert.equal(fields['+ Full reserve'],overBar.tip['Target']);
+            assert.ok(!('+ Build reserved' in fields),overHeader.hover);
             // Taken includes the full reserve. The difference from the cap is the uncovered reserve.
             const number=(text,pattern)=>Number.parseFloat(text.match(pattern)[1]);
             const header={taken:number(overHeader.sum,/^([0-9.]+) of/),cap:number(overHeader.sum,/of ([0-9.]+) GiB/),over:number(overHeader.sum,/· ([0-9.]+) GiB over cap/)};
-            const tip={builds:parseFloat(fields.Builds),reserved:parseFloat(fields['+ Build reserved (full)']),
+            const tip={builds:parseFloat(fields.Builds),reserved:parseFloat(fields['+ Full reserve']),
               taken:parseFloat(fields.Taken),over:parseFloat(fields['Over cap']),cap:parseFloat(fields['Queue cap'])};
-            assert.ok(Math.abs(tip.builds+tip.reserved-tip.taken)<=0.1+1e-9,'Builds + Build reserved is not Taken. '+JSON.stringify(tip));
-            assert.ok(Math.abs(tip.taken-tip.cap-tip.over)<=0.1+1e-9,'Taken - Queue cap is not the amount over the cap. '+JSON.stringify(tip));
+            assert.ok(Math.abs(tip.builds+tip.reserved-tip.taken)<=0.15,'Builds + Build reserved is not Taken. '+JSON.stringify(tip));
+            assert.ok(Math.abs(tip.taken-tip.cap-tip.over)<=0.15,'Taken - Queue cap is not the amount over the cap. '+JSON.stringify(tip));
             assert.deepEqual([header.taken,header.cap,header.over],[tip.taken,tip.cap,tip.over],'The header and its tooltip differ.');
             const plainHeader=await (async()=>{await show(base);return evaluate(`document.querySelector('#walk-sum').textContent`);})();
             assert.ok(!plainHeader.includes('over cap'),'The header names an over-cap amount when nothing is over the cap.');
-            assert.equal(await evaluate(`document.getElementById('b-overlay').hidden`),true,'The bar draws an over-cap box when nothing is over the cap.');
+            assert.equal(await evaluate(`document.querySelectorAll('.short-reserve').length`),0,'A reserve has a red outline when nothing is short.');
             proof.overHeader=overHeader;
             // Cloud status text and bar labels are as wide as on the live page; none of it may show on the cap line.
             const cloudReading=structuredClone(base);
@@ -1417,6 +3134,20 @@ try {
                 await evaluate("hideTip();window.scrollTo(0,0)");
               }
             }
+            // Use the pending and refused notices from the memory feed test.
+            await show({...base, bump_notices:[
+              {unit:'queue', detail:'not applied: the step left the queue'},
+              {unit:'report', detail:'saved at 08:30 PST, waiting for the queue'},
+            ]});
+            const notices = await evaluate(`(() => {
+              const panel = document.querySelector('#bump-notices');
+              return {visible:!!panel?.getClientRects().length,
+                lines:[...(panel?.children ?? [])].map(row => row.textContent)};
+            })()`);
+            assert.deepEqual(notices, {visible:true, lines:[
+              'Bump for queue not applied: the step left the queue',
+              'Bump for report saved at 08:30 PST, waiting for the queue',
+            ]}, 'The page must show the pending and refused bump notices.');
             await show(base);
 
             for (const state of ['idle','waiting','unmatched','busy']) {
@@ -1444,7 +3175,7 @@ try {
               assert.equal(ciProof.chart,state==='busy');
               if(state==='busy') assert.equal(ciProof.stage,'—');
               assert.equal(ciProof.ci,0.125);
-              const takenTenths=Math.round(parseFloat(ciProof.builds)*10)+Math.round(parseFloat(ciProof.reserved)*10);
+              const takenTenths=memoryTenths(ciProof.builds)+memoryTenths(ciProof.reserved);
               assert.equal(ciProof.taken,(takenTenths/10).toFixed(1)+' of '+ciProof.cap.replace(' GiB','')+' GiB taken');
             }
             await show(base);
@@ -1456,8 +3187,8 @@ try {
               return rows.map(({row,index})=>{
                 const chart=document.querySelector('.wrow[data-run="'+proofRun(index)+'"]');
                 const table=document.querySelector('.walk-table tr[data-tip="'+proofTip('row',index)+'"]');
-                return {name:row.name,stage:table.querySelector('.place').textContent,
-                  unit:table.querySelector('.unit').textContent,percent:table.querySelector('.done').textContent,
+                return {name:chart.querySelector('.name').textContent,stage:table.querySelector('.place').textContent,
+                  step:table.querySelector('.step').textContent,percent:table.querySelector('.done').textContent,
                   underBar:!!chart.querySelector('.progress-amount'),
                   used:chart.querySelector('.seg-remote').getBoundingClientRect().width,
                   color:getComputedStyle(chart.querySelector('.seg-remote')).backgroundColor,
@@ -1468,13 +3199,13 @@ try {
               });
             })()`);
             assert.equal(macProof.length,3);
-            assert.deepEqual(macProof.map(row=>row.name),['hana build','hana nextest','cargo-liner nextest']);
+            assert.deepEqual(macProof.map(row=>row.name),['trunk-p172-assembly-rows','trunk','cargo-liner']);
             assert.deepEqual(macProof.map(row=>row.percent),['60.4%','64.7%','98.3%']);
-            assert.deepEqual(macProof.map(row=>row.unit),['—','trunk','—']);
+            assert.deepEqual(macProof.map(row=>row.step),['build','nextest','nextest']);
             const macLabels=await evaluate(`latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build').map(({index})=>({
-              repository:document.querySelector('.wrow[data-run="'+proofRun(index)+'"] .owner').textContent,
+              owner:document.querySelector('.wrow[data-run="'+proofRun(index)+'"] .owner').textContent,
               jobs:document.querySelector('tr[data-tip="'+proofTip('row',index)+'"] .vcpus').textContent}))`);
-            assert.deepEqual(macLabels.map(row=>row.repository),['unregistered session','hana','unregistered session']);
+            assert.deepEqual(macLabels.map(row=>row.owner),['','hana','']);
             assert.deepEqual(macLabels.map(row=>row.jobs),['—','12','6']);
             for(const row of macProof) {
               assert.equal(row.stage,'building');
@@ -1494,9 +3225,10 @@ try {
             assert.equal(failedMac.unknown,'—');
             await show(base);
 
+            // Waiting step names must leave Duration and Verify in place.
             const positions=()=>evaluate(`(() => {
               const row=document.querySelector('.walk-table tr[data-tip^="row:"]');
-              return ['.duration','.unit','.pid'].map(selector=>{
+              return ['.duration','.verify'].map(selector=>{
                 const r=row.querySelector(selector).getBoundingClientRect(); return {left:r.left,width:r.width};
               });
             })()`);
@@ -1514,16 +3246,162 @@ try {
               if(index===0) assert.ok(Math.abs(beforeWait[index].width-afterWait[index].width)<=1,
                 'A waiting row changes the Duration width. '+JSON.stringify({width,theme,beforeWait,afterWait}));
             }
+            const longStep = 'check generated-artifacts-and-cross-platform-test-manifests';
+            const walkOverflow = () => evaluate(`(() => {
+              const walk = document.querySelector('.walk-scroll');
+              return walk.scrollWidth - walk.clientWidth;
+            })()`);
+            const beforeLongOverflow = await walkOverflow();
+            const waiter = waiting.waiters[0];
+            waiter.name = waiter.name.split(': ', 1)[0] + ': ' + longStep;
+            if (waiter.title) waiter.title.step = longStep;
+            await show(waiting);
+            const longName = await evaluate(`(() => {
+              const row = document.querySelector('.walk-table tr.wait');
+              return {step:row.querySelector('.step').textContent, tip:tipText(row.dataset.tip, latest)[0]};
+            })()`);
+            assert.equal(longName.step, longStep);
+            const afterLongWait = await positions();
+            for (let index = 0; index < beforeWait.length; index++) {
+              assert.ok(Math.abs(beforeWait[index].left - afterLongWait[index].left) <= 1,
+                'A long waiting step moves a table column. ' + JSON.stringify({width,theme,beforeWait,afterLongWait}));
+              assert.ok(Math.abs(beforeWait[index].width - afterLongWait[index].width) <= 1,
+                'A long waiting step changes a column width. ' + JSON.stringify({width,theme,beforeWait,afterLongWait}));
+            }
+            assert.ok(await walkOverflow() <= beforeLongOverflow + 1, 'A long waiting step adds horizontal overflow.');
+            assert.ok(longName.tip.includes(longStep), 'The waiting row tooltip omits the full step name.');
+            if (width === 900 || width === 1400) {
+              const onlyWaiting = structuredClone(waiting);
+              onlyWaiting.walk = [];
+              const cargoStyle = onlyWaiting.waiters[0];
+              cargoStyle.unit = '';
+              cargoStyle.name = 'cargo-liner: build cargo-style';
+              cargoStyle.title = {unit:'', step:cargoStyle.name};
+              await show(onlyWaiting);
+              const waitingLayout = () => evaluate(`(() => {
+                const table = document.querySelector('.walk-table');
+                const text = table.querySelector('tr.wait .step .cell-text');
+                const columns = ['.duration','.verify','.step'].map(selector => {
+                  const {left, width} = table.querySelector('thead ' + selector).getBoundingClientRect();
+                  return {left, width};
+                });
+                const cut = [text, ...text.children].some(part => part.scrollWidth > part.clientWidth);
+                return {columns, cut, step:text.textContent, running:table.querySelectorAll('tr[data-tip^="row:"]').length};
+              })()`);
+              const cargoLayout = await waitingLayout();
+              assert.equal(cargoLayout.running, 0);
+              assert.equal(cargoLayout.step, 'build cargo-style');
+              assert.equal(cargoLayout.cut, false, `The cargo-style waiting step is cut at ${width} px in ${theme} mode.`);
+              onlyWaiting.waiters = structuredClone(waiting.waiters);
+              await show(onlyWaiting);
+              const changedLayout = await waitingLayout();
+              assert.deepEqual(changedLayout.columns, cargoLayout.columns,
+                'Changing the waiting rows moves the columns with no running steps.');
+              if (width === 1400) {
+                const setWidth = width => call('Emulation.setDeviceMetricsOverride',
+                  {width,height:1200,deviceScaleFactor:1,mobile:false});
+                Object.assign(cargoStyle, {
+                  unit:'cargo-liner-in-a-long-fixture-unit', targets:['natedev','mac'],
+                  title:{unit:'cargo-liner-in-a-long-fixture-unit',step:'build cargo-style'},
+                });
+                onlyWaiting.waiters = [cargoStyle];
+                await show(onlyWaiting);
+                const atWidth = async width => {
+                  await setWidth(width);
+                  const layout = await evaluate(`(() => {
+                    fitLabels();
+                    return {label:parseFloat(document.documentElement.style.getPropertyValue('--amt')),
+                      tight:document.querySelector('#walk').classList.contains('tight')};
+                  })()`);
+                  const {columns, cut, step} = await waitingLayout();
+                  return {width, ...layout, stepWidth:columns[2].width, cut, step};
+                };
+                const originalEdge = [await atWidth(930), await atWidth(931), await atWidth(932)];
+                // The viewport widths at the layout changes depend on the browser font.
+                const layoutEdge = async (property, start) => {
+                  let narrow = await atWidth(start);
+                  let wide = await atWidth(1200);
+                  assert.notEqual(wide[property], narrow[property], 'The fixture needs both values of ' + property);
+                  while (wide.width - narrow.width > 1) {
+                    const middle = await atWidth(Math.floor((narrow.width + wide.width) / 2));
+                    if (middle[property] === narrow[property]) narrow = middle;
+                    else wide = middle;
+                  }
+                  return [narrow, wide, await atWidth(wide.width + 1)];
+                };
+                const adjacent = await layoutEdge('label', 900);
+                const tightEdge = await layoutEdge('tight', 760);
+                await setWidth(1440);
+                const dualTargets = structuredClone(base);
+                dualTargets.walk = [
+                  structuredClone(readings.verify_calls.walk.find(row => row.queued && row.verify)),
+                  structuredClone(readings.mac_three.walk.find(row => row.kind === 'mac-build')),
+                ];
+                dualTargets.walk[0].machine = 'natedev';
+                dualTargets.walk[1].machine = 'mac';
+                dualTargets.waiters = [];
+                await show(dualTargets);
+                const emptyQueue = await positions();
+                dualTargets.waiters = [{...cargoStyle, unit:'cargo-liner', title:{unit:'cargo-liner',step:'build cargo-style'}}];
+                await show(dualTargets);
+                assert.equal(await evaluate("document.querySelectorAll('tr.wait td.machine .machine-icon').length"), 2);
+                const twoIcons = await positions();
+                dualTargets.waiters = structuredClone(readings.three_target_gate_wait.waiters);
+                await show(dualTargets);
+                assert.deepEqual(await evaluate(`[...document.querySelectorAll('tr.wait td.machine .machine-icon')]
+                  .map(icon => icon.dataset.machine)`), ['natedev','mac-linux','hana-aws']);
+                const threeIcons = await positions();
+                const stepFits = group => group.every((view, index) =>
+                  !view.cut && view.step === 'build cargo-style' && (!index || view.stepWidth >= group[index - 1].stepWidth));
+                const labelFits = [originalEdge, adjacent].every(stepFits);
+                const tightFits = stepFits(tightEdge);
+                const columnsStay = withIcons => emptyQueue.every((column, index) =>
+                  column.left === withIcons[index].left && column.width === withIcons[index].width);
+                const twoStay = columnsStay(twoIcons);
+                const threeStay = columnsStay(threeIcons);
+                assert.ok(labelFits && tightFits && twoStay && threeStay, 'Step clips or a waiting row moves Duration or Verify. ' +
+                  JSON.stringify({theme, originalEdge, adjacent, tightEdge, labelFits, tightFits,
+                    emptyQueue, twoIcons, threeIcons, twoStay, threeStay}));
+                await setWidth(width);
+              }
+            }
             const absent=structuredClone(base);
             const absentRun=absent.walk.find(row=>row.queued);
             absentRun.unit='';absentRun.showrunner='';delete absentRun.machine;
             delete absentRun.caller;
             delete absentRun.owner_text;
             await show(absent);
-            const absentCells=await evaluate(`({unit:document.querySelector('.walk-table td.unit').textContent,
+            const absentCells=await evaluate(`({step:document.querySelector('.walk-table tbody .step').textContent,
               owner:document.querySelector('.wrow[data-run] .owner').textContent,
               machine:document.querySelector('.walk-table td.machine').textContent})`);
-            assert.equal(absentCells.unit,'');assert.equal(absentCells.owner,'');assert.equal(absentCells.machine,'—');
+            // A row with no unit starts with the owner before ": " in its name, and its step goes in Step.
+            assert.equal(absentCells.step,'nextest');assert.equal(absentCells.owner,'');assert.equal(absentCells.machine,'—');
+
+            await show(readings.step_unknown);
+            const unknown = await evaluate(`(() => {
+              const rows = [...document.querySelectorAll('.wrow[data-run], .wrow.wait')];
+              const unrecorded = value => !value || value === '—' || value === 'owner not recorded';
+              return rows.flatMap(chart => {
+                const row = stepRow(chart.dataset.tip, latest);
+                if (!unrecorded(row.unit) || !unrecorded(row.showrunner)) return [];
+                const name = chart.querySelector('.name');
+                const step = document.querySelector('tr[data-tip="' + chart.dataset.tip + '"] .step');
+                return [{key:chart.dataset.tip, source:row.name, name:name.textContent, step:step.textContent,
+                  owner:chart.querySelector('.owner').textContent,
+                  staffColor:!!name.querySelector('.staff-name') || !!step.querySelector('.staff-name'),
+                  plainColor:getComputedStyle(name).color === getComputedStyle(chart).color &&
+                    getComputedStyle(step).color === getComputedStyle(step.parentElement).color}];
+              });
+            })()`);
+            assert.ok(unknown.some(row => row.key.startsWith('row:')));
+            assert.ok(unknown.some(row => row.key.startsWith('wait:')));
+            for (const row of unknown) {
+              const [name, ...step] = row.source.split(': ');
+              assert.equal(row.name, name, row.key);
+              assert.equal(row.step, step.join(': '), row.key);
+              assert.equal(row.owner, '', row.key);
+              assert.ok(row.plainColor && !row.staffColor, row.key + ' uses a staff color.');
+            }
 
             for (const [name, expected] of [['pressure','memory'],['spacing','its turn'],['head','its turn']]) {
               await show(readings[name]);
@@ -1586,9 +3464,9 @@ try {
               for(const [label,value] of Object.entries(headProof.values)) {
                 assert.ok(headProof.hover.includes(label+'  '+value),'The head tooltip omits the term: '+label);
               }
-              const tenths=text=>Math.round(parseFloat(text)*10);
-              assert.equal(tenths(headProof.values['Queue cap'])-tenths(headProof.values.Builds)
-                -tenths(headProof.values['Build reserved']),tenths(headProof.values.Free));
+              const tenths=memoryTenths;
+              assert.ok(Math.abs(tenths(headProof.values['Queue cap'])-tenths(headProof.values.Builds)
+                -tenths(headProof.values['Build reserved'])-tenths(headProof.values.Free))<=2);
               for(const [label,value] of Object.entries(headProof.values))
                 assert.equal(value,headProof.legend[label].value,'The head changes a legend amount: '+label);
               assert.ok(!headProof.hover.includes('Safety net') && !headProof.hover.includes('Swap coming back'));
@@ -1630,17 +3508,57 @@ try {
             for (const name of ['old_cap','missing_cap','missing_use']) {
               await show(readings[name]);
               const state=await evaluate(`({rows:document.querySelectorAll('.wrow[data-run]').length,
-                cap:document.querySelector('#cap-value').textContent, text:document.body.textContent,
+                cap:document.querySelector('#cap-value').textContent, note:document.querySelector('#cap-reason').textContent,
                 room:document.querySelector('#v-room').textContent})`);
               assert.equal(state.cap, 'Queue cap unavailable', 'The missing cap has a value.');
               assert.ok(state.rows > 0);
               assert.equal(state.room, proof.room);
-              assert.match(state.text, /unavailable/);
-              if (name==='missing_use') assert.match(state.text, /private memory.stat is missing/);
+              const [reason, ...amounts] = state.note.split('; ');
+              assert.match(reason, /unavailable/);
+              if (name==='missing_use') assert.match(reason, /private memory.stat is missing/);
+              assert.deepEqual(amounts.map(term => term.replace(/ [^ ]+ GiB$/, '')),
+                ['free RAM', 'safety', 'swap coming back', 'kept aside', 'room']);
+              if (name === 'missing_cap') {
+                const checkColumns = () => evaluate(`(() => {
+                  const scroll = document.querySelector('.walk-scroll');
+                  const dialog = document.querySelector('#review-new-item');
+                  const positions = () => {
+                    scroll.scrollLeft = 0;
+                    const columns = [...scroll.querySelectorAll('th[scope="col"]:not(.row-action)')].map(cell => {
+                      const {left, width} = cell.getBoundingClientRect();
+                      return {left, width, padding: getComputedStyle(cell).paddingRight};
+                    });
+                    return {columns, tight: document.querySelector('#walk').classList.contains('tight')};
+                  };
+                  fitLabels();
+                  const withAction = positions();
+                  dialog.removeAttribute('id');
+                  fitLabels();
+                  const withoutAction = positions();
+                  dialog.id = 'review-new-item';
+                  fitLabels();
+                  scroll.scrollLeft = scroll.scrollWidth;
+                  const action = scroll.querySelector('.row-add').getBoundingClientRect();
+                  const clip = scroll.getBoundingClientRect();
+                  const reachable = scroll.scrollLeft > 0 && action.left >= clip.left && action.right <= clip.right;
+                  scroll.scrollLeft = 0;
+                  return {withAction, withoutAction, reachable};
+                })()`);
+                for (const capWidth of new Set([width, 390])) {
+                  if (capWidth !== width) await call('Emulation.setDeviceMetricsOverride',
+                    {width:capWidth,height:1200,deviceScaleFactor:1,mobile:false});
+                  const {withAction, withoutAction, reachable} = await checkColumns();
+                  if (capWidth === 390) assert.ok(withAction.tight, 'The no-cap proof needs compact gaps at 390 px.');
+                  assert.deepEqual(withAction, withoutAction, `The action moves data columns with no cap at ${capWidth} px.`);
+                  assert.ok(reachable, `The action is clipped with no cap at ${capWidth} px.`);
+                }
+                if (width !== 390) await call('Emulation.setDeviceMetricsOverride',
+                  {width,height:1200,deviceScaleFactor:1,mobile:false});
+              }
             }
             for (const name of ['empty_report','missing_report']) {
               await show(readings[name]);
-              const state=await evaluate(`({history:document.querySelector('#report-charts').textContent,
+              const state=await evaluate(`({history:document.querySelector('#builds-costs-dialog').textContent,
                 top:document.querySelector('#report-top').textContent, rows:document.querySelectorAll('.wrow[data-run]').length})`);
               assert.ok(state.rows>0);
               if(name==='missing_report') {
@@ -1691,9 +3609,10 @@ try {
             word:part('word').textContent,
             icons:[...line.querySelectorAll('[data-status-icon]')].filter(icon=>!icon.hidden).map(icon=>icon.dataset.statusIcon),
             timingsHidden:part('trip').hidden&&part('render').hidden,
-            position:getComputedStyle(line).position});
+            position:getComputedStyle(line.closest('.page-top')).position});
           const good=async()=>{
             reading.read_at=now/1000;
+            reading.fresh_until=reading.read_at+ageLimit;
             window.fetch=async()=>({ok:true,json:async()=>reading});
             await refresh.refresh(); fitLabels();
           };
@@ -1740,14 +3659,14 @@ try {
           assert.equal(states[name].state,'Live');
           assert.ok(!states[name].ageHidden && states[name].reason==='');
         }
-        const capture = async (name, selector) => {
-          if (!comparisonImages) return;
+        const capture = async (name, selector, enabled = comparisonImages) => {
+          if (!enabled) return;
           await evaluate(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({block:'center'})`);
           const clip=await evaluate(`(() => {
             const r=document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
             return {x:Math.max(0,r.left+scrollX),y:r.top+scrollY,width:r.width,height:r.height,scale:1};
           })()`);
-          await saveScreenshot(name,{captureBeyondViewport:true,clip});
+          await saveScreenshot(name,{captureBeyondViewport:true,clip},enabled);
         };
         if (cloudOwnerComparison) {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
@@ -1767,20 +3686,20 @@ try {
               const table=document.querySelector('tr[data-tip="' + proofTip('row', 0) + '"]');
               return {name:chart.querySelector('.name').textContent,
                 small:chart.querySelector('.owner').textContent,
-                unit:table.querySelector('.unit').textContent,
-                machine:table.querySelector('.machine').textContent};
+                step:table.querySelector('.step').textContent,
+                machine:table.querySelector('td.machine .machine')?.dataset.machine};
             })()`);
             assert.equal(row.machine,'aws');
-            assert.equal(row.name,version==='before'?'nextest':'research nextest');
-            assert.equal(row.unit,version==='before'?'owner not recorded':'research');
+            assert.equal(row.name,version==='before'?'nextest':'research');
+            assert.equal(row.step,version==='before'?'':'nextest');
             if(version==='after') assert.equal(row.small,'hana');
             await capture(version+'-aws-row','#walk');
             await evaluate(`showTip(proofTip('row', 0),180,160)`);
             const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
             if(version==='after') {
-              assert.match(tooltip,/showrunner\s*:?\s*hana/);
-              assert.match(tooltip,/unit\s*:?\s*research/);
-            } else assert.match(tooltip,/owner not recorded/);
+              assert.match(tooltip,/^research · nextest\n/);
+              assert.match(tooltip,/\nShowrunner\nhana\n/);
+            } else assert.doesNotMatch(tooltip,/not recorded/,'The hover shows an owner that is not recorded.');
             await capture(version+'-aws-tooltip','#tip');
             if (comparisonImages) comparisons.push({version,...row,tooltip});
           }
@@ -1801,23 +3720,24 @@ try {
             const state=await evaluate(`(() => {
               const index=latest.walk.findIndex(row=>row.kind==='mac-build');
               const chart=document.querySelector('.wrow[data-run="'+proofRun(index)+'"]');
-              const headers=[...document.querySelectorAll('.walk-table thead th')].map(cell=>cell.textContent);
-              const waiting=[...document.querySelectorAll('.walk-table tr.queue-head th')].map(cell=>cell.textContent);
+              const headers=[...document.querySelectorAll('.walk-table thead th:not(.row-action)')].map(cell=>cell.textContent);
+              const waiting=[...document.querySelectorAll('.walk-table tr.queue-head th:not(.row-action)')].map(cell=>cell.textContent);
               const spacings=[...document.querySelectorAll('.walk-table thead th,.walk-table tr.queue-head th')]
-                .filter(cell=>getComputedStyle(cell).display!=='none' && cell.nextElementSibling)
+                .filter(cell=>getComputedStyle(cell).display!=='none' && cell.nextElementSibling &&
+                  !cell.nextElementSibling.matches('.action-spacer,.row-action'))
                 .map(cell=>parseFloat(getComputedStyle(cell).paddingRight));
-              const table=document.querySelector('tr[data-tip="'+proofTip('row',index)+'"]');
+              const queued=document.querySelector('.wrow.wait[data-tip="' + proofTip('wait', 0) + '"]');
               return {index,name:chart.querySelector('.name').textContent,small:chart.querySelector('.owner').textContent,
-                unit:table.querySelector('.unit').textContent,
-                waitingUnit:document.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .unit').textContent,
+                step:document.querySelector('tr[data-tip="' + proofTip('row', index) + '"] .step')?.textContent,
+                waitingStep:document.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .step')?.textContent,
                 headers,waiting,spacings,scroll:document.documentElement.scrollWidth,client:innerWidth,
                 tip:tooltipHtml(proofTip('row',index),latest)};
             })()`);
             if(version==='after') {
               assert.equal(state.name,'CI nextest');
-              assert.equal(state.unit,'CI');
-              assert.equal(state.waitingUnit,'CI');
-              assert.match(state.small,/hana CI.*hana-mac-1.*test-hana/);
+              assert.equal(state.step,'');
+              assert.equal(state.waitingStep,'');
+              assert.equal(state.small,'');
               assert.deepEqual(state.headers, runningHeaders);
               assert.deepEqual(state.waiting, queuedHeaders);
               assert.ok(state.spacings.every(gap=>gap===12), JSON.stringify(state.spacings));
@@ -1857,16 +3777,6 @@ try {
             await capture(version+'-owner-tooltip','#tip');
             if (comparisonImages) comparisons.push({version,...state});
           }
-          for(const width of [600,800,1200,1600]) {
-            await call('Emulation.setDeviceMetricsOverride',{width,height:1200,deviceScaleFactor:1,mobile:false});
-            await show(readings.step_unknown);
-            const unitCells=await evaluate(`(() => {
-              const cells=[...document.querySelectorAll('.walk-table .unit .cell-text')].filter(cell=>cell.textContent==='owner not recorded');
-              return cells.map(cell=>({text:cell.textContent,scroll:cell.scrollWidth,width:cell.clientWidth}));
-            })()`);
-            assert.ok(unitCells.length>0);
-            for(const cell of unitCells) assert.ok(cell.scroll<=cell.width, 'The Unit cell cuts its text. '+JSON.stringify({width,cell}));
-          }
           await call('Emulation.setDeviceMetricsOverride',{width:600,height:1200,deviceScaleFactor:1,mobile:false});
           await show(readings.step_ci);
           await capture('after-narrow-owner-ci','#walk');
@@ -1882,10 +3792,10 @@ try {
             const displayed=await evaluate(`({pid:latest.walk[0].pid,
               name:document.querySelector('.wrow[data-run="' + proofRun(0) + '"] .name').textContent,
               small:document.querySelector('.wrow[data-run="' + proofRun(0) + '"] .owner').textContent,
-              unit:document.querySelector('tr[data-tip="' + proofTip('row', 0) + '"] .unit').textContent,
+              step:document.querySelector('tr[data-tip="' + proofTip('row', 0) + '"] .step').textContent,
               tooltip:tooltipHtml(proofTip('row', 0),latest)})`);
-            assert.match(displayed.name,/^CI /);assert.match(displayed.small,/hana CI/);
-            assert.equal(displayed.unit,'CI');assert.match(displayed.tooltip,/hana CI/);
+            assert.match(displayed.name,/^CI /);assert.equal(displayed.small,'');
+            assert.equal(displayed.step,'');assert.match(displayed.tooltip,/hana CI/);
             await writeFile(join(folder,'live-mac-ci-page.json'),JSON.stringify(displayed,null,2));
             await capture('live-mac-ci','#walk');
             await evaluate(`showTip(proofTip('row', 0),700,420)`);
@@ -1900,11 +3810,11 @@ try {
           for (const version of ['before','after']) {
             await show(readings['owner_names_'+version]);
             const names = await evaluate(`(() => {
-              const rows = [...document.querySelectorAll('.walk-table tbody tr')];
-              return {running:rows.filter(row=>row.dataset.tip?.startsWith('row:')).map(row=>row.querySelector('.step').textContent),
-                waiting:rows.filter(row=>row.dataset.tip?.startsWith('wait:')).map(row=>row.querySelector('.step').textContent)};
+              const rows = [...document.querySelectorAll('.walk-chart .wrow')];
+              return {running:rows.filter(row=>row.dataset.tip?.startsWith('row:')).map(row=>row.querySelector('.name').textContent),
+                waiting:rows.filter(row=>row.dataset.tip?.startsWith('wait:')).map(row=>row.querySelector('.name').textContent)};
             })()`);
-            const expected = version === 'before' ? ['test affected','merge gate'] : ['panes test affected','showrunner merge gate'];
+            const expected = version === 'before' ? ['test affected','gate'] : ['panes test affected','showrunner gate'];
             assert.deepEqual(names.running,expected);
             assert.deepEqual(names.waiting,expected);
             await capture(version+'-running-step-names','#walk');
@@ -1928,14 +3838,14 @@ try {
           })()`);
           assert.equal(work.reserved, 11);
           assert.deepEqual(work.rows, [
-            [700001, 'recorded cloud', 'recorded cloud', 'recorded cloud', 'recorded cloud'],
-            [50, 'CI nextest', 'CI nextest', 'hana CI', 'hana CI'],
-            [301, 'held caller', 'held caller', 'held caller', 'held caller'],
-            [302, 'unregistered session', 'unregistered session', 'unregistered session', 'unregistered session'],
-            [304, 'hana nextest', 'hana nextest', 'unregistered session', 'hana nextest'],
-            [200, 'recorded local', 'recorded local', 'recorded local', 'recorded local'],
-            [700002, 'recorded cloud', 'recorded cloud', 'recorded cloud', 'recorded cloud'],
-            [303, 'recorded slot', 'recorded slot', 'recorded slot', 'recorded slot'],
+            [700001, 'nextest', 'fixture unit', 'fixture showrunner', 'recorded cloud'],
+            [50, '', 'hana CI: nextest', '', 'hana CI'],
+            [301, '', 'held caller', '', 'held caller'],
+            [302, '', 'unregistered session', '', 'unregistered session'],
+            [304, '', 'hana: nextest', '', 'hana: nextest'],
+            [200, '', 'fixture unit', 'fixture showrunner', 'recorded local'],
+            [700002, 'nextest', 'fixture unit', 'fixture showrunner', 'recorded cloud'],
+            [303, 'nextest', 'fixture unit', 'fixture showrunner', 'recorded slot'],
           ]);
           await capture('resolved-work-names','#walk');
           comparisons.push({version:'caller-selection',...work});
@@ -2001,7 +3911,7 @@ try {
                     return range.getBoundingClientRect().bottom;
                   };
                   return {title:heading.textContent,font:getComputedStyle(heading).font,
-                    hover:heading.title,truncated:heading.firstElementChild.scrollWidth>heading.firstElementChild.clientWidth,
+                    hover:tipText(heading.dataset.tip,latest).join('\\n'),truncated:heading.firstElementChild.scrollWidth>heading.firstElementChild.clientWidth,
                     clipped:getComputedStyle(heading.firstElementChild).textOverflow==='ellipsis' && getComputedStyle(heading.firstElementChild).overflow==='hidden',
                     withinChart:heading.getBoundingClientRect().right<=header.getBoundingClientRect().right+1,
                     headerHeight:header.getBoundingClientRect().height,
@@ -2022,9 +3932,8 @@ try {
                     }),beside:walk.classList.contains('beside')};
                 })()`);
                 assert.equal(state.title,`${title} (${readings[name].waiters.length})`);
-                assert.ok(state.hover.startsWith(title+'\n'));
-                assert.match(state.hover,/Showrunner:/);
-                assert.match(state.hover,/Unit:/);
+                assert.ok(state.hover.startsWith('Queued  ' + readings[name].waiters.length + '\n'));
+                assert.match(state.hover,/Order  submission order/);
                 assert.equal(state.font,state.runningFont);
                 assert.equal(state.headerHeight,30);
                 assert.equal(state.nextGap,0);
@@ -2224,7 +4133,7 @@ try {
           Object.assign(reading.walk[mac],{name:'hana nextest',showrunner:'hana',unit:'research',runner:'worker',worker:'impl2',
             used:9.7,started_at:reading.read_at-13*60,read_at:reading.read_at,stage:{kind:'MacTesting'},
             progress:{kind:'RowProgress',phase:'testing',done:891,total:894,percent:100*891/894,unit:'units'}});
-          Object.assign(reading.walk[local],{name:'builds merge gate',showrunner:'builds',unit:'—',runner:'showrunner',worker:''});
+          Object.assign(reading.walk[local],{name:'builds gate',showrunner:'builds',unit:'—',runner:'showrunner',worker:''});
           Object.assign(reading.waiters[0],{name:'report nextest',showrunner:'builds',unit:'report',runner:'unit director',worker:''});
           // A colon is its own cell on the after page; the before page draws it after the label.
           const identity=key=>evaluate(`(() => {
@@ -2270,7 +4179,7 @@ try {
             [['showrunner','builds'],['unit','this run is from the showrunner']]);
           assert.equal(lefts(showrunnerState).length,1);
         }
-        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison && !waitTipComparison && !macrouteComparison) {
+        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison && !waitTipComparison && !macrouteComparison && !rowAskComparison) {
           const review = structuredClone(readings.spacing);
           review.priority_text = "queue priority: port (the user's bump)";
           review.head_text = 'Head: need 1.9 GiB > room 0.0 GiB (free 8.5 GiB − safety 3.0 GiB − 6.0 GiB swapped outside builds) · cloud 2 of 9 slots';
@@ -2305,16 +4214,16 @@ try {
                 const mac=document.querySelector('.wrow[data-run="' + proofRun(1) + '"]');
                 const macBar=mac.querySelector('.seg-remote,.seg-used');
                 const awsBar=document.querySelector('.wrow[data-run="' + proofRun(2) + '"] .seg-remote');
-                return {headers:[...table.querySelectorAll('thead th')].map(cell=>cell.textContent),
+                return {headers:[...table.querySelectorAll('thead th:not(.row-action)')].map(cell=>cell.textContent),
                   done:table.querySelector('tr[data-tip="' + proofTip('row', 1) + '"] .done')?.textContent,
                   underBar:!!mac.querySelector('.progress-amount'),
                   remoteColor:getComputedStyle(macBar).backgroundColor,
                   awsColor:awsBar?getComputedStyle(awsBar).backgroundColor:null,
                   localColor:getComputedStyle(document.querySelector('.wrow[data-run="' + proofRun(0) + '"] .seg-used')).backgroundColor,
-                  machineColors:[...table.querySelectorAll('tr[data-tip^="row:"] .machine')].map(cell=>getComputedStyle(cell).color),
+                  machineColors:[...table.querySelectorAll('tr[data-tip^="row:"] td.machine .machine')].map(icon=>getComputedStyle(icon).color),
                   ciVisible:!!table.querySelector('tr[data-tip="' + proofTip('row', 3) + '"]'),
-                  waiting:table.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .unit').textContent,
-                  waitingOwner:table.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .owner').textContent,
+                  waiting:table.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .step')?.textContent,
+                  waitingOwner:document.querySelector('.wrow[data-tip="' + proofTip('wait', 0) + '"] .owner')?.textContent,
                   pageOverflow:document.documentElement.scrollWidth>document.documentElement.clientWidth};
               })()`);
               if(version==='after') {
@@ -2328,8 +4237,8 @@ try {
                 assert.deepEqual(comparison.machineColors,['natedev','mac','aws'].map(machine=>rgb(review.colors[theme].machines[machine])));
                 assert.equal(new Set(comparison.machineColors).size,3);
                 assert.equal(comparison.ciVisible,false);
-                assert.equal(comparison.waiting,'CI');
-                assert.equal(comparison.waitingOwner,'hana CI');
+                assert.equal(comparison.waiting,'');
+                assert.equal(comparison.waitingOwner,'');
                 assert.equal(comparison.pageOverflow,false);
               } else {
                 assert.equal(comparison.ciVisible,true);
@@ -2383,6 +4292,7 @@ try {
           await navigate(version==='before' ? 'before.html' : 'memory_live.html');
           const reading=structuredClone(readings.macroute_running);
           const row=reading.walk.find(row=>row.kind==='mac-build');
+          row.started_at = reading.read_at - 600;
           if(version==='before') row.name += ' · '+row.gate_label;
           await show(reading);
           const index=reading.walk.findIndex(row=>row.kind==='mac-build');
@@ -2395,7 +4305,7 @@ try {
               scroll:tip.scrollWidth,client:tip.clientWidth};
           })()`);
           if(version==='after') {
-            assert.equal(state.title,'fps nextest');
+            assert.equal(state.title,'fps: nextest');
             assert.equal(state.duration,'running 10 min');
             assert.ok(state.width<=24*16+22,JSON.stringify(state));
             assert.ok(state.scroll<=state.client,JSON.stringify(state));
@@ -2450,6 +4360,7 @@ try {
                 build_tools_bytes:1.04*GIB,rust_analyzer_bytes:1.04*GIB,sccache_bytes:0,other_build_tools_bytes:0,
                 queued_builds_bytes:1.04*GIB,ci_bytes:1.04*GIB,
                 swap_covered_bytes:GIB,swap_target_bytes:2*GIB,swap_missing_bytes:GIB,build_covered_bytes:1.04*GIB,room_bytes:1.04*GIB},
+                swap:{...latest.swap,window_seconds:0},
                 unmatched_priority_entries:[{unit:'research'},{unit:'cables'}],
                 walk:[{key:'fractional-run',name:'Codex servers',group:'codex',used:0.4,parts:[
                   {who:'codex',pid:123,started_at:100,gib:0.2},{who:'codex',pid:456,started_at:100,gib:0.2}]}],
@@ -2463,11 +4374,11 @@ try {
             })()`);
             const amounts=rows=>Object.fromEntries(rows.map(row=>[row.label,row.value]));
             const builds=review['g-builds'].filter(row=>row.kind!=='caption');
-            assert.equal(Math.round(parseFloat(builds[0].value)*10),
-              builds.slice(1).reduce((sum,row)=>sum+Math.round(parseFloat(row.value)*10),0));
+            const [buildsTotal, ...buildsParts] = builds.map(row=>memoryTenths(row.value));
+            assert.equal(buildsTotal,31);
+            assert.deepEqual(buildsParts.sort(),[10,10,11]);
             const wait=amounts(review['wait:fractional-wait']);
-            assert.equal(Math.round(parseFloat(wait['Short by'])*10),
-              Math.round(parseFloat(wait.Needs)*10)-Math.round(parseFloat(wait['= Free'])*10));
+            assert.equal(wait['Short by'],'<0.1 GiB');
             const cap=amounts(review.cap);
             assert.equal(cap.Builds,review.legend.builds);
             assert.equal(cap['+ Build reserved'],review.legend.reserved);
@@ -2487,7 +4398,8 @@ try {
               for(const [key,reserve] of [['reserved','build'],['safety','safety'],
                 ['swap','swap'],['swap-pool:outside','swap']]) {
                 for(const target of [2,3]) {
-                  const reading={...latest,swap:{...latest.swap,outside_bytes:2*GIB},
+                  // Without a recorded basis, a Target row shows only when it differs from the title.
+                  const reading={...latest,build_reserve:undefined,swap:{...latest.swap,outside_bytes:2*GIB,window_seconds:0},
                     ram:{...latest.ram,[reserve+'_covered_bytes']:2*GIB,
                       [reserve+'_target_bytes']:target*GIB,[reserve+'_missing_bytes']:(target-2)*GIB}};
                   cases.push({key,target,rows:tooltipRows(key,reading)});
@@ -2495,6 +4407,21 @@ try {
               }
               return cases;
             })()`);
+            const basisProof = await evaluate(`(() => {
+              const reading={...latest,
+                build_reserve:{growth_bytes:5*GIB,share_percent:80,between_steps_bytes:GIB,unread_bytes:0},
+                swap:{...latest.swap,reserve_share_percent:20,window_seconds:600,swap_in_window_bytes:10*GIB},
+                ram:{...latest.ram,build_covered_bytes:5*GIB,build_target_bytes:5*GIB,build_missing_bytes:0,
+                  swap_covered_bytes:2*GIB,swap_target_bytes:2*GIB,swap_missing_bytes:0}};
+              return Object.fromEntries(['reserved','swap'].map(key=>[key,tooltipRows(key,reading)]));
+            })()`);
+            // With a recorded basis, each tooltip ends in its sum, also when the sum equals the title.
+            assert.deepEqual(basisProof.reserved.filter(row=>row.kind!=='title'&&row.kind!=='caption')
+              .map(row=>[row.label,row.value]),
+              [['Room to grow','5.0 GiB'],['× Share held','80.0%'],['+ Between steps','1.0 GiB'],['= Target','5.0 GiB']]);
+            assert.deepEqual(basisProof.swap.filter(row=>row.kind!=='title'&&row.kind!=='caption')
+              .map(row=>[row.label,row.value]),
+              [['Lookback','10 min'],['Swap-in','10.0 GiB'],['× Share held','20.0%'],['= Target','2.0 GiB']]);
             for(const {key,target,rows} of reserveProof) {
               const title=rows.find(row=>row.kind==='title');
               const targetRow=rows.find(row=>row.label==='Target');
@@ -2506,26 +4433,29 @@ try {
               }
             }
             const leafProof = await evaluate(`(() => {
-              const reading={...latest,cap:3.06,taken:2.04,ram:{...latest.ram,
+              const reading={...latest,cap:3.06,taken:2.04,build_reserve:undefined,ram:{...latest.ram,
                 rust_analyzer_bytes:1.02*GIB,sccache_bytes:0,other_build_tools_bytes:0,
                 build_tools_bytes:1.02*GIB,queued_builds_bytes:0,ci_bytes:0,
-                build_covered_bytes:1.02*GIB,room_bytes:1.02*GIB,
+                build_covered_bytes:1.02*GIB,build_target_bytes:1.02*GIB,room_bytes:1.02*GIB,
                 desktop_bytes:10*GIB,agents_bytes:0,programs:[],smaller_programs_bytes:0,other_programs_bytes:0,
                 compressed_swap_bytes:0,kernel_structures_bytes:0,kernel_counters_bytes:0,kernel_bytes:0,
                 cache_bytes:0,unattributed_bytes:-GIB,kernel_no_counter_bytes:0}};
+              const ram=reading.ram;
+              ram.available_bytes=ram.build_covered_bytes+ram.room_bytes+ram.safety_covered_bytes+ram.swap_covered_bytes;
+              ram.total_bytes=ram.build_tools_bytes+ram.available_bytes+ram.desktop_bytes+ram.unattributed_bytes;
               window.renderReading(reading);
               const keys=['tools','g-builds','cap','walksum','g-free','g-else','budget'];
               return {tips:Object.fromEntries(keys.map(key=>[key,tooltipRows(key,reading)])),
                 legend:Object.fromEntries(['tools','g-builds','g-free','g-else','unattributed','cap']
                   .map(key=>[key,document.querySelector('#v-'+key).textContent]))};
             })()`);
-            const tenths=value=>Math.round(parseFloat(value)*10);
+            const tenths=memoryTenths;
             for(const [key,rows] of Object.entries(leafProof.tips)) {
               const values=rows.filter(row=>row.value.endsWith(' GiB')).map(row=>tenths(row.value));
-              assert.equal(values[0],values.slice(1).reduce((sum,value)=>sum+value,0),key);
+              assert.equal(values[0], values.slice(1).reduce((sum,value)=>sum+value,0),key);
               if(key in leafProof.legend) assert.equal(rows[0].value,leafProof.legend[key]);
             }
-            assert.equal(leafProof.tips.cap[0].value,'3.0 GiB');
+            assert.equal(leafProof.tips.cap[0].value,'3.1 GiB');
             assert.equal(leafProof.tips.walksum[0].value,'2.0 GiB');
             assert.equal(leafProof.tips['g-else'][0].value,'9.0 GiB');
             assert.equal(leafProof.legend.unattributed,'-1.0 GiB');
@@ -2613,39 +4543,40 @@ try {
         const mockState = structuredClone(legendReading);
         const shotAt = mockState.read_at;
         const bytes = gib => gib * 1024**3;
-        Object.assign(mockState,{cap:11.3,total:44.4,taken:11.3,used:3.2,reserved:8.1,room:0,shortfall:0});
-        Object.assign(mockState.ram,{queued_builds_bytes:bytes(3.2),build_tools_bytes:0,ci_bytes:0,
+        Object.assign(mockState,{cap:18.3,total:51.4,taken:18.3,used:10.2,reserved:8.1,room:0,shortfall:0});
+        Object.assign(mockState.ram,{queued_builds_bytes:bytes(10.2),build_tools_bytes:0,ci_bytes:0,
           rust_analyzer_bytes:0,sccache_bytes:0,other_build_tools_bytes:0,
           safety_target_bytes:bytes(4),safety_covered_bytes:bytes(4),safety_missing_bytes:0,
           swap_target_bytes:bytes(2.1),swap_covered_bytes:bytes(2.1),swap_missing_bytes:0,
           build_covered_bytes:bytes(8.1),build_target_bytes:bytes(8.1),build_missing_bytes:0,
-          available_bytes:bytes(14.2),total_bytes:bytes(44.4),cap_bytes:bytes(11.3),room_bytes:0,shortfall_bytes:0});
+          available_bytes:bytes(14.2),total_bytes:bytes(51.4),cap_bytes:bytes(18.3),room_bytes:0,shortfall_bytes:0});
+        mockState.build_reserve = {growth_bytes:bytes(10.125),share_percent:80,between_steps_bytes:0,unread_bytes:0};
         mockState.waiters = [
           {name:'fps test',unit:'fps',showrunner:'hana',since:shotAt-720,place:1,why:'memory',need:1,free:0,
-            runs_on:'natedev or Mac',first_in_line:true,head_room:{unavailable:'',rows:[{label:'Queue cap',gib:11.3},
-              {label:'− Builds',gib:3.2},
+            runs_on:'natedev or Mac',first_in_line:true,head_room:{unavailable:'',rows:[{label:'Queue cap',gib:18.3},
+              {label:'− Builds',gib:10.2},
               {label:'− Build reserved',gib:8.1},{label:'= Free',gib:0}]}},
           {name:'cables build',unit:'cables',showrunner:'hana',since:shotAt-51*3600,
-            place:2,why:'memory',need:1,free:0,runs_on:'natedev only',because:'edits the merged checkout'},
-          {name:'cables build',unit:'cables',showrunner:'hana',since:shotAt-51*3600,
-            place:3,why:'memory',need:1,free:0,runs_on:'natedev only',because:localReason}];
+            place:2,why:'its turn',need:1,free:0,runs_on:'natedev only',because:localReason}];
+        const waitingState = {...mockState,waiters:[{...mockState.waiters[1],place:1,why:'memory',
+          first_in_line:true,because:'edits the merged checkout'}]};
         mockState.walk = [{name:'cables build',unit:'cables',showrunner:'hana',runner:'worker',worker:'codex2',
-          started_at:shotAt-840,used:3.2,reserved:8.1,counted:11.3,queued:true,machine:'natedev',
+          started_at:shotAt-840,used:3.2,reserved:2,counted:5.2,queued:true,machine:'natedev',
           progress:{kind:'RowProgress',phase:'testing',done:412,total:993,percent:100*412/993,unit:'tests'}}];
+        await show(mockState);
         // Compare every global legend reference in both covered and shortfall states.
         for(const state of [mockState,readings.head_memory,readings.head_shortfall,readings.head_swap_shortfall]) {
           await show(state);
           const references = await evaluate(`(() => {
-            const shown=shownReading(latest);
             const legend = Object.fromEntries([
-              ...RAM_BLOCKS.map(([,name,amount])=>[name,ramAmount(amount(shown.ram))]),
+              ...RAM_BLOCKS.map(([key,name])=>[name,document.getElementById('v-'+key).textContent]),
               ['Builds',document.querySelector('#v-g-builds').textContent],
               ['Free RAM',document.querySelector('#v-g-free').textContent],
               ['System reserved',document.querySelector('#v-system').textContent],
               ['Queue cap',document.querySelector('#v-cap').textContent],
               ['Everything else',document.querySelector('#v-g-else').textContent]]);
-            const keys=[...Object.keys(TIPS),...(latest.waiters||[]).flatMap((row,index)=>row.head_room?[proofTip('wait',index)]:[]),
-              ...(latest.walk.length===1 && latest.walk[0].queued ? [proofTip('row', 0)] : [])];
+            const keys=Object.keys(TIPS).filter(key=>key!=='shortfall')
+              .concat(latest.waiters.flatMap((row,index)=>row.head_room?[proofTip('wait',index)]:[]));
             return keys.flatMap(key=>tooltipRows(key,latest).flatMap(row=> {
               const label=row.label.replace(/^[+−=] /,'');
               return label in legend ? [{key,label,value:row.value,legend:legend[label]}] : [];
@@ -2653,6 +4584,9 @@ try {
           })()`);
           for(const reference of references) assert.equal(reference.value,reference.legend,
             'A tooltip changes a legend amount: '+JSON.stringify(reference));
+          const swapNote = await evaluate("document.querySelector('#swap-reserve').textContent");
+          const swapLegend = references.find(reference=>reference.key==='swap' && reference.label==='Swap coming back');
+          assert.equal(swapNote,`Swap coming back: ${swapLegend.legend}`);
           const capSums=await evaluate(`Object.keys(TIPS).concat((latest.waiters||[]).map((row,index)=>proofTip('wait',index)))
             .map(key=>({key,rows:tooltipRows(key,latest)})).filter(tip=>tip.rows.some(row=>row.label==='Queue cap'))`);
           for(const tip of capSums) assert.ok(!tip.rows.some(row=>/Safety net|Swap coming back/.test(row.label)),
@@ -2660,15 +4594,43 @@ try {
           if (comparisonImages) comparisons.push({legendReferences:references});
         }
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-        for(const [name,key] of [['waiting',proofTip('wait',1,mockState)],['first-in-line',proofTip('wait',0,mockState)],
-          ['running',proofTip('row',0,mockState)],['queue-cap','cap'],['build-reserved','reserved'],['long-reason',proofTip('wait',2,mockState)]]) {
-          const reading = mockState;
-          await show(reading);
-          await evaluate(`showTip(${JSON.stringify(key)},700,700)`);
-          await capture(name,'#tip');
-          const rows=await evaluate(`tooltipRows(${JSON.stringify(key)},latest)`);
+        const mockTips = [['queue-cap','cap'], ['waiting',null],
+          ['first-in-line',proofTip('wait',0,mockState)], ['running',proofTip('row',0,mockState)],
+          ['build-reserved','reserved'], ['long-reason',proofTip('wait',1,mockState)]];
+        await show(mockState);
+        for (const [name,mockKey] of gateMode ? mockTips.slice(0,1) : mockTips) {
+          if (name==='waiting') await show(waitingState);
+          const key = mockKey ?? proofTip('wait',0,waitingState);
+          const shape = await evaluate(`(() => {
+            showTip(${JSON.stringify(key)},700,700);
+            const grid = document.querySelector('#tip > .tip');
+            const style = getComputedStyle(grid);
+            const labels = [...grid.querySelectorAll(':scope > dt')];
+            const values = labels.map(label=>label.nextElementSibling);
+            const long = grid.querySelector('.long');
+            const box = grid.getBoundingClientRect();
+            return {grids: grid.querySelectorAll('dl').length + 1, columns:style.gridTemplateColumns.split(' ').length,
+              title:grid.querySelectorAll('dt.title').length, dark:matchMedia('(prefers-color-scheme: dark)').matches,
+              labels:labels.map(cell=>[getComputedStyle(cell).textAlign,cell.getBoundingClientRect().left]),
+              values:values.map(cell=>[getComputedStyle(cell).textAlign,cell.getBoundingClientRect().right]),
+              fits:grid.scrollWidth<=grid.clientWidth && box.left>=0 && box.right<=innerWidth &&
+                box.top>=0 && box.bottom<=innerHeight,
+              long:long ? [getComputedStyle(long).textAlign,getComputedStyle(long).gridColumn] : null,
+              rows:tooltipRows(${JSON.stringify(key)},latest)};
+          })()`);
+          const {rows, labels, values} = shape;
+          assert.deepEqual([shape.grids,shape.columns,shape.title,shape.dark,shape.fits],[1,2,1,true,true],name);
+          assert.ok(labels.every(([align,left])=>align==='left' && left===labels[0][1]),name);
+          assert.ok(values.every(([align,right])=>align==='right' && right===values[0][1]),name);
+          assert.ok(rows.every(({label,value})=>!label.includes(':') && !/[.!?]$/.test(value)),name);
+          assert.equal(new Set(rows.map(({label,value})=>label+'  '+value)).size,rows.length,name);
+          assert.deepEqual(shape.long,name==='long-reason' ? ['left','1 / -1'] : null,name);
+          await capture(name,'#tip',comparisonImages || tipDesignComparison);
+          console.log(JSON.stringify({tooltip:name,rows:rows.map(({label,value})=>[label,value]),dark:shape.dark}));
           const amounts=Object.fromEntries(rows.map(row=>[row.label,row.value]));
-          const tenths=value=>Math.round(parseFloat(value)*10);
+          if(name==='waiting') assert.deepEqual([amounts['Place in line'],amounts.Free,amounts['Short by']],
+            ['1','0.0 GiB','1.0 GiB']);
+          const tenths=memoryTenths;
           if(amounts.Free||amounts['= Free']) assert.equal(tenths(amounts['Short by']||'0'),
             Math.max(0,tenths(amounts.Needs)-tenths(amounts.Free||amounts['= Free'])));
           if(name==='first-in-line') assert.equal(tenths(amounts['= Free']),
@@ -2676,7 +4638,10 @@ try {
           if(name==='running') assert.equal(tenths(amounts['= In queue cap']),tenths(amounts.Uses)+tenths(amounts['+ Build reserved']));
           if(name==='queue-cap') assert.equal(tenths(amounts['Queue cap']),
             tenths(amounts.Builds)+tenths(amounts['+ Build reserved'])+tenths(amounts['+ Free']));
+          if(name==='build-reserved') assert.equal(tenths(amounts['= Target']),
+            Math.round(tenths(amounts['Room to grow'])*parseFloat(amounts['× Share held'])/100));
           if (comparisonImages) comparisons.push({mock:name,rows});
+          if (name==='waiting') await show(mockState);
         }
 
         // Both swap images use the same current reading and dark desktop viewport.
@@ -2690,7 +4655,7 @@ try {
             : await evaluate("document.querySelector('#tip').innerText");
           if(version==='after') {
             const share=rows.findIndex(row=>row.label==='Share held');
-            assert.equal(rows[share].value,'20%');
+            assert.equal(rows[share].value,'20.0%');
             assert.ok(!rows.some(row=>row.label==='Target'));
             assert.equal(rows.find(row=>row.kind==='title').value,'2.1 GiB');
             const alignment=await evaluate("getComputedStyle(document.querySelector('#tip dt').nextElementSibling).textAlign");
@@ -2725,16 +4690,192 @@ try {
           && document.querySelector('#tip .tip').scrollWidth<=document.querySelector('#tip .tip').clientWidth`);
         assert.ok(gateFit,'The gate tooltip clips its text.');
         await capture('gate-tooltip-dark-desktop','#tip');
+        const rowAskWidth = rowAskComparison ? 1440 : 1400;
+        const dataColumns = () => evaluate(`[...document.querySelectorAll('.walk-table th[scope="col"]:not(.row-action)')].map(cell => {
+          const box = cell.getBoundingClientRect();
+          return {text:cell.textContent,left:box.left,width:box.width};
+        })`);
+        let beforeColumns;
+        if (rowAskComparison) {
+          assert.ok(beforePage, 'The row comparison needs the previous page.');
+          await call('Emulation.setDeviceMetricsOverride', {width:rowAskWidth,height:1100,deviceScaleFactor:1,mobile:false});
+          servedReading = gateReading;
+          await navigate('before.html');
+          assert.equal(await evaluate("document.querySelectorAll('.row-add').length"), 0);
+          beforeColumns = await dataColumns();
+          await capture('before-rows-dark','#walk');
+          await navigate('memory_live.html');
+        }
+        const gateButton = `'tr[data-tip="' + proofTip('row', ${gateIndex}) + '"] .row-add'`;
+        assert.deepEqual(await evaluate(`(() => {
+          const button = document.querySelector(${gateButton});
+          return {label:button.getAttribute('aria-label'),icon:!!button.querySelector('.lucide-plus'),
+            queued:document.querySelectorAll('tr.wait .row-add').length};
+        })()`), {label:'New item for natemerge integrate',icon:true,queued:gateReading.waiters.length});
+        const actions = await evaluate(`[...document.querySelectorAll('.row-add')].map(button => {
+          const cell = button.closest('td');
+          const box = button.getBoundingClientRect();
+          return {last:cell === cell.parentElement.lastElementChild, column:cell.className,
+            left:box.left, right:box.right, width:box.width};
+        })`);
+        assert.ok(actions.length > 1);
+        for (const action of actions) {
+          assert.equal(action.last, true);
+          assert.equal(action.column, 'row-action');
+          assert.equal(action.left, actions[0].left);
+          assert.equal(action.width, 22);
+          assert.ok(action.right <= rowAskWidth, 'The action column is outside the desktop view.');
+        }
+        if (rowAskComparison) {
+          assert.deepEqual(await dataColumns(), beforeColumns, 'The action column moved a data column.');
+          await capture('after-rows-dark','#walk');
+        }
+        const rowAskStep = async (step, expression) => {
+          let timer;
+          try {
+            return await Promise.race([evaluate(expression), new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error(step + ' timed out.')), 5000);
+            })]);
+          } finally {
+            clearTimeout(timer);
+          }
+        };
+        const openRowAsk = () => rowAskStep('Load New item recipients', `(async () => {
+          const dialog = document.querySelector('#review-new-item');
+          const loaded = new Promise(resolve => {
+            const options = dialog.querySelector('[data-recipients]');
+            const observer = new MutationObserver(() => {
+              if (options.querySelector('input')) { observer.disconnect(); resolve(); }
+            });
+            observer.observe(options, {childList:true});
+          });
+          document.querySelector(${gateButton}).click();
+          await loaded;
+          const preview = dialog.querySelector('.new-item-evidence .tip');
+          const tooltip = document.createElement('template');
+          tooltip.innerHTML = tooltipHtml(proofTip('row', ${gateIndex}), latest);
+          const bounds = dialog.getBoundingClientRect();
+          const regions = [dialog.querySelector('.new-item-body'), preview, ...preview.children];
+          return {open:dialog.matches(':modal'),
+            recipient:dialog.querySelector('[name="recipient_id"]:checked').value,
+            kind:dialog.querySelector('[name="kind"]:checked').value, sameTip:preview.isEqualNode(tooltip.content.firstElementChild),
+            fits:bounds.left >= 0 && bounds.right <= innerWidth && bounds.top >= 0 && bounds.bottom <= innerHeight &&
+              regions.every(region => region.scrollWidth <= region.clientWidth),
+            evidence:dialog.querySelector('.new-item-evidence').textContent};
+        })()`);
+        const checkRowAsk = dialog => {
+          assert.deepEqual({...dialog,evidence:undefined},
+            {open:true,recipient:'fixture-builds',kind:'question',sameTip:true,fits:true,evidence:undefined});
+          assert.ok(dialog.evidence.includes(gateAbout) && dialog.evidence.includes('Overall memory'));
+        };
+        const submitRowAsk = async row => {
+          submittedItem = undefined;
+          const result = await rowAskStep('Send New item evidence', `(async () => {
+            const dialog = document.querySelector('#review-new-item');
+            const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
+            const words = dialog.querySelector('textarea');
+            words.value = 'Can we check this gate?';
+            words.dispatchEvent(new Event('input', {bubbles:true}));
+            dialog.querySelector('[type="submit"]').click();
+            const closedAtSend = !dialog.open;
+            const {detail} = await created;
+            return {closedAtSend,id:detail.id};
+          })()`);
+          assert.deepEqual(result, {closedAtSend:true,id:'Q1'});
+          assert.equal(submittedItem.recipient_id, 'fixture-builds');
+          assert.equal(submittedItem.words, 'Can we check this gate?');
+          const evidence = submittedItem.evidence;
+          assert.equal(evidence.kind, 'build-step');
+          assert.equal(evidence.step_id, row.key);
+          assert.equal(evidence.title, row.name);
+          assert.equal(evidence.owner, row.showrunner);
+          assert.ok(evidence.cells.some(cell => cell.label === 'Machine' && cell.value === 'natedev'));
+          assert.ok(evidence.cells.every(cell => cell.label), 'Evidence includes the action column.');
+          assert.ok(evidence.memory.segments.some(segment => segment.label === 'Queued builds' && segment.gib > 0));
+          assert.ok(evidence.tip.some(entry => entry.label === 'Changes' && entry.value === 'sdlc branch'));
+          assert.ok(evidence.tip.some(entry => entry.kind === 'detail' && entry.text === gateAbout));
+        };
+        checkRowAsk(await openRowAsk());
+        if (rowAskComparison) await capture('after-dialog-dark','#review-new-item');
+        await submitRowAsk(gateRow);
+
+        const evidenceReading = structuredClone(gateReading);
+        const evidenceRow = evidenceReading.walk[gateIndex];
+        Object.assign(evidenceRow, {key:'gate-without-unit', name:'Builds gate', unit:'',
+          title:{unit:'', step:'Builds gate'}, showrunner:'builds'});
+        delete evidenceRow.started_by;
+        await show(evidenceReading);
+        checkRowAsk(await openRowAsk());
+        await submitRowAsk(evidenceRow);
+        if (!gateMode) {
+          await call('Emulation.setDeviceMetricsOverride', {width:390,height:844,deviceScaleFactor:1,mobile:false});
+          const mobileActions = await evaluate(`(async () => {
+            await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            const scroll = document.querySelector('.walk-scroll');
+            const buttons = [...scroll.querySelectorAll('.row-add')];
+            return {width:innerWidth, pageFits:document.documentElement.scrollWidth <= innerWidth,
+              buttons:buttons.map(button => {
+                button.scrollIntoView({block:'center',inline:'nearest'});
+                scroll.scrollLeft = scroll.scrollWidth;
+                const bounds = button.getBoundingClientRect(), clip = scroll.getBoundingClientRect();
+                const hit = document.elementFromPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2);
+                const visible = bounds.width === 22 && bounds.height === 22 && bounds.left >= clip.left &&
+                  bounds.right <= clip.right && bounds.left >= 0 && bounds.right <= innerWidth && button.contains(hit);
+                return {visible,bounds:bounds.toJSON(),clip:clip.toJSON(),hit:hit?.tagName};
+              })};
+          })()`);
+          assert.equal(mobileActions.width, 390);
+          assert.ok(mobileActions.pageFits && mobileActions.buttons.length === actions.length &&
+            mobileActions.buttons.every(button => button.visible),
+            'A plus button is clipped or the page overflows at 390 px. ' + JSON.stringify(mobileActions));
+          await evaluate(`document.querySelector(${gateButton}).scrollIntoView({block:'center',inline:'nearest'})`);
+          checkRowAsk(await openRowAsk());
+          await evaluate("document.querySelector('#review-new-item [data-cancel]').click()");
+          await call('Emulation.setDeviceMetricsOverride',
+            {width:rowAskWidth,height:1100,deviceScaleFactor:1,mobile:false});
+        }
+        if (awsCostsComparison) {
+          servedReading = readings.aws_costs;
+          await navigate('memory_live.html');
+          await show(readings.aws_costs);
+          await captureAwsCosts(evaluate, call);
+        }
         if (comparisonImages) {
           await show(base);
           await evaluate('hideTip()');
           const endClip=await evaluate(`(() => {
-            const start=document.querySelector('#swap').getBoundingClientRect();
-            const bottom=document.querySelector('main').getBoundingClientRect().bottom;
-            return {x:0,y:start.top+scrollY,width:innerWidth,height:bottom-start.top+24,scale:1};
+            document.querySelector('[data-page-action="builds-swap"]').click();
+            const box=document.querySelector('#builds-swap-dialog').getBoundingClientRect();
+            return {x:box.left,y:box.top+scrollY,width:box.width,height:box.height,scale:1};
           })()`);
           await saveScreenshot('after-dark-desktop',{captureBeyondViewport:true,clip:endClip});
+          await evaluate("document.querySelector('#builds-swap-dialog [data-close]').click()");
         }
+
+        await show(base);
+        const [[captureRequest]] = await Promise.all([
+          once(server, 'page-capture', {signal:AbortSignal.timeout(5000)}),
+          evaluate(`(() => {
+            document.querySelector('#pill').click();
+            document.querySelector('#builds-swap-dialog [data-owner-new]').click();
+            return document.querySelector('#review-new-item').matches(':modal');
+          })()`).then(open => assert.ok(open, 'New item does not open above Swap.')),
+        ]);
+        assert.equal(captureRequest.place, '/memory_live.html#console-window=builds-swap-dialog');
+        const captureDialogs = await evaluate(`(async () => {
+          const frame = document.createElement('iframe');
+          frame.src = ${JSON.stringify(captureRequest.place)};
+          frame.style.cssText = 'position:fixed;left:-2000px;width:1400px;height:1100px';
+          const loaded = new Promise(resolve => frame.addEventListener('load', resolve, {once:true}));
+          document.body.append(frame);
+          try {
+            await loaded;
+            return [...frame.contentDocument.querySelectorAll('dialog:modal')].map(dialog => dialog.id);
+          } finally {
+            frame.remove();
+          }
+        })()`);
+        assert.deepEqual(captureDialogs, ['builds-swap-dialog'], 'The screenshot address does not restore Swap.');
 
         if (comparisonImages) {
           await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,

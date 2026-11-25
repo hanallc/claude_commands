@@ -10,6 +10,7 @@ import json
 import math
 import os
 import subprocess
+import tempfile
 import sys
 import unittest
 from contextlib import redirect_stderr
@@ -25,6 +26,7 @@ from scripts.accounts import accounts
 from scripts.agents import worker_lifecycle
 from scripts.production import add_showrunner
 from scripts.production.production_doc import ProductionDocument, read_new_production, read_production
+from scripts.production.production_names import GUARD_READY_FILE, MERGE_CHECKOUT_FIELD
 from scripts.production import showrunners
 from scripts.whoami import usage_store
 from scripts.whoami.account_test_support import stored_room
@@ -42,6 +44,7 @@ from scripts.production.fake_unit_host import process as write_process
 from scripts.lib import operation_deadline, script_prompts
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import sessions
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 class NativeClaudeShowrunnerTests(StaffTestCase):
@@ -97,6 +100,13 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(staff.by_id(owner.id), owner)
 
     def test_new_showrunner_and_missing_parent_are_admitted_with_their_live_docs(self) -> None:
+        proof = Path(self.env["SHOWRUNNER_STATE_DIR"]) / GUARD_READY_FILE
+        saved = proof.read_bytes()
+        proof.unlink()
+        with self.subTest(guard_proof=False):
+            self.refused(self.run_command("kid"), GUARD_READY_FILE)
+            self.assertIsNone(staff.by_path("kid"))
+        _ = proof.write_bytes(saved)
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -107,9 +117,19 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(parent.doc, staff.LiveDoc("natedev", self.doc("top")))
         self.assertEqual(child.parent, staff.ReportsTo(parent.id))
 
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        directory = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, cls.enterClassContext(patch.dict(os.environ, {
+            **fixture_git_environment(directory), "GIT_CONFIG_SYSTEM": os.devnull,
+        }, clear=True)))
+        super().setUpClass()
+
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.env["XDG_CONFIG_HOME"] = str(self.root / "config")
         _ = self.enterContext(patch.object(add_showrunner, "local_machine", return_value="natedev"))
         _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
         _ = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", self.doc("top")))
@@ -118,7 +138,10 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     def invoke(self, arguments: list[str], *, cwd: Path | None = None,
                subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
         if subprocess_cli:
-            return subprocess.run([sys.executable, "-c", LINUX_LAUNCHER_CLI, str(SCRIPT), *arguments],
+            bootstrap = ("import sys\nfrom pathlib import Path\nfrom scripts.production import production_doc\n"
+                         + "production_doc.GUARD_REPOSITORY = Path(sys.argv.pop(1))\n" + LINUX_LAUNCHER_CLI)
+            return subprocess.run([sys.executable, "-c", bootstrap, str(self.root / "kid-checkout"),
+                                   str(SCRIPT), *arguments],
                                   env=self.env, capture_output=True, text=True, check=False, cwd=cwd,
                                   timeout=TEST_HANG_GUARD_SECS)
         return super().invoke(arguments, cwd=cwd)
@@ -273,13 +296,14 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         current = staff.native_id(fixture_runtime_id("owned-launch-after-account-move"))
         _ = staff.update_current_session(owner.current_session, current)
         _ = staff.rename(owner.id, "renamed-kid")
-        document = self.root / "renamed-kid-production.md"
-        _ = self.doc("kid").rename(document)
+        previous = self.doc("kid")
+        document = previous.with_name("renamed-" + previous.name)
+        _ = previous.rename(document)
         _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", document))
         home = self.named_account()
         _ = staff.set_home(owner.id, staff.SessionHome(home))
         for copied_facts, stale_owner in (({"session_id": native}, False),
-                                         ({"doc": str(self.root / "kid-production.md")}, False),
+                                         ({"doc": str(previous)}, False),
                                          ({"config_dir": str(Path(self.env["HOME"]) / ".claude2")}, False),
                                          ({"config_dir": str(Path(self.env["HOME"]) / ".claude2")}, True)):
             with self.subTest(copied_facts=copied_facts, stale_owner=stale_owner):
@@ -303,9 +327,9 @@ class AddShowrunnerTests(AddShowrunnerFixture):
                 self.assertEqual(json.loads(receipt_path.read_text()), saved.fields)
         transcript = home / "projects/fixture" / f"{current}.jsonl"
         write_text_atomic(transcript, '{}\n')
-        self.starts(current, registers="renamed-kid")
-
-        recovered = self.run_command("renamed-kid")
+        with patch.object(self, "doc", return_value=document):
+            self.starts(current, registers="renamed-kid")
+            recovered = self.run_command("renamed-kid")
 
         self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
         starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
@@ -586,6 +610,9 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertFalse(any(call[2:4] == ["agent", "start"] for call in self.herdr_calls()[len(before):]))
 
     def test_resume_starts_in_the_given_directory_with_the_resume_prompt(self) -> None:
+        doc = self.doc("kid")
+        _ = doc.write_text("".join(line for line in doc.read_text().splitlines(keepends=True)
+                                   if not line.startswith(f"- **{MERGE_CHECKOUT_FIELD}:**")))
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         elsewhere = self.root / "elsewhere"
         elsewhere.mkdir()
@@ -1092,6 +1119,9 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             _ = subprocess.run(["git", "-C", str(main), *command], check=True, capture_output=True)
         (main / "sub").mkdir()
         self.trust(main)
+        document = self.doc("kid")
+        _ = document.write_text("\n".join(line for line in document.read_text().splitlines()
+                                           if not line.startswith(f"- **{MERGE_CHECKOUT_FIELD}:**")) + "\n")
         for folder in (main / "sub", self.root / "side"):
             with self.subTest(folder=folder.name):
                 result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(folder), "--account", "claude2", "--check")

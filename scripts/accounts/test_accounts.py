@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from scripts.direct import pass_record as pass_recorder
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lib.fixture_test_support import set_up_fixture
+from scripts.lint.memory_test_support import copy_config_file_fixture, config_environment, write_config_fixture
 
 import sys
 from pathlib import Path
@@ -56,6 +57,7 @@ from scripts.agents.test_support import write_machine_config
 from scripts.accounts import pane_moves
 from scripts.message import sessions
 from scripts.herdr import herdr, worker_panes
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.accounts import moves, worker_names
 from scripts.whoami import account, note_file
 from scripts.whoami import agent_accounts
@@ -389,11 +391,11 @@ class AccountsTests(unittest.TestCase):
     def test_status_renders_requested_pending_confirmed_per_worker_and_failed_reason(self) -> None:
         common = moves.MoveCommon(at="2026-10-14T12:00:00+00:00", tool="codex", subject="workers", move_id="move-one")
         request: moves.RequestedMove = {**common, "kind": "requested", "from": "codex1", "to": "codex3",
-            "why": "weekly refusal", "window": "weekly", "reset": "2026-10-16T12:00:00+00:00"}
+            "why": "weekly refusal", "scope": "group", "window": "weekly", "reset": "2026-10-16T12:00:00+00:00"}
         moves.append_move(request)
         moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=str(self.home / ".codex3"), worker="worker-a", run="run-one"))
         moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=str(self.home / ".codex3"), worker="worker-b", run="run-one"))
-        failed: moves.RequestedMove = {**request, "move_id": "failed-move", "subject": "claude-session: Director", "tool": "claude"}
+        failed: moves.RequestedMove = {**request, "move_id": "failed-move", "subject": "claude-session: Director", "tool": "claude", "scope": "session"}
         moves.append_move(failed)
         moves.append_move(moves.FailedMove(at=common["at"], move_id="failed-move", subject="claude-session: Director", tool="claude",
             kind="failed", reason="still on claude1"))
@@ -1198,7 +1200,7 @@ class AccountsTests(unittest.TestCase):
                      agent_session=herdr.ReportedAgentSession("idle-thread")),
                   herdr.AgentOccupant(pane_id="w1:p3", agent="codex", agent_status=herdr.AgentStatus.STARTING,
                      agent_session=herdr.ReportedAgentSession("starting-thread"))]
-        with (patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"),
+        with (patch.object(herdr, "herdr_binary", return_value=MISSING_HERDR_BIN),
               patch.object(herdr.Herdr, "agents", return_value=agents) as activity,
               patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({
                   "busy-thread": (990,), "idle-thread": (991,), "starting-thread": (992,)}, ())) as conversations):
@@ -2780,7 +2782,7 @@ class AccountsTests(unittest.TestCase):
                                        accounts.AccountRoleBurn("claude2", (), 10, 1),
                                        accounts.AccountRoleBurn("claude3", (), 10, 1)])
 
-    def test_single_session_move_reads_the_inventory_listing_once(self) -> None:
+    def test_single_session_move_rechecks_inventory_for_the_same_account(self) -> None:
         from scripts.agents.inventory import (
             AttributedSessionConfiguration, ListedSession, ShowrunnerRegistration, ShowrunnerRegistrations,
         )
@@ -2799,7 +2801,8 @@ class AccountsTests(unittest.TestCase):
             self.assertIsInstance(result, accounts.MoveStarted)
             listing.assert_called_once_with()
             moved.assert_called_once_with([owner.session_id], "claude2", why="fixture move", cause="by hand",
-                                          source_accounts={owner.session_id: "claude1"} if live else {})
+                                          source_accounts={owner.session_id: "claude1"} if live else {},
+                                          user_command=True)
 
         self.login_directory("claude1", "move@example.invalid")
         stored_room("move@example.invalid", 0, datetime.now(timezone.utc) + timedelta(days=1))
@@ -2810,7 +2813,7 @@ class AccountsTests(unittest.TestCase):
                   patch.object(stop_resume, "move_sessions") as moved):
                 result = self.run_cli("move", owner.name, "claude1", *(["--dry-run"] if dry_run else []))
                 self.assertEqual(result, (0, "fixture session: already on claude1\n", ""))
-                listing.assert_called_once_with()
+                self.assertEqual(listing.call_count, 1 if dry_run else 2)
                 checked.assert_not_called()
                 moved.assert_not_called()
 
@@ -7601,7 +7604,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             ["systemctl", "--user", "is-active", "--quiet", "accounts-workers-move"],
             ["systemd-run", "--user", "--collect", "--quiet", "--unit=accounts-workers-move",
              str(accounts.SCRIPTS / "lib/py"), str(accounts.SCRIPTS / "accounts/accounts.py"),
-             "move", "workers", "codex1", "--follow-role", "--why", "auto: workers-entry"],
+             "move", "workers", "codex1", "--follow-role", "--why", "auto: workers-entry", "--cause", "auto"],
             ["systemctl", "--user", "is-active", "--quiet", "accounts-workers-move"],
         ])
 
@@ -7630,9 +7633,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 journal_snapshot: list[moves.MoveEntry] = []
 
                 def request(identity: str, target_label: str) -> moves.RequestedMove:
-                    entry = moves.RequestedMove(kind="requested", at="2026-11-10T22:00:00Z",
-                        tool="codex", subject="workers", move_id=identity, cause="auto", why="auto: " + identity,
-                        **{"from": "codex2", "to": target_label}, window="weekly")
+                    entry: moves.RequestedMove = {"kind": "requested", "scope": "group", "at": "2026-11-10T22:00:00Z",
+                        "tool": "codex", "subject": "workers", "move_id": identity, "cause": "auto", "why": "auto: " + identity,
+                        "from": "codex2", "to": target_label, "window": "weekly"}
                     moves.append_move(entry)
                     return entry
 
@@ -7699,9 +7702,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 reading = refusals.FreshReading(refusals.ReadingWindow(weekly_left, refusals.KnownReset(now + timedelta(days=2)), now),
                                                 refusals.NoWindow(), "200")
                 _ = accounts.accounts_config_file().write_text('{"workers": "codex2"}\n')
-                moves.append_move(moves.RequestedMove(kind="requested", at=now.isoformat(), tool="codex", subject="workers",
-                    move_id="request-" + case, cause="refusal", why="codex2 refused",
-                    **{"from": "codex2", "to": "codex1"}, window="weekly"))
+                moves.append_move({"kind": "requested", "scope": "group", "at": now.isoformat(), "tool": "codex",
+                    "subject": "workers", "move_id": "request-" + case, "cause": "refusal", "why": "codex2 refused",
+                    "from": "codex2", "to": "codex1", "window": "weekly"})
                 calls: list[staff.StaffId] = []
 
                 def move(row: staff.StaffRow, record: staff.StaffSnapshot, target_label: str,
@@ -7908,6 +7911,89 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual(accounts.burn(datetime(2026, 10, 9, tzinfo=timezone.utc), datetime(2026, 10, 10, tzinfo=timezone.utc)),
             [accounts.AccountRoleBurn("claude3", ("unit directors",), 10, 1)])
 
+    def test_workers_swap_records_producer_group_scope_and_retry_keeps_target(self) -> None:
+        source, _ = self.workers_fixture()
+        machine = cast(Callable[[], str], getattr(accounts, "_session_counts_machine"))()
+        producer = fixture_member("producer", name="codex-producer", backend=staff.CodexBackend(source),
+            doc=staff.LiveDoc(machine, self.root / "codex-producer/plan.md"),
+            worktree=staff.PresentWorktree(machine, self.root / "codex-producer"))
+        registry = write_registry(self.root / "producer-models.conf", {"producers": {"codex-producer": "codex:gpt-test:high"}})
+        identity = str(producer.current_session)
+
+        with (patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH}),
+              patch.object(stop_resume, "_read_move_source", return_value=stop_resume.StoppedMoveSource()),
+              patch.object(stop_resume, "_record_launches"),
+              patch.object(stop_resume, "_stop", return_value=stop_results.NotRunning(identity)),
+              patch.object(stop_resume, "_retire_prompt"),
+              patch.object(stop_resume, "_alert_pending_moves"),
+              patch.object(stop_resume, "_resume_move", side_effect=[
+                  stop_results.ResumeFailed(identity, "fixture resume failed"),
+                  stop_results.ClaudeUp(identity, "w1:p1", "codex1"),
+              ]) as resume,
+              redirect_stdout(io.StringIO())):
+            swapped = accounts.swap("workers", "codex1")
+            assert isinstance(swapped, accounts.WorkersSwapStarted)
+            self.assertEqual(swapped.outcomes, (stop_results.ResumePending(identity, "codex1", "fixture resume failed"),))
+            requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
+            self.assertEqual([(entry["subject"], entry["to"], entry.get("scope")) for entry in requests],
+                             [(f"{identity}: {producer.name}", "codex1", "group")])
+            pending = moves.read_latest_request(identity)
+            assert isinstance(pending, moves.LatestMoveRequest)
+            self.assertEqual(pending.target, "codex1")
+
+            role_map.write_role_map(role_map.RoleMapChange("workers", "codex2", "fixture swap", datetime.now(timezone.utc).isoformat()))
+            with stop_resume.detached_moves(), patch.object(stop_resume, "_detach") as detach:
+                self.assertEqual(stop_resume.main(["retry", pending.request_id]), 0)
+            detach.assert_called_once()
+            command = cast(list[str], detach.call_args.args[0])
+            self.assertEqual(stop_resume.main([command[0], "--log", str(self.root / "producer-move.log"), *command[1:]]), 0)
+
+        self.assertEqual([entry.args[1] for entry in resume.call_args_list], ["codex1", "codex1"])
+        requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
+        self.assertEqual([(entry["to"], entry.get("scope")) for entry in requests], [("codex1", "group"), ("codex1", "group")])
+        self.assertEqual(moves.pending_move_requests(), ())
+
+    def test_automatic_workers_swap_passes_its_cause_and_never_a_user_command(self) -> None:
+        source, _ = self.workers_fixture()
+        machine = cast(Callable[[], str], getattr(accounts, "_session_counts_machine"))()
+        producer = fixture_member("producer", name="codex-producer", backend=staff.CodexBackend(source),
+            doc=staff.LiveDoc(machine, self.root / "codex-producer/plan.md"),
+            worktree=staff.PresentWorktree(machine, self.root / "codex-producer"))
+        registry = write_registry(self.root / "producer-models.conf", {"producers": {"codex-producer": "codex:gpt-test:high"}})
+
+        with (patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH}),
+              patch.object(stop_resume, "move_sessions", return_value=[stop_results.ResumePending(
+                  producer.current_session, "codex1", "destination is not ready")]) as producer_move,
+              redirect_stdout(io.StringIO())):
+            _ = accounts.swap("workers", "codex1", why="auto: fixture", cause="auto")
+        producer_move.assert_called_once_with([str(producer.current_session)], "codex1", why="auto: fixture",
+                                             cause="auto", source_accounts={},
+                                             intent=moves.ExplicitMoveTarget.GROUP_ACCOUNT, user_command=False)
+
+        launch = cast(Callable[..., None], getattr(accounts, "_launch_worker_moves"))
+        for user_command in (False, True):
+            with self.subTest(user_command=user_command), \
+                    patch.object(shutil, "which", return_value=None), patch.object(subprocess, "Popen") as popen:
+                launch("codex1", "auto: fixture", cause="auto", user_command=user_command)
+                command = cast(list[str], popen.call_args.args[0])
+                self.assertEqual(command[command.index("--cause") + 1], "auto")
+                self.assertEqual("--user-command" in command, user_command)
+
+        for extra, user_command in (((), False), (("--user-command",), True)):
+            with self.subTest(extra=extra), \
+                    patch.object(accounts, "move_workers", return_value=accounts.MoveRefused("fixture")) as moved:
+                _ = self.run_cli("move", "workers", "codex1", "--follow-role", "--why", "auto: fixture",
+                                 "--cause", "auto", *extra)
+                self.assertEqual((moved.call_args.kwargs["cause"], moved.call_args.kwargs["user_command"]),
+                                 ("auto", user_command))
+
+        # Only the workers branch reads the hidden flags.
+        for arguments in (("units", "claude3", "--cause", "auto"), ("alpha", "claude3", "--user-command")):
+            with self.subTest(arguments=arguments), \
+                    patch.object(accounts, "move_group", side_effect=AssertionError("group moved")), \
+                    patch.object(accounts, "move", side_effect=AssertionError("session moved")):
+                self.assertEqual(self.run_cli("move", *arguments)[0], 1)
+
     def test_workers_swap_selects_the_target_before_stops_and_keeps_pending_and_refused_workers(self) -> None:
         for missing_settings in (False, True):
             with self.subTest(missing_settings=missing_settings):
@@ -7964,7 +8050,8 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 self.assertEqual({cast(staff.StaffRow, entry.args[0]).id for entry in stopped.call_args_list}, {failed.id, pending.id})
                 self.assertEqual(stopped.call_count, 2)
                 producer_move.assert_called_once_with([str(producer.current_session)], "codex1", why="by hand",
-                                                     cause="by hand", source_accounts={})
+                                                     cause="by hand", source_accounts={},
+                                                     intent=moves.ExplicitMoveTarget.GROUP_ACCOUNT, user_command=True)
                 self.assertEqual(observed, [target, target])
                 self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
                 lines = output.splitlines()
@@ -8049,7 +8136,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                                    return_value=stop_results.ResumePending(worker.id, target, "destination is not ready")) as stop,
                       patch.object(pane_moves, "preview_worker", return_value=pane_moves.WorkerResume(
                           worker_panes.StoppedWorker(worker, "fixture-pane", "fixture-terminal"),
-                          "impl", "codex1"))):
+                          "impl", "codex1", worker_panes.LaunchPolicy(
+                              models_registry.LaunchSettings("codex", "fixture-model", "medium", ""),
+                              "workspace-write", "")))):
                     code, stdout, stderr = self.run_cli("swap", "workers", target, *([] if shared else ["--dry-run"]))
                 self.assertEqual((code, stderr), (1 if shared else 0, ""))
                 if shared:
@@ -8341,9 +8430,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
     def setUp(self) -> None:
         from scripts.production.staff_test_support import StaffTestCase
 
-        self.fixture = StaffTestCase()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = set_up_fixture(self.addCleanup, StaffTestCase())
         self.root = self.fixture.root
         from scripts.herdr.test_worker_panes import PaneWorld
         from scripts.agents import restart
@@ -8361,18 +8448,21 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.world.add(self.owner, "w1:p0")
         config = self.root / "conf"
         config.mkdir()
-        _ = (config / "accounts.conf").write_text(
-            (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_text())
-        _ = (config / "direct.conf").write_text("# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
-                                               + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
-                                               + "# range: 1..1800\nWORKER_COMPACT_SECONDS=300\n"
-                                               + "# range: 0.01..600\nWORKER_PUBLISH_LOCK_SECONDS=15\n"
-                                               + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
-        _ = (config / "shutdown.conf").write_text("# whole: 1..300\nSTOP_GRACE_SECONDS=2\n# whole: 1..300\nKILL_GRACE_SECONDS=5\n# whole: 1..300\nMOVE_STOP_MARGIN_SECONDS=10\n")
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/accounts.conf",
+                                     config / "accounts.conf")
+        for name in ("detached_runs.conf", "postmaster.conf"):
+            _ = write_config_fixture(config / name)
+        _ = (config / "direct.conf").write_text("# range: 0.1..0.9\nworker_split_ratio=0.667\n"
+                                               + "# whole: 1..\nunit_compact_above_tokens=43000\n"
+                                               + "# range: 1..1800\nworker_compact_seconds=300\n"
+                                               + "# range: 0.01..600\nworker_publish_lock_seconds=15\n"
+                                               + "# range: 1..600\npane_agent_start_seconds=90\n")
+        _ = (config / "shutdown.conf").write_text("# whole: 1..300\nstop_grace_seconds=2\n# whole: 1..300\nkill_grace_seconds=5\n# whole: 1..300\nmove_stop_margin_seconds=10\n")
         registry = write_registry(config / "models.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(config), "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
             "UNIT_RUN_DIR": str(self.run_dir), "XDG_STATE_HOME": str(self.root / "state"),
+            "HERDR_PLATFORM": "linux", "HERDR_PROC": str(self.world.process_root),
         })))
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "runs"))
         _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former"))
@@ -8788,6 +8878,8 @@ class PaneWorkerMoveTests(unittest.TestCase):
         with live_detached_run(self.run_dir, kept):
             moved = pane_moves.move_worker(kept, record, "codex2", "quota", self.run_dir)
         self.assertIsInstance(moved, stop_results.ClaudeUp)
+        requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested" and entry["subject"] == kept.id]
+        self.assertEqual([entry.get("scope") for entry in requests], ["group"])
         self.assertEqual(self.world.closed, [])
         self.assertEqual(self.world.launches, [herdr.ExistingPane(pane, "terminal-" + pane)])
         self.assertEqual(self.world.stops, [kept.current_session])
@@ -8799,18 +8891,71 @@ class PaneWorkerMoveTests(unittest.TestCase):
 
     def test_idle_worker_with_a_live_run_resumes_and_receives_its_result_on_the_target(self) -> None:
         from scripts.agents import detached_runs
+        from scripts.direct import progress_history
         from scripts.herdr.test_worker_panes import live_detached_run
+        from scripts.lib.test_models_registry import write_registry
         from scripts.message import send, send_budget
+        from scripts.production import worker
 
-        families: tuple[Literal["claude", "codex"], ...] = ("claude", "codex")
-        for family in families:
-            with self.subTest(family=family):
-                row = self.worker("live-" + family, family=family)
+        cases: tuple[tuple[str, Literal["claude", "codex"]], ...] = (
+            ("live-claude", "claude"), ("live-codex", "codex"), ("parked", "claude"),
+            ("parked-launch-unavailable", "claude"))
+        for name, family in cases:
+            with self.subTest(case=name):
+                row = self.worker(name, family=family)
                 row = staff.set_worker_role(row.id, staff.KnownWorkerRole("impl"))
+                run_record = self.run_dir / f"detached_runs/{row.name}.json"
+                saved_options = ["--model", "opus", "--permission-mode", "bypassPermissions", "--effort", "high"]
+                if name.startswith("parked"):
+                    self.dispatch(row)
+                    pane = next(pane for pane, process in self.world.foreground.items()
+                                if self.world.processes[process[0]].current_identity == row.current_session)
+                    self.world.foreground[pane][2].extend(saved_options)
                 with live_detached_run(self.run_dir, row):
+                    if name.startswith("parked"):
+                        passed = worker_panes.worker_pass(row, self.run_dir)
+                        instance = str(passed["instance_id"])
+                        delivery = progress_history.dispatch_delivery(passed)
+                        live = cast(detached_runs.RunRecord, json.loads(run_record.read_text()))
+                        live["pane_dispatch_id"] = instance
+                        atomic_file.write_text_atomic(run_record, json.dumps(live))
+                        worker_name = staff.WorkerName.parse(name)
+                        with worker_panes.worker_lock(self.owner.id, worker_name) as hold:
+                            assert isinstance(hold, worker_panes.WorkerLockHold)
+                            receipt = worker.dispatch_receipt(row, delivery.line, delivery.completion_id,
+                                                              run=self.run_dir, require_transcript=True)
+                            assert isinstance(receipt, worker.DispatchWaitingForRuns) and receipt.can_park
+                            park = worker_panes.ParkWaitingPass(self.run_dir, instance, delivery.completion_id)
+                            closed = worker.park_waiting_worker(row, hold, park, delivery, receipt)
+                        self.assertIsInstance(closed, worker_panes.Closed)
+                        _ = write_registry(self.root / "conf/models.conf",
+                                           {"direct.claude": {"impl": "sonnet:low"}}, update=True)
+                    if name == "parked-launch-unavailable":
+                        state_path = self.run_dir / unit_runs.STATE_FILE
+                        state = cast(dict[str, object], json.loads(state_path.read_text()))
+                        saved = cast(dict[str, dict[str, object]], state["pass"])[name]
+                        del saved["parked_launch"]
+                        atomic_file.write_text_atomic(state_path, json.dumps(state))
+                        membership = staff.snapshot()
+                        before = len(self.world.stops), len(self.world.launches), moves.read_moves()
+                        preview = pane_moves.preview_worker(row, membership, "claude2", "quota", self.run_dir)
+                        moved = pane_moves.move_worker(row, membership, "claude2", "quota", self.run_dir)
+                        self.assertEqual(preview, accounts.SessionMoveRefused(
+                            row.id, "anomaly: worker launch settings are unreadable: the parked worker launch is unavailable"))
+                        self.assertEqual(moved, preview)
+                        self.assertEqual((len(self.world.stops), len(self.world.launches), moves.read_moves()), before)
+                        continue
                     context = detached_runs.resume_context(self.run_dir / "detached_runs", row.name)
                     moved = self.move(family + "2", why="quota")
                     self.assertEqual(moved.returncode, 0, moved.stderr)
+                    if name == "parked":
+                        self.assertIsInstance(self.world.launches[-1], herdr.SplitPane)
+                        kind, arguments, _ = self.world.requests[-1]
+                        self.assertEqual(kind, "claude")
+                        self.assertEqual(arguments[:2], ["--resume", row.current_session])
+                        model = arguments.index("--model")
+                        self.assertEqual(arguments[model:model + len(saved_options)], saved_options)
+                        self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["instance_id"], "dispatch-" + name)
                     prompt = next(command[-1] for command in reversed(self.world.commands)
                                   if command[:2] == ("agent", "prompt"))
                     self.assertIn(context, prompt)
@@ -8820,8 +8965,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
                                      str(self.account_home(family + "2")))
                     self.assertEqual(accounts.detached_move_context(str(row.id)), context)
 
-                record = cast(detached_runs.RunRecord, json.loads(
-                    (self.run_dir / f"detached_runs/{row.name}.json").read_text()))
+                record = cast(detached_runs.RunRecord, json.loads(run_record.read_text()))
                 record.update(session_dir=str(self.run_dir), label="fixture gate", done_message_file="")
                 atomic_file.write_text_atomic(Path(record["log"]), "The detached check passed.\n")
 
@@ -8842,7 +8986,23 @@ class PaneWorkerMoveTests(unittest.TestCase):
                       patch.object(send, "deliver_worker_text", side_effect=deliver) as delivery,
                       patch.object(send_budget, "seconds", return_value=1),
                       patch.object(detached_runs, "result_text", return_value="The detached check passed.")):
-                    self.assertIn("sent", detached_runs.deliver(record, detached_runs.CompletedCommand(0)))
+                    result = detached_runs.CompletedCommand(0)
+                    if name == "parked":
+                        # The supervisor parks the result; the turn-end replay resumes the worker under its lock.
+                        record.update(status="finished")
+                        atomic_file.write_text_atomic(run_record, json.dumps(record))
+                        self.assertEqual(detached_runs.deliver(record, result), detached_runs.PARKED_WORKER_RESULT)
+                        with worker_panes.worker_lock(self.owner.id, staff.WorkerName.parse(name)) as hold:
+                            assert isinstance(hold, worker_panes.WorkerLockHold)
+                            held = hold
+                            _ = detached_runs.submit_finished_worker_result(
+                                self.run_dir, row, worker_input=detached_runs.WorkerResultInput.TYPE,
+                                resume_parked=lambda: worker.restore_parked_worker(row, self.owner.id, held),
+                                input_lock=held)
+                        parked_record = cast(detached_runs.RunRecord, json.loads(run_record.read_text()))
+                        self.assertIn("sent", parked_record.get("delivery", ""))
+                    else:
+                        self.assertIn("sent", detached_runs.deliver(record, result))
                 delivery.assert_called_once()
                 result_prompt = next(command[-1] for command in reversed(self.world.commands)
                                      if command[:2] == ("agent", "prompt"))
@@ -8907,8 +9067,8 @@ class PaneWorkerMoveTests(unittest.TestCase):
 
         row = self.worker("w74", live=False)
         self.dispatch(row)
-        atomic_file.write_text_atomic(self.root / "conf/shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/shutdown.conf",
+                                     self.root / "conf/shutdown.conf")
         pane_record.write(self.world.session, pane_record.launch("w1:p1", str(row.current_session), str(self.root),
             {"CLAUDE_CONFIG_DIR": str(self.root / ".claude1")}, ["claude", "-n", row.name]))
         result_path = self.run_dir / f"detached_runs/{row.name}.json"
@@ -9286,7 +9446,7 @@ class PickerTests(unittest.TestCase):
         self.codex("default", "worker@example.invalid")
         common = moves.MoveCommon(at=self.now.isoformat(), tool="codex", subject="workers", move_id="account-move")
         request: moves.RequestedMove = {**common, "kind": "requested", "from": "codex1", "to": "codex2",
-            "why": "manual", "window": "unknown", "cause": "by hand"}
+            "why": "manual", "scope": "group", "window": "unknown", "cause": "by hand"}
         moves.append_move(request)
         stamp = self.now.isoformat()
         moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",
@@ -10472,8 +10632,8 @@ class SharedStatusDocumentTests(unittest.TestCase):
     def test_account_colors_share_config_with_json_board_and_terminal_labels(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "statusline.conf"
-            _ = (config.parent / "accounts.conf").write_bytes(
-                (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_bytes())
+            _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/accounts.conf",
+                                         config.parent / "accounts.conf")
             for setting, css, escape in (
                 ("brown", "#af875f", "\x1b[38;5;137m"),
                 ("magenta", "#800080", "\x1b[35m"),

@@ -170,7 +170,7 @@ def claim_phase(run: Path, phase: str, cwd: Path, log: Path, status: Path | Uncl
     if phase:
         with log.open("a") as output:
             reserved = subprocess.run([PYTHON, str(SCRIPTS / "phase_reservation.py"), "claim",
-                "--session-dir", str(run), "--phase", phase, "--repo", str(cwd)],
+                "--session-dir", str(run), "--phase", phase, "--launch-cwd", str(cwd)],
                 env=env, stdout=output, stderr=subprocess.STDOUT)
         if reserved.returncode:
             print(f"ERROR: phase {phase} could not claim its files before its worker opens; see {log}.", file=sys.stderr)
@@ -244,6 +244,8 @@ def _run(launch: ClaudeLaunch) -> int:
             worker_state.publish_worker_claim(claim, name)
     if not claim_phase(launch.run, launch.phase, launch.cwd, log, status, launch.slot, env):
         return 1
+    if launch.phase:
+        launch = replace(launch, cwd=phase_reservation.claimed_launch_directory(directory, launch.cwd))
     env["UNIT_RUN_DIR"] = str(launch.run)
     env["UNIT_PASS_OWNER"] = "launcher"
     build_folders = str(SCRIPTS / "../lib/build_folders.py")

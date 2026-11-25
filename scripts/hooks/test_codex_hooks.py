@@ -48,10 +48,13 @@ COMPACTION_COMMAND = ('"$HOME/.claude/scripts/lib/py" '
                       '"$HOME/.claude/scripts/hooks/pre-compact-marker.py" --family codex')
 COMPACTION_GROUP: dict[str, object] = {"matcher": "*",
     "hooks": [{"type": "command", "command": COMPACTION_COMMAND, "timeout": 10}]}
-CLEAR_TURN_COMMAND = '"$HOME/.claude/scripts/hooks/compaction-marker-clear.sh"'
+GOAL_CARD_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/goal_card.py"'
+CLEAR_TURN_COMMAND = codex_hooks.PROMPT_COMMAND
 CLEAR_END_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/compaction-marker-clear.py"'
 CLEAR_TURN_GROUP: dict[str, object] = {"matcher": "*",
     "hooks": [{"type": "command", "command": CLEAR_TURN_COMMAND, "timeout": 10}]}
+DIRECTOR_HOLD_COMMAND = ('"$HOME/.claude/scripts/lib/py" '
+                         '"$HOME/.claude/scripts/hooks/conversation_pause.py" codex-director-hold')
 CLEAR_END_GROUP: dict[str, object] = {"matcher": "*",
     "hooks": [{"type": "command", "command": CLEAR_END_COMMAND, "timeout": 10}]}
 TURN_END_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/../herdr/turn_end.py"'
@@ -317,13 +320,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertIn('\n  "hooks":', self.hooks_file.read_text())
         calls = self.calls()
         self.assertEqual([call["method"] for call in calls],
-                         ["initialize", "hooks/list", "config/batchWrite", "hooks/list",
-                          "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
-                          "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
-                          "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
-                          "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
-                          "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
-                          "config/batchWrite", "hooks/list"])
+                         ["initialize", "hooks/list"] + ["config/batchWrite", "hooks/list"] * 12)
         initialize = cast(dict[str, object], calls[0]["params"])
         client = cast(dict[str, object], initialize["clientInfo"])
         capabilities = cast(dict[str, object], initialize["capabilities"])
@@ -347,16 +344,17 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(self.groups("SubagentStart"), [STE_GROUP])
         self.assertEqual(self.groups("PreCompact"), [COMPACTION_GROUP])
         self.assertIn(f"compaction-marker codex hook: trusted {self.hooks_file}:pre_compact:0:0", result.stdout)
-        for event, listed_event, group, name, key, matcher in (
-            ("UserPromptSubmit", "userPromptSubmit", CLEAR_TURN_GROUP, "compaction-clear-turn", "user_prompt_submit", None),
-            ("PostCompact", "postCompact", CLEAR_END_GROUP, "compaction-clear-end", "post_compact", "*"),
-            ("Stop", "stop", TURN_END_GROUP, "turn-end", "stop", None),
+        for event, listed_event, names, key, matcher in (
+            ("UserPromptSubmit", "userPromptSubmit", ("compaction-clear-turn",), "user_prompt_submit", None),
+            ("PostCompact", "postCompact", ("compaction-clear-end",), "post_compact", "*"),
+            ("Stop", "stop", ("turn-end",), "stop", None),
         ):
-            self.assertEqual(self.groups(event), [group])
-            self.assertIn(f"{name} codex hook: trusted {self.hooks_file}:{key}:0:0", result.stdout)
+            self.assertEqual(self.groups(event), LIFECYCLE_GROUPS[event])
+            for index, name in enumerate(names):
+                self.assertIn(f"{name} codex hook: trusted {self.hooks_file}:{key}:{index}:0", result.stdout)
             listed = [entry for entry in self.listed_handlers() if entry["eventName"] == listed_event]
             self.assertEqual([(entry["matcher"], entry["trustStatus"], entry["enabled"]) for entry in listed],
-                             [(matcher, "trusted", True)])
+                             [(matcher, "trusted", True)] * len(names))
         self.assertIn(f"ste codex hook: trusted {self.hooks_file}:session_start:0:0", result.stdout)
         self.assertIn(f"ste-subagent codex hook: trusted {self.hooks_file}:subagent_start:0:0", result.stdout)
         self.assertEqual(self.state()["cwd"], str(self.home))
@@ -376,6 +374,32 @@ class CodexHookInstallerTests(unittest.TestCase):
             QUEUE_GROUP,
         ])
         self.assertEqual(len(self.groups()), 4)
+
+    def test_install_replaces_old_prompt_commands_and_keeps_custom_trust(self) -> None:
+        custom = {"type": "command", "command": "custom-prompt", "timeout": 10}
+        old = [
+            {"type": "command", "command": '"$HOME/.claude/scripts/hooks/compaction-marker-clear.sh"',
+             "timeout": 10},
+            {"type": "command", "command": GOAL_CARD_COMMAND, "timeout": 10},
+            {"type": "command", "command": GOAL_CARD_COMMAND + " 2>/dev/null || true", "timeout": 10},
+            {"type": "command", "command": DIRECTOR_HOLD_COMMAND, "timeout": 10},
+        ]
+        group: dict[str, object] = {"matcher": "*", "hooks": [*old, custom]}
+        _ = self.hooks_file.write_text(json.dumps({"hooks": {"UserPromptSubmit": [group]}}), encoding="utf-8")
+        before = next(entry for entry in self.listed_handlers() if entry["command"] == "custom-prompt")
+        self.save_trust({cast(str, before["key"]): cast(str, before["currentHash"])})
+
+        result = self.run_installer("install")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.groups("UserPromptSubmit"), [{**group, "hooks": [custom]}, CLEAR_TURN_GROUP])
+        entries = [entry for entry in self.listed_handlers() if entry["eventName"] == "userPromptSubmit"]
+        self.assertEqual([(entry["command"], entry["trustStatus"]) for entry in entries],
+                         [("custom-prompt", "trusted"), (CLEAR_TURN_COMMAND, "trusted")])
+
+        again = self.run_installer("install")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(self.groups("UserPromptSubmit"), [{**group, "hooks": [custom]}, CLEAR_TURN_GROUP])
 
     def test_install_keeps_the_hooks_link_and_adds_missing_hooks_to_its_target(self) -> None:
         shared = self.root / "shared"
@@ -440,7 +464,8 @@ class CodexHookInstallerTests(unittest.TestCase):
             f"{self.hooks_file}:session_start:0:0", f"{self.hooks_file}:subagent_start:0:0",
             f"{self.hooks_file}:session_start:1:0", f"{self.hooks_file}:post_tool_use:{len(original)}:0",
             f"{self.hooks_file}:pre_compact:0:0", f"{self.hooks_file}:user_prompt_submit:0:0",
-            f"{self.hooks_file}:post_compact:0:0", f"{self.hooks_file}:stop:0:0",
+            f"{self.hooks_file}:post_compact:0:0",
+            f"{self.hooks_file}:stop:0:0",
         ])
         self.assertEqual(len(self.trust()), 12)
 
@@ -855,7 +880,8 @@ class CodexHookInstallerTests(unittest.TestCase):
         start_lines = ["ste codex hook: trusted", "ste-subagent codex hook: trusted",
                        "queue-start codex hook: trusted", "queue-tools codex hook: trusted",
                        "compaction-marker codex hook: trusted", "compaction-clear-turn codex hook: trusted",
-                       "compaction-clear-end codex hook: trusted", "turn-end codex hook: trusted"]
+                       "compaction-clear-end codex hook: trusted",
+                       "turn-end codex hook: trusted"]
 
         trust = self.trust()
         berth_key = next(key for key in trust if key.endswith(":pre_tool_use:0:0"))
@@ -895,8 +921,8 @@ class CodexHookInstallerTests(unittest.TestCase):
                           "build-hold-guard codex hook: absent", "ste codex hook: absent",
                           "ste-subagent codex hook: absent", "queue-start codex hook: absent",
                           "queue-tools codex hook: absent", "compaction-marker codex hook: absent",
-                          "compaction-clear-turn codex hook: absent", "compaction-clear-end codex hook: absent",
-                          "turn-end codex hook: absent"])
+                          "compaction-clear-turn codex hook: absent",
+                          "compaction-clear-end codex hook: absent", "turn-end codex hook: absent"])
 
     def test_check_reports_absent_untrusted_modified_and_disabled(self) -> None:
         absent = self.run_installer("check")

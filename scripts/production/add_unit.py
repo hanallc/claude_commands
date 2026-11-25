@@ -27,13 +27,16 @@ from scripts.herdr import pane_launch
 from scripts.herdr import herdr
 from scripts.agents import pane_record, remote
 from scripts.lib import build_folders, git_exclude, git_files, models_registry
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.production import autocompact
 from scripts.message import sessions
 from scripts.production import unit_names
-from scripts.production.production_doc import Production, Refusal, read_production
+from scripts.production.production_doc import (
+    EnrolledPaths, LegacyProduction, Production, ProductionPathsError, Refusal,
+    read_production, resolve_production_paths,
+)
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_sources import ensure_staff_showrunner as ensure_staff_showrunner
@@ -291,13 +294,30 @@ def relative_plan(production: Production, raw: str) -> Path:
         raise Refusal("plan must be inside Showrunner checkout") from error
 
 
-def stub_plan(production: Production, unit: str) -> Path:
-    """Name the stub plan from the production and unit."""
-    name = unit_names.branch(production.name, unit_names.stem(unit))
+def document_paths(production: Production) -> EnrolledPaths | LegacyProduction:
     try:
-        return production.doc.parent.relative_to(production.checkout) / f"{name}.md"
+        return resolve_production_paths(production.doc)
+    except ProductionPathsError as error:
+        raise Refusal(str(error)) from error
+
+
+def require_serving_merge_unit(production: Production, unit_type: staff.UnitType,
+                               paths: EnrolledPaths | LegacyProduction) -> None:
+    """Require an existing merge unit before an enrolled production adds another unit."""
+    if (unit_type != "merge" and isinstance(paths, EnrolledPaths)
+            and staff.serving_merge_unit(production.owner.id) is None):
+        raise Refusal(f"{production.name}: add a merge unit before adding other units")
+
+
+def stub_plan(production: Production, unit: str) -> Path:
+    """Place the tracked brief beside the document's relative path."""
+    name = unit_names.branch(production.name, unit_names.stem(unit))
+    paths = document_paths(production)
+    checkout = paths.main if isinstance(paths, EnrolledPaths) else production.checkout
+    try:
+        return production.doc.parent.relative_to(checkout) / f"{name}.md"
     except ValueError as error:
-        raise Refusal("production doc must be inside Showrunner checkout") from error
+        raise Refusal(f"production doc must be inside {checkout}") from error
 
 
 def require_unit_worktree(production: Production, worktree: Path, branch: str) -> None:
@@ -312,8 +332,8 @@ def default_worktree(production: Production, unit: str) -> Path:
     word = build_folders.repo_word(production.checkout)
     path = build_folders.worktree_path(word, unit, worktrees.UNIT_WORKTREE_NAME)
     legacy = path.with_name("director")
-    if not os.path.lexists(path) and worktrees.checkout_record(path) is None:
-        if worktrees.checkout_record(legacy) is not None:
+    if not os.path.lexists(path) and worktree_records.checkout_record(path) is None:
+        if worktree_records.checkout_record(legacy) is not None:
             return legacy
     return path
 
@@ -407,7 +427,7 @@ def launch_request(args: argparse.Namespace, *,
     if isinstance(member, staff_sources.MemberFound) and isinstance(member.row.worktree, staff.PresentWorktree):
         recorded = unit_lookup.local_worktree(member).path
         if isinstance(session, NewSession) or recorded != worktree or os.path.lexists(recorded):
-            saved_make = worktrees.checkout_record(recorded)
+            saved_make = worktree_records.checkout_record(recorded)
             if saved_make is not None and worktrees.pending_checkout(recorded, production.checkout, saved_make.branch):
                 branch = saved_make.branch
             else:
@@ -575,11 +595,13 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
     member = checked_unit_member(production, request.unit, record,
                                  identity=(session_staff.LiveSession(request.session.session_id)
                                            if isinstance(request.session, ResumedSession) else session_staff.NO_SESSION))
+    paths = document_paths(production)
+    if isinstance(paths, LegacyProduction) and not production.doc.is_relative_to(production.checkout):
+        raise Refusal("production doc must be inside Showrunner checkout")
+    if isinstance(member, staff_sources.NoSuchMember):
+        with staff.supplied_snapshot(record):
+            require_serving_merge_unit(production, request.unit_type, paths)
     require_merge_branch(production)
-    try:
-        _ = production.doc.relative_to(production.checkout)
-    except ValueError as error:
-        raise Refusal("production doc must be inside Showrunner checkout") from error
     pending = worktrees.pending_checkout(request.worktree, production.checkout, request.branch)
     existing = row_is_present(request, member, record, pending=pending)
     plan_context: ProductionPlanRequired | ExistingConversationPlan = ProductionPlanRequired()
@@ -769,8 +791,9 @@ def ensure_worktree(request: UnitLaunch) -> None:
     try:
         _ = worktrees.create_checkout(
             worktree, production.checkout, build_folders.NewWorktreeBranch(request.branch, production.merge_branch),
-            layout, owner=request.identity.unit, merge_branch=production.merge_branch, allow_existing=True)
-    except worktrees.Refused as error:
+            layout, owner=request.identity.unit, merge_branch=production.merge_branch,
+            allow_existing=True, record_adoption=True)
+    except worktree_records.Refused as error:
         raise Refusal(str(error)) from error
     if isinstance(request.plan, PlanGiven):
         destination = worktree / request.plan.path
@@ -1383,15 +1406,20 @@ def _main(argv: list[str]) -> int:
     _ = parser.add_argument("--model", default="")
     _ = parser.add_argument("--autocompact", default="", help="auto or 100k-1M; kept for every relaunch of --resume; a listed unit only records it")
     _ = parser.add_argument("--config-dir", default="", help=argparse.SUPPRESS)
+    _ = parser.add_argument("--join-recovery-locks", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--cwd")
     _ = parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     staff.validate_unit_name_for_write(cast(str, args.name))
     try:
+        from scripts.accounts import moves
+
         request = launch_request(args)
-        with staff.row_operation(request.session.session_id if isinstance(request.session, ResumedSession)
-                                 else request.unit_id):
-            identity_record = staff.initial_snapshot()
+        session = request.session
+        with (staff.session_operation(session.session_id, native_key=moves.native_row_key(session.session_id),
+                                      join_recovery=cast(bool, args.join_recovery_locks))
+              if isinstance(session, ResumedSession) else staff.row_operation(request.unit_id)) as locked:
+            identity_record = locked if isinstance(locked, staff.StaffSnapshot) else staff.initial_snapshot()
             request = launch_request(args, record=identity_record)
             explicit_autocompact = cast(str, args.autocompact)
             if (explicit_autocompact and isinstance(request.session, ResumedSession)

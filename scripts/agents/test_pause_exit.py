@@ -7,14 +7,14 @@ import sys
 import subprocess
 import time
 from dataclasses import replace
-from functools import cached_property
+from functools import cached_property, partial
 from contextlib import redirect_stdout
-from typing import cast, final, override
+from typing import Literal, cast, final, override
 from unittest import mock
 
 from scripts.accounts import accounts
 from scripts.herdr import herdr, pane_launch
-from scripts.message import sessions
+from scripts.message import send as message_send, sessions
 from scripts.production import live_units, staff, unit_lookup, worker
 from scripts.lib.resume_message import BusyPass, NoOwnPass
 from scripts.production.cli_fixture import invoke_cli
@@ -144,23 +144,58 @@ class PauseExitTests(StaffTestCase):
         self.stop_workers.assert_called_once()
         self.stop_director.assert_called_once()
 
-    def test_failed_continuation_delivery_preserves_the_pause(self) -> None:
-        for outcome in ({"kind": "queued", "reason": "fixture queue"},
-                        {"kind": "unconfirmed", "reason": "fixture failure"}, RuntimeError("fixture delivery failed")):
-            with self.subTest(outcome=outcome):
-                _ = staff.pause(str(self.unit.id), "maintenance")
-                paused = self.current()
-                self.send.reset_mock()
-                self.send.side_effect = outcome if isinstance(outcome, RuntimeError) else None
-                if not isinstance(outcome, RuntimeError):
-                    self.send.return_value = outcome
-                result = self.agents("resume", self.unit.name)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(self.current(), paused)
-                self.assertIn("continuation delivery", result.stderr)
-                self.assertNotIn(": active", result.stdout)
-                self.send.assert_called_once()
-                self.start.assert_not_called()
+    def assert_uncertain_continuation_recovers_receipt(
+        self, handoff_outcome: Literal["queued", "sent"],
+        lost_reply: restart_support.MessageQueued | restart_support.MessageUnconfirmed | RuntimeError,
+    ) -> None:
+        paused = staff.pause(str(self.unit.id), "maintenance")
+        self.assertEqual(paused.resume_pending, staff.NoPendingResume())
+        assert isinstance(paused.paused, staff.Paused)
+        key = f"agents-resume:{paused.id}:{paused.paused.since}"
+        pending = replace(paused, paused=staff.Active(), resume_pending=staff.ResumePending(key, paused.paused))
+
+        def omit_first_receipt(recipient: str, summary: str, text: str, *, key: str,
+                               recipient_kind: staff.Kind | None,
+                               once_per_key: bool) -> restart_support.MessageSendOutcome:
+            self.assertIsNone(recipient_kind)
+            args = ["--to", recipient, "--summary", summary, "--text", text, "--key", key]
+            if once_per_key:
+                args.append("--once-per-key")
+            result = message_send.send(message_send.parse(args))
+            if result.outcome == "skipped":
+                self.assertEqual(result.detail, message_send.ONCE_ACCEPTED)
+                return {"kind": "accepted"}
+            self.assertEqual(result.outcome, handoff_outcome)
+            if isinstance(lost_reply, RuntimeError):
+                raise lost_reply
+            return lost_reply
+
+        self.send.side_effect = omit_first_receipt
+        with (mock.patch.object(message_send, "STATE", self.root / "message-state"),
+              mock.patch.object(message_send, "send_with_membership",
+                                return_value=message_send.Result(handoff_outcome, "fixture handoff")) as handoff):
+            result = self.agents("resume", self.unit.name)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn(": active", result.stdout)
+            self.assertIn("continuation delivery", result.stderr)
+            self.assertEqual(self.current(), pending)
+
+            retry = self.agents("resume", self.unit.name)
+            self.assertEqual(retry.returncode, 0, retry.stderr)
+            self.assertIn(f"{self.unit.name}: active", retry.stdout)
+            self.assertEqual(self.current(), replace(paused, paused=staff.Active()))
+        handoff.assert_called_once()
+        self.assertEqual(self.send.call_count, 2)
+        self.start.assert_not_called()
+
+    def test_unreceipted_continuation_queue_retains_pending_until_retry(self) -> None:
+        self.assert_uncertain_continuation_recovers_receipt("queued", {"kind": "queued", "reason": "fixture queue"})
+
+    def test_unconfirmed_continuation_delivery_retains_pending_until_retry(self) -> None:
+        self.assert_uncertain_continuation_recovers_receipt("sent", {"kind": "unconfirmed", "reason": "fixture failure"})
+
+    def test_continuation_send_error_retains_pending_until_retry(self) -> None:
+        self.assert_uncertain_continuation_recovers_receipt("sent", RuntimeError("fixture delivery failed"))
 
     def test_missing_agent_program_preserves_the_exit_before_exec(self) -> None:
         self.save_exit()
@@ -277,6 +312,22 @@ class PauseExitTests(StaffTestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(events, ["task", "task", "stop"])
 
+    def resume_on_peer(self, arguments: list[str], *, row: staff.StaffRow, target: tuple[str, ...]) -> tuple[int, str]:
+        expected = ["resume", "--here", "--why=resumed by name"]
+        if target:
+            expected.append(f"--to={target[1]}")
+        self.assertEqual(arguments, [*expected, "--", str(row.id)])
+        peer = stop_resume.member_machine(row)
+        live = stop_resume.ClaudeUp(row.current_session, "w1:p1", "claude2",
+                                   start_state=ClaudeStartState.ALREADY_RUNNING)
+        with (mock.patch.object(shutdown, "local_machine", return_value=peer),
+              mock.patch.object(shutdown, "other_machine", return_value=remote.local_machine()),
+              mock.patch.object(stop_resume, "running_on_account", return_value=live) as probe):
+            result = self.agents(*arguments)
+        probe.assert_called_once_with(str(row.current_session), "", kind="claude")
+        self.assertEqual(result.stderr, "")
+        return result.returncode, result.stdout
+
     def test_resume_of_a_paused_unit_removes_the_pause_and_sends_one_continuation(self) -> None:
         for original, observed in (
                 (self.unit, stop_resume.ClaudeUp(self.unit.current_session, "w1:p1", "claude2",
@@ -300,7 +351,11 @@ class PauseExitTests(StaffTestCase):
                         self.assertEqual(staff.by_id(original.id), original)
                         return stop_resume.ClaudeUp(original.current_session, "w1:p1", to or "claude2")
                     self.start.side_effect = start
-                    with mock.patch.object(stop_resume, "running_on_account", return_value=observed) as running:
+                    with (mock.patch.object(shutdown, "local_machine", return_value=remote.local_machine()),
+                          mock.patch.object(shutdown, "other_machine", return_value=remote.other_machine()),
+                          mock.patch.object(shutdown, "run_remote", side_effect=partial(
+                              self.resume_on_peer, row=original, target=target)) as ssh,
+                          mock.patch.object(stop_resume, "running_on_account", return_value=observed) as running):
                         result = self.agents("resume", str(original.id), *target)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(staff.by_id(original.id), original)
@@ -314,6 +369,9 @@ class PauseExitTests(StaffTestCase):
                         self.assertIn("Continue", cast(str, self.send.call_args.args[2]))
                     if original != self.unit:
                         running.assert_not_called()
+                        ssh.assert_called_once()
+                    else:
+                        ssh.assert_not_called()
 
     def test_resume_of_an_exited_unit_uses_the_shared_resume_and_removes_the_exit(self) -> None:
         self.save_exit()

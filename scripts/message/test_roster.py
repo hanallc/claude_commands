@@ -7,7 +7,7 @@ from scripts.production.staff_test_support import foreign_hostname
 from scripts.herdr import herdr_types
 
 from scripts.lib import names
-from scripts.lib.test_names import fixture_names
+from scripts.lib.test_names import clear_runtime_names, fixture_names, new_command_errors
 from scripts.agents.test_support import write_machine_config
 
 import io
@@ -107,8 +107,8 @@ class RosterTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        names.runtime_names.cache_clear()
-        self.addCleanup(names.runtime_names.cache_clear)
+        clear_runtime_names()
+        self.addCleanup(clear_runtime_names)
         _ = self.enterContext(mock.patch.object(names, "load_names", return_value=fixture_names()))
         # Fixture processes run as this test's own pid: never read the real account it runs on.
         _ = self.enterContext(mock.patch.object(account, "process_config_dir", return_value=None))
@@ -661,23 +661,31 @@ class RosterTests(unittest.TestCase):
         owner = fixture_member("producer", name="free-claude", runtime_id=identity)
         registered = sessions.addressed(f"session:{identity}", sessions.live_sessions())
         assert registered is not None
+        worker = next(row for row in staff.find(kind="worker") if row.name == "alpha-impl")
         started = send.now()
-        targets = ("free-claude", f"session:{identity}", f"uds:{registered['messagingSocketPath']}")
-        for target in targets:
+        for target, previous, skip_scan in (
+            (owner.name, f"staff:{owner.id}", True),
+            (f"session:{identity}", f"session:{identity}", True),
+            (f"uds:{registered['messagingSocketPath']}", f"session:{identity}", False),
+            (f"codex:{worker.current_session}", f"staff:{worker.id}", True),
+        ):
             registry = mock.Mock(wraps=sessions.read_registry)
             with self.subTest(target=target):
-                previous = f"staff:{owner.id}" if target == owner.name else f"session:{identity}"
                 _ = (state / "keys.json").write_text(json.dumps({"notice": {"last": {previous: started.isoformat()}}}))
-                options = send.parse(["--here", "--to", target, "--from", "fixture", "--text", "Notice",
+                options = send.parse(["--to", target, "--from", "fixture", "--text", "Notice",
                                       "--key", "notice", "--repeat-minutes", "30"])
                 with (mock.patch.object(send, "STATE", state),
                       mock.patch.object(send, "now", return_value=started),
                       mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()),
                       mock.patch.object(sessions, "read_registry", registry),
+                      mock.patch.object(process_table, "snapshot", wraps=process_table.snapshot) as scan,
+                      mock.patch.object(roster, "peer_roster", side_effect=AssertionError("local recipient has a route")),
                       mock.patch.object(send, "relay", return_value=send.Result("sent", "fixture")) as relay):
                     self.assertEqual(send.send(options).outcome, "skipped")
                 registry.assert_called_once_with()
                 relay.assert_not_called()
+                if skip_scan:
+                    scan.assert_not_called()
 
 
     def test_fast_labels_agree_with_full_roster_for_live_claude_sessions(self) -> None:
@@ -1253,6 +1261,8 @@ class RosterTests(unittest.TestCase):
         with mock.patch.object(Path, "iterdir", list_folder):
             result = roster.roster(os.environ, roster.ThisMachine())
         self.assertIn(f"Claude session records: cannot list {self.sessions}", result.problems)
+        self.assertFalse(any(isinstance(problem, roster.UnreadableSessionRecordProblem)
+                             for problem in result.problems))
         with mock.patch.object(roster, "peer_roster") as peer:
             found = send.matching_recipients("peer-only", send.LocalThenPeer(), result, membership=membership)
         self.assertIsInstance(found, send.LocalRosterIncomplete)
@@ -1265,6 +1275,10 @@ class RosterTests(unittest.TestCase):
         result = roster.roster(os.environ, roster.ThisMachine())
         for path in unreadable:
             self.assertIn(f"Claude session records: cannot read {path}", result.problems)
+        self.assertCountEqual(
+            [problem for problem in result.problems if isinstance(problem, roster.UnreadableSessionRecordProblem)],
+            [f"Claude session records: cannot read {path}" for path in unreadable],
+        )
 
     def test_a_run_with_an_unreadable_owner_is_a_problem_for_that_run_only(self) -> None:
         run = self.runs / "lost-owner-run"
@@ -1399,7 +1413,7 @@ class RosterTests(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(names, "runtime_names", wraps=names.runtime_names), \
                 mock.patch.object(names, "load_names", return_value=error), \
-                mock.patch.object(names, "_reported_errors", set[names.NamesError]()), redirect_stderr(output):
+                mock.patch.object(names, "_reported_errors", new_command_errors()), redirect_stderr(output):
             for attempt in range(2):
                 with self.subTest(attempt=attempt):
                     self.assertEqual(roster.shown_name(entry).render(), "session:identity")
@@ -2742,6 +2756,16 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("mac: Codex daemon: closed", errors[0])
 
+    def test_peer_snapshot_preserves_the_unreadable_record_problem_type(self) -> None:
+        message = "Claude session records: cannot read /peer/2.json"
+        self.peer_snapshot(roster.Roster([], [message, roster.UnreadableSessionRecordProblem(message)]), status=1)
+
+        result = roster.peer_roster(os.environ)
+
+        self.assertEqual(result.problems, [f"mac: {message}", f"mac: {message}"])
+        self.assertNotIsInstance(result.problems[0], roster.UnreadableSessionRecordProblem)
+        self.assertIsInstance(result.problems[1], roster.UnreadableSessionRecordProblem)
+
     def test_snapshot_round_trips_every_relationship_reach_thread_and_session_state(self) -> None:
         base = self._entry("base", "freestanding", "session:base")
         rows = [
@@ -2761,6 +2785,9 @@ class RosterTests(unittest.TestCase):
             replace(base, kind="codex", role="worker", session=roster.NoClaudeSession(),
                     reach=roster.CannotReceiveMessages("between turns; no unit director is running"),
                     assignment=roster.WorkerAssignment("test", "/remote/no-thread")),
+            replace(base, role="worker", status="closed", reach=roster.CannotReceiveMessages("closed"),
+                    worker_closure=roster.WorkerClosure.CONFIRMED),
+            replace(base, role="worker", status="incomplete: closed", reach=roster.CannotReceiveMessages("closed")),
         ]
         result = roster.Roster(rows, ["remote source problem"])
         encoded = roster.RosterSnapshot(result).encode()
@@ -2882,6 +2909,12 @@ class RosterTests(unittest.TestCase):
 
 
 class PaneRosterTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        # Fixture processes run as this test's own pid: never read the real account it runs on.
+        _ = self.enterContext(mock.patch.object(account, "process_config_dir", return_value=None))
+
     def test_worker_with_an_unreadable_pane_list_cannot_use_its_registry_route(self) -> None:
         fixture = self.row_production()
         worker = fixture_worker("unproved", fixture.unit.id, backend=staff.ClaudeBackend())
@@ -2919,7 +2952,6 @@ class PaneRosterTests(StaffTestCase):
         write_machine_config(config)
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), \
              mock.patch.object(herdr, "herdr_binary", side_effect=herdr_types.HerdrMissing("herdr is not installed")), \
-             mock.patch.object(account, "process_config_dir", return_value=None), \
              mock.patch.object(codex_daemon, "read_daemons", return_value=[]):
             found = roster.roster(os.environ, roster.ThisMachine())
         self.assertEqual([problem for problem in found.problems if problem.startswith("pane workers:")],
@@ -2966,6 +2998,10 @@ class PaneRosterTests(StaffTestCase):
             self.assertEqual(entries["open"].status, "working; pane w1:p1")
             self.assertIn("stopped", entries["stopped"].status)
             self.assertEqual(entries["closed"].reach, roster.CannotReceiveMessages("closed"))
+            self.assertEqual(
+                {worker.name for worker in rows if roster.is_closed_worker(entries[worker.name])},
+                {"closed"},
+            )
             self.assertNotIn("registry-copy", entries)
             self.assertNotIn("herdr agents:w1:p1", entries)
             self.assertNotIn(remote_worker.name, entries)
@@ -2976,6 +3012,10 @@ class PaneRosterTests(StaffTestCase):
             self.assertIsInstance(entries["unknown"].reach, roster.CannotReceiveMessages)
             self.assertIn("incomplete:", entries["closed"].status)
             self.assertIn("absence", entries["closed"].status)
+            incomplete = entries["closed"]
+            for entry in (incomplete, replace(incomplete, reach=roster.CannotReceiveMessages("closed"))):
+                with self.subTest(reason=entry.reach):
+                    self.assertFalse(roster.is_closed_worker(entry))
             self.assertEqual(self.staff_file.read_bytes(), before)
 
     def test_roster_names_owner_and_record_failures(self) -> None:

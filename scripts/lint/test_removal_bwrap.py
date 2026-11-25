@@ -7,13 +7,14 @@ import os
 from dataclasses import replace
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 
 from scripts.lib import removal_guard
-from scripts.lib.removal_bwrap_test_support import BuildMount, RemovalSandbox
+from scripts.lib.removal_bwrap_test_support import LINUX_CHECKOUT, BuildMount, RemovalSandbox
 
 CANARY = "keep this content\n"
 BUILD = "scripts/lint/sweep.py"
@@ -47,6 +48,27 @@ import sys
 
 mounts = Path("/proc/self/mountinfo").read_text().splitlines()
 assert any(line.split()[4] == sys.argv[1] for line in mounts), sys.argv[1]
+"""
+CLEANUP = "scripts/disks/cleanup_old_folders.py"
+PARENT_CLEANUP_WITH_PROCESS_FIXTURE = """
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+checkout, proc, *arguments = sys.argv[1:]
+sys.path.insert(0, checkout)
+from scripts.disks import cleanup_old_folders as cleanup
+
+def fake_ssh(args):
+    assert args[:4] == ("ssh", "-o", "BatchMode=yes", "mac"), args
+    assert args[-1].endswith(" --json"), args
+    assert (Path.home() / "rust/hanadocs/payload").read_text() == "keep this content\\n"
+    mac = cleanup.HostList(cleanup.Machine.MAC, ()).record()
+    return subprocess.CompletedProcess(args, 0, json.dumps(mac), "")
+
+cleanup.PROC_ROOT = proc
+raise SystemExit(cleanup.run_cli(arguments, run_ssh=fake_ssh))
 """
 
 
@@ -165,12 +187,74 @@ class RemovalProofTests(unittest.TestCase):
         sandbox = self.sandbox()
         self.prove(sandbox, BUILD, ("--target-dir", str(sandbox.build / "proof/unit/short")))
 
-    def test_gate_sweep_lists_for_manual_review(self) -> None:
+    def test_cleanup_removes_only_the_approved_exact_folder(self) -> None:
         sandbox = self.sandbox()
-        root = sandbox.home / "worktrees" / "gates"
-        candidate = root / "proof-repo" / "proof-gate"
-        _ = self.canary(sandbox, candidate / "keep")
-        self.prove(sandbox, "scripts/lint/gate_folders_delete.py", ("--root", str(root)), manual=(candidate,))
+        candidate = sandbox.home / "old-output"
+        payload = self.canary(sandbox, candidate / "payload")
+        bare = sandbox.home / "old-archive" / "saved.git"
+        model = sandbox.build / "proof" / "unit" / "short"
+        worktree = sandbox.home / "old-worktree"
+        hanadocs = sandbox.home / "rust" / "hanadocs"
+        keep = tuple(self.canary(sandbox, path) for path in (
+            sandbox.home / "old-output-next/payload", hanadocs / "payload", model / "payload", worktree / ".git",
+            bare / "HEAD", bare / "objects" / "object", bare / "refs" / "head",
+        ))
+        paths = ", ".join(map(str, (candidate, hanadocs, model, model.parent.parent, worktree, bare.parent)))
+        _ = sandbox.host_path(sandbox.home / "config/disks.conf").write_text(
+            f"[cleanup]\ncleanup.dead.natedev={paths}\ncleanup.dead.mac={paths}\n"
+            + f"cleanup.list_only.natedev={sandbox.build / 'sccache'}\ncleanup.list_only.mac=~/build/slot\n"
+            + "cleanup.list_only_reason.natedev=shared tool cache\ncleanup.list_only_reason.mac=bob's hand step\n")
+
+        proc = sandbox.home / "proc"
+        if sys.platform == "linux":
+            sandbox.host_path(proc / "self").mkdir(parents=True)
+            _ = sandbox.host_path(proc / "self/status").write_text("CapPrm: 0000000000000000\n")
+            cli = sandbox.script(CLEANUP, "--host-list")
+            self.assertEqual(cli.returncode, 0, cli.stdout + cli.stderr)
+            self.assertIn(f"{str(candidate)!r}", cli.stdout)
+
+        def run_parent(*arguments: str) -> subprocess.CompletedProcess[str]:
+            return sandbox.python("-c", PARENT_CLEANUP_WITH_PROCESS_FIXTURE, str(LINUX_CHECKOUT),
+                                  str(proc), *arguments)
+
+        if sys.platform == "linux":
+            pid = proc / "42"
+            sandbox.host_path(pid / "fd").mkdir(parents=True)
+            _ = sandbox.host_path(pid / "status").write_text(
+                f"Uid: {os.geteuid()} {os.geteuid()}\nState: S\nThreads: 1\n")
+            _ = sandbox.host_path(pid / "environ").write_bytes(b"")
+            sandbox.host_path(pid / "cwd").symlink_to(candidate)
+            busy = run_parent()
+            self.assertEqual(busy.returncode, 0, busy.stdout + busy.stderr)
+            self.assertIn(f"{str(candidate)!r}", busy.stdout)
+            self.assertIn("pid 42 works in it", busy.stdout)
+            self.assertNotIn("would remove", busy.stdout)
+            self.assertIn("mac total: 0 bytes", busy.stdout)
+            shutil.rmtree(sandbox.host_path(pid))
+
+        def run_cleanup(*arguments: str) -> subprocess.CompletedProcess[str]:
+            if sys.platform == "linux":
+                return run_parent("--host-list", *arguments)
+            return sandbox.script(CLEANUP, "--host-list", *arguments)
+
+        preview = run_cleanup()
+        self.assertEqual(preview.returncode, 0, preview.stdout + preview.stderr)
+        self.assertIn(f"{str(candidate)!r}", preview.stdout)
+        self.assertEqual(preview.stdout.count("would remove"), 1, preview.stdout)
+        for git_work in (worktree, bare.parent):
+            self.assertRegex(preview.stdout, rf"{str(git_work)!r}\t[0-9]+\tholds Git work: the owner saves it,")
+        self.assertIn(f"{model.parent.parent.as_posix()!r}\tunknown\tcontains a model folder", preview.stdout)
+        self.assert_canaries(sandbox, (payload, *keep))
+        approval = next(line.removeprefix("Digest: ") for line in preview.stdout.splitlines() if line.startswith("Digest: "))
+        refused = run_cleanup("--go", "0" * 64)
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertIn("list digest changed", refused.stderr)
+        self.assert_canaries(sandbox, (payload, *keep))
+        removed = run_cleanup("--go", approval)
+        self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+        self.assertEqual(removed.stdout.splitlines(), [f"removed {str(candidate)!r}"])
+        self.assertFalse(sandbox.host_path(candidate).exists())
+        self.assert_canaries(sandbox, keep)
 
     @unittest.skipUnless(sys.platform == "linux", "requires a Linux bind mount")
     def test_removal_refuses_a_bind_mount_above_the_reviewed_folder(self) -> None:

@@ -10,8 +10,11 @@ import hashlib
 import io
 import json
 import os
+import pty
+import select
 import shlex
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -21,7 +24,7 @@ import time
 import unittest
 from collections.abc import Callable, Collection, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,10 +39,12 @@ from scripts.lib import cargo_target_config
 from scripts.lib import file_lock
 from scripts.message import send_budget, session_send
 from scripts.message.session_send_test_support import forbid_real_sender
-from scripts.lib import build_folders, conf, copy_record, removal_guard
+from scripts.lib import atomic_file, build_folders, conf, copy_record, removal_guard
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.process_start import Gone, ProcessStart, Started, proc_table_start
+from scripts.lib.sizes import MIB, gib
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import floor_claims
 from scripts.lint.test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -282,7 +287,7 @@ class SweepCase(unittest.TestCase):
         self.declare_output_root(self.output_root)
 
     def declare_output_root(self, root: Path) -> None:
-        host = socket.gethostname().partition(".")[0]
+        host = conf.local_host_key_name()
         _ = write_config_fixture(conf.path("build_folders"), f"removal.path_templates.{host}={root}/<repo>/<unit>/<short> {root}/<repo>/ci/<number>\n")
 
     def output_fixture(self) -> Path:
@@ -462,6 +467,11 @@ class LastUseTests(SweepCase):
 
 
 class DepInfoTests(SweepCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = write_config_fixture(conf.path("lint"), "sweep_dep_info_head_bytes=4096\n")
+
     def test_names_the_copy_in_its_directory(self) -> None:
         target = self.target()
         directory = str(target.tree / "examples")
@@ -1264,6 +1274,87 @@ class ReclamationTests(SweepCase):
         self.assertFalse(sweep.sweep_removals_path().exists())
         self.assertFalse(sweep.target_deletes_path().exists())
 
+    def test_natedev_build_folder_configuration_error_keeps_its_cause(self) -> None:
+        _ = self.candidate("candidate", time.time() - DAY)
+        guard = self.guard(self.output_root)
+        _ = write_config_fixture(conf.path("lint"), "sweep_max_tree_depth=invalid\n")
+        with mock.patch.object(removal_guard, "read", return_value=guard):
+            with self.assertRaisesRegex(conf.Unusable, "sweep_max_tree_depth"):
+                _ = sweep.main(["--floor-only", "--host", "natedev"])
+
+    def test_floor_alert_reuses_a_visible_list_after_a_directory_sync_error(self) -> None:
+        first = self.candidate("first", time.time() - DAY)
+        second = self.candidate("second", time.time() - DAY)
+        folder = self.build_home / removal_guard.LIST_DIRECTORY
+
+        with (self.capture_review(),
+              mock.patch.object(sweep, "send_holder_message", return_value=DELIVERED_NATEDEV_ALERT) as send):
+            _ = self.review.add_manual(removal_guard.Tool.BUILD, first, first, 1, "disk floor review")
+            with mock.patch.object(atomic_file, "sync_folder", side_effect=OSError("directory sync failed")):
+                with self.assertRaises(atomic_file.AtomicDurabilityUnconfirmed):
+                    _ = sweep.send_floor_alert("Review build output.")
+            send.assert_not_called()
+            [visible] = folder.glob("*.jsonl")
+            self.assertEqual(removal_guard.ListedEntry.parse(visible.read_text()).path, first)
+
+            _ = self.review.add_manual(removal_guard.Tool.BUILD, second, second, 1, "disk floor review")
+            self.assertIs(sweep.send_floor_alert("Review build output."), DELIVERED_NATEDEV_ALERT)
+            message = cast(str, send.call_args.args[1])
+            self.assertIn(f"Removal list: {visible}", message)
+            with redirect_stdout(io.StringIO()) as report:
+                self.review.report()
+            self.assertEqual(report.getvalue().splitlines(), [f"removal list: {visible}"])
+            self.assertEqual(list(folder.glob("*.jsonl")), [visible])
+            self.assertEqual([removal_guard.ListedEntry.parse(line).path for line in visible.read_text().splitlines()],
+                             [first, second])
+
+    def test_publishing_removes_only_abandoned_removal_list_staging(self) -> None:
+        folder = self.build_home / removal_guard.LIST_DIRECTORY
+        folder.mkdir(parents=True)
+        with subprocess.Popen([sys.executable, "-c", "pass"]) as writer:
+            _ = writer.wait(timeout=TEST_HANG_GUARD_SECS)
+        abandoned = folder / f".sweep-{'a' * 32}.jsonl.{writer.pid}.dead.tmp"
+        active = folder / f".sweep-{'b' * 32}.jsonl.{os.getpid()}.active.tmp"
+        unrelated = folder / f".unrelated.jsonl.{writer.pid}.other.tmp"
+        for path in (abandoned, active, unrelated):
+            _ = path.write_text("staged output")
+        target = self.candidate("review", time.time() - DAY)
+        _ = self.review.add_manual(removal_guard.Tool.BUILD, target, target, 1, "disk floor review")
+
+        remove = Path.unlink
+        denied = {abandoned}
+
+        def deny_unlink(path: Path, missing_ok: bool = False) -> None:
+            if path in denied:
+                raise PermissionError(errno.EACCES, "fixture denies unlink", str(path))
+            remove(path, missing_ok=missing_ok)
+
+        errors = io.StringIO()
+        with mock.patch.object(Path, "unlink", deny_unlink), redirect_stderr(errors):
+            first_list = self.review.publish()
+        self.assertEqual(removal_guard.ListedEntry.parse(first_list.read_text()).path, target)
+        self.assertEqual(abandoned.read_text(), "staged output")
+        self.assertIn(str(abandoned), errors.getvalue())
+        self.assertIn("fixture denies unlink", errors.getvalue())
+
+        same_destination = folder / f".{first_list.name}.{writer.pid}.dead.tmp"
+        _ = same_destination.write_text("staged output")
+        second_target = self.candidate("second review", time.time() - DAY)
+        _ = self.review.add_manual(removal_guard.Tool.BUILD, second_target, second_target, 1, "disk floor review")
+        denied = {same_destination}
+        errors = io.StringIO()
+        with mock.patch.object(Path, "unlink", deny_unlink), redirect_stderr(errors):
+            self.assertEqual(self.review.publish(), first_list)
+        self.assertEqual([removal_guard.ListedEntry.parse(line).path for line in first_list.read_text().splitlines()],
+                         [target, second_target])
+        self.assertEqual(same_destination.read_text(), "staged output")
+        self.assertIn(str(same_destination), errors.getvalue())
+        self.assertIn("fixture denies unlink", errors.getvalue())
+
+        self.assertFalse(abandoned.exists())
+        self.assertEqual(active.read_text(), "staged output")
+        self.assertEqual(unrelated.read_text(), "staged output")
+
     def test_approval_refuses_a_link_to_another_build_form(self) -> None:
         folder = self.candidate("original", time.time() - DAY)
         guard = self.guard(self.output_root)
@@ -1589,9 +1680,10 @@ class ReclamationTests(SweepCase):
         self.assertTrue(payload.samefile(retained))
         self.assertEqual(self.trim_rows(), [])
         rmdir = os.rmdir
+        root = folder.stat()
 
         def refuse_root(name: str, *, dir_fd: int | None = None) -> None:
-            if name == folder.name and dir_fd is not None:
+            if dir_fd is not None and os.path.samestat(root, os.stat(name, dir_fd=dir_fd, follow_symlinks=False)):
                 raise PermissionError("fixture refuses the final directory removal")
             rmdir(name, dir_fd=dir_fd)
 
@@ -1689,6 +1781,7 @@ def cut_stamp(seconds: float) -> str:
 FLOOR_TEST_SETTINGS = (
     "sweep_cold_crates=50\nsweep_measurement_paths=3\nsweep_alert_interval_seconds=3600\n"
     + "sweep_delete_stamp_grace_seconds=2\n"
+    + "sweep_unexplained_fall_bytes=10737418240\nsweep_growth_window_seconds=1800\n"
 )
 
 
@@ -1847,7 +1940,7 @@ class FloorTests(SweepCase):
         roots, outputs = sweep.discover_cargo_outputs([str(base)], lint_settings=conf.read("lint"))
         self.assertEqual(set(roots), {str(path) for pair in pairs for path in pair})
         for pair in pairs:
-            self.assertEqual(set(outputs.roots_for(str(pair[0]))), set(map(str, pair)))
+            self.assertEqual(set(outputs.pair_roots_for(str(pair[0]))), set(map(str, pair)))
         status, text = self.hold(base, 10 * GIB, [0], dry_run=True, recorded=False)
         self.assertEqual(status, 0)
         self.assertEqual(reported_floor_targets(text), set(roots))
@@ -1982,16 +2075,16 @@ class FloorTests(SweepCase):
         self.assertEqual(saved.workspaces, (pairs[1],))
         self.assertEqual(set(saved.history), {pairs[0], pairs[2]})
 
-    def test_floor_sweep_keeps_an_unverified_slot_and_continues(self) -> None:
+    def test_floor_sweep_keeps_an_unverified_copy_and_continues(self) -> None:
         base = self.base()
         unverified, _ = cargo_target(base, "unverified", APP, time.time() - DAY)
         independent, _ = cargo_target(base, "independent", DEMO, time.time() - DAY)
-        leases = sweep.output_slot_leases
+        leases = sweep.output_copy_leases
         verified: set[str] = set()
 
-        def read_leases(path: str) -> tuple[sweep.SlotBuildOutput, ...]:
+        def read_leases(path: str) -> tuple[sweep.CopyBuildOutput, ...]:
             if path == str(unverified.parent):
-                raise PermissionError("fixture slot verification failed")
+                raise PermissionError("fixture copy verification failed")
             verified.add(path)
             return leases(path)
 
@@ -1999,13 +2092,13 @@ class FloorTests(SweepCase):
         build_root = base / "build"
         _ = write_config_fixture(conf.path("build_folders"),
                                  f"roots.build={build_root}\nroots.build.natedev={build_root}\n")
-        with (mock.patch.object(sweep, "output_slot_leases", side_effect=read_leases),
+        with (mock.patch.object(sweep, "output_copy_leases", side_effect=read_leases),
               redirect_stderr(errors)):
             status, _ = self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB], dry_run=True, recorded=True)
         self.assertEqual(status, 0, errors.getvalue())
         self.assertTrue(unverified.is_dir())
         self.assertIn(str(unverified.parent), errors.getvalue())
-        self.assertIn("cannot verify the slot lease", errors.getvalue())
+        self.assertIn("cannot verify the copy lease", errors.getvalue())
         self.assertIn(str(independent.parent), verified)
 
     def test_a_target_removed_during_shrink_does_not_fail_the_floor_pass(self) -> None:
@@ -2168,6 +2261,74 @@ class FloorTests(SweepCase):
         self.assertCountEqual(outcome.held_targets, (protected, busy))
         self.assertIn(protected, dict(outcome.protected))
 
+    def chained_targets(self, base: Path) -> tuple[str, str, str, str]:
+        """Four targets that three saved mappings chain: one and shared, two and shared, two and three.
+
+        The names sort in chain order, so the floor pass meets two, held by its pair, before three.
+        """
+        one, shared, two, three = (str(cargo_target(base, name, digest, time.time() - DAY)[0].parent)
+                                   for name, digest in (("chain-1", APP), ("chain-2", DEMO),
+                                                        ("chain-3", TOOL), ("chain-4", MY_TOOL)))
+        self.root_row(base / "ws-one", one, shared)
+        self.root_row(base / "ws-two", two, shared)
+        self.root_row(base / "ws-three", two, three)
+        return one, shared, two, three
+
+    def test_one_process_holds_its_pairs_and_their_targets_but_not_the_whole_chain(self) -> None:
+        base = self.base()
+        one, shared, two, three = self.chained_targets(base)
+        use = sweep.TargetUse(62002, "maps build output")
+        with (mock.patch.object(sweep, "process_uses", return_value={one: use}),
+              mock.patch.object(sweep, "shrink_floor", wraps=sweep.shrink_floor) as shrink):
+            status, printed = self.hold(base, 10 * GIB, [0], dry_run=True, recorded=False)
+        self.assertEqual(status, 0)
+        busy = cast(dict[str, sweep.FloorProtection], shrink.call_args.args[6])
+        self.assertEqual(busy, {one: use, shared: use, two: sweep.PairHeld(use)})
+        self.assertIn(f"lint sweep: pid {use.pid} {use.how}; {shared} left alone", printed)
+        self.assertIn(f"the floor lists {three}", printed)
+
+    def test_held_paths_spread_from_uses_and_from_a_lock_found_on_a_pair_held_target(self) -> None:
+        for late_lock in (False, True):
+            with self.subTest(late_lock=late_lock):
+                base = self.base()
+                one, shared, two, three = self.chained_targets(base)
+                use = sweep.TargetUse(62003, "maps build output")
+                judgment_lock = scratch.judgment_lock
+                checked: list[str] = []
+
+                @contextmanager
+                def lock_two_after_the_first_check(path: Path) -> Generator[bool]:
+                    if late_lock and str(path) == two and two in checked:
+                        yield False
+                        return
+                    checked.append(str(path))
+                    with judgment_lock(path) as idle:
+                        yield idle
+
+                with (mock.patch.object(sweep, "process_uses", return_value={one: use}),
+                      mock.patch.object(scratch, "judgment_lock", side_effect=lock_two_after_the_first_check),
+                      mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT),
+                      mock.patch.object(sweep, "send_holder_message", return_value=DELIVERED_NATEDEV_ALERT),
+                      mock.patch.object(sweep, "notify_floor_problem", wraps=sweep.notify_floor_problem) as notify):
+                    status, _ = self.hold(base, 10 * GIB, [0], dry_run=False, recorded=False)
+                self.assertEqual(status, 0)
+                outcome = cast(sweep.FloorOutcome, notify.call_args.args[0])
+                self.assertEqual(set(outcome.held_targets),
+                                 {one, shared, two, three} if late_lock else {one, shared, two})
+
+    def test_scan_clusters_keep_the_whole_mapping_chain(self) -> None:
+        base = self.base()
+        roots = self.chained_targets(base)
+        _, outputs = sweep.discover_cargo_outputs([str(base)], lint_settings=conf.read("lint"))
+        self.assertEqual(len(outputs.workspaces), 3)
+        token = sweep.OUTPUT_ROOTS.set(outputs)
+        self.addCleanup(sweep.OUTPUT_ROOTS.reset, token)
+        trees = {root: sweep.build_trees(root) for root in roots}
+        with mock.patch.object(sweep, "scan_roots", wraps=sweep.scan_roots) as scans:
+            _ = sweep.scan_floor_roots(list(roots), trees, lint_settings=conf.read("lint"))
+        self.assertEqual([sorted(cast(sweep.DiscoveredTargetRoots, call.args[0])) for call in scans.call_args_list],
+                         [sorted(roots)])
+
     def test_unavailable_index_uses_saved_roots_after_the_checkout_is_gone(self) -> None:
         base = self.base()
         tree, payload = cargo_target(base, "cached", APP, time.time() - DAY)
@@ -2222,11 +2383,27 @@ class FloorTests(SweepCase):
             CargoOutputRoots(base / "two", shared, other),
             CargoOutputRoots(base / "bridge", build, shared),
         ))
-        self.assertEqual(index.roots_for(str(target)), tuple(sorted(map(str, roots))))
+        self.assertEqual(index.connected_roots_for(str(target)), tuple(sorted(map(str, roots))))
         shared.rmdir()
-        self.assertEqual(index.roots_for(str(other)), tuple(sorted(map(str, (target, build, other)))))
+        self.assertEqual(index.connected_roots_for(str(other)), tuple(sorted(map(str, (target, build, other)))))
         shared.mkdir()
-        self.assertEqual(index.roots_for(str(build)), tuple(sorted(map(str, roots))))
+        self.assertEqual(index.connected_roots_for(str(build)), tuple(sorted(map(str, roots))))
+
+    def test_pair_roots_stop_at_the_roots_own_mappings(self) -> None:
+        base = self.base()
+        roots = [base / name for name in ("one", "shared", "two", "three")]
+        for root in roots:
+            root.mkdir()
+        one, shared, two, three = roots
+        index = sweep.CargoOutputIndex((
+            CargoOutputRoots(base / "ws-one", one, shared),
+            CargoOutputRoots(base / "ws-two", two, shared),
+            CargoOutputRoots(base / "ws-three", two, three),
+        ))
+        self.assertEqual(index.pair_roots_for(str(one)), tuple(sorted(map(str, (one, shared)))))
+        self.assertEqual(index.pair_roots_for(str(shared)), tuple(sorted(map(str, (one, shared, two)))))
+        self.assertEqual(index.pair_roots_for(str(three)), tuple(sorted(map(str, (two, three)))))
+        self.assertEqual(index.connected_roots_for(str(one)), tuple(sorted(map(str, roots))))
 
     def test_recorded_pairs_precede_saved_pairs_and_dry_discovery_keeps_the_cache(self) -> None:
         base = self.base()
@@ -2246,7 +2423,7 @@ class FloorTests(SweepCase):
         self.assertEqual(set(roots), {str(root) for pair in pairs
                                      for root in (pair.target_directory, pair.build_directory)})
         for pair in (first, second):
-            self.assertEqual(set(index.roots_for(str(pair.target_directory))),
+            self.assertEqual(set(index.pair_roots_for(str(pair.target_directory))),
                              {str(pair.target_directory), str(pair.build_directory)})
         self.assertEqual(sweep.cargo_output_cache_path().read_bytes(), before)
 
@@ -2265,7 +2442,7 @@ class FloorTests(SweepCase):
         self.assertEqual(set(roots), {str(root) for pair in pairs
                                      for root in (pair.target_directory, pair.build_directory)})
         for pair in pairs:
-            self.assertEqual(set(index.roots_for(str(pair.target_directory))),
+            self.assertEqual(set(index.pair_roots_for(str(pair.target_directory))),
                              {str(pair.target_directory), str(pair.build_directory)})
 
     def test_floor_fixture_supports_repeated_capacity_reads_during_the_scan(self) -> None:
@@ -2558,7 +2735,7 @@ class FloorTests(SweepCase):
         natedev_floor = "# range: 0..\nsweep_build_floor_gib.natedev=733.29\n"
         for host, overrides, expected in (("testhost", "", 1000 * 4096 // 4),
                                           ("testhost", plain_floor, int(40.5 * GIB)),
-                                          ("testhost", plain_floor + host_floor, 55 * GIB),
+                                          ("TestHost.Example", host_floor, 55 * GIB),
                                           ("natedev", natedev_floor, int(733.29 * GIB))):
             with self.subTest(host=host, overrides=overrides):
                 base = self.base()
@@ -4378,9 +4555,9 @@ class FloorTests(SweepCase):
         self.assertIn("The sweep keeps their output.", message)
         self.assertNotIn("Free ", message)
         lock_path = busy_tree / sweep.LOCK_NAMES[0]
-        self.assertIn(f"- {busy_tree.parent} ({sweep.gib(held_bytes)}): pid {os.getpid()} holds the cargo lock {lock_path};"
+        self.assertIn(f"- {busy_tree.parent} ({gib(held_bytes)}): pid {os.getpid()} holds the cargo lock {lock_path};"
                       + " no session found", message)
-        self.assertIn(f"Not swept: CI's targets ({sweep.gib(ci_bytes)})", message)
+        self.assertIn(f"Not swept: CI's targets ({gib(ci_bytes)})", message)
         self.assertIn("No phone alert was attempted for this event.", message)
         self.assertNotIn("phone", send.call_args.kwargs)
         self.assertNotIn("Could not remove", message)
@@ -4486,26 +4663,23 @@ class FloorTests(SweepCase):
         with self.crossing_delivery({}) as delivery:
             _ = write_config_fixture(conf.path("lint"), "sweep_phone_rearm_gib=5\nsweep_phone_rearm_minutes=0\n")
             for free, expected in ((200, 0), (140, 2), (130, 2), (150, 2), (140, 2), (151, 2), (140, 2),
-                                   (155, 2), (140, 2), (160, 3), (140, 5)):
+                                   (155, 2), (140, 2), (160, 2), (140, 4)):
                 with self.subTest(free=free, expected=expected):
                     self.finalize_crossing(free)
                     self.assertEqual(len(delivery.attempts), expected)
-                    if expected >= 3:
-                        self.assertIn("sweep.disk_floor_recovered", delivery.attempts[2].command)
             self.assertEqual([attempt.recipient for attempt in delivery.attempts],
-                             ["natedev", "user", "user", "natedev", "user"])
+                             ["natedev", "user", "natedev", "user"])
             for recipient in ("natedev", "user"):
-                keys = [attempt.key for attempt in delivery.attempts
-                        if attempt.recipient == recipient and "sweep.disk_floor_recovered" not in attempt.command]
+                keys = [attempt.key for attempt in delivery.attempts if attempt.recipient == recipient]
                 self.assertNotEqual(keys[0], keys[1])
 
-    def test_phone_floor_crossing_sends_one_return_before_the_next_fall(self) -> None:
+    def test_phone_floor_crossing_rearms_silently_after_the_interval(self) -> None:
         for machine in ("natedev", "Mac"):
             for event, readings in (
                 ("cycle", ((0, 200, 0), (1, 149.8, 1), (2, 148.5, 1), (3, 149.9, 1),
-                           (4, 148.2, 1), (5, 156, 1), (64, 156, 1), (65, 156, 2), (66, 149, 3))),
+                           (4, 148.2, 1), (5, 156, 1), (64, 156, 1), (65, 156, 1), (66, 149, 2))),
                 ("margin", ((0, 200, 0), (1, 149.8, 1), (2, 150, 1), (3, 151, 1), (4, 155, 1),
-                            (5, 149, 1), (6, 156, 1), (66, 156, 2), (67, 149, 3))),
+                            (5, 149, 1), (6, 156, 1), (66, 156, 1), (67, 149, 2))),
                 ("morning", ((0, 149.8, 1), (1, 155.23, 1), (20, 154.47, 1), (40, 150.86, 1), (120, 147.7, 1))),
                 ("dip at line", ((0, 149.8, 1), (1, 156, 1), (60, 155, 1), (61, 156, 1),
                                  (120, 156, 1), (121, 149, 1))),
@@ -4531,31 +4705,17 @@ class FloorTests(SweepCase):
                             self.assertEqual(len(pushes), expected)
                     self.assertTrue(all(attempt.accepted for attempt in pushes))
                     self.assertIn(f"{machine} has 149.8 GiB free", pushes[0].text)
+                    self.assertEqual([attempt.command[attempt.command.index("--text-id") + 1] for attempt in pushes],
+                                     ["sweep.disk_floor"] * len(pushes))
                     if event in ("cycle", "margin"):
-                        self.assertEqual([attempt.command[attempt.command.index("--text-id") + 1] for attempt in pushes],
-                                         ["sweep.disk_floor", "sweep.disk_floor_recovered", "sweep.disk_floor"])
-                        self.assertIn(f"{machine} disk space is back", pushes[1].text)
-                        self.assertIn(f"{machine} has 156.0 GiB free, above the 155.0 GiB line.", pushes[1].text)
-                        self.assertIn("The next fall below 150.0 GiB sends one alert.", pushes[1].text)
-                        self.assertIn(f"{machine} has 149.0 GiB free", pushes[2].text)
-                        self.assertNotEqual(pushes[0].key, pushes[2].key)
-                    else:
-                        self.assertEqual([attempt.command[attempt.command.index("--text-id") + 1] for attempt in pushes],
-                                         ["sweep.disk_floor"])
+                        self.assertIn(f"{machine} has 149.0 GiB free", pushes[1].text)
+                        self.assertNotEqual(pushes[0].key, pushes[1].key)
 
-    def test_phone_floor_return_retries_until_accepted_and_requires_a_sent_fall(self) -> None:
+    def test_phone_floor_recovery_retires_the_fall_key(self) -> None:
         for machine in ("natedev", "Mac"):
-            for event, replies, counts, accepted in (
-                ("sent", {}, (1, 2, 2, 2), (True, True)),
-                ("failed return", {"user": [0, 3, 0]}, (1, 2, 3, 3), (True, False, True)),
-                ("fall after failed return", {"user": [0, 3, 0]}, (1, 2, 3, 3), (True, False, True)),
-                ("lost return receipt", {}, (1, 2, 3, 3), (True, True, False)),
-                ("failed fall", {"user": [3]}, (1, 1, 1, 1), (False,)),
-                ("kept fall", {}, (1, 1, 1, 1), (False,)),
-                ("kept fall retire exit 3", {}, (1, 1, 1, 1), (False,)),
-                ("lost retire reply", {}, (1, 1, 1, 1), (False,)),
-                ("lost kept fall receipt", {}, (1, 1, 1, 1), (False,)),
-            ):
+            for event in ("sent", "failed fall", "kept fall", "kept fall retire exit 3",
+                          "lost retire reply", "lost kept fall receipt"):
+                replies = {"user": [3]} if event == "failed fall" else {}
                 with (self.subTest(machine=machine, event=event), self.crossing_delivery(replies) as delivery,
                       mock.patch.object(tmp_sweep, "lsof_paths", return_value=tmp_sweep.ProcessUsesKnown([]))):
                     _ = write_config_fixture(conf.path("lint"), "sweep_phone_rearm_gib=5\nsweep_phone_rearm_minutes=0\n")
@@ -4569,62 +4729,63 @@ class FloorTests(SweepCase):
                     base = delivery.base
                     policy = (sweep.MacFloor((str(base),), floor_claims.ClaimSnapshot(frozenset()), base / "mirror")
                               if machine == "Mac" else sweep.NatedevFloor.CURRENT)
-                    pushes: list[AlertSendAttempt] = []
                     save = sweep.write_floor_record
-
-                    def interrupt_return_receipt(path: Path, record: sweep.FloorRecord) -> None:
-                        if any("sweep.disk_floor_recovered" in attempt.command for attempt in delivery.attempts):
-                            raise RuntimeError("fixture stops before the return receipt save")
-                        save(path, record)
 
                     def interrupt_kept_fall_receipt(path: Path, record: sweep.FloorRecord) -> None:
                         if delivery.kept_keys:
                             raise RuntimeError("fixture stops before the kept fall receipt save")
                         save(path, record)
 
-                    readings = (140, 156, 139, 138) if event == "fall after failed return" else (140, 156, 157, 158)
-                    for free, expected in zip(readings, counts, strict=True):
-                        if event == "lost kept fall receipt" and free == 140:
-                            with (mock.patch.object(sweep, "write_floor_record", side_effect=interrupt_kept_fall_receipt),
-                                  self.assertRaisesRegex(RuntimeError, "before the kept fall receipt save")):
-                                _ = self.hold(base, 300 * GIB, [free * GIB, free * GIB], recorded=True, policy=policy)
-                            self.assertIs(self.saved_receipts()[1], sweep.CrossingReceipt.PENDING)
-                        elif event == "lost return receipt" and free == 156:
-                            with (mock.patch.object(sweep, "write_floor_record", side_effect=interrupt_return_receipt),
-                                  self.assertRaisesRegex(RuntimeError, "before the return receipt save")):
-                                _ = self.hold(base, 300 * GIB, [free * GIB, free * GIB], recorded=True, policy=policy)
-                        else:
-                            self.assertEqual(self.hold(base, 300 * GIB, [free * GIB, free * GIB],
-                                                       recorded=True, policy=policy)[0], 0)
-                        pushes = [attempt for attempt in delivery.attempts if attempt.recipient == "user"]
-                        self.assertEqual(len(pushes), expected)
-                        if event == "kept fall retire exit 3" and free == 156:
-                            self.assertIsInstance(self.saved_record().phone_crossing, sweep.AbovePhoneFloor)
-                    self.assertEqual(tuple(attempt.accepted for attempt in pushes), accepted)
-                    returns = pushes[1:2] if event == "fall after failed return" else pushes[1:]
-                    for attempt in returns:
-                        self.assertIn("sweep.disk_floor_recovered", attempt.command)
-                        self.assertIn(f"{machine} disk space is back", attempt.text)
-                    if event == "fall after failed return":
-                        self.assertIn("sweep.disk_floor", pushes[2].command)
-                        self.assertIn(f"{machine} has 139.0 GiB free", pushes[2].text)
-                        self.assertNotEqual(pushes[0].key, pushes[2].key)
-                    if event in ("failed return", "lost return receipt"):
-                        self.assertEqual(pushes[1].key, pushes[2].key)
+                    if event == "lost kept fall receipt":
+                        with (mock.patch.object(sweep, "write_floor_record", side_effect=interrupt_kept_fall_receipt),
+                              self.assertRaisesRegex(RuntimeError, "before the kept fall receipt save")):
+                            _ = self.hold(base, 300 * GIB, [140 * GIB, 140 * GIB], recorded=True, policy=policy)
+                        self.assertIs(self.saved_receipts()[1], sweep.CrossingReceipt.PENDING)
+                    else:
+                        self.assertEqual(self.hold(base, 300 * GIB, [140 * GIB, 140 * GIB],
+                                                   recorded=True, policy=policy)[0], 0)
+                    pushes = [attempt for attempt in delivery.attempts if attempt.recipient == "user"]
+                    self.assertEqual(len(pushes), 1)
+                    self.assertEqual(pushes[0].accepted, event == "sent")
+
+                    for free in (156, 157, 158):
+                        attempts = len(delivery.attempts)
+                        self.assertEqual(self.hold(base, 300 * GIB, [free * GIB, free * GIB],
+                                                   recorded=True, policy=policy)[0], 0)
+                        self.assertEqual(len(delivery.attempts), attempts)
+                        expected = (sweep.RetiringPhoneCrossing if event == "lost retire reply" and free == 156
+                                    else sweep.AbovePhoneFloor)
+                        self.assertIsInstance(self.saved_record().phone_crossing, expected)
                     retired = [command for command in delivery.commands if "retire" in command]
-                    if event != "failed fall":
-                        self.assertTrue(retired)
-                        self.assertEqual(delivery.retire_hosts,
-                                         ["natedev" if machine == "Mac" else "local"] * len(retired))
-                        for command in retired:
-                            self.assertEqual(command[command.index("--key") + 1], pushes[0].key)
-                        if len(pushes) > 1:
-                            self.assertLess(delivery.commands.index(retired[0]), delivery.commands.index(pushes[1].command))
-                    if event in ("kept fall", "kept fall retire exit 3", "lost retire reply", "lost kept fall receipt"):
-                        self.assertEqual(delivery.kept_keys, set())
-                        self.assertIsInstance(self.saved_record().phone_crossing, sweep.AbovePhoneFloor)
-                    if event == "lost retire reply":
-                        self.assertEqual(len(retired), 2)
+                    self.assertEqual(len(retired), 2 if event == "lost retire reply" else 1)
+                    self.assertEqual(delivery.retire_hosts,
+                                     ["natedev" if machine == "Mac" else "local"] * len(retired))
+                    for command in retired:
+                        self.assertEqual(command[command.index("--key") + 1], pushes[0].key)
+                    self.assertEqual(delivery.kept_keys, set())
+
+    def test_old_recovery_record_rearms_without_delivery(self) -> None:
+        for receipt, retired in (("pending", False), ("pending", True), ("accepted", True)):
+            with self.subTest(receipt=receipt, retired=retired), self.crossing_delivery({}) as delivery:
+                _ = write_config_fixture(conf.path("lint"), "sweep_phone_rearm_gib=5\nsweep_phone_rearm_minutes=60\n")
+                now = time.time()
+                path = sweep.floor_record_path()
+                _ = path.write_text(json.dumps({
+                    "measured_at": now - 60, "free_bytes": 156 * GIB, "build_cache_bytes": 0,
+                    "phone_crossing": {"identity": "old-crossing", "rearm_since": now - 3601,
+                                       "recovery": receipt, "retired": retired, "return_policy": "allowed"},
+                }))
+                expected = (sweep.AbovePhoneFloor() if retired else
+                            sweep.RetiringPhoneCrossing("old-crossing", sweep.AboveRearmLine(now - 3601)))
+                self.assertEqual(self.saved_record().phone_crossing, expected)
+                self.finalize_crossing(156)
+                self.assertIsInstance(self.saved_record().phone_crossing, sweep.AbovePhoneFloor)
+                self.assertEqual(delivery.attempts, [])
+                self.assertEqual(delivery.retire_hosts, [] if retired else ["local"])
+                self.finalize_crossing(140)
+                self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev", "user"])
+                self.assertIn("sweep.disk_floor", delivery.attempts[1].command)
+                self.assertNotEqual(delivery.attempts[1].key, "phone:old-crossing")
 
     def test_crossing_retries_only_the_channel_without_a_receipt(self) -> None:
         for failed in ("user", "natedev"):
@@ -5003,7 +5164,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                     else:
                         self.finalize_crossing(140, removed=2 * GIB)
                 choices.assert_called_once()
-                shortfall = sweep.gib(150 * GIB - free)
+                shortfall = gib(150 * GIB - free)
                 if links == "held-only":
                     recommendation = ("Every measured folder holds output a build is using. "
                                       "The sweep frees it when the build ends.")
@@ -5042,7 +5203,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                 held_effect = "A build is using output inside it; deleting it can break that build."
                 other_effect = "Deleting it removes its contents; their use is unknown."
                 lines = [
-                    f"Free disk space fell below the 150.0 GiB alert line. {sweep.gib(free)} remains."
+                    f"Free disk space fell below the 150.0 GiB alert line. {gib(free)} remains."
                     + (" This is the Mac disk." if machine == "Mac" else ""),
                     "Cleanup removed 2.0 GiB.",
                     *([f"{large}: holds {large_size}. " + (held_effect if held_targets else other_effect)]
@@ -5059,6 +5220,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
 
     def test_crossing_names_the_largest_choice_when_no_choice_frees_enough(self) -> None:
         with self.crossing_delivery({}) as delivery:
+            _ = write_config_fixture(conf.path("lint"), "sweep_message_limit=1024\n")
             _ = write_config_fixture(conf.path("lint"), "sweep_alert_folder_count=5\n")
             measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [
                 sweep.OutsideCacheDirectory("/tmp/claude/largest", 60 * GIB, 0, sweep.NoLargestGrowingChild()),
@@ -5108,7 +5270,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         ):
             with self.subTest(event=event), self.crossing_delivery({}) as delivery:
                 _ = write_config_fixture(conf.path("lint"),
-                    "sweep_alert_folder_count=3\nsweep_message_path_widths=80 40\n")
+                    "sweep_alert_folder_count=3\nsweep_message_limit=1024\nsweep_message_path_widths=80 40\n")
                 paths = {name: f"/private/folder-list/{name}"
                          for name in ("largest", "second", "third", "fourth", "fifth", "empty")}
                 if event in ("long path", "text limit"):
@@ -5309,6 +5471,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
 
     def test_protected_recommendation_names_its_folder_among_several_choices(self) -> None:
         with self.crossing_delivery({}) as delivery:
+            _ = write_config_fixture(conf.path("lint"), "sweep_push_text_limit=500\n")
             with self.measured_output_roots(("/private/larger", "/private/smaller")):
                 self.finalize_crossing(140, protected=(("/private/larger", 27 * GIB), ("/private/smaller", 20 * GIB)))
             recommendation = ("Review /private/larger first (recommended): deleting it frees 27.0 GiB, "
@@ -5340,7 +5503,6 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                     policy = (sweep.MacFloor((str(base),), floor_claims.ClaimSnapshot(frozenset()), base / "mirror")
                               if machine == "Mac" else sweep.NatedevFloor.CURRENT)
                     send = cast(mock.Mock, sweep.send_floor_alert)
-                    recovery_count = 0
                     for free, expected in readings:
                         self.assertEqual(self.hold(base, 300 * GIB, [free * GIB, free * GIB],
                                                    recorded=True, policy=policy)[0], 0)
@@ -5348,13 +5510,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                         self.assertEqual(len(messages), expected)
                         for call in messages:
                             self.assertIn("Free disk space fell", call)
-                        if free > 150 + margin and expected:
-                            recovery_count = 1
-                        self.assertEqual(sum(attempt.recipient == "user" for attempt in delivery.attempts),
-                                         expected + recovery_count)
-                        recovered = [attempt for attempt in delivery.attempts
-                                     if "sweep.disk_floor_recovered" in attempt.command]
-                        self.assertEqual(len(recovered), recovery_count)
+                        self.assertEqual(sum(attempt.recipient == "user" for attempt in delivery.attempts), expected)
                     self.assertEqual(self.saved_receipts(), (sweep.CrossingReceipt.ACCEPTED, sweep.CrossingReceipt.ACCEPTED))
                     text = phone_text(delivery.attempts)
                     self.assertIn(f"{machine} disk is low; {machine} tests can fail", text)
@@ -5930,7 +6086,7 @@ raise SystemExit(int(os.environ[variable]))
 
     def test_phone_alert_wait_covers_configured_review_while_session_wait_stays_short(self) -> None:
         config = Path(self.enterContext(tempfile.TemporaryDirectory())) / "notify.conf"
-        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
+        _ = config.write_text("review_timeout_seconds=90\n")
         with (mock.patch.object(review, "NOTIFY_CONFIG", config),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
               redirect_stdout(io.StringIO())):
@@ -6187,7 +6343,7 @@ raise SystemExit(int(os.environ[variable]))
 
     def test_holder_message_uses_the_first_configured_path_width_and_reports_removal(self) -> None:
         _ = write_config_fixture(conf.path("lint"),
-                                 "sweep_message_path_widths=24 16\n")
+                                 "sweep_message_path_widths=24 16\nsweep_message_limit=365\n")
         holder = sweep.FloorHolder("/phase46/" + "a" * 70 + "/target", 2 * GIB, 46,
                                    "maps build output", "phase46")
 
@@ -6283,6 +6439,8 @@ raise SystemExit(int(os.environ[variable]))
         self.assertNotIn("-2.0 GiB", message)
 
     def test_long_paths_fit_phone_and_keep_each_last_component(self) -> None:
+        _ = write_config_fixture(conf.path("lint"), "sweep_message_limit=1024\n"
+                                 + "sweep_message_path_widths=256 128 96 72 56 40 24 16\n")
         now = time.time()
         directories = [
             sweep.OutsideCacheDirectory(
@@ -7727,6 +7885,203 @@ class MacFloorTests(SweepCase):
         self.assertIsInstance(cast(object, take.call_args.kwargs["policy"]), sweep.MacFloor)
         tmp.assert_not_called()
 
+    def test_standalone_mac_sweep_skips_a_held_floor_lock(self) -> None:
+        base = self.output_fixture()
+        with ((base / "floor.lock").open("a+") as owner,
+              mock.patch.object(sweep, "floor_record_path", return_value=base / "floor.json"),
+              mock.patch.object(sweep, "target_dirs") as discover,
+              mock.patch.object(sweep, "alert_floor_lock") as alert):
+            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            text = self.mac_hold(self.policy(base), 1)
+        self.assertIn("removed_bytes=0", text)
+        discover.assert_not_called()
+        alert.assert_not_called()
+
+    def test_mac_sweep_releases_the_floor_lock_when_the_session_ends(self) -> None:
+        base = self.output_fixture()
+        blocked = base / "one" / "two" / "three"
+        blocked.mkdir(parents=True)
+        program = base / "sweep_fixture.py"
+        _ = program.write_text("""
+import fcntl
+import os
+import signal
+import sys
+import termios
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, os.environ["FLOOR_TEST_PACKAGE_ROOT"])
+from scripts.lint import sweep
+from scripts.mac_test import floor_claims
+
+base = Path(__file__).parent
+mode = os.environ["FLOOR_TEST_MODE"]
+scandir = os.scandir
+flock = fcntl.flock
+register = signal.signal
+
+def discover(path):
+    if Path(path) == base / "one" / "two" / "three":
+        with (base / "scan.lock").open("r") as barrier:
+            print("discovery blocked", file=sys.stderr, flush=True)
+            flock(barrier, fcntl.LOCK_EX)
+    return scandir(path)
+
+def observe_flock(descriptor, operation):
+    if (isinstance(descriptor, int) and operation == fcntl.LOCK_EX
+            and os.fstat(descriptor).st_ino == (base / "floor.lock").stat().st_ino):
+        print("taking floor lock", file=sys.stderr, flush=True)
+    return flock(descriptor, operation)
+
+def deliver_both(signum, handler):
+    if signum != signal.SIGALRM or not callable(handler):
+        return register(signum, handler)
+    def stop(first, frame):
+        handler(first, frame)
+        signal.raise_signal(signal.SIGHUP)
+    return register(signum, stop)
+
+worker = sys.argv[1:2] == [sweep.MAC_FLOOR_WORKER_FLAG]
+if not worker:
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+with (mock.patch.object(sweep, "__file__", __file__),
+      mock.patch.object(sweep, "mac_floor_settings", return_value=(1, (str(base),))),
+      mock.patch.object(sweep, "floor_record_path", return_value=base / "floor.json"),
+      mock.patch.object(sweep.removal_guard, "read", side_effect=sweep.removal_guard.Refused(
+          sweep.removal_guard.RefusalReason.INVALID_ROOT)),
+      mock.patch.object(sweep, "free_bytes", return_value=1 if mode == "retry" else 0),
+      mock.patch.object(floor_claims, "read_claims", return_value=floor_claims.ClaimSnapshot(frozenset())),
+      mock.patch.object(os, "scandir", side_effect=discover),
+      mock.patch.object(fcntl, "flock", side_effect=observe_flock),
+      mock.patch.object(signal, "signal", side_effect=deliver_both if mode == "two signals" else register),
+      mock.patch.object(sweep, "notify_floor_problem")):
+    sys.exit(sweep.main(sys.argv[1:]))
+""")
+        lock = base / "floor.lock"
+        lock.touch()
+        package_root = str(Path(__file__).resolve().parents[2])
+        config = Path(os.environ["CONF_DIR"]) / "mac_test.conf"
+        for mode, seconds, status, reason in (
+            ("hangup", 30, 129, "floor sweep stopped by SIGHUP"),
+            ("transport killed", 30, 129, "floor sweep stopped by SIGHUP"),
+            ("transport stalled", 6, 124, "floor sweep timed out"),
+            ("supervisor killed", 30, -signal.SIGKILL, "discovery blocked"),
+            ("delayed startup", 6, 124, "floor sweep timed out before startup"),
+            ("two signals", 30, 124, "floor sweep timed out"),
+            ("timeout", 8, 124, "floor sweep timed out"),
+            ("retry timeout", 8, 124, "floor sweep timed out"),
+            ("retry", 30, 0, "removed_bytes=0"),
+        ):
+            with self.subTest(mode=mode), ExitStack() as terminal:
+                _ = write_config_fixture(config, "floor_sweep_timeout_s=180\n")
+                master, slave = pty.openpty()
+                master_stream = terminal.enter_context(os.fdopen(master, "rb"))
+                transport = None
+                if mode == "transport killed":
+                    transport = terminal.enter_context(subprocess.Popen(
+                        [sys.executable, "-c", "import os; os.read(0, 1)"], stdin=subprocess.PIPE,
+                        pass_fds=(master,), start_new_session=True))
+                    master_stream.close()
+                waiting_for_lock = mode.startswith("retry")
+                barrier_path = lock if waiting_for_lock else base / "scan.lock"
+                barrier = terminal.enter_context(barrier_path.open("a+"))
+                fcntl.flock(barrier, fcntl.LOCK_EX)
+                client_deadline = time.monotonic() + seconds
+                # The caller sends this time before SSH starts the Mac process.
+                sent_at = time.time() - (seconds if mode == "delayed startup" else 0)
+                mac_deadline = sent_at + seconds / 2
+                with os.fdopen(slave, "rb") as slave_stream:
+                    child = subprocess.Popen(
+                        [sys.executable, str(program), "--mac-floor-deadline", str(mac_deadline),
+                         "--floor-only", "--host", "mac"],
+                        stdin=slave_stream, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
+                        start_new_session=True, env={**os.environ, "SSH_TTY": os.ttyname(slave),
+                                                     "FLOOR_TEST_MODE": mode,
+                                                     "FLOOR_TEST_PACKAGE_ROOT": package_root})
+                try:
+                    if mode == "delayed startup":
+                        remainder, _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+                        output = remainder.decode()
+                        self.assertEqual(child.returncode, status, output)
+                        self.assertEqual(output.splitlines(), [f"lint sweep: {reason}", "mac_floor_cleanup=complete"])
+                        with lock.open("r") as probe:
+                            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        self.assertEqual(list((self.build_home / removal_guard.LIST_DIRECTORY).glob("*.jsonl")), [])
+                        continue
+                    assert child.stdout is not None
+                    _ = terminal.callback(child.stdout.close)
+                    output = ""
+                    expected = "taking floor lock" if waiting_for_lock else "discovery blocked"
+                    deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+                    while True:
+                        ready, _, _ = select.select([child.stdout], [], [], max(0, deadline - time.monotonic()))
+                        self.assertTrue(ready, f"The sweep did not reach {expected}.\n{output}")
+                        line = cast(bytes, child.stdout.readline()).decode()
+                        self.assertTrue(line, output)
+                        output += line
+                        if line.strip() == expected:
+                            break
+                    with lock.open("r") as probe:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if mode == "hangup":
+                        master_stream.close()
+                    elif transport is not None:
+                        transport.kill()
+                        _ = transport.wait(timeout=TEST_HANG_GUARD_SECS)
+                    elif mode == "two signals":
+                        child.send_signal(signal.SIGALRM)
+                    elif mode == "supervisor killed":
+                        child.kill()
+                        self.assertEqual(child.wait(timeout=TEST_HANG_GUARD_SECS), status)
+                        with lock.open("r") as probe:
+                            with self.assertRaises(BlockingIOError):
+                                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(barrier, fcntl.LOCK_UN)
+                    elif mode == "retry":
+                        fcntl.flock(barrier, fcntl.LOCK_UN)
+                    # Keep the server terminal open even when the client cannot receive the result.
+                    remaining = client_deadline - time.monotonic()
+                    remainder, _ = child.communicate(
+                        timeout=max(0, remaining) if mode == "transport stalled" else TEST_HANG_GUARD_SECS)
+                    output += remainder.decode()
+                    self.assertEqual(child.returncode, status, output)
+                    self.assertIn(reason, output)
+                    if mode == "supervisor killed":
+                        self.assertNotIn("mac_floor_cleanup=complete", output.splitlines())
+                    else:
+                        self.assertEqual(output.splitlines()[-1], "mac_floor_cleanup=complete", output)
+                    if mode == "retry timeout":
+                        fcntl.flock(barrier, fcntl.LOCK_UN)
+                    with lock.open("r") as probe:
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if mode != "retry":
+                        self.assertEqual(list((self.build_home / removal_guard.LIST_DIRECTORY).glob("*.jsonl")), [])
+                finally:
+                    if child.poll() is None:
+                        child.terminate()
+                        _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    if transport is not None and transport.poll() is None:
+                        transport.kill()
+
+    def test_cancelled_publication_has_no_visible_review_list(self) -> None:
+        target = self.output_fixture()
+        plan = removal_guard.RemovalList(removal_guard.Tool.BUILD)
+        _ = plan.add_manual(removal_guard.Tool.BUILD, target, target, 1, "disk floor review")
+        folder = self.build_home / removal_guard.LIST_DIRECTORY
+
+        def cancel_before_publish(descriptor: int) -> None:
+            self.assertGreater(os.fstat(descriptor).st_size, 0)
+            self.assertEqual(list(folder.glob("*.jsonl")), [])
+            raise KeyboardInterrupt("cancel before publication")
+
+        with mock.patch.object(os, "fsync", side_effect=cancel_before_publish):
+            with self.assertRaisesRegex(KeyboardInterrupt, "cancel before publication"):
+                _ = plan.publish()
+        path = plan.publish()
+        self.assertEqual(removal_guard.ListedEntry.parse(path.read_text()).path, target)
+
     def test_mirror_leases_and_unreadable_process_use_keep_output(self) -> None:
         base = self.output_fixture()
         tree, payload = cargo_target(base, "idle", APP, time.time() - DAY)
@@ -7770,11 +8125,14 @@ class LockHolderTests(unittest.TestCase):
         def never_held(*_args: object, **_kwargs: object) -> io.StringIO:
             return io.StringIO(other)
 
+        settings = base / "lint.conf"
+        _ = write_config_fixture(settings, "sweep_proc_locks_reads=2\n")
+        lint_settings = conf.read(settings)
         with mock.patch.object(file_lock, "open", create=True, side_effect=skip_once):
-            self.assertEqual(sweep.lock_holder(str(lock), "locks"), 4242)
+            self.assertEqual(sweep.lock_holder(str(lock), "locks", lint_settings=lint_settings), 4242)
         with mock.patch.object(file_lock, "open", create=True, side_effect=never_held) as opened:
-            self.assertIsNone(sweep.lock_holder(str(lock), "locks"))
-        self.assertEqual(opened.call_count, conf.read("lint").whole("sweep_proc_locks_reads"))
+            self.assertIsNone(sweep.lock_holder(str(lock), "locks", lint_settings=lint_settings))
+        self.assertEqual(opened.call_count, 2)
 
     @unittest.skipUnless(os.path.isfile(sweep.PROC_LOCKS), "the lock holder is read from /proc/locks")
     def test_a_live_flock_names_this_process(self) -> None:
@@ -7901,7 +8259,7 @@ class BudgetTests(unittest.TestCase):
         target = root / "target"
         target.mkdir()
         repository = Path(__file__).resolve().parents[2] / "config" / "lint.conf"
-        doc_budget = int(conf.read(repository).number("sweep_doc_index_mib") * sweep.MIB)
+        doc_budget = int(conf.read(repository).number("sweep_doc_index_mib") * MIB)
         environment = {key: value for key, value in os.environ.items() if key != "CONF_DIR"}
         environment.update({sweep.BUDGET_ENV: "", sweep.DOC_INDEX_ENV: ""})
         with (mock.patch.dict(os.environ, environment, clear=True),

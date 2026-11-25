@@ -3,12 +3,12 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import copy_config_fixture
 from scripts.lib.checkout_test_support import python_tool_source
 
 import io
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,6 +24,7 @@ from unittest import mock
 from scripts.notify import push_texts, silence
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 PUSH: silence.KeptPush = {"source": "build", "priority": "0", "title": "Build done",
                           "message": "No action needed.\nThe build passed.", "detail": "", "key": "", "text_id": ""}
@@ -75,7 +76,7 @@ class SilenceTests(unittest.TestCase):
     def test_nightly_result_without_herdr_keeps_only_the_newest_result_until_silence_ends(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         checkout = Path(__file__).resolve().parents[2]
-        _ = shutil.copytree(checkout / "config", root / "config")
+        _ = copy_config_fixture(checkout / "config", root / "config")
         keys = root / "keys"
         _ = keys.write_text("PUSHOVER_USER=fixture\nPUSHOVER_TOKEN=fixture\n")
         posted = root / "posted.jsonl"
@@ -99,7 +100,7 @@ if sys.argv[1:] == ["release"]:
 raise SystemExit(pushover.send(sys.argv[1:], keys, post))
 '''))
         environment = {
-            "HOME": str(root), "PATH": os.environ["PATH"], "HERDR_BIN": "/nonexistent/herdr",
+            "HOME": str(root), "PATH": os.environ["PATH"], "HERDR_BIN": MISSING_HERDR_BIN,
             "PYTHONPATH": str(checkout / "scripts/lib/python_startup"),
             "CONF_DIR": str(root / "config"), "NOTIFY_STATE_DIR": str(root / "notify"),
             "XDG_STATE_HOME": str(root / "state"), "USER_ZONE": "America/New_York",

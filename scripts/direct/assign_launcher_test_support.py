@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import Callable, TextIO, cast, override
 from unittest.mock import patch
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.direct import assign, phase_table
 from scripts.direct.assign_claude_test_support import direct_launcher_helpers
 from scripts.direct.findings_test_support import invoke_findings
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
+from scripts.direct.test_phase_reservation import make_fixture_worktree, model_worktree_environment
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -32,40 +34,40 @@ ASSIGN = ROOT / "scripts/direct/assign.sh"
 ASSIGNMENT_SETTINGS = {
     "direct": """\
 # whole: 1..
-MIN_REPAIR_BUDGET=3
+min_repair_budget=3
 # range: 5e-324..
-REPAIR_ROUNDS_PER_FINDING=0.5
+repair_rounds_per_finding=0.5
 # whole: 1..
-RUNAWAY_ROUNDS=5
+runaway_rounds=5
 # whole: 1..
-MAX_FIX_ATTEMPTS=2
+max_fix_attempts=2
 # whole: 1..
-MAX_REOPENS=2
+max_reopens=2
 # whole: 1..
-STALLED_ROUNDS=4
+stalled_rounds=4
 # whole: 1..
-MAX_CONSECUTIVE_SAME_KIND_PASSES=4
+max_consecutive_same_kind_passes=4
 # whole: 1..
-MAX_REVIEW_CANCELLATIONS=1
+max_review_cancellations=1
 # whole: 1..
-UNIT_COMPACT_ABOVE_TOKENS=200000
+unit_compact_above_tokens=200000
 # whole: 1..
-ROUTING_FROM_ROUND=4
+routing_from_round=4
 # whole: 1..
-ASTRA_AFTER_FAILED_FIXES=2
+astra_after_failed_fixes=2
 # range: 0.1..0.9
-WORKER_SPLIT_RATIO=0.667
-WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.
+worker_split_ratio=0.667
+worker_first_turn_text=Reply with ready. Do not use tools.
 # range: 1..600
-WORKER_FIRST_TURN_SECONDS=120
+worker_first_turn_seconds=120
 # range: 1..600
-WORKER_SETTLE_SECONDS=30
+worker_settle_seconds=30
 # range: 1..1800
-WORKER_COMPACT_SECONDS=300
+worker_compact_seconds=300
 # range: 1..600
-PANE_AGENT_START_SECONDS=90
+pane_agent_start_seconds=90
 # range: 0.01..600
-WORKER_PUBLISH_LOCK_SECONDS=15
+worker_publish_lock_seconds=15
 """,
     "build_folders": """\
 # whole: 1..
@@ -93,7 +95,6 @@ locks.probe_wait_seconds=0.25
 locks.probe_retry_seconds=0.005
 """,
     "scratch": """\
-visible_root=~/repro
 holds_file=~/.local/state/scratch/holds.json
 # whole: 1..
 default_life_seconds=86400
@@ -121,11 +122,11 @@ remote_transport_seconds=30
 """,
     "staff": """\
 # range: 0.001..
-OPERATION_LOCK_SECONDS=30
+operation_lock_seconds=30
 # range: 0.001..
-REMOTE_SECONDS=20
-PRODUCER_WORKSPACE=producers
-PRODUCER_FOLDER_ROOT=~/productions
+remote_seconds=20
+producer_workspace=producers
+producer_folder_root=~/productions
 """,
     "copies": """\
 remote_registry=~/.local/state/copies/remote-mirrors
@@ -259,15 +260,20 @@ class AssignLauncherFixture(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         bytecode_setting = os.environ.get("PYTHONDONTWRITEBYTECODE", "")
-        self.native.setUp()
-        self.addCleanup(self.native.doCleanups)
+        _ = set_up_fixture(self.addCleanup, self.native)
         _ = self.enterContext(assignment_helpers(bytecode_setting))
-        self.home = Path.home()
+        self.home = Path.home().resolve()
+        model = model_worktree_environment(self.home, Path(os.environ["CONF_DIR"]))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, model)))
         self.session_dir = self.native.run_dir
-        self.project = self.session_dir.parent / "project"
-        self.project.mkdir()
+        self.project = self.home / "rust" / "project"
+        self.project.mkdir(parents=True)
         _ = subprocess.run(["git", "init", "-q", str(self.project)], check=True, capture_output=True,
                            timeout=TEST_HANG_GUARD_SECS)
+        _ = (self.project / "plan.md").write_text("# Assignment fixture\n\n## Delegation Context\n\n- **Project:** Test\n")
+        self.commit_project()
+        self.project = make_fixture_worktree(self.project, "fixture", "project")
+        # Git ignores .unit.toml, so the unit configuration goes in the linked checkout the unit uses.
         _ = unit_config.write(self.project, unit_config.UnitConfig(unit_config.PlanFile(Path("plan.md")),
                                                                 unit_config.NoAppPort(), ()))
         owner = staff.by_id(self.native.fixture.parent.id)
@@ -277,7 +283,6 @@ class AssignLauncherFixture(unittest.TestCase):
         _ = staff.rename(parent.id, "fixture-production")
         owner = staff.rename(owner.id, "fixture")
         _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.project), expected=owner.worktree)
-        _ = (self.project / "plan.md").write_text("# Assignment fixture\n\n## Delegation Context\n\n- **Project:** Test\n")
         self.history = self.session_dir.parent / "history"
         self.paths = self.session_dir.parent / "paths.txt"
         _ = self.paths.write_text("src/worker.py\ntests/test_worker.py\n")
@@ -312,7 +317,6 @@ class AssignLauncherFixture(unittest.TestCase):
                 print(result.stderr, end="", file=sys.stderr)
             return result
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=run))
-        self.commit_project()
         (self.session_dir / "progress_history_state.json").unlink()
         self.record("start-run", "--working-dir", str(self.project), "--plan-doc", "plan.md",
                     "--main-family", "codex", "--main-model", "gpt-main", "--main-effort", "high",

@@ -18,9 +18,10 @@ import os
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
-from functools import cache, lru_cache
+from functools import lru_cache
 from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, cast
@@ -43,6 +44,7 @@ LIVE_HEARTBEAT_SECS = 600
 # Names the run's history, whose first line is the `run_started` event `start-run` writes.
 STATE_FILE = "progress_history_state.json"
 OWNER_FIELD = "owner_staff_id"
+PRIVATE_HELPER_SLOT = "private_helper_slot"
 # Every run's durable history: runs/, review_turns/, archives. The former name is read until
 # `unit_runs.py move-history` moves the folder; a test or a scratch run names its own with
 # UNIT_HISTORY_DIR. Both sit under the state folder, read at each call, since a caller may change HOME.
@@ -76,6 +78,51 @@ def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staf
             raise staff.StaffUnreadable(f"run owner {reference}: unit staff row is unavailable")
         return row
     return RunOwnerUnrecorded("run has no unit staff owner")
+
+
+def read_run_fields(folder: Path) -> dict[str, object]:
+    """Read the exact run record. A missing record has no run state."""
+    try:
+        value = cast(object, json.loads((folder / STATE_FILE).read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{folder}: invalid recorder state")
+    return cast(dict[str, object], value)
+
+
+def terminal_run(fields: Mapping[str, object]) -> bool:
+    return fields.get("status") in ("completed", "stopped", "error") and isinstance(fields.get("finished_at"), (float, int))
+
+
+def points_to_run(row: staff.StaffRow, run: Path) -> bool:
+    from scripts.production import staff
+
+    return isinstance(row.run, staff.OpenRun) and row.run.path.resolve() == run.resolve()
+
+
+@dataclass(frozen=True)
+class RunExecutionBlocker:
+    reason: str
+
+
+class NoRunExecutionBlocker(Enum):
+    IDLE = "no execution blocks run end"
+
+
+type RunExecutionState = RunExecutionBlocker | NoRunExecutionBlocker
+
+
+@dataclass(frozen=True)
+class PreparedRunEnded:
+    """Carry the checked owner into cleanup after pointer removal."""
+
+    run: Path
+    owner: staff.StaffId
+
+
+class CleanupOwnerFromState(Enum):
+    RECORDED = "read the saved owner for cleanup"
 
 
 def environ(name: str) -> str:
@@ -210,10 +257,17 @@ def run_archive() -> Path:
     return moved_folder(state_dir() / RUN_ARCHIVE_NAME, state_dir() / FORMER_RUN_ARCHIVE_NAME)
 
 
-@cache
+# The anomalies this command printed. A CLI process runs one command in one context, and
+# verify_helper.py runs each call in a copy of its context, so the set lives for one command.
+_reported_anomalies: ContextVar[frozenset[str]] = ContextVar("reported_anomalies", default=frozenset())
+
+
 def report_anomaly(message: str) -> None:
-    """Print each run anomaly once per process."""
-    print(message, file=sys.stderr)
+    """Print each run anomaly once per command."""
+    reported = _reported_anomalies.get()
+    if message not in reported:
+        _ = _reported_anomalies.set(reported | {message})
+        print(message, file=sys.stderr)
 
 
 def director(run: Path, *, dependencies: Callable[[Path], None] | None = None,

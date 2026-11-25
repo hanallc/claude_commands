@@ -333,16 +333,16 @@ def write_scheduled_task_prompts(session_id: str, prompts: tuple[ScheduledTaskPr
         with tempfile.NamedTemporaryFile(
             "w",
             dir=root,
-            prefix=".scheduled-prompts-",
+            prefix=f".scheduled-prompts-{os.getppid()}-{os.getpid()}-",
             delete=False,
             encoding="utf-8",
         ) as temporary:
+            temporary_path = Path(temporary.name)
             json.dump([{"id": task.id, "prompt": task.prompt, "recurring": task.recurring}
                        for task in prompts], temporary)
             _ = temporary.write("\n")
             temporary.flush()
             os.fsync(temporary.fileno())
-            temporary_path = Path(temporary.name)
         os.replace(temporary_path, destination)
         temporary_path = None
     finally:
@@ -881,6 +881,9 @@ class DirectorTurn(Enum):
     HOLD = "hold"
 
 
+DIRECTOR_HOLD_CONTEXT = "This unit is paused. Hold at the prompt. Do not start new work. Wait for agents resume."
+
+
 def director_turn(
     session_id: str, *,
     record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
@@ -898,7 +901,7 @@ def message_arrived(
 ) -> HookReply:
     record = session_staff(session_id) if isinstance(record, unit_runs.RunStaffAtUse) else record
     if director_turn(session_id, record=record) is DirectorTurn.HOLD:
-        return ContextOnly("This unit is paused. Hold at the prompt. Do not start new work. Wait for agents resume.")
+        return ContextOnly(DIRECTOR_HOLD_CONTEXT)
     response = answer(prompt) if source is PromptSource.TYPED else NotAnAnswer()
     return_question = is_return_question(prompt)
     if not return_question and not pauses(source):

@@ -52,7 +52,6 @@ class StaffHoldTests(StaffTestCase):
                   mock.patch.object(conversation_pause, "prompt_source", return_value=source),
                   mock.patch.object(hook, "_record_typed_prompt"),
                   mock.patch.object(hook, "_record_activity"),
-                  mock.patch("signal.signal"), mock.patch("signal.alarm"),
                   mock.patch("sys.stdin", io.StringIO(payload)), redirect_stdout(io.StringIO()) as output):
                 cast(Callable[[], None], hook.main)()
             self.assertTrue(output.getvalue(), source)
@@ -66,7 +65,6 @@ class StaffHoldTests(StaffTestCase):
         _ = staff.resume(str(self.row.id))
         with (mock.patch.object(conversation_pause, "prompt_source", return_value=conversation_pause.PromptSource.PEER),
               mock.patch.object(hook, "_record_activity"),
-              mock.patch("signal.signal"), mock.patch("signal.alarm"),
               mock.patch("sys.stdin", io.StringIO(payload)), redirect_stdout(io.StringIO()) as output):
             cast(Callable[[], None], hook.main)()
         self.assertEqual(output.getvalue(), "")

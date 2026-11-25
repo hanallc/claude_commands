@@ -15,7 +15,7 @@ from typing import cast
 
 from scripts.aws_target import hana_protocol, hana_source as source
 from scripts.aws_target.hana_result import HanaCommandResult, PeakUnavailable
-from scripts.lib import build_slots, conf
+from scripts.lib import build_copies, build_folders, conf
 from scripts.mac_test import linux_runner
 
 IMAGE_COMPILER_VERSION = Path('/etc/hana-aws/compiler-version')
@@ -62,7 +62,7 @@ def read_settings(configuration: conf.ConfigRead, command_timeout_s: float) -> G
 
 
 def materialize_and_run(request: hana_protocol.HanaExecutionRequest, verified_bundle: source.VerifiedGitBundle,
-                        *, command_timeout_s: float, root: Path = source.SOURCE_ROOT,
+                        *, command_timeout_s: float,
                         output_max_bytes: int = 16 * 1024 * 1024, build_start_fd: int = -1) -> hana_protocol.HanaRunOutcome:
     """Retain source and maker locks through shell preparation and result capture."""
     configuration = conf.read_or_repository('hana_aws')
@@ -70,45 +70,43 @@ def materialize_and_run(request: hana_protocol.HanaExecutionRequest, verified_bu
         settings = read_settings(configuration, command_timeout_s)
         if request.argv != request.manifest.argv:
             raise ValueError('The command differs from its source manifest')
-        with source.materialize(request.manifest, source.read_limits(configuration), verified_bundle, root=root,
-                showrunner='hana', unit=request.key.episode, work=request.key.attempt,
-                selection=build_slots.ExactSlotRequest(request.slot)) as leased:
+        with source.materialize(request.manifest, source.read_limits(configuration), verified_bundle,
+                                number=request.slot, work=request.key.attempt) as leased:
             if isinstance(leased, source.MissingBasis):
                 return hana_protocol.HanaExecutionRefused('MissingBasis: ' + json.dumps(
                     {'repository': leased.repository, 'commits': leased.commits}, separators=(',', ':')))
-            execution = linux_runner.LeasedSlotExecution(leased.slot, leased.descriptors)
-            shell = linux_runner.prepare_shell(leased.path, root / 'shells', settings.shell, settings.shell_timeout_s,
-                pass_fds=linux_runner.execution_descriptors())
-            result = linux_runner.run_slot(execution, request.argv, dict(request.manifest.environment), shell=shell,
-                compiler_version=settings.compiler_version, free_floor_gib=settings.free_floor_gib,
-                output_max_bytes=output_max_bytes, timeout_s=settings.command_timeout_s, build_start_fd=build_start_fd)
+            execution = linux_runner.LeasedSlotExecution(leased.copy, leased.descriptors)
+            with build_folders.leased_build_folder(build_folders.MainOutput(leased.copy.repository)) as main:
+                build_folders.mark_folder_use(main)
+                shell = linux_runner.prepare_shell(leased.path, main / 'shells', settings.shell, settings.shell_timeout_s,
+                    pass_fds=linux_runner.execution_descriptors())
+                result = linux_runner.run_slot(execution, request.argv, dict(request.manifest.environment), shell=shell,
+                    compiler_version=settings.compiler_version, free_floor_gib=settings.free_floor_gib,
+                    output_max_bytes=output_max_bytes, timeout_s=settings.command_timeout_s, build_start_fd=build_start_fd)
             return hana_protocol.HanaCommandFinished(HanaCommandResult(request.key, request.source_key.key,
                 leased.identity.commit, leased.identity.toolchain, socket.gethostname().split('.')[0],
-                request.argv, leased.slot.number, result.status, result.stdout, result.stderr,
+                request.argv, leased.copy.number, result.status, result.stdout, result.stderr,
                 result.started_at, result.finished_at, result.execution_seconds,
                 PeakUnavailable('The command unit did not report peak memory')))
     except linux_runner.LeasedCommandLost as error:
         return hana_protocol.HanaExecutionLost(str(error))
-    except (OSError, ValueError, subprocess.SubprocessError, build_slots.SlotsFull,
-            build_slots.SlotsNotConfigured, build_slots.SlotGitFailure) as error:
+    except (OSError, ValueError, subprocess.SubprocessError, build_copies.CopyGitFailure) as error:
         return hana_protocol.HanaExecutionRefused(str(error))
 
 
 def materialize_source_update(request: hana_protocol.HanaExecutionRequest,
-        verified_bundle: source.VerifiedGitBundle, *, root: Path = source.SOURCE_ROOT) -> hana_protocol.HanaSourceUpdateOutcome:
+        verified_bundle: source.VerifiedGitBundle) -> hana_protocol.HanaSourceUpdateOutcome:
     """Prepare a complete bundle without shell preparation or command execution."""
     try:
         if request.manifest.basis_commits or request.argv != request.manifest.argv:
             raise ValueError('The source update requires the complete original capture')
         limits = source.read_limits(conf.read_or_repository('hana_aws'))
-        with source.materialize(request.manifest, limits, verified_bundle, root=root,
-                showrunner='hana', unit=request.key.episode, work=request.key.attempt,
-                selection=build_slots.ExactSlotRequest(request.slot)) as leased:
+        with source.materialize(request.manifest, limits, verified_bundle,
+                                number=request.slot, work=request.key.attempt) as leased:
             if isinstance(leased, source.MissingBasis):
                 raise ValueError('The complete source update still requires basis commits')
             return hana_protocol.HanaSourceUpdated(leased.identity)
-    except (OSError, ValueError, subprocess.SubprocessError, build_slots.SlotsFull,
-            build_slots.SlotsNotConfigured, build_slots.SlotGitFailure) as error:
+    except (OSError, ValueError, subprocess.SubprocessError, build_copies.CopyGitFailure) as error:
         return hana_protocol.HanaSourceUpdateRefused(str(error))
 
 

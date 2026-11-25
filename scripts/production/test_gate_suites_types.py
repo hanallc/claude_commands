@@ -1,4 +1,4 @@
-"""Merge gate suites contracts."""
+"""Test the gate suite runner."""
 
 from __future__ import annotations
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
@@ -22,10 +22,12 @@ from datetime import UTC, datetime, timedelta, tzinfo
 from scripts.agents import remote
 from scripts.copies import copies
 from scripts.direct import progress_history
-from scripts.lib import build_folders
-from scripts.production import change_review, gate, staff, showrunners
-from scripts.production.staff_test_support import isolated_staff_file, fixture_member
+from scripts.lib import build_folders, scratch
+from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
+from scripts.production import change_review, gate, nightly_schedule, staff, showrunners
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_unit_saved_name
 from scripts.production.gate_modules import GateRefused
+from scripts.production.gate_routes import GateResultUnknown
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.gate_test_support import gate_suites, wait_for_file
 from scripts.production.gate_suites_test_support import GateSuitesFixture
@@ -91,7 +93,7 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assertEqual(arguments.args[:2], ("fixture-showrunner", f"merge-gate-nightly:{tree}"))
         message = cast(str, arguments.args[2])
         self.assertIn(failing_file, message)
-        self.assertNotIn("requires the full suite", message)
+        self.assertNotIn("full-required marker exists", message)
         self.assertFalse((self.state / "runner/full-required").exists())
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
 
@@ -255,18 +257,24 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assertIn("1980 other diagnostic lines omitted.", message)
         self.assertIn(summary, message)
 
-    def test_nightly_notice_without_a_failed_job_says_the_full_suite_is_required(self) -> None:
+    def test_nightly_runner_failure_names_the_jobs_that_run_the_full_suite_again(self) -> None:
         from scripts.production import showrunners
 
-        with (mock.patch.object(gate, "nightly_owner", return_value="fixture-showrunner"),
+        self.write(Path(self.environment["CONF_DIR"]) / "build_steps.conf",
+                   "names.integrate=fixture integrate\nnames.test-all=fixture test all\n"
+                   + "names.test-nightly=fixture test nightly\n")
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(gate, "nightly_owner", return_value="fixture-showrunner"),
               mock.patch.object(showrunners, "tell", return_value="sent to fixture-showrunner") as notice):
             _ = gate.tell_nightly_red(gate.GateArguments(merge_branch="integration"), "fixture-tree", [])
 
         arguments = notice.call_args
         assert arguments is not None
         message = cast(str, arguments.args[2])
+        self.assertIn("The fixture test nightly job failed", message)
         self.assertIn("(runner failure)", message)
-        self.assertIn("requires the full suite", message)
+        self.assertIn("The fixture integrate and fixture test all jobs run the full suite again"
+                      + " while the full-required marker exists.", message)
         self.assertNotIn("Tests passed", message)
 
     def test_type_check_requires_exit_zero_and_a_clean_summary(self) -> None:
@@ -383,6 +391,7 @@ class NightlyClock(datetime):
 @final
 class NightlyPushTests(unittest.TestCase):
     root: Path = Path()
+    next_run = "Tue 11-24 00:53 PST"
 
     @property
     def fixer(self) -> staff.StaffRow:
@@ -409,8 +418,9 @@ class NightlyPushTests(unittest.TestCase):
         with (mock.patch.object(gate, "nightly_git", return_value=""),
               mock.patch.object(gate, "checked_git", return_value="fixture-tree"),
               mock.patch.object(gate, "nightly_owner", return_value="sdlc"),
+              mock.patch.object(nightly_schedule, "nightly_next_run", return_value=self.next_run),
               mock.patch.object(copies, "standing", return_value=nullcontext(self.root)),
-              mock.patch.object(gate, "run_suites", return_value=run,
+              mock.patch.object(gate, "run_gate_suites", return_value=run,
                                 side_effect=run if isinstance(run, Exception) else None),
               mock.patch.object(showrunners, "tell", return_value="told sdlc"),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
@@ -467,6 +477,8 @@ class NightlyPushTests(unittest.TestCase):
         from scripts.herdr import herdr, detection_rules
         from scripts.accounts import accounts
 
+        fixer = fixture_unit_saved_name(self.fixer, "staff")
+        expected_push = ("Nightly check failed", "Fix assigned to: staff.")
         run = gate.GateRun((gate.GateJobResult("production", "test_staff.py", 1, 0,
                                  "FAIL: saved branch differs"),), 0, 0)
         for route in ("assignment", "maintenance", "notice failure", "send failure", "assignment race",
@@ -519,7 +531,7 @@ class NightlyPushTests(unittest.TestCase):
                     self.assertIn("FAIL: saved branch differs", cast(list[str], saved["failures"]))
                     self.assertEqual(saved["received"], {} if route == "notice failure" else {"at": finished.isoformat()})
                     self.assertEqual(saved["finished"], finished.isoformat())
-                    assignment = ["nightly-assigned", "--result", record_path.stem, "--unit", str(self.fixer.id)]
+                    assignment = ["nightly-assigned", "--result", record_path.stem, "--unit", str(fixer.id)]
                     if route == "save failure":
                         from scripts.message import send, send_result
                         NightlyClock.current = finished + timedelta(minutes=5)
@@ -545,6 +557,8 @@ class NightlyPushTests(unittest.TestCase):
                             self.assertEqual(gate.main(assignment), 0)
                             self.assertEqual(gate.main(["nightly-check"]), 0)
                             phone.assert_called_once()
+                            message = cast(send.Message, phone.call_args.args[0])
+                            self.assertEqual((message.summary, message.text), expected_push)
                         continue
                     assigned_minutes = 30 if route in ("assignment race", "maintenance") else 5
                     NightlyClock.current = finished + timedelta(minutes=assigned_minutes)
@@ -577,13 +591,13 @@ class NightlyPushTests(unittest.TestCase):
                     command = cast(list[str], sent.call_args.args[0])
                     text_id = command[command.index("--text-id") + 1]
                     values = dict(command[i + 1].split("=", 1) for i, word in enumerate(command) if word == "--value")
-                    message = push_texts.render(text_id, **values).message
-                    self.assertIn("production/test_staff.py", message)
+                    rendered = push_texts.render(text_id, **values)
+                    title, message = rendered.posted_title, rendered.message
                     if route.startswith("long "):
                         from scripts.notify import pushover
-                        message = pushover.fields({"token": "fixture", "user": "fixture"}, "Nightly", message, "0")["message"]
-                    self.assertIn("sdlc received it at " + ("03:05 EST" if route == "notice failure" else "03:00 EST"), message)
-                    self.assertIn(f"Assigned to fixes at 03:{assigned_minutes:02d} EST", message)
+                        fields = pushover.fields({"token": "fixture", "user": "fixture"}, title, message, "0")
+                        title, message = fields["title"], fields["message"]
+                    self.assertEqual((title, message), expected_push)
                     with redirect_stdout(io.StringIO()) as repeated:
                         self.assertEqual(gate.main(assignment), 0)
                         self.assertEqual(gate.main(assignment), 0)
@@ -591,7 +605,7 @@ class NightlyPushTests(unittest.TestCase):
                     self.assertIn("unchanged", repeated.getvalue())
                     sent.assert_called_once()
                     saved = cast(dict[str, object], json.loads(record_path.read_text()))
-                    self.assertEqual(cast(dict[str, str], saved["assignment"])["unit"], str(self.fixer.id))
+                    self.assertEqual(cast(dict[str, str], saved["assignment"])["unit"], str(fixer.id))
 
     def test_nightly_check_retries_an_assigned_push_without_claiming_receipt(self) -> None:
         directory = self.root / "state/nightly-red"
@@ -752,6 +766,41 @@ class NightlyPushTests(unittest.TestCase):
             self.assertIn("Nightly result push could not be sent: render unavailable", output.getvalue())
             sent.assert_not_called()
 
+    def assert_not_run_push(self, command: list[str], reason: str) -> None:
+        from scripts.notify import push_texts
+
+        text_id = command[command.index("--text-id") + 1]
+        self.assertEqual(text_id, "nightly.not_run")
+        values = dict(command[i + 1].split("=", 1) for i, word in enumerate(command) if word == "--value")
+        self.assertEqual(values, {"reason": reason, "action": "", "next_run": self.next_run})
+        rendered = push_texts.render(text_id, **values)
+        self.assertEqual(rendered.posted_title, "Nightly check did not run")
+        self.assertEqual(rendered.message, f"Why: {reason}.\nNext run: {self.next_run}.")
+
+    def test_nightly_next_run_uses_the_timer_schedule_and_user_zone(self) -> None:
+        now = datetime(2026, 11, 24, 8, 54, tzinfo=UTC)
+        upcoming = datetime(2026, 11, 25, 8, 53, tzinfo=UTC)
+        elapsed = upcoming - timedelta(days=1)
+        calendar = "*-*-* 03:53:00 America/New_York"
+        for reported_start in (upcoming, elapsed):
+            timestamp = f"@{int(reported_start.timestamp())}"
+            timer = f"TimersCalendar={{ OnCalendar={calendar} ; next_elapse={timestamp} }}\n"
+            results = [subprocess.CompletedProcess([], 0, timer + f"NextElapseUSecRealtime={timestamp}\n", "")]
+            if reported_start == elapsed:
+                results.append(subprocess.CompletedProcess([], 0,
+                    "Next elapse: Wed 2026-11-25 03:53:00 EST\n"
+                    + "    (in UTC): Wed 2026-11-25 08:53:00 UTC\n", ""))
+            with (self.subTest(reported_start=reported_start), mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}),
+                  mock.patch.object(nightly_schedule, "datetime", NightlyClock),
+                  mock.patch.object(subprocess, "run", side_effect=results) as run):
+                NightlyClock.current = now
+                self.assertEqual(nightly_schedule.nightly_next_run(), "Wed 11-25 00:53 PST")
+                self.assertEqual(run.call_count, len(results))
+                self.assertEqual(run.call_args_list[0].args[0][-1], "claude-nightly.timer")
+                if reported_start == elapsed:
+                    self.assertEqual(run.call_args_list[1].args[0],
+                                     ["systemd-analyze", "calendar", f"--base-time=@{int(now.timestamp())}", calendar])
+
     def test_setup_failure_push_preserves_the_exception(self) -> None:
         good = gate.GateRun((gate.GateJobResult("test", "ok", 0, 0, ""),), 0, 0)
         for stage in ("fetch", "standing"):
@@ -764,16 +813,35 @@ class NightlyPushTests(unittest.TestCase):
                 self.assertIs(caught.exception, failure)
                 sent.assert_called_once()
                 command = cast(list[str], sent.call_args.args[0])
-                self.assertEqual(command[command.index("--text-id") + 1], "nightly.not_run")
+                self.assert_not_run_push(command, f"{stage} failed connection closed")
                 self.assertEqual(command[command.index("--key") + 1], "nightly-result")
                 self.assertEqual(command[command.index("--need") + 1], "note")
                 self.assertIn(f"reason={stage} failed connection closed", command)
-                self.assertIn("action=None. The next nightly run tries again.", command)
+                self.assertIn("action=", command)
                 self.assertNotIn("--priority", command)
+
+    def test_nightly_without_a_guest_verdict_publishes_the_reason_and_keeps_the_status(self) -> None:
+        for failure, status in (
+                (gate.MacLinuxTookNoRun("fixture guest did not start"), MAC_LINUX_PRELAUNCH_REFUSED_STATUS),
+                (GateResultUnknown("fixture guest gave no verdict"), GATE_RESULT_UNKNOWN_STATUS)):
+            with (self.subTest(status=status), self.execution(failure) as sent,
+                  mock.patch.object(gate, "_sweep_nightly_build_folders"),
+                  mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
+                  redirect_stdout(io.StringIO()),
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(gate.main(["--nightly", "--merge-branch", "main",
+                                            "--unit", "fixture-merge", "--repo", str(self.root)]), status)
+                self.assertEqual(errors.getvalue(), f"{failure}\n")
+                notices = [command for call in sent.call_args_list
+                           if "--text-id" in (command := cast(list[str], call.args[0]))]
+                self.assertEqual(len(notices), 1, sent.call_args_list)
+                command, = notices
+                self.assert_not_run_push(command, str(failure))
+                self.assertIn(f"reason={failure}", command)
 
     def test_interrupt_push_preserves_the_exception(self) -> None:
         run = gate.GateRun((), 0, 0)
-        for stage in ("nightly_git", "run_suites"):
+        for stage in ("nightly_git", "run_gate_suites"):
             failure = KeyboardInterrupt()
             with self.subTest(stage=stage), self.execution(run) as sent:
                 with mock.patch.object(gate, stage, side_effect=failure):
@@ -782,7 +850,7 @@ class NightlyPushTests(unittest.TestCase):
                 self.assertIs(caught.exception, failure)
                 sent.assert_called_once()
                 command = cast(list[str], sent.call_args.args[0])
-                self.assertEqual(command[command.index("--text-id") + 1], "nightly.not_run")
+                self.assert_not_run_push(command, "interrupted by SIGINT")
                 self.assertIn("reason=interrupted by SIGINT", command)
                 self.assertEqual(command[command.index("--key") + 1], "nightly-result")
 
@@ -795,7 +863,7 @@ class NightlyPushTests(unittest.TestCase):
             self.assertIs(caught.exception, failure)
             sent.assert_called_once()
             command = cast(list[str], sent.call_args.args[0])
-            self.assertEqual(command[command.index("--text-id") + 1], "nightly.not_run")
+            self.assert_not_run_push(command, "OSError")
             self.assertIn("reason=OSError", command)
 
     def test_cleanup_failure_does_not_send_a_second_push(self) -> None:
@@ -814,21 +882,21 @@ class NightlyPushTests(unittest.TestCase):
             self.assertIn("nightly.result", cast(list[str], sent.call_args.args[0]))
 
     def test_not_run_reason_removes_final_periods(self) -> None:
-        from scripts.notify import push_texts
-
         run = gate.GateRun((), 0, 0)
-        with self.execution(run) as sent, mock.patch.object(gate, "nightly_git", side_effect=OSError("fetch\nfailed...")):
-            with self.assertRaises(OSError), redirect_stdout(io.StringIO()):
-                _ = self.nightly()
-            command = cast(list[str], sent.call_args.args[0])
-            values = dict(command[i + 1].split("=", 1) for i, word in enumerate(command) if word == "--value")
-            self.assertEqual(values["reason"], "fetch failed")
-            self.assertIn("action=None. The next nightly run tries again.", command)
-            self.assertIn("Why: fetch failed.", push_texts.render("nightly.not_run", **values).message)
+        for detail, reason in (("fetch\nfailed...", "fetch failed"),
+                               ("git fetch of main failed: ssh connection timed out.",
+                                "git fetch of main failed: ssh connection timed out")):
+            with (self.subTest(reason=reason), self.execution(run) as sent,
+                  mock.patch.object(gate, "nightly_git", side_effect=OSError(detail))):
+                with self.assertRaises(OSError), redirect_stdout(io.StringIO()):
+                    _ = self.nightly()
+                command = cast(list[str], sent.call_args.args[0])
+                self.assert_not_run_push(command, reason)
+                self.assertIn("action=", command)
 
     def test_not_run_reason_fits_the_message_limit(self) -> None:
         from scripts.notify import push_texts
-        from scripts.notify.pushover import MESSAGE_MAX
+        from scripts.notify.pushover import MESSAGE_MAX, phone_message_limit
 
         run = gate.GateRun((), 0, 0)
         with self.execution(run) as sent, mock.patch.object(gate, "nightly_git", side_effect=OSError("word\n" * 2000)):
@@ -837,7 +905,11 @@ class NightlyPushTests(unittest.TestCase):
             command = cast(list[str], sent.call_args.args[0])
             values = dict(command[i + 1].split("=", 1) for i, word in enumerate(command) if word == "--value")
             rendered = push_texts.render("nightly.not_run", **values)
+            limit = phone_message_limit("nightly", "nightly.not_run")
+            reason_limit = limit - len(f"Why: .\nNext run: {self.next_run}.")
+            self.assert_not_run_push(command, ("word " * 2000)[:reason_limit].rstrip())
             self.assertLessEqual(len(rendered.message), MESSAGE_MAX)
+            self.assertLessEqual(len(rendered.message), limit)
             self.assertNotIn("\n", values["reason"])
             self.assertIn("word word", values["reason"])
 

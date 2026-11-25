@@ -16,6 +16,7 @@ from datetime import timedelta
 from dataclasses import replace
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Generator
+from hashlib import sha256
 from pathlib import Path
 from typing import Literal, cast, final, override
 from unittest.mock import Mock, patch
@@ -26,6 +27,8 @@ import sys
 
 GIT: str = shutil.which("git") or "git"
 
+from scripts.lib.fixture_test_support import set_up_fixture
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.accounts import accounts, next_moves, outage_alerts, refusal_watch, role_map, unit_watchdog
 from scripts.accounts import test_refusal_watch as fixtures
 from scripts.production import fake_unit_host, showrunners, staff
@@ -33,11 +36,13 @@ from scripts.message import sessions as reader_sessions
 from scripts.agents.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, recorded_unit
 from scripts.agents import stop_resume
+from scripts.notify.push_texts import RenderedPush
 from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.agents import pane_record as hook_pane_record
 
 from scripts.agents import inventory, pane_record
 from scripts.herdr import herdr, pane_launch
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.herdr.test_herdr import ClaudeForegroundSocket
 from scripts.message import session_records, sessions
 from scripts.production import unit_lookup
@@ -84,11 +89,9 @@ class UnitWatchdogTests(unittest.TestCase):
     def setUp(self) -> None:
         _ = self.enterContext(redirect_stdout(io.StringIO()))
         _ = self.enterContext(redirect_stderr(io.StringIO()))
-        self.fixture = fixtures.RefusalWatchTests()
-        self.fixture.setUp()
-        write_text_atomic(Path(os.environ["CONF_DIR"]) / "shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = set_up_fixture(self.addCleanup, fixtures.RefusalWatchTests())
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/shutdown.conf",
+                                     Path(os.environ["CONF_DIR"]) / "shutdown.conf")
         self.home = self.fixture.home
         _ = self.enterContext(isolated_staff_file(self.home / "staff.json", {}))
         _ = showrunner_relationship("fixture")
@@ -117,7 +120,7 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.enterContext(patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()))
         _ = self.enterContext(patch.object(stop_resume, "_send_move_push"))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=self.command))
-        _ = self.enterContext(patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"))
+        _ = self.enterContext(patch.object(herdr, "herdr_binary", return_value=MISSING_HERDR_BIN))
         _ = self.enterContext(patch.object(herdr.Herdr, "panes", return_value=[]))
         _ = self.enterContext(patch.object(herdr.Herdr, "agents", return_value=[]))
         _ = self.enterContext(patch.object(herdr.Herdr, "close_restore_placeholders"))
@@ -219,11 +222,11 @@ class UnitWatchdogTests(unittest.TestCase):
                 with patch.object(staff, "snapshot", side_effect=self.current_staff):
                     unit_watchdog._finish_recovery(argv[offset + 1], argv[offset + 2], Path(argv[offset + 3]), argv[offset + 4])  # pyright: ignore[reportPrivateUsage]
 
-    def pass_at(self, minute: int, *, dry_run: bool = False) -> list[str]:
+    def pass_at(self, minute: int, *, dry_run: bool = False, exited: unit_watchdog.ExitRecovery | None = None) -> list[str]:
         if not dry_run:
             self.complete_jobs()
         with patch.object(staff, "snapshot", side_effect=self.current_staff):
-            return unit_watchdog.run(NOW + timedelta(minutes=minute), dry_run=dry_run)
+            return unit_watchdog.run(NOW + timedelta(minutes=minute), dry_run=dry_run, exited=exited)
 
     def recover_queued(self, source: unit_watchdog.RecoverySource) -> tuple[str, list[list[str]]]:
         self.commands.clear()
@@ -1139,6 +1142,68 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.pass_at(4)
         self.assertEqual(len(self.pending), 30)
         self.assertEqual(self.commands, [])
+
+    def test_detached_restart_failure_sends_one_push_with_the_original_key(self) -> None:
+        _ = self.add_unit("alpha")
+        self.die("alpha")
+        self.refused.add("claude4")
+        notice = unit_watchdog.RestartFailureNotice(account="claude3", generation="original",
+                                                    session="alpha", reference="alpha")
+        exited = unit_watchdog.ExitRecovery("alpha", notice)
+        with patch.object(stop_resume, "_send_move_push", return_value=True) as push:
+            self.assertEqual(self.pass_at(0), [])
+            self.assertEqual(self.pass_at(1, exited=exited), [])
+            self.assertTrue(exited.managed)
+            self.assertEqual(len(self.pending), 1)
+            self.finish_jobs = False
+            self.assertEqual(self.pass_at(2), [])
+            push.assert_not_called()
+            self.finish_jobs = True
+            lines = self.pass_at(3)
+            self.assertTrue(any("fixture refused; retry from" in line for line in lines))
+            push.assert_called_once()
+            text, key = cast(tuple[RenderedPush, str], push.call_args.args)
+            digest = sha256("\0".join(("alpha", "claude3", "original")).encode()).hexdigest()
+            self.assertEqual(key, f"resume-ended:{digest}")
+            self.assertEqual(text.title, "alpha did not start on claude3")
+            self.assertEqual(text.message, "Action: In the natedev session, run: /agents resume alpha --to claude3")
+            _ = self.pass_at(4, exited=unit_watchdog.ExitRecovery("alpha", {**notice, "generation": "later"}))
+            push.assert_called_once()
+
+    def test_detached_restart_success_clears_the_pending_push(self) -> None:
+        _ = self.add_unit("alpha")
+        self.die("alpha")
+        notice = unit_watchdog.RestartFailureNotice(account="claude3", generation="original",
+                                                    session="alpha", reference="alpha")
+        exited = unit_watchdog.ExitRecovery("alpha", notice)
+        with patch.object(stop_resume, "_send_move_push") as push:
+            self.assertEqual(self.pass_at(0, exited=exited), [])
+            self.assertTrue(exited.managed)
+            self.assertEqual(self.pass_at(1), [])
+            self.finish_jobs = False
+            self.assertEqual(self.pass_at(2), [])
+            self.assertEqual(len(self.pending), 1)
+            self.finish_jobs = True
+            self.assertEqual(self.pass_at(3), ["watchdog: alpha: restarted on claude4"])
+        self.assertEqual(unit_watchdog._read_state(), {})  # pyright: ignore[reportPrivateUsage]
+        push.assert_not_called()
+
+    def test_detached_restart_timeout_sends_the_pending_push(self) -> None:
+        _ = self.add_unit("alpha")
+        self.die("alpha")
+        self.finish_jobs = False
+        notice = unit_watchdog.RestartFailureNotice(account="claude3", generation="original",
+                                                    session="alpha", reference="alpha")
+        exited = unit_watchdog.ExitRecovery("alpha", notice)
+        with patch.object(stop_resume, "_send_move_push", return_value=True) as push:
+            self.assertEqual(self.pass_at(0), [])
+            self.assertEqual(self.pass_at(2, exited=exited), [])
+            self.assertTrue(exited.managed)
+            self.assertEqual(self.pass_at(3), [])
+            push.assert_not_called()
+            lines = self.pass_at(8)
+            self.assertTrue(any("detached restart did not finish within its time limit" in line for line in lines))
+            push.assert_called_once()
 
     def test_gone_folder_ends_recovery_and_alerts_once(self) -> None:
         owner = self.add_unit("alpha")

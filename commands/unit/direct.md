@@ -169,12 +169,12 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
 </LongLivedWorkers>
 
 <CoreContract>
-- Never modify unrelated files. The unit director may make a worktree, and its branch, for its own workers, with `scripts/worktree/make_worktree.sh`.
-  The unit's staff row keeps its one home worktree;
-  where a worker works stays in its run record, not in staff. The director
-  removes each worktree it made when that work ends. In the home worktree, the
-  only branch the run may create is the remote branch <PushCheckpoint/> pushes;
-  never switch to an existing branch.
+- Never modify unrelated files. The unit director creates a separate worktree with `worktrees.py make <repo word> <unit> <short-name>`.
+  The unit's staff row keeps its home worktree. The run record keeps the worker's checkout.
+  When the work ends, run `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py remove <path>`.
+  Send the reported paths to the showrunner as a removal list.
+  In the home worktree, create only the branch that <PushCheckpoint/> pushes.
+  Never switch to an existing branch.
 - The unit director does not write implementation code unless the user explicitly asks.
   Exceptions: <FastTrack/>, <NoWorkerMode/>, and agreed doc-only/trivial post-review fixes.
 - `single` never commits. Loop and verbose modes create one
@@ -233,6 +233,8 @@ turn's final line names which one**:
 
 `— holding: waiting on <what is running>` · `gate: <name>` · `decision: <question>` ·
 `blocked: <cause>` · `done: run summary emitted`
+
+In idle update mode (<IdleUpdate/>), a turn with no text for nate carries this line only.
 
 The closed list:
 
@@ -337,7 +339,7 @@ To limit memory for the detached command, use this scope form.
 systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>
 ```
 
-`start` checks for a live twin before it applies `config/detached_runs.conf` `LIVE_RUN_LIMIT` to that worker.
+`start` checks for a live twin before it applies `config/detached_runs.conf` `live_run_limit` to that worker.
 At the limit, exit 4 starts nothing and names the live runs on stderr.
 Wait for a run's result as the next message, or put more files in one run.
 Exit 3 means the caller has no registered worker route; only that exit permits attached execution.
@@ -473,7 +475,7 @@ Use `<YYYY-MM-DDTHH:MM>` for a later day.
 State the time the recorder printed.
 
 Before every Codex poll, set `${PROGRESS_INTERVAL_SECONDS}` from
-`UNIT_PROGRESS_INTERVAL_SECONDS` in `~/.claude/config/direct.conf`.
+`unit_progress_interval_seconds` in `~/.claude/config/direct.conf`.
 It sets the Codex poll timeout. A missing or non-positive integer is an error;
 tell the user to set it. No timer sends reports: a report comes only when
 someone asks (2026-10-19).
@@ -504,7 +506,7 @@ Record each wait and hold, so the units board names the reason. User, 2026-11-15
   `--reason` says until what: `the user checks the review page`. Use the `--kind` of whoever keeps it.
 - Close the record with `progress_history.py finish-wait --session-dir "${SESSION_DIR}" --wait-id <id>` when the reason ends.
   `start-phase` of the target and the end of the run close it.
-- A wait for a worker, a gate, a build slot or build memory needs no record here; its own tools record it.
+- The tools record waits for workers, gates, numbered copies, and build memory.
 </WaitRecord>
 
 A requested status check — `/unit:report`, or a user or showrunner asking —
@@ -526,6 +528,10 @@ Read `~/.claude/docs/direct/authorization.md` in full when an action needs user 
 `<DecisionEconomy/>` is defined by this import, shared with every session:
 
 @~/.claude/docs/decision_criteria.md
+
+Your text to nate while he is away follows this import:
+
+@~/.claude/docs/idle_update.md
 
 <DecisionRouting>
 For every decision raised by review, repair, or phase review:
@@ -756,7 +762,7 @@ while another phase is open.
 already have been cleared by the validated successful release. If either state
 survives, the phase is not complete and this section must not run.
 
-In `single`, also run `finish-run --status completed`, then run <RunAsBuilt/>,
+In `single`, also run <RunAsBuilt/>, then run `finish-run --status completed`,
 apply <RetainPhaseReservation/>, report that no checkpoint release was
 attempted, run `bash ~/.claude/scripts/direct/end_session.sh`, and end. Other
 modes continue.

@@ -10,7 +10,7 @@ from typing import cast, override
 from scripts.direct.verify_mac_offload_test_support import (
     CARGO_STUB, RUNNER_STUB, VERIFY, VerifyMacOffloadFixture,
 )
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 
 
 FIXED_ENVIRONMENT = {
@@ -25,8 +25,8 @@ class VerifyResultEnvironmentTests(VerifyMacOffloadFixture):
         super().setUp()
         fixed = " ".join(f"{name}={value}" for name, value in FIXED_ENVIRONMENT.items())
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "direct.conf",
-                                 f"VERIFY_TEST_FIXED_ENV={fixed}\nVERIFY_RESULT_ENV_NAMES=NO_COLOR CLICOLOR RUST_LOG\n"
-                                 + "VERIFY_RESULT_ENV_PREFIXES=\n")
+                                 f"verify_test_fixed_env={fixed}\nverify_result_env_names=NO_COLOR CLICOLOR RUST_LOG\n"
+                                 + "verify_result_env_prefixes=\n")
         for name in ("NO_COLOR", "CLICOLOR"):
             _ = self.environment.pop(name, None)
         cargo = CARGO_STUB.replace(
@@ -77,7 +77,7 @@ Path(os.environ["TEST_RUNNER_STATE"], "remote-command").write_text(command)
 
     def test_empty_environment_policy_reaches_cargo_and_passes(self) -> None:
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "direct.conf",
-            "VERIFY_RESULT_ENV_NAMES=\nVERIFY_RESULT_ENV_PREFIXES=\nVERIFY_TEST_FIXED_ENV=\n")
+            "verify_result_env_names=\nverify_result_env_prefixes=\nverify_test_fixed_env=\n")
         result = self.verify("test", "sample", "--local", "Linux test")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.local_runs()), 1)
@@ -124,10 +124,10 @@ Path(os.environ["TEST_RUNNER_STATE"], "remote-command").write_text(command)
 
     def test_ssh_route_carries_result_values_and_fixed_terminal_values(self) -> None:
         settings = self.root / "linux.conf"
-        _ = write_config_fixture(settings, "offload=on\nhost=fake-linux\nslots=1\nkinds=test,check,doc\n", template="mac_test")
+        _ = write_config_fixture(settings, "offload=on\nhost=fake-linux\nkinds=test,check,doc\n", template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
             "targets=peer,natedev\nkind.peer=ssh\nplatform.peer=linux\nsettings.peer=linux.conf\n"
-            + "kind.natedev=local\nplatform.natedev=linux\n")
+            + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
         result = self.verify("test", "sample", "--target", "peer", extra={
             "NO_COLOR": "1", **{name: "caller" for name in FIXED_ENVIRONMENT},
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0",

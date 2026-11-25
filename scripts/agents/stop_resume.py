@@ -10,6 +10,8 @@ import math
 import os
 import argparse
 import json
+import select
+import socket
 import shlex
 import signal
 import sys
@@ -20,12 +22,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Collection, Generator, Mapping
-from contextlib import ExitStack, contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout, suppress
 from contextvars import ContextVar, copy_context
 from io import StringIO, TextIOWrapper
 from importlib import import_module
 from hashlib import sha256
-from functools import cached_property, partial
+from functools import cache, cached_property, partial
 from threading import Event, Lock
 from time import monotonic
 from types import MappingProxyType
@@ -51,6 +53,7 @@ from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.agents.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
 from scripts.production import staff
+from scripts.production.production_doc import EnrolledPaths, ProductionPathsError
 from scripts.lib.resume_message import (
     AccountMove, NO_ACCOUNT_MOVE, BusyPass, NO_OWN_PASS, WorkersHeld, launcher_prompt, worker_mode,
     ResumeWorkers as ResumeWorkers,
@@ -71,6 +74,7 @@ from scripts.message import sessions
 from scripts.agents.stop_results import shutdown_state_root
 
 if TYPE_CHECKING:
+    from scripts.accounts.unit_watchdog import RestartFailureNotice
     from scripts.agents.restart import StopReadArguments
     from scripts.herdr import worker_panes
     from scripts.notify.push_texts import RenderedPush
@@ -84,8 +88,6 @@ class LiveAccountUnproved(ResumeFailed):
 
 
 class RowStarter(Protocol):
-    def start_row(self, row: StaffRow, record: StaffSnapshot, client: herdr.Herdr, *,
-                  target_account: str | accounts.AccountSelection) -> str: ...
     def session_launch(self, identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]: ...
     def producer_launch(self, row: StaffRow) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]: ...
     def producer_resume(self, row: StaffRow, entry: pane_record.PaneLaunch
@@ -167,7 +169,7 @@ def _pending_producer_opening(name: str, saved: dict[str, object]) -> PendingPro
 
 
 def producer_folder(name: str) -> Path:
-    root = conf.read_or_repository("staff").text("PRODUCER_FOLDER_ROOT")
+    root = conf.read_or_repository("staff").text("producer_folder_root")
     return Path(root).expanduser() / name
 
 
@@ -178,7 +180,7 @@ def _producer_start_request(row: StaffRow) -> ProducerFirstStart:
 
 def _reserve_producer_pane(request: ProducerFirstStart, kind: Literal["claude", "codex"], home: Path,
                            client: herdr.Herdr) -> PendingProducerAdmission:
-    workspace = conf.read_or_repository("staff").text("PRODUCER_WORKSPACE")
+    workspace = conf.read_or_repository("staff").text("producer_workspace")
     environment = account_reader.named_account_environment(home) if kind == "claude" else {"CODEX_HOME": str(home)}
     prepared = herdr.prepare_agent_environment(str(request.folder), environment)
     if isinstance(prepared, nix_env.Refused):
@@ -492,7 +494,7 @@ def _confirm_producer_opening(request: ProducerFirstStart, opening: PendingProdu
                 raise OSError(reason(cursor.readability))
             proof = client.submit_opening_prompt(pending.pane, herdr.OpeningPrompt(
                 text, transcript, cursor=cursor, resend_once=resend),
-                opening.since, int(conf.read("shutdown").number("START_SECONDS") * 1000))
+                opening.since, int(conf.read("shutdown").number("start_seconds") * 1000))
             if isinstance(proof, herdr.PromptNotSubmitted):
                 state = cursor.readability
                 raise OSError(reason(state) if isinstance(state, UnprovedCodexRollout) and not resend else proof.reason)
@@ -631,7 +633,7 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
             client.run_in_pane(pending.pane, ["eval", herdr.agent_alias_script(kind) + shell_setup], terminal=pending.terminal)
             outcome = herdr.start_agent(client.session, pending.pane, kind,
                 trust_arguments(kind, str(request.folder), arguments), herdr.NoOpeningPrompt(),
-                int(conf.read("shutdown").number("START_SECONDS") * 1000), agent=request.name)
+                int(conf.read("shutdown").number("start_seconds") * 1000), agent=request.name)
             if isinstance(outcome, herdr.PromptNotSubmitted):
                 raise OSError(outcome.reason)
         entry = client.producer_admission_launch(pending.pane, kind)
@@ -712,17 +714,9 @@ _resume_names: ContextVar[LaunchNames | LaunchNamesNotRead] = ContextVar("resume
 _NO_SOURCE_ACCOUNTS: Mapping[str, str] = MappingProxyType({})
 _detached_moves: ContextVar[bool] = ContextVar("detached_moves", default=False)
 _move_resume: ContextVar[bool] = ContextVar("move_resume", default=False)
-_batch_process: ContextVar[bool] = ContextVar("batch_process", default=False)
-
-
-@dataclass(frozen=True)
-class BuildQueueUnreadable:
-    reason: str
-
-
-@dataclass(frozen=True)
-class BuildMoveDeferred(StopFailed):
-    """The director remains running until build ownership permits its automatic move."""
+# A user command checks a held row again after this time. A poll is necessary: flock has no timeout, and the
+# wait also watches the restart activity lock.
+_ROW_POLL_SECONDS = 0.2
 
 
 @dataclass(frozen=True)
@@ -746,6 +740,7 @@ class ResolvedMoveMember:
 class LockedMoveRow:
     session: str
     member: ResolvedMoveMember
+    identity: str
     lock: ExitStack
     marked_target: str = ""
 
@@ -775,27 +770,30 @@ class MoveStopTarget:
 
 @dataclass(frozen=True)
 class MoveRequestNotRecorded:
-    """The stop has no journal request."""
+    """There is no journal request for this stop."""
+
+
+class MoveRequestRefused(ValueError):
+    """The stop cannot proceed because it could not record a request."""
 
 
 @dataclass
 class MoveStopAttempt:
     target: MoveStopTarget
-    build_request: Callable[[], moves.RequestedMove | MoveRequestNotRecorded]
+    build_request: Callable[[], moves.RequestedMove]
     request: moves.RequestedMove | MoveRequestNotRecorded = field(default_factory=MoveRequestNotRecorded)
 
     @cached_property
-    def _prepared_request(self) -> moves.RequestedMove | MoveRequestNotRecorded:
+    def _prepared_request(self) -> moves.RequestedMove:
         return self.build_request()
 
     def record_request(self) -> None:
         try:
             request = self._prepared_request
-            if not isinstance(request, MoveRequestNotRecorded):
-                moves.append_move(request)
-                self.request = request
+            moves.append_move(request)
+            self.request = request
         except Exception as error:
-            print(f"{self.target.identity}: move log anomaly: {error}", file=sys.stderr)
+            raise MoveRequestRefused(f"could not record the move request: {error}") from error
 
 
 class StopTargetAtUse:
@@ -806,26 +804,34 @@ _move_stop_target: ContextVar[MoveStopAttempt | StopTargetAtUse] = ContextVar(
     "move_stop_target", default=StopTargetAtUse())
 
 
-@dataclass
-class MoveBatch:
-    id: str
-    members: dict[str, ResolvedMoveMember]
-    intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget
-    handed_off: bool = False
-    prior_failures: tuple[moves.MoveMember, ...] = ()
-    prior_finished: frozenset[str] = frozenset()
-    results: dict[str, MoveResult] = field(default_factory=dict)
-
-
 @dataclass(frozen=True)
 class DetachedMoveRequest:
+    request_id: str
     staff_members: frozenset[str]
-    pending: tuple[moves.MoveMember, ...] = ()
-    finished: frozenset[str] = field(default_factory=frozenset)
+    # The time that the parent user command waited before the handoff.
+    waited_seconds: float = 0.0
 
 
 class NewMoveRequest:
-    """The batch carries no results from another process."""
+    """The caller requests a new account move."""
+
+
+class LegacyMoveReport:
+    """A legacy report supplies display data only."""
+
+
+@dataclass
+class MoveBatch:
+    members: dict[str, ResolvedMoveMember]
+    intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget
+    origin: NewMoveRequest | DetachedMoveRequest | moves.PendingMoveRequest
+    target: str
+    request_id: str = field(default_factory=lambda: uuid4().hex)
+    results: dict[str, MoveResult] = field(default_factory=dict)
+    native_sessions: dict[str, str] = field(default_factory=dict)
+    user_command: bool = False
+    claimed: set[str] = field(default_factory=set)
+    started: float = 0.0
 
 
 _NEW_MOVE_REQUEST = NewMoveRequest()
@@ -969,6 +975,34 @@ def _stop_staff_row(record: StaffSnapshot, reference: str) -> StaffRow | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def stop_producer(identity: StaffId, why: str, *, deadline: float,
+                  save_exit_after_stop: bool = False) -> StopResult:
+    """Protect an intentional producer stop with a hold under the row lock."""
+    with staff.row_operation(identity):
+        row = staff.initial_snapshot().rows_by_id.get(identity)
+        if row is None or row.kind != "producer":
+            return SessionNotFound(identity)
+        machine = member_machine(row)
+        if machine and machine != remote.local_machine() and machine != remote.this_machine():
+            return StopFailed(str(row.current_session), f"session is on {machine}")
+        new_hold = not isinstance(row.exited, staff.Exited)
+        if new_hold:
+            if save_exit_after_stop:
+                _ = staff.pause(identity, why)
+            else:
+                _ = staff.exit(identity, why)
+        result = stop(identity, deadline=deadline)
+        if isinstance(result, (Stopped, NotRunning)) and result.session_id != row.current_session:
+            result = StopFailed(str(row.current_session), "the producer conversation changed before the stop")
+        if isinstance(result, (Stopped, NotRunning)):
+            shutdown_record.update(started=[], pending=[identity])
+            if new_hold and save_exit_after_stop:
+                _ = staff.exit(identity, why)
+        elif new_hold:
+            _ = staff.set_hold(identity, row.paused)
+        return result
+
+
 def _stop_recorded(session: str, kind: str = "", *,
                    codex: herdr.CodexConversations | None = None) -> StopResult:
     """Stop on purpose; retain its launch for an explicit resume, not crash recovery."""
@@ -1063,25 +1097,36 @@ def _retire_prompt(session_id: str) -> None:
 
 
 def stop_grace_seconds() -> float:
-    return float(conf.read("shutdown").text("STOP_GRACE_SECONDS"))
+    return float(conf.read("shutdown").text("stop_grace_seconds"))
 
 
-def stop_target(session: str) -> str | SessionNotFound | StopFailed:
+def stop_target(session: str, *, strict: bool = False) -> str | SessionNotFound | StopFailed:
     """Resolve the same local target for a stop and its preview."""
     try:
         try:
             record = staff.initial_snapshot()
         except (OSError, ValueError) as error:
+            if strict:
+                raise
             print(f"{session}: staff anomaly: {error}", file=sys.stderr)
             record = staff.StaffSnapshot(())
-        member = _stop_staff_row(record, session)
+        member = record.by_current_session(session) if strict else _stop_staff_row(record, session)
         if member is not None:
             return member.current_session
         registry = sessions.read_registry()
-        if any(session == row["sessionId"] for row in sessions.running_sessions(registry=registry)):
+        if strict:
+            live = sessions.session_liveness(session, registry=registry)
+            if isinstance(live, sessions.SessionLivenessUnknown):
+                return StopUnproved(session, live.reason)
+            if isinstance(live, sessions.LiveSessionProcess):
+                return session
+        elif any(session == row["sessionId"] for row in sessions.running_sessions(registry=registry)):
             return session
-        entries = pane_record.read(herdr.shared_session())
+        read_panes = pane_record.read_strict if strict else pane_record.read
+        entries = read_panes(herdr.shared_session())
         references = pane_launch.named_references(session, record, entries)
+        if strict:
+            references.intersection_update({pane_launch.NativeLaunchReference(session)})
         identities: set[str] = set()
         panes = herdr.Herdr(herdr.shared_session()).panes() if references else []
         for reference in references:
@@ -1116,11 +1161,14 @@ def _stop(session: str, kind: str = "", *,
     signal_pid = 0
     try:
         settings = conf.read("shutdown")
-        stop_grace, kill_grace = stop_grace_seconds(), float(settings.text("KILL_GRACE_SECONDS"))
+        stop_grace, kill_grace = stop_grace_seconds(), float(settings.text("kill_grace_seconds"))
         attempt = _move_stop_target.get()
         pinned = attempt.target if isinstance(attempt, MoveStopAttempt) else attempt
-        target = (pinned.identity if isinstance(pinned, MoveStopTarget)
-                  and isinstance(pinned.member.owner, pane_launch.StaffLaunchReference) else stop_target(session))
+        if isinstance(pinned, MoveStopTarget):
+            target = (pinned.identity if isinstance(pinned.member.owner, pane_launch.StaffLaunchReference)
+                      else stop_target(pinned.identity, strict=True))
+        else:
+            target = stop_target(session)
         if isinstance(target, (SessionNotFound, StopFailed)):
             return target
         if isinstance(pinned, MoveStopTarget):
@@ -1209,19 +1257,22 @@ NO_WORKERS_TO_KEEP_RUNNING: frozenset[StaffId] = frozenset()
 
 def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
                       codex: herdr.CodexConversations | None = None,
-                      keep_running: frozenset[StaffId] = NO_WORKERS_TO_KEEP_RUNNING) -> list[str]:
+                      keep_running: frozenset[StaffId] = NO_WORKERS_TO_KEEP_RUNNING,
+                      failures: dict[StaffId, str] | None = None) -> list[str]:
     """Stop the selected workers concurrently and retain every staff row."""
     from scripts.agents import worker_lifecycle
     from scripts.herdr import worker_panes
     from scripts.agents import restart
 
-    if not record.find(kind="worker", parent=unit):
+    members = [row for row in record.find(kind="worker", parent=unit) if row.id not in keep_running]
+    if not members:
         return []
     try:
         deadline = worker_lifecycle.effective_deadline()
         states = [state for state in worker_panes.observe(unit, record) if state.row.id not in keep_running]
-        unresolved = [f"{item.row.name}: {item.reason}" for item in states
-                      if isinstance(item, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker))]
+        failed = {item.row.id: item.reason for item in states
+                  if isinstance(item, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker))}
+        unresolved = [f"{item.row.name}: {failed[item.row.id]}" for item in states if item.row.id in failed]
         live = [item for item in states if isinstance(item, worker_panes.OpenWorker)]
         client = herdr.Herdr(herdr.shared_session())
         shared: StopReadArguments = {"codex": codex} if codex is not None else {}
@@ -1231,9 +1282,14 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
             for item, future in futures:
                 if not future.result():
                     unresolved.append(f"{item.row.name}: not proved stopped")
+                    failed[item.row.id] = "Could not confirm that the worker stopped"
     except (OSError, ValueError, herdr_types.HerdrFailure, SystemExit) as error:
-        unresolved = [f"{unit}: {' '.join(str(error).splitlines())}"]
+        reason = " ".join(str(error).splitlines())
+        unresolved = [f"{unit}: {reason}"]
+        failed = {row.id: reason for row in members}
         print(f"anomaly: {unresolved[0]}", file=sys.stderr)
+    if failures is not None:
+        failures.update(failed)
     return unresolved
 
 
@@ -1272,6 +1328,10 @@ def _pane_environment(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
     unset = ["HERDR_TAB_ID", "STAFF_ID", "STAFF_OPERATION_FD", "PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY",
              *sorted(key for key in os.environ.keys() | entry["environment"].keys() if key.startswith("STAFF_ROW_FD_"))]
     environment = {key: value for key, value in entry["environment"].items() if key not in unset}
+    implicit = pane_launch.implicit_claude_home(entry)
+    if isinstance(implicit, pane_launch.ImplicitClaudeHome):
+        unset.append("CLAUDE_CONFIG_DIR")
+        environment = implicit.environment(environment)
     environment = {**environment, "HERDR_PANE_ID": tab.pane_id,
                    "HERDR_WORKSPACE_ID": pane["workspace_id"], "RELAUNCH_PROMPT_DELIVERY": "pane"}
     return unset, environment
@@ -1293,9 +1353,11 @@ def _pane_command(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, ac
     """Build the account command for a shell in another pane."""
     unset, environment = _pane_environment(tab, entry)
     kind = pane_launch.saved_kind(entry)
+    implicit = pane_launch.implicit_claude_home(entry)
     if kind == "claude":
-        home = environment.get("CLAUDE_CONFIG_DIR") or str(_launch_home(entry).path)
-        herdr.trust_claude_launch(Path(entry["cwd"]), Path(home))
+        trust = (herdr.ClaudeTrustFile(implicit.settings_file) if isinstance(implicit, pane_launch.ImplicitClaudeHome)
+                 else Path(environment.get("CLAUDE_CONFIG_DIR") or _launch_home(entry).path))
+        herdr.trust_claude_launch(Path(entry["cwd"]), trust)
     program = [sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account]
     if kind == "codex":
         environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(_launch_home(entry).path)
@@ -1307,7 +1369,7 @@ def _pane_command(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, ac
 
 
 def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch,
-                      account: str, message: str) -> Never:
+                      account: str, message: str, *, codex_prompt: bool = False) -> Never:
     """Replace the foreground command with the saved account launch."""
     kind = pane_launch.saved_kind(entry)
     environment = accounts.launch_shell_environment(Path(entry["cwd"]))
@@ -1315,13 +1377,18 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
     environment.update(pane_environment)
     for key in unset:
         _ = environment.pop(key, None)
+    implicit = pane_launch.implicit_claude_home(entry)
     if kind == "claude":
-        prepared = accounts.prepare_claude_launch(account, resume=True)
-        for key in prepared.remove:
-            _ = environment.pop(key, None)
-        environment.update(prepared.variables)
-        home = environment.get("CLAUDE_CONFIG_DIR") or str(_launch_home(entry).path)
-        herdr.trust_claude_launch(Path(entry["cwd"]), Path(home))
+        if isinstance(implicit, pane_launch.ImplicitClaudeHome):
+            _ = environment.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            herdr.trust_claude_launch(Path(entry["cwd"]), herdr.ClaudeTrustFile(implicit.settings_file))
+        else:
+            prepared = accounts.prepare_claude_launch(account, resume=True)
+            for key in prepared.remove:
+                _ = environment.pop(key, None)
+            environment.update(prepared.variables)
+            home = environment.get("CLAUDE_CONFIG_DIR") or str(_launch_home(entry).path)
+            herdr.trust_claude_launch(Path(entry["cwd"]), Path(home))
     else:
         environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(_launch_home(entry).path)
     program = agent_program.resolve_program(kind, environment=environment)
@@ -1329,33 +1396,38 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
     if kind == "claude":
         arguments = models_registry.claude_arguments(arguments, environment)
     command = [program, *trust_arguments(kind, entry["cwd"], arguments)]
-    if message and kind == "claude":
+    if message and (kind == "claude" or codex_prompt):
         command.append(message)
     os.chdir(entry["cwd"])
     row = staff.initial_snapshot().by_member_reference(entry["session_id"])
     if row is not None and isinstance(row.exited, staff.Exited):
         _ = staff.resume(str(row.id))
-    selected_home = staff.SessionHome(Path(environment["CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR"]).absolute())
+    selected_home = (staff.SessionHome(implicit.config_dir) if isinstance(implicit, pane_launch.ImplicitClaudeHome)
+                     else staff.SessionHome(Path(environment["CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR"]).absolute()))
     if row is not None and row.home != selected_home:
         try:
             _ = staff.set_home(row.id, selected_home)
         except (staff.StaffUnreadable, staff.StaffNotFound) as error:
             print(f"anomaly: {row.id}: pane home is unavailable: {error}", file=sys.stderr)
     try:
+        if codex_prompt and row is not None and isinstance(row.paused, staff.Paused):
+            _ = staff.resume(str(row.id))
         os.execvpe(program, command, staff.child_environment(environment))
     except OSError:
         if row is not None and row.home != selected_home and isinstance(row.home, staff.SessionHome):
             _ = staff.set_home(row.id, row.home)
         if row is not None and isinstance(row.exited, staff.Exited):
             _ = staff.set_hold(str(row.id), row.exited)
+        if codex_prompt and row is not None and isinstance(row.paused, staff.Paused):
+            _ = staff.set_hold(str(row.id), row.paused)
         raise
 
 
-def _prompt_identity(client: herdr.Herdr, pane: str, deadline: float) -> str:
+def wait_for_native_session(client: herdr.Herdr, pane: str, deadline: float, *, kind: Literal["claude", "codex"]) -> str:
     """Wait for the pane to expose its native identity within the start deadline."""
     while True:
         try:
-            return client.native_session(pane, "claude", operation_deadline.remaining(max(0.001, deadline - monotonic())))
+            return client.native_session(pane, kind, operation_deadline.remaining(max(0.001, deadline - monotonic())))
         except (OSError, ValueError, subprocess.SubprocessError, herdr_types.HerdrFailure):
             remaining = deadline - monotonic()
             if remaining <= 0:
@@ -1368,8 +1440,8 @@ def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, a
     client = herdr.Herdr(herdr.shared_session())
     command = _pane_command(tab, entry, account)
     settings = conf.read("shutdown")
-    start_seconds = settings.number("START_SECONDS")
-    _ = settings.number("STAY_SECONDS")
+    start_seconds = settings.number("start_seconds")
+    _ = settings.number("stay_seconds")
     home = str(_launch_home(entry).path)
     transcript = herdr.SessionTranscript(Path(home), entry["session_id"])
     cursor: herdr.TranscriptCursor | herdr.UnspecifiedPromptTranscript = herdr.UnspecifiedPromptTranscript()
@@ -1394,7 +1466,7 @@ def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, a
     if not message:
         return live
     try:
-        identity = _prompt_identity(client, tab.pane_id, deadline)
+        identity = wait_for_native_session(client, tab.pane_id, deadline, kind="claude")
     except (OSError, ValueError, subprocess.SubprocessError, herdr_types.HerdrFailure) as error:
         print(f"{entry['session_id']}: prompt identity anomaly: {error}", file=sys.stderr)
         return live
@@ -1499,6 +1571,8 @@ def running_on_account(identity: str, pane_id: str, *, kind: str = "claude", cap
 
 def member_machine(member: StaffRow) -> str:
     """Return the member's recorded machine, or an empty string when unknown."""
+    if isinstance(member.launch_folder, staff.SessionLaunchFolder):
+        return member.launch_folder.machine
     location = member.worktree if isinstance(member.worktree, (staff.PresentWorktree, staff.RemovedWorktree)) else member.doc
     if isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree, staff.LiveDoc, staff.WrappedDoc)):
         return location.machine
@@ -1513,16 +1587,41 @@ def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
                    and reference.casefold() in row.name.casefold()})[:5]
 
 
+PAUSED_CONTINUATION = "Continue where you stopped."
+
+
 def resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
+           keep_workers: bool = False,
            client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
-    try:
-        settings = conf.read("shutdown")
-        for key in ("START_SECONDS", "STAY_SECONDS"):
-            _ = settings.number(key)
-    except conf.Unusable as error:
-        return ResumeFailed(session, str(error))
-    with staff.row_operation(session):
-        return _resume(session, why=why, to=to, requester=requester, client=client)
+    """Resume the director alone when keep_workers is true."""
+    with ExitStack() as locks:
+        try:
+            locks.enter_context(herdr.reboot_lock())
+            settings = conf.read("shutdown")
+            for key in ("start_seconds", "stay_seconds"):
+                _ = settings.number(key)
+        except (conf.Unusable, herdr.RebootLockBusy) as error:
+            return ResumeFailed(session, str(error))
+        with staff.row_operation(session):
+            return _resume(session, why=why, to=to, requester=requester, keep_workers=keep_workers, client=client)
+
+
+@dataclass(frozen=True)
+class StoppedOnPurpose:
+    name: str
+
+
+def resume_for_upkeep(identity: StaffId) -> ResumeResult | StoppedOnPurpose | None:
+    """Check for a restart or an exit hold under the row lock."""
+    with staff.row_operation(identity):
+        if shutdown_record.active():
+            return None
+        row = staff.initial_snapshot().rows_by_id.get(identity)
+        if row is None or row.kind != "producer":
+            return SessionNotFound(identity)
+        if isinstance(row.exited, staff.Exited) or isinstance(row.paused, staff.Paused):
+            return StoppedOnPurpose(row.name)
+        return resume(identity)
 
 
 def resend_producer_opening(name: str, *, to: str = "") -> ResumeResult:
@@ -1558,20 +1657,24 @@ def _unrecorded_codex_launch(identity: str) -> pane_record.PaneLaunch | SessionN
 
 
 def _resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
+            keep_workers: bool = False,
             client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     names = LaunchNames.read()
-    result = _resume_from_names(session, names, why=why, to=to, requester=requester, client=client)
-    if isinstance(result, ClaudeUp):
+    result = _resume_from_names(session, names, why=why, to=to, requester=requester, keep_workers=keep_workers, client=client)
+    if isinstance(result, ClaudeUp) and not keep_workers:
         members = [row for row in names.tab_record.rows
                    if row.current_session == result.session_id or row.id == session or row.name == session]
         if len(members) == 1:
-            with staff.row_operation(str(members[0].id)):
-                shutdown_record.remove_started([str(members[0].id)])
+            member = members[0]
+            with staff.row_operation(str(member.id)):
+                if member.kind == "producer" and isinstance(member.exited, staff.Exited):
+                    _ = staff.resume(str(member.id))
+                shutdown_record.remove_started([str(member.id)])
     return result
 
 
 def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | None, requester: str,
-                       client: herdr.Herdr | herdr.LaunchClientSource) -> ResumeResult:
+                       keep_workers: bool, client: herdr.Herdr | herdr.LaunchClientSource) -> ResumeResult:
     record = names.tab_record
     retired = next((row for row in record.retired_producers if session in (row.name, row.id, row.current_session)), None)
     if retired is not None:
@@ -1585,7 +1688,9 @@ def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | 
         member = matches[0]
         machine = member_machine(member)
         if machine and machine != remote.local_machine():
-            return ResumeFailed(session, f"session is on {machine}")
+            route = remote.machine_alias(machine)
+            if not isinstance(route, remote.MachineAlias) or route.alias != remote.this_machine():
+                return ResumeFailed(session, f"session is on {machine}")
         if member.kind == "producer":
             try:
                 saved = producer_creation.read_record(producer_creation.record_path(member.name))
@@ -1624,7 +1729,7 @@ def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | 
             return ResumeFailed(session, "ambiguous name; candidates: " + ", ".join(identities))
         if identities:
             session = identities[0]
-    result = _resume_once(session, why=why, to=to, requester=requester, names=names, client=client)
+    result = _resume_once(session, why=why, to=to, requester=requester, names=names, keep_workers=keep_workers, client=client)
     if isinstance(result, SessionNotFound) and not matches:
         nearby = _nearby_resume_names(session, names)
         suffix = "; candidates: " + ", ".join(nearby) if nearby else ""
@@ -1651,7 +1756,7 @@ def _unit_resume_owner(production: str, unit: str, record: StaffSnapshot) -> uni
     owner = unit_lookup.checked_unit(production, unit, record=record)
     if not isinstance(owner, unit_lookup.NonAgentPaneHolders):
         return owner
-    seconds = conf.read("shutdown").number("HOLDER_EXIT_SECONDS")
+    seconds = conf.read("shutdown").number("holder_exit_seconds")
     deadline = monotonic() + operation_deadline.remaining(seconds)
     wait = Event()
     while isinstance(owner, unit_lookup.NonAgentPaneHolders):
@@ -1669,8 +1774,19 @@ def _unit_resume_owner(production: str, unit: str, record: StaffSnapshot) -> uni
     return owner
 
 
+def _enrolled_showrunner_worker(row: staff.StaffRow, record: staff.StaffSnapshot) -> bool:
+    if row.kind != "worker":
+        return False
+    owner = record.parent_of(row)
+    if owner is None or owner.kind != "showrunner":
+        return False
+    from scripts.herdr.worker_panes import enrolled_worker_owner
+
+    return isinstance(enrolled_worker_owner(owner), EnrolledPaths)
+
+
 def _resume_once(session: str, *, why: str, to: str | None = None, requester: str = "",
-                 names: LaunchNames,
+                 names: LaunchNames, keep_workers: bool = False,
                  client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     began = monotonic()
     identity = session
@@ -1759,20 +1875,29 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     return ResumeFailed(identity, "a unit owner is still live")
                 case unit_lookup.ProvedAbsentUnit():
                     pass
-        mode = worker_mode() if row is not None else NO_WORKERS
+        mode = worker_mode() if row is not None and not keep_workers else NO_WORKERS
         if isinstance(mode, WorkersHeld) and row is not None and row.kind == "worker" and kind == "codex":
             return ResumeFailed(identity, "no-worker mode keeps Codex workers stopped")
-        if entry is None:
-            if row is None:
-                return SessionNotFound(session)
-            restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
-            pane = restart.start_row(row, names.tab_record, client, target_account=to or "")
+        if row is None and entry is None:
+            return SessionNotFound(session)
+        if row is not None and (entry is None or _enrolled_showrunner_worker(row, names.tab_record)):
+            from scripts.agents import restart
+
+            if keep_workers:
+                pane = restart.start_row(row, names.tab_record, client, target_account=to or "",
+                                         worker_scope=restart.WorkerRestartScope.SELECTED_ROWS)
+            else:
+                pane = restart.start_row(row, names.tab_record, client, target_account=to or "")
             result = running_on_account(identity, pane, kind=kind)
             if isinstance(result, ClaudeUp):
                 return replace(result, elapsed_seconds=monotonic() - began, start_state=ClaudeStartState.STARTED)
             return ResumeFailed(identity, "session did not start") if isinstance(result, sessions.SessionNotLive) else result
+        assert entry is not None
+        from scripts.worktree import worktrees
+
         entry = entry.copy()
         entry["session_id"] = identity
+        entry["cwd"] = str(worktrees.moved_launch_folder(Path(entry["cwd"])))
         entry["environment"] = names.environment(entry)
 
         source = pane_launch.config_home(entry, record=names.tab_record)
@@ -1782,14 +1907,21 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         else:
             print(f"anomaly: {identity}: session home is unknown; select the normal account", file=sys.stderr)
         selected = member_account.resume_account(kind, row if row is not None else SESSION_WITHOUT_STAFF_ROW, to=to or "")
+        implicit = member_account.implicit_claude_resume(
+            row if row is not None else SESSION_WITHOUT_STAFF_ROW, entry, to or "")
         copied_from = ""
         if isinstance(selected, accounts.CodexWorkersAccount):
             target_dir, label = selected.home, selected.label
             account_environment = {"CODEX_HOME": str(target_dir)}
         else:
             target_dir, label = selected.dir, selected.label
-            account_environment = account_reader.named_account_environment(target_dir)
-        entry["environment"] = {**entry["environment"], **account_environment}
+            account_environment = ({} if isinstance(implicit, pane_launch.ImplicitClaudeHome)
+                                   else account_reader.named_account_environment(target_dir))
+        if isinstance(implicit, pane_launch.ImplicitClaudeHome):
+            entry["environment"] = implicit.environment(entry["environment"])
+        else:
+            _ = entry.pop("implicit_claude_home", None)
+            entry["environment"] = {**entry["environment"], **account_environment}
         if row is not None and row.kind == "producer":
             expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(entry["cwd"]), target_dir)
             entry["environment"] = expectation.environment(entry["environment"])
@@ -1848,11 +1980,13 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 detached = detached_runs.resume_context(run / detached_runs.DETACHED_RUNS_DIR, row.name)
             elif isinstance(mode, WorkersHeld):
                 workers = mode
-            elif row is not None:
+            elif row is not None and not keep_workers:
                 workers = worker.resume_workers(row.id, names.tab_record)
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
-        if isinstance(own, worker.UnsubmittedAssignment):
+        if keep_workers:
+            message = ""
+        elif isinstance(own, worker.UnsubmittedAssignment):
             message = launcher_prompt(row.id, own.dispatch_id, own.command) if row is not None else ""
             if detached:
                 message += "\n" + detached
@@ -1874,6 +2008,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     entries[tab.pane_id] = pending
                     pane_record.save(client.session, entries)
             attempt_pane = tab.pane_id
+            if keep_workers:
+                _exec_in_own_pane(tab, entry, label, script_prompt(PAUSED_CONTINUATION), codex_prompt=True)
             _exec_in_own_pane(tab, entry, label, message)
         started: herdr.AgentLaunched | sessions.LiveSessionProcess
         if kind == "codex":
@@ -1883,7 +2019,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             attempt_pane = tab.pane_id
             launched = herdr.launch_prepared_agent(client.session, herdr.ExistingPane(tab.pane_id, ""), prepared, kind,
                 trust_arguments(kind, entry["cwd"], resume_arguments(entry)), herdr.NoOpeningPrompt(),
-                int(operation_deadline.remaining(conf.read("shutdown").number("START_SECONDS")) * 1000),
+                int(operation_deadline.remaining(conf.read("shutdown").number("start_seconds")) * 1000),
                 agent=entry["name"] or identity, client=client)
             if isinstance(launched.outcome, herdr.PromptNotSubmitted):
                 raise herdr_types.HerdrFailure(launched.outcome.reason)
@@ -1926,7 +2062,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         if not _move_resume.get():
             _watch_resume(identity, tab.pane_id, label, started, requester, why)
         return ClaudeUp(identity, tab.pane_id, label, monotonic() - began, copied_from)
-    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, ProductionPathsError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         if original is not None and attempt_pane:
             try:
                 cleanup_client = herdr.Herdr(herdr.shared_session())
@@ -1964,9 +2100,51 @@ def _watch_resume(identity: str, pane: str, account: str,
 
 
 _STOP_RESUME_PROGRAM = Path(__file__).resolve()
+_DETACHED_START_SECONDS = 15
 
 
-def _detach(arguments: list[str], task: str, *, program: Path = _STOP_RESUME_PROGRAM) -> Path:
+def _with_options(command: list[str], *options: str) -> list[str]:
+    """Put options before the `--` that starts the session list, so the parser does not read them as sessions."""
+    boundary = command.index("--") if "--" in command else len(command)
+    return [*command[:boundary], *options, *command[boundary:]]
+
+
+def _launch_mac_with_log(command: list[str], environment: dict[str, str], log_fd: int) -> None:
+    read_fd, ready_fd = os.pipe()
+    try:
+        try:
+            _ = subprocess.Popen(_with_options(command, "--ready-fd", str(ready_fd)), env=environment,
+                                 start_new_session=True,
+                                 stdin=subprocess.DEVNULL, stdout=log_fd, pass_fds=(ready_fd,))
+        finally:
+            os.close(ready_fd)
+        if not select.select([read_fd], [], [], _DETACHED_START_SECONDS)[0]:
+            raise subprocess.TimeoutExpired(command, _DETACHED_START_SECONDS)
+        if not os.read(read_fd, 1):
+            raise OSError("The detached process exited before it confirmed the log claim")
+    finally:
+        os.close(read_fd)
+
+
+def notify_ready(ready_fd: int | None, *, systemd: bool) -> None:
+    """Confirm the start of a detached process to the parent that waits in `_detach`."""
+    if ready_fd is not None:
+        try:
+            with suppress(BrokenPipeError):
+                _ = os.write(ready_fd, b"1")
+        finally:
+            os.close(ready_fd)
+    if systemd:
+        address = os.environ.pop("NOTIFY_SOCKET", "")
+        if not address:
+            raise OSError("The systemd readiness socket is unavailable because NOTIFY_SOCKET is missing")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notifier:
+            notifier.connect("\0" + address[1:] if address.startswith("@") else address)
+            _ = notifier.send(b"READY=1")
+
+
+def _detach(arguments: list[str], task: str, *, program: Path = _STOP_RESUME_PROGRAM, log: Path | None = None,
+            log_fd: int | None = None) -> Path:
     """Run lifecycle work outside the caller's stop boundary."""
     from scripts.production import showrunners
 
@@ -1974,15 +2152,29 @@ def _detach(arguments: list[str], task: str, *, program: Path = _STOP_RESUME_PRO
     if "--requester" not in arguments:
         requester = showrunners.own_name()
         options = ["--requester", requester]
-        boundary = arguments.index("--") if "--" in arguments else len(arguments)
-        arguments = [*arguments[:boundary], *options, *arguments[boundary:]]
-    logs = shutdown_state_root() / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    log = logs / f"{task}-{uuid4().hex}.log"
+        arguments = _with_options(arguments, *options)
+    if log is None:
+        logs = shutdown_state_root() / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        log = logs / f"{task}-{uuid4().hex}.log"
     environment = dict(os.environ)
     _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
-    command = [sys.executable, str(program), arguments[0], "--log", str(log), *arguments[1:]]
-    if sys.platform == "darwin":
+    log_options = ["--log", str(log)]
+    if log_fd is not None:
+        log_options.extend(("--log-fd", "1"))
+    command = [sys.executable, str(program), arguments[0], *log_options, *arguments[1:]]
+    if log_fd is not None:
+        if sys.platform == "darwin":
+            _launch_mac_with_log(command, environment, log_fd)
+        else:
+            # Keep the descriptor open until the child claims the log.
+            source = f"/proc/{os.getpid()}/fd/{log_fd}"
+            _ = subprocess.run(["systemd-run", "--user", "--collect", "--quiet", "--service-type=notify",
+                                "--expand-environment=no", f"--property=StandardOutput=append:{source}",
+                                "--property=StandardError=journal", "--property=UnsetEnvironment=CLAUDE_CODE_SESSION_ID",
+                                *_with_options(command, "--notify-systemd")], env=environment, stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, check=True, timeout=_DETACHED_START_SECONDS)
+    elif sys.platform == "darwin":
         _ = subprocess.Popen(command, env=environment, start_new_session=True,
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
@@ -1997,29 +2189,30 @@ detach = _detach
 
 
 def _handoff_batch(selected: list[str], target: str, why: str, warn_seconds: int, cause: moves.MoveCause,
-                   source_accounts: Mapping[str, str] = _NO_SOURCE_ACCOUNTS) -> None:
+                   source_accounts: Mapping[str, str]) -> None:
     batch = _move_batch.get()
-    references = {session: batch.members[session] for session in selected}
-    completed = {session: result for session, result in batch.results.items() if session not in references}
-    destination = ("--group", batch.intent.group) if isinstance(batch.intent, moves.FollowGroupAccount) else ("--target", target)
-    _ = _detach(["batch", *destination, "--why", why, "--cause", cause, "--warn-seconds", str(warn_seconds),
-                 "--move-id", batch.id,
-                 *(arg for member in references.values() if isinstance(member.owner, pane_launch.StaffLaunchReference)
-                   for arg in ("--staff-member", member.reference)),
-                 *(arg for member in _members_needing_help(completed, batch).values()
-                   for arg in ("--needs-help", json.dumps([member.reference, member.name]))),
-                 *(arg for reference in sorted(_finished_members(completed, batch)) for arg in ("--finished", reference)),
-                 *(arg for session, member in references.items() if (label := source_accounts.get(session))
-                   for arg in ("--source-account", f"{member.reference}={label}")),
-                 "--", *(member.reference for member in references.values())], "move")
-    batch.handed_off = True
+    identities = {session: batch.native_sessions[session] for session in selected}
+    group = ("--group", batch.intent.group) if isinstance(batch.intent, moves.FollowGroupAccount) else ()
+    group_scope = ("--explicit-group-scope",) if batch.intent is moves.ExplicitMoveTarget.GROUP_ACCOUNT else ()
+    user = ("--user-command", "--waited-seconds", f"{monotonic() - batch.started:.3f}") if batch.user_command else ()
+    logs = shutdown_state_root() / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    log = logs / f"move-{uuid4().hex}.log"
+    # The parent waits until the child confirms its start; the child takes the claims before it confirms.
+    with log.open("ab") as stream:
+        _ = _detach(["batch", "--target", target, *group, *group_scope, *user, "--why", why, "--cause", cause,
+                     "--warn-seconds", str(warn_seconds), "--request-id", batch.request_id,
+                     *(arg for session, identity in identities.items() if (label := source_accounts.get(session))
+                       for arg in ("--source-account", f"{identity}={label}")),
+                     "--", *identities.values()], "move", log=log, log_fd=stream.fileno())
 
 
 def _handoff_locked_moves(selected: Mapping[str, str], locks: Mapping[str, LockedMoveRow], target: str,
                           why: str, warn_seconds: int, cause: moves.MoveCause,
                           sources: Mapping[str, str]) -> dict[str, MoveResult]:
     for session in selected:
-        locks[session].lock.close()
+        if session in locks:
+            locks[session].lock.close()
     try:
         _handoff_batch(list(selected), target, why, warn_seconds, cause, sources)
     except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
@@ -2031,7 +2224,7 @@ def _check_stay(identity: str, pane: str, account: str, pid: int, generation: st
                 requester: str = "", why: str = "") -> str:
     """Observe the started generation after the command returns; recovery belongs to the watchdog."""
     settings = conf.read("shutdown")
-    stay_seconds = settings.number("STAY_SECONDS")
+    stay_seconds = settings.number("stay_seconds")
     began = monotonic()
     while _same_process(pid, generation):
         remaining = stay_seconds - (monotonic() - began)
@@ -2042,12 +2235,12 @@ def _check_stay(identity: str, pane: str, account: str, pid: int, generation: st
                        generation=generation)
 
 
-def _send_move_push(push: RenderedPush, key: str) -> None:
+def _send_move_push(push: RenderedPush, key: str) -> bool:
     from scripts.message import send_budget, send_result
     from scripts.notify import push_texts, review
 
     try:
-        window = conf.read("shutdown").whole("MOVE_ALERT_REPEAT_MINUTES")
+        window = conf.read("shutdown").whole("move_alert_repeat_minutes")
         limit = review.user_send_seconds()
         command = push_texts.user_send_argv(push, key=key, timeout=limit)
         command.extend(("--repeat-minutes", str(window)))
@@ -2055,11 +2248,23 @@ def _send_move_push(push: RenderedPush, key: str) -> None:
                               timeout=send_budget.user_seconds(limit))
     except (OSError, ValueError, subprocess.SubprocessError):
         print("shutdown: could not send the move result", file=sys.stderr)
-        return
+        return False
     result = send_result.send_outcome(done.returncode, done.stdout)
     if not (isinstance(result, send_result.ConfirmedSendOutcome) and
             result.header.outcome in ("sent", "skipped", "kept", "replaced")):
         print("shutdown: the sender did not confirm the move result", file=sys.stderr)
+        return False
+    return True
+
+
+def send_restart_failure(identity: str, notice: RestartFailureNotice) -> bool:
+    from scripts.notify.push_texts import render
+
+    account = notice["account"]
+    generation = notice["generation"]
+    key = sha256(f"{identity}\0{account}\0{generation}".encode()).hexdigest()
+    return _send_move_push(render("shutdown.restart_failed", account=account, session=notice["session"],
+                                  identity=identity, reference=notice["reference"]), f"resume-ended:{key}")
 
 
 def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, requester: str = "",
@@ -2067,7 +2272,6 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
     """Build one actionable outcome for the showrunner, user push and stay log."""
     from scripts.production import showrunners, staff_sources
     from scripts.accounts import unit_watchdog
-    from scripts.notify.push_texts import render
 
     try:
         record = staff.snapshot()
@@ -2075,18 +2279,27 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
         print(f"{identity}: staff anomaly: {error}", file=sys.stderr)
         record = staff.StaffSnapshot(())
     row = record.by_current_session(identity)
-    entry = pane_record.read(herdr.shared_session()).get(pane)
+    entries = pane_record.read(herdr.shared_session())
+    entry = entries.get(pane)
     entry = entry if entry and (pane_launch.reference_id(entry) == identity
         or row is not None and record.by_member_reference(pane_launch.reference_id(entry)) == row) else None
     environment = entry["environment"] if entry else {}
-    name = row.name if row is not None else str(entry.get("name", "")) if entry else ""
-    name = name or identity
+    session_name = row.name if row is not None else str(entry.get("name", "")) if entry else ""
+    name = session_name or identity
     unit = row.name if row is not None and row.kind == "unit" else ""
+    notice = None
+    if not _move_resume.get() and environment.get(PROBE_ENV) != "1":
+        unique = bool(session_name) and len(pane_launch.named_references(session_name, record, entries)) == 1
+        reserved = any(session_name == producer.name for producer in record.retired_producers)
+        reference = session_name if unique and not reserved else identity
+        notice = unit_watchdog.RestartFailureNotice(account=account, generation=generation,
+                                                    session=session_name, reference=reference)
+    exited = unit_watchdog.ExitRecovery(identity, notice)
     if unit:
         try:
-            recovery = unit_watchdog.run(datetime.now(timezone.utc), dry_run=False)
+            recovery = unit_watchdog.run(datetime.now(timezone.utc), dry_run=False, exited=exited)
             next_step = "; ".join(recovery) if recovery else "watchdog reported no recovery action"
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
             next_step = f"watchdog could not recover it: {error}"
     else:
         command = "agents resume " + shlex.join([name, "--to", account, "--why", why or "retry after early exit"])
@@ -2099,11 +2312,8 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
             print(showrunners.tell(name, f"resume-ended-{identity}-{uuid4().hex}", cause, sender="shutdown"))
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"{identity}: could not tell showrunner: {error}")
-    if not _move_resume.get() and environment.get(PROBE_ENV) != "1":
-        key = sha256(f"{identity}\0{account}\0{generation}".encode()).hexdigest()
-        _send_move_push(render("shutdown.restart_failed", account=account, machine=remote.local_machine(),
-                               stopped=(row.name if row is not None else str(entry.get("name", "")) if entry else "") or "one session",
-                               cause=cause), f"resume-ended:{key}")
+    if notice is not None and not exited.managed:
+        _ = send_restart_failure(identity, notice)
     return cause
 
 
@@ -2117,11 +2327,9 @@ def _warn_session(session: str, target: str, why: str, seconds: int) -> None:
 
 
 def _prepare_move_request(reference: str, plan: MoveStopTarget, target: str, why: str, cause: moves.MoveCause,
-                          fallback_source: str, names: LaunchNames | LaunchNamesNotRead
-                          ) -> moves.RequestedMove | MoveRequestNotRecorded:
+                          fallback_source: str, names: LaunchNames, *,
+                          intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget) -> moves.RequestedMove:
     """Build a request from the proved live source or the retained source."""
-    if isinstance(names, LaunchNamesNotRead):
-        return MoveRequestNotRecorded()
     source = plan.source.session.account if isinstance(plan.source, LiveMoveSource) else fallback_source
     row = plan.member.staff_row(names.tab_record)
     identity = plan.identity
@@ -2143,7 +2351,8 @@ def _prepare_move_request(reference: str, plan: MoveStopTarget, target: str, why
             print(f"anomaly: {identity}: session home is unknown; retain the normal source account", file=sys.stderr)
     return {"kind": "requested", "at": datetime.now(timezone.utc).isoformat(),
         "move_id": uuid4().hex, "tool": tool, "subject": f"{identity}: {row.name}" if row is not None else reference,
-        "from": previous, "to": target, "why": why, "window": "unknown", "cause": cause}
+        "from": previous, "to": target, "why": why, "window": "unknown", "cause": cause,
+        "scope": "session" if intent is moves.ExplicitMoveTarget.REQUESTED_ACCOUNT else "group"}
 
 
 def _record_move_outcome(request: moves.RequestedMove, result: ClaudeUp | StopFailed | SessionNotFound | ResumePending) -> None:
@@ -2205,130 +2414,198 @@ def _resume_move(identity: str, target: str, requester: str, why: str, began: fl
         _move_resume.reset(token)
 
 
-def _verify_build_holders(selected: list[str]) -> dict[str, tuple[str, ...]] | BuildQueueUnreadable:
-    """Keep live verify calls, including calls that have not entered the admission queue."""
-    from scripts.build_hold.owning_session import OwningSession, RunNotInStaff, RunOwner, owning_session, run_resolution
-    from scripts.direct import step_record
-    from scripts.lib import process_start
+def _owns_detached_request(identity: str, request_id: str) -> bool:
+    return _is_request(moves.read_latest_request(identity), request_id)
 
-    directory = step_record.record_directory()
+
+def _is_request(current: moves.LatestMoveRequest | moves.NoLatestMoveRequest, request_id: str) -> bool:
+    return isinstance(current, moves.LatestMoveRequest) and current.request_id == request_id
+
+
+def _move_lock_command(batch: MoveBatch, identity: str, target: str) -> str:
+    # The child of a user command removes its claim at the limit, so a retry finds nothing; it gives the batch command.
+    if isinstance(batch.origin, NewMoveRequest) or (batch.user_command and isinstance(batch.origin, DetachedMoveRequest)):
+        destination = batch.intent if isinstance(batch.intent, moves.FollowGroupAccount) else target
+        return moves.batch_move_command(identity, destination, user_command=batch.user_command)
+    return moves.RETRY_COMMAND
+
+
+def _move_claim(batch: MoveBatch, target: str) -> moves.LatestMoveRequest:
+    destination = f"group:{batch.intent.group}" if isinstance(batch.intent, moves.FollowGroupAccount) else target
+    return moves.LatestMoveRequest(batch.request_id, destination,
+                                   explicit_group_scope=batch.intent is moves.ExplicitMoveTarget.GROUP_ACCOUNT,
+                                   owner=_own_claim_owner() if batch.user_command else None)
+
+
+@cache
+def _own_claim_owner() -> moves.ClaimOwner:
+    return moves.own_claim_owner()
+
+
+@dataclass(frozen=True)
+class RowHeld:
+    """Another operation holds a row that a user command needs; the command takes the row when it is free."""
+
+    session: str
+    member: ResolvedMoveMember
+    identity: str
+    reason: str
+    holder: str
+
+
+def _hold_row(session: str, member: ResolvedMoveMember, identity: str, target: str, reason: str, holder: str
+              ) -> RowHeld | moves.MoveSuperseded:
+    """Claim a held row for a user command at its first try; a later try ends when the claim is missing or replaced.
+
+    A move that holds the row reads the latest request before its stop and drops the row as superseded.
+    Only a newer move removes or replaces the claim, so the command then stops its wait for the row.
+    """
+    batch = _move_batch.get()
+    batch.native_sessions[session] = identity
+    held = RowHeld(session, member, identity, reason, holder)
+    retry = batch.origin
+    claim = _move_claim(batch, target)
     try:
-        paths = sorted(path for path in directory.iterdir() if path.suffix == ".json")
-    except FileNotFoundError:
-        return {}
-    except OSError as error:
-        return BuildQueueUnreadable(f"verify records are unreadable: {error}")
-    owned: dict[str, list[str]] = {}
-    for path in paths:
-        record = step_record.read(path.stem)
-        if isinstance(record, (step_record.MissingRecord, step_record.StaleRecord)):
-            continue
-        if isinstance(record, step_record.UnreadableRecord):
-            return BuildQueueUnreadable(f"verify call {record.call_id} is unreadable: {record.reason}")
+        if identity in batch.claimed:
+            return held if _owns_detached_request(identity, batch.request_id) else moves.MoveSuperseded(identity)
+        if isinstance(retry, DetachedMoveRequest):
+            # The child takes the claim of its parent, so the claim lives while the child waits.
+            if not moves.set_claim_owner(identity, batch.request_id, _own_claim_owner()):
+                return moves.MoveSuperseded(identity)
+        else:
+            with moves.claim_lock():
+                if isinstance(retry, moves.PendingMoveRequest) and moves.read_latest_request(identity) != retry.request:
+                    return moves.MoveSuperseded(identity)
+                name = retry.member.name if isinstance(retry, moves.PendingMoveRequest) else member.name
+                moves.write_latest_request(identity, claim, name=name)
+        batch.claimed.add(identity)
+    except (OSError, ValueError) as error:
+        print(f"{identity}: cannot write or read the move request before the row is free: {error}", file=sys.stderr)
+    return held
+
+
+def _restart_holds(row_id: str) -> bool:
+    """A restart holds each row in its record from the stop to the start, also in the gap where it holds no row lock."""
+    return shutdown_record.active() and row_id in shutdown_record.read()
+
+
+def _restart_held_row(session: str, member: ResolvedMoveMember, identity: str, target: str, *, user_command: bool
+                      ) -> RowHeld | moves.MoveSuperseded | moves.MoveInProgress | moves.MoveWaitingForRow:
+    reason = "a restart holds this row"
+    if user_command:
+        return _hold_row(session, member, identity, target, reason, "")
+    return _held_row_result(session, member, identity, target, reason, "")
+
+
+def _end_user_claims(held: Mapping[str, RowHeld]) -> None:
+    """End each claim of a user command when the command ends, also when its process lives on.
+
+    The command removes the claim of a row that it never took, so that no other path replays it.
+    A retry keeps that request, because it replaced the pending move.
+    Any other request that the command leaves stays for a retry as a plain request.
+    """
+    batch = _move_batch.get()
+    untaken = {row.identity for row in held.values()}
+    for identity in sorted(batch.claimed):
         try:
-            if sys.platform == "darwin":
-                result = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(record.pid)],
-                    capture_output=True, text=True, timeout=5, check=False)
-                if result.returncode or "HOME=" not in result.stdout:
-                    raise OSError("process environment is unreadable")
-                entries = result.stdout.split()
+            if identity in untaken and not isinstance(batch.origin, moves.PendingMoveRequest):
+                moves.remove_latest_request(identity, batch.request_id)
             else:
-                proc = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
-                entries = (proc / str(record.pid) / "environ").read_bytes().decode(errors="replace").split("\0")
-            environment = dict(entry.split("=", 1) for entry in entries if "=" in entry)
-            resolution = run_resolution(environment)
-            if isinstance(resolution, RunNotInStaff):
-                owner, reason = "", f"named run owner cannot be resolved: {resolution.run}"
-            else:
-                resolved = (OwningSession(resolution.session_id) if isinstance(resolution, RunOwner)
-                            else owning_session(environment))
-                owner = resolved.session_id if isinstance(resolved, OwningSession) else ""
-                reason = "verify call has no readable session identity" if not owner else ""
-        except (OSError, subprocess.SubprocessError) as error:
-            owner, reason = "", str(error)
-        # The environment belongs to this call only while its saved process identity still matches.
-        current = process_start.process_start(record.pid)
-        if isinstance(current, (process_start.Gone, process_start.Zombie)):
-            continue
-        if isinstance(current, process_start.Started) and current.start != record.proc_start:
-            continue
-        if isinstance(current, process_start.Unreadable):
-            return BuildQueueUnreadable(f"verify call {record.call_id} identity is unreadable: {current.reason}")
-        if reason:
-            return BuildQueueUnreadable(f"verify call {record.call_id}: {reason}")
-        if owner in selected:
-            owned.setdefault(owner, []).append(f"verify.sh {record.kind} in {record.repo}")
-    return {owner: tuple(steps) for owner, steps in owned.items()}
+                _ = moves.set_claim_owner(identity, batch.request_id, None)
+        except (OSError, ValueError) as error:
+            print(f"{identity}: cannot end the move request: {error}", file=sys.stderr)
 
 
-def _build_holders(sessions: list[str]) -> dict[str, tuple[str, ...]] | BuildQueueUnreadable:
-    """Name the running, waiting and cloud build steps that each session owns in the admission queue."""
-    from scripts.build_queue import admission_client, admission_protocol as wire
-
-    try:
-        reading = admission_client.view()
-    except wire.AdmissionUnavailable as error:
-        return BuildQueueUnreadable(str(error) or "no answer")
-    owned: dict[str, list[str]] = {}
-    steps = [*((step.session_id, step.step, step.folder) for step in reading.view.running),
-             *((step.session_id, step.step, step.folder) for step in reading.view.waiting),
-             *((row.identity.session_id, row.identity.step, row.identity.folder)
-               for row in (reading.cloud if isinstance(reading, wire.CloudQueueRead) else ()))]
-    for session, step, folder in steps:
-        if session in sessions:
-            owned.setdefault(session, []).append(f"{step} in {folder}" if folder else step)
-    verify = _verify_build_holders(sessions)
-    if isinstance(verify, BuildQueueUnreadable):
-        return verify
-    for session, names in verify.items():
-        owned.setdefault(session, []).extend(names)
-    return {session: tuple(names) for session, names in owned.items()}
+def _hung_holder_seconds(settings: conf.ConfigRead) -> float:
+    """Limit the wait for a holder that is hung: one stop and one start of a restart, a resume or a move."""
+    stop = (settings.whole("stop_grace_seconds") + settings.whole("kill_grace_seconds")
+            + settings.whole("move_stop_margin_seconds"))
+    upkeep = settings.number("upkeep_row_wait_seconds") + settings.number("restart_record_lock_seconds")
+    start = (settings.number("holder_exit_seconds") + settings.number("own_pane_shell_seconds")
+             + settings.number("start_seconds") + settings.number("opening_prompt_seconds") + settings.number("stay_seconds"))
+    return stop + upkeep + start
 
 
-def _lock_move_row(session: str, target: str, cleanup: ExitStack, admitted: Mapping[str, LockedMoveRow],
-                   ) -> LockedMoveRow | moves.MoveInProgress | StopFailed:
+def _await_row_operation(deadline: float) -> bool:
+    """A user command meets rows where another operation, such as a stop, a start or a restart, is in flight.
+
+    A user command waits for the operation to end (ruling): wait one poll,
+    then the caller tries the held rows again. A row in the record of an active restart stays held, also in the gap
+    where the restart holds no row lock. True when the caller can wait again after this try; False when the limit
+    for a hung holder has passed, so this try is the last one.
+    """
+    time.sleep(_ROW_POLL_SECONDS)
+    return monotonic() < deadline
+
+
+def _held_row_result(session: str, member: ResolvedMoveMember, identity: str, target: str, reason: str, holder: str
+                     ) -> moves.MoveInProgress | moves.MoveWaitingForRow:
+    batch = _move_batch.get()
+    command = _move_lock_command(batch, identity, target)
+    active = staff.row_activity(member.row_key)
+    if isinstance(active, staff.RowMoving):
+        try:
+            account = (accounts.current_move_account(batch.intent.group)
+                       if isinstance(batch.intent, moves.FollowGroupAccount) else target)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return moves.MoveWaitingForRow(session, reason, command)
+        if active.target == account:
+            return moves.MoveInProgress(session, account, command)
+    busy = f"another operation holds this row ({holder})" if holder else reason
+    return moves.MoveWaitingForRow(session, reason if isinstance(active, staff.RowAvailable) else busy, command)
+
+
+def _lock_move_row(session: str, target: str, cleanup: ExitStack, admitted: Mapping[str, LockedMoveRow], *,
+                   user_command: bool) -> LockedMoveRow | RowHeld | moves.MoveInProgress | StopFailed | SessionNotFound:
     batch = _move_batch.get()
     member = batch.members[session]
-    examined: set[str] = set()
-    while (key := member.row_key) not in examined:
-        if key in admitted:
-            batch.members[session] = admitted[key].member
-            return admitted[key]
-        examined.add(key)
+    if member.row_key in admitted:
+        previous = admitted[member.row_key]
+        batch.members[session] = previous.member
+        return previous
+    lock = cleanup.enter_context(ExitStack())
+    identity = member.reference
+    detached = batch.origin
+    try:
+        owner = None
+        if isinstance(member.owner, pane_launch.StaffLaunchReference):
+            owner = member.staff_row(staff.initial_snapshot())
+            if owner is None:
+                return StopFailed(member.reference, "staff member is unavailable")
+            identity = str(owner.current_session)
+        if isinstance(detached, DetachedMoveRequest) and not _owns_detached_request(identity, detached.request_id):
+            return moves.MoveSuperseded(identity)
+        if owner is not None and _restart_holds(str(owner.id)):
+            return _restart_held_row(session, member, identity, target, user_command=user_command)
+        record = lock.enter_context(staff.session_operation(identity, native_key=moves.native_row_key(identity)))
+        current = record.by_current_session(identity)
+        if owner is not None and (current is None or current.id != owner.id):
+            lock.close()
+            return moves.MoveWaitingForRow(session, "the move owner changed while acquiring its row",
+                                           _move_lock_command(batch, identity, target))
+        if current is not None:
+            member = _staff_move_member(current.id, record)
+            if _restart_holds(str(current.id)):
+                lock.close()
+                return _restart_held_row(session, member, identity, target, user_command=user_command)
         batch.members[session] = member
-        lock = cleanup.enter_context(ExitStack())
-        active: staff.RowAvailable | staff.RowBusy | staff.RowMoving = staff.RowAvailable()
-        try:
-            active = staff.row_activity(key)
-            if not isinstance(active, staff.RowAvailable):
-                raise staff.StaffRefused("another operation holds this row")
-            _ = lock.enter_context(staff.slot_operation(key, member.name or "session"))
-            record = staff.initial_snapshot()
-            current = (_staff_move_member(member.owner.id, record)
-                       if isinstance(member.owner, pane_launch.StaffLaunchReference)
-                       else _batch_member(member.reference, record, pane_record.read_strict(herdr.shared_session())))
-            if current.row_key == key:
-                batch.members[session] = current
-                return LockedMoveRow(session, current, lock)
-        except staff.StaffRefused as error:
-            lock.close()
-            if isinstance(active, staff.RowAvailable):
-                active = staff.row_activity(key)
-            if isinstance(active, staff.RowMoving):
-                try:
-                    account = (accounts.current_move_account(batch.intent.group)
-                               if isinstance(batch.intent, moves.FollowGroupAccount) else target)
-                except (OSError, ValueError, subprocess.SubprocessError):
-                    return moves.MoveWaitingForRow(session, str(error))
-                if active.target == account:
-                    return moves.MoveInProgress(session, account)
-            return moves.MoveWaitingForRow(session, str(error))
-        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
-            lock.close()
-            return StopFailed(session, str(error))
+        batch.native_sessions[session] = identity
+        return LockedMoveRow(session, member, identity, lock)
+    except staff.StaffRefused as error:
         lock.close()
-        member = current
-    return moves.MoveWaitingForRow(session, "the move owner changed while acquiring its row")
+        if isinstance(detached, DetachedMoveRequest):
+            try:
+                if not _owns_detached_request(identity, detached.request_id):
+                    return moves.MoveSuperseded(identity)
+            except (OSError, ValueError) as read_error:
+                return StopFailed(identity, str(read_error))
+        if user_command:
+            # A user command claims the row at once and waits for the operation that holds it.
+            return _hold_row(session, member, identity, target, str(error), error.holder)
+        return _held_row_result(session, member, identity, target, str(error), error.holder)
+    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
+        lock.close()
+        return StopFailed(session, str(error))
 
 
 def _native_move_member(reference: str, entries: Mapping[str, pane_record.PaneLaunch]) -> ResolvedMoveMember:
@@ -2356,145 +2633,114 @@ def _batch_member(reference: str, record: StaffSnapshot,
     return ResolvedMoveMember(pane_launch.NativeLaunchReference(reference), "")
 
 
-def _members_needing_help(results: Mapping[str, MoveResult], batch: MoveBatch) -> dict[str, moves.MoveMember]:
-    failed = [session for session, result in results.items()
-              if not isinstance(result, (ClaudeUp, MoveHandedOff, BuildMoveDeferred))]
-    pending = {member.reference: member for member in batch.prior_failures}
-    if not failed:
-        return pending
-    try:
-        entries = pane_record.read_strict(herdr.shared_session())
-        record = staff.initial_snapshot()
-    except (OSError, ValueError, herdr_types.HerdrFailure):
-        entries, record = {}, staff.StaffSnapshot(())
-    probes = {pane_launch.reference_id(entry) for entry in entries.values() if entry["environment"].get(PROBE_ENV) == "1"}
-    for session in failed:
-        member = batch.members[session]
-        row = member.staff_row(record)
-        name = (record.qualified_name(row) if row is not None
-                else _native_move_member(member.reference, entries).name or member.name)
-        if isinstance(results[session], moves.MoveWaitingForRow) and not name:
-            name = "unnamed session"
-        if name and member.reference not in probes and (row is None or row.current_session not in probes):
-            pending[member.reference] = moves.MoveMember(member.reference, name)
-    return pending
-
-
-def _finished_members(results: Mapping[str, MoveResult], batch: MoveBatch) -> frozenset[str]:
-    return batch.prior_finished.union(reference for session, result in results.items() if isinstance(result, ClaudeUp)
-                                      for reference in (session, batch.members[session].reference))
-
-
-def _report_move_batch(batch: MoveBatch, results: Mapping[str, MoveResult], target: str) -> None:
+def _alert_pending_moves(batch: MoveBatch, entries: Mapping[str, pane_record.PaneLaunch]) -> None:
     from scripts.notify import pushover
     from scripts.notify.push_texts import render
 
-    try:
-        pending = _members_needing_help(results, batch)
-        finished = _finished_members(results, batch)
-        if not pending:
-            try:
-                _ = moves.read_batch_result(batch.id)
-            except FileNotFoundError:
-                return
-        destination = batch.intent if isinstance(batch.intent, moves.FollowGroupAccount) else target
-        saved = moves.save_batch_result(batch.id, destination, tuple(pending.values()), finished)
-    except (OSError, ValueError) as error:
-        print(f"shutdown: could not save the move result: {error}", file=sys.stderr)
+    probes = {pane_launch.reference_id(entry) for entry in entries.values() if entry["environment"].get(PROBE_ENV) == "1"}
+    names: list[str] = []
+    for session, result in batch.results.items():
+        if isinstance(result, (ClaudeUp, MoveHandedOff, moves.MoveSuperseded, moves.MoveWaitingForRow)):
+            continue
+        member = batch.members[session]
+        identity = batch.native_sessions.get(session)
+        if identity is None or member.reference in probes or identity in probes or session in probes:
+            continue
+        try:
+            current = moves.read_latest_request(identity)
+        except (OSError, ValueError):
+            continue
+        if isinstance(current, moves.LatestMoveRequest) and current.request_id == batch.request_id:
+            names.append(member.name or "unnamed session")
+    if not names:
         return
-    if not pending or not saved.pending:
-        return
-    command = "~/.claude/scripts/lib/py ~/.claude/scripts/agents/stop_resume.py"
     machine = remote.local_machine()
-    destination = (f"for {batch.intent.group}" if isinstance(batch.intent, moves.FollowGroupAccount)
-                   else f"to {target}")
+    group = batch.intent.group if isinstance(batch.intent, moves.FollowGroupAccount) else ""
+    destination = f"for {group}" if group else f"to {batch.target}"
     push = render("alert.decision", sender="shutdown", title="Some sessions still need to move",
-                  action=f"In a terminal on {machine}, run `{command} retry {batch.id}`.",
-                  body=f"These sessions did not finish their move {destination}: "
-                       + ", ".join(member.name for member in saved.pending) + ".")
+                  action=f"Retry pending moves on {machine} with `{moves.RETRY_COMMAND}`.",
+                  body=f"These sessions did not finish their move {destination}: " + ", ".join(names) + ".")
     if len(push.message) > pushover.phone_message_limit(push.sender, push.id):
         push = render(push.id, **(push.values | {"body":
-            f"{len(saved.pending)} sessions did not finish their move {destination}. "
-            + f"Read the full list on {machine} with `{command} result {batch.id}`."}))
-    _send_move_push(push, f"account-move:{batch.id}")
+            f"{len(names)} sessions did not finish their move {destination}. "
+            + f"Read the pending list on {machine} with `{moves.MOVE_COMMAND} result`."}))
+    _ = _send_move_push(push, f"account-move:{group}:{batch.target}")
 
 
 def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: int = 0,
                   requester: str = "", cause: moves.MoveCause = "by hand",
-                  source_accounts: Mapping[str, str] = _NO_SOURCE_ACCOUNTS, batch_id: str = "",
-                  request: DetachedMoveRequest | NewMoveRequest = _NEW_MOVE_REQUEST,
+                  source_accounts: Mapping[str, str] = _NO_SOURCE_ACCOUNTS,
+                  request: DetachedMoveRequest | NewMoveRequest | moves.PendingMoveRequest = _NEW_MOVE_REQUEST,
                   intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget =
                   moves.ExplicitMoveTarget.REQUESTED_ACCOUNT,
-                  staff_members: Collection[staff.StaffId] = (),
-                  retry_id: str = "") -> list[MoveResult]:
-    """Move available sessions and report busy rows for a manual retry."""
+                  staff_members: Collection[staff.StaffId] = (), user_command: bool = False) -> list[MoveResult]:
+    """Move the selected sessions now.
+
+    A user command waits for a busy row and wins over an automatic move. An automatic move reports a busy row at once.
+    By the placeholder (x) default, a newer user command also wins over an older one.
+    """
     selected = list(dict.fromkeys(sessions))
+    if not selected:
+        return []
     members: dict[str, ResolvedMoveMember] = {}
-    batch = (MoveBatch(batch_id, members, intent, prior_failures=request.pending, prior_finished=request.finished)
-             if isinstance(request, DetachedMoveRequest) else MoveBatch("", members, intent))
-    token = _move_batch.set(batch)
+    batch = MoveBatch(members, intent, request, target, user_command=user_command)
+    if isinstance(request, DetachedMoveRequest):
+        batch.request_id = request.request_id
     try:
-        if not selected:
-            return []
         record = staff.initial_snapshot()
         entries = pane_record.read_strict(herdr.shared_session())
+        settings = conf.read("shutdown")
         by_owner: dict[pane_launch.StaffLaunchReference | pane_launch.NativeLaunchReference, str] = {}
         aliases: dict[str, str] = {}
         sources: dict[str, str] = {}
         for session in selected:
             fixed_member = (session in staff_members
                             or isinstance(request, DetachedMoveRequest) and session in request.staff_members)
-            member = (_staff_move_member(staff.StaffId(session), record)
-                      if fixed_member else _batch_member(session, record, entries))
+            if isinstance(request, (moves.PendingMoveRequest, DetachedMoveRequest)) and not fixed_member:
+                member = _native_move_member(session, entries)
+            else:
+                member = (_staff_move_member(staff.StaffId(session), record)
+                          if fixed_member else _batch_member(session, record, entries))
             primary = by_owner.setdefault(member.owner, session)
             aliases[session] = primary
             _ = members.setdefault(primary, member)
             if label := source_accounts.get(session):
                 _ = sources.setdefault(primary, label)
         selected = list(members)
-        if isinstance(request, NewMoveRequest):
-            references = frozenset(member.reference for member in members.values())
-            destination = intent if isinstance(intent, moves.FollowGroupAccount) else target
-            batch.id = retry_id or moves.move_batch_id(batch_id or uuid4().hex, destination, references)
+    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
+        results: list[MoveResult] = []
+        for session in sessions:
+            if isinstance(request, DetachedMoveRequest) and session not in request.staff_members:
+                try:
+                    if not _owns_detached_request(session, request.request_id):
+                        results.append(moves.MoveSuperseded(session))
+                        continue
+                except (OSError, ValueError) as read_error:
+                    results.append(StopFailed(session, str(read_error)))
+                    continue
+            results.append(StopFailed(session, str(error)))
+        return results
+    token = _move_batch.set(batch)
+    try:
         try:
             results = _run_moves(selected, target, why=why, warn_seconds=max(0, warn_seconds),
-                                 requester=requester, cause=cause, source_accounts=sources)
+                                 requester=requester, cause=cause, source_accounts=sources, settings=settings)
         except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
             results = [batch.results.get(session, StopFailed(session, str(error))) for session in selected]
         batch.results.update(zip(selected, results))
         return [batch.results[aliases[session]] for session in sessions]
-    except staff.StaffUnreadable as error:
-        if cause != "by hand":
-            reason = f"move deferred: build ownership is unreadable ({error})"
-            print(f"build wait: {reason}")
-            return [BuildMoveDeferred(session, reason) for session in sessions]
-        return [StopFailed(session, str(error)) for session in sessions]
-    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
-        return [StopFailed(session, str(error)) for session in sessions]
     finally:
         _move_batch.reset(token)
-        if batch.id and not batch.handed_off:
-            _report_move_batch(batch, batch.results, target)
+        _alert_pending_moves(batch, entries)
 
 
-def _read_move_source(identity: str, pane_id: str, kind: str) -> LiveMoveSource | StoppedMoveSource | StopFailed:
-    running = running_on_account(identity, pane_id, kind=kind, capture_generation=True)
-    if isinstance(running, ResumeFailed):
-        return StopFailed(identity, running.reason)
-    if isinstance(running, LiveMoveSource):
-        if running.session.account == "unknown account":
-            return StopFailed(identity, "live process account is unreadable")
-        return running
-    return StoppedMoveSource()
-
-
-def _prepare_move(row: LockedMoveRow, account: str, record: StaffSnapshot
-                  ) -> MoveStopTarget | ClaudeUp | StopFailed:
-    member = row.member
+def _read_move_source(member: ResolvedMoveMember, identity: str, record: StaffSnapshot, *, check_presence: bool
+                      ) -> LiveMoveSource | StoppedMoveSource | StopFailed | SessionNotFound:
     owner = member.staff_row(record)
     if owner is None and isinstance(member.owner, pane_launch.StaffLaunchReference):
         return StopFailed(member.reference, "staff member is unavailable")
-    identity = str(owner.current_session) if owner is not None else member.reference
+    if owner is not None and owner.current_session != identity:
+        return moves.MoveWaitingForRow(identity, "the move owner changed while holding its row", moves.RETRY_COMMAND)
     try:
         publication = pane_record.publication_for_session(identity, record=record)
         if owner is not None and owner.kind == "producer":
@@ -2510,19 +2756,42 @@ def _prepare_move(row: LockedMoveRow, account: str, record: StaffSnapshot
                 except ValueError:
                     pass  # The stop still requires exact native process proof.
         tab = _tab_of(member.reference)
-        source = _read_move_source(identity, tab.pane_id if isinstance(tab, herdr.TabSession) else "", kind)
-        if isinstance(source, StopFailed):
-            return source
+        running = running_on_account(identity, tab.pane_id if isinstance(tab, herdr.TabSession) else "",
+                                     kind=kind, capture_generation=True)
+        if isinstance(running, ResumeFailed):
+            return StopFailed(identity, running.reason)
+        if isinstance(running, LiveMoveSource):
+            if running.session.account == "unknown account":
+                return StopFailed(identity, "live process account is unreadable")
+            return running
+        if check_presence and owner is None:
+            target = stop_target(identity, strict=True)
+            if isinstance(target, StopFailed):
+                return target
+            if isinstance(target, SessionNotFound) and publication is None and isinstance(tab, SessionNotFound):
+                return target
+        return StoppedMoveSource()
+    except (OSError, ValueError, staff.StaffRefused, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+        return StopFailed(identity, str(error))
+
+
+def _prepare_move(row: LockedMoveRow, account: str, record: StaffSnapshot, *, check_presence: bool
+                  ) -> MoveStopTarget | ClaudeUp | StopFailed | SessionNotFound:
+    source = _read_move_source(row.member, row.identity, record, check_presence=check_presence)
+    if isinstance(source, (StopFailed, SessionNotFound)):
+        return source
+    try:
         if isinstance(source, LiveMoveSource) and source.session.account == account:
-            if owner is not None:
+            if (owner := row.member.staff_row(record)) is not None:
+                kind = "codex" if account.startswith("codex") else "claude"
                 member_account.repair_home(owner, kind, source.pid)
             return source.session
         if row.marked_target != account:
             _ = row.lock.enter_context(staff.mark_row_move(row.member.row_key, account))
             row.marked_target = account
-        return MoveStopTarget(member, identity, source)
+        return MoveStopTarget(row.member, row.identity, source)
     except (OSError, ValueError, staff.StaffRefused, herdr_types.HerdrFailure) as error:
-        return StopFailed(identity, str(error))
+        return StopFailed(row.identity, str(error))
 
 
 def _warn_moves(plans: Mapping[str, MoveStopTarget], target: str, why: str, seconds: int) -> None:
@@ -2537,20 +2806,88 @@ def _warn_moves(plans: Mapping[str, MoveStopTarget], target: str, why: str, seco
     _ = Event().wait(max(0.0, warning_until - monotonic()))
 
 
+def _remove_latest_move(identity: str, request_id: str) -> None:
+    try:
+        moves.remove_latest_request(identity, request_id)
+    except (OSError, ValueError) as error:
+        print(f"shutdown: could not remove the latest move request: {error}", file=sys.stderr)
+
+
+def _claim_move_request(row: LockedMoveRow, batch: MoveBatch, target: str, *, new: bool) -> bool:
+    claim = _move_claim(batch, target)
+    try:
+        with moves.claim_lock():
+            current = moves.read_latest_request(row.identity)
+            retry = batch.origin
+            if not new:
+                superseded = current != claim
+            elif row.identity in batch.claimed:
+                # Only a newer move removes or replaces the claim of a waiting user command (placeholder (x) default).
+                superseded = not _is_request(current, batch.request_id)
+            elif not batch.user_command:
+                # An automatic move never takes a row from a live user command.
+                superseded = isinstance(current, moves.LatestMoveRequest) and moves.claim_is_live(current)
+            else:
+                superseded = (isinstance(retry, moves.PendingMoveRequest)
+                              and (retry.member.reference != row.identity or current != retry.request))
+            if new and not superseded:
+                name = retry.member.name if isinstance(retry, moves.PendingMoveRequest) else row.member.name
+                moves.write_latest_request(row.identity, claim, name=name)
+        if superseded:
+            batch.results[row.session] = moves.MoveSuperseded(row.identity)
+            row.lock.close()
+            return False
+        if batch.user_command:
+            batch.claimed.add(row.identity)
+    except (OSError, ValueError) as error:
+        batch.results[row.session] = StopFailed(row.identity, f"cannot record or read the latest move request: {error}")
+        row.lock.close()
+        return False
+    return True
+
+
 def _run_moves(selected: list[str], target: str, *, why: str, warn_seconds: int, requester: str,
-               cause: moves.MoveCause, source_accounts: Mapping[str, str]) -> list[MoveResult]:
+               cause: moves.MoveCause, source_accounts: Mapping[str, str], settings: conf.ConfigRead) -> list[MoveResult]:
+    """Move the free rows at once, then wait for the held rows and move them in later passes."""
+    batch = _move_batch.get()
+    aliases: dict[str, str] = {}
+    held: dict[str, RowHeld] = {}
+    move_pass = partial(_run_move_pass, held=held, aliases=aliases, target=target, why=why, warn_seconds=warn_seconds,
+                        requester=requester, cause=cause, source_accounts=source_accounts)
+    # The limit starts before the first pass. The child counts it from the start of its parent.
+    batch.started = monotonic() - (batch.origin.waited_seconds if isinstance(batch.origin, DetachedMoveRequest) else 0.0)
+    try:
+        move_pass(selected)
+        deadline = batch.started + _hung_holder_seconds(settings) if held else 0.0
+        while held:
+            again = _await_row_operation(deadline)
+            move_pass(list(held))
+            if not again:
+                break
+    finally:
+        # On each end, also an interrupt in the first pass.
+        _end_user_claims(held)
+    for session, row in held.items():
+        batch.results[session] = _held_row_result(session, row.member, row.identity, target, row.reason, row.holder)
+    return [batch.results[aliases.get(session, session)] for session in selected]
+
+
+def _run_move_pass(sessions: list[str], *, held: dict[str, RowHeld], aliases: dict[str, str], target: str, why: str,
+                   warn_seconds: int, requester: str, cause: moves.MoveCause, source_accounts: Mapping[str, str]) -> None:
+    """Move each free row and keep the rows that another operation holds in `held`; keep no row lock after the pass."""
     batch = _move_batch.get()
     results = batch.results
     locks: dict[str, LockedMoveRow] = {}
     admitted: dict[str, LockedMoveRow] = {}
-    aliases: dict[str, str] = {}
-    held: dict[str, tuple[str, ...]] = {}
     warned: set[str] = set()
-    build_deadline = math.inf
-    settings = conf.read("shutdown")
+    check_presence = isinstance(batch.origin, moves.PendingMoveRequest)
     with ExitStack() as cleanup:
-        for session in selected:
-            row = _lock_move_row(session, target, cleanup, admitted)
+        for session in sessions:
+            row = _lock_move_row(session, target, cleanup, admitted, user_command=batch.user_command)
+            if isinstance(row, RowHeld):
+                held[session] = row
+                continue
+            _ = held.pop(session, None)
             if not isinstance(row, LockedMoveRow):
                 results[session] = row
                 continue
@@ -2558,83 +2895,65 @@ def _run_moves(selected: list[str], target: str, *, why: str, warn_seconds: int,
                 aliases[session] = row.session
                 continue
             admitted[row.member.row_key] = row
-            locks[session] = row
-        if locks and _detached_moves.get():
-            results.update(_handoff_locked_moves({session: session for session in locks}, locks, target,
-                                                 why, warn_seconds, cause, source_accounts))
-            locks.clear()
+            admitted[moves.native_row_key(row.identity)] = row
+            if _claim_move_request(row, batch, target, new=not isinstance(batch.origin, DetachedMoveRequest)):
+                locks[session] = row
         while locks:
             with herdr.process_action():
                 account = (accounts.current_move_account(batch.intent.group)
                            if isinstance(batch.intent, moves.FollowGroupAccount) else target)
+                batch.target = account
                 record = staff.initial_snapshot()
                 ready: dict[str, MoveStopTarget] = {}
-                for session, row in locks.items():
-                    prepared = _prepare_move(row, account, record)
+                for session, row in tuple(locks.items()):
+                    prepared = _prepare_move(row, account, record, check_presence=check_presence)
                     if isinstance(prepared, MoveStopTarget):
                         ready[session] = prepared
                     else:
                         results[session] = prepared
+                        if isinstance(prepared, (ClaudeUp, SessionNotFound)):
+                            _remove_latest_move(row.identity, batch.request_id)
                         row.lock.close()
-                reading = (_build_holders([plan.identity for plan in ready.values()])
-                           if ready and cause != "by hand" else {})
-                next_held: dict[str, tuple[str, ...]] = {}
-                for session, plan in tuple(ready.items()):
-                    if isinstance(reading, BuildQueueUnreadable):
-                        steps = held.get(session, ())
-                        if not steps:
-                            reason = f"move deferred: build ownership is unreadable ({reading.reason})"
-                            print(f"build wait: {reason}")
-                            results[session] = BuildMoveDeferred(session, reason)
-                            locks[session].lock.close()
-                            del ready[session]
-                            continue
-                    else:
-                        steps = reading.get(plan.identity, ())
-                    if steps:
-                        if session not in held:
-                            print(f"build wait: {session} owns {'; '.join(steps)}; the move waits for its steps to end")
-                        next_held[session] = steps
-                        del ready[session]
-                held = next_held
+                if _detached_moves.get():
+                    if ready:
+                        # The detached child also waits for the held rows.
+                        _hand_over(_handoff_locked_moves({session: session for session in (*ready, *held)}, locks,
+                                                         account, why, warn_seconds, cause, source_accounts), held)
+                    break
                 if ready:
                     caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
                     if any(plan.identity == caller for plan in ready.values()):
                         _record_launches([plan.member.reference for plan in ready.values()])
-                        chosen = {session: plan.identity for session, plan in ready.items()}
-                        chosen.update((session, session) for session in held)
                         sources = dict(source_accounts) | {session: plan.source.session.account for session, plan in ready.items()
                                                           if isinstance(plan.source, LiveMoveSource)}
-                        results.update(_handoff_locked_moves(chosen, locks, account, why, warn_seconds, cause, sources))
+                        # The child stops this caller, so the child also waits for the held rows.
+                        chosen = {session: plan.identity for session, plan in ready.items()}
+                        chosen.update((session, session) for session in held)
+                        _hand_over(_handoff_locked_moves(chosen, locks, account, why, warn_seconds, cause, sources), held)
                         break
                     unwarned = {session: plan for session, plan in ready.items() if session not in warned}
                     if warn_seconds and unwarned:
                         _warn_moves(unwarned, account, why, warn_seconds)
                         warned.update(unwarned)
-                        locks = {session: locks[session] for session in (*held, *ready)}
+                        locks = {session: locks[session] for session in ready}
                         continue
-                    moved = _move_now(list(ready), account, why=why, requester=requester,
-                                      cause=cause, source_accounts=source_accounts, plans=ready, locks=locks,
-                                      admitted_record=record)
-                    results.update(zip(ready, moved))
-            if not held:
-                break
-            if not _batch_process.get():
-                results.update(_handoff_locked_moves({session: session for session in held}, locks, target,
-                                                     why, warn_seconds, cause, source_accounts))
-                break
-            now = monotonic()
-            if build_deadline == math.inf:
-                build_deadline = now + settings.whole("MOVE_BUILD_WAIT_MINUTES") * 60
-            if now >= build_deadline:
-                for session, steps in held.items():
-                    reason = f"move deferred: build ownership remains: {'; '.join(steps)}"
-                    print(f"build wait limit: {session}: {reason}")
-                    results[session] = BuildMoveDeferred(session, reason)
-                break
-            locks = {session: locks[session] for session in held}
-            time.sleep(min(settings.whole("MOVE_BUILD_POLL_SECONDS"), build_deadline - now))
-    return [results[aliases.get(session, session)] for session in selected]
+                    ready = {session: plan for session, plan in ready.items()
+                             if _claim_move_request(locks[session], batch, target, new=False)}
+                    if ready:
+                        moved = _move_now(list(ready), account, why=why, requester=requester,
+                                          cause=cause, source_accounts=source_accounts, plans=ready, locks=locks,
+                                          admitted_record=record)
+                        results.update(zip(ready, moved))
+            break
+
+
+def _hand_over(handed: Mapping[str, MoveResult], held: dict[str, RowHeld]) -> None:
+    """Record the handoff results; the child owns the claims and the held rows that it took."""
+    batch = _move_batch.get()
+    batch.results.update(handed)
+    batch.claimed.difference_update(batch.native_sessions.get(session, session) for session, result in handed.items()
+                                    if isinstance(result, MoveHandedOff))
+    held.clear()
 
 
 def _stop_move(attempt: MoveStopAttempt) -> StopResult:
@@ -2652,6 +2971,7 @@ def _move_now(selected: list[str], target: str, *, why: str, requester: str,
     from scripts.herdr import worker_panes
 
     began = monotonic()
+    batch = _move_batch.get()
     label = note_file.parse_account_label(target)
     if not isinstance(label, note_file.NumberedAccountLabel) or label.tool == "claude":
         checked = accounts.check_move_target(target, datetime.now(timezone.utc))
@@ -2660,21 +2980,25 @@ def _move_now(selected: list[str], target: str, *, why: str, requester: str,
                 locks[session].lock.close()
             return [StopFailed(plans[session].identity, checked.reason) for session in selected]
     _record_launches([plan.member.reference for plan in plans.values()])
-    names: LaunchNames | LaunchNamesNotRead = _UNREAD_NAMES
     try:
         names = LaunchNames.read()
     except Exception as error:
-        for plan in plans.values():
-            print(f"{plan.identity}: move log anomaly: {error}", file=sys.stderr)
+        for session in selected:
+            locks[session].lock.close()
+        return [StopFailed(plans[session].identity, f"could not record the move request: {error}") for session in selected]
     attempts: dict[str, MoveStopAttempt] = {}
+    failures: dict[str, StopFailed] = {}
     for session, plan in plans.items():
         attempt = MoveStopAttempt(plan, partial(_prepare_move_request, session, plan, target, why, cause,
-                                               source_accounts.get(session, ""), names))
-        if isinstance(plan.source, StoppedMoveSource):
-            attempt.record_request()
+                                                source_accounts.get(session, ""), names, intent=batch.intent))
         attempts[session] = attempt
+        if isinstance(plan.source, StoppedMoveSource):
+            try:
+                attempt.record_request()
+            except MoveRequestRefused as error:
+                failures[session] = StopFailed(plan.identity, str(error))
     with ThreadPoolExecutor(max_workers=len(selected)) as pool:
-        failures: dict[str, StopFailed] = {}
+        role_failures: dict[str, StopFailed] = {}
         worker_policies: dict[StaffId, worker_panes.CheckedRolePolicy] = {}
         needs_role: dict[str, MoveStopTarget] = {}
         for session, plan in plans.items():
@@ -2685,13 +3009,13 @@ def _move_now(selected: list[str], target: str, *, why: str, requester: str,
                 if pane_record.publication_for_session(plan.identity, record=admitted_record) is None:
                     needs_role[session] = plan
             except (OSError, ValueError) as error:
-                failures[session] = StopFailed(plan.identity, str(error))
+                role_failures[session] = StopFailed(plan.identity, str(error))
         if needs_role:
             try:
                 record = staff.initial_snapshot()
             except (OSError, ValueError) as error:
                 for session, plan in needs_role.items():
-                    failures[session] = StopFailed(plan.identity, f"anomaly: cannot read worker role: {error}")
+                    role_failures[session] = StopFailed(plan.identity, f"anomaly: cannot read worker role: {error}")
             else:
                 for session, plan in needs_role.items():
                     row = plan.member.staff_row(record)
@@ -2699,21 +3023,31 @@ def _move_now(selected: list[str], target: str, *, why: str, requester: str,
                         continue
                     policy = worker_panes.checked_role_policy(worker_panes.dispatch_role(row))
                     if isinstance(policy, worker_panes.StartRefused):
-                        failures[session] = StopFailed(plan.identity, f"{policy.reason.value}: {policy.detail}")
+                        role_failures[session] = StopFailed(plan.identity, f"{policy.reason.value}: {policy.detail}")
                     else:
                         worker_policies[row.current_session] = policy
-        for session in failures:
+        for session, failure in role_failures.items():
             attempt = attempts[session]
             if isinstance(attempt.request, MoveRequestNotRecorded):
-                attempt.record_request()
-        stops = [pool.submit(failures.__getitem__, session) if session in failures
-                 else pool.submit(_stop_move, attempts[session]) for session in selected]
+                try:
+                    attempt.record_request()
+                except MoveRequestRefused as error:
+                    print(f"{failure.session_id}: {error}", file=sys.stderr)
+            failures[session] = failure
+        stops = {session: pool.submit(_stop_move, attempt)
+                 for session, attempt in attempts.items() if session not in failures}
         stopped: list[StopResult] = []
-        for session, future in zip(selected, stops):
+        for session in selected:
+            if session in failures:
+                stopped.append(failures[session])
+                continue
             try:
-                result = future.result()
+                result = stops[session].result()
                 if isinstance(result, (Stopped, NotRunning)):
-                    _retire_prompt(result.session_id)
+                    if isinstance(attempts[session].request, MoveRequestNotRecorded):
+                        result = StopFailed(plans[session].identity, "the move request was not recorded")
+                    else:
+                        _retire_prompt(result.session_id)
                 stopped.append(result)
             except Exception as error:
                 stopped.append(StopFailed(session, str(error)))
@@ -2731,8 +3065,8 @@ def _move_now(selected: list[str], target: str, *, why: str, requester: str,
             if isinstance(result, (StopFailed, SessionNotFound)):
                 outcomes[index] = result
                 session = selected[index]
-                if not isinstance(request := attempts[session].request, MoveRequestNotRecorded):
-                    _record_move_outcome(request, result)
+                if (attempt := attempts.get(session)) is not None and not isinstance(attempt.request, MoveRequestNotRecorded):
+                    _record_move_outcome(attempt.request, result)
                 locks[session].lock.close()
         for future in as_completed(resumes):
             index, identity = resumes[future]
@@ -2748,8 +3082,11 @@ def _move_now(selected: list[str], target: str, *, why: str, requester: str,
                 outcome = ResumePending(identity, target, str(error))
             outcomes[index] = outcome
             session = selected[index]
-            if not isinstance(request := attempts[session].request, MoveRequestNotRecorded):
+            request = attempts[session].request
+            if not isinstance(request, MoveRequestNotRecorded):
                 _record_move_outcome(request, outcome)
+            if isinstance(outcome, ClaudeUp):
+                _remove_latest_move(locks[session].identity, batch.request_id)
             locks[session].lock.close()
     return [outcomes[index] for index in range(len(selected))]
 
@@ -2784,7 +3121,6 @@ def _load_batch_modules() -> None:
         "scripts.production.unit_names",
         # Launches can need these modules to check the target environment.
         "scripts.lib.copy_record",
-        "scripts.lib.slot_root",
         # Automatic moves use the admission queue and verify process records.
         "scripts.build_queue.admission_client",
         "scripts.build_queue.admission_protocol",
@@ -2795,16 +3131,145 @@ def _load_batch_modules() -> None:
         _ = import_module(name)
 
 
-def _move_failure(argument: str) -> moves.MoveMember:
+def _print_retry_result(result: MoveResult) -> int:
+    if isinstance(result, SessionNotFound):
+        print("Removed the pending move for a session that no longer exists.")
+        return 0
+    if isinstance(result, moves.MoveSuperseded):
+        print(f"not moved: {result.reason}")
+        return 0
+    if isinstance(result, (moves.MoveWaitingForRow, moves.MoveInProgress)) and result.command:
+        print(f"Move pending. Run again: {result.command}")
+        return 1
+    if isinstance(result, (ClaudeUp, MoveHandedOff)):
+        return 0
+    print(f"Move failed: {result.reason}", file=sys.stderr)
+    return 1
+
+
+def _pending_target(target: str) -> tuple[str, moves.FollowGroupAccount | moves.ExplicitMoveTarget]:
+    if target.startswith("group:"):
+        group = target.removeprefix("group:")
+        if group not in accounts.CLAUDE_GROUPS:
+            raise ValueError("invalid pending move group")
+        return "", moves.FollowGroupAccount(group)
+    return target, moves.ExplicitMoveTarget.REQUESTED_ACCOUNT
+
+
+@dataclass(frozen=True)
+class MoveStillPending:
+    account: str
+    intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget
+
+
+def _pending_destination(destination: str, request: moves.LatestMoveRequest | LegacyMoveReport) -> MoveStillPending:
+    target, intent = _pending_target(destination)
+    if isinstance(intent, moves.FollowGroupAccount):
+        target = accounts.current_move_account(intent.group)
+    elif isinstance(request, moves.LatestMoveRequest) and request.explicit_group_scope:
+        intent = moves.ExplicitMoveTarget.GROUP_ACCOUNT
+    return MoveStillPending(target, intent)
+
+
+def _reconcile_move(identity: str, name: str, destination: str, request: moves.LatestMoveRequest | LegacyMoveReport
+                     ) -> MoveStillPending | ClaudeUp | SessionNotFound | StopFailed:
     try:
-        value = cast(object, json.loads(argument))
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("invalid pending move member") from error
-    if isinstance(value, list):
-        fields = cast(list[object], value)
-        if len(fields) == 2 and isinstance(fields[0], str) and isinstance(fields[1], str):
-            return moves.MoveMember(fields[0], fields[1])
-    raise argparse.ArgumentTypeError("invalid pending move member")
+        with staff.session_operation(identity, native_key=moves.native_row_key(identity)) as record:
+            if isinstance(request, moves.LatestMoveRequest) and moves.read_latest_request(identity) != request:
+                return moves.MoveSuperseded(identity)
+            pending = _pending_destination(destination, request)
+            owner = record.by_current_session(identity)
+            member = (_staff_move_member(owner.id, record) if owner is not None
+                      else ResolvedMoveMember(pane_launch.NativeLaunchReference(identity), name))
+            source = _read_move_source(member, identity, record, check_presence=True)
+            if isinstance(source, StopFailed):
+                return source
+            if isinstance(source, SessionNotFound) or isinstance(source, LiveMoveSource) and source.session.account == pending.account:
+                if isinstance(request, moves.LatestMoveRequest):
+                    moves.remove_latest_request(identity, request.request_id)
+                return source if isinstance(source, SessionNotFound) else source.session
+            return pending
+    except staff.StaffRefused as error:
+        command = moves.RETRY_COMMAND if isinstance(request, moves.LatestMoveRequest) else ""
+        return moves.MoveWaitingForRow(identity, str(error), command)
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+        return StopFailed(identity, str(error))
+
+
+def _pending_move_command(command: str, request_id: str) -> int:
+    code = 0
+    found = False
+    announced = False
+    seen: set[str] = set()
+
+    def reconcile(member: moves.MoveMember, destination: str,
+                  request: moves.PendingMoveRequest | LegacyMoveReport) -> None:
+        nonlocal code, found, announced
+        identity = member.reference
+        if identity in seen:
+            return
+        seen.add(identity)
+        current = request.request if isinstance(request, moves.PendingMoveRequest) else request
+        state = _reconcile_move(identity, member.name, destination, current)
+        if isinstance(state, moves.MoveWaitingForRow) and command != "result" and isinstance(current, moves.LatestMoveRequest):
+            # The retry is a user command, so it waits for the busy row in move_sessions.
+            try:
+                state = _pending_destination(destination, current)
+            except (OSError, ValueError) as error:
+                state = StopFailed(identity, str(error))
+        if isinstance(state, (ClaudeUp, moves.MoveSuperseded)):
+            return
+        found = True
+        if isinstance(state, SessionNotFound):
+            action = "Removed the pending move" if isinstance(request, moves.PendingMoveRequest) else "Skipped a legacy move"
+            print(f"{member.name}: {action} for a session that no longer exists.")
+        elif isinstance(state, StopFailed):
+            reason = " ".join(state.reason.splitlines())
+            advice = f" Run again: {state.command}" if isinstance(state, moves.MoveWaitingForRow) and state.command else ""
+            print(f"{member.name}: could not check the pending move: {reason}.{advice}", file=sys.stderr if not advice else sys.stdout)
+            code = 1
+        elif isinstance(request, LegacyMoveReport):
+            target = state.intent if isinstance(state.intent, moves.FollowGroupAccount) else state.account
+            print(f"{member.name}: start a new move with {moves.batch_move_command(identity, target)}")
+        elif command == "result":
+            print(f"{member.name}: {destination}")
+        else:
+            if not announced:
+                print("The retry starts a new move request.")
+                announced = True
+            result, = move_sessions([identity], state.account, why="retry account move", request=request, intent=state.intent,
+                                    user_command=True)
+            code |= _print_retry_result(result)
+
+    try:
+        for item in sorted(moves.pending_move_requests(), key=lambda item: item.member.name):
+            if not request_id or item.request.request_id == request_id:
+                reconcile(item.member, item.request.target, item)
+        for batch_id in (request_id,) if request_id else moves.legacy_batch_ids():
+            try:
+                saved = moves.read_batch_result(batch_id)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, RecursionError):
+                print(f"Could not read legacy move report {batch_id}.json.", file=sys.stderr)
+                code = 1
+                continue
+            if not saved.pending:
+                continue
+            record = staff.initial_snapshot()
+            entries = pane_record.read_strict(herdr.shared_session())
+            destination = f"group:{saved.target.group}" if isinstance(saved.target, moves.FollowGroupAccount) else saved.target
+            for member in saved.pending:
+                resolved = _batch_member(member.reference, record, entries)
+                owner = resolved.staff_row(record)
+                identity = str(owner.current_session) if owner is not None else resolved.reference
+                reconcile(moves.MoveMember(identity, member.name), destination, LegacyMoveReport())
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+        print(f"shutdown: could not read the move requests: {error}", file=sys.stderr)
+        return 1
+    if not found and not code:
+        print("No sessions need a move.")
+    return code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2818,19 +3283,23 @@ def main(argv: list[str] | None = None) -> int:
     _ = batch.add_argument("--cause", choices=("by hand", "refusal", "auto", "credits off"), default="by hand")
     _ = batch.add_argument("--warn-seconds", type=int, default=0)
     _ = batch.add_argument("--source-account", action="append", default=[])
-    _ = batch.add_argument("--move-id", default="")
+    _ = batch.add_argument("--request-id", default="", help=argparse.SUPPRESS)
     _ = batch.add_argument("--group", choices=accounts.CLAUDE_GROUPS, help=argparse.SUPPRESS)
+    _ = batch.add_argument("--explicit-group-scope", action="store_true", help=argparse.SUPPRESS)
+    _ = batch.add_argument("--user-command", action="store_true", help=argparse.SUPPRESS)
+    _ = batch.add_argument("--waited-seconds", type=float, default=0.0, help=argparse.SUPPRESS)
+    # The log path is the same file as the log descriptor, so the batch writes through the path.
+    _ = batch.add_argument("--log-fd", type=int, help=argparse.SUPPRESS)
+    _ = batch.add_argument("--ready-fd", type=int, help=argparse.SUPPRESS)
+    _ = batch.add_argument("--notify-systemd", action="store_true", help=argparse.SUPPRESS)
     _ = batch.add_argument("--staff-member", action="append", default=[], help=argparse.SUPPRESS)
-    _ = batch.add_argument("--retry-id", default="", help=argparse.SUPPRESS)
-    _ = batch.add_argument("--needs-help", type=_move_failure, action="append", default=[], help=argparse.SUPPRESS)
-    _ = batch.add_argument("--finished", action="append", default=[], help=argparse.SUPPRESS)
-    _ = batch.add_argument("--log", type=Path, default=shutdown_state_root() / "move.log")
+    _ = batch.add_argument("--log", type=Path)
     _ = batch.add_argument("--preload-restarted", action="store_true", help=argparse.SUPPRESS)
     _ = batch.add_argument("sessions", nargs="+")
     retry = commands.add_parser("retry")
-    _ = retry.add_argument("id")
+    _ = retry.add_argument("id", nargs="?", default="")
     result_command = commands.add_parser("result")
-    _ = result_command.add_argument("id")
+    _ = result_command.add_argument("id", nargs="?", default="")
     stay = commands.add_parser("stay")
     for option in ("session", "pane", "account", "generation"):
         _ = stay.add_argument("--" + option, required=True)
@@ -2840,73 +3309,69 @@ def main(argv: list[str] | None = None) -> int:
     _ = stay.add_argument("--log", type=Path, default=shutdown_state_root() / "stay.log")
     args = parser.parse_args(argv)
     if cast(str, args.command) in ("retry", "result"):
-        retry_id = cast(str, args.id)
-        try:
-            saved = moves.read_batch_result(retry_id)
-        except (OSError, ValueError) as error:
-            print(f"shutdown: could not read the move result: {error}", file=sys.stderr)
-            return 1
-        if not saved.pending:
-            print("No sessions need a move.")
-            return 0
-        if cast(str, args.command) == "result":
-            destination = (f"for {saved.target.group}" if isinstance(saved.target, moves.FollowGroupAccount)
-                           else f"to {saved.target}")
-            print(f"Sessions that still need to move {destination}")
-            for member in saved.pending:
-                print(member.name)
-            return 0
-        destination = (("--group", saved.target.group) if isinstance(saved.target, moves.FollowGroupAccount)
-                       else ("--target", saved.target))
-        argv = ["batch", *destination, "--retry-id", retry_id,
-                "--", *(member.reference for member in saved.pending)]
-        args = parser.parse_args(argv)
+        return _pending_move_command(cast(str, args.command), cast(str, args.id))
     # Even a directly invoked batch must not hand itself off a second time.
     _ = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
-    log = cast(Path, args.log)
     if cast(str, args.command) == "stay":
+        log = cast(Path, args.log)
         with log.open("a", encoding="utf-8") as output, redirect_stdout(output):
             cause = _check_stay(cast(str, args.session), cast(str, args.pane), cast(str, args.account),
                                 cast(int, args.pid), cast(str, args.generation), cast(str, args.requester), cast(str, args.why))
             _ = output.write(cause + "\n")
         return int(bool(cause))
-    # The batch is the one process that may wait for build steps; its output goes to the move log.
+    # The batch writes its output to the move log.
     group = cast(accounts.ClaudeGroup | None, args.group)
     target = cast(str, args.target)
     if not (target or group):
         batch.error("provide --target for an explicit move or --group for a group move")
-    token = _batch_process.set(True)
-    intent = moves.FollowGroupAccount(group) if group is not None else moves.ExplicitMoveTarget.REQUESTED_ACCOUNT
-    batch_id = cast(str, args.move_id)
-    request = (DetachedMoveRequest(frozenset(cast(list[str], args.staff_member)),
-                tuple(cast(list[moves.MoveMember], args.needs_help)), frozenset(cast(list[str], args.finished)))
-               if batch_id else _NEW_MOVE_REQUEST)
-    started = False
-    try:
-        with log.open("a", encoding="utf-8") as output, redirect_stdout(output):
-            try:
-                _load_batch_modules()
-            except (ImportError, AttributeError) as error:
-                if cast(bool, args.preload_restarted):
-                    raise
-                print(f"batch startup: module preload failed ({type(error).__name__}); restarting in a new interpreter",
-                      flush=True)
-                os.execv(sys.executable, [sys.executable, __file__, "batch", "--preload-restarted", *argv[1:]])
-            started = True
-            results = move_sessions(cast(list[str], args.sessions), target,
-                                    why=cast(str, args.why), warn_seconds=cast(int, args.warn_seconds),
-                                    requester=cast(str, args.requester), cause=cast(moves.MoveCause, args.cause),
-                                    batch_id=batch_id, request=request, intent=intent,
-                                    retry_id=cast(str, args.retry_id),
-                                    source_accounts={identity: label for item in cast(list[str], args.source_account)
-                                                     for identity, _, label in (item.partition("="),)})
-            for result in results:
-                _ = output.write(json.dumps({"result": type(result).__name__, **asdict(result)}) + "\n")
-    finally:
-        _batch_process.reset(token)
-        if not started and isinstance(request, DetachedMoveRequest):
-            _report_move_batch(MoveBatch(batch_id, {}, intent, prior_failures=request.pending,
-                                        prior_finished=request.finished), {}, target)
+    intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget
+    if group is not None:
+        intent = moves.FollowGroupAccount(group)
+    elif cast(bool, args.explicit_group_scope):
+        intent = moves.ExplicitMoveTarget.GROUP_ACCOUNT
+    else:
+        intent = moves.ExplicitMoveTarget.REQUESTED_ACCOUNT
+    request_id = cast(str, args.request_id)
+    request = (DetachedMoveRequest(request_id, frozenset(cast(list[str], args.staff_member)),
+                                   cast(float, args.waited_seconds))
+               if request_id else _NEW_MOVE_REQUEST)
+    if not cast(bool, args.preload_restarted):
+        if request_id and cast(bool, args.user_command):
+            # The child takes the claims of its parent before it confirms its start, so each claim stays live.
+            for identity in cast(list[str], args.sessions):
+                try:
+                    _ = moves.set_claim_owner(identity, request_id, _own_claim_owner())
+                except (OSError, ValueError) as error:
+                    print(f"{identity}: cannot take the move request: {error}", file=sys.stderr)
+        notify_ready(cast(int | None, args.ready_fd), systemd=cast(bool, args.notify_systemd))
+    log = cast(Path | None, args.log)
+    if log is None:
+        log = shutdown_state_root() / "move.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a", encoding="utf-8") as output, redirect_stdout(output):
+        try:
+            _load_batch_modules()
+        except (ImportError, AttributeError) as error:
+            if cast(bool, args.preload_restarted):
+                raise
+            print(f"batch startup: module preload failed ({type(error).__name__}); restarting in a new interpreter",
+                  flush=True)
+            os.execv(sys.executable, [sys.executable, __file__, "batch", "--preload-restarted", *argv[1:]])
+        results = move_sessions(cast(list[str], args.sessions), target,
+                                why=cast(str, args.why), warn_seconds=cast(int, args.warn_seconds),
+                                requester=cast(str, args.requester), cause=cast(moves.MoveCause, args.cause),
+                                request=request, intent=intent, user_command=cast(bool, args.user_command),
+                                source_accounts={identity: label for item in cast(list[str], args.source_account)
+                                                 for identity, _, label in (item.partition("="),)})
+        for result in results:
+            fields = asdict(result)
+            if isinstance(result, moves.MoveSuperseded):
+                fields["reason"] = f"not moved: {result.reason}"
+            elif isinstance(result, moves.MoveWaitingForRow) and result.command:
+                fields["reason"] = f"Move pending: {result.reason}. Run again: {result.command}"
+            elif isinstance(result, moves.MoveInProgress) and result.command:
+                fields["reason"] = f"Move pending. Run again: {result.command}"
+            _ = output.write(json.dumps({"result": type(result).__name__, **fields}) + "\n")
     return int(any(not isinstance(result, (ClaudeUp, MoveHandedOff)) for result in results))
 
 
