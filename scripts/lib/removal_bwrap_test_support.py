@@ -36,15 +36,23 @@ def mac_profile(private: Path, checkout: Path) -> str:
     python_library = (Path(sys.base_prefix) / "Python").resolve()
     runtime = tuple(Path(path) for path in (
         "/bin", "/usr/bin", "/usr/lib", "/System/Library", "/usr/share/zoneinfo", "/private/var/db/timezone",
+        "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld",
+        "/private/preboot/Cryptexes/OS/System/Library/dyld",
+        "/System/Cryptexes/OS/System/Library/dyld",
     ))
+    nix_store = Path("/nix/store")
+    if interpreter.is_relative_to(nix_store):
+        # dyld loads libpython and extension libraries from the Nix store.
+        runtime += (nix_store,)
     readable = (private, checkout, *sorted(libraries), *runtime)
-    readable_files = (interpreter, python_library, Path("/dev/null"))
+    readable_files = (interpreter, python_library, Path("/dev/null"), Path("/dev/random"), Path("/dev/urandom"))
     parents = {parent for path in (*readable, *readable_files) for parent in path.parents}
     directories = " ".join(map(subpath, readable))
     def literals(paths: tuple[Path, ...] | list[Path]) -> str:
         return " ".join(f"(literal {json.dumps(str(path), ensure_ascii=False)})" for path in paths)
 
     cache = f"dataclass-code-{os.getuid()}"
+    # The default policy permits sysctl and Mach lookups.
     return (
         "(version 1)\n(allow default)\n(deny network*)\n(deny file-read*)\n(deny file-write*)\n"
         f"(allow file-read* {directories} {literals(readable_files)})\n"

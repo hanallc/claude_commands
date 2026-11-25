@@ -13,7 +13,9 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -254,15 +256,29 @@ class ToolFolderRemovalTests(unittest.TestCase):
                 return sandbox.python("-c", *arguments)
         return sandbox.python("-c", *arguments)
 
+    def assert_child_ok(self, result: subprocess.CompletedProcess[str]) -> None:
+        if result.returncode == 0:
+            return
+        if result.returncode < 0:
+            number = -result.returncode
+            try:
+                reason = signal.Signals(number).name
+            except ValueError:
+                reason = f"signal {number}"
+        else:
+            reason = f"exit {result.returncode}"
+        command = shlex.join(cast(list[str], result.args))
+        self.fail(f"{reason}: {command}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
+
     def assert_claim(self, result: subprocess.CompletedProcess[str], name: str) -> None:
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_child_ok(result)
         self.assertEqual(result.stdout.strip(), name)
 
     def test_removes_only_the_leftover(self) -> None:
         sandbox = self.sandbox()
         outside = sandbox.outside.read_bytes()
         probe = sandbox.python("-c", PROBE_OUTSIDE, str(sandbox.outside))
-        self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+        self.assert_child_ok(probe)
         candidate = self.candidate(sandbox)
         local = sandbox.host_path(candidate)
         keep = local.parent / "keep"
@@ -354,7 +370,7 @@ class ToolFolderRemovalTests(unittest.TestCase):
             if sys.platform == "darwin":
                 image = sandbox.fixture / "removal.dmg"
                 _ = self.disk_image("create", "-size", "16m", "-fs", "HFS+", "-layout", "NONE",
-                                    "-format", "UDRW", str(image))
+                                    "-type", "UDIF", str(image))
                 cleanup.enter_context(self.attach_image(image, local))
                 keep = local / "output"
                 probe = (PROBE_MAC_MOUNT, str(sandbox.checkout), str(mount))
@@ -363,7 +379,7 @@ class ToolFolderRemovalTests(unittest.TestCase):
                 probe = (PROBE_MOUNT, str(mount))
             self.canary(keep)
             result = self.run_python(sandbox, candidate, *probe)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assert_child_ok(result)
             yield keep
 
     def test_interrupted_image_attach_detaches_only_the_private_image(self) -> None:
@@ -394,9 +410,9 @@ class ToolFolderRemovalTests(unittest.TestCase):
         candidate = self.candidate(sandbox)
         with self.mount_canary(sandbox, candidate) as keep:
             result = self.claim(sandbox, candidate, ClaimCase.NESTED_MOUNT)
+            self.assert_claim(result, "proof-2")
             self.assert_canary(keep)
             self.assert_canary(sandbox.host_path(candidate / "old" / "output"))
-            self.assert_claim(result, "proof-2")
 
     def test_keeps_a_bind_mount_after_the_removal_parent_moves(self) -> None:
         sandbox = replace(self.sandbox(), mount=BuildMount.BIND_UNIT)
@@ -404,7 +420,7 @@ class ToolFolderRemovalTests(unittest.TestCase):
         with self.mount_canary(sandbox, candidate) as keep:
             checkout = sandbox.checkout if sys.platform == "darwin" else LINUX_CHECKOUT
             result = self.run_python(sandbox, candidate, RUN_MOVED_PARENT, str(checkout), str(candidate))
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assert_child_ok(result)
             moved = candidate.parent.with_name("moved") / candidate.name
             self.assert_canary(sandbox.host_path(moved / "old" / "output"))
             self.assert_canary(sandbox.host_path(moved / "unit" / "output") if sys.platform == "darwin" else keep)
@@ -413,27 +429,27 @@ class ToolFolderRemovalTests(unittest.TestCase):
         sandbox = self.sandbox()
         candidate = self.candidate(sandbox)
         result = self.claim(sandbox, candidate, ClaimCase.OWNER_REPLACEMENT)
-        self.assert_canary(sandbox.host_path(candidate / "live"))
         self.assert_claim(result, "proof-2")
+        self.assert_canary(sandbox.host_path(candidate / "live"))
 
     def test_keeps_a_replacement_at_the_checked_staging_name(self) -> None:
         sandbox = self.sandbox()
         candidate = self.candidate(sandbox)
         result = self.claim(sandbox, candidate, ClaimCase.STAGED_REPLACEMENT)
+        self.assert_claim(result, "replacement refused")
         parent = sandbox.host_path(candidate.parent)
         self.assert_canary(parent / "original-tree" / "old" / "output")
         staged = [path for path in parent.glob(".removing-*") if path.is_dir()]
         self.assertEqual(len(staged), 1, result.stdout + result.stderr)
         [replacement] = staged
         self.assert_canary(replacement / "replacement")
-        self.assert_claim(result, "replacement refused")
 
     def assert_kept(self, case: ClaimCase) -> None:
         sandbox = self.sandbox()
         candidate = self.candidate(sandbox)
         result = self.claim(sandbox, candidate, case)
-        self.assert_canary(sandbox.host_path(candidate / "old" / "output"))
         self.assert_claim(result, "proof-2")
+        self.assert_canary(sandbox.host_path(candidate / "old" / "output"))
 
     def test_keeps_a_folder_with_an_unreadable_lease(self) -> None:
         self.assert_kept(ClaimCase.UNREADABLE_LEASE)
@@ -479,4 +495,4 @@ class ToolFolderRemovalTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    _ = unittest.main()
