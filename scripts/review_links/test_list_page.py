@@ -3840,6 +3840,10 @@ window.fetch=(url,options)=>{
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_item_actions_unread_sync_and_words_fields(self) -> None:
         _ = self.fixture_items()
+        request = the_list.add(MORTY.id, "Report the result", owner=OWNER.id, number=107, source="nate",
+                               changes={"state": the_list.ItemState.BLOCKED,
+                                        "latest_status": 'Please Tell Morty & confirm the "release result".'})
+        _ = the_list.update(MORTY.id, request.id, {"latest_status": "The result is ready."}, source="morty")
         with patch.object(list_page, "counts_strip", return_value=""):
             markup = list_page.render(self.root / "reviews").decode()
         setup = '''<script>
@@ -3865,7 +3869,8 @@ window.fetch=async(_path,options={})=>{
  const submit=(number,action)=>{const form=recordDetails(row(number)).querySelector('form');form.requestSubmit(form.querySelector('[value="'+action+'"]'));return form;};
  try{
   for(const [query,expected] of [['105','105'],['L105','105'],['#105','105'],['BUILDS','105'],
-    ['Straße','106'],['WORKING','105,106'],['Waiting','58'],['Parked','41'],['Closed','']]){
+    ['Straße','106'],['WORKING','105,106'],['Waiting','58'],['Parked','41'],['Closed',''],
+    ['tELL mORTY','107'],['& confirm the "release result"','107'],['missing request phrase','']]){
    await choose('all',query);check(visible()===expected,'words filter: '+query);
   }
   await choose('working','106');row('106').querySelector('.list-toggle').click();
