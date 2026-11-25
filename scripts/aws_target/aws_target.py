@@ -31,7 +31,7 @@ from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecu
 from scripts.aws_target.config import AwsOff, AwsOn, aws_switch, read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
 from scripts.build_targets.target_config import ssh_target_state_directory
-from scripts.for_you.action import ActionStore, ActionStoreError
+from scripts.for_you.action import ActionStore, ActionStoreError, action_id
 from scripts.lib import conf
 from scripts.message import send_budget, send_result
 from scripts.message.session_send import send_argv
@@ -150,43 +150,33 @@ def snapshot_failure_push(failures: Sequence[SnapshotFailure]) -> push_texts.Ren
     return push_texts.render('aws.snapshot_failed', failures='\n'.join(lines))
 
 
-def update_price_read_action(failures: Sequence[SnapshotFailure], now: int, *, key: str = '',
-                             save_legacy_key: Callable[[str], None] | None = None) -> int:
-    """File the action for a permission refusal or withdraw it after recovery."""
-    try:
-        actions = ActionStore()
-        opened = next((record for record in actions.list()
-                       if record.status == 'open' and record.requested_by == PRICE_READ_REQUESTER
-                       and record.dedupe_key == PRICE_READ_ACTION_KEY), None)
-        if failures:
-            if save_legacy_key is not None:
-                key = opened.key if opened is not None else f'action/{uuid4()}'
-                save_legacy_key(key)
-            if opened is not None and opened.key != key:
-                _ = actions.withdraw(opened.key, requested_by=PRICE_READ_REQUESTER,
-                                     reason='A new refused read replaced this action.')
-            regions = ', '.join(failure.region for failure in failures)
-            record = actions.add(
-                title='Allow AWS price reads',
-                command='~/.claude/scripts/lib/py ~/.claude/scripts/aws_target/deploy.py up --approve-resources',
-                machine='natedev', cwd='/home/natepiano', requested_by=PRICE_READ_REQUESTER,
-                reason=f'AWS refused the price read in {regions}. '
-                       + 'After 2 hours without the read, test runs on AWS can pick a region that costs more. '
-                       + 'The command allows the read, costs nothing, and asks for your AWS admin passphrase.',
-                waits=f'Test runs on AWS in {regions}', concerns='aws', dedupe_key=PRICE_READ_ACTION_KEY, key=key,
-                completion='automatic',
-            )
-            if record.key != key:
-                raise ActionStoreError('Another open action appeared before the new action could be added.')
-        elif opened is not None:
-            stamp = datetime.fromtimestamp(now, UTC).isoformat()
-            _ = actions.withdraw(opened.key, requested_by=PRICE_READ_REQUESTER,
-                                 reason=f'The hourly read succeeded at {stamp}.')
-    except (ActionStoreError, OSError) as error:
-        detail = ' '.join(str(error).split())
-        print(f'aws_target: cannot update the AWS price read action: {detail}', file=sys.stderr)
-        return 1
-    return 0
+def withdraw_price_read_action(actions: ActionStore, *, reason: str, keep_key: str = '') -> None:
+    """Withdraw the open price read action unless its key matches keep_key."""
+    for record in actions.list():
+        if (record.status == 'open' and record.requested_by == PRICE_READ_REQUESTER
+                and record.dedupe_key == PRICE_READ_ACTION_KEY and record.key != keep_key):
+            _ = actions.withdraw(record.key, requested_by=PRICE_READ_REQUESTER, reason=reason)
+            return
+
+
+def file_price_read_action(failures: Sequence[SnapshotFailure], *, key: str) -> None:
+    """File the action for a permission refusal with the saved key."""
+    key = f'action/{action_id(key)}'
+    actions = ActionStore()
+    withdraw_price_read_action(actions, reason='A new refused read replaced this action.', keep_key=key)
+    regions = ', '.join(failure.region for failure in failures)
+    record = actions.add(
+        title='Allow AWS price reads',
+        command='~/.claude/scripts/lib/py ~/.claude/scripts/aws_target/deploy.py up --approve-resources',
+        machine='natedev', cwd='/home/natepiano', requested_by=PRICE_READ_REQUESTER,
+        reason=f'AWS refused the price read in {regions}. '
+               + 'After 2 hours without the read, test runs on AWS can pick a region that costs more. '
+               + 'The command allows the read, costs nothing, and asks for your AWS admin passphrase.',
+        waits=f'Test runs on AWS in {regions}', concerns='aws', dedupe_key=PRICE_READ_ACTION_KEY, key=key,
+        completion='automatic',
+    )
+    if record.key != key:
+        raise ActionStoreError('Another open action appeared before the new action could be added.')
 
 
 def gpu_price_sizes(values: conf.ConfigRead) -> tuple[str, ...]:
@@ -503,8 +493,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
         prices = list(ledger.rows(document, 'prices'))
         readings = list(ledger.rows(document, 'regions')) if 'regions' in document else []
         reason_limit = configuration.whole('snapshot_error_reason_max_chars')
-        previous_failures = snapshot_failures(document)
-        failures = {row.region: row for row in previous_failures}
+        failures = {row.region: row for row in snapshot_failures(document)}
         status = 0
         aws_unavailable = False
         read_prices: list[ledger.RegionalSpotPrice] = []
@@ -562,10 +551,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
             since = ledger.instant(previous, 'since') if previous else now
             notice_claimed = previous.get('notice_claimed', previous.get('notified')) is True
             action_key = ledger.text(previous, 'action_key') if 'action_key' in previous else ''
-            # Older snapshots can record a permission refusal without an action key.
-            legacy_refusal = not action_key and bool(previous) and (
-                notice_claimed or any(snapshot_permission_failure(row) for row in previous_failures))
-            if access_failures and not action_key and not legacy_refusal:
+            if access_failures and not action_key:
                 # Save the key before creating the action so a retry uses the same key.
                 action_key = f'action/{uuid4()}'
             streak = SnapshotFailureStreak(since, notice_claimed, action_key,
@@ -582,20 +568,22 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
         except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
             print(f'aws_target: daily Spot prices not saved: {type(error).__name__}: {error}', file=sys.stderr)
             status = 1
+        action_filed = False
+        try:
+            if isinstance(streak, SnapshotHealthy):
+                stamp = datetime.fromtimestamp(now, UTC).isoformat()
+                withdraw_price_read_action(ActionStore(), reason=f'The hourly read succeeded at {stamp}.')
+            elif access_failures and not streak.action_created:
+                file_price_read_action(access_failures, key=streak.action_key)
+                action_filed = True
+        except (ActionStoreError, OSError) as error:
+            detail = ' '.join(str(error).split())
+            print(f'aws_target: cannot update the AWS price read action: {detail}', file=sys.stderr)
+            status = 1
         if access_failures and isinstance(streak, SnapshotFailureStreak):
-            if not streak.action_created:
-                def save_action_key(key: str) -> None:
-                    nonlocal streak
-                    assert isinstance(streak, SnapshotFailureStreak)
-                    streak = replace(streak, action_key=key)
-                    save_snapshot()
-
-                action_status = update_price_read_action(access_failures, now, key=streak.action_key,
-                                                         save_legacy_key=None if streak.action_key else save_action_key)
-                status |= action_status
-                if not action_status:
-                    streak = replace(streak, action_created=True)
-                    save_snapshot()
+            if action_filed:
+                streak = replace(streak, action_created=True)
+                save_snapshot()
             if not streak.notice_claimed:
                 # Save the claim before delivery because note keys alone do not suppress repeats.
                 streak = replace(streak, notice_claimed=True)
@@ -605,8 +593,6 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                     streak = replace(streak, notice_claimed=False)
                     save_snapshot()
                     print('aws_target: snapshot user notice remains pending', file=sys.stderr)
-        elif not current_failures:
-            status |= update_price_read_action((), now)
         # The stamp is the last scheduled read. A forced read leaves it, so the next hourly read still runs.
         if not force:
             _ = lock.seek(0)

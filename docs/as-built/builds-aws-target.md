@@ -1187,7 +1187,6 @@ The first permission refusal files the **Allow AWS price reads** action with `de
 The card reason says, "After 2 hours without the read, test runs on AWS can pick a region that costs more."
 The card shows **Completion: Automatic** and also has a **Done** button.
 The streak saves the action key before it files the action.
-For an older streak without a key, the snapshot saves the open action's key before it uses the action.
 A new streak withdraws any open action from the previous streak before it files an action for the current regions.
 It records successful action creation separately from the notice claim.
 A later permission refusal retries a failed action creation, even after the notice goes out.

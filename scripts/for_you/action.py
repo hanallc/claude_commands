@@ -160,9 +160,8 @@ class ActionStore:
 
     def add(self, *, title: str, command: str, machine: str, cwd: str, requested_by: str,
             reason: str, waits: str, concerns: str, dedupe_key: str, key: str = "",
-            completion: ActionCompletion = "manual",
-            before_reuse: Callable[[str], None] | None = None) -> UserAction:
-        """Call before_reuse under the lock before returning an open request with a different key."""
+            completion: ActionCompletion = "manual") -> UserAction:
+        """Create one action or return an existing action for the request."""
         now = datetime.now(timezone.utc).isoformat()
         identifier = action_id(key) if key else str(uuid4())
         record = UserAction(f"action/{identifier}", 1, title, command, machine, cwd, requested_by,
@@ -178,8 +177,6 @@ class ActionStore:
             for existing in records:
                 if (existing.status == "open" and existing.requested_by == requested_by
                         and existing.dedupe_key == dedupe_key):
-                    if before_reuse is not None:
-                        before_reuse(existing.key)
                     return existing
             return self._write(record)
 

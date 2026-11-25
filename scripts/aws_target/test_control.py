@@ -1166,16 +1166,9 @@ region_transfer_usd={"us-west-1":0.00015}
             self.assertEqual(self.snapshot(), 1)
         self.assertEqual(sorted(record.status for record in actions.list()), ['done', 'open'])
 
-    def test_reused_price_read_action_key_survives_a_stop_before_the_success_save(self) -> None:
+    def test_saved_price_read_action_key_survives_a_stop_before_the_success_save(self) -> None:
         self.failure = 'describe-spot-price-history'
-        with redirect_stderr(StringIO()):
-            self.assertEqual(self.snapshot(), 1)
         actions = action.ActionStore()
-        opened, = actions.list()
-        document = aws_target.read_snapshot(self.state)
-        streak = ledger.mapping(document['failure_streak'])
-        document['failure_streak'] = {'since': streak['since'], 'notice_claimed': True}
-        _ = (self.state / 'spot-prices.json').write_text(json.dumps(document))
 
         def stop_before_success(path: Path, text: str) -> None:
             output = ledger.mapping(cast(object, json.loads(text)))
@@ -1184,20 +1177,21 @@ region_transfer_usd={"us-west-1":0.00015}
             atomic_file.write_text_atomic(path, text)
 
         interval = conf.read(self.settings).whole('price_refresh_seconds')
-        self.clock.advance(interval)
         with (mock.patch.object(aws_target, 'write_text_atomic', side_effect=stop_before_success),
               redirect_stderr(StringIO()),
               self.assertRaisesRegex(RuntimeError, 'Fixture stop before the success save')):
             _ = self.snapshot()
+        opened, = actions.list()
         pending = ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])
         self.assertFalse(pending['action_created'])
+        self.assertEqual(pending['action_key'], opened.key)
+        self.assertEqual(self.notices, [])
 
         done = actions.mark_done(opened.key, evidence='The user completed the action.')
         self.clock.advance(interval)
         with redirect_stderr(StringIO()):
             self.assertEqual(self.snapshot(), 1)
         self.assertEqual(actions.list(), (done,))
-        self.assertEqual(pending['action_key'], opened.key)
         self.assertTrue(ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])['action_created'])
         self.assertEqual(len(self.notices), 1)
 
@@ -1233,9 +1227,23 @@ region_transfer_usd={"us-west-1":0.00015}
         with redirect_stderr(StringIO()):
             self.assertEqual(self.snapshot(), 1)
         self.assertEqual(len(self.notices), 1)
-        self.assertTrue(ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])['notice_claimed'])
+        saved = ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])
+        self.assertTrue(saved['notice_claimed'])
         opened, = actions.list()
         self.assertEqual(opened.status, 'open')
+        self.assertEqual(saved['action_key'], opened.key)
+
+    def test_file_price_read_action_rejects_an_empty_key_before_withdrawal(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        opened, = actions.list()
+        failures = aws_target.snapshot_failures(aws_target.read_snapshot(self.state))
+
+        with self.assertRaises(action.ActionStoreError):
+            aws_target.file_price_read_action(failures, key='')
+        self.assertEqual(actions.list(), (opened,))
 
     def test_failed_notice_retries_without_changing_its_key(self) -> None:
         self.failure = 'describe-spot-price-history'
