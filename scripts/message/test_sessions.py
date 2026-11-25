@@ -28,6 +28,7 @@ from scripts.message.relay_identity import SavedRelaySender, read_relay_sender, 
 from scripts.message.relay_test_support import write_relay_record
 from scripts.message.recipient_test_support import staff_child_command
 from scripts.production import staff
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 
 
 SCRIPT = Path(__file__).with_name("sessions.py")
@@ -560,6 +561,20 @@ class SessionLookupTests(ShutdownTestCase):
             self.assertEqual(read.entries[0].details.get("cwd"), "/kept-folder")
             self.assertEqual(read.entries[0].details.get("status"), "idle")
             self.assertEqual([item["name"] for item in sessions.live_sessions()], ["kept"])
+
+
+class StaffMemberTargetTests(StaffTestCase):
+    def test_member_target_uses_the_replacement_session_after_a_staff_rename(self) -> None:
+        runner = fixture_member("showrunner", name="runner")
+        unit = fixture_member("unit", name="director", parent=runner.id)
+        target = "session:" + unit.id
+        self.assertEqual(sessions.member_target(target), "session:" + unit.current_session)
+
+        _ = staff.rename(unit.id, "renamed-director")
+        replacement = staff.native_id(fixture_runtime_id("replacement-director"))
+        _ = staff.update_current_session(unit.current_session, replacement)
+
+        self.assertEqual(sessions.member_target(target), "session:" + replacement)
 
 
 class ProcessStartTests(ShutdownTestCase):

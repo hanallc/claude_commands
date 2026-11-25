@@ -1264,6 +1264,10 @@ class LocalReviewTests(unittest.TestCase):
         self.assertIn("Example (typical):\nTitle: natedev: trunk waits for your go\nSession: trunk\n", shown)
         self.assertNotIn("{", shown.split("Example (typical):")[1])
         with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(review.main(["show", "shutdown.restart_failed"]), 0)
+        self.assertTrue(output.getvalue().endswith("Example (typical):\nTitle: trunk did not start on claude4\n"
+            + "Action: In the natedev session, run: /agents resume trunk --to claude4\n"))
+        with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(review.main(["show", "no.such"]), 1)
         self.assertEqual(output.getvalue(), f"No template named no.such.\n\n{listing}\n")
 

@@ -255,7 +255,6 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/census.py` | read | StaffId |
 | `scripts/production/change_review.py` | read | snapshot |
 | `scripts/production/change_routing.py` | read | staff.json path |
-| `scripts/production/codex_winddown.py` | read | snapshot |
 | `scripts/production/completion_receipt.py` | read | native_id |
 | `scripts/production/delivery_state.py` | read | staff.json path |
 | `scripts/production/demote_showrunner.py` | write | by_id, change_director, cli_result, move, operation, snapshot |
