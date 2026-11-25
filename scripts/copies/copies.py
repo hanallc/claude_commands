@@ -1580,9 +1580,9 @@ def gate_command_source_check(command: Sequence[str], *,
         return None
     script, arguments = program
     launcher = Path(script)
-    if launcher.name not in MERGE_GATE_PROGRAMS:
+    if launcher.name not in GATE_SCRIPTS:
         return None
-    relative = Path(GATE_SCRIPT).with_name(launcher.name)
+    relative = Path(GATE_SCRIPT)
     launcher_checkout = None
     if launcher.is_absolute():
         from scripts.lib.python_startup.sitecustomize import checkout_root
@@ -1599,7 +1599,7 @@ def gate_command_source_check(command: Sequence[str], *,
         path = parser_root / GATE_SCRIPT
         if path.resolve() != path:
             raise CopyError(f"Use the regular {GATE_SCRIPT} file in {parser_root}.")
-        if launcher_checkout is None and launcher.name == "gate.py":
+        if launcher_checkout is None:
             expanded = [part.replace("{tree}", str(source)) for part in command] if numbered_copy else command
             if not first_step.canonical_gate_command(expanded, source):
                 return
