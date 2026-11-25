@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from contextlib import ExitStack, contextmanager, redirect_stderr
-from dataclasses import dataclass, replace
-from io import StringIO
+from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 import os
 from pathlib import Path
 import plistlib
@@ -14,7 +13,6 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import time
 from typing import cast
 import unittest
 from unittest import mock
@@ -49,18 +47,6 @@ probe = mount / "write-probe"
 probe.touch(exist_ok=False)
 probe.unlink()
 """
-
-MOVED_PARENT_DETACH_RETRY_S = 10
-
-
-@dataclass
-class MovedParentCleanup:
-    directory: tempfile.TemporaryDirectory[str]
-    deferred: bool = False
-
-    def cleanup(self) -> None:
-        if not self.deferred:
-            self.directory.cleanup()
 
 
 def remove_after_parent_moves(candidate: Path) -> None:
@@ -98,11 +84,10 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
         return "\n".join([shlex.join(command), f"exit status: {result.returncode}",
                           "stdout:", result.stdout, "stderr:", result.stderr])
 
-    def cleanup_command(self, attempts: list[str], *arguments: str,
-                        timeout: int = 20) -> subprocess.CompletedProcess[str] | None:
+    def cleanup_command(self, attempts: list[str], *arguments: str) -> subprocess.CompletedProcess[str] | None:
         command = list(arguments)
         try:
-            result = run_mac_fixture_command(command, timeout=timeout)
+            result = run_mac_fixture_command(command, timeout=20)
         except AssertionError as error:
             attempts.append(str(error))
             return None
@@ -112,12 +97,9 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
         attempts.append(self.command_detail(command, result))
         return result
 
-    def attached_images(self, attempts: list[str], *, deadline: float | None = None) -> list[dict[str, object]]:
+    def attached_images(self, attempts: list[str]) -> list[dict[str, object]]:
         for _ in range(2):
-            timeout = 20 if deadline is None else int(deadline - time.monotonic())
-            if timeout < 1:
-                break
-            result = self.cleanup_command(attempts, "/usr/bin/hdiutil", "info", "-plist", timeout=timeout)
+            result = self.cleanup_command(attempts, "/usr/bin/hdiutil", "info", "-plist")
             if result is not None and result.returncode == 0:
                 try:
                     reply = cast(dict[str, list[dict[str, object]]], plistlib.loads(result.stdout.encode()))
@@ -195,95 +177,39 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
         for pid, command in children.items():
             attempts.append(f"PID {pid} {command} cwd: {directories.get(pid, 'unavailable')}")
 
-    def verified_mounts(self, image: Path, device: str, owners: list[dict[str, object]], attempts: list[str]) -> list[Path]:
-        if len(owners) != 1 or owners[0].get("image-path") != str(image):
-            self.fail("\n".join([f"{device} no longer belongs to {image}.", *attempts]))
-        root = image.parent.resolve()
-        mounts: list[Path] = []
-        for entity in self.image_entities(owners[0]):
-            if point := entity.get("mount-point"):
-                mount = Path(point)
-                target = mount.resolve()
-                if not mount.is_absolute() or target == root or not target.is_relative_to(root):
-                    self.fail("\n".join([f"{device} has a mount outside the fixture: {mount}", *attempts]))
-                mounts.append(target)
-        return mounts
-
-    def detach_is_busy(self, result: subprocess.CompletedProcess[str] | None) -> bool:
-        return result is not None and result.returncode == 16 and any(
-            "resource busy" in stream.lower() for stream in (result.stdout, result.stderr))
-
-    def retry_moved_parent_detach(self, image: Path, device: str, attempts: list[str],
-                                  result: subprocess.CompletedProcess[str] | None,
-                                  ) -> tuple[subprocess.CompletedProcess[str] | None, int, float]:
-        started = time.monotonic()
-        deadline = started + MOVED_PARENT_DETACH_RETRY_S
-        attempt = 1
-        while self.detach_is_busy(result):
-            remaining = deadline - time.monotonic()
-            # Allow one second each for the identity check and the detach.
-            if remaining < 2:
-                if remaining > 0:
-                    time.sleep(remaining)
-                break
-            owners = self.device_images(self.attached_images(attempts, deadline=deadline), device)
-            if not owners:
-                break
-            _ = self.verified_mounts(image, device, owners, attempts)
-            timeout = int(deadline - time.monotonic())
-            if timeout < 1:
-                continue
-            attempt += 1
-            result = self.cleanup_command(attempts, "/usr/bin/hdiutil", "detach", "-force", device, timeout=timeout)
-            if self.detach_is_busy(result) and (delay := min(1, deadline - time.monotonic())) > 0:
-                time.sleep(delay)
-        return result, attempt, time.monotonic() - started
-
-    def cleanup_image(self, image: Path, device: str | None, attempts: list[str], *,
-                      moved_parent: MovedParentCleanup | None = None) -> None:
+    def cleanup_image(self, image: Path, device: str | None, attempts: list[str]) -> None:
         remaining = self.attached_images(attempts)
-        deferred_image = None
-        attempt = 1
-        elapsed = 0.0
         if device is not None and (owners := self.device_images(remaining, device)):
-            mounts = self.verified_mounts(image, device, owners, attempts)
+            if len(owners) != 1 or owners[0].get("image-path") != str(image):
+                self.fail("\n".join([f"{device} no longer belongs to {image}.", *attempts]))
+            root = image.parent.resolve()
+            mounts: list[Path] = []
+            for entity in self.image_entities(owners[0]):
+                if point := entity.get("mount-point"):
+                    mount = Path(point)
+                    target = mount.resolve()
+                    if not mount.is_absolute() or target == root or not target.is_relative_to(root):
+                        self.fail("\n".join([f"{device} has a mount outside the fixture: {mount}", *attempts]))
+                    mounts.append(target)
             result = self.cleanup_command(attempts, "/usr/bin/hdiutil", "detach", "-force", device)
-            if moved_parent is not None and self.detach_is_busy(result):
-                result, attempt, elapsed = self.retry_moved_parent_detach(image, device, attempts, result)
-            busy = self.detach_is_busy(result)
-            if busy:
+            if result is not None and result.returncode == 16 and any(
+                    "resource busy" in stream.lower() for stream in (result.stdout, result.stderr)):
                 self.busy_mount_diagnostics(mounts, attempts)
             remaining = self.attached_images(attempts)
-            if owners := self.device_images(remaining, device):
-                if moved_parent is None or not busy or elapsed < MOVED_PARENT_DETACH_RETRY_S:
-                    self.fail("\n".join([f"Disk device still attached: {device} for {image}", *attempts]))
-                _ = self.verified_mounts(image, device, owners, attempts)
-                deferred_image = owners[0]
-            elif result is None or result.returncode != 0:
+            if self.device_images(remaining, device):
+                self.fail("\n".join([f"Disk device still attached: {device} for {image}", *attempts]))
+            if result is None or result.returncode != 0:
                 self.fail("\n".join([f"Detach failed for {device}.", *attempts]))
-        fixture_images = [name for entry in remaining if entry is not deferred_image
-                          and isinstance(name := entry.get("image-path"), str)
+        fixture_images = [name for entry in remaining if isinstance(name := entry.get("image-path"), str)
                           and Path(name).is_relative_to(image.parent.parent)]
         if fixture_images:
             self.fail("\n".join([f"Disk images still attached: {', '.join(fixture_images)}", *attempts]))
-        if deferred_image is not None and moved_parent is not None:
-            moved_parent.deferred = True
-            print("\n".join([
-                "Mac: the image detach after the parent moves stays busy under a holder that this user cannot see; "
-                + "the gate cleanup detaches it",
-                *attempts,
-            ]), file=sys.stderr, flush=True)
-        elif attempt > 1:
-            print(f"Mac: detach attempt {attempt} released {device} after {elapsed:.2f} s.",
-                  file=sys.stderr, flush=True)
 
     @contextmanager
-    def attach_image(self, image: Path, mount: Path, *,
-                     moved_parent: MovedParentCleanup | None = None) -> Generator[None]:
+    def attach_image(self, image: Path, mount: Path) -> Generator[None]:
         device: str | None = None
         attempts: list[str] = []
         interrupt: BaseException | None = None
-        completed = False
         try:
             reply = self.disk_image("attach", "-nobrowse", "-mountpoint", str(mount),
                                     "-owners", "off", "-plist", str(image), allow_skip=True, attempts=attempts)
@@ -294,22 +220,20 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
             device = devices.pop()
             self.assertTrue(mount.is_mount(), f"hdiutil did not mount {mount}")
             yield
-            completed = True
         except BaseException as error:
             if not isinstance(error, Exception):
                 interrupt = error
             raise
         finally:
             try:
-                self.cleanup_image(image, device, attempts, moved_parent=moved_parent if completed else None)
+                self.cleanup_image(image, device, attempts)
             except BaseException as cleanup_error:
                 if interrupt is None:
                     raise
                 interrupt.add_note(f"Disk image cleanup failed: {cleanup_error}")
 
     @contextmanager
-    def mount_canary(self, sandbox: RemovalSandbox, candidate: Path, *,
-                     moved_parent: MovedParentCleanup | None = None) -> Generator[Path]:
+    def mount_canary(self, sandbox: RemovalSandbox, candidate: Path) -> Generator[Path]:
         mount = candidate / "unit"
         local = sandbox.host_path(mount)
         local.mkdir()
@@ -318,7 +242,7 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
                 image = sandbox.fixture / "removal.dmg"
                 _ = self.disk_image("create", "-size", "16m", "-fs", "HFS+", "-layout", "NONE",
                                     "-type", "UDIF", str(image), allow_skip=True)
-                cleanup.enter_context(self.attach_image(image, local, moved_parent=moved_parent))
+                cleanup.enter_context(self.attach_image(image, local))
                 keep = local / "output"
                 probe = (PROBE_MAC_MOUNT, str(sandbox.checkout), str(mount))
             else:
@@ -498,122 +422,6 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
             self.cleanup_image(image, device, [])
         self.assertIn("exit status: 2\nstdout:\n\nstderr:\ndetach error", str(failure.exception))
 
-    def test_moved_parent_retry_reports_the_attempt_that_released_the_device(self) -> None:
-        directory = tempfile.TemporaryDirectory()
-        _ = self.enterContext(directory)
-        moved_parent = MovedParentCleanup(directory)
-        image = Path(directory.name).resolve() / "fixture/removal.dmg"
-        mount = image.parent / "moved/unit"
-        device = "/dev/disk9"
-        info = plistlib.dumps({"images": [
-            {"image-path": str(image), "system-entities": [{"dev-entry": device, "mount-point": str(mount)}]},
-        ]}).decode()
-        clean = plistlib.dumps({"images": []}).decode()
-        query = ["/usr/bin/hdiutil", "info", "-plist"]
-        detach = ["/usr/bin/hdiutil", "detach", "-force", device]
-        stderr = StringIO()
-        attempts: list[str] = []
-        with (mock.patch.object(time, "monotonic", side_effect=[100.0, 100.0, 100.0, 100.5, 101.0]),
-              mock.patch.object(subprocess, "run", side_effect=[
-                  subprocess.CompletedProcess(query, 0, info, ""),
-                  subprocess.CompletedProcess(detach, 16, "", "Resource busy"),
-                  subprocess.CompletedProcess(query, 0, info, ""),
-                  subprocess.CompletedProcess(detach, 0, "", ""),
-                  subprocess.CompletedProcess(query, 0, clean, ""),
-              ]) as run, redirect_stderr(stderr)):
-            self.cleanup_image(image, device, attempts, moved_parent=moved_parent)
-        self.assertEqual([call.args[0] for call in run.call_args_list], [query, detach, query, detach, query])
-        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [20, 20, 10, 9, 20])
-        self.assertEqual(stderr.getvalue(), f"Mac: detach attempt 2 released {device} after 1.00 s.\n")
-        self.assertIn("Resource busy", attempts[1])
-        self.assertIn("exit status: 0", attempts[3])
-        moved_parent.cleanup()
-        self.assertFalse(Path(directory.name).exists())
-
-    def test_moved_parent_retry_leaves_a_busy_device_and_fixture_for_the_gate(self) -> None:
-        directory = tempfile.TemporaryDirectory(delete=False)
-        self.addCleanup(directory.cleanup)
-        moved_parent = MovedParentCleanup(directory)
-        image = Path(directory.name).resolve() / "fixture/removal.dmg"
-        mount = image.parent / "moved/unit"
-        mount.mkdir(parents=True)
-        device = "/dev/disk9"
-        info = plistlib.dumps({"images": [
-            {"image-path": str(image), "system-entities": [{"dev-entry": device, "mount-point": str(mount)}]},
-        ]}).decode()
-        query = ["/usr/bin/hdiutil", "info", "-plist"]
-        detach = ["/usr/bin/hdiutil", "detach", "-force", device]
-        attached = subprocess.CompletedProcess(query, 0, info, "")
-        busy = subprocess.CompletedProcess(detach, 16, "", "Resource busy")
-        stderr = StringIO()
-        now = 100.0
-
-        def monotonic() -> float:
-            return now
-
-        def advance(seconds: float) -> None:
-            nonlocal now
-            now += seconds
-
-        with (mock.patch.object(time, "monotonic", side_effect=monotonic),
-              mock.patch.object(time, "sleep", side_effect=advance),
-              mock.patch.object(subprocess, "run", side_effect=[*([attached, busy] * 10), attached]) as run,
-              mock.patch.object(self, "busy_mount_diagnostics") as diagnostics, redirect_stderr(stderr)):
-            self.cleanup_image(image, device, [], moved_parent=moved_parent)
-        diagnostics.assert_called_once()
-        self.assertEqual(now, 100 + MOVED_PARENT_DETACH_RETRY_S)
-        self.assertEqual([call.args[0] for call in run.call_args_list], [*([query, detach] * 10), query])
-        self.assertTrue(stderr.getvalue().startswith(
-            "Mac: the image detach after the parent moves stays busy under a holder that this user cannot see; "
-            + "the gate cleanup detaches it\n"
-        ))
-        self.assertEqual(stderr.getvalue().count(f"{shlex.join(detach)}\nexit status: 16"), 10)
-        moved_parent.cleanup()
-        self.assertTrue(mount.is_dir())
-
-    def test_moved_parent_does_not_retry_busy_text_with_status_two(self) -> None:
-        directory = tempfile.TemporaryDirectory()
-        _ = self.enterContext(directory)
-        moved_parent = MovedParentCleanup(directory)
-        image = Path(directory.name).resolve() / "fixture/removal.dmg"
-        device = "/dev/disk9"
-        info = plistlib.dumps({"images": [
-            {"image-path": str(image), "system-entities": [{"dev-entry": device}]},
-        ]}).decode()
-        query = ["/usr/bin/hdiutil", "info", "-plist"]
-        detach = ["/usr/bin/hdiutil", "detach", "-force", device]
-        with (mock.patch.object(subprocess, "run", side_effect=[
-                  subprocess.CompletedProcess(query, 0, info, ""),
-                  subprocess.CompletedProcess(detach, 2, "detach output", "Resource busy\nExtra error detail"),
-                  subprocess.CompletedProcess(query, 0, info, ""),
-              ]) as run, self.assertRaisesRegex(AssertionError, "Disk device still attached") as failure):
-            self.cleanup_image(image, device, [], moved_parent=moved_parent)
-        self.assertEqual([call.args[0] for call in run.call_args_list], [query, detach, query])
-        self.assertFalse(moved_parent.deferred)
-        self.assertIn(f"{shlex.join(detach)}\nexit status: 2\nstdout:\ndetach output\n"
-                      + "stderr:\nResource busy\nExtra error detail", str(failure.exception))
-
-    def test_moved_parent_retry_refuses_a_device_with_a_different_image(self) -> None:
-        directory = tempfile.TemporaryDirectory()
-        _ = self.enterContext(directory)
-        moved_parent = MovedParentCleanup(directory)
-        image = Path(directory.name).resolve() / "fixture/removal.dmg"
-        device = "/dev/disk9"
-        original, changed = (plistlib.dumps({"images": [
-            {"image-path": str(source), "system-entities": [{"dev-entry": device}]},
-        ]}).decode() for source in (image, image.with_name("other.dmg")))
-        query = ["/usr/bin/hdiutil", "info", "-plist"]
-        detach = ["/usr/bin/hdiutil", "detach", "-force", device]
-        with (mock.patch.object(time, "monotonic", return_value=100.0),
-              mock.patch.object(subprocess, "run", side_effect=[
-                  subprocess.CompletedProcess(query, 0, original, ""),
-                  subprocess.CompletedProcess(detach, 16, "", "Resource busy"),
-                  subprocess.CompletedProcess(query, 0, changed, ""),
-              ]) as run, self.assertRaisesRegex(AssertionError, "no longer belongs")):
-            self.cleanup_image(image, device, [], moved_parent=moved_parent)
-        self.assertEqual([call.args[0] for call in run.call_args_list], [query, detach, query])
-        self.assertFalse(moved_parent.deferred)
-
     def test_detach_requires_the_saved_device_and_the_same_private_image(self) -> None:
         image = Path("/private/tmp/test-root/fixture/removal.dmg")
         device = "/dev/disk9"
@@ -668,23 +476,29 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
             self.assert_canary(sandbox.host_path(candidate / "old" / "output"))
 
     def test_keeps_a_bind_mount_after_the_removal_parent_moves(self) -> None:
-        moved_parent = None
         if sys.platform == "darwin":
-            directory = tempfile.TemporaryDirectory(prefix="tool-removal-", delete=False)
-            moved_parent = MovedParentCleanup(directory)
-            self.addCleanup(moved_parent.cleanup)
-            sandbox = RemovalSandbox(Path(directory.name).resolve() / "fixture", mount=BuildMount.BIND_UNIT)
-            sandbox.configure()
-        else:
-            sandbox = replace(self.sandbox(), mount=BuildMount.BIND_UNIT)
+            self.skipTest("not run on macOS: after the parent moves, the test image stays busy under a holder this user cannot see")
+        sandbox = replace(self.sandbox(), mount=BuildMount.BIND_UNIT)
         candidate = self.candidate(sandbox)
         moved = candidate.parent.with_name("moved") / candidate.name
-        with self.mount_canary(sandbox, candidate, moved_parent=moved_parent) as keep:
-            checkout = sandbox.checkout if sys.platform == "darwin" else LINUX_CHECKOUT
-            result = self.run_python(sandbox, candidate, RUN_MOVED_PARENT, str(checkout), str(candidate))
+        with self.mount_canary(sandbox, candidate) as keep:
+            result = self.run_python(sandbox, candidate, RUN_MOVED_PARENT, str(LINUX_CHECKOUT), str(candidate))
             self.assert_child_ok(result)
             self.assert_canary(sandbox.host_path(moved / "old" / "output"))
-            self.assert_canary(sandbox.host_path(moved / "unit" / "output") if sys.platform == "darwin" else keep)
+            self.assert_canary(keep)
+
+    def test_moved_parent_skips_on_mac_before_creating_a_fixture(self) -> None:
+        with (mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.object(self, "sandbox") as sandbox,
+              mock.patch.object(self, "disk_image") as disk_image,
+              self.assertRaises(unittest.SkipTest) as skipped):
+            self.test_keeps_a_bind_mount_after_the_removal_parent_moves()
+        self.assertEqual(
+            str(skipped.exception),
+            "not run on macOS: after the parent moves, the test image stays busy under a holder this user cannot see",
+        )
+        sandbox.assert_not_called()
+        disk_image.assert_not_called()
 
 
 if __name__ == "__main__":
