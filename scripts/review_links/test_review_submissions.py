@@ -794,7 +794,7 @@ class ReviewSubmissionTests(unittest.TestCase):
             self.assertEqual(submissions.submit(payload), saved)
         self.assertEqual(saved.path.parent, self.issues)
         receipt = cast(dict[str, str], json.loads((submissions.image_folder(saved).parent / "receipt.json").read_text()))
-        self.assertEqual(receipt, {"id": "P1", "kind": "proposal", "recipient": OWNER,
+        self.assertEqual(receipt, {"destination": "native", "id": "P1", "kind": "proposal", "recipient": OWNER,
                                    "path": str(saved.path), "original_path": str(saved.path),
                                    "payload_hash": saved.payload_hash})
         self.assertEqual(list(new_folder.glob("*.md")), [])

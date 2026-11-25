@@ -1959,6 +1959,14 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
         pages = {width: fixture_page(width, photo=False) for width in fixtures}
     documents = pages
     finished = threading.Event()
+
+    def fixture_width(url: str) -> int | None:
+        address = urlsplit(url)
+        if address.path.startswith("/case/"):
+            return int(address.path.removeprefix("/case/"))
+        widths = parse_qs(address.query).get("width")
+        return int(widths[0]) if widths else None
+
     outer = f"""<!doctype html><meta charset="utf-8">
     <style>body{{margin:0}}iframe{{display:block;border:0}}</style>
     <iframe title="Dialog probe"></iframe><img src="/complete" alt="" hidden>
@@ -1989,8 +1997,9 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
             self.response(status, "application/json", json.dumps(body).encode())
 
         def fixture(self) -> DialogFixture:
-            width, = parse_qs(urlsplit(self.headers["Referer"]).query)["width"]
-            return fixtures[int(width)]
+            width = fixture_width(self.headers["Referer"])
+            assert width is not None
+            return fixtures[width]
 
         def do_GET(self) -> None:
             address = urlsplit(self.path)
@@ -2013,8 +2022,13 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
             elif self.path == "/":
                 self.response(200, "text/html; charset=utf-8", outer)
             elif address.path.startswith("/case/") or address.path == "/console/list.html":
-                width, = parse_qs(address.query)["width"]
-                self.response(200, "text/html; charset=utf-8", documents[int(width)])
+                width = fixture_width(self.path)
+                if width is None:
+                    width = fixture_width(self.headers.get("Referer", ""))
+                if width is not None and width in documents:
+                    self.response(200, "text/html; charset=utf-8", documents[width])
+                else:
+                    self.response(404, "text/plain", b"Unknown fixture")
             else:
                 self.response(404, "text/plain", b"Unknown fixture path")
 

@@ -826,8 +826,9 @@ window.fetch=async (path,options={})=>{
  const words=dialog.querySelector('textarea');
  words.value='A new List item';
  words.dispatchEvent(new Event('input',{bubbles:true}));
+ const createdEvent=new Promise(resolve=>document.addEventListener('review-item-created',resolve,{once:true}));
  dialog.querySelector('[type="submit"]').click();
- await until(dialog,()=>!dialog.open);
+ await createdEvent;
  check(reads===0,'The List waits for the row save before it refreshes.');
  const reply=__ROW_REPLY__;
  finishRowSave(Response.json(reply.body,{status:reply.status}));
@@ -988,7 +989,11 @@ window.fetch=async (path,options={})=>{
   check(pendingCapture && !send.disabled,'Send is available while the screenshot is pending.');
   send.click();
   await until(dialog,()=>!dialog.querySelector('.new-item-error').hidden && !send.disabled);
+  dialog.querySelector('[data-later-draft]').click();
+  check(!words.readOnly && document.activeElement===words,'Edit a separate draft opens the words for editing.');
   type('The words for a new Send');
+  dialog.querySelector('[data-later-draft]').click();
+  check(words.readOnly && words.value==='The first Send','Return to Retry restores the locked words.');
   const address=location.href,top=scrollY;
   check(top>0,'The List has scrolled before the retry.');
   send.click();
@@ -2925,8 +2930,9 @@ document.body.append(result);
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_status_counts_partition_all_items_with_and_without_unread(self) -> None:
+        states = [state for state in the_list.ItemState if state is not the_list.ItemState.SCHEDULED]
         for offset in (0, 8):
-            for number, state in enumerate(the_list.ItemState, start=1 + offset):
+            for number, state in enumerate(states, start=1 + offset):
                 closed = state is the_list.ItemState.CLOSED
                 item = self.add(f"Check {state.value}", the_list.ItemState.WORKING if closed else state, number=number)
                 if offset:
@@ -2978,19 +2984,27 @@ document.body.append(result);
             self.assertEqual(the_list.main(["answer", parked_answer.id, "--question", "Q1", "--text", "It passed."]), 0)
         answered = the_list.load(MORTY.id, parked_answer.id)
         _ = list_page.submit(root, urlencode(self.fields(answered, "park", until=(NOW + timedelta(days=1)).isoformat())))
+        for number in (22, 23):
+            _ = the_list.add(MORTY.id, f"Check scheduled item {number}", owner=OWNER.id, source="nate",
+                             number=number, changes={
+                                 "state": the_list.ItemState.SCHEDULED,
+                                 "schedule": the_list.ScheduledRun(NOW + timedelta(days=1), "Check the result."),
+                             })
+        _ = the_list.mark_read(MORTY.id, "L23", source="nate")
         markup = list_page.render(root, status=status, include_counts=False).decode()
         controls = markup.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
         # A park at or after the answer reads the answer and puts item 21 in Parked.
-        self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["19", "3", "2", "2", "2", "9"])
+        self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["21", "3", "2", "2", "2", "9", "2"])
         probe = '''<script>
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
 const chips=[...document.querySelectorAll('[data-filter-row="show"] button')];
 const unread=document.getElementById('list-unread');
 const total=document.querySelector('[data-list-count]');
 const entries=[
- ['all',[1,2,3,4,5,6,7,9,10,11,12,13,14,15,17,18,19,20,21],[1,3,4,6,9,11,13,15,18,19,20,21]],
+ ['all',[1,2,3,4,5,6,7,9,10,11,12,13,14,15,17,18,19,20,21,22,23],[1,3,4,6,9,11,13,15,18,19,20,21,22]],
  ['needs-me',[4,5,20],[4,20]],['producer-answering',[17,19],[19]],['working',[1,2],[1]],['blocked',[3,7],[3]],
  ['parked',[9,10,11,12,13,14,15,18,21],[9,11,13,15,18,21]],
+ ['scheduled',[22,23],[22]],
 ];
 const count=button=>Number(button.dataset.filterCount);
 const visible=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')]
@@ -3062,7 +3076,7 @@ document.body.append(result);
         def check_counts(page: str, needs_me: int, parked: int) -> None:
             controls = page.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
             self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls),
-                             ["2", str(needs_me), "0", "0", "0", str(parked)])
+                             ["2", str(needs_me), "0", "0", "0", str(parked), "0"])
 
         check_counts(initial, 0, 2)
         answered = list_page.render(root, include_counts=False).decode()
@@ -3140,7 +3154,7 @@ document.body.append(result);
                 self.assertEqual((state["parked"], state.get("unread_answer")), ("true", "false"))
             parked = list_page.render(root, include_counts=False).decode().partition("<script>")[0]
             controls = parked.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
-            self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["2", "0", "0", "0", "0", "2"])
+            self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["2", "0", "0", "0", "0", "2", "0"])
             self.assertNotIn("<small data-new-answer>New answer</small>", parked)
             with patch.object(the_list, "now", return_value=NOW + timedelta(minutes=2)):
                 answer("Q2")

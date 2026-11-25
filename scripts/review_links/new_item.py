@@ -119,7 +119,6 @@ _CUSTOM_FREQUENCIES = {
     "month": repeat_rule.Frequency.MONTHLY, "year": repeat_rule.Frequency.YEARLY,
 }
 _REPEAT_MENU_ERROR = "Use a repeat from the List menu or a Custom repeat."
-_EASTERN = ZoneInfo("America/New_York")
 Scheduled = the_list.ScheduledRun | the_list.ScheduledSeries
 
 
@@ -267,11 +266,11 @@ def read_schedule(text: str, *, now: datetime, zone: ZoneInfo) -> Scheduled:
 
 def schedule_lines(schedule: Scheduled) -> tuple[str, str]:
     start = schedule.first.start if isinstance(schedule, the_list.ScheduledSeries) else schedule.start
-    eastern = start.astimezone(_EASTERN)
+    local = start.astimezone(user_zone())
     starts = f"Starts: {start:%a %b %-d %Y %H:%M %Z}"
-    if start.utcoffset() != eastern.utcoffset():
-        equivalent = "%H:%M %Z" if start.date() == eastern.date() else "%a %b %-d %Y %H:%M %Z"
-        starts += f" ({eastern:{equivalent}})"
+    if start.utcoffset() != local.utcoffset():
+        equivalent = "%H:%M %Z" if start.date() == local.date() else "%a %b %-d %Y %H:%M %Z"
+        starts += f" ({local:{equivalent}})"
     if isinstance(schedule, the_list.ScheduledRun):
         return starts, "Does not repeat"
     rule = schedule.rule

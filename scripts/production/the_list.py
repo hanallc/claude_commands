@@ -40,6 +40,7 @@ from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, sync_folder, wr
 from scripts.lib.file_lock import LockResult, exclusive
 from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
+from scripts.notify import push_texts
 from scripts.production import delivery_state, record_store, repeat_rule, session_pane, staff
 from scripts.review_links import change_page, list_draft, page_question, question_path, question_record
 
@@ -2637,11 +2638,11 @@ def _confirm_on_natedev(identity: str, run_key: str) -> int:
     return result.returncode
 
 
-def _scheduled_notice_args(identity: str, delivery: RunDelivery, notice: RunNotice) -> tuple[str, ...]:
+def _scheduled_notice_command(identity: str, delivery: RunDelivery, notice: RunNotice) -> list[str]:
     due = _schedule_time_text(delivery.run.start)
     number = identity[1:]
     key = f"list-run:{identity}:{delivery.key}:{notice.name.lower()}"
-    common = ("--from", "the List", "--key", key, "--repeat-minutes", "52560000")
+    repeat = ("--repeat-minutes", "52560000")
     if notice in _START_NOTICES:
         heading = f"Scheduled List item {number} starts now: {delivery.title}"
         message = (f"{heading}\nDo this: {delivery.run.words}\nDue: {due}.\n"
@@ -2650,10 +2651,11 @@ def _scheduled_notice_args(identity: str, delivery: RunDelivery, notice: RunNoti
         heading = f"Scheduled List item {number} has no confirmation"
         message = f"{heading}. {delivery.title} was due at {due}."
     if notice is RunNotice.USER_TIMEOUT:
-        return (*common, "--to", "user", "--text-id", "nate.adhoc", "--user-asked",
-                "--value", "sender=the List", "--value", f"title={heading}", "--value", f"description={message}")
+        rendered = push_texts.render("nate.adhoc", sender="the List", title=heading, description=message)
+        return [*push_texts.user_send_argv(rendered, key=key), "--user-asked", *repeat]
     recipient = delivery.owner if notice is RunNotice.OWNER_START else delivery.producer
-    return (*common, "--to", f"staff:{recipient}", "--text", message)
+    return session_send.send_argv("--from", "the List", "--key", key, *repeat,
+                                  "--to", f"staff:{recipient}", "--text", message)
 
 
 # Adopt and reap children that remain in the sender group after the sender exits.
@@ -2690,7 +2692,7 @@ def _send_scheduled_notice(identity: str, delivery: RunDelivery, notice: RunNoti
                            capture: ScheduledNoticeCapture) -> None:
     budget = operation_deadline.remaining(_SCHEDULED_SEND_SECONDS)
     deadline = monotonic() + budget
-    sender = session_send.send_argv(*_scheduled_notice_args(identity, delivery, notice))
+    sender = _scheduled_notice_command(identity, delivery, notice)
     # Keep the sender output available even if a child keeps its descriptors open.
     report, output, errors = capture.report, capture.output, capture.errors
     command = ["timeout", "--signal=KILL", "--kill-after=1", str(budget), sys.executable, "-I", "-c",

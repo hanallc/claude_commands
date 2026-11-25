@@ -271,7 +271,9 @@ class NewItemTests(ServerFixture):
                     self.assertEqual(preview.splitlines()[1:], [readback])
                     self.assertIn(stamp[11:16], preview.splitlines()[0])
                     if number == 1:
-                        self.assertEqual(preview.splitlines()[0], "Starts: Fri Nov 27 2026 13:00 PST (16:00 EST)")
+                        self.assertEqual(preview.splitlines()[0], "Starts: Fri Nov 27 2026 13:00 PST")
+                    if owner is BOB:
+                        self.assertEqual(preview.splitlines()[0], "Starts: Mon Nov 30 2026 09:00 EST (06:00 PST)")
                     self.assertEqual(output.splitlines()[:2], preview.splitlines())
                     self.assertIn(f"List item {number}.", output.splitlines()[2])
             with self.subTest(recovery="closed Scheduled item"):

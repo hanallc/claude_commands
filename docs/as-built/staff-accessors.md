@@ -234,6 +234,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/lint/tmp_sweep.py` | read | local_snapshot |
 | `scripts/maintenance/agent_notes_job.py` | read | snapshot |
 | `scripts/maintenance/folder_size.py` | read | snapshot and active select producers. LiveDoc supplies the recorded path. StaffId identifies the notice recipient. |
+| `scripts/maintenance/herdr_upkeep.py` | read | StaffRefused reports a staff read failure during the scheduled List check. |
 | `scripts/mac_test/mac_test.py` | read | initial_snapshot, by_id, StaffId; holder_name shows the current name of a fixed holder key, delivery_target sends to the staff id |
 | `scripts/message/escalate.py` | read | active, snapshot |
 | `scripts/message/failed_lookup.py` | read | snapshot |
@@ -252,6 +253,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/add_showrunner_test_support.py` | read | staff.json path |
 | `scripts/production/add_unit.py` | write | cli_result, ensure, initial_snapshot, native_id, operation, row_operation, set_worktree |
 | `scripts/production/add_unit_test_support.py` | write | find, native_id, record_production, set_worktree, update_current_session |
+| `scripts/production/broadcast.py` | read | initial_snapshot supplies producer membership. StaffUnreadable reports a failure to read it. |
 | `scripts/production/census.py` | read | StaffId |
 | `scripts/production/change_review.py` | read | snapshot |
 | `scripts/production/change_routing.py` | read | staff.json path |
@@ -343,6 +345,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/serve.py` | read | snapshot supplies the recipients for the New item dialog. |
 | `scripts/review_links/staff_names.py` | read | snapshot gives the staff rows; StaffRow kind and name pick each staff name's role color for the console pages |
 | `scripts/review_links/investigations_page.py` | read | snapshot and by_id resolve legacy investigation submissions |
+| `scripts/review_links/list_draft.py` | read | StaffId identifies the List keeper and the notice recipients. |
 | `scripts/review_links/list_page.py` | read | snapshot, by_id, and parent_of name List owners, validate morty, resolve the alert showrunner, and supply identities to the shared count readers |
 | `scripts/agents/inventory.py` | read | local_snapshot |
 | `scripts/agents/launch_names.py` | read | initial_snapshot |
