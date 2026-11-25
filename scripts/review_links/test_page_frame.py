@@ -718,11 +718,8 @@ def long_open_row_page() -> bytes:
 def builds_page() -> bytes:
     """Render the owned Builds page for the browser checks."""
     from scripts.build_queue import memory_feed
-    from scripts.review_links import console_theme
 
-    source = console_theme.with_theme((SCRIPTS / "build_queue" / "memory_live.html").read_text(encoding="utf-8"))
-    page = (page_frame.template(source, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", "15")
-            .replace("__BUILD_LIMIT_ICONS__", json.dumps(memory_feed.build_limit_icons())))
+    page = memory_feed.page_document(15)
     return page_frame.with_owner(page.encode(), "builds", PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)), lambda: "")
 
 

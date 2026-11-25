@@ -305,6 +305,12 @@ def retain_question_delivery(item: ReviewItem, assets: dict[str, str], status: c
         assets['question-delivery:'+item.key] = change_page.question_failure_html(True)
 
 
+def _captured_memory_text(text: str | None, gib: float | None) -> str:
+    if text is not None:
+        return text
+    return 'unavailable' if gib is None else f'{gib:g} GiB'
+
+
 def retain_record_assets(item: ReviewItem, status: change_page.DeliveryStatus,
                          sources: ReviewSourceStamps) -> dict[str, str]:
     """Keep the assets and delivery notice for one Review record."""
@@ -323,15 +329,17 @@ def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str
         cells = ''.join('<div><dt>'+html.escape(cell.label)+'</dt><dd>'+html.escape(cell.value)+'</dd></div>'
                         for cell in evidence.cells)
         memory = evidence.memory
-        segments = ' · '.join(f'{part.label} {part.gib:g} GiB' for part in memory.segments)
+        segments = ' · '.join(f'{part.label} {_captured_memory_text(part.text, part.gib)}' for part in memory.segments)
+        free = _captured_memory_text(memory.free_text, memory.free_for_next_gib)
+        cap = _captured_memory_text(memory.cap_text, memory.queue_cap_gib)
+        reading = html.escape(f'{free} free for the next step · Queue cap {cap}')
         tip = ''.join('<div><dd>'+html.escape(part.text)+'</dd></div>'
                       if isinstance(part, (new_item_dialog.TipDetail, new_item_dialog.TipCaption))
                       else '<div><dt>'+html.escape(part.label)+'</dt><dd>'+html.escape(part.value)+'</dd></div>'
                       for part in evidence.tip)
         body = ('<section data-submission-evidence><h3>Evidence</h3><strong>'+html.escape(evidence.title)
                 +'</strong><p>'+html.escape(evidence.owner)+' · '+html.escape(evidence.captured_at)
-                +'</p><dl>'+cells+'</dl><p>'+f'{memory.free_for_next_gib:g} GiB free for the next step · '
-                +f'Queue cap {memory.queue_cap_gib:g} GiB</p><p>'+html.escape(segments)
+                +'</p><dl>'+cells+'</dl><p>'+reading+'</p><p>'+html.escape(segments)
                 +'</p><strong>'+html.escape(evidence.tip_title)+'</strong><p>'+html.escape(evidence.tip_status)
                 +'</p><dl>'+tip+'</dl></section>')
     page_data = origin.bug_page_data

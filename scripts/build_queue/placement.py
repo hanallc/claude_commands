@@ -149,6 +149,7 @@ class UnknownAssignedSettingsGeneration:
 SETTINGS_REFUSAL_REASONS = frozenset({"off", "repo"})
 # The claim failure reason when the assigned Mac Linux guest took no run.
 MAC_LINUX_NO_ANSWER = "mac_linux_no_answer"
+MAC_LINUX_START_UNCONFIRMED = "mac_linux_start_unconfirmed"
 
 
 @dataclass(frozen=True)
