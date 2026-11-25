@@ -5497,7 +5497,12 @@ observer.observe(original.parentElement,{childList:true});
         self.assertEqual(saved.recipient, question_record.KeeperForUnavailableProducer(MORTY.id, DWIGHT.id))
         markup = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
         self.assertIn(words, markup)
-        self.assertIn("dwight is not live, so morty will answer.", markup)
+        note_match = re.search(r'<p data-waiting-note(?: hidden)?>(.*?)</p>', markup)
+        assert note_match is not None
+        note = ElementTree.fromstring(f"<p>{note_match[1]}</p>")
+        self.assertEqual("".join(note.itertext()), "dwight is not live, so morty will answer.")
+        self.assertEqual([(name.text, name.get("data-color-text"), name.get("style")) for name in note],
+                         [("dwight", "role.producer", "color:#90fe42"), ("morty", "role.producer", "color:#90fe42")])
         for text in ("Resend question", "ready to send", "may not have reached", "Question not delivered."):
             self.assertNotIn(text, markup)
         assert isinstance(submission, list_page.ListQuestionDelivery)

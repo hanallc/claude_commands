@@ -186,7 +186,13 @@ SCRIPT = r'''window.staffNames={
  unitOpen:'',
  set(values,unitOpen='',roleLabels=this.roleLabels){this.values=values;this.unitOpen=unitOpen;this.roleLabels=roleLabels;},
  escape(text){return String(text).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#x27;'}[c]));},
- html(text){return this.values[text] ?? this.escape(text);},
+ html(text,reference=text){
+  const value=this.values[reference];
+  if(typeof value!=='string') return this.escape(text);
+  if(text===reference) return value;
+  const label=this.escape(text);
+  return value.startsWith('<span ') ? value.slice(0,value.indexOf('>')+1)+label+'</span>' : label;
+ },
  roleLabel(role,text){
   const opening=this.roleLabels[role]?.opening;
   const label=this.escape(text);

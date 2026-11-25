@@ -565,6 +565,7 @@ class ConfirmedGuestRun(TypedDict):
 class LastMove(TypedDict):
     kind: Literal["bump"]
     who: str
+    who_id: NotRequired[staff.StaffId]
     from_place: int
     to_place: int
     at: str
@@ -1090,10 +1091,6 @@ class FeedStaff:
         if member is None and folder.is_absolute():
             member = self.worktree_owner(machine, folder)
         return self.labels_by_id.get(member.id) if member is not None else None
-
-    def member_name(self, reference: str) -> str:
-        member = self.members.by_member_reference(reference) if reference else None
-        return member.name if member is not None else ""
 
     def fixed_owner_labels(self, staff_id: staff.StaffId) -> unit_labels.UnitLabels | None:
         return self.labels_by_id.get(staff_id)
@@ -3353,9 +3350,13 @@ def move_progress(directory: Path) -> person_actions.BumpProgress:
 def move_fields(move: person_actions.AppliedBump | None, members: FeedStaff, zone: tzinfo) -> MoveFields:
     if move is None:
         return {}
-    who = members.member_name(move.who) or ("user" if move.who == "user" else "name not recorded")
-    return {"last_move": {"kind": "bump", "who": who, "from_place": move.from_place,
-            "to_place": move.to_place, "at": datetime.fromtimestamp(move.at, zone).strftime("%H:%M %Z")}}
+    actor = members.members.by_member_reference(move.who) if move.who else None
+    who = actor.name if actor is not None else ("user" if move.who == "user" else "name not recorded")
+    last_move: LastMove = {"kind": "bump", "who": who, "from_place": move.from_place,
+                           "to_place": move.to_place, "at": datetime.fromtimestamp(move.at, zone).strftime("%H:%M %Z")}
+    if actor is not None:
+        last_move["who_id"] = actor.id
+    return {"last_move": last_move}
 
 
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,

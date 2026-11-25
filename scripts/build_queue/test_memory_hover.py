@@ -451,9 +451,10 @@ class MemoryHoverTests(unittest.TestCase):
                         self.assertEqual(icon[0].get("class"), "machine-emoji")
                         self.assertEqual("".join(icon.itertext()), emoji)
 
-    def role_setup(self) -> str:
-        members = tuple(staff.StaffRow(staff.StaffId(name), "unit", name, staff.StaffRoot(),
-                        current_session=staff.StaffId(name)) for name in ("builder", "helper", "queue", "report"))
+    def role_setup(self, members: tuple[staff.StaffRow, ...] | None = None) -> str:
+        if members is None:
+            members = tuple(staff.StaffRow(staff.StaffId(name), "unit", name, staff.StaffRoot(),
+                            current_session=staff.StaffId(name)) for name in ("builder", "helper", "queue", "report"))
         colors = {"role.unit-director": "#ffaf02", "role.showrunner": "#a379fd", "role.worker": "#ff0404"}
         with patch.object(accounts, "role_colors", return_value=colors):
             names = staff_names.StaffNames(staff.StaffSnapshot(members))
@@ -585,12 +586,20 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(grid[0].findtext("span"), "builder")
 
     def test_bump_actor_uses_the_staff_color_in_the_mark_and_tooltip(self) -> None:
-        move = {"kind": "bump", "who": "builder", "from_place": 2, "to_place": 1, "at": "12:22 PST"}
-        mark, tip = cast(list[str], self.page_expression("(()=>{" + self.role_setup()
-            + "return [bumpMark('builder', 'moved:row:fixture-run-0'), tooltipHtml('moved:row:fixture-run-0', data)];})()",
-            {"walk": [{"name": "Compile", "last_move": move}]}, walk=True))
-        for rendered in (mark, tip):
-            self.assertRegex(rendered, r'data-color-text="role.unit-director" style="color:#ffaf02">builder</span>')
+        members = (staff.StaffRow(staff.StaffId("showrunner-id"), "showrunner", "builder", staff.StaffRoot(),
+                                 current_session=staff.StaffId("showrunner-session")),
+                   staff.StaffRow(staff.StaffId("unit-id"), "unit", "builder", staff.StaffRoot(),
+                                  current_session=staff.StaffId("unit-session")))
+        move = {"kind": "bump", "who": "builder", "who_id": "unit-id", "from_place": 2, "to_place": 1, "at": "12:22 PST"}
+        mark, tip = cast(list[str], self.page_expression("(()=>{" + self.role_setup(members)
+            + "renderWalk(data);return [$('walk').innerHTML, tooltipHtml('moved:row:fixture-run-0', data)];})()",
+            {"walk": [{"name": "Compile", "queued": True, "last_move": move}]}, walk=True))
+        mark_actor = ElementTree.fromstring(f"<root>{mark}</root>").find(".//span[@class='move-mark']/span/span")
+        tip_actor = ElementTree.fromstring(tip).findall("dd")[1].find("span")
+        for actor in (mark_actor, tip_actor):
+            assert actor is not None
+            self.assertEqual((actor.text, actor.get("data-color-text"), actor.get("style")),
+                             ("builder", "role.unit-director", "color:#ffaf02"))
 
     def test_builds_page_has_no_navigation_or_framing_restriction(self) -> None:
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
@@ -2812,6 +2821,70 @@ process.stdout.write(JSON.stringify(steps));
             return [before, after, colors()];
             })()""", aws_cost_fixture(), walk=True, history=True)
         self.assertEqual(result, [["#ffaf02", "#ffaf02", True], ["#123456", "#123456", True], [None, None, True]])
+
+    def test_open_aws_day_refreshes_staff_names_with_the_same_report(self) -> None:
+        result = self.page_expression("(()=>{" + self.role_setup() + r"""
+            const day = data.days[0];
+            awsCostReport = data;
+            const periods = awsPeriods("day", data.days);
+            awsCostGroups = {groups:{day:periods}, largest:{day:1000}};
+            awsCostOpen.get("day").set(periods[0].id, true);
+            awsRunViews.set(day.day, {groupBy:"none", openGroups:new Set()});
+            const names = window.staffNames, values = names.values;
+            renderAwsHistory();
+            const color = () => $("aws-history-rows").innerHTML.match(/color:(#[a-f0-9]+)">report<\/span>/)?.[1];
+            const before = color();
+            const changed = {...values, report:values.report.replace("role.unit-director", "role.showrunner")
+              .replace("#ffaf02", "#a379fd")};
+            refreshBuildStaffNames({staff_names:changed, report_version:"same-report"});
+            const after = color();
+            const {report, ...remaining} = changed;
+            refreshBuildStaffNames({staff_names:remaining, report_version:"same-report"});
+            return [before, after, color(), $("aws-history-rows").innerHTML.includes(">report</td>")];
+            })()""", aws_cost_fixture(), walk=True, history=True)
+        self.assertEqual(result, ["#ffaf02", "#a379fd", None, True])
+
+    def test_aws_color_refresh_keeps_focus_on_the_same_day_group_button(self) -> None:
+        chrome = shutil.which("google-chrome")
+        if chrome is None:
+            self.skipTest("Chrome is required for the AWS focus check.")
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        page_reading = fixture.guest_gate_page()
+        script = self.role_setup() + """
+const reading = __READING__, costs = __COSTS__;
+costs.days[1].runs_list[0].unit = "report";
+const labels = staffNames.roleLabels;
+render({...reading, staff_names:staffNames.values, role_labels:labels});
+renderReport({kind:"IndexUnavailable", aws_costs:costs});
+for (const day of costs.days.slice(0, 2)) awsCostOpen.get("day").set("day-" + day.day, true);
+renderAwsHistory();
+const buttons = () => [...document.querySelectorAll('[data-aws-group-by="unit"]')];
+const original = buttons()[1];
+const unit = labels.unit;
+original.focus();
+const focusedBefore = document.activeElement === original;
+render({...reading, staff_names:staffNames.values, role_labels:{...labels,
+  unit:{css:"#123456", opening:unit.opening.replace(unit.css,"#123456")}}});
+const current = buttons()[1];
+document.querySelector('#result').textContent = JSON.stringify([
+  buttons().length, focusedBefore, current !== original, document.activeElement === current,
+  current.style.getPropertyValue("--role-label-color"),
+]);
+""".replace("__READING__", memory_feed.page_json(page_reading)).replace("__COSTS__", json.dumps(aws_cost_fixture()))
+        with tempfile.TemporaryDirectory(prefix="aws-color-focus-") as folder:
+            page = Path(folder) / PAGE_NAME
+            document = memory_feed.page_document(0).replace("</body>",
+                '<output id="result"></output><script>' + script + '</script></body>')
+            _ = page.write_text(document, encoding="utf-8")
+            result = subprocess.run([chrome, "--headless", "--no-sandbox", "--disable-gpu",
+                "--disable-background-networking", f"--user-data-dir={folder}/chrome",
+                "--window-size=1440,900", "--dump-dom", page.as_uri()], capture_output=True,
+                text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = result.stdout.partition('<output id="result">')[2].partition("</output>")[0]
+        self.assertEqual(output, '[2,true,true,true,"#123456"]')
 
     def test_aws_cost_breakdowns_use_bill_day_states_and_recorded_job_and_unit_names(self) -> None:
         estimate, units, billed, no_attempt, older, zero = cast(list[str], self.page_expression(

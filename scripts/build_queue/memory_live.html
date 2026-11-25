@@ -761,8 +761,8 @@ function priorityFields(entries, lines) {
 function staffTitle(name, value, suffix = '') {
   return {...field(name + suffix, value, 'title'), labelStaffName: name, labelSuffix: suffix};
 }
-function staffName(text) {
-  return globalThis.staffNames?.html(text) ?? esc(text);
+function staffName(text, reference = text) {
+  return globalThis.staffNames?.html(text, reference) ?? esc(text);
 }
 function roleName(text) {
   return globalThis.staffNames?.parts(text) ?? esc(text);
@@ -771,7 +771,7 @@ function roleLabel(role, text) {
   return globalThis.staffNames?.roleLabel(role, text) ?? esc(text);
 }
 function nameParts(parts) {
-  return parts.map(part => part.kind === 'staff' ? staffName(part.text)
+  return parts.map(part => part.kind === 'staff' ? staffName(part.text, part.reference)
     : part.kind === 'machine' ? machineName(part.text) : esc(part.text)).join('');
 }
 // A machine name shows in its machine color (the .machine rules).
@@ -2097,7 +2097,8 @@ function tooltipRows(key, rawData) {
     const move = row?.last_move;
     if (move?.kind !== "bump") return [];
     const place = row.place ?? move.to_place;
-    return [field("Bump", `place ${place}`, "title"), staffField("Moved by", [move.who]),
+    const actor = {kind:"staff", text:move.who, reference:move.who_id};
+    return [field("Bump", `place ${place}`, "title"), {...field("Moved by", move.who), valueParts:[actor]},
       field("From", move.from_place > 0 ? `place ${move.from_place}` : "place not recorded"),
       field("To", "the top"), field("At", move.at)];
   }
@@ -2129,10 +2130,10 @@ function tooltipHtml(key, data) {
   const rows = tooltipRows(key, data);
   return rows.length ? tipRowsHtml(rows) : '';
 }
-function bumpMark(who, tip = "") {
+function bumpMark(who, tip = "", whoId = who) {
   return `<span class="move-mark"${tip ? ` data-tip="${esc(tip)}" tabindex="0"` : ""}>` +
     '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 3h14M18 13l-6-6-6 6M12 7v14"/></svg>' +
-    `<span>${tip ? staffName(who) : esc(who)}</span></span>`;
+    `<span>${tip ? staffName(who, whoId) : esc(who)}</span></span>`;
 }
 function tipRowsHtml(rows) {
   return '<dl class="tip">'+tipCellsHtml(rows)+'</dl>';
@@ -2143,7 +2144,7 @@ function tipCellsHtml(rows) {
     const attr=classes ? ` class="${classes}"` : '';
     const value = row.kind === 'call' ? `<div>${esc(row.value).replace(/\S+/g, '<span>$&</span>')}</div>`
       : row.kind === 'folder' ? row.value.split(/(?<=\/)(?=.)/).map(segment => `<span>${esc(segment)}</span>`).join('<wbr/>')
-      : row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(staffName).join(', ') : esc(row.value);
+      : row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(name => staffName(name)).join(', ') : esc(row.value);
     const cell = `<dd${attr}>${value}</dd>`;
     if (['caption','long'].includes(row.kind)) return cell;
     const label = row.labelParts ? nameParts(row.labelParts)
@@ -2490,6 +2491,8 @@ function showQueueError(message) {
 function captureReportView() {
   const active = document.activeElement;
   const focus = active?.closest('[data-move-id], [data-tip], [data-owner-key], [id]');
+  const grouping = active?.closest('[data-aws-group-by]');
+  const day = grouping?.closest('[data-aws-day]');
   const selector = element => element?.dataset.moveId ? `.queue-grip[data-move-id="${CSS.escape(element.dataset.moveId)}"]`
     : element?.dataset.tip ? `${element.tagName.toLowerCase()}${element.classList.contains("wrow") ? ".wrow" : ""}[data-tip="${CSS.escape(element.dataset.tip)}"]`
     : element?.dataset.ownerKey ? `[data-owner-key="${CSS.escape(element.dataset.ownerKey)}"]`
@@ -2504,8 +2507,10 @@ function captureReportView() {
   const focusedRow = active?.closest('.wrow, tr[data-tip]');
   const candidates = [...document.querySelectorAll('.wrow[data-tip], main > section[id]')];
   const anchor = [tipRow, focusedRow].find(inView) || candidates.find(element => inView(element) && element.getBoundingClientRect().top >= 0);
+  const focusSelector = day ? `[data-aws-day="${CSS.escape(day.dataset.awsDay)}"] [data-aws-group-by="${CSS.escape(grouping.dataset.awsGroupBy)}"]`
+    : active?.matches?.('.row-add') ? selector(focus) + ' .row-add' : active !== document.body ? selector(focus) : '';
   return {anchor: selector(anchor), top: anchor?.getBoundingClientRect().top,
-    focus: active?.matches?.('.row-add') ? selector(focus) + ' .row-add' : active !== document.body ? selector(focus) : '',
+    focus: focusSelector,
     details: [...document.querySelectorAll('details')].map(element => [selector(element), element.open])};
 }
 function restoreReportView(view) {
@@ -2932,8 +2937,13 @@ function refreshBuildStaffNames(reading) {
   const names = globalThis.staffNames;
   if (!reading.staff_names || !names) return;
   const color = names.roleLabels.unit?.css;
+  const previous = names.values;
   names.set(reading.staff_names, reading.unit_open, reading.role_labels);
-  if (awsCostReport && color !== names.roleLabels.unit?.css) renderAwsHistory();
+  if (!awsCostReport) return;
+  const values = names.values;
+  const staffChanged = previous !== values && (Object.keys(previous).length !== Object.keys(values).length
+    || Object.entries(values).some(([name, markup]) => previous[name] !== markup));
+  if (staffChanged || color !== names.roleLabels.unit?.css) renderAwsHistory();
 }
 function renderAwsCosts(costs) {
   awsCostReport = costs?.limits && costs?.today ? costs : null;
@@ -3364,7 +3374,7 @@ function renderWalk(d) {
     : esc(step);
   const cells = (place, labels, duration, pid, target, vcpus, tip, className = "", done = "—", tokens = "—", move = null, actionName = "") => {
     const kept = className.startsWith("held"), waiting = kept || className.startsWith("wait");
-    const moved = move?.kind === "bump" ? bumpMark(move.who, `moved:${tip}`) : "—";
+    const moved = move?.kind === "bump" ? bumpMark(move.who, `moved:${tip}`, move.who_id) : "—";
     const hint = tip ? ` data-tip="${esc(tip)}" tabindex="0"` : "";
     tableRows.push(`<tr class="${className}"${hint}><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td>` +
       `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(labels.verify)}</td><th scope="row" class="step"><span class="cell-text">${stepText(labels.step, waiting)}</span></th><td class="pid">${kept ? "" : typeof pid === "number" ? pid : "—"}</td>` +
