@@ -293,7 +293,7 @@ font:inherit;font-variant-numeric:tabular-nums;margin:0;min-height:24px}
 .list-panel a,.list-counts a{color:var(--accent)}.list-panel ol.list-log{list-style:none;padding:0;font-size:13px}
 .list-log-panel{contain:size;display:flex;flex-direction:column;min-width:0;min-height:0}
 .list-log-panel h3{flex:none}
-.list-log-scroll{min-height:0;overflow-y:auto}
+.list-log-scroll{min-height:0;overflow-y:auto;scrollbar-color:var(--ink-3) transparent}
 .list-log-scroll .list-log{margin-bottom:0}
 .list-log li{display:grid;grid-template-columns:130px 1fr;gap:12px;padding:6px 0;border-bottom:1px dashed var(--line)}
 .list-log time,.list-log small{color:var(--ink-3)}.list-log small{display:inline;font-size:inherit}
