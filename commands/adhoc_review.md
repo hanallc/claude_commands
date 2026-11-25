@@ -98,7 +98,8 @@ For each item, in order:
    - If the user picks `elaborate` (also: "more", "detail", "expand", "why"): add one new rationale, constraint, or example relevant to the current item. Do not broaden scope or dump the raw item. Then re-present the same choices and wait again.
    - If the user picks `simplify`, follow **Simplify the item** below.
    - If the user picks `read messages`, run `~/.claude/scripts/lib/py ~/.claude/scripts/message/review_hold.py end-now`.
-     Read each release the notice names. Give one short line on what came in. Show the same item again.
+     Read each release named by the command or the prompt hook's held-messages notice.
+     Summarize the messages in one line. Show the same item again.
    - If the user says they are lost, confused, or asks what the introduced concepts mean, treat that as a failed initial explanation and stop asking for a decision. Apply repair-downward-then-upward from the shared file: **the upward repair here is Step 3.5** — run it now, whether or not it ran earlier. Re-running it mid-walk costs one turn; iterating item detail at ever finer grain costs many and does not terminate.
    - If the user asks a clarifying question, answer it without recording a decision or advancing. Re-present the choices only when useful.
    - If the user proposes a modification, restate only the revised decision, update the recommendation or example as needed, and wait for explicit acknowledgment before recording it.

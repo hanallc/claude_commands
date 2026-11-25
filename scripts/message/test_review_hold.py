@@ -72,17 +72,63 @@ class ReviewHoldTests(unittest.TestCase):
         self.assertTrue(review_hold.keep_native_message(SESSION, after_prompt))
         self.assertFalse(review_hold.held_file(SESSION).exists())
 
-    def test_end_now_says_when_no_hold_is_open(self) -> None:
+    def test_end_now_releases_saved_messages_without_an_open_hold(self) -> None:
         notice = "No review hold is open.\n"
-        held = review_hold.held_file(SESSION)
         self.assertEqual(self.end_now(), notice)
-        self.assertFalse(held.parent.exists())
+        self.assertFalse(review_hold.held_file(SESSION).parent.exists())
 
-        self.open_review(SESSION, RELEASE_AT - 600)
-        message = review_hold.ReviewMessage("Sender", RELEASE_AT - 1, "Release this after the idle end.")
-        self.assertTrue(review_hold.keep_native_message(SESSION, message))
-        self.assertEqual(self.end_now(), notice)
-        self.assertFalse(held.exists())
+        for mode in ("expired", "failed-release", "disabled"):
+            with self.subTest(mode=mode), mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": mode}):
+                self.open_review(mode, RELEASE_AT - (60 if mode == "disabled" else 600))
+                message = review_hold.ReviewMessage("Sender", RELEASE_AT - 1, "Saved message.")
+                self.assertTrue(review_hold.keep_native_message(mode, message))
+                if mode == "failed-release":
+                    trigger = review_hold.ReviewMessage("Sender", RELEASE_AT, "Start an idle release.")
+                    with review_hold.route(mode, trigger, urgent=False, include_new=False,
+                                           record_keys=review_hold_delivery.record_keys) as release:
+                        assert isinstance(release, review_hold.ReleasedMessages)
+                        self.assertEqual(release.held, (message,))
+                        _ = review_hold.file_release(mode, release, RELEASE_AT, batch_only=True)
+                elif mode == "disabled":
+                    _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "send.conf", "review_hold=off")
+
+                held = review_hold.held_file(mode)
+                expected = review_hold.held_notice(1, held, "Released at 18:00:00 UTC")
+                self.assertEqual(self.end_now(), expected + "\n")
+                self.assertEqual(held.read_text(encoding="utf-8").count(message.text), 1)
+                self.assertEqual(review_hold.item_count(mode), 3)
+                self.assertEqual(self.end_now(), notice)
+
+    def test_a_prompt_preserves_end_now_during_an_urgent_send(self) -> None:
+        self.open_review(SESSION, RELEASE_AT - 60)
+        ordinary = review_hold.ReviewMessage("Sender", RELEASE_AT - 3, "Ordinary message.")
+        old = review_hold.ReviewMessage("Sender", RELEASE_AT - 2, "Old urgent message.", key="urgent")
+        urgent = review_hold.ReviewMessage("Sender", RELEASE_AT - 1, "URGENT: New message.", key=old.key)
+        for message in (ordinary, old):
+            self.assertTrue(review_hold.keep_native_message(SESSION, message))
+
+        record_keys = mock.Mock()
+        with review_hold.route(SESSION, urgent, urgent=True, record_keys=record_keys) as sending:
+            assert isinstance(sending, review_hold.ReleasedMessages)
+            self.assertEqual(sending.held, (old,))
+            self.assertEqual(self.end_now(), "A release of held messages is in progress.\n")
+            review_hold.record_user_prompt(SESSION, RELEASE_AT + 1, self.fail, record_keys=record_keys)
+            sending.accepted_at = RELEASE_AT + 2
+
+        held = review_hold.held_file(SESSION)
+        with review_hold.pending_release(SESSION, record_keys=record_keys) as pending:
+            self.assertEqual(pending.held, (ordinary,))
+            expected = review_hold.held_notice(1, held, "Released at 18:00:02 UTC")
+            self.assertEqual(review_hold.file_release(SESSION, pending, RELEASE_AT + 2, batch_only=True), expected)
+            pending.accepted_at = RELEASE_AT + 2
+        contents = held.read_text(encoding="utf-8")
+        self.assertEqual(contents.count(ordinary.text), 1)
+        self.assertNotIn(old.text, contents)
+        with review_hold.pending_release(SESSION, record_keys=record_keys) as pending:
+            self.assertEqual(pending.held, ())
+
+        later = review_hold.ReviewMessage("Sender", RELEASE_AT + 3, "Keep this message.")
+        self.assertTrue(review_hold.keep_native_message(SESSION, later))
         self.assertEqual(review_hold.item_count(SESSION), 3)
 
 

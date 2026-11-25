@@ -499,10 +499,10 @@ def record_user_prompt(session: str, at: float, emit: Callable[[str], None], *,
             write_text_atomic(path.with_suffix(".prompt"), repr(at), new_file_mode=0o600)
             if isinstance(state.last_activity, EndedReview):
                 held = _reserve(path, state, delivery)
-                # The user is back in a review with open items, so the hold starts again.
-                # A release in transport passes the open hold by its notice; messages it left wait for the hold end.
                 if _read_count(count) and _enabled(conf.read("send")):
-                    _write_state(path, replace(_read_state(count, path), last_activity=at, release_pending=False))
+                    # Restart the hold and keep any release requested before this prompt.
+                    _write_state(path, replace(_read_state(count, path), last_activity=at,
+                                               release_pending=state.release_pending))
             else:
                 held = ()
         _emit_saved(count, path, held, at, emit, record_keys)
@@ -535,8 +535,9 @@ def _deliver_saved(session: str, at: float, emit: Callable[[str], None], record_
             if not end_now and not has_messages:
                 return
             hold_open = _hold_open(count, state, at, conf.read("send"))
-            # End an open hold on request. Otherwise, deliver after the hold ends.
-            if hold_open == end_now:
+            if hold_open and not end_now:
+                return
+            if has_messages or hold_open:
                 held = _reserve(path, _end_review(path, state), delivery)
                 notice = "A release of held messages is in progress." if has_messages else "No messages were held."
         if held:
