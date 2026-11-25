@@ -1790,6 +1790,35 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(service["name"], "hana-linux-1")
         self.assertIsInstance(service["bytes"], admission_records.ReadingUnavailable)
 
+    def test_ci_service_rejects_a_partial_sample_when_a_member_stat_is_unreadable(self) -> None:
+        busy, idle = (self.root / f"github-runner-hana-linux-{index}.service" for index in (1, 2))
+        proc = self.root / "proc"
+        amount = 100 * 1024 ** 2
+        write_scope(busy, members=(701, 702, 704))
+        write_scope(idle, members=(703,))
+        write_process(proc, 701, amount)
+        write_process(proc, 702, amount)
+        write_process(proc, 703, 2 * amount)
+        history = memory_feed.CIRunnerHistory()
+        expected = [{"name": "hana-linux-1", "bytes": 2 * amount}, {"name": "hana-linux-2", "bytes": 2 * amount}]
+        self.assertEqual(memory_feed.ci_runner_service_ram((busy, idle), (), history), expected)
+
+        stat = proc / "702/stat"
+        identity = stat.read_bytes()
+        _ = stat.write_text("bad stat\n")
+        for _ in range(2):
+            services = memory_feed.ci_runner_service_ram((busy, idle), (), history)
+            self.assertEqual(memory_feed.ci_service_shares(services, 4 * amount), (expected, 0))
+        services = memory_feed.ci_runner_service_ram((busy, idle), (), history)
+        shares, remaining = memory_feed.ci_service_shares(services, 4 * amount)
+        self.assertEqual(shares[0]["name"], "hana-linux-1")
+        self.assertIsInstance(shares[0]["bytes"], admission_records.ReadingUnavailable)
+        self.assertEqual(shares[1], expected[1])
+        self.assertEqual(remaining, 2 * amount)
+
+        _ = stat.write_bytes(identity)
+        self.assertEqual(memory_feed.ci_runner_service_ram((busy, idle), (), history), expected)
+
     def test_ci_service_exit_keeps_the_last_good_reading_for_two_samples(self) -> None:
         unit = self.root / "github-runner-hana-linux-1.service"
         pid, amount = 701, 200 * 1024 ** 2

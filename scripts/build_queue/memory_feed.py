@@ -1382,43 +1382,55 @@ def ci_runner_name(unit: Path) -> str:
 
 
 class CIRunnerHistory:
-    """Keep the last good reading for up to two reads after a process exits."""
+    """Keep the last good reading for up to two incomplete process samples."""
 
     def __init__(self) -> None:
         self.last_good: dict[Path, tuple[int, int]] = {}
 
-    def current(self, unit: Path, sample: RamReading | None) -> RamReading:
+    def current(self, unit: Path, sample: RamReading | process_start.Unreadable | None) -> RamReading:
         if isinstance(sample, int):
             self.last_good[unit] = (sample, 0)
             return sample
-        if sample is None and (previous := self.last_good.get(unit)) is not None and previous[1] < 2:
+        if ((sample is None or isinstance(sample, process_start.Unreadable))
+                and (previous := self.last_good.get(unit)) is not None and previous[1] < 2):
             amount, misses = previous
             self.last_good[unit] = (amount, misses + 1)
             return amount
         _ = self.last_good.pop(unit, None)
+        if isinstance(sample, process_start.Unreadable):
+            return admission_records.ReadingUnavailable(sample.reason)
         return sample if sample is not None else admission_records.ReadingUnavailable("no live runner processes in the sample")
 
 
-def read_ci_runner(members: set[int], processes: Mapping[int, gate.ProcessIdentity], cargo: set[int]) -> RamReading | None:
-    """Read service process memory. An empty sample after an exit can recover on the next read."""
+def read_ci_runner(
+    members: set[int], processes: Mapping[int, gate.ProcessIdentity], cargo: set[int],
+) -> RamReading | process_start.Unreadable | None:
+    """Read service memory only when each live member is in the process table."""
     candidates = members - cargo
     if not candidates:
         return 0
     pids = candidates.intersection(processes)
+    # The table omits ended processes and processes whose stat it could not read.
+    for pid in candidates - pids:
+        identity = process_start.proc_table_start(pid, PROC)
+        if isinstance(identity, process_start.Unreadable):
+            return identity
+        if isinstance(identity, process_start.Started):
+            return process_start.Unreadable(f"runner process {pid} is missing from the process table")
     use = gate.process_memory(pids, PROC).anonymous
     if isinstance(use, admission_records.RunUseUnavailable):
         # A status read can fail or lack valid RssAnon or RssShmem for more than two reads.
         return admission_records.ReadingUnavailable(use.reason)
     if use.bytes:
         return use.bytes
-    # The table can skip a PID with a bad stat file. A process exit can also give zero bytes.
-    identities = {pid: process_start.proc_table_start(pid, PROC) for pid in pids or candidates}
-    if any(identities[pid] == process_start.Started(processes[pid].start) for pid in pids):
-        return 0
-    for identity in identities.values():
+    # A process can exit during the memory read. Check if a zero sample has a live member.
+    live = False
+    for pid in pids:
+        identity = process_start.proc_table_start(pid, PROC)
         if isinstance(identity, process_start.Unreadable):
-            return admission_records.ReadingUnavailable(identity.reason)
-    return None
+            return identity
+        live |= identity == process_start.Started(processes[pid].start)
+    return 0 if live else None
 
 
 def ci_runner_service_ram(

@@ -3091,7 +3091,10 @@ renderWalk = reading => { painted = reading; };
                       grids["wait:fixture-wait-0"])
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         self.assertRegex(page, r"\.tip \{[^}]*grid-template-columns: fit-content\(44%\) minmax\(0, 1fr\)")
-        self.assertNotRegex(page, r"\.tip\[data-build-tools-tip\] \{[^}]*grid-template-columns")
+        self.assertIn('data-build-tools-tip=""', grids["tools"])
+        self.assertRegex(page, r"\.tip \{[^}]*[;{]\s*width: max-content;")
+        self.assertEqual(re.findall(r"\.tip\[data-build-tools-tip\][^{}]*\{[^{}]*\}", page),
+                         [".tip[data-build-tools-tip] dt { min-width: max-content; }"])
         self.assertIn(".tip :is(dt, dd) { overflow-wrap: anywhere; }", page)
         self.assertRegex(page, r"\.tip dt \{[^}]*text-align: left")
         self.assertRegex(page, r"\.tip dd \{[^}]*text-align: right")

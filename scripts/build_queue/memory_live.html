@@ -186,7 +186,7 @@ __PAGE_FRAME_STYLE__
 .tip dt, .tip dd { white-space: normal; overflow-wrap: anywhere; }
 .tip dt { max-width: min(13rem, 51vw); }
 .tip dd { min-width: 0; }
-.tip[data-build-tools-tip] { width: min(31rem, var(--tip-width, 31rem)); max-width: none; }
+.tip[data-build-tools-tip] dt { min-width: max-content; }
 .tip .program-memory {
   --program-live: color-mix(in srgb, var(--accent) 72%, var(--bg));
   --program-past: color-mix(in srgb, var(--agents) 72%, var(--bg));
