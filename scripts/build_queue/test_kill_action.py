@@ -36,7 +36,7 @@ from scripts.lib import atomic_file, process_group, process_start, process_stop,
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.message import send_budget
+from scripts.message import send, send_budget
 from scripts.production import staff
 
 
@@ -48,6 +48,10 @@ class KillActionTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())))
         _ = self.enterContext(patch.object(process_stop, "CGROUP_ROOT", self.root / "cgroups"))
+        # Each test owns its message state and sends nothing, so no test reads the machine's message state.
+        _ = self.enterContext(patch.object(send, "STATE", self.root / "message"))
+        _ = self.enterContext(patch.object(send, "send", return_value=send.Result("sent", "fixture delivery")))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state")})))
 
     def launch_record(self, caller: detached_runs.Caller, command: list[str],
                       launch_supervisor: Callable[[list[str], IO[bytes]], object]) -> Path:
@@ -847,6 +851,8 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
             patch.object(worker_panes, "worker_run", return_value=self.root),
             patch.object(worker_panes, "parent_run_index", return_value={}),
             patch.object(worker_panes, "observe_worker", return_value=worker_panes.WorkerNotObserved.CURRENT),
+            # The fixture pane has no herdr pane, so a close never reads the machine's live panes.
+            patch.object(worker_panes, "close", return_value=worker_panes.Closed()),
             patch.object(scratch, "end", return_value=()),
             patch.object(turn_end, "_prepare_notice", return_value=turn_end.TurnDecision(turn_end.TurnOutcome.DONE,
                                                                                        lambda: None)),
