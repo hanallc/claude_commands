@@ -1506,7 +1506,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 change_page.recover_pending(server.delivery_status, only=error.cleanup)
             return
         except (ValueError, change_page.change_review.ChangeReviewError) as error:
-            self.browser_failure(400, str(error) if isinstance(error, change_page.QuestionAnswerRefused) else "Check the answer and submit it again.", error)
+            reason = str(error) if isinstance(error, change_page.QuestionAnswerRefused) else "Check the answer and submit it again."
+            self.review_answer_refused(error, reason)
             return
         except change_page.FeatureLogFailed as error:
             self.browser_failure(503, "The feature log could not be updated.", error)
@@ -2158,9 +2159,6 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             body = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8")
             key = review_page.review_fields(body)['row'][0]
             saved = server.review_cache.save(body, server.delivery_status)
-        except review_items.ReviewRecordChanged as error:
-            self.browser_failure(409, str(error), error)
-            return
         except change_review.VerdictDurabilityUnconfirmed as error:
             server.review_cache.invalidate()
             try:
@@ -2170,7 +2168,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 server.review_cache.invalidate()
             return
         except ValueError as error:
-            self.browser_failure(400, str(error), error)
+            self.review_answer_refused(error, str(error))
             return
         except (OSError, RuntimeError, change_page.Refusal) as error:
             self.browser_failure(503, "The answer could not be saved.", error)
@@ -2667,6 +2665,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             print(f"review-links disks sessions: {error}", file=sys.stderr)
             folders = None
         self.json_response(200, {"state": started.state.value, "target": started.target, "sessions": folders})
+
+    def review_answer_refused(self, error: Exception, reason: str) -> None:
+        if isinstance(error, review_items.ReviewRecordChanged):
+            self.browser_failure(409, str(error), error)
+        else:
+            self.browser_failure(400, reason, error)
 
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)

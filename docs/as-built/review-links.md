@@ -2873,8 +2873,23 @@ If the page has no receiver name, the toast says "Sending."
 For an action that saves without a message, the toast says "Saved."
 Later, Validate, Park, Unpark, Mark read, Remove, and Skip also use "Saved."
 The existing sender delivers any notice after the hold ends.
-The toast uses the recipient name shown when the user presses **Send**.
+The toast reads the receiver name from the send control or the selected recipient.
+The control uses the same name in its visible or accessible label.
 For **Tell**, the toast uses the signed producer.
+For **Ask question**, the List form signs the receiver ID and the name on the button.
+A retry uses the button name from its signed form.
+List Ask and Review refuse stale routes and keep the words for the current card.
+A fresh List Ask can send the same words to a new receiver.
+The previous question stays open with its original receiver.
+A Review Question revision includes the owner name, the answer relay, and its name.
+Review checks the legacy Question route under the owner lock and uses it for delivery.
+For an Images answer with a linked List item, the toast names the owner and the producer who receive the words.
+Images checks all pending recipients at release.
+For a new linked answer, Images checks the producer under the List lock before it saves the answer.
+A retry uses the producer saved with the answer.
+The Retry button and toast name the recipients who still need the words.
+The removed-picture success notice names the recipients of that send.
+If the recipient set changes during the hold, Images keeps the words and refreshes the form.
 If a draft can recover an earlier filing, the toast says "Sending."
 The toast appears at the bottom right of the top window.
 It sits 24 px from the bottom and right edges.

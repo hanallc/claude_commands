@@ -1098,8 +1098,10 @@ class ChangePageTests(unittest.TestCase):
         _ = self.enterContext(patch.object(change_page, "deliver", side_effect=finish_delivery))
         _ = self.enterContext(patch.object(change_page, "send_message", side_effect=self.capture_message))
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
-        if not legacy_links:
-            return
+        if legacy_links:
+            self.start_review_server()
+
+    def start_review_server(self) -> None:
         # Restart tests enable legacy recovery after they create the records.
         with (patch.object(change_page, "recover_pending"),
               patch.object(serve, "loaded_module_stamps", return_value={})):
@@ -3956,9 +3958,10 @@ class ChangePageTests(unittest.TestCase):
             self.assertEqual(len(self.messages), count + 1)
 
         key = self.file_user_question("Keep the spacing")
-        browser = change_page.ReviewBrowser("private-recovery")
+        path, forms, _ = self.browser("questions")
+        browser = change_browser.page_at(self.root, path + "?type=questions")
         status = change_page.DeliveryStatus(self.root)
-        fields = {"row": key, "token": change_browser.row_token(browser, key), "outcome": "answer", "feedback": "Keep it"}
+        fields = self.browser_fields(forms, key, "answer", "Keep it")
         delivery, answer = change_browser.submit(browser, urlencode(fields), status)
         self.assertEqual(answer, "Keep it")
         self.assertIsInstance(delivery, change_page.MessageDelivery)
