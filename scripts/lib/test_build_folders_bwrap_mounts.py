@@ -210,7 +210,7 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
         return mounts
 
     def detach_is_busy(self, result: subprocess.CompletedProcess[str] | None) -> bool:
-        return result is not None and result.returncode != 0 and any(
+        return result is not None and result.returncode == 16 and any(
             "resource busy" in stream.lower() for stream in (result.stdout, result.stderr))
 
     def retry_moved_parent_detach(self, image: Path, device: str, attempts: list[str],
@@ -570,6 +570,28 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
         self.assertEqual(stderr.getvalue().count(f"{shlex.join(detach)}\nexit status: 16"), 10)
         moved_parent.cleanup()
         self.assertTrue(mount.is_dir())
+
+    def test_moved_parent_does_not_retry_busy_text_with_status_two(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        _ = self.enterContext(directory)
+        moved_parent = MovedParentCleanup(directory)
+        image = Path(directory.name).resolve() / "fixture/removal.dmg"
+        device = "/dev/disk9"
+        info = plistlib.dumps({"images": [
+            {"image-path": str(image), "system-entities": [{"dev-entry": device}]},
+        ]}).decode()
+        query = ["/usr/bin/hdiutil", "info", "-plist"]
+        detach = ["/usr/bin/hdiutil", "detach", "-force", device]
+        with (mock.patch.object(subprocess, "run", side_effect=[
+                  subprocess.CompletedProcess(query, 0, info, ""),
+                  subprocess.CompletedProcess(detach, 2, "detach output", "Resource busy\nExtra error detail"),
+                  subprocess.CompletedProcess(query, 0, info, ""),
+              ]) as run, self.assertRaisesRegex(AssertionError, "Disk device still attached") as failure):
+            self.cleanup_image(image, device, [], moved_parent=moved_parent)
+        self.assertEqual([call.args[0] for call in run.call_args_list], [query, detach, query])
+        self.assertFalse(moved_parent.deferred)
+        self.assertIn(f"{shlex.join(detach)}\nexit status: 2\nstdout:\ndetach output\n"
+                      + "stderr:\nResource busy\nExtra error detail", str(failure.exception))
 
     def test_moved_parent_retry_refuses_a_device_with_a_different_image(self) -> None:
         directory = tempfile.TemporaryDirectory()
