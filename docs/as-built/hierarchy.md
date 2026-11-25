@@ -158,6 +158,14 @@ Row commands accept both displayed IDs and existing list-based IDs.
 An ambiguous displayed ID requires `--list <path>`.
 Saved pins therefore survive attachment changes without copying or renumbering rows.
 
+`change_review.py withdraw --row <id> --reason <text>` records the caller's staff name and preserves any prior verdict.
+The event uses `unknown` when the current session has no staff name.
+`reopen --row <id> --reason <text>` restores a withdrawn row to To review and uses its retained urgency to sort the queue.
+It keeps the row ID and review log. It adds one event with the caller's name and reason.
+The command refuses a row without a withdrawn verdict.
+`correct-withdraw-who --row <id> --at <ISO timestamp> --who <staff name>` corrects one event on a withdrawn row.
+Use the full timestamp from the log, with its offset. The correction keeps every other event field.
+
 `record_verdict` returns `VerdictRecorded`, `VerdictAlreadyRecorded`, or `VerdictConflict`.
 An identical retry repeats the result and scratch cleanup.
 A conflicting retry reports the saved verdict and still attempts scratch cleanup.

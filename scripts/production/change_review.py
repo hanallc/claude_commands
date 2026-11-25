@@ -63,6 +63,8 @@ HELD_NEXT_STEP = (f"commit a checkpoint (a plain commit, not a merge: a merge ma
 LIST_HEADER = "- **Change review:**"
 SECTION = "## To review"
 REVIEWED = "## Reviewed"
+WITHDRAWN = "withdrawn"
+WITHDRAWAL_PREFIX = "Withdrawn: "
 CHECK = "How to check"
 URGENCY = "Urgency"
 # Open rows hold the owner's fixed staff id. Reviewed rows keep their recorded production.
@@ -1798,6 +1800,10 @@ def _move_to_reviewed(path: Path, lines: list[str], cells: dict[str, str], verdi
     if cells.get(KIND):
         for column in (KIND, CHECK, PRODUCTION):
             _add_column(path, lines, REVIEWED, column)
+    if verdict == WITHDRAWN:
+        for column, value in cells.items():
+            if value:
+                _add_column(path, lines, REVIEWED, column)
     reviewed, top, _ = _table(path, lines, REVIEWED)
     _insert(lines, top, [_row(path, reviewed, {**dict.fromkeys(reviewed, ""), **cells,
                                                "Verdict": _cell(verdict), "Date": day.isoformat()})])
@@ -1856,11 +1862,15 @@ def record_verdict(
     return result
 
 
+def _caller_name() -> str:
+    identity = staff.runtime_id()
+    return (showrunners.session_name(identity) if identity else "") or "unknown"
+
+
 def withdraw_row(path: Path, row: str, words: str, stamp: datetime, production: Path) -> bool:
     """Close a row as withdrawn and keep its earlier verdict in the log."""
-    prefix = "Withdrawn: "
-    event = review_events.ReviewLog(stamp, "nate", prefix + _words("reason", words))
-    verdict = "withdrawn"
+    reason = _words("reason", words)
+    event = review_events.ReviewLog(stamp, _caller_name(), WITHDRAWAL_PREFIX + reason)
 
     def write(lines: list[str]) -> bool:
         for section in (SECTION, REVIEWED):
@@ -1873,12 +1883,11 @@ def withdraw_row(path: Path, row: str, words: str, stamp: datetime, production: 
             cells = dict(zip(columns, _cells(lines[index])))
             events = review_events.decode(_plain(cells.get("Review log", "")))
             previous = _plain(cells.get("Verdict", ""))
-            if previous == verdict:
-                for earlier in reversed(events):
-                    if earlier.who == event.who and earlier.words.startswith(prefix):
-                        if earlier.words == event.words:
-                            return False
-                        raise ChangeReviewError(f"{row} is already withdrawn")
+            if previous == WITHDRAWN:
+                latest = next((earlier for earlier in reversed(events) if earlier.words.startswith(WITHDRAWAL_PREFIX)), None)
+                if latest is not None and latest.words == event.words:
+                    return False
+                raise ChangeReviewError(f"{row} is already withdrawn")
             try:
                 slots = change_routing.delivery_slots(delivery, strict=True)
             except (OSError, ValueError) as error:
@@ -1894,15 +1903,15 @@ def withdraw_row(path: Path, row: str, words: str, stamp: datetime, production: 
                 except ValueError:
                     previous_time = stamp
                     previous = f"Previous verdict ({previous_date or 'date unavailable'}) — {previous}"
-                events = (*events, review_events.ReviewLog(previous_time, event.who, previous))
+                events = (*events, review_events.ReviewLog(previous_time, "nate", previous))
             cells["Review log"] = _cell(review_events.encode((*events, event)))
             if section == SECTION:
                 del lines[index]
-                _move_to_reviewed(path, lines, cells, verdict, stamp.date())
+                _move_to_reviewed(path, lines, cells, WITHDRAWN, stamp.date())
             else:
                 _add_column(path, lines, REVIEWED, "Review log")
                 reviewed, _, _ = _table(path, lines, REVIEWED)
-                cells.update({"Verdict": verdict, "Date": stamp.date().isoformat()})
+                cells.update({"Verdict": WITHDRAWN, "Date": stamp.date().isoformat()})
                 lines[index] = _row(path, reviewed, cells) + "\n"
             return True
         raise RowNotListed(f"{row} is not on the change review list")
@@ -1912,6 +1921,64 @@ def withdraw_row(path: Path, row: str, words: str, stamp: datetime, production: 
     delivery = change_routing.delivery_path(root, path, row)
     with review_delivery_lock(root):
         return _edit(path, production, stamp.date(), write, lambda _: f"withdraw {row}")
+
+
+def _closed_withdrawal(path: Path, lines: list[str], row: str) -> tuple[list[str], int, dict[str, str]]:
+    if any(line.strip() == REVIEWED for line in lines):
+        columns, first, end = _table(path, lines, REVIEWED)
+        index = next((index for index in range(first, end) if lines[index].startswith(f"| {row} |")), None)
+        if index is not None:
+            cells = dict(zip(columns, _cells(lines[index])))
+            if cells.get("Verdict") == WITHDRAWN:
+                return columns, index, cells
+    raise ChangeReviewError(f"{row} is not withdrawn")
+
+
+def reopen_row(path: Path, row: str, words: str, stamp: datetime, production: Path) -> None:
+    """Restore a withdrawn row and record who reopened it."""
+    reason = _words("reason", words)
+
+    def write(lines: list[str]) -> None:
+        _, index, cells = _closed_withdrawal(path, lines, row)
+        del lines[index]
+        _ = cells.pop("Verdict", None)
+        _ = cells.pop("Date", None)
+        if owner := _plain(cells.get(PRODUCTION, "")):
+            matches = [member for member in staff.initial_snapshot().find(kind="showrunner") if member.name == owner]
+            if len(matches) == 1:
+                cells[PRODUCTION] = str(matches[0].id)
+        append_row_review_log(cells, review_events.ReviewLog(stamp, _caller_name(), "Reopened: " + reason))
+        for column, value in cells.items():
+            if value:
+                _add_column(path, lines, SECTION, column)
+        columns, _, end = _table(path, lines, SECTION)
+        _insert(lines, end, [_row(path, columns, dict.fromkeys(columns, "") | cells)])
+
+    root = change_routing.review_root()
+    root.mkdir(parents=True, exist_ok=True)
+    with review_delivery_lock(root):
+        _edit(path, production, stamp.date(), write, lambda _: f"reopen {row}")
+
+
+def correct_withdraw_who(path: Path, row: str, at: str, who: str, production: Path) -> None:
+    """Correct one withdrawal event on a withdrawn row."""
+    stamp = _words("at", at)
+    name = _words("who", who)
+
+    def write(lines: list[str]) -> None:
+        columns, index, cells = _closed_withdrawal(path, lines, row)
+        events = list(review_events.decode(_plain(cells.get("Review log", ""))))
+        matches = [index for index, event in enumerate(events)
+                   if event.time.isoformat() == stamp and event.words.startswith(WITHDRAWAL_PREFIX)]
+        if len(matches) != 1:
+            raise ChangeReviewError(f"{row} needs exactly one withdrawal event at {stamp}")
+        match, = matches
+        if events[match].who != name:
+            events[match] = replace(events[match], who=name)
+            cells["Review log"] = _cell(review_events.encode(tuple(events)))
+            lines[index] = _row(path, columns, cells) + "\n"
+
+    _edit(path, production, today(), write, lambda _: f"correct withdraw who {row}")
 
 
 def review_rows(path: Path) -> list[dict[str, str]]:
@@ -2691,6 +2758,8 @@ class CommandLine(argparse.Namespace):
     row: str = ""
     verdict: str = ""
     reason: str = ""
+    at: str = ""
+    who: str = ""
     validation: str = ""
     kind: str = ""
     production: str = ""
@@ -2986,6 +3055,8 @@ ACTION_OPTIONS: dict[str, tuple[str, ...]] = {
     "set-kind": ("list", "production", "row", "kind"),
     "verdict": ("list", "production", "row", "verdict", "validation"),
     "withdraw": ("list", "production", "row", "reason"),
+    "reopen": ("list", "production", "row", "reason"),
+    "correct-withdraw-who": ("list", "production", "row", "at", "who"),
     "list-path": ("production",),
     "showrunner": ("production",),
     "backfill-production": ("list", "write"),
@@ -3077,6 +3148,14 @@ def _run(options: CommandLine) -> int:
             print(f"{shown} withdrawn" if written else f"{shown} already withdrawn")
             for line in end_row_scratch(target.path, target.row):
                 print(line)
+        case "reopen":
+            target = _row_option(options)
+            reopen_row(target.path, target.row, options.reason, now(), production_doc(options.production))
+            print(f"{row_display_id(target.path, target.row)} reopened")
+        case "correct-withdraw-who":
+            target = _row_option(options)
+            correct_withdraw_who(target.path, target.row, options.at, options.who, production_doc(options.production))
+            print(f"{row_display_id(target.path, target.row)} withdrawal author set to {options.who.strip()}")
         case "list-path":
             print(production_list(options.production))
         case "showrunner":
@@ -3114,12 +3193,12 @@ def _run(options: CommandLine) -> int:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    _ = parser.add_argument("action", choices=("check", "list-ready", "live", "add", "edit", "show", "verdict", "withdraw",
+    _ = parser.add_argument("action", choices=("check", "list-ready", "live", "add", "edit", "show", "verdict", "withdraw", "reopen", "correct-withdraw-who",
                                                    "mark-important", "set-kind", "list-path", "showrunner",
                                                    "backfill-production", "image", "batch"))
     _ = parser.add_argument("--repo", default=".")
     for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "step", "change", "check", "see",
-                 "row", "verdict", "reason", "validation", "production", "urgency", "due", "after", "kind", "image", "output", "file"):
+                 "row", "verdict", "reason", "at", "who", "validation", "production", "urgency", "due", "after", "kind", "image", "output", "file"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--write", action="store_true")
     _ = parser.add_argument("--hold", action="append")

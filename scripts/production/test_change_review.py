@@ -3077,7 +3077,9 @@ class ActionTest(unittest.TestCase):
         _ = change_review.hold_for_row(self.path, "C76", [str(folder)])
         held = os.path.realpath(folder)
         self.assertIn(held, scratch.holds())
-        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+        caller = showrunners.owner_for("fixture")
+        with (mock.patch.object(change_review, "now", return_value=ADD_TIME),
+              mock.patch.object(staff, "runtime_id", return_value=caller.current_session)):
             with mock.patch.object(scratch, "end", side_effect=scratch.ScratchError("fixture cleanup failed")):
                 code, output, error = run(*arguments)
             self.assertEqual((code, error), (0, ""))
@@ -3102,11 +3104,12 @@ class ActionTest(unittest.TestCase):
         self.assertEqual((row["Verdict"], row["Date"], row["Merged"]), ("withdrawn", "2026-11-13", "2026-10-14"))
         self.assertIn("café", row["Review log"])
         self.assertEqual(review_events.decode(row["Review log"]),
-                         (review_events.ReviewLog(ADD_TIME, "nate", f"Withdrawn: {words}"),))
+                         (review_events.ReviewLog(ADD_TIME, "fixture", f"Withdrawn: {words}"),))
 
     def test_withdraw_a_reviewed_row_and_keep_its_previous_verdict(self) -> None:
         words = "The change was reverted"
-        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+        with (mock.patch.object(change_review, "now", return_value=ADD_TIME),
+              mock.patch.object(staff, "runtime_id", return_value=DEMO_ID)):
             code, _, error = run("withdraw", "--production", DOC, "--list", str(self.path),
                                  "--row", "C70", "--reason", words)
             self.assertEqual(code, 0, error)
@@ -3115,8 +3118,61 @@ class ActionTest(unittest.TestCase):
         row, = snapshot.reviewed
         self.assertEqual((row["#"], row["Verdict"], row["Date"]), ("C70", "withdrawn", "2026-11-13"))
         previous, withdrawal = review_events.decode(row["Review log"])
-        self.assertEqual((previous.words, previous.time.date()), ("works", date(2026, 10, 13)))
-        self.assertEqual(withdrawal, review_events.ReviewLog(ADD_TIME, "nate", f"Withdrawn: {words}"))
+        self.assertEqual((previous.who, previous.words, previous.time.date()), ("nate", "works", date(2026, 10, 13)))
+        self.assertEqual(withdrawal, review_events.ReviewLog(ADD_TIME, "demo", f"Withdrawn: {words}"))
+
+    def test_reopen_restores_the_queue_place_and_appends_one_event(self) -> None:
+        _ = self.path.write_text(LIST
+            .replace("How to check |\n", "How to check | Urgency | Production |\n")
+            .replace("| --- | --- | --- | --- | --- |\n", "| --- | --- | --- | --- | --- | --- | --- |\n")
+            .replace("Launch Hana |\n", f"Launch Hana | later | {DEMO_ID} |\n")
+            .replace("Change a font |\n", "Change a font | | |\n"), encoding="utf-8")
+        target = ("--production", DOC, "--list", str(self.path), "--row", "C76")
+        change_review.record_review_log(self.path, "C76", "A previous note", PRODUCTION, event_time=ADD_TIME)
+        before = change_review.pending(self.path)
+        self.assertEqual([row["#"] for row in before], ["C77", "C76"])
+        reason = "The change is ready again"
+        with (mock.patch.object(change_review, "now", return_value=ADD_TIME),
+              mock.patch.object(staff, "runtime_id", return_value=DEMO_ID)):
+            self.assertEqual(run("withdraw", *target, "--reason", "Check the new result"),
+                             (0, "demo/C76 withdrawn\n", ""))
+            withdrawn = next(row for row in change_review.review_snapshot(self.path).reviewed if row["#"] == "C76")
+            self.assertEqual(run("reopen", *target, "--reason", reason), (0, "demo/C76 reopened\n", ""))
+        snapshot = change_review.review_snapshot(self.path)
+        rows = [dict(row) for row in snapshot.pending]
+        log = rows[-1].pop("Review log")
+        _ = before[-1].pop("Review log")
+        self.assertEqual(rows, before)
+        self.assertEqual([row["#"] for row in snapshot.reviewed], ["C70"])
+        self.assertEqual(review_events.decode(log), (
+            *review_events.decode(withdrawn["Review log"]),
+            review_events.ReviewLog(ADD_TIME, "demo", f"Reopened: {reason}"),
+        ))
+
+    def test_reopen_requires_a_reason_and_refuses_an_open_row(self) -> None:
+        before = self.path.read_bytes()
+        arguments = ("reopen", "--production", DOC, "--list", str(self.path), "--row", "C76")
+        self.assertEqual(run(*arguments), (1, "", "--reason needs one line of words\n"))
+        self.assertEqual(run(*arguments, "--reason", "Try again"), (1, "", "C76 is not withdrawn\n"))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_correct_withdraw_who_changes_only_the_selected_event(self) -> None:
+        target = ("--production", DOC, "--list", str(self.path), "--row", "C70")
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            self.assertEqual(run("withdraw", *target, "--reason", "It was replaced")[0], 0)
+        before, = change_review.review_snapshot(self.path).reviewed
+        events = review_events.decode(before["Review log"])
+        arguments = ("correct-withdraw-who", *target, "--who", "natedev")
+        text = self.path.read_bytes()
+        self.assertEqual(run(*arguments, "--at", events[0].time.isoformat())[0], 1)
+        self.assertEqual(self.path.read_bytes(), text)
+        self.assertEqual(run(*arguments, "--at", ADD_TIME.isoformat()),
+                         (0, "change-review/C70 withdrawal author set to natedev\n", ""))
+        after, = change_review.review_snapshot(self.path).reviewed
+        self.assertEqual(review_events.decode(after.pop("Review log")),
+                         (events[0], replace(events[1], who="natedev")))
+        _ = before.pop("Review log")
+        self.assertEqual(after, before)
 
     def test_edit_and_verdict_replacement_failures_keep_the_list_and_rerun_once(self) -> None:
         for action in ("edit", "verdict"):
