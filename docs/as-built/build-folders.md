@@ -295,24 +295,29 @@ With sudo, the parent checks processes of all users. Any unreadable process bloc
 The parent starts only `setpriv`. The SSH child reads the time limit after it changes to the caller's user.
 The child uses `SUDO_UID` and `SUDO_GID` for all writes and removals.
 It starts with no supplementary groups or capabilities. The command refuses a root run without the sudo identity.
-The sudo list shows each gate folder that would move to disk. It shows the count and size of those folders.
-Review the list. When it has approved moves, it ends with three lines.
-The first gives the count and size of the folders that would move, for example `5 folders, 0.07 GiB, would move from memory to disk.`
-Then it prints `To move these folders, run:` and the complete sudo command.
+The sudo list starts with the count and size of the gate folders that would move to disk.
+For example, it starts with `5 folders, 0.07 GiB, would move from memory to disk`.
+Review the list. When it has approved moves, it ends with `To move these folders, run:` and the complete sudo command.
 Copy the command to move the approved folders.
 Use the standard cleanup command for other removal rows.
 The command reads the configured places from `config/disks.conf`.
 The standard list approves removal only for places named by the cleanup settings and their side files.
-Other places found by the scans show `list only: no setting names it`.
-Each row shows the place, the machine, the size when measured, and the result of the checks.
+Other places found by the scans stay unless the cleanup settings name them.
+The standard list starts with the count and size of the folders it would remove.
+For example, it starts with `1 folder, 2.00 MiB, would be removed`.
+A second line gives a count when some folders stay.
+Each row shows the machine, the place, the size in MiB or GiB, and what happens to it.
+For example, a result can read `would remove: no program use found; last changed 3 days ago`.
+The list ends with the digest. When it has approved removals, the lead line and full command follow the digest.
 On natedev it also reads the Mac list over SSH. When SSH fails, the command shows the first error line if available.
 The Mac slot folder is list-only. Bob handles its removal by hand.
 `/build/sccache` is a shared tool cache from the system configuration. The cleanup lists it and keeps it.
 
 The command lists each direct entry under `roots.gate`.
 The list shows `t-` and `targeted-test-` rows first.
-A row includes its lock and lease files and shows its kind, size, newest modification time, lease state, and live use.
-The newest time includes the lock and lease files.
+A row includes its lock and lease files.
+The list shows how long ago the most recent change occurred when that time is known.
+This time includes changes to the lock and lease files.
 If the command cannot read the gate root, it shows one kept row for that root and lists the other places.
 The command keeps a gate row that contains a `.git` file or folder at any depth.
 It also keeps a bare repository that it identifies by name.
@@ -344,10 +349,8 @@ If it finds a reference to the gate filesystem through a path outside the gate r
 The list shows `gate root open through another path; live use not provable`.
 The command keeps a row if any entry belongs to another user.
 It also keeps a row if the lease start identity is invalid.
-A folder that passes the checks shows `would remove if named` when `cleanup.dead` does not name it.
-The summary first shows the combined count and GiB of `t-` and `targeted-test-` rows that would remove if named.
-It then shows the count and GiB by kind and result.
-It also shows the count and GiB for each reason it keeps a row.
+A gate folder that passes the checks stays when `cleanup.dead` does not name it.
+Its row starts the result with `stays: the cleanup settings do not name it`.
 
 On natedev, the list finds `.saved-target-*` folders directly in `~/rust`.
 It also checks `~/worktrees` and its subfolders to a depth of three for saved targets.

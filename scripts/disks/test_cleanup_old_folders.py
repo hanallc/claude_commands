@@ -1,6 +1,7 @@
 """Check manual cleanup with private folders and an injected SSH runner."""
 from __future__ import annotations
 
+import dataclasses
 import fcntl
 import errno
 import io
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import redirect_stderr, redirect_stdout
@@ -28,6 +30,7 @@ SCRIPT = Path(__file__).with_name("cleanup_old_folders.py").resolve()
 GATE_LEASE_START = "Wed Nov 25 12:00:00 2026" if sys.platform == "darwin" else "123"
 REUSED_GATE_LEASE_START = "Wed Nov 25 12:00:01 2026" if sys.platform == "darwin" else "124"
 FIXTURE_GATE_DEVICE = -1
+LIST_SIZE = r"<?[0-9]+\.[0-9]{2} (?:MiB|GiB)"
 
 
 class CleanupTests(unittest.TestCase):
@@ -341,10 +344,10 @@ for folder in masks:
         with mock.patch.object(self, "unreachable", wraps=self.unreachable) as ssh:
             status, output, errors = self.command()
         self.assertEqual((status, errors), (0, ""))
-        self.assertRegex(output, rf"natedev\t{str(path)!r}\t[0-9]+\twould remove")
-        self.assertIn("mac\t-\tunknown\tmac unreachable: connection refused\n", output)
+        self.assertRegex(output.splitlines()[0], rf"^1 folder, {LIST_SIZE}, would be removed$")
+        self.assertRegex(output, rf"natedev\t{str(path)!r}\t{LIST_SIZE}\twould remove: no program use found")
+        self.assertIn("mac unreachable: connection refused\n", output)
         self.assertNotIn("ssh debug detail", output)
-        self.assertIn("mac total: unknown", output)
         self.assertRegex(output, r"(?m)^Digest: [0-9a-f]{64}$")
         self.assertEqual((path / "payload").read_text(), "old content\n")
         ssh.assert_called_once()
@@ -361,6 +364,16 @@ for folder in masks:
                     '"$(command -v python3)" -IB "$HOME/.claude/scripts/disks/cleanup_old_folders.py"'
                     + f"{scope} --go {approval}",
                 ])
+
+    def test_row_text_names_recorded_program_use(self) -> None:
+        cleanup = cleanup_old_folders
+        details = cleanup.GateDetails("mg", 0, (cleanup.LeaseStatus(cleanup.LeaseState.ABSENT),), "cargo (pid 12)")
+        row = cleanup.Row(Path("/dev/shm/mg-a"), 1, cleanup.GATE_IF_NAMED, gate=details)
+        self.assertEqual(cleanup.row_result(row, 0),
+                         "stays: the cleanup settings do not name it; program use: cargo (pid 12); last changed today")
+        quiet = cleanup.Row(Path("/dev/shm/mg-b"), 1, cleanup.GATE_IF_NAMED,
+                            gate=dataclasses.replace(details, use=cleanup.GATE_USE_NONE))
+        self.assertIn("; no program use found;", cleanup.row_result(quiet, 0))
 
     def test_kept_rows_and_json_have_no_apply_command(self) -> None:
         self.write_settings("~/missing")
@@ -384,7 +397,7 @@ for folder in masks:
             with self.subTest(stderr=stderr), mock.patch.object(subprocess, "run", side_effect=error) as ssh:
                 status, output, errors = self.command(runner=cleanup_old_folders.run_remote)
                 self.assertEqual((status, errors), (0, ""))
-                self.assertIn(f"mac\t-\tunknown\tmac unreachable: {detail}\n", output)
+                self.assertIn(f"mac unreachable: {detail}\n", output)
                 self.assertNotIn("ssh debug detail", output)
                 ssh.assert_called_once_with(
                     ("ssh", "-o", "BatchMode=yes", "mac", cleanup_old_folders.REMOTE_COMMAND + " --json"),
@@ -536,7 +549,7 @@ assert not loaded, sorted(loaded)
                     status, output, errors = self.command("--host-list")
                 self.assertEqual((status, errors), (0, ""))
                 for path in (first, second):
-                    self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\topen file scan is incomplete")
+                    self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\tstays: open file scan is incomplete")
                     self.assertIn("pid 42 fixture-process", output)
                     self.assertTrue((path / "payload").is_file())
                 self.assertNotIn("would remove", output)
@@ -571,7 +584,7 @@ assert not loaded, sorted(loaded)
             status, output, errors = self.command("--host-list")
         self.assertFalse(descriptor.is_symlink())
         self.assertEqual((status, errors), (0, ""))
-        self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\twould remove")
+        self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\twould remove")
 
     @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup parent")
     def test_sudo_parent_checks_processes_from_other_users_and_starts_an_unprivileged_worker(self) -> None:
@@ -647,30 +660,27 @@ assert not loaded, sorted(loaded)
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(cleanup.run_cli((), run_ssh=self.unreachable), 0)
         approval = self.list_digest(output.getvalue())
-        self.assertIn("would move to disk", output.getvalue())
-        self.assertEqual(output.getvalue().splitlines()[-3:], [
-            "1 folder, 0.00 GiB, would move from memory to disk.",
+        self.assertRegex(output.getvalue().splitlines()[0], rf"^1 folder, {LIST_SIZE}, would move from memory to disk$")
+        self.assertEqual(output.getvalue().splitlines()[-2:], [
             "To move these folders, run:",
             'sudo "$(command -v python3)" -IB "$HOME/.claude/scripts/disks/cleanup_old_folders.py"'
             + f" --go {approval}",
         ])
 
-    def test_move_count_line_counts_only_the_moving_folders(self) -> None:
+    def test_move_total_counts_only_the_moving_folders(self) -> None:
         cleanup = cleanup_old_folders
         gib = 1 << 30
         rows = (cleanup.Row(Path("/dev/shm/t-a"), 3 * gib // 2, cleanup.WouldMove(Path("/build/a"), "a")),
                 cleanup.Row(Path("/dev/shm/t-b"), gib // 2, cleanup.WouldMove(Path("/build/b"), "b")),
                 cleanup.Row(Path("/dev/shm/t-c"), None, cleanup.WouldMove(Path("/build/c"), "c")),
-                cleanup.Row(Path("/dev/shm/t-d"), 7 * gib, cleanup.WouldRemove("d")))
-        local = cleanup.HostList(cleanup.Machine.NATEDEV, rows)
+                cleanup.Row(Path("/dev/shm/t-d"), 7 * gib, cleanup.GATE_IF_NAMED))
         with redirect_stdout(io.StringIO()) as output:
-            cleanup.show_apply_command(local, local, "f" * 64, mode=cleanup.CleanupMode.MOVE_GATE_GIT,
-                                       host_list=False)
-        self.assertEqual(output.getvalue().splitlines()[0],
-                         "3 folders, 2.00 GiB (size unknown for 1), would move from memory to disk.")
-        with redirect_stdout(io.StringIO()) as output:
-            cleanup.show_apply_command(local, local, "f" * 64, mode=cleanup.CleanupMode.STANDARD, host_list=False)
-        self.assertNotIn("would move from memory to disk", output.getvalue())
+            cleanup.show_list_total((cleanup.HostList(cleanup.Machine.NATEDEV, rows),),
+                                    cleanup.CleanupMode.MOVE_GATE_GIT)
+        self.assertEqual(output.getvalue().splitlines(), [
+            "3 folders, 2.00 GiB, would move from memory to disk (1 with unknown size)",
+            "1 folder stays",
+        ])
 
     @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
     def test_the_worker_applies_only_with_the_invoking_user_ids(self) -> None:
@@ -750,15 +760,15 @@ assert not loaded, sorted(loaded)
         names = "pid 42 hidden-cwd, pid 43 hidden-fd"
         self.assertEqual(output.splitlines().count(f"Open file scan is incomplete: {names}"), 1)
         for path in (free, cwd, open_file):
-            self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\topen file scan is incomplete: {names}")
+            self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\tstays: open file scan is incomplete: {names}")
         self.assertNotIn("would remove", output)
 
         with mock.patch.object(cleanup_old_folders, "PROC_ROOT", str(proc)):
             status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        self.assertRegex(output, rf"{str(free)!r}\t[0-9]+\twould remove")
-        self.assertRegex(output, rf"{str(cwd)!r}\t[0-9]+\tpid 44 works in it")
-        self.assertRegex(output, rf"{str(open_file)!r}\t[0-9]+\tpid 44 holds a file open in it")
+        self.assertRegex(output, rf"{str(free)!r}\t{LIST_SIZE}\twould remove")
+        self.assertRegex(output, rf"{str(cwd)!r}\t{LIST_SIZE}\tstays: pid 44 works in it")
+        self.assertRegex(output, rf"{str(open_file)!r}\t{LIST_SIZE}\tstays: pid 44 holds a file open in it")
 
     def test_pwd_denials_keep_folders_and_links_and_name_each_process_once(self) -> None:
         free = self.candidate()
@@ -805,16 +815,16 @@ assert not loaded, sorted(loaded)
         names = "pid 42 hidden-pwd, pid 45 hidden-environment"
         self.assertEqual(output.splitlines().count(f"Open file scan is incomplete: {names}"), 1)
         for path in (free, held, unused_link, used_link):
-            self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\topen file scan is incomplete: {names}")
+            self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\tstays: open file scan is incomplete: {names}")
         self.assertNotIn("would remove", output)
 
         with mock.patch.object(cleanup_old_folders, "PROC_ROOT", str(proc)):
             status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
         for path in (free, unused_link):
-            self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\twould remove")
-        self.assertRegex(output, rf"{str(used_link)!r}\t[0-9]+\tpid 43 .* uses the link in PWD")
-        self.assertRegex(output, rf"{str(held)!r}\t[0-9]+\tpid 44 uses it in PWD")
+            self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\twould remove")
+        self.assertRegex(output, rf"{str(used_link)!r}\t{LIST_SIZE}\tstays: pid 43 .* uses the link in PWD")
+        self.assertRegex(output, rf"{str(held)!r}\t{LIST_SIZE}\tstays: pid 44 uses it in PWD")
 
     def test_linux_preview_and_apply_use_the_proc_table(self) -> None:
         path = self.candidate()
@@ -850,7 +860,7 @@ assert not loaded, sorted(loaded)
             _ = pid.rename(proc / "exited")
             status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\twould remove")
+        self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\twould remove")
 
     def test_matching_live_lease_keeps_and_dead_or_reused_pid_lists(self) -> None:
         path = self.candidate(home=self.build)
@@ -889,10 +899,10 @@ assert not loaded, sorted(loaded)
             self.assertEqual((status, errors), (0, ""))
             rows = {line.split("\t")[1]: line.split("\t")[3] for line in output.splitlines()
                     if line.startswith("natedev\t")}
-            self.assertEqual({place for place, result in rows.items() if result.startswith("would remove if named")},
-                             {repr(str(dead)), repr(str(self.gate / "mg-unleased"))})
-            self.assertIn(f"lease=dead (PID 42 start {GATE_LEASE_START!r})", rows[repr(str(dead))])
-            self.assertIn("lease=alive (PID 43)", rows[repr(str(live))])
+            unnamed = {place for place, result in rows.items()
+                       if result.startswith("stays: the cleanup settings do not name it")}
+            self.assertEqual(unnamed, {repr(str(dead)), repr(str(self.gate / "mg-unleased"))})
+            self.assertIn(f"lease ended (PID 42 start {GATE_LEASE_START!r})", rows[repr(str(dead))])
             self.assertIn("lease PID 43 is still running", rows[repr(str(live))])
             self.assertIn("gate recovery record", rows[repr(str(recovery))])
 
@@ -907,7 +917,7 @@ assert not loaded, sorted(loaded)
             status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
         self.assertIn("cannot verify lease PID 42", output)
-        self.assertNotRegex(output, rf"{str(dead)!r}\t[0-9]+\twould remove")
+        self.assertNotRegex(output, rf"{str(dead)!r}\t{LIST_SIZE}\twould remove")
 
     def test_gate_rows_keep_git_repositories_by_name(self) -> None:
         marker_folder = self.candidate("t-directory", home=self.gate)
@@ -925,8 +935,8 @@ assert not loaded, sorted(loaded)
         status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
         for path in (marker_folder, marker_file, module.parents[3], bare):
-            self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\tholds a Git repository; manual review")
-        self.assertIn("kept (holds a Git repository; manual review): 4 (0.002 GiB)", output)
+            self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\tstays: holds a Git repository; manual review")
+        self.assertEqual(output.splitlines()[1], "4 folders stay")
 
     def gate_checkout_to_move(self, name: str = "t-checkout") -> Path:
         path = self.candidate(name, home=self.gate)
@@ -1205,9 +1215,8 @@ assert not loaded, sorted(loaded)
         decoded = cleanup.decode_cleanup_rows(cast(object, json.loads(json.dumps(worker_record["rows"]))), review.machine)
         self.assertEqual(decoded, review.rows)
         with redirect_stdout(io.StringIO()) as output:
-            cleanup.show(review, cleanup.LocalListOnly.REQUESTED, record["digest"])
-        self.assertIn(f"would move to disk at {str(target)!r}", output.getvalue())
-        self.assertRegex(output.getvalue(), r"would move to disk: 1 \([0-9.]+ GiB\)")
+            cleanup.show(review, cleanup.LocalListOnly.REQUESTED, record["digest"], mode=mode)
+        self.assertIn(f"would move to disk: new place {str(target)!r}", output.getvalue())
         self.assertTrue(path.is_dir())
         self.assertFalse(target.parent.exists())
         self.assertEqual(record["rows"][0].get("move_to"), str(target))
@@ -1259,7 +1268,7 @@ assert not loaded, sorted(loaded)
         self.assertEqual((status, errors), (0, ""))
         run.assert_not_called()
         for path in (fixture, gate_checkout):
-            self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\tholds a Git repository; manual review")
+            self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\tstays: holds a Git repository; manual review")
 
     def test_other_rows_keep_git_data_in_the_gate_root_without_starting_git(self) -> None:
         source, worktree = self.git_fixture()
@@ -1288,7 +1297,7 @@ assert not loaded, sorted(loaded)
         self.assertEqual((status, errors), (0, ""))
         run.assert_not_called()
         for path in rows:
-            self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\tGit data in the gate root; manual review")
+            self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\tstays: Git data in the gate root; manual review")
 
     def test_git_storage_on_the_gate_device_keeps_the_row_without_starting_git(self) -> None:
         source, linked = self.git_fixture()
@@ -1315,7 +1324,7 @@ assert not loaded, sorted(loaded)
                     status, output, errors = self.command("--host-list")
                 self.assertEqual((status, errors), (0, ""))
                 run.assert_not_called()
-                self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\tGit data in the gate root; manual review")
+                self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\tstays: Git data in the gate root; manual review")
 
     @unittest.skipUnless(sys.platform == "linux", "requires Linux process paths")
     def test_gate_rows_are_kept_when_a_process_uses_the_device_through_an_alias(self) -> None:
@@ -1352,7 +1361,7 @@ assert not loaded, sorted(loaded)
                     status, output, errors = self.command("--host-list")
                 self.assertEqual((status, errors), (0, ""))
                 for path in (first, second):
-                    self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\t"
+                    self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\tstays: "
                                      + "gate root open through another path; live use not provable")
                 reference.unlink()
                 if reference == cwd:
@@ -1378,7 +1387,7 @@ assert not loaded, sorted(loaded)
                 root.unlink()
                 executable.unlink()
                 self.assertEqual((status, errors), (0, ""))
-                self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\t"
+                self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\tstays: "
                                  + "gate root open through another path; live use not provable")
 
     def test_an_unreadable_gate_root_keeps_one_row_and_lists_other_folders(self) -> None:
@@ -1397,8 +1406,8 @@ assert not loaded, sorted(loaded)
         self.assertEqual((status, errors), (0, ""))
         self.assertEqual(output.count(f"\t{str(self.gate)!r}\t"), 1)
         self.assertRegex(output, rf"{str(self.gate)!r}\tunknown\t.*permission denied")
-        self.assertRegex(output, rf"{str(other)!r}\t[0-9]+\twould remove")
-        self.assertRegex(output, rf"{str(cache)!r}\t[0-9]+\tkept: shared tool cache, list only")
+        self.assertRegex(output, rf"{str(other)!r}\t{LIST_SIZE}\twould remove")
+        self.assertRegex(output, rf"{str(cache)!r}\t{LIST_SIZE}\tstays: shared tool cache, list only")
 
     def test_gate_newest_time_includes_the_lock_and_lease(self) -> None:
         path = self.candidate("t-stamps", home=self.gate)
@@ -1429,7 +1438,7 @@ assert not loaded, sorted(loaded)
         with mock.patch.object(process_start, "process_start", return_value=process_start.Started(GATE_LEASE_START)):
             status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\tcannot verify the start time for lease PID 42")
+        self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\tstays: cannot verify the start time for lease PID 42")
 
     def test_gate_row_keeps_an_entry_owned_by_another_user(self) -> None:
         path = self.candidate("mg-other-owner/nested", home=self.gate)
@@ -1446,7 +1455,7 @@ assert not loaded, sorted(loaded)
         with mock.patch.object(cleanup_old_folders, "entry_stamp", side_effect=foreign_owner):
             status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        self.assertRegex(output, rf"{str(path.parent)!r}\t[0-9]+\tother user's files; live use not provable")
+        self.assertRegex(output, rf"{str(path.parent)!r}\t{LIST_SIZE}\tstays: other user's files; live use not provable")
 
     def test_gate_rows_keep_a_path_open_in_a_nonleader_thread(self) -> None:
         gate = self.candidate("mg-thread", home=self.gate)
@@ -1467,10 +1476,10 @@ assert not loaded, sorted(loaded)
             status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
         row = next(line for line in output.splitlines() if line.startswith(f"natedev\t{str(gate)!r}\t"))
-        self.assertRegex(row, r"\t[0-9]+\tpid 42 holds a file open")
-        self.assertIn("use=pid 42 holds a file open", row)
+        self.assertRegex(row, rf"\t{LIST_SIZE}\tstays: pid 42 holds a file open")
+        self.assertEqual(row.count("pid 42 holds a file open"), 1)
 
-    def test_gate_summary_counts_measured_bytes_by_kind_and_verdict(self) -> None:
+    def test_gate_list_shows_age_size_and_why_folders_stay(self) -> None:
         large = self.candidate("t-large", home=self.gate)
         _ = (large / "payload").write_bytes(b"x" * (2 << 20))
         targeted = self.candidate("targeted-test-small", home=self.gate)
@@ -1484,18 +1493,18 @@ assert not loaded, sorted(loaded)
         self.write_settings(str(self.home / "missing"))
         os.utime(large, (1_700_000_000, 1_700_000_000))
         os.utime(large / "payload", (1_700_000_001, 1_700_000_001))
-        status, output, errors = self.command("--host-list")
+        with mock.patch.object(time, "time_ns", return_value=1_700_259_202_000_000_000):
+            status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        self.assertIn("newest=2023-11-14T22:13:21Z", output)
-        self.assertRegex(output, rf"{str(unknown)!r}\t[0-9]+\tunknown gate entry type")
-        self.assertRegex(output, rf"{str(alias)!r}\t[0-9]+\tgate entry is a link")
-        self.assertRegex(output, rf"{str(orphan)!r}\t[0-9]+\torphan gate sidecars")
-        self.assertRegex(output, rf"{str(nested_record.parents[1])!r}\t[0-9]+\tgate recovery record")
+        self.assertEqual(output.splitlines()[:2], ["0 folders, 0.00 MiB, would be removed", "6 folders stay"])
+        self.assertRegex(output, rf"{str(large)!r}\t2\.[0-9]{{2}} MiB\tstays: .*last changed 3 days ago")
+        self.assertNotRegex(output, r"\b(?:kind|newest|lease|use)=")
+        self.assertRegex(output, rf"{str(unknown)!r}\t{LIST_SIZE}\tstays: unknown gate entry type")
+        self.assertRegex(output, rf"{str(alias)!r}\t{LIST_SIZE}\tstays: gate entry is a link")
+        self.assertRegex(output, rf"{str(orphan)!r}\t{LIST_SIZE}\tstays: orphan gate sidecars")
+        self.assertRegex(output, rf"{str(nested_record.parents[1])!r}\t{LIST_SIZE}\tstays: gate recovery record")
         rows = [line.split("\t")[1] for line in output.splitlines() if line.startswith("natedev\t")]
         self.assertEqual(rows[:2], [repr(str(large)), repr(str(targeted))])
-        self.assertIn("Gate rows on natedev: t and targeted-test would remove if named: 2 (0.002 GiB); "
-                      + "t would remove if named: 1 (0.002 GiB); targeted-test would remove if named: 1 (0.000 GiB); "
-                      + "fc kept: 1 (0.000 GiB); mg kept: 2 (0.000 GiB); unknown kept: 1 (0.000 GiB)", output)
 
     def test_child_lease_keeps_parent_in_preview_and_apply(self) -> None:
         payload = self.candidate("old/nested/copy") / "payload"
@@ -1565,14 +1574,14 @@ assert not loaded, sorted(loaded)
                 status, output, errors = self.command()
                 self.assertEqual((status, errors), (0, ""))
                 self.assertIn(f"{str(path)!r}", output)
-                self.assertIn(f"\tkept: {reason}, list only\n", output)
+                self.assertIn(f"\tstays: {reason}, list only\n", output)
                 self.assertNotIn("would remove", output)
                 self.assertEqual(self.command("--go", self.list_digest(output))[0], 0)
                 self.assertTrue((path / "payload").is_file())
                 with mock.patch.object(cleanup_old_folders, "platform_mounts", return_value=lambda: (Path("/"), path)):
                     status, output, errors = self.command("--host-list")
                     self.assertEqual((status, errors), (0, ""))
-                    self.assertIn(f"{str(path)!r}\tunknown\tkept: {reason}, list only; ", output)
+                    self.assertIn(f"{str(path)!r}\tunknown\tstays: {reason}, list only; ", output)
                     self.assertIn(removal_guard.RefusalReason.MOUNT.value, output)
 
     def test_list_only_cache_preserves_the_scan_error(self) -> None:
@@ -1582,7 +1591,7 @@ assert not loaded, sorted(loaded)
         with mock.patch.object(cleanup_old_folders, "inspect_cleanup_tree", side_effect=failure):
             status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        self.assertIn(f"{str(cache)!r}\tunknown\tkept: shared tool cache, list only; {failure}\n", output)
+        self.assertIn(f"{str(cache)!r}\tunknown\tstays: shared tool cache, list only; {failure}\n", output)
 
     def test_only_known_repositories_have_protected_model_folders(self) -> None:
         fixture = self.build / "p-fixture"
@@ -1592,8 +1601,8 @@ assert not loaded, sorted(loaded)
         self.write_settings(f"{fixture}, {hana}")
         status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        self.assertRegex(output, rf"{str(fixture)!r}\t[0-9]+\twould remove")
-        self.assertIn(f"{str(hana)!r}\tunknown\tcontains a model folder: {hana / 'main'}", output)
+        self.assertRegex(output, rf"{str(fixture)!r}\t{LIST_SIZE}\twould remove")
+        self.assertIn(f"{str(hana)!r}\tunknown\tstays: contains a model folder: {hana / 'main'}", output)
 
     def git(self, path: Path, *arguments: str) -> str:
         return subprocess.run(("git", "-C", str(path), *arguments), check=True,
@@ -1678,7 +1687,7 @@ assert not loaded, sorted(loaded)
                     status, output, errors = self.command("--host-list")
                 self.assertEqual((status, errors), (0, ""))
                 self.assertIn(f"{str(path)!r}\t", output)
-                self.assertIn("\tgit config include\n", output)
+                self.assertIn("\tstays: git config include\n", output)
                 self.assertNotIn("would remove", output)
                 git.assert_not_called()
 
@@ -1764,7 +1773,7 @@ assert not loaded, sorted(loaded)
         self.assertEqual((status, errors), (0, ""))
         self.assertIn(f"registration: {str(git_files.at(checkout).git_dir)!r}", output)
         self.assertIn(f"{str(source)!r}\t", output)
-        self.assertIn("\tthe clone has registered linked worktrees", output)
+        self.assertIn("\tstays: the clone has registered linked worktrees", output)
 
     def test_local_git_config_with_a_protected_path_is_review_only(self) -> None:
         _, checkout = self.clone_fixture()
@@ -1863,15 +1872,15 @@ assert not loaded, sorted(loaded)
 
         status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        self.assertRegex(output, rf"{str(clone)!r}\t[0-9]+\twould remove")
-        self.assertRegex(output, rf"{str(fixture)!r}\t[0-9]+\tholds a Git repository; manual review")
+        self.assertRegex(output, rf"{str(clone)!r}\t{LIST_SIZE}\twould remove")
+        self.assertRegex(output, rf"{str(fixture)!r}\t{LIST_SIZE}\tstays: holds a Git repository; manual review")
 
         broken_registration = self.home / "source/.git/worktrees/no-backlink"
         broken_registration.mkdir(parents=True)
         _ = pointer.write_text(f"gitdir: {broken_registration}\n")
         status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        self.assertNotRegex(output, rf"{str(clone)!r}\t[0-9]+\twould remove")
+        self.assertNotRegex(output, rf"{str(clone)!r}\t{LIST_SIZE}\twould remove")
         self.assertIn(str(broken_registration / "gitdir"), output)
 
     def test_orphan_row_does_not_block_clone_review_or_removal(self) -> None:
@@ -1890,8 +1899,8 @@ assert not loaded, sorted(loaded)
         with mock.patch.object(cleanup_old_folders.CleanupBounds, "storage_path", check_storage):
             status, output, errors = self.command("--host-list")
             self.assertEqual((status, errors), (0, ""))
-            self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\twould remove")
-            self.assertRegex(output, rf"{str(orphan)!r}\t[0-9]+\tlist only: no setting names it")
+            self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\twould remove")
+            self.assertRegex(output, rf"{str(orphan)!r}\t{LIST_SIZE}\tstays: list only: no setting names it")
             approval = self.list_digest(output)
             status, output, errors = self.command("--host-list", "--go", approval)
         self.assertEqual((status, errors), (0, ""), output)
@@ -1940,7 +1949,7 @@ assert not loaded, sorted(loaded)
         _ = self.git(source, "worktree", "lock", str(path))
         status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        self.assertIn("\tgit worktree locked\n", output)
+        self.assertIn("\tstays: git worktree locked\n", output)
         applied = self.command("--host-list", "--go", approval)
         self.assertEqual(applied[0], 1)
         self.assertTrue((path / ".git").is_file())
@@ -2258,7 +2267,7 @@ assert not loaded, sorted(loaded)
         status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
         for path in included:
-            self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\twould remove")
+            self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\twould remove")
         for path in excluded:
             self.assertNotIn(str(path), output)
         self.assertNotIn("/alias/", output)
@@ -2291,10 +2300,10 @@ assert not loaded, sorted(loaded)
         with mock.patch.object(tmp_sweep, "lsof_paths", return_value=uses):
             status, output, errors = self.command("--host-list")
             self.assertEqual((status, errors), (0, ""))
-            self.assertRegex(output, rf"{str(clean)!r}\t[0-9]+\twould remove")
-            self.assertRegex(output, rf"{str(busy)!r}\t[0-9]+\tpid 42 holds a file")
+            self.assertRegex(output, rf"{str(clean)!r}\t{LIST_SIZE}\twould remove")
+            self.assertRegex(output, rf"{str(busy)!r}\t{LIST_SIZE}\tstays: pid 42 holds a file")
             for path in (wrapper, target, profile, doc, wrong_type, wrong_doc, doc_profile, unknown_directory):
-                self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\t.*not verified as Cargo output")
+                self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\t.*not verified as Cargo output")
             approval = self.list_digest(output)
             status, output, errors = self.command("--host-list", "--go", approval)
         self.assertEqual((status, errors), (0, ""), output)
@@ -2319,7 +2328,7 @@ assert not loaded, sorted(loaded)
         self.write_settings("~/rust/.saved-target-*")
         status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        self.assertRegex(output, rf"{str(saved)!r}\t[0-9]+\twould remove")
+        self.assertRegex(output, rf"{str(saved)!r}\t{LIST_SIZE}\twould remove")
 
     def test_saved_target_removes_known_mend_links_without_removing_their_targets(self) -> None:
         target = self.saved_target("rust/.saved-target-mend-alias")
@@ -2343,8 +2352,8 @@ assert not loaded, sorted(loaded)
         self.write_settings("~/rust/.saved-target-*")
         status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        self.assertRegex(output, rf"{str(target)!r}\t[0-9]+\twould remove")
-        self.assertRegex(output, rf"{str(mixed)!r}\t[0-9]+\t.*not verified as Cargo output")
+        self.assertRegex(output, rf"{str(target)!r}\t{LIST_SIZE}\twould remove")
+        self.assertRegex(output, rf"{str(mixed)!r}\t{LIST_SIZE}\t.*not verified as Cargo output")
         approval = self.list_digest(output)
         status, output, errors = self.command("--host-list", "--go", approval)
         self.assertEqual((status, errors), (0, ""), output)
@@ -2362,7 +2371,7 @@ assert not loaded, sorted(loaded)
         self.write_settings("~/rust/.saved-target-*")
         status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        self.assertRegex(output, rf"{str(saved)!r}\t[0-9]+\twould remove")
+        self.assertRegex(output, rf"{str(saved)!r}\t{LIST_SIZE}\twould remove")
         _ = (profile / "other.wasm").write_bytes(b"unknown output")
         status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
@@ -2391,7 +2400,7 @@ assert not loaded, sorted(loaded)
             status, output, errors = self.command("--host-list")
             self.assertEqual((status, errors), (0, ""))
             for name in ("dead", "free"):
-                self.assertRegex(output, rf"{str(links[name])!r}\t[0-9]+\twould remove")
+                self.assertRegex(output, rf"{str(links[name])!r}\t{LIST_SIZE}\twould remove")
             self.assertIn("pid 42 fixture-shell uses the link in PWD", output)
             self.assertIn("staff row fixture worker", output)
             approval = self.list_digest(output)
@@ -2455,7 +2464,7 @@ assert not loaded, sorted(loaded)
             status, output, errors = self.command("--host-list")
             self.assertEqual((status, errors), (0, ""))
             for path in (scratch, target, folder, link):
-                self.assertRegex(output, rf"{str(path)!r}\t(?:[0-9]+|unknown)\tlist only: no setting names it")
+                self.assertRegex(output, rf"{str(path)!r}\t(?:{LIST_SIZE}|unknown)\tstays: list only: no setting names it")
             self.assertNotIn("would remove", output)
             approval = self.list_digest(output)
             self.assertEqual(self.command("--host-list", "--go", approval)[0], 0)
@@ -2490,7 +2499,7 @@ assert not loaded, sorted(loaded)
                 status, output, errors = self.command("--host-list")
             self.assertEqual((status, errors), (0, ""))
             for path in (link, orphan):
-                self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\t.*open file scan is incomplete: pid 42 unreadable-shell")
+                self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\t.*open file scan is incomplete: pid 42 unreadable-shell")
             self.assertNotIn("would remove", output)
             approval = self.approval("--host-list")
             with mock.patch.object(cleanup_old_folders, "apply", side_effect=apply_after_denial):
@@ -2522,7 +2531,7 @@ assert not loaded, sorted(loaded)
             status, output, errors = self.command("--host-list")
             self.assertEqual((status, errors), (0, ""))
             for path in (dead, lease_only, lock_only):
-                self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\tlist only: no setting names it")
+                self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\tstays: list only: no setting names it")
             self.assertIn("lease PID 42 is still running", output)
             approval = self.list_digest(output)
             status, output, errors = self.command("--host-list", "--go", approval)
@@ -2565,7 +2574,7 @@ assert not loaded, sorted(loaded)
             status, output, errors = self.command("--host-list")
             self.assertEqual((status, errors), (0, ""))
             self.assertIn("pid 42 works in it; staff row fixture worker", output)
-            self.assertRegex(output, rf"{str(repo)!r}\tunknown\tlist only: no setting names it; review only,"
+            self.assertRegex(output, rf"{str(repo)!r}\tunknown\tstays: list only: no setting names it; review only,"
                                      + r" dirty: 1, unpushed: 1, branch: 'fixture-branch'")
             self.assertNotIn(str(model), output)
             self.assertNotIn("would remove", output)
@@ -2787,8 +2796,8 @@ assert not loaded, sorted(loaded)
 
         status, output, errors = self.command(runner=run)
         self.assertEqual((status, errors), (0, ""))
-        self.assertIn(f"mac\t{str(mac_path)!r}\t9\twould remove", output)
-        self.assertIn("mac total: 9 bytes", output)
+        self.assertIn(f"mac\t{str(mac_path)!r}\t<0.01 MiB\twould remove", output)
+        self.assertRegex(output.splitlines()[0], rf"^2 folders, {LIST_SIZE}, would be removed$")
         approval = self.list_digest(output)
         self.assertNotEqual(approval, mac_record["digest"])
         status, output, errors = self.command("--go", approval, runner=run)

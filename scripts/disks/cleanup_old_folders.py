@@ -104,9 +104,6 @@ class LeaseStatus:
     state: LeaseState
     owner: str = ""
 
-    def text(self) -> str:
-        return f"{self.state.value} ({self.owner})" if self.owner else self.state.value
-
 
 @dataclass(frozen=True)
 class GateDetails:
@@ -272,6 +269,7 @@ UNREGISTERED_GIT = "not a registered linked worktree"
 NO_LOCAL_ORIGIN = "no local source repository"
 NO_CLEANUP_SETTING = removal_guard.Kept("list only: no setting names it")
 GATE_IF_NAMED = removal_guard.Kept("would remove if named")
+GATE_USE_NONE = "none found"
 GATE_RECOVERY = "gate recovery record"
 GATE_OTHER_OWNER = "other user's files; live use not provable"
 GATE_GIT_KEEP_REASON = "holds a Git repository; manual review"
@@ -2583,7 +2581,7 @@ def assess_gate(candidate: Candidate, guard: CleanupGuard, uses: CleanupProcessR
         if kind in ("gate-recovery", "merge-gate-recovery") and reason != GATE_RECOVERY:
             reason = f"{GATE_RECOVERY}. {reason}"
         outcome = removal_guard.Kept(reason)
-    details = GateDetails(kind, newest, lease_statuses, ", ".join(use_notes) or "none found")
+    details = GateDetails(kind, newest, lease_statuses, ", ".join(use_notes) or GATE_USE_NONE)
     return Row(path, size, outcome, sidecars=names, place=candidate.place, gate=details)
 
 
@@ -3334,42 +3332,69 @@ def remove_remote(review: HostList, run_ssh: SshRunner) -> int:
     return answer.returncode
 
 
-def show_gate_totals(review: HostList, mode: CleanupMode) -> None:
-    groups: dict[tuple[str, str], list[int | None]] = {}
-    kept: dict[str, list[int | None]] = {}
-    for row in review.rows:
-        if isinstance(row.gate, GateDetails):
-            if isinstance(row.outcome, WouldMove):
-                verdict = GATE_MOVE_LABEL
-            elif isinstance(row.outcome, WouldRemove):
-                verdict = "would remove"
-            elif row.outcome == GATE_IF_NAMED:
-                verdict = GATE_IF_NAMED.reason
-            else:
-                verdict = "kept"
-                kept.setdefault(row.outcome.reason, []).append(row.size)
-            groups.setdefault((row.gate.kind, verdict), []).append(row.size)
-    show_moves = mode is CleanupMode.MOVE_GATE_GIT and review.machine is Machine.NATEDEV
-    if groups or show_moves:
-        def total(label: str, sizes: list[int | None]) -> str:
-            gib = sum(size or 0 for size in sizes) / (1 << 30)
-            unknown = sizes.count(None)
-            note = f", {unknown} sizes unknown" if unknown else ""
-            return f"{label}: {len(sizes)} ({gib:.3f} GiB{note})"
+def list_size(size: int | None) -> str:
+    if size is None:
+        return "unknown"
+    if size >= 1 << 30:
+        return f"{size / (1 << 30):.2f} GiB"
+    mib = size / (1 << 20)
+    return "<0.01 MiB" if 0 < mib < 0.01 else f"{mib:.2f} MiB"
 
-        test_sizes = [size for kind in TEST_GATE_KINDS for size in groups.get((kind, GATE_IF_NAMED.reason), [])]
-        totals = [total(f"t and targeted-test {GATE_IF_NAMED.reason}", test_sizes)]
-        moves = [size for (_, verdict), sizes in groups.items() if verdict == GATE_MOVE_LABEL for size in sizes]
-        if moves or show_moves:
-            totals.append(total(GATE_MOVE_LABEL, moves))
-        for kind, verdict in sorted(groups, key=lambda group: (group[0] not in TEST_GATE_KINDS, group)):
-            totals.append(total(f"{kind} {verdict}", groups[kind, verdict]))
-        totals.extend(total(f"kept ({table_text(reason)})", sizes) for reason, sizes in sorted(kept.items()))
-        print(f"Gate rows on {review.machine.value}: " + "; ".join(totals))
+
+def folder_count(count: int) -> str:
+    return f"{count} folder" if count == 1 else f"{count} folders"
+
+
+def show_list_total(reviews: Sequence[HostList], mode: CleanupMode) -> None:
+    moving = mode is CleanupMode.MOVE_GATE_GIT
+    approved = WouldMove if moving else WouldRemove
+    verdict = "would move from memory to disk" if moving else "would be removed"
+    rows = [row for review in reviews for row in review.rows]
+    sizes = [row.size for row in rows if isinstance(row.outcome, approved)]
+    unknown = sizes.count(None)
+    size = list_size(sum(size for size in sizes if size is not None))
+    note = f" ({unknown} with unknown size)" if unknown else ""
+    print(f"{folder_count(len(sizes))}, {size}, {verdict}{note}")
+    staying = len(rows) - len(sizes)
+    if staying:
+        print(f"{folder_count(staying)} {'stays' if staying == 1 else 'stay'}")
+
+
+def row_result(row: Row, now_ns: int) -> str:
+    outcome = row.outcome
+    use = "no program use found"
+    if isinstance(row.gate, GateDetails) and row.gate.use != GATE_USE_NONE:
+        use = f"program use: {row.gate.use}"
+    if isinstance(outcome, WouldMove):
+        result = f"{GATE_MOVE_LABEL}: new place {str(outcome.target)!r}; {use}"
+    elif isinstance(outcome, WouldRemove):
+        result = f"would remove: {use}"
+    elif outcome == GATE_IF_NAMED:
+        result = f"stays: the cleanup settings do not name it; {use}"
+    else:
+        reason = outcome.reason.removeprefix("kept: ")
+        if reason.startswith(GIT_KEEP_REASON):
+            reason = "holds Git work; the owner saves it first" + reason[len(GIT_KEEP_REASON):]
+        result = f"stays: {reason}"
+    if row.git:
+        result += f", {row.git}"
+    if row.sidecars:
+        result += f"; includes {', '.join(map(repr, row.sidecars))}"
+    if isinstance(row.gate, GateDetails):
+        for lease in row.gate.leases:
+            if lease.state is LeaseState.DEAD:
+                result += f"; lease ended ({lease.owner})"
+        if isinstance(row.gate.newest_ns, int):
+            days = (now_ns - row.gate.newest_ns) // (86_400 * 10**9)
+            age = "today" if days <= 0 else f"{days} {'day' if days == 1 else 'days'} ago"
+            result += f"; last changed {age}"
+    return table_text(result)
 
 
 def show(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, approval: str, *,
          mode: CleanupMode = CleanupMode.STANDARD) -> None:
+    reviews = (local, mac) if isinstance(mac, HostList) else (local,)
+    show_list_total(reviews, mode)
     uid = os.geteuid()
     if uid == 0:
         print("Use check: processes of all users.")
@@ -3382,35 +3407,13 @@ def show(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, ap
     if local.unreadable_processes:
         reason = incomplete_scan_reason(local.unreadable_processes)
         print(reason[0].upper() + reason[1:])
-    print("Machine\tPlace\tBytes\tResult")
-    reviews = (local, mac) if isinstance(mac, HostList) else (local,)
+    print("Machine\tPlace\tSize\tResult")
+    now_ns = time.time_ns()
     for review in reviews:
         for row in review.rows:
-            if isinstance(row.outcome, WouldMove):
-                reason = f"{GATE_MOVE_LABEL} at {str(row.outcome.target)!r}"
-            else:
-                reason = row.outcome.reason if isinstance(row.outcome, removal_guard.Kept) else "would remove"
-            if row.git:
-                reason = f"{reason}, {row.git}"
-            if row.sidecars:
-                reason = f"{reason}; includes {', '.join(map(repr, row.sidecars))}"
-            if isinstance(row.gate, GateDetails):
-                gate = row.gate
-                newest = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(gate.newest_ns // 10**9))
-                          if isinstance(gate.newest_ns, int) else gate.newest_ns.value)
-                leases = ", ".join(lease.text() for lease in gate.leases) or LeaseState.ABSENT.value
-                reason += f"; kind={gate.kind}; newest={newest}; lease={leases}; use={gate.use}"
-            size = row.size if row.size is not None else "unknown"
-            print(f"{review.machine.value}\t{str(row.path)!r}\t{size}\t{table_text(reason)}")
+            print(f"{review.machine.value}\t{str(row.path)!r}\t{list_size(row.size)}\t{row_result(row, now_ns)}")
     if isinstance(mac, MacListUnavailable):
-        print(f"mac\t-\tunknown\t{table_text(mac.message())}")
-    for review in reviews:
-        total = sum(row.size or 0 for row in review.rows)
-        note = " measured (some sizes unknown)" if any(row.size is None for row in review.rows) else ""
-        print(f"{review.machine.value} total: {total} bytes{note}")
-        show_gate_totals(review, mode)
-    if isinstance(mac, MacListUnavailable):
-        print("mac total: unknown")
+        print(table_text(mac.message()))
     print(f"Digest: {approval}")
 
 
@@ -3469,16 +3472,9 @@ def show_apply_command(local: HostList, mac: HostList | MacListUnavailable | Loc
     sudo = mode is CleanupMode.MOVE_GATE_GIT
     outcome = WouldMove if sudo else WouldRemove
     rows = chain(local.rows, mac.rows) if not sudo and isinstance(mac, HostList) else local.rows
-    applied = [row for row in rows if isinstance(row.outcome, outcome)]
-    if applied:
+    if any(isinstance(row.outcome, outcome) for row in rows):
         prefix = "sudo " if sudo else ""
         scope = " --host-list" if host_list else ""
-        if sudo:
-            gib = sum(row.size or 0 for row in applied) / (1 << 30)
-            unknown = sum(row.size is None for row in applied)
-            note = f" (size unknown for {unknown})" if unknown else ""
-            folders = "folder" if len(applied) == 1 else "folders"
-            print(f"{len(applied)} {folders}, {gib:.2f} GiB{note}, would move from memory to disk.")
         print(f"To {'move' if sudo else 'remove'} these folders, run:")
         print(f'{prefix}"$(command -v python3)" -IB "$HOME/.claude/scripts/disks/cleanup_old_folders.py"'
               + f"{scope} --go {approval}")
