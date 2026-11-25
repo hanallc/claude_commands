@@ -67,8 +67,8 @@ from scripts.lib.build_steps import (GATE_PROGRAMS, RECORDED_STEP_NAMES,
                                      copies_run_command, live_process_arguments,
                                      gate_job_from_process, process_arguments, read_step_names)
 from scripts.lib.build_steps import CommandUnreadable as CommandUnreadable
-from scripts.build_queue.slot_wait import QueueRowName as QueueRowName
-from scripts.build_queue.slot_wait import (SHELLS, NoNamedStep, QueueKind, command_programs,
+from scripts.build_queue.queue_wait import QueueRowName as QueueRowName
+from scripts.build_queue.queue_wait import (SHELLS, NoNamedStep, QueueKind, command_programs,
                                            public_queue_text, recorded_step, verify_value_options)
 from scripts.build_queue.scope_activity import (LiveBuildRun, NotServiceSlice,
     RunningServiceJob, ScopeProcesses, environment_values)
