@@ -260,6 +260,10 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
         "scripts/buildlog/launches.py", "MARK_BYTES",
         "Use a fixed sample for the saved launch scan cursor.",
     ),
+    InternalLiteral(
+        "scripts/buildlog/repository.py", "LINT_COPY_ALLOCATION_BYTES",
+        "Set the fixed size of a lint copy allocation id.",
+    ),
     TunableLiteral(
         "scripts/direct/plan_history.py", "RATE_FACTOR_LIMIT", "2.0",
         "direct", "plan_history.max_rate_factor", "# range: 1..", _PRODUCTION_BATCH,
@@ -433,7 +437,6 @@ KEY_FORM_KEYS: tuple[KeyException, ...] = tuple(
             "prefixes.verify-copy",
             "prefixes.verify-hold",
             "prefixes.verify-tree",
-            "slots.Nates-MacBook-Pro-2023.cargo-liner.max",
         )),
         ("build_steps", "The build steps use hyphenated step names.", ExceptionLifetime.PERMANENT, (
             "about.between-steps",

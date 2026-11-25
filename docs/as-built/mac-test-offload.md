@@ -26,6 +26,13 @@ The same episode can receive a Mac assignment after disk evidence recovers.
 The live step record keeps diagnostic disk evidence.
 Standalone fixed local callers retain their existing local admission path.
 
+The queue checks waiters in order for each remote place.
+For Mac places only, a lower step's newer free reading clears a higher step's busy result for the same destination.
+The higher step can take the place in that pass.
+The queue keeps each step's other eligibility results.
+A step that needs evidence can hold the place for one waiting pass interval plus the probe time limit.
+The remote claim checks the place again before the step starts.
+
 ## Mac Linux gate type checks
 
 A gate that runs in the Mac Linux guest runs its requested type checks and tests in the same numbered copy.
@@ -123,8 +130,8 @@ A `mend-check` finding starts the Mac fix pass in the same Mac run. The `mend-fi
 
 ## Mac Linux guest folders
 
-The Mac Linux route uses `mac_run.held` to take a repository slot on the Mac.
-A Mac block or a busy repository slot can refuse the claim.
+The Mac Linux route uses `mac_run.held` to claim a repository on the Mac.
+A Mac block or an active claim for the repository can refuse the claim.
 The route returns `GuestNotStarted` with the refusal reason before any upload or retry backoff.
 The route releases the claim when the guest proves the run ended.
 The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
@@ -288,7 +295,8 @@ The check writes `~/.local/state/mac-idle/alert.json` on each pass.
 The hub `scripts/buildlog/mac_idle_alert.py` owns the path, record validation, and alert text.
 The views read the saved file and local configuration.
 Before a view shows a `MAC BLOCKED`, `MAC IDLE` or `MAC UNREACHABLE` line, it reads the live Mac state with `mac_idle.mac_work` (`mac_idle.view_alert_line`).
-That read uses only the local block, claim and `unreachable_until` files, and `/proc` for the claim holder's process.
+That read uses the local block, claim, `unreachable_until` and `failed_probe` files.
+It uses `/proc` to check the claim holder's process.
 It does not look for a CI job on the Mac, so a saved `free` line can show for one sample beside a CI job that just started.
 It compares the cause, not the holder, so a block or idle claim that replaces another one of the same cause shows the old holder until the next sample.
 The view shows the saved line only when the live state and cause agree with the saved reading.
@@ -342,7 +350,10 @@ It resolves the address with `showrunners.py address builds`.
 The message names the block, idle claim, free Mac, disk exclusion, or unreachable Mac.
 It lists the waiting steps and their wait evidence.
 The views place the same `MAC IDLE` alert first.
-`MAC UNREACHABLE` identifies a future connection backoff.
+`MAC UNREACHABLE` shows the retry deadline while the connection backoff is active.
+After the deadline, running Mac CI counts as work when eligible steps wait.
+The `failed_probe` mark keeps the alert visible when the watch finds no work.
+The line says that the last probe failed.
 `MAC IDLE WATCH` identifies unreadable or stale state.
 The unreachable state sends the message after `alert_seconds` while eligible steps wait.
 The unreadable state sends no message or phone push.
@@ -350,6 +361,8 @@ The unreadable state sends no message or phone push.
 The machine watch, `scripts/buildlog/machine_watch.py`, sends the phone push. See [build-targets.md](build-targets.md).
 It reads the saved alert of the same pass.
 The unreachable state uses `mac_idle.unreachable` with `need=blocked` after `excluded_notice_seconds.mac` (600 s) while eligible steps wait.
+The failed probe mark keeps the same outage across retry deadlines.
+A successful probe clears the mark.
 A free Mac, an idle claim or a disk exclusion with waiting steps sends no phone push.
 `mac_idle` counts a waiting step only after `alert_seconds`.
 The machine watch sends one message to bob and the builds showrunner 600 s after it first sees the waiting steps.
@@ -458,7 +471,7 @@ The runner uses `rsync -rlp --safe-links` and publishes the completed copy throu
 Files return to `~/.local/state/mac-test/fetched/<call id>/<folder>`. Existing destinations are refused. A failure or signal removes the partial copy.
 A fetch result adds `fetch=fetched|missing|too_large|failed|not_run` to the result file.
 
-After a Linux run reports completion, natedev releases the slot claim before it calls `buildlog.sync.sync_target(target)`.
+After a Linux run reports completion, natedev releases the repository claim before it calls `buildlog.sync.sync_target(target)`.
 The exchange selects one configured peer and preserves the host paths from `sync.hosts.<target>`.
 AWS rows arrive under `~/.local/state/buildlog/aws-build/` on natedev.
 The Linux runner uses `BUILDLOG_SYNC=1` to finish the local recorder write before it reports completion.
@@ -482,7 +495,7 @@ It also excludes direct children of another user, except children of PID 1.
 Slot processes keep their user, but an orphan can acquire PID 1 as its parent.
 Other same-user processes with unreadable evidence keep the slot busy.
 
-`verify-linux` steps use the target slots and build budget for admission.
+`verify-linux` steps use the repository claim and build budget for admission.
 They do not contact natedev's admission service or obey natedev's hold.
 The controller still checks spending before AWS admission.
 
@@ -824,12 +837,16 @@ It also carries the repository scope.
 Busy refusals can name the unit director's session.
 
 `offload.py` requests Mac, Linux, and AWS mirrors through `copies.py`.
-It publishes ownership only for the selected slot after admission succeeds.
-Failed admission and unselected slots retain their owners.
-Claims and admission use `target_config.slot_capacity` with an explicit missing-value policy.
-An empty configured capacity raises `ConfigError`.
-The policy supplies a fallback only when both capacity keys are absent.
-The Mac retains its single slot per repository.
+Each SSH target permits one claim per repository.
+Native Mac and mac-linux work share this limit.
+On Linux targets, the sender publishes mirror ownership after admission succeeds.
+Failed admission preserves the mirror owner.
+The reader keeps the saved file and fence for each old numbered claim.
+An old live claim holds the repository.
+When a local owner ends, the reader releases its local claim.
+For each remote claim, the runner checks the saved mirror before release.
+New Linux claims use the first mirror.
+The runner takes the saved assignment's mirror lease before it adopts a Linux reservation.
 
 The Terminal launcher enters the numbered copy before it checks its per-run token.
 Cleanup removes the token before `stop-checkout` scans the copy.
@@ -967,8 +984,7 @@ Token readiness reports remain separate from fixed placement constraints.
 No placement wait holds the cargo token; a local grant takes it.
 A remote selection releases the unused continuation claim.
 
-The adapter claims only the assignment's target, scope, and slot under the existing provider lock.
-Linux repository scopes carry the selected slot.
+The adapter claims the assignment's target and scope under the provider lock.
 Distinct known Mac repository scopes can coexist.
 A whole-Mac scope overlaps every repository scope.
 A definite refusal reports `ClaimFailure` before the queue decides another attempt.
@@ -1013,7 +1029,7 @@ Unknown remote memory remains unknown and creates no local memory charge.
 One `mirror_busy_backoff_s` key in `mac_test.conf` serves both Mac and AWS targets.
 Each target stores `mirror-busy-<repository>.until` beside its unreachable backoff record.
 A mirror busy refusal during copy writes this time.
-No available slot lease also writes this time.
+A busy mirror lease also writes this time.
 A `mirror-use` busy refusal after copy becomes `BusyMacDecline`, without a lost run.
 A successful copy removes the repository's refusal time.
 `free-now` reads this local record without SSH or a lock.

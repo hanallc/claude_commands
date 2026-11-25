@@ -23,7 +23,7 @@ class HanaTransportPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             install_aws_fixture_settings(root / 'config')
-            private = private_slot_config(root, repository='hana')
+            private = private_slot_config(root)
             with mock.patch.dict(os.environ, private.environment):
                 settings = Path(private.environment['CONF_DIR']) / 'hana_aws.conf'
                 _ = settings.write_text(
