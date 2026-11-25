@@ -120,7 +120,8 @@ class KillActionTests(unittest.TestCase):
         start = threading.Thread.start
 
         def record_thread(thread: threading.Thread) -> None:
-            workers.append(thread)
+            if thread.name == kill_action.RECOVERY_THREAD:
+                workers.append(thread)
             start(thread)
 
         with (patch.object(threading.Thread, "start", new=record_thread),
