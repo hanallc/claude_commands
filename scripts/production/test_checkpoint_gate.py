@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 from collections.abc import Generator, Sequence
-from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
 import io
 from dataclasses import replace
 from functools import partial
 import os
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
 from textwrap import dedent
@@ -23,6 +24,7 @@ from scripts.build_queue import (
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.queue_fixture import write_process
+from scripts.build_queue.queue_place import queue_place
 from scripts.build_queue.test_placement import PlacementFixture
 from scripts.build_targets.target_config import PinnedTarget
 from scripts.copies import copies
@@ -113,13 +115,13 @@ class CheckpointGateTests(unittest.TestCase):
             token = copies.COMMAND_LOCKS.set((descriptor,))
             self.addCleanup(copies.COMMAND_LOCKS.reset, token)
             with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "natedev,mac-linux"}),
-                  mock.patch.object(subprocess, "run",
+                  mock.patch.object(checkpoint_gate, "run_gate_step_command",
                       return_value=subprocess.CompletedProcess(GATE, 0, "", "")) as run):
                 result = checkpoint_gate.run_test_command(list(GATE), folder)
                 self.assertEqual(result.returncode, 0)
                 run.assert_called_once()
                 argv = cast(list[str], run.call_args.args[0])
-                self.assertEqual(run.call_args.kwargs["pass_fds"], (descriptor,))
+                self.assertEqual(run.call_args.args[1:], (folder, (descriptor,)))
                 self.assertEqual(argv[2:], ["gate-step", "--repo", str(folder), "--targets", "natedev,mac-linux",
                     "--lease-fd", str(descriptor), "--", *GATE])
 
@@ -154,7 +156,7 @@ class CheckpointGateTests(unittest.TestCase):
             _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=off\n")
             with (mock.patch.dict(os.environ),
                   mock.patch.object(build_folders, "repo_word", return_value="claude"),
-                  mock.patch.object(subprocess, "run",
+                  mock.patch.object(checkpoint_gate, "run_gate_step_command",
                       return_value=subprocess.CompletedProcess(GATE, 0, "", "")) as run):
                 _ = os.environ.pop("BUILDLOG_GATE_TARGETS", None)
                 result = checkpoint_gate.run_test_command(list(GATE), fixture.root)
@@ -336,6 +338,65 @@ RED_OUTPUT = "  FAIL [  0.1s] (1/1) check known_flake\n--- lib/test_infrastructu
 
 class BatchProbeTests(GateSuitesFixture):
     def test_configured_merge_commands_probe_on_natedev_only(self) -> None:
+        self.check_configured_merge_commands(under_parent=False)
+
+    def test_configured_merge_commands_probe_under_the_parent_reservation(self) -> None:
+        self.check_configured_merge_commands(under_parent=True)
+
+    def probe_environment(self) -> dict[str, str]:
+        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
+            owner = fixture_member("showrunner", name="probe-owner")
+        environment = {**self.environment, "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": owner.current_session,
+                       "BUILDLOG_GATE_TARGETS": "natedev,mac-linux"}
+        for key in (admission_client.RESERVED_STEP_ENV, "BUILDLOG_PLACEMENT_FILE", "BUILDLOG_PLACEMENT_EPISODE"):
+            _ = environment.pop(key, None)
+        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_targets.conf",
+                                 "targets=natedev,mac-linux\n")
+        return environment
+
+    def make_probe_batch(self, red: checkpoint_gate.RedStep, pinned_main: str) -> merge_checkpoint.BatchRed:
+        log = self.state / "probe.log"
+        production = ProductionDocument(self.quiet_production, "fixture", "integration", self.checkout,
+                                        log, ZoneInfo("UTC"))
+        record = merge_checkpoint.BatchResumeRecord(self.state / "batch", (), ())
+        rollback = merge_checkpoint.ResetBatchCheckout(production, self.base, self.base, self.base, record)
+        failure = checkpoint_gate.RedCheckpointTests("red fixture", "red fixture", (red,))
+        return merge_checkpoint.BatchRed(failure, (), rollback, pinned_main, log, {})
+
+    def test_parent_only_interrupt_reaps_the_probe_gate_and_releases_the_copy(self) -> None:
+        pid_file = self.state / "probe-gate-pid"
+        self.write(self.main / GATE[1], dedent(f"""\
+            import os
+            from pathlib import Path
+            import signal
+
+            with os.fdopen(int(os.environ[{copies.PREPARED_GATE_FD!r}]), "rb") as handoff:
+                assert handoff.read(32) == f"{{os.getpid()}}\\n".encode("ascii")
+            Path({str(pid_file)!r}).write_text(str(os.getpid()))
+            os.kill({os.getpid()}, signal.SIGINT)
+            signal.pause()
+            """))
+        pinned_main = self.commit(self.main, "interrupt fixture on pinned main")
+        step = checkpoint_gate.CheckpointTestStep("merge test 1", list(GATE), self.checkout)
+        red = checkpoint_gate.RedStep(step, frozenset({"hooks/test_first.py"}))
+        batch = self.make_probe_batch(red, pinned_main)
+        with mock.patch.dict(os.environ, self.probe_environment(), clear=True):
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    _ = merge_checkpoint.run_batch_probe(batch)
+                self.assertEqual(list(build_folders.held_folder_leases()), [])
+                self.assert_process_stopped(int(pid_file.read_text()))
+                self.assert_gate_released()
+            finally:
+                if pid_file.exists():
+                    with suppress(ProcessLookupError):
+                        descriptor = os.pidfd_open(int(pid_file.read_text()))
+                        try:
+                            signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+                        finally:
+                            os.close(descriptor)
+
+    def check_configured_merge_commands(self, *, under_parent: bool) -> None:
         configured = (
             "env HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/merge_gate.py",
             "env HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py ~/.claude/scripts/production/gate.py",
@@ -373,22 +434,17 @@ class BatchProbeTests(GateSuitesFixture):
                 grants.append(reply)
             return previous(reply)
 
-        log = self.state / "probe.log"
-        production = ProductionDocument(self.quiet_production, "fixture", "integration", self.checkout,
-                                        log, ZoneInfo("UTC"))
-        record = merge_checkpoint.BatchResumeRecord(self.state / "batch", (), ())
-        rollback = merge_checkpoint.ResetBatchCheckout(production, self.base, self.base, self.base, record)
-        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
-            owner = fixture_member("showrunner", name="probe-owner")
-        environment = {**self.environment, "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": owner.current_session,
-                       "BUILDLOG_GATE_TARGETS": "natedev,mac-linux"}
-        for key in (admission_client.RESERVED_STEP_ENV, "BUILDLOG_PLACEMENT_FILE", "BUILDLOG_PLACEMENT_EPISODE"):
-            _ = environment.pop(key, None)
-        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_targets.conf",
-                                 "targets=natedev,mac-linux\n")
-        with (mock.patch.dict(os.environ, environment, clear=True),
+        with (mock.patch.dict(os.environ, self.probe_environment(), clear=True),
               mock.patch.object(admission, "reply_filter", side_effect=observe),
-              mock.patch.object(admission, "handle_request", side_effect=observe_request)):
+              mock.patch.object(admission, "handle_request", side_effect=observe_request),
+              ExitStack() as reservation):
+            if under_parent:
+                parent = reservation.enter_context(queue_place("gate", self.checkout))
+                _ = cast(object, reservation.enter_context(
+                    mock.patch.dict(os.environ, parent.child_environment(os.environ))))
+                self.assertEqual(len(grants), 1)
+                self.assertIsInstance(grants[0], admission_protocol.Admitted)
+                grants.clear()
             for prefix in configured:
                 field = f"- **Merge tests:** `{prefix} --checkout . --tests-only`"
                 command, = merge_checkpoint.parse_merge_tests([field], self.checkout)
@@ -396,27 +452,30 @@ class BatchProbeTests(GateSuitesFixture):
                 red = checkpoint_gate.RedStep(step, frozenset({module}))
                 probe = checkpoint_gate.batch_module_command(red, self.checkout, self.checkout)
                 self.assertEqual(probe, [*command, "--module", module])
-                failure = checkpoint_gate.RedCheckpointTests("red fixture", "red fixture", (red,))
-                batch = merge_checkpoint.BatchRed(failure, (), rollback, pinned_main, log, {})
+                batch = self.make_probe_batch(red, pinned_main)
                 for row, expected in (("", "base"), (self.checkpoint, "checkpoint\n")):
                     with self.subTest(prefix=prefix, row=row):
-                        requests.clear()
-                        grants.clear()
                         observed.unlink(missing_ok=True)
                         result = merge_checkpoint.run_batch_probe(batch, row)
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                         self.assertEqual(observed.read_text(), expected)
-                        self.assertTrue(requests)
-                        for request in requests:
-                            self.assertEqual(request.route, PinnedTarget("natedev"))
-                            self.assertEqual([candidate.destination.target for candidate in request.constraints.candidates],
-                                             ["natedev"])
-                        self.assertEqual(len(grants), 1)
-                        grant = grants[0]
-                        self.assertIsInstance(grant, admission_wire.LocalPlacementGranted)
-                        assert isinstance(grant, admission_wire.LocalPlacementGranted)
-                        self.assertEqual(grant.assignment.destination.target, "natedev")
-                        self.assert_gate_released()
+                        if under_parent:
+                            self.assertEqual(requests, [])
+                            self.assertEqual(grants, [])
+                        else:
+                            self.assertTrue(requests)
+                            for request in requests:
+                                self.assertEqual(request.route, PinnedTarget("natedev"))
+                                self.assertEqual([candidate.destination.target for candidate in request.constraints.candidates],
+                                                 ["natedev"])
+                            self.assertEqual(len(grants), 1)
+                            grant = grants[0]
+                            self.assertIsInstance(grant, admission_wire.LocalPlacementGranted)
+                            assert isinstance(grant, admission_wire.LocalPlacementGranted)
+                            self.assertEqual(grant.assignment.destination.target, "natedev")
+                            self.assert_gate_released()
+                            requests.clear()
+                            grants.clear()
                         self.assertEqual(list(build_folders.held_folder_leases()), [])
             slot, = build_folders.numbered_copy_records()
             self.assertIsInstance(slot, build_folders.NumberedCopySource)
@@ -424,6 +483,7 @@ class BatchProbeTests(GateSuitesFixture):
             self.assertEqual(slot.commit, pinned_main)
             self.assertEqual(slot.source, self.checkout)
         self.assert_gate_released()
+        log = self.state / "probe.log"
         self.assertEqual(log.read_text().count("PROBE_EXIT=0\n"), 6)
         self.assertEqual([event["module"] for event in self.module_events() if event["event"] == "start"],
                          ["test_first.py"] * 6)

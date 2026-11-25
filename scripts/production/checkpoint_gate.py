@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tomllib
 from collections.abc import Generator, Sequence
@@ -163,6 +164,19 @@ def gate_step_command(command: list[str], folder: Path, targets: tuple[str, ...]
             "--", *command[start:]]
 
 
+def run_gate_step_command(command: list[str], folder: Path, locks: tuple[int, ...]) -> subprocess.CompletedProcess[str]:
+    """Interrupt the supervisor so it can stop and reap its gate."""
+    with subprocess.Popen(command, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, pass_fds=locks) as child:
+        try:
+            stdout, stderr = child.communicate()
+        except BaseException:
+            child.send_signal(signal.SIGINT)
+            _ = child.communicate()
+            raise
+        return subprocess.CompletedProcess(command, cast(int, child.returncode), stdout, stderr)
+
+
 def run_test_command(command: list[str], folder: Path, *, merge_head: str = "",
                      raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
     locks = copies.COMMAND_LOCKS.get()
@@ -177,6 +191,8 @@ def run_test_command(command: list[str], folder: Path, *, merge_head: str = "",
     elif targets := checkpoint_gate_targets(command, folder):
         submitted = gate_step_command(command, folder, targets)
     try:
+        if submitted[start + 1:start + 3] == [str(scripts / "copies/copies.py"), "gate-step"]:
+            return run_gate_step_command(submitted, folder, locks)
         return subprocess.run(submitted, cwd=folder, capture_output=True, text=True, check=False, pass_fds=locks)
     except OSError as error:
         if raise_start_errors and not use_copy:
