@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
+import os
 from pathlib import Path
 import plistlib
 import re
@@ -114,19 +115,80 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
         return [entry for entry in images
                 if any(entity.get("dev-entry") == device for entity in self.image_entities(entry))]
 
+    def live_children(self, snapshot: str, test_pid: int) -> dict[int, str]:
+        by_parent: dict[int, list[tuple[int, str, str]]] = {}
+        for line in snapshot.splitlines():
+            fields = line.split(maxsplit=3)
+            if len(fields) == 4 and all(value.isdecimal() for value in fields[:2]):
+                pid, parent = map(int, fields[:2])
+                if pid > 0:
+                    by_parent.setdefault(parent, []).append((pid, fields[2], fields[3]))
+
+        pending = [test_pid]
+        live: dict[int, str] = {}
+        for parent in pending:
+            for pid, state, command in by_parent.get(parent, []):
+                if state.startswith("Z") or pid in pending:
+                    continue
+                pending.append(pid)
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    continue
+                except PermissionError:
+                    pass
+                live[pid] = command
+        return live
+
+    def busy_mount_diagnostics(self, mounts: list[Path], attempts: list[str]) -> None:
+        if not mounts:
+            attempts.append("No verified mount path for lsof.")
+        for mount in mounts:
+            _ = self.cleanup_command(attempts, "/usr/sbin/lsof", "-n", "+f", "--", str(mount))
+
+        test_pid = os.getpid()
+        attempts.append(f"Live children of test PID {test_pid}:")
+        process_attempts: list[str] = []
+        snapshot = self.cleanup_command(process_attempts, "/bin/ps", "-axo", "pid=,ppid=,state=,comm=")
+        if snapshot is None or snapshot.returncode != 0:
+            attempts.extend(process_attempts)
+            return
+
+        children = self.live_children(snapshot.stdout, test_pid)
+        if not children:
+            attempts.append("No live children.")
+            return
+        pids = ",".join(map(str, children))
+        result = self.cleanup_command(attempts, "/usr/sbin/lsof", "-n", "-a", "-p", pids, "-d", "cwd", "-Fpn")
+        directories: dict[int, str] = {}
+        if result is not None:
+            pid = 0
+            for field in result.stdout.splitlines():
+                if field.startswith("p"):
+                    pid = int(field[1:]) if field[1:].isdecimal() else 0
+                elif field.startswith("n/") and pid in children:
+                    directories[pid] = field[1:]
+        for pid, command in children.items():
+            attempts.append(f"PID {pid} {command} cwd: {directories.get(pid, 'unavailable')}")
+
     def cleanup_image(self, image: Path, device: str | None, attempts: list[str]) -> None:
         remaining = self.attached_images(attempts)
         if device is not None and (owners := self.device_images(remaining, device)):
             if len(owners) != 1 or owners[0].get("image-path") != str(image):
                 self.fail("\n".join([f"{device} no longer belongs to {image}.", *attempts]))
             root = image.parent.resolve()
+            mounts: list[Path] = []
             for entity in self.image_entities(owners[0]):
                 if point := entity.get("mount-point"):
                     mount = Path(point)
                     target = mount.resolve()
                     if not mount.is_absolute() or target == root or not target.is_relative_to(root):
                         self.fail("\n".join([f"{device} has a mount outside the fixture: {mount}", *attempts]))
+                    mounts.append(target)
             result = self.cleanup_command(attempts, "/usr/bin/hdiutil", "detach", "-force", device)
+            if result is not None and result.returncode != 0 and any(
+                    "resource busy" in stream.lower() for stream in (result.stdout, result.stderr)):
+                self.busy_mount_diagnostics(mounts, attempts)
             remaining = self.attached_images(attempts)
             if self.device_images(remaining, device):
                 self.fail("\n".join([f"Disk device still attached: {device} for {image}", *attempts]))
@@ -260,6 +322,76 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
             for stderr in ("before", "after"):
                 self.assertIn(f"{shlex.join(query)}\nexit status: 0\nstdout:\n{info}\nstderr:\n{stderr}", detail)
             self.assertEqual([call.args[0] for call in run.call_args_list], [query, detach, query])
+
+    def test_busy_detach_reports_mount_holders_and_live_child_cwds(self) -> None:
+        image = Path("/private/tmp/test-root/fixture/removal.dmg")
+        mount = image.parent / "moved/proof/unit"
+        device = "/dev/disk9"
+        info = plistlib.dumps({"images": [
+            {"image-path": str(image), "system-entities": [{"dev-entry": device, "mount-point": str(mount)}]},
+        ]}).decode()
+        snapshot = "\n".join([
+            "102 101 S sandbox child",
+            "101 100 S sandbox-exec",
+            "103 100 Z zombie child",
+            "104 100 R /bin/ps",
+            "105 1 S unrelated process",
+            "106 100 S helper",
+        ])
+        mount_output = f"Python 102 4r DIR {mount}"
+        cwd_output = f"p101\nn{image.parent}\np102\nn{mount}\n"
+        with (mock.patch.object(os, "getpid", return_value=100),
+              mock.patch.object(os, "kill", side_effect=[None, ProcessLookupError(), None, PermissionError()]) as kill,
+              mock.patch.object(subprocess, "run", side_effect=[
+                  subprocess.CompletedProcess([], 0, info, ""),
+                  subprocess.CompletedProcess([], 16, "", "Resource busy"),
+                  subprocess.CompletedProcess([], 0, mount_output, "mount diagnostic"),
+                  subprocess.CompletedProcess([], 0, snapshot, ""),
+                  subprocess.CompletedProcess([], 1, cwd_output, "cwd diagnostic"),
+                  subprocess.CompletedProcess([], 0, info, ""),
+              ]) as run, self.assertRaises(AssertionError) as failure):
+            self.cleanup_image(image, device, [])
+        self.assertEqual([call.args[0] for call in run.call_args_list], [
+            ["/usr/bin/hdiutil", "info", "-plist"],
+            ["/usr/bin/hdiutil", "detach", "-force", device],
+            ["/usr/sbin/lsof", "-n", "+f", "--", str(mount)],
+            ["/bin/ps", "-axo", "pid=,ppid=,state=,comm="],
+            ["/usr/sbin/lsof", "-n", "-a", "-p", "101,106,102", "-d", "cwd", "-Fpn"],
+            ["/usr/bin/hdiutil", "info", "-plist"],
+        ])
+        self.assertTrue(all(call.kwargs["timeout"] == 20 for call in run.call_args_list))
+        self.assertEqual(kill.call_args_list, [mock.call(pid, 0) for pid in (101, 104, 106, 102)])
+        detail = str(failure.exception)
+        self.assertIn(f"Disk device still attached: {device} for {image}", detail)
+        self.assertIn(f"stdout:\n{mount_output}\nstderr:\nmount diagnostic", detail)
+        self.assertIn(f"stdout:\n{cwd_output}\nstderr:\ncwd diagnostic", detail)
+        self.assertIn(f"PID 101 sandbox-exec cwd: {image.parent}", detail)
+        self.assertIn(f"PID 102 sandbox child cwd: {mount}", detail)
+        self.assertIn("PID 106 helper cwd: unavailable", detail)
+        for excluded in ("PID 103", "PID 104", "PID 105"):
+            self.assertNotIn(excluded, detail)
+
+    def test_reports_partial_mount_diagnostics_after_lsof_timeout(self) -> None:
+        image = Path("/private/tmp/test-root/fixture/removal.dmg")
+        mount = image.parent / "moved/proof/unit"
+        device = "/dev/disk9"
+        info = plistlib.dumps({"images": [
+            {"image-path": str(image), "system-entities": [{"dev-entry": device, "mount-point": str(mount)}]},
+        ]}).decode()
+        command = ["/usr/sbin/lsof", "-n", "+f", "--", str(mount)]
+        with (mock.patch.object(subprocess, "run", side_effect=[
+            subprocess.CompletedProcess([], 0, info, ""),
+            subprocess.CompletedProcess([], 16, "", "Resource busy"),
+            subprocess.TimeoutExpired(command, 20, output=b"partial lsof output", stderr=b"partial lsof error"),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, info, ""),
+        ]) as run, self.assertRaises(AssertionError) as failure):
+            self.cleanup_image(image, device, [])
+        detail = str(failure.exception)
+        self.assertIn(f"timed out after 20 s: {shlex.join(command)}", detail)
+        self.assertIn("stdout:\npartial lsof output\nstderr:\npartial lsof error", detail)
+        self.assertIn("No live children.", detail)
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/hdiutil", "info", "-plist"])
 
     def test_reports_a_failed_detach_after_the_device_disappears(self) -> None:
         image = Path("/private/tmp/test-root/fixture/removal.dmg")
