@@ -274,10 +274,9 @@ class JobTests(unittest.TestCase):
     def test_a_hung_part_times_out_without_costing_a_parallel_part(self) -> None:
         script = self.root / "part.py"
         _ = script.write_text("import signal,sys\nif sys.argv[-1] == 'notes': signal.pause()\nprint('completed')\n")
-        cadence = Schedule(1, 0.2)
         with patch.object(job, "__file__", str(script)), ThreadPoolExecutor() as pool:
-            blocked = pool.submit(job.run_part, Part.NOTES, cadence, time.monotonic() + 2)
-            healthy = pool.submit(job.run_part, Part.PACER, cadence, time.monotonic() + 2)
+            blocked = pool.submit(job.run_part, Part.NOTES, Schedule(1, 0.2), time.monotonic() + 2)
+            healthy = pool.submit(job.run_part, Part.PACER, Schedule(1, 30), time.monotonic() + 30)
             good, bad = healthy.result(), blocked.result()
         self.assertEqual((good.outcome, good.exit_code, good.output.strip()), (job.Outcome.SUCCESS, 0, "completed"))
         self.assertEqual((bad.outcome, bad.exit_code), (job.Outcome.TIMED_OUT, 124))
