@@ -32,6 +32,7 @@ from scripts.mac_test.claim_state import RepositoryScope
 from scripts.production import checkpoint_gate, merge_checkpoint
 from scripts.production.gate_suites_test_support import GateSuitesFixture
 from scripts.production.production_doc import ProductionDocument
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 
 GATE = ("python3", "scripts/production/gate.py", "--tests-only")
@@ -342,6 +343,14 @@ class BatchProbeAdmissionTests(GateSuitesFixture):
         install.mkdir()
         (install / "scripts").symlink_to(Path(__file__).resolve().parents[1], target_is_directory=True)
         module = "hooks/test_first.py"
+        fixture_module = self.main / "scripts" / module
+        with fixture_module.open("a", encoding="utf-8") as source:
+            _ = source.write(dedent("""\
+                row = Path.cwd() / "unit.txt"
+                (state / "probe-input").write_text(row.read_text() if row.exists() else "base")
+                """))
+        pinned_main = self.commit(self.main, "probe fixture on pinned main")
+        observed = self.state / "probe-input"
         admission = self.admission.server
         previous = admission.reply_filter
         grants: list[admission_protocol.Admitted | admission_protocol.LocalPlacementGranted] = []
@@ -351,24 +360,34 @@ class BatchProbeAdmissionTests(GateSuitesFixture):
                 grants.append(reply)
             return previous(reply)
 
-        with (mock.patch.dict(os.environ, self.environment, clear=True),
+        with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
+            owner = fixture_member("showrunner", name="probe-owner")
+        environment = {**self.environment, "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": owner.current_session,
+                       "BUILDLOG_GATE_TARGETS": "natedev"}
+        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_targets.conf",
+                                 "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+        with (mock.patch.dict(os.environ, environment, clear=True),
               mock.patch.object(admission, "reply_filter", side_effect=observe)):
             for prefix in configured:
-                with self.subTest(prefix=prefix):
-                    field = f"- **Merge tests:** `{prefix} --checkout . --tests-only`"
-                    command, = merge_checkpoint.parse_merge_tests([field], self.checkout)
-                    step = checkpoint_gate.CheckpointTestStep("merge test 1", list(command), self.checkout)
-                    red = checkpoint_gate.RedStep(step, frozenset({module}))
-                    probe = checkpoint_gate.batch_module_command(red, self.checkout, self.main)
-                    self.assertEqual(probe, [*command, "--module", module])
-                    assert probe is not None
-                    grants.clear()
-                    result = checkpoint_gate.run_test_command(probe, self.main)
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertEqual(len(grants), 1)
-                    self.assert_gate_released()
+                field = f"- **Merge tests:** `{prefix} --checkout . --tests-only`"
+                command, = merge_checkpoint.parse_merge_tests([field], self.checkout)
+                step = checkpoint_gate.CheckpointTestStep("merge test 1", list(command), self.checkout)
+                red = checkpoint_gate.RedStep(step, frozenset({module}))
+                probe = checkpoint_gate.batch_module_command(red, self.checkout)
+                self.assertEqual(probe, [*command, "--module", module])
+                assert probe is not None
+                for row, expected in (("", "base"), (self.checkpoint, "checkpoint\n")):
+                    with self.subTest(prefix=prefix, row=row):
+                        grants.clear()
+                        observed.unlink(missing_ok=True)
+                        result = checkpoint_gate.run_test_command(probe, self.checkout,
+                                                                  merge_head=pinned_main, merge_revision=row)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertEqual(observed.read_text(), expected)
+                        self.assertEqual(len(grants), 1)
+                        self.assert_gate_released()
         self.assertEqual([event["module"] for event in self.module_events() if event["event"] == "start"],
-                         ["test_first.py", "test_first.py"])
+                         ["test_first.py"] * 4)
 
 
 @final

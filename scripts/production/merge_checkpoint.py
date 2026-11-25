@@ -2158,27 +2158,19 @@ def require_drop_absent(checkout: ResetBatchCheckout, tip: str) -> None:
 
 
 def run_batch_probe(red: BatchRed, commit: str = "") -> subprocess.CompletedProcess[str]:
-    """Test selected modules in a private worktree of the pinned main commit."""
+    """Test selected modules in a copy of the pinned main commit."""
     checkout = red.rollback.production.checkout
-    with tempfile.TemporaryDirectory(prefix="checkpoint-probe-") as directory:
-        worktree = Path(directory) / "tree"
-        _ = good(git(checkout, "worktree", "add", "--detach", str(worktree), red.main_tip), "batch")
-        try:
-            if commit:
-                _ = good(git(worktree, "merge", "--no-ff", "--no-edit", commit), "batch")
-            command = checkpoint_gate.batch_module_command(red.red[0], checkout, worktree)
-            assert command is not None
-            result = checkpoint_gate.run_test_command(command, worktree, raise_start_errors=True)
-            with red.log.open("a", encoding="utf-8") as output:
-                _ = output.write(f"\nProbe {commit or 'main'} on {red.main_tip}\n")
-                _ = output.write(result.stdout + result.stderr)
-                _ = output.write(f"\nPROBE_EXIT={result.returncode}\n")
-            checkpoint_gate.stop_test_without_result(
-                checkpoint_gate.CheckpointTestStep("batch module probe", command, worktree), result, red.log,
-                merge_head="")
-            return result
-        finally:
-            _ = good(git(checkout, "worktree", "remove", "--force", str(worktree)), "batch")
+    command = checkpoint_gate.batch_module_command(red.red[0], checkout)
+    assert command is not None
+    result = checkpoint_gate.run_test_command(command, checkout, merge_head=red.main_tip, merge_revision=commit)
+    with red.log.open("a", encoding="utf-8") as output:
+        _ = output.write(f"\nProbe {commit or 'main'} on {red.main_tip}\n")
+        _ = output.write(result.stdout + result.stderr)
+        _ = output.write(f"\nPROBE_EXIT={result.returncode}\n")
+    checkpoint_gate.stop_test_without_result(
+        checkpoint_gate.CheckpointTestStep("batch module probe", command, checkout), result, red.log,
+        merge_head=red.main_tip)
+    return result
 
 
 def probe_batch_rows(red: BatchRed) -> MergeRequest | None:
@@ -2186,7 +2178,7 @@ def probe_batch_rows(red: BatchRed) -> MergeRequest | None:
     checkout = red.rollback.production.checkout
     rows = tuple(notice.request for notice in red.notices)
     if (len(rows) < 2 or len(red.red) != 1 or red.red[0].step.folder != checkout
-            or checkpoint_gate.batch_module_command(red.red[0], checkout, checkout) is None
+            or checkpoint_gate.batch_module_command(red.red[0], checkout) is None
             or not red.main_tip or not batch_ancestor(checkout, red.main_tip, red.tested_tip)):
         return None
     candidates = [row for row in rows if batch_ancestor(checkout, row.commit, red.tested_tip)
