@@ -604,13 +604,14 @@ notice to the unit director before any merge command runs:
    Stop a detached merge with `detached_runs.py stop --reason "<why>" <record>`.
    Keep each item's flags on its line.
    Use single commands for `--bump` and child handoffs.
-   Add one `--trailer <line>` per attribution line this session requires, `--regime trial` if the broad
-   review used the craft lens, `--holds <K>` (this phase's held checkpoints)
-   and `--merge-defects <D>` (the defect rows its merge design checks found in
-   its own work, moved ones included and rows the check calls older left out),
-   both counted from `LOG`, and `--excluded "no merge design check"` for a
-   phase no merge design check judged (`report` and `watch` leave it out). The
-   default regime is `after`; both counts default to zero. Give `--scratch
+   Add one `--trailer <line>` per required attribution line. Use
+   `--regime trial` if the broad review used the craft lens. The default regime is `after`.
+   Use `--holds <K>` for the number of held checkpoints in this phase.
+   Use `--merge-defects <D>` for the defects that the merge design checks found in the phase's work.
+   Include moved defects and exclude defects older than the phase.
+   Count holds and defects from `LOG`. Both counts default to zero.
+   Use `--excluded "no merge design check"` for a phase without a merge design check.
+   The `report` command excludes that phase. Give `--scratch
    <SCRATCH>` to keep its merge message and test log there. For a phase shrink
    notice, add `--shrink`. For a unit's closing documentation commit after its last phase merges, add `--as-built`.
    The scope check accepts Markdown paths that include the plan's change or deletion.
@@ -669,16 +670,13 @@ message.
    and unblocks fields. A failed promote still reports each place already
    reached. A rerun of the same hash resumes promotion.
 
-6. **After the push.** Run <CrossUnitChange/> when public items were renamed or removed or files
-   restructured. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/ci_points.py due
-   --production <showrunner name> --state-dir WAITING_STATE_DIR` after each code
-   merge; when it says due, run <CIPoint/>. Run `~/.claude/scripts/lib/py
-   ~/.claude/scripts/production/ci_points.py watch --production <showrunner name>
-   --state-dir WAITING_STATE_DIR` after each code checkpoint. Give the user its
-   table on the first alert. A shrink adds no review-ledger row or CI count. While the
-   watch exits 3, the `Review watch` finding needs the user. Run
-   `review_regime.py ack` only on the user's own acknowledgment. Pass `--no-ci`
-   to `due` when the production rules say CI does not apply.
+6. **After the push.** Run <CrossUnitChange/> if the merge renamed or removed
+   public items or changed the file structure. After each code merge, run
+   `~/.claude/scripts/lib/py ~/.claude/scripts/production/ci_points.py due
+   --production <showrunner name> --state-dir WAITING_STATE_DIR`.
+   Run <CIPoint/> when the result says CI is due. Pass `--no-ci` to `due` when
+   the production rules say CI does not apply. A shrink adds no review ledger
+   row or CI count.
 </MergeCheckpoint>
 
 ---

@@ -1,4 +1,4 @@
-"""Exercise CI points and review alerts in disposable productions."""
+"""Exercise CI points in disposable productions."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ from scripts.copies.copies_test_support import copies_environment
 from scripts.lib import build_folders
 from scripts.lib.git_test_support import fixture_git_environment
 
-import fcntl
 import json
 import os
 import re
@@ -20,14 +19,12 @@ import textwrap
 import unittest
 from pathlib import Path
 from typing import ClassVar, TypedDict, cast, final, override
-from unittest.mock import patch
 
 from scripts.agents import remote
 from scripts.production import ci_points, promotion
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.merge_checkpoint import merge_lock
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.fork_test_support import ForkChild, ForkChildren
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -37,7 +34,6 @@ PUSH_REPO = "github.com/example/example"
 PUSH_URL = f"git@{PUSH_REPO.replace('/', ':', 1)}.git"
 PUSH_URL_443 = "ssh://git@ssh.github.com:443/example/example.git"
 STUB = '''#!__PYTHON__
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -48,14 +44,6 @@ name = Path(sys.argv[0]).name
 args = sys.argv[1:]
 with (state / "calls.jsonl").open("a", encoding="utf-8") as output:
     output.write(json.dumps({"name": name, "args": args}) + "\\n")
-if name == "review_regime.py":
-    if args[:1] == ["watch"]:
-        print("12 of 12 phases: report ready, waiting for your acknowledgment")
-        raise SystemExit(3 if (state / "watch-three").exists() else 0)
-    if args[:1] == ["report"]:
-        print("| review | after |")
-        print("| phases merged | 12 |")
-        raise SystemExit(0)
 if name in ("send.py", "claude", "systemd-run", "ssh", "nix", "cargo-berth", "notifier.sh", "showrunners.py", "py"):
     raise SystemExit(0)
 raise SystemExit(99)
@@ -271,7 +259,7 @@ class CiPointsTests(unittest.TestCase):
         self.bin.mkdir()
         self.doc = self.root / "tool-based-ui-production.md"
         self.log = self.checkout / "production.log"
-        for name in ("review_regime.py", "gh", "claude",
+        for name in ("gh", "claude",
                      "systemd-run", "ssh", "nix", "cargo-berth"):
             self.stub(self.bin / name)
         parser = self.bin / "uv"
@@ -295,7 +283,6 @@ class CiPointsTests(unittest.TestCase):
                     "XDG_CACHE_HOME": str(self.home / ".cache"),
                     "GIT_SSH_COMMAND": shlex.quote(str(git_ssh)), "GIT_SSH_VARIANT": "ssh",
                     "CI_POINTS_TEST_ORIGIN": str(self.origin), "GH_REPO": PUSH_REPO,
-                    "CI_POINTS_REVIEW_REGIME": str(self.bin / "review_regime.py"),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
                     "UNIT_HISTORY_DIR": str(self.root / "history"),
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"),
@@ -1098,19 +1085,16 @@ PY
         self.assertFalse((self.stub_state / "validate-calls").exists())
         self.assertEqual(self.calls("gh"), [])
 
-    def test_showrunner_uses_one_review_watch_state_directory(self) -> None:
+    def test_showrunner_uses_one_ci_point_state_directory(self) -> None:
         root = Path(__file__).resolve().parents[2]
         produce = (root / "commands/showrunner/produce.md").read_text(encoding="utf-8")
         state_list = produce.split("State:\n\n", 1)[1].split("\n\n", 1)[0]
         self.assertRegex(state_list, r"`WAITING_STATE_DIR`\s+—\s+`<STATE_DIR>/waiting_state`")
         calls = cast(list[tuple[str, str]], re.findall(
-            r"ci_points\.py\s+(due|watch|ci start|ci collect)\b([^`]*)`",
+            r"ci_points\.py\s+(due|ci start|ci collect)\b([^`]*)`",
             produce, flags=re.DOTALL))
-        self.assertEqual(len(calls), 4, calls)
-        stateful = [(command, body) for command, body in calls
-                    if command in ("due", "watch", "ci start", "ci collect")]
-        self.assertEqual(len(stateful), 4, calls)
-        for command, body in stateful:
+        self.assertCountEqual([command for command, _ in calls], ["due", "ci start", "ci collect"])
+        for command, body in calls:
             with self.subTest(command=command):
                 self.assertRegex(body, r"--state-dir\s+WAITING_STATE_DIR\b")
                 self.assertNotRegex(body, r"--state-dir\s+SCRATCH\b")
@@ -1404,72 +1388,6 @@ PY
                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(held.returncode, 2, held.stdout + held.stderr)
         self.assertIn("ci: held", held.stdout)
-
-    def test_watch_first_exit_three_reports_notifies_and_logs_once(self) -> None:
-        _ = (self.stub_state / "watch-three").touch()
-        first = self.run_ci("watch", "--state-dir", str(self.state))
-        self.assert_step(first, "watch", True)
-        self.assertIn("| phases merged | 12 |", first.stdout)
-        second = self.run_ci("watch", "--state-dir", str(self.state))
-        self.assert_step(second, "watch", True)
-        self.assertNotIn("| phases merged | 12 |", second.stdout)
-        self.assertEqual(self.calls("send.py"), [])
-        self.assertIn("| phases merged | 12 |", self.log.read_text())
-        self.assertEqual(len(self.calls("review_regime.py")), 3)
-        self.assertEqual(self.log.read_text().count("review watch"), 1)
-
-    def test_simultaneous_watch_calls_claim_only_one_first_alert(self) -> None:
-        _ = (self.stub_state / "watch-three").touch()
-        self.state.mkdir(exist_ok=True)
-
-        def watch(announcement: int) -> int:
-            original = fcntl.flock
-
-            def observed_lock(fd: int, operation: int) -> None:
-                if operation == fcntl.LOCK_EX:
-                    try:
-                        original(fd, operation | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        _ = os.write(announcement, b"blocked")
-                        os.close(announcement)
-                    else:
-                        raise RuntimeError("The parent must hold the review lock.")
-                    # Observe the first wait. Later locks use the real function.
-                    fcntl.flock = original
-                original(fd, operation)
-
-            with (patch.dict(os.environ, self.env, clear=True),
-                  patch.object(sys, "argv", [str(SCRIPT), "watch", "--production", "example",
-                                            "--state-dir", str(self.state)]),
-                  patch.object(fcntl, "flock", observed_lock)):
-                os.chdir(self.checkout)
-                return ci_points.main()
-
-        with ForkChildren() as children, (self.state / "review_watch.lock").open("a+") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            processes: list[ForkChild] = []
-            readiness: list[int] = []
-            for _ in range(2):
-                read_ready, write_ready = children.pipe()
-                processes.append(children.start(
-                    lambda write_ready=write_ready: watch(write_ready),
-                    close_fds=(lock.fileno(),), pass_fds=(write_ready,)))
-                readiness.append(read_ready)
-            for fd, process in zip(readiness, processes, strict=True):
-                readable, _, _ = select.select([fd], [], [], 300)
-                self.assertEqual(readable, [fd], "watch never reached the held lock")
-                if os.read(fd, 7) != b"blocked":
-                    result = process.result()
-                    self.fail("watch exited before observing the review lock: " + result.stdout + result.stderr)
-            self.assertTrue(all(process.is_alive() for process in processes))
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            completed = [process.result() for process in processes]
-        results = [(process.stdout, process.stderr) for process in completed]
-        self.assertTrue(all(process.returncode == 0 for process in completed), results)
-        self.assertEqual(sum("| phases merged | 12 |" in stdout for stdout, _ in results), 1)
-        self.assertEqual(len(self.calls("send.py")), 0)
-        self.assertEqual(self.log.read_text().count("review watch"), 1)
-
 
     def test_mixed_handoff_history_does_not_advance_the_ci_interval(self) -> None:
         for number in range(1, 5):
