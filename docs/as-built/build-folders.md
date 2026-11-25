@@ -260,4 +260,24 @@ The inventory can list the folder after the owner ends and all borrowers release
 Run `scripts/lib/py scripts/lint/sweep.py --switch-removal-list` to list the former build folders at the switch.
 The list uses the `removal_guard.py` format. Legacy paths require manual review because they do not match the templates in `removal.path_templates.<machine>`.
 
+### Kept numbered copies
+
+`build_folders.kept_build_copies(root)` lists numbered copies with regular keep files.
+It skips empty keep files with one link.
+Each `KeptCopy` gives the path, the stripped reason, and the keep file's modification time in UTC.
+If the keep file cannot be opened or read, the reason reports the error.
+The listing reports a keep file with more than one link as an error before opening the file.
+The listing reads no processes and takes no locks.
+It skips protected root entries and does not follow symbolic links.
+
+Use `hana_instances.scan_checkouts` on the host that owns the copies.
+Pass the paths to one scan outside the masked walk.
+Pass the scan and each row to `build_folders.recheck_kept_copy`.
+The recheck takes the copy's folder lock without waiting and returns `Clear`, `NotClear`, or `CheckFailed`.
+The last two results include a reason.
+An empty or unreadable keep file gives `CheckFailed`.
+A keep file with more than one link also gives `CheckFailed`.
+The recheck uses the supplied scan and leaves the copy and its files in place.
+The unused inventory and the removal checks continue to treat the kept copy as in use after a clear result.
+
 See [Repository copies](copies.md) for the copy commands and [Worktrees](worktrees.md) for worktree removal.

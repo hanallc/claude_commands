@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
+from datetime import datetime, timezone
 import os
 import errno
 import fcntl
@@ -380,6 +381,320 @@ class FolderFormTests(unittest.TestCase):
         with self.assertRaisesRegex(build_copies.BuildFolderInUse, "identity changed"), (
                 build_copies.claim_unused_build_folder(copy.path)):
             self.fail("The claim admitted a replacement folder")
+
+    def keep_test_copy(self) -> folders.KeptCopy:
+        from scripts.lib import build_copies
+
+        self.init_repository()
+        self.set_origin("git@example.invalid:team/widget.git")
+        _ = (self.root / "source.txt").write_text("checkout\n")
+        revision = commit_repository(self.root, "source", "source.txt")
+        reason = "cleanup could not confirm process exit"
+        with build_copies.take_copy(self.root, revision, showrunner="tools", unit="proof",
+                                    work="test", purpose="test recheck") as copy:
+            marker = folders.copy_keep_file(copy.path)
+            _ = marker.write_text(f" {reason}\n")
+        timestamp = 1_700_000_000
+        os.utime(marker, (timestamp, timestamp))
+        return folders.KeptCopy(copy.path, reason, datetime.fromtimestamp(timestamp, timezone.utc))
+
+    def test_clear_kept_copy_stays_out_of_inventory_and_removal(self) -> None:
+        from scripts.hana_instances import hana_instances
+        from scripts.lib import build_copies
+        from scripts.lint import folder_audit, tmp_sweep
+        from scripts.production import staff
+
+        copy = self.keep_test_copy()
+        root = folders.build_root()
+        marker = folders.copy_keep_file(copy.path)
+        lease = folders.lease_path(copy.path)
+        before = (marker.read_bytes(), marker.stat().st_mtime_ns, lease.read_bytes(), lease.stat().st_mtime_ns)
+        uses = hana_instances.CheckoutUsesKnown((copy.path,), tmp_sweep.ProcessUsesKnown([]))
+        scan = hana_instances.CheckoutScan([], [], uses)
+        check = hana_instances.check_checkout
+
+        def check_while_locked(path: Path, reading: hana_instances.CheckoutScan) -> folders.KeptCopyCheck:
+            self.assertEqual(build_folder_lock.probe(path, root, lambda: build_folder_lock.NO_WAIT), "held")
+            return check(path, reading)
+
+        with (mock.patch.object(hana_instances, "check_checkout", side_effect=check_while_locked),
+              mock.patch.object(hana_instances, "collect_processes", side_effect=AssertionError("read the process table")),
+              mock.patch.object(folder_audit, "process_uses", side_effect=AssertionError("scanned process paths"))):
+            row, = folders.kept_build_copies(root)
+            self.assertEqual(row, copy)
+            self.assertEqual(folders.recheck_kept_copy(row, scan), folders.Clear())
+        self.assertEqual(build_folder_lock.probe(copy.path, root, lambda: build_folder_lock.NO_WAIT), "free")
+        with mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())):
+            self.assertNotIn(copy.path, [row.path for row in build_copies.unused_build_folders(root)])
+        with self.assertRaisesRegex(build_copies.BuildFolderInUse, "has a keep file"), (
+                build_copies.claim_unused_build_folder(copy.path)):
+            self.fail("The claim admitted a kept copy")
+        prepare = mock.Mock(side_effect=AssertionError("the kept copy reached preparation"))
+        self.assertFalse(folders.remove_build_folder(copy.path, temporary=False, wait=False, prepare=prepare))
+        prepare.assert_not_called()
+        self.assertTrue(copy.path.is_dir())
+        self.assertEqual((marker.read_bytes(), marker.stat().st_mtime_ns, lease.read_bytes(), lease.stat().st_mtime_ns), before)
+
+    def test_kept_copy_recheck_reports_a_process_in_the_checkout(self) -> None:
+        from scripts.hana_instances import hana_instances
+        from scripts.lint import tmp_sweep
+
+        copy = self.keep_test_copy()
+        processes = tmp_sweep.ProcessUsesKnown([(str(copy.path / "work"), 123, tmp_sweep.WORKS_IN)])
+        scan = hana_instances.CheckoutScan([], [], hana_instances.CheckoutUsesKnown((copy.path,), processes))
+        self.assertEqual(folders.recheck_kept_copy(copy, scan), folders.NotClear("a process still uses the checkout"))
+
+    def test_kept_copy_recheck_reports_an_unreadable_scan(self) -> None:
+        from scripts.hana_instances import hana_instances
+
+        copy = self.keep_test_copy()
+        scan = hana_instances.CheckoutScan([], [], hana_instances.CheckoutUsesUnavailable((copy.path,), "unreadable scan"))
+        self.assertEqual(folders.recheck_kept_copy(copy, scan), folders.CheckFailed("unreadable scan"))
+
+    def test_kept_copy_recheck_reports_a_held_lock_without_waiting(self) -> None:
+        from scripts.hana_instances import hana_instances
+
+        copy = self.keep_test_copy()
+        with (build_folder_lock.hold_named_lock(copy.path, folders.build_root(), mode=fcntl.LOCK_EX,
+                                              create=False, busy=BlockingIOError(), changed=ValueError()),
+              mock.patch.object(hana_instances, "check_checkout", side_effect=AssertionError("checked a busy copy"))):
+            row, = folders.kept_build_copies(folders.build_root())
+            self.assertEqual(row, copy)
+            self.assertEqual(folders.recheck_kept_copy(row, hana_instances.CheckoutScan([], [])),
+                             folders.CheckFailed("the folder lock is held"))
+
+    def test_kept_copy_recheck_refuses_a_replaced_parent(self) -> None:
+        from scripts.hana_instances import hana_instances
+
+        copy = self.keep_test_copy()
+        parent = copy.path.parent
+        take_lock = build_folder_lock.take_lock
+
+        def replace_parent(descriptor: int, mode: int, timing: build_folder_lock.ProbeTiming) -> bool:
+            acquired = take_lock(descriptor, mode, timing)
+            _ = parent.rename(parent.with_name("old-parent"))
+            parent.mkdir()
+            return acquired
+
+        with (mock.patch.object(build_folder_lock, "take_lock", side_effect=replace_parent),
+              mock.patch.object(hana_instances, "check_checkout") as check):
+            self.assertEqual(folders.recheck_kept_copy(copy, hana_instances.CheckoutScan([], [])),
+                             folders.CheckFailed("the kept copy parent changed"))
+        check.assert_not_called()
+
+    def test_kept_copy_listing_skips_an_empty_keep_file(self) -> None:
+        copy = self.keep_test_copy()
+        root = folders.build_root()
+        self.assertEqual(folders.kept_build_copies(root), [copy])
+        _ = folders.copy_keep_file(copy.path).write_text("")
+        self.assertEqual(folders.build_folder_state(copy.path), "free")
+        self.assertEqual(folders.kept_build_copies(root), [])
+
+    def test_kept_copy_open_detects_truncation_in_listing_and_recheck(self) -> None:
+        from scripts.hana_instances import hana_instances
+
+        copy = self.keep_test_copy()
+        root = folders.build_root()
+        marker = folders.copy_keep_file(copy.path)
+        timestamp = copy.kept_since.timestamp()
+        _ = marker.write_text(" \n")
+        os.utime(marker, (timestamp, timestamp))
+        row, = folders.kept_build_copies(root)
+        self.assertEqual(row, folders.KeptCopy(copy.path, "", copy.kept_since))
+        original_open = os.open
+
+        def open_fixture(path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            if path == marker.name:
+                self.assertGreater(marker.stat().st_size, 0)
+                _ = marker.write_text("")
+                os.utime(marker, (timestamp, timestamp))
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        with (mock.patch.object(os, "open", side_effect=open_fixture),
+              mock.patch.object(hana_instances, "check_checkout", return_value=folders.Clear()) as check):
+            with self.subTest(operation="listing"):
+                self.assertEqual(folders.kept_build_copies(root), [])
+            _ = marker.write_text(" \n")
+            with self.subTest(operation="recheck"):
+                result = folders.recheck_kept_copy(row, hana_instances.CheckoutScan([], []))
+                self.assertIsInstance(result, folders.CheckFailed)
+                check.assert_not_called()
+
+    def test_kept_copy_read_error_stays_in_listing_and_fails_recheck(self) -> None:
+        from scripts.hana_instances import hana_instances
+
+        copy = self.keep_test_copy()
+        marker = folders.copy_keep_file(copy.path)
+        _ = marker.write_bytes(b"\xff\n")
+        timestamp = copy.kept_since.timestamp()
+        os.utime(marker, (timestamp, timestamp))
+
+        row, = folders.kept_build_copies(folders.build_root())
+        self.assertEqual((row.path, row.kept_since), (copy.path, copy.kept_since))
+        self.assertIn("the keep file could not be read", row.reason)
+        self.assertIn("utf-8", row.reason)
+        self.assertEqual(folders.build_folder_state(copy.path), "kept")
+        with mock.patch.object(hana_instances, "check_checkout", return_value=folders.Clear()) as check:
+            result = folders.recheck_kept_copy(row, hana_instances.CheckoutScan([], []))
+        self.assertEqual(result, folders.CheckFailed(row.reason.removeprefix("the keep file could not be read: ")))
+        check.assert_not_called()
+        self.assertEqual(marker.read_bytes(), b"\xff\n")
+
+    def test_kept_copy_listing_reports_denied_keep_file_open(self) -> None:
+        from scripts.hana_instances import hana_instances
+
+        copy = self.keep_test_copy()
+        marker = folders.copy_keep_file(copy.path)
+        original_open = os.open
+        error = PermissionError(errno.EACCES, "permission denied", marker.name)
+
+        def open_fixture(path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            if path == marker.name:
+                self.assertIsNotNone(dir_fd)
+                self.assertTrue(flags & os.O_NOFOLLOW)
+                raise error
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        with (mock.patch.object(os, "open", side_effect=open_fixture),
+              mock.patch.object(hana_instances, "check_checkout") as check):
+            row, = folders.kept_build_copies(folders.build_root())
+            self.assertEqual(row, folders.KeptCopy(copy.path, f"the keep file could not be read: {error}", copy.kept_since))
+            self.assertEqual(folders.build_folder_state(copy.path), "kept")
+            self.assertEqual(folders.recheck_kept_copy(row, hana_instances.CheckoutScan([], [])),
+                             folders.CheckFailed(str(error)))
+        check.assert_not_called()
+
+    def test_kept_copy_reports_hard_link_without_opening_it(self) -> None:
+        from scripts.hana_instances import hana_instances
+
+        copy = self.keep_test_copy()
+        root = folders.build_root()
+        marker = folders.copy_keep_file(copy.path)
+        protected = root / "cargo" / "protected"
+        protected.parent.mkdir()
+        _ = protected.write_text("protected data\n")
+        timestamp = copy.kept_since.timestamp()
+        os.utime(protected, (timestamp, timestamp))
+        marker.unlink()
+        os.link(protected, marker)
+        original_open = os.open
+
+        def guarded_open(path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            if path == marker.name or path == marker:
+                info = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+                self.assertLessEqual(info.st_nlink, 1, "opened a keep file with more than one link")
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        reason = f"{marker}: the keep file must be a regular file with one link"
+        with (mock.patch.object(os, "open", side_effect=guarded_open),
+              mock.patch.object(hana_instances, "check_checkout") as check):
+            row, = folders.kept_build_copies(root)
+            self.assertEqual(row, folders.KeptCopy(copy.path, reason, copy.kept_since))
+            self.assertEqual(folders.recheck_kept_copy(row, hana_instances.CheckoutScan([], [])),
+                             folders.CheckFailed(reason))
+        check.assert_not_called()
+
+    def test_kept_copy_detects_hard_link_added_during_open(self) -> None:
+        from scripts.hana_instances import hana_instances
+
+        copy = self.keep_test_copy()
+        root = folders.build_root()
+        marker = folders.copy_keep_file(copy.path)
+        protected = root / "cargo" / "protected"
+        protected.parent.mkdir()
+        original_open = os.open
+
+        def open_fixture(path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+            if path == marker.name:
+                os.link(marker, protected)
+            return descriptor
+
+        reason = f"{marker}: the keep file must be a regular file with one link"
+        with (mock.patch.object(os, "open", side_effect=open_fixture),
+              mock.patch.object(hana_instances, "check_checkout", return_value=folders.Clear()) as check):
+            row, = folders.kept_build_copies(root)
+            self.assertEqual(row, folders.KeptCopy(copy.path, reason, copy.kept_since))
+            protected.unlink()
+            self.assertEqual(folders.recheck_kept_copy(copy, hana_instances.CheckoutScan([], [])),
+                             folders.CheckFailed(reason))
+        check.assert_not_called()
+
+    def test_kept_copy_and_unit_walks_share_temporary_folder_rules(self) -> None:
+        root = folders.build_root()
+        repo = root / "widget"
+        temporary_repo = root / "p-keptabcd"
+        temporary_unit = repo / "p-keptabcd"
+        ordinary = repo / "p-ordinary"
+        units = (temporary_repo / "unit", temporary_unit, ordinary)
+        for unit in units:
+            copy = unit / "1"
+            copy.mkdir(parents=True)
+            _ = folders.copy_keep_file(copy).write_text("cleanup failed\n")
+        for temporary in (temporary_repo, temporary_unit):
+            folders.lease_path(temporary).symlink_to(temporary / "missing")
+
+        self.assertEqual(list(folders.copy_unit_folders(root)), [ordinary])
+        self.assertEqual([row.path for row in folders.kept_build_copies(root)], [ordinary / "1"])
+
+    def test_kept_copy_listing_skips_protected_folders_and_links(self) -> None:
+        copy = self.keep_test_copy()
+        root = folders.build_root()
+        hanadocs = self.root / "rust" / "hanadocs"
+        cargo = root / "cargo"
+        old = root / "old-saved"
+        for protected in (hanadocs, cargo, old):
+            (protected / "hidden" / "1").mkdir(parents=True)
+            _ = (protected / "hidden" / "1.keep").write_text("protected\n")
+        (root / "source-link").symlink_to(hanadocs)
+        (copy.path.parent.parent / "unit-link").symlink_to(hanadocs)
+        (copy.path.parent / "2").symlink_to(hanadocs)
+        _ = (copy.path.parent / "2.keep").write_text("copy link\n")
+        (copy.path.parent / "3").mkdir()
+        (copy.path.parent / "3.keep").symlink_to(hanadocs / "hidden" / "1.keep")
+        original_stat, original_open = os.stat, os.open
+
+        def verify_path(path: int | str | Path) -> None:
+            if isinstance(path, int):
+                return
+            relative = Path(path)
+            self.assertFalse({"hanadocs", "cargo", "old-saved", "source-link", "unit-link", "3.keep"}
+                             .intersection(relative.parts), str(path))
+
+        def guarded_stat(path: int | str | Path, *, dir_fd: int | None = None,
+                         follow_symlinks: bool = True) -> os.stat_result:
+            verify_path(path)
+            if path == "2":
+                self.assertFalse(follow_symlinks)
+            return original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+        def guarded_open(path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            verify_path(path)
+            self.assertNotEqual(path, "2")
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        with (mock.patch.object(os, "stat", side_effect=guarded_stat),
+              mock.patch.object(os, "open", side_effect=guarded_open),
+              mock.patch.object(build_folder_lock, "take_lock", side_effect=AssertionError("the listing took a lock"))):
+            self.assertEqual(folders.kept_build_copies(root), [copy])
+
+    def test_unused_copy_inventory_skips_excluded_roots_before_stat(self) -> None:
+        from scripts.lib import build_copies
+        from scripts.production import staff
+
+        root = self.root / "inventory"
+        excluded = [root / name for name in ("cargo", "old-saved", "paths", "hana-ci")]
+        for path in excluded:
+            (path / "unit" / "1").mkdir(parents=True)
+        original_lstat = os.lstat
+
+        def guarded_lstat(path: Path | str, *, dir_fd: int | None = None) -> os.stat_result:
+            self.assertFalse(any(Path(path).is_relative_to(protected) for protected in excluded), str(path))
+            return original_lstat(path, dir_fd=dir_fd)
+
+        with (mock.patch.object(os, "lstat", side_effect=guarded_lstat),
+              mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(()))):
+            self.assertEqual(build_copies.unused_build_folders(root), [])
 
     def test_copy_removal_keeps_borrowers_and_resumes_after_git_deletes_the_checkout(self) -> None:
         from scripts.lib import build_copies

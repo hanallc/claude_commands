@@ -366,15 +366,10 @@ def _disk_bytes(path: Path) -> int:
     return int(reading.stdout.split(maxsplit=1)[0]) * 1024
 
 
-def _excluded_build_root_child(name: str) -> bool:
-    return (name in build_folders.BUILD_ROOT_EXCEPTIONS or name.startswith("old-")
-            or name in ("cargo", "paths", "hana-ci"))
-
-
 def _numbered_candidate(path: Path, root: Path) -> bool:
     """Verify the path. Return True for a numbered copy and False for a temporary folder."""
     parts = path.relative_to(root).parts
-    if (not parts or _excluded_build_root_child(parts[0]) or not stat.S_ISDIR(path.lstat().st_mode)
+    if (not parts or build_folders.excluded_build_root_child(parts[0]) or not stat.S_ISDIR(path.lstat().st_mode)
             or path.resolve(strict=True) != root.resolve() / Path(*parts)):
         raise BuildFolderInUse(f"{path}: the folder path is not verified")
     temporary = build_folders.is_temporary_build_folder
@@ -557,7 +552,7 @@ def _unused_unit_entry(unit: Path, root: Path, copies: set[Path]) -> UnusedBuild
 def _temporary_folders(root: Path) -> Iterator[Path]:
     with suppress(OSError), os.scandir(root) as repositories:
         for repo in repositories:
-            if _excluded_build_root_child(repo.name) or not repo.is_dir(follow_symlinks=False):
+            if build_folders.excluded_build_root_child(repo.name) or not repo.is_dir(follow_symlinks=False):
                 continue
             path = Path(repo.path)
             if build_folders.is_temporary_build_folder(path):
@@ -575,10 +570,10 @@ def unused_build_folders(root: Path) -> list[UnusedBuildFolder]:
     borrowers = _borrower_index()
     current = _current_unit_names()
     found: list[UnusedBuildFolder] = []
-    units = sorted(path for path in build_folders.copy_unit_folders(root) if isinstance(path, Path))
+    units = sorted(path for path in build_folders.copy_unit_folders(
+        root, exclude_root_child=build_folders.excluded_build_root_child) if isinstance(path, Path))
     for unit in units:
-        if (_excluded_build_root_child(unit.parent.name)
-                or not isinstance(build_folders.parse_resolved_form(unit / "1", root), build_folders.BuildCopy)):
+        if not isinstance(build_folders.parse_resolved_form(unit / "1", root), build_folders.BuildCopy):
             continue
         try:
             numbers = build_folders.copy_numbers(unit)

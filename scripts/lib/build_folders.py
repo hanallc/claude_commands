@@ -6,7 +6,7 @@ try:
 except FileNotFoundError:
     pass
 
-from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Container, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -1032,9 +1032,15 @@ def lease_path(path: Path) -> Path:
     return path.with_name(path.name + ".lease.json")
 
 
-def is_temporary_build_folder(path: Path, *, require_lease: bool = True) -> bool:
+def is_temporary_build_folder(path: Path, *, require_lease: bool = True,
+                              directory_entries: Container[str] | None = None) -> bool:
     """Check the temporary build name and, by default, its lease record."""
-    return bool(_TEMPORARY_BUILD_NAME.fullmatch(path.name)) and (not require_lease or os.path.lexists(lease_path(path)))
+    if not _TEMPORARY_BUILD_NAME.fullmatch(path.name):
+        return False
+    if not require_lease:
+        return True
+    lease = lease_path(path)
+    return lease.name in directory_entries if directory_entries is not None else os.path.lexists(lease)
 
 
 def _temporary_claim_location(path: Path, root: Path | None = None) -> Path | None:
@@ -1524,6 +1530,11 @@ BUILD_ROOT_EXCEPTIONS = USER_REMOVAL_ROOTS | frozenset({
 })
 
 
+def excluded_build_root_child(name: str) -> bool:
+    """Identify root entries that the copy inventories must skip."""
+    return name in BUILD_ROOT_EXCEPTIONS or name.startswith("old-") or name in ("cargo", "paths", "hana-ci")
+
+
 def copy_numbers(parent: Path) -> dict[int, bool]:
     """List copy numbers and whether each has a directory."""
     numbers: dict[int, bool] = {}
@@ -1569,7 +1580,9 @@ def _copy_leases_in_unit(unit: Path, root: Path, timing: build_folder_lock.Probe
             yield UnknownFolderLease(path, str(error))
 
 
-def copy_unit_folders(root: Path) -> Iterator[Path | UnknownFolderLease]:
+def copy_unit_folders(root: Path, *,
+                      exclude_root_child: Callable[[str], bool] = BUILD_ROOT_EXCEPTIONS.__contains__
+                      ) -> Iterator[Path | UnknownFolderLease]:
     """List unit directories or report the directory whose state is unreadable."""
     try:
         repositories = list(root.iterdir())
@@ -1579,7 +1592,7 @@ def copy_unit_folders(root: Path) -> Iterator[Path | UnknownFolderLease]:
         yield UnknownFolderLease(root, str(error))
         return
     for repo in repositories:
-        if repo.name in BUILD_ROOT_EXCEPTIONS or is_temporary_build_folder(repo):
+        if exclude_root_child(repo.name) or is_temporary_build_folder(repo):
             continue
         try:
             if not stat.S_ISDIR(repo.lstat().st_mode):
@@ -1624,6 +1637,146 @@ def copy_folders(root: Path) -> Iterator[tuple[Path, BuildCopy]]:
         for number, exists in numbers.items():
             if exists:
                 yield unit / str(number), BuildCopy(unit.parent.name, unit.name, number)
+
+
+@dataclass(frozen=True)
+class KeptCopy:
+    path: Path
+    reason: str
+    kept_since: datetime
+
+
+@dataclass(frozen=True)
+class Clear:
+    pass
+
+
+@dataclass(frozen=True)
+class NotClear:
+    reason: str
+
+
+@dataclass(frozen=True)
+class CheckFailed:
+    reason: str
+
+
+KeptCopyCheck = Clear | NotClear | CheckFailed
+
+
+class CheckoutProcessScan(Protocol):
+    def check_checkout(self, checkout: Path, /) -> KeptCopyCheck: ...
+
+
+@contextmanager
+def _open_copy_directory(path: str, parent: int) -> Generator[int]:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    try:
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _kept_copy_metadata(path: Path, info: os.stat_result, *, list_unreadable: bool) -> KeptCopy:
+    reason = ""
+    regular = stat.S_ISREG(info.st_mode)
+    if not regular or info.st_nlink != 1:
+        reason = f"{copy_keep_file(path)}: the keep file must be a regular file with one link"
+        if not list_unreadable or not regular or info.st_nlink < 2:
+            raise ValueError(reason)
+    elif info.st_size == 0:
+        raise ValueError(f"{copy_keep_file(path)}: the keep file is empty")
+    return KeptCopy(path, reason, datetime.fromtimestamp(info.st_mtime, timezone.utc))
+
+
+def _read_kept_copy(path: Path, directory: int, *, list_unreadable: bool = False) -> KeptCopy:
+    marker = copy_keep_file(path)
+    info = os.stat(marker.name, dir_fd=directory, follow_symlinks=False)
+    row = _kept_copy_metadata(path, info, list_unreadable=list_unreadable)
+    if row.reason:
+        return row
+    try:
+        descriptor = os.open(marker.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    except OSError as error:
+        if not list_unreadable:
+            raise
+        info = os.stat(marker.name, dir_fd=directory, follow_symlinks=False)
+        row = _kept_copy_metadata(path, info, list_unreadable=True)
+        return replace(row, reason=row.reason or f"the keep file could not be read: {error}")
+    with os.fdopen(descriptor, encoding="utf-8") as reason:
+        row = _kept_copy_metadata(path, os.fstat(reason.fileno()), list_unreadable=list_unreadable)
+        if row.reason:
+            return row
+        try:
+            text = reason.read().strip()
+        except (OSError, UnicodeDecodeError) as error:
+            if not list_unreadable:
+                raise
+            text = f"the keep file could not be read: {error}"
+        return replace(row, reason=text)
+
+
+def _kept_copies_in_unit(unit: Path, directory: int) -> Iterator[KeptCopy]:
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if not entry.name.endswith(".keep") or not entry.is_file(follow_symlinks=False):
+                continue
+            name = entry.name.removesuffix(".keep")
+            with suppress(OSError, ValueError, OverflowError):
+                path = unit / _folder_number(_parse_number(name))
+                if stat.S_ISDIR(os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mode):
+                    yield _read_kept_copy(path, directory, list_unreadable=True)
+
+
+def _kept_copy_directories(parent: Path, directory: int, *, repositories: bool = False) -> Iterator[str]:
+    with os.scandir(directory) as entries:
+        children = {entry.name: entry for entry in entries}
+        for name, entry in children.items():
+            if repositories and excluded_build_root_child(name):
+                continue
+            if is_temporary_build_folder(parent / name, directory_entries=children):
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                yield name
+
+
+def kept_build_copies(root: Path) -> list[KeptCopy]:
+    """List numbered copies with keep files under this build root."""
+    root = Path(os.path.abspath(root))
+    kept: list[KeptCopy] = []
+    with suppress(OSError), build_folder_lock.open_folder_parent(root / "1", Path(root.anchor), create=False) as directory:
+        for repo in _kept_copy_directories(root, directory, repositories=True):
+            with suppress(OSError), _open_copy_directory(repo, directory) as repository:
+                for name in _kept_copy_directories(root / repo, repository):
+                    unit = root / repo / name
+                    if not isinstance(parse_resolved_form(unit / "1", root), BuildCopy):
+                        continue
+                    with suppress(OSError), _open_copy_directory(name, repository) as unit_directory:
+                        kept.extend(_kept_copies_in_unit(unit, unit_directory))
+    return sorted(kept, key=lambda copy: copy.path)
+
+
+def recheck_kept_copy(copy: KeptCopy, scan: CheckoutProcessScan) -> KeptCopyCheck:
+    """Check a kept copy against the supplied scan while holding its folder lock."""
+    path = copy.path
+    try:
+        with build_folder_lock.folder_parent(path, path.parents[2], create=False) as directory:
+            descriptor = build_folder_lock.open_lock(path, directory, create=False)
+            try:
+                if not build_folder_lock.take_lock(descriptor, fcntl.LOCK_EX, build_folder_lock.NO_WAIT):
+                    return CheckFailed("the folder lock is held")
+                if not build_folder_lock.lock_current(path, directory, descriptor):
+                    return CheckFailed("the folder lock file changed")
+                folder = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                if not stat.S_ISDIR(folder.st_mode) or _read_kept_copy(path, directory) != copy:
+                    return CheckFailed("the kept copy changed")
+                if not build_folder_lock.parent_current(path, directory):
+                    return CheckFailed("the kept copy parent changed")
+                return scan.check_checkout(path)
+            finally:
+                os.close(descriptor)
+    except (OSError, ValueError, RuntimeError, OverflowError, IndexError) as error:
+        return CheckFailed(str(error))
 
 
 def numbered_copy_records() -> Iterator[NumberedSourceEvidence]:
