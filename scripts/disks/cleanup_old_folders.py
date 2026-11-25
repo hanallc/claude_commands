@@ -31,17 +31,19 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from itertools import chain
 from pathlib import Path
-from typing import Literal, NamedTuple, NotRequired, TextIO, TypedDict, cast, final, override
+from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TextIO, TypedDict, cast, final, override
 from urllib.parse import unquote, urlsplit
 
 from scripts.copies import copies
 from scripts.lib import build_folder_lock, build_folders, conf, git_files, git_rescue, process_start
 from scripts.lib import removal_guard
-from scripts.lib import session_move
 from scripts.lib.process_failure import failure_detail
 from scripts.lint import tmp_sweep
 from scripts.production import staff
 from scripts.worktree import worktree_records
+
+if TYPE_CHECKING:
+    from scripts.lib.session_move import TreeEntry
 
 
 class Machine(Enum):
@@ -2446,6 +2448,8 @@ def gate_move_target(path: Path, bounds: CleanupBounds) -> Path:
 
 @contextmanager
 def gate_move_parent(target: Path, bounds: CleanupBounds, *, create: bool) -> Generator[int]:
+    from scripts.lib import session_move
+
     with ExitStack() as stack:
         directory = stack.enter_context(session_move.open_directory(bounds.build))
         mount = session_move.mount_identity(directory)
@@ -2557,6 +2561,8 @@ def assess_gate(candidate: Candidate, guard: CleanupGuard, uses: CleanupProcessR
                             confirm_sidecars(checked, guard, related, lease, sidecars)
                         if inspect_sidecars(checked.parent, guard, related) != sidecars:
                             raise removal_guard.ChangedEntry("worktree sidecars changed")
+                        from scripts.lib import session_move
+
                         target = gate_move_target(path, guard.bounds)
                         with session_move.open_directory(guard.bounds.build):
                             pass
@@ -2933,6 +2939,8 @@ def copy_gate_tree(source: int, destination: int) -> None:
 
 
 def sync_gate_copy(destination: int, destination_parent: int) -> None:
+    from scripts.lib import session_move
+
     mount = session_move.mount_identity(destination)
     for path, parent, info, kind in session_move.tree_entries(destination, mount):
         if kind is session_move.HashedEntry.FILE:
@@ -2946,6 +2954,8 @@ def sync_gate_copy(destination: int, destination_parent: int) -> None:
 
 
 def copy_gate_sidecar(source: int, destination: int, name: str, expected: build_folders.SidecarIdentity) -> None:
+    from scripts.lib import session_move
+
     info = os.stat(name, dir_fd=source, follow_symlinks=False)
     if (*removal_guard.identity(info), info.st_ctime_ns) != expected:
         raise removal_guard.ChangedEntry(f"worktree sidecar changed: {name}")
@@ -2960,7 +2970,7 @@ def copy_gate_sidecar(source: int, destination: int, name: str, expected: build_
             os.fsync(fd)
 
 
-def move_copy_differs(source: session_move.TreeEntry, target: session_move.TreeEntry,
+def move_copy_differs(source: TreeEntry, target: TreeEntry,
                       before: os.stat_result, after: os.stat_result) -> bool:
     return (not source.same_content(target) or before.st_mode != after.st_mode
             or before.st_mtime_ns != after.st_mtime_ns)
@@ -2974,6 +2984,8 @@ class VerifiedGateCopy:
 
 def verify_gate_copy(checked: CheckedCleanup, source: int, target: int, target_parent: int,
                      entries: dict[Path, CleanupEntry], sidecars: WorktreeSidecars) -> VerifiedGateCopy:
+    from scripts.lib import session_move
+
     original_ids: session_move.EntryIdentities = {}
     copied_ids: session_move.EntryIdentities = {}
     original = session_move.read_manifest(source, original_ids,
@@ -3019,6 +3031,8 @@ def verify_gate_copy(checked: CheckedCleanup, source: int, target: int, target_p
 
 
 def require_unchanged_gate_copy(target: Path, parent: int, destination: int, verified: VerifiedGateCopy) -> None:
+    from scripts.lib import session_move
+
     entries = {path: entry_stamp(info) for path, _parent, info, _kind in
                session_move.tree_entries(destination, session_move.mount_identity(destination))}
     sidecars: dict[str, EntryStamp] = {}
@@ -3033,6 +3047,8 @@ def require_unchanged_gate_copy(target: Path, parent: int, destination: int, ver
 
 
 def publish_gate_copy(target: Path, parent: int, stage_name: str, stage: int, sidecars: WorktreeSidecars) -> None:
+    from scripts.lib import session_move
+
     require_gate_move_parent_owner(parent)
     session_move.require_parent_path(target.parent, parent)
     session_move.require_parent_path(target.parent / stage_name, stage)
@@ -3067,6 +3083,8 @@ def publish_gate_copy(target: Path, parent: int, stage_name: str, stage: int, si
 
 
 def move_gate_folder(path: Path, guard: CleanupGuard, approval: WouldMove, details: GateDetails) -> None:
+    from scripts.lib import session_move
+
     target = gate_move_target(path, guard.bounds)
     if not guard.bounds.is_gate_child(path) or target != approval.target:
         raise removal_guard.ChangedEntry("the approved move path changed")

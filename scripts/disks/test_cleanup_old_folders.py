@@ -396,6 +396,18 @@ with patch.object(subprocess, "run", side_effect=process_start) as run:
         self.assertFalse(read_log.exists())
         self.assertFalse(shift_log.exists())
 
+    def test_cleanup_import_skips_gate_move_and_showrunners(self) -> None:
+        program = """
+import sys
+from scripts.disks import cleanup_old_folders
+
+loaded = {"scripts.lib.session_move", "scripts.production.showrunners"} & sys.modules.keys()
+assert not loaded, sorted(loaded)
+"""
+        result = subprocess.run((sys.executable, "-B", "-c", program), cwd=SCRIPT.parents[2],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_sudo_remote_child_uses_the_configured_timeout_and_reports_a_timeout(self) -> None:
         self.write_settings("~/missing")
         command = ("ssh", "mac")
