@@ -5994,8 +5994,8 @@ done
 
     def _newer_remote_free_readings(self, queued: list[wire.PlacementRequest]
                                    ) -> dict[tuple[str, placement.PlacementDestination], float]:
-        """Find newer free readings for higher steps whose reading says busy."""
-        free: dict[tuple[str, str], dict[placement.PlacementDestination, float]] = {}
+        """Find newer free readings for higher busy steps at the same destination."""
+        free: dict[placement.PlacementDestination, float] = {}
         shared: dict[tuple[str, placement.PlacementDestination], float] = {}
         busy = placement.TemporaryExclusion("busy")
         for request in reversed(queued):
@@ -6014,21 +6014,16 @@ done
                     if isinstance(evidence.eligibility, placement.AllowedHost):
                         allowed.append(evidence)
                     continue
-                # Busy is the only place fact. A shared reading would lose the session's Mac block
-                # (blocking_claim_block), the copy give-way rule (copy_gives_way), the per-key disk floor,
-                # and command and repository support.
+                # Share a free reading only for busy eligibility at the same destination.
+                # Each step keeps its session block, copy give-way, disk floor, and support checks.
                 if not (evidence.eligibility == busy or isinstance(evidence.eligibility, placement.AllowedHost)):
                     continue
-                readings = free.get((destination.provider, destination.target), {})
-                latest = max((observed_at for other, observed_at in readings.items()
-                              if observed_at > evidence.observed_at and same_remote_resource(other, destination)),
-                             default=evidence.observed_at)
+                latest = free.get(destination, evidence.observed_at)
                 if latest > evidence.observed_at:
                     shared[pair] = latest
             for evidence in allowed:
                 destination = evidence.key.destination
-                readings = free.setdefault((destination.provider, destination.target), {})
-                readings[destination] = max(readings.get(destination, evidence.observed_at), evidence.observed_at)
+                free[destination] = max(free.get(destination, evidence.observed_at), evidence.observed_at)
         return shared
 
     def _placement_pass(self, inputs: records.QueueInputs, ordered: list[tuple[Path, records.RankedWaiter]],

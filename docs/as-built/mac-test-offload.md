@@ -27,7 +27,7 @@ The live step record keeps diagnostic disk evidence.
 Standalone fixed local callers retain their existing local admission path.
 
 The queue checks waiters in order for each remote place.
-A lower step's newer free reading clears a higher step's busy result for the same remote resource.
+A lower step's newer free reading clears a higher step's busy result for the same destination.
 The higher step can take the place in that pass.
 The queue keeps each step's other eligibility results.
 A step that needs evidence can hold the place for one waiting pass interval plus the probe time limit.
