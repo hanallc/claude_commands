@@ -38,8 +38,8 @@ Add `--dry-run` to print their names without stopping them.
 All lifecycle scripts use `scripts/agents/`.
 
 `agents clone NAME --as NEW` forks a live conversation on the source machine.
-Use a staff name, staff ID, or native session ID.
-For a session without a staff row, use its native session ID.
+Use a staff name, saved launch name, staff ID, or native session ID.
+The command refuses a saved launch name that matches multiple sessions on this machine.
 The command requires one proved pane and opens the clone after its source tab on the same Herdr server.
 The live pane must show the current model and effort.
 For Codex, show Model with Reasoning in the status line.
@@ -49,6 +49,7 @@ The first prompt names both sessions and asks the clone to wait for a request ad
 The command refuses occupied names and reserved message addresses.
 The fork uses the source account environment.
 An absent `CLAUDE_CONFIG_DIR` stays absent.
+Resume and restart keep the saved implicit Claude home unless an explicit account is selected.
 The command verifies the fork before it saves the launch or adds a root `session` row.
 It saves the launch before the staff write.
 A definite refusal closes only the fork terminal.

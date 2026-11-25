@@ -64,8 +64,16 @@ def _source_id(reference: str, record: staff.StaffSnapshot) -> str:
         return named[0].current_session
     try:
         return staff.native_id(reference)
-    except staff.StaffRefused as error:
-        raise ValueError(f"{reference}: no staff name matches. Use the native session ID.") from error
+    except staff.StaffRefused:
+        pass
+    identities = {match.session for path in pane_record.record_directory().glob("*.json")
+                  for match in pane_launch.named_references(reference, record, pane_record.read_strict(path.stem))
+                  if isinstance(match, pane_launch.NativeLaunchReference)}
+    if len(identities) > 1:
+        raise ValueError(f"{reference}: several saved sessions match. Use the native session ID.")
+    if not identities:
+        raise ValueError(f"{reference}: no saved session name matches. Use the native session ID.")
+    return identities.pop()
 
 
 def _source(reference: str, record: staff.StaffSnapshot) -> tuple[CloneSource, herdr.Herdr]:
@@ -195,6 +203,7 @@ def _admit_clone(name: str, source: CloneSource, client: herdr.Herdr, launched: 
             raise ValueError(f"{name}: the fork identity already belongs to another session")
         entry = pane_record.launch(pane, native, clone.cwd, clone.process.environment, clone.arguments, kind=source.kind)
         entry.update(name=name, pid=clone.pid, proc_start=clone.process.started, config_dir=str(home))
+        pane_launch.retain_implicit_claude_home(entry, clone.process.environment)
         try:
             pane_record.write(client.session, entry)
             try:

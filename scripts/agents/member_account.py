@@ -48,6 +48,16 @@ def resume_account(kind: Literal["claude", "codex"], row: StaffRow | SessionWith
     return accounts.role_account("unit")
 
 
+def implicit_claude_resume(row: StaffRow | SessionWithoutStaffRow, entry: pane_launch.NativePaneLaunch,
+                           target: str | accounts.AccountSelection) -> pane_launch.ImplicitClaudeHome | pane_launch.SelectedClaudeAccount:
+    """Reuse the implicit account when a standalone Claude resumes on its saved home."""
+    if not target and isinstance(row, staff.StaffRow) and row.kind == "session" and pane_launch.saved_kind(entry) == "claude":
+        implicit = pane_launch.implicit_claude_home(entry)
+        if isinstance(implicit, pane_launch.ImplicitClaudeHome) and row.home == staff.SessionHome(implicit.config_dir):
+            return implicit
+    return pane_launch.SelectedClaudeAccount.USE_SELECTION
+
+
 def repair_home(row: StaffRow, kind: str, pid: int) -> None:
     """Repair the member's home from its unchanged current process."""
     try:

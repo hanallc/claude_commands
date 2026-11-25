@@ -2059,7 +2059,8 @@ class Herdr:
                     pane = self.order_tabs(workspace, saved, opening_members=((pane, member),) if member else ()).get(pane, pane)
                 except (HerdrFailure, OSError, ValueError) as error:
                     print(f"herdr {self.session}: tab order unchanged: {error}", file=sys.stderr)
-            self.save_layout()
+            if not after_pane:
+                self.save_layout()
             return pane
 
     def _workspace_named(self, space: str, *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE,
@@ -2932,7 +2933,8 @@ class Herdr:
                         screen = self.run("pane", "read", pane, "--source", "visible")
                 except (HerdrFailure, OSError, subprocess.SubprocessError) as screen_error:
                     screen = f"visible screen is unavailable: {screen_error}"
-            print(f"herdr {name}:{pane}: {error}; session retained", file=sys.stderr)
+            if publication is LaunchPublicationTiming.ON_START:
+                print(f"herdr {name}:{pane}: {error}; session retained", file=sys.stderr)
             if screen:
                 print(screen, file=sys.stderr)
             return _without_prompt_transport(opening, launched_at, AgentNotStarted(str(error)))
@@ -4427,11 +4429,18 @@ def _write_claude_trust(folder: Path, target: Path, project_key: Path) -> Truste
     return Trusted(folder, target, project_key)
 
 
-def trust_claude_launch(folder: Path, config_dir: Path) -> None:
+@dataclass(frozen=True)
+class ClaudeTrustFile:
+    """The settings file selected by the launch environment."""
+
+    path: Path
+
+
+def trust_claude_launch(folder: Path, config_dir: Path | ClaudeTrustFile) -> None:
     """Write trust before either Claude launch path starts a process."""
     from scripts.whoami.agent_accounts import claude_config_file
 
-    target = claude_config_file(config_dir)
+    target = config_dir.path if isinstance(config_dir, ClaudeTrustFile) else claude_config_file(config_dir)
     try:
         folder = folder.resolve()
         result = _write_claude_trust(folder, target, repository_trust_key(folder))
@@ -6942,6 +6951,7 @@ class PreparedAgentEnvironment:
     directory: Path
     env: dict[str, str]
     unset_environment: frozenset[str] = NO_ENVIRONMENT_REMOVALS
+    claude_home: pane_launch.ImplicitClaudeHome | pane_launch.SelectedClaudeAccount = pane_launch.SelectedClaudeAccount.USE_SELECTION
 
 
 @dataclass(frozen=True)
@@ -7094,8 +7104,16 @@ def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane 
     if kind == "claude":
         agent_arguments = models_registry.claude_arguments(agent_arguments, prepared.env)
         try:
-            default_home = Path(prepared.env.get("HOME") or Path.home()) / ".claude"
-            trust_claude_launch(prepared.directory, Path(prepared.env.get("CLAUDE_CONFIG_DIR") or default_home))
+            home = Path(prepared.env.get("HOME") or Path.home())
+            configured = prepared.env.get("CLAUDE_CONFIG_DIR")
+            if isinstance(destination, ForkTab):
+                target = ClaudeTrustFile((Path(configured) if configured else home) / ".claude.json")
+                trust_claude_launch(prepared.directory, target)
+                prepared = replace(prepared, env={**prepared.env, pane_launch.CLAUDE_FORK_NAME_ENV: destination.title})
+            elif isinstance(prepared.claude_home, pane_launch.ImplicitClaudeHome):
+                trust_claude_launch(prepared.directory, ClaudeTrustFile(prepared.claude_home.settings_file))
+            else:
+                trust_claude_launch(prepared.directory, Path(configured or home / ".claude"))
         except HerdrFailure as error:
             print(str(error), file=sys.stderr)
             return AgentLaunched("", _without_prompt_transport(opening, launched_at, ClaudeTrustNotWritten(str(error))))
@@ -7108,24 +7126,24 @@ def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane 
     client = Herdr(name) if isinstance(client, LaunchClientSource) else client
     member = ""
     folder_member: session_folder.Member | None = None
-    try:
-        membership = _tab_staff()
-        owner = (None if isinstance(destination, ForkTab) else
-                 membership.by_member_reference(session_id or agent) or membership.by_path(agent))
-        if owner is not None:
-            session_id = owner.current_session
-            member = owner.id
-            folder_member = session_folder.member_for(owner, membership)
-        observed = (read_conversation(session_id, kind,
-                    **({"codex": codex} if isinstance(codex, CodexConversations) else {}))
-                    if session_id else StoppedConversation())
-    except (HerdrFailure, OSError, ValueError) as error:
-        print(f"herdr {session_id}: live session evidence is unknown: {error}", file=sys.stderr)
-    else:
-        if isinstance(observed, LiveConversation):
-            raise HerdrFailure(f"would start a second copy of running session {session_id}", "already_running")
-        if isinstance(observed, UnknownConversation) and not reported_unknown:
-            conversation_note(observed)
+    if not isinstance(destination, ForkTab):
+        try:
+            membership = _tab_staff()
+            owner = membership.by_member_reference(session_id or agent) or membership.by_path(agent)
+            if owner is not None:
+                session_id = owner.current_session
+                member = owner.id
+                folder_member = session_folder.member_for(owner, membership)
+            observed = (read_conversation(session_id, kind,
+                        **({"codex": codex} if isinstance(codex, CodexConversations) else {}))
+                        if session_id else StoppedConversation())
+        except (HerdrFailure, OSError, ValueError) as error:
+            print(f"herdr {session_id}: live session evidence is unknown: {error}", file=sys.stderr)
+        else:
+            if isinstance(observed, LiveConversation):
+                raise HerdrFailure(f"would start a second copy of running session {session_id}", "already_running")
+            if isinstance(observed, UnknownConversation) and not reported_unknown:
+                conversation_note(observed)
     if kind == "claude" and folder_member is not None:
         prepared = in_session_folder(prepared, folder_member, session_id)
     terminal = ""
@@ -7160,7 +7178,7 @@ def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane 
         if isinstance(destination, SplitPane):
             client.label_pane(pane, destination.label)
         script = agent_alias_script(kind)
-        if isinstance(destination, (ExistingPane, ForkTab)):
+        if isinstance(destination, (ExistingPane, ForkTab)) or isinstance(prepared.claude_home, pane_launch.ImplicitClaudeHome):
             # Set the environment in the selected shell before the agent starts.
             environment = _pane_environment(prepared.env)
             exports = shlex.join([f"{key}={value}" for key, value in environment.items()
@@ -7168,6 +7186,7 @@ def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane 
             removals = (prepared.unset_environment | {
                 "STAFF_ID", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
                 "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
+                pane_launch.CLAUDE_FORK_NAME_ENV,
             }) - {"TERM", "COLORTERM"}
             script += ("for legacy_label in $(env); do case $legacy_label in SHOWRUNNER_*=*) "
                       'unset "${legacy_label%%=*}";; esac; done; '
@@ -7187,19 +7206,24 @@ def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane 
         finally:
             forget_pane_evidence(name, pane)
     except (HerdrFailure, OSError, subprocess.SubprocessError) as error:
-        if isinstance(error, HerdrFailure) and error.code == "wrong_target" and not resuming_with_prompt:
-            raise
-        print(f"herdr {name}:{pane}: start incomplete: {error}; pane retained", file=sys.stderr)
-        failure = AgentNotStarted(str(error)) if isinstance(error, AgentExited) else PromptNotSubmitted(str(error))
-        outcome = _without_prompt_transport(opening, launched_at, failure)
-    if (isinstance(outcome, AgentNotStarted) and outcome.state == "not_sent"
-            and not isinstance(destination, ExistingPane)):
         if isinstance(destination, ForkTab):
+            reason = "start timed out" if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)) else str(error)
+            failure = AgentNotStarted(reason)
+        else:
+            if isinstance(error, HerdrFailure) and error.code == "wrong_target" and not resuming_with_prompt:
+                raise
+            print(f"herdr {name}:{pane}: start incomplete: {error}; pane retained", file=sys.stderr)
+            failure = AgentNotStarted(str(error)) if isinstance(error, AgentExited) else PromptNotSubmitted(str(error))
+        outcome = _without_prompt_transport(opening, launched_at, failure)
+    if isinstance(destination, ForkTab):
+        if isinstance(outcome, PromptNotSubmitted):
             if client.close_terminal_pane(pane, terminal):
                 print(f"herdr {name}:{pane}: fork pane closed after start failed ({outcome.reason})", file=sys.stderr)
             else:
-                print(f"herdr {name}:{pane}: fork terminal closure is unconfirmed", file=sys.stderr)
-            return ForkLaunched(pane, outcome, terminal)
+                print(f"herdr {name}:{pane}: fork terminal closure is unconfirmed ({outcome.reason})", file=sys.stderr)
+        return ForkLaunched(pane, outcome, terminal)
+    if (isinstance(outcome, AgentNotStarted) and outcome.state == "not_sent"
+            and not isinstance(destination, ExistingPane)):
         if isinstance(destination, NewTab):
             close_agent(name, pane)
         else:
@@ -7208,8 +7232,6 @@ def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane 
     if (resuming_with_prompt and isinstance(outcome, PromptNotSubmitted)
             and (isinstance(destination, ExistingPane) or not isinstance(outcome, AgentNotStarted))):
         outcome = _resume_prompt_failure(outcome, pane)
-    if isinstance(destination, ForkTab):
-        return ForkLaunched(pane, outcome, terminal)
     return AgentLaunched(pane, outcome)
 
 

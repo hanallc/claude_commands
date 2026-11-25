@@ -37,7 +37,7 @@ Use the `agents` program.
 ## Clone a session
 
 Run the command on the source session's machine.
-Use its staff name, staff id, or native session id.
+Use its staff name, saved launch name, staff ID, or native session ID.
 The source must have one proved Herdr pane.
 Show the current model and effort in that pane.
 For Codex, include Model with Reasoning in the status line.

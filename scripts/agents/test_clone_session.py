@@ -90,11 +90,11 @@ class CloneCommandTests(StaffTestCase):
 
     def source(self, kind: Literal["claude", "codex"], home: Path, args: list[str], *,
                footer: str = "", clone_home: Path | None = None, implicit_account: bool = False,
-               clone_uses_explicit_account: bool = False) -> None:
+               clone_uses_explicit_account: bool = False, identity: str = SOURCE) -> None:
         key = "CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME"
         account = {"HOME": str(home.parent)} if implicit_account else {key: str(home)}
         clone_account = {key: str(clone_home or home)} if clone_home or clone_uses_explicit_account else account
-        origin = herdr.NativeAgentProcess(herdr.PaneSessionReport(SOURCE), "source-start", {**account, "STAFF_ID": SOURCE})
+        origin = herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "source-start", {**account, "STAFF_ID": SOURCE})
         fork = herdr.NativeAgentProcess(herdr.PaneSessionReport(FORK), "fork-start", clone_account)
 
         def foreground_launch(pane: str, _kind: str) -> herdr.ForegroundLaunch:
@@ -195,7 +195,7 @@ class CloneCommandTests(StaffTestCase):
         assert call is not None
         self.assertIn('model_reasoning_effort="ultra"', cast(list[str], call.args[4]))
 
-    def test_clone_refuses_an_unstaffed_label_and_names_the_native_id_route(self) -> None:
+    def test_clone_refuses_an_unknown_saved_name_and_names_the_native_id_route(self) -> None:
         self.source("claude", self.clone_scratch / ".claude", ["claude"], footer="Opus 4.8 high")
         diagnostic = io.StringIO()
         with redirect_stderr(diagnostic):
@@ -203,6 +203,31 @@ class CloneCommandTests(StaffTestCase):
         self.assertIn("Use the native session ID", diagnostic.getvalue())
         cast(Mock, self.launch).assert_not_called()
         cast(Mock, self.client_factory).assert_not_called()
+
+    def test_clone_resolves_saved_names_across_servers_and_refuses_ambiguity(self) -> None:
+        home = self.clone_scratch / ".claude"
+        self.source("claude", home, ["claude"], footer="Opus 4.8 high", identity=THIRD)
+        cast(Mock, self.client.tab_sessions).return_value = [herdr.TabSession(PANE, "bob", "workspace", THIRD)]
+
+        def native_session(pane: str, _kind: str, _timeout: float) -> str:
+            return THIRD if pane == PANE else FORK
+
+        cast(Mock, self.native).side_effect = native_session
+        bob = pane_record.launch(PANE, THIRD, str(self.folder), {}, ["claude", "-n", "bob"])
+        other = pane_record.launch(PANE, "019b3a40-4250-7000-8000-000000000204", str(self.folder), {},
+                                   ["claude", "-n", "bob"])
+        pane_record.write("fixture", bob)
+        pane_record.write("second-server", other)
+        diagnostic = io.StringIO()
+        with redirect_stderr(diagnostic):
+            self.assertEqual(shutdown.main(["clone", "bob", "--as", "alpha-copy"]), 2)
+        self.assertIn("several saved sessions match", diagnostic.getvalue())
+        cast(Mock, self.launch).assert_not_called()
+        pane_record.record_path("second-server").unlink()
+        self.assertEqual(shutdown.main(["clone", "bob", "--as", "alpha-copy"]), 0)
+        call = cast(Mock, self.launch).call_args
+        assert call is not None
+        self.assertEqual(cast(list[str], call.args[4])[:3], ["--resume", THIRD, "--fork-session"])
 
     def test_clone_refuses_an_existing_staff_name_before_launch(self) -> None:
         self.assertEqual(shutdown.main(["clone", SOURCE, "--as", "ALPHA"]), 2)
@@ -272,6 +297,9 @@ class CloneCommandTests(StaffTestCase):
         self.assertEqual(prepared.env, {"HOME": str(home.parent), "PATH": "/bin"})
         self.assertIn("CLAUDE_CONFIG_DIR", prepared.unset_environment)
         self.assert_new_row(home)
+        saved = pane_record.publication_for_session(FORK)
+        assert saved is not None
+        self.assertEqual(saved.entry.get("implicit_claude_home"), str(home.parent))
 
     def test_clone_refuses_an_explicit_account_for_an_implicit_source(self) -> None:
         home = self.clone_scratch / ".claude"

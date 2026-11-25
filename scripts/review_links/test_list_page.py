@@ -7341,6 +7341,22 @@ const change=async path=>{
         entry = next(entry for entry in list_page.records(include_closed=True) if entry.item.id == closed.id)
         self.assertEqual(list_page.ask_boxes(entry, "secret", names), "")
 
+    def test_go_box_displays_the_role_of_a_standalone_session(self) -> None:
+        identity = staff.StaffId("6c0c0a8e-3c1f-4d8e-9e43-0d51f0a7c2b1")
+        clone = staff.StaffRow(identity, "session", "alpha-copy", staff.StaffRoot(), current_session=identity,
+                               launch_folder=staff.SessionLaunchFolder("natedev", self.root),
+                               home=staff.SessionHome(self.root / ".claude"))
+        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
+            row.to_json() for row in (MORTY, DWIGHT, OWNER, OTHER, clone)]}))
+        item = self.add("Review the clone's work")
+        ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=identity,
+                               what="Continue the review.", why="The clone needs nate's go.",
+                               config=False, requester=MORTY.id, source="morty")
+        with patch.object(list_page, "counts_strip", return_value=""):
+            markup = list_page.render(self.root / "reviews").decode()
+        self.assertIn(f'data-ask="{ask.ask_id}"', markup)
+        self.assertIn("alpha-copy, a standalone session", re.sub(r"<[^>]+>", "", without_role_colors(markup)))
+
     def test_browser_go_closes_the_ask_and_the_item_leaves_needs_me(self) -> None:
         added = self.add("Merge the needsme unit", the_list.ItemState.WAITING_FOR_NATE, number=1)
         item = the_list.mark_read(MORTY.id, added.id, source="nate")

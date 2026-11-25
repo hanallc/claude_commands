@@ -3418,11 +3418,13 @@ class LaunchDestinationTests(StaffTestCase):
                                                   frozenset({"CLAUDE_CONFIG_DIR"}))
         arguments = ["--resume", source, "--fork-session", "-n", "clone"]
         with (patch.object(herdr, "trust_claude_launch"),
+              patch.object(herdr, "_tab_staff") as membership,
               patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (1,))) as live):
             launched = herdr.launch_prepared_agent("agents", herdr.ForkTab("w1:p1", "clone"),
                 prepared, "claude", arguments, herdr.NoOpeningPrompt(), 5000, agent="clone", client=client)
         self.assertEqual(launched.pane, "w1:p2")
         live.assert_not_called()
+        membership.assert_not_called()
         opened.assert_called_once()
         self.assertEqual(cast(str, opened.call_args.kwargs["after_pane"]), "w1:p1")
         setup = cast(Mock, client.run_in_pane).call_args
@@ -3433,6 +3435,8 @@ class LaunchDestinationTests(StaffTestCase):
                                 env={"CLAUDE_CONFIG_DIR": "/server/account"}, text=True,
                                 capture_output=True, check=True)
         self.assertEqual(result.stdout, "unset")
+        self.assertIn(f"export HOME={self.root}", command)
+        self.assertIn(f"{pane_launch.CLAUDE_FORK_NAME_ENV}=clone", command)
         started.assert_called_once_with("clone", "w1:p2", "claude", arguments, herdr.NoOpeningPrompt(), 5000,
                                         publication=herdr.LaunchPublicationTiming.AFTER_FORK_CHECKS)
 
@@ -3468,6 +3472,41 @@ class LaunchDestinationTests(StaffTestCase):
         closed.assert_called_once_with("pane", "close", fork)
         stop.assert_not_called()
         self.assertEqual(list(panes), [source])
+
+    def test_fork_start_timeout_closes_the_verified_terminal(self) -> None:
+        client = Mock(spec=herdr.Herdr)
+        cast(Mock, client.open_tab).return_value = "w1:p2"
+        cast(Mock, client.command_terminal).return_value = "fork-terminal"
+        cast(Mock, client.start_agent).side_effect = subprocess.TimeoutExpired("agent start", 1)
+        cast(Mock, client.close_terminal_pane).return_value = True
+        diagnostic = io.StringIO()
+        with redirect_stderr(diagnostic):
+            result = herdr.launch_prepared_agent("fixture", herdr.ForkTab("w1:p1", "clone"),
+                herdr.PreparedAgentEnvironment(self.root, {}), "codex", ["fork", "source"],
+                herdr.NoOpeningPrompt(), 1_000, agent="clone", client=client)
+        self.assertIsInstance(result.outcome, herdr.AgentNotStarted)
+        self.assertIn("fork pane closed after start failed (start timed out)", diagnostic.getvalue())
+        cast(Mock, client.close_terminal_pane).assert_called_once_with("w1:p2", "fork-terminal")
+
+    def test_fork_writes_trust_to_the_file_selected_by_its_account_environment(self) -> None:
+        home = self.root / "source-home"
+        configured = home / ".claude"
+        configured.mkdir(parents=True)
+        client = Mock(spec=herdr.Herdr)
+        cast(Mock, client.open_tab).return_value = "w1:p2"
+        cast(Mock, client.command_terminal).return_value = "fork-terminal"
+        cast(Mock, client.start_agent).return_value = herdr.PromptSubmissionNotRequired()
+        for account in ({}, {"CLAUDE_CONFIG_DIR": str(configured)}):
+            with self.subTest(account=account):
+                target = (configured if account else home) / ".claude.json"
+                alternate = (home if account else configured) / ".claude.json"
+                result = herdr.launch_prepared_agent("fixture", herdr.ForkTab("w1:p1", "clone"),
+                    herdr.PreparedAgentEnvironment(self.root, {"HOME": str(home), **account}),
+                    "claude", ["--fork-session"], herdr.NoOpeningPrompt(), 1_000, agent="clone", client=client)
+                self.assertIsInstance(result.outcome, herdr.PromptSubmissionNotRequired)
+                self.assertIsInstance(herdr.claude_trust(self.root, target), herdr.Trusted)
+                self.assertFalse(alternate.exists())
+                target.unlink()
 
     def test_codex_fork_leaves_its_source_launch_untouched_until_verification(self) -> None:
         client = herdr.Herdr("private")

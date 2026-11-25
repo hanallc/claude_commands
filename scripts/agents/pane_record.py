@@ -397,14 +397,18 @@ def _needed(name: str) -> bool:
 
 def _environment(parts: Sequence[bytes]) -> dict[str, str]:
     pairs = (os.fsdecode(part).partition("=") for part in parts if b"=" in part)
-    return {key: value for key, _, value in pairs if _needed(key)}
+    return {key: value for key, _, value in pairs if _captured_launch_variable(key)}
+
+
+def _captured_launch_variable(name: str) -> bool:
+    return name == "HOME" or _needed(name)
 
 
 def _mac_record(pid: int) -> tuple[list[str], dict[str, str]]:
     # Imported here: the Linux hook never needs the account module.
     from scripts.whoami.account import kern_procargs2, procargs2_parts
 
-    parts = procargs2_parts(kern_procargs2(pid), _needed)
+    parts = procargs2_parts(kern_procargs2(pid), _captured_launch_variable)
     return list(parts.arguments), parts.environment
 
 

@@ -514,7 +514,8 @@ ASK_HEADINGS = {the_list.AskKind.GO: "Needs your go", the_list.AskKind.APPROVAL:
 ASK_BUTTONS = {the_list.AskKind.GO: "Go", the_list.AskKind.APPROVAL: "Approved"}
 ASK_NOTES = {the_list.AskKind.GO: "Pressing Go sends your go to {agent}.",
              the_list.AskKind.APPROVAL: "Pressing Approved sends your approval to {agent}."}
-STAFF_ROLES = {"showrunner": "a showrunner", "unit": "a unit director", "worker": "a worker", "producer": "a producer"}
+STAFF_ROLES = {"showrunner": "a showrunner", "unit": "a unit director", "worker": "a worker",
+               "producer": "a producer", "session": "a standalone session"}
 UNIT_ROLES = {"direct": "a unit director", "merge": "the merge director", "style": "the style director"}
 
 
