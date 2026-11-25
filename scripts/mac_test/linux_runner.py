@@ -38,12 +38,10 @@ from scripts.lib.dev_shell import (
 from scripts.mac_test import floor_claims
 
 if TYPE_CHECKING:
-    from scripts.copies import copies
     from scripts.lib import build_copies, build_folders
     from scripts.lib.boot_identity import boot_identity as boot_identity
     from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
 else:
-    from scripts.copies import copies
     from scripts.lib import build_folders
     from scripts.lib.boot_identity import boot_identity as boot_identity
     from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
@@ -244,35 +242,6 @@ def shell_environment_script(shell: ShellEnvironment) -> str:
 def normalize_tool_version(value: str) -> str:
     """Keep each nonempty version line in one common form."""
     return ' '.join(line.strip() for line in value.splitlines() if line.strip())
-
-
-def tool_version_filter() -> str:
-    """Use the same normalizer for versions read by Bash."""
-    code = "\n".join((
-        "import sys",
-        "from scripts.mac_test.linux_runner import normalize_tool_version",
-        "print(normalize_tool_version(sys.stdin.read()))",
-    ))
-    return f'"$HOME/.claude/scripts/lib/py" -c {shlex.quote(code)}'
-
-
-def probe_script(mirror: str, *, shell_environment: bool = False) -> str:
-    """Read Linux disk capacity and the public tool versions."""
-    return '\n'.join((
-        ':' if shell_environment else 'export PATH="$HOME/.cargo/bin:$PATH"',
-        copies.mirror_probe_setup(mirror),
-        f'checkout="$HOME"/{shlex.quote(mirror)}',
-        'disk_usage=$(df -Pk "$checkout") || exit 1',
-        'free_gib=$(printf \'%s\\n\' "$disk_usage" | awk \'NR > 1 {if (!seen || $4 < free) free=$4; seen=1} END {printf "%.6f", free / 1048576}\') || exit 1',
-        'printf \'free_gib=%s\\nhost=%s\\n\' "$free_gib" "$(hostname -s)"',
-        'nextest_version=$(cargo-nextest nextest --version) || exit 1',
-        'mend_version=$(cargo-mend mend --version) || exit 1',
-        f'nextest_version=$(printf \'%s\' "$nextest_version" | {tool_version_filter()}) || exit 1',
-        f'mend_version=$(printf \'%s\' "$mend_version" | {tool_version_filter()}) || exit 1',
-        'scripts_commit=$(cat "$HOME/.claude/.build-target-script-commit") || exit 1',
-        'printf \'nextest=%s\\nmend=%s\\nscripts_commit=%s\\nrc=0\\n\' '
-        + '"$nextest_version" "$mend_version" "$scripts_commit"',
-    ))
 
 
 class SlotRun(TypedDict):

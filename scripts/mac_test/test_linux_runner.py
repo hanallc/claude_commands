@@ -23,7 +23,7 @@ from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.mac_test import eligibility, floor_claims, linux_runner, offload
+from scripts.mac_test import eligibility, linux_runner, offload
 from scripts.mac_test.offload_test_commands import WORKSPACE_SWEEP_SETTINGS
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 
@@ -107,16 +107,6 @@ lint)
     printf 'warm\n' > "$target/warm-proof"
     exit "${FAKE_LINT_STATUS:-0}"
     ;;
-df)
-    has_argument -g "$@" && { echo "Linux must not use df -g" >&2; exit 1; }
-    free=${FAKE_FREE_GIB:-100}
-    available=$((free * 1024 * 1024))
-    has_argument -B1 "$@" && available=$((free * 1024 * 1024 * 1024))
-    for argument in "$@"; do
-        [[ $argument == -*G* ]] && available=${free}G
-    done
-    printf 'Filesystem Blocks Used Available Use%% Mounted on\nfixture 999999999 0 %s 1%% /\n' "$available"
-    ;;
 rustc)
     [[ $# == 1 && $1 == -V ]] || { echo "Unexpected rustc arguments: $*" >&2; exit 1; }
     printf 'rustc %s\n' "${TEST_SHELL_TOOL_VERSION-fixture}"
@@ -129,8 +119,8 @@ rustup)
         exit 1
     fi
     ;;
-cargo|cargo-nextest|cargo-mend)
-    if [[ $tool == cargo && "$*" == "metadata --format-version 1 --no-deps" && $# == 4 ]]; then
+cargo)
+    if [[ "$*" == "metadata --format-version 1 --no-deps" && $# == 4 ]]; then
         [[ -f Cargo.toml ]] || exit 101
         if [[ -n ${FAKE_CARGO_NEEDS_TOOLCHAIN-} && -z ${RUSTUP_TOOLCHAIN-} \
               && ! -f rust-toolchain && ! -f rust-toolchain.toml ]]; then
@@ -147,16 +137,8 @@ cargo|cargo-nextest|cargo-mend)
         printf '{"workspace_root": %s, "target_directory": %s}\n' "$workspace" "$REPLY"
         exit 0
     fi
-    [[ $# == 2 && $2 == --version && ($1 == nextest || $1 == mend) ]] \
-        || { echo "Unexpected $tool arguments: $*" >&2; exit 1; }
-    if [[ $1 == nextest && -n ${TEST_NEXTEST_VERSION+set} ]]; then
-        printf '%s\n' "$TEST_NEXTEST_VERSION"
-    else
-        printf '%s %s\n' "$1" "${TEST_SHELL_TOOL_VERSION-fixture}"
-    fi
-    ;;
-hostname)
-    echo fake-linux
+    echo "Unexpected cargo arguments: $*" >&2
+    exit 1
     ;;
 rm)
     if [[ ${FAKE_RM_FAIL-} == 1 ]]; then
@@ -220,7 +202,7 @@ class LinuxShellTests(unittest.TestCase):
         self.event_path = self.root / "events.jsonl"
         tools = self.root / "bin"
         tools.mkdir()
-        for tool in ("nix", "df", "rm", "rustup", "cargo", "cargo-nextest", "cargo-mend"):
+        for tool in ("nix", "rm", "rustup", "cargo"):
             self.write_tool(tools / tool)
         self.write_tool(self.root / ".claude/scripts/lint/lint")
         _ = copy_helpers(self.root, *COPY_HELPERS)
@@ -313,69 +295,6 @@ class LinuxShellTests(unittest.TestCase):
                         if inherited:
                             self.assertTrue((self.root / ".rustup" / (inherited + ".lock")).exists())
                             self.assertEqual(self.events("rustup")[-1]["environment"]["RUSTUP_TOOLCHAIN"], inherited)
-
-    def test_probe_uses_direct_tools_without_reading_rustc(self) -> None:
-        script = linux_runner.probe_script("mirror")
-        self.assertNotIn("rustc -V", script)
-        self.assertNotIn("cargo nextest", script)
-        self.assertNotIn("cargo mend", script)
-        self.assertIn("cargo-nextest nextest --version", script)
-        self.assertIn("cargo-mend mend --version", script)
-
-    def test_probe_uses_linux_disk_units_and_reports_all_parity_fields(self) -> None:
-        for tool in ("rustc", "cargo", "hostname"):
-            self.write_tool(self.root / "bin" / tool)
-        stamp = self.root / ".claude/.build-target-script-commit"
-        _ = stamp.write_text("fixture-commit\n")
-        # Probe a registered mirror so the disk and tool checks do not start the setup helper.
-        _ = (self.mirror / floor_claims.MIRROR_MARK).write_text("registered remote mirror\n")
-
-        result = subprocess.run(
-            ["bash", "-c", offload.probe_script(self.identity, "linux", 2)], cwd=self.root,
-            env=self.environment, text=True, capture_output=True, check=False, timeout=5,
-        )
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        values = dict(line.split("=", 1) for line in result.stdout.splitlines())
-        self.assertEqual(float(values["free_gib"]), 100.0)
-        self.assertNotIn("rustc", values)
-        self.assertEqual(values["nextest"], "nextest fixture")
-        self.assertEqual(values["mend"], "mend fixture")
-        self.assertEqual(values["scripts_commit"], "fixture-commit")
-        self.assertNotIn("-g", self.events("df")[-1]["args"])
-
-    def test_probe_disk_units_do_not_depend_on_the_mirror_path(self) -> None:
-        identity = eligibility.KnownRepository("phase-copy", "https://example.com/team/GiB")
-        mirror = self.root / offload.remote_mirror(identity, "linux", 2)
-        mirror.mkdir(parents=True)
-        for tool in ("rustc", "cargo", "hostname"):
-            self.write_tool(self.root / "bin" / tool)
-        _ = (self.root / ".claude/.build-target-script-commit").write_text("fixture-commit\n")
-
-        result = subprocess.run(
-            ["bash", "-c", offload.probe_script(identity, "linux", 2)], cwd=self.root,
-            env=self.environment, text=True, capture_output=True, check=False, timeout=5,
-        )
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        values = dict(line.split("=", 1) for line in result.stdout.splitlines())
-        self.assertEqual(float(values["free_gib"]), 100.0)
-
-    def test_multiline_probe_versions_keep_one_record_per_tool(self) -> None:
-        for tool in ("rustc", "cargo", "hostname"):
-            self.write_tool(self.root / "bin" / tool)
-        _ = (self.root / ".claude/.build-target-script-commit").write_text("fixture-commit\n")
-        self.environment["TEST_NEXTEST_VERSION"] = (
-            " cargo-nextest 0.9.143 \n release: 0.9.143\n commit: abc\n date: today\n host: linux \n")
-
-        result = subprocess.run(["bash", "-c", offload.probe_script(self.identity, "linux", 2)],
-            cwd=self.root, env=self.environment, text=True, capture_output=True, check=False, timeout=5)
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        values = dict(line.split("=", 1) for line in result.stdout.splitlines())
-        self.assertEqual(values["nextest"],
-            "cargo-nextest 0.9.143 release: 0.9.143 commit: abc date: today host: linux")
-        self.assertIsInstance(offload.parse_probe(result.stdout), offload.ProbeSnapshot)
 
 
 class LinuxProcessTests(unittest.TestCase):

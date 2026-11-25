@@ -7,8 +7,6 @@ import json
 import os
 import shutil
 import socket
-import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -18,8 +16,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import override
 from unittest import mock
-
-from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.buildlog import cli, disk, filesystem, report
 from scripts.buildlog import store
@@ -133,54 +129,6 @@ class DiskTests(unittest.TestCase):
         with mock.patch.object(linux_runner, "read_cargo_output_roots", return_value=outputs), \
              mock.patch.object(shutil, "disk_usage", side_effect=[(100, 10, 90), (100, 10, 90), (100, 99, 1)]):
             self.assertEqual(linux_runner.output_free_bytes(base), 1)
-
-    def run_linux_probe(self) -> subprocess.CompletedProcess[str]:
-        base = self.base()
-        checkout = base / "checkout"
-        checkout.mkdir()
-        _ = (checkout / "Cargo.toml").write_text('[workspace]\n')
-        installed = base / ".claude"
-        _ = copy_helpers(base, *COPY_HELPERS)
-        _ = (installed / ".build-target-script-commit").write_text("fixture\n")
-        support = base / "support"
-        support.mkdir()
-        capacities = {str(base): 97, str(checkout): 91}
-        _ = (support / "capacity.json").write_text(json.dumps(capacities))
-        tools = base / ".cargo" / "bin"
-        tools.mkdir(parents=True)
-        stub = (
-            f"#!{sys.executable}\n"
-            + "import json, os, sys\nfrom pathlib import Path\n"
-            + "tool = Path(sys.argv[0]).name\n"
-            + "support = Path(os.environ['PROBE_SUPPORT'])\n"
-            + "if tool in ('cargo', 'rustc'):\n"
-            + "    raise AssertionError(sys.argv)\n"
-            + "elif tool == 'df':\n"
-            + "    print('Filesystem Blocks Used Available Use% Mounted on')\n"
-            + "    capacities = json.loads((support / 'capacity.json').read_text())\n"
-            + "    for path in sys.argv[2:]:\n"
-            + "        if not Path(path).is_dir():\n            raise SystemExit(1)\n"
-            + "        print('fixture 999999999 0', capacities[path] * 1024 ** 2, '1%', path)\n"
-            + "else:\n    print(tool + ' fixture')\n"
-        )
-        for tool in ("cargo", "rustc", "cargo-nextest", "cargo-mend", "df", "hostname"):
-            path = tools / tool
-            _ = path.write_text(stub)
-            path.chmod(0o755)
-        environment = {
-            **os.environ, "HOME": str(base), "PYTHONPATH": str(support),
-            "PROBE_SUPPORT": str(support),
-        }
-        return subprocess.run(["bash", "-c", linux_runner.probe_script("checkout")],
-                              env=environment, capture_output=True, text=True, check=False)
-
-    def test_linux_probe_reports_checkout_capacity_without_cargo_or_rustc(self) -> None:
-        result = self.run_linux_probe()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("free_gib=91.000000\n", result.stdout)
-        self.assertIn("nextest=cargo-nextest fixture\n", result.stdout)
-        self.assertIn("mend=cargo-mend fixture\n", result.stdout)
-        self.assertIn("rc=0\n", result.stdout)
 
     def test_linux_capacity_retries_parent_when_output_is_removed_during_measurement(self) -> None:
         base = self.base()

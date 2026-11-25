@@ -1811,9 +1811,6 @@ _MAC_DISK_PROBE = (
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
     from scripts.copies import copies
 
-    if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
-        from scripts.mac_test import linux_runner
-        return linux_runner.probe_script(remote_mirror(repository, target, slot))
     return copies.mirror_probe_setup(remote_mirror(repository, target, slot)) + "\n" + _MAC_DISK_PROBE
 
 

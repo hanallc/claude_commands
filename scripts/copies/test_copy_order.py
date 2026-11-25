@@ -1604,7 +1604,8 @@ placement_once
 
         admitted = self.root / "admitted-source"
         invoked = self.root / "hana-runner-invoked"
-        tools.write_executable(tools.runner, f"#!/bin/sh\ntouch {shlex.quote(str(invoked))}\nexit 1\n")
+        tools.write_executable(tools.runner,
+            f"from pathlib import Path\nPath({str(invoked)!r}).touch()\nraise SystemExit(1)\n")
         verify = CHECKOUT / "scripts/direct/verify.sh"
         startup = self.root / "stage-source-record.sh"
         _ = startup.write_text(
