@@ -1324,6 +1324,25 @@ Python's default SIGINT raises `KeyboardInterrupt` and runs the existing cleanup
 `defer_cleanup_signals` retains its signal mask during normal cleanup.
 It uses `pthread_sigmask` and installs no handler.
 
+### Tests outside the queue
+
+The Builds page lists live commands above the direct test CPU limit.
+It scans agent and detached scopes and excludes session launchers, agents, bare shells, and queued work.
+The table shows Command, Owner, PID, Age, Current CPU, and CPU total.
+The last column has a Stop button and an empty heading.
+An empty table shows “No test runs outside the queue now.”
+
+Current CPU shows a whole percent from the change in live process CPU between readings.
+The first reading shows a dash.
+CPU total shows whole seconds from live process CPU and the root command's reaped child CPU.
+Detached scopes use the cgroup CPU counter for both readings.
+
+Stop requires the Builds operator, the same origin, and the console request token.
+The server checks the current queue, rescans the processes, and matches the PID and start time.
+It sends SIGTERM only to verified processes in that row.
+The button shows “Stopping” until a refresh removes the row.
+A refusal or failure restores the button and shows `Not stopped: <reason>` below the row.
+
 ### Startup, cut-over, and rollback
 
 The system socket starts the system service as the user. The service runs outside `builds.slice` with `OOMScoreAdjust=-900`.

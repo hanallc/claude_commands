@@ -2755,3 +2755,13 @@ The admission service restores the anchor it saved for that move.
 The console and the admission socket reject fields outside the request type.
 The admission service commits the move on its loop and replays the reply for a repeated request ID.
 The console returns HTTP 409 with the current order when it detects a conflict.
+
+### Stop a command outside the queue
+
+The Builds page requests a token with `GET /console/builds/outside-stop`.
+It sends the token, PID, and start time to `POST /console/builds/outside-stop`.
+The route uses the queue move operator, live mode, Host, Origin, token, and request size and time checks.
+The server reads the current queue and checks the process identity in a new scan.
+It returns HTTP 200 with the result when it sends SIGTERM.
+It returns HTTP 409 with a reason when the command has no current row.
+Refusals and failures include a reason.

@@ -501,8 +501,19 @@ body.queue-unavailable [data-page-action^="builds-"] { display: none; }
 .leftover-row { display: grid; grid-template-columns: minmax(0, 1fr) max-content max-content; gap: 4px 16px; padding: 5px 0; }
 .leftover-row .age { white-space: nowrap; }
 .leftover-row .detail { color: var(--ink-2); overflow-wrap: anywhere; }
-.outside-queue-row { grid-template-columns: minmax(0, 1fr) max-content; }
-.outside-queue-row + .outside-queue-row { border-top: 1px solid var(--line); }
+.outside-queue-table { overflow-x: auto; }
+.outside-queue-table table { width: 100%; border-collapse: collapse; }
+.outside-queue-table :is(th, td) { padding: 6px 12px; text-align: left; }
+.outside-queue-table :is(th, td):first-child { padding-left: 0; overflow-wrap: anywhere; }
+.outside-queue-table :is(th, td):last-child { padding-right: 0; }
+.outside-queue-table th { font-weight: 600; }
+.outside-queue-table tbody tr { border-top: 1px solid var(--line); }
+.outside-queue-table .num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.outside-queue-table button { color: var(--ink); background: var(--card); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 10px; font: inherit; cursor: pointer; }
+.outside-queue-table button:disabled { cursor: default; opacity: .65; }
+.outside-queue-table .outside-stop-result { border-top: 0; }
+.outside-stop-result td { padding-top: 0; }
 .report-window { color: var(--ink-2); font-size: 0.85rem; }
 .report-top-row { margin: 0; padding: 10px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .report-top-row:last-child { border-bottom: 0; }
@@ -730,9 +741,9 @@ small .aws-point { cursor: help; }
     <div id="build-limits-content"></div>
   </details>
 
-  <section class="card" id="outside-queue" hidden>
-    <div class="section-head">Tests outside the queue</div>
-    <div id="outside-queue-rows"></div>
+  <section class="card" id="outside-queue" hidden aria-labelledby="outside-queue-heading">
+    <div class="section-head" id="outside-queue-heading">Tests outside the queue</div>
+    <div class="outside-queue-table" id="outside-queue-rows"></div>
   </section>
 
   <section class="card" id="aws-costs" aria-label="AWS costs">
@@ -2421,6 +2432,12 @@ function programMemoryHtml(memory, amounts) {
 }
 let displayedQueue = null;
 function pageTooltipHtml(key, data) {
+  if (key.startsWith("outside:")) {
+    const row = (data.outside_queue || []).find(row => outsideQueueKey(row) === key);
+    return row ? tipRowsHtml([field(row.command, "", "title"), field("PID", String(row.pid)),
+      field("Age", outsideQueueAge(row)), field("Current CPU", outsideQueueCpu(row)),
+      field("CPU total", outsideQueueTotal(row))]) : "";
+  }
   if (!key.startsWith("limit:")) {
     const queueTip = key.startsWith("held:") || key.startsWith("wait:");
     return tooltipHtml(key, queueTip && displayedQueue ? displayedQueue : data);
@@ -2826,16 +2843,81 @@ function renderLeftovers(d) {
   $("leftover-rows").innerHTML = rows.length ? rows.join("") : "No leftover processes.";
 }
 
+const outsideStopPath = "/console/builds/outside-stop";
+const outsideStops = new Map();
+
+function outsideQueueKey(row) { return `outside:${row.pid}:${row.start_time}`; }
+function validOutsideQueuePid(pid) { return Number.isInteger(pid) && pid > 1 && pid <= 2147483647; }
+function outsideQueueCanStop(row) {
+  return validOutsideQueuePid(row.pid) && typeof row.start_time === "string" && /^[0-9]{1,20}$/.test(row.start_time);
+}
+function outsideQueueAge(row) {
+  if (!Number.isFinite(row.age_seconds) || row.age_seconds < 0) return "—";
+  return row.age_seconds < 60 ? `${Math.floor(row.age_seconds)} s` : durationMinutes(row.age_seconds / 60);
+}
+function outsideQueueCpu(row) { return row.current_cpu == null ? "—" : `${row.current_cpu.toFixed(0)}%`; }
+function outsideQueueTotal(row) { return `${row.cpu_seconds.toFixed(0)} s`; }
+
 function renderOutsideQueue(d) {
   const rows = d.outside_queue || [];
-  $("outside-queue").hidden = rows.length === 0;
-  $("outside-queue-rows").innerHTML = rows.map(row => {
+  const keys = new Set(rows.map(outsideQueueKey));
+  for (const key of outsideStops.keys()) {
+    if (!keys.has(key)) outsideStops.delete(key);
+  }
+  $("outside-queue").hidden = false;
+  const target = $("outside-queue-rows");
+  if (!rows.length) {
+    target.textContent = "No test runs outside the queue now.";
+    return;
+  }
+  const body = rows.map(row => {
     const owner = row.owner || "Owner unknown";
     const names = row.unit && row.unit !== owner
       ? `${staffName(row.unit)} · ${staffName(owner)}` : staffName(owner);
-    return `<div class="leftover-row outside-queue-row"><span class="detail">${names} · ${esc(row.command)}</span><span class="num">${row.cpu_seconds.toFixed(1)} s CPU</span></div>`;
+    const identity = `${row.pid}-${row.start_time}`;
+    const reason = outsideStops.get(outsideQueueKey(row))?.reason;
+    const stopping = reason === "";
+    const status = reason ? `<tr class="outside-stop-result"><td colspan="7" role="status">Not stopped: ${esc(reason)}</td></tr>` : "";
+    const button = outsideQueueCanStop(row)
+      ? `<button type="button" id="outside-stop-${esc(identity)}" data-outside-stop aria-label="${stopping ? "Stopping" : "Stop"} Pid ${row.pid}"` +
+        `${stopping ? " disabled>Stopping" : ">Stop"}</button>`
+      : "";
+    return `<tr class="outside-queue-row" data-tip="${esc(outsideQueueKey(row))}">` +
+      `<th scope="row">${esc(row.command)}</th><td>${names}</td><td class="num">${validOutsideQueuePid(row.pid) ? row.pid : "—"}</td>` +
+      `<td class="num">${outsideQueueAge(row)}</td><td class="num">${outsideQueueCpu(row)}</td>` +
+      `<td class="num">${outsideQueueTotal(row)}</td><td>${button}</td></tr>${status}`;
   }).join("");
+  target.innerHTML = `<table aria-labelledby="outside-queue-heading"><thead><tr>` +
+    `<th scope="col">Command</th><th scope="col">Owner</th><th scope="col" class="num">Pid</th>` +
+    `<th scope="col" class="num">Age</th><th scope="col" class="num">Current CPU</th>` +
+    `<th scope="col" class="num">CPU total</th><th scope="col"></th></tr></thead><tbody>${body}</tbody></table>`;
 }
+
+$("outside-queue-rows").addEventListener("click", async event => {
+  const button = event.target.closest("[data-outside-stop]");
+  if (!button || button.disabled) return;
+  event.stopPropagation();
+  const key = button.closest("[data-tip]").dataset.tip;
+  const row = latest?.outside_queue?.find(row => outsideQueueKey(row) === key);
+  if (!row || !outsideQueueCanStop(row)) return;
+  const stop = {reason:""};
+  outsideStops.set(key, stop);
+  renderOutsideQueue(latest);
+  try {
+    const access = await fetch(outsideStopPath, {cache:"no-store"});
+    const {token, reason} = await access.json();
+    if (!access.ok || !token) throw new Error(reason || "Stop is unavailable.");
+    const response = await fetch(outsideStopPath, {method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({pid:row.pid, start_time:row.start_time, token})});
+    const reply = await response.json();
+    if (response.ok && reply.result === "stopped") return;
+    throw new Error(reply.reason || "Stop is unavailable.");
+  } catch (error) {
+    if (outsideStops.get(key) !== stop) return;
+    stop.reason = (error.message || "Stop is unavailable.").replace(/\s+/g, " ");
+    renderOutsideQueue(latest);
+  }
+});
 
 function reportCost(value, unit = "h/day") {
   if (value.state === "unavailable") return `unavailable: ${value.reason}`;

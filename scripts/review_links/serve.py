@@ -39,7 +39,7 @@ STARTED_NS = time.time_ns()
 
 from scripts.disks import disks_page, sessions, slots
 from scripts.aws_target import aws_page, machines_page
-from scripts.build_queue import admission_client, admission_protocol as admission, memory_files
+from scripts.build_queue import admission_client, admission_protocol as admission, memory_feed, memory_files
 from scripts.lib import atomic_file, conf, scratch
 from scripts.lib.file_lock import exclusive
 from scripts.lib.process_group import run_process_group
@@ -57,6 +57,7 @@ LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
 MAX_NEW_ITEM_BODY = (4 * ((new_item_dialog.MAX_TOTAL_IMAGE_BYTES + 2) // 3) + 256 * 1024
                      + new_item_dialog.MAX_PAGE_DATA_BYTES + new_item_dialog.MAX_BUG_PAGE_STATE_BYTES)
 QUEUE_MOVE_PATH = "/console/builds/queue-move"
+OUTSIDE_STOP_PATH = "/console/builds/outside-stop"
 # A send to one of these pages, or to a change browser, can wait for Undo. The largest is a New item with its images.
 HELD_SEND_PATHS = frozenset((review_page.PAGE_PATH, list_page.PAGE_PATH, images.PAGE_PATH, review_page.NEW_ITEM_PATH))
 HELD_SEND_LIMIT = MAX_NEW_ITEM_BODY
@@ -1010,6 +1011,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path == QUEUE_MOVE_PATH:
             self.queue_move_token(route.query)
             return None
+        if route.path == OUTSIDE_STOP_PATH:
+            self.outside_stop_token(route.query)
+            return None
         if route.path == go_ledger.GO_CHECK_PATH:
             self.go_check(route.query)
             return None
@@ -1319,6 +1323,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         if route.path == QUEUE_MOVE_PATH:
             self.queue_move_post(route.query)
+            return
+        if route.path == OUTSIDE_STOP_PATH:
+            self.outside_stop_post(route.query)
             return
         refusal = self.tailscale_refusal()
         if refusal:
@@ -2049,7 +2056,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 server.review_cache.invalidate()
         return change_page.DeliveryUnconfirmed()
 
-    def queue_move_allowed(self, *, origin_required: bool) -> bool:
+    def builds_action_allowed(self, *, origin_required: bool) -> bool:
         if self.tailscale_refusal() or not self.same_origin(required=origin_required):
             return False
         server = cast(ReviewLinksServer, self.server)
@@ -2061,7 +2068,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         settings = conf.read_or_repository("build_queue")
         try:
-            allowed = self.queue_move_allowed(origin_required=False)
+            allowed = self.builds_action_allowed(origin_required=False)
             highlight = settings.number("move_highlight_seconds") if allowed else 0
         except ValueError:
             allowed = False
@@ -2072,32 +2079,34 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         server = cast(ReviewLinksServer, self.server)
         self.json_response(200, {"token": server.new_item_token, "highlight_seconds": highlight})
 
+    def read_builds_action(self, query: str, action: str, limit: int, timeout: float) -> dict[str, object]:
+        if query or self.headers.get_content_type() != "application/json":
+            raise ValueError(f"Send a {action} as JSON.")
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdecimal():
+            raise ValueError(f"Invalid {action} request size.")
+        length = int(lengths[0])
+        if not 0 < length <= limit or self.headers.get_all("Transfer-Encoding"):
+            raise ValueError(f"Invalid {action} request size.")
+        connection = cast(socket.socket, self.connection)
+        previous_timeout = connection.gettimeout()
+        connection.settimeout(timeout)
+        try:
+            payload = cast(object, json.loads(self.rfile.read(length)))
+        finally:
+            connection.settimeout(previous_timeout)
+        if not isinstance(payload, dict):
+            raise ValueError(f"Send one {action}.")
+        return cast(dict[str, object], payload)
+
     def queue_move_post(self, query: str) -> None:
         settings = conf.read_or_repository("build_queue")
         try:
-            if not self.queue_move_allowed(origin_required=True):
+            if not self.builds_action_allowed(origin_required=True):
                 self.json_response(403, {"reason": "Queue moves require the operator's Tailscale account."})
                 return
-            if query or self.headers.get_content_type() != "application/json":
-                raise ValueError("Send a queue move as JSON.")
-            lengths = self.headers.get_all("Content-Length", [])
-            limit = settings.whole("move_request_bytes")
-            if len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdecimal():
-                raise ValueError("Invalid queue move request size.")
-            length = int(lengths[0])
-            if not 0 < length <= limit or self.headers.get_all("Transfer-Encoding"):
-                raise ValueError("Invalid queue move request size.")
             timeout = settings.number("move_timeout_seconds")
-            connection = cast(socket.socket, self.connection)
-            previous_timeout = connection.gettimeout()
-            connection.settimeout(timeout)
-            try:
-                payload = cast(object, json.loads(self.rfile.read(length)))
-            finally:
-                connection.settimeout(previous_timeout)
-            if not isinstance(payload, dict):
-                raise ValueError("Send one queue move.")
-            fields = cast(dict[str, object], payload)
+            fields = self.read_builds_action(query, "queue move", settings.whole("move_request_bytes"), timeout)
             if not self.valid_request_token(fields.pop("token", None)):
                 self.json_response(403, {"reason": "The queue move token expired. Refresh Builds."})
                 return
@@ -2126,6 +2135,48 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         else:
             content = cast(dict[str, object], json.loads(admission.encode_record(result)))
             self.json_response(409 if isinstance(result, admission.QueueMoveConflict) else 200, content)
+
+    def outside_stop_token(self, query: str) -> None:
+        if self.command != "GET" or query:
+            self.json_response(400, {"reason": "Use the Stop button on the Builds page."})
+            return
+        if not self.builds_action_allowed(origin_required=False):
+            self.json_response(403, {"reason": "Stop requires the operator's Tailscale account."})
+            return
+        server = cast(ReviewLinksServer, self.server)
+        self.json_response(200, {"token": server.new_item_token})
+
+    def outside_stop_post(self, query: str) -> None:
+        try:
+            if not self.builds_action_allowed(origin_required=True):
+                self.json_response(403, {"reason": "Stop requires the operator's Tailscale account."})
+                return
+            settings = conf.read_or_repository("build_queue")
+            fields = self.read_builds_action(query, "Stop request", settings.whole("move_request_bytes"),
+                                             settings.number("move_timeout_seconds"))
+            if not self.valid_request_token(fields.pop("token", None)):
+                self.json_response(403, {"reason": "The Stop token expired. Refresh Builds."})
+                return
+            pid, start_time = fields.get("pid"), fields.get("start_time")
+            if (fields.keys() != {"pid", "start_time"} or type(pid) is not int or not 1 < pid <= 2**31 - 1
+                    or not isinstance(start_time, str) or re.fullmatch(r"[0-9]{1,20}", start_time) is None):
+                raise ValueError("Invalid process identity.")
+        except (ValueError, TypeError, TimeoutError, RecursionError) as error:
+            self.json_response(400, {"reason": str(error)})
+            return
+        try:
+            # Mine refreshes the queue and includes placement waiters.
+            result = memory_feed.stop_outside_command(
+                pid, start_time, lambda: admission_client.mine(""), memory_feed.FeedStaff(staff.snapshot()))
+        except (OSError, ValueError, admission.AdmissionUnavailable) as error:
+            self.browser_failure(503, "Could not check the current commands.", error)
+            return
+        if result == "stopped":
+            self.json_response(200, {"result": result})
+        elif result == "not a current row":
+            self.json_response(409, {"reason": result})
+        else:
+            self.json_response(503, {"reason": result.removeprefix("failed: ")})
 
     def tune_token(self, query: str) -> None:
         """Return the console request token for a Go confirmation."""

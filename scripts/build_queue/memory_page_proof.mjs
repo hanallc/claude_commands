@@ -13,7 +13,8 @@
 // Use --verify-call as the third argument for the Verify column proof.
 // Use --headcount to compare the Running and Queued headers.
 // Use --build-tools as the third argument for the Build tools proof.
-// Use --outside-queue as the third argument for the CPU time proof.
+// Use --outside-queue after the output folder to check the outside command table.
+// Add a published page from main to save the before image.
 // Use --queue-rows to capture the dark queue card, its tooltips, and its right edge.
 // Use the fourth argument to select the older page.
 // Use --guest-tip after the output folder for the guest row tooltip screenshot.
@@ -268,7 +269,7 @@ try {
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const systemTemporaryRoot = focusedProof || awsCostShots ? tmpdir() : fixtureOutput;
   const page = await readFile(join(liveAwsCostSource ?? folder, 'memory_live.html'));
-  const beforePath = queueRowsProof || standingProof ? comparison : focusedProof ? null : previousPage;
+  const beforePath = queueRowsProof || standingProof || outsideQueueProof ? comparison : focusedProof ? null : previousPage;
   const beforePage = beforePath ? (await readFile(beforePath, 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
   const swapBeforePage = !gateMode && process.env.SWAP_BEFORE_PAGE
@@ -429,7 +430,21 @@ try {
     if (unnamedPlace >= 0) members.splice(unnamedPlace, 0, unnamed);
     return {revision:reading.move_revision, members, kept_runs:[]};
   };
+  let outsideStopReply = {status:200, body:{result:'stopped'}};
   const server = createServer(async (req, res) => {
+    if (req.url === '/console/builds/outside-stop') {
+      if (req.method === 'POST') {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        res.writeHead(outsideStopReply.status, {'Content-Type':'application/json'});
+        res.end(JSON.stringify(outsideStopReply.body));
+        server.emit('outside-stop-request', JSON.parse(Buffer.concat(chunks)));
+      } else {
+        res.writeHead(200, {'Content-Type':'application/json'});
+        res.end(JSON.stringify({token:'outside-fixture-token'}));
+      }
+      return;
+    }
     if (req.url.split('?', 1)[0] === '/console/review/new-item') {
       res.writeHead(200, {'Content-Type':'application/json'});
       if (req.method === 'POST') {
@@ -587,7 +602,7 @@ try {
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
         const desktopWidth = gateMode ? 1400 : 1600;
         await call('Emulation.setDeviceMetricsOverride', {width:desktopWidth,height:1200,deviceScaleFactor:1,mobile:false});
-        const navigate = async path => {
+        const navigate = async (path, freezeRender = true) => {
           currentFixture = servedReading;
           const loaded = new Promise((resolve, reject) => events.set(`${sessionId}:Page.loadEventFired`, {resolve,reject}));
           await Promise.all([loaded, call('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/${path}`})]);
@@ -600,7 +615,7 @@ try {
           window.proofRun = index => latest.walk[index].key;
           window.renderReading = render;
           window.proofData = structuredClone(latest);
-          window.render = () => {};
+          if (${freezeRender}) window.render = () => {};
           await document.fonts.ready;
           const legend = document.querySelector('.legend-box');
           if (${JSON.stringify(path)} === 'memory_live.html' && legend.open) throw new Error('The legend starts open.');
@@ -618,48 +633,120 @@ try {
           break browserProof;
         }
         if (outsideQueueProof || !focusedProof) {
-          servedReading = readings.outside_queue;
-          await navigate('memory_live.html');
-          const result = await evaluate(`(() => {
+          const inspectOutside = () => evaluate(`(() => {
             const section = document.querySelector('#outside-queue');
             section.scrollIntoView({block:'center'});
-            const bounds = section.getBoundingClientRect();
-            const rows = Array.from(section.querySelectorAll('.outside-queue-row'), row => ({
-              cells:Array.from(row.children, cell => cell.textContent),
-              color:row.querySelector('.detail [data-color-text]')?.getAttribute('data-color-text'),
-            }));
             return {heading:section.querySelector('.section-head').textContent,
-              previousCard:section.previousElementSibling?.id,
-              nextCard:section.nextElementSibling?.id,
-              rows, visible:!section.hidden, clip:{x:bounds.left+scrollX,y:bounds.top+scrollY,
-              width:bounds.width,height:bounds.height,scale:1}};
+              previousCard:section.previousElementSibling?.id, nextCard:section.nextElementSibling?.id,
+              headers:Array.from(section.querySelectorAll('thead th'), cell => cell.textContent),
+              rows:Array.from(section.querySelectorAll('.outside-queue-row'), row => ({
+                cells:Array.from(row.children, cell => cell.textContent),
+                color:row.querySelector('[data-color-text]')?.getAttribute('data-color-text'),
+                clipped:Array.from(row.children).some(cell => cell.scrollWidth > cell.clientWidth),
+              })),
+              emptyText:section.querySelector('#outside-queue-rows').textContent,
+              visible:!section.hidden};
           })()`);
+          const saveOutside = async name => {
+            await evaluate("scrollTo(0, 0); document.querySelector('.legend-box').open = false;");
+            const {cssContentSize:{width,height}} = await call('Page.getLayoutMetrics');
+            const clip = {x:0,y:0,width:Math.max(desktopWidth,width),height,scale:1};
+            const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip});
+            await writeFile(join(folder, name), Buffer.from(shot.data, 'base64'));
+          };
+          servedReading = readings.outside_first;
+          await navigate('memory_live.html');
+          assert.deepEqual((await inspectOutside()).rows.map(row => row.cells[4]), ['—', '—']);
+          servedReading = readings.outside_queue;
+          await navigate('memory_live.html', false);
+          const result = await inspectOutside();
           assert.equal(result.visible, true);
           assert.equal(result.heading, 'Tests outside the queue');
           assert.equal(result.previousCard, 'build-limits', 'Tests outside the queue must follow Build limits.');
           assert.equal(result.nextCard, 'aws-costs', 'AWS costs must follow Tests outside the queue.');
-          assert.deepEqual(result.rows, [{cells:['queue · test · targeted_test.py', '136.0 s CPU'],
-            color:'role.unit-director'}]);
-          const output = join(folder, 'cpumark-dark.png');
-          const pageOutput = join(folder, 'cpumark-page-dark.png');
-          if (outsideQueueProof) {
-            const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:result.clip});
-            await writeFile(output, Buffer.from(shot.data, 'base64'));
-            await evaluate(`(() => {
-              document.querySelector('.legend-box').open = false;
-              scrollTo(0, 0);
-            })()`);
-            const {cssContentSize: {height}} = await call('Page.getLayoutMetrics');
-            const pageShot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,
-              clip:{x:0,y:0,width:desktopWidth,height,scale:1}});
-            await writeFile(pageOutput, Buffer.from(pageShot.data, 'base64'));
-          }
+          assert.deepEqual(result.headers, ['Command', 'Owner', 'Pid', 'Age', 'Current CPU', 'CPU total', '']);
+          assert.deepEqual(result.rows, [
+            {cells:['verify_cache_test.py', 'builds', '8112', '5 min', '25%', '153 s', 'Stop'],
+              color:'role.showrunner', clipped:false},
+            {cells:['targeted_test.py', 'queue · test', '8102', '5 min', '75%', '139 s', 'Stop'],
+              color:'role.unit-director', clipped:false},
+          ]);
           assert.equal(await evaluate(`(() => {
-            renderReading({...proofData, outside_queue:[]});
-            return document.querySelector('#outside-queue').hidden;
+            const row = document.querySelector('.outside-queue-row');
+            const box = row.getBoundingClientRect();
+            row.dispatchEvent(new PointerEvent('pointermove', {bubbles:true, pointerType:'mouse',
+              clientX:box.left + 10, clientY:box.top + 10}));
+            const values = [...document.querySelectorAll('#tip dd:not(.title)')];
+            return values.length === 4 && values.every(cell => getComputedStyle(cell).textAlign === 'right');
           })()`), true);
+          const stopButton = "document.querySelector('#outside-stop-8102-8102')";
+          const stopState = () => evaluate(`[
+            ...document.querySelectorAll('[data-outside-stop]')
+          ].map(button => [button.textContent, button.disabled])`);
+          for (const [status, reason] of [[409, 'not a current row'], [503, 'Access denied']]) {
+            outsideStopReply = {status, body:{reason}};
+            const posted = once(server, 'outside-stop-request', {signal:AbortSignal.timeout(5000)});
+            assert.deepEqual(await evaluate(`new Promise((resolve, reject) => {
+              const table = document.querySelector('#outside-queue-rows');
+              const row = ${stopButton}.closest('tr');
+              const key = row.dataset.tip;
+              const observer = new MutationObserver(() => {
+                const button = ${stopButton};
+                if (button.disabled) return;
+                const current = button.closest('tr');
+                clearTimeout(timeout);
+                observer.disconnect();
+                resolve({text:current.nextElementSibling?.textContent, button:button.textContent,
+                  sameRow:current.dataset.tip === key, lines:table.querySelectorAll('[role="status"]').length});
+              });
+              const timeout = setTimeout(() => { observer.disconnect(); reject(new Error('Stop gave no result')); }, 3000);
+              observer.observe(table, {childList:true});
+              ${stopButton}.click();
+            })`), {text:`Not stopped: ${reason}`, button:'Stop', sameRow:true, lines:1});
+            assert.deepEqual((await posted)[0], {pid:8102, start_time:'8102', token:'outside-fixture-token'});
+          }
+          outsideStopReply = {status:200, body:{result:'stopped'}};
+          const posted = once(server, 'outside-stop-request', {signal:AbortSignal.timeout(5000)});
+          await evaluate(`${stopButton}.click()`);
+          assert.deepEqual(await stopState(), [['Stop', false], ['Stopping', true]]);
+          await posted;
+          await evaluate('pageRefresh.refresh(true)');
+          assert.deepEqual(await stopState(), [['Stop', false], ['Stopping', true]]);
+          assert.equal(await evaluate("document.querySelectorAll('.outside-stop-result').length"), 0);
           if (outsideQueueProof) {
-            console.log(JSON.stringify({pass:true, views:2, output, pageOutput}));
+            await evaluate('hideTip()');
+            await saveOutside('i390-page-after-dark.png');
+          }
+          servedReading = {...readings.outside_queue, outside_queue:readings.outside_queue.outside_queue
+            .filter(row => row.pid !== 8102)};
+          await evaluate('pageRefresh.refresh(true)');
+          assert.deepEqual(await stopState(), [['Stop', false]]);
+          assert.equal(await evaluate(stopButton + ' === null'), true);
+          servedReading = readings.outside_empty;
+          await evaluate('pageRefresh.refresh(true)');
+          const empty = await inspectOutside();
+          assert.equal(empty.visible, true);
+          assert.equal(empty.emptyText, 'No test runs outside the queue now.');
+          assert.deepEqual(empty.rows, []);
+          servedReading = {...readings.outside_queue, outside_queue:[
+            {command:'older_test.py', owner:'builds', pid:8112, cpu_seconds:153},
+            {command:'missing_pid.py', owner:'builds', start_time:'8102', cpu_seconds:139},
+            {command:'invalid_identity.py', owner:'builds', pid:8104, start_time:'unknown', cpu_seconds:132},
+          ]};
+          await evaluate('pageRefresh.refresh(true)');
+          assert.deepEqual((await inspectOutside()).rows.map(row => [row.cells[2], row.cells[3], row.cells[6]]),
+            [['8112', '—', ''], ['—', '—', ''], ['8104', '—', '']]);
+          assert.deepEqual(await stopState(), []);
+          if (outsideQueueProof) {
+            if (beforePage) {
+              servedReading = readings.outside_queue;
+              await navigate('before.html');
+              const before = await inspectOutside();
+              assert.equal(before.rows.length, result.rows.length);
+              assert.deepEqual(before.headers, []);
+              await saveOutside('i390-page-before-dark.png');
+            }
+            console.log(JSON.stringify({pass:true, rows:result.rows.length}));
             break browserProof;
           }
         }

@@ -7297,6 +7297,60 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(status, 409)
             move.assert_called_once_with(undo, 3)
 
+    def test_outside_stop_requires_the_operator_origin_and_token(self) -> None:
+        _ = write_config_fixture(conf.path("build_queue"), "move_timeout_seconds=3\nmove_request_bytes=512\n")
+        origin = f"http://127.0.0.1:{self.port}"
+        headers = {"Content-Type": "application/json"}
+        process = {"pid": 8102, "start_time": "3608400"}
+        body = json.dumps({**process, "token": self.server.new_item_token})
+        path = serve.OUTSIDE_STOP_PATH
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "builds_operator", return_value=False) as operator,
+              patch.object(memory_feed, "stop_outside_command") as stop):
+            self.assertEqual(self.request(path).status, 403)
+            self.assertEqual(self.post(path, body, origin=origin, headers=headers)[0], 403)
+            operator.return_value = True
+            self.assertEqual(self.post(path, body, headers=headers)[0], 403)
+            self.assertEqual(self.post(path, body, origin="http://other.invalid", headers=headers)[0], 403)
+            missing = self.post(path, json.dumps(process), origin=origin, headers=headers)
+            self.assertEqual(missing[0], 403)
+            self.assertEqual(json.loads(missing[1]), {"reason": "The Stop token expired. Refresh Builds."})
+            stop.assert_not_called()
+
+    def test_outside_stop_uses_the_current_queue_and_returns_the_result(self) -> None:
+        from scripts.build_queue import admission_client
+
+        _ = write_config_fixture(conf.path("build_queue"), "move_timeout_seconds=3\nmove_request_bytes=512\n")
+        origin = f"http://127.0.0.1:{self.port}"
+        headers = {"Content-Type": "application/json"}
+        reading = object()
+        members = staff.StaffSnapshot(())
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "builds_operator", return_value=True),
+              patch.object(staff, "snapshot", return_value=members),
+              patch.object(admission_client, "mine", return_value=reading) as current_queue,
+              patch.object(memory_feed, "stop_outside_command") as stop):
+            token_reply = self.request(serve.OUTSIDE_STOP_PATH)
+            self.assertEqual(token_reply.status, 200)
+            self.assertEqual(json.loads(token_reply.body), {"token": self.server.new_item_token})
+            body = json.dumps({"pid": 8102, "start_time": "3608400", "token": self.server.new_item_token})
+            for result, expected, reply in (
+                ("stopped", 200, {"result": "stopped"}),
+                ("not a current row", 409, {"reason": "not a current row"}),
+                ("failed: Access denied", 503, {"reason": "Access denied"}),
+            ):
+                with self.subTest(result=result):
+                    stop.return_value = result
+                    status, content = self.post(serve.OUTSIDE_STOP_PATH, body, origin=origin, headers=headers)
+                    self.assertEqual((status, json.loads(content)), (expected, reply))
+                    stop.assert_called_once_with(8102, "3608400", ANY, ANY)
+                    read_queue = cast(Callable[[], object], stop.call_args.args[2])
+                    self.assertIs(read_queue(), reading)
+                    owners = cast(memory_feed.FeedStaff, stop.call_args.args[3])
+                    self.assertIs(owners.members, members)
+                    stop.reset_mock()
+            self.assertEqual(current_queue.call_args_list, [call("")] * 3)
+
     def test_console_tune_requires_the_origin_and_token(self) -> None:
         key = "faster_box_max_cost_ratio"
         setting = console_tune.TunableSetting("console_tune_test", "AWS Machines",
