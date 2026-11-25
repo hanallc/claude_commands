@@ -1,6 +1,6 @@
 """Check the memory page hover with private captured readings."""
 from __future__ import annotations
-from scripts.build_queue import admission_records
+from scripts.build_queue import admission_records, admission_wire
 
 from dataclasses import replace
 import json
@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from xml.etree import ElementTree
 from typing import cast
 from scripts.lint import memory_admit as gate
@@ -304,6 +305,277 @@ class MemoryHoverTests(unittest.TestCase):
         rows = self.mac_owner_hover({"showrunner": "builds"})
         self.assertEqual([row for row in rows if row[0] == "Started by"], [])
         self.assertEqual([row for row in rows if row[1] == "builds"], [("Showrunner", "builds")])
+
+    def test_the_handler_mac_tooltip_shows_the_placement_caller(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        page = cast(object, json.loads(memory_feed.page_json(fixture.handler_mac_page())))
+        rows = cast(list[dict[str, object]], self.page_expression(
+            "tooltipRows('row:' + data.walk.find(row => row.kind === 'mac-build').key, data)", page))
+        self.assertEqual(rows[0]["label"], "handler · Phase 56c pass 2 stage CPU")
+        fields = {row["label"]: row["value"] for row in rows[1:]}
+        self.assertEqual(fields["Showrunner"], "cargo-liner")
+        self.assertNotIn("Worker", fields)
+        self.assertNotIn("Caller", fields)
+        self.assertNotIn("Started by", fields)
+        self.assertNotIn("unregistered session", str(rows))
+
+    def test_handler_tooltip_keeps_the_caller_unit_when_step_text_matches(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        for showrunner in ("cargo-liner", "release.service"):
+            with self.subTest(showrunner=showrunner):
+                reading = fixture.handler_mac_page(caller_production=showrunner, fixed_kind="worker",
+                                                   fixed_unit="infra", what="handler")
+                page = cast(object, json.loads(memory_feed.page_json(reading)))
+                actual = self.page_expression("""(() => {
+                  const row = data.walk.find(row => row.kind === 'mac-build');
+                  const [title, ...fields] = tooltipRows('row:' + row.key, data);
+                  return {title: title.label, owner: fields.filter(field => ['Showrunner', 'Worker'].includes(field.label))
+                    .map(field => [field.label, field.value]), queue: queueRowLabels(row)};
+                })()""", page)
+                self.assertEqual(actual, {"title": "handler", "owner": [["Showrunner", showrunner], ["Worker", "mirror"]],
+                    "queue": {"name": "infra", "unit": "infra", "owner": "builds", "step": "handler", "verify": ""}})
+
+    def test_handler_tooltip_shows_the_complete_structured_showrunner_name(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        reading = fixture.handler_mac_page(caller_production="release.service · builds", fixed_production="infra")
+        page = cast(object, json.loads(memory_feed.page_json(reading)))
+        markup = str(self.page_expression(
+            "tooltipHtml('row:' + data.walk.find(row => row.kind === 'mac-build').key, data)", page, walk=True))
+        tip = ElementTree.fromstring(markup)
+        cells = list(tip)
+        fields = {"".join(label.itertext()): "".join(value.itertext())
+                  for label, value in zip(cells[:-1], cells[1:], strict=True) if label.tag == "dt"}
+        self.assertEqual(fields.get("Showrunner"), "release.service · builds")
+        self.assertEqual(fields.get("handler · Phase 56c pass 2 stage CPU"), "running 1 min")
+        self.assertNotIn("Worker", fields)
+
+    def test_matched_mac_tooltip_keeps_the_recorded_caller(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        reading = fixture.handler_mac_page(caller_production="release$", fixed_kind="", stored_caller="")
+        rows = self.read_work_tooltip(reading, "mac-build")
+        fields = {row["label"]: row["value"] for row in rows[1:]}
+        self.assertEqual((fields.get("Caller"), fields.get("Worker"), fields.get("Showrunner")),
+                         ("impl2", "impl2", "release$"))
+
+    def test_matched_mac_tooltip_keeps_the_base_caller_when_the_placement_worker_differs(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        reading = fixture.handler_mac_page(fixed_kind="worker", fixed_production="release$",
+                                           stored_caller="recorded caller")
+        row, = (row for row in reading["walk"] if row.get("kind") == "mac-build")
+        self.assertEqual(row.get("caller"), "mirror")
+        rows = self.read_work_tooltip(reading, "mac-build")
+        fields = {row["label"]: row["value"] for row in rows[1:]}
+        self.assertEqual((fields.get("Caller"), fields.get("Worker"), fields.get("Showrunner")),
+                         ("mirror", "mirror", "cargo-liner"))
+
+    def test_mac_tooltip_shows_unknown_when_unit_spacing_differs_and_showrunner_is_filtered(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        reading = fixture.handler_mac_page(recorded_unit="core  services", caller_unit="core services",
+                                           fixed_kind="worker", fixed_unit="core  services",
+                                           fixed_production="release.service")
+        rows = self.read_work_tooltip(reading, "mac-build")
+        fields = {row["label"]: row["value"] for row in rows[1:]}
+        self.assertEqual(rows[0]["label"], "core services · Phase 56c pass 2 stage CPU")
+        self.assertEqual((fields.get("Showrunner"), fields.get("Worker")), ("unknown", "mirror"))
+
+    def test_mac_tooltip_preserves_the_base_owner_for_distinct_units_with_similar_names(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        for recorded_unit, caller_unit in (("core  services", "core services"), ("core services", "core  services")):
+            with self.subTest(recorded_unit=recorded_unit, caller_unit=caller_unit):
+                reading = fixture.handler_mac_page(recorded_unit=recorded_unit, caller_unit=caller_unit,
+                                                   fixed_kind="worker", fixed_unit=recorded_unit)
+                row, = (row for row in reading["walk"] if row.get("kind") == "mac-build")
+                self.assertNotIn("tooltip_owner_override", row)
+                rows = self.read_work_tooltip(reading, "mac-build")
+                fields = {row["label"]: row["value"] for row in rows[1:]}
+                self.assertEqual(rows[0]["label"], "core services · Phase 56c pass 2 stage CPU")
+                self.assertEqual((fields.get("Showrunner"), fields.get("Worker")), ("builds", "mirror"))
+
+    def test_mac_tooltip_matches_the_same_raw_two_space_unit_name(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        reading = fixture.handler_mac_page(recorded_unit="core  services", caller_unit="core  services")
+        rows = self.read_work_tooltip(reading, "mac-build")
+        fields = {row["label"]: row["value"] for row in rows[1:]}
+        self.assertEqual(rows[0]["label"], "core  services · Phase 56c pass 2 stage CPU")
+        self.assertEqual(fields.get("Showrunner"), "cargo-liner")
+
+    def test_mac_tooltip_shows_the_raw_unit_once_when_what_matches_it(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        reading = fixture.handler_mac_page(recorded_unit="core  services", caller_unit="core  services",
+                                           what="core  services")
+        rows = self.read_work_tooltip(reading, "mac-build")
+        self.assertEqual(rows[0]["label"], "core  services")
+        self.assertEqual([field["value"] for field in rows if field["label"] == "Showrunner"], ["cargo-liner"])
+
+    def test_mac_tooltip_uses_the_base_owner_when_the_matched_caller_has_no_showrunner(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        recorded_labels = unit_labels.recorded_member_labels
+
+        def labels_without_showrunner(snapshot: staff.StaffSnapshot, member: staff.StaffRow) -> unit_labels.UnitLabels:
+            labels = recorded_labels(snapshot, member)
+            return replace(labels, showrunner="") if member.name == "impl2" else labels
+
+        missing_marker = fixture.handler_mac_page(caller_production="—", fixed_production="infra")
+        with mock.patch.object(unit_labels, "recorded_member_labels", side_effect=labels_without_showrunner):
+            empty_label = fixture.handler_mac_page(fixed_production="infra")
+        for showrunner, reading in (("—", missing_marker), ("", empty_label)):
+            with self.subTest(showrunner=showrunner):
+                row, = (row for row in reading["walk"] if row.get("kind") == "mac-build")
+                self.assertNotIn("tooltip_owner_override", row)
+                rows = self.read_work_tooltip(reading, "mac-build")
+                self.assertEqual(rows[0]["label"], "infra: Phase 56c pass 2 stage CPU")
+                self.assertEqual([field["value"] for field in rows if field["label"] == "Showrunner"], ["infra"])
+
+    def test_guest_tooltip_keeps_the_showrunner_after_a_unit_rename(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        owner = unit_labels.make_labels("impl2", unit_labels.UnderShowrunner("builds", "", ""),
+                                       unit_labels.UnitWithoutRunningDirector("handler-v2"))
+        reading = fixture.guest_gate_page(unit="handler", owner=owner)
+        row = next(row for row in reading["walk"] if row["pid"] == 8200)
+        self.assertEqual((row["unit"], row.get("showrunner")), ("handler", "builds"))
+        page = cast(dict[str, object], json.loads(memory_feed.page_json(reading)))
+        tips, _ = fixture.render_assignment_table(page)
+        texts = "\n".join(tips["walk"][reading["walk"].index(row)]).splitlines()
+        self.assertIn("Showrunner  builds", texts)
+        self.assertNotIn("Showrunner  unknown", texts)
+
+    def test_unitless_tooltips_keep_the_base_memory_format_in_owner_names(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        mac = fixture.handler_mac_page(recorded_unit="other", fixed_production="release 1024 MiB")
+        aws = fixture.cloud_owner_page("nextest",
+            identity=admission_wire.Identity("", "release 1024 MiB", "nextest", ""))
+        for kind, reading in (("mac-build", mac), ("cloud", aws)):
+            with self.subTest(kind=kind):
+                row = next(row for row in reading["walk"] if row.get("kind") == kind)
+                self.assertEqual(row.get("showrunner"), "release 1024 MiB")
+                self.assertIn(row["unit"], ("", "—"))
+                rows = self.read_work_tooltip(reading, kind)
+                self.assertEqual([field["value"] for field in rows if field["label"] == "Showrunner"],
+                                 ["release 1.0 GiB"])
+
+    def read_work_tooltip(self, reading: memory_feed.MemoryPage, kind: str) -> list[dict[str, object]]:
+        page = cast(object, json.loads(memory_feed.page_json(reading)))
+        return cast(list[dict[str, object]], self.page_expression(
+            f"tooltipRows('row:' + data.walk.find(row => row.kind === {json.dumps(kind)}).key, data)", page))
+
+    def test_tooltips_show_unknown_when_the_browser_filters_the_showrunner(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        owner = unit_labels.make_labels("director", unit_labels.UnderShowrunner("release.service", "", ""),
+                                       unit_labels.DirectsUnit("research"))
+        reading = fixture.owner_machine_page(owner)
+        page = cast(object, json.loads(memory_feed.page_json(reading)))
+        actual = self.page_expression("""Object.fromEntries([['row', data.walk], ['wait', data.waiters]].flatMap(
+          ([key, rows]) => rows.map(row => [key + ':' + (row.kind || 'local'), [row.title.unit, row.showrunner,
+            tooltipRows(key + ':' + row.key, data).filter(field => field.label === 'Showrunner').map(field => field.value)]])))""",
+            page)
+        self.assertEqual(actual, {key: ["research", "release.service", ["unknown"]] for key in
+                                  ("row:local", "row:mac-build", "row:cloud", "wait:local", "wait:cloud")})
+
+    def test_older_mac_row_uses_its_title_unit_for_an_unknown_showrunner(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        owner = unit_labels.make_labels("director", unit_labels.UnderShowrunner("release.service", "", ""),
+                                       unit_labels.DirectsUnit("handler"))
+        reading = fixture.owner_machine_page(owner)
+        page = cast(object, json.loads(memory_feed.page_json(reading)))
+        rows = cast(list[dict[str, object]], self.page_expression("""(() => {
+          const row = data.walk.find(row => row.kind === 'mac-build');
+          delete row.tooltip_unit;
+          delete row.unit;
+          return tooltipRows('row:' + row.key, data);
+        })()""", page))
+        self.assertEqual(rows[0]["label"], "handler · nextest")
+        self.assertEqual([field["value"] for field in rows if field["label"] == "Showrunner"], ["unknown"])
+
+    def test_older_same_name_rows_use_the_base_unit_for_an_unknown_showrunner(self) -> None:
+        cases: tuple[tuple[str, dict[str, object]], ...] = (
+            ("native Mac", {"kind": "mac-build", "machine": "mac"}),
+            ("Mac Linux guest", {"machine": "mac-linux", "guest_run": {"target": "mac-linux", "attempt": "fixture"},
+                                 "used": {"kind": "RunUseUnavailable", "reason": "remote memory is unavailable"}}),
+            ("local", {"machine": "natedev", "queued": True}),
+            ("AWS", {"kind": "cloud", "machine": "aws"}),
+            ("ended-step hold", {"machine": "natedev", "queued": True, "between_steps": True, "reserved": 1}),
+        )
+        for kind, fields in cases:
+            with self.subTest(kind=kind):
+                row = {"name": "handler", "unit": "handler", "title": {"unit": "", "step": "handler"},
+                       "showrunner": "release.service", "started_at": 100, "used": 1, "reserved": 0, **fields}
+                rows = cast(list[dict[str, object]], self.page_expression(
+                    "tooltipRows('row:fixture-run-0', data)", {"walk": [row], "read_at": 200}))
+                self.assertEqual(rows[0]["label"], "handler")
+                self.assertEqual([field["value"] for field in rows if field["label"] == "Showrunner"], ["unknown"])
+
+    def test_unreadable_aws_gate_tooltip_shows_unknown_for_a_filtered_showrunner(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        owner = unit_labels.make_labels("director", unit_labels.UnderShowrunner("release.service", "", ""),
+                                       unit_labels.DirectsUnit("research"))
+        reading = fixture.gate_job_page("gate", (), owner=owner)
+        row, = (row for row in reading["walk"] if row.get("kind") == "cloud")
+        self.assertEqual((row["title"], row["unit"], row.get("showrunner")),
+                         ({"unit": "", "step": "research"}, "research", "release.service"))
+        self.assert_unknown_showrunner_in_tooltip(reading, row, "research")
+
+    def test_same_name_local_and_native_mac_steps_keep_the_tooltip_unit(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        owner = unit_labels.make_labels("director", unit_labels.UnderShowrunner("release.service", "", ""),
+                                       unit_labels.DirectsUnit("nextest"))
+        reading = fixture.owner_machine_page(owner, local_what="nextest")
+        local, = (row for row in reading["walk"] if row.get("queued"))
+        mac, = (row for row in reading["walk"] if row.get("kind") == "mac-build")
+        for row in (local, mac):
+            with self.subTest(kind=row.get("kind", "local")):
+                self.assertEqual(row["title"], {"unit": "", "step": "nextest"})
+                self.assertEqual(row["unit"], "nextest")
+                self.assert_unknown_showrunner_in_tooltip(reading, row, "nextest")
+
+    def test_same_name_ended_step_keeps_the_tooltip_unit(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        reading = fixture.ended_step_hold_page("test hana")
+        row, = reading["walk"]
+        self.assertEqual(row["title"], {"unit": "", "step": "test hana"})
+        self.assert_unknown_showrunner_in_tooltip(reading, row, "test hana")
+
+    def assert_unknown_showrunner_in_tooltip(self, reading: memory_feed.MemoryPage,
+                                            row: memory_feed.RowQueueNotes, title: str) -> None:
+        page = cast(object, json.loads(memory_feed.page_json(reading)))
+        key = row.get("key", "")
+        rows = cast(list[dict[str, object]], self.page_expression(
+            f"tooltipRows({json.dumps('row:' + key)}, data)", page))
+        self.assertEqual(rows[0]["label"], title)
+        self.assertEqual([field["value"] for field in rows[1:] if field["label"] == "Showrunner"], ["unknown"])
 
     def test_queue_rows_show_unit_showrunner_step_and_one_running_target(self) -> None:
         # nate, 2026-11-21 and 2026-11-23: the unit starts the row, the showrunner is the small text under it,
@@ -2235,6 +2507,17 @@ renderWalk = reading => { painted = reading; };
         self.assertEqual(list(caption), [])
         reason = next(cell for cell in grid if cell.tag == "dd" and "".join(cell.itertext()) == because)
         self.assertEqual([span.text for span in reason.findall("span")], ["builder"])
+
+    def test_worker_only_swap_tooltip_keeps_the_base_fields(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        owner = unit_labels.make_labels("impl2", unit_labels.NoShowrunner(), unit_labels.UnitWithoutRunningDirector("research"))
+        row, = (row for row in fixture.owner_swap_reading(owner, step_name="between steps").rows
+                if row.get("kind") == "owner")
+        self.assertEqual((row["name"], row.get("unit"), row.get("showrunner")), ("impl2", "research", "—"))
+        self.assertEqual(self.page_expression("tipText('swap:0', data)", {"swap_by": [row]}),
+                         ["impl2  1.0 GiB", "Swap charged to this program"])
 
     def test_swap_rows_use_their_own_text_and_show_one_owner_only(self) -> None:
         def row(name: str, kind: str, amount: int, **extra: object) -> dict[str, object]:

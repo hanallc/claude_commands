@@ -786,6 +786,7 @@ class QueueRowTitle(TypedDict):
 class NamedQueueRow(TypedDict):
     name: QueueRowName | ProcessName
     title: QueueRowTitle
+    tooltip_unit: UnitCell
 
 
 def queue_row_labels(step: QueueRowName, name: QueueRowName, *, unit: UnitCell = "",
@@ -794,14 +795,14 @@ def queue_row_labels(step: QueueRowName, name: QueueRowName, *, unit: UnitCell =
     name = QueueRowName.owner_only(name, step, caller, ci_label)
     step = QueueRowName.owner_only(step, name)
     if ci_label:
-        return {"name": name, "title": {"unit": "", "step": CIJobTitle(ci_label)}}
+        return {"name": name, "title": {"unit": "", "step": CIJobTitle(ci_label)}, "tooltip_unit": ""}
     if isinstance(unit, StaffUnitName) and step != unit:
-        return {"name": name, "title": {"unit": unit, "step": step}}
-    return {"name": name, "title": {"unit": "", "step": name}}
+        return {"name": name, "title": {"unit": unit, "step": step}, "tooltip_unit": unit}
+    return {"name": name, "title": {"unit": "", "step": name}, "tooltip_unit": unit}
 
 
 def process_row_labels(name: ProcessName) -> NamedQueueRow:
-    return {"name": name, "title": {"unit": "", "step": name}}
+    return {"name": name, "title": {"unit": "", "step": name}, "tooltip_unit": ""}
 
 
 @overload
@@ -1016,6 +1017,19 @@ class FeedStaff:
         member = self.members.by_member_reference(reference) if reference else None
         return member.name if member is not None else ""
 
+    def placement_tooltip_owner(self, step: admission_records.RunningStep) -> TooltipOwnerOverride | None:
+        """Match the caller's raw unit name to the placement."""
+        member = self.members.by_current_session(step.session_id) if step.session_id else None
+        if member is None or step.unit in ("", "—"):
+            return None
+        unit = self.members.parent_of(member) if member.kind == "worker" else member
+        if unit is None or unit.kind != "unit" or unit.name != step.unit:
+            return None
+        labels = self.labels_by_id.get(member.id)
+        if labels is None or labels.showrunner in ("", "—"):
+            return None
+        return {"unit": unit.name, "showrunner": labels.showrunner}
+
     def fixed_owner_labels(self, staff_id: staff.StaffId) -> unit_labels.UnitLabels | None:
         return self.labels_by_id.get(staff_id)
 
@@ -1099,6 +1113,12 @@ def held_place_row(place: admission_records.HeldPlace, zone: tzinfo) -> HeldPlac
             "kept_until": targets.clock(datetime.fromtimestamp(place.ends_at, UTC), zone)}
 
 
+class TooltipOwnerOverride(TypedDict):
+    unit: str
+    showrunner: str
+    step_is_unit: NotRequired[Literal[True]]
+
+
 class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow, RunFolderField):
     kind: Literal["mac-build"]
     row_owner: QueueRowName
@@ -1107,6 +1127,7 @@ class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow, RunFolderField):
     gate_label: str
     showrunner: str
     unit: str
+    tooltip_owner_override: NotRequired[TooltipOwnerOverride]
     pid: int
     machine: Literal["mac"]
     started_at: float
@@ -1650,7 +1671,7 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
                  identity: unit_labels.UnitLabels, *, names: StepNames,
                  slot_roots: Mapping[str, str], slot_machine: str,
                  placed_step: admission_records.RunningStep | None = None, source_folder: str = "",
-                 verify_source_missing: bool = False) -> MacBuildRow:
+                 verify_source_missing: bool = False, tooltip_owner: TooltipOwnerOverride | None = None) -> MacBuildRow:
     """Keep Mac memory and its stage separate from natedev admission values."""
     label = ci_step_label(build.ci_runner, build.ci_job) if build.origin is queue_view.MacBuildOrigin.CI else ""
     gate = queue_view.gate_label_text(build)
@@ -1704,6 +1725,14 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
                           "unit": "tests" if build.counter.phase.startswith("test:") else "units"}
                          if isinstance(build.counter, progress.ProgressCounter) else
                          {"kind": "NoProgress", "reason": build.counter.reason})}
+    if tooltip_owner is not None and not ci:
+        title = row["title"]
+        step = title["step"] if title["unit"] else row_step or title["step"]
+        title_labels = unit_labels.make_labels(step, unit_labels.NoShowrunner(),
+                                               unit_labels.DirectsUnit(tooltip_owner["unit"]))
+        if title_labels.session == title_labels.unit:
+            tooltip_owner = {**tooltip_owner, "step_is_unit": True}
+        row["tooltip_owner_override"] = tooltip_owner
     if placement_notes is not None:
         row["runs_on"] = placement_notes["runs_on"]
         row["targets"] = placement_notes["targets"]
@@ -3379,7 +3408,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             mac_row: MacBuildRow = mac_work_row(build, mac_reading, identity, names=names, slot_roots=slot_roots,
                                    slot_machine=mac_machine, placed_step=placed,
                                    source_folder=source.folder if source is not None else "",
-                                   verify_source_missing=verify_source_missing)
+                                   verify_source_missing=verify_source_missing,
+                                   tooltip_owner=members.placement_tooltip_owner(placed) if placed is not None else None)
             if placed is not None:
                 mac_row = {**mac_row, **move_fields(moves.get(placed.mac_placement.partition("/")[0]), members, zone)}
             work_rows.append(mac_row)

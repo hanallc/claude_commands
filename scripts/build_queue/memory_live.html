@@ -1376,9 +1376,11 @@ function doneText(row) {
     : progress.total > 0 && recorded(progress.done) ? 100 * progress.done / progress.total : null;
   return recorded(percent) ? formatPercent(percent, progress.done === progress.total) : "—";
 }
-function ownerFields(row) {
-  const showrunner = ownerText(row.showrunner);
-  const fields = [staffField('Showrunner', [showrunner])];
+function ownerFields(row, baseUnit = '') {
+  const override = row.tooltip_owner_override;
+  const showrunner = override?.showrunner || ownerText(row.showrunner);
+  const unit = override?.unit ?? row.tooltip_unit ?? (baseUnit && baseUnit !== '—' ? baseUnit : row.title?.unit);
+  const fields = [staffField('Showrunner', [showrunner || (unit && unit !== '—' ? 'unknown' : '')])];
   if (row.runner === 'worker') fields.push(staffField('Worker', [ownerText(row.worker)]));
   if (row.caller) fields.push(field('Caller', row.caller));
   return fields.filter(row => row.value);
@@ -1392,6 +1394,11 @@ function olderStepTitle(row) {
 }
 function stepTitle(row, value) {
   const {unit, step} = row.title ?? olderStepTitle(row);
+  const override = row.tooltip_owner_override;
+  if (override) {
+    const shownStep = unit ? step : row.row_step || step;
+    return staffTitle(override.unit, value, override.step_is_unit ? '' : ' · ' + shownStep);
+  }
   return unit ? staffTitle(unit, value, ' · ' + step) : field(step, value, 'title');
 }
 function becauseRows(reason, parts) {
@@ -1452,7 +1459,7 @@ function stepTooltip(key, data) {
   if (macRow(row) && row.gate_label && !row.gate_label.startsWith('placement ')) {
     detailFields.push(field('Mac build', row.gate_label));
   }
-  if (unavailable) return [...rows, ...ownerFields(row), ...detailFields, ...stepFields, ...unavailableLocation, ...namedTargets,
+  if (unavailable) return [...rows, ...ownerFields(row, row.unit), ...detailFields, ...stepFields, ...unavailableLocation, ...namedTargets,
     ...(waiting && namesGuest ? routeFields(row) : []), ...callFields];
   if (row.group) return [...rows, field('Started by', 'not the queue'),
     ...groupRows((row.parts || []).map(part => {
@@ -1461,7 +1468,7 @@ function stepTooltip(key, data) {
       const parts = [...(part.who_parts || [{kind:'text',text:part.who}]), ...(suffix ? [{kind:'text',text:' · '+suffix}] : [])];
       return {...field(partsText(parts), ramAmount(part.gib * GIB)), labelParts:parts};
     }))];
-  rows.push(...ownerFields(row), ...detailFields, ...stepFields);
+  rows.push(...ownerFields(row, row.unit), ...detailFields, ...stepFields);
   if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));

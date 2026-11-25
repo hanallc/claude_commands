@@ -16,6 +16,7 @@
 // Use --queue-rows to capture the dark queue card, its tooltips, and its right edge.
 // Use the fourth argument to select the older page.
 // Use --guest-tip after the output folder for the guest row tooltip screenshot.
+// Use --handler-tip after the output folder to capture the handler tooltip.
 // Use --standing-orders as the third argument for nate's standing orders on real-shape rows; a fourth argument names a rendered page to check.
 // Use <output-folder> --aws-cost-shots to capture the approved AWS costs example.
 // Add a folder with live memory.json, report.json, and memory_live.html for the Day images.
@@ -66,8 +67,10 @@ const buildToolsProof = previousPage === '--build-tools';
 const queueDragProof = previousPage === '--queue-drag';
 const queueRowsProof = previousPage === '--queue-rows';
 const guestTipProof = previousPage === '--guest-tip';
+const handlerTipProof = previousPage === '--handler-tip';
 const standingProof = previousPage === '--standing-orders';
-const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || guestTipProof || standingProof;
+const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || guestTipProof ||
+  handlerTipProof || standingProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Machine','vCPU','Tokens','Moved'];
@@ -577,6 +580,45 @@ try {
           fitLabels();
           })()`);
         };
+        if (handlerTipProof) {
+          await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+          const handlerTooltip = async reading => {
+            servedReading = reading;
+            await navigate('memory_live.html');
+            const proof = await evaluate(`(() => {
+              const mac = latest.walk.find(row => row.kind === 'mac-build');
+              const key = 'row:' + mac.key;
+              const row = document.querySelector('tr[data-tip="' + CSS.escape(key) + '"]');
+              row.scrollIntoView({block:'center'});
+              showTip(key, 0, 0, row);
+              const tip = document.querySelector('#tip');
+              const {left,top,width,height} = tip.getBoundingClientRect();
+              return {text:tip.innerText, width:innerWidth, dark:matchMedia('(prefers-color-scheme: dark)').matches,
+                clip:{x:left+scrollX,y:top+scrollY,width,height,scale:1}};
+            })()`);
+            assert.equal(proof.width, 1440);
+            assert.ok(proof.dark);
+            return proof;
+          };
+          const unknown = await handlerTooltip(readings.handler_tip_unknown);
+          assert.match(unknown.text, /^handler · nextest\n/);
+          assert.match(unknown.text, /\nShowrunner\nunknown\n/);
+          const sameStep = await handlerTooltip(readings.handler_tip_same_step);
+          assert.match(sameStep.text, /^handler\n/);
+          assert.match(sameStep.text, /\nShowrunner\nrelease\.service\n/);
+          const compound = await handlerTooltip(readings.handler_tip_compound);
+          assert.match(compound.text, /\nShowrunner\nrelease\.service · builds\n/);
+          const proof = await handlerTooltip(readings.handler_tip);
+          assert.match(proof.text, /^handler · Phase 56c pass 2 stage CPU\n/);
+          assert.match(proof.text, /\nShowrunner\ncargo-liner\n/);
+          assert.doesNotMatch(proof.text, /\n(?:Worker|Caller)\n/);
+          assert.doesNotMatch(proof.text, /unregistered session/);
+          const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:proof.clip});
+          const output = join(folder, 'handler-tooltip-dark.png');
+          await writeFile(output, Buffer.from(shot.data,'base64'));
+          console.log(JSON.stringify({pass:true,shot:output}));
+          break browserProof;
+        }
         if (awsCostShots) {
           servedReading = liveAwsCostSource ? base : readings.aws_costs;
           await navigate('memory_live.html');
