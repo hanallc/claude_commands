@@ -988,9 +988,12 @@ with folders.temporary_build_folder(request) as path:
         common = self.source / ".git"
         lock_path = common / "build-copy-config.lock"
         first_read, resume_first = threading.Event(), threading.Event()
+        release_first = threading.Event()
+        rescue_git = cast(Callable[..., subprocess.CompletedProcess[bytes]], getattr(git_rescue, "_git"))
         git = cast(Callable[..., str], getattr(build_copies, "_git"))
         flock = fcntl.flock
         first_copy = build_folders.copy_path("widget", "queue", 1)
+        second_copy = first_copy.with_name("2")
 
         def pause_after_read(folder: Path, *arguments: str, pass_fds: Sequence[int] = (),
                              accepted: tuple[int, ...] = (0,)) -> str:
@@ -1011,12 +1014,23 @@ with folders.temporary_build_folder(request) as path:
             else:
                 flock(descriptor, mode)
 
+        def release_after_status(folder: Path, *arguments: str, data: bytes = b"", index: Path | None = None,
+                                 accepted: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[bytes]:
+            result = rescue_git(folder, *arguments, data=data, index=index, accepted=accepted)
+            if folder == second_copy and arguments[:1] == ("status",):
+                release_first.set()
+                self.assertEqual(first.result(timeout=TEST_HANG_GUARD_SECS), first_copy)
+            return result
+
         def take(number: int) -> Path:
             with build_copies.take_copy(self.source, self.base, showrunner="builds", unit="queue",
                     work="proof", purpose="test", selection=build_copies.ExactCopyRequest(number)) as copy:
+                if number == 1:
+                    self.assertTrue(release_first.wait(TEST_HANG_GUARD_SECS), "The second rescue did not run status.")
                 return copy.path
 
         with (mock.patch.object(build_copies, "_git", side_effect=pause_after_read),
+              mock.patch.object(git_rescue, "_git", new=release_after_status),
               mock.patch.object(fcntl, "flock", new=observe_contention),
               ThreadPoolExecutor(max_workers=1) as worker):
             first = worker.submit(take, 1)
@@ -1025,9 +1039,10 @@ with folders.temporary_build_folder(request) as path:
                 second_path = take(2)
             finally:
                 resume_first.set()
+                release_first.set()
             first_path = first.result(timeout=TEST_HANG_GUARD_SECS)
 
-        self.assertEqual((first_path, second_path), (first_copy, first_copy.with_name("2")))
+        self.assertEqual((first_path, second_path), (first_copy, second_copy))
         self.assertEqual(self.git(self.source, "config", "--local", "--get-all", "extensions.worktreeConfig"), "true")
         self.assertNotIn("core.bare=", self.git(self.source, "config", "--local", "--list"))
         self.assertEqual(self.git(self.source, "config", "--file", str(common / "config.worktree"),
