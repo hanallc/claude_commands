@@ -298,7 +298,7 @@ with hana_command_lock(directory) as access:
         self.assertEqual(hana.claim_assigned(second, self.holder, self.controller), hana.HanaClaimRefused('Hana is busy'))
         self.assertEqual(self.provider.calls, [])
 
-    def test_claim_rejects_wrong_slot_source_session_and_holder(self) -> None:
+    def test_claim_rejects_wrong_destination_source_session_and_holder(self) -> None:
         variants = [replace(self.assignment, destination=replace(self.assignment.destination, slot=2)),
             replace(self.assignment, source_key=execution_identity.SourceKeyUnavailable('missing')),
             replace(self.assignment, destination=replace(self.assignment.destination, host='other'))]

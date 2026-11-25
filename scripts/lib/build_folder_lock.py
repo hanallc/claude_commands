@@ -2,16 +2,22 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 import fcntl
+from importlib import import_module
 import os
 from pathlib import Path
 import stat
 import time
-from typing import Literal
+from typing import Literal, Protocol, cast
 
 
+class _BuildFolderCreation(Protocol):
+    def build_folder_creation(self, path: Path, /) -> AbstractContextManager[tuple[int, ...]]: ...
+
+
+USER_REMOVAL_ROOTS = frozenset({"slot"})
 _LOCK_MARK = b"build-folder-lock\n"
 
 
@@ -40,6 +46,16 @@ def _open_parent(path: Path, root: Path, *, create: bool) -> int:
 
 @contextmanager
 def folder_parent(path: Path, root: Path, *, create: bool) -> Generator[int]:
+    """Hold shared claim locks before creating parent directories."""
+    with ExitStack() as scope:
+        if create:
+            folders = cast(_BuildFolderCreation, cast(object, import_module("scripts.lib.build_folders")))
+            _ = scope.enter_context(folders.build_folder_creation(path))
+        yield scope.enter_context(open_folder_parent(path, root, create=create))
+
+
+@contextmanager
+def open_folder_parent(path: Path, root: Path, *, create: bool) -> Generator[int]:
     """Open each parent without following links. Retry once if creation races with a move."""
     try:
         directory = _open_parent(path, root, create=create)
@@ -97,6 +113,9 @@ class ProbeTiming:
     retry_seconds: float
 
 
+NO_WAIT = ProbeTiming(0, 0)
+
+
 def take_lock(descriptor: int, mode: int, timing: ProbeTiming) -> bool:
     """Try the lock until the probe wait ends."""
     deadline = time.monotonic() + timing.wait_seconds
@@ -126,6 +145,39 @@ def lock_current(path: Path, directory: int, descriptor: int) -> bool:
                                                             follow_symlinks=False))
     except FileNotFoundError:
         return False
+
+
+@contextmanager
+def hold_named_lock(path: Path, root: Path, *, mode: int, create: bool,
+                    busy: BlockingIOError, changed: Exception, timing: ProbeTiming = NO_WAIT,
+                    allocation_check: Callable[[Path, int], bool] | None = None) -> Generator[int | None]:
+    """Hold the current lock inode within the specified wait time."""
+    for _attempt in range(2):
+        with ExitStack() as scope:
+            directory = None
+            try:
+                directory = scope.enter_context(open_folder_parent(path, root, create=create))
+                descriptor = open_lock(path, directory, create=create)
+            except FileNotFoundError:
+                if create:
+                    if allocation_check is not None and directory is not None and not parent_current(path, directory):
+                        continue
+                    raise
+                yield None
+                return
+            _ = scope.callback(os.close, descriptor)
+            if not take_lock(descriptor, mode, timing):
+                raise busy
+            if allocation_check is not None:
+                if create:
+                    mark_lock(descriptor)
+                if not allocation_check(path, directory):
+                    continue
+            if not lock_current(path, directory, descriptor):
+                break
+            yield descriptor
+            return
+    raise changed
 
 
 def probe(path: Path, root: Path, timing: Callable[[], ProbeTiming]) -> Literal["held", "free"]:
