@@ -1973,7 +1973,7 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
     if any(entry["text"] == text for entry in open_entries(production, identities)):
         raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
     # The review can take a minute, so it runs before the lock: `questions` is not held up by it.
-    accepted = review_open_question(production.name, QuestionForReview(text, "", question, rank), console=True)
+    accepted = review_open_question(production.name, QuestionForReview(text, "", question, rank))
     if isinstance(accepted, HeldRegistrationQuestion):
         raise RegistrationFailure("ask", f"question held for review: {text}: {accepted.details}")
     now = datetime.now(production.zone)
@@ -2607,16 +2607,13 @@ class ReviewUnavailableQuestion(NamedTuple):
 AcceptedQuestion = ReviewedQuestion | ReviewUnavailableQuestion
 
 
-def review_open_question(name: str, item: QuestionForReview, *,
-                         console: bool = False) -> AcceptedQuestion | HeldRegistrationQuestion:
-    # Copied registration trees can run reminder-only commands without notify installed.
+def review_open_question(name: str, item: QuestionForReview) -> AcceptedQuestion | HeldRegistrationQuestion:
+    # Import the reviewer only when the command files a full question.
+    from scripts.console_text import check as console_text
     from scripts.notify import review
+
     key = review.QuestionKey(name, item.text)
-    if console:
-        from scripts.console_text import check as console_text
-        outcome = console_text.check(item.question, "question", key=key, title=item.text)
-    else:
-        outcome = review.review_question(key, item.question)
+    outcome = console_text.check(item.question, "question", key=key, title=item.text)
     if isinstance(outcome, review.QuestionAccepted):
         return ReviewedQuestion(item.text, outcome.question)
     if isinstance(outcome, review.QuestionReviewUnavailable):

@@ -22,6 +22,7 @@ from scripts.agents.remote import local_machine
 from scripts.herdr.place import HerdrPlace
 from scripts.lib import atomic_file, conf
 from scripts.message import send_result
+from scripts.notify import review
 from scripts.production import change_review, delivery_state, investigation, record_store, session_pane, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
 from scripts.review_links import change_page, list_page, question_record, review_items
@@ -72,6 +73,7 @@ class TheListTests(unittest.TestCase):
         self.list_config.parent.mkdir(parents=True)
         _ = self.list_config.write_text("".join(f"# whole: 1..\n{key}={limit}\n" for key, limit in LIST_TEXT_LIMITS.items()))
         _ = self.enterContext(patch.object(the_list, "now", return_value=START))
+        _ = self.enterContext(patch.object(review, "review_question", return_value=review.QuestionAccepted("")))
         _ = self.send_patch.start()
         self.addCleanup(self.send_patch.stop)
 
@@ -1298,6 +1300,22 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(saved.log, (*before.log, the_list.ItemChange(START, the_list.AskWithdrawn(closed, reason), BOB.name)))
         self.assertEqual(path.read_bytes().split(b"## Log\n\n", 1)[1].splitlines()[:-1], earlier_log)
 
+    def test_withdraw_ask_on_a_closed_item_keeps_it_closed_and_removes_its_go(self) -> None:
+        item = self.add()
+        ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge.",
+                               why="The merge needs nate's go.", config=False, requester=MORTY.id, source="morty")
+        closed = the_list.close(MORTY.id, item.id, "The merge is complete.", source="morty")
+        self.assertEqual(the_list.open_asks(closed), (ask,))
+        with patch.object(staff, "runtime_id", return_value=MORTY.current_session):
+            self.assertEqual(self.command("withdraw-ask", item.id, "--ask", ask.ask_id, "--reason", "The merge is complete."),
+                             (0, f"withdrew {item.id} {ask.ask_id}\n", ""))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual((saved.state, saved.closed, saved.closing_words),
+                         (the_list.ItemState.CLOSED, closed.closed, closed.closing_words))
+        self.assertEqual(the_list.open_asks(saved), ())
+        reopened = the_list.reopen(MORTY.id, item.id, source="morty")
+        self.assertEqual(the_list.answerable_asks(reopened, staff.snapshot()), ())
+
     def test_withdraw_ask_refuses_closed_unknown_and_empty_reason(self) -> None:
         item = self.add()
         ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge.",
@@ -1541,6 +1559,28 @@ class TheListTests(unittest.TestCase):
         with patch.object(the_list, "now", return_value=START + timedelta(minutes=1)):
             changed = the_list.update(MORTY.id, item.id, {"latest_status": "Morty acts."}, source="owner report")
         self.assertIs(the_list.feedback_notice_time(changed), the_list.NoTimestamp.UNSET)
+
+    def test_list_reply_review_runs_before_the_write_lock(self) -> None:
+        item = self.add()
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        _ = the_list.ask_question(MORTY.id, item.id, the_list.PageRequest("request", "question", "Which check passed?"), status)
+        before = the_list.load(MORTY.id, item.id)
+        reply = "Step B passed."
+        failure = review.RuleFailure("console-standard-5", "Step B")
+        original_lock = record_store.NumberedRecords.locked
+        with (patch.object(record_store.NumberedRecords, "locked", autospec=True, side_effect=original_lock) as locked,
+              patch.object(review, "review_question") as reader):
+            def reject(*_args: object, **_kwargs: object) -> review.QuestionReviewFailed:
+                locked.assert_not_called()
+                return review.QuestionReviewFailed(reply, (), (failure,))
+
+            reader.side_effect = reject
+            result = self.command("answer", item.id, "--question", "Q1", "--text", reply)
+            self.assertEqual(result[0], 1)
+            self.assertIn("console-standard-5: Step B", result[2])
+            key = review.QuestionKey(f"reply/list/{MORTY.id}/{item.id}/Q1", "")
+            reader.assert_called_once_with(key, reply, console_kind="reply")
+            self.assertEqual(the_list.load(MORTY.id, item.id), before)
 
     def test_answer_refusals_leave_the_record_unchanged(self) -> None:
         item = self.add()

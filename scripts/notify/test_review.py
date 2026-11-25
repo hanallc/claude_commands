@@ -307,6 +307,19 @@ class LocalReviewTests(unittest.TestCase):
             "slug": key.name, "text": key.text, "question": draft.body, "details": [reason],
         })
 
+    def test_console_rewrite_without_failed_rules_holds_the_draft(self) -> None:
+        key = review.QuestionKey("demo", "Open the page")
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Open the page.", False)
+        held = review.QuestionReviewFailed(draft.body, ("The reviewer requested a rewrite without a failed rule.",))
+        for body in ("Open the window.", ""):
+            with self.subTest(body=body):
+                runner = FakeReviewer(verdict(draft, "rewrite", body=body, failed_rules=[]))
+                self.assertEqual(review.review_question(key, draft.body, runner=runner, console_kind="reply"), held)
+                self.assertTrue((review.state_path() / "questions" / f"{key.digest}.json").is_file())
+        approved = FakeReviewer(verdict(draft))
+        self.assertEqual(review.review_question(key, draft.body, runner=approved, console_kind="reply"),
+                         review.QuestionAccepted(draft.body))
+
     def test_unavailable_question_review_preserves_original_and_logs_reason(self) -> None:
         draft = review.Draft("demo", "0", "", NoActionRequired(), "Retry build 42?", False)
         runner = FakeReviewer(verdict(draft), failure="timeout")

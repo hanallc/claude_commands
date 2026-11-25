@@ -1960,7 +1960,6 @@ def withdraw_ask(keeper: staff.StaffId, identity: str, ask_id: str, reason: str,
     def edit(item: ListItem, moment: datetime) -> ListItem:
         if caller.id not in (keeper, item.producer):
             raise ListError("only the item's producer or morty can withdraw an ask")
-        _open(item)
         if not any(ask.ask_id == ask_id for ask in open_asks(item)):
             raise ListError(f"{identity} has no open ask {ask_id}")
         return replace(item, asks=tuple(replace(ask, closed=moment, withdrawn=True) if ask.ask_id == ask_id else ask
@@ -2249,18 +2248,24 @@ class _ListQuestionStore:
         receipt = ItemChange(now(), QuestionRequestReceipt(request, question.question_id), PAGE_SOURCE)
         _ = _save_page_request(_store(self.keeper), self.keeper, replace(item, log=(*item.log, receipt)), request)
 
+    def require_answerer(self, current: ListItem, question_id: str) -> _QuestionAnswerer:
+        question = next((question for question in current.questions if question.question_id == question_id), None)
+        if question is None or question.answer is not None:
+            raise question_record.AnswerRefused("This item has no open question with that id.")
+        answerer = self.answerer
+        allowed = (self.keeper, question.recipient_id(self.keeper))
+        if answerer is NoQuestionAnswerer.ABSENT or answerer.member.id not in (*allowed, answerer.morty):
+            raise question_record.AnswerRefused("Only the question recipient or morty can answer.")
+        return answerer
+
     def set_answer(self, item: str, question_id: str, answer: question_record.Answer) -> None:
+        _ = self.require_answerer(load(self.keeper, item), question_id)
+        console_text.require(answer.text, "reply", identity=f"list/{self.keeper}/{item}/{question_id}",
+                             refusal=question_record.AnswerRefused)
         store = _store(self.keeper)
         with store.locked():
             current = load(self.keeper, item)
-            question = next((question for question in current.questions if question.question_id == question_id), None)
-            if question is None or question.answer is not None:
-                raise question_record.AnswerRefused("This item has no open question with that id.")
-            answerer = self.answerer
-            allowed = (self.keeper, question.recipient_id(self.keeper))
-            if answerer is NoQuestionAnswerer.ABSENT or answerer.member.id not in (*allowed, answerer.morty):
-                raise question_record.AnswerRefused("Only the question recipient or morty can answer.")
-            console_text.require(answer.text, "list field", refusal=question_record.AnswerRefused)
+            answerer = self.require_answerer(current, question_id)
             questions = tuple(replace(saved, answer=answer) if saved.question_id == question_id else saved
                               for saved in current.questions)
             moment = now()

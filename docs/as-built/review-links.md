@@ -122,7 +122,8 @@ Select a recipient to enable Send.
 Select any other chip to change the recipient.
 Proposal limits the row to recipients with a native proposal folder.
 The proposal writer checks the title and body before it creates the record.
-`proposal_issue.py number` checks an existing draft before it assigns a number.
+`/issue` runs `console_text/check.py --kind proposal --file <draft>` before it writes the proposal.
+`proposal_issue.py number` checks the title and body before it assigns a number.
 Generated style decisions use their own filing path.
 When the selected recipient becomes unavailable, the dialog clears the selection and disables Send until you choose a recipient.
 Changing the type or reopening a kept draft preserves this empty selection.
@@ -1901,7 +1902,7 @@ The console lists it as **Images**, with the Lucide `image` icon.
 A showrunner or unit registers each image, or a before and after pair, with one command:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image PATH | --before PATH --after PATH) --caption "TEXT" --owner STAFF_ID (--change ID | --phase ID)
+~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image PATH [--two-halves] | --before PATH --after PATH) --caption "TEXT" --owner STAFF_ID (--change ID | --phase ID)
 ```
 
 - Start the caption with Nate's request in his words or with the thing he sees.
@@ -1913,7 +1914,9 @@ A showrunner or unit registers each image, or a before and after pair, with one 
   `config/review_links.conf` sets the wait, the terminal rows and the band height.
 - The owner is the staff id that made the image. The command refuses an id that is not in the staff record.
 - The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files and refuses an empty caption.
-- The fast check and the Console reader test review the caption before the command copies any image.
+- The fast check and the model review run before the command copies the image.
+  The model receives the caption and the layout.
+  Use `--two-halves` for a single file that contains two halves other than before and after.
 - It copies the image to `<review root>/images/<12-hex id>/image<suffix>` with a private `.review-link-image.json` record.
   A pair copies `before<suffix>` and `after<suffix>` to one folder with one record and one id.
   The record keeps the after image in `file` and the before image in `before`.
@@ -1987,6 +1990,10 @@ It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.
 The first line names the answer: `From the user (via the Images page): ` and then `your image is approved.` or `your image is not approved. The feedback follows.`
 A `Feedback:` line follows when the user wrote text.
 Then come the image link (a `Before:` and an `After:` link for a pair), the caption, the For line and the delete command for the owner to run after it acts.
+
+The Images answer command runs the fast check and model review before the image write lock.
+The save checks that the question is still open.
+
 After a send, the record gets `feedback_at` and the page hides the image; the image file stays until the owner deletes it.
 A page loaded before the answer buttons can still post a delete, which removes the image folder under `images/.review-link-images.lock` and sends no message.
 When no try reaches the owner, the server answers 503 and writes nothing.

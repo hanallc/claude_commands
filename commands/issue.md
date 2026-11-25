@@ -102,9 +102,16 @@ Read the canonical project from `~/rust/hanadocs/home-base/issues - <short>.base
    area: "[[unfiled]]"
    ```
 
-8. Create the file at `~/rust/hanadocs/issues/<derived-filename>.md` with the filled-in frontmatter followed by the body content. If the title was shortened in step 3, prepend the original long title as a `## ` heading before the body content.
+8. If step 3 shortened the title, put the original title in a `##` heading above the body.
 
-   For a proposal, then give it its P number: `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/proposal_issue.py" number "<issue path>"`.
+   For a proposal, save the filename stem as a `##` heading followed by the body in a scratch file.
+   Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/console_text/check.py" --kind proposal --file "<draft>"`.
+   If the check fails, report its reasons and stop before creating the issue.
+
+   Write the filled-in frontmatter and body to `~/rust/hanadocs/issues/<derived-filename>.md`.
+
+   For a proposal, assign its P number with `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/proposal_issue.py" number "<issue path>"`.
+   If numbering refuses the text, remove the issue only if its contents still match the file you wrote.
 
 9. Show the user the created file path and a summary of what was created.
 

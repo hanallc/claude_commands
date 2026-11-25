@@ -1,4 +1,6 @@
 """Check the filing patterns and the shared model review."""
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
@@ -55,10 +57,35 @@ class ConsoleTextCheckTests(unittest.TestCase):
         for text in ("The date is 11/25/2026.", "Open Tools/Audio/Output."):
             with self.subTest(text=text):
                 self.assertEqual(check.fast_check(text, "reply"), ())
-        for path in ("/tmp/proof", "~/notes/proof", "./notes/proof", "scripts/review_links/check.py"):
+        for path in ("/tmp/proof", "~/notes/proof", "./notes/proof", "../notes/proof", "scripts/review_links/check.py"):
             with self.subTest(path=path):
                 self.assertEqual(check.fast_check(f"Open {path}.", "reply"),
                                  (review.RuleFailure("omit-file-path", path),))
+
+    def test_short_capitalized_token_does_not_end_a_sentence(self) -> None:
+        point = "Ask Dr. Lane. The window opens. The test starts."
+        self.assertEqual(check.fast_check(point, "reply"), ())
+        long_point = point + " Wait for the result."
+        self.assertEqual(check.fast_check(long_point, "reply"),
+                         (review.RuleFailure("point-at-most-three-sentences", long_point),))
+
+    def test_proposal_cli_reports_failures_before_filing(self) -> None:
+        with TemporaryDirectory() as folder:
+            draft = Path(folder) / "draft.md"
+            arguments = ["--kind", "proposal", "--file", str(draft)]
+            errors = StringIO()
+            title = "Show the new layout"
+            with redirect_stderr(errors), patch.object(review, "review_question") as reader:
+                _ = draft.write_text(f"## {title}\n\nRead ../notes/proof.")
+                self.assertEqual(check.main(arguments), 1)
+                self.assertIn("omit-file-path: ../notes/proof", errors.getvalue())
+                reader.assert_not_called()
+
+                accepted = f"## {title}\n\nThe labels stay visible."
+                _ = draft.write_text(accepted)
+                reader.return_value = review.QuestionAccepted(accepted)
+                self.assertEqual(check.main(arguments), 0)
+                reader.assert_called_once_with(review.QuestionKey("proposal", accepted), accepted, console_kind="proposal")
 
     def test_fast_only_kinds_skip_the_model(self) -> None:
         text = "The image shows the old layout."

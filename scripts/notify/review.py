@@ -254,10 +254,14 @@ class QuestionKey:
         return hashlib.sha256((self.name + self.text).encode()).hexdigest()[:16]
 
 
+type CaptionLayout = Literal["single picture", "before and after pair", "picture with two halves"]
+
+
 @dataclass(frozen=True)
 class QuestionReview:
     key: QuestionKey
     console_kind: str = ""
+    caption_layout: CaptionLayout | None = None
 
 
 @dataclass(frozen=True)
@@ -698,6 +702,8 @@ def validate(value: object, draft: Draft, revision: bool,
         verdict = _text(record, "verdict")
         if verdict not in ("send", "rewrite", "ask", "withhold") or (content_only and verdict == "withhold"):
             raise ValueError("verdict")
+        if console and verdict == "rewrite" and not failures:
+            return Failed(draft, ["The reviewer requested a rewrite without a failed rule."], metadata)
         title, body = _text(record, "title"), _text(record, "body")
         if content_only and verdict == "rewrite" and not body.strip():
             raise ValueError("rewrite needs nonempty text")
@@ -865,7 +871,9 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
                 if not heading or not instructions.strip():
                     return Unreviewed("no Console reader instructions", details())
                 prompt = f"{standard}\n{instructions}"
-                draft_prompt = f"Console text kind: {context.console_kind}\nDraft:\n{draft.body}\nRevision: {str(revision).lower()}"
+                layout = f"Image layout: {context.caption_layout}\n" if context.caption_layout is not None else ""
+                draft_prompt = (f"Console text kind: {context.console_kind}\n{layout}"
+                                f"Draft:\n{draft.body}\nRevision: {str(revision).lower()}")
         else:
             action_line = first_line(draft.action, draft.session) if isinstance(draft.action, ActionRequired) or isinstance(draft.session, SessionLine) else "no action"
             draft_prompt = (f"Title: {draft.title}\n{action_line}\n"
@@ -968,12 +976,13 @@ def save_question_review(key: QuestionKey, result: QuestionOutcome) -> None:
 
 
 def review_question(key: QuestionKey, question: str, revision: bool = False, *,
-                    runner: ProcessRunner = run_process, console_kind: str = "") -> QuestionOutcome:
+                    runner: ProcessRunner = run_process, console_kind: str = "",
+                    caption_layout: CaptionLayout | None = None) -> QuestionOutcome:
     """Review a question or Console draft without entering push delivery."""
     if not question.strip():
         raise ValueError("question needs nonempty text")
     path = state_path() / "questions" / f"{key.digest}.json"
-    context = QuestionReview(key, console_kind)
+    context = QuestionReview(key, console_kind, caption_layout)
     draft = Draft(key.name, "0", "", NoActionRequired(), question, False)
     timeout = review_timeout_seconds()
     outcome = _review(draft, revision or path.exists(), runner, context, timeout_seconds=timeout)

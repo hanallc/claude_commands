@@ -763,6 +763,26 @@ class RegistrationTests(RegistrationFixture):
         reviewer.assert_called_once_with(review.QuestionKey(self.fixture_owner_name(), title), title,
                                          console_kind="question")
 
+    def test_questions_uses_the_console_check_before_filing_a_new_question(self) -> None:
+        title = "Keep the layout?"
+        body = "Read ../notes/proof. Keep the layout?"
+        state = self.question_state([{"text": title, "question": body}])
+        with mock.patch.object(review, "review_question") as reader:
+            result = self.run_command("questions", "--state", str(state))
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("omit-file-path: ../notes/proof", result.stdout)
+            reader.assert_not_called()
+        self.assertEqual(self.open_rows(), [])
+
+        body = "The labels stay visible. Keep the layout?"
+        state = self.question_state([{"text": title, "question": body}])
+        draft = f"## {title}\n\n{body}"
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(draft)) as reader:
+            result = self.run_command("questions", "--state", str(state))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        reader.assert_called_once_with(review.QuestionKey(self.fixture_owner_name(), title), draft, console_kind="question")
+        self.assertEqual(self.open_rows()[0]["question"], body)
+
     def test_questions_store_what_waits_on_the_user_and_print_one_line(self) -> None:
         outstanding = self.outstanding()
         _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"choose layout"}]')

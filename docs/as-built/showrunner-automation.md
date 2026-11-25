@@ -609,6 +609,8 @@ The `the_list.py answer` command accepts answers from the saved recipient, the r
 A saved answer marks the item unread.
 Use `answer --keeper` to select the item's folder.
 Without `--keeper`, `answer` uses the caller's List folder if it holds the item, or morty's folder otherwise.
+The fast check and model review run before the write lock.
+The save checks the question ID and the caller's permission again.
 `update` uses morty's folder by default.
 For a legacy item, use `the_list.py update --keeper <keeper> --id L<N> --next-step "<step>"`.
 A producer can name any keeper in `update`, but it updates only its own fields on items it produces.
@@ -641,6 +643,8 @@ An empty optional time removes that time.
 8. Print the table with `list`.
 9. Ask nate for a Go with `ask L<n> --kind go|approval --target <staff id> --what <text> --why <text> [--config]`.
 10. Withdraw an open ask with `withdraw-ask L<n> --ask A<k> --reason "<text>"`.
+
+`withdraw-ask` works on a closed item and keeps the item closed.
 
 `ask` adds an `Ask` to the item's `asks` field and prints `L<n> A<k>`.
 The ids are `A1`, `A2` and on for each item.
@@ -824,12 +828,13 @@ A missing folder uses its nearest existing parent until the folder appears.
   Questions use `QuestionRecord` files; reminder strings use `OUTSTANDING`.
   `OUTSTANDING` is `<SHOWRUNNER_STATE_DIR>/outstanding/<showrunner staff id>.json`.
   A missing `open_for_user` key preserves the existing items.
-  A new question requires its full text and a review result before storage.
+  A new question requires its full text.
+  The `questions` command uses the same fast check and model review as `ask`.
 
 - `ask --ask "<one line>" [--context "<why now>"] [--item "<entry>" ...] [--recommend "<choice and why>"] [--choice "<answer>" ...] [--unit <unit>]` files a reviewed question without a reply to the user.
   The [Console text standard](../console_text_standard.md) applies to `ask` and to answers and replies from the writer.
   The fast check tests text patterns before the existing model reviewer reads the draft.
-  The model reader checks the words in the draft.
+  The model approves a draft only with a `send` verdict.
   The filing command returns the failed rules and quotes to the writer. The hold keeps the draft.
   A quote that differs from the draft keeps the draft on hold.
   If the model is unavailable, `ask` records the reason.
