@@ -44,6 +44,7 @@ from xml.parsers.expat import ExpatError
 from scripts.lib import build_folders
 from scripts.lib import conf, process_group, process_start, scratch
 from scripts.lib.conf import UseConfiguredValue
+from scripts.lib.process_failure import failure_detail
 from scripts.notify import push_texts
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -1015,7 +1016,7 @@ class Session:
             if result.returncode == 0:
                 self.mac_lock_alert_key = None
                 return
-            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            detail = failure_detail(result)
         except (conf.Unusable, OSError, subprocess.SubprocessError) as error:
             detail = str(error)
         print(f"hana_shot: could not retire the Mac lock alert: {detail}", file=sys.stderr)
