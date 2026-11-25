@@ -1469,6 +1469,76 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
                                                       list_page.PAGE_PATH, browser), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_linked_review_send_blocks_a_second_form(self) -> None:
+        from scripts.review_links.test_page_frame import window_probe_results
+
+        root = self.root / "reviews"
+        doc = self.root / "sdlc.md"
+        listing = self.root / f"{change_review.PREFIX}sdlc.md"
+        _ = doc.write_text(f'# Production\n- **Showrunner checkout:** `{self.root}`\n- **Change review:** `{listing}`\n')
+        _ = listing.write_text(change_review.BODY.replace("\n## Reviewed",
+            f"| C1 | Check the change | {NOW.date().isoformat()} | Read the result. |\n\n## Reviewed"))
+        key = "sdlc/C1"
+        item = self.add("Check the linked review")
+        _ = the_list.link(MORTY.id, item.id, (key,), source="morty")
+        members = staff.StaffSnapshot((MORTY, replace(OWNER, doc=staff.LiveDoc(local_machine(), doc))))
+        with (patch.object(staff, "snapshot", return_value=members),
+              patch.object(change_review, "lists_directory", return_value=self.root)):
+            snapshot = review_page.build_snapshot(root)
+            page = list_page.render(root, include_counts=False, review_records=snapshot.records)
+            card = snapshot.body(key, view=review_page.ReviewBodyView.CARD)
+        probe = br'''<script>
+(async()=>{
+ const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
+ const dialog=document.querySelector('[data-list-review-dialog]');
+ const row=document.querySelector('[data-list-item]');
+ const link=row.querySelector('a[data-list-review-card]');
+ const until=(node,ready)=>new Promise((resolve,reject)=>{
+  const observer=new MutationObserver(finish);
+  const timer=setTimeout(()=>{observer.disconnect();reject(new Error('The card or toast did not appear.'));},5000);
+  function finish(){
+   if(ready()){observer.disconnect();clearTimeout(timer);resolve();}
+  }
+  observer.observe(node,{attributes:true,childList:true,subtree:true});finish();
+ });
+ try{
+  link.click();
+  const frame=dialog.querySelector('iframe');
+  await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  const view=frame.contentWindow,card=frame.contentDocument,form=card.querySelector('[data-review-form]');
+  const toast=()=>top.document.querySelector('[data-send-undo]');
+  const hold='a'.repeat(24);
+  view.fetch=async(url)=>{
+   if(url.endsWith('/undo')) return view.Response.json({outcome:'undone'});
+   if(url.endsWith('/'+hold)) return view.Response.json({reason:'The test save failed.'},{status:503});
+   return view.Response.json({hold,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+  };
+  const words='Keep these words.';
+  form.elements.feedback.value=words;
+  for(const undo of [true,false]){
+   form.requestSubmit(form.querySelector('[value="feedback"]'));
+   await until(top.document.body,toast);
+   link.click();
+   if(dialog.open || dialog.querySelectorAll('iframe').length!==1)
+    throw new Error('The pending link must leave the original form closed.');
+   if(undo) toast().querySelector('button').click();
+   else toast().getAnimations()[0].finish();
+   await until(dialog,()=>dialog.open && !frame.hasAttribute('data-saving'));
+   check(dialog.querySelector('iframe:not([hidden])')===frame && frame.contentDocument===card,
+    'The original form returns.');
+   check(form.elements.feedback.value===words,'The original words remain.');
+   const message=undo ? 'Undone. Edit and send again.' : 'Not saved: The test save failed.';
+   check(card.querySelector('[data-review-card-notice]').textContent===message,'The form shows the result.');
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        page = page.replace(b"</body>", probe + b"</body>", 1)
+        self.assertEqual(window_probe_results(
+            {list_page.PAGE_PATH: page, review_page.PAGE_PATH: card}, list_page.PAGE_PATH, "firefox"), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_review_links_open_one_card_without_leaving_the_list(self) -> None:
         root = self.root / "reviews"
         doc = self.root / "sdlc.md"
@@ -1859,7 +1929,8 @@ async function inspect(){
   toast().querySelector('button').click();
   await changed(dialog,()=>dialog.open && !close.disabled,'Undo reopens the card');
   check(undoRequests===1 && sendReads===0 && status()==='Undone. Edit and send again.' &&
-   formInCard().elements.feedback.value===words,'Undo restores the card and its words.');
+   formInCard().elements.feedback.value===words && card.activeElement===formInCard().elements.feedback,
+   'Undo restores the card and focuses its draft.');
   submit('feedback');
   await changed(document.body,()=>toast()?.querySelector('button'),'the next Review Undo toast shows');
   toast().getAnimations()[0].finish();
@@ -7498,13 +7569,54 @@ window.fetch=async(_url,options)=>{
  await until(()=>document.querySelector('[data-send-undo] button'),'The Undo toast did not show.');
  check(document.querySelector('[data-send-undo] span').textContent==='Sent to morty.',
   'The toast names the record keeper.');
+ check(!row.getClientRects().length,'The List item leaves when the Undo toast shows.');
  document.querySelector('[data-send-undo] button').click();
  await until(()=>notice.textContent==='Undone. Edit and send again.','The row did not say that the send was undone.');
  check(words.value==='Tell morty after Undo.','After Undo the Tell keeps its words.');
+ await until(()=>row.getClientRects().length && document.activeElement===words,'Undo did not show the row and focus the draft.');
  check(row.dataset.state===before.state && row.dataset.unread===before.unread,
   'After Undo the row keeps its state and its unread mark, so it is not marked sent.');
  check(undos===1 && requests.length===1,'Undo posts once and nothing else is sent.');
 ''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_held_question_hides_the_item_and_failure_restores_it(self) -> None:
+        _ = self.add("Ask about the first item", number=1)
+        _ = self.add("Keep the second item visible", number=2)
+        self.browser_action_sequence(r'''
+ const loaded=window.fetch;
+ window.fetch=(url,options={})=>{
+  if(String(url).startsWith('/send-hold/'))
+   return Promise.resolve(Response.json({reason:'The question failed.'},{status:400}));
+  if(options.method!=='POST') return loaded(url,options);
+  requests.push(new URLSearchParams(options.body));
+  return Promise.resolve(Response.json({hold:'a'.repeat(24),seconds:30},
+   {status:202,headers:{'X-Send-Hold':'held'}}));
+ };
+ const shown=()=>[...document.querySelectorAll('[data-list-item]')].filter(item=>item.getClientRects().length);
+ const all=document.querySelector('[data-filter-row="show"] [data-filter-value="all"]');
+ const order=()=>shown().map(item=>item.dataset.key).join();
+ const before=order(),words=form.elements.words;
+ const notice=form.querySelector('[data-send-status]'),text='Which check passed?';
+ const changed=async(test,message)=>{
+  const end=performance.now()+4000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(message);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ words.value=text;words.dispatchEvent(new Event('input'));
+ submit('question');
+ const toast=()=>document.querySelector('[data-send-undo]:has(button)');
+ await changed(toast,'The Undo toast did not show.');
+ check(shown().length===1 && !row.getClientRects().length && all.dataset.filterCount==='1',
+  'The held question removes its item from the List and the chip count.');
+ toast().getAnimations()[0].finish();
+ await changed(()=>notice.textContent==='Not saved: The question failed.','The row did not report the failure.');
+ await changed(()=>row.getClientRects().length,'The failed question did not return.');
+ check(order()===before && recordIsOpen(row) && words.value===text && all.dataset.filterCount==='2',
+  'Failure restores the open item, its draft, and the chip count.');
+''', add_item=False, window_size=(500, 900))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_tell_undo_toast_names_the_signed_producer(self) -> None:

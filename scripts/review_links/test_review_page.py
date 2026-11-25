@@ -6958,6 +6958,7 @@ window.fetch=async(url,options)=>{
   await until(()=>host.querySelector('[data-send-undo] button'),'The Undo toast did not show.');
   check(host.querySelector('[data-send-undo] span').textContent==='Sent to page-owner and builder-unit.',
         'The toast names every receiver of the verdict with words.');
+  check(!row()?.getClientRects().length,'The verdict card is gone when the Undo toast shows.');
   host.querySelector('[data-send-undo] button').click();
   const cardForm=()=>row()?.isConnected && !row().hidden ? recordDetails(row())?.querySelector('[data-review-form]') : null;
   const undone=()=>cardForm()?.querySelector('[data-send-status]').textContent==='Undone. Edit and send again.';
@@ -6966,6 +6967,7 @@ window.fetch=async(url,options)=>{
   await until(undone,'The card did not say that the send was undone.');
   form=cardForm();
   check(form.elements.feedback.value===words,'After Undo the card keeps the words.');
+  await until(()=>document.activeElement===form.elements.feedback,'Undo did not focus the feedback field.');
   await until(()=>!form.querySelector('[value="works"]').disabled,'The card did not enable Send after Undo.');
   // The row comes back with a short fade, and a Send during that fade does nothing, so Send again until it posts.
   let next=0;
@@ -6981,6 +6983,49 @@ window.fetch=async(url,options)=>{
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         markup = browser_markup(self.root).replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_held_review_question_and_feedback_hide_the_row(self) -> None:
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,posts,until}=fixtureUndo(),failures=[];
+ const check=(ok,label)=>{if(!ok) failures.push(label);};
+ const heldFetch=window.fetch,host=window.top.document;
+ window.fetch=(url,options)=>String(url).startsWith('/send-hold/') && options?.method!=='POST'
+  ? Promise.resolve(Response.json({reason:'The Review send failed.'},{status:503})) : heldFetch(url,options);
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='820px';
+  const key=document.querySelector('[data-list-item][data-type="change"]').dataset.key;
+  const rows=()=>[...document.querySelectorAll('[data-list-item]')].filter(item=>item.getClientRects().length);
+  const row=()=>rows().find(item=>item.dataset.key===key);
+  const before=rows().map(item=>item.dataset.key).join();
+  row().querySelector('.list-toggle').click();
+  const words='Keep the Review draft.';
+  for(const outcome of ['question','feedback']){
+   const form=await readyReviewCard(row());
+   form.elements.feedback.value=words;
+   form.requestSubmit(form.querySelector('[value="'+outcome+'"]'));
+   const toast=()=>host.querySelector('[data-send-undo]:has(button)');
+   await until(toast,'The Undo toast did not show.');
+   const motion=document.querySelector('[data-record-motion-key="'+CSS.escape(key)+'"]');
+   check(!row() && !motion?.getClientRects().length,'The row and its animation leave when the toast appears.');
+   if(outcome==='question') toast().querySelector('button').click();
+   else toast().getAnimations()[0].finish();
+   const message=outcome==='question' ? 'Undone. Edit and send again.' : 'Not saved: The Review send failed.';
+   const restored=()=>row() && recordDetails(row()).querySelector('[data-review-form]');
+   await until(()=>restored()?.querySelector('[data-send-status]').textContent===message,'The card did not report the result.');
+   if(outcome==='question')
+    await until(()=>document.activeElement===restored()?.elements.feedback,'Undo did not focus the Review draft.');
+   check(recordIsOpen(row()) && restored().elements.feedback.value===words &&
+    rows().map(item=>item.dataset.key).join()===before,'Undo and failure restore the open row, its order and its draft.');
+  }
+  check(posts.map(post=>post.get('outcome')).join()==='question,feedback','Each Review send creates one hold.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        markup = browser_markup(self.root).replace('</body>', probe+'</body>')
         self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')

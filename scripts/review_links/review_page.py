@@ -1747,12 +1747,12 @@ async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true
   refreshError(error);
  }
 }
-async function saveReviewAction(data,{receiver,sending,confirmedSave,saved,failed,undone=failed,displayFailed,recover,finished}){
+async function saveReviewAction(data,{hold,receiver,sending,confirmedSave,saved,failed,undone=failed,displayFailed,recover,finished}){
  let conflict=false,confirmed=false;
  try{
   const saveAction=['later','validate'].includes(data.get('outcome'));
   sending?.();
-  const response=await heldFetch(location.pathname,{method:'POST',body:data},saveAction ? null : receiver);
+  const response=await hold.post(location.pathname,{method:'POST',body:data},saveAction ? null : receiver);
   conflict=response.status===409;
   confirmed=response.ok;
   if(confirmed) confirmedSave?.();
@@ -1760,8 +1760,9 @@ async function saveReviewAction(data,{receiver,sending,confirmedSave,saved,faile
   if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
   await saved(result);
  }catch(error){
-  if(error instanceof SendUndone) undone(error.message);
-  else if(confirmed) displayFailed();
+  const wasHeld=hold.restore();
+  if(error instanceof SendUndone) await undone(error.message);
+  else if(confirmed) displayFailed(wasHeld);
   else if(conflict) await recover(error.message);
   else failed(error.message);
  }finally{
@@ -1901,6 +1902,7 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
   report('');
   let saved=false;
   await saveReviewAction(data,{
+   hold:holdCard(row),
    receiver:sendActionReceiver(form,data),
    sending:()=>boxFrame?.dispatchEvent(new Event('review-card-sending')),
    saved:()=>{
@@ -1912,7 +1914,11 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
     }else location.reload();
    },
    failed:reason=>report('Not saved: '+reason),
-   undone:report,
+   undone:message=>{
+    report(message);
+    if(boxFrame) boxFrame.dataset.focusReviewDraft='';
+    else form.elements.feedback.focus();
+   },
    displayFailed:()=>{
     const message='Saved; the item could not refresh.';
     saved=true;
@@ -2028,7 +2034,8 @@ function awaitsHandoff(key){
 function isListed(entry,filters){
  const {owner,show,type,sourceOwner}=filters;
  const key=entry.key,departure=saved.get(key);
- if(pendingSaves.get(key)?.departing || awaitsHandoff(key)) return false;
+ const pending=pendingSaves.get(key);
+ if(pending?.toast || pending?.departing || awaitsHandoff(key)) return false;
  return (!departure || entry.type==='for-you' || departure.readAnswer && entry.state!=='Done' ||
   departure.handed && entry.state!=='Open') &&
   availableForFilters(entry,filters) && (!owner || rowOwners(entry).includes(owner)) &&
@@ -2119,7 +2126,7 @@ const view=createRecordTable({...reviewPlaceOptions,content:()=>content,
  focusKey:()=>focusAfterLoad?.key,
  pinOpenRow:key=>{
   const pending=pendingSaves.get(key);
-  return (!pending || pending.keepOpen) && !awaitsHandoff(key);
+  return (!pending || !pending.toast && pending.keepOpen) && !awaitsHandoff(key);
  },
  unmount:rememberItem,
  rememberItem,
@@ -2312,11 +2319,15 @@ function bindForm(row){
    // A question or feedback on a change or a proposal shows its own result, so its row stays open through the save.
    const keepOpen=['question','feedback'].includes(outcome) && ['change','proposal'].includes(row.dataset.type);
    const held=content.dataset.undoEnabled==='true' && ['later','validate'].includes(outcome);
-   const pending={saved:false,departing:!validationQuestion,held,keepOpen,top:scrollY};
+   const pending={saved:false,departing:!validationQuestion,held,keepOpen,toast:false,top:scrollY};
    pendingSaves.set(key,pending);pageRefresh.abandon();drawSaveState(key);
    const request=view.startItemRequest(key),session=view.openSession;
    const closes=outcome==='later' || !['question','feedback','validate'].includes(outcome);
    const submission=view.preserveRecordRowTop(()=>view.startAction(row));
+   const hold=holdCard(row,hidden=>{
+    pending.toast=hidden;
+    if(hidden){pending.held=true;view.applyAction();}
+   });
    const reopened=()=>view.openItem?.dataset.key===key && view.opened.has(key) &&
     !view.currentItemRequest(request);
    const showResult=result=>{
@@ -2341,6 +2352,7 @@ function bindForm(row){
     view.preserveRecordRowTop(()=>showResult({kind:'failure',message:'Not saved: '+reason}));
    };
    await saveReviewAction(data,{
+   hold,
    receiver:sendActionReceiver(form,data),
    confirmedSave:()=>{
     pending.saved=true;
@@ -2366,6 +2378,7 @@ function bindForm(row){
       view.preserveRecordRowTop(()=>view.installOwnItemResult(request,text,(item,detail)=>applyReviewDetail(key,item,detail,text)));
     }
     if(validationQuestion){
+     hold.restore();
      view.preserveRecordRowTop(()=>{
       if(result.detail_closed && !reopened()) view.closeCard(key);
       showResult(savedMessage);
@@ -2383,6 +2396,7 @@ function bindForm(row){
      retained:showOwnDetail && result.state==='Done' ? index.get(key) : null,ownSession:showOwnDetail ? session : undefined,
      closes:result.detail_closed ?? (!handed && !['question','later'].includes(outcome)),awaitingSnapshot:true};
     const applySaved=()=>view.preserveRecordRowTop(()=>{
+     hold.restore();
      if(!reopened() && !showOwnDetail && (outcome==='later' || !isDeferredLink(key))) view.closeCard(key);
      saved.set(key,marker);savedEntry(key,marker);
      if(marker.closes) storeSavedVerdicts();
@@ -2396,17 +2410,24 @@ function bindForm(row){
     else applySaved();
    },
    failed:fail,
-   undone:message=>{
+   undone:async message=>{
     pendingSaves.delete(key);
     showResult({kind:'undone',message});
+    if(!view.currentItemRequest(request)) return;
+    await view.rowSettled(view.openItem);
+    if(view.currentItemRequest(request))
+     recordDetails(view.openItem).querySelector('textarea[name="feedback"]')?.focus();
    },
-   displayFailed:()=>{
+   displayFailed:wasHeld=>{
     if(!view.currentItemRequest(request)) return;
     view.preserveRecordRowTop(()=>{
      if(closes){
       view.closeCard(key);
       showResult({kind:'failure',message:'Saved; the item could not refresh.'});
-     }else view.savedItemError(request);
+     }else{
+      if(wasHeld) view.applyAction();
+      view.savedItemError(request);
+     }
     });
    },
    recover:async reason=>{

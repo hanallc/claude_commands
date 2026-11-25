@@ -589,6 +589,7 @@ STYLE = (BUTTON_STATES
 .page-status{display:flex;align-items:center;flex-wrap:wrap;gap:6px 0;font:14px/1.5 system-ui,sans-serif;
 color:var(--ink-2);margin:0 0 20px;min-height:21px;background:var(--bg,Canvas)}
 .action-failure{color:var(--error);white-space:pre-line;overflow-wrap:anywhere}
+[data-send-held],[data-record-motion]:has([data-send-held]){display:none!important}
 .page-status>[hidden],.page-status [hidden]{display:none!important}
 .page-status>span:not(.page-status-announcement){white-space:nowrap;display:inline-flex;align-items:center;gap:6px}
 .page-status>span:not(:first-child):not(.page-status-announcement)::before{content:'·';margin:0 10px;color:var(--ink-3)}
@@ -1143,7 +1144,7 @@ function showSendUndo(request,seconds,receiver){
   });
  });
 }
-async function heldFetch(url,init={},receiver){
+async function heldFetch(url,init={},receiver,onHold){
  const headers=new Headers(init.headers);headers.set('X-Undo-Hold','1');
  const body=String(init.body ?? '');
  const key=JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
@@ -1164,7 +1165,12 @@ async function heldFetch(url,init={},receiver){
  }
  const {hold,seconds}=await first.json();
  request.hold=hold;
- const undo=!request.closed && seconds>0 && await showSendUndo(request,seconds,receiver);
+ let undo=false;
+ if(!request.closed && seconds>0){
+  const shown=showSendUndo(request,seconds,receiver);
+  onHold?.();
+  undo=await shown;
+ }
  if(undo===true){request.finish();throw new SendUndone();}
  // A server restart drops the connection; the held send waits in its file, so read its result again.
  for(let failures=0;;){
@@ -1203,6 +1209,26 @@ CARD_SUBMIT_SCRIPT = r'''function cardSubmitBlocked(form,fading=false){
 function setCardSubmitting(form,submitting,controls=form){
  if(submitting) form.dataset.sending='true';else delete form.dataset.sending;
  controls.querySelectorAll('button').forEach(button=>button.disabled=submitting);
+}
+function holdCard(card,changed){
+ let held=false,motion;
+ function setHeld(value){
+  if(held===value) return false;
+  held=value;
+  if(held && card.hasAttribute('data-list-item')){
+   // A departing row can still have a visible copy.
+   const key=CSS.escape(card.dataset.key);
+   motion=document.querySelector('[data-record-motion-key="'+key+'"]');
+  }
+  card.toggleAttribute('data-send-held',held);
+  motion?.toggleAttribute('data-send-held',held);
+  changed?.(held);
+  return true;
+ }
+ return {
+  post:(url,init,receiver)=>heldFetch(url,init,receiver,()=>setHeld(true)),
+  restore:()=>setHeld(false),
+ };
 }
 ''' + HELD_SEND_SCRIPT
 

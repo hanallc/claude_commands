@@ -619,6 +619,8 @@ class ImagesTests(ImagesFixture):
  };
  window.fetch = async (path, options = {}) => {
   if (String(path).endsWith('/undo')) return Response.json({outcome: 'undone'});
+  if (String(path).startsWith('/send-hold/'))
+   return Response.json({reason: 'The image send failed.'}, {status: 503});
   if (options.method !== 'POST') return new Promise(() => {});
   posts.push(new URLSearchParams(options.body));
   return Response.json({hold: 'a'.repeat(24), seconds: 30}, {status: 202, headers: {'X-Send-Hold': 'held'}});
@@ -626,6 +628,7 @@ class ImagesTests(ImagesFixture):
  try {
   const card = document.querySelector('[data-images] article'), form = card.querySelector('form');
   const status = form.querySelector('[data-image-status]');
+  const group = () => document.querySelector('[data-image-groups] a[href="#' + card.id + '"]');
   form.elements.feedback.value = 'Too dark.';
   const view = host.defaultView;
   check(view.innerWidth === 390 && view.matchMedia('(prefers-color-scheme: dark)').matches,
@@ -634,6 +637,7 @@ class ImagesTests(ImagesFixture):
    form.requestSubmit(form.querySelector('button[value="' + action + '"]'));
    await until(() => host.querySelector('[data-send-undo] button'), 'The Undo toast did not show.');
    const toast = host.querySelector('[data-send-undo]'), text = toast.querySelector('span');
+   check(!card.getClientRects().length && !group(), 'The card and its group leave when the toast appears.');
    const button = toast.querySelector('button'), box = toast.getBoundingClientRect();
    check(text.textContent === 'Sent to ' + __RECEIVER__ + '.' && button.textContent === 'Undo',
          'The toast names the image owner and offers Undo.');
@@ -647,8 +651,16 @@ class ImagesTests(ImagesFixture):
    button.click();
    await until(() => status.textContent === 'Undone. Edit and send again.', 'The card did not say Undone.');
    check(card.isConnected && form.elements.feedback.value === 'Too dark.', 'After Undo the card returns with its words.');
+   check(card.getClientRects().length && group() && document.activeElement === form.elements.feedback,
+         'Undo shows the card and focuses its feedback field.');
   }
   check(posts.map(post => post.get('action')).join(',') === 'feedback,approved,question', 'Undo sends nothing more.');
+  form.requestSubmit(form.querySelector('[value="question"]'));
+  await until(() => host.querySelector('[data-send-undo] button'), 'The next Undo toast did not show.');
+  host.querySelector('[data-send-undo]').getAnimations()[0].finish();
+  await until(() => status.textContent === 'Not sent: The image send failed.', 'The card did not show the failure.');
+  check(card.getClientRects().length && group() && form.elements.feedback.value === 'Too dark.',
+        'A failed send restores the card, its group and its words.');
  } catch (error) {
   failures.push(String(error));
  }
