@@ -81,10 +81,10 @@ A failed start or a start exception also restores the pause record.
 
 The rule is visible pending over double send.
 Claude Code has no atomic keyed input write, so a sender cannot prove whether a killed attempt was accepted.
-Three windows remain, and each needs a kill at one exact line:
+Three crash windows remain.
 
 1. A `send.py pending` drain killed after it flushes a queued continuation and before it rewrites the queue sends it again on the next drain. Every queued message has this window.
-2. A sender killed after it saves `relay-unconfirmed` and before the socket write leaves the resume pending. A retry does not send.
+2. The resume stays pending if the sender dies after it saves `relay-unconfirmed` and before `record_once` saves acceptance.
 3. A sender stopped after it saves the Mac destination and before SSH, followed by a director move, leaves the resume pending. A retry does not send.
 
 A pending resume exits non-zero and keeps its record.

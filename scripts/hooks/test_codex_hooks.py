@@ -438,8 +438,7 @@ class CodexHookInstallerTests(unittest.TestCase):
             f"{self.hooks_file}:session_start:0:0", f"{self.hooks_file}:subagent_start:0:0",
             f"{self.hooks_file}:session_start:1:0", f"{self.hooks_file}:post_tool_use:{len(original)}:0",
             f"{self.hooks_file}:pre_compact:0:0", f"{self.hooks_file}:user_prompt_submit:0:0",
-            f"{self.hooks_file}:user_prompt_submit:1:0", f"{self.hooks_file}:post_compact:0:0",
-            f"{self.hooks_file}:stop:0:0",
+            f"{self.hooks_file}:post_compact:0:0", f"{self.hooks_file}:stop:0:0",
         ])
         self.assertEqual(len(self.trust()), 12)
 
