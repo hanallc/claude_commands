@@ -921,7 +921,11 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 with queue.queue_place("rust-analyzer", fixture.root) as place:
                     places.append(place)
                     child = place.popen([sys.executable, "-c", "pass"])
-                    self.assertEqual(child.wait(timeout=TEST_HANG_GUARD_SECS), 0)
+                    try:
+                        status = child.wait(timeout=TEST_HANG_GUARD_SECS)
+                    except subprocess.TimeoutExpired:
+                        self.fail("The queued program did not exit before the holder raised an error.")
+                    self.assertEqual(status, 0)
                     _, row = fixture.reservation()
                     reservation_id = str(row.get("reservation_id", ""))
                     place.observe(GIB, GIB)
