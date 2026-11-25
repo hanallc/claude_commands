@@ -153,10 +153,6 @@ def action_row(record: UserAction, requester: str) -> ForYouRow:
                      requester_reference=record.requested_by)
 
 
-def rebuild_config() -> Path:
-    return conf.path("statusline") if "CONF_DIR" in os.environ else rebuild_row.DEFAULT_CONFIG
-
-
 def action_source_paths() -> tuple[Path, Path, Path]:
     needs = need.needs_folder()
     return ActionStore().folder, needs, needs / "done"
@@ -164,7 +160,7 @@ def action_source_paths() -> tuple[Path, Path, Path]:
 
 def source_paths(config: Path | None = None) -> tuple[Path, ...]:
     """Watch the native action sources and the rebuild comparison."""
-    config = rebuild_config() if config is None else config
+    config = conf.path("statusline") if config is None else config
     paths = (*action_source_paths(), config)
     try:
         cache = rebuild_row.cache_path(config)
@@ -190,7 +186,7 @@ def read(config: Path | None = None, *,
          rebuild: rebuild_row.RebuildAnswer | None = None, members: staff.StaffSnapshot | None = None,
          include_running_revision: bool = True, watch: need.SourceWatch | None = None) -> ForYouSnapshot:
     """Project both stores and the comparison cache without running a rebuild or a refresh."""
-    config = rebuild_config() if config is None else config
+    config = conf.path("statusline") if config is None else config
     unavailable: list[UnavailableSource] = []
     names: dict[str, str] = {}
     members_by_reference: dict[str, staff.StaffRow] = {}
@@ -295,14 +291,15 @@ def read(config: Path | None = None, *,
                           answer.comparison_deadline)
 
 
-def read_for_status_line(config: Path = rebuild_row.DEFAULT_CONFIG, *,
+def read_for_status_line(config: Path | None = None, *,
                          rebuild: rebuild_row.RebuildAnswer | None = None,
                          watch: need.SourceWatch | None = None) -> ForYouSnapshot:
     """Keep the waiting rebuild names if a read exceeds the recursion limit."""
     try:
         return read(config, rebuild=rebuild, include_running_revision=False, watch=watch)
     except RecursionError as error:
-        answer = rebuild if rebuild is not None else rebuild_row.read(config, watch=watch)
+        answer = rebuild if rebuild is not None else rebuild_row.read(
+            config if config is not None else "statusline", watch=watch)
         return ForYouSnapshot((), (UnavailableSource("For you", str(error)),), answer.machines, answer.refresh_due,
                               answer.comparison_deadline)
 
@@ -310,7 +307,7 @@ def read_for_status_line(config: Path = rebuild_row.DEFAULT_CONFIG, *,
 def global_action_count(rebuild: rebuild_row.RebuildAnswer | None = None) -> str:
     """Return a complete action count or an explicit unavailable result."""
     try:
-        count = read(rebuild_row.DEFAULT_CONFIG, rebuild=rebuild, include_running_revision=False).open_count
+        count = read(rebuild=rebuild, include_running_revision=False).open_count
     except (OSError, ValueError):
         return "unavailable"
     return str(count.value) if isinstance(count, KnownOpenCount) else "unavailable"

@@ -133,7 +133,8 @@ A Codex thread name is display text and selects no conversation.
 Unknown names return status 1.
 They list up to five close names from local units and showrunners when available.
 Ambiguous names return status 1 with up to five matching members.
-A remote member returns status 1 with its machine name.
+The command forwards a remote staff row to its configured workstation over SSH.
+The command returns status 1 when the row's machine is unknown or unreachable.
 A running session returns status 0 with an `unchanged` line that names its current account.
 Resume does not stop or move a running session.
 Unknown Codex process evidence prints an anomaly and does not block resume.
@@ -371,7 +372,10 @@ The push shows qualified names and gives a short command to retry pending moves.
 If the names and the phone footer exceed the push limit, the message gives a command to read the full list.
 The group and target identify the phone push for repeat suppression.
 `MOVE_ALERT_REPEAT_MINUTES` sets the repeat window to 1,440 minutes by default.
-A standalone resume failure still sends its own keyed push.
+A standalone resume failure uses a keyed `shutdown.restart_failed` push.
+For a unit under watchdog recovery, the watchdog keeps the pending push with the outage.
+A failed detached start sends the push with its original key.
+A confirmed start clears the pending push.
 Each completed member records its outcome without waiting for other resumes.
 An early exit or failed resume uses the existing showrunner failure report.
 

@@ -19,6 +19,7 @@ from unittest.mock import patch
 from scripts.lib import conf
 from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff
 from scripts.review_links import page_frame, review_submissions, serve
 from scripts.review_links.browser_test_support import STATUS_PAGES, firefox_probe_results, status_configuration
@@ -78,6 +79,7 @@ class PageStatusTests(unittest.TestCase):
     def test_page_owner_uses_current_name_and_parent_chain(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = root / "console.conf"
+        _ = write_config_fixture(root / "review_links.conf")
         _ = config.write_text("page.list.owner=owner\nowner.default=default\n", encoding="utf-8")
         document = root / "remote" / "production.md"
         live = staff.LiveDoc("natedev", document)
@@ -398,6 +400,7 @@ class PageStatusTests(unittest.TestCase):
     def test_accounts_shows_the_configured_owner_and_names_the_route(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = root / "console.conf"
+        _ = write_config_fixture(root / "review_links.conf")
         document = root / "production.md"
         showrunner = staff.StaffRow(staff.StaffId("showrunner"), "showrunner", "natedev", staff.STAFF_ROOT,
                                     current_session=staff.StaffId("session-showrunner"),

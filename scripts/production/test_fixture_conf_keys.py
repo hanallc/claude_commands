@@ -25,7 +25,9 @@ kind.natedev = local
 """, encoding="utf-8")
 '''
 
-SUMMARY = "fixture config keys: {} missing, {} fixtures not checked because their text is not a literal\n"
+FIXTURE_SUMMARY = "fixture config keys: {} missing, {} fixtures not checked because their text is not a literal\n"
+KEY_READS_SUMMARY = "config key reads: {} of a removed key, {} of a key no config file holds\n"
+SUMMARY = FIXTURE_SUMMARY + KEY_READS_SUMMARY.format(0, 0)
 
 
 class FixtureConfKeyTests(unittest.TestCase):
@@ -168,6 +170,283 @@ def fixture(config: Path, template: str) -> None:
                 self.assertEqual(status, 2)
                 self.assertTrue(errors.getvalue().startswith("fixture_conf_keys: "), errors.getvalue())
                 self.assertIn(fault, errors.getvalue())
+
+    def test_python_reads_of_removed_renamed_and_deleted_keys(self) -> None:
+        self.write("config/legacy.conf", "timeout=60\nbackoff_seconds=5\n")
+        self.write("scripts/base_reader.py", 'settings.whole("timeout")\n')
+        self.base = self.commit()
+        self.write("config/build_targets.conf", "kind.mac=ssh\n")
+        (self.repo / "config/legacy.conf").unlink()
+        (self.repo / "scripts/base_reader.py").unlink()
+        self.write("scripts/z_reader.py", 'settings.whole("timeout")\n')
+        self.write("scripts/a_reader.py", 'settings.text("targets")\nsettings.text("kind.natedev")\n')
+        self.write("scripts/test_reader.py", 'settings.text("targets")\n')
+        self.write("scripts/reader_fixture.py", 'settings.whole("timeout")\n')
+        self.write("scripts/nonliteral.py", '# "timeout"\nsettings.text("kind.natedev.extra")\n')
+        self.write("tools/reader.py", 'settings.text("targets")\n')
+        tip = self.commit()
+        self.write("scripts/a_reader.py", 'settings.text("kind.mac")\n')
+        status, output = self.run_check(tip)
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "removed keys in config/build_targets.conf: kind.natedev, targets\n"
+            + "removed keys in config/legacy.conf: backoff_seconds, timeout\n"
+            + "scripts/a_reader.py:1: reads targets, which the tip removes from config/build_targets.conf\n"
+            + "scripts/a_reader.py:2: reads kind.natedev, which the tip removes from config/build_targets.conf\n"
+            + "scripts/z_reader.py:1: reads timeout, which the tip removes from config/legacy.conf\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(3, 0)))
+
+    def test_shell_reads_match_only_whole_tokens(self) -> None:
+        self.write("config/build_targets.conf", "kind.natedev=local\n")
+        for suffix in ("sh", "zsh", "bash"):
+            self.write(f"scripts/read_targets.{suffix}", 'read_setting "targets"\n'
+                       + "read_setting retargets targets2 _targets -targets .targets "
+                       + "targets_extra targets-extra targets.old\n")
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "removed keys in config/build_targets.conf: targets\n"
+            + "scripts/read_targets.bash:1: reads targets, which the tip removes from config/build_targets.conf\n"
+            + "scripts/read_targets.sh:1: reads targets, which the tip removes from config/build_targets.conf\n"
+            + "scripts/read_targets.zsh:1: reads targets, which the tip removes from config/build_targets.conf\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(3, 0)))
+
+    def test_shared_key_requires_the_removed_file_name_in_the_same_source(self) -> None:
+        self.write("config/other.conf", "targets=mac\n")
+        self.base = self.commit()
+        self.write("config/build_targets.conf", "kind.natedev=local\n")
+        self.write("scripts/from_stem.py", 'settings = conf.read("build_targets")\nsettings.text("targets")\n')
+        self.write("scripts/from_file.py", 'settings = conf.read("build_targets.conf")\nsettings.text("targets")\n')
+        self.write("scripts/from_stem.sh", 'open_settings build_targets\nread_setting targets\n')
+        self.write("scripts/from_file.sh", 'open_settings build_targets.conf\nread_setting targets\n')
+        self.write("scripts/from_other.py", 'settings = conf.read("other")\nsettings.text("targets")\n')
+        self.write("scripts/from_backup.sh", 'open_settings build_targets.conf.bak\nread_setting targets\n')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "removed keys in config/build_targets.conf: targets\n"
+            + "scripts/from_file.py:2: reads targets, which the tip removes from config/build_targets.conf\n"
+            + "scripts/from_file.sh:2: reads targets, which the tip removes from config/build_targets.conf\n"
+            + "scripts/from_stem.py:2: reads targets, which the tip removes from config/build_targets.conf\n"
+            + "scripts/from_stem.sh:2: reads targets, which the tip removes from config/build_targets.conf\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(4, 0)))
+
+    def test_missing_fixture_key_still_fails_with_removed_key_reads(self) -> None:
+        self.write("config/build_targets.conf", "kind.natedev=local\nunreachable_wait_seconds=600\n")
+        self.write("scripts/read_targets.py", 'settings.text("targets")\n')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 1, output)
+        self.assertEqual(output, (
+            "new keys in config/build_targets.conf: unreachable_wait_seconds\n"
+            + "scripts/backup/test_state_backup.py:5: the config/build_targets.conf fixture lacks "
+            + "unreachable_wait_seconds\n"
+            + "removed keys in config/build_targets.conf: targets\n"
+            + "scripts/read_targets.py:1: reads targets, which the tip removes from config/build_targets.conf\n"
+            + FIXTURE_SUMMARY.format(1, 0) + KEY_READS_SUMMARY.format(1, 0)))
+
+    def test_bound_repository_read_reports_a_key_no_config_file_holds(self) -> None:
+        self.write("config/hosts/limits.conf", "transfer_timeout.natedev=180\nslots.aws-hana.hana.max_bytes=5\n")
+        reader = '''\
+from scripts.lib import conf as config
+
+def limits():
+    settings = config.read_or_repository("build_targets")
+    settings.whole("slots.aws-hana.hana.max")
+    settings.whole("transfer_timeout")
+    settings.whole(dynamic_key())
+    other.whole("not_a_config_read")
+'''
+        self.write("scripts/limits.py", reader)
+        self.write("scripts/test_limits.py", reader)
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/limits.py:5: reads slots.aws-hana.hana.max, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 1)))
+
+    def test_fixed_reads_resolve_config_parameters_and_bound_key_names(self) -> None:
+        self.write("scripts/limits.py", '''\
+from scripts.lib.conf import ConfigRead, read, read_or_repository as load_committed
+
+settings = read("build_targets")
+module_key = "absent.module_key"
+settings.effective_key(module_key)
+load_committed("build_targets").values("absent.batch_a", "absent.batch_b", host_only_prefix="ignored.prefix")
+
+def limits(settings: ConfigRead):
+    key = "absent.argument"
+    settings.text(key=key)
+    settings.value("targets", parser_for("ignored.second_argument"))
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/limits.py:5: reads absent.module_key, which no config file on the tip holds\n"
+            + "scripts/limits.py:6: reads absent.batch_a, which no config file on the tip holds\n"
+            + "scripts/limits.py:6: reads absent.batch_b, which no config file on the tip holds\n"
+            + "scripts/limits.py:10: reads absent.argument, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 4)))
+
+    def test_shell_fixed_reads_and_removed_reads_share_one_sorted_report(self) -> None:
+        self.write("config/build_targets.conf", "kind.natedev=local\n")
+        self.write("scripts/read_targets.sh", '''\
+conf_value "build_targets" 'unlisted_value'
+conf_value build_targets targets
+conf_get build_targets "unlisted_get"
+conf.py get 'build_targets' unlisted_cli
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "removed keys in config/build_targets.conf: targets\n"
+            + "scripts/read_targets.sh:1: reads unlisted_value, which no config file on the tip holds\n"
+            + "scripts/read_targets.sh:2: reads targets, which the tip removes from config/build_targets.conf\n"
+            + "scripts/read_targets.sh:3: reads unlisted_get, which no config file on the tip holds\n"
+            + "scripts/read_targets.sh:4: reads unlisted_cli, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(1, 3)))
+
+    def test_advisory_scan_accepts_latin1_and_counts_bad_python(self) -> None:
+        _ = (self.repo / "scripts/latin1.py").write_bytes(
+            b'# coding: latin-1\n# caf\xe9\n'
+            + b'from scripts.lib import conf\nconf.read("build_targets").text("absent.latin1")\n'
+        )
+        self.write("scripts/bad_syntax.py", "def broken(:\n")
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertIn("scripts/latin1.py:4: reads absent.latin1, which no config file on the tip holds\n", output)
+        self.assertTrue(output.endswith(KEY_READS_SUMMARY.format(0, 1).rstrip("\n")
+                                        + ", 1 sources not scanned\n"), output)
+
+    def test_distinct_keys_on_one_line_and_one_report_for_a_split_read(self) -> None:
+        self.write("config/build_targets.conf", "kind.natedev=local\n")
+        self.write("scripts/reader.py", '''\
+from scripts.lib import conf
+settings = conf.read("build_targets")
+settings.values("targets", "never.present", "targets", "never.present")
+settings.text(
+    "targets",
+)
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "removed keys in config/build_targets.conf: targets\n"
+            + "scripts/reader.py:3: reads never.present, which no config file on the tip holds\n"
+            + "scripts/reader.py:3: reads targets, which the tip removes from config/build_targets.conf\n"
+            + "scripts/reader.py:5: reads targets, which the tip removes from config/build_targets.conf\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(2, 1)))
+
+    def test_direct_and_aliased_module_imports_resolve_readers(self) -> None:
+        self.write("scripts/reader.py", '''\
+import scripts.lib.conf as cfg
+import scripts.lib.conf
+cfg.read("build_targets").whole("absent.alias")
+scripts.lib.conf.read("build_targets").whole("absent.direct")
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/reader.py:3: reads absent.alias, which no config file on the tip holds\n"
+            + "scripts/reader.py:4: reads absent.direct, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 2)))
+
+    def test_nested_functions_inherit_readers_until_a_local_binding_shadows_them(self) -> None:
+        self.write("scripts/reader.py", '''\
+from scripts.lib import conf
+module_settings = conf.read("build_targets")
+
+def outer():
+    settings = conf.read("build_targets")
+
+    def inner():
+        settings.whole("absent.enclosing")
+        module_settings.whole("absent.module")
+
+    def shadow(settings):
+        settings.whole("absent.shadowed")
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/reader.py:8: reads absent.enclosing, which no config file on the tip holds\n"
+            + "scripts/reader.py:9: reads absent.module, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 2)))
+
+    def test_readers_follow_assignments_and_loop_bindings_in_statement_order(self) -> None:
+        self.write("scripts/reader.py", '''\
+from scripts.lib import conf
+
+def reads(readers):
+    settings = conf.read("build_targets")
+    settings.whole("absent.before")
+    settings = None
+    settings.whole("absent.rebound")
+    loop_reader = conf.read("build_targets")
+    for loop_reader in readers:
+        loop_reader.whole("absent.loop")
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/reader.py:5: reads absent.before, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 1)))
+
+    def test_shell_fixed_reads_use_command_position_and_a_literal_key(self) -> None:
+        self.write("config/other.conf", "held.elsewhere=1\n")
+        self.write("scripts/reader.sh", '''\
+conf_value "build_targets" \\
+    continued.key
+conf_value "$stem" variable.key
+conf_value "$stem" held.elsewhere
+: && conf_value 'build_targets' chained.key
+:; conf_value build_targets sequence.key
+: || conf_value build_targets alternate.key
+printf '' | conf_value build_targets pipeline.key
+value=$(conf_value build_targets substitution.key)
+value=`conf_value build_targets backtick.key`
+if :; then conf_value build_targets then.key; else conf_value build_targets else.key; fi
+for target in local; do conf_value build_targets loop.key; done
+: # conf_value build_targets ignored.comment
+echo "conf_value build_targets ignored.example"
+echo conf_value build_targets ignored.argument
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        expected = (
+            (2, "continued"), (3, "variable"), (5, "chained"), (6, "sequence"), (7, "alternate"),
+            (8, "pipeline"), (9, "substitution"), (10, "backtick"), (11, "else"), (11, "then"), (12, "loop"),
+        )
+        self.assertEqual(output, "".join(
+            f"scripts/reader.sh:{line}: reads {key}.key, which no config file on the tip holds\n"
+            for line, key in expected
+        ) + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, len(expected)))
+
+    def test_config_read_annotations_must_resolve_to_the_config_module(self) -> None:
+        self.write("scripts/reader.py", '''\
+from scripts.lib import conf
+from scripts.lib.conf import ConfigRead as Reader
+
+class ConfigRead:
+    pass
+
+def local(settings: ConfigRead):
+    settings.whole("absent.local")
+
+def foreign(settings: unrelated.ConfigRead):
+    settings.whole("absent.foreign")
+
+def declared(settings: conf.ConfigRead):
+    settings.whole("absent.qualified")
+
+def imported(settings: Reader):
+    settings.whole("absent.imported")
+''')
+        status, output = self.run_check(self.commit())
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output, (
+            "scripts/reader.py:14: reads absent.qualified, which no config file on the tip holds\n"
+            + "scripts/reader.py:17: reads absent.imported, which no config file on the tip holds\n"
+            + FIXTURE_SUMMARY.format(0, 0) + KEY_READS_SUMMARY.format(0, 2)))
 
 
 if __name__ == "__main__":

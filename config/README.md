@@ -1,5 +1,62 @@
 # Config Files
 
+## One common way
+
+1. **Format.** Write each tunable setting as a `key=value` row in a `.conf` file.
+2. **Location.** Use `~/.claude/config/<stem>.conf` and give each tool or area one stem.
+   Use only the shared config folder for live files.
+   Do not use a per-file environment variable to select a config file.
+   Use only `CONF_DIR` to select a test folder.
+3. **Full key name.** The full name is `<stem>.<key>`.
+   The stem is the file name without `.conf`.
+   Write only `<key>` in the file.
+4. **Key form.**
+
+   - The stem is the first part of the full name.
+     The `hand_made.claude.model` key in `config/cli.conf` has the full name `cli.hand_made.claude.model`.
+   - Start the key with the feature name.
+     Use the same first part for all keys of the feature.
+     Each part narrows the meaning.
+     The last part names the field.
+   - Use lowercase snake case for each part other than a machine or host name.
+     Put the unit on the field, such as `_seconds`, `_bytes`, `_minutes`, `_kib`, or `_chars`.
+   - Use `paths` for a list of folder paths.
+     Use `path_templates` when the values contain substitution names.
+   - Use one value for all machines that need the same setting.
+     Add a machine part only when the machines need different values.
+     Put a comment above the row to explain the difference.
+   - Use the exact machine or host name, as in `enabled.mac-linux` and `slots.Nates-MacBook-Pro-2023.hana.max`.
+     Keep the host override form `<key>.<short-host>`.
+   - Use the exact name for a repository, program, build step, path, model, ID, or other name that the code looks up.
+   - Approved examples include `machines.window_days`, `enabled.mac`, and `slots.<host>.<repo>.max`.
+
+5. **Groups.** Use dots in keys and a plain comment to name a group of keys.
+   Omit `[section]` lines.
+   `conf.py` ignores `[section]` lines, so sections can cause a read to return the wrong value.
+6. **Comments and limits.** Put a comment above each key to describe what it controls.
+   Put `# whole: A..B` or `# range: A..B` directly above each numeric key.
+   Use `# one of: a, b` for a closed text choice.
+7. **One reader.** Use `conf.read(stem)` in Python and `conf_value` in shell.
+   Read values at use on each pass.
+   Keep cached values within the pass and define defaults in config.
+8. **Change and approval.** Get the user's approval for each value change.
+   Run `/tune` with the user's words.
+   Send each key change, rename, or deletion to the showrunner for Nate's approval before merge.
+   Merge a new key with the working name that Bob gives through the showrunner.
+   Bob asks Nate about the name after the merge.
+   A later name change is a rename.
+   You can delete a key without approval if no code reads it.
+9. **Tests.** Set `CONF_DIR` and write fixtures with `write_config_fixture`.
+   Use `CONF_DIR` as the only config path variable in tests.
+   The gate uses the confsweep audit hook in `scripts/test_times/module_run.py` on main.
+   This hook alone fails tests that write to the live config folder.
+10. **Data files.** Keep the formats of lists, tables, and documents that people do not tune.
+    Examples include `config/names.toml`, `config/cargo-fmt-allowlist.json`, `config/aws-build-tailscale.json`, and the `.md` prompts.
+    Keep runtime state outside `config/`.
+11. **Model registry.** Keep the sections, parser, and `/default_models` for `config/models.conf`.
+    The catalog sync and the publisher use the sections.
+12. **Blank lines.** Put one blank line between a key row and the next comment or `[section]` line.
+
 ## Live values
 
 Python callers use `scripts/lib/conf.py`. Each `conf.read(file)` reads and parses
@@ -15,17 +72,15 @@ A comment directly above a key sets its limits: `# whole: A..B`,
 `# range: A..B` or `# one of: a, b, c`.
 
 The reader resolves a missing or invalid key when the caller uses it.
+A path to a `.conf` file in the active configuration folder recovers like its stem.
 An absent default file or key can use the repository value when `CONF_DIR` is unset.
 Otherwise, the reader warns and uses the newest valid committed value under that revision's limits.
 Recovery prefers a value that also passes the current setting's limit.
 With no usable value, it raises `conf.Unusable`.
 `ConfigRead.origin(key, convert)` distinguishes a usable live value, a recovered value and an unavailable value without a warning.
 
-Only the user approves a value change. A session asks the user and runs `/tune`
-on approval, with the user's words. `/tune` makes the value live on both
-machines at once, then commits it on main and pulls the Mac, without a test or
-release cycle. Moving an unchanged value from code
-to config needs no approval and does not use `/tune`.
+`/tune` makes an approved value live on both machines.
+It commits the value on main and pulls main on the Mac.
 
 ## accounts.conf
 
@@ -110,13 +165,16 @@ An exhausted retry count fails the gate. A failed message does not change the re
 `on` enables the existing thresholds and messages.
 A missing file, missing key, or invalid value means `on`.
 The hook reads the file on each call through `scripts.lib.conf`.
+The hook uses `transcript.tail_bytes` for the first scan.
+If this value is unusable, the hook scans once with the 4 MiB retry limit.
 Tests select a temporary config folder with `CONF_DIR`.
 The hook still reads the transcript and writes its debug log.
 Compaction runs by itself during work.
 
 ## context_deferral.conf
 
-Each non-comment line uses `kind: value`; `#` starts a comment.
+The current hook still reads `kind: value` rows.
+`#` starts a comment.
 `window` sets the maximum region length in characters, after whitespace is collapsed.
 `action`, `marker`, `state`, `later`, and `exclude` hold case-insensitive regular expressions.
 The hook joins the expressions of each kind with `|`.
@@ -130,11 +188,12 @@ A missing file, invalid entry, or hook error permits the stop without output.
 
 ## lint.conf
 
-Which lint checks run, everywhere they run: `cache`, `mend`, `style_review`,
-`clippy`, `doc`, `fmt`, under an `[operations]` section. Values are `on` or
-`off`; a missing key or missing file means `on`. One key per check with no
-per-consumer override — `clippy=off` means cargo clippy does not run in a
-`/unit:direct` phase or the lint CLI.
+The current file still groups the lint switches under `[operations]`.
+The switches are `cache`, `mend`, `style_review`, `clippy`, `doc`, and `fmt`.
+Each switch accepts `on` or `off`.
+The current reader uses `on` if the file or key is missing.
+Each switch applies to all callers.
+`clippy=off` disables cargo clippy in a `/unit:direct` phase and in the lint CLI.
 
 Use `/lint_config` to view or change them. Consumers read it on their
 next run, so a change is immediate:
@@ -620,12 +679,27 @@ The text colors exceed 4.5:1 contrast against both backgrounds in their theme.
 The service publishes the repository page with an atomic write at each start.
 The service retains the last successful reading when the admission service does not answer.
 
+## screen_record.conf
+
+`recording.max_bytes` sets the ffmpeg file cap and the size that marks a clip as capped.
+`retention.max_directory_bytes` sets the size limit for stored clips before recording.
+
+## shot_report.conf
+
+`transcripts.parallel_scan_bytes` sets the total file size above which a transcript scan uses parallel workers.
+The scan runs in series if the setting is unusable.
+
+## style_ledger.conf
+
+`write.lock_attempts` sets the maximum number of attempts when ledger rows change before the write lock.
+
 ## test_times.conf
 
 `SLOW_TEST_S` sets the minimum gate test time retained in the build log.
 `NEXTEST_SLOW_TEST_S` sets the recording threshold for nextest rows.
 Failed tests, errors, and unexpected successes remain in the log at every duration.
 `TOP_RUNS` sets the number of recent gate runs used to rank each module by its median CPU time.
+`module_cost.max_output_replay_bytes` limits the bytes replayed from each module cost output stream.
 Callers read these settings through `scripts/lib/conf.py` at each use.
 `CONF_DIR` selects a fixture folder for tests.
 

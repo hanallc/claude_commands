@@ -432,7 +432,8 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 
 class GuestCheckoutTests(unittest.TestCase):
     settings: mac_linux.GuestSettings = mac_linux.GuestSettings(
-        ('unused-mac', 'unused-guest'), pwd.getpwuid(os.getuid()).pw_name, 1, 10, 5)
+        ('unused-mac', 'unused-guest'), pwd.getpwuid(os.getuid()).pw_name, 1, 10, 5,
+        connect_attempt_limit=3)
     machine_id: str = 'a' * 32
     repo: Path = Path('/natedev/verify checkout')
 
@@ -953,10 +954,9 @@ class MacLinuxRouteTests(unittest.TestCase):
         config.mkdir()
         self.registry = config / 'build_targets.conf'
         _ = write_config_fixture(self.registry, f'enabled.mac-linux=on\n{target_config.UNREACHABLE_WAIT_KEY}=20\n')
-        _ = (config / 'mac_linux.conf').write_text(
+        _ = write_config_fixture(config / 'mac_linux.conf',
             f'ssh.hops=fixture-mac fixture-guest\nguest.user={account}\ntest.jobs=2\n'
-            + 'run.time_limit_seconds=7\n',
-            encoding='utf-8')
+            + 'run.time_limit_seconds=7\nssh.connect_attempts=3\n')
         _ = write_config_fixture(config / 'mac_test.conf', 'unreachable_backoff_s=30\n')
         _ = (config / 'build_admission.conf').write_text(
             '# range: 0.01..\nquery_timeout_seconds=1\n', encoding='utf-8')
@@ -2822,6 +2822,33 @@ with (patch.object(conf, 'read', read_config),
         settings = mac_linux.read_settings(conf.read(self.registry))
         self.assertEqual(settings.unreachable_wait_seconds, 86400)
 
+    def test_connect_attempt_limit_requires_a_positive_whole_number(self) -> None:
+        configuration = self.registry.with_name('mac_linux.conf')
+        for value in ('0', '1.5'):
+            with self.subTest(value=value), self.assertRaisesRegex(conf.Unusable, r'ssh\.connect_attempts'):
+                _ = write_config_fixture(configuration, f'ssh.connect_attempts={value}\n')
+                _ = mac_linux.read_settings(conf.read(self.registry))
+
+    def test_read_settings_recovers_the_missing_connect_attempt_limit(self) -> None:
+        home = self.root / 'home'
+        live_config = home / '.claude/config'
+        registry = live_config / 'build_targets.conf'
+        _ = write_config_fixture(registry, 'kind.mac-linux=ssh\nplatform.mac-linux=linux\n'
+                                 + 'settings.mac-linux=mac_linux.conf\n'
+                                 + f'{target_config.UNREACHABLE_WAIT_KEY}=20\n')
+        configuration = live_config / 'mac_linux.conf'
+        _ = write_config_fixture(configuration, 'ssh.hops=fixture-mac fixture-guest\nguest.user=fixture\n'
+                                 + 'test.jobs=2\nrun.time_limit_seconds=7\nssh.connect_attempts=3\n')
+        _ = configuration.write_text(configuration.read_text().replace(
+            '# whole: 1..\nssh.connect_attempts=3\n', ''))
+        repository = self.root / 'repository-config/mac_linux.conf'
+        _ = write_config_fixture(repository, 'ssh.connect_attempts=5\n')
+        with (patch.dict(os.environ, {'HOME': str(home)}),
+              patch.object(conf, '_repository_path', return_value=repository)):
+            del os.environ['CONF_DIR']
+            settings = mac_linux.read_settings(conf.read('build_targets'))
+        self.assertEqual(settings.connect_attempt_limit, 5)
+
     def test_missing_bwrap_refuses_before_upload(self) -> None:
         binaries = self.root / 'without-bwrap'
         binaries.mkdir()
@@ -3409,7 +3436,8 @@ with (patch.object(conf, 'read', read_config),
 
     def test_each_guest_ssh_hop_waits_the_unreachable_wait_for_a_keepalive_answer(self) -> None:
         # A busy Mac can be silent for more than 30 s, so each hop waits the unreachable wait of 600 s.
-        settings = mac_linux.GuestSettings(('fixture-mac', 'fixture-guest'), 'gate-runner', 4, 1800, 600)
+        settings = mac_linux.GuestSettings(('fixture-mac', 'fixture-guest'), 'gate-runner', 4, 1800, 600,
+                                           connect_attempt_limit=3)
         command = settings.command('true')
         alive = ['-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=40']
         mac_hop = list(command[:-2])
@@ -3639,6 +3667,16 @@ with (patch.object(conf, 'read', read_config),
         self.assert_guest_clean('probe', 'arm', 'run', 'run', 'run', 'cleanup')
         self.assertFalse((self.guest_home / 'build').exists())
 
+    def test_probe_arm_and_stream_use_the_configured_connect_attempt_limit(self) -> None:
+        _ = write_config_fixture(self.registry.with_name('mac_linux.conf'), 'ssh.connect_attempts=1\n')
+        for stage, events in (('run', ('probe', 'arm', 'run', 'cleanup')),
+                              ('arm', ('probe', 'arm')), ('probe', ('probe',))):
+            with self.subTest(stage=stage), patch.dict(os.environ, {f'FIXTURE_SSH_{stage.upper()}': 'reset'}):
+                _ = self.trace.write_text('')
+                reason = self.unconfirmed(self.route())
+                self.assertIn('Connection reset by peer after 1 connect attempt', reason)
+                self.assert_guest_clean(*events)
+
     def test_zero_exit_with_empty_reply_retries_only_the_exact_inner_connect_diagnostic(self) -> None:
         detail = b'ssh: connect to host 127.0.0.1 port 31022: Connection reset by peer\n'
         diagnostics = mac_linux.INNER_CONNECT_MARKER.encode() + b'\n' + detail
@@ -3654,7 +3692,8 @@ with (patch.object(conf, 'read', read_config),
                 success = subprocess.CompletedProcess[bytes]([], 0, b'reply\n17\n', b'')
                 stream = Mock(side_effect=[failed, success])
                 with patch.object(mac_linux, 'sleep') as delay:
-                    result = mac_linux.retry_guest_connect(stream, time.monotonic() + 10, bundle_stream=bundle)
+                    result = mac_linux.retry_guest_connect(stream, time.monotonic() + 10, attempt_limit=3,
+                                                            bundle_stream=bundle)
                 self.assertIs(result, success if retries else failed)
                 self.assertEqual(stream.call_count, 2 if retries else 1)
                 self.assertEqual(delay.call_count, int(retries))
@@ -3768,17 +3807,24 @@ with (patch.object(conf, 'read', read_config),
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup', 'cleanup', 'cleanup', 'cleanup')
 
     def test_interrupted_cleanup_pause_keeps_the_connect_attempt_count(self) -> None:
-        settings = mac_linux.read_settings(conf.read(self.registry))
-        armed = mac_linux.arm_guest(settings, 'cleanup-connect-interrupt')
-        end = mac_linux.GuestEndWait(settings, armed)
-        with (patch.object(mac_linux, 'sleep', side_effect=[None, KeyboardInterrupt(), None, None]) as delay,
-              patch.dict(os.environ, {'FIXTURE_SSH_CLEANUP': 'reset,reset,reset'})):
-            with self.assertRaises(KeyboardInterrupt):
-                end.run()
-            end.run()
-        self.assertTrue(end.proven)
-        self.assertEqual(delay.call_args_list, [call(1), call(1), call(1), call(8)])
-        self.assert_guest_clean('arm', 'cleanup', 'cleanup', 'cleanup', 'cleanup')
+        for attempt_limit, pauses in ((3, [call(1), call(1), call(1), call(8)]),
+                                      (2, [call(1), call(8), call(8)])):
+            with self.subTest(attempt_limit=attempt_limit):
+                _ = self.trace.write_text('', encoding='utf-8')
+                _ = write_config_fixture(self.registry.with_name('mac_linux.conf'),
+                                         f'ssh.connect_attempts={attempt_limit}\n')
+                settings = mac_linux.read_settings(conf.read(self.registry))
+                armed = mac_linux.arm_guest(settings, 'cleanup-connect-interrupt')
+                end = mac_linux.GuestEndWait(settings, armed)
+                failures = ','.join(['reset'] * attempt_limit)
+                with (patch.object(mac_linux, 'sleep', side_effect=[None, KeyboardInterrupt(), None, None]) as delay,
+                      patch.dict(os.environ, {'FIXTURE_SSH_CLEANUP': failures})):
+                    with self.assertRaises(KeyboardInterrupt):
+                        end.run()
+                    end.run()
+                self.assertTrue(end.proven)
+                self.assertEqual(delay.call_args_list, pauses)
+                self.assert_guest_clean('arm', *(('cleanup',) * (attempt_limit + 1)))
 
     def test_sandboxed_guest_returns_module_metrics(self) -> None:
         result = self.route()

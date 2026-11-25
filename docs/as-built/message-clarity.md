@@ -238,7 +238,7 @@ The gate permits only an exact match. A missing template id or failed gate check
   Sent by: hana · Template: auto_mode.refused
   ```
 
-  - `Sent by` is `sender_name(source)`: the source on one line, at most 80 characters. A `send.py in <session>` source (`send.py`'s `default_sender()`) shows only the session; any other source (`stall-watch`, `rca`, `natedev`, `build-followups`, `send.py`, or the parent command line when there is no `--source`) shows as it is.
+  - `Sent by` shows the source on one line. `notify.pushover.max_source_chars` limits the sender name and the parent command to 80 characters. The parent command is the source when the command has no `--source` option. A source of the form `send.py in <session>` shows the session name.
   - `Template` is the `--text-id`, or `none (free text)` for a push with no text id.
   - The footer always fits in 1024 characters: a long message is cut at the end first, never the footer.
   - An empty sender is refused: nothing is posted, the log outcome is `refused before sending: no sender`, and the exit is 2.
@@ -300,16 +300,39 @@ Legacy failure records remain readable by the existing tools.
 - An auto-mode refusal uses `--text-id auto_mode.refused`. A free-text refusal push is held before the claim.
   The check matches `auto mode` or `auto-mode`, plus `refused`, `denied` or `stopped`, in its title or text.
   A resend with the template is not skipped by `--repeat-minutes`.
-  The three rca.py pushes in `RCA_TEXTS` are exempt: `permission.rca_started`, `permission.rca_fixed` and `permission.rca_fixed_rewritten`.
-  They describe permission stops or refusals. A cause can name an auto-mode refusal.
 - For a paid credit decision, use `--text-id quota.paid_credits` or `--text-id quota.paid_credits_queued`.
   `wrong_template()` holds a free-text or `nate.adhoc` push whose title, text, or action reports paid credit use.
 - The ordinary decision accepts `account`, `machine`, `credits`, `refill`, `next_reset`, and `credit_accounts`.
   The queued decision omits `next_reset`. Older callers can omit `credit_accounts` to use the live config.
   `paid_credits_values()` uses the session name as the sender. Without a session record, it uses `--value sender`, then `--from`.
   It refuses the call if it has no sender.
-- `--text-id auto_mode.refused`: the session gives `session`, `machine`, one `command` for each refused command (in order), `waits` and an optional `rule`. `command` is the only key that can repeat, and only for this template; `parse()` collects the items in a list. `auto_mode_values()` fills `sender` from the session's own record (`own_session_name()`), `action` from the commands' first words (`rca.action_of()`: `a file change`, `a shell command`, `an action`, `2 shell commands`, or `2 actions` for mixed kinds), `refused` from the commands (one per line), `waits_line` from `waits` (`rca.waits_line()`), `noun` and `this` from the number of commands, and `rule_line` from `rule`. It drops the final periods from `waits` and cuts a command longer than 90 characters to its first 89 and `…`. A send with no `--key` gets the key `auto-mode:<session>:<first 12 hex of the sha256 of the sorted one-line commands>` (`auto_mode_key()`), so `rca.py fixed` can retire the alert. The waits sentence is a value the session writes, so `send()` keeps it only when the cold-read review approves the whole alert within `WAITS_REVIEW_SECONDS` (30 s, `review.review(…, limit=30)`; `reviewed_waits()`). A timeout or a `Failed`, `Rewritten`, `Withheld` or `Unreviewed` verdict sends the alert without it and prints why to stderr. With the review off the alert goes as given. It refuses no command, an empty command, a `waits` that has a thing to type or names a pane or session (`waits` says only what waits; the Action line says what the user does), `--value sender`, `--from`, `--machine` and a run with no session record. `send.py --help` lists the registered pushes (`SESSION_TEMPLATES`): the templates a session sends, and the three rca.py pushes with the rca.py call that sends them. `Options.commands` keeps each `command` value as given, before the cut, for the rca.py case.
-  The send rule lives beside `auto_mode.refused` in `send.py --help`. The session applies it before sending; no program checks it.
+- Use `--text-id auto_mode.refused` for an auto-mode refusal.
+  Give `session`, `machine` and one `command` for each refused command.
+  Give `waits` and `rule` when applicable.
+  For this template, `parse()` accepts repeated `command` values in the order given.
+  Give at least one command and make each command nonempty.
+  Describe only the work that waits in `waits`.
+  Put the user's instruction in the Action line.
+  `parse()` rejects `waits` values that tell the user what to type.
+  It also rejects `waits` values that name a pane or session.
+  It also rejects `--value sender`, `--from`, `--machine` and a send without a session record.
+  `auto_mode_values()` uses the sending session's name as the sender.
+  It counts the commands, selects the singular or plural noun and removes final periods from `waits`.
+  The template shows the count in the title and the target session on the Session line.
+  It adds `waits` to the title if the result fits within 44 characters.
+  `Options.commands` keeps each original command for the RCA case.
+  If the caller omits `--key`, `auto_mode_key()` uses the session and a hash of the commands.
+  It collapses whitespace, removes duplicates and sorts the commands before computing the SHA-256 hash.
+  The key uses `auto-mode:<session>:<first 12 hex digits>`.
+  `rca.py fixed` uses this key to retire the alert.
+  `reviewed_waits()` reviews the clause with the alert title and action.
+  The `waits_review_seconds` setting gives the review 30 seconds by default.
+  The send keeps the clause if the review approves it or flags only the fixed title or header.
+  Otherwise, the send omits the clause and prints the reason to stderr.
+  If review is off, the send uses the clause as given.
+  `send.py --help` lists the templates in `SESSION_TEMPLATES`.
+  The help for `auto_mode.refused` gives the send rule.
+  Apply that rule before sending.
 - After `parse()` renders a registered text, it refuses the run when `action_conflicts()` gives a reason: `<id> gives a second action: <reasons>`. A template value cannot add a second action. Registered texts other than agent-written ids are sent as rendered and skip live review when approved (2026-10-23: a `waits` value told the user to type `! kill …` in a second session).
 - `--text-id session.needs_go`: the session gives `session`, `machine`, `go`, `why` and `does`. `needs_go_values()` fills `sender` from the session's own record and drops a final period from `why` and `does`. It refuses the same things as `auto_mode.refused`. A free-text or agent-written push (`nate.adhoc`) whose title, text or action has `type: Go:`, `until you allow`, `until you type` or `waits for your go` is held (`wrong_template()`).
 - `user()` passes the message's `--key` to `pushover.py`, in the free-text and the `--text-id` forms, so a kept push with the same key from the same sender replaces the older kept one, and a `--need blocked` push carries the key's tag. `remote()` forwards `--key` to the far `send.py`. `push_texts.user_send_argv(…, key=)` adds `--key`.
@@ -378,7 +401,17 @@ New escalate holds retain their registered template and values.
   - `fingerprint(entry)` is the sha256 over the templates and every example's values and filled text.
   - `listing(entries)` gives one line per entry, sorted by id: the id in one column, then its purpose. `shown(entry)` gives the entry's purpose, its template with the `{placeholders}` (Title, Session, Action, body, as the phone lays them out) and its first example filled through `render_entry`. `review.py list` and `review.py show <id>` print them with no network and no reviewer; an unknown id prints `No template named <id>.` and the list, and exits 1. `/nate`, `/nate help` and `/nate usage` print the `adhoc`, `silence` and `show` lines and then `review.py list`; `/nate show <id>` prints `review.py show <id>` (user request, 2026-10-21).
   - `REVIEWED_FILE` and `catalog()`, which loads `push_catalog.ENTRIES` and checks for unique ids and named examples.
-- `scripts/notify/push_catalog.py` holds every fixed phone text, from scripts and from nixos, each with realistic examples. A comment says where the examples come from. Entry ids include `shutdown.*`, `quota.*`, `rust.*`, `sweep.disk_floor`, `codex.reset_ready` and `nixos.{disk_low,gpu_stopped,ups_battery,ups_shutdown}`.
+- `scripts/notify/push_catalog.py` holds every fixed phone text, from scripts and from nixos, each with realistic examples. A comment says where the examples come from. Entry ids include `shutdown.*`, `quota.*`, `rust.*`, `sweep.disk_floor` and `nixos.{disk_low,gpu_stopped,ups_battery,ups_shutdown}`.
+- `shutdown.restart_failed` uses the title `{session} did not start on {account}`.
+  The title uses an ellipsis when it shortens a long name or account.
+  The title fits 44 characters.
+  An unnamed session appears as `A session` in the title.
+  The action is `In the natedev session, run: /agents resume {session} --to {account}`.
+  The command uses the full name when it is unique.
+  The command uses the session ID when the name is missing or shared.
+  The push has no body.
+  At silence release, Pushover reads the session and account from the old saved text and renders the current push.
+  Pushover drops an old push with one log entry if the saved text lacks either value.
 - `nixos.gpu_stopped`: sender `gpu`, need `decision` (priority 0 without an in-window `--due`), values `xid`, `meaning`, and `time` as `HH:MM <zone>` in the user's zone; wording lives in `push_catalog.py`. `scripts/notify/gpu_xid.py` owns the code-to-meaning table and CLI: `gpu_xid.py <code>` prints the meaning and exits 0; an unknown code exits 2.
 - `nightly.result` reports the branch, finish time, type result and full test result.
   `nightly.not_run` shows `Nightly check did not run`, the reason, and the next scheduled run in the user's time zone.
@@ -477,30 +510,66 @@ With recurring jobs that have enough budget to admit work, accessible state, and
 
 ### Permission root cause: `scripts/message/rca.py`
 
-The user asked for this on 2026-10-23: each permission alert starts a root cause analysis, and the user gets one push when it starts and one when it is fixed, so the same command never stops a session again.
+A permission alert can open a case.
+A later permission alert can join an open or started case with the same session and commands.
+The `start` and `fixed` commands send no follow-up push.
 
-- A case is one JSON file, `<id>.json`, in `$XDG_STATE_HOME/message/rca` (else `~/.local/state/message/rca`), with a `.lock` for `flock`. Its fields are `id`, `session`, `machine`, `production` (or `""`), `commands`, `kind` (`prompt` or `auto_mode`), `transcript`, `opened` (UTC ISO time), `status` (`open`, `started` or `fixed`), `owner`, `cause`, `fix`, `commit`, `reminded`, `alerts`, `stopped` (UTC ISO time of the permission stop or refusal; `opened` when the report gives none), `waits` (the waits sentence the alert showed, or `""`), `alert_source` and `alert_key` (the alert's sender and key, `""` when it had no key) and `refusals` (how many times the push review refused the fixed text). `read_case()` gives a case file from before a field existed that field's default (`stopped` reads `opened`). The id is the date in the user's zone and a counter: `261023-1` is the first case of 2026-10-23. Each machine keeps its own cases, so the rca.py commands run on the machine that opened the case.
+- Each machine stores its own case files in `$XDG_STATE_HOME/message/rca` or `~/.local/state/message/rca`.
+  Run the `rca.py` commands on the machine that opened the case.
+  Each case uses one JSON file named `<id>.json`.
+  The case ID uses the date in the user's time zone and a counter.
+  For example, `261023-1` is the first case of 2026-10-23.
+  Updates take an exclusive lock on `.lock`.
+  A case records `id`, `session`, `machine`, `production`, `commands`, `kind`, `transcript` and `opened`.
+  It also records `status`, `owner`, `cause`, `fix`, `commit`, `reminded`, `owner_told` and `alerts`.
+  The status can be `open`, `started` or `fixed`.
+  The kind can be `prompt` or `auto_mode`.
+  The case stores the event time in `stopped` and the alert's waits sentence in `waits`.
+  It stores the alert's sender and key in `alert_source` and `alert_key`.
+  If an older case has no event time, `read_case()` uses `opened`.
+  It supplies empty strings for missing alert fields.
 - `rca.py open --session S --machine M --kind K [--command C …] [--transcript P] [--production <showrunner name>]` makes a case, or, when an open or started case has the same session and the same set of commands (whitespace collapsed, order ignored), adds 1 to its `alerts`. It prints `rca: opened <id>` or `rca: joined <id>`. `open_case(Report)` never raises and the command always exits 0: the alert already went out, so an error only prints `rca: no case opened: …` to stderr.
 - The transcript belongs to the selected session. The current staff row supplies its production and unit labels.
 - The owner message says `stopped at a permission prompt` for a prompt case.
   For an auto-mode case, it says `had a command refused by auto mode`.
   Both forms say `Find why this happened and fix the source.`
-- The owner is the production's showrunner (`showrunners.current_address(name)`). With no production, or when its showrunner does not run, the owner is the `natedev` session. A new case sends the owner one message: `send.py --to <owner> --from rca --key rca-<id> --text …`. The message names the case, session, machine, commands and transcript (no `Transcript:` line when the case has none), and gives four steps: run `~/.claude/scripts/lib/py ~/.claude/scripts/message/rca.py start <id> --owner <unit>`; find where the command came from (a work order, a helper prompt, a skill or a script); route the fix to the unit that owns that source, so the command never needs a prompt (an allow rule only when the command is safe and expected); after the fix merges, run `rca.py fixed <id> --cause … --fix … --commit <sha>`, with cause and fix in plain words for a reader who does not know the code (no file names, commands or shas), rewritten once when the push review refuses them. `tell_owner()` waits through the shared `send(argv)` path and appends the UTC time, key and completed outcome to `owner.log`. New cases persist `owner_told=false` before delivery and set it true only after success. The watcher and the auto-mode refusal send defer owner delivery until the next concurrent RCA batch; first notices, due reminders, owner socket lookups and case locks share the remaining 110-second tick budget, below the notifier’s 120-second watchdog. Failed or timed-out notices remain in their cases for the next pass. Direct RCA calls retain the 300-second send limit.
-- `rca.py start <id> --owner <unit>` sets `started` and the owner, and sends `permission.rca_started`. `rca.py fixed <id> --cause TEXT --fix TEXT --commit SHA` first runs the cold-read push review (`review.review()`, as pushover.py runs it) on the whole rendered `permission.rca_fixed`, since cause and fix are free text. On the first refusal (`Rewritten`, `Failed` or `Withheld`) it sends nothing, adds 1 to `refusals`, prints `rca: not sent: the push review refused this text:` with the text, the reviewer's failures, questions and rewrite, and exits 1, so the owner writes cause and fix again once. On a second refusal it sends the reviewer's rewrite as `permission.rca_fixed_rewritten`, or the owner's text when the reviewer gave no rewrite. With no reviewer (`Unreviewed`) or the review off, the owner's text goes. When the text goes, `fixed` sets `fixed` and the commit, then retires the case's alert by its sender and key (`send.py retire --to user --from <alert_source> --key <alert_key>`, `push_texts.user_retire_argv`), and then sends the push; a case with no `alert_key` skips the retire. So a kept alert never goes out at silence end, and an emergency alert stops repeating. Each push goes through `push_texts.user_send_argv` and `send.py --to user --text-id … --from <sender> --key rca-<id>`, so while silence is on the fixed push replaces the kept started one. The sender is the production, or `messaging` when there is none. A fixed case takes no `start`; `fixed` can run again to send its push again. A push that send.py does not send exits 1 and keeps the new status; a first refusal exits 1 and keeps the old status; an unknown id exits 2.
-- `rca.py list` prints one line per open or started case. `rca.py remind`, and `rca.remind()` at the end of each `stall_watch.py` pass, sends the owner one reminder (`--key rca-<id>-remind`) for each case still `open` 30 minutes after it opened. First notices still pending and due reminders run concurrently, wait for delivery and mark `owner_told` or `reminded` only on exit 0; a failure retries on the next pass. The `start` and `fixed` pushes wait for send.py (`SEND_SECONDS`, 300 s) and print its outcome, because a showrunner runs them by hand and reads it.
-- The three texts have need `note` and no action. They name no owner, file, command or commit.
-  The commit stays in the case and `owner.log`.
-  `story()` fills `time` from `silence.shown(stopped)` and `stop` from the case.
-  The stop text is `auto mode refused <kind>` or `the session asked you to allow <kind>`.
-  `rca.action_of()` supplies the kind: `a file change`, `a shell command`, `an action`, `2 shell commands` or `2 actions`.
-  Only send.py cuts refused commands.
-  - `permission.rca_started` title: `{sender}: finding why {session} hit a check`.
-    Body: `At {time} in the {session} session, {stop}.{waits_line} A session now finds the cause and fixes it, so this does not happen again. A second push comes when the fix is in.`
-    `waits_line` is the case's waits sentence, or `""`.
-  - `permission.rca_fixed` title: `{sender}: fixed why {session} hit a check`.
-    The body has three lines: `At {time} in the {session} session, {stop}.`, `Why: {cause}.` and `Now: {fix}.`
-    The fixed push has no waits sentence. rca.py puts cause and fix on one line each and removes their final periods.
-  - `permission.rca_fixed_rewritten`: title `{title}`, body `{body}`: the reviewer's rewrite of a fixed text it refused twice.
+- The production's showrunner receives the owner message.
+  When the production has no active showrunner, the `natedev` session receives it.
+  A new case sends one message with `send.py --to <owner> --from rca --key rca-<id> --text …`.
+  The message gives the case ID, session, machine, commands and transcript path when available.
+  It gives the owner four steps.
+
+  1. Run `rca.py start <id> --owner <unit>` on the machine that opened the case.
+  2. Find the source of the command.
+  3. Assign the fix to the unit that owns the source.
+  4. Run `rca.py fixed <id> --cause TEXT --fix TEXT --commit SHA` after the fix merges.
+
+  Use an allow rule only for a safe and expected command.
+  `tell_owner()` waits for `send(argv)` and records the UTC time, key and outcome in `owner.log`.
+  A new case starts with `owner_told=false`.
+  It sets `owner_told=true` only after successful delivery.
+  The watcher and the auto-mode refusal send defer owner delivery to the next concurrent RCA batch.
+  The batch shares the time that remains in the 110-second tick budget.
+  The outer watchdog allows 120 seconds.
+  Failed and timed-out owner notices remain pending for the next pass.
+  Direct owner sends use the configured send limit of 300 seconds.
+- `rca.py start <id> --owner <unit>` sets the status to `started` and records the owner.
+  `rca.py fixed <id> --cause TEXT --fix TEXT --commit SHA` sets the status to `fixed` and records the cause, fix and commit.
+  It then runs `send.py retire --to user --from <alert_source> --key <alert_key>` if the case has an alert key.
+  It prints the retirement result.
+  Retirement removes a kept alert and stops an emergency alert from repeating.
+  If retirement fails, `fixed` exits 1 and keeps the saved cause, fix and commit.
+  The alert can still repeat.
+  Run `fixed` again to retry retirement.
+  An unknown case ID exits 2.
+  A `start` command for a fixed case also exits 2.
+- `rca.py list` prints one line per open or started case.
+  `rca.py remind` sends one owner reminder for each case still open after 30 minutes.
+  Its key is `rca-<id>-remind`.
+  The watcher calls `rca.remind()` at the end of each pass.
+  First notices and due reminders run concurrently.
+  They set `owner_told` or `reminded` after a successful send.
+  A failed send stays pending for the next pass.
 - Hooks:
   - `stall_watch.permission_prompt` uses the title `<unit> is stuck at a permission prompt` and keeps the Session line.
     The action tells the user to open the unit's herdr tab and answer its prompt.

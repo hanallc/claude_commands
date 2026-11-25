@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.lib import live_settings, main_publish, zone, user_zone
+from scripts.lib import conf_reads, live_settings, main_publish, zone
+from scripts.lib.git_test_support import commit_repository
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("zone.py")
@@ -75,17 +76,24 @@ class ResolveTests(unittest.TestCase):
 
 
 class StoredZoneTests(unittest.TestCase):
-    def test_stored_uses_the_shared_reader_for_values_and_the_default(self) -> None:
+    def test_stored_uses_the_explicit_file_and_recovers_its_committed_zone(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         conf = root / "user_zone.conf"
-        for contents, expected in ((None, user_zone.DEFAULT_ZONE), ("# no setting\n", user_zone.DEFAULT_ZONE),
-                                   ("zone=\n", user_zone.DEFAULT_ZONE), ("zone= Europe/Paris \n", "Europe/Paris")):
+        _ = subprocess.run(["git", "-C", str(root), "init", "-q"], check=True, capture_output=True,
+                           timeout=TEST_HANG_GUARD_SECS)
+        _ = write_config_fixture(conf, f"zone={INITIAL_ZONE}\n")
+        _ = commit_repository(root, "Set test zone", conf.name)
+        conf.unlink()
+        for contents, expected in ((None, INITIAL_ZONE), ("# no setting\n", INITIAL_ZONE),
+                                   ("zone=\n", INITIAL_ZONE), ("zone= Europe/Paris \n", "Europe/Paris")):
             with self.subTest(contents=contents):
                 if contents is not None:
                     _ = conf.write_text(contents, encoding="utf-8")
-                with mock.patch.object(user_zone, "stored_zone", wraps=user_zone.stored_zone) as reader:
+                reads = root / "reads"
+                _ = reads.write_text("")
+                with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}), conf_reads.record_reads(reads):
                     self.assertEqual(zone.stored(conf), expected)
-                reader.assert_called_once_with(str(conf))
+                self.assertIn("user_zone", reads.read_text().splitlines())
 
 
 @unittest.skipIf(platform.system() == "Darwin", "/zone set runs on natedev")
@@ -109,7 +117,6 @@ class SetTests(unittest.TestCase):
         self.env = {key: value for key, value in os.environ.items() if key not in ("USER_ZONE", "XDG_STATE_HOME")}
         self.env.update({
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
-            "USER_ZONE_CONF": str(self.checkout / "config/user_zone.conf"),
             "ZONE_SSH": str(ssh), "ZONE_BROADCAST": str(self.fakes / "broadcast.py"),
             "ZONE_STATE": str(self.root / "state"), "CONF_DIR": str(self.checkout / "config"),
             "XDG_STATE_HOME": str(self.root / "xdg"),
@@ -193,7 +200,6 @@ class SetTests(unittest.TestCase):
                                   capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
         with mock.patch.dict(os.environ, self.env, clear=True), \
-                mock.patch.object(user_zone, "CONF", self.checkout / "config/user_zone.conf"), \
                 mock.patch.object(main_publish, "ssh", side_effect=send), redirect_stdout(io.StringIO()) as output:
             self.assertEqual(zone.set_zone("Curacao"), 0)
         self.assertIn("mac: a newer Save is already live", output.getvalue())
@@ -281,7 +287,6 @@ class SetTests(unittest.TestCase):
         conf = self.checkout / "config/user_zone.conf"
         head = self.git(self.checkout, "rev-parse", "HEAD")
         with mock.patch.dict(os.environ, self.env, clear=True), \
-                mock.patch.object(user_zone, "CONF", conf), \
                 mock.patch.object(live_settings, "publish", side_effect=RuntimeError("stopped before commit")), \
                 self.assertRaises(RuntimeError):
             _ = zone.set_zone("Curacao")
@@ -346,7 +351,6 @@ class SetTests(unittest.TestCase):
             return original_run(command, **options)
 
         with mock.patch.dict(os.environ, self.env, clear=True), \
-                mock.patch.object(user_zone, "CONF", self.checkout / "config/user_zone.conf"), \
                 mock.patch.object(subprocess, "run", side_effect=run):
             status = zone.set_zone("Curacao")
         self.assertEqual(status, 0)

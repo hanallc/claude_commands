@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from datetime import UTC, datetime
 import io
 from pathlib import Path
@@ -22,7 +22,9 @@ from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.mac_test.offload_test_commands import (
     ACTIVITY_SELECTOR_STUB, install_nextest_log_writer, write_shell,
 )
-from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS
+from scripts.lint.memory_test_support import (
+    UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture,
+)
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.lib.checkout_test_support import fixture_shim_source
 from scripts.lib import conf, removal_guard, test_hang_guard
@@ -169,6 +171,10 @@ class MacCleanupProtocolTests(unittest.TestCase):
 
 
     def test_nextest_summary_scan_bounds_long_lines(self) -> None:
+        config = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        scan_bytes = 96
+        _ = write_config_fixture(config / "mac_test.conf", f"nextest.summary_scan_bytes={scan_bytes}\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)})))
         summary = b"Summary [0.1s] 1 test run: 1 failed, "
         noise = b"x" * (64 * 1024)
         fake_summary = b"Summary [0.2s] 1 test run: 1 passed"
@@ -190,6 +196,7 @@ class MacCleanupProtocolTests(unittest.TestCase):
                 for call in readline.call_args_list:
                     (size,) = cast(tuple[int], call.args)
                     self.assertTrue(0 < size < len(noise))
+                    self.assertLessEqual(size, scan_bytes)
                 self.assertEqual(output.getvalue(),
                                  b"mac_test: full nextest log: log\nmac_test: tail fragment: end\n"
                                  + (expected + b"\n" if expected else b""))
@@ -209,7 +216,8 @@ class MacTargetCleanupShellTests(unittest.TestCase):
         configuration.mkdir()
         _ = (configuration / "build_targets.conf").write_text(MAC_TARGET_CONFIG)
         mac_settings = configuration / "mac_test.conf"
-        _ = mac_settings.write_text("mirror_root=~/.local/state/mac-test/mirror\n" + nextest_settings())
+        _ = write_config_fixture(mac_settings, "mirror_root=~/.local/state/mac-test/mirror\n"
+                                 + nextest_settings() + "nextest.summary_scan_bytes=96\n")
         _ = (configuration / "lint.conf").write_text(LINT_TRIM_CONFIG)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         _ = cast(object, self.enterContext(mock.patch.object(nextest_log, "DEFAULT_SETTINGS", mac_settings)))
@@ -364,26 +372,36 @@ exit "$CLEANUP_TEST_STATUS"
         write_shell(lint, 'cat "$CLEANUP_TEST_DIR/nextest-out" >&2\nexit "$CLEANUP_TEST_STATUS"\n')
         limits = ((nextest_log.TAIL_BYTES, str(len(fragment))), (nextest_log.SUMMARY_BYTES, "52"))
         logs = self.home_directory / nextest_log.DIRECTORY
+        config = self.root / "config/mac_test.conf"
+        key_problem = f"{config}: nextest.summary_scan_bytes='1048577': outside range 1..1048576"
+        cases = (
+            (96, summary[:52] + "\n"),
+            (1048577, f"warning: {key_problem}\n"
+             + f"mac_test: cannot replay the nextest log: {key_problem}; no usable committed value\n"),
+        )
         for shell in (["/bin/sh"], ["zsh", "-f"]):
-            with self.subTest(shell=shell):
-                failed = self.run_remote(shell, 42, ("--target-dir=other-target",), budget_values=limits)
-                self.assertTrue(failed.stdout.startswith("mac_test: full nextest log: "), failed.stdout + failed.stderr)
-                self.assertEqual((failed.returncode, failed.stderr), (0, ""))
-                log, = logs.iterdir()
-                self.assertRegex(log.name, nextest_log.LOG_NAME)
-                self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
-                self.assertEqual(log.read_text(), output)
-                self.assertEqual(failed.stdout, (
-                    f"mac_test: full nextest log: {log}\n"
-                    + f"mac_test: tail fragment: {fragment}\n{summary[:52]}\n"
-                    + "mac_exit=42\nmac_cleanup=skipped\n"
-                ))
+            for scan_bytes, expected_replay in cases:
+                with self.subTest(shell=shell, scan_bytes=scan_bytes), ExitStack() as cleanup:
+                    _ = write_config_fixture(config, f"nextest.summary_scan_bytes={scan_bytes}\n")
+                    failed = self.run_remote(shell, 42, ("--target-dir=other-target",), budget_values=limits)
+                    self.assertTrue(failed.stdout.startswith("mac_test: full nextest log: "), failed.stdout + failed.stderr)
+                    self.assertEqual(failed.returncode, 0, failed.stderr)
+                    log, = logs.iterdir()
+                    _ = cleanup.callback(log.unlink)
+                    self.assertRegex(log.name, nextest_log.LOG_NAME)
+                    self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
+                    self.assertEqual(log.read_text(), output)
+                    self.assertEqual(failed.stdout, (
+                        f"mac_test: full nextest log: {log}\n"
+                        + f"mac_test: tail fragment: {fragment}\n{expected_replay}"
+                        + "mac_exit=42\nmac_cleanup=skipped\n"
+                    ))
+                    self.assertEqual(failed.stderr, "")
 
-                passed = self.run_remote(shell, 0, ("--target-dir=other-target",), budget_values=limits)
-                self.assertEqual((passed.returncode, passed.stderr), (0, ""))
-                self.assertEqual(passed.stdout, output + "\nmac_exit=0\nmac_cleanup=skipped\n")
-                self.assertEqual(list(logs.iterdir()), [log])
-                log.unlink()
+                    passed = self.run_remote(shell, 0, ("--target-dir=other-target",), budget_values=limits)
+                    self.assertEqual((passed.returncode, passed.stderr), (0, ""))
+                    self.assertEqual(passed.stdout, output + "\nmac_exit=0\nmac_cleanup=skipped\n")
+                    self.assertEqual(list(logs.iterdir()), [log])
 
     def test_remote_text_removes_only_old_abandoned_sessions_before_building(self) -> None:
         minutes = 3

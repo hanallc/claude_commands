@@ -1,6 +1,7 @@
 """The pacer's plan, its measurements, and the rollout reader feeding them."""
 
 import json
+import os
 from copy import deepcopy
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from scripts.lib.transcript_test_support import compressed_copy
+from scripts.lint.memory_test_support import write_config_fixture
 from typing import override
 from unittest.mock import patch
 
@@ -223,14 +225,19 @@ class MeasurementTests(unittest.TestCase):
 
         week = 1_800_000_000
         path = self.rollout("c.jsonl", [
-            reading(0, 10, week), reading(1, 11, week), reading(2, 12, week),
+            reading(0, 10, week), reading(1, 10.5, week), reading(2, 12, week),
             reading(3, 60, week + 999_999),        # another account: a new window, no spend
             reading(4, 0, week), reading(5, 1, week),  # a limit reset, then spend again
             reading(6, 40, week),                  # an impossible jump is not spend
         ])
-        state = pacer.empty_state()
-        pacer.ingest(state, iter([path]))
-        self.assertEqual(state["buckets"][pacer.hour_key(NOW)]["spent"], 3.0)
+        config = self.root / "config"
+        with patch.dict(os.environ, {"CONF_DIR": str(config)}):
+            for max_step_percent, spent in ((3.0, 3.0), (1.0, 1.5)):
+                with self.subTest(max_step_percent=max_step_percent):
+                    _ = write_config_fixture(config / "codex_pacer.conf", f"sampling.max_step_percent={max_step_percent}\n")
+                    state = pacer.empty_state()
+                    pacer.ingest(state, iter([path]))
+                    self.assertEqual(state["buckets"][pacer.hour_key(NOW)]["spent"], spent)
 
     def test_fit_recovers_the_fast_premium(self) -> None:
         state = pacer.empty_state()

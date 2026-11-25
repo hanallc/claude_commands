@@ -26,6 +26,7 @@ from unittest import mock
 from scripts.production import demote_showrunner, promote_showrunner, staff
 from scripts.accounts import role_map
 from scripts.agents import remote, shutdown, status_entry, stop_resume, restart_support
+from scripts.agents.remote import local_machine
 from scripts.agents.inventory import Inventory
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
@@ -876,6 +877,8 @@ class StaffTests(StaffCommandTestCase):
         from scripts.production.fake_showrunner import write_session
 
         owner, unit, worker = self.tree()
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree(local_machine(), self.root / unit.name),
+                                  expected=unit.worktree)
         before = unit.to_json()
         caller = fixture_member("showrunner", name="fixture-director")
         listener = write_session(sessions.sessions_dir(), "registry-name", caller.current_session)

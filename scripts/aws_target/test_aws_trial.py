@@ -51,7 +51,8 @@ def write_guest_config(root: Path, *, slow_test_s: float = 1.0) -> None:
     _ = (root / 'test_times.conf').write_text(
         f'# range: 0..\nSLOW_TEST_S={slow_test_s}\n'
         + '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n'
-        + '# whole: 1..\nTOP_RUNS=5\n')
+        + '# whole: 1..\nTOP_RUNS=5\n'
+        + '# whole: 1..\nmodule_cost.max_output_replay_bytes=1048576\n')
 
 
 @final

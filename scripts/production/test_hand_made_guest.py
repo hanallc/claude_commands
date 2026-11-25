@@ -149,7 +149,8 @@ class GuestRouteTests(unittest.TestCase):
         self.config.mkdir()
         self.switch("on")
         _ = (self.config / "mac_linux.conf").write_text(
-            "ssh.hops=fixture-mac fixture-guest\nguest.user=fixture\ntest.jobs=2\nrun.time_limit_seconds=7\n")
+            "ssh.hops=fixture-mac fixture-guest\nguest.user=fixture\ntest.jobs=2\nrun.time_limit_seconds=7\n"
+            + "\n# whole: 1..\nssh.connect_attempts=3\n")
         _ = write_config_fixture(self.config / "mac_test.conf", "unreachable_backoff_s=30\n")
         (self.root / "tmp").mkdir()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {

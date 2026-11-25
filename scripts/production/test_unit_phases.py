@@ -189,6 +189,7 @@ class UnitPhasesTests(unittest.TestCase):
         _ = (self.root / "table-conf/statusline.conf").write_text("# whole: 1..\ncounts.retry_seconds=7\n")
         environment = {"HOME": str(self.root), "NOTIFIER_STATE_DIR": str(notifier),
                        "SHOWRUNNER_STATE_DIR": str(self.root / "state"),
+                       "USER_ZONE": "",
                        "CHANGE_REVIEW_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links")}
         read_text = Path.read_text
 
@@ -201,6 +202,7 @@ class UnitPhasesTests(unittest.TestCase):
               patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources(()))):
             cache = counts_row.write_unit(member.id)
             self.assertEqual(cache.read_text().splitlines()[:2], ["Review: 1 efficiency", ""])
+            self.assertIn(str(self.root / "table-conf/user_zone.conf"), cache.read_text().splitlines()[2:])
             with patch.object(Path, "read_text", read), patch.object(time, "time", return_value=1000):
                 cache = counts_row.write_unit(member.id)
             line, due, *sources = cache.read_text().splitlines()
@@ -2838,6 +2840,7 @@ class UnitPhasesTests(unittest.TestCase):
         config.mkdir()
         _ = write_config_fixture(config / "production.conf",
                                  "UNIT_ANOMALIES_TO=fixture-director\nunits_anomaly_repeat_minutes=60\n")
+        _ = write_config_fixture(config / "user_zone.conf")
         def observed(*, record: staff.StaffSnapshot, running: object = None) -> tuple[session_staff.LabeledSession, ...]:
             self.assertEqual(record.by_id(member.id), member)
             self.assertIsNone(running)

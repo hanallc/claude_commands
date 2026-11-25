@@ -14,6 +14,7 @@ import unittest
 
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.shell_test_support import fixture_zsh_environment
+from scripts.lib.test_conf import AGENT_LIMIT_CASES, write_agent_limit_codex_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SHELL_READER = Path(__file__).with_name("conf.sh")
@@ -198,6 +199,20 @@ class ShellConfTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "2\n")
                 self.assertEqual((self.root / "python.log").read_text(), "python\n")
+
+    def test_agent_limits_use_the_selected_catalog_and_report_the_bad_part(self) -> None:
+        self.env["PATH"] += os.pathsep + os.environ.get("PATH", os.defpath)
+        self.env["CODEX_MODELS_CACHE_FILE"] = str(write_agent_limit_codex_cache(self.root))
+        for case in AGENT_LIMIT_CASES:
+            with self.subTest(case=case):
+                case.write_config(self.config)
+                result = self.run_reader("profile")
+                if case.refusal:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn(case.refusal, result.stderr)
+                else:
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (0, case.value + "\n", ""))
 
     def test_fault_delegation_recovers_the_committed_value(self) -> None:
         self.write("# whole: 1..4\ncount=3\n")

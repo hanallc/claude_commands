@@ -107,7 +107,6 @@ For `session:<staff-id>`, the staff row supplies the current session.
 A restarted session can therefore receive messages at its current socket.
 
 `COMMAND` supplies fixed message text.
-`codex_winddown.start_count` passes its `TICK` text through `--command` and creates no prompt file.
 For `PROMPT=scheduled`, the notifier runs `update_registration.py delivery --owner <staff-id>` once before delivery.
 It removes the `session:` prefix from `TARGET` for that command.
 The command resolves the owner's current name and document through one staff read.

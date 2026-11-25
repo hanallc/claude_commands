@@ -144,8 +144,9 @@ REAL_CURRENT_CLAUDE_RECORD = unit_lookup.current_claude_record
 
 
 def write_send_config(path: Path, values: str) -> int:
-    """Keep timing settings when a test writes its own send settings."""
-    for name in ("postmaster", "codex_daemon", "send_repeat_guard", "rca", "machines", "production"):
+    """Write the settings that the send fixture uses."""
+    for name in ("postmaster", "codex_daemon", "send_repeat_guard", "rca", "machines", "production", "notify",
+                 "user_zone"):
         _ = write_config_fixture(path.parent / f"{name}.conf")
     write_configs(path.parent)
     return write_config_fixture(path, values)
@@ -2770,6 +2771,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertIn("Read the phase report.", self.held_text())
 
     def test_repeat_guard_holds_the_third_delivery_and_logs_each_held_copy(self) -> None:
+        _ = write_config_fixture(self.root / "config/send_repeat_guard.conf", "repeat_count=3\n")
         with mock.patch.object(repeat_guard, "check", wraps=repeat_guard.check) as guard:
             results = [self.send("--text", "Morty stopped at 02:00 EDT, pid 100") for _ in range(5)]
         outcomes = [result.outcome for result in results]
@@ -5064,6 +5066,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(len(self.relayed), 2)
 
     def test_flood_guard_counts_a_staff_recipient_across_session_restarts(self) -> None:
+        _ = write_config_fixture(self.root / "config/send_repeat_guard.conf", "repeat_count=3\n")
         outcomes: list[str] = []
         for identity in ("first", "second", "third"):
             self.session(identity, "resources")
@@ -7397,18 +7400,6 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertEqual(len(cases), 1)
             self.assertFalse(cases[0].get("owner_told", True))
 
-    def test_the_rca_pushes_are_not_held_as_a_free_text_auto_mode_refusal(self) -> None:
-        values = {"sender": "cargo-liner", "session": "handler", "time": "09:01 AST",
-                  "stop": "auto mode refused a shell command", "cause": "a helper ran a build command that needs your permission",
-                  "fix": "helpers use the build command that is always allowed"}
-        rendered = push_texts.render(rca.FIXED_TEXT, **values)
-        self.assertTrue(send.reports_auto_mode_refusal(rendered.title + "\n" + rendered.body))
-        for text_id in (rca.STARTED_TEXT, rca.FIXED_TEXT, rca.REWRITTEN_TEXT):
-            with self.subTest(text_id=text_id):
-                options = local_options(["--to", "user", "--summary", rendered.title, "--no-action", "--text", rendered.body])
-                self.assertEqual(send.wrong_template(options._replace(text_id=text_id), rendered.body), None)
-                self.assertEqual(send.wrong_template(options, rendered.body), send.AUTO_MODE_HELD)
-
     def test_auto_mode_hides_long_commands_and_gives_rca_the_full_text(self) -> None:
         self.writer_session()
         exact, long = "a" * 90, "cargo test --workspace --all-features " + "b" * 60
@@ -7537,6 +7528,15 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
             self.assertEqual(send.send(local_options(self.user_arguments("--key", "plain"))).outcome, "sent")
 
+    def test_free_text_auto_mode_refusal_is_held_without_an_action(self) -> None:
+        for title, body in (("Build status", "Auto mode refused a command."),
+                            ("Auto mode", "The session refused a command.")):
+            with self.subTest(title=title):
+                options = send.parse(["--here", "--to", "user", "--no-action", "--summary", title, "--text", body])
+                self.assertEqual(options.text_id, "")
+                self.assertIsInstance(options.action, NoActionRequired)
+                self.assertEqual(send.wrong_template(options, f"{title}\n{body}"), send.AUTO_MODE_HELD)
+
     def test_help_lists_the_auto_mode_template_and_when_to_use_it(self) -> None:
         with redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit):
             _ = send.parse(["--help"])
@@ -7547,10 +7547,6 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("quota.paid_credits: an account now spends paid credits; a script with no Claude session names itself with --from.", output.getvalue())
         self.assertIn("quota.paid_credits_queued: an account now spends paid credits and the user queued a workers move;", output.getvalue())
         self.assertIn("session.needs_go: a session is stopped until the user types a go in its pane.", output.getvalue())
-        self.assertIn("permission.rca_started: a unit starts to fix the cause of a permission stop or refusal. Sent by"
-                      + f" rca.py start; sessions run rca.py, not this: {rca.CALL} start <id> --owner <unit>", output.getvalue())
-        self.assertIn("permission.rca_fixed: the fix merged; that permission does not stop or refuse the session again."
-                      + f" Sent by rca.py fixed; sessions run rca.py, not this: {rca.CALL} fixed <id>", output.getvalue())
 
     def needs_go_arguments(self, *extra: str, **changed: str) -> list[str]:
         values = {"session": "trunk", "machine": "natedev", "go": "Go: remove arrange_jacks/ from phases/130/files; 140 owns it",

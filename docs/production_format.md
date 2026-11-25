@@ -285,6 +285,8 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    3. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/fixture_conf_keys.py --repo ~/.claude --base origin/main --tip <join>`.
       It names each literal test fixture of a config file that lacks a key
       the row adds. Add the key to each named fixture.
+      It reports reads of removed keys and keys that no config file holds.
+      It counts sources that it cannot scan. The advisory scan does not block the join.
 
    Send the notice only when both runs are green. Name the join hash and both
    results in it.

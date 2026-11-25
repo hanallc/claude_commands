@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 
 from scripts.agents import pane_record  # noqa: E402
-from scripts.lib import autocompact, models_registry  # noqa: E402
+from scripts.lib import autocompact, conf, models_registry  # noqa: E402
 from scripts.lib.agent_program import is_claude_process  # noqa: E402
 
 # Auto-compaction does NOT wait for the window. Reconstructed from the 2.1.220
@@ -130,8 +130,7 @@ RESPONSE_TOKENS_CAP = 25_000
 BASE64_RUN = re.compile(r"[A-Za-z0-9+/=]{4096,}")
 IMAGE_TOKENS = 1_600
 
-# Bytes of transcript tail to scan for the most recent usage record.
-TAIL_BYTES = 512 * 1024
+# Maximum bytes for the retry scan.
 TAIL_BYTES_RETRY = 4 * 1024 * 1024
 
 # A compaction writes two adjacent entries: a `system` record carrying
@@ -503,7 +502,7 @@ def pending_line_bytes(text: str) -> int:
     return len(stripped) + 1 + images * IMAGE_TOKENS * int(PENDING_BYTES_PER_TOKEN)
 
 
-def latest_reading(path: Path) -> Reading | None:
+def latest_reading(path: Path, configuration: conf.ConfigRead) -> Reading | None:
     """Tokens in the context window as of the most recent assistant turn.
 
     Usage records only exist for turns that have already been sent, so the raw
@@ -526,7 +525,11 @@ def latest_reading(path: Path) -> Reading | None:
     refuses to err in everywhere else. Staying silent costs exactly one tool
     call, because the next assistant turn writes a real post-compaction record.
     """
-    for size in (TAIL_BYTES, TAIL_BYTES_RETRY):
+    try:
+        scan_sizes = (configuration.whole("transcript.tail_bytes"), TAIL_BYTES_RETRY)
+    except conf.Unusable:
+        scan_sizes = (TAIL_BYTES_RETRY,)
+    for size in scan_sizes:
         lines = read_tail(path, size)
         for offset, line in enumerate(reversed(lines)):
             if any(marker in line for marker in COMPACT_MARKERS):
@@ -601,7 +604,7 @@ def measure(payload: HookInput) -> Measurement | None:
     transcript = resolve_transcript(payload)
     if transcript is None:
         return None
-    reading = latest_reading(transcript)
+    reading = latest_reading(transcript, conf.read("context_usage"))
     if reading is None:
         return None
     return {

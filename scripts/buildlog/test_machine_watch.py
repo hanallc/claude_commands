@@ -83,7 +83,7 @@ class MachineWatchTests(NotificationGuardedTestCase):
         }))
         _ = write_config_fixture(config / "build_targets.conf", "enabled.mac-linux=on\n")
         _ = write_config_fixture(config / "mac_test.conf", "offload=on\n")
-        for stem in ("mac_linux", "hana_aws", "cloud_gate", "lint"):
+        for stem in ("mac_linux", "hana_aws", "cloud_gate", "lint", "user_zone"):
             _ = write_config_fixture(config / f"{stem}.conf")
         (self.root / "mac-state").mkdir()
         self.paths = machine_watch.watch_paths()
@@ -489,6 +489,7 @@ class MachineWatchTests(NotificationGuardedTestCase):
         self.assertEqual(saved, ["hana-gpu", "mac-linux"])
 
     def test_minute_sample_runs_the_watch_on_natedev(self) -> None:
+        _ = write_config_fixture(self.root / "config/build_admission.conf")
         with mock.patch.object(sample, "sample", return_value=sample.SampleTaken(1000, "natedev")), \
              mock.patch.object(machine_watch, "watch_once") as watch, \
              mock.patch.object(machine_facts, "sample_once") as facts:

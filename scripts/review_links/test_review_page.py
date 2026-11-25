@@ -23,7 +23,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Self, TextIO, cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, conf_reads, urgency
-from scripts.lib import user_zone as user_zone_config
 from scripts.lib.process_group import run_process_group, stop_process_group
 from scripts.lib.user_zone import user_zone
 import unittest
@@ -5710,13 +5709,12 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 self.assertFalse(updated.unread_answer)
 
         with self.subTest(count='six legacy Efficiency rows'):
-            zone_path = self.fixture.temporary / 'user_zone.conf'
-            _ = zone_path.write_text('zone=America/New_York\n')
-            with (patch.dict(os.environ), patch.object(user_zone_config, 'CONF', str(zone_path)),
-                  patch.object(conf_reads, 'read_text', wraps=conf_reads.read_text) as reads):
+            _ = write_config_fixture(conf.path('user_zone'), 'zone=America/New_York\n')
+            reads = self.fixture.temporary / 'efficiency-reads'
+            with patch.dict(os.environ), conf_reads.record_reads(reads):
                 _ = os.environ.pop('USER_ZONE', None)
                 self.assertEqual(review_items.efficiency(document, record=snapshot.members), 3)
-            self.assertEqual(sum(call.args[0] == str(zone_path) for call in reads.call_args_list), 1)
+            self.assertEqual(reads.read_text().splitlines().count('user_zone'), 1)
 
     def test_an_answer_returns_a_later_investigation_until_mark_read(self) -> None:
         for legacy_answer in (False, True):
@@ -5739,16 +5737,17 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         if legacy_answer:
             lines = path.read_text().splitlines(keepends=True)
             _ = path.write_text(''.join(earlier_log + '\n' if line.startswith('review_log: ') else line for line in lines))
-        zone_path = self.fixture.temporary / 'user_zone.conf'
-        _ = zone_path.write_text('zone=America/New_York\n')
-        with patch.dict(os.environ), patch.object(user_zone_config, 'CONF', str(zone_path)):
+        _ = write_config_fixture(conf.path('user_zone'), 'zone=America/New_York\n')
+        with patch.dict(os.environ):
             _ = os.environ.pop('USER_ZONE', None)
             answered = review_page.build_snapshot(self.root)
-            with patch.object(conf_reads, 'read_text', wraps=conf_reads.read_text) as reads:
+            reads = self.fixture.temporary / 'index-reads'
+            _ = reads.write_text('')
+            with conf_reads.record_reads(reads):
                 self.assertTrue(answered.records[key].for_you(now))
                 entries = unpack_index(review_page.index_json(answered.entries))
                 self.assertTrue(answered.records[key].unread_answer)
-            self.assertEqual([call for call in reads.call_args_list if call.args[0] == str(zone_path)], [])
+            self.assertNotIn('user_zone', reads.read_text().splitlines())
         self.assertTrue(next(entry for entry in entries if entry['key'] == key).get('unreadAnswer'))
         self.assertIn(b'value="read"', answered.body(key))
         self.assertEqual(review_later.times()[key], until)

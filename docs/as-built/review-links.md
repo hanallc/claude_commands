@@ -838,11 +838,19 @@ A retry can recover the filed item after a restart.
 For a synchronous screenshot, the server uses the capture digest to verify a retry.
 It replaces the old screenshot when the checkbox is selected.
 Clear **Include a screenshot** to omit the image.
-A Bug includes structured page sections and up to 48 rows of visible text from when the dialog opens.
+A Bug includes structured page sections and visible text from when the dialog opens.
+`new_item.max_page_rows` sets the visible row limit. It ships at 48.
 Other types include the same page data when Send requests a pending screenshot or the screenshot is unavailable.
 The Review card shows this evidence under **Page data**.
 A Bug also includes the page title, address, filters, and render time.
 The dialog shows Error lines and Script errors when the page has errors.
+
+The `new_item.*` keys and `page_capture.max_active` in `config/review_links.conf` set the New item limits.
+A new Send uses the live values.
+Saved items, restart recovery and attachment use the upper bound of each limit line.
+If a limit is unusable, Send gets a 503 response and the dialog keeps the draft.
+The console unavailable view omits the owner controls and the dialog.
+
 Review reuses gzip bytes for an unchanged page shell with its current owner control.
 A Bug with a screenshot also includes the viewport.
 **Send** closes the New item dialog at once.

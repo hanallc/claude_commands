@@ -10,12 +10,13 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from contextlib import AbstractContextManager, closing, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, ExitStack, closing, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.usage import collect, usage_report, waste_watch
 from scripts.production import session_staff, showrunners, staff
 from scripts.production.staff_test_support import (
@@ -55,6 +56,9 @@ class WasteWatchTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "CODEX_HOME": str(self.root / ".codex")}))
+        config = self.root / "config"
+        _ = write_config_fixture(config / "waste_watch.conf", "alert.max_wait_share=0.10\n")
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, config_environment(config))))
         self.models_cache = self.root / ".codex/models_cache.json"
         self.models_cache.parent.mkdir()
         _ = self.models_cache.write_text(json.dumps({"models": [
@@ -189,6 +193,10 @@ class WasteWatchTests(unittest.TestCase):
         self.request("worker", 0, 900_000)
         self.wait("worker", 1, 100_000)
         self.assertEqual(self.run_watch(), "")
+        config = self.root / "config/waste_watch.conf"
+        _ = write_config_fixture(config, "alert.max_wait_share=0.09\n")
+        self.assertIn("alpha spent 10%", self.run_watch(dry_run=True))
+        _ = write_config_fixture(config, "alert.max_wait_share=0.10\n")
         self.request("small", 2, 400_000, folder="/invented/small")
         self.wait("small", 3, 400_000, folder="/invented/small")
         self.assertEqual(self.run_watch(), "")
@@ -422,6 +430,34 @@ class WasteWatchTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertTrue(output.getvalue().startswith(f"waste_watch dry run: would send to {ADDRESS}:\n"))
         self.assertEqual(self.sent(), [])
+
+    def test_the_command_sends_context_alerts_when_the_wait_share_is_unusable(self) -> None:
+        _ = write_config_fixture(self.root / "config/waste_watch.conf", "alert.max_wait_share=invalid\n")
+        self.request("worker", 0, 900_000)
+        self.wait("worker", 1, 500_000)
+        self.context_requests("stuck-worker", [300_000] * 5)
+        for state_write_fails in (False, True):
+            with self.subTest(state_write_fails=state_write_fails), ExitStack() as stack:
+                self.sends.unlink(missing_ok=True)
+                (self.db_path.parent / "waste_watch.json").unlink(missing_ok=True)
+                errors = io.StringIO()
+                _ = stack.enter_context(redirect_stderr(errors))
+                if state_write_fails:
+                    _ = stack.enter_context(mock.patch.object(waste_watch, "write_state",
+                                                              side_effect=OSError("fixture state write failed")))
+                status = waste_watch.main(["--db", str(self.db_path), "--production-docs", str(self.docs),
+                                           "--now", "2026-10-16T12:00:00Z"])
+                self.assertEqual(status, 1)
+                sent = self.sent()
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(sent[0][:5], ["--to", ADDRESS, "--from", "usage-waste-watch", "--text"])
+                self.assertIn("alpha has 1 Codex worker thread above the model compaction limit.", sent[0][5])
+                self.assertNotIn("of its weighted usage", sent[0][5])
+                if state_write_fails:
+                    self.assertIn("waste_watch: fixture state write failed", errors.getvalue().splitlines())
+                self.assertRegex(errors.getvalue(),
+                                 r"(?m)^waste_watch: .*alert\.max_wait_share='invalid': .*no usable committed value$")
+                self.assertEqual(self.alert_times(), {} if state_write_fails else {"alpha": NOW.isoformat()})
 
 
 @final

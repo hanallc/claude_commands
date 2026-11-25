@@ -435,7 +435,7 @@ class ListPageTests(unittest.TestCase):
         _ = (config / "statusline.conf").write_text(
             "role.showrunner=#a379fd\nrole.unit-director=#ffaf02\n"
             + "role.producer=#90fe42\nrole.worker=#ff0404\n")
-        _ = (config / "review_links.conf").write_text(
+        _ = write_config_fixture(config / "review_links.conf",
             "# whole: 1..20\ndelivery_tries=3\n# range: 0..300\ndelivery_pause_seconds=0\n"
             + "# whole: 1..20\nfeedback_rows=5\n# whole: 1..20\nreview_words_rows=4\n"
             + "# whole: 1..1440\nlater_soon_minutes=60\n"

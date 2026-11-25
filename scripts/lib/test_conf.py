@@ -3,10 +3,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import redirect_stderr
+from dataclasses import dataclass
 from decimal import Decimal
+from enum import Enum, auto
 import io
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -18,6 +21,92 @@ from unittest import mock
 from scripts.lib import conf, conf_reads
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+class AgentLimitCatalog(Enum):
+    STANDARD_FIXTURE = auto()
+    CLAUDE_ALIAS_COLLISION = auto()
+    REPOSITORY = auto()
+
+
+@dataclass(frozen=True)
+class AgentLimitCase:
+    family: str
+    value: str
+    refusal: str = ""
+    catalog: AgentLimitCatalog = AgentLimitCatalog.STANDARD_FIXTURE
+    comment_prefix: str = ""
+
+    def write_config(self, directory: Path) -> None:
+        catalog = directory / "models.conf"
+        if self.catalog is AgentLimitCatalog.REPOSITORY:
+            catalog.unlink(missing_ok=True)
+        elif self.catalog is AgentLimitCatalog.CLAUDE_ALIAS_COLLISION:
+            _ = catalog.write_text(CLAUDE_ALIAS_COLLISION_CATALOG, encoding="utf-8")
+        else:
+            _ = catalog.write_text(AGENT_LIMIT_CATALOG, encoding="utf-8")
+        _ = (directory / "example.conf").write_text(
+            f"{self.comment_prefix}# agent: {self.family}\nprofile={self.value}\n", encoding="utf-8",
+        )
+
+
+AGENT_LIMIT_CATALOG = """\
+[claude.agents]
+claude-fixture=low,high
+claude-fixture-alias=low,high
+
+[claude.families]
+claude-fixture-alias=claude-fixture
+
+[codex.agents]
+gpt-fixture=high
+gpt-fixture-low=low
+gpt-6.1-codex-fixture-alias=high
+
+[codex.families]
+codex-fixture-alias=gpt-fixture
+"""
+
+CLAUDE_ALIAS_COLLISION_CATALOG = """\
+[claude.agents]
+opus=high
+claude-opus-custom=low
+
+[claude.families]
+opus=claude-opus-custom
+"""
+
+
+def write_agent_limit_codex_cache(directory: Path) -> Path:
+    cache = directory / "codex-models.json"
+    _ = cache.write_text('{"models":[{"slug":"gpt-6.1-codex-fixture-alias","visibility":"list"}]}\n',
+                         encoding="utf-8")
+    return cache
+
+
+AGENT_LIMIT_CASES = (
+    AgentLimitCase("claude", "claude-fixture-alias"),
+    AgentLimitCase("codex", "gpt-fixture"),
+    AgentLimitCase("codex", "codex-fixture-alias:high"),
+    AgentLimitCase("claude", "claude-fixture:low"),
+    AgentLimitCase("claude", "missing-fixture",
+                   "ERROR: [example.profile] agent 'missing-fixture' is not allowed for family 'claude'."),
+    AgentLimitCase("codex", "codex-fixture-alias:low",
+                   "ERROR: [example.profile] effort 'low' is not allowed for agent 'gpt-6.1-codex-fixture-alias'."),
+    AgentLimitCase("claude", "claude-fixture:", "ERROR: [example.profile] effort must not be empty after ':'."),
+    AgentLimitCase("codex", "gpt-fixture:high:low",
+                   "ERROR: [example.profile] effort 'high:low' is not allowed for agent 'gpt-fixture'."),
+    AgentLimitCase("claude", "gpt-fixture",
+                   "ERROR: [example.profile] agent 'gpt-fixture' is not allowed for family 'claude'."),
+    AgentLimitCase("codex", "claude-fixture-alias",
+                   "ERROR: [example.profile] agent 'claude-fixture-alias' is not allowed for family 'codex'."),
+    AgentLimitCase("claude", "opus:high", "ERROR: [example.profile] agent 'opus' is not allowed for family 'claude'."),
+    AgentLimitCase("claude", "opus:high", catalog=AgentLimitCatalog.REPOSITORY),
+    AgentLimitCase("claude", "opus:high", catalog=AgentLimitCatalog.CLAUDE_ALIAS_COLLISION),
+    AgentLimitCase("claude", "opus:low", "ERROR: [example.profile] effort 'low' is not allowed for agent 'opus'.",
+                   catalog=AgentLimitCatalog.CLAUDE_ALIAS_COLLISION),
+    AgentLimitCase("claude", "missing-fixture", comment_prefix="\u00a0"),
+)
 
 
 class ConfTests(unittest.TestCase):
@@ -368,13 +457,16 @@ conf_reads.record('disabled')
         source.parent.mkdir(parents=True)
         contents = "# whole: 1..\nusage_stale_minutes=23\n"
         _ = source.write_text(contents)
-        self.assertEqual(conf.read("accounts").whole("usage_stale_minutes"), 23)
-        with mock.patch.object(conf, "_git", side_effect=AssertionError("unexpected Git recovery")):
-            self.assertEqual(conf.read("accounts").text("notes_directory"), "~/rust/hanadocs/agents")
-            origin = conf.read("accounts").origin("notes_directory", str)
-        self.assertIsInstance(origin, conf.RecoveredValue)
-        if isinstance(origin, conf.RecoveredValue):
-            self.assertEqual(origin.value, "~/rust/hanadocs/agents")
+        for file in ("accounts", source):
+            with (self.subTest(file=file), redirect_stderr(io.StringIO()) as warning,
+                  mock.patch.object(conf, "_git", side_effect=AssertionError("unexpected Git recovery"))):
+                self.assertEqual(conf.read(file).whole("usage_stale_minutes"), 23)
+                self.assertEqual(conf.read(file).text("notes_directory"), "~/rust/hanadocs/agents")
+                origin = conf.read(file).origin("notes_directory", str)
+                self.assertIsInstance(origin, conf.RecoveredValue)
+                if isinstance(origin, conf.RecoveredValue):
+                    self.assertEqual(origin.value, "~/rust/hanadocs/agents")
+                self.assertEqual(warning.getvalue(), "")
         self.assertEqual(source.read_text(), contents)
 
     def test_missing_override_key_refuses_repository_values(self) -> None:
@@ -403,17 +495,19 @@ conf_reads.record('disabled')
 
     def test_value_origin_uses_repository_for_an_absent_file(self) -> None:
         del os.environ["CONF_DIR"]
-        origin = conf.read("accounts").origin("usage_stale_minutes", int)
-        self.assertIsInstance(origin, conf.RecoveredValue)
-        if isinstance(origin, conf.RecoveredValue):
-            self.assertEqual(origin.value, 10)
+        for file in ("accounts", Path("~/.claude/config/accounts.conf")):
+            with self.subTest(file=file):
+                origin = conf.read(file).origin("usage_stale_minutes", int)
+                self.assertIsInstance(origin, conf.RecoveredValue)
+                if isinstance(origin, conf.RecoveredValue):
+                    self.assertEqual(origin.value, 10)
 
     def test_existing_invalid_key_and_explicit_missing_path_do_not_use_repository(self) -> None:
         del os.environ["CONF_DIR"]
         source = self.root / "home/.claude/config/accounts.conf"
         source.parent.mkdir(parents=True)
         with redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
-            _ = conf.read(source).whole("usage_stale_minutes")
+            _ = conf.read(self.directory / "accounts.conf").whole("usage_stale_minutes")
         for contents in ("# whole: 1..\nusage_stale_minutes=broken\n", "# whole: 1..\nusage_stale_minutes=0\n"):
             with self.subTest(contents=contents):
                 _ = source.write_text(contents)
@@ -465,6 +559,22 @@ conf_reads.record('disabled')
             conf.check("example", "size", "huge")
         self.assertIn("size", str(caught.exception))
         self.assertIn(str(self.path), str(caught.exception))
+
+    def test_agent_limits_use_the_selected_catalog_and_report_the_bad_part(self) -> None:
+        cache = write_agent_limit_codex_cache(self.root)
+        self.enterContext(mock.patch.dict(os.environ, {"CODEX_MODELS_CACHE_FILE": str(cache)}))
+        for case in AGENT_LIMIT_CASES:
+            with self.subTest(case=case):
+                case.write_config(self.directory)
+                if case.refusal:
+                    expected = re.escape(case.refusal)
+                    with redirect_stderr(io.StringIO()), self.assertRaisesRegex(conf.Unusable, expected):
+                        _ = conf.read("example").text("profile")
+                    with self.assertRaisesRegex(conf.Unusable, expected):
+                        conf.check("example", "profile", case.value)
+                else:
+                    self.assertEqual(conf.read("example").text("profile"), case.value)
+                    conf.check("example", "profile", case.value)
 
     def test_bad_types_and_out_of_range_values_warn_once_and_refuse_without_history(self) -> None:
         readers: tuple[tuple[Callable[[conf.ConfigRead, str], object], str], ...] = (
@@ -657,11 +767,48 @@ conf_reads.record('disabled')
         for bounds, accepted, refused in (("..-2", "-2", "-1"), ("2..", "2", "1"),
                                           ("..", "-100", "1.5")):
             with self.subTest(bounds=bounds):
-                self.write(f"# whole: {bounds}\namount={accepted}\n")
+                self.write(f"# whole: {bounds}\namount={accepted}\n# whole: 1..10\namount.testhost=3\n")
                 conf.check("example", "amount", accepted)
                 self.assertEqual(conf.read("example").whole("amount"), int(accepted))
                 with self.assertRaises(conf.Unusable):
                     conf.check("example", "amount", refused)
+                settings = conf.read("example")
+                with mock.patch("socket.gethostname", return_value="testhost.example"):
+                    if bounds == "..-2":
+                        self.assertEqual(settings.whole_upper_bound("amount"), -2)
+                    else:
+                        reason = f"amount={accepted!r}: expected an upper bound"
+                        with self.assertRaisesRegex(conf.Unusable, re.escape(reason)):
+                            _ = settings.whole_upper_bound("amount")
+
+        self.history()
+        self.commit("# whole: 1..10\namount=3\n")
+        self.commit("# whole: 1..\namount=3\n")
+        repository = self.root / "repository-config/example.conf"
+        _ = write_config_fixture(repository, "# whole: 1..20\namount=4\n")
+        for case, live, repository_allowed, expected, warning_count in (
+            ("missing file uses repository", b"", True, 20, 0),
+            ("missing key uses repository", b"other=2\n", True, 20, 0),
+            ("missing file uses history", b"", False, 10, 1),
+            ("missing key uses history", b"other=2\n", False, 10, 1),
+            ("bad encoding uses history", b"amount=\xff\n", True, 10, 1),
+            ("wrong limit form uses history", b"# range: 1..8\namount=2\n", True, 10, 1),
+            ("open limit uses history", b"# whole: 1..\namount=2\n", True, 10, 1),
+            ("inverted limit uses history", b"# whole: 8..1\namount=2\n", True, 10, 1),
+        ):
+            with (self.subTest(case=case), mock.patch.dict(os.environ), redirect_stderr(io.StringIO()) as warning,
+                  mock.patch.object(conf, "directory", return_value=self.directory),
+                  mock.patch.object(conf, "_repository_path", return_value=repository)):
+                if repository_allowed:
+                    del os.environ["CONF_DIR"]
+                if live:
+                    _ = self.path.write_bytes(live)
+                else:
+                    self.path.unlink(missing_ok=True)
+                self.assertEqual(conf.read("example").whole_upper_bound("amount"), expected)
+                self.assertEqual(len(warning.getvalue().splitlines()), warning_count)
+                if warning_count:
+                    self.assertTrue(warning.getvalue().startswith(f"warning: {self.path}: amount="))
 
     def test_numeric_readers_refuse_the_wrong_limit_form_and_missing_limits(self) -> None:
         for reader, form in ((conf.ConfigRead.whole, "range"), (conf.ConfigRead.number, "whole"),

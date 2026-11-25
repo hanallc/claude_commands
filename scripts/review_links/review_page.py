@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
 from scripts.for_you.action import ActionStore, ActionStoreError, REVIEW_PATH
-from scripts.lib.user_zone import CONF as USER_ZONE_CONF, user_zone
+from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, change_routing, proposal_issue, staff, update_registration
 from scripts.production.record_store import FileStamp, state_root
 from scripts.rebuild import need
@@ -356,7 +356,7 @@ def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str
                 +'</p><strong>'+html.escape(evidence.tip_title)+'</strong><p>'+html.escape(evidence.tip_status)
                 +'</p><dl>'+tip+'</dl></section>')
     page_data = origin.bug_page_data
-    if origin.page_state is not None:
+    if isinstance(origin.page_state, new_item_dialog.BugPageState):
         screenshot = review_submissions.PAGE_SCREENSHOT
         title = origin.page_state.title or (page_data.title if page_data else origin.page)
         body += bug_page_state_box(key, origin.page_state, title, screenshot in images)
@@ -475,7 +475,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     sources = ReviewSourceStamps()
     sources.extend((folder/change_browser.MANIFEST, staff.record_path(), state_root(),
                     change_review.lists_directory(), urgency.state_dir(), conf.path('review_links'), conf.path('production'), conf.path('statusline'),
-                    Path(USER_ZONE_CONF)))
+                    conf.path('user_zone')))
     zone = user_zone()
     token,initial = change_browser.browser_manifest(folder)
     members = staff.snapshot()
@@ -712,6 +712,7 @@ class ReviewSnapshotCache:
         self, request: (new_item_dialog.NewItemRequest | new_item_dialog.UnverifiedDraftRetry
                         | review_submissions.ListDraftSend), *,
         screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT,
+        limits: new_item_dialog.NewItemLimits | None = None,
         capture_requested: bool = False,
         refusal: new_item_dialog.SubmissionError | None = None,
         capture_intent: new_item_dialog.SubmissionCaptureIntent = new_item_dialog.NoDeferredCapture.ABSENT,
@@ -727,7 +728,7 @@ class ReviewSnapshotCache:
             remote_staff = not staff.is_owner()
             members = staff.snapshot()
             with staff.supplied_snapshot(members) if remote_staff else nullcontext():
-                saved = review_submissions.submit(request, members=members, screenshot=screenshot,
+                saved = review_submissions.submit(request, members=members, limits=limits, screenshot=screenshot,
                                                   capture_requested=capture_requested, refusal=refusal,
                                                   capture_intent=capture_intent, capture_target=capture_target,
                                                   initial_delivery=initial_delivery)

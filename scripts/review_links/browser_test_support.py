@@ -17,6 +17,7 @@ from unittest.mock import patch
 from scripts.lib import conf
 from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.review_links import console
 
 NO_DATA_FILE: dict[str, object] = {}
@@ -46,7 +47,7 @@ def status_configuration() -> Generator[None]:
             + "# range: 0.001..86400\nstatus.render_limit_seconds=1\n"
             + "# range: 0.001..86400\nstatus.reading_delay_seconds=1\n"
             + pages)
-        _ = (root / "review_links.conf").write_text(
+        _ = write_config_fixture(root / "review_links.conf",
             "# range: 5..300\npage_refresh_seconds=15\n"
             + "# range: 0.5..60\nframe_retry_seconds=2\n"
             + "# whole: 1..300\npage_request_timeout_seconds=15\n")

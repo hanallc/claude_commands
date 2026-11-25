@@ -6000,10 +6000,8 @@ raise SystemExit(int(os.environ[variable]))
                              sweep.FloorChannelOutcome.FAILED)
 
     def test_phone_alert_wait_covers_configured_review_while_session_wait_stays_short(self) -> None:
-        config = Path(self.enterContext(tempfile.TemporaryDirectory())) / "notify.conf"
-        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
-        with (mock.patch.object(review, "NOTIFY_CONFIG", config),
-              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
+        _ = write_config_fixture(conf.path("notify"), "REVIEW_TIMEOUT_SECONDS=90\n")
+        with (mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
               redirect_stdout(io.StringIO())):
             self.assertEqual(sweep.send_floor_alert("disk notice"), sweep.FloorChannelOutcome.DELIVERED)
             self.assertEqual(sweep.send_phone_push(render("nixos.disk_low", free="9", shortfall="1")),

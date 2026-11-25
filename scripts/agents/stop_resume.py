@@ -73,6 +73,7 @@ from scripts.message import sessions
 from scripts.agents.stop_results import shutdown_state_root
 
 if TYPE_CHECKING:
+    from scripts.accounts.unit_watchdog import RestartFailureNotice
     from scripts.agents.restart import StopReadArguments
     from scripts.herdr import worker_panes
     from scripts.notify.push_texts import RenderedPush
@@ -1712,7 +1713,9 @@ def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | 
         member = matches[0]
         machine = member_machine(member)
         if machine and machine != remote.local_machine():
-            return ResumeFailed(session, f"session is on {machine}")
+            route = remote.machine_alias(machine)
+            if not isinstance(route, remote.MachineAlias) or route.alias != remote.this_machine():
+                return ResumeFailed(session, f"session is on {machine}")
         if member.kind == "producer":
             try:
                 saved = producer_creation.read_record(producer_creation.record_path(member.name))
@@ -2308,7 +2311,7 @@ def _check_stay(identity: str, pane: str, account: str, pid: int, generation: st
                        generation=generation)
 
 
-def _send_move_push(push: RenderedPush, key: str) -> None:
+def _send_move_push(push: RenderedPush, key: str) -> bool:
     from scripts.message import send_budget, send_result
     from scripts.notify import push_texts, review
 
@@ -2321,11 +2324,23 @@ def _send_move_push(push: RenderedPush, key: str) -> None:
                               timeout=send_budget.user_seconds(limit))
     except (OSError, ValueError, subprocess.SubprocessError):
         print("shutdown: could not send the move result", file=sys.stderr)
-        return
+        return False
     result = send_result.send_outcome(done.returncode, done.stdout)
     if not (isinstance(result, send_result.ConfirmedSendOutcome) and
             result.header.outcome in ("sent", "skipped", "kept", "replaced")):
         print("shutdown: the sender did not confirm the move result", file=sys.stderr)
+        return False
+    return True
+
+
+def send_restart_failure(identity: str, notice: RestartFailureNotice) -> bool:
+    from scripts.notify.push_texts import render
+
+    account = notice["account"]
+    generation = notice["generation"]
+    key = sha256(f"{identity}\0{account}\0{generation}".encode()).hexdigest()
+    return _send_move_push(render("shutdown.restart_failed", account=account, session=notice["session"],
+                                  identity=identity, reference=notice["reference"]), f"resume-ended:{key}")
 
 
 def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, requester: str = "",
@@ -2333,7 +2348,6 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
     """Build one actionable outcome for the showrunner, user push and stay log."""
     from scripts.production import showrunners, staff_sources
     from scripts.accounts import unit_watchdog
-    from scripts.notify.push_texts import render
 
     try:
         record = staff.snapshot()
@@ -2341,18 +2355,27 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
         print(f"{identity}: staff anomaly: {error}", file=sys.stderr)
         record = staff.StaffSnapshot(())
     row = record.by_current_session(identity)
-    entry = pane_record.read(herdr.shared_session()).get(pane)
+    entries = pane_record.read(herdr.shared_session())
+    entry = entries.get(pane)
     entry = entry if entry and (pane_launch.reference_id(entry) == identity
         or row is not None and record.by_member_reference(pane_launch.reference_id(entry)) == row) else None
     environment = entry["environment"] if entry else {}
-    name = row.name if row is not None else str(entry.get("name", "")) if entry else ""
-    name = name or identity
+    session_name = row.name if row is not None else str(entry.get("name", "")) if entry else ""
+    name = session_name or identity
     unit = row.name if row is not None and row.kind == "unit" else ""
+    notice = None
+    if not _move_resume.get() and environment.get(PROBE_ENV) != "1":
+        unique = bool(session_name) and len(pane_launch.named_references(session_name, record, entries)) == 1
+        reserved = any(session_name == producer.name for producer in record.retired_producers)
+        reference = session_name if unique and not reserved else identity
+        notice = unit_watchdog.RestartFailureNotice(account=account, generation=generation,
+                                                    session=session_name, reference=reference)
+    exited = unit_watchdog.ExitRecovery(identity, notice)
     if unit:
         try:
-            recovery = unit_watchdog.run(datetime.now(timezone.utc), dry_run=False)
+            recovery = unit_watchdog.run(datetime.now(timezone.utc), dry_run=False, exited=exited)
             next_step = "; ".join(recovery) if recovery else "watchdog reported no recovery action"
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
             next_step = f"watchdog could not recover it: {error}"
     else:
         command = "agents resume " + shlex.join([name, "--to", account, "--why", why or "retry after early exit"])
@@ -2365,11 +2388,8 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
             print(showrunners.tell(name, f"resume-ended-{identity}-{uuid4().hex}", cause, sender="shutdown"))
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"{identity}: could not tell showrunner: {error}")
-    if not _move_resume.get() and environment.get(PROBE_ENV) != "1":
-        key = sha256(f"{identity}\0{account}\0{generation}".encode()).hexdigest()
-        _send_move_push(render("shutdown.restart_failed", account=account, machine=remote.local_machine(),
-                               stopped=(row.name if row is not None else str(entry.get("name", "")) if entry else "") or "one session",
-                               cause=cause), f"resume-ended:{key}")
+    if notice is not None and not exited.managed:
+        _ = send_restart_failure(identity, notice)
     return cause
 
 
@@ -2881,11 +2901,15 @@ def _alert_pending_moves(batch: MoveBatch, entries: Mapping[str, pane_record.Pan
     push = render("alert.decision", sender="shutdown", title="Some sessions still need to move",
                   action=f"Retry pending moves on {machine} with `{moves.RETRY_COMMAND}`.",
                   body=f"These sessions did not finish their move {destination}: " + ", ".join(names) + ".")
-    if len(push.message) > pushover.phone_message_limit(push.sender, push.id):
+    try:
+        needs_shorter_body = len(push.message) > pushover.phone_message_limit(push.sender, push.id)
+    except conf.Unusable:
+        needs_shorter_body = False
+    if needs_shorter_body:
         push = render(push.id, **(push.values | {"body":
             f"{len(names)} sessions did not finish their move {destination}. "
             + f"Read the pending list on {machine} with `{moves.MOVE_COMMAND} result`."}))
-    _send_move_push(push, f"account-move:{group}:{batch.target}")
+    _ = _send_move_push(push, f"account-move:{group}:{batch.target}")
 
 
 def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: int = 0,

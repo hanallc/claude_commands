@@ -58,6 +58,7 @@ class StaffRoutingTests(unittest.TestCase):
         config = self.root / "config"
         _ = write_config_fixture(config / "review_links.conf", "unrouted_alert_recipient=top\n")
         _ = write_config_fixture(config / "change_review.conf")
+        _ = write_config_fixture(config / "user_zone.conf")
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
         return doc
 

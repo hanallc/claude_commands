@@ -30,7 +30,7 @@ from scripts.accounts import accounts, new_account
 from scripts.direct import recorder_state
 from scripts.for_you.action import ActionStore
 from scripts.hooks import showrunner_footer
-from scripts.lib import conf, file_lock
+from scripts.lib import conf, conf_reads, file_lock
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.production import footer_counts, investigation, session_labels, staff
@@ -108,7 +108,7 @@ def fixture_command(root: Path, *, rebuild_cache: str = "~/.local/state/showrunn
     configuration = fixture_colors(root / "config/statusline.conf")
     with configuration.open("a", encoding="utf-8") as settings:
         _ = settings.write("# whole: 1..\ncounts.retry_seconds=7\n" + fixture_rebuild_settings(rebuild_cache))
-    _ = configuration.with_name("user_zone.conf").write_text(f"zone={USER_ZONE.key}\n", encoding="utf-8")
+    _ = write_config_fixture(configuration.with_name("user_zone.conf"), f"zone={USER_ZONE.key}\n")
     for name in ("statusline.sh", "statusline.jq", "assignment.py", "rebuild_row.py"):
         _ = shutil.copyfile(PROGRAM.parent / name, folder / name)
     for source in PROGRAM.parent.iterdir():
@@ -570,10 +570,10 @@ class ForYouStatusTests(unittest.TestCase):
 
             with (patch.dict(os.environ, {"HOME": directory, "STAFF_FILE": os.devnull,
                                          "STATUSLINE_SYSTEM": "Darwin",
+                                         "CONF_DIR": str(root),
                                          "REBUILD_NEEDS_DIR": str(root / "needs")}),
                   patch.object(sys, "argv", ["assignment.py", "-r"]),
                   patch.object(sys, "stdin", io.StringIO("{}")),
-                  patch.object(rebuild_row, "DEFAULT_CONFIG", config),
                   patch.object(for_you, "console_status_line_actions", side_effect=read_console_actions) as request,
                   patch.object(subprocess, "Popen") as refresh,
                   patch.object(os, "execvp") as render):
@@ -592,6 +592,7 @@ class ForYouStatusTests(unittest.TestCase):
             cache = root / "rebuild-cache"
             _ = config.write_text(fixture_rebuild_settings(str(cache)), encoding="utf-8")
             environment = {"HOME": directory, "STAFF_FILE": os.devnull, "STATUSLINE_SYSTEM": "Linux",
+                           "CONF_DIR": str(root),
                            "REBUILD_NEEDS_DIR": str(root / "needs"), "FOR_YOU_ACTIONS_DIR": str(fixture_actions(root))}
             for expire, expected in ((False, "0"), (True, "unavailable")):
                 seed_rebuild_cache(root, config, cache=cache)
@@ -609,7 +610,6 @@ class ForYouStatusTests(unittest.TestCase):
                       patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
                       patch.object(sys, "argv", ["assignment.py", "-r"]),
                       patch.object(sys, "stdin", io.StringIO("{}")),
-                      patch.object(rebuild_row, "DEFAULT_CONFIG", config),
                       patch.object(ActionStore, "list", side_effect=actions) as read,
                       patch.object(need, "read_needs", wraps=need.read_needs) as needs,
                       patch.object(subprocess, "Popen") as refresh,
@@ -634,7 +634,7 @@ class ForYouStatusTests(unittest.TestCase):
             environment = {"HOME": directory, "FOR_YOU_ACTIONS_DIR": str(store.folder)}
             with (patch.dict(os.environ, environment, clear=True),
                   patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
-                  patch.object(rebuild_row, "DEFAULT_CONFIG", config)):
+                  patch.dict(os.environ, {"CONF_DIR": str(config.parent)})):
                 need.add_need("mac", "a" * 40, "Fixture need", "Fixture")
                 folder = need.needs_folder()
                 iterdir = Path.iterdir
@@ -682,7 +682,7 @@ class ForYouStatusTests(unittest.TestCase):
                   patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
                   patch.object(sys, "argv", ["assignment.py", "-r"]),
                   patch.object(sys, "stdin", io.StringIO("{}")),
-                  patch.object(rebuild_row, "DEFAULT_CONFIG", config),
+                  patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
                   patch.object(time, "time", return_value=0) as clock,
                   patch.object(subprocess, "Popen") as refresh,
                   patch.object(os, "execvp") as render):
@@ -720,7 +720,7 @@ class ForYouStatusTests(unittest.TestCase):
             with (patch.dict(os.environ, {"HOME": directory, "STAFF_FILE": str(record),
                                          "FOR_YOU_ACTIONS_DIR": str(fixture_actions(home))}, clear=True),
                   patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((OWNER,))),
-                  patch.object(rebuild_row, "DEFAULT_CONFIG", config),
+                  patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
                   patch.object(rebuild_row, "cache_path", side_effect=move_cache)):
                 first = assignment.read_actions(remote=False)
                 self.assertTrue(first.value.refresh_due)
@@ -751,7 +751,7 @@ class ForYouStatusTests(unittest.TestCase):
             with (patch.dict(os.environ, {"HOME": directory, "STAFF_FILE": str(record),
                                          "FOR_YOU_ACTIONS_DIR": str(fixture_actions(home))}, clear=True),
                   patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((OWNER,))),
-                  patch.object(rebuild_row, "DEFAULT_CONFIG", config),
+                  patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
                   patch.object(rebuild_row, "cache_path", side_effect=read_comparison_path)):
                 target = state / "session-fields"
                 first = assignment.read_actions(remote=False)
@@ -779,7 +779,7 @@ class ForYouStatusTests(unittest.TestCase):
             with (patch.dict(os.environ, {"HOME": directory, "STAFF_FILE": str(record),
                                          "FOR_YOU_ACTIONS_DIR": str(fixture_actions(home))}, clear=True),
                   patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((OWNER,))),
-                  patch.object(rebuild_row, "DEFAULT_CONFIG", config),
+                  patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
                   patch.object(sys, "stdin", io.StringIO("{}")),
                   patch.object(subprocess, "Popen"),
                   patch.object(os, "execvp") as render):
@@ -793,7 +793,7 @@ class ForYouStatusTests(unittest.TestCase):
                                      "STATUSLINE_RENDER_KEY": "fixture"}, clear=True),
               patch.object(sys, "argv", ["assignment.py", "-r"]),
               patch.object(sys, "stdin", io.StringIO("{}")),
-              patch.object(rebuild_row, "DEFAULT_CONFIG", config),
+              patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
               patch.object(os, "execvp") as render):
             assignment.render_status(remote=False)
         arguments = cast(list[str], render.call_args.args[1])
@@ -864,7 +864,7 @@ class ForYouStatusTests(unittest.TestCase):
                                          "STATUSLINE_RENDER_KEY": "fixture"}, clear=True),
                   patch.object(sys, "argv", ["assignment.py", "--arg", "pwd", directory]),
                   patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": UNIT.id}))),
-                  patch.object(rebuild_row, "DEFAULT_CONFIG", config),
+                  patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
                   patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((OWNER, UNIT))),
                   patch.object(counts_row, "write_unit", side_effect=RuntimeError("Review source failed")) as refresh,
                   patch.object(os, "execvp")):
@@ -885,7 +885,7 @@ class ForYouStatusTests(unittest.TestCase):
 
             with (patch.dict(os.environ, environment, clear=True),
                   patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((OWNER,))),
-                  patch.object(rebuild_row, "DEFAULT_CONFIG", config),
+                  patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
                   patch.object(sys, "argv", ["assignment.py", "-r"]),
                   patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": OWNER.current_session}))),
                   patch.object(os, "execvp") as render):
@@ -1203,7 +1203,7 @@ class RoleTests(ConfiguredShellTests):
         read_log = {"CONF_READ_LOG": os.environ["CONF_READ_LOG"]} if "CONF_READ_LOG" in os.environ else {}
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home),
                "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home)),
-               "USER_ZONE_CONF": str(self.runtime / "config/user_zone.conf"), **read_log, **marks}
+               **read_log, **marks}
         command = command or self.shell_command
         result = subprocess.run(
             [shell, "-c", command], input=json.dumps(payload), capture_output=True, text=True,
@@ -1427,19 +1427,20 @@ class RoleTests(ConfiguredShellTests):
     def test_reset_times_take_the_zone_from_the_setting_and_its_label(self) -> None:
         reset = int(datetime(2026, 12, 3, 12, tzinfo=timezone.utc).timestamp())
         payload = limits({"used_percentage": 95, "resets_at": reset}, {"used_percentage": 60})
-        conf = self.home / "override-zone.conf"
-        _ = conf.write_text("# the user's zone\nzone=America/Curacao\n", encoding="utf-8")
+        configuration = self.home / "override-config"
+        _ = write_config_fixture(configuration / "user_zone.conf", "zone=America/Curacao\n")
+        _ = fixture_colors(configuration / "statusline.conf")
         reads = self.home / "config-reads"
         for shell in (*SHELLS, shutil.which("dash")):
             with self.subTest(shell=shell or "dash unavailable"):
                 if shell is None:
                     self.skipTest("dash is not on PATH")
                 _ = reads.write_text("")
-                line = self.command_lines(payload, shell=shell, USER_ZONE_CONF=str(conf), CONF_READ_LOG=str(reads))[1]
+                line = self.command_lines(payload, shell=shell, CONF_DIR=str(configuration), CONF_READ_LOG=str(reads))[1]
                 self.assertIn("5-hour \x1b[91m5% left\x1b[0m until 08:00 AST", line)
                 self.assertIn("statusline", reads.read_text().splitlines())
-                self.assertIn(conf.stem, reads.read_text().splitlines())
-                pinned = self.command_lines(payload, shell=shell, USER_ZONE_CONF=str(conf),
+                self.assertIn("user_zone", reads.read_text().splitlines())
+                pinned = self.command_lines(payload, shell=shell, CONF_DIR=str(configuration),
                                             USER_ZONE="Europe/Paris")[1]
                 self.assertIn("until 13:00 CET", pinned)
 
@@ -1782,11 +1783,13 @@ class CountsRowTests(ConfiguredShellTests):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.configuration = self.home / "counts-config"
         self.configure_review_sources(self.configuration)
-        _ = (self.configuration / "statusline.conf").write_text(
-            "# whole: 1..\ncounts.retry_seconds=7\n", encoding="utf-8")
+        statusline = fixture_colors(self.configuration / "statusline.conf")
+        _ = write_config_fixture(statusline, "# whole: 1..\ncounts.retry_seconds=7\n"
+                                 + fixture_rebuild_settings("~/.local/state/showrunner/rebuilds"))
+        _ = write_config_fixture(self.configuration / "user_zone.conf", f"zone={USER_ZONE.key}\n")
         environment = {"CONF_DIR": str(self.configuration), "USER_ZONE": USER_ZONE.key}
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
-        seed_rebuild_cache(self.home, self.runtime / "config/statusline.conf")
+        seed_rebuild_cache(self.home, statusline)
         doc = self.home / "docs/plans/show-production.md"
         doc.parent.mkdir(parents=True)
         self.ledger = self.home / "ledger.md"
@@ -1826,8 +1829,7 @@ class CountsRowTests(ConfiguredShellTests):
     def lines(self, session_id: str = OWNER.id, shell: str = "/bin/sh") -> list[str]:
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": MISSING_HERDR_BIN,
                "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home)),
-               "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"), "CONF_DIR": str(self.configuration),
-               "USER_ZONE_CONF": str(self.runtime / "config/user_zone.conf")}
+               "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"), "CONF_DIR": str(self.configuration)}
         result = subprocess.run([shell, "-c", self.shell_command], input=json.dumps({"session_id": session_id}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
         return [ANSI.sub("", line) for line in result.stdout.splitlines()]
@@ -1866,8 +1868,7 @@ class CountsRowTests(ConfiguredShellTests):
         self.questions(*(OutstandingItem(since="2026-10-16T19:00", text=f"Q{n}") for n in range(12)))
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": MISSING_HERDR_BIN,
                "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home)),
-               "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"), "CONF_DIR": str(self.configuration),
-               "USER_ZONE_CONF": str(self.runtime / "config/user_zone.conf")}
+               "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"), "CONF_DIR": str(self.configuration)}
         result = subprocess.run(["/bin/sh", "-c", self.shell_command], input=json.dumps({"session_id": OWNER.id}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
         self.assertEqual(result.stdout.splitlines()[-1],
@@ -2084,7 +2085,6 @@ class CountsRowTests(ConfiguredShellTests):
                        "NOTIFIER_STATE_DIR": str(self.home / ".local/state/notifier"),
                        "SHOWRUNNER_STATE_DIR": str(self.home / ".local/state/showrunner")}
         with patch.dict(os.environ, environment), \
-                patch.object(rebuild_row, "DEFAULT_CONFIG", self.runtime / "config/statusline.conf"), \
                 patch.object(pane_record, "RECORD_DIR", self.home / "pane-records"), \
                 patch.object(counts_row, "write", wraps=counts_row.write) as refresh, \
                 patch.object(os, "execvp") as render, \
@@ -2699,17 +2699,25 @@ class RebuildRowTests(unittest.TestCase):
 
     def test_settings_read_values_at_use(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "statusline.conf"
+            root = Path(directory)
+            default = root / "statusline.conf"
+            path = root / "explicit.conf"
+            reads = root / "reads"
             text = ("rebuild.repo=/custom/repo\nrebuild.ref=custom\nrebuild.natedev=linux\n"
                     + "rebuild.mac=darwin\nrebuild.ssh=remote\nrebuild.interval=17\nrebuild.eval_timeout=41\nrebuild.eval_retry_seconds=301\n")
-            _ = path.write_text(text, encoding="utf-8")
-            settings = rebuild_row.RebuildSettings.read(path)
-            self.assertEqual(settings, rebuild_row.RebuildSettings(Path("/custom/repo"), "custom", "linux", "darwin", "remote", 17, 41, 301))
-            _ = path.write_text(text.replace("interval=17", "interval=29").replace("eval_timeout=41", "eval_timeout=73")
-                                .replace("eval_retry_seconds=301", "eval_retry_seconds=503"), encoding="utf-8")
-            self.assertEqual(rebuild_row.RebuildSettings.read(path).interval, 29)
-            self.assertEqual(rebuild_row.RebuildSettings.read(path).eval_timeout, 73)
-            self.assertEqual(rebuild_row.RebuildSettings.read(path).eval_retry_seconds, 503)
+            _ = write_config_fixture(default, text.replace("interval=17", "interval=34"))
+            _ = write_config_fixture(path, text, template="statusline")
+            with patch.dict(os.environ, {"CONF_DIR": str(root)}), conf_reads.record_reads(reads):
+                self.assertEqual(rebuild_row.RebuildSettings.read().interval, 34)
+                settings = rebuild_row.RebuildSettings.read(path)
+                self.assertEqual(settings, rebuild_row.RebuildSettings(Path("/custom/repo"), "custom", "linux", "darwin", "remote", 17, 41, 301))
+                _ = write_config_fixture(path, "rebuild.interval=29\nrebuild.eval_timeout=73\nrebuild.eval_retry_seconds=503\n",
+                                         template="statusline")
+                self.assertEqual(rebuild_row.RebuildSettings.read(path).interval, 29)
+                self.assertEqual(rebuild_row.RebuildSettings.read(path).eval_timeout, 73)
+                self.assertEqual(rebuild_row.RebuildSettings.read(path).eval_retry_seconds, 503)
+            self.assertIn("statusline", reads.read_text().splitlines())
+            self.assertIn("explicit", reads.read_text().splitlines())
 
     def test_cache_stores_the_last_evaluation_and_clears_after_rebuild(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

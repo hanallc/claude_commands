@@ -67,7 +67,9 @@ class DisksPageTests(unittest.TestCase):
         _ = (configuration / "disks.conf").write_text("# whole: 1..\ncache_seconds=600\n")
         # The page reads staff names, and staff reads the machine list.
         _ = shutil.copy(Path(__file__).parents[2] / "config" / "machines.conf", configuration)
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(configuration), "USER_ZONE": "America/New_York",
+        })))
 
     def test_session_tooltip_keeps_held_folder_names_plain(self) -> None:
         runner = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
