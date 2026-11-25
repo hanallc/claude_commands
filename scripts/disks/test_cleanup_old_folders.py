@@ -189,8 +189,9 @@ import sys
 sys.path.insert(0, sys.argv[1])
 from scripts.disks import cleanup_old_folders as cleanup
 review_local = cleanup.review_local
-def review_and_add(machine):
-    result = review_local(machine)
+def review_and_add(machine: cleanup.Machine, *, mode: cleanup.CleanupMode = cleanup.CleanupMode.STANDARD
+                   ) -> tuple[cleanup.HostList, cleanup.CleanupBounds]:
+    result = review_local(machine, mode=mode)
     Path({str(late)!r}).mkdir()
     cleanup.cleanup_git(Path({str(self.home)!r}), "init", "-q", {str(git_result)!r})
     return result
@@ -218,10 +219,10 @@ cleanup.review_local = review_and_add
         apply = cleanup.apply
         late = self.build / "old-late"
 
-        def apply_with_new_name(review: cleanup_old_folders.HostList,
-                                bounds: cleanup_old_folders.CleanupBounds) -> int:
+        def apply_with_new_name(review: cleanup_old_folders.HostList, bounds: cleanup_old_folders.CleanupBounds, *,
+                                mode: cleanup_old_folders.CleanupMode = cleanup_old_folders.CleanupMode.STANDARD) -> int:
             late.mkdir()
-            return apply(review, bounds)
+            return apply(review, bounds, mode=mode)
 
         channel = cleanup.WorkerChannel(io.StringIO('{"kind":"apply"}\n'), io.StringIO())
         with (mock.patch.object(cleanup, "process_uses", return_value=cleanup.CleanupProcessReview()),
@@ -589,8 +590,10 @@ with patch.object(subprocess, "run", side_effect=process_start) as run:
         review = cleanup.HostList(cleanup.Machine.NATEDEV, ())
         bounds = cleanup.CleanupBounds(self.home, self.build, frozenset(), self.gate)
 
-        def apply_as_invoker(_review: cleanup_old_folders.HostList, _bounds: cleanup_old_folders.CleanupBounds) -> int:
+        def apply_as_invoker(_review: cleanup_old_folders.HostList, _bounds: cleanup_old_folders.CleanupBounds, *,
+                             mode: cleanup_old_folders.CleanupMode = cleanup_old_folders.CleanupMode.STANDARD) -> int:
             self.assertEqual((os.geteuid(), os.getegid()), (uid, gid))
+            self.assertIs(mode, cleanup_old_folders.CleanupMode.STANDARD)
             return 0
 
         for worker_uid, expected in ((0, "refused"), (uid, "applied")):
@@ -2387,10 +2390,10 @@ with patch.object(subprocess, "run", side_effect=process_start) as run:
                 raise PermissionError(errno.EACCES, "denied", path)
             return read_bytes(path)
 
-        def apply_after_denial(review: cleanup_old_folders.HostList,
-                               bounds: cleanup_old_folders.CleanupBounds) -> int:
+        def apply_after_denial(review: cleanup_old_folders.HostList, bounds: cleanup_old_folders.CleanupBounds, *,
+                               mode: cleanup_old_folders.CleanupMode = cleanup_old_folders.CleanupMode.STANDARD) -> int:
             with mock.patch.object(Path, "read_bytes", deny_reads):
-                return apply(review, bounds)
+                return apply(review, bounds, mode=mode)
 
         read_bytes = Path.read_bytes
         with mock.patch.object(cleanup_old_folders, "PROC_ROOT", str(proc)):
