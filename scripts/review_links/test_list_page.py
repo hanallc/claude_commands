@@ -46,7 +46,7 @@ from scripts.production import (change_review, change_routing, delivery_state, i
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import (browser_test_support, console, go_ledger, list_page, page_frame, serve, staff_names,
                                   studio_page)
-from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
+from scripts.review_links import change_browser, change_page, images, new_item_dialog, page_question, question_record
 from scripts.review_links import review_items, review_link, review_page, review_submissions, search_fold, send_hold
 from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
 from scripts.review_links.server_test_support import started_review_server
@@ -2458,6 +2458,346 @@ frame.addEventListener('load',async()=>{
         for text in (OWNER.id, MORTY.id, "EtaRange(", "next_step", "latest_status"):
             self.assertNotIn(text, shown)
 
+    def render_item_links_panel(self, entry: list_page.ListRecord, sections: str, today: datetime,
+                                names: staff_names.StaffNames, unread_answers: frozenset[str], *,
+                                schedule: list_page.DisplayedSchedule = the_list.NoSchedule.UNSET) -> str:
+        progress = list_page.item_progress(entry.item, names, schedule)
+        return list_page.detail_panel(entry, sections, today, names, unread_answers, progress, schedule=schedule)
+
+    def test_item_text_links_http_urls_and_escapes_other_text(self) -> None:
+        source = 'See <proof> (https://console.test/path?x=1&y=2), http://console.test/end.:<next>"'
+        first = ('<a class="item-url" href="https://console.test/path?x=1&amp;y=2" target="_blank" '
+                 'rel="noopener">https://console.test/path?x=1&amp;y=2</a>')
+        second = ('<a class="item-url" href="http://console.test/end" target="_blank" '
+                  'rel="noopener">http://console.test/end</a>')
+        self.assertEqual(list_page.item_text_html(source), f'See &lt;proof&gt; ({first}), {second}.:&lt;next&gt;&quot;')
+        self.assertEqual(list_page.item_text_html('http://console.test/end>"'), second + '&gt;&quot;')
+        self.assertEqual(list_page.item_text_html('http://console.test/end"caption'), second + '&quot;caption')
+        self.assertEqual(list_page.item_text_html('javascript:alert(1) ftp://console.test/path'),
+                         'javascript:alert(1) ftp://console.test/path')
+        self.assertEqual(list_page.item_text_html('javascript:http://console.test/end', paragraphs=True),
+                         f'<p>javascript:{second}</p>')
+        self.assertEqual(list_page.item_text_html('See **proof** http://console.test/end.', paragraphs=True),
+                         f'<p>See <strong>proof</strong> {second}.</p>')
+
+    def test_item_text_splits_adjacent_urls_and_keeps_bold(self) -> None:
+        first, second = "https://one.test/a,b", "https://two.test/b"
+        markup = list_page.item_text_html(f"{first},{second}")
+        anchors = ElementTree.fromstring(f"<p>{markup}</p>").findall("a")
+        self.assertEqual([anchor.get("href") for anchor in anchors], [first, second])
+        self.assertEqual(anchors[0].tail, ",")
+        markup = list_page.item_text_html(f"{first},ftp://two.test/b")
+        anchors = ElementTree.fromstring(f"<p>{markup}</p>").findall("a")
+        self.assertEqual([anchor.get("href") for anchor in anchors], [first])
+        self.assertEqual(anchors[0].tail, ",ftp://two.test/b")
+        markup = list_page.item_text_html(f"**{second}**", paragraphs=True)
+        bold = ElementTree.fromstring(markup).findall("strong/a")
+        self.assertEqual([(anchor.get("href"), anchor.text) for anchor in bold], [(second, second)])
+
+    def test_item_text_uses_the_url_end_rule(self) -> None:
+        example = "https://example.test/a"
+        wildcard = "https://example.test/build/*/linux"
+        apostrophe = "https://example.test/it's/x"
+        first, second = "https://one.test/a", "https://two.test/b"
+        short_first, short_second = "https://a.test/x", "https://b.test/y"
+        cases = (
+            (f"See '{first}','{second}'.", (first, second)),
+            (f"**{example}**", (example,)),
+            (wildcard, (wildcard,)),
+            (apostrophe, (apostrophe,)),
+            (f"({example}).", (example,)),
+            (f"{short_first},{short_second}", (short_first, short_second)),
+            (f"https://a.test/{short_second}", ("https://a.test/", short_second)),
+            (f"{short_first}{short_second}", ("https://a.test/",)),
+            (f"{short_first},ftp://b.test/y", (short_first,)),
+            (f"{short_first},ftp://b.test/https://c.test/z", (short_first, "https://c.test/z")),
+            (f"{short_first},Git+ssh-2.0://b.test/y,{short_second}", (short_first, short_second)),
+            (f"https://a.test/12ftp://b.test/y", ("https://a.test/12",)),
+            (f'"{example}"', (example,)),
+            (f"Did you read {example}?", (example,)),
+        )
+        for source, urls in cases:
+            with self.subTest(source=source):
+                markup = ElementTree.fromstring(f"<p>{list_page.item_text_html(source)}</p>")
+                self.assertEqual("".join(markup.itertext()), source)
+                self.assertEqual([(anchor.get("href"), anchor.text) for anchor in markup.findall("a")],
+                                 [(url, url) for url in urls])
+
+    def test_item_links_exclude_trailing_punctuation_and_list_one_destination(self) -> None:
+        url = "https://example.test/check"
+        marks = ("!", "?", ";", "]", "'", ".", ",", ")", ":", "?!;].")
+        for mark in marks:
+            with self.subTest(mark=mark):
+                markup = list_page.item_text_html(f"Read {url}{mark}", paragraphs=True)
+                anchor = ElementTree.fromstring(markup).find("a")
+                assert anchor is not None
+                self.assertEqual((anchor.get("href"), anchor.text, anchor.tail), (url, url, mark))
+        ipv6 = "https://[2001:db8::1]"
+        anchors = ElementTree.fromstring(list_page.item_text_html(f"Read {ipv6}]!", paragraphs=True)).findall("a")
+        self.assertEqual([(anchor.get("href"), anchor.tail) for anchor in anchors], [(ipv6, "]!")])
+
+        status = " ".join([*(f"{url}{mark}" for mark in marks), url])
+        item = the_list.add(MORTY.id, "Read the check", owner=OWNER.id, source="nate",
+                            changes={"latest_status": status})
+        panel = self.render_item_links_panel(list_page.ListRecord(MORTY.id, item), "", NOW, staff_names.read(), frozenset())
+        section = panel.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
+        anchors = ElementTree.fromstring(f"<section>{section}</section>").findall("ul/li/a")
+        self.assertEqual([anchor.get("href") for anchor in anchors], [url])
+
+    def test_links_include_the_scheduled_next_step(self) -> None:
+        urls = ["https://one.test/check", "https://two.test/check"]
+        run = the_list.ScheduledRun(NOW + timedelta(days=1), ",".join(urls))
+        item = the_list.add(MORTY.id, "Check the schedule", owner=OWNER.id, source="nate",
+                            changes={"state": the_list.ItemState.SCHEDULED, "schedule": run})
+        names = staff_names.read()
+        for record in (item, replace(item, log=())):
+            with self.subTest(has_log=bool(record.log)):
+                panel = self.render_item_links_panel(
+                    list_page.ListRecord(MORTY.id, record), "", NOW, names, frozenset(),
+                    schedule=list_page.schedule_display(record))
+                self.assertIn('<section class="item-links">', panel)
+                section = panel.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
+                rows = ElementTree.fromstring(f"<section>{section}</section>").findall("ul/li")
+                self.assertEqual([(row[0].get("href"), row[1].text) for row in rows],
+                                 [(url, "Next step") for url in urls])
+
+    def test_schedule_log_splits_adjacent_urls(self) -> None:
+        urls = ["https://one.test/check", "https://two.test/check"]
+        first = the_list.ScheduledRun(NOW + timedelta(days=1), ",".join(urls))
+        second_urls = ["https://three.test/check", "https://four.test/check"]
+        second = the_list.ScheduledRun(first.start + timedelta(days=1), ",".join(second_urls))
+        series = the_list.ScheduledSeries(
+            first, repeat_rule.parse("FREQ=DAILY;COUNT=2"), the_list.series_run_limit(),
+            exceptions=(the_list.RunException(2, second),))
+        item = the_list.add(MORTY.id, "Check the schedule log", owner=OWNER.id, source="nate",
+                            changes={"state": the_list.ItemState.SCHEDULED, "schedule": series})
+        log = list_page.item_log(list_page.ListRecord(MORTY.id, item), NOW, staff_names.read(), frozenset())
+        anchors = ElementTree.fromstring(f"<ol>{log.markup}</ol>").findall(".//a")
+        self.assertEqual([(anchor.get("href"), anchor.tail) for anchor in anchors],
+                         [(urls[0], ","), (urls[1], None), (second_urls[0], ","), (second_urls[1], None)])
+
+    def test_blocking_condition_links_keep_asterisks_and_apostrophes_inside_paths(self) -> None:
+        _ = self.add("Blocking item", number=210)
+        wildcard = "https://example.test/build/*/linux"
+        apostrophe = "https://example.test/build/o'brien"
+        item = the_list.add(MORTY.id, "Inspect the links", owner=OWNER.id, source="nate", changes={
+            "blocked_by": (the_list.ItemDependency(210, f"See {wildcard},{apostrophe}'*?!."),),
+        })
+        panel = self.render_item_links_panel(list_page.ListRecord(MORTY.id, item), "", NOW, staff_names.read(), frozenset())
+        section = panel.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
+        parsed = ElementTree.fromstring('<section>' + section.replace(' data-record-jump ', ' data-record-jump="" ')
+                                        + '</section>')
+        inline = parsed.findall("ul/li/a[@class='item-url']")
+        self.assertEqual([(anchor.get("href"), anchor.text, anchor.tail) for anchor in inline], [
+            (wildcard, wildcard, ","),
+            (apostrophe, apostrophe, "'*?!."),
+        ])
+        labels = parsed.findall("ul/li/a[@class='item-link-label']")
+        self.assertEqual([anchor.get("href") for anchor in labels], [wildcard, apostrophe])
+
+    def test_item_url_labels_follow_generated_console_destinations(self) -> None:
+        output = io.StringIO()
+        with (patch.object(images, "register", return_value={"id": "sample", "file": "image.png"}),
+              patch.object(review_link, "link_host", return_value="console.test"), redirect_stdout(output)):
+            self.assertEqual(images.main(["register", "--image", "image.png", "--title", "A fixture image",
+                                         "--owner", OWNER.id, "--phase", "itemlinks"]), 0)
+        image_link = output.getvalue().splitlines()[1].removeprefix("Image link: ")
+        origin = "http://console.test:8765"
+        self.assertEqual(urlsplit(image_link).netloc, "console.test:8765")
+        relative_image = image_link.removeprefix(origin)
+        list_place = list_page.PAGE_PATH + list_page.item_link(MORTY.id, 210)
+        review_place = review_page.PAGE_PATH + "#key=sdlc%2FC1"
+        for path, expected in (
+            (relative_image, "Images page"),
+            (images.PAGE_PATH + "#image=sample", "Images page"),
+            ("/console/" + console.place_query("list", list_place), "List item 210"),
+            (list_place, "List item 210"),
+            ("/console/" + console.place_query("review", review_place), "Review item"),
+            (review_page.card_url("sdlc/C1"), "Review item"),
+        ):
+            for prefix in ("", "/tenant/desk"):
+                with self.subTest(path=path, prefix=prefix):
+                    self.assertEqual(list_page.item_url_label(urlsplit(origin + prefix + path)), expected)
+
+    def test_item_links_lists_oldest_sources_once(self) -> None:
+        images = "http://console.test:8765/console/images#image=sample"
+        related = "http://console.test:8765/console/list.html#item=keeper%2FL210"
+        review = "http://console.test:8765/console/review.html#key=owner%2FC1"
+        external = "https://example.test/check?x=1&y=2"
+        item = the_list.add(MORTY.id, "Review the links", owner=OWNER.id,
+                            source="nate", changes={"latest_status": f"See {images}."})
+        with patch.object(the_list, "now", return_value=NOW + timedelta(hours=2)):
+            item = the_list.update(MORTY.id, item.id,
+                                   {"evidence": f"{related}\n{images}"}, source="morty")
+        note = the_list.ItemChange(NOW + timedelta(hours=3), f"Also read {external}.", "morty")
+        answer = question_record.Answer(f"Check {review}.", (NOW + timedelta(hours=1)).isoformat())
+        question = question_record.Question("Q1", NOW.isoformat(), "Where is the review?", answer=answer)
+        item = replace(item, log=(*item.log, note), questions=(question,))
+        names = staff_names.read()
+        entry = list_page.ListRecord(MORTY.id, item)
+        panel = self.render_item_links_panel(entry, '<form></form>', NOW.astimezone(user_zone()), names, frozenset({"Q1"}))
+        links = panel.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
+        rows = ElementTree.fromstring(f"<section>{links}</section>").findall("ul/li")
+        self.assertEqual([(row[0].text, row[1].text, row[2].text) for row in rows], [
+            ("Images page", "Latest status", images),
+            ("Review item", "Answer", review),
+            ("List item 210", "Evidence", related),
+            ("example.test/check", "Note", external),
+        ])
+        self.assertEqual([row[0].get("href") for row in rows], [images, review, related, external])
+        self.assertLess(panel.index('class="list-item-fields"'), panel.index('class="item-links"'))
+        self.assertLess(panel.index('class="item-links"'), panel.index('<form>'))
+        self.assertIn(f'<a class="item-url" href="{html.escape(external)}"', panel)
+        questions = list_page.panel_questions(item, NOW, frozenset({"Q1"}))
+        self.assertIn(f'<a class="item-url" href="{review}" target="_blank" rel="noopener">', questions)
+        empty = the_list.add(MORTY.id, "No addresses", owner=OWNER.id, source="nate", changes={})
+        empty_panel = self.render_item_links_panel(
+            list_page.ListRecord(MORTY.id, empty), "", NOW, names, frozenset())
+        self.assertNotIn('<h3>Links</h3>', empty_panel)
+
+    def test_later_blocking_condition_keeps_the_oldest_url_source_and_order(self) -> None:
+        _ = self.add("Blocking item", number=210)
+        shared = "https://console.test/console/images#image=sample"
+        next_step = "https://example.test/next"
+        condition = "https://example.test/condition"
+        item = the_list.add(MORTY.id, "Inspect the links", owner=OWNER.id, source="nate",
+                            changes={"latest_status": f"See {shared}."})
+        with patch.object(the_list, "now", return_value=NOW + timedelta(hours=1)):
+            item = the_list.update(MORTY.id, item.id, {"next_step": f"Read {next_step}."}, source="morty")
+        with patch.object(the_list, "now", return_value=NOW + timedelta(hours=2)):
+            item = the_list.update(MORTY.id, item.id, {
+                "blocked_by": (the_list.ItemDependency(210, f"Check {shared} and {condition}."),),
+            }, source="morty")
+        panel = self.render_item_links_panel(list_page.ListRecord(MORTY.id, item), "", NOW, staff_names.read(), frozenset())
+        section = panel.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
+        parsed = ElementTree.fromstring(f"<section>{section.replace(' data-record-jump ', ' data-record-jump="" ')}</section>")
+        anchors = parsed.findall("ul/li/a[@class='item-link-label']")
+        self.assertEqual([(anchor.get("href"), anchor.text) for anchor in anchors], [
+            (shared, "Images page"),
+            (next_step, "example.test/next"),
+            (condition, "example.test/condition"),
+        ])
+        self.assertEqual([field.text for field in parsed.findall("ul/li/span[@class='item-link-field']")],
+                         ["Latest status", "Next step", "Blocked by"])
+
+    def test_closed_question_keeps_its_original_link_source_and_order(self) -> None:
+        shared = "https://example.test/check"
+        question_url = "https://example.test/question"
+        status_url = "https://example.test/status"
+        item = the_list.add(MORTY.id, "Inspect the links", owner=OWNER.id, source="nate", changes={})
+        asked_at = NOW + timedelta(hours=1)
+        question_clock = Mock(wraps=datetime)
+        question_clock.configure_mock(**{"now.return_value": asked_at})
+        with patch.object(page_question, "datetime", question_clock):
+            fields = self.fields(item, "question", words=f"Did you read {shared} and {question_url}?")
+            _ = list_page.submit(self.root / "reviews", urlencode(fields))
+        with patch.object(the_list, "now", return_value=NOW + timedelta(hours=2)):
+            _ = the_list.update(MORTY.id, item.id, {"latest_status": f"Read {shared} and {status_url}."},
+                                source="morty")
+        with patch.object(the_list, "now", return_value=NOW + timedelta(hours=3)):
+            _ = the_list.close(MORTY.id, item.id, "The check is complete.", source="nate")
+        with patch.object(the_list, "now", return_value=NOW + timedelta(hours=4)):
+            item = the_list.reopen(MORTY.id, item.id, source="nate")
+        self.assertEqual(item.questions, ())
+        panel = self.render_item_links_panel(list_page.ListRecord(MORTY.id, item), "", NOW, staff_names.read(), frozenset())
+        section = panel.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
+        rows = ElementTree.fromstring(f"<section>{section}</section>").findall("ul/li")
+        self.assertEqual([(row[0].get("href"), row[1].text) for row in rows], [
+            (shared, "Question"),
+            (question_url, "Question"),
+            (status_url, "Latest status"),
+        ])
+
+    def test_collapsed_list_row_keeps_item_urls_plain(self) -> None:
+        url = "https://console.test/check"
+        _ = the_list.add(MORTY.id, f"See {url}", owner=OWNER.id, source="nate", changes={
+            "next_step": f"Read **this** {url}.",
+            "next_check": the_list.CheckCondition(url),
+            "eta": the_list.EtaDescription(url),
+        })
+        body = list_page.render(self.root / "reviews", include_counts=False).decode()
+        row = body.split('<tr class="list-row">', 1)[1].split("</tr>", 1)[0]
+        self.assertIn(f"<strong>See {url}</strong>", row)
+        self.assertIn(f"<p>Read <strong>this</strong> {url}.</p>", row)
+        self.assertNotIn("<a ", row)
+        detail = body.split('<div class="list-panel">', 1)[1].split('<script', 1)[0]
+        self.assertIn(f'href="{url}" target="_blank" rel="noopener"', detail)
+
+    def test_one_links_section_keeps_related_jumps_and_url_links(self) -> None:
+        _ = self.add("Related item", number=210)
+        _ = self.add("Blocking item", number=211)
+        url = "https://console.test/check"
+        item = the_list.add(MORTY.id, "Inspect the links", owner=OWNER.id, source="nate", changes={
+            "latest_status": f"See {url}.", "related_to": (210,),
+            "blocked_by": (the_list.ItemDependency(211, "The check passes."),),
+        })
+        body = list_page.render(self.root / "reviews", include_counts=False).decode()
+        row = body.split(f'data-key="{MORTY.id}/{item.id}"', 1)[1].split("</tbody>", 1)[0]
+        self.assertEqual(row.count("<h3>Links</h3>"), 1)
+        self.assertNotIn("<h3>Related items</h3>", row)
+        section = row.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
+        parsed = ElementTree.fromstring(f"<section>{section.replace(' data-record-jump ', ' data-record-jump="" ')}</section>")
+        anchors = parsed.findall("ul/li/a")
+        self.assertEqual([(anchor.text, anchor.get("href"), anchor.get("target")) for anchor in anchors], [
+            ("#211", list_page.item_link(MORTY.id, 211), None),
+            ("#210", list_page.item_link(MORTY.id, 210), None),
+            ("console.test/check", url, "_blank"),
+        ])
+        self.assertTrue(all("data-record-jump" in anchor.attrib for anchor in anchors[:2]))
+        self.assertEqual(anchors[-1].get("rel"), "noopener")
+
+    def test_blocking_condition_links_the_url_once_in_the_links_section(self) -> None:
+        _ = self.add("First blocking item", number=210)
+        _ = self.add("Second blocking item", number=211)
+        url = "https://example.test/check"
+        item = the_list.add(MORTY.id, "Inspect the check", owner=OWNER.id, source="nate", changes={
+            "latest_status": f"Read {url}.",
+            "blocked_by": (the_list.ItemDependency(210, f"Check <proof> at {url}!"),
+                           the_list.ItemDependency(211, f"Confirm {url}.")),
+        })
+        panel = self.render_item_links_panel(list_page.ListRecord(MORTY.id, item), "", NOW, staff_names.read(), frozenset())
+        section = panel.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
+        parsed = ElementTree.fromstring(f"<section>{section.replace(' data-record-jump ', ' data-record-jump=\"\" ')}</section>")
+        rows = parsed.findall("ul/li")
+        self.assertEqual([row[0].text for row in rows], ["#210", "#211", "example.test/check"])
+        self.assertEqual(rows[0][0].tail, " — Check <proof> at ")
+        self.assertEqual(rows[1][0].tail, " — Confirm ")
+        links = parsed.findall("ul/li/a[@class='item-url']")
+        self.assertEqual([anchor.get("href") for anchor in links], [url, url])
+        self.assertEqual([(anchor.text, anchor.get("target"), anchor.get("rel"), anchor.tail) for anchor in links],
+                         [(url, "_blank", "noopener", "!"), (url, "_blank", "noopener", ".")])
+        self.assertIs(links[0], rows[0][1])
+        self.assertIs(links[1], rows[1][1])
+        self.assertEqual([anchor.get("href") for anchor in parsed.findall("ul/li/a[@class='item-link-label']")], [url])
+
+    def test_links_scan_skips_url_free_history_and_keeps_current_evidence(self) -> None:
+        item = the_list.add(MORTY.id, "History without URLs", owner=OWNER.id, source="nate", changes={})
+        history = tuple(the_list.ItemChange(NOW, f"Note {index}.", "morty") for index in range(32))
+        item = replace(item, log=(*item.log, *history))
+        names = staff_names.read()
+        with patch.object(list_page, "item_url_matches", wraps=list_page.item_url_matches) as matches:
+            panel = self.render_item_links_panel(list_page.ListRecord(MORTY.id, item), "", NOW, names, frozenset())
+        matches.assert_not_called()
+        self.assertNotIn('<h3>Links</h3>', panel)
+        url = "https://console.test/current"
+        legacy = replace(item, evidence=f"See {url}.")
+        panel = self.render_item_links_panel(list_page.ListRecord(MORTY.id, legacy), "", NOW, names, frozenset())
+        self.assertIn(f'href="{url}" target="_blank" rel="noopener">console.test/current</a>', panel)
+
+    def test_browser_latest_status_links_open_a_new_tab_and_wrap(self) -> None:
+        url = "https://console.test:8765/check/" + "proof" * 90
+        _ = the_list.add(MORTY.id, "Check the result", owner=OWNER.id, source="nate",
+                         changes={"latest_status": f"See {url}."})
+        self.browser_action_sequence(r"""
+ const panel=recordDetails(row).querySelector('.list-panel');
+ const link=panel.querySelector('.list-field-latest_status a');
+ const section=panel.querySelector('.item-links');
+ check(link?.target==='_blank' && link.relList.contains('noopener'),'Latest status opens a new tab.');
+ check(link?.href==='https://console.test:8765/check/'+'proof'.repeat(90),'The link keeps the whole URL.');
+ check(link?.getClientRects().length>1,'The inline link wraps at phone width.');
+ check(section.clientWidth===section.scrollWidth,'The Links section fits at phone width.');
+""", add_item=False, reduced_motion=True, window_size=(390, 1000))
+
     def test_producer_filter_and_both_tables_show_the_producer_label_color(self) -> None:
         _ = self.add("Producer labels")
         body = list_page.render(self.root / "reviews", include_counts=False).decode()
@@ -2524,7 +2864,8 @@ frame.addEventListener('load',async()=>{
         _ = the_list.update(MORTY.id, item.id, {"evidence": replacement, "next_step": "Read the result."}, source="morty")
         body = list_page.render(self.root / "reviews", include_counts=False).decode()
         log = body.split('<ol class="list-log">', 1)[1]
-        added_html = "Read https://example.invalid/proof?x=1&amp;y=2."
+        added_html = ('Read <a class="item-url" href="https://example.invalid/proof?x=1&amp;y=2" '
+                      'target="_blank" rel="noopener">https://example.invalid/proof?x=1&amp;y=2</a>.')
         for index, expected in enumerate((added_html, "The &lt;check&gt; passed.", replacement)):
             with self.subTest(index=index):
                 row = log.split(f'<li data-log-index="{index}">', 1)[1].split('</li>', 1)[0]
@@ -2552,8 +2893,8 @@ frame.addEventListener('load',async()=>{
         item = replace(item, log=(*item.log,
             the_list.ItemChange(NOW, the_list.QuestionAnswered("Q1"), "morty"),
             the_list.ItemChange(NOW, the_list.QuestionClosed(question), "nate")))
-        log = list_page.item_log_html(list_page.ListRecord(MORTY.id, item), NOW.astimezone(user_zone()),
-                                      staff_names.read(), frozenset())
+        log = list_page.item_log(list_page.ListRecord(MORTY.id, item), NOW.astimezone(user_zone()),
+                                 staff_names.read(), frozenset()).markup
         self.assertIn('<li class="question" data-log-index="1">', log)
         self.assertIn('<div><strong>Answer</strong> to question Q1', log)
         self.assertIn('<li class="question" data-log-index="2">', log)
@@ -2760,7 +3101,7 @@ frame.addEventListener('load',async()=>{
         self.assertIn("State</dt><dd>Done</dd>", log)
 
     def long_log_item(self, entries: int = 30) -> the_list.ListItem:
-        item = self.add("Long log", number=1)
+        item = self.add("Long log", number=1, evidence="")
         for update in range(entries):
             _ = the_list.update(MORTY.id, item.id, {"next_step": f"Check result {update}."}, source="morty")
         return item
@@ -2914,11 +3255,12 @@ document.body.append(result);
 
     def add(self, title: str, state: the_list.ItemState = the_list.ItemState.WORKING, *,
             owner: the_list.ItemOwner = OWNER.id, number: int | the_list.NextNumber = the_list.NextNumber.AVAILABLE,
-            next_check: the_list.NextCheck = the_list.NoTimestamp.UNSET) -> the_list.ListItem:
+            next_check: the_list.NextCheck = the_list.NoTimestamp.UNSET,
+            evidence: str = "Read https://example.invalid/proof?x=1&y=2.") -> the_list.ListItem:
         return the_list.add(MORTY.id, title, owner=owner, number=number, source="nate", changes={
             "state": state, "next_check": next_check, "next_step": "Read the result and check the page.",
             "latest_status": "The page reads the saved records.", "done_when": "The checks pass.",
-            "evidence": "Read https://example.invalid/proof?x=1&y=2.",
+            "evidence": evidence,
             "eta": the_list.EtaRange(NOW + timedelta(hours=1), NOW + timedelta(hours=2))})
 
     def fixture_items(self) -> list[the_list.ListItem]:
@@ -6908,8 +7250,8 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         saved = the_list.load(MORTY.id, item.id)
         legacy = replace(saved, log=tuple(entry for entry in saved.log
                                          if entry.what != the_list.QuestionAnswered("Q1")))
-        legacy_log = list_page.item_log_html(list_page.ListRecord(MORTY.id, legacy), NOW.astimezone(user_zone()),
-                                            staff_names.read(), frozenset())
+        legacy_log = list_page.item_log(list_page.ListRecord(MORTY.id, legacy), NOW.astimezone(user_zone()),
+                                        staff_names.read(), frozenset()).markup
         self.assertIn('<li class="question" data-log-index="Q1-answered">' + answer_time, legacy_log)
         self.assertEqual(legacy_log.count('12:35 EST'), 1)
 
@@ -8548,6 +8890,31 @@ window.fetch=async(_url,options)=>{
         _ = the_list.update(MORTY.id, identity, {"state": the_list.ItemState.WORKING}, source="dwight")
         return the_list.update(MORTY.id, identity, {"state": the_list.ItemState.REPAIRED, "next_step": instructions},
                                source="dwight")
+
+    def test_repair_and_not_fixed_keep_links_in_the_open_item(self) -> None:
+        repair_url = "https://example.test/repair"
+        feedback_url = "https://example.test/feedback"
+        item = self.file_repaired_report("Fix the menu", f"Try {repair_url}.")
+        root = self.root / "reviews"
+        body = list_page.render(root, include_counts=False).decode()
+        row = body.split('<tr class="list-row">', 1)[1].split("</tr>", 1)[0]
+        self.assertIn(f"Try {repair_url}.", row)
+        self.assertNotIn("<a ", row)
+        self.assertIn('<h3>How to try</h3><p>Try <a class="item-url"', body)
+        self.assertIn(f'href="{repair_url}" target="_blank" rel="noopener"', body)
+
+        fields = self.fields(item, "not works", words=f"See {feedback_url}.")
+        _ = list_page.submit(root, urlencode(fields))
+        saved = list_page.saved_action_state(MORTY.id, item.id, include_detail=True)
+        self.assertEqual(saved.get("next_step_sort"), "dwight repairs it again")
+        self.assertIn('class="staff-name', saved.get("next_step_html", ""))
+        panel = saved.get("detail_html", "")
+        self.assertIn(f'<p>Not fixed: See <a class="item-url" href="{feedback_url}" '
+                      + 'target="_blank" rel="noopener">', panel)
+        links = panel.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
+        rows = ElementTree.fromstring(f"<section>{links}</section>").findall("ul/li")
+        self.assertEqual([(row[0].get("href"), row[1].text) for row in rows],
+                         [(repair_url, "Next step"), (feedback_url, "Feedback")])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_repair_undo_restores_the_draft_and_works_leaves_needs_me(self) -> None:

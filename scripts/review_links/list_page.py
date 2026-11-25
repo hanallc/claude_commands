@@ -17,7 +17,7 @@ from enum import Enum, StrEnum
 from functools import cache
 from pathlib import Path
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
-from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
+from urllib.parse import SplitResult, parse_qs, quote, unquote, urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import accounts
@@ -27,7 +27,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, delivery_state, footer_counts, record_store, repeat_rule, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
-from scripts.review_links import change_browser, change_page, console, go_ledger, page_frame, page_question, question_path
+from scripts.review_links import change_browser, change_page, console, go_ledger, page_frame, question_path
 from scripts.review_links import record_table, review_actions, review_items, review_legacy, review_link, review_page
 from scripts.review_links import search_fold, staff_names
 from scripts.review_links import question_record
@@ -47,6 +47,77 @@ FIELD_LABELS = {
 }
 HEADERS = ("#", FIELD_LABELS["owner"], FIELD_LABELS["producer"], "Item",
            *(FIELD_LABELS[field] for field in ("state", "next_step", "eta")), "Update")
+# The characters before the first scheme letter can belong to the previous URL.
+ITEM_URL_BOUNDARY = re.compile(r'[\s<>"]|(?<![A-Za-z0-9+.-])[0-9+.-]*(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*)://')
+BRACKETED_URL_HOST = re.compile(r"https?://[^/?#\[\]]*\[[^/?#\[\]]+\]", re.IGNORECASE)
+
+
+class ItemUrlMatch(NamedTuple):
+    start: int
+    text: str
+    address: SplitResult
+
+
+def item_url_matches(text: str) -> Iterable[ItemUrlMatch]:
+    if "://" not in text:
+        return
+    boundaries = ITEM_URL_BOUNDARY.finditer(text)
+    boundary = next(boundaries, None)
+    while boundary is not None:
+        piece, boundary = boundary, next(boundaries, None)
+        scheme = piece["scheme"]
+        if scheme is None or scheme.lower() not in ("http", "https"):
+            continue
+        start, end = piece.start("scheme"), len(text)
+        if boundary is not None:
+            end = boundary.start("scheme" if boundary["scheme"] is not None else 0)
+        candidate = text[start:end]
+        url = candidate.rstrip(".,):!?;]*'")
+        if "[" in url and "]" not in url:
+            host = BRACKETED_URL_HOST.match(candidate)
+            if host:
+                url = host[0]
+        try:
+            address = urlsplit(url)
+        except ValueError:
+            continue
+        if address.hostname:
+            yield ItemUrlMatch(start, url, address)
+
+
+def item_url_html(url: str, label: str, css: str = "item-url") -> str:
+    return (f'<a class="{css}" href="{html.escape(url)}" target="_blank" rel="noopener">'
+            + html.escape(label) + '</a>')
+
+
+def item_text_html(text: str, *, paragraphs: bool = False, link_urls: bool = True) -> str:
+    """Escape the text and render HTTP and HTTPS links."""
+    render: Callable[[str], str] = html.escape
+    if paragraphs:
+        render = change_browser.question_paragraphs if "`" in text else change_browser.paragraph_text_html
+    if "://" not in text:
+        return render(text)
+    links: dict[str, str] = {}
+    parts: list[str] = []
+    end = 0
+    # Keep the URLs intact while the formatter reads paragraphs and inline markup.
+    marker = "\0"
+    while marker in text:
+        marker += "\0"
+    for match in item_url_matches(text) if link_urls else ():
+        token = f"{marker}url{len(links)}{marker}"
+        links[token] = item_url_html(match.text, match.text)
+        parts.extend((text[end:match.start], token))
+        end = match.start + len(match.text)
+    parts.append(text[end:])
+    prepared = "".join(parts)
+    if paragraphs and "://" in prepared:
+        # Keep the paragraph formatter from linking an address that this matcher skipped.
+        separator = f"{marker}scheme{marker}"
+        markup = render(prepared.replace("://", separator)).replace(separator, "://")
+    else:
+        markup = render(prepared)
+    return re.sub(f"{marker}url[0-9]+{marker}", lambda match: links[match[0]], markup) if links else markup
 
 
 class ListChip(StrEnum):
@@ -333,7 +404,8 @@ def field_html(field: str, value: object, today: datetime, names: staff_names.St
         owner = cast(the_list.ItemOwner, value)
         return names.html(owner, owner_name(names.members, owner))
     if field == "eta":
-        return html.escape(eta_text(cast(the_list.Eta, value), today))
+        eta = cast(the_list.Eta, value)
+        return item_text_html(eta.text) if isinstance(eta, the_list.EtaDescription) else html.escape(eta_text(eta, today))
     if field == "parked_until":
         if not isinstance(value, (datetime, the_list.ParkUntilDelivered)):
             return "Not parked"
@@ -345,17 +417,19 @@ def field_html(field: str, value: object, today: datetime, names: staff_names.St
             return html.escape(short_list_time(value, today.tzinfo))
         return html.escape(list_time(value, today))
     if isinstance(value, the_list.CheckCondition):
-        return html.escape(value.text)
+        return item_text_html(value.text)
     if field in ("next_step", "latest_status", "done_when", "closing_words"):
-        return change_browser.question_paragraphs(cast(str, value) or "Not recorded")
+        return item_text_html(cast(str, value) or "Not recorded", paragraphs=True)
     if field == "unit":
         return names.html(cast(str, value)) or "Not recorded"
     if field == "blocked_by":
         dependencies = cast(tuple[the_list.ItemDependency, ...], value)
-        return html.escape(", ".join(f"L{entry.number} ({entry.condition})" for entry in dependencies)) or "None"
+        return item_text_html(", ".join(f"L{entry.number} ({entry.condition})" for entry in dependencies)) or "None"
     if field == "related_to":
         return ", ".join(f"L{number}" for number in cast(tuple[int, ...], value)) or "None"
-    return html.escape(cast(str, value)) or "Not recorded"
+    if field in ("state", "requested_by"):
+        return html.escape(cast(str, value)) or "Not recorded"
+    return item_text_html(cast(str, value)) or "Not recorded"
 
 
 def log_source_html(source: str, names: staff_names.StaffNames) -> str:
@@ -378,7 +452,7 @@ def log_row(index: str, moment: datetime, body: str, today: datetime, *,
 
 def log_field_html(field: str, value: object, today: datetime, names: staff_names.StaffNames, evidence_id: str) -> str:
     if field == "evidence":
-        text = html.escape(cast(str, value)) or "Not recorded"
+        text = item_text_html(cast(str, value)) or "Not recorded"
         return f'<details class="log-evidence"><summary id="{evidence_id}">Details</summary><div>{text}</div></details>'
     return field_html(field, value, today, names)
 
@@ -397,12 +471,12 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
             body += f'<p>Starts {html.escape(short_list_time(run.start, today.tzinfo))}</p>'
             if isinstance(schedule, the_list.ScheduledSeries):
                 body += '<p>' + html.escape(schedule.rule.describe(run.start)) + '</p>'
-            body += change_browser.question_paragraphs(run.words)
+            body += item_text_html(run.words, paragraphs=True)
             if isinstance(schedule, the_list.ScheduledSeries):
                 for exception in schedule.exceptions:
                     if isinstance(exception.run, the_list.ScheduledRun):
                         body += f'<p>Run {exception.number} · {html.escape(short_list_time(exception.run.start, today.tzinfo))}</p>'
-                        body += change_browser.question_paragraphs(exception.run.words)
+                        body += item_text_html(exception.run.words, paragraphs=True)
         if visible_fields:
             body += '<dl>' + ''.join(
                 f'<dt>{names.role_label(field, FIELD_LABELS[field])}</dt><dd>{log_field_html(field, value, today, names, evidence_id)}</dd>'
@@ -412,14 +486,14 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
         recipients = " and ".join(names.html(identity, owner_name(names.members, identity))
                                   for identity in content.recipient_ids(keeper))
         body = label + " " + recipients + by
-        body += change_browser.question_paragraphs(content.words)
+        body += item_text_html(content.words, paragraphs=True)
     elif isinstance(content, the_list.QuestionAnswered):
         question = "Answer"
         body = " to question " + html.escape(content.question_id) + by
     elif isinstance(content, the_list.QuestionClosed):
         question = "Question"
         body = (" " + html.escape(content.question.question_id) + " closed with the item" + by
-                + change_browser.question_paragraphs(content.question.words))
+                + item_text_html(content.question.words, paragraphs=True))
     elif isinstance(content, the_list.MarkedRead):
         body = "Marked read" + by
     elif isinstance(content, the_list.Reopened):
@@ -445,31 +519,40 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
             body = "Asked nate for " + ("a go" if ask.kind is the_list.AskKind.GO else "approval") + by + ": "
         else:
             body = f"<strong>{ASK_BUTTONS[ask.kind]}</strong>" + by + ": "
-        body += html.escape(ask.what) + " → " + target
+        body += item_text_html(ask.what) + " → " + target
     elif isinstance(content, the_list.GoNotDelivered):
         recipient = names.html(content.recipient, owner_name(names.members, content.recipient))
-        body = "Go not delivered to " + recipient + by + ": " + html.escape(content.ask.what)
+        body = "Go not delivered to " + recipient + by + ": " + item_text_html(content.ask.what)
     elif isinstance(content, str):
-        body = html.escape(content) + by
+        body = item_text_html(content) + by
     else:
         return ""
     return log_row(str(index), change.time, body, today, question=question)
 
 
-def item_log_html(record: ListRecord, today: datetime, names: staff_names.StaffNames,
-                  unread_answers: frozenset[str]) -> str:
+class ItemLog(NamedTuple):
+    markup: str
+    url_candidates: list[the_list.ItemChange]
+
+
+def item_log(record: ListRecord, today: datetime, names: staff_names.StaffNames,
+             unread_answers: frozenset[str]) -> ItemLog:
     item = record.item
     row_id = html.escape(record.key.replace("/", "-"), quote=True)
     answers = {question.question_id for question in item.questions if question.answer is not None}
     answer_entries: dict[str, the_list.ItemChange] = {}
     rows: list[tuple[datetime, str]] = []
+    url_candidates: list[the_list.ItemChange] = []
     for index, (change, fields) in enumerate(zip(item.log, the_list.log_field_changes(item), strict=True)):
         content = change.what
         if isinstance(content, the_list.QuestionAnswered) and content.question_id in answers:
             answer_entries[content.question_id] = change
         elif not the_list.is_page_request_receipt(change):
-            rows.append((change.time, log_entry_html(change, index, today, names, fields,
-                                                    f"list-evidence-{row_id}-{index}", record.keeper)))
+            markup = log_entry_html(change, index, today, names, fields, f"list-evidence-{row_id}-{index}", record.keeper)
+            rows.append((change.time, markup))
+            if ("://" in markup or isinstance(content, (the_list.AskOpened, the_list.GoGiven, the_list.GoNotDelivered))
+                    and "://" in content.ask.why):
+                url_candidates.append(change)
     for question in item.questions:
         answer = question.answer
         identity = question.question_id
@@ -483,15 +566,15 @@ def item_log_html(record: ListRecord, today: datetime, names: staff_names.StaffN
                   else question.recipient_id(record.keeper))
         answer_body = log_source_html(source, names)
         rows.append((asked, log_row(f"{identity}-asked", asked,
-                                   question_body + change_browser.question_paragraphs(question.words), today,
+                                   question_body + item_text_html(question.words, paragraphs=True), today,
                                    question="Question")))
         rows.append((answered, log_row(f"{identity}-answered", answered,
-                                       answer_body + change_browser.question_paragraphs(answer.text), today,
+                                       answer_body + item_text_html(answer.text, paragraphs=True), today,
                                        question="Answer")))
-    if not answers.difference(unread_answers):
-        return ''.join(markup for _, markup in reversed(rows))
-    # Use reverse record order for events with the same time.
-    return ''.join(markup for _, markup in sorted(reversed(rows), key=lambda row: row[0], reverse=True))
+    rows.reverse()
+    if answers.difference(unread_answers):
+        rows.sort(key=lambda row: row[0], reverse=True)
+    return ItemLog(''.join(markup for _, markup in rows), url_candidates)
 
 
 def item_link(keeper: staff.StaffId, number: int) -> str:
@@ -749,15 +832,19 @@ def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: fr
     sections: list[str] = []
     for question in item.questions:
         answer = question.answer
+        identity = html.escape(question.question_id)
+        if answer is not None and question.question_id not in unread_answers:
+            continue
+        pending = answer is None and question.question_id not in failed
+        waiting = " — waiting for an answer" if pending else ""
+        body = (f'<section class="page-question" data-question="{identity}"><h3>Question {identity}{waiting}</h3>'
+                + question_time_html(question.asked_at, today) + f'<p>{item_text_html(question.words)}</p>')
         if answer is None:
-            sections.append(page_question.open_question_html(
-                question, asked_time_html=question_time_html(question.asked_at, today),
-                failed=question.question_id in failed))
-        elif question.question_id in unread_answers:
-            sections.append(page_question.answered_question_html(question, answer,
-                asked_time_html=question_time_html(question.asked_at, today),
-                answer_time_html=question_time_html(answer.answered_at, today),
-                answer_mark_html=' <span class="question-unread">Unread</span>'))
+            body += change_page.question_failure_html(question.question_id in failed)
+        else:
+            body += ('<h3>Answer <span class="question-unread">Unread</span></h3>'
+                     + question_time_html(answer.answered_at, today) + f'<p>{item_text_html(answer.text)}</p>')
+        sections.append(body + '</section>')
     return ''.join(sections)
 
 
@@ -794,9 +881,9 @@ def ask_boxes(entry: ListRecord, secret: str, names: staff_names.StaffNames) -> 
         boxes.append(
             f'<section class="list-ask" data-ask="{ask.ask_id}" aria-labelledby="{box_id}">'
             + f'<h3 id="{box_id}">{ASK_HEADINGS[ask.kind]}</h3>'
-            + f'<dl><dt>What</dt><dd>{html.escape(ask.what)}</dd>'
+            + f'<dl><dt>What</dt><dd>{item_text_html(ask.what)}</dd>'
             + f'<dt>Who needs it</dt><dd>{names.html(member.id, member.name)}, {staff_role_html(member, names)}</dd>'
-            + f'<dt>Why</dt><dd>{html.escape(ask.why)}</dd></dl>'
+            + f'<dt>Why</dt><dd>{item_text_html(ask.why)}</dd></dl>'
             + f'<form method="post" action="{go_ledger.GO_PATH}" data-go-form>' + hidden
             + f'<button type="submit" aria-describedby="{box_id}-note">{ASK_BUTTONS[ask.kind]}</button>'
             + f'<small id="{box_id}-note">{ASK_NOTES[ask.kind].format(agent=names.html(member.id, member.name))}</small>'
@@ -813,14 +900,23 @@ def report_state_time(item: the_list.ListItem, today: datetime) -> str:
 class ListProgress(NamedTuple):
     latest_status: str
     status_time: the_list.Timestamp
-    next_step_html: str
-    next_step_sort: str
+    next_step: str
+    repair_producer_html: str
+    show_next_step: bool
+
+    def next_step_html(self, *, link_urls: bool = False) -> str:
+        if self.repair_producer_html:
+            return '<p>' + self.repair_producer_html + ' repairs it again</p>'
+        if self.show_next_step:
+            return item_text_html(self.next_step or "Not recorded", paragraphs=True, link_urls=link_urls)
+        return ""
 
 
 def item_progress(item: the_list.ListItem, names: staff_names.StaffNames, schedule: DisplayedSchedule) -> ListProgress:
     latest_status, status_time = item.latest_status, item.latest_status_time
     _, next_step = displayed_work(item, schedule)
-    step_html = change_browser.question_paragraphs(next_step or "Not recorded")
+    repair_producer_html = ""
+    show_next_step = True
     if isinstance(item.report, the_list.ListReport):
         use_repair_status = True
         use_repair_step = item.state is the_list.ItemState.WORKING and not next_step
@@ -832,7 +928,7 @@ def item_progress(item: the_list.ListItem, names: staff_names.StaffNames, schedu
                 if use_repair_step:
                     producer = owner_name(names.members, item.producer)
                     next_step = producer + " repairs it again"
-                    step_html = '<p>' + names.html(item.producer, producer) + ' repairs it again</p>'
+                    repair_producer_html = names.html(item.producer, producer)
                 break
             if isinstance(event, the_list.FieldChange):
                 use_repair_status = use_repair_status and "latest_status" not in event.fields
@@ -840,14 +936,140 @@ def item_progress(item: the_list.ListItem, names: staff_names.StaffNames, schedu
             if not (use_repair_status or use_repair_step):
                 break
         if item.state is the_list.ItemState.DELIVERED:
-            next_step = step_html = ""
-    return ListProgress(latest_status, status_time, step_html, next_step.casefold())
+            next_step = ""
+            show_next_step = False
+    return ListProgress(latest_status, status_time, next_step, repair_producer_html, show_next_step)
+
+
+class ItemLinkSource(NamedTuple):
+    time: datetime
+    field: str
+    text: str
+
+
+def field_link_text(fields: Mapping[str, object]) -> Iterable[tuple[str, str]]:
+    for field, value in fields.items():
+        if isinstance(value, str):
+            if "://" in value:
+                yield FIELD_LABELS[field], value
+        elif isinstance(value, (the_list.CheckCondition, the_list.EtaDescription)):
+            if "://" in value.text:
+                yield FIELD_LABELS[field], value.text
+        elif isinstance(value, the_list.ScheduledRun):
+            yield FIELD_LABELS["next_step"], value.words
+        elif isinstance(value, the_list.ScheduledSeries):
+            yield FIELD_LABELS["next_step"], value.first.words
+            for exception in value.exceptions:
+                if isinstance(exception.run, the_list.ScheduledRun):
+                    yield FIELD_LABELS["next_step"], exception.run.words
+        elif field == "blocked_by":
+            for dependency in cast(tuple[the_list.ItemDependency, ...], value):
+                if "://" in dependency.condition:
+                    yield FIELD_LABELS[field], dependency.condition
+
+
+def log_link_text(content: the_list.LogContent) -> Iterable[tuple[str, str]]:
+    if isinstance(content, the_list.FieldChange):
+        yield from field_link_text(content.fields)
+    elif isinstance(content, the_list.PageFeedback):
+        yield "Feedback", content.words
+    elif isinstance(content, the_list.QuestionClosed):
+        yield "Question", content.question.words
+    elif isinstance(content, (the_list.AskOpened, the_list.GoGiven, the_list.GoNotDelivered)):
+        yield "What", content.ask.what
+        yield "Why", content.ask.why
+    elif isinstance(content, str):
+        yield "Note", content
+
+
+def item_link_sources(item: the_list.ListItem, log: ItemLog, displayed_next_step: str) -> Iterable[ItemLinkSource]:
+    for change in log.url_candidates:
+        content = change.what
+        for field, text in log_link_text(content):
+            if "://" in text:
+                source_time = (datetime.fromisoformat(content.question.asked_at).astimezone(UTC)
+                               if isinstance(content, the_list.QuestionClosed) else change.time)
+                yield ItemLinkSource(source_time, field, text)
+    for question in item.questions:
+        if "://" in question.words:
+            asked = datetime.fromisoformat(question.asked_at).astimezone(UTC)
+            yield ItemLinkSource(asked, "Question", question.words)
+        if question.answer is not None and "://" in question.answer.text:
+            answered = datetime.fromisoformat(question.answer.answered_at).astimezone(UTC)
+            yield ItemLinkSource(answered, "Answer", question.answer.text)
+    for ask in item.asks:
+        if "://" in ask.what:
+            yield ItemLinkSource(ask.opened, "What", ask.what)
+        if "://" in ask.why:
+            yield ItemLinkSource(ask.opened, "Why", ask.why)
+    fields = {"title": item.title, "blocked_by": item.blocked_by, "next_check": item.next_check, "eta": item.eta,
+              "next_step": item.next_step, "latest_status": item.latest_status, "evidence": item.evidence,
+              "done_when": item.done_when, "closing_words": item.closing_words}
+    updated = item.updated if isinstance(item.updated, datetime) else datetime.max.replace(tzinfo=UTC)
+    for field, text in field_link_text(fields):
+        yield ItemLinkSource(updated, field, text)
+    if displayed_next_step != item.next_step and "://" in displayed_next_step:
+        yield ItemLinkSource(updated, FIELD_LABELS["next_step"], displayed_next_step)
+
+
+def console_item_label(address: SplitResult) -> str:
+    path = address.path.removesuffix(".html")
+    if path.endswith("/console/review"):
+        return "Review item"
+    if path.endswith(("/console/images", "/console/list")):
+        fragment = parse_qs(address.fragment)
+        if path.endswith("/console/images") and fragment.get("image"):
+            return "Images page"
+        if path.endswith("/console/list"):
+            item = re.fullmatch(r"(?:[^/]+/)?L?([0-9]+)", fragment.get("item", [""])[0])
+            if item:
+                return f"List item {item[1]}"
+    return ""
+
+
+def item_url_label(address: SplitResult) -> str:
+    destination = address
+    if address.path.rstrip("/").endswith(("/console", "/console/console.html", "/console/index.html")):
+        query = parse_qs(address.query)
+        page = query.get("page", [""])[0]
+        place = query.get(console.PLACE_PREFIX + page, [""])[0]
+        try:
+            destination = urlsplit(place)
+        except ValueError:
+            destination = address
+        if page == "review" and not place:
+            return "Review item"
+    return console_item_label(destination) or address.netloc.rsplit("@", 1)[-1] + address.path
+
+
+def item_links_html(entry: ListRecord, log: ItemLog, displayed_next_step: str) -> str:
+    item = entry.item
+    related = [
+        f'<li><a data-record-jump href="{html.escape(item_link(entry.keeper, link.number))}">#{link.number}</a>'
+        + ' — ' + item_text_html(link.condition) + '</li>' for link in item.blocked_by
+    ]
+    related.extend(
+        f'<li>Related: <a data-record-jump href="{html.escape(item_link(entry.keeper, number))}">#{number}</a></li>'
+        for number in item.related_to
+    )
+    links: dict[str, str] = {}
+    for source in sorted(item_link_sources(item, log, displayed_next_step), key=lambda source: source.time):
+        for match in item_url_matches(source.text):
+            url = match.text
+            if url in links:
+                continue
+            links[url] = ('<li>' + item_url_html(url, item_url_label(match.address), "item-link-label")
+                          + f'<span class="item-link-field">{source.field}</span>'
+                          + f'<span class="item-link-address">{html.escape(url)}</span></li>')
+    if not related and not links:
+        return ""
+    return '<section class="item-links"><h3>Links</h3><ul>' + ''.join(related) + ''.join(links.values()) + '</ul></section>'
 
 
 def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff_names.StaffNames,
                  unread_answers: frozenset[str], progress: ListProgress, asks: str = "",
                  *, schedule: DisplayedSchedule = the_list.NoSchedule.UNSET) -> str:
-    log = item_log_html(entry, today, names, unread_answers)
+    log = item_log(entry, today, names, unread_answers)
     log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
     item = entry.item
     status_time = progress.status_time
@@ -860,15 +1082,16 @@ def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff
         f'<section class="list-field-{field}"><h3>'
         + ('How to try' if field == "next_step" and item.state == the_list.ItemState.REPAIRED else FIELD_LABELS[field])
         + (status_stamp if field == "latest_status" else "") + '</h3>'
-        + (progress.next_step_html if field == "next_step" else field_html(field, value, today, names))
+        + (progress.next_step_html(link_urls=True) if field == "next_step" else field_html(field, value, today, names))
         + (' · ' + state_stamp if field == "state" and state_stamp else '') + '</section>'
         for field, value in (("state", item.state), ("eta", eta), ("latest_status", progress.latest_status),
                              ("next_step", item.next_step), ("done_when", item.done_when))
-        if (field != "latest_status" or not duplicate_status) and (field != "next_step" or progress.next_step_html))
+        if (field != "latest_status" or not duplicate_status) and (field != "next_step" or progress.show_next_step))
     report = review_page.list_report_details(item.report) if isinstance(item.report, the_list.ListReport) else ''
+    links = item_links_html(entry, log, progress.next_step)
     return ('<div class="list-panel"><div>' + report + asks + '<div class="list-item-fields">' + fields
-            + '</div><div data-list-item-content>' + sections + '</div>'
-            + '</div>' + record_table.log_panel(log_id, log) + '</div>')
+            + '</div>' + links + '<div data-list-item-content>' + sections + '</div>'
+            + '</div>' + record_table.log_panel(log_id, log.markup) + '</div>')
 
 
 class LinkedReviewRead(StrEnum):
@@ -969,12 +1192,7 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
     item = entry.item
     if isinstance(visibility, the_list.WaitingForAnswer) and item.state != the_list.ItemState.REPAIRED:
         return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label, mark, progress)
-    links = [f'<li><a data-record-jump href="{html.escape(item_link(entry.keeper, link.number), quote=True)}">#{link.number}</a>'
-             + ' — ' + html.escape(link.condition) + '</li>' for link in item.blocked_by]
-    links.extend(f'<li>Related: <a data-record-jump href="{html.escape(item_link(entry.keeper, number), quote=True)}">#{number}</a></li>'
-                 for number in item.related_to)
-    sections = '<section><h3>Links</h3><ul>' + ''.join(links) + '</ul></section>' if links else ''
-    sections += review_links(item, reviews, today)
+    sections = review_links(item, reviews, today)
     failed: frozenset[str] = visibility.failed if isinstance(visibility, the_list.QuestionAttention) else frozenset()
     questions = panel_questions(item, today, unread_answers, failed) if isinstance(schedule, the_list.NoSchedule) else ''
     form = feedback_form(entry, secret, members=names.members, parking_label=parking_label,
@@ -1006,7 +1224,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     due = the_list.eta_due(eta)
     eta_sort: tuple[int, float | str] = (0, due.timestamp()) if due is not None else (1, eta_text(eta, today).casefold())
     values = (item.number, owner_sort, producer.casefold(), item.title.casefold(), item.state.value.casefold(),
-              progress.next_step_sort, eta_sort, item.unread_since.timestamp() if isinstance(item.unread_since, datetime) else 0)
+              progress.next_step.casefold(), eta_sort, item.unread_since.timestamp() if isinstance(item.unread_since, datetime) else 0)
     parking = (the_list.ParkUntilDelivered.DELIVERED.value
                if item.parked_until is the_list.ParkUntilDelivered.DELIVERED else str(parked).lower())
     key = entry.key
@@ -1072,13 +1290,13 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
             update += '<small>' + notice + ", " + html.escape(list_time(sent, today)) + '</small>'
     overdue = not scheduled and due is not None and due < today and item.state != the_list.ItemState.CLOSED
     eta_class = "list-eta warning" if overdue else "list-eta"
-    full_eta = field_html("eta", eta, today, names)
+    full_eta = html.escape(eta_text(eta, today))
     short_eta = html.escape(eta_cell_text(eta, today))
     eta_cell = (f'<span class="{eta_class}" id="list-eta-{row_id}" tabindex="0" title="{full_eta}">'
                 + f'<span class="list-eta-text">{short_eta}</span>'
                 + f'<span class="list-eta-full" aria-hidden="true">{full_eta}</span></span>')
     cells = (number, owner_cell, field_html("producer", item.producer, today, names),
-             title, state, progress.next_step_html, eta_cell, update)
+             title, state, progress.next_step_html(), eta_cell, update)
     row = ''.join(f'<td' + (' class="record-id"' if label == '#' else '')
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden_attr = ' hidden' if hidden else ''
@@ -1256,8 +1474,8 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
     if report:
         saved["state_time_html"] = report_state_time(item, local_today)
     if report or include_detail:
-        saved["next_step_html"] = progress.next_step_html
-        saved["next_step_sort"] = progress.next_step_sort
+        saved["next_step_html"] = progress.next_step_html()
+        saved["next_step_sort"] = progress.next_step.casefold()
     if has_detail:
         reviews: ReviewRecords = {}
         if item.reviews:
@@ -2250,6 +2468,14 @@ background:var(--ink-2);border-radius:50%}
 .list-item-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:16px}
 .list-item-fields section{grid-column:span 2}
 .list-item-fields :is(.list-field-state,.list-field-eta){grid-column:auto}
+.list-table .item-url{color:var(--accent);overflow-wrap:anywhere}
+.item-links ul{list-style:none;padding:0;margin:0 0 16px}
+.item-links li{padding:6px 0;border-top:1px solid var(--line);overflow-wrap:anywhere}
+.item-links li:first-child{padding-top:0;border-top:0}
+.item-links .item-link-label{color:var(--accent);font-weight:600;text-decoration:none}
+.item-links .item-link-label:is(:hover,:focus-visible){text-decoration:underline}
+.item-link-field{color:var(--ink-2);margin-inline-start:8px}
+.item-link-address{display:block;color:var(--ink-3);font-size:12px;margin-top:2px}
 .list-actions{position:relative}
 :is(.list-tell,.list-actions,.list-parking-actions)>button,.list-park [data-later-toggle]{
  border:1px solid var(--ink-3);border-radius:8px;background:var(--card);color:var(--ink);cursor:pointer
