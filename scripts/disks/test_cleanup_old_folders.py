@@ -7,6 +7,7 @@ import io
 import json
 import os
 import pwd
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,7 +19,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.disks import cleanup_old_folders
-from scripts.lib import build_folders, git_files, git_rescue, process_start, removal_guard
+from scripts.lib import build_folders, git_files, git_rescue, process_start, removal_guard, session_move
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lint import tmp_sweep
 from scripts.production import staff
@@ -188,8 +189,9 @@ import sys
 sys.path.insert(0, sys.argv[1])
 from scripts.disks import cleanup_old_folders as cleanup
 review_local = cleanup.review_local
-def review_and_add(machine):
-    result = review_local(machine)
+def review_and_add(machine: cleanup.Machine, *, mode: cleanup.CleanupMode = cleanup.CleanupMode.STANDARD
+                   ) -> tuple[cleanup.HostList, cleanup.CleanupBounds]:
+    result = review_local(machine, mode=mode)
     Path({str(late)!r}).mkdir()
     cleanup.cleanup_git(Path({str(self.home)!r}), "init", "-q", {str(git_result)!r})
     return result
@@ -217,10 +219,10 @@ cleanup.review_local = review_and_add
         apply = cleanup.apply
         late = self.build / "old-late"
 
-        def apply_with_new_name(review: cleanup_old_folders.HostList,
-                                bounds: cleanup_old_folders.CleanupBounds) -> int:
+        def apply_with_new_name(review: cleanup_old_folders.HostList, bounds: cleanup_old_folders.CleanupBounds, *,
+                                mode: cleanup_old_folders.CleanupMode = cleanup_old_folders.CleanupMode.STANDARD) -> int:
             late.mkdir()
-            return apply(review, bounds)
+            return apply(review, bounds, mode=mode)
 
         channel = cleanup.WorkerChannel(io.StringIO('{"kind":"apply"}\n'), io.StringIO())
         with (mock.patch.object(cleanup, "process_uses", return_value=cleanup.CleanupProcessReview()),
@@ -355,6 +357,55 @@ for folder in masks:
                     ("ssh", "-o", "BatchMode=yes", "mac", cleanup_old_folders.REMOTE_COMMAND + " --json"),
                     capture_output=True, text=True, timeout=17, check=False)
 
+    def test_sudo_remote_parent_starts_only_setpriv_and_opens_no_file_for_writing(self) -> None:
+        self.write_settings("~/missing")
+        _ = self.configuration.write_text(self.configuration.read_text().replace(
+            "cleanup.ssh_seconds=17\n", "cleanup.ssh_seconds=invalid\n"))
+        read_log = self.home / "config-reads.log"
+        shift_log = self.home / "config-shift-reads.log"
+        program = """
+import os
+from pathlib import Path
+import subprocess
+import sys
+from unittest.mock import patch
+from scripts.disks import cleanup_old_folders as cleanup
+
+def refuse_write(event, arguments):
+    if event == "open" and os.geteuid() == 0 and arguments[2] & (os.O_ACCMODE | os.O_CREAT | os.O_TRUNC):
+        raise AssertionError(f"the sudo parent opened a file for writing: {arguments[0]}")
+
+sys.addaudithook(refuse_write)
+command = ("ssh", "mac")
+user = cleanup.SudoCleanupUser(os.getuid(), os.getgid(), "fixture", Path.home(), "/fixture/setpriv")
+
+def process_start(arguments, **kwargs):
+    assert arguments[0] == user.setpriv, arguments
+    return subprocess.CompletedProcess(arguments, 0)
+
+with patch.object(subprocess, "run", side_effect=process_start) as run:
+    with patch.object(os, "geteuid", return_value=0):
+        assert cleanup.run_remote(command, user=user).returncode == 0
+    assert run.call_count == 1
+    assert tuple(run.call_args.args[0][-2:]) == command
+"""
+        result = subprocess.run((sys.executable, "-B", "-c", program), capture_output=True, text=True, check=False,
+                                env=os.environ | {"CONF_READ_LOG": str(read_log),
+                                                  "CONF_SHIFT_READ_LOG": str(shift_log)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(read_log.exists())
+        self.assertFalse(shift_log.exists())
+
+    def test_sudo_remote_child_uses_the_configured_timeout_and_reports_a_timeout(self) -> None:
+        self.write_settings("~/missing")
+        command = ("ssh", "mac")
+        with (mock.patch.dict(os.environ, {"SUDO_UID": str(os.geteuid()), "SUDO_GID": str(os.getegid())}),
+              mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired(command, 17)) as ssh,
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(cleanup_old_folders.run_remote_after_drop(command), 1)
+        ssh.assert_called_once_with(command, capture_output=True, text=True, timeout=17, check=False)
+        self.assertEqual(errors.getvalue(), "SSH timed out after 17 seconds\n")
+
     def test_a_changed_digest_refuses_even_when_the_size_is_the_same(self) -> None:
         path = self.candidate()
         self.write_settings("~/old")
@@ -444,6 +495,136 @@ for folder in masks:
                     self.assertIn("pid 42 fixture-process", output)
                     self.assertTrue((path / "payload").is_file())
                 self.assertNotIn("would remove", output)
+
+    def test_a_descriptor_that_closes_during_the_scan_does_not_keep_a_folder(self) -> None:
+        path = self.candidate()
+        self.write_settings(str(path))
+        proc, pid = self.proc_fixture()
+        (pid / "cwd").symlink_to(self.home)
+        descriptor = pid / "fd/5"
+        readlink = os.readlink
+
+        def read_descriptor(name: bytes | str | Path) -> bytes | str:
+            if os.fsdecode(name) == str(descriptor):
+                descriptor.unlink()
+            return readlink(name) if isinstance(name, bytes) else readlink(os.fsdecode(name))
+
+        def deny_descriptor(name: bytes | str | Path) -> bytes | str:
+            if os.fsdecode(name) == str(descriptor):
+                raise PermissionError(errno.EACCES, "denied", name)
+            return readlink(name) if isinstance(name, bytes) else readlink(os.fsdecode(name))
+
+        descriptor.symlink_to(path / "payload")
+        with (mock.patch.object(cleanup_old_folders, "PROC_ROOT", str(proc)),
+              mock.patch.object(os, "readlink", side_effect=deny_descriptor)):
+            denied, kept, errors = self.command("--host-list")
+        self.assertEqual((denied, errors), (0, ""))
+        self.assertIn("open file scan is incomplete: pid 42", kept)
+        self.assertTrue(descriptor.is_symlink())
+        with (mock.patch.object(cleanup_old_folders, "PROC_ROOT", str(proc)),
+              mock.patch.object(os, "readlink", side_effect=read_descriptor)):
+            status, output, errors = self.command("--host-list")
+        self.assertFalse(descriptor.is_symlink())
+        self.assertEqual((status, errors), (0, ""))
+        self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\twould remove")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup parent")
+    def test_sudo_parent_checks_processes_from_other_users_and_starts_an_unprivileged_worker(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.candidate()
+        self.write_settings(str(path))
+        proc, pid = self.proc_fixture()
+        uid, gid = os.geteuid(), os.getegid()
+        account = pwd.getpwuid(uid)
+        (pid / "cwd").symlink_to(path)
+        request = json.dumps({"kind": "process", "pid": 43, "paths": [str(path)], "links": False,
+                              "descriptors": [], "gate_root": ""})
+        review = json.dumps({"kind": "review", "rows": [], "unreadable": []})
+        incoming = io.StringIO(f"{request}\n{review}\n")
+        outgoing = io.StringIO()
+        child = mock.MagicMock(stdout=incoming, stdin=outgoing)
+        child.configure_mock(**{"wait.return_value": 0})
+        worker = mock.MagicMock()
+        worker.configure_mock(**{"__enter__.return_value": child})
+
+        def fixture_executable(name: str) -> str:
+            return f"/fixture/{name}"
+
+        with (mock.patch.dict(os.environ, {"SUDO_UID": str(uid), "SUDO_GID": str(gid)}),
+              mock.patch.object(os, "geteuid", return_value=0),
+              mock.patch.object(cleanup, "PROC_ROOT", str(proc)),
+              mock.patch.object(cleanup, "LINUX_BUILD_ROOT", self.build),
+              mock.patch.object(cleanup, "protected_mounts", return_value=(self.build / "cargo",)) as masks,
+              mock.patch.object(shutil, "which", side_effect=fixture_executable),
+              mock.patch.object(subprocess, "Popen", return_value=worker) as spawn,
+              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                  ("ssh",), 255, "", "fixture unreachable\n")) as ssh,
+              mock.patch.object(outgoing, "close"), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(cleanup.run_cli(()), 0)
+        checked = cleanup.message_object(cast(object, json.loads(outgoing.getvalue())))
+        self.assertEqual(checked["paths"], [[str(path), 42, tmp_sweep.WORKS_IN]])
+        self.assertEqual(checked["unreadable"], [])
+        self.assertIn("Use check: processes of all users.", output.getvalue())
+        command = cast(tuple[str, ...], spawn.call_args.args[0])
+        self.assertEqual(command[:9], (
+            "/fixture/setpriv", f"--reuid={uid}", f"--regid={gid}", "--clear-groups", "--no-new-privs",
+            "--inh-caps=-all", "--ambient-caps=-all", "--bounding-set=-all", "/fixture/bwrap",
+        ))
+        drop = command.index("--cap-drop")
+        self.assertEqual(command[drop + 1], "ALL")
+        self.assertEqual(command[-2:], (cleanup.CleanupMode.MOVE_GATE_GIT.value, str(self.build / "cargo")))
+        masks.assert_called_once_with(Path(account.pw_dir), self.build)
+        environment = cast(dict[str, str], spawn.call_args.kwargs["env"])
+        self.assertEqual(environment["HOME"], account.pw_dir)
+        ssh_command = cast(tuple[str, ...], ssh.call_args.args[0])
+        self.assertEqual(ssh_command[:8], command[:8])
+        self.assertEqual(ssh_command[8:11], (sys.executable, "-IB", "-c"))
+        self.assertEqual(ssh_command[-5:], (
+            "ssh", "-o", "BatchMode=yes", "mac", cleanup.REMOTE_COMMAND + " --json"))
+        self.assertEqual(ssh.call_args.kwargs["env"], environment)
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_the_worker_applies_only_with_the_invoking_user_ids(self) -> None:
+        cleanup = cleanup_old_folders
+        uid, gid = os.geteuid(), os.getegid()
+        review = cleanup.HostList(cleanup.Machine.NATEDEV, ())
+        bounds = cleanup.CleanupBounds(self.home, self.build, frozenset(), self.gate)
+
+        def apply_as_invoker(_review: cleanup_old_folders.HostList, _bounds: cleanup_old_folders.CleanupBounds, *,
+                             mode: cleanup_old_folders.CleanupMode = cleanup_old_folders.CleanupMode.STANDARD) -> int:
+            self.assertEqual((os.geteuid(), os.getegid()), (uid, gid))
+            self.assertIs(mode, cleanup_old_folders.CleanupMode.STANDARD)
+            return 0
+
+        for worker_uid, expected in ((0, "refused"), (uid, "applied")):
+            with (self.subTest(worker_uid=worker_uid),
+                  mock.patch.dict(os.environ, {"SUDO_UID": str(uid), "SUDO_GID": str(gid)}),
+                  mock.patch.object(os, "geteuid", return_value=worker_uid),
+                  mock.patch.object(os, "getegid", return_value=gid),
+                  mock.patch.object(cleanup, "review_local", return_value=(review, bounds)) as inspect,
+                  mock.patch.object(cleanup, "apply", side_effect=apply_as_invoker) as apply):
+                outgoing = io.StringIO()
+                channel = cleanup.WorkerChannel(io.StringIO('{"kind":"apply"}\n'), outgoing)
+                if expected == "refused":
+                    with self.assertRaisesRegex(ValueError, "unprivileged"):
+                        _ = cleanup.serve_masked_cleanup(channel, self.build, frozenset())
+                    inspect.assert_not_called()
+                    apply.assert_not_called()
+                else:
+                    self.assertEqual(cleanup.serve_masked_cleanup(channel, self.build, frozenset()), 0)
+                    self.assertIn('"kind": "applied", "status": 0', outgoing.getvalue())
+                    apply.assert_called_once_with(review, bounds)
+
+    def test_root_without_a_sudo_user_stops_before_review(self) -> None:
+        cleanup = cleanup_old_folders
+        with (mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(os, "geteuid", return_value=0),
+              mock.patch.object(cleanup, "protected_mounts") as mounts,
+              mock.patch.object(cleanup, "run_masked_cleanup", side_effect=ValueError("started a worker")),
+              mock.patch.object(cleanup, "review_local") as inspect, redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(cleanup.run_cli(("--host-list",)), 1)
+        self.assertIn("SUDO_UID", errors.getvalue())
+        mounts.assert_not_called()
+        inspect.assert_not_called()
 
     def test_kernel_denials_keep_folders_and_name_each_process(self) -> None:
         free = self.candidate()
@@ -657,6 +838,324 @@ for folder in masks:
         for path in (marker_folder, marker_file, module.parents[3], bare):
             self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\tholds a Git repository; manual review")
         self.assertIn("kept (holds a Git repository; manual review): 4 (0.002 GiB)", output)
+
+    def gate_checkout_to_move(self, name: str = "t-checkout") -> Path:
+        path = self.candidate(name, home=self.gate)
+        metadata = path / ".git"
+        metadata.mkdir()
+        _ = (metadata / "HEAD").write_text("ref: refs/heads/main\n")
+        self.write_settings(str(path))
+        return path
+
+    def test_gate_move_keeps_linked_worktrees_at_any_depth(self) -> None:
+        cleanup = cleanup_old_folders
+        linked = self.candidate("t-linked", home=self.gate)
+        nested = self.gate_checkout_to_move("t-nested-linked")
+        (nested / "child").mkdir()
+        for metadata in (linked / ".git", nested / "child/.git"):
+            _ = metadata.write_text("gitdir: /fixture/git/worktrees/linked\n")
+        self.write_settings(f"{linked} {nested}")
+        review, _bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=cleanup.CleanupMode.MOVE_GATE_GIT)
+        rows = {row.path: row.outcome for row in review.rows}
+        for path in (linked, nested):
+            self.assertEqual(rows[path], removal_guard.Kept("linked worktree; its registration is elsewhere"))
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_requires_the_callers_ownership_at_listing_and_removal(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        target = self.build / "claude/resources/shm-moved" / path.name
+        target.parent.mkdir(parents=True)
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        self.assertIsInstance(next(row.outcome for row in review.rows if row.path == path), cleanup.WouldMove)
+
+        uid, gid = os.geteuid(), os.getegid()
+        with (mock.patch.dict(os.environ, {"SUDO_UID": str(uid + 1), "SUDO_GID": str(gid)}),
+              mock.patch.object(cleanup, "review_local") as inspect):
+            channel = cleanup.WorkerChannel(io.StringIO(), io.StringIO())
+            with self.assertRaisesRegex(ValueError, "must run as the sudo caller"):
+                _ = cleanup.serve_masked_cleanup(channel, self.build, frozenset(), mode=mode)
+            inspect.assert_not_called()
+
+        with mock.patch.object(os, "geteuid", return_value=os.geteuid() + 1):
+            other_owner, _bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        self.assertEqual(next(row.outcome for row in other_owner.rows if row.path == path),
+                         removal_guard.Kept("other user's files; live use not provable"))
+
+        fstat = os.fstat
+        parent_info = target.parent.stat()
+
+        def other_parent_owner(fd: int) -> os.stat_result:
+            info = fstat(fd)
+            if os.path.samestat(info, parent_info):
+                fields = list(info)
+                fields[4] = info.st_uid + 1
+                return os.stat_result(fields)
+            return info
+
+        with (mock.patch.object(os, "fstat", side_effect=other_parent_owner),
+              redirect_stdout(io.StringIO()) as output):
+            wrong_parent, _bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+            self.assertEqual(next(row.outcome for row in wrong_parent.rows if row.path == path),
+                             removal_guard.Kept("the move target parent belongs to another user"))
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1)
+        self.assertIn("the move target parent belongs to another user", output.getvalue())
+        self.assertEqual((path / "payload").read_text(), "old content\n")
+        self.assertEqual(list(target.parent.iterdir()), [])
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_keeps_the_source_when_the_verified_copy_changes_before_publication(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        target = self.build / "claude/resources/shm-moved" / path.name
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        verify = cleanup.verify_gate_copy
+        publication_states: list[bool] = []
+
+        def change_after_verification(
+                checked: cleanup_old_folders.CheckedCleanup, source: int, destination: int, target_parent: int,
+                entries: dict[Path, cleanup_old_folders.CleanupEntry],
+                sidecars: cleanup_old_folders.WorktreeSidecars) -> cleanup_old_folders.VerifiedGateCopy:
+            publication_states.append(target.exists())
+            verified = verify(checked, source, destination, target_parent, entries, sidecars)
+            if len(publication_states) == 1:
+                self.assertEqual(os.fstat(target_parent).st_mode & 0o777, 0o700)
+                fd = os.open("payload", os.O_WRONLY | os.O_TRUNC, dir_fd=destination)
+                with os.fdopen(fd, "w") as payload:
+                    _ = payload.write("changed after verification\n")
+            return verified
+
+        with (mock.patch.object(cleanup, "verify_gate_copy", side_effect=change_after_verification),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1, output.getvalue())
+        self.assertEqual(publication_states, [False, True])
+        self.assertIn("copy differs", output.getvalue())
+        self.assertEqual((path / "payload").read_text(), "old content\n")
+        self.assertEqual((target / "payload").read_text(), "changed after verification\n")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_keeps_the_source_when_a_published_file_changes_during_hashing(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        target = self.build / "claude/resources/shm-moved" / path.name
+        (path / "z-last").touch()
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        read_entry = session_move.read_entry
+
+        def change_after_hash(parent: int, relative: Path, info: os.stat_result,
+                              kind: session_move.HashedEntry, mount: int) -> session_move.TreeEntry:
+            result = read_entry(parent, relative, info, kind, mount)
+            if relative.name == "z-last" and target.exists() and os.path.samestat(os.fstat(parent), target.stat()):
+                _ = (target / "payload").write_text("")
+            return result
+
+        with (mock.patch.object(session_move, "read_entry", side_effect=change_after_hash),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1, output.getvalue())
+        self.assertIn("the published copy changed", output.getvalue())
+        self.assertEqual((path / "payload").read_text(), "old content\n")
+        self.assertEqual((target / "payload").read_text(), "")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_rolls_back_published_paths_when_a_sidecar_rename_fails(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        target = self.build / "claude/resources/shm-moved" / path.name
+        lock = path.with_name(path.name + ".lock")
+        lock.touch()
+        source_lease = build_folders.lease_path(path)
+        _ = source_lease.write_text('{"pid": 42, "process_start": "123"}')
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        rename = session_move.rename_exclusive
+        target_present: list[bool] = []
+
+        def refuse_lock(source: int, name: str, parent: int, destination: str) -> None:
+            if name == lock.name and os.path.samestat(os.fstat(parent), target.parent.stat()):
+                target_present.append(target.is_dir())
+                raise OSError(errno.EIO, "fixture cannot publish lock")
+            rename(source, name, parent, destination)
+
+        with (mock.patch.object(process_start, "process_start", return_value=process_start.Gone()),
+              redirect_stdout(io.StringIO()) as output):
+            review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+            with mock.patch.object(session_move, "rename_exclusive", side_effect=refuse_lock):
+                self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1, output.getvalue())
+            self.assertIn("fixture cannot publish lock", output.getvalue())
+            self.assertEqual(target_present, [True])
+            for source in (path, lock, source_lease):
+                self.assertTrue(source.exists(), source)
+                self.assertFalse(target.with_name(source.name).exists(), source)
+            retry, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+            self.assertEqual(cleanup.apply(retry, bounds, mode=mode), 0, output.getvalue())
+        self.assertEqual((target / "payload").read_text(), "old content\n")
+        self.assertFalse(path.exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_can_retry_after_fsync_fails_after_a_rename(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        target = self.build / "claude/resources/shm-moved" / path.name
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        fsync = os.fsync
+        failed = False
+
+        def fail_after_rename(fd: int) -> None:
+            nonlocal failed
+            if not failed and target.is_dir() and os.path.samestat(os.fstat(fd), target.parent.stat()):
+                self.assertEqual((target / "payload").read_text(), "old content\n")
+                failed = True
+                raise OSError(errno.EIO, "fixture cannot sync the published folder")
+            fsync(fd)
+
+        with redirect_stdout(io.StringIO()) as output:
+            with mock.patch.object(os, "fsync", side_effect=fail_after_rename):
+                self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1, output.getvalue())
+            self.assertIn("fixture cannot sync the published folder", output.getvalue())
+            self.assertEqual((path / "payload").read_text(), "old content\n")
+            self.assertFalse(target.exists())
+            staged, = target.parent.glob("*/" + target.name)
+            self.assertEqual((staged / "payload").read_text(), "old content\n")
+            retry, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+            self.assertEqual(cleanup.apply(retry, bounds, mode=mode), 0, output.getvalue())
+        self.assertEqual((target / "payload").read_text(), "old content\n")
+        self.assertFalse(path.exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_preserves_contents_modes_times_hard_links_and_sidecars(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        payload = path / "payload"
+        payload.chmod(0o640)
+        os.utime(payload, ns=(1_700_000_000_000_000_000, 1_700_000_001_000_000_000))
+        (path / "hard-link").hardlink_to(payload)
+        source_info = payload.stat()
+        sidecars = {path.with_name(path.name + ".lock"): "",
+                    build_folders.lease_path(path): '{"pid": 42, "process_start": "123"}'}
+        for sidecar, contents in sidecars.items():
+            _ = sidecar.write_text(contents)
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        with (mock.patch.object(process_start, "process_start", return_value=process_start.Gone()),
+              redirect_stdout(io.StringIO()) as output):
+            review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0, output.getvalue())
+        target = self.build / "claude/resources/shm-moved" / path.name
+        self.assertFalse(path.exists())
+        self.assertEqual((target / ".git/HEAD").read_text(), "ref: refs/heads/main\n")
+        self.assertEqual((target / "payload").read_text(), "old content\n")
+        target_info = (target / "payload").stat()
+        self.assertTrue(os.path.samestat(target_info, (target / "hard-link").stat()))
+        self.assertEqual((target_info.st_mode, target_info.st_mtime_ns), (source_info.st_mode, source_info.st_mtime_ns))
+        for sidecar, contents in sidecars.items():
+            self.assertFalse(sidecar.exists())
+            self.assertEqual(target.with_name(sidecar.name).read_text(), contents)
+        self.assertEqual(set(target.parent.iterdir()), {target, *(target.with_name(sidecar.name) for sidecar in sidecars)})
+        self.assertIn(f"moved {str(path)!r} to {str(target)!r}", output.getvalue())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_keeps_source_and_copy_after_same_size_content_mismatch(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        target = self.build / "claude/resources/shm-moved" / path.name
+        lock = path.with_name(path.name + ".lock")
+        lock.touch()
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        copy = cleanup.copy_gate_tree
+
+        def corrupt(source: int, destination: int) -> None:
+            copy(source, destination)
+            fd = os.open("payload", os.O_WRONLY, dir_fd=destination)
+            with os.fdopen(fd, "wb") as payload:
+                info = os.fstat(fd)
+                _ = payload.write(b"new content\n")
+                payload.flush()
+                os.utime(fd, ns=(info.st_atime_ns, info.st_mtime_ns))
+
+        with (mock.patch.object(cleanup, "copy_gate_tree", side_effect=corrupt),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1)
+        self.assertIn("copy differs", output.getvalue())
+        self.assertEqual((path / "payload").read_text(), "old content\n")
+        self.assertFalse(target.exists())
+        staged, = target.parent.glob("*/" + target.name)
+        self.assertEqual((staged / "payload").read_text(), "new content\n")
+        self.assertTrue(lock.is_file())
+        self.assertTrue(staged.with_name(lock.name).is_file())
+
+    def test_gate_move_keeps_git_rows_with_recovery_use_or_incomplete_scan(self) -> None:
+        cleanup = cleanup_old_folders
+        recovery = self.gate_checkout_to_move("t-recovery")
+        used = self.gate_checkout_to_move("t-used")
+        unreadable = self.gate_checkout_to_move("t-unreadable")
+        (recovery / ".git/run.json").touch()
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        for evidence, expected in (
+            (cleanup.CleanupProcessReview(paths=((str(used), 42, tmp_sweep.WORKS_IN),)), "pid 42 works in it"),
+            (cleanup.CleanupProcessReview(path_failure=removal_guard.Kept("open file scan is incomplete")),
+             "open file scan is incomplete"),
+        ):
+            with (self.subTest(expected=expected), mock.patch.object(cleanup, "process_uses", return_value=evidence)):
+                review, _bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+                rows = {row.path: row.outcome for row in review.rows}
+                self.assertEqual(rows[recovery], removal_guard.Kept("gate recovery record"))
+                self.assertEqual(rows[used if evidence.paths else unreadable], removal_guard.Kept(expected))
+        self.assertFalse((self.build / "claude/resources/shm-moved").exists())
+
+    def test_gate_move_list_names_the_target_and_writes_no_copy(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        target = self.build / "claude/resources/shm-moved" / path.name
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        review, _bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        record = review.record()
+        worker_record = cleanup.worker_review(review)
+        decoded = cleanup.decode_cleanup_rows(cast(object, json.loads(json.dumps(worker_record["rows"]))), review.machine)
+        self.assertEqual(decoded, review.rows)
+        with redirect_stdout(io.StringIO()) as output:
+            cleanup.show(review, cleanup.LocalListOnly.REQUESTED, record["digest"])
+        self.assertIn(f"would move to disk at {str(target)!r}", output.getvalue())
+        self.assertRegex(output.getvalue(), r"would move to disk: 1 \([0-9.]+ GiB\)")
+        self.assertTrue(path.is_dir())
+        self.assertFalse(target.parent.exists())
+        self.assertEqual(record["rows"][0].get("move_to"), str(target))
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_keeps_the_source_when_the_target_appears_after_listing(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        target = self.build / "claude/resources/shm-moved" / path.name
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        target.mkdir(parents=True)
+        _ = (target / "existing").write_text("keep this\n")
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1)
+        self.assertIn("move target already exists", output.getvalue())
+        self.assertEqual((target / "existing").read_text(), "keep this\n")
+        self.assertEqual((path / "payload").read_text(), "old content\n")
+
+    def test_gate_move_keeps_bare_and_nested_git_and_standard_cleanup_rows(self) -> None:
+        cleanup = cleanup_old_folders
+        bare = self.candidate("t-bare", home=self.gate)
+        (bare / "HEAD").touch()
+        (bare / "refs").mkdir()
+        (bare / "objects").mkdir()
+        nested = self.candidate("t-nested", home=self.gate)
+        (nested / "child/.git").mkdir(parents=True)
+        ordinary = self.candidate()
+        self.write_settings(str(ordinary))
+        preview, _bounds = cleanup.review_local(cleanup.Machine.NATEDEV)
+        self.assertIsInstance(next(row.outcome for row in preview.rows if row.path == ordinary), cleanup.WouldRemove)
+        moves, _bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=cleanup.CleanupMode.MOVE_GATE_GIT)
+        rows = {row.path: row.outcome for row in moves.rows}
+        for path in (bare, nested):
+            self.assertEqual(rows[path], removal_guard.Kept(
+                "holds a Git repository; manual review. The removal guard requires one top-level checkout"))
+        self.assertEqual(rows[ordinary], removal_guard.Kept("use the standard cleanup list to remove this folder"))
 
     def test_gate_listing_does_not_start_git(self) -> None:
         source, checkout = self.git_fixture()
@@ -1891,10 +2390,10 @@ for folder in masks:
                 raise PermissionError(errno.EACCES, "denied", path)
             return read_bytes(path)
 
-        def apply_after_denial(review: cleanup_old_folders.HostList,
-                               bounds: cleanup_old_folders.CleanupBounds) -> int:
+        def apply_after_denial(review: cleanup_old_folders.HostList, bounds: cleanup_old_folders.CleanupBounds, *,
+                               mode: cleanup_old_folders.CleanupMode = cleanup_old_folders.CleanupMode.STANDARD) -> int:
             with mock.patch.object(Path, "read_bytes", deny_reads):
-                return apply(review, bounds)
+                return apply(review, bounds, mode=mode)
 
         read_bytes = Path.read_bytes
         with mock.patch.object(cleanup_old_folders, "PROC_ROOT", str(proc)):

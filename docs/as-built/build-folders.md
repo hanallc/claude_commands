@@ -285,8 +285,21 @@ See [Repository copies](copies.md) for the copy commands and [Worktrees](worktre
 ## Cleanup of places outside the model
 
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/disks/cleanup_old_folders.py` to list old places outside the model.
+On natedev, Nate runs the list by hand with sudo first.
+
+```sh
+sudo "$(command -v python3)" -IB "$HOME/.claude/scripts/disks/cleanup_old_folders.py"
+```
+
+With sudo, the parent checks processes of all users. Any unreadable process blocks removal.
+The parent starts only `setpriv`. The SSH child reads the time limit after it changes to the caller's user.
+The child uses `SUDO_UID` and `SUDO_GID` for all writes and removals.
+It starts with no supplementary groups or capabilities. The command refuses a root run without the sudo identity.
+The sudo list shows each gate folder that would move to disk. It shows the count and size of those folders.
+Review the list, then run the same sudo command with `--go <digest>` to move its approved folders.
+Use the standard cleanup command for other removal rows.
 The command reads the configured places from `config/disks.conf`.
-Only places named by the cleanup settings and their associated side files can qualify for removal.
+The standard list approves removal only for places named by the cleanup settings and their side files.
 Other places found by the scans show `list only: no setting names it`.
 Each row shows the place, the machine, the size when measured, and the result of the checks.
 On natedev it also reads the Mac list over SSH. When SSH fails, the command shows the first error line if available.
@@ -300,14 +313,28 @@ The newest time includes the lock and lease files.
 If the command cannot read the gate root, it shows one kept row for that root and lists the other places.
 The command keeps a gate row that contains a `.git` file or folder at any depth.
 It also keeps a bare repository that it identifies by name.
-The list shows `holds a Git repository; manual review` for these rows.
+The standard list shows `holds a Git repository; manual review` for these rows.
+The sudo list can approve a move when a top-level Git checkout is the only reason to keep the folder.
+The sudo list keeps folders with a `.git` file because the linked worktree has a registration elsewhere.
+The removal guard keeps bare repositories and folders with nested checkout markers for manual review.
+The target is `/build/claude/resources/shm-moved/<entry name>`. The child refuses an existing target.
+The sudo caller must own the source entries and the target parent.
+The child copies the folder and its lock and lease files into a staging folder with mode `0700`.
+It preserves modes, times, and hard links.
+It copies links as links.
+The child compares the paths, types, sizes, file hashes, and link targets.
+The child renames the verified folder to the target first. It then renames the lock and lease files.
+If publication fails, the child returns the paths it published to staging.
+The child verifies the published copy again. It compares the file and folder stamps just before source removal.
+Cleanup can miss a write by a process with the same user ID between the entry's last check and source removal.
+A copy error keeps the source and the copy.
 The gate check uses file names and runs no Git commands.
 The command keeps other rows whose Git directory, registration, alternates, or local origin use the gate root's filesystem.
 These rows show `Git data in the gate root; manual review`.
 The command keeps every folder with a `run.json` recovery record.
 It keeps unknown entries, links, mounts, and folders in use.
 It keeps orphan side files and entries with unreadable evidence.
-The process scan checks only the current user.
+Without sudo, the process scan checks only the current user.
 On natedev, the parent uses `/proc` to check thread paths.
 It checks the working directory, root directory, executable, open files, and file mappings.
 If it finds a reference to the gate filesystem through a path outside the gate root, it keeps every gate row.
@@ -377,15 +404,16 @@ The child checks those names again before it starts Git or calls the removal gua
 The parent reads the process table. It compares mapped paths and link targets as bytes.
 It checks the descriptors, working directory, and root of each live task.
 For a single folder, it stops checking a process when it finds a use of that folder.
-An unreadable task makes the process scan incomplete.
+An unreadable task makes the process scan incomplete. The scan skips tasks and descriptors that disappear before the read.
 It checks each path as printed and without a trailing ` (deleted)`.
 It checks every combination of literal `\012` and newline for each of those paths.
 More than four `\012` sequences in one path make the process scan incomplete.
-The temporary sweep and the build sweep use the same thread scan as cleanup.
+The temporary sweep, build sweep, and cleanup use the same rules to decode process paths.
 Both sweeps keep entries when the process scan is incomplete.
 The parent calls the Mac over SSH, checks the digest, and prints the list.
 The table quotes folder paths, sidecar names, and Git paths. A list-only row also shows any scan error.
-Only Nate runs the command with `--go <digest>` by hand. No timer, service, hook, or session runs it.
+Only Nate runs the command with `--go <digest>` by hand. Use sudo on natedev for the gate moves.
+No timer, service, hook, or session runs it.
 The command checks the fresh list against the digest. The Mac checks its own part of the list before removal.
 The removal guard checks every approved entry under the folder locks before the first deletion.
 After this check, the child requests a fresh process check with the locks held. It keeps the row if use is found or the scan is incomplete.
