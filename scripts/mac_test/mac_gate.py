@@ -222,13 +222,17 @@ def detach_gate_images(path: Path, retained: os.stat_result) -> bool:
                 if not isinstance(entities, list):
                     continue
                 for entry in cast(list[object], entities):
-                    device = ledger.mapping(entry).get('dev-entry')
-                    if isinstance(device, str) and re.fullmatch(r'/dev/disk[0-9]+', device):
-                        if not os.path.samestat(retained, path.lstat()) or path.resolve() != folder:
-                            return False
-                        with suppress(OSError, subprocess.SubprocessError):
-                            _ = run_hdiutil('detach', '-force', device)
-                        break
+                    point = ledger.mapping(entry).get('mount-point')
+                    if not isinstance(point, str) or not Path(point).is_absolute():
+                        continue
+                    mount = Path(point).resolve()
+                    if mount == folder or not mount.is_relative_to(folder) or not mount.is_mount():
+                        continue
+                    if not os.path.samestat(retained, path.lstat()) or path.resolve() != folder:
+                        return False
+                    with suppress(OSError, subprocess.SubprocessError):
+                        _ = run_hdiutil('detach', '-force', str(mount))
+                    break
             return not attached_gate_images(folder)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return False

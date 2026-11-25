@@ -611,10 +611,12 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         private = [image(folder / 'm0001/fixture/removal.dmg', '/dev/disk9'),
                    image(folder / 'm0002/fixture/removal.dmg', '/dev/disk10')]
         query = ['/usr/bin/hdiutil', 'info', '-plist']
-        detached = [['/usr/bin/hdiutil', 'detach', '-force', disk] for disk in ('/dev/disk9', '/dev/disk10')]
+        detached = [['/usr/bin/hdiutil', 'detach', '-force', str(folder / name)]
+                    for name in ('disk9', 'disk10')]
         for stays_attached in (False, True):
             with (self.subTest(stays_attached=stays_attached),
                   mock.patch.object(sys, 'platform', 'darwin'),
+                  mock.patch.object(Path, 'is_mount', return_value=True),
                   mock.patch.object(mac_gate, 'running_owner', return_value=False),
                   mock.patch.object(subprocess, 'check_output', side_effect=[
                       plistlib.dumps({'images': [*other, *private]}),
@@ -632,6 +634,31 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
                     remove.assert_called_once_with(folder, wait=False, expected=folder.lstat())
                 self.assertEqual([call.args[0] for call in hdiutil.call_args_list], [query, *detached, query])
                 self.assertTrue(all(call.kwargs.get('timeout') == 20 for call in hdiutil.call_args_list))
+
+    def test_gate_detach_requires_a_live_mount_inside_the_folder(self) -> None:
+        folder = self.root.resolve() / 'gate-temporary'
+        folder.mkdir()
+        outside = folder.with_name('gate-temporary-other')
+        outside.mkdir()
+        link = folder / 'link'
+        link.symlink_to(outside, target_is_directory=True)
+        stale = folder / 'stale-mount'
+        stale.mkdir()
+        reply = plistlib.dumps({'images': [{
+            'image-path': str(folder / 'removal.dmg'),
+            'system-entities': [
+                {'dev-entry': '/dev/disk9'},
+                {'mount-point': '/dev/disk9'},
+                {'mount-point': str(outside)},
+                {'mount-point': str(link)},
+                {'mount-point': str(stale)},
+            ],
+        }]})
+        with (mock.patch.object(Path, 'is_mount', autospec=True, return_value=False) as is_mount,
+              mock.patch.object(mac_gate, 'run_hdiutil', return_value=reply) as hdiutil):
+            self.assertFalse(mac_gate.detach_gate_images(folder, folder.lstat()))
+        self.assertEqual([call.args for call in hdiutil.call_args_list], [('info', '-plist')] * 2)
+        is_mount.assert_called_once_with(stale)
 
     def test_dead_guest_cleanup_releases_only_the_free_gate_folder_lease(self) -> None:
         guest = self.sleeping_process()

@@ -87,17 +87,19 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
 
     def detach_image(self, image: Path, mount: Path, moved_mount: Path | None,
                      images: list[dict[str, object]]) -> None:
+        root = image.parent.resolve()
+        expected_points = {path.resolve() for path in (mount, moved_mount) if path is not None}
         for attached in images:
             if attached.get("image-path") != str(image):
                 continue
-            if current := self.current_mount(mount, moved_mount):
-                _ = self.disk_image("detach", "-force", str(current))
-                continue
             entities = cast(list[dict[str, str]], attached["system-entities"])
-            device = next((entry["dev-entry"] for entry in entities
-                           if re.fullmatch(r"/dev/disk[0-9]+", entry.get("dev-entry", ""))), None)
-            assert device is not None, f"no disk device for {image}: {entities}"
-            _ = self.disk_image("detach", "-force", device)
+            points = (Path(point) for entry in entities if (point := entry.get("mount-point")))
+            if not any(point.is_absolute() and point.resolve() in expected_points for point in points):
+                continue
+            if current := self.current_mount(mount, moved_mount):
+                target = current.resolve()
+                if target != root and target.is_relative_to(root):
+                    _ = self.disk_image("detach", "-force", str(target))
 
     def assert_no_images(self, image: Path, mount: Path, moved_mount: Path | None,
                          images: list[dict[str, object]]) -> None:
@@ -162,21 +164,25 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
         image = fixture / "removal.dmg"
         mount = fixture / "mount"
         other = {"image-path": str(root.parent / "other.dmg"), "system-entities": [{"dev-entry": "/dev/disk8"}]}
-        attached = {"image-path": str(image), "system-entities": [{"dev-entry": "/dev/disk9"}]}
+        attached = {"image-path": str(image), "system-entities": [
+            {"dev-entry": "/dev/disk9"},
+            {"dev-entry": "/dev/disk9s1", "mount-point": str(mount)},
+        ]}
         info = plistlib.dumps({"images": [other, attached]}).decode()
         clean = plistlib.dumps({"images": [other]}).decode()
-        with mock.patch.object(subprocess, "run", side_effect=[
-            KeyboardInterrupt(),
-            subprocess.CompletedProcess([], 0, info, ""),
-            subprocess.CompletedProcess([], 0, "", ""),
-            subprocess.CompletedProcess([], 0, clean, ""),
-        ]) as run:
+        with (mock.patch.object(Path, "is_mount", return_value=True),
+              mock.patch.object(subprocess, "run", side_effect=[
+                  KeyboardInterrupt(),
+                  subprocess.CompletedProcess([], 0, info, ""),
+                  subprocess.CompletedProcess([], 0, "", ""),
+                  subprocess.CompletedProcess([], 0, clean, ""),
+              ]) as run):
             with self.assertRaises(KeyboardInterrupt), self.attach_image(image, mount):
                 self.fail("the interrupted attach returned")
         self.assertEqual([call.args[0] for call in run.call_args_list], [
             ["/usr/bin/hdiutil", "attach", "-nobrowse", "-mountpoint", str(mount), "-owners", "off", "-plist", str(image)],
             ["/usr/bin/hdiutil", "info", "-plist"],
-            ["/usr/bin/hdiutil", "detach", "-force", "/dev/disk9"],
+            ["/usr/bin/hdiutil", "detach", "-force", str(mount)],
             ["/usr/bin/hdiutil", "info", "-plist"],
         ])
 
@@ -211,19 +217,34 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
         image = Path("/private/tmp/test-root/fixture/removal.dmg")
         mount = image.parent / "unit"
         info = plistlib.dumps({"images": [
-            {"image-path": str(image), "system-entities": [{"dev-entry": "/dev/disk9"}]},
+            {"image-path": str(image), "system-entities": [
+                {"dev-entry": "/dev/disk9", "mount-point": str(mount)},
+            ]},
         ]}).decode()
         query = ["/usr/bin/hdiutil", "info", "-plist"]
-        with mock.patch.object(subprocess, "run", side_effect=[
-            subprocess.TimeoutExpired(query, 20),
-            subprocess.CompletedProcess([], 0, info, ""),
-            subprocess.CompletedProcess([], 0, "", ""),
-            subprocess.CompletedProcess([], 0, plistlib.dumps({"images": []}).decode(), ""),
-        ]) as run:
+        with (mock.patch.object(Path, "is_mount", return_value=True),
+              mock.patch.object(subprocess, "run", side_effect=[
+                  subprocess.TimeoutExpired(query, 20),
+                  subprocess.CompletedProcess([], 0, info, ""),
+                  subprocess.CompletedProcess([], 0, "", ""),
+                  subprocess.CompletedProcess([], 0, plistlib.dumps({"images": []}).decode(), ""),
+              ]) as run):
             self.cleanup_image(image, mount, None)
         self.assertEqual([call.args[0] for call in run.call_args_list], [
-            query, query, ["/usr/bin/hdiutil", "detach", "-force", "/dev/disk9"], query,
+            query, query, ["/usr/bin/hdiutil", "detach", "-force", str(mount)], query,
         ])
+
+    def test_fixture_detach_requires_a_mount_inside_the_fixture(self) -> None:
+        image = Path("/private/tmp/test-root/fixture/removal.dmg")
+        for entity, mount in (
+            ({"dev-entry": "/dev/disk9"}, image.parent / "unit"),
+            ({"mount-point": str(image.parent.parent / "outside")}, image.parent.parent / "outside"),
+        ):
+            images: list[dict[str, object]] = [{"image-path": str(image), "system-entities": [entity]}]
+            with (self.subTest(entity=entity), mock.patch.object(Path, "is_mount", return_value=True),
+                  mock.patch.object(subprocess, "run") as run):
+                self.detach_image(image, mount, None, images)
+            run.assert_not_called()
 
     def test_mac_fixture_timeout_reports_partial_output(self) -> None:
         command = ["/usr/bin/hdiutil", "info", "-plist"]
