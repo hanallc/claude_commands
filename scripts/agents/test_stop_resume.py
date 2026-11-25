@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from enum import Enum
 from functools import partial
+from hashlib import sha256
 from pathlib import Path
 from threading import Barrier, Lock, local
 from typing import Literal, Never, cast, final, override
@@ -2081,6 +2082,18 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(result, stop_resume.ResumeFailed("accounts", "session is on other-machine"))
         self.start.assert_not_called()
         self.kill.assert_not_called()
+
+    def test_resume_accepts_the_configured_alias_for_the_local_machine(self) -> None:
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(staff.StaffId("accounts"), "unit", "accounts", staff.StaffRoot(),
+            current_session=identity, worktree=staff.PresentWorktree("mac", self.root),
+            unit_type=staff.UnitDetails("direct"))
+        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+              patch.object(remote, "local_machine", return_value="Nates-MacBook-Pro-2023"),
+              patch.object(remote, "this_machine", return_value="mac")):
+            result = stop_resume.resume(str(row.id))
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.start.assert_called_once()
 
     def test_codex_record_uses_workers_home_without_claude_trust(self) -> None:
         _ = write_registry(self.root / "configuration/models.conf", {"producers": {"alpha": "codex:gpt-test:high"}}, update=True)
@@ -5301,37 +5314,84 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("stopped 0.6 s", log)
         self.assertLess(self.clock.elapsed, conf.read("shutdown").number("STAY_SECONDS"))
         push.assert_called_once()
-        self.assertTrue(cast(str, push.call_args.args[1]).startswith("resume-ended:"))
+        key = sha256("\0".join([self.entry["session_id"], "claude3", "generation-1"]).encode()).hexdigest()
+        text, actual_key = cast(tuple[RenderedPush, str], push.call_args.args)
+        self.assertEqual(actual_key, f"resume-ended:{key}")
+        self.assertEqual(text.title, "alpha did not start on claude3")
+        self.assertEqual(text.message, "Action: In the natedev session, run: /agents resume alpha --to claude3")
         self.start.assert_not_called()
 
-    def test_early_exit_tells_showrunner_pushes_except_probe_and_enters_watchdog(self) -> None:
+    def test_early_exit_tells_showrunner_and_pushes_on_unsuccessful_unit_recovery(self) -> None:
         from scripts.production import showrunners, staff_sources
         from scripts.accounts import unit_watchdog
         identity = staff.StaffId(self.entry["session_id"])
         owner = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity, unit_type=staff.UnitDetails("direct"))
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,))))
-        for probe in (False, True):
-            for outcome in ("watchdog: alpha restarted on claude3",
-                            "watchdog: alpha: folder no longer exists; restore dropped"):
-                with self.subTest(probe=probe, outcome=outcome):
-                    self.entry["environment"]["CLAUDE_PROBE_SESSION"] = "1" if probe else "0"
-                    pane_record.write("agents", self.entry)
-                    with (patch.object(staff_sources, "unit_parent", return_value=staff_sources.UnitProduction("demo", str(self.root / "production.md"))),
-                          patch.object(showrunners, "tell", return_value="told demo") as tell,
-                          patch.object(stop_resume, "_send_move_push") as push,
-                          patch.object(unit_watchdog, "run", return_value=[outcome]) as recovery):
-                        result, log = self.run_stay_child(requester="other")
-                        self.assertEqual(result, 1)
-                        tell.assert_called_once()
-                        self.assertEqual(tell.call_args.args[0], "demo")
-                        line = cast(str, tell.call_args.args[2])
-                        self.assertEqual(line, f"alpha stopped 0.6 s after its move or resume to claude3; {outcome}")
-                        self.assertIn(line, log)
-                        self.assertEqual(push.call_count, 0 if probe else 1)
-                        if not probe:
-                            self.assertEqual(cast(RenderedPush, push.call_args.args[0]).values["cause"], line)
-                        recovery.assert_called_once()
-                    self.clock.elapsed = 0.0
+        cases = [
+            (False, "watchdog: alpha: restarted on claude3", None, True),
+            (False, "watchdog: alpha was down since 06:05 AST; restarted on claude4", None, True),
+            (False, "watchdog: alpha-other: restarted on claude3", None, False),
+            (False, "watchdog: demo/alpha: restart failed", None, False),
+            (False, "watchdog: alpha was down since 06:05 AST; restarted on claude4; "
+             + "retry from claude3's pane launch", None, True),
+            (False, "", None, True),
+            (False, "", None, False),
+            (False, "", herdr_types.HerdrFailure("unreadable state"), False),
+            (False, "", herdr_types.HerdrFailure("incomplete discovery"), True),
+            (True, "", None, False),
+            (True, "watchdog: demo/alpha: restart failed", None, False),
+        ]
+        for probe, outcome, error, managed in cases:
+            def run_watchdog(_now: datetime, *, dry_run: bool, exited: unit_watchdog.ExitRecovery) -> list[str]:
+                self.assertFalse(dry_run)
+                self.assertEqual(exited.identity, identity)
+                self.assertEqual(exited.notice is None, probe)
+                exited.managed = managed
+                if error is not None:
+                    raise error
+                return [outcome] if outcome else []
+
+            with self.subTest(probe=probe, outcome=outcome, error=error, managed=managed):
+                self.entry["environment"]["CLAUDE_PROBE_SESSION"] = "1" if probe else "0"
+                pane_record.write("agents", self.entry)
+                with (patch.object(staff_sources, "unit_parent", return_value=staff_sources.UnitProduction("demo", str(self.root / "production.md"))),
+                      patch.object(showrunners, "tell", return_value="told demo") as tell,
+                      patch.object(stop_resume, "_send_move_push") as push,
+                      patch.object(unit_watchdog, "run", side_effect=run_watchdog) as recovery):
+                    result, log = self.run_stay_child(requester="other")
+                self.assertEqual(result, 1)
+                recovery.assert_called_once()
+                next_step = outcome or ("watchdog reported no recovery action" if error is None else
+                                        f"watchdog could not recover it: {error}")
+                line = f"alpha stopped 0.6 s after its move or resume to claude3; {next_step}"
+                tell.assert_called_once()
+                self.assertEqual(tell.call_args.args[0], "demo")
+                self.assertEqual(tell.call_args.args[2], line)
+                self.assertIn(line, log)
+                self.assertEqual(push.call_count, int(not probe and not managed))
+                if not probe and not managed:
+                    self.assertEqual(cast(RenderedPush, push.call_args.args[0]).title, "alpha did not start on claude3")
+                self.clock.elapsed = 0.0
+
+    def test_early_exit_uses_the_session_id_for_units_with_the_same_name(self) -> None:
+        from scripts.accounts import unit_watchdog
+
+        identity = staff.StaffId(self.entry["session_id"])
+        owner = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity, unit_type=staff.UnitDetails("direct"))
+        other = staff.native_id(fixture_runtime_id("other-alpha"))
+        other_owner = replace(owner, id=other, current_session=other,
+                              parent=staff.ReportsTo(staff.native_id(fixture_runtime_id("other-parent"))))
+        with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner, other_owner))),
+              patch.object(staff_sources, "unit_parent", return_value=staff_sources.UnitProduction("demo", str(self.root / "production.md"))),
+              patch.object(showrunners, "tell"),
+              patch.object(stop_resume, "_send_move_push") as push,
+              patch.object(unit_watchdog, "run", return_value=["watchdog: alpha: restarted on claude3"])):
+            result, _log = self.run_stay_child()
+        self.assertEqual(result, 1)
+        push.assert_called_once()
+        text = cast(RenderedPush, push.call_args.args[0])
+        self.assertEqual(text.title, "alpha did not start on claude3")
+        self.assertEqual(text.message, f"Action: In the natedev session, run: /agents resume {identity} --to claude3")
 
     def test_named_probe_reports_rounded_time_account_retry_and_shutdown_sender(self) -> None:
         from scripts.production import showrunners
@@ -5365,7 +5425,20 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(line, "019b3a40-4250-7000-8000-000000000102 stopped 0.6 s after its move or resume to claude3; resume it: "
                          + "agents resume 019b3a40-4250-7000-8000-000000000102 --to claude3 --why 'usage limit'")
         self.assertIn(line, log)
-        self.assertEqual(cast(RenderedPush, push.call_args.args[0]).values["cause"], line)
+        push.assert_called_once()
+        text = cast(RenderedPush, push.call_args.args[0])
+        self.assertEqual(text.title, "A session did not start on claude3")
+        self.assertEqual(text.message, "Action: In the natedev session, run: "
+                         + "/agents resume 019b3a40-4250-7000-8000-000000000102 --to claude3")
+
+    def test_restart_failure_push_command_parses_a_dash_name_and_account_with_space(self) -> None:
+        push = render("shutdown.restart_failed", session="--help", identity=self.entry["session_id"], account="claude 4")
+        arguments = shlex.split(push.message.partition("/agents ")[2])
+        with patch.object(shutdown, "_lifecycle", return_value=0) as lifecycle:
+            self.assertEqual(shutdown.main(arguments), 0)
+        lifecycle.assert_called_once()
+        options = cast(shutdown.CommandLine, lifecycle.call_args.args[0])
+        self.assertEqual((options.session, options.to), ("--help", "claude 4"))
 
     def test_no_requester_or_unit_never_tells_showrunners_and_only_pushes_non_probes(self) -> None:
         from scripts.production import showrunners
@@ -6173,6 +6246,38 @@ class StopResumeTests(unittest.TestCase):
             stop_resume.ResumePending("resume-error", "claude4", "cannot run"),
             stop_resume.ResumePending("gone-tab", "claude4", "session has no tab after stop"), stop_resume.ClaudeUp("good", "own-pane", "claude4")])
 
+    def test_pending_move_summary_changes_when_the_phone_separator_exceeds_the_budget(self) -> None:
+        session = "native-1"
+        target = "claude4"
+        prefix = "These sessions did not finish their move to claude4: "
+        action = f"Retry pending moves on natedev with `{moves.RETRY_COMMAND}`."
+        empty = render("alert.decision", sender="shutdown", title="Some sessions still need to move",
+                       action=action, body=prefix + ".")
+        budget = pushover.phone_message_limit(empty.sender, empty.id)
+        for excess in (0, 1):
+            name = "x" * (budget - empty.phone_message_length + excess)
+            full = render(empty.id, **(empty.values | {"body": prefix + name + "."}))
+            self.assertEqual(len(full.message), budget + excess - 1)
+            self.assertEqual(full.phone_message_length, budget + excess)
+            batch = stop_resume.MoveBatch(
+                {session: stop_resume.ResolvedMoveMember(pane_launch.NativeLaunchReference(session), name)},
+                moves.ExplicitMoveTarget.REQUESTED_ACCOUNT, stop_resume.NewMoveRequest(), target,
+                results={session: stop_resume.ResumeFailed(session, "fixture start failed")},
+                native_sessions={session: session},
+            )
+            with (self.subTest(excess=excess),
+                  patch.object(moves, "read_latest_request", return_value=moves.LatestMoveRequest(batch.request_id, target)),
+                  patch.object(remote, "local_machine", return_value="natedev"),
+                  patch.object(stop_resume, "_send_move_push") as send):
+                stop_resume._alert_pending_moves(batch, {})  # pyright: ignore[reportPrivateUsage]
+            send.assert_called_once()
+            push = cast(RenderedPush, send.call_args.args[0])
+            if excess:
+                self.assertEqual(push.body, "1 sessions did not finish their move to claude4. "
+                                 + f"Read the pending list on natedev with `{moves.MOVE_COMMAND} result`.")
+            else:
+                self.assertEqual(push.body, full.body)
+
     def test_two_watcher_failures_send_one_phone_alert(self) -> None:
         rows = tuple(staff.StaffRow(staff.StaffId(f"staff-{index}"), "showrunner", f"runner-{index}-" + "x" * 70,
                                    staff.StaffRoot(), current_session=staff.StaffId(f"native-{index}"))
@@ -6207,7 +6312,8 @@ class StopResumeTests(unittest.TestCase):
             with (patch.object(pushover, "read_keys", return_value={"user": "fixture", "token": "fixture"}),
                   patch.object(pushover, "log"), redirect_stdout(io.StringIO())):
                 self.assertEqual(pushover.post_message(push.sender, "1", push.title, push.message,
-                                                       self.root / "phone-keys", phone, "", key, push.id), 0)
+                                                       self.root / "phone-keys", phone, "", key, push.id,
+                                                       action_end=push.action_end), 0)
             return subprocess.CompletedProcess(command, 0, "SENT: fixture\n", "")
 
         def stop_member(reference: str) -> stop_resume.NotRunning:

@@ -21,7 +21,7 @@ from unittest import mock
 from scripts.buildlog import rust_release
 from scripts.lib import build_folders, cargo_output, scratch
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import review
 from scripts.notify.push_texts import RenderedPush, render, user_send_argv
@@ -97,7 +97,7 @@ class RustReleaseTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         temporary = self.enterContext(tempfile.TemporaryDirectory())
-        private = private_slot_config(Path(temporary))
+        private = private_copy_config(Path(temporary))
         self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.root = Path(temporary) / "buildlog"
         self.scratch = Path(temporary) / "scratch"

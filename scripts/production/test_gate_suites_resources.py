@@ -409,7 +409,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         self.assert_gate_released()
 
     @gate_suites("hooks")
-    def test_checkout_stays_busy_during_memory_and_slot_waits(self) -> None:
+    def test_checkout_stays_busy_during_memory_and_cpu_token_waits(self) -> None:
         busy = self.occupy_memory_queue()
         self.supply_jobserver(b"")
         waited: set[str] = set()

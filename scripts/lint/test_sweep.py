@@ -1990,16 +1990,16 @@ class FloorTests(SweepCase):
         self.assertEqual(saved.workspaces, (pairs[1],))
         self.assertEqual(set(saved.history), {pairs[0], pairs[2]})
 
-    def test_floor_sweep_keeps_an_unverified_slot_and_continues(self) -> None:
+    def test_floor_sweep_keeps_an_unverified_copy_and_continues(self) -> None:
         base = self.base()
         unverified, _ = cargo_target(base, "unverified", APP, time.time() - DAY)
         independent, _ = cargo_target(base, "independent", DEMO, time.time() - DAY)
-        leases = sweep.output_slot_leases
+        leases = sweep.output_copy_leases
         verified: set[str] = set()
 
-        def read_leases(path: str) -> tuple[sweep.SlotBuildOutput, ...]:
+        def read_leases(path: str) -> tuple[sweep.CopyBuildOutput, ...]:
             if path == str(unverified.parent):
-                raise PermissionError("fixture slot verification failed")
+                raise PermissionError("fixture copy verification failed")
             verified.add(path)
             return leases(path)
 
@@ -2007,13 +2007,13 @@ class FloorTests(SweepCase):
         build_root = base / "build"
         _ = write_config_fixture(conf.path("build_folders"),
                                  f"roots.build={build_root}\nroots.build.natedev={build_root}\n")
-        with (mock.patch.object(sweep, "output_slot_leases", side_effect=read_leases),
+        with (mock.patch.object(sweep, "output_copy_leases", side_effect=read_leases),
               redirect_stderr(errors)):
             status, _ = self.hold(base, 10 * GIB, [9 * GIB, 11 * GIB], dry_run=True, recorded=True)
         self.assertEqual(status, 0, errors.getvalue())
         self.assertTrue(unverified.is_dir())
         self.assertIn(str(unverified.parent), errors.getvalue())
-        self.assertIn("cannot verify the slot lease", errors.getvalue())
+        self.assertIn("cannot verify the copy lease", errors.getvalue())
         self.assertIn(str(independent.parent), verified)
 
     def test_a_target_removed_during_shrink_does_not_fail_the_floor_pass(self) -> None:
@@ -5380,9 +5380,26 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         ):
             for offset in (-1, 0, 1):
                 with self.subTest(state=state, offset=offset), redirect_stderr(io.StringIO()):
-                    _ = write_config_fixture(conf.path("lint"), f"sweep_push_text_limit={len(rendered.message) + offset}\n")
+                    _ = write_config_fixture(conf.path("lint"), f"sweep_push_text_limit={rendered.phone_message_length + offset}\n")
                     push = sweep.fit_disk_floor_push(140 * GIB, 150 * GIB, selected, lint_settings=conf.read("lint"))
                     self.assertEqual(push, rendered if offset == 1 else fallback)
+
+    def test_disk_floor_push_falls_back_when_the_separator_reaches_500_characters(self) -> None:
+        _ = self.base()
+        free, floor = 140 * GIB, 150 * GIB
+        label = "/private/output"
+        choice = sweep.FolderChoice(label, 180 * GIB, sweep.FolderChoiceKind.OTHER)
+        short = sweep.disk_floor_push(free, floor, sweep.AvailableFolderChoices((choice,)))
+        label += "x" * (499 - len(short.message))
+        choices = sweep.AvailableFolderChoices((replace(choice, label=label),))
+        full = sweep.disk_floor_push(free, floor, choices)
+        self.assertEqual(len(full.message), 499)
+        self.assertEqual(full.phone_message_length, 500)
+        _ = write_config_fixture(conf.path("lint"), "sweep_push_text_limit=500\n")
+
+        fallback = sweep.disk_floor_push(free, floor, sweep.UNAVAILABLE_FOLDER_CHOICES)
+        self.assertLess(fallback.phone_message_length, 500)
+        self.assertEqual(sweep.fit_disk_floor_push(free, floor, choices, lint_settings=conf.read("lint")), fallback)
 
     def test_protected_recommendation_names_its_folder_among_several_choices(self) -> None:
         with self.crossing_delivery({}) as delivery:

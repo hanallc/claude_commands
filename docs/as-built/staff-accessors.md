@@ -221,6 +221,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/hooks/staff_session_identity.py` | write | initial_snapshot, native_id, runtime_id, update_current_session |
 | `scripts/hooks/stop-direct-continue.py` | read | local_by_current_session, unit_command, local_snapshot; active_dispatch reads the worker's fixed staff ID |
 | `scripts/hooks/user-prompt-submit-conversation-pause.py` | read | StaffSnapshot (type); conversation_pause.session_staff reads the row |
+| `scripts/lib/build_copies.py` | read | local_snapshot, RemovedWorktree, StaffUnreadable |
 | `scripts/lib/python_startup/sitecustomize.py` | read | `TEST_RUNNER_FILES` lists `staff.py` for the removal guard in test checkouts. |
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/removal_guard.py` | read | snapshot, all_rows, StaffRefused, PresentWorktree, RemovedWorktree; known_names reads unit and repository names |
@@ -255,7 +256,6 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/census.py` | read | StaffId |
 | `scripts/production/change_review.py` | read | snapshot |
 | `scripts/production/change_routing.py` | read | staff.json path |
-| `scripts/production/codex_winddown.py` | read | snapshot |
 | `scripts/production/completion_receipt.py` | read | native_id |
 | `scripts/production/delivery_state.py` | read | staff.json path |
 | `scripts/production/demote_showrunner.py` | write | by_id, change_director, cli_result, move, operation, snapshot |
@@ -385,7 +385,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-The table has 240 accessor rows (41 write, 198 read, and 1 owner).
+The table has 241 accessor rows (41 write, 199 read, and 1 owner).
 
 ## Approved copies
 

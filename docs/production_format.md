@@ -463,7 +463,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     Continue if the tests pass. If the code blocks you, use item 10's line.
     While you wait, take the work the showrunner names.
     You can also start independent phase work, tests, docs, or research.
-    Build a fix in a numbered copy. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_slots.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
+    Build a fix in a numbered copy. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_copies.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
 15. **A failed lint** (user, 2026-10-01: 12 lint runs in a row on an
     unchanged tree failed on the same error; 60 failed lints in one day cost
     about 75 minutes). Lint covers the whole workspace. When it fails, fix
