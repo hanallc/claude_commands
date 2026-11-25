@@ -2982,8 +2982,7 @@ const refresh = createPageRefresh(tick);
                     "identity": codec.snapshot_value(facts),
                     "since": now - 60,
                     "machine": "natedev",
-                    "wait": {"kind": "RepositorySlotWaiting", "repository": "widget", "held": [1, 2],
-                             "maximum": 2, "maximum_key": "slots.natedev.widget.max"},
+                    "wait": {"kind": "RepositorySlotWaiting", "repository": "widget", "held": [1, 2], "maximum": 2},
                 }]
                 queue_snapshot.write_view_snapshot(folder, now, now, json.dumps(envelope).encode())
                 after = memory_feed.reading()
