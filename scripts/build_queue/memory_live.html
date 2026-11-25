@@ -17,7 +17,7 @@ html { overflow-anchor: none; }
   --machine-icon-width: 28px; --machine-badge-outset: 7px;
   --other: #a3a19b; --free: #e7e5df; --floor: #eda100;
   --agents: #7f6fc4; --desktop: #78756e;
-  --tools: #7a9cc4; --ci: #1c5aa8; --programs: #8796ab; --kernel: #3e4a5c; --cache: #d6d4ce; --unattributed: #b9b7b1;
+  --tools: #7a9cc4; --programs: #8796ab; --kernel: #3e4a5c; --cache: #d6d4ce; --unattributed: #b9b7b1;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -28,7 +28,7 @@ html { overflow-anchor: none; }
     --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
     --other: #5c5b57; --free: #2a2a28; --floor: #c98500;
     --agents: #9585e0; --desktop: #8a877f;
-    --tools: #4a6f99; --ci: #2563b8; --programs: #5a6a80; --kernel: #2b3442; --cache: #3c3c39; --unattributed: #6c6b66;
+    --tools: #4a6f99; --programs: #5a6a80; --kernel: #2b3442; --cache: #3c3c39; --unattributed: #6c6b66;
   }
 }
 :root[data-theme="dark"] {
@@ -39,7 +39,7 @@ html { overflow-anchor: none; }
   --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
   --other: #5c5b57; --free: #2a2a28; --floor: #c98500;
   --agents: #9585e0; --desktop: #8a877f;
-  --tools: #4a6f99; --ci: #2563b8; --programs: #5a6a80; --kernel: #2b3442; --cache: #3c3c39; --unattributed: #6c6b66;
+  --tools: #4a6f99; --programs: #5a6a80; --kernel: #2b3442; --cache: #3c3c39; --unattributed: #6c6b66;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
@@ -119,7 +119,6 @@ __PAGE_FRAME_STYLE__
 .seg-used { background: var(--used); }
 .seg-tools { background: var(--tools); }
 .seg-room { background: var(--room); }
-.seg-ci { background: var(--ci); border-left: 1px solid var(--card); }
 .seg-programs { background: var(--programs); }
 .seg-kernel { background: var(--kernel); }
 .seg-cache { background: var(--cache); }
@@ -135,7 +134,6 @@ __PAGE_FRAME_STYLE__
 .brace.l2 { top: 26px; height: 24px; }
 .brace.cap { top: auto; bottom: 0; height: 24px; border: 2px solid var(--cap); border-top: none; border-radius: 0 0 6px 6px; color: var(--cap); line-height: 18px; }
 .brace.free { border-color: var(--room); color: var(--room); }
-.bar > .seg-ci { min-width: 3px; }
 /* A reserve that free RAM does not fill. A reserve that holds 0 still shows as a thin block. */
 .bar > .short-reserve { box-shadow: inset 0 0 0 2px var(--error); min-width: 8px; }
 .brace.reserved { border-color: var(--res-a); color: var(--res-a); }
@@ -188,6 +186,8 @@ __PAGE_FRAME_STYLE__
 .tip dt, .tip dd { white-space: normal; overflow-wrap: anywhere; }
 .tip dt { max-width: min(13rem, 51vw); }
 .tip dd { min-width: 0; }
+.tip.build-tools-tip { grid-template-columns: fit-content(72%) minmax(0, 1fr); }
+.tip.build-tools-tip dt { max-width: none; }
 .tip .program-memory {
   --program-live: color-mix(in srgb, var(--accent) 72%, var(--bg));
   --program-past: color-mix(in srgb, var(--agents) 72%, var(--bg));
@@ -245,7 +245,6 @@ summary .v { margin-left: auto; padding-left: 12px; font-variant-numeric: tabula
 .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; flex: none; }
 .sw.used { background: var(--used); }
 .sw.tools { background: var(--tools); }
-.sw.ci { background: var(--ci); }
 .sw.res { background: repeating-linear-gradient(135deg, var(--res-a) 0 2px, var(--res-b) 2px 4px); }
 .sw.room { background: var(--room); }
 .sw.waiting { background: transparent; border: 2px dashed var(--ink-3); }
@@ -698,7 +697,6 @@ small .aws-point { cursor: help; }
       <div class="bar">
         <div class="seg-tools" id="s-tools" data-tip="tools"><span class="lbl" id="l-tools"></span></div>
         <div class="seg-used" id="s-queued" data-tip="queued"><span class="lbl" id="l-queued"></span></div>
-        <div class="seg-ci" id="s-ci" data-tip="ci"><span class="lbl" id="l-ci"></span></div>
         <div class="hatch" id="s-reserved" data-tip="reserved"><span class="lbl" id="l-reserved"></span></div>
         <div class="seg-room" id="s-room" data-tip="room"><span class="lbl" id="l-room"></span></div>
         <div class="seg-floor" id="s-safety" data-tip="safety"><span class="lbl" id="l-safety"></span></div>
@@ -722,7 +720,6 @@ small .aws-point { cursor: help; }
       <div class="group-head" data-tip="g-builds"><span class="name">Builds</span><span class="v num" id="v-g-builds">–</span></div>
       <div class="row" data-tip="tools"><span class="sw tools"></span><span class="name">Build tools</span><span class="v num" id="v-tools">–</span></div>
       <div class="row" data-tip="queued"><span class="sw used"></span><span class="name">Queued builds</span><span class="v num" id="v-queued">–</span></div>
-      <div class="row" data-tip="ci"><span class="sw ci"></span><span class="name">hana CI</span><span class="v num" id="v-ci">–</span></div>
      </div>
      <div class="legend-group cap-group">
       <div class="group-head" data-tip="cap"><span class="name">Queue cap: what builds may use</span></div>
@@ -885,7 +882,7 @@ function shownReading(data) {
   if (shownReadings.has(data)) return shownReadings.get(data);
   const ram = {...data.ram};
   const reserves = reserveReadings(ram, data);
-  ram.builds_bytes = sumMemory([ram.build_tools_bytes, ram.queued_builds_bytes, ram.ci_bytes]);
+  ram.builds_bytes = sumMemory([buildToolBytes(ram), ram.queued_builds_bytes]);
   ram.outside_bytes = sumMemory([ram.desktop_bytes, ram.agents_bytes, ram.other_programs_bytes,
     ram.kernel_bytes, ram.cache_bytes, ram.unattributed_bytes]);
   const overCapBytes = hasCap(data) ? reserves.build.raw.shortfall - ram.room_bytes : 0;
@@ -911,13 +908,20 @@ function shownReading(data) {
   shownReadings.set(data, shown);
   return shown;
 }
+function buildToolBytes(ram) {
+  return ram.build_tools_bytes + (ram.ci_bytes ?? 0);
+}
 function buildToolBreakdown(ram) {
   const parts = [['rust-analyzer', ram.rust_analyzer_bytes], ['+ sccache', ram.sccache_bytes]];
-  const {python_tests_bytes: tests, waiting_runs_bytes: waiting, other_build_tools_bytes: other} = ram;
+  for (const service of ram.ci_services ?? []) {
+    parts.push([`+ hana CI service ${service.name}`, service.bytes]);
+  }
+  const {python_tests_bytes: tests, waiting_runs_bytes: waiting} = ram;
+  const other = ram.other_build_tools_bytes + (ram.ci_bytes ?? 0);
   const split = [tests, waiting, other].every(recorded);
   if (split) parts.push(['+ Python tests', tests], ['+ Waiting runs', waiting]);
   if (!split || other > 0) parts.push(['+ Other build tools', other]);
-  return memoryBreakdown(ram.build_tools_bytes, parts);
+  return memoryBreakdown(buildToolBytes(ram), parts);
 }
 function memoryBreakdown(bytes, parts = []) {
   return {bytes, parts: parts.map(([label, value]) => [label, value?.parts ? value : memoryBreakdown(value)])};
@@ -1250,9 +1254,8 @@ function ramBreakdowns(ram, reserves, data, overCapBytes) {
     return total;
   }
   const queued = runs(ram.queued_builds_bytes, row => row.queued && !row.ci && !macRow(row) && row.kind !== 'cloud');
-  const ci = runs(ram.ci_bytes, row => row.ci);
   const builds = memoryBreakdown(ram.builds_bytes, [
-    ['Build tools', tools], ['+ Queued builds', queued], ['+ hana CI', ci]]);
+    ['Build tools', tools], ['+ Queued builds', queued]]);
   const programs = memoryBreakdown(ram.other_programs_bytes, [
     ...(ram.programs || []).map(program => [program.name, program.bytes]),
     ...(ram.smaller_program_count ? [[`${ram.smaller_program_count} smaller programs`, ram.smaller_programs_bytes]] : [])]);
@@ -1283,7 +1286,7 @@ function ramBreakdowns(ram, reserves, data, overCapBytes) {
     ['Builds', builds], [fullReserve ? '+ Full reserve' : '+ Build reserved', reserve]]);
   const overCap = memoryBreakdown(overCapBytes);
   if (overCapBytes > 0) addMemorySum(taken, cap, overCap);
-  return {tools, queued, ci, builds, desktop, agents, programs, kernel, cache, unattributed,
+  return {tools, queued, builds, desktop, agents, programs, kernel, cache, unattributed,
     outside, room, free, cap, taken, overCap, budget, runUses};
 }
 const RESERVES = [
@@ -1336,7 +1339,7 @@ function runningReadings(data, add) {
     const bytes = gibBytes(row.reserved);
     const reserve = reserved.length === 1 && reserved[0] === row && Math.abs(bytes - target.bytes) < 1
       ? target : add(memoryBreakdown(bytes));
-    const counted = (row.queued || row.ci) && row.reserved > 0 && recorded(used.bytes)
+    const counted = row.queued && row.reserved > 0 && recorded(used.bytes)
       ? add(memoryBreakdown(used.bytes + reserve.bytes, [['Uses', used], ['+ Build reserved', reserve]])) : null;
     return [row, {used, reserve, counted}];
   }));
@@ -1761,7 +1764,6 @@ const TIPS = {
   'g-builds': d => breakdownTip('Builds', d.memory.builds, 'RAM that builds use now'),
   tools: d => breakdownTip('Build tools', d.memory.tools, 'RAM that build tools use now'),
   queued: d => breakdownTip('Queued builds', d.memory.queued, 'RAM of builds the queue started'),
-  ci: d => breakdownTip('hana CI', d.memory.ci, 'RAM of hana CI programs'),
   'g-free': d => breakdownTip('Free RAM', d.memory.free, 'RAM that no program holds'),
   reserved: d => reserveTip('Build reserved', 'Held for running builds to grow into', d.reserves.build, buildReserveRows(d)),
   room: d => legendTip('Free', d.ram.room_bytes, 'Where the next step can start', [
@@ -1821,8 +1823,7 @@ function pressureTip(name, value, limit, caption) {
 const GIB = 1024 ** 3;
 const MEMORY_UNITS = new Map([[GIB, "GiB"], [1024 ** 2, "MiB"], [1024, "KiB"], [1, "B"]]);
 const RAM_BLOCKS = [
-  ["tools", "Build tools", r => r.build_tools_bytes, "builds"], ["queued", "Queued builds", r => r.queued_builds_bytes, "builds"],
-  ["ci", "hana CI", r => r.ci_bytes, "builds"],
+  ["tools", "Build tools", buildToolBytes, "builds"], ["queued", "Queued builds", r => r.queued_builds_bytes, "builds"],
   ["reserved", "Build reserved", r => r.build_covered_bytes, "free", "build"], ["room", "Free", r => r.room_bytes, "free"],
   ["safety", "Safety net", r => r.safety_covered_bytes, "free", "safety"],
   ["swap", "Swap coming back", r => r.swap_covered_bytes, "free", "swap"],
@@ -1938,7 +1939,7 @@ function swapTip(row, display) {
     ...(row.owner_count === 1 ? groupRows(ownerFields(row)) : [])];
 }
 // The fraction of all RAM at the queue cap: both charts draw their cap line here.
-// Build tools, queued builds, CI, reserved memory and free memory add to the queue cap.
+// Build tools, queued builds, reserved memory and free memory add to the queue cap.
 function capEnd(d) {
   const total = recorded(d.ram.total_bytes) && d.ram.total_bytes > 0 ? d.ram.total_bytes : 1;
   return hasCap(d) ? d.cap * GIB / total : 0;
@@ -2178,15 +2179,15 @@ function tooltipRows(key, rawData) {
 }
 function tooltipHtml(key, data) {
   const rows = tooltipRows(key, data);
-  return rows.length ? tipRowsHtml(rows) : '';
+  return rows.length ? tipRowsHtml(rows, key === 'tools' ? ' build-tools-tip' : '') : '';
 }
 function bumpMark(who, tip = "") {
   return `<span class="move-mark"${tip ? ` data-tip="${esc(tip)}" tabindex="0"` : ""}>` +
     '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 3h14M18 13l-6-6-6 6M12 7v14"/></svg>' +
     `<span>${esc(who)}</span></span>`;
 }
-function tipRowsHtml(rows) {
-  return '<dl class="tip">'+tipCellsHtml(rows)+'</dl>';
+function tipRowsHtml(rows, extraClass = "") {
+  return `<dl class="tip${extraClass}">${tipCellsHtml(rows)}</dl>`;
 }
 function tipCellsHtml(rows) {
   return rows.map(row => {
@@ -2228,12 +2229,6 @@ function recorded(value) { return typeof value === "number"; }
 function hasCap(d) { return recorded(d.cap); }
 function useValue(row) { return recorded(row.used) ? row.used : 0; }
 function visibleDetail(row) {
-  if (row.ci) {
-    const jobs = (row.ci_runners || []).filter(runner => runner.state === "busy").map(runner => runner.job).filter(Boolean);
-    if (jobs.length) return jobs.join(", ");
-    if (!row.started_at) return "idle";
-    return publicText(row.detail || row.state || "");
-  }
   return publicText(row.detail || "");
 }
 function publicText(text) {
@@ -3648,25 +3643,18 @@ function renderWalk(d) {
       (waiting ? "" : `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) +
       `<td class="moved">${moved}</td><td class="row-action">${actionName ? rowAdd(actionName) : ""}</td></tr>`);
   };
-  const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || guestRow(row) || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
+  const ordered = d.walk.filter(row => row.kind === "cloud" || macRow(row) || guestRow(row) || row.queued && !row.ci);
   const runningCount = ordered.filter(row => row.kind !== "mac-unavailable").length;
   $("walk-title").textContent = `Running, in start order (${runningCount})`;
-  const rows = [];
-  if (d.ram.build_tools_bytes > 0) {
-    const labels = queueRowLabels({name: "Build tools"});
-    cells("", labels, "", null, targetCell(""), null, "tools", "tools");
-    rows.push(`<div class="wrow tools" data-tip="tools">${rowLabel(labels)}` + rowMemory("tools") + `</div>`);
-  }
-  rows.push(...ordered.map(r => {
+  const rows = ordered.map(r => {
     const labels = queueRowLabels(r);
-    const idleCI = r.ci && visibleDetail(r) === "idle";
     const guest = guestRow(r);
     const target = targetCell(r.machine, undefined, r.guest_unconfirmed === true ? "not confirmed" : r.guest_unconfirmed);
-    cells(stageText(r), labels, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "",
+    cells(stageText(r), labels, r.started_at ? ago(r.started_at, d.read_at) : r.state || "",
       r.pid, target, r.vcpus, `row:${r.key}`, "", doneText(r), r.tokens, r.last_move, r.kind === "mac-unavailable" ? "" : r.name, r.kill_ref);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(labels)}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`, guest ? `on ${r.machine}` : "")) + `</div>`;
-  }));
+  });
   // The table row only holds the place of the chart room row beside it; its value shows in the chart.
   const columnClasses = ["place", "done", "duration", "verify", "step", "pid", "machine", "vcpus", "tokens", "moved", "row-action"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
@@ -3882,7 +3870,7 @@ function fitWalkDetails() {
   }
   context.font = canvasFont(walk.querySelector(".amounts"));
   const shown = shownReading(latest);
-  const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci || row.kind === "mac-build"))
+  const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.kind === "mac-build"))
     .map(row => [useValue(row) > 0 ? shown.stepReadings.get(row).used.text : "", row.reserved > 0 ? shown.stepReadings.get(row).reserve.text : ""].filter(Boolean));
   const {room, tools} = shown.memory;
   amountGroups.push([room.text], [tools.text],
@@ -4000,12 +3988,10 @@ function placeMemoryBars(d) {
   const progressEnd = !hasCap(d) ? 0 : Math.max(0, Math.floor(document.querySelector(".walk-bud").getBoundingClientRect().left) - range.left);
   const r = d.ram;
   const unit = width / (recorded(r.total_bytes) && r.total_bytes > 0 ? r.total_bytes / GIB : d.total);
-  const tools = r.build_tools_bytes / GIB * unit;
-  const used = tools + r.queued_builds_bytes / GIB * unit;
-  const ciWidth = shownBytes(r.ci_bytes) / GIB * unit;
+  const tools = buildToolBytes(r) / GIB * unit;
   const reserved = r.build_covered_bytes / GIB * unit;
   const room = r.room_bytes / GIB * unit;
-  const reserveAt = used + ciWidth;
+  const reserveAt = tools + r.queued_builds_bytes / GIB * unit;
   const roomAt = reserveAt + reserved;
   const end = roomAt + room;
   const box = (left, size, className, tip = "") => size > 0
@@ -4023,11 +4009,6 @@ function placeMemoryBars(d) {
     placeBarLabels(container, limit);
   }
   let usedAt = tools, reservedAt = reserveAt;
-  const toolsRow = document.querySelector(".wrow.tools");
-  if (toolsRow) {
-    toolsRow.querySelector(".track").innerHTML = capBox(0, tools, "seg-tools");
-    placeAmounts(toolsRow, [{kind: "used-amount", left: 0, text: shown.memory.tools.text}]);
-  }
   const reserveScale = r.build_target_bytes > 0 ? reserved / (r.build_target_bytes / GIB) : 0;
   for (const row of document.querySelectorAll(".wrow[data-run]")) {
     const run = d.walk.find(run => run.key === row.dataset.run);
@@ -4043,9 +4024,6 @@ function placeMemoryBars(d) {
       }
     } else if (run.kind === "cloud" && recorded(run.used)) {
       bars = box(0, Math.min(row.querySelector(".track").clientWidth, run.used * unit), "seg-remote");
-    } else if (run.ci) {
-      bars = capBox(used, ciWidth, "seg-ci");
-      if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: used, text: amount.used.text});
     } else if (run.kind !== "cloud") {
       const useWidth = Math.max(0, useValue(run) * unit);
       const reserveWidth = Math.max(0, Math.min(run.reserved * reserveScale, roomAt - reservedAt));

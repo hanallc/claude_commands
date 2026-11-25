@@ -1091,7 +1091,6 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(memory_feed, "host_name", return_value=FIXTURE_MACHINE))
         _ = self.enterContext(mock.patch.object(memory_feed, "PROC", self.root / "proc"))
         _ = self.enterContext(mock.patch.object(memory_feed, "SYS_BLOCK", self.root / "sys" / "block"))
-        _ = self.enterContext(mock.patch.object(memory_feed, "CI_CGROUP", self.root / "ci"))
         # The live jobserver and its journal stay out of the tests: 12 GiB floor, 4 free of 31 tokens.
         _ = self.enterContext(mock.patch.object(memory_feed, "stevie_output", return_value="12288\n4\n31\n"))
         _ = self.enterContext(mock.patch.object(memory_feed, "request_token_dump",
@@ -1673,13 +1672,6 @@ process.stdout.write(JSON.stringify({
             original = row.get("key")
             cast(dict[str, object], cast(object, row))["name"] = "changed owner label"
             self.assertEqual(memory_feed.step_key(row), original)
-        # Two CI rows with no runner differ only by their cgroup.
-        with tempfile.TemporaryDirectory() as folder:
-            ci_keys = set[str]()
-            for name in ("hana-linux-1.slice", "hana-linux-2.slice"):
-                (cgroup := Path(folder) / name).mkdir()
-                ci_keys.add(memory_feed.step_key(memory_feed.build_ci_row(0.0, 0.0, cgroup)))
-        self.assertEqual(len(ci_keys), 2)
         tips, table = self.render_assignment_table(payload)
         self.assertNotIn('class="unit"', table)
         names = {f"{kind}:{key}": name for kind, key, name in cast(list[tuple[str, str, str]],
@@ -1767,31 +1759,43 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(row.get("name_parts"), [{"kind": "staff", "text": unit}, {"kind": "text", "text": ": integrate"}])
         self.assertIn('data-color-text="role.unit-director"', page.get("staff_names", {}).get(unit, ""))
 
-    def test_ci_memory_stays_in_the_taken_total_with_an_idle_or_running_job(self) -> None:
+    def test_ci_services_count_once_in_build_tools_at_any_size(self) -> None:
+        gib = admission_records.GIB
         cgroup = self.root / "ci"
-        (cgroup / "github-runner-fixture.service").mkdir(parents=True)
-        for busy in (False, True):
-            with self.subTest(busy=busy):
-                runner = {"unit": "github-runner-fixture.service", "name": "fixture",
-                          "state": "busy" if busy else "idle", "used": 0.125, "pid": 701,
-                          "started_at": 199_000, "job": "tests"}
-                step = admission_records.RunningStep("", "hana-ci.slice", "service", str(cgroup), 0,
-                    admission_records.UnownedSliceMemory(admission_records.GIB // 8,
-                        anonymous=admission_records.AnonymousRunUse(admission_records.GIB // 8),
-                        cgroup=str(cgroup), owner="hana-ci.slice", pid=701,
-                        job_state=RunningServiceJob(199_000) if busy else IdleService()), pid=701)
-                reading = captured_reading(running=(step,))
+        runners = [cgroup / f"github-runner-hana-linux-{index}.service" for index in (1, 2)]
+        busy, idle = runners
+        overhead = gib * 7 // 10
+        small = 16 * 1024 ** 2
+        cargo = 2 * gib
+        write_scope(busy, members=(701, 702), current=cargo + overhead, anonymous=cargo + overhead)
+        write_scope(idle, members=(703,), current=small, anonymous=small)
+        for source in (admission_records.ScopeSource(busy / "cargo.scope", frozenset({702})),
+                       admission_records.ProcessSource((admission_records.ProcessAnonymousUse(702,
+                           admission_records.AnonymousRunUse(cargo)),))):
+            with self.subTest(source=source):
+                base = reservation_reading()
+                inputs = base.explanation.decided_from
+                running = replace(inputs.running[0], ci_runner="hana-linux-1", measured=admission_records.MeasuredMemory(
+                    cargo, anonymous=admission_records.AnonymousRunUse(cargo), anonymous_source=source))
+                service = admission_records.RunningStep("", "hana-ci.slice", "service", str(cgroup), 0,
+                    admission_records.UnownedSliceMemory(overhead + small,
+                        anonymous=admission_records.AnonymousRunUse(overhead + small), cgroup=str(cgroup),
+                        owner="hana-ci.slice", pid=701, job_state=RunningServiceJob(199_000)), pid=701)
+                reading = gate.queue_read_from(replace(inputs, running=(running, service)), admission_policy_fixture())
                 with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
-                      mock.patch.object(memory_feed, "read_ci_runner", return_value=runner)):
+                      mock.patch.object(memory_feed, "build_tool_ram", return_value=memory_feed.BuildToolRam(0, 0, 0))):
                     page = memory_feed.reading()
-                row, = [row for row in page["walk"] if row.get("ci")]
-                self.assertNotIn("run_folder", row)
-                self.assertEqual(cast(memory_feed.RunRow, row).get("ci_runners", [])[0]["state"], "busy" if busy else "idle")
-                self.assertEqual(page["ci_ram"], 0.125)
-                self.assertEqual(page["taken"], page["used"] + page["ci_ram"] + page["reserved"])
-                self.assertEqual(page["taken"], 0.125)
-                self.assertEqual(page["taken"], cast(float, page["cap"]) - page["room"])
-                self.assertEqual(row.get("admitted"), busy)
+                ram = page["ram"]
+                self.assertEqual(ram.get("ci_services"), [{"name": "hana-linux-1", "bytes": overhead},
+                                                          {"name": "hana-linux-2", "bytes": small}])
+                self.assertEqual(ram["build_tools_bytes"], overhead + small)
+                self.assertEqual(ram["other_build_tools_bytes"], 0)
+                self.assertEqual(ram["queued_builds_bytes"], cargo)
+                self.assertAlmostEqual(page["taken"], page["used"] + memory_feed.gib(overhead + small) + page["reserved"])
+                row, = page["walk"]
+                self.assertTrue(row.get("queued"))
+                self.assertEqual(row["name"], "hana CI: nextest")
+                self.assertNotIn(row["pid"], (701, 703))
 
     def test_the_feed_publishes_configured_colors_for_both_themes(self) -> None:
         original = self.configuration.read_text()
@@ -1822,11 +1826,10 @@ process.stdout.write(JSON.stringify({
                 reading = with_wait_reason(captured_reading(running=(step,)), admission_records.StartSpacingWait(110))
                 with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
                     page = memory_feed.reading()
-                ci, = [row for row in page["walk"] if row.get("ci")]
-                self.assertEqual(ci.get("admitted"), isinstance(state, RunningServiceJob))
+                self.assertFalse(page["walk"])
                 self.assertIn("another step just started; the queue waits a few seconds between starts", page["waiters"][0]["reason"])
                 self.assertEqual(page["taken"], 0.125)
-                self.assertEqual(page["ci_ram"], 0.125)
+                self.assertEqual(page["ram"]["build_tools_bytes"], admission_records.GIB // 8)
 
     def test_page_heading_shows_next_step_room_without_a_waiting_count(self) -> None:
         page = self.expected_page()
@@ -2043,15 +2046,6 @@ process.stdout.write(JSON.stringify({
         for field in ("used", "reserved", "taken", "room", "cap", "other", "shown_reserved"):
             self.assertEqual(page.get(field), before.get(field), field)
 
-    def test_cargo_job_reads_cargo_words_after_the_ci_front_options(self) -> None:
-        front = ("python3", "-I", "/store/scripts/build_queue/ci_cargo_front.py", "--front", "/store/bin/cargo",
-                 "--shared-folder", "/run/hana-ci-admission/hana-linux-1", "--")
-        for words, job in ((("build", "--release"), "release build"), (("nextest", "run"), "tests"),
-                           (("+nightly", "doc"), "doc"), ((), "")):
-            with self.subTest(words=words):
-                self.assertEqual(memory_feed.cargo_job((*front, *words)), job)
-                self.assertEqual(memory_feed.cargo_job(("/store/bin/cargo", *words)), job)
-
     def test_decoded_ci_rows_use_the_configured_label_when_the_recorded_label_is_unknown(self) -> None:
         _ = (self.root / "build_admission.conf").write_text("ci_label=Fixture CI · {runner} · {job}\n")
         base = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
@@ -2146,12 +2140,7 @@ process.stdout.write(JSON.stringify({
                 reading = gate.queue_read_from(replace(inputs, running=(running, service)), admission_policy_fixture())
                 waiting = replace(base.view.waiting[0], unit=runner, session_id="", session_name="unrelated display name")
                 reading = replace(reading, view=replace(reading.view, waiting=(waiting,)))
-                def runner_record(path: Path, proc: Path) -> memory_feed.CIRunner:
-                    del proc
-                    return {"unit": path.name, "name": path.name.removeprefix("github-runner-").removesuffix(".service"),
-                            "state": "idle", "used": 0.0625, "pid": 701}
-                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
-                      mock.patch.object(memory_feed, "read_ci_runner", side_effect=runner_record)):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
                     page = memory_feed.reading()
                 run = next(row for row in page["walk"] if row.get("queued"))
                 self.assertEqual(run.get("showrunner"), "")
@@ -2160,16 +2149,12 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(page["waiters"][0]["showrunner"], "")
                 self.assertEqual(page["waiters"][0].get("ci_label"), "unrelated display name")
                 self.assertEqual(run["unit"], "")
-                ci = next(row for row in page["walk"] if row.get("ci"))
-                self.assertEqual(ci["unit"], "")
-                self.assertTrue(ci.get("ci_label"))
-                for row in (run, page["waiters"][0], ci):
+                self.assertEqual(len(page["walk"]), 1)
+                for row in (run, page["waiters"][0]):
                     self.assertFalse(row.get("mac_text"))
-                for row in (run, ci):
-                    self.assertFalse(row.get("runs_on"))
-                # bob, 2026-11-23: a waiting CI step can run only on the host, where the running CI row shows it.
+                self.assertFalse(run.get("runs_on"))
                 host = FIXTURE_MACHINE
-                self.assertEqual(ci.get("machine"), host)
+                self.assertEqual(run.get("machine"), host)
                 self.assertEqual(page["waiters"][0].get("targets"), [host])
                 self.assertEqual(page["waiters"][0].get("runs_on"), f"{host} only")
         impostor = replace(base.view.waiting[0], unit="other", session_name="hana-linux-1")
@@ -5112,9 +5097,9 @@ const refresh = createPageRefresh(tick);
                                   blocks["build_missing_bytes"]), missing)
                 self.assertEqual((blocks["room_bytes"], blocks["shortfall_bytes"]), (room, shortfall))
                 self.assertEqual(sum(missing), shortfall)
-                self.assertEqual(blocks["build_tools_bytes"], 5 * gib)
+                self.assertEqual(blocks["build_tools_bytes"], 7 * gib)
                 self.assertEqual(blocks["queued_builds_bytes"], gib)
-                self.assertEqual(blocks["ci_bytes"], 2 * gib)
+                self.assertEqual(blocks["other_build_tools_bytes"], 5 * gib // 2)
                 self.assertEqual(blocks["cap_bytes"], gib + 5 * gib + 2 * gib + covered[2] + room)
                 self.assertEqual((blocks["agents_bytes"], blocks["desktop_bytes"]), (5 * gib, gib * 3 // 2))
                 self.assertEqual(blocks["desktop_protection_bytes"], 2 * gib)
@@ -5125,7 +5110,7 @@ const refresh = createPageRefresh(tick);
                 self.assertEqual((blocks["compressed_swap_bytes"], blocks["kernel_structures_bytes"],
                                   blocks["kernel_counters_bytes"], blocks["kernel_no_counter_bytes"]),
                                  (3 * gib, 2 * gib, gib, gib))
-                shown = (blocks["queued_builds_bytes"] + blocks["build_tools_bytes"] + blocks["ci_bytes"]
+                shown = (blocks["queued_builds_bytes"] + blocks["build_tools_bytes"]
                          + blocks["build_covered_bytes"] + blocks["room_bytes"]
                          + blocks["safety_covered_bytes"] + gib * 3 // 2 + blocks["swap_covered_bytes"] + 5 * gib
                          + blocks["other_programs_bytes"] + 6 * gib + 4 * gib + blocks["unattributed_bytes"])
@@ -5631,7 +5616,7 @@ const refresh = createPageRefresh(tick);
                 with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)),
                       mock.patch.object(memory_feed, "PROC", fixture.proc.path)):
                     page = memory_feed.reading()
-                self.assertEqual(page["ci_ram"], 1.0)
+                self.assertEqual(page["ram"]["build_tools_bytes"], gib)
 
     def test_registered_and_unregistered_ci_jobs_count_once_without_margin_text(self) -> None:
         for registered, registered_use, unregistered_use, kept in (
@@ -5660,11 +5645,11 @@ const refresh = createPageRefresh(tick);
                 with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)):
                     page = memory_feed.reading()
                 self.assertEqual(page["used"], registered_use)
-                self.assertEqual(page["ci_ram"], unregistered_use)
+                self.assertEqual(page["ram"]["build_tools_bytes"], unregistered_use * admission_records.GIB)
                 self.assertEqual(page["cap"], 23)
                 self.assertEqual(page["reserved"], kept)
                 self.assertEqual(page["room"], 17 - kept)
-                self.assertEqual(len(page["walk"]), len(registered) + 1)
+                self.assertEqual(len(page["walk"]), len(registered))
                 self.assertEqual(sum(row.get("queued", False) for row in page["walk"]), len(registered))
                 text = memory_feed.page_json(page)
                 self.assertNotIn("CI builds do not wait in the queue yet.", text)
