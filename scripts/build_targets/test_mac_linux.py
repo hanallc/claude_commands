@@ -39,6 +39,7 @@ from scripts.copies import copies
 from scripts.lib import atomic_file, build_folders, conf, process_group, process_start, scratch
 from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.production import checkpoint_gate, gate
@@ -2469,38 +2470,43 @@ fi
         self.check_folder_report_thread_failure('report')
 
     def test_a_stalled_folder_config_read_warns_after_the_guest_result(self) -> None:
-        program = """
-from pathlib import Path
-import sys
-from threading import Event
-from unittest.mock import patch
+        guard = LauncherHangGuard(self.id())
+        read_started = Event()
+        release_read = Event()
+        expire_join = Event()
+        output = io.StringIO()
+        read = conf.read
 
-from scripts.build_targets import mac_linux
-from scripts.build_targets.test_mac_linux import MacLinuxRouteTests
-from scripts.lib import conf
+        def read_config(file: str | Path) -> conf.ConfigRead:
+            if file == 'build_admission':
+                read_started.set()
+                guard.event(release_read)
+                raise TimeoutError('the fixture released the stalled read')
+            return read(file)
 
-entered = Event()
-read = conf.read
+        def join_preparation(**_timing: float) -> None:
+            guard.event(expire_join)
 
-def read_config(file):
-    if file == 'build_admission':
-        entered.set()
-        Event().wait()
-    return read(file)
+        with (guard.protect(), redirect_stdout(output), redirect_stderr(output),
+              patch.object(conf, 'read', read_config),
+              patch.object(mac_linux, 'monotonic', return_value=0.0), ExitStack() as threads):
+            def new_thread(*, target: Callable[[], None], daemon: bool) -> Thread:
+                worker = Thread(target=target, daemon=daemon)
+                _ = threads.callback(guard.join, worker)
+                if target.__name__ == 'prepare':
+                    _ = threads.callback(release_read.set)
+                    _ = threads.enter_context(patch.object(worker, 'join', join_preparation))
+                elif target.__name__ == 'collect':
+                    self.assertFalse(daemon)
+                    # Let the collector warn before releasing the read.
+                    _ = threads.callback(expire_join.set)
+                return worker
 
-case = MacLinuxRouteTests('runTest')
-case.repo, case.guest_home = map(Path, sys.argv[1:])
-with (patch.object(conf, 'read', read_config),
-      patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', 0.75)):
-    case.check_folder_report_stream()
-    assert entered.wait(1), 'The configuration read did not start.'
-    print('Guest result returned.', flush=True)
-"""
-        process = subprocess.run([sys.executable, '-c', program, str(self.repo), str(self.guest_home)],
-                                 cwd=Path(__file__).resolve().parents[2], stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True, timeout=10, check=False)
-        self.assertEqual(process.returncode, 0, process.stdout)
-        self.assertEqual(process.stdout.splitlines(), [
+            _ = threads.enter_context(patch.object(mac_linux, 'Thread', new_thread))
+            self.check_folder_report_stream()
+            guard.event(read_started)
+            print('Guest result returned.', flush=True)
+        self.assertEqual(output.getvalue().splitlines(), [
             'Guest result returned.',
             'Mac Linux guest queue report failed: the queue report configuration read timed out',
         ])
