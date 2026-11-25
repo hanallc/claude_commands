@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from scripts.agents.remote import local_machine
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.worktree import finished_worktrees, worktrees
+from scripts.worktree import finished_worktrees, worktree_records, worktrees
 
 
 MAKE_WORKTREE = Path(__file__).with_name("make_worktree.sh").resolve()
@@ -93,7 +93,7 @@ class MakeWorktreeTests(unittest.TestCase):
                         case "finished":
                             add_tree(recorded)
                             record = worktrees.new_record(recorded, "legacy", source, base, "", "main")
-                            layout = worktrees.RecordedWorktreeOutput(unit, "legacy", root / "output")
+                            layout = worktree_records.RecordedWorktreeOutput(unit, "legacy", root / "output")
                             worktrees.write_record(replace(record, layout=layout))
                             expected = (held, recorded)
                         case "unlanded":
@@ -162,10 +162,10 @@ class MakeWorktreeTests(unittest.TestCase):
                                 directories = finished_worktrees.mac_process_directories()
                             expected = (held,)
                         case "other-unreadable-record":
-                            worktrees.record_file(held).mkdir(parents=True)
+                            worktree_records.record_file(held).mkdir(parents=True)
                         case "other-record":
                             record = worktrees.new_record(held, "legacy", source, base, "", "main")
-                            layout = worktrees.RecordedWorktreeOutput("another", "legacy", root / "output")
+                            layout = worktree_records.RecordedWorktreeOutput("another", "legacy", root / "output")
                             worktrees.write_record(replace(record, layout=layout))
                         case "retry":
                             destination = held

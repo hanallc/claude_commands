@@ -160,6 +160,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
 | `scripts/agents/codex_test_support.py` | read | CodexBackend (fixture) |
 | `scripts/agents/detached_runs.py` | read | local_snapshot |
+| `scripts/agents/restart_support.py` | read | Kind (type only); the continuation send names the recipient kind |
 | `scripts/agents/test_agent_exec.sh` | read | staff.json (shell) |
 | `scripts/astra/astra_review.py` | read | runtime_id |
 | `scripts/astra/astra_roles.py` | write | local_snapshot, set_worker_role |
@@ -201,7 +202,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/direct/verify_token_wait_test_support.py` | read | caller_identity; fixture child runs keep the runner's session |
 | `scripts/direct/worker_state.py` | read | StaffRow |
 | `scripts/direct/workers.py` | read | initial_snapshot, local_snapshot |
-| `scripts/disks/slots.py` | read | local_snapshot, by_id, StaffId, StaffUnreadable; `staff_names` names slot lease owners for the Disks page |
+| `scripts/disks/slots.py` | read | local_snapshot, by_id, StaffId, StaffUnreadable; `staff_names` names numbered copy lease owners for the Disks page |
 | `scripts/hana_shot/hana_shot.py` | read | local_snapshot, runtime_id |
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
 | `scripts/herdr/herdr_sessions.py` | read | initial_snapshot |
@@ -221,6 +222,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/hooks/staff_session_identity.py` | write | initial_snapshot, native_id, runtime_id, update_current_session |
 | `scripts/hooks/stop-direct-continue.py` | read | local_by_current_session, unit_command, local_snapshot; active_dispatch reads the worker's fixed staff ID |
 | `scripts/hooks/user-prompt-submit-conversation-pause.py` | read | StaffSnapshot (type); conversation_pause.session_staff reads the row |
+| `scripts/lib/python_startup/sitecustomize.py` | read | `TEST_RUNNER_FILES` lists `staff.py` for the removal guard in test checkouts. |
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/removal_guard.py` | read | snapshot, all_rows, StaffRefused, PresentWorktree, RemovedWorktree; known_names reads unit and repository names |
 | `scripts/lib/resume_message.py` | read | StaffId |
@@ -327,10 +329,13 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/change_page.py` | read | snapshot resolves Review owners; QuestionStaff.read resolves saved questions during delivery recovery and owner answers; source_name names each source |
 | `scripts/review_links/console.py` | read | local_snapshot gives the staff rows for the page owner controls in the unavailable view; StaffRow (type) checks the shown owner |
 | `scripts/review_links/for_you.py` | read | snapshot names each For you action owner and finds the open run of a waiting worker's unit |
+| `scripts/review_links/go_check.py` | read | snapshot, by_current_session and caller_identity find the caller's staff id, which the Go check sends to the server |
+| `scripts/review_links/go_ledger.py` | read | StaffId (type) names the List keeper and each Go recipient in the ledger record |
 | `scripts/review_links/images.py` | read | snapshot().by_id checks each image owner at register and names the owner on the Images page |
 | `scripts/review_links/new_item_dialog.py` | read | StaffId (type) identifies the selected recipient and the recipient in the scoped reply key. |
 | `scripts/review_links/page_frame.py` | read | StaffRow and StaffSnapshot (types) carry the page owner and the staff rows that name it in the owner control. |
 | `scripts/review_links/page_question.py` | read | StaffId (type) identifies the question recipient. |
+| `scripts/review_links/question_record.py` | read | StaffId (type) identifies the saved recipient of a question. |
 | `scripts/review_links/review_items.py` | read | snapshot, by_id and parent_of resolve the Review owner and source unit |
 | `scripts/review_links/review_actions.py` | read | snapshot names the owner showrunner in a proposal or efficiency Approve outcome |
 | `scripts/review_links/review_page.py` | read | snapshot resolves the Review owner and source unit for the table and actions |
@@ -381,7 +386,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-The table has 228 accessor rows (41 write, 186 read, and 1 owner).
+The table has 240 accessor rows (41 write, 198 read, and 1 owner).
 
 ## Approved copies
 

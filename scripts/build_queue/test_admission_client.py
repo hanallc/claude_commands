@@ -278,6 +278,31 @@ class ClientTests(unittest.TestCase):
                 self.assertNotIn(request.episode, fixture.server.placement_requests)
                 fixture.release(occupied)
 
+    def test_replaced_placement_control_uses_the_replacement_message(self) -> None:
+        from scripts.build_queue import admission_wire as status_wire, placement
+
+        owner = placement.SubmittingOwner("fixture", 123, "start")
+        cancel = wire.CancelPlacement("cancel", "episode", owner, "the caller left")
+        prerequisite = wire.PrerequisiteReport("prerequisite", "episode", owner, placement.TokenHeld())
+        expected = "Replaced: a newer run of fixture-unit took the place of this run."
+        with mock.patch.object(client, "_call", return_value=wire.Refused(status_wire.REPLACED_REASON)):
+            with self.subTest(command="cancel-placement CLI"):
+                with mock.patch.object(records, "process_start_time", return_value=owner.start_time), \
+                        redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                    code = client.main(["cancel-placement", "--episode", cancel.episode, "--pid", str(owner.pid)])
+                self.assertEqual(code, 2)
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(errors.getvalue(), "Replaced: a newer run of this unit took the place of this run.\n")
+            with self.subTest(command="cancel-placement with a unit"):
+                with self.assertRaises(client.RunReplaced) as refused:
+                    _ = client.cancel_placement(cancel, unit="fixture-unit")
+                self.assertEqual(refused.exception.reason, expected)
+            for report_refusal in (True, False):
+                with self.subTest(command="report-prerequisite", report_refusal=report_refusal):
+                    with self.assertRaises(client.RunReplaced) as refused:
+                        _ = client.report_prerequisite(prerequisite, unit="fixture-unit", report_refusal=report_refusal)
+                    self.assertEqual(refused.exception.reason, expected)
+
     def test_wait_subject_uses_the_usable_repository_and_step_fields(self) -> None:
         for repository, step, subject in (
             ("—", "nextest", "nextest"),

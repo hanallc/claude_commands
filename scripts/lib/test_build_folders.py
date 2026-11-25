@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Callable, Generator
+from collections.abc import Callable
 import os
 import errno
 import fcntl
@@ -21,10 +21,10 @@ import time
 import unittest
 from typing import Never, cast, override
 from unittest import mock
-from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout
+from contextlib import AbstractContextManager, chdir, nullcontext, redirect_stdout
 
 from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, git_files, scratch, unit_runs, process_group
-from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, config_environment, write_config_fixture
+from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, FixtureConfigValues, config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 
@@ -255,6 +255,23 @@ class FolderFormTests(unittest.TestCase):
                         read.return_value = points
                     self.assertEqual(sweep.sweep_unused_folders(False, now=time.time(), lint_settings=lint), 0)
                     self.assertTrue(nested.is_dir())
+
+    def test_removal_keeps_a_numbered_copy_with_a_keep_file_and_no_lock(self) -> None:
+        copy = folders.copy_path("claude", "proof", 1)
+        copy.mkdir(parents=True)
+        marker = folders.copy_keep_file(copy)
+        _ = marker.write_text("checkout exit is unconfirmed")
+
+        with folders.folder_removal_lease(copy) as lease:
+            self.assertIsInstance(lease, folders.RefusedRemovalLease)
+        self.assertFalse(folders.remove_build_folder(copy, transient_lock=True))
+        self.assertFalse(copy.with_suffix(".lock").exists())
+        self.assertFalse(folders.remove_build_folder(copy.parent))
+        self.assertTrue(copy.is_dir())
+        self.assertEqual(marker.read_text(), "checkout exit is unconfirmed")
+
+        marker.unlink()
+        self.assertTrue(folders.remove_build_folder(copy.parent))
 
     def test_copy_with_an_unreadable_lock_is_unknown(self) -> None:
         path = folders.copy_path("claude", "proof", 1)
@@ -493,7 +510,7 @@ class FolderFormTests(unittest.TestCase):
         self.assertTrue(folders.may_remove_build_path(repository))
         with mock.patch.object(os, "geteuid", return_value=repository.stat().st_uid + 1):
             self.assertFalse(folders.may_remove_build_path(repository))
-            self.assertFalse(folders.remove_build_folder(repository, repository.rmdir))
+            self.assertFalse(folders.remove_build_folder(repository))
         self.assertTrue(repository.is_dir())
 
     def test_parse_form_recognizes_only_complete_forms(self) -> None:
@@ -945,7 +962,11 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
 
     def test_tool_lock_files_do_not_keep_a_temporary_folder(self) -> None:
         with folders.temporary_build_folder(folders.UniqueBuildFolder("rust-project-")) as path:
-            _ = (path / "Cargo.lock").write_text("version = 4\n")
+            cargo = path / "Cargo.lock"
+            _ = cargo.write_text("version = 4\n")
+            cargo.chmod(0o400)
+            lock = self.enterContext(cargo.open("rb"))
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             git = path / ".git"
             git.mkdir()
             _ = (git / "index.lock").write_text("tool lock")
@@ -953,6 +974,20 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
         self.assertFalse(path.exists())
         self.assertFalse(path.with_name(path.name + ".lock").exists())
         self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+
+    def test_a_cargo_directory_does_not_turn_cargo_lock_into_a_lease(self) -> None:
+        path = folders.create_build_folder(folders.UniqueBuildFolder("rust-project-"))
+        _release_folder(path)
+        (path / "Cargo").mkdir()
+        cargo_lock = path / "Cargo.lock"
+        _ = cargo_lock.write_text("version = 4\n")
+        cargo_lock.chmod(0o400)
+
+        with cargo_lock.open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertTrue(folders.remove_build_folder(path, wait=False))
+
+        self.assertFalse(path.exists())
 
     def test_outer_cleanup_removes_a_free_nested_record(self) -> None:
         with folders.temporary_build_folder(folders.UniqueBuildFolder("outer-free-")) as outer:
@@ -1190,7 +1225,7 @@ print('nested')
         self.assertEqual(result.stdout, "nested\n")
 
     def test_allocation_interrupts_check_the_folder_lock_and_lease(self) -> None:
-        probe = """import errno, fcntl, json, os, pathlib, shutil, signal, stat, sys
+        probe = """import errno, fcntl, json, os, pathlib, signal, stat, sys
 from unittest import mock
 from scripts.lib import build_folders as f
 root = pathlib.Path(os.environ['TMPDIR'])
@@ -1208,8 +1243,8 @@ def interrupt():
         if stage not in ('removal', 'folder_removed', 'lease_removed', 'lock_removed'):
             assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
         os.kill(os.getpid(), signal.SIGINT)
-flock, mkdir, lease, fstat, remove = fcntl.flock, os.mkdir, getattr(f, '_write_lease'), os.fstat, shutil.rmtree
-unlink, remove_folder = os.unlink, f.remove_folder
+flock, mkdir, lease, fstat = fcntl.flock, os.mkdir, getattr(f, '_write_lease'), os.fstat
+unlink, remove_folder = os.unlink, getattr(f, '_remove_folder')
 def lock_step(fd, mode):
     result = flock(fd, mode)
     if mode == fcntl.LOCK_EX | fcntl.LOCK_NB:
@@ -1235,26 +1270,24 @@ class PublishStep(dict):
     def __setitem__(self, key, value):
         super().__setitem__(key, value)
         interrupt()
-def removal_step(name, *, dir_fd, onexc):
-    os.unlink(str(path / 'partial'))
-    interrupt()
-    return remove(name, dir_fd=dir_fd, onexc=onexc)
-def folder_removed(*args):
-    remove_folder(*args)
+def folder_removed(*args, **kwargs):
+    remove_folder(*args, **kwargs)
     interrupt()
 def unlink_step(name, *, dir_fd=None):
     unlink(name, dir_fd=dir_fd)
-    if (stage == 'lease_removed' and str(name).endswith('.lease.json')) or (stage == 'lock_removed' and str(name).endswith('.lock')):
+    if ((stage == 'removal' and name == 'partial')
+            or (stage == 'lease_removed' and name == lease_path.name)
+            or (stage == 'lock_removed' and name == lock.name)):
         interrupt()
 patches = {'lock': mock.patch.object(fcntl, 'flock', side_effect=lock_step),
            'mkdir': mock.patch.object(os, 'mkdir', side_effect=mkdir_step),
            'lease': mock.patch.object(f, '_write_lease', side_effect=lease_step),
            'fstat': mock.patch.object(os, 'fstat', side_effect=fstat_step),
            'publish': mock.patch.object(f, '_locks', PublishStep()),
-           'folder_removed': mock.patch.object(f, 'remove_folder', side_effect=folder_removed),
+           'folder_removed': mock.patch.object(f, '_remove_folder', side_effect=folder_removed),
            'lease_removed': mock.patch.object(os, 'unlink', side_effect=unlink_step),
            'lock_removed': mock.patch.object(os, 'unlink', side_effect=unlink_step),
-           'removal': mock.patch.object(shutil, 'rmtree', side_effect=removal_step)}
+           'removal': mock.patch.object(os, 'unlink', side_effect=unlink_step)}
 with patches[stage]:
     try:
         if stage in ('removal', 'folder_removed', 'lease_removed', 'lock_removed'):
@@ -1282,7 +1315,7 @@ for descriptor in descriptors:
     else:
         raise AssertionError('the interrupted open leaked a descriptor')
 assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
-assert f.remove_build_folder(path, lambda: shutil.rmtree(path) if path.exists() else None)
+assert f.remove_build_folder(path)
 assert not path.exists() and not lock.exists() and not lease_path.exists()
 print('free')
 """
@@ -1430,7 +1463,7 @@ print('signals')
                                 self.assertEqual(made, path)
                                 _release_folder(made)
                             else:
-                                self.assertTrue(folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
+                                self.assertTrue(folders.remove_build_folder(path))
                                 self.assertFalse(path.exists())
                                 self.assertFalse(path.with_name(path.name + ".lock").exists())
                                 self.assertFalse(path.with_name(path.name + ".lease.json").exists())
@@ -1471,24 +1504,24 @@ print('signals')
         parent = self.root / "parent"
         parent.mkdir()
         moved = self.root / "moved"
-        opens: list[Path] = []
-        original = build_folder_lock.folder_parent
+        descriptors: list[int] = []
+        open_lock = build_folder_lock.open_lock
 
-        @contextmanager
-        def replace_parent(path: Path, root: Path, *, create: bool) -> Generator[int]:
-            with original(path, root, create=create) as descriptor:
-                opens.append(root)
-                if root == parent:
-                    _ = parent.rename(moved)
-                    parent.mkdir()
-                    _ = (parent / "keep").write_text("replacement")
-                yield descriptor
+        def remember_parent(path: Path, directory: int, *, create: bool) -> int:
+            descriptors.append(directory)
+            return open_lock(path, directory, create=create)
 
-        with mock.patch("scripts.lib.build_folder_lock.folder_parent", side_effect=replace_parent):
+        with (mock.patch.object(build_folder_lock, "folder_parent", wraps=build_folder_lock.folder_parent) as opens,
+              mock.patch.object(build_folder_lock, "open_lock", side_effect=remember_parent)):
             with folders.temporary_build_folder(folders.UniqueBuildFolder("proof-", folders.ExplicitBuildParent(parent))) as path:
+                _ = parent.rename(moved)
+                parent.mkdir()
+                _ = (parent / "keep").write_text("replacement")
                 self.assertTrue((moved / path.name).is_dir())
                 self.assertFalse(path.exists())
-        self.assertEqual(opens, [parent])
+        opens.assert_called_once_with(path, parent, create=False)
+        allocated, removed, stage = descriptors
+        self.assertEqual({removed, stage}, {allocated})
         self.assertEqual(list(moved.iterdir()), [])
         self.assertEqual([entry.name for entry in parent.iterdir()], ["keep"])
 
@@ -1521,7 +1554,7 @@ print('signals')
                                        showrunner="builds", unit="queue", work="fixed", purpose="proof")
         direct = folders.create_build_folder(spec)
         _release_folder(direct)
-        self.assertTrue(folders.remove_build_folder(direct, lambda: shutil.rmtree(direct)))
+        self.assertTrue(folders.remove_build_folder(direct))
         with folders.temporary_build_folder(spec) as path:
             self.assertEqual(path, direct)
             self.assertEqual(folders.build_folder_state(path), "held")
@@ -1551,7 +1584,7 @@ locks.probe_retry_seconds=0.005
                 self.assertEqual(folders.build_folder_state(persistent), "free")
                 self.assertEqual((persistent / "proof").read_text(), "saved")
 
-    def test_collector_scans_the_folder_path_after_the_parent_changes(self) -> None:
+    def test_collector_refuses_a_changed_parent(self) -> None:
         old_parent = self.root / "old-parent"
         old_parent.mkdir()
         (old_parent / "tree.lock").touch()
@@ -1573,28 +1606,31 @@ locks.probe_retry_seconds=0.005
         with folders.folder_removal_lease(path, children=True) as lease:
             self.assertIsInstance(lease, folders.HeldFolderRemovalLease)
 
-    def test_removal_calls_cleanup_without_creating_an_absent_parent(self) -> None:
+    def test_removal_calls_prepare_without_creating_an_absent_parent(self) -> None:
         path = self.root / "absent-parent" / "tree"
         for result in (True, False, None):
             with self.subTest(result=result):
                 cleanup = mock.Mock(return_value=result)
 
-                self.assertEqual(folders.remove_build_folder(path, cleanup), result is not False)
+                self.assertEqual(folders.remove_build_folder(path, prepare=cleanup), result is not False)
 
                 cleanup.assert_called_once_with()
                 self.assertFalse(path.parent.exists())
         cleanup = mock.Mock(side_effect=FileNotFoundError("cleanup failed"))
         with self.assertRaisesRegex(FileNotFoundError, "cleanup failed"):
-            _ = folders.remove_build_folder(path, cleanup)
+            _ = folders.remove_build_folder(path, prepare=cleanup)
         cleanup.assert_called_once_with()
         self.assertFalse(path.parent.exists())
 
     def test_retry_after_removal_does_not_leave_a_lock(self) -> None:
         path = self.root / "tree"
         path.mkdir()
-        self.assertTrue(folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
+        self.assertTrue(folders.remove_build_folder(path))
         with self.assertRaises(FileNotFoundError):
-            _ = folders.remove_build_folder(path, lambda: shutil.rmtree(path))
+            _ = path.lstat()
+        self.assertTrue(folders.remove_build_folder(path))
+        with self.assertRaises(FileNotFoundError):
+            _ = path.lstat()
         self.assertFalse(path.with_suffix(".lock").exists())
 
     def test_release_removed_folder_only_releases_a_free_pair_for_an_absent_path(self) -> None:
@@ -1715,7 +1751,7 @@ from scripts.lib import build_folders as f
 path = Path(sys.argv[1])
 assert f.create_build_folder(f.StableOwnerFolder(path.name, f.ExplicitBuildParent(path.parent))) == path
 assert f.build_folder_state(path) == 'held'
-assert not f.remove_build_folder(path, lambda: (_ for _ in ()).throw(AssertionError('cleanup ran')))
+assert not f.remove_build_folder(path, prepare=lambda: (_ for _ in ()).throw(AssertionError('prepare ran')))
 print('shared')
 """
         result = subprocess.run([sys.executable, "-c", probe, str(path)], capture_output=True, text=True, timeout=10)
@@ -1810,11 +1846,11 @@ with path.with_name(path.name + '.lock').open('a') as lock:
             self.assertTrue(lock.is_file())
             self.assertTrue(lease.is_file())
             self.assertEqual(folders.build_folder_state(path), "held")
-            self.assertFalse(folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
+            self.assertFalse(folders.remove_build_folder(path))
             self.assertTrue(path.is_dir() and lock.is_file() and lease.is_file())
             _ = child.communicate(input="end", timeout=10)
             self.assertEqual(folders.build_folder_state(path), "free")
-            self.assertTrue(folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
+            self.assertTrue(folders.remove_build_folder(path))
             self.assertFalse(path.exists() or lock.exists() or lease.exists())
         finally:
             if child is not None:
@@ -1972,7 +2008,7 @@ assert not loaded, loaded
             with self.subTest(stage=stage):
                 paths: list[Path] = []
                 allocate = folders.create_build_folder
-                remove = shutil.rmtree
+                remove = cast(Callable[..., None], getattr(folders, "_delete_renamed_folder"))
                 cancel = threading.Event()
                 sent = threading.Event()
                 release = threading.Event()
@@ -1993,17 +2029,16 @@ assert not loaded, loaded
                         os.kill(os.getpid(), signal.SIGTERM)
                     return path
 
-                def cancel_then_remove(path: str, *, dir_fd: int,
-                                       onexc: Callable[[Callable[..., object], str, BaseException], object]) -> None:
+                def cancel_then_remove(*args: object, **kwargs: object) -> None:
                     if stage == "removal":
                         cancel.set()
                         self.assertTrue(sent.wait(10), "the worker did not send SIGTERM")
-                    remove(path, dir_fd=dir_fd, onexc=onexc)
+                    remove(*args, **kwargs)
 
                 previous = signal.signal(signal.SIGTERM, interrupted)
                 try:
                     with (mock.patch.object(folders, "create_build_folder", side_effect=allocate_then_cancel),
-                          mock.patch.object(shutil, "rmtree", side_effect=cancel_then_remove),
+                          mock.patch.object(folders, "_delete_renamed_folder", side_effect=cancel_then_remove),
                           self.assertRaisesRegex(KeyboardInterrupt, "SIGTERM")):
                         with folders.temporary_build_folder(folders.UniqueBuildFolder("gate-proof-")):
                             pass
@@ -2016,6 +2051,16 @@ assert not loaded, loaded
                         record = cast(dict[str, object], json.loads(lease.read_text()))
                         self.assertEqual(record["pid"], os.getpid())
                         self.assertEqual(record["purpose"], "gate-proof-")
+                    for staged in path.parent.glob(".removing-*"):
+                        if staged.suffix:
+                            continue
+                        inode = staged.lstat()
+                        self.assertTrue(stat.S_ISDIR(inode.st_mode), staged)
+                        record = cast(dict[str, object], json.loads(folders.lease_path(staged).read_text()))
+                        self.assertEqual(record, {"device": inode.st_dev, "inode": inode.st_ino})
+                        lock = staged.with_name(staged.name + ".lock")
+                        with build_folder_lock.folder_parent(staged, staged.parent, create=False) as parent:
+                            self.assertTrue(build_folder_lock.is_marked_lock(lock.name, parent, lock.lstat()), staged)
                     self.assertEqual(folders.build_folder_state(path), "free")
                 finally:
                     release.set()
@@ -2264,10 +2309,10 @@ assert not loaded, loaded
 
     def test_configuration_helper_supplies_missing_files_and_preserves_overrides(self) -> None:
         copied = self.root / "copied-config"
-        _ = config_environment(copied)
+        _ = config_environment(copied, values=FixtureConfigValues.EXACT)
         config = copied / "build_folders.conf"
         config.unlink()
-        environment = config_environment(config.parent)
+        environment = config_environment(config.parent, values=FixtureConfigValues.EXACT)
         self.assertEqual(environment, {"CONF_DIR": str(config.parent),
                                        "BUILD_TARGETS_CONFIG": str(config.parent / "build_targets.conf")})
         sources = Path(__file__).resolve().parents[2] / "config"
@@ -2285,7 +2330,7 @@ assert not loaded, loaded
             self.assertTrue(path.is_dir())
         self.assertFalse(path.exists())
         _ = config.write_text(original.replace("prefixes.admit-test=admit-test-", "prefixes.admit-test=private-"))
-        _ = config_environment(config.parent)
+        _ = config_environment(config.parent, values=FixtureConfigValues.EXACT)
         self.assertEqual(folders.FOLDER_PREFIXES["admit-test"], "private-")
 
     def test_repository_key_keeps_the_fixed_path_name(self) -> None:
@@ -2435,6 +2480,376 @@ os._exit(0)
         self.assertFalse(free.exists())
         self.assertTrue(inner.is_dir())
         self.assertTrue(closed.is_dir())
+
+    def test_a_sweep_keeps_a_child_allocated_after_the_first_scan(self) -> None:
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                outer = folders.create_build_folder(folders.UniqueBuildFolder("sweep-outer-"))
+                _release_folder(outer)
+                parent = outer / "unmanaged" if nested else outer
+                parent.mkdir(exist_ok=True)
+                child = parent / ("sync" if nested else "late-child")
+                request = folders.StableOwnerFolder(child.name, folders.ExplicitBuildParent(parent))
+                scan = cast(Callable[..., object], getattr(folders, "_hold_child_leases"))
+
+                def allocate_after_scan(path: Path, *args: object, **kwargs: object) -> object:
+                    result = scan(path, *args, **kwargs)
+                    if path == outer:
+                        made = folders.create_build_folder(request)
+                        self.addCleanup(_release_folder, made)
+                    return result
+
+                with mock.patch.object(folders, "_hold_child_leases", side_effect=allocate_after_scan):
+                    folders.sweep_temporary_build_folders(self.root, wait=False)
+                self.assertTrue(outer.is_dir())
+                self.assertTrue(child.is_dir())
+                self.assertEqual(folders.build_folder_state(child), "held")
+                _release_folder(child)
+
+    def test_staging_prevents_allocation_from_a_relative_temporary_parent(self) -> None:
+        target = folders.create_build_folder(folders.UniqueBuildFolder("outer-"))
+        _release_folder(target)
+        scan = cast(Callable[..., object], getattr(folders, "_hold_child_leases"))
+        allocated: list[Path] = []
+        attempts: list[Path] = []
+
+        def allocate_after_scan(path: Path, *args: object, **kwargs: object) -> object:
+            result = scan(path, *args, **kwargs)
+            if path != target:
+                attempts.append(path)
+                try:
+                    child = folders.create_build_folder(folders.StableOwnerFolder(
+                        "late", folders.InheritedTemporaryParent()))
+                except (OSError, ValueError):
+                    pass
+                else:
+                    allocated.append(child)
+                    self.addCleanup(_release_folder, child)
+            return result
+
+        with (chdir(target), mock.patch.dict(os.environ, {"TMPDIR": "."}),
+              mock.patch.object(folders, "_hold_child_leases", side_effect=allocate_after_scan)):
+            folders.sweep_temporary_build_folders(self.root, wait=False)
+
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(allocated, [])
+        self.assertFalse(target.exists())
+
+    def test_allocation_retries_a_renamed_parent_once(self) -> None:
+        for replacements in (1, 2):
+            with self.subTest(replacements=replacements):
+                parent = self.root / f"parent-{replacements}"
+                parent.mkdir()
+                child = parent / "child"
+                former: list[Path] = []
+                open_lock = build_folder_lock.open_lock
+
+                def replace_parent(path: Path, directory: int, *, create: bool) -> int:
+                    descriptor = open_lock(path, directory, create=create)
+                    if path == child and create and len(former) < replacements:
+                        former.append(parent.rename(self.root / f"old-{replacements}-{len(former)}"))
+                        parent.mkdir()
+                    return descriptor
+
+                request = folders.StableOwnerFolder(child.name, folders.ExplicitBuildParent(parent))
+                with mock.patch.object(build_folder_lock, "open_lock", side_effect=replace_parent):
+                    if replacements == 2:
+                        with self.assertRaises(FileNotFoundError):
+                            _ = folders.create_build_folder(request)
+                    else:
+                        made = folders.create_build_folder(request)
+                        self.addCleanup(_release_folder, made)
+                        self.assertEqual(made, child)
+                        self.assertTrue(child.is_dir())
+                        self.assertEqual(folders.build_folder_state(child), "held")
+                self.assertEqual(len(former), replacements)
+                for moved in former:
+                    self.assertFalse((moved / child.name).exists())
+                    self.assertEqual(folders.build_folder_state(moved / child.name), "free")
+
+    def test_a_sibling_can_allocate_while_a_sweep_checks_the_target(self) -> None:
+        target = folders.create_build_folder(folders.StableOwnerFolder(
+            "target", folders.ExplicitBuildParent(self.root)))
+        _release_folder(target)
+        request = folders.StableOwnerFolder("sibling", folders.ExplicitBuildParent(self.root))
+        sibling = self.root / "sibling"
+        scan = cast(Callable[..., object], getattr(folders, "_hold_child_leases"))
+
+        def allocate_sibling(path: Path, *args: object, **kwargs: object) -> object:
+            result = scan(path, *args, **kwargs)
+            if path == target:
+                with scratch.directory_record_lock(self.root, wait=False) as record:
+                    self.assertTrue(record)
+                    self.addCleanup(_release_folder, folders.create_build_folder(request))
+                    child = folders.create_build_folder(folders.StableOwnerFolder(
+                        "late", folders.ExplicitBuildParent(target)))
+                    self.addCleanup(_release_folder, child)
+            return result
+
+        with mock.patch.object(folders, "_hold_child_leases", side_effect=allocate_sibling):
+            folders.sweep_temporary_build_folders(self.root, wait=False)
+        self.assertTrue(sibling.is_dir())
+        self.assertEqual(folders.build_folder_state(sibling), "held")
+        self.assertTrue((target / "late").is_dir())
+        self.assertEqual(folders.build_folder_state(target / "late"), "held")
+
+    def test_a_sweep_keeps_the_hidden_tree_when_the_original_path_is_taken(self) -> None:
+        target = folders.create_build_folder(folders.UniqueBuildFolder("occupied-"))
+        _release_folder(target)
+        scan = cast(Callable[..., object], getattr(folders, "_hold_child_leases"))
+
+        def fill_original_path(path: Path, *args: object, **kwargs: object) -> object:
+            if path != target:
+                target.mkdir()
+                _ = (target / "replacement").write_text("keep")
+            return scan(path, *args, **kwargs)
+
+        def reserve_late_child(path: Path, *args: object, **kwargs: object) -> object:
+            result = fill_original_path(path, *args, **kwargs)
+            if path == target:
+                with build_folder_lock.folder_parent(target / "cargo", target, create=False) as parent:
+                    lock = build_folder_lock.open_lock(target / "cargo", parent, create=True)
+                self.addCleanup(os.close, lock)
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                build_folder_lock.mark_lock(lock)
+            return result
+
+        with (mock.patch.object(folders, "_hold_child_leases", side_effect=reserve_late_child),
+              mock.patch("sys.stderr", new_callable=io.StringIO) as report):
+            folders.sweep_temporary_build_folders(self.root, wait=False)
+        hidden_trees = [item for item in self.root.glob(".removing-*") if item.is_dir()]
+        self.assertEqual(len(hidden_trees), 1)
+        hidden = hidden_trees[0]
+        self.assertIn(str(hidden), report.getvalue())
+        self.assertTrue((hidden / "cargo.lock").is_file())
+        self.assertEqual((target / "replacement").read_text(), "keep")
+
+    def test_a_sweep_rechecks_a_hidden_tree_before_removing_it(self) -> None:
+        hidden = self.root / ".removing-123-0123456789abcdef"
+        child = hidden / "child"
+        child.mkdir(parents=True)
+        # A lease record without the staging lock does not identify a staged tree.
+        folders.lease_path(hidden).touch()
+        folders.sweep_temporary_build_folders(self.root, wait=False)
+        self.assertTrue(child.is_dir())
+        with build_folder_lock.folder_parent(hidden, self.root, create=False) as directory:
+            lock = build_folder_lock.open_lock(hidden, directory, create=True)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                build_folder_lock.mark_lock(lock)
+            finally:
+                os.close(lock)
+        with (hidden / "child.lock").open("wb") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            folders.sweep_temporary_build_folders(self.root, wait=False)
+            self.assertTrue(child.is_dir())
+        folders.sweep_temporary_build_folders(self.root, wait=False)
+        self.assertFalse(hidden.exists())
+
+    def staged_tree(self) -> Path:
+        path = self.root / ".removing-123-0123456789abcdef"
+        path.mkdir()
+        with path.with_suffix(".lock").open("wb") as lock:
+            build_folder_lock.mark_lock(lock.fileno())
+        return path
+
+    def test_a_sweep_keeps_a_replacement_after_the_staging_lock_is_removed(self) -> None:
+        hidden = self.staged_tree()
+        lock = hidden.with_suffix(".lock")
+        open_path = os.open
+        replacements: list[Path] = []
+
+        def replace_staged_tree(path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                                flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            if path == lock.name and flags & os.O_RDWR and not replacements:
+                hidden.rmdir()
+                lock.unlink()
+                hidden.mkdir()
+                replacement = hidden / "replacement"
+                _ = replacement.write_text("keep the replacement")
+                replacements.append(replacement)
+            return open_path(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(os, "open", side_effect=replace_staged_tree):
+            folders.sweep_temporary_build_folders(self.root, wait=False)
+
+        [replacement] = replacements
+        self.assertTrue(replacement.is_file())
+        self.assertEqual(replacement.read_text(), "keep the replacement")
+        self.assertFalse(lock.exists())
+
+    def test_a_sweep_recovers_a_staged_tree_with_a_mode_zero_child(self) -> None:
+        hidden = self.staged_tree()
+        closed = hidden / "closed"
+        closed.mkdir()
+        _ = (closed / "output").write_text("staged output")
+        closed.chmod(0)
+        try:
+            folders.sweep_temporary_build_folders(self.root, wait=False)
+            self.assertFalse(hidden.exists())
+            self.assertFalse(hidden.with_suffix(".lock").exists())
+        finally:
+            if closed.exists():
+                closed.chmod(0o700)
+
+    def test_a_sweep_keeps_a_replacement_at_the_checked_staging_path(self) -> None:
+        hidden = self.staged_tree()
+        moved = self.root / "moved"
+        _ = (hidden / "original").write_text("original output")
+        delete = cast(Callable[..., None], getattr(folders, "_delete_renamed_folder"))
+
+        def replace_before_deletion(*args: object, **kwargs: object) -> None:
+            _ = hidden.rename(moved)
+            hidden.mkdir()
+            _ = (hidden / "replacement").write_text("replacement output")
+            delete(*args, **kwargs)
+
+        with mock.patch.object(folders, "_delete_renamed_folder", side_effect=replace_before_deletion):
+            folders.sweep_temporary_build_folders(self.root, wait=False)
+
+        self.assertTrue(hidden.is_dir())
+        self.assertEqual((hidden / "replacement").read_text(), "replacement output")
+        self.assertEqual((moved / "original").read_text(), "original output")
+        self.assertTrue(hidden.with_suffix(".lock").is_file())
+        folders.sweep_temporary_build_folders(self.root, wait=False)
+        self.assertEqual((hidden / "replacement").read_text(), "replacement output")
+        self.assertTrue(folders.lease_path(hidden).is_file())
+
+    def test_plain_removal_keeps_a_held_child(self) -> None:
+        path = self.root / "tree"
+        path.mkdir()
+        request = folders.StableOwnerFolder("child", folders.ExplicitBuildParent(path))
+        child = folders.create_build_folder(request)
+        self.addCleanup(_release_folder, child)
+        result = self.command("remove", str(path))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertTrue(child.is_dir())
+        self.assertEqual(folders.build_folder_state(child), "held")
+
+    def test_output_reservation_retries_after_a_parent_rename(self) -> None:
+        parent = self.root / "unit"
+        parent.mkdir()
+        path = parent / "output"
+        old = self.root / "former-unit"
+        open_lock = build_folder_lock.open_lock
+
+        def rename_parent(path_to_lock: Path, directory: int, *, create: bool) -> int:
+            descriptor = open_lock(path_to_lock, directory, create=create)
+            if path_to_lock == path and create and not old.exists():
+                _ = parent.rename(old)
+            return descriptor
+
+        with mock.patch.object(build_folder_lock, "open_lock", side_effect=rename_parent):
+            with folders.folder_removal_lease(path, create=True, root=self.root, wait=False) as lease:
+                self.assertIsInstance(lease, folders.HeldFolderRemovalLease)
+                self.assertEqual(folders.build_folder_state(path), "held")
+                self.assertEqual(folders.build_folder_state(old / path.name), "free")
+
+    def test_output_reservation_retries_when_the_parent_moves_before_open(self) -> None:
+        parent = self.root / "new-unit"
+        output = parent / "output"
+        former = self.root / "former-unit"
+        mkdir = os.mkdir
+
+        def move_parent(path: str | bytes | os.PathLike[str] | os.PathLike[bytes], mode: int = 0o777, *,
+                        dir_fd: int | None = None) -> None:
+            mkdir(path, mode, dir_fd=dir_fd)
+            if path == parent.name and not former.exists():
+                _ = parent.rename(former)
+
+        with mock.patch.object(os, "mkdir", side_effect=move_parent):
+            with folders.folder_removal_lease(output, create=True, root=self.root, wait=False) as lease:
+                self.assertIsInstance(lease, folders.HeldFolderRemovalLease)
+                self.assertEqual(folders.build_folder_state(output), "held")
+        self.assertTrue(former.is_dir())
+        self.assertEqual(list(former.iterdir()), [])
+
+    def test_scratch_can_lock_the_record_during_removal(self) -> None:
+        path = self.root / "scratch" / "scratch-source"
+        path.mkdir(parents=True)
+        write_record = scratch.atomic_record
+        request = folders.StableOwnerFolder("late", folders.ExplicitBuildParent(path))
+
+        def allocate_before_removal(mark: Path, fields: object) -> None:
+            write_record(mark, fields)
+            if mark == scratch.removal_mark(path):
+                child = folders.create_build_folder(request)
+                self.addCleanup(_release_folder, child)
+
+        with scratch.removal_lock(path) as idle:
+            self.assertTrue(idle)
+            with scratch.directory_record_lock(path, wait=False) as record:
+                self.assertTrue(record)
+                with (mock.patch.object(scratch, "atomic_record", side_effect=allocate_before_removal),
+                      self.assertRaisesRegex(scratch.ScratchError, "busy: a lease")):
+                    scratch.remove_with_cargo_output(path)
+        self.assertTrue((path / "late").is_dir())
+        self.assertEqual(folders.build_folder_state(path / "late"), "held")
+
+    def test_the_style_collector_can_take_sync_lock(self) -> None:
+        from scripts.lint import sweep
+
+        path = self.root / "source"
+        path.mkdir()
+        target = folders.create_build_folder(folders.StableOwnerFolder(
+            scratch.STYLE_TARGET_NAME, folders.ExplicitBuildParent(path)))
+        _release_folder(target)
+        (target / scratch.STYLE_LOCK_NAME).touch()
+        scan = cast(Callable[..., object], getattr(folders, "_hold_child_leases"))
+        child = target / "late"
+
+        def allocate_after_scan(folder: Path, *args: object, **kwargs: object) -> object:
+            result = scan(folder, *args, **kwargs)
+            if folder == target:
+                request = folders.StableOwnerFolder(child.name, folders.ExplicitBuildParent(target))
+                self.addCleanup(_release_folder, folders.create_build_folder(request))
+            return result
+
+        with folders.folder_removal_lease(path, children=True, wait=False) as lease:
+            self.assertNotIsInstance(lease, folders.RefusedRemovalLease)
+            locks = sweep.lock_trees([str(target)])
+            if not isinstance(locks, sweep.TargetLocksAcquired):
+                self.fail(f"the style lock was held: {locks}")
+            self.addCleanup(sweep.release, locks.held)
+        with mock.patch.object(folders, "_hold_child_leases", side_effect=allocate_after_scan):
+            folders.sweep_temporary_build_folders(path, wait=False)
+        self.assertTrue(child.is_dir())
+        _release_folder(child)
+        folders.sweep_temporary_build_folders(path, wait=False)
+        self.assertFalse(target.exists())
+
+    def test_a_style_target_sync_lease_keeps_its_tree(self) -> None:
+        for evidence in ("folder", "record"):
+            with self.subTest(evidence=evidence):
+                path = self.root / evidence
+                target = path / scratch.STYLE_TARGET_NAME
+                target.mkdir(parents=True)
+                if evidence == "folder":
+                    (target / "sync").mkdir()
+                else:
+                    folders.lease_path(target / "sync").touch()
+                with (target / scratch.STYLE_LOCK_NAME).open("wb") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.assertFalse(folders.remove_build_folder(path, wait=False))
+                self.assertTrue(target.is_dir())
+                self.assertTrue(folders.remove_build_folder(path, wait=False))
+
+    def test_temporary_cleanup_keeps_a_held_child_under_an_unreadable_directory(self) -> None:
+        with folders.temporary_build_folder(folders.UniqueBuildFolder("outer-")) as outer:
+            nested = outer / "nested"
+            nested.mkdir()
+            child = folders.create_build_folder(folders.StableOwnerFolder(
+                "child", folders.ExplicitBuildParent(nested)))
+            self.addCleanup(_release_folder, child)
+            nested.chmod(0)
+        self.assertTrue(outer.is_dir())
+        try:
+            self.assertEqual(stat.S_IMODE(nested.stat().st_mode), 0)
+        finally:
+            if nested.is_dir():
+                nested.chmod(0o700)
+        self.assertTrue(child.is_dir())
+        self.assertEqual(folders.build_folder_state(child), "held")
 
     def test_a_lock_removed_after_its_open_is_not_current(self) -> None:
         real_open = os.open

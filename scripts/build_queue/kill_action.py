@@ -349,7 +349,7 @@ def detached_run_state(
 
 
 def request_stop(action: SavedKillAction) -> bool:
-    """Check the locked route or finish the stop for this action."""
+    """Ask the detached run stop path to stop the saved command."""
     def can_stop() -> bool:
         state = detached_run_state(action.route, action.recipient, notice_id=action.id)
         return isinstance(state, RunningDetachedRun) and (
@@ -510,7 +510,7 @@ class KillActions:
             self._acknowledge_notice(action.route.record, action.run.reference, action.id)
         return finished
 
-    def _advance(self, action: SavedKillAction) -> SavedKillAction:
+    def _advance(self, action: SavedKillAction, *, recover_orphan: bool = False) -> SavedKillAction:
         """Use the run record to advance to the notice."""
         if isinstance(action.stage, StopRequested):
             if action.result["stop"] != StopState.STOPPING:
@@ -527,9 +527,8 @@ class KillActions:
                     retry = True
                 state = detached_run_state(action.route, action.recipient, notice_id=action.id)
                 route = action.route
-                if isinstance(state, RunningDetachedRun) and state.stop_committed:
-                    detached_runs.finish_stopped_record(route.record, notice_id=action.id, owner=action.recipient,
-                                                        run_slice=route.run_slice)
+                if recover_orphan and isinstance(state, RunningDetachedRun) and state.stop_committed:
+                    detached_runs.reap_orphan(route.record)
                     state = detached_run_state(route, action.recipient, notice_id=action.id)
                 if isinstance(state, RunningDetachedRun):
                     if not state.stop_committed and not retry:
@@ -567,7 +566,7 @@ class KillActions:
                             self._release_notices(reference)
                         else:
                             self._release_notices(reference, action.id)
-                            action = self._advance(action)
+                            action = self._advance(action, recover_orphan=True)
                             if not isinstance(action.stage, FinishedStop):
                                 continue
                     if not any(self._notice_files(reference)):

@@ -11,6 +11,7 @@ import ctypes
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Generator, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import os
 import select
@@ -32,7 +33,7 @@ from typing import BinaryIO, Literal, NamedTuple, TextIO, cast, final, override
 from unittest.mock import Mock, call, patch
 
 
-from scripts.herdr import herdr
+from scripts.herdr import herdr, message_proof
 from scripts.herdr import pane_launch
 from scripts.herdr import fake_herdr
 from scripts.message import codex_daemon
@@ -196,6 +197,87 @@ class NativePaneSessionTests(StaffTestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HERDR_BIN": str(Path(herdr.__file__).with_name("fake_herdr.py")),
         })))
+
+    def test_message_recipient_lookup_skips_a_candidate_with_an_unreadable_environment(self) -> None:
+        denied_pid, recipient_pid = 998070, 998071
+        identity = fixture_runtime_id("readable-recipient")
+        place = herdr.HerdrPlace("agents", "w1:p1")
+        proc = self.root / "proc"
+        denied_path = proc / str(denied_pid) / "environ"
+        readable_path = proc / str(recipient_pid) / "environ"
+        readable_path.parent.mkdir(parents=True)
+        readable_path.touch()
+        foreground = [{"pid": pid, "argv": ["claude"]} for pid in (denied_pid, recipient_pid)]
+        info: dict[str, object] = {"foreground_processes": foreground}
+        read_bytes = Path.read_bytes
+        denied_environments = {denied_path}
+
+        def read_process_file(path: Path) -> bytes:
+            if path in denied_environments:
+                raise PermissionError(13, "Permission denied", str(path))
+            return read_bytes(path)
+
+        with (patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
+              patch.object(herdr, "_PLATFORM", "linux"),
+              patch.object(sessions, "process_start", return_value="fixture-start"),
+              patch.object(staff, "runtime_id", return_value=identity) as runtime_id,
+              patch.object(Path, "read_bytes", read_process_file)):
+            proof = message_proof.ProvedMessageOwner(conversation=identity, pid=recipient_pid, start="fixture-start")
+            with message_proof.message_lookup(proof), herdr.process_action():
+                with message_proof.message_lookup(message_proof.StrictOwnerProof.REQUIRED):
+                    self.assertIsInstance(herdr.pane_foreground(place, info), herdr.UnknownPaneOwner)
+                owner = herdr.pane_foreground(place, info)
+                self.assertIsInstance(owner, herdr.ProvedClaudeForeground)
+                assert isinstance(owner, herdr.ProvedClaudeForeground)
+                self.assertEqual(owner.pid, recipient_pid)
+                self.assertEqual(herdr.read_foreground_pane_owner(owner, {}).current_identity, identity)
+                runtime_id.assert_called_once_with(recipient_pid)
+                denied_environments.add(readable_path)
+                unknown = herdr.pane_foreground(place, info)
+                self.assertIsInstance(unknown, herdr.UnknownPaneOwner)
+                assert isinstance(unknown, herdr.UnknownPaneOwner)
+                self.assertIn("Permission denied", unknown.reason)
+                self.assertIn(str(readable_path), unknown.reason)
+
+            denied_environments.remove(readable_path)
+            for other in (replace(proof, conversation=fixture_runtime_id("other-recipient")),
+                          replace(proof, pid=denied_pid), replace(proof, start="old-start")):
+                with self.subTest(message_owner=other), message_proof.message_lookup(other):
+                    self.assertIsInstance(herdr.pane_foreground(place, info), herdr.UnknownPaneOwner)
+            self.assertIsInstance(herdr.pane_foreground(place, info), herdr.UnknownPaneOwner)
+            self.assertIsInstance(herdr.foreground_pane_owner(info, for_input=True), herdr.UnprovedForegroundOwner)
+
+    def test_close_pane_refuses_when_either_claude_environment_is_unreadable(self) -> None:
+        first, second = 998070, 998071
+        identity = fixture_runtime_id("closure-target")
+        client = herdr.Herdr("agents")
+        pane = "w1:p1"
+        row = {"pane_id": pane, "terminal_id": "terminal-one"}
+        info = {"shell_pid": 998069, "foreground_process_group_id": first,
+                "foreground_processes": [{"pid": pid, "argv": ["claude"]} for pid in (first, second)]}
+        for denied_pid in (first, second):
+            with self.subTest(denied_pid=denied_pid):
+                readable_pid = second if denied_pid == first else first
+                proof = message_proof.ProvedMessageOwner(conversation=identity, pid=readable_pid, start="fixture-start")
+
+                def read_environment(process: Path) -> dict[str, str]:
+                    if process.name == str(denied_pid):
+                        raise PermissionError(13, "Permission denied", str(process / "environ"))
+                    return {}
+
+                errors = io.StringIO()
+                with (patch.dict(os.environ, {"HERDR_PROC": str(self.root / "proc")}),
+                      patch.object(herdr, "_PLATFORM", "linux"),
+                      patch.object(herdr, "_process_environment", side_effect=read_environment),
+                      patch.object(sessions, "process_start", return_value="fixture-start"),
+                      patch.object(staff, "runtime_id", return_value=identity),
+                      patch.object(client, "pane_row", return_value=row),
+                      patch.object(client, "result", return_value={"process_info": info}),
+                      patch.object(client, "run") as run,
+                      message_proof.message_lookup(proof), redirect_stderr(errors)):
+                    self.assertFalse(client.close_pane(pane, target=identity))
+                self.assertIn("Permission denied", errors.getvalue())
+                run.assert_not_called()
 
     def test_pane_agent_process_reads_only_the_foreground_agent_without_native_identity(self) -> None:
         from scripts.herdr.test_worker_panes import PaneWorld
@@ -5092,6 +5174,7 @@ class HerdrTests(unittest.TestCase):
         _ = shutil.copy2(Path(herdr.__file__).with_name("place.py"), isolated / "place.py")
         _ = shutil.copy2(Path(herdr.__file__).with_name("herdr_types.py"), isolated / "herdr_types.py")
         _ = shutil.copy2(Path(herdr.__file__).with_name("pane_launch.py"), isolated / "pane_launch.py")
+        _ = shutil.copy2(Path(herdr.__file__).with_name("message_proof.py"), isolated / "message_proof.py")
         message = isolated.parent / "message"
         copy_session_modules(message)
         _ = shutil.copytree(Path(herdr.__file__).resolve().parents[1] / "lib", isolated.parent / "lib", dirs_exist_ok=True,
@@ -8287,8 +8370,9 @@ class RowTabTests(StaffTestCase):
                 self.assertEqual(sum("p1 tab t0" in line for line in errors.getvalue().splitlines()), 1)
 
     def test_layout_scan_refreshes_the_pane_list_after_pane_not_found(self) -> None:
-        for disappeared in (True, False):
-            with self.subTest(disappeared=disappeared):
+        for closure in ("first scan", "still listed", "second scan"):
+            with self.subTest(closure=closure):
+                disappeared = closure == "first scan"
                 pane = self.client.tabs[0]
                 now = time.time()
                 old = now - herdr.LAYOUT_KEEP_SECONDS - 1
@@ -8312,19 +8396,27 @@ class RowTabTests(StaffTestCase):
                             raise herdr_types.HerdrFailure("pane_not_found: fixture pane is absent", "pane_not_found")
                     return original(*arguments, deadline=deadline)
 
-                with patch.object(self.client, "result", side_effect=result), redirect_stderr(io.StringIO()) as errors:
+                with (patch.object(self.client, "result", side_effect=result), redirect_stderr(io.StringIO()) as errors,
+                      herdr.pane_evidence_run()):
                     self.client.record_layout()
-                if disappeared:
-                    self.client.tabs.insert(0, pane)
+                    if disappeared:
+                        self.client.tabs.insert(0, pane)
 
-                self.assertEqual(process_queries, ["p0", "p1", "p2"])
-                self.assertEqual(pane_lists, [["p0", "p1", "p2"], ["p1", "p2"] if disappeared else ["p0", "p1", "p2"]])
-                self.assertEqual(herdr.saved_layout("fixture")["workspaces"][0], saved)
-                self.assertEqual(set(self.client.scans[-1].found), {self.rows["split"].id, self.rows["worker"].id})
-                if disappeared:
-                    self.assertEqual(errors.getvalue(), "")
-                else:
-                    self.assertIn("p0 tab t0: pane evidence is unknown: pane_not_found", errors.getvalue())
+                    self.assertEqual(process_queries, ["p0", "p1", "p2"])
+                    self.assertEqual(pane_lists, [["p0", "p1", "p2"], ["p1", "p2"] if disappeared else ["p0", "p1", "p2"]])
+                    self.assertEqual(herdr.saved_layout("fixture")["workspaces"][0], saved)
+                    self.assertEqual(set(self.client.scans[-1].found), {self.rows["split"].id, self.rows["worker"].id})
+                    if disappeared:
+                        self.assertEqual(errors.getvalue(), "")
+                    else:
+                        self.assertIn("p0 tab t0: pane evidence is unknown: pane_not_found", errors.getvalue())
+                    if closure == "second scan":
+                        self.client.tabs.remove(pane)
+                        try:
+                            after_close = self.client.scan_row_panes(staff.initial_snapshot(), [dict(pane)])
+                        finally:
+                            self.client.tabs.insert(0, pane)
+                        self.assertEqual(after_close.unknown, [herdr.UnknownPane("p0", "t0", "pane closed during scan")])
 
     def test_layout_scan_refreshes_once_after_several_panes_close(self) -> None:
         queries: list[tuple[str, ...]] = []
@@ -8346,6 +8438,32 @@ class RowTabTests(StaffTestCase):
                                    ("pane", "list")])
         self.assertEqual(set(self.client.scans[-1].found), {self.rows["worker"].id})
         self.assertEqual(errors.getvalue(), "")
+
+    def test_retitle_with_matching_titles_skips_process_queries(self) -> None:
+        title = self.rows["unit"].name
+        self.client.tabs[0]["label"] = title
+        self.client.record_layout()
+        self.assertIn(self.rows["unit"].id, [identity for _, identity in self.bindings()])
+
+        with patch.object(self.client, "result", wraps=self.client.result) as queries:
+            self.assertFalse(self.client.retitle("p0", title))
+
+        self.assertFalse(any(query.args[:2] == ("pane", "process-info") for query in queries.call_args_list))
+
+    def test_retitle_with_matching_titles_resolves_a_pending_reorder(self) -> None:
+        owner = self.rows["unit"]
+        other = self.rows["worker"]
+        self.client.tabs[0]["label"] = owner.name
+        self.client.record_layout()
+        self.client.mark_tab_rename(owner.id)
+        self.client.mark_tab_rename(other.id)
+
+        self.assertTrue(self.client.retitle("p0", owner.name))
+
+        saved = herdr.saved_layout("fixture")
+        pending = {entry["staff_id"] for space in saved["workspaces"] for entry in space["tabs"]
+                   if entry.get("sort_after_rename")}
+        self.assertEqual(pending, {other.id})
 
     def test_retitle_uses_proved_rows_and_reports_an_unknown_pane_once(self) -> None:
         self.client.unknown.add("p2")
@@ -9112,6 +9230,33 @@ class SavedLayoutTests(unittest.TestCase):
             pane_launch.save(pane_launch.record_directory() / "fixture.json", {entry["pane_id"]: entry}, record=staff.StaffSnapshot(()))
             client.prepare_restore_workspaces(frozenset(space for space, _ in self.BEFORE))
             self.assertEqual(client.layout(), self.BEFORE)
+
+        with self.subTest(launch="retained shell with a null terminal id"):
+            client = LayoutHerdr("shell-workspace")
+            space = "shell-owner"
+            client.spaces = [("w1", space)]
+            _ = client.add_tab("w1", space)
+            shell = client.tabs[0]
+            session = shell.pop("session_id")
+            owner = staff.initial_snapshot().by_current_session(session)
+            assert owner is not None
+            fake_unit_host.process(os.environ, 42, 1, ["zsh"], {"CLAUDE_CODE_SESSION_ID": session})
+            client.spaces = [("w1", "renamed-shell-workspace")]
+            now = time.time()
+            write_text_atomic(herdr.layout_path(client.session),
+                              json.dumps(herdr.SavedLayout(at=now, workspaces=[
+                                  herdr.SavedSpace(name=space, seen=now, tabs=[
+                                      herdr.SavedMemberTab(staff_id=owner.id, seen=now)])])))
+            original = client.result
+
+            def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                if arguments == ("pane", "list"):
+                    return {"panes": [dict(shell, terminal_id=None)]}
+                return original(*arguments, deadline=deadline)
+
+            with patch.object(client, "result", new=result):
+                client.prepare_restore_workspaces(frozenset({space}))
+            self.assertEqual(client.layout(), [("renamed-shell-workspace", [space])])
 
     def test_placeholder_with_a_running_program_survives_cleanup(self) -> None:
         _ = self.running()

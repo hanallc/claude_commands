@@ -2,9 +2,10 @@
 """Find loose folders in ~/rust, ~/rust/scratch, /tmp, /tmp/claude and $TMPDIR once a day.
 Remove idle folders that hold no unsaved work. Tell their makers.
 
-The scratch guard refuses most loose folders before they exist, and the hourly tmp sweep removes the
-temp leftovers that cannot hold work (tempfile folders, folders that hold only folders, verify.sh run folders, invoke.sh logs). This audit is
-the backstop for the rest: folders that can hold work. A folder is loose when it is none of these:
+The scratch guard prevents the creation of most loose folders.
+The hourly tmp sweep lists eligible entries for vetted manual removal.
+These include tempfile folders, folders that hold only folders, verify.sh run folders and invoke.sh logs.
+This audit checks the remaining loose folders. A folder is loose when it is none of these:
 
   * in ~/rust: a name in config/rust_roots.txt (one per line, `#` starts a comment), or the scratch
     root ~/rust/scratch;

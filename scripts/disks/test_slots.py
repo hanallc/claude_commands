@@ -50,13 +50,13 @@ class ReadSlotsTests(unittest.TestCase):
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         environment = config_environment(folder)
         _ = write_config_fixture(folder / "build_steps.conf",
-            "names.integrate=integrate\nowned.default={unit} {step}\nowned.integrate={unit} {step}\n")
+            "names.integrate=integrate\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
 
     def test_lease_names_keep_staff_references_separate_from_work_text(self) -> None:
         from scripts.lib.build_steps import StepNames
 
-        names = StepNames({"names.build": "helper", "owned.default": "{unit} {step}"})
+        names = StepNames({"names.build": "helper"})
         for step, expected in (("build", "helper"), ("", "helper")):
             with self.subTest(step=step):
                 use = slots.slot_use({"unit": "unit-id", "showrunner": "showrunner-id",

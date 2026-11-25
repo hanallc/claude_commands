@@ -18,6 +18,15 @@ from scripts.lib.atomic_file import sync_folder
 JOURNAL_NAME = "person_actions.jsonl"
 
 
+def asked_words(why: str | wire.WordsNotGiven, actor: str) -> str | wire.Refused:
+    """Resolve the reason before a priority change."""
+    if isinstance(why, str) and why.strip():
+        return why
+    if actor == records.PLAIN_SHELL_ACTOR:
+        return records.PLAIN_SHELL_WORDS
+    return wire.Refused("--words is required: pass the user's words; the queue priority did not change")
+
+
 @dataclass(frozen=True)
 class SetBump:
     step_key: str

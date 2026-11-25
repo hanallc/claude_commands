@@ -54,8 +54,9 @@ Boxes receive signed URLs and no scaler credential file.
 Two existing keys switch the two AWS machines:
 
 - `enabled` in `config/cloud_gate.conf` switches the cloud gate box.
-  With `off`, the gate route sends gates to natedev, the pinned `hana-gpu` route refuses its step, and the hourly job reads no placement scores.
-  Both routes give the reason `cloud gates are off (cloud_gate.conf enabled=off)`.
+  With `off`, the cloud worker refuses a new gate launch and the pinned `hana-gpu` step.
+  The hourly job reads no placement scores.
+  The refusal gives the reason `cloud gates are off (cloud_gate.conf enabled=off)`.
 - `enabled` in `config/hana_aws.conf` switches the Hana box.
   With `off`, placement and the controller give no claim and start no box, and the controller makes no AWS call for a box at rest.
 
@@ -361,7 +362,10 @@ An older observation cannot close a newer permit or replace a later running obse
 The fence survives controller restarts.
 Observations at the same time as the fence leave exposure unchanged.
 
-The existing `cost-ledger.json` version remains 1.
+The ledger reads versions 1 and 2 of `cost-ledger.json` and writes version 2.
+Drain old gate workers and upgrade ledger users before the first version 2 write.
+After that write, a code-only rollback to version 1 makes old reconcile code refuse the ledger.
+Keep version 2 support in all rollbacks.
 The optional `hana_compute` and `hana_storage` collections hold Hana exposure records.
 Older records have no Hana exposure when these collections are absent.
 A missing `hana_lifecycle_fence` remains absent until a fresh observation arrives.
@@ -397,7 +401,7 @@ A refused key is the one exception.
 When AWS refuses the key itself (`KEY_REFUSED_CODES` in `aws_cli.py`, such as `AuthFailure`), the child writes `key_refused.json` in the account directory and stops.
 While that record exists, each child makes no AWS call: no lifecycle step, no charge refresh, and no stop for a running box.
 The hourly job also makes no AWS call while the record exists.
-The cloud gate route then sends each gate to natedev with no AWS call, with the reason `key_refusal.REFUSED_REASON`.
+The cloud gate route gives `key_refusal.REFUSED_REASON` without an AWS call.
 The record clears only after one child sees every AWS machine off and a later child sees one on.
 So a person sets `enabled=off` in both `cloud_gate.conf` and `hana_aws.conf`, keeps them off for at least one tick (about 10 s), then sets one to `on`.
 An unusable `enabled` value does not count as off for this rule.
@@ -894,23 +898,81 @@ The list can include other regions that the account policy permits.
 The gate ranks deployed types and public zones by the expected USD per run before launch.
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
-Direct gate placement uses natedev and `mac-linux`.
-A merge gate or targeted test with a prepared copy handoff from `copies.py run` can use the cloud route without a placement assignment.
-The cloud route reserves a queue slot before it requests a box.
-The route checks `enabled` in `cloud_gate.conf` before it reads deployment state and again before a new launch.
-With `enabled=off`, a gate without a placement assignment runs its tests on natedev.
+A direct gate uses natedev or `mac-linux`.
+The prepared copy wrapper can pass an AWS assignment to the gate.
+The queue offers AWS only when both the registry and the scaler settings enable it.
+The live registry has no AWS scaler entry.
+
+The queue checks slot availability and daily spending room before it grants AWS.
+The budget check counts each current grant until the worker records its booking.
+The queue reads the registry again when it returns an unused grant or consumes launch permission.
+Prepared copies can run nightly suites and named modules on AWS.
+Promotion without tests uses natedev.
+When a passing AWS gate requests type checks, natedev runs those checks.
+A gate without an assignment runs its tests on natedev.
+An AWS assignment occupies one slot under `cloud_gate_slots`.
+The route checks `enabled` in `cloud_gate.conf` before it reads deployment state.
+The worker checks both switches before it sends a launch request.
+
+The legacy slot queue sorts requests by unit rank, then by queue time.
+Grouped requests keep their unit rank and use the group start time.
+The placement pass assigns scaler requests separately.
+
+The queue supplies these paths beside the placement progress file.
+
+1. The dispatch journal
+2. The AWS cost ledger directory
+3. The AWS account settings
+4. The target registry
+
+The worker reads the account settings from the assignment.
+The caller saves and syncs its prelaunch record in the queue state directory before it consumes launch permission.
+The caller adds each service folder to the journal before it starts the worker.
+The worker holds the journal lock while it runs.
+The queue uses the exact claim, caller identity, and saved local records to settle an ended dispatch.
+If a dead caller left no reservation or launch record, the queue closes the journal with `no launch`.
+A closed journal prevents a late worker from reserving spend or starting a box.
+Queue recovery makes no AWS call.
+A booking without a saved launch request can close while the journal lock excludes workers.
+A request has one current AWS dispatch across worktrees.
+A repeat can start cleanup after the earlier caller ends if the queue grants a slot.
+An open booking can block the grant until the recovery fix lands.
+The repeat launches only after the ledger records the release and the journal confirms closure.
+The queue syncs the ledger directory before it records closure.
+If AWS might have accepted a launch, the worker keeps its first token until it confirms the result.
+An open reservation or an unconfirmed launch keeps the assignment current until local records confirm its end.
 A confirmed Spot interruption before a final result starts another cloud attempt.
 `spot_interruption_retries=2` permits two retries, which can reach another zone and then another region.
 The retry uses the next choice in the saved launch order.
 The route keeps its cloud slot across retries.
-The route saves the interruption count and the next choice in `current.json` before each retry.
-Resume restores both values, so a crash cannot reset the retry budget.
+The route saves the interruption count and the next choice in the claim state before each retry.
+Resume restores both values under the same claim.
+A repeat with a new claim can reset the retry budget until the recovery fix lands.
 Each retry gets a new attempt ID and passes the existing spend and attempt checks.
 The worker confirms cleanup of the interrupted box and reservation before the retry.
 The final fallback row includes the interruption count when retries or capacity choices end.
-A gate without a placement assignment runs the tests on natedev after a final cloud refusal.
+An assigned gate exits 79 when the journal confirms no launch.
+It exits 80 if a launch remains possible and no test verdict is available.
 A complete gate failure keeps its failed result and gets no retry.
 An uncertain launch or termination keeps its cost reservation until reconciliation confirms the end.
+The route reports pending settlement to the queue while the launch remains uncertain.
+A completed AWS run with open settlement keeps its verdict and prints one warning on standard error.
+The stop cleanup looks up an unknown instance by client token.
+Cleanup accepts a saved termination for the same booking, region, and set of instances.
+An empty lookup proves absence only if the lookup starts at or after the booking expiry.
+If the reconciler cannot read a launch journal, it prints the file path and keeps that booking open.
+It continues cleanup for the other bookings.
+The queue reads settlement for the exact claim from its dispatch journal.
+The queue also checks deployment and Spot quota evidence from local files.
+The worker checks the current spending caps before each fresh assigned launch.
+A wrapper that owns the placement can request settlement after status 80.
+It keeps the episode for a replacement when the journal confirms no launch.
+The wrapper preserves status 80 if the settlement request or replacement fails.
+When cleanup is due, the queue requests the reconcile service for an expired booking in the journal.
+The service uses the ledger directory and account settings from the assignment.
+The request returns before reconciliation completes.
+The queue prints one warning per attempt if the service cannot start.
+The reconciler records the confirmed end in the local ledger.
 The launch path uses Spot only; it has no on-demand choice.
 Paired trials use the same regional launch and cleanup path.
 
@@ -957,7 +1019,7 @@ The module time limit and process groups stop the gate.
 The bootstrap names no `merge_gate` attribute and copies no host function source.
 A paired trial uses the changed candidate's entry point to supervise both verified trees.
 A candidate without the entry point publishes `candidate predates guest entry point` through the existing boot error link.
-If the cloud route returns a final refusal, a gate without a placement assignment uses the natedev fallback.
+The controller reports the failure to the queue.
 The result fields and transfer links keep their existing format.
 
 The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
@@ -1317,7 +1379,7 @@ Missing or unreadable evidence returns 2.
 A new gate ranks only variants from its deployment.
 `deploy.py up` saves the deployed `instance_types` in `gate-deployment.json`.
 A gate skips a configured type that this list does not name, and prints `Run deploy.py up`.
-When the list names no configured type, the gate falls back to natedev before any launch.
+When the list names no configured type, the gate refuses before launch.
 A manifest without the list keeps every configured type.
 An `UnauthorizedOperation` refusal skips that type for the rest of the launch while another type remains.
 `launch.json` saves the skipped types in `unauthorized_types`.
@@ -1347,7 +1409,7 @@ The quota check adds the new box to known live gate vCPUs.
 A G or VT type uses the G and VT quota. Other types use the Standard quota.
 The check uses quotas from the hourly snapshot within `price_max_age_seconds`.
 The worker prints `Cloud gate skips <type> in <region>` for a type above the median time limit.
-If that limit removes every variant, the gate falls back to natedev.
+If that limit removes every variant, the gate refuses before launch.
 Within each group, variants with a current price come first, ranked by the expected USD per run.
 The user, 2026-11-14: "base our spot Requests on lowest price per run".
 If any variant has a current price, equal costs and unpriced variants follow the `instance_types` order, then input order.
@@ -1383,8 +1445,11 @@ Equal costs keep configured order.
 Missing or stale prices follow fresh prices.
 Without applicable fresh prices, the gate preserves configured order except for capacity cooldowns.
 
-`capacity_cooldown_seconds=1800` moves recently refused capacity to the end without removing it.
+`capacity_cooldown_seconds=1800` moves recently refused capacity to the end of the launch order.
 `InsufficientInstanceCapacity`, `InsufficientSpotCapacity`, and `SpotMaxPriceTooLow` affect one region, type, and zone.
+Placement reports AWS unavailable while every deployed variant with current Spot quota room has a zone refusal in its cooldown window.
+The window includes the recorded refusal time through that time plus `capacity_cooldown_seconds`.
+Placement reads this evidence from `cloud-gate-launches.jsonl`.
 `MaxSpotInstanceCountExceeded` and `VcpuLimitExceeded` affect every variant of the region.
 Ranking reads the end of `cloud-gate-launches.jsonl` in 64 KiB blocks.
 It stops at the first row before the longer of the price-age and cooldown windows.

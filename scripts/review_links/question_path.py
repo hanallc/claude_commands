@@ -1,7 +1,7 @@
 """Share the queue rule and Later values for List and Review."""
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, tzinfo
 from enum import StrEnum
 import json
 import re
@@ -70,8 +70,21 @@ def later_label(value: LaterValue, format_time: Callable[[datetime], str]) -> st
     return "Until delivered"
 
 
+def resolve_later_time(value: datetime, zone: tzinfo) -> datetime:
+    """Apply the configured zone to a legacy time without an offset."""
+    return value.replace(tzinfo=zone) if value.tzinfo is None else value
+
+
 def later_active(value: Later, now: datetime) -> bool:
-    return value is UntilDelivered.DELIVERED or isinstance(value, datetime) and value > now
+    return value is UntilDelivered.DELIVERED or isinstance(value, datetime) and value.timestamp() > now.timestamp()
+
+
+def next_later_deadline(values: Iterable[Later], now: datetime) -> str:
+    """Return the first future deadline in epoch seconds."""
+    current = now.timestamp()
+    future = (stamp for value in values if isinstance(value, datetime) and (stamp := value.timestamp()) > current)
+    first = min(future, default=None)
+    return '' if first is None else str(int(first))
 
 
 @dataclass(frozen=True)
@@ -95,10 +108,15 @@ def answer_log_id(question_id: str) -> str:
     return 'answer:' + question_id
 
 
-def has_unread_answer(answered_at: AnswerTime, log: tuple[ReviewLog, ...]) -> bool:
+def answer_is_unread(answered_at: AnswerTime, read_times: Iterable[datetime]) -> bool:
     """An answer is unread if no read action occurred at or after it."""
     return isinstance(answered_at, datetime) and not any(
-        event.time >= answered_at and event.words.startswith(('Marked read', 'Later until ')) for event in log)
+        read_at >= answered_at for read_at in read_times)
+
+
+def has_unread_answer(answered_at: AnswerTime, log: tuple[ReviewLog, ...]) -> bool:
+    return answer_is_unread(answered_at, (event.time for event in log
+                            if event.words.startswith(('Marked read', 'Later until '))))
 
 
 def queue(base: Queue, *, unread_answer: bool, later: bool, unread_delivery: bool = False,
