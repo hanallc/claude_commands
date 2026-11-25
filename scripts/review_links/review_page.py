@@ -279,13 +279,11 @@ def report_url(destination: investigation.ListDestination) -> str:
     return page_frame.LIST_PAGE_PATH + page_frame.list_item_fragment(destination.keeper, destination.number)
 
 
-def report_belongs_on_list(item: ReviewItem) -> bool:
-    return isinstance(item.source, review_items.InvestigationSource) and item.source.record.belongs_on_list
-
-
 def list_report_details(report: the_list.ListReport) -> str:
     """Use the Review card renderers for the report words and picture."""
     content = section(report.kind.value, report.words)
+    if not report.evidence_key.startswith('investigation/'):
+        return content
     try:
         if report.submission_scope:
             scope = new_item_dialog.read_submission_key(report.submission_scope)
@@ -565,7 +563,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
                 origin = review_items.submission_origin(item)
                 if isinstance(origin, new_item_dialog.ReviewSubmission):
                     submission_keys[origin.request_id] = item.key
-            if not report_belongs_on_list(item):
+            if not review_items.on_list(item):
                 entries.append(summary)
             records[item.key] = item
     browser = change_page.ReviewBrowser(token, initial)
@@ -729,7 +727,7 @@ class ReviewSnapshotCache:
             try:
                 updated, item = self.publish_record(current, key)
                 version = updated.version
-                if not isinstance(item, ReviewItem):
+                if not isinstance(item, ReviewItem) or review_items.on_list(item):
                     detail = ClosedReviewDetail()
                 elif fields['outcome'][0] not in ('question', 'feedback', 'validate'):
                     detail = ClosedReviewDetail()
@@ -798,6 +796,9 @@ class ReviewSnapshotCache:
                         filing.enter_context(investigation.file_for_list(investigation.InvestigationPurpose.BUG_REPORT))
                     elif item.kind == "enhancement":
                         filing.enter_context(investigation.file_for_list(investigation.InvestigationPurpose.ENHANCEMENT))
+                    elif item.kind == new_item_dialog.SubmissionKind.INVESTIGATION:
+                        filing.enter_context(investigation.file_for_list(
+                            investigation.InvestigationPurpose.LIST_INVESTIGATION))
 
                 if isinstance(request, review_submissions.ListDraftSend):
                     prepare = request.prepare
@@ -893,7 +894,7 @@ class ReviewSnapshotCache:
         sources = ReviewSourceStamps()
         if isinstance(item, ReviewRecordNotPublished) or (
                 item.state == ReviewState.DONE and item.type != ReviewType.FOR_YOU
-                and not report_belongs_on_list(item)):
+                and not review_items.on_list(item)):
             _ = records.pop(key, None)
             entries = [entry for entry in current.entries if entry['key'] not in (key, previous_key)]
             record_version = key
@@ -910,7 +911,7 @@ class ReviewSnapshotCache:
             if isinstance(origin, new_item_dialog.ReviewSubmission):
                 submission_keys[origin.request_id] = key
             validate_body_inputs(item, record_assets)
-            if not report_belongs_on_list(item):
+            if not review_items.on_list(item):
                 updated_entry = card_entry(item, members, names, current.zone)
                 entries = [updated_entry if entry['key'] == previous_key else entry for entry in current.entries
                            if entry['key'] != key or key == previous_key]
@@ -995,7 +996,7 @@ def waiting_items(request: console.NewsRequest, *, snapshot: ReviewSnapshot | No
         now = datetime.now(snapshot.zone)
         records = (item for item in snapshot.records.values() if item.for_you(now))
     return frozenset(item.key+'/'+item.times.updated.isoformat() for item in records
-                     if item.type != ReviewType.FOR_YOU and not report_belongs_on_list(item))
+                     if item.type != ReviewType.FOR_YOU and not review_items.on_list(item))
 
 
 def legacy_url(path: str, query: str) -> str:
@@ -1038,7 +1039,7 @@ def assign_menu(item: ReviewItem, names: staff_names.StaffNames) -> str:
 def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *,
          owner: str = '', validator: str = '', assignment: str = '', routes: str = '',
          names: staff_names.StaffNames | None = None) -> str:
-    if (report_belongs_on_list(item) or item.state == ReviewState.DONE
+    if (review_items.on_list(item) or item.state == ReviewState.DONE
             or (item.type == ReviewType.FOR_YOU and not item.actions)):
         return ''
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key), 'revision': revision}
@@ -1409,7 +1410,7 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         return review_items.read_current(root, retained, staff.snapshot())
 
     def validate_revision(current: ReviewItem) -> ReviewItem:
-        if report_belongs_on_list(current):
+        if review_items.on_list(current):
             raise review_items.ReviewRecordChanged('Open the report on the List.')
         if current.state == ReviewState.DONE:
             raise review_items.ReviewRecordChanged('This item is already Done.')
@@ -1462,7 +1463,8 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         raise question_record.AnswerRefused('choose an action on this card')
     source = item.source
     if isinstance(source, review_items.ChangeSource):
-        with change_review.checked_review_write(source.path, root, validate) as current:
+        with (change_review.checked_review_write(source.path, root, validate) as current,
+              change_page.file_change_actions(review_actions.file_change_work)):
             action = change_page.VALIDATION_QUESTION if current.state == ReviewState.VALIDATING else outcome
             delivery = change_browser.submit_review_change(current, snapshot.browser, action, words, status)
         if isinstance(delivery, change_page.MessageDelivery) and outcome not in ('validate', 'feedback', 'question'):

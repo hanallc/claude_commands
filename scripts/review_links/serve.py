@@ -43,7 +43,7 @@ from scripts.build_queue import admission_client, admission_protocol as admissio
 from scripts.lib import atomic_file, conf, scratch, session_folder
 from scripts.lib.file_lock import exclusive
 from scripts.lib.process_group import run_process_group
-from scripts.production import change_routing, change_review, staff, the_list, tidy_wrapped
+from scripts.production import change_routing, change_review, investigation, staff, the_list, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import console_tune, go_ledger, new_item, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, send_hold, staff_names, studio_page
 from scripts.review_links.review_link import private_name, tailscale_ip as tailscale_ip
@@ -1440,7 +1440,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 location = change_page.publish_next(page, body)
                 self.redirect(location)
                 return
-            delivery = change_page.submit(page, body, server.delivery_status)
+            with change_page.file_change_actions(review_actions.file_change_work):
+                delivery = change_page.submit(page, body, server.delivery_status)
         except change_review.VerdictDurabilityUnconfirmed as error:
             try:
                 self.failed_answer(page, body, 503, "The verdict was written. Durability is unconfirmed.", error)
@@ -1525,7 +1526,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if length <= 0:
                 raise ValueError("empty answer")
             body = self.rfile.read(length).decode("utf-8")
-            delivery, answer = change_browser.submit(browser, body, server.delivery_status)
+            with change_page.file_change_actions(review_actions.file_change_work):
+                delivery, answer = change_browser.submit(browser, body, server.delivery_status)
         except change_review.VerdictDurabilityUnconfirmed as error:
             try:
                 self.browser_failure(503, "The verdict was written. Durability is unconfirmed.", error)
@@ -1951,8 +1953,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                             claims=claims)
                     except review_actions.SubmissionDeliveryPending:
                         delivery = change_page.NoMessageDelivery()
-                    if on_list or isinstance(request, new_item_dialog.NewItemRequest) and (
-                            request.page_recipient == new_item_dialog.PageRecipient.PRODUCER):
+                    if (on_list or isinstance(request, new_item_dialog.NewItemRequest) and
+                            request.page_recipient == new_item_dialog.PageRecipient.PRODUCER
+                            or isinstance(saved.record, investigation.Investigation) and saved.record.belongs_on_list):
                         number = the_list.reserved_review_number(review_submissions.list_filing_reservation(saved))
                         if isinstance(number, int):
                             response["list_number"] = number
@@ -2209,7 +2212,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             result['detail_unavailable'] = True
         if isinstance(saved.item, review_items.ReviewItem):
             later = saved.item.times.later
-            result.update(state=saved.item.state, type=saved.item.type,
+            state = review_items.ReviewState.DONE if review_items.on_list(saved.item) else saved.item.state
+            result.update(state=state, type=saved.item.type,
                           later=0 if isinstance(later, review_items.NoLaterTime) else later.timestamp()*1000)
         if self.headers.get(send_hold.REPLAY_HEADER) == "1":
             delivery = change_page.finish_verdict_cleanup(saved.delivery, server.delivery_status)

@@ -1427,6 +1427,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_a_held_review_answer_reports_a_delivery_failure_after_saving(self) -> None:
         case = self.review_fixture(changes=1)
+        keeper = fixture_member('producer', name='morty')
         key = "page-owner/C1"
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         _ = write_config_fixture(conf.path("review_links"), "undo_seconds=1\n")
@@ -1444,6 +1445,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertFalse(answer["delivery_pending"])
         rows = {row["#"]: row for row in change_review.review_rows(case.fixture.review_list)}
         self.assertEqual(rows["C1"]["Verdict"], "not works: The proof failed.")
+        item, = the_list.records(keeper.id)
+        assert isinstance(item.report, the_list.ListReport)
+        self.assertEqual((item.report.kind, item.report.words), (the_list.ReportKind.CHANGE, 'The proof failed.'))
 
     def test_list_owner_control_and_sends_use_the_configured_producer(self) -> None:
         case = self.review_fixture()
@@ -1507,8 +1511,12 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(repeated, saved | {"version": repeated["version"]})
                     number = saved["list_number"]
                     row = the_list.load(morty.id, f"L{number}")
-                    self.assertEqual((row.owner, row.producer, row.reviews),
-                                     (recipient.id, recipient.id, (saved["key"],)))
+                    self.assertEqual((row.owner, row.producer), (recipient.id, recipient.id))
+                    if kind == new_item_dialog.SubmissionKind.QUESTION:
+                        self.assertEqual(row.reviews, (saved["key"],))
+                    else:
+                        assert isinstance(row.report, the_list.ListReport)
+                        self.assertEqual(row.report.evidence_key, saved["key"])
                     send.assert_called_once_with(f"session:{recipient.current_session}", change_page.SENDER, ANY)
 
     def test_new_item_command_files_through_the_handler_and_makes_its_list_item(self) -> None:
@@ -1529,7 +1537,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                 item = self.check_new_item_command(fail_retry=True, change_mapping=change_mapping)
                 first, = responses
                 self.assertEqual(first["list_number"], item.number)
-                self.assertEqual(first["key"], item.reviews[0])
+                assert isinstance(item.report, the_list.ListReport)
+                self.assertEqual(first["key"], item.report.evidence_key)
 
     def test_enhancement_command_files_and_prefixes_the_list_title_at_the_word_limit(self) -> None:
         first_line = "Show the next check in the row."
@@ -1545,20 +1554,25 @@ class ReviewLinksServerTests(unittest.TestCase):
                 fail_retry=True, kind=new_item.ItemType.ENHANCEMENT, review_type=review_items.ReviewType.INVESTIGATION,
                 words=words, filed_words=f"Enhancement: {words}")
         first, = responses
-        self.assertEqual((first["list_number"], first["key"]), (item.number, item.reviews[0]))
+        assert isinstance(item.report, the_list.ListReport)
+        self.assertEqual((first["list_number"], first["key"]), (item.number, item.report.evidence_key))
 
     def test_new_item_command_reuses_a_draft_filed_without_a_notice(self) -> None:
         with self.lose_list_send_response() as responses:
             item = self.check_new_item_command(fail_retry=True, legacy_notice=True)
         first, = responses
-        self.assertEqual((first["list_number"], first["key"]), (item.number, item.reviews[0]))
+        assert isinstance(item.report, the_list.ListReport)
+        self.assertEqual((first["list_number"], first["key"]), (item.number, item.report.evidence_key))
 
     def test_new_item_command_saves_the_link_with_the_row(self) -> None:
         with patch.object(the_list, "link", side_effect=OSError("No space left on device")) as link:
             item = self.check_new_item_command()
         link.assert_not_called()
-        key, = item.reviews
-        self.assertIn(urlencode({"jump": key}), item.evidence)
+        assert isinstance(item.report, the_list.ListReport)
+        evidence = investigation.list_evidence_record(item.report.evidence_key)
+        destination = evidence.list_destination
+        assert isinstance(destination, investigation.ListDestination)
+        self.assertEqual(the_list.load(destination.keeper, f"L{destination.number}"), item)
 
     def check_new_item_command(
         self, *, fail_retry: bool = False, change_mapping: bool = False, kind: new_item.ItemType = new_item.ItemType.BUG,
@@ -1685,9 +1699,12 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(output.getvalue(),
                          f"{kind.capitalize()} → {unit.name}, a unit of {owner.name}.{producer_line} "
                          + f"List item {item.number}.\n")
-        self.assertEqual((item.title, item.owner, item.producer, item.unit, item.reviews),
-                         (title, unit.id, producer.id, unit.name, (key,)))
-        self.assertEqual(item.latest_status, filed_words)
+        self.assertEqual((item.title, item.owner, item.producer, item.unit), (title, unit.id, producer.id, unit.name))
+        if review_type == review_items.ReviewType.PROPOSAL:
+            self.assertEqual((item.reviews, item.latest_status), ((key,), filed_words))
+        else:
+            assert isinstance(item.report, the_list.ListReport)
+            self.assertEqual((item.report.evidence_key, item.report.words), (key, words))
         return item
 
     def test_restart_recovers_a_list_notice_after_the_row_exists(self) -> None:
@@ -3588,7 +3605,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
-        _ = self.map_list_recipient(owner.id)
+        keeper = self.map_list_recipient(owner.id)
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
         server = self.server
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
@@ -3635,6 +3652,10 @@ class ReviewLinksServerTests(unittest.TestCase):
             deliver.assert_called_once()
         self.assertEqual(len(investigation.records(owner.id)), 1)
         self.assertEqual(the_list.records(owner.id), [])
+        row, = the_list.records(keeper.id)
+        self.assertEqual(row.number, lost['list_number'])
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual((row.report.kind, row.report.evidence_key), (the_list.ReportKind.INVESTIGATION, key))
         self.assertEqual(self.request(review_page.ATTACHMENT_PATH + "?" + urlencode(
             {"key": key, "id": review_submissions.PAGE_SCREENSHOT.id})), preview)
 
@@ -6370,6 +6391,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_review_can_return_a_change_after_its_verdict_replace_fails(self) -> None:
         case = self.review_fixture(changes=1, feature_project=True)
+        _ = fixture_member('producer', name='morty')
         key = 'page-owner/C1'
         self.propose_feature(key)
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
@@ -6392,6 +6414,34 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(status, 200, body)
             self.assertTrue(case.fixture.delivery_done.wait(TEST_HANG_GUARD_SECS))
         self.assertEqual(case.fixture.proposal(key)['status'], 'dropped')
+
+    def test_standalone_change_links_file_the_same_list_reports(self) -> None:
+        case = self.review_fixture(changes=3)
+        keeper = fixture_member('producer', name='morty')
+        url = change_page.publish(case.fixture.production, case.fixture.review_list, ['C1', 'C2', 'C3'])
+        path = urlsplit(url).path
+        page = change_page.page_at(case.root, path)
+        with (patch.object(self.server, 'root', case.root),
+              patch.object(self.server, 'delivery_status', case.status)):
+            for row, outcome, kind in (('C1', 'not works', the_list.ReportKind.CHANGE),
+                                       ('C2', 'feedback', the_list.ReportKind.CHANGE),
+                                       ('C3', 'validate', the_list.ReportKind.VALIDATION)):
+                with self.subTest(outcome=outcome):
+                    words = f'Check the result of {row}.'
+                    form = urlencode({'row': row, 'token': page.token, 'outcome': outcome, 'feedback': words})
+                    case.fixture.delivery_done.clear()
+                    status, body = self.post(path, form)
+                    self.assertEqual(status, 303, body)
+                    self.assertTrue(case.fixture.delivery_done.wait(TEST_HANG_GUARD_SECS))
+                    key = f'page-owner/{row}'
+                    report = next(entry.report for entry in the_list.records(keeper.id) if key in entry.reviews)
+                    validation_log = (review_items.ValidationLogStart(1) if outcome == 'validate'
+                                      else review_items.LegacyValidationLog.MOVE_MARKER)
+                    self.assertEqual(report, the_list.ListReport(kind, key, words, validation_log=validation_log))
+            self.assertNotIn(b'name="outcome" value="feedback"', self.request(path).body)
+        moved = review_items.read(case.root, kinds=(review_items.ReviewType.CHANGE,))
+        self.assertEqual(len(moved), 3)
+        self.assertTrue(all(review_items.on_list(item) for item in moved))
 
     def test_review_recovery_retries_feature_closeout_after_the_verdict(self) -> None:
         case = self.review_fixture(changes=1, feature_project=True)
@@ -6662,9 +6712,9 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_review_refuses_a_verdict_while_a_change_is_validating(self) -> None:
         case = self.review_fixture(changes=1)
-        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         key = 'page-owner/C1'
-        _ = cache.save(case.card_body(cache.get(), key, 'validate', 'Check the change.'), case.status)
+        _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the change.'), case.status)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         listing = case.fixture.review_list
         claim = change_routing.delivery_path(case.root, listing, 'C1')
         before = (listing.read_bytes(), claim.read_bytes(), dict(case.status.request_attempts))
@@ -6684,9 +6734,9 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_validating_ask_returns_the_saved_body_and_delivery_state(self) -> None:
         case = self.review_fixture(changes=1)
-        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         key = 'page-owner/C1'
-        _ = cache.save(case.card_body(cache.get(), key, 'validate', 'Check the change.'), case.status)
+        _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the change.'), case.status)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         started, release = threading.Event(), threading.Event()
 
         def send(_delivery: change_page.MessageDelivery, _status: change_page.DeliveryStatus) -> None:
@@ -6715,10 +6765,10 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_review_body_serves_the_validating_question_in_both_card_views(self) -> None:
         case = self.review_fixture(changes=1)
+        key = 'page-owner/C1'
+        _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the change.'), case.status)
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         self.addCleanup(cache.close)
-        key = 'page-owner/C1'
-        _ = cache.save(case.card_body(cache.get(), key, 'validate', 'Check the change.'), case.status)
         with patch.object(self.server, 'review_cache', cache):
             table = self.request(review_page.PAGE_PATH + '?' + urlencode({'body': key}))
             card = self.request(review_page.card_url(key))

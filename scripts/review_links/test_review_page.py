@@ -7,7 +7,7 @@ from scripts.production.change_review_test_support import pictured_changes
 
 import shutil
 import io
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import html
 import json
 import re
@@ -48,7 +48,7 @@ from scripts.production import the_list
 from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, record_store, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_page
-from scripts.review_links import question_path, question_record
+from scripts.review_links import question_path, question_record, review_link
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, new_item_dialog, reply_tokens, review_actions, review_events, review_later, review_submissions
 from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
@@ -271,8 +271,9 @@ class ReviewPageTests(unittest.TestCase):
         return new_item_dialog.NewItemRequest(f'r1-{uuid4().hex}-{kind}-{recipient}', kind, recipient,
                                               f'Check the {kind} record.', new_item_dialog.NoEvidence())
 
-    def test_sent_rows_keep_native_types_and_return_to_open(self) -> None:
+    def test_sent_rows_keep_native_types_and_reopen_only_questions_and_proposals(self) -> None:
         owner = self.ready_submission_recipient()
+        _ = fixture_member('producer', name='morty')
         doc = self.fixture.temporary / 'producer.md'
         proposals = doc.parent / 'producer-proposals'
         _ = doc.write_text(f'# Producer\n- **Proposals:** {proposals}\n')
@@ -295,12 +296,14 @@ class ReviewPageTests(unittest.TestCase):
                 self.assertEqual(review_items.source_path(row), created.saved.path)
                 self.assertIn(created.saved.path.parent, snapshot.source_stamps)
                 entries = {entry['key']: entry for entry in unpack_index(review_page.index_json(snapshot.entries))}
-                self.assertEqual(entries[created.key].get('waitingWhy'), f'{recipient.name} answers this')
+                if review_type in review_items.INVESTIGATION_TYPES:
+                    self.assertNotIn(created.key, entries)
+                else:
+                    self.assertEqual(entries[created.key].get('waitingWhy'), f'{recipient.name} answers this')
                 self.assertNotIn(created.saved.reply_token.encode(), snapshot.body(created.key))
                 self.assertNotIn(created.saved.key.encode(), snapshot.index_response())
                 self.assertNotIn(created.key, initial.records)
         snapshot = review_page.build_snapshot(self.root)
-        self.assertIn(b'data-filter-value="bug"', snapshot.page)
         self.assertEqual([item.key for item in review_items.read(
             self.root, kinds=(review_items.ReviewType.BUG,))], [published[-1].key])
         self.assertIn(proposals, snapshot.source_stamps)
@@ -310,9 +313,11 @@ class ReviewPageTests(unittest.TestCase):
                 self.assertNotIn(created.key, {item.key for item in review_items.read_open(self.root)})
                 self.assertTrue(change_page.answer_item(created.saved.key, 'The check passed.', created.saved.reply_token, self.status))
         open_keys = {item.key for item in review_items.read_open(self.root)}
-        self.assertTrue({item.key for item in published} <= open_keys)
-        self.assertEqual(review_items.investigations(self.fixture.production, staff.snapshot()), 2)
+        new_keys = {item.key for item in published}
+        self.assertEqual(open_keys & new_keys, {item.key for item in published[:2]})
+        self.assertEqual(review_items.investigations(self.fixture.production, staff.snapshot()), 0)
         reopened = review_page.build_snapshot(self.root)
+        self.assertTrue({item.key for item in published[2:]}.isdisjoint(entry['key'] for entry in reopened.entries))
         self.assertEqual([reopened.records[created.key].type for created in published],
                          [review_items.ReviewType.RESPONSE, *[case[2] for case in cases[1:]]])
 
@@ -3893,6 +3898,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
         self.assertEqual(review_page.build_snapshot(self.root).body(key).count(words.encode()), 1)
 
     def test_feedback_send_reuses_the_log_entry_after_a_slot_write_failure(self) -> None:
+        keeper = fixture_member('producer', name='morty')
         page = self.fixture.page
         key = 'page-owner/C1'
         words = 'Adjust the spacing.'
@@ -3917,7 +3923,10 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
         assert isinstance(request, change_page.OpenFeedback)
         self.assertEqual(request.question_id, entry.feedback_request_id)
         row = change_page.answer_row(page, 'C1')
-        self.assertEqual(review_events.decode(row['Review log']), (entry,))
+        first, moved = review_events.decode(row['Review log'])
+        self.assertEqual(first, entry)
+        item, = the_list.records(keeper.id)
+        self.assertEqual(moved.words, f'moved to List item {item.number}')
         waiting = review_page.build_snapshot(self.root)
         self.assertEqual(waiting.render_body(waiting.records[key], waiting.assets).count(words.encode()), 1)
 
@@ -5045,6 +5054,443 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             self.assertEqual(second.getvalue(), "")
             self.assertEqual(the_list.records(keeper.id), [moved])
             self.assertEqual(investigation.load(owner.id, old.id), done)
+
+    def test_new_investigation_uses_the_shared_list_report(self) -> None:
+        owner = self.ready_submission_recipient()
+        keeper = fixture_member('producer', name='morty')
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        self.addCleanup(cache.close)
+        words = 'Check the startup delay.\n\nKeep the timing from the log.'
+        request = replace(self.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
+                          words=words)
+        created = cache.create_submission(request)
+        _ = cache.create_submission(request)
+        row, = the_list.records(keeper.id)
+        self.assertEqual((row.owner, row.state), (owner.id, the_list.ItemState.NEW))
+        self.assertIsInstance(row.state_entered, datetime)
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual((row.report.kind, row.report.words, row.report.evidence_key),
+                         (the_list.ReportKind.INVESTIGATION, words, created.key))
+        self.assertFalse(any(entry['key'] == created.key for entry in cache.get().entries))
+        self.assertIn('Keep the timing from the log.', list_page.render(self.root, include_counts=False).decode())
+
+    def test_change_return_and_feedback_use_the_shared_list_report(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        self.addCleanup(cache.close)
+        for key, outcome, words in (('page-owner/C1', 'not works', 'Keep the margin.'),
+                                    ('page-owner/C2', 'feedback', 'Check the font.')):
+            with self.subTest(outcome=outcome):
+                saved = cache.save(self.card_body(cache.get(), key, outcome, words), self.status)
+                self.assertIsInstance(saved.delivery, change_page.MessageDelivery)
+                self.assertIsInstance(saved.detail, review_page.ClosedReviewDetail)
+                self.assertFalse(any(entry['key'] == key for entry in cache.get().entries))
+                row = next(item for item in the_list.records(keeper.id) if key in item.reviews)
+                self.assertEqual(row.state, the_list.ItemState.NEW)
+                assert isinstance(row.report, the_list.ListReport)
+                self.assertEqual((row.report.kind, row.report.words), (the_list.ReportKind.CHANGE, words))
+
+    def test_failed_list_filing_leaves_a_change_return_ready_to_retry(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        self.addCleanup(cache.close)
+        key = 'page-owner/C1'
+        words = 'Keep the margin.'
+        request = self.card_body(cache.get(), key, 'not works', words)
+        with patch.object(the_list, 'file_report', side_effect=OSError('The List write failed.')):
+            with self.assertRaisesRegex(question_record.AnswerRefused, 'The answer could not be saved'):
+                _ = cache.save(request, self.status)
+        row = change_review.review_rows(self.fixture.review_list)[0]
+        self.assertFalse(row.get('Verdict'))
+        self.assertEqual(cache.get().records[key].state, review_items.ReviewState.OPEN)
+        self.assertEqual(the_list.records(keeper.id), [])
+        self.assertEqual(self.status.request_attempts, {})
+
+        saved = cache.save(request, self.status)
+        self.assertIsInstance(saved.detail, review_page.ClosedReviewDetail)
+        report, = the_list.records(keeper.id)
+        assert isinstance(report.report, the_list.ListReport)
+        self.assertEqual((report.report.evidence_key, report.report.words), (key, words))
+
+    def test_review_validation_files_a_list_item_owned_by_the_showrunner(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        self.addCleanup(cache.close)
+        key = 'page-owner/C1'
+        words = 'Check the dialog twice.'
+        linked = the_list.add_review_item(keeper.id, 'Check the dialog', owner=self.fixture.unit.id,
+                                          producer=keeper.id, unit='', words='The existing List item.',
+                                          evidence='', review_key=key, source='morty',
+                                          reservation=self.fixture.temporary/'validation-number')
+        saved = cache.save(self.card_body(cache.get(), key, 'validate', words), self.status)
+        assert isinstance(saved.delivery, change_page.MessageDelivery)
+        owner, = saved.delivery.recipients
+        member = staff.snapshot().by_id(owner)
+        assert member is not None
+        self.assertEqual(member.kind, 'showrunner')
+        row, = the_list.records(keeper.id)
+        self.assertEqual((row.number, row.owner, row.state, row.reviews),
+                         (linked, owner, the_list.ItemState.NEW, (key,)))
+        self.assertIsInstance(row.state_entered, datetime)
+        assert isinstance(row.report, the_list.ListReport)
+        self.assertEqual((row.report.kind, row.report.words), (the_list.ReportKind.VALIDATION, words))
+        self.assertFalse(any(entry['key'] == key for entry in cache.get().entries))
+
+    def test_change_return_retry_updates_the_words_after_a_failed_verdict_save(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        self.addCleanup(cache.close)
+        key = 'page-owner/C1'
+        first_words = 'Check the first margin.'
+        new_words = 'Check the second margin.'
+        with patch.object(change_review, 'save_verdict', side_effect=OSError('The verdict write failed.')):
+            with self.assertRaisesRegex(question_record.AnswerRefused, 'The answer could not be saved'):
+                _ = cache.save(self.card_body(cache.get(), key, 'not works', first_words), self.status)
+        first, = the_list.records(keeper.id)
+        self.assertEqual(first.report, the_list.ListReport(the_list.ReportKind.CHANGE, key, first_words))
+        self.assertFalse(change_review.review_rows(self.fixture.review_list)[0].get('Verdict'))
+
+        _ = cache.save(self.card_body(cache.get(), key, 'not works', new_words), self.status)
+        saved, = the_list.records(keeper.id)
+        self.assertEqual(saved.number, first.number)
+        self.assertEqual(saved.report, the_list.ListReport(the_list.ReportKind.CHANGE, key, new_words))
+        row = next(row for row in change_review.review_rows(self.fixture.review_list) if row['#'] == 'C1')
+        self.assertEqual(row['Verdict'], 'not works: '+new_words)
+
+    def test_failed_validation_shows_the_validators_words_in_list_details(self) -> None:
+        _ = fixture_member('producer', name='morty')
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        self.addCleanup(cache.close)
+        key = 'page-owner/C1'
+        saved = cache.save(self.card_body(cache.get(), key, 'validate', 'Check the margin.'), self.status)
+        assert isinstance(saved.delivery, change_page.MessageDelivery)
+        words = 'The last row covers the margin.'
+        result = change_review.save_verdict(self.fixture.review_list, 'C1', words, self.fixture.production,
+                                            validation_id=saved.delivery.attempt)
+        self.assertIsInstance(result, change_review.VerdictSaved)
+        self.assertNotIn(key, {item.key for item in review_items.read_open(self.root)})
+        page = list_page.render(self.root, include_counts=False).decode()
+        self.assertIn('<h3>Validation result</h3><p>'+words+'</p>', page)
+
+    def test_edited_validation_retry_shows_the_validators_result(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        key = 'page-owner/C1'
+        first = review_page.build_snapshot(self.root)
+        request = self.card_body(first, key, 'validate', 'Check the first row.')
+        with patch.object(self.status, 'write_slots', side_effect=OSError('The delivery slot cannot be saved.')):
+            with self.assertRaisesRegex(OSError, 'The delivery slot cannot be saved.'):
+                _ = review_page.submit(self.root, request, self.status, snapshot=first)
+        original, = the_list.records(keeper.id)
+        self.assertEqual(original.report, the_list.ListReport(
+            the_list.ReportKind.VALIDATION, key, 'Check the first row.',
+            validation_log=review_items.ValidationLogStart(1)))
+
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        self.addCleanup(cache.close)
+        words = 'Check the last row.'
+        saved = cache.save(self.card_body(cache.get(), key, 'validate', words), self.status)
+        assert isinstance(saved.delivery, change_page.MessageDelivery)
+        result_words = 'The last row covers the margin.'
+        result = change_review.save_verdict(self.fixture.review_list, 'C1', result_words, self.fixture.production,
+                                            validation_id=saved.delivery.attempt)
+        self.assertIsInstance(result, change_review.VerdictSaved)
+        html = list_page.render(self.root, include_counts=False).decode()
+        self.assertTrue('<h3>Validation result</h3><p>'+result_words+'</p>' in html)
+        updated, = the_list.records(keeper.id)
+        self.assertEqual(updated.number, original.number)
+        self.assertEqual(updated.report, the_list.ListReport(
+            the_list.ReportKind.VALIDATION, key, words, validation_log=review_items.ValidationLogStart(2)))
+
+    def test_validation_list_details_show_only_the_filed_attempt(self) -> None:
+        _ = fixture_member('producer', name='morty')
+        key = 'page-owner/C1'
+        first, _ = review_page.submit(self.root, self.body(key, 'validate', 'Check the first margin.'), self.status)
+        assert isinstance(first, change_page.MessageDelivery)
+        prior_words = 'The first margin is too wide.'
+        result = change_review.save_verdict(self.fixture.review_list, 'C1', prior_words, self.fixture.production,
+                                            validation_id=first.attempt)
+        self.assertIsInstance(result, change_review.VerdictSaved)
+
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        self.addCleanup(cache.close)
+        second = cache.save(self.card_body(cache.get(), key, 'validate', 'Check the second margin.'), self.status)
+        assert isinstance(second.delivery, change_page.MessageDelivery)
+        pending = list_page.render(self.root, include_counts=False).decode()
+        self.assertFalse('<h3>Validation result</h3>' in pending, 'The pending check has no result.')
+
+        current_words = 'The second margin is too narrow.'
+        result = change_review.save_verdict(self.fixture.review_list, 'C1', current_words, self.fixture.production,
+                                            validation_id=second.delivery.attempt)
+        self.assertIsInstance(result, change_review.VerdictSaved)
+        completed = list_page.render(self.root, include_counts=False).decode()
+        self.assertIn('<h3>Validation result</h3><p>'+current_words+'</p>', completed)
+        self.assertFalse('<h3>Validation result</h3><p>'+prior_words+'</p>' in completed,
+                         'The result omits the previous failure.')
+
+    def test_moved_validation_shows_its_result_after_the_move_marker_write_fails(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        key = 'page-owner/C1'
+        first, _ = review_page.submit(self.root, self.body(key, 'validate', 'Check the first margin.'), self.status)
+        assert isinstance(first, change_page.MessageDelivery)
+        first_result = change_review.save_verdict(self.fixture.review_list, 'C1', 'The first check failed.',
+                                                  self.fixture.production, validation_id=first.attempt)
+        self.assertIsInstance(first_result, change_review.VerdictSaved)
+
+        second, _ = review_page.submit(self.root, self.body(key, 'validate', 'Check the next margin.'), self.status)
+        assert isinstance(second, change_page.MessageDelivery)
+        with patch.object(change_review, 'record_review_log', side_effect=OSError('The source write failed.')):
+            with self.assertRaisesRegex(OSError, 'The source write failed'):
+                _ = the_list.move_review_waits(self.root, staff.snapshot())
+        saved, = the_list.records(keeper.id)
+        pending = list_page.render(self.root, include_counts=False).decode()
+        self.assertFalse('<h3>Validation result</h3>' in pending, 'The pending check has no result.')
+
+        words = 'The second check failed.'
+        result = change_review.save_verdict(self.fixture.review_list, 'C1', words, self.fixture.production,
+                                            validation_id=second.attempt)
+        self.assertIsInstance(result, change_review.VerdictSaved)
+        self.assertEqual(the_list.move_review_waits(self.root, staff.snapshot()), [])
+        self.assertEqual(the_list.records(keeper.id), [saved])
+
+        third, _ = review_page.submit(self.root, self.body(key, 'validate', 'Check the last margin.'), self.status)
+        assert isinstance(third, change_page.MessageDelivery)
+        third_result = change_review.save_verdict(self.fixture.review_list, 'C1', 'The third check failed.',
+                                                  self.fixture.production, validation_id=third.attempt)
+        self.assertIsInstance(third_result, change_review.VerdictSaved)
+        page = list_page.render(self.root, include_counts=False).decode()
+        self.assertEqual(re.findall(r'<h3>Validation result</h3><p>(.*?)</p>', page), [words])
+
+    def test_move_review_waits_retries_without_duplicate_items_or_log_lines(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        key = 'page-owner/C1'
+        _ = review_page.submit(self.root, self.body(key, 'validate', 'Check the result.'), self.status)
+        with patch.object(change_review, 'record_review_log', side_effect=OSError('The source write failed.')):
+            with self.assertRaisesRegex(OSError, 'The source write failed'):
+                _ = the_list.move_review_waits(self.root, staff.snapshot())
+        partial, = the_list.records(keeper.id)
+        report = investigation.file(self.fixture.unit.id, 'Check startup', 'Keep the full words.\n\nCheck the log.',
+                                    waiting_why='A check is due.')
+        before = {item.key:item for item in review_items.read(self.root)}
+        report_key = review_items.investigation_record_key(report)
+        self.assertEqual(before[key].state, review_items.ReviewState.VALIDATING)
+        self.assertEqual(before[report_key].state, review_items.ReviewState.WAITING)
+        with (patch.object(staff, 'caller_identity', return_value=keeper.current_session),
+              patch.object(review_link, 'review_root', return_value=self.root)):
+            with redirect_stdout(io.StringIO()) as first:
+                self.assertEqual(the_list.main(['move-review-waits']), 0)
+            with redirect_stdout(io.StringIO()) as repeat:
+                self.assertEqual(the_list.main(['move-review-waits']), 0)
+        self.assertEqual(len(first.getvalue().splitlines()), 2)
+        self.assertEqual(repeat.getvalue(), '')
+        rows = the_list.records(keeper.id)
+        self.assertEqual(len(rows), 2)
+        self.assertIn(partial, rows)
+        current = review_page.build_snapshot(self.root)
+        self.assertTrue({key, report_key}.isdisjoint(entry['key'] for entry in current.entries))
+        for row in rows:
+            assert isinstance(row.report, the_list.ListReport)
+            moved_key = row.report.evidence_key
+            record = current.records[moved_key]
+            self.assertEqual(record.log[:-1], before[moved_key].log)
+            self.assertEqual(record.log[-1].words, f'moved to List item {row.number}')
+        native = investigation.load(report.owner, report.id)
+        self.assertEqual(native.question, report.question)
+        self.assertIsInstance(native.list_destination, investigation.ListDestination)
+        self.assertEqual(partial.report, the_list.ListReport(the_list.ReportKind.VALIDATION, key, 'Check the result.',
+                                                           validation_log=review_items.ValidationLogStart(1)))
+
+    def test_move_review_waits_keeps_sources_that_open_after_the_scan(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        report = investigation.file(self.fixture.unit.id, 'Check the startup', 'Read the startup log.',
+                                    waiting_why='A check is due.')
+        key = 'page-owner/C1'
+        delivery, _ = review_page.submit(self.root, self.body(key, 'question', 'Check the log.'), self.status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        question = self.status.slots(delivery.page, delivery.row).question
+        assert isinstance(question, change_page.OpenQuestion)
+        scanned = review_items.read(self.root)
+        self.assertTrue(self.status.answer_question(delivery.page, delivery.row, question.question_id, 'The log is clear.'))
+        _ = investigation.answer(report.owner, report.id, 'The service starts.')
+        with patch.object(review_items, 'read', return_value=scanned):
+            self.assertEqual(the_list.move_review_waits(self.root, staff.snapshot()), [])
+        self.assertEqual(the_list.records(keeper.id), [])
+        current = {item.key: item for item in review_items.read(self.root)}
+        for identity in (key, review_items.investigation_record_key(report)):
+            self.assertEqual(current[identity].state, review_items.ReviewState.OPEN)
+            self.assertFalse(review_items.on_list(current[identity]))
+
+    def test_migrated_investigation_reply_stays_on_the_list(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        owner = self.fixture.unit
+        report = investigation.file(owner.id, 'Check the startup', 'Read the startup log.',
+                                    waiting_why='A check is due.')
+        destination, = the_list.move_review_waits(self.root, staff.snapshot())
+        self.assertEqual(destination.keeper, keeper.id)
+        _ = investigation.answer(owner.id, report.id, 'The service starts.')
+        key = review_items.investigation_record_key(report)
+        self.assertNotIn(key, {item.key for item in review_items.read_open(self.root)})
+        _, queue = review_items.next_queue('investigation', owner, False, staff.snapshot())
+        self.assertEqual(queue, [])
+        self.assertEqual(review_items.ready_investigations(owner.id), 0)
+        page = list_page.render(self.root, include_counts=False).decode()
+        self.assertIn('Read the startup log.', page)
+        self.assertIn('The service starts.', page)
+
+    def test_migrated_change_keeps_the_request_and_reply_on_the_list(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        key = 'page-owner/C1'
+        words = 'Check the final entry in the log.'
+        delivery, _ = review_page.submit(self.root, self.body(key, 'question', words), self.status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        slots = self.status.slots(delivery.page, delivery.row)
+        question = slots.question
+        assert isinstance(question, change_page.OpenQuestion)
+        self.status.write_slots(delivery.page, delivery.row, replace(slots, waiting_why=''))
+        before = next(item for item in review_items.read(self.root) if item.key == key)
+        self.assertEqual(before.waiting_why, '')
+
+        _ = the_list.move_review_waits(self.root, staff.snapshot())
+        report, = the_list.records(keeper.id)
+        self.assertEqual(report.report, the_list.ListReport(the_list.ReportKind.CHANGE, key, words))
+        self.assertTrue(self.status.answer_question(delivery.page, delivery.row, question.question_id, 'The entry is present.'))
+        self.assertNotIn(key, {item.key for item in review_items.read_open(self.root)})
+        page = list_page.render(self.root, include_counts=False).decode()
+        self.assertIn(words, page)
+        self.assertIn('The entry is present.', page)
+
+    def test_moved_efficiency_keeps_the_pending_question_words(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        _, key = self.decisions()
+        words = 'Which check will this remove?\n\nKeep the crash check.'
+        _ = review_page.submit(self.root, self.body(key, 'question', words), self.status)
+        item = next(item for item in review_items.read(self.root) if item.key == key)
+        self.assertEqual(item.state, review_items.ReviewState.WAITING)
+
+        _ = the_list.move_review_waits(self.root, staff.snapshot())
+        row, = the_list.records(keeper.id)
+        self.assertEqual(row.report, the_list.ListReport(the_list.ReportKind.EFFICIENCY, key, words))
+
+    def test_investigation_file_command_uses_the_shared_list_report(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        owner = self.fixture.unit
+        with (patch.object(staff, 'caller_identity', return_value=owner.current_session),
+              redirect_stdout(io.StringIO()) as result):
+            self.assertEqual(investigation.main(['file', '--title', 'Check the startup',
+                '--question', 'Read the startup log.', '--waiting-why', 'A check is due.']), 0)
+        report = investigation.load(owner.id, result.getvalue().strip())
+        item, = the_list.records(keeper.id)
+        self.assertEqual(report.list_destination, investigation.ListDestination(keeper.id, item.number))
+        key = review_items.investigation_record_key(report)
+        self.assertEqual(item.report, the_list.ListReport(the_list.ReportKind.INVESTIGATION, key, report.question))
+        self.assertFalse(any(entry['key'] == key for entry in review_page.build_snapshot(self.root).entries))
+
+    def test_investigation_file_reuses_the_native_id_after_interrupted_list_filing(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        owner = self.fixture.unit
+        arguments = ['file', '--title', 'Check the startup', '--question', 'Read the startup log.',
+                     '--waiting-why', 'A check is due.']
+        with patch.object(staff, 'caller_identity', return_value=owner.current_session):
+            with (patch.object(the_list, 'file_report', side_effect=OSError('The List write failed.')),
+                  redirect_stdout(io.StringIO()) as failed, redirect_stderr(io.StringIO())):
+                self.assertEqual(investigation.main(arguments), 1)
+            self.assertEqual(failed.getvalue(), '')
+            before, = investigation.records(owner.id)
+            self.assertEqual(the_list.records(keeper.id), [])
+
+            review_actions.recover_interrupted_list_reports()
+            first, = the_list.records(keeper.id)
+            with redirect_stdout(io.StringIO()) as retried:
+                self.assertEqual(investigation.main(arguments), 0)
+            self.assertEqual(retried.getvalue(), before.id+'\n')
+            review_actions.recover_interrupted_list_reports()
+            self.assertEqual(the_list.records(keeper.id), [first])
+            self.assertEqual([record.id for record in investigation.records(owner.id)], [before.id])
+
+            with redirect_stdout(io.StringIO()) as filed_again:
+                self.assertEqual(investigation.main(arguments), 0)
+            self.assertNotEqual(filed_again.getvalue(), retried.getvalue())
+            self.assertEqual(len(the_list.records(keeper.id)), 2)
+
+    def test_investigation_file_retries_titles_with_quotes_and_spaces(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        owner = self.fixture.unit
+        cases = (('Check the "ready" status', True), ('  Check the pause  ', False),
+                 ('  Check the "start" status  ', True))
+        with patch.object(staff, 'caller_identity', return_value=owner.current_session):
+            for title, recover in cases:
+                with self.subTest(title=title, recover=recover):
+                    previous = investigation.records(owner.id)
+                    list_count = len(the_list.records(keeper.id))
+                    arguments = ['file', '--title', title, '--question', 'Read the log.',
+                                 '--waiting-why', '  A check is due.  ']
+                    with (patch.object(the_list, 'file_report', side_effect=OSError('The List write failed.')),
+                          redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+                        self.assertEqual(investigation.main(arguments), 1)
+                    before = investigation.records(owner.id)
+                    self.assertEqual(len(before), len(previous)+1)
+                    self.assertEqual(before[-1].title, title)
+                    if recover:
+                        review_actions.recover_interrupted_list_reports()
+                    with redirect_stdout(io.StringIO()) as retried:
+                        self.assertEqual(investigation.main(arguments), 0)
+                    self.assertEqual(retried.getvalue(), before[-1].id+'\n')
+                    self.assertEqual(len(investigation.records(owner.id)), len(before))
+                    self.assertEqual(len(the_list.records(keeper.id)), list_count+1)
+
+    def test_investigation_file_skips_an_unrelated_pending_record_with_a_damaged_body(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        owner = self.fixture.unit
+        with investigation.file_for_list(investigation.InvestigationPurpose.LIST_INVESTIGATION):
+            damaged = investigation.file(owner.id, '  Check the "old" log  ', 'Read the old log.',
+                                         waiting_why='A check is due.')
+        path = investigation.review_record_path(owner.id, damaged.id)
+        contents = path.read_text().partition(record_store.section('Answer'))[0]
+        _ = path.write_text(contents)
+
+        with (patch.object(staff, 'caller_identity', return_value=owner.current_session),
+              redirect_stdout(io.StringIO()) as filed, redirect_stderr(io.StringIO()) as errors):
+            status = investigation.main(['file', '--title', '  Check the "new" log  ',
+                                         '--question', 'Read the new log.', '--waiting-why', 'A check is due.'])
+        self.assertEqual(status, 0, errors.getvalue())
+        error, = errors.getvalue().splitlines()
+        self.assertTrue(error.startswith(f'investigation: {path}:'), error)
+        report = investigation.load(owner.id, filed.getvalue().strip())
+        row, = the_list.records(keeper.id)
+        self.assertEqual(report.list_destination, investigation.ListDestination(keeper.id, row.number))
+        self.assertEqual(path.read_text(), contents)
+
+    def test_investigation_file_skips_an_unrelated_pending_record_with_invalid_utf8(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        owner = self.fixture.unit
+        with investigation.file_for_list(investigation.InvestigationPurpose.LIST_INVESTIGATION):
+            damaged = investigation.file(owner.id, 'Old report', 'Read the old log.', waiting_why='A check is due.')
+        path = investigation.review_record_path(owner.id, damaged.id)
+        contents = path.read_bytes().replace(b'Read the old log.', b'Read the old log\xff')
+        _ = path.write_bytes(contents)
+
+        with (patch.object(staff, 'caller_identity', return_value=owner.current_session),
+              redirect_stdout(io.StringIO()) as filed, redirect_stderr(io.StringIO()) as errors):
+            status = investigation.main(['file', '--title', 'New report', '--question', 'Read the new log.',
+                                         '--waiting-why', 'A check is due.'])
+        self.assertEqual(status, 0, errors.getvalue())
+        error, = errors.getvalue().splitlines()
+        self.assertTrue(error.startswith(f'investigation: {path}:'), error)
+        self.assertIn('utf-8', error)
+        identity = filed.getvalue().strip()
+        self.assertEqual(identity, f'I{int(damaged.id[1:])+1}')
+        report = investigation.load(owner.id, identity)
+        row, = the_list.records(keeper.id)
+        self.assertEqual(report.list_destination, investigation.ListDestination(keeper.id, row.number))
+        self.assertEqual(path.read_bytes(), contents)
+
+        with (patch.object(staff, 'caller_identity', return_value=owner.current_session),
+              redirect_stdout(io.StringIO()) as refused, redirect_stderr(io.StringIO())):
+            status = investigation.main(['file', '--title', 'Old report', '--question', 'Read the old log.',
+                                         '--waiting-why', 'A check is due.'])
+        self.assertEqual(status, 1)
+        self.assertEqual(refused.getvalue(), '')
+        self.assertEqual(the_list.records(keeper.id), [row])
+        self.assertEqual(path.read_bytes(), contents)
 
     def test_completed_bug_stays_in_its_store_and_out_of_review(self) -> None:
         producer = fixture_member('producer', name='builds')
