@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from pathlib import Path
 import plistlib
@@ -85,24 +85,63 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
         # The mount table can still show the original path after a rename.
         return next((path for path in (moved_mount, mount) if path is not None and path.is_mount()), None)
 
+    def cleanup_command(self, attempts: list[str], *arguments: str) -> bool:
+        command = list(arguments)
+        try:
+            result = run_mac_fixture_command(command, timeout=20)
+        except AssertionError as error:
+            attempts.append(str(error))
+            return False
+        except OSError as error:
+            attempts.append(f"{shlex.join(command)}\ncommand did not start: {error}")
+            return False
+        attempts.append("\n".join([shlex.join(command), f"exit status: {result.returncode}",
+                                   "stdout:", result.stdout, "stderr:", result.stderr]))
+        return result.returncode == 0
+
+    def detach_image_device(self, image: Path, root: Path, attempts: list[str]) -> None:
+        for attached in self.attached_images():
+            if attached.get("image-path") != str(image):
+                continue
+            entities = cast(list[dict[str, str]], attached["system-entities"])
+            points = (Path(point) for entry in entities if (point := entry.get("mount-point")))
+            for point in points:
+                target = point.resolve()
+                if not point.is_absolute() or target == root or not target.is_relative_to(root):
+                    return
+            devices = {device for entry in entities if (device := entry.get("dev-entry"))
+                       and re.fullmatch(r"/dev/disk[0-9]+", device)}
+            if len(devices) == 1:
+                _ = self.cleanup_command(attempts, "/usr/bin/hdiutil", "detach", "-force", devices.pop())
+            return
+
     def detach_image(self, image: Path, mount: Path, moved_mount: Path | None,
-                     images: list[dict[str, object]]) -> None:
+                     images: list[dict[str, object]], attempts: list[str]) -> None:
         root = image.parent.resolve()
         expected_points = {path.resolve() for path in (mount, moved_mount) if path is not None}
         for attached in images:
             if attached.get("image-path") != str(image):
                 continue
             entities = cast(list[dict[str, str]], attached["system-entities"])
-            points = (Path(point) for entry in entities if (point := entry.get("mount-point")))
-            if not any(point.is_absolute() and point.resolve() in expected_points for point in points):
+            points = {Path(point).resolve() for entry in entities if (point := entry.get("mount-point"))
+                      and Path(point).is_absolute()}
+            if not points & expected_points or any(
+                    point == root or not point.is_relative_to(root) for point in points):
                 continue
-            if current := self.current_mount(mount, moved_mount):
-                target = current.resolve()
-                if target != root and target.is_relative_to(root):
-                    _ = self.disk_image("detach", "-force", str(target))
+            current = self.current_mount(mount, moved_mount)
+            if current is None:
+                return
+            target = current.resolve()
+            if target == root or not target.is_relative_to(root):
+                return
+            if not self.cleanup_command(attempts, "/usr/bin/hdiutil", "detach", "-force", str(target)):
+                if target.resolve() == target and target.is_mount():
+                    _ = self.cleanup_command(attempts, "/sbin/umount", "-f", str(target))
+                self.detach_image_device(image, root, attempts)
+            return
 
     def assert_no_images(self, image: Path, mount: Path, moved_mount: Path | None,
-                         images: list[dict[str, object]]) -> None:
+                         images: list[dict[str, object]], attempts: list[str]) -> None:
         root = image.parent.parent
         remaining: list[str] = []
         for attached in images:
@@ -115,17 +154,25 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
             entities = cast(list[dict[str, str]], attached["system-entities"])
             paths = [entry["mount-point"] for entry in entities if "mount-point" in entry]
             remaining.extend(paths or [image_path])
-        self.assertFalse(remaining, f"disk images still attached: {', '.join(remaining)}")
+        self.assertFalse(remaining, "\n".join([f"disk images still attached: {', '.join(remaining)}", *attempts]))
 
     def cleanup_image(self, image: Path, mount: Path, moved_mount: Path | None) -> None:
-        with suppress(AssertionError):
-            self.detach_image(image, mount, moved_mount, self.attached_images())
-        remaining = self.attached_images()
-        if any(entry.get("image-path") == str(image) for entry in remaining):
-            with suppress(AssertionError):
-                self.detach_image(image, mount, moved_mount, remaining)
+        attempts: list[str] = []
+        try:
+            self.detach_image(image, mount, moved_mount, self.attached_images(), attempts)
+        except AssertionError as error:
+            attempts.append(str(error))
+        try:
             remaining = self.attached_images()
-        self.assert_no_images(image, mount, moved_mount, remaining)
+            if any(entry.get("image-path") == str(image) for entry in remaining):
+                try:
+                    self.detach_image(image, mount, moved_mount, remaining, attempts)
+                except AssertionError as error:
+                    attempts.append(str(error))
+                remaining = self.attached_images()
+        except AssertionError as error:
+            raise AssertionError("\n".join([str(error), *attempts])) from error
+        self.assert_no_images(image, mount, moved_mount, remaining, attempts)
 
     @contextmanager
     def attach_image(self, image: Path, mount: Path, moved_mount: Path | None = None) -> Generator[None]:
@@ -197,7 +244,7 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
             subprocess.CompletedProcess([], 0, info, ""),
             subprocess.CompletedProcess([], 0, "", ""),
         ]) as run, mock.patch.object(Path, "is_mount", autospec=True, return_value=True) as is_mount):
-            self.detach_image(image, mount, moved, self.attached_images())
+            self.detach_image(image, mount, moved, self.attached_images(), [])
         is_mount.assert_called_once_with(moved)
         self.assertEqual(run.call_args.args[0], ["/usr/bin/hdiutil", "detach", "-force", str(moved)])
 
@@ -206,12 +253,65 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
         mount = image.parent / "unit/proof/unit"
         moved = image.parent / "moved/proof/unit"
         info = plistlib.dumps({"images": [
-            {"image-path": str(image), "system-entities": [{"mount-point": str(mount)}]},
+            {"image-path": str(image), "system-entities": [
+                {"dev-entry": "/dev/disk9"},
+                {"mount-point": str(mount)},
+            ]},
         ]}).decode()
-        with (mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, info, "")),
+        commands = [
+            (["/usr/bin/hdiutil", "detach", "-force", str(moved)], 1, "path output", "path error"),
+            (["/sbin/umount", "-f", str(moved)], 2, "unmount output", "unmount error"),
+            (["/usr/bin/hdiutil", "detach", "-force", "/dev/disk9"], 3, "device output", "device error"),
+        ]
+        query = subprocess.CompletedProcess([], 0, info, "")
+        failures = [subprocess.CompletedProcess(*command) for command in commands]
+        with (mock.patch.object(subprocess, "run", side_effect=[
+                  query, *failures[:2], query, failures[2], query,
+                  *failures[:2], query, failures[2], query,
+              ]),
               mock.patch.object(Path, "is_mount", return_value=True),
-              self.assertRaisesRegex(AssertionError, f"disk images still attached: {re.escape(str(moved))}")):
+              self.assertRaises(AssertionError) as failure):
             self.cleanup_image(image, mount, moved)
+        detail = str(failure.exception)
+        self.assertIn(f"disk images still attached: {moved}", detail)
+        for command, status, stdout, stderr in commands:
+            attempt = f"{shlex.join(command)}\nexit status: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            self.assertEqual(detail.count(attempt), 2, detail)
+
+    def test_failed_path_detach_uses_the_moved_path_and_a_fresh_device_match(self) -> None:
+        image = Path("/private/tmp/test-root/fixture/removal.dmg")
+        mount = image.parent / "unit/proof/unit"
+        moved = image.parent / "moved/proof/unit"
+        initial: list[dict[str, object]] = [{"image-path": str(image), "system-entities": [
+            {"dev-entry": "/dev/disk8"},
+            {"mount-point": str(mount)},
+        ]}]
+        other = {"image-path": str(image.with_suffix(".other")), "system-entities": [{"dev-entry": "/dev/disk8"}]}
+        matched = {"image-path": str(image), "system-entities": [{"dev-entry": "/dev/disk9"}]}
+        outside = {"image-path": str(image), "system-entities": [
+            {"dev-entry": "/dev/disk9", "mount-point": str(image.parent.parent / "outside")},
+        ]}
+        for fresh, device in (([other, matched], "/dev/disk9"), ([other], None), ([outside], None)):
+            with self.subTest(fresh=fresh):
+                reply = plistlib.dumps({"images": fresh}).decode()
+                results = [
+                    subprocess.CompletedProcess([], 1, "", "no such disk"),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, reply, ""),
+                ]
+                commands = [
+                    ["/usr/bin/hdiutil", "detach", "-force", str(moved)],
+                    ["/sbin/umount", "-f", str(moved)],
+                    ["/usr/bin/hdiutil", "info", "-plist"],
+                ]
+                if device is not None:
+                    results.append(subprocess.CompletedProcess([], 0, "", ""))
+                    commands.append(["/usr/bin/hdiutil", "detach", "-force", device])
+                with (mock.patch.object(subprocess, "run", side_effect=results) as run,
+                      mock.patch.object(Path, "is_mount", autospec=True, return_value=True) as is_mount):
+                    self.detach_image(image, mount, moved, initial, [])
+                self.assertEqual([call.args[0] for call in run.call_args_list], commands)
+                self.assertEqual(is_mount.call_args_list, [mock.call(moved), mock.call(moved)])
 
     def test_final_query_recovers_an_image_after_an_info_timeout(self) -> None:
         image = Path("/private/tmp/test-root/fixture/removal.dmg")
@@ -243,7 +343,7 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
             images: list[dict[str, object]] = [{"image-path": str(image), "system-entities": [entity]}]
             with (self.subTest(entity=entity), mock.patch.object(Path, "is_mount", return_value=True),
                   mock.patch.object(subprocess, "run") as run):
-                self.detach_image(image, mount, None, images)
+                self.detach_image(image, mount, None, images, [])
             run.assert_not_called()
 
     def test_mac_fixture_timeout_reports_partial_output(self) -> None:
