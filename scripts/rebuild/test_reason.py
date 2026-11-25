@@ -86,7 +86,7 @@ class RebuildReasonTests(unittest.TestCase):
 
     def review_card(self, row: for_you.ForYouRow) -> str:
         members = staff.snapshot()
-        inputs = review_page.ReviewBodyInputs(change_page.ReviewBrowser("fixture"), members, 4, "",
+        inputs = review_page.ReviewBodyInputs(change_page.ReviewBrowser("fixture"), members, 4,
                                               {}, ZoneInfo("America/New_York"), staff_names.StaffNames(members))
         return review_page.details(review_items.for_you_item(row, members), inputs)
 
