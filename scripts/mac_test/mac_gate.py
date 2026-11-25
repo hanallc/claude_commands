@@ -5,16 +5,19 @@ from __future__ import annotations
 import argparse
 from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stdout, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 import fcntl
 import json
+import math
 import os
 import re
 from pathlib import Path
+import plistlib
 import select
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,7 +34,7 @@ from scripts.buildlog import store
 from scripts.copies import copies
 from scripts.lib import build_folders, conf, copy_record, process_group, scratch
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
+from scripts.lib.process_start import Gone, Started, Unreadable, Zombie, process_start
 from scripts.production import gate
 from scripts.production.affected_modules import GraphError
 from scripts.production.gate_modules import GateRefused, discover_test_modules
@@ -48,6 +51,7 @@ RESULT_PREFIX = 'mac_gate_result='
 CLEANUP_ERROR_PREFIX = 'mac_gate_cleanup_error='
 QUEUE_COMMAND = (sys.executable, str(Path(__file__).with_name('mac_queue_run.py')))
 MAC_TIME_LIMIT_S = 3600
+HDIUTIL_TIMEOUT_S = 20
 
 
 class CheckoutCleanup(StrEnum):
@@ -59,6 +63,7 @@ class CheckoutCleanup(StrEnum):
 class MacGateResult:
     row: dict[str, object]
     run: gate.GateRun
+    cleanup_error: str = ''
 
 
 @dataclass(frozen=True)
@@ -140,6 +145,181 @@ def stop_inline_checkout(repo: Path) -> None:
         raise GateRefused('Test processes still use the Mac checkout')
 
 
+def release_gate_folder_lease(path: Path, retained: os.stat_result, owner_pid: int) -> None:
+    """Release the dead guest's lease while the original folder stays in place."""
+    if not path.is_absolute() or not stat.S_ISDIR(retained.st_mode) or owner_pid <= 1:
+        return
+    with suppress(OSError, ValueError), build_folders.folder_removal_lease(path, wait=False) as lease:
+        if not isinstance(lease, build_folders.HeldFolderRemovalLease) or lease.folder != path:
+            return
+        lease_name = build_folders.lease_path(path).name
+        lock_name = path.name + '.lock'
+        sidecars = lease.sidecar_identities()
+        if lock_name not in sidecars:
+            return
+        try:
+            descriptor = os.open(lease_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=lease.directory)
+        except FileNotFoundError:
+            if lease_name in sidecars:
+                return
+        else:
+            with os.fdopen(descriptor, encoding='utf-8') as record:
+                info = os.fstat(record.fileno())
+                if (info.st_dev, info.st_ino, info.st_ctime_ns) != sidecars.get(lease_name):
+                    return
+                pid = ledger.mapping(cast(object, json.load(record))).get('pid')
+                if type(pid) is not int or pid != owner_pid:
+                    return
+        if not isinstance(process_start(owner_pid), (Gone, Zombie)):
+            return
+        for name in (lease_name, lock_name):
+            if (path.parent.resolve() != path.parent
+                    or not os.path.samestat(path.parent.stat(), os.fstat(lease.directory))
+                    or not os.path.samestat(retained, os.stat(path.name, dir_fd=lease.directory, follow_symlinks=False))
+                    or lease.sidecar_identities() != sidecars):
+                return
+            if name in sidecars:
+                os.unlink(name, dir_fd=lease.directory)
+                del sidecars[name]
+
+
+def run_hdiutil(*arguments: str, timeout: float = HDIUTIL_TIMEOUT_S) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(['/usr/bin/hdiutil', *arguments], stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as error:
+        stdout = (error.stdout or b'').decode(errors='replace')
+        stderr = (error.stderr or b'').decode(errors='replace')
+        raise GateRefused(f'{error}\nstdout:\n{stdout}\nstderr:\n{stderr}') from error
+
+
+def hdiutil_detail(result: subprocess.CompletedProcess[bytes]) -> str:
+    stdout = result.stdout.decode(errors='replace')
+    stderr = result.stderr.decode(errors='replace')
+    return f'hdiutil exit status: {result.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}'
+
+
+def attached_gate_images(folder: Path, *, timeout: float = HDIUTIL_TIMEOUT_S) -> list[dict[str, object]]:
+    result = run_hdiutil('info', '-plist', timeout=timeout)
+    if result.returncode:
+        raise GateRefused(f'Cannot read attached disk images. {hdiutil_detail(result)}')
+    reply = ledger.mapping(cast(object, plistlib.loads(result.stdout)))
+    images = reply.get('images')
+    if not isinstance(images, list):
+        raise ValueError('hdiutil returned no image list')
+    attached: list[dict[str, object]] = []
+    for entry in cast(list[object], images):
+        image = ledger.mapping(entry)
+        source = image.get('image-path')
+        if isinstance(source, str) and Path(source).is_absolute():
+            backing_file = Path(source).resolve()
+            if backing_file != folder and backing_file.is_relative_to(folder):
+                attached.append(image)
+    return attached
+
+
+def gate_image_entities(image: dict[str, object]) -> list[dict[str, object]]:
+    entities = image.get('system-entities')
+    return [ledger.mapping(entry) for entry in cast(list[object], entities)] if isinstance(entities, list) else []
+
+
+def gate_image_target(folder: Path, image: dict[str, object]) -> tuple[str, Path]:
+    devices: set[str] = set()
+    mounts: list[Path] = []
+    for entity in gate_image_entities(image):
+        device = entity.get('dev-entry')
+        if isinstance(device, str) and re.fullmatch(r'/dev/disk[0-9]+', device):
+            devices.add(device)
+        if 'mount-point' in entity:
+            point = entity['mount-point']
+            if not isinstance(point, str) or not Path(point).is_absolute():
+                raise GateRefused(f'Invalid mount point for {image["image-path"]}: {point}')
+            mount = Path(point).resolve()
+            if mount == folder or not mount.is_relative_to(folder):
+                raise GateRefused(f'Mount outside the gate folder for {image["image-path"]}: {mount}')
+            if mount.is_mount():
+                mounts.append(mount)
+    if len(devices) != 1 or not mounts:
+        raise GateRefused(f'Cannot identify one disk device and a live mount for {image["image-path"]}')
+    return devices.pop(), mounts[0]
+
+
+def detach_gate_image(path: Path, folder: Path, retained: os.stat_result, image: dict[str, object],
+                      deadline: float, interval: float) -> list[dict[str, object]]:
+    device, mount = gate_image_target(folder, image)
+    source = image['image-path']
+    busy = ''
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GateRefused(busy or f'The image detach time expired for {device} at {mount}')
+        try:
+            attached = attached_gate_images(folder, timeout=remaining)
+        except GateRefused as error:
+            if not busy:
+                raise
+            raise GateRefused(f'{busy}\n{error}') from error
+        current = next((entry for entry in attached if entry['image-path'] == source
+                        and any(entity.get('dev-entry') == device for entity in gate_image_entities(entry))), None)
+        if current is None:
+            break
+        _, mount = gate_image_target(folder, current)
+        if not os.path.samestat(retained, path.lstat()) or path.resolve() != folder:
+            raise GateRefused('The gate folder changed before image detach')
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GateRefused(busy or f'The image detach time expired for {device} at {mount}')
+        try:
+            result = run_hdiutil('detach', device, timeout=remaining)
+        except GateRefused as error:
+            raise GateRefused(f'{busy or f"Cannot detach disk image {device} at {mount}."}\n{error}') from error
+        if result.returncode == 0:
+            attached = attached_gate_images(folder)
+            if any(entry['image-path'] == source for entry in attached):
+                raise GateRefused(f'Disk image {device} remains attached at {mount}. {hdiutil_detail(result)}')
+            return attached
+        detail = hdiutil_detail(result)
+        if result.returncode != 16 or 'resource busy' not in detail.lower():
+            raise GateRefused(f'Cannot detach disk image {device} at {mount}. {detail}')
+        busy = f'Disk image {device} is busy at {mount}. {detail}'
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(interval, remaining))
+    return attached_gate_images(folder)
+
+
+def detach_attached_gate_images(path: Path, folder: Path, retained: os.stat_result) -> None:
+    images = attached_gate_images(folder)
+    if not images:
+        return
+    try:
+        seconds = float(os.environ['MAC_GATE_DETACH_SECONDS'])
+        interval = float(os.environ['MAC_GATE_DETACH_INTERVAL_SECONDS'])
+    except (KeyError, ValueError) as error:
+        raise GateRefused('The Mac gate cleanup has no valid detach timing') from error
+    if not all(math.isfinite(value) and value > 0 for value in (seconds, interval)):
+        raise GateRefused('The Mac gate cleanup has no valid detach timing')
+    deadline = time.monotonic() + seconds
+    while images:
+        images = detach_gate_image(path, folder, retained, images[0], deadline, interval)
+
+
+def detach_gate_images(path: Path, retained: os.stat_result) -> None:
+    """Detach the images stored in the retained gate folder."""
+    try:
+        if not stat.S_ISDIR(retained.st_mode) or not build_folders.may_remove_build_path(path):
+            raise GateRefused('Cannot detach images from a protected gate folder')
+        with build_folders.folder_removal_lease(path, wait=False, create=True, transient_lock=True) as lease:
+            if not isinstance(lease, build_folders.HeldFolderRemovalLease) or lease.folder != path:
+                raise GateRefused('Cannot hold the gate folder for image detach')
+            folder = path.resolve(strict=True)
+            if not os.path.samestat(retained, folder.lstat()):
+                raise GateRefused('The gate folder changed before image detach')
+            detach_attached_gate_images(path, folder, retained)
+    except (GateRefused, OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        raise GateRefused(f'The Mac kept its gate folder {path}. {error}') from error
+
+
 def stop_guest(journal: Path, deadline: float, *, task_ended: bool = False) -> None:
     """Recover the guest's recorded resources or check the groups after task cleanup."""
     try:
@@ -176,11 +356,27 @@ def stop_guest(journal: Path, deadline: float, *, task_ended: bool = False) -> N
     folders = record['folders']
     if not isinstance(folders, list):
         raise GateRefused('The Mac gate journal has no folder list')
+    owner_pid = ledger.instant(record, 'pid')
     for name in cast(list[str], folders):
         path = Path(name)
-        with suppress(FileNotFoundError):
-            if not build_folders.remove_build_folder(path, wait=False):
-                raise GateRefused(f'The Mac kept its gate folder {path}')
+        try:
+            retained = path.lstat()
+        except FileNotFoundError:
+            retained = None
+        try:
+            if retained is not None and sys.platform == 'darwin':
+                detach_gate_images(path, retained)
+            try:
+                removed = build_folders.remove_build_folder(path, wait=False, expected=retained)
+            except FileNotFoundError:
+                continue
+            if not removed:
+                images = '. Its images are detached.' if retained is not None and sys.platform == 'darwin' else ''
+                raise GateRefused(f'The Mac kept its gate folder {path}{images}')
+        except GateRefused:
+            if retained is not None:
+                release_gate_folder_lease(path, retained, owner_pid)
+            raise
 
 
 def checkout_task(folder: Path) -> str:
@@ -330,12 +526,19 @@ def checkout_bundle(ssh: list[str], checkout: str, repo: Path, folder: Path,
     return [bundle]
 
 
-def checkout_cleanup_command(root: str, runner: str, checkout: str) -> str:
+def checkout_stop_command(root: str, runner: str) -> str:
+    settings = conf.read('mac_gate')
+    seconds = settings.number('cleanup.detach_seconds')
+    interval = settings.number('cleanup.detach_interval_seconds')
+    return f'MAC_GATE_DETACH_SECONDS={seconds} MAC_GATE_DETACH_INTERVAL_SECONDS={interval} {runner} stop {root}'
+
+
+def checkout_cleanup_command(root: str, stop: str, checkout: str) -> str:
     fallback = f'printf "{CheckoutCleanup.RETAINED}\\n"'
     if Path(checkout).is_absolute():
         probe = copies.path_missing_command(checkout)
         fallback = f'if {probe}; then printf "{CheckoutCleanup.REMOVED}\\n"; else {fallback}; fi'
-    return (f'if [ -f {root}/mac_gate.py ]; then {runner} stop {root}; '
+    return (f'if [ -f {root}/mac_gate.py ]; then {stop}; '
             f'else rm -rf -- {root} && {fallback}; fi')
 
 
@@ -365,11 +568,11 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
         if phase == 'cleanup-ended':
             from scripts.mac_test.mac_queue_run import MAC_GATE_SCRIPT
 
-            cleanup = f'{python} "$HOME/.claude"/{MAC_GATE_SCRIPT} stop {root}'
+            cleanup = checkout_stop_command(root, f'{python} "$HOME/.claude"/{MAC_GATE_SCRIPT}')
             if Path(checkout).is_absolute():
                 cleanup += ' ' + shlex.join(['--checkout', checkout])
         else:
-            cleanup = checkout_cleanup_command(root, runner, checkout)
+            cleanup = checkout_cleanup_command(root, checkout_stop_command(root, runner), checkout)
         result = subprocess.run([*ssh, cleanup], capture_output=True, text=True, check=False)
         outcome = result.stdout.strip()
         if result.returncode or outcome not in (CheckoutCleanup.REMOVED, CheckoutCleanup.RETAINED):
@@ -382,6 +585,7 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
             copies.unregister_remote(host, checkout)
         return 0
 
+    stop = checkout_stop_command(root, runner)
     request = cloud_gate.read(folder / 'request.json')
     local_repo = Path((folder / 'local-repo').read_text())
     owner = copies.source_owner(local_repo)
@@ -401,7 +605,7 @@ def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
     if not response.startswith('mac_gate_checkout=') or not Path(checkout).is_absolute() or '\n' in checkout:
         raise GateRefused('The Mac did not confirm the gate checkout')
     write_text_atomic(checkout_file, checkout)
-    _ = argv_file.with_suffix('.json.close').write_text(checkout_cleanup_command(root, runner, checkout))
+    _ = argv_file.with_suffix('.json.close').write_text(checkout_cleanup_command(root, stop, checkout))
     mirror = copies.RemoteMirror(owner, copies.SelectedRepository(repository), host, checkout, session,
                                  task=checkout_task(Path(remote)))
     _ = argv_file.with_suffix('.json.lease').write_text(str(copies.remote_lease_path(mirror)))
@@ -485,6 +689,8 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
                cancellation: gate.MacGateCancellation | UseCallerProcessLifetime,
                ) -> MacGateResult | str:
     """Wait for a Mac placement in queue order and run the assigned modules."""
+    from scripts.mac_test.mac_transport import MAC_GATE_EXIT_STATUS_FD
+
     try:
         repo = repo.resolve()
         with ExitStack() as cleanup:
@@ -513,9 +719,12 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
             command[2:2] = ['--caller-fd', str(caller)]
             if cancelled.poll(0):
                 return 'The Mac gate was cancelled'
+            guest_status = cleanup.enter_context(tempfile.TemporaryFile())
+            status_fd = guest_status.fileno()
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                        text=True, encoding='utf-8', errors='replace', start_new_session=True,
-                                       pass_fds=(caller,))
+                                       env={**os.environ, MAC_GATE_EXIT_STATUS_FD: str(status_fd)},
+                                       pass_fds=(caller, status_fd))
             with process:
                 try:
                     output, _ = process.communicate(timeout=MAC_TIME_LIMIT_S)
@@ -527,25 +736,34 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
             was_cancelled = bool(cancelled.poll(0))
             status = process.returncode
             assert status is not None
-            if status or was_cancelled:
+            cleanup_error = queue_cleanup_error(lines, folder)
+            _ = guest_status.seek(0)
+            if was_cancelled or (status and not (cleanup_error and guest_status.read() == b'0\n')):
                 return queue_failure(lines, folder, status, cancelled=was_cancelled)
             results = [line.removeprefix(RESULT_PREFIX) for line in lines if line.startswith(RESULT_PREFIX)]
             if len(results) != 1:
+                if status:
+                    return queue_failure(lines, folder, status, cancelled=False)
                 return 'The Mac returned no unique gate result'
             row = ledger.mapping(cast(object, json.loads(results[0])))
             run = cloud_gate.decode_requested_run(row, request)
             cloud_gate.validate_run_modules(run, request)
-            return MacGateResult(row, run)
+            return MacGateResult(row, run, cleanup_error)
     except subprocess.TimeoutExpired:
         return f'The Mac queue call exceeded {MAC_TIME_LIMIT_S:g} seconds'
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, GateRefused, GraphError, copies.CopyError, scratch.ScratchError) as error:
         return f'The Mac gate could not finish: {error}'
 
 
-def queue_failure(lines: list[str], folder: Path, status: int, *, cancelled: bool) -> str:
+def queue_cleanup_error(lines: list[str], folder: Path) -> str:
     prefix = f'{CLEANUP_ERROR_PREFIX}{folder.name}:'
-    cleanup = next((line.removeprefix(prefix).strip() for line in reversed(lines) if line.startswith(prefix)), '')
+    return next((line.removeprefix(prefix).strip() for line in reversed(lines) if line.startswith(prefix)), '')
+
+
+def queue_failure(lines: list[str], folder: Path, status: int, *, cancelled: bool) -> str:
+    cleanup = queue_cleanup_error(lines, folder)
     reason = cleanup or ('The Mac gate was cancelled' if cancelled else f'The Mac queue call ended with status {status}')
+    prefix = f'{CLEANUP_ERROR_PREFIX}{folder.name}:'
     detail = next((line.strip().removeprefix(prefix).strip() for line in reversed(lines) if line.strip()), '')
     return f'{reason}: {detail}' if detail and detail != reason and not detail.startswith(RESULT_PREFIX) else reason
 
@@ -556,7 +774,11 @@ def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: 
     """Return the observed module results or a reason to run them on natedev."""
     outcome = run_remote(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                          selected=selected, cancellation=cancellation)
-    return outcome if isinstance(outcome, str) else outcome.run
+    if isinstance(outcome, str):
+        return outcome
+    if outcome.cleanup_error:
+        print(f'Mac gate: {outcome.cleanup_error}', file=sys.stderr, flush=True)
+    return outcome.run
 
 
 @dataclass(frozen=True)
@@ -621,6 +843,7 @@ class Arguments(argparse.Namespace):
     argv_file: Path = Path()
     repo: Path = Path()
     output: Path = Path()
+    modules: list[str] = field(default_factory=list)
     mac_result: Path = Path()
     natedev_record: Path = Path()
     owner: str = ''
@@ -631,9 +854,11 @@ class Arguments(argparse.Namespace):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='action', required=True)
-    manual = commands.add_parser('run', help='run all modules on the Mac and save the result')
+    manual = commands.add_parser('run', help='run modules on the Mac and save the result')
     _ = manual.add_argument('repo', type=Path)
     _ = manual.add_argument('output', type=Path)
+    _ = manual.add_argument('--module', dest='modules', action='append', metavar='PATH',
+                            help='select a test module by repository-relative path (repeatable)')
     writer = commands.add_parser('write-list', help='write exclusions from a Mac result and a natedev gate log')
     _ = writer.add_argument('repo', type=Path)
     _ = writer.add_argument('mac_result', type=Path)
@@ -671,12 +896,18 @@ def main() -> int:
         elif args.action == 'write-list':
             write_modules(args.repo.resolve(), args.mac_result, args.natedev_record)
         else:
-            result = run_remote(args.repo.resolve(), mode=gate.SuiteMode.GATE, full=True,
-                                module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=gate.ALL_MODULES,
+            repo = args.repo.resolve()
+            selected = (gate.TreeSelection(tuple(args.modules), gate.checked_git(repo, 'rev-parse', 'HEAD^{tree}'))
+                        if args.modules else gate.ALL_MODULES)
+            result = run_remote(repo, mode=gate.SuiteMode.GATE, full=True,
+                                module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=selected,
                                 cancellation=USE_CALLER_PROCESS_LIFETIME)
             if isinstance(result, str):
                 raise GateRefused(result)
-            cloud_gate.save(args.output, result.row)
+            cleanup = {'cleanup_error': result.cleanup_error} if result.cleanup_error else {}
+            cloud_gate.save(args.output, result.row | cleanup)
+            if result.cleanup_error:
+                raise GateRefused(result.cleanup_error)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, GateRefused, GraphError, copies.CopyError, scratch.ScratchError) as error:
         print(f'Mac gate: {error}', file=sys.stderr)
         return 2
