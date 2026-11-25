@@ -141,6 +141,23 @@
       "time": "2026-11-01T12:00:00-05:00"
     }
   },
+  "hana_shot.mac_locked": {
+    "typical": {
+      "objections": [
+        {
+          "quote": "Hana screenshot waits for the Mac",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "The screenshot starts when the Mac is ready.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: nate 2026-11-24 22:41 PST on the Review page picked 'Locked now: the test runs at once, and the phone text words are OK' ('okay - i'm locking the mac now'); sdlc 22:47 PST: covered; reviewer: claude-opus-5-5",
+      "sha256": "c74fe3284561fbd52311a98fe81337704e0b74530d2411e78cd4e3c144e5292b",
+      "time": "2026-11-25T01:47:52.420368-05:00"
+    }
+  },
   "mac.locked": {
     "typical": {
       "objections": [],
