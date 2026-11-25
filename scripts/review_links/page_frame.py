@@ -21,6 +21,8 @@ QUESTION_WAITING = "The {owner_role} will answer this"
 OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "aws_machines", "placement_disk",
                          "rebuilds", "review", "studio"))
 TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
+STATUS_ELEMENT = re.compile(rb'\s*<p class="page-status"(?=[\s>])[^>]*>.*?</p>', re.DOTALL)
+PAGE_TOP = '<div class="page-top">'
 HEADING_ACTIONS = '<div class="page-heading-actions" data-page-actions>'
 
 
@@ -77,21 +79,27 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, 
     if main is None or b'data-page-owner="' in content:
         return content
     control = owner_control(page, owner, members, recipient=recipient, actions=actions).encode()
-    # The action area comes just before the heading row. Only the area stays in view; the title scrolls.
-    # The script at the end of the row places the area before the browser shows the content after it.
     area = HEADING_ACTIONS.encode() + control + b'</div>'
     heading = TITLE_ELEMENT.search(content, main.end())
-    if heading is not None:
-        row = area + b'<div class="page-heading">' + heading[0] + HEADING_MEASURE.encode() + b'</div>'
-        content = content[:heading.start()] + row + content[heading.end():]
+    top = PAGE_TOP.encode()
+    if heading is None:
+        row = area + b'<div class="page-heading"></div>'
+        content = content[:main.end()] + top + row + b'</div>' + HEADING_MEASURE.encode() + content[main.end():]
     else:
-        row = area + b'<div class="page-heading">' + HEADING_MEASURE.encode() + b'</div>'
-        content = content[:main.end()] + row + content[main.end():]
+        row = area + b'<div class="page-heading">' + heading[0] + b'</div>'
+        if content[:heading.start()].endswith(top):
+            content = content[:heading.start()] + row + content[heading.end():]
+            content = content.replace(PAGE_TOP_SCRIPT.encode(), b'', 1)
+        else:
+            status = STATUS_ELEMENT.match(content, heading.end())
+            end = status.end() if status else heading.end()
+            content = (content[:heading.start()] + top + row + content[heading.end():end] + b'</div>'
+                       + HEADING_MEASURE.encode() + content[end:])
     head = re.search(rb"<head(?=[\s>])[^>]*>", content)
     if head is not None:
         content = content[:head.end()] + PAGE_SCRIPT_ERRORS.encode() + content[head.end():]
-    row_style = HEADING_STYLE.encode()
-    style = (OWNER_STYLE + ACTIONS_SCRIPT).encode()
+    row_style = (HEADING_STYLE + PAGE_TOP_STYLE).encode()
+    style = (OWNER_STYLE + PAGE_TOP_SCRIPT + ACTIONS_SCRIPT).encode()
     if BUTTON_STATES.encode() not in content:
         style = b'<style>' + BUTTON_STATES.encode() + b'</style>' + style
     if row_style not in content:
@@ -105,30 +113,38 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, 
     return content
 
 
-HEADING_MEASURE = '<script>window.measurePageActions?.();</script>'
-# Without the script, the area takes its height above the title, so the title never goes under the controls.
-# When the full title and the controls fit on one line, the script puts the controls beside the title.
+HEADING_MEASURE = '<script>measurePageActions();</script>'
 HEADING_STYLE = ('.page-heading{box-sizing:border-box;display:flex;align-items:center;margin-bottom:8px}'
                  + '.page-heading>h1{margin:0}'
-                 + '[data-page-actions-beside]+.page-heading{min-height:var(--page-actions-height,0px);'
+                 + '[data-page-actions-beside]+.page-heading{min-height:var(--page-controls-height,0px);'
                  + 'padding-inline-end:var(--page-actions-reserve,0px)}')
 
+# Page content and its sticky bars use z-index 3 or lower. The frozen top uses 4.
+# Menus, tooltips and the Builds paused badge use 5 to 10. The Undo stack is above them.
+# Modal dialogs and the image zoom use the browser top layer.
+PAGE_TOP_STYLE = """
+:root{scroll-padding-top:var(--page-top-height,0px)}
+main:has(>.page-top>.page-status,>.page-top>.page-heading>h1):not(.page-wide){max-width:1124px}
+.page-top{position:sticky;top:0;z-index:4;display:flow-root;flex:0 0 100%;min-width:0;
+margin-block:-8px 12px;padding-block:8px;background:var(--bg,Canvas)}
+.page-top>.page-status{position:relative;top:auto;z-index:auto;padding-block:0;margin:0}
+.page-top .page-status>[data-status-reason]{white-space:normal;overflow-wrap:anywhere;min-width:0}
+@media (max-width:640px){
+ .page-top{display:contents}
+ .page-top>:is(.page-heading,.page-title){position:sticky;top:8px;z-index:4;flex:0 0 100%;min-width:0;
+ background:var(--bg,Canvas);box-shadow:0 -8px var(--bg,Canvas)}
+ .page-top>[data-page-actions-beside]{z-index:5}
+ .page-top>.page-status{margin-bottom:20px;flex-basis:100%}
+}
+"""
 
-# The stacking order, lowest to highest: page content with its own sticky bars (z-index 3 or lower),
-# the action area (4), overlays such as tooltips, menus and the Builds paused badge (5 to 10),
-# and the sticky status line (20).
-# Beside the title, the action area has no height, so it takes no layout space.
-# Its controls overflow it at the top right, and the heading row keeps space for them.
-# Only the area sticks; the title scrolls with the page.
-# A copy of the area shows in each open page window. The window rule in ACTIONS_SCRIPT adds and removes it.
 OWNER_STYLE = """<style>
 .page-owner{display:flex;align-items:center;gap:8px;min-width:0;font:600 14px/1.4 system-ui,sans-serif}
 .page-owner-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .page-owner button{display:grid;place-items:center;flex:none;width:36px;height:36px;min-height:36px;
 margin:0;padding:7px;background:var(--card,#1a1a19);color:var(--ink-2,#c3c2b7);border:1px solid var(--line,#34332f);border-radius:8px;cursor:pointer}
 .page-owner svg{width:18px;height:18px}
-:root{--page-actions-space:8px;--page-actions-height:36px}
-[data-page-actions]{position:sticky;top:var(--page-actions-space);z-index:4;flex:0 0 100%;display:flex;
+[data-page-actions]{position:relative;flex:0 0 100%;display:flex;
 justify-content:flex-end;align-items:flex-start;gap:8px;max-width:100%;margin-bottom:8px;color:var(--ink,CanvasText)}
 [data-page-actions][data-page-actions-beside]{height:0;margin-bottom:0}
 [data-page-actions]>*{background:var(--bg,Canvas);box-shadow:0 0 0 4px var(--bg,Canvas)}
@@ -136,29 +152,12 @@ justify-content:flex-end;align-items:flex-start;gap:8px;max-width:100%;margin-bo
 [data-page-window-actions]>*{background:none;box-shadow:none;pointer-events:auto}
 </style>"""
 
-
-# The script sets the sizes that the heading row and other sticky parts use.
-# A Late or Failed status line sticks directly below the stuck area, so the page order never changes.
-# The window rule: while a page window (a modal dialog) is open, the rest of the page is inert.
-# Thus each open window gets a copy of the action area at the same place, above the window.
-# The window keeps the copy until it closes. When a window meets the controls from left to right,
-# the frame sets --page-window-top on it to the bottom of the action area. A centered window limits
-# its height with it, so it stays centered and clears the copy. A window at the top starts below it.
-# Without the value, each window has the place and the height of main.
-# A screenshot address names the open window, so the capture shows the page as the user sees it.
-ACTIONS_SCRIPT = """<script>
-function stickyPageStatusHeight(){
- const banner=document.querySelector('[data-page-status]');
- return banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
-}
-function pageActionsSpace(){
- return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-actions-space'));
-}
+PAGE_TOP_SCRIPT = """<script>
 function pageActionsArea(){
  return document.querySelector('[data-page-actions]:not([data-page-window-actions])');
 }
-// The area has no height; this box holds the controls that overflow it.
-function pageActionsBox(area=pageActionsArea()){
+// The controls can extend below the zero-height action area.
+function pageActionsBox(area){
  const home=area.getBoundingClientRect();
  let left=home.right,bottom=home.top;
  for(const control of area.children){
@@ -168,28 +167,60 @@ function pageActionsBox(area=pageActionsArea()){
  return {top:home.top,left,right:home.right,bottom,width:home.right-left,height:bottom-home.top};
 }
 function stuckPageActionsBottom(){
- const area=pageActionsArea();
- return area ? pageActionsSpace()+pageActionsBox(area).height+stickyPageStatusHeight() : stickyPageStatusHeight();
+ const padding=getComputedStyle(document.documentElement).getPropertyValue('--page-top-height');
+ return parseFloat(padding) || 0;
 }
-// The full title and the controls must fit on one line, or the controls stay above the title.
+// Keep the controls above the title when they cannot fit beside it.
 function measurePageActions(){
- const root=document.documentElement, home=pageActionsArea();
- if(!home) return;
- const row=home.nextElementSibling, title=row?.querySelector(':scope>h1');
- const set=(name,pixels)=>{if(root.style.getPropertyValue(name)!==pixels+'px') root.style.setProperty(name,pixels+'px');};
- const box=pageActionsBox(home);
- let beside=box.width>0;
- if(title && beside){
-  const style=title.getAttribute('style');
-  title.style.cssText+=';flex:none;width:max-content';
-  beside=title.getBoundingClientRect().width+box.width+12<=row.clientWidth;
-  if(style===null) title.removeAttribute('style'); else title.setAttribute('style',style);
+ const root=document.documentElement, top=document.querySelector('.page-top');
+ if(!top) return;
+ const home=pageActionsArea(), heading=top.querySelector('.page-heading,.page-title');
+ const set=(target,name,pixels)=>{
+  if(target.style.getPropertyValue(name)!==pixels+'px') target.style.setProperty(name,pixels+'px');
+ };
+ if(home && heading){
+  const title=heading.querySelector(':scope>h1'), box=pageActionsBox(home);
+  let beside=box.width>0;
+  if(title && beside){
+   const style=title.getAttribute('style');
+   title.style.cssText+=';flex:none;width:max-content';
+   beside=title.getBoundingClientRect().width+box.width+12<=heading.clientWidth;
+   if(style===null) title.removeAttribute('style'); else title.setAttribute('style',style);
+  }
+  home.toggleAttribute('data-page-actions-beside',beside);
+  set(top,'--page-controls-height',box.height);
+  set(top,'--page-actions-reserve',beside ? box.width+12 : 0);
  }
- if(home.hasAttribute('data-page-actions-beside')!==beside) home.toggleAttribute('data-page-actions-beside',beside);
- set('--page-status-height',stickyPageStatusHeight());
- set('--page-actions-height',box.height);
- set('--page-actions-reserve',beside ? box.width+12 : 0);
+ const phone=matchMedia('(max-width:640px)').matches;
+ const frozen=phone ? heading : top;
+ const height=frozen ? frozen.getBoundingClientRect().height+parseFloat(getComputedStyle(frozen).top) : 0;
+ set(root,'--page-top-height',height);
+ const panel=top.parentElement;
+ if(panel.id==='panel') set(panel,'scroll-padding-top',height+parseFloat(getComputedStyle(panel).paddingTop));
 }
+document.addEventListener('DOMContentLoaded',()=>{
+ const top=document.querySelector('.page-top');
+ if(!top) return;
+ const measure=()=>{
+  measurePageActions();
+  dispatchEvent(new Event('page-top-resize'));
+ };
+ const resize=new ResizeObserver(measure);
+ resize.observe(top);
+ for(const child of top.children) resize.observe(child);
+ const title=top.querySelector('.page-heading>h1');
+ if(title) resize.observe(title);
+ const home=pageActionsArea();
+ if(home) for(const control of home.children) resize.observe(control);
+ addEventListener('resize',measure);
+ measure();
+},{once:true});
+</script>"""
+
+# A modal window keeps a copy of the action area in view.
+# Keep the parts of the window below the copy where they meet horizontally.
+# The screenshot address names the open window.
+ACTIONS_SCRIPT = """<script>
 (()=>{
  const root=document.documentElement, windows=[];
  let clicked=null, reopen='', reopenClick=null;
@@ -228,9 +259,10 @@ function measurePageActions(){
   const home=pageActionsArea();
   if(!home) return;
   const box=home.getBoundingClientRect(), area=pageActionsBox(home);
+  const top=Math.max(box.top,8);
   for(const entry of windows){
    const {dialog,copy}=entry;
-   Object.assign(copy.style,{top:box.top+'px',left:box.left+'px',width:box.width+'px'});
+   Object.assign(copy.style,{top:top+'px',left:box.left+'px',width:box.width+'px'});
    if(measure){
     // The window gets the value only where its parts meet the controls from left to right.
     const meets=()=>[...dialog.children].some(part=>{
@@ -243,7 +275,7 @@ function measurePageActions(){
     entry.meets=meets() || (dialog.style.getPropertyValue('--page-window-top')!==''
      && (dialog.style.removeProperty('--page-window-top'),meets()));
    }
-   const value=entry.meets ? area.bottom+'px' : '';
+   const value=entry.meets ? (top+area.height)+'px' : '';
    if(dialog.style.getPropertyValue('--page-window-top')!==value) dialog.style.setProperty('--page-window-top',value);
   }
  }
@@ -302,23 +334,7 @@ function measurePageActions(){
   },{once:true});
   addEventListener('load',()=>{openNamed();watch.disconnect();reopen='';},{once:true});
  }
- document.addEventListener('DOMContentLoaded',()=>{
-  const home=pageActionsArea(), banner=document.querySelector('[data-page-status]');
-  if(!home) return;
-  const row=home.nextElementSibling, title=row?.querySelector(':scope>h1');
-  const measure=()=>{measurePageActions();place();};
-  const resize=new ResizeObserver(measure);
-  resize.observe(home);
-  for(const control of home.children) resize.observe(control);
-  if(title){resize.observe(row);resize.observe(title);}
-  if(banner){
-   resize.observe(banner);
-   // The clock writes the same state each second; only a new state can change the position.
-   new MutationObserver(records=>{if(records.some(record=>record.oldValue!==banner.dataset.state)) measure();})
-    .observe(banner,{attributeFilter:['data-state'],attributeOldValue:true});
-  }
-  measure();
- },{once:true});
+ addEventListener('page-top-resize',()=>place());
 })();
 </script>"""
 
@@ -351,8 +367,8 @@ def icon_svg(name: str) -> str:
     return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
 
 
-def title(text: str, page: str) -> str:
-    """Build the title and refresh status."""
+def title(text: str, page: str, *, status_companion: str = "") -> str:
+    """Build the title and refresh status with an optional control."""
     settings = conf.read_or_repository("console")
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
                "renderLimit": settings.number("status.render_limit_seconds"),
@@ -363,13 +379,15 @@ def title(text: str, page: str) -> str:
                         ('Live', 'radio'), ('Reading', 'loader-circle'), ('Late', 'clock-alert'),
                         ('Failed', 'triangle-alert'), ('Paused', 'circle-pause')))
     heading = f'<h1 class="page-title">{html.escape(text)}</h1>'
-    return (heading
+    return (PAGE_TOP + heading
             + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
             + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" data-page-facts>'
             + '<span class="page-status-state">' + icons + '<span data-status-word>Reading…</span></span>'
             + '<span data-status-age hidden></span><span data-status-trip hidden></span>'
             + '<span data-status-render hidden></span><span data-status-reason hidden></span>'
-            + '<span class="page-status-announcement" aria-live="polite" data-status-announcement></span></p>')
+            + '<span class="page-status-announcement" aria-live="polite" data-status-announcement></span></p>'
+            + status_companion + '</div>'
+            + PAGE_TOP_SCRIPT + HEADING_MEASURE)
 
 
 def rendered(content: bytes, started: float, read_at: float) -> bytes:
@@ -565,9 +583,7 @@ STYLE = (BUTTON_STATES
          + ':root{scrollbar-gutter:stable}'
          + 'body{background:var(--bg,Canvas);color:var(--ink,CanvasText)}'
          + 'main{box-sizing:border-box;margin:0 auto;padding:32px 32px 64px}'
-         + 'main:has(>.page-status,>.page-heading>h1):not(.page-wide){max-width:1124px}'
          + '.page-title{font:700 26px/1.25 system-ui,sans-serif;letter-spacing:normal;margin:0 0 8px;color:var(--ink,CanvasText)}'
-         + HEADING_STYLE
          + '@media (max-width:560px){:root:not(.layout-measuring) main{padding:24px 16px 48px}}'
          + r'''
 .page-status{display:flex;align-items:center;flex-wrap:wrap;gap:6px 0;font:14px/1.5 system-ui,sans-serif;
@@ -582,8 +598,6 @@ color:var(--ink-2);margin:0 0 20px;min-height:21px;background:var(--bg,Canvas)}
 .page-status[data-state=Late] .page-status-state,.page-status-slow{color:var(--warning)}
 .page-status[data-state=Failed] .page-status-state{color:var(--error)}
 .page-status[data-state=Paused] .page-status-state{color:var(--ink-3)}
-.page-status[data-state=Late],.page-status[data-state=Failed]{position:sticky;z-index:20;padding:4px 0;
-top:calc(var(--page-actions-space,0px) + var(--page-actions-height,0px))}
 .page-status-announcement{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
 [data-status-icon=Reading] svg{animation:page-status-turn 1s linear infinite}
 @keyframes page-status-turn{to{transform:rotate(360deg)}}
@@ -604,7 +618,7 @@ border-radius:8px;background:var(--card);color:var(--ink)}
 .review-action-group+.review-action-group{padding-left:26px;border-left:1px solid var(--line)}
 @media(max-width:960px){.review-action-group+.review-action-group{padding-left:0;border:0}}
 @media(max-width:560px){.review-actions{flex-direction:column;align-items:flex-start;flex-wrap:nowrap}}
-''')
+''' + HEADING_STYLE + PAGE_TOP_STYLE)
 
 class ReturningActionHeading(StrEnum):
     ITEM_RETURNS = "The item returns to you"
@@ -1112,7 +1126,9 @@ MOTION_SCRIPT = r'''function createCardMotion(content){
   animation.cancel();animations=animations.filter(item=>item!==animation);
  }
  function scroll(element,always=false){
-  if(element && (always || element.getBoundingClientRect().top<0))
+  if(!element) return;
+  const inset=typeof stuckPageActionsBottom==='function' ? stuckPageActionsBottom() : 0;
+  if(always || element.getBoundingClientRect().top<inset)
    element.scrollIntoView({block:'start',behavior:reduced() ? 'instant' : 'smooth'});
  }
  function fadeIn(target){
@@ -1130,7 +1146,8 @@ MOTION_SCRIPT = r'''function createCardMotion(content){
  async function revealCard(target){
   finish();const operation=generation;
   if(reduced()){scroll(target,true);return;}
-  const top=Math.min(Math.max(0,scrollY+target.getBoundingClientRect().top),
+  const inset=typeof stuckPageActionsBottom==='function' ? stuckPageActionsBottom() : 0;
+  const top=Math.min(Math.max(0,scrollY+target.getBoundingClientRect().top-inset),
    Math.max(0,document.documentElement.scrollHeight-innerHeight));
   if(Math.abs(top-scrollY)>1) await new Promise(resolve=>{
    const done=()=>{clearTimeout(timeout);removeEventListener('scrollend',done);resolve();};

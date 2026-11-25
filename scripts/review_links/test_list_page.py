@@ -67,6 +67,10 @@ NOW = datetime(2026, 11, 16, 18, tzinfo=UTC)
 FIREFOX_MIN_SHARED_WIDTH = 500
 
 
+def without_scripts(markup: str) -> str:
+    return re.sub(r'<script\b[^>]*>.*?</script>', '', markup, flags=re.DOTALL)
+
+
 REVIEW_CARD_CONFLICT_CHECK = r"""
 async function reviewCardPosition(card){
  const win=card.defaultView;
@@ -1427,6 +1431,27 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
   await closeNewItem(dialog,'the review box');
   await opensAgain(capture.place,doc=>doc.querySelector('[data-list-review-dialog]')?.open===true
    && doc.querySelector('[data-list-review-dialog] iframe')!==null,'the review box');
+  dialog.querySelector('.list-review-close').click();
+  await until(()=>!dialog.open,'the review box to close');
+  frameElement.style.width='390px';
+  const spacer=document.createElement('div');
+  spacer.style.height='1000px';
+  document.querySelector('.page-top').after(spacer);
+  scrollTo({top:800,behavior:'instant'});
+  await painted();
+  const original=document.querySelector('[data-page-actions] [data-owner-new]');
+  check(innerWidth===390 && scrollY>=500 && original.getBoundingClientRect().bottom<0,
+   'At 390 px the page scrolls past the original New item button.');
+  link.click();
+  await until(()=>dialog.open && dialog.hasAttribute('data-fullscreen'),'the phone review box');
+  await painted();
+  const copy=dialog.querySelector('[data-page-window-actions] [data-owner-new]');
+  const box=copy.getBoundingClientRect();
+  check(box.top>=0 && box.bottom<=innerHeight && onTop(copy),'The New item copy is clickable on the phone.');
+  check(dialog.getBoundingClientRect().top>=box.bottom-1,'The phone review box starts below the New item copy.');
+  copy.click();
+  await until(()=>newItem().matches(':modal'),'New item to open over the phone review box');
+  check(dialog.matches(':modal') && onTop(newItem()),'New item opens above the phone review box.');
  }catch(error){failures.push(String(error));}
  await report();
 })();'''
@@ -2151,9 +2176,12 @@ frame.addEventListener('load',async()=>{
    check(inView(title),'the target row is outside the viewport at '+title.getBoundingClientRect().top);
    check(title.getAnimations().some(animation=>animation.playState==='running'),'the target row has a short highlight');
    if(scenario==='banner'){
-    const bottom=banner.getBoundingClientRect().bottom,top=title.getBoundingClientRect().top;
-    check(win.getComputedStyle(banner).position==='sticky' && bottom>=60,'the tall status banner is sticky');
-    check(top>=bottom+15,'the target top '+top+' leaves a gap below the banner bottom '+bottom);
+    const frozen=banner.closest('.page-top'), box=frozen.getBoundingClientRect();
+    const top=target.getBoundingClientRect().top;
+    check(win.getComputedStyle(frozen).position==='sticky' && Math.abs(box.top)<1 &&
+     banner.getBoundingClientRect().height>=60,'the tall status line stays in the frozen top');
+    const gap=top-box.bottom;
+    check(Math.abs(gap-16)<=1,'the gap below the frozen top is '+gap+' px, expected 16 px');
    }
   }
   const expected=originalFilters.slice();
@@ -3426,7 +3454,7 @@ document.body.append(result);
         check_counts(initial, 0, 2)
         answered = list_page.render(root, include_counts=False).decode()
         check_counts(answered, 2, 0)
-        self.assertEqual(answered.partition('<script>')[0].count('<small data-new-answer>New answer</small>'), 2)
+        self.assertEqual(without_scripts(answered).count('<small data-new-answer>New answer</small>'), 2)
         news = list_page.waiting_updates(console.NewsRequest(root))
         self.assertEqual({key.rsplit('/', 1)[0] for key in news}, {f'{MORTY.id}/{item.id}' for item in items})
         read_responses: list[list_page.SavedActionState] = []
@@ -3497,7 +3525,7 @@ document.body.append(result);
             for state in states:
                 assert state is not None
                 self.assertEqual((state["parked"], state.get("unread_answer")), ("true", "false"))
-            parked = list_page.render(root, include_counts=False).decode().partition("<script>")[0]
+            parked = without_scripts(list_page.render(root, include_counts=False).decode())
             controls = parked.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
             self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["2", "0", "0", "0", "0", "2"])
             self.assertNotIn("<small data-new-answer>New answer</small>", parked)
@@ -5807,7 +5835,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         question_clock.configure_mock(**{"now.side_effect": (asked_at, answered_at)})
         with patch.object(page_question, "datetime", question_clock):
             delivery = list_page.submit(root, urlencode(fields), status)
-            opened = list_page.render(root, status=status).decode().split('<script>', 1)[0]
+            opened = without_scripts(list_page.render(root, status=status).decode())
             self.assertIn('data-waiting-for-answer="true"', opened)
             self.assertIn('<p data-waiting-note>morty will answer.</p>', opened)
             self.assertIn('Question Q1 — waiting for an answer</h3>' + asked_time, opened)
@@ -5820,7 +5848,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
                   patch.object(the_list, "now", return_value=answer_logged_at), redirect_stdout(io.StringIO())):
                 self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The <filter> changed."]), 0)
         _ = list_page.submit(root, urlencode(fields))
-        answered = list_page.render(root).decode().split('<script>', 1)[0]
+        answered = without_scripts(list_page.render(root).decode())
         self.assertIn('data-waiting-for-answer="false"', answered)
         self.assertIn('name="action" value="question"', answered)
         self.assertIn('aria-label="Unread update"', answered)
@@ -5837,7 +5865,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         current = the_list.load(MORTY.id, item.id)
         _ = list_page.submit(root, urlencode(self.fields(current, "read")))
         _ = the_list.update(MORTY.id, item.id, {"latest_status": "A newer update arrived."}, source="morty")
-        read = list_page.render(root).decode().split('<script>', 1)[0]
+        read = without_scripts(list_page.render(root).decode())
         self.assertIn('aria-label="Unread update"', read)
         panel, log = read.split('<ol class="list-log">', 1)
         self.assertNotIn('data-question="Q1"', panel)
@@ -5892,7 +5920,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
                 _ = list_page.submit(root, urlencode(fields), status)
                 saved = the_list.load(MORTY.id, item.id)
                 self.assertEqual(the_list.unread_update(saved), the_list.unread_update(current))
-                markup = list_page.render(root, include_counts=False, status=status).decode().split('<script>', 1)[0]
+                markup = without_scripts(list_page.render(root, include_counts=False, status=status).decode())
                 panel, log = markup.split('<ol class="list-log">', 1)
                 self.assertIn('data-question="Q2"', panel)
                 self.assertIn('class="question-unread">Unread</span>', panel)
@@ -5962,7 +5990,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
                         list_page.deliver(second)
                         send.assert_called_once()
                     self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=status)["waiting_for_answer"], "false")
-                    markup = list_page.render(root, include_counts=False, status=status).decode().split('<script>', 1)[0]
+                    markup = without_scripts(list_page.render(root, include_counts=False, status=status).decode())
                     self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
                     sections: dict[str, str] = {
                         match.group(1): match.group(2)
@@ -5999,7 +6027,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
                 assert isinstance(sending.owner, delivery_state.QuestionSendOwner)
                 change_page.publish_question_attempt(path, replace(sending, owner=replace(sending.owner, job_id="damaged")))
             self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=reopened)["waiting_for_answer"], "false")
-            body = list_page.render(root, include_counts=False, status=reopened).decode().split("<script>", 1)[0]
+            body = without_scripts(list_page.render(root, include_counts=False, status=reopened).decode())
             self.assertIn("Which check finished?", body)
             self.assertNotIn("Question not delivered.", body)
             self.assertNotIn('value="resend-Q1"', body)
@@ -6198,7 +6226,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         reopened = change_page.DeliveryStatus(root)
         self.assertEqual(reopened.slots(page, delivery.row).verdict, intent)
         self.assertEqual(reopened.failed_delivery(page, delivery.row), failure)
-        markup = list_page.render(root, include_counts=False).decode().split('<script>', 1)[0]
+        markup = without_scripts(list_page.render(root, include_counts=False).decode())
         self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
         self.assertIn("Question not delivered.", markup)
         self.assertNotIn('value="resend-', markup)
@@ -6248,7 +6276,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
             submission = list_page.submit(root, urlencode(self.fields(item, "question", words=words)), status)
         saved = the_list.load(MORTY.id, item.id).questions[0]
         self.assertEqual(saved.recipient, question_record.KeeperForUnavailableProducer(MORTY.id, DWIGHT.id))
-        markup = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
+        markup = without_scripts(list_page.render(root, include_counts=False, status=status).decode())
         self.assertIn(words, markup)
         self.assertIn("dwight is not live, so morty will answer.", markup)
         for text in ("Resend question", "ready to send", "may not have reached", "Question not delivered."):
@@ -6329,7 +6357,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
                 self.assertEqual(list_page.saved_action_state(MORTY.id, first.id, status=recovering)["waiting_for_answer"], "false")
                 second = first_jobs[message_id]
                 self.assertEqual(list_page.saved_action_state(MORTY.id, second.id, status=recovering)["waiting_for_answer"], "true")
-                markup = list_page.render(root, include_counts=False, status=recovering).decode().split('<script>', 1)[0]
+                markup = without_scripts(list_page.render(root, include_counts=False, status=recovering).decode())
                 self.assertIn('Question Q1 — waiting for an answer', markup)
                 self.assertNotIn("Question not delivered.", markup)
                 self.assertEqual(len(list_page.waiting_updates(console.NewsRequest(root))), 2)
@@ -6358,7 +6386,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
             restarted = change_page.DeliveryStatus(root)
             change_page.recover_review_messages(restarted)
             list_page.deliver(list_page.submit(root, urlencode(fields), restarted))
-        markup = list_page.render(root, include_counts=False).decode().split('<script>', 1)[0]
+        markup = without_scripts(list_page.render(root, include_counts=False).decode())
         self.assertIn('data-waiting-for-answer="true"', markup)
         self.assertNotIn('value="resend-Q1"', markup)
         self.assertEqual(len(transport.calls), 1)
@@ -6438,7 +6466,8 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
                                      question_record.KeeperForUnavailableProducer(MORTY.id, DWIGHT.id))
                     note = '<p data-waiting-note>dwight is not live, so morty will answer.</p>'
                     self.assertIn(note, saved.get("waiting_details_html", ""))
-                body = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
+                body = without_scripts(list_page.render(root, include_counts=False, status=status).decode())
+                self.assertIn(f'data-key="{MORTY.id}/{item.id}"', body)
                 self.assertNotIn('value="resend-Q1"', body)
 
     def test_recovery_and_list_reject_a_changed_question_message(self) -> None:
@@ -6474,7 +6503,8 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
                     change_page.recover_review_messages(status)
                     send.assert_not_called()
                     self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=status)["waiting_for_answer"], "false")
-                    body = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
+                    body = without_scripts(list_page.render(root, include_counts=False, status=status).decode())
+                    self.assertIn(f'data-key="{MORTY.id}/{item.id}"', body)
                     self.assertNotIn('value="resend-', body)
                     current = the_list.load(MORTY.id, item.id)
                     fields = urlencode(self.fields(current, "question", words=words))
@@ -6543,7 +6573,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
               redirect_stdout(io.StringIO())):
             self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The check passed."]), 0)
         reopened = change_page.DeliveryStatus(root)
-        body = list_page.render(root, include_counts=False, status=reopened).decode().split("<script>", 1)[0]
+        body = without_scripts(list_page.render(root, include_counts=False, status=reopened).decode())
         self.assertIn('data-waiting-for-answer="false"', body)
         self.assertIn('aria-label="Unread update"', body)
         self.assertEqual(body.count("Question not delivered."), 1)
@@ -6553,7 +6583,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         self.assertEqual(len(list_page.waiting_updates(console.NewsRequest(root))), 1)
         self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=reopened)["unread"], "true")
         _ = the_list.mark_read(MORTY.id, item.id, source="nate")
-        read = list_page.render(root, include_counts=False, status=reopened).decode().split("<script>", 1)[0]
+        read = without_scripts(list_page.render(root, include_counts=False, status=reopened).decode())
         self.assertRegex(read, r'data-filter-value="needs-me"[^>]*data-filter-count="0"')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")

@@ -1184,6 +1184,8 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
                   record_table.Chip('investigations', 'Investigations and Bugs', hidden=True)]
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       +'<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
+    search = ('<div class="record-filter-words"><label class="list-search-label" for="list-search">Search</label>'
+              '<input type="search" id="list-search" placeholder="Filter by id or words"></div>')
     content = (record_table.STYLE+record_table.DATE_TIME_STYLE+STYLE
         +f'<div data-review data-version="{snapshot.version}" data-show="{show}" data-refresh-seconds="{snapshot.refresh_seconds}" '
         +f'data-request-timeout-seconds="{snapshot.request_timeout_seconds}" '
@@ -1193,9 +1195,7 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         +f'data-title-limit="{snapshot.title_limit}" data-zone="{html.escape(snapshot.zone.key, quote=True)}" '
         +f'data-later="{html.escape(json.dumps(dict(snapshot.later)), quote=True)}" '
         +f'style="--list-log-max-height:{snapshot.log_max_height_rem}rem">'
-        +page_frame.title('Review', 'review')
-        +'<div class="record-filter-words"><label class="list-search-label" for="list-search">Search</label>'
-        +'<input type="search" id="list-search" placeholder="Filter by id or words"></div>'
+        +page_frame.title('Review', 'review', status_companion=search)
         +'<div class="review-queue">'
         +record_table.chip_row('Type', type_chips, 'all')
         +record_table.chip_row('Show', SHOW_CHIPS, show)
@@ -1458,13 +1458,11 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
 QUESTION_COLOR_RULE = '.question{--type-color:#b99aff}'
 STYLE = '<style>' + QUESTION_COLOR_RULE + '''
 main:has(>[data-review]){max-width:1124px}
-[data-review]{display:flex;flex-wrap:wrap;align-items:center;column-gap:16px}
+[data-review]{display:flex;flex-wrap:wrap;align-items:center}
 [data-review]>:is(.page-title,.page-heading,.review-queue){flex:0 0 100%;min-width:0}
-[data-review]>:is(.page-status,.record-filter-words){margin:0}
-[data-review]>.page-status{flex:1 1 0;min-width:0}
-[data-review]>.page-status>[data-status-reason]{white-space:normal;overflow-wrap:anywhere;min-width:0}
-[data-review]>.record-filter-words{flex:0 0 300px}
-.review-queue{margin-top:12px}
+[data-review]>.page-top{margin-bottom:4px}
+[data-review]>.page-top>.page-status{margin:0;min-width:0}
+[data-review]>.page-top>.record-filter-words{margin:0}
 .review-title{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .review-waiting-why{display:block;color:var(--ink-3);font-size:.85em}
 .review-attachments img{max-width:min(240px,100%);max-height:160px;object-fit:contain;margin-inline-end:8px}
@@ -1505,9 +1503,17 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 @media(min-width:961px){.review-handoff{display:flex;align-items:baseline;gap:.25em}}
 @media(max-width:960px){[data-review] .list-row td:last-child::before{content:'Age: '}
 .review-panel{grid-template-columns:1fr;padding:0 14px 16px}.review-log-column{display:block}}
-@media(max-width:800px){[data-review]>:is(.page-status,.record-filter-words){flex-basis:100%}
-[data-review]>.record-filter-words{margin-top:8px}
-[data-review]>.record-filter-words input{width:100%}}
+@media(width>800px){
+ [data-review]>.page-top{display:grid;grid-template-columns:minmax(0,1fr) 300px;align-items:center;column-gap:16px}
+ [data-review]>.page-top>:is(.page-title,.page-heading,[data-page-actions]){grid-column:1/-1}
+}
+@media(max-width:800px){
+ [data-review]>.page-top>.record-filter-words{width:100%;margin-top:8px}
+}
+@media(max-width:640px){
+ [data-review]>.page-top>.record-filter-words{flex:0 0 100%}
+ .review-queue{margin-top:12px}
+}
 @media(max-width:480px){[data-review] .record-filter-row{grid-template-columns:minmax(0,1fr)}}
 </style>'''
 

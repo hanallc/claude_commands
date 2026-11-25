@@ -199,18 +199,19 @@ The page uses the shared notice for deletion or delivery failures.
 The original address follows the latest saved list, including when report delivery fails.
 If the manifest update and next-list publication fail, the POST response still excludes the branches it deleted.
 Images uses the page notice if the image is deleted and the list cannot refresh.
-Each page has one action area at the top right: `<div class="page-heading-actions" data-page-actions>`.
-The area holds the owner name and the New item button, which is last.
-The heading row (`.page-heading`) holds the page title and follows the area.
-On a page without a title, the heading row is empty.
-Only the action area is sticky. The title scrolls with the page.
-The area sticks 8 px (`--page-actions-space`) below the top edge.
-Without the script, the area takes its height above the title, so the title never goes under the controls.
-A script at the end of the heading row measures the row before the browser reads the content after it.
-When the full title and the controls fit on one line, the script puts the controls beside the title.
-Then the area has no height (`data-page-actions-beside`), and the heading row keeps space for the controls.
-The script sets `--page-actions-height` and `--page-actions-reserve` from the size of the controls.
-The owner group in the area has one opaque page background with a 4 px edge, and content scrolls under it.
+The shared frame freezes the title, the action area, and the status line at the top of the page.
+Review also freezes Search.
+Search sits to the right of the status above 800 px and below the status at smaller widths.
+The frozen top has an opaque page background.
+The content scrolls under it.
+At widths of 640 px or less, only the title stays in view.
+The action area and status line scroll with the content at these widths.
+Review Search also scrolls with the content at these widths.
+The action area holds the owner name and the New item button.
+The script puts the actions beside the title when they fit on one line.
+When they do not fit, the actions stay above the title.
+The frame measures the frozen top when its size changes.
+It uses this height as the page scroll padding for anchor jumps and focused rows.
 A page can add action buttons between the owner name and New item.
 `page_frame.page_action_button(action, icon, label, dialog_id)` makes one button, and pages pass it through `actions`.
 `owner_control()` and `with_owner()` take `actions`. The names `new-item` and `owner` are reserved.
@@ -218,18 +219,18 @@ A press on a page action button opens its dialog with `showModal()` and binds it
 `bindConsoleDialog` binds each dialog one time. A second call for the same dialog does nothing.
 When the dialog closes, focus goes back to the button that opened it, and the page does not scroll.
 A press on the copy of the button inside its own open dialog moves the focus to the first control of the dialog.
-A Late or Failed status line sticks directly below the stuck area, so the page order never changes.
-Nothing steps while the page scrolls: each part moves by at most the scroll distance.
-The status line never covers the owner name or button, and the area never covers the status line.
-Scrolling never changes the layout of the content, and at scroll zero the area stays in its normal place.
-The AWS region filter sticks directly below the action area and any sticky status line.
-The Images group index sticks 16 px below the action area and any sticky status line.
-The stacking order, from lowest to highest, is as follows:
-1. Page content, which includes a page's own sticky bars (z-index 3 or lower).
-2. The action area (z-index 4).
-3. Overlays: tooltips, menus, popovers and the Builds paused badge (z-index 5 to 10).
-4. The sticky Late or Failed status line (z-index 20).
-An item jump places the focused row below the action area and the status line.
+The AWS region filter sticks directly below the frozen top.
+The page gives targets below the filter a scroll margin equal to the filter height.
+The Images group index sticks 16 px below the frozen top.
+
+The stacking order is as follows, from lowest to highest.
+
+1. Page content and its sticky bars (z-index 3 or lower).
+2. The frozen top (z-index 4).
+3. Menus, tooltips, and the Builds paused badge (z-index 5 to 10).
+4. The Undo stack.
+5. Modal dialogs and the image zoom in the browser top layer.
+
 The window rule in `page_frame.py` keeps New item available while a page window is open.
 A page window is a `<dialog>` that a page opens with `showModal()`.
 These are the windows:
@@ -239,12 +240,14 @@ These are the windows:
 4. The Accounts color picker in `accounts_page.py`.
 A modal dialog makes the rest of the page inert, and a popover shown after it is also inert.
 Thus the frame adds a copy of the action area to each window when the window starts to open (`beforetoggle`).
-The copy is the last child of the window, at the same place as the area, and the window removes it when it closes.
+The copy is the last child of the window.
+It follows the position of the action area and stays in view when that area scrolls off the phone screen.
+The window removes the copy when it closes.
 The copy has the same labels as the area. It has no `id` attributes.
 The controls in the copy have no plate and no edge, so each part of the copy that shows is a control.
 The copy itself takes no clicks: a click beside its controls goes to the window, as a click on the backdrop does.
 A window meets the action area when a part of the window and the controls of the area overlap from left to right.
-While a window meets the area, the frame sets `--page-window-top` on it to the bottom of the action area.
+While a window meets the copy, the frame sets `--page-window-top` to the bottom of the copy.
 The frame measures each open window at these times:
 - when the window opens, and when another window closes,
 - when the view or the action area changes size,
@@ -1368,7 +1371,7 @@ The table can change Show to All to reveal the target.
 A direct link with no filters opens a parked item in All.
 The table clears each filter that excludes the target and keeps each filter that matches it.
 The table scrolls to the target and highlights it briefly.
-The table leaves a gap below the sticky status banner when it shows.
+The table leaves a gap below the frozen top.
 A missing target shows “Item #N is not on the List”.
 A closed target shows “Item #N is closed”.
 The source row keeps its form and draft while it shows the target notice.
@@ -2133,6 +2136,7 @@ It is the last navigation entry, with the label `Placement disk POC` and the `to
 The server reads the HTML file named by `placement_disk.file` in `config/console.conf` on each request.
 It does not copy the file, so an edit to the file shows after a page refresh.
 The server adds the page owner control at the first `<h1>` after `<main>`.
+The panel adds the frozen top height to its top padding when it scrolls a control into view.
 When the file is missing or unreadable, or the `~` path names an unknown user, the server returns 503 with `The Placement disk POC page is not available.`
 The page loads three.js from cdnjs. Served page documents send no Content-Security-Policy, so the load works in the console frame.
 

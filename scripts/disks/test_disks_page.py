@@ -173,7 +173,8 @@ class DisksPageTests(unittest.TestCase):
         self.assertIn('</h1><p class="page-status"', page)
         self.assertIn('data-status-age hidden></span><span data-status-trip hidden></span>', page)
         self.assertIn('data-status-render hidden></span><span data-status-reason hidden></span>', page)
-        self.assertNotIn("__", page.split("<script>", 1)[0].split("</style>", 1)[1])
+        body = re.sub(r'<script\b[^>]*>.*?</script>', '', page.split('<body>', 1)[1], flags=re.DOTALL)
+        self.assertNotIn("__", body)
         settings_text = page.split('type="application/json">', 1)[1].split("</script>", 1)[0]
         self.assertEqual(json.loads(settings_text.replace("<\\/", "</")), SETTINGS)
         # The step tooltip rules and code come from the Builds page as they are, so the two pages share them.

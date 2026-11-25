@@ -735,16 +735,22 @@ function drawWindow(){
   prefix.push(prefix.at(-1)+height);
  }
  const origin=scrollY+table.getBoundingClientRect().top+table.tHead.getBoundingClientRect().height;
- if(revealKey){
-  const at=entries.findIndex(({data})=>data.key===revealKey);
-  if(at>=0){spacer(before,0);spacer(after,prefix.at(-1));const y=origin+prefix[at];if(y<scrollY || y>scrollY+innerHeight-120) scrollTo({top:y-16,behavior:'instant'});}
-  revealKey='';
+ const reveal=revealKey;
+ revealKey='';
+ const revealAt=reveal ? entries.findIndex(({data,visible})=>visible && data.key===reveal) : -1;
+ const inset=revealAt>=0 && typeof stuckPageActionsBottom==='function' ? stuckPageActionsBottom() : 0;
+ const outsideView=top=>top<inset || top>innerHeight-120;
+ let windowTop=scrollY;
+ if(revealAt>=0 && !mounted.has(reveal)){
+  const y=origin+prefix[revealAt];
+  if(outsideView(y-scrollY)) windowTop=Math.max(0,y-inset-16);
  }
- const start=Math.max(0,locate(prefix,scrollY-origin)-8);
- const end=Math.min(entries.length,start+90,Math.max(start+18,locate(prefix,scrollY-origin+innerHeight)+9));
+ const start=Math.max(0,locate(prefix,windowTop-origin)-8);
+ const end=Math.min(entries.length,start+90,Math.max(start+18,locate(prefix,windowTop-origin+innerHeight)+9));
  const focusedRow=document.activeElement?.closest('[data-list-item]');
  const focused=focusedRow?.dataset.key || options.focusKey?.();
  const ranges=[[start,end],...motionRanges];
+ if(revealAt>=0) ranges.push([Math.max(0,revealAt-1),Math.min(entries.length,revealAt+2)]);
  for(const key of new Set([focused,opened.values().next().value,openItem?.dataset.key])){
   if(!key || options.pinOpenRow?.(key)===false) continue;
   const at=entries.findIndex(({data})=>data.key===key);
@@ -786,6 +792,13 @@ function drawWindow(){
   cursor=node;
  }
  syncOpenItem();
+ if(revealAt>=0){
+  const row=mounted.get(reveal)?.querySelector('.list-row');
+  if(row){
+   const top=row.getBoundingClientRect().top;
+   if(outsideView(top)) scrollTo({top:scrollY+top-inset-16,behavior:'instant'});
+  }
+ }
  restoreLog();
  showHiddenActionResults([...mounted.values()]);
  options.mounted?.();
@@ -1449,10 +1462,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  if(!focusTarget) return;
  highlightedRow?.removeAttribute('data-record-highlight');
  clearTimeout(highlightTimer);
- const banner=document.querySelector('[data-page-status]');
- const inset=typeof stuckPageActionsBottom==='function' ? stuckPageActionsBottom() :
-  banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
- row.style.scrollMarginTop=(inset+16)+'px';
+ row.style.scrollMarginTop='16px';
  row.querySelector('.list-toggle').focus({preventScroll:true});
  row.scrollIntoView({block:'start',behavior:'instant'});
  row.dataset.recordHighlight='';

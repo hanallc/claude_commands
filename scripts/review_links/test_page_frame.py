@@ -24,7 +24,6 @@ from scripts.review_links import page_frame, review_submissions, serve
 from scripts.review_links.browser_test_support import STATUS_PAGES, firefox_probe_results, status_configuration
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-STICKY_ACTIONS = b'position:sticky;top:var(--page-actions-space);'
 PAGE_OWNER = staff.StaffRow(staff.StaffId("owner"), "showrunner", "Page owner", staff.STAFF_ROOT,
                             current_session=staff.StaffId("session-owner"))
 
@@ -74,10 +73,10 @@ class PageStatusTests(unittest.TestCase):
               patch.object(subprocess, "Popen", side_effect=AssertionError("The owner launched a process."))):
             page = serve.owned_document(b'<html><head></head><body><main><h1>The List</h1></main></body></html>', "list")
         self.assertIn(b'data-page-owner="list"', page)
-        self.assertIn(b'<main><div class="page-heading-actions" data-page-actions><div class="page-owner" data-page-owner="list">',
-                      page)
-        self.assertIn(b'</div></div><div class="page-heading"><h1>The List</h1>' + page_frame.HEADING_MEASURE.encode()
-                      + b'</div></main>', page)
+        self.assertIn(b'<main><div class="page-top"><div class="page-heading-actions" data-page-actions>'
+                      + b'<div class="page-owner" data-page-owner="list">', page)
+        self.assertIn(b'</div></div><div class="page-heading"><h1>The List</h1></div></div>'
+                      + page_frame.HEADING_MEASURE.encode() + b'</main>', page)
         self.assertIn(page_frame.HEADING_STYLE.encode(), page)
         self.assertIn(b'class="staff-name" data-color-text="role.showrunner"', page)
         self.assertIn(b'aria-label="New item for Current &amp; name" title="New item for Current &amp; name"', page)
@@ -102,10 +101,99 @@ class PageStatusTests(unittest.TestCase):
             self.assertEqual(review_submissions.recipient_options(members),
                              [{"id": identity, "name": "morty", "proposal": False}])
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the frozen top.")
+    def test_desktop_frozen_top_keeps_its_position_and_clears_scroll_targets(self) -> None:
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ try{
+  frameElement.style.width='1440px';
+  frameElement.style.height='800px';
+  await painted();
+  const frozen=document.querySelector('.page-top');
+  const parts=[frozen,...frozen.querySelectorAll('h1,.page-owner,[data-page-status]')];
+  const boxes=()=>parts.map(element=>element.getBoundingClientRect());
+  const content=document.querySelector('#jump-link');
+  const before=boxes(), contentTop=content.getBoundingClientRect().top;
+  scrollTo({top:600,behavior:'instant'});
+  await painted();
+  check(scrollY===600 && Math.abs(content.getBoundingClientRect().top-contentTop+600)<1,
+   'The content scrolls 600 px.');
+  check(parts.length===4 && boxes().every((box,index)=>box.height>0 &&
+   Math.abs(box.top-before[index].top+before[0].top)<1),
+   'The title, actions, and status keep their positions in the block when it reaches the top.');
+  const clear=target=>{
+   const bounds=target.getBoundingClientRect();
+   return bounds.top>=frozen.getBoundingClientRect().bottom-0.5 && bounds.bottom<=innerHeight;
+  };
+  content.click();
+  await painted();
+  check(location.hash==='#anchor' && clear(document.querySelector('#anchor')),
+   'The anchor jump puts the full target below the frozen top.');
+  const target=document.querySelector('#scroll-target'), beforeScroll=scrollY;
+  target.scrollIntoView({block:'start',behavior:'instant'});
+  await painted();
+  check(scrollY>beforeScroll && clear(target),'scrollIntoView puts the full target below the frozen top.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        content = ('<a id="jump-link" href="#anchor">Jump to target</a><div style="height:1200px"></div>'
+                   '<p id="anchor">Anchor target</p><div style="height:1200px"></div>'
+                   '<p id="scroll-target">Scroll target</p><div style="height:1200px"></div>')
+        for width_style, page, before_content in (
+            ("text", long_open_row_page(), b'<div data-test-list>'),
+            ("page-wide", builds_page(), b'<div class="queue-error"'),
+        ):
+            with self.subTest(width_style=width_style):
+                self.assertIn(before_content, page)
+                markup = page.replace(before_content, content.encode() + before_content, 1)
+                self.assertEqual(firefox_probe_results(markup.replace(b'</body>', probe + b'</body>')), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the frozen title.")
+    def test_only_the_title_stays_frozen_at_640_pixels(self) -> None:
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ try{
+  frameElement.style.width='640px';
+  frameElement.style.height='800px';
+  document.querySelector('[data-detail]').hidden=false;
+  await painted();
+  const heading=document.querySelector('.page-heading'), title=heading.querySelector('h1');
+  const owner=document.querySelector('.page-owner-name'), button=document.querySelector('[data-owner-new]');
+  const status=document.querySelector('[data-page-status]');
+  const top=heading.getBoundingClientRect().top;
+  const controls=[owner,button,status];
+  const before=controls.map(element=>element.getBoundingClientRect());
+  const hitCenter=box=>document.elementFromPoint(box.left+box.width/2,box.top+box.height/2);
+  check(innerWidth===640 && before.every((box,index)=>box.top>=0 && box.bottom<=innerHeight &&
+   controls[index].contains(hitCenter(box))),'The actions and status start in view at 640 px.');
+  const main=document.querySelector('main').getBoundingClientRect();
+  scrollTo({top:600,behavior:'instant'});
+  await painted();
+  const bounds=title.getBoundingClientRect(), stuck=heading.getBoundingClientRect();
+  check(scrollY===600 && top>stuck.top && Math.abs(stuck.top-8)<1 && title.contains(hitCenter(bounds)),
+   'The title stays in view at the top.');
+  check(controls.every((element,index)=>{
+   const bottom=element.getBoundingClientRect().bottom;
+   return bottom<0 && Math.abs(bottom-before[index].bottom+600)<1;
+  }),'The owner, New item button, and status scroll out of view.');
+  const after=document.querySelector('main').getBoundingClientRect();
+  check(after.left===main.left && after.width===main.width,'The content keeps its left edge and width.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        page = long_open_row_page()
+        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the owner button position.")
     def test_page_owner_stays_visible_above_a_long_open_row(self) -> None:
         page = long_open_row_page()
-        reference = json.dumps(main_heading(page).decode()).replace('<', r'\u003c').encode()
+        reference = json.dumps(without_frozen_top(page).decode()).replace('<', r'\u003c').encode()
         probe = b'''<script>
 (async()=>{
  const failures=[];
@@ -114,7 +202,7 @@ class PageStatusTests(unittest.TestCase):
   frameElement.style.height='800px';
   const button=document.querySelector('[data-owner-new]');
   const owner=button.closest('.page-owner'), name=owner.querySelector('.page-owner-name');
-  const actions=document.querySelector('[data-page-actions]'), heading=document.querySelector('.page-heading');
+  const actions=document.querySelector('[data-page-actions]'), frozen=document.querySelector('.page-top');
   const reference=document.createElement('iframe');
   reference.style.cssText='position:fixed;left:-10000px;top:0;border:0;height:800px';
   const referenceReady=new Promise(resolve=>reference.addEventListener('load',resolve,{once:true}));
@@ -148,13 +236,13 @@ class PageStatusTests(unittest.TestCase):
    return [box.left+2,(box.left+box.right)/2,box.right-2].some(x=>[top+1,(top+box.bottom)/2,box.bottom-1]
     .some(y=>!banner.contains(document.elementFromPoint(x,y))));
   };
-  for(const width of [1440,1024,320]){
+  for(const width of [1440,1024]){
    const verify=(ok,message)=>check(ok,width+' px: '+message);
    frameElement.style.width=width+'px';
    reference.style.width=width+'px';
    scrollTo({top:0,behavior:'instant'});
    await painted();
-   const first=JSON.stringify(boxes(document)), layout=columns(), titleTop=title.getBoundingClientRect().top;
+   const first=JSON.stringify(boxes(document)), layout=columns();
    verify(first===JSON.stringify(boxes(reference.contentDocument)),
     'The name, the button and the title match the page without the sticky rule at scroll zero.');
    const background=getComputedStyle(owner).backgroundColor;
@@ -171,17 +259,18 @@ class PageStatusTests(unittest.TestCase):
     await painted();
     verify(scrollY===top && columns()===layout,'The content keeps its left edge and width at scroll '+top+'.');
    }
-   const last=owner.getBoundingClientRect(), status=banner.getBoundingClientRect(), headingBox=heading.getBoundingClientRect();
+   const last=owner.getBoundingClientRect(), status=banner.getBoundingClientRect();
+   const block=frozen.getBoundingClientRect(), heading=title.getBoundingClientRect();
    const nameBox=name.getBoundingClientRect(), buttonBox=button.getBoundingClientRect();
    verify(innerWidth===width && scrollY>innerHeight && scrollY===bottom(),'The page scrolls to the bottom of the long row.');
    const state=banner.querySelector('.page-status-state').getBoundingClientRect();
-   verify(Math.abs(status.top-last.bottom)<1 && reason.getBoundingClientRect().top>=state.bottom,
-    'The sticky status spans two lines directly below the action area.');
-   verify(Math.abs(last.top-8)<1 && actions.contains(owner),'The action area sticks 8 px below the top.');
-   verify(Math.abs(title.getBoundingClientRect().top-(titleTop-scrollY))<1 && headingBox.bottom<0,
-    'The title scrolls with the page.');
-   verify(Math.abs(last.right-headingBox.right)<1 && last.bottom<=status.top+0.5 && last.bottom<=innerHeight,
-    'The owner stays at the top right above the status.');
+   verify(status.top>=Math.max(last.bottom,heading.bottom)-0.5 && reason.getBoundingClientRect().top>=state.bottom,
+    'The status spans two lines below the title and the actions.');
+   verify(Math.abs(last.top-block.top-8)<1 && actions.contains(owner),'The actions stay 8 px below the frozen top.');
+   verify(heading.height>0 && heading.top>=block.top && heading.bottom<=status.top,
+    'The title stays in view above the status.');
+   verify(Math.abs(last.right-block.right)<1 && last.bottom<=innerHeight,
+    'The owner stays at the right edge of the frozen top.');
    verify(nameBox.width>0 && Math.abs(buttonBox.left-nameBox.right-8)<0.1 && buttonBox.width===36,
     'The name stays beside the full button.');
    verify(detail.getBoundingClientRect().top<last.top,'The open row scrolls under the action area.');
@@ -201,9 +290,8 @@ class PageStatusTests(unittest.TestCase):
    verify(view.revealMatchingItem('open'),'The item jump finds the row.');
    await painted();
    verify(document.activeElement===row.querySelector('button') && scrollY>0 &&
-    row.getBoundingClientRect().top>=banner.getBoundingClientRect().bottom &&
-    banner.getBoundingClientRect().top>=owner.getBoundingClientRect().bottom-0.5,
-    'The item jump from scroll zero focuses the row below the action area and the status.');
+    row.getBoundingClientRect().top>=frozen.getBoundingClientRect().bottom-0.5,
+    'The item jump from scroll zero focuses the row below the frozen top.');
   }
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
@@ -224,7 +312,7 @@ class PageStatusTests(unittest.TestCase):
   const main=document.querySelector('main'), table=document.querySelector('table'), title=document.querySelector('h1');
   const reason=banner.querySelector('[data-status-reason]');
   const bottom=()=>document.scrollingElement.scrollHeight-innerHeight;
-  const space=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-actions-space'));
+  const frozen=document.querySelector('.page-top');
   const layout=()=>JSON.stringify([main,table].map(element=>{
    const {top,left,width}=element.getBoundingClientRect();
    return [top+scrollY,left,width];
@@ -247,7 +335,7 @@ class PageStatusTests(unittest.TestCase):
    banner.querySelector('[data-status-word]').textContent=state;
    reason.hidden=false;
    reason.textContent=text;
-   for(const width of [1440,320]){
+   for(const width of [1440,1024]){
     const found=new Set();
     const verify=(ok,message,top)=>{
      if(!ok && !found.has(message)){found.add(message);failures.push(state+', '+width+' px, scroll '+top+': '+message);}
@@ -269,7 +357,7 @@ class PageStatusTests(unittest.TestCase):
      verify(clear(button,3),'The New item button is fully in view and not covered.',top);
      verify(statusShown(),'The status line is fully in view and not covered by the action area.',top);
      verify(row.bottom<=status.top+0.5,'The action area stays above the status line.',top);
-     verify(row.top>=space-0.5,'The action area stays at least 8 px below the top.',top);
+     verify(row.top>=7.5,'The action area stays at least 8 px below the viewport top.',top);
      verify(layout()===start,'The content does not move.',top);
      if(previous){
       // Each part moves up by at most the scroll distance and never moves down, so nothing steps.
@@ -279,9 +367,9 @@ class PageStatusTests(unittest.TestCase):
      }
      previous={top,row:row.top,status:status.top};
     }
-    verify(Math.abs(owner.getBoundingClientRect().top-space)<1 && title.getBoundingClientRect().bottom<0
-     && Math.abs(banner.getBoundingClientRect().top-owner.getBoundingClientRect().bottom)<1,
-     'At the bottom the title is out of view, the action area sticks 8 px below the top and the status line sticks directly below it.',bottom());
+    verify(Math.abs(frozen.getBoundingClientRect().top)<1 && clear(title,1)
+     && banner.getBoundingClientRect().top>=Math.max(title.getBoundingClientRect().bottom,owner.getBoundingClientRect().bottom)-0.5,
+     'At the bottom the frozen top shows the title and the actions above the status.',bottom());
    }
   }
  }catch(error){failures.push(String(error));}
@@ -290,7 +378,7 @@ class PageStatusTests(unittest.TestCase):
         self.assertEqual(firefox_probe_results(long_open_row_page().replace(b'</body>', probe + b'</body>')), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the AWS region filter.")
-    def test_aws_region_filter_sticks_below_the_action_area(self) -> None:
+    def test_aws_region_filter_sticks_below_the_frozen_top(self) -> None:
         from scripts.review_links import console_theme
 
         source = console_theme.with_theme((SCRIPTS / "aws_target" / "aws_prices.html").read_text(encoding="utf-8"))
@@ -305,7 +393,7 @@ class PageStatusTests(unittest.TestCase):
   document.querySelector('main').insertAdjacentHTML('beforeend','<div style="height:4000px"></div>');
   document.querySelector('#geographies').textContent='Geography';
   const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
-  const owner=document.querySelector('.page-owner'), regions=document.querySelector('nav.regions');
+  const frozen=document.querySelector('.page-top'), regions=document.querySelector('nav.regions');
   const banner=document.querySelector('[data-page-status]');
   for(const state of ['Live','Late']){
    for(const width of [1440,320]){
@@ -313,13 +401,28 @@ class PageStatusTests(unittest.TestCase):
     banner.dataset.state=state;
     scrollTo({top:2000,behavior:'instant'});
     await painted();
-    const bar=regions.getBoundingClientRect(), row=owner.getBoundingClientRect();
-    // A Late status line sticks directly below the action area, so the filter sticks below the status line.
-    const above=state==='Late' ? banner.getBoundingClientRect().bottom : row.bottom;
+    const bar=regions.getBoundingClientRect();
+    const above=(width<=640 ? frozen.querySelector('.page-heading') : frozen).getBoundingClientRect().bottom;
     const hit=document.elementFromPoint((bar.left+bar.right)/2,bar.top+1);
     if(scrollY<1000 || Math.abs(bar.top-above)>=1 || bar.bottom>innerHeight || !regions.contains(hit)){
-     failures.push(width+' px, '+state+': the region filter must stick fully in view below the action area and the status and take a click at its top.');
+     failures.push(width+' px, '+state+': the region filter must stay in view below the frozen top and take a click at its top.');
     }
+   }
+  }
+  const quotas=document.querySelector('#prices-quotas');
+  const spacer=document.createElement('div');
+  spacer.style.height='400px';
+  quotas.before(spacer);
+  for(const width of [1440,440]){
+   frameElement.style.width=width+'px';
+   history.replaceState(null,'',location.pathname);
+   scrollTo({top:0,behavior:'instant'});
+   await painted();
+   location.hash='prices-quotas';
+   await painted();
+   const target=quotas.getBoundingClientRect(), filter=regions.getBoundingClientRect();
+   if(scrollY<300 || target.top<filter.bottom-1 || target.top>=innerHeight){
+    failures.push(width+' px: the jump to Prices and quotas must clear the region filter.');
    }
   }
  }catch(error){failures.push(String(error));}
@@ -327,24 +430,66 @@ class PageStatusTests(unittest.TestCase):
 })();</script>'''
         self.assertEqual(firefox_probe_results(markup.replace(b'</body>', probe + b'</body>')), [[]])
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the Placement panel.")
+    def test_focused_placement_control_clears_the_frozen_panel_header(self) -> None:
+        markup = (b'<!doctype html><html><head><style>'
+                  b'#panel{height:280px;width:340px;overflow:auto;padding:16px}'
+                  b'</style></head><body><main id="stage"></main><aside id="panel"><h1>Placement disk</h1>'
+                  b'<div style="height:500px"></div><button id="target">Select disk</button>'
+                  b'<div style="height:500px"></div></aside></body></html>')
+        page = page_frame.with_owner(markup, "placement_disk", PAGE_OWNER,
+                                     staff.StaffSnapshot((PAGE_OWNER,)), lambda: "")
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ try{
+  frameElement.style.width='1000px';
+  frameElement.style.height='700px';
+  const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  await painted();
+  const panel=document.querySelector('#panel'), header=panel.querySelector('.page-top');
+  const target=panel.querySelector('#target');
+  target.focus({preventScroll:true});
+  target.scrollIntoView({block:'start',behavior:'instant'});
+  await painted();
+  const box=target.getBoundingClientRect();
+  const hit=document.elementFromPoint((box.left+box.right)/2,(box.top+box.bottom)/2);
+  if(document.activeElement!==target || panel.scrollTop<300 || scrollY!==0 ||
+     box.top<header.getBoundingClientRect().bottom-1 || !target.contains(hit)){
+   failures.push('The focused control must stay visible below the header inside the panel.');
+  }
+  target.blur();
+  const headerBox=header.getBoundingClientRect();
+  panel.scrollTop+=box.top-(headerBox.top+headerBox.height/2);
+  await painted();
+  const start=panel.scrollTop, covered=target.getBoundingClientRect();
+  if(covered.top<panel.getBoundingClientRect().top || covered.top>=header.getBoundingClientRect().bottom){
+   failures.push('The control must start under the frozen header inside the panel.');
+  }
+  target.focus();
+  await painted();
+  const focused=target.getBoundingClientRect();
+  const focusedHit=document.elementFromPoint((focused.left+focused.right)/2,(focused.top+focused.bottom)/2);
+  if(document.activeElement!==target || panel.scrollTop>=start || scrollY!==0 ||
+     focused.top<header.getBoundingClientRect().bottom-1 || !target.contains(focusedHit)){
+   failures.push('Native focus must scroll the control below the frozen panel header.');
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the Builds paused badge.")
     def test_builds_paused_badge_matches_main_and_stays_visible(self) -> None:
-        from scripts.build_queue import memory_feed
-        from scripts.review_links import console_theme
-
-        source = console_theme.with_theme((SCRIPTS / "build_queue" / "memory_live.html").read_text(encoding="utf-8"))
-        page = (page_frame.template(source, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", "15")
-                .replace("__BUILD_LIMIT_ICONS__", json.dumps(memory_feed.build_limit_icons())))
-        markup = page_frame.with_owner(page.encode(), "builds", PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)), lambda: "")
-        # The page stays paused, so the status line does not stick and nothing moves.
+        markup = builds_page()
         paused = (b'<script>document.addEventListener("DOMContentLoaded",()=>setPaused(true));</script>'
                   + b'<style>*,*::before,*::after{animation:none!important;transition:none!important}</style></head>')
         markup = markup.replace(b'</head>', paused, 1)
         still = markup.replace(b'<head>', b'<head><script>window.fetch=()=>new Promise(()=>{});</script>', 1)
         for width in (1440, 320):
             with self.subTest(width=width):
-                self.assertTrue(firefox_screenshot(still, width, 800) == firefox_screenshot(main_heading(still), width, 800),
-                                "At scroll zero the paused page must match the page without the sticky action area.")
+                self.assertTrue(firefox_screenshot(still, width, 800) == firefox_screenshot(without_frozen_top(still), width, 800),
+                                "At scroll zero the paused page must match the page without the frozen top.")
         probe = b'''<script>
 (async()=>{
  const failures=[];
@@ -570,10 +715,21 @@ def long_open_row_page() -> bytes:
     return page_frame.with_owner(markup, "list", PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)), lambda: "")
 
 
-def main_heading(page: bytes) -> bytes:
-    """Remove the sticky rule of the action area, so the page shows the heading as it is before a scroll."""
-    assert page.count(STICKY_ACTIONS) == 1
-    return page.replace(STICKY_ACTIONS, b'', 1)
+def builds_page() -> bytes:
+    """Render the owned Builds page for the browser checks."""
+    from scripts.build_queue import memory_feed
+    from scripts.review_links import console_theme
+
+    source = console_theme.with_theme((SCRIPTS / "build_queue" / "memory_live.html").read_text(encoding="utf-8"))
+    page = (page_frame.template(source, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", "15")
+            .replace("__BUILD_LIMIT_ICONS__", json.dumps(memory_feed.build_limit_icons())))
+    return page_frame.with_owner(page.encode(), "builds", PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)), lambda: "")
+
+
+def without_frozen_top(page: bytes) -> bytes:
+    """Disable the frozen top for the comparison at scroll zero."""
+    style = b'<style>.page-top,.page-top>:is(.page-heading,.page-title){position:relative;top:0}</style>'
+    return page.replace(b'</head>', style + b'</head>', 1)
 
 
 def firefox_screenshot(page: bytes, width: int, height: int) -> bytes:
@@ -989,8 +1145,8 @@ document.body.insertAdjacentHTML('beforeend',REPORT_DIALOG);
  await report();
 })();'''.replace('REPORT_DIALOG', json.dumps(dialog).replace('<', '\\u003c')), (report,))
 
-    def test_the_heading_row_is_right_before_the_script_and_does_not_move_on_load(self) -> None:
-        # The hook records the column width when the script in the heading row measures it the first time.
+    def test_the_frozen_top_is_measured_before_the_content_loads(self) -> None:
+        # Record the column width at the first measurement.
         hook = ('<script>{const measure=measurePageActions;window.measurePageActions=()=>{'
                 + 'window.columnAtMeasure??=getComputedStyle(document.querySelector(\'main\')).maxWidth;measure();};}'
                 + '</script>')
@@ -1014,7 +1170,7 @@ document.body.insertAdjacentHTML('beforeend',REPORT_DIALOG);
  await report();
 })();''', before_title=hook, after_title=parsed)
 
-    def test_only_the_action_area_stays_in_view_at_the_end_of_a_long_page(self) -> None:
+    def test_the_frozen_top_keeps_new_item_available_at_the_end_of_a_long_page(self) -> None:
         self.run_window_probe(r'''
 (async()=>{
  if(nested) return;
@@ -1028,13 +1184,26 @@ document.body.insertAdjacentHTML('beforeend',REPORT_DIALOG);
   scrollTo({top:document.scrollingElement.scrollHeight,behavior:'instant'});
   await painted();
   check(scrollY>2000,'The page scrolls far.');
-  check(title.getBoundingClientRect().bottom<0,'The title scrolls out of view.');
+  const frozen=document.querySelector('.page-top').getBoundingClientRect();
+  const status=document.querySelector('[data-page-status]').getBoundingClientRect();
+  check(frozen.top===0 && title.getBoundingClientRect().top>=0 && status.bottom<=frozen.bottom,
+   'The title and status stay inside the frozen top.');
   const after=button.getBoundingClientRect();
   check(Math.abs(after.top-8)<1 && Math.abs(after.right-before[2].right)<1,'The New item button sticks 8 px below the top.');
   check(onTop(name),'The owner name stays in view and on top.');
   check(pressNewItem('at the end of the page')!==null,'The press reaches New item at the end of the page.');
   await until(()=>captures.length>0,'the New item screenshot request');
-  check(newItem().open && onTop(newItem()),'New item opens at the end of the page.');
+  const dialog=newItem();
+  check(dialog.matches(':modal') && onTop(dialog),'New item opens at the end of the page.');
+  const overTop=document.elementFromPoint(frozen.left+2,frozen.top+2);
+  check(overTop===dialog || dialog.contains(overTop),'The dialog backdrop covers the frozen top.');
+  dialog.querySelector('[data-cancel]').click();
+  await painted();
+  document.querySelector('a[data-image-zoom]').click();
+  const zoom=document.querySelector('[data-image-zoom-dialog]');
+  await painted();
+  check(zoom.matches(':modal') && zoom.contains(document.elementFromPoint(frozen.left+2,frozen.top+2)),
+   'The zoom covers the frozen top.');
  }catch(error){failures.push(String(error));}
  await report();
 })();''')

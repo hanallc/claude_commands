@@ -907,9 +907,10 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(response.status, 200, response.body)
                 self.assertNotIn("content-security-policy", response.headers)
                 self.assertIn(b'<main id="stage"></main>', response.body)
-                self.assertIn(b'<aside id="panel"><div class="page-heading-actions" data-page-actions>', response.body)
-                self.assertIn(b'</div></div><div class="page-heading"><h1>' + heading + b'</h1>'
-                              + page_frame.HEADING_MEASURE.encode() + b'</div></aside>', response.body)
+                self.assertIn(b'<aside id="panel"><div class="page-top">'
+                              + b'<div class="page-heading-actions" data-page-actions>', response.body)
+                self.assertIn(b'</div></div><div class="page-heading"><h1>' + heading + b'</h1></div></div>'
+                              + page_frame.HEADING_MEASURE.encode() + b'</aside>', response.body)
                 self.assertIn(b'data-page-owner="placement_disk"', response.body)
 
     def test_placement_disk_file_expands_the_home_folder(self) -> None:
@@ -7440,7 +7441,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual([(question.question_id, question.words) for question in saved.questions], [("Q1", words)])
             opened = self.request(list_page.PAGE_PATH)
             self.assertEqual(opened.status, 200)
-            markup = opened.body.decode().split('<script>', 1)[0]
+            markup = re.sub(r'<script\b[^>]*>.*?</script>', '', opened.body.decode(), flags=re.DOTALL)
             self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
             self.assertIn('data-open-question="true"', markup)
             self.assertIn("Question not delivered.", markup)

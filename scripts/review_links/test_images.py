@@ -215,6 +215,45 @@ class ChangeImageTests(ImagesFixture):
 
 
 class ImagesTests(ImagesFixture):
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_selecting_an_image_at_viewport_top_clears_the_frozen_header(self) -> None:
+        _ = self.register()
+        owner = self.owner
+        assert owner is not None
+        page = page_frame.with_owner(images.render(self.status), "images", owner,
+                                     staff.StaffSnapshot((owner,)), lambda: "")
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ try{
+  frameElement.style.width='1024px';
+  frameElement.style.height='800px';
+  const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  document.querySelector('[data-image-layout]').style.minHeight='2400px';
+  const target=document.querySelector('[data-images] article');
+  const header=document.querySelector('.page-top');
+  await painted();
+  scrollTo({top:target.getBoundingClientRect().top+scrollY,behavior:'instant'});
+  await painted();
+  if(Math.abs(target.getBoundingClientRect().top)>=1 || header.getBoundingClientRect().bottom<30 ||
+     matchMedia('(prefers-reduced-motion: reduce)').matches){
+   throw new Error('The image must start at viewport y=0 under the header with motion enabled.');
+  }
+  const moved=new Promise(resolve=>{
+   const done=()=>{clearTimeout(timer);removeEventListener('scrollend',done);resolve();};
+   const timer=setTimeout(done,1500);
+   addEventListener('scrollend',done,{once:true});
+  });
+  document.querySelector('[data-image-groups] a').click();
+  await moved;
+  await painted();
+  const gap=target.getBoundingClientRect().top-header.getBoundingClientRect().bottom;
+  if(gap< -1 || gap>5) failures.push('The selected image must clear the header. Gap: '+gap+' px.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+
     def test_staff_image_owners_have_role_colors_and_unknown_owners_stay_plain(self) -> None:
         record = self.register()
         body = images.render(self.status).decode()
@@ -2249,7 +2288,7 @@ class ImagePairTests(ImagesFixture):
   frameElement.style.height='800px';
   document.querySelector('[data-image-layout]').style.minHeight='300vh';
   const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
-  const actions=document.querySelector('[data-page-actions]'), groups=document.querySelector('[data-image-groups]');
+  const frozen=document.querySelector('.page-top'), groups=document.querySelector('[data-image-groups]');
   for(const top of [0,64,800]){
    scrollTo({top,behavior:'instant'});
    await painted();
@@ -2259,13 +2298,16 @@ class ImagePairTests(ImagesFixture):
     failures.push('The Images pair must fit side by side at 1024 px and scroll position '+top+'.');
    }
   }
-  const space=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-actions-space'));
-  const controls=Math.max(...[...actions.children].map(control=>control.getBoundingClientRect().bottom));
-  if(Math.abs(actions.getBoundingClientRect().top-space)>=1 || document.querySelector('.page-heading').getBoundingClientRect().bottom>0){
-   failures.push('At scroll position 800 the action area must stick at the top and the title must scroll away.');
+  const top=frozen.getBoundingClientRect();
+  const parts=[...frozen.querySelectorAll('h1,.page-owner,[data-page-status]')];
+  if(Math.abs(top.top)>=1 || parts.length!==3 || parts.some(element=>{
+   const box=element.getBoundingClientRect();
+   return box.height===0 || box.top<top.top || box.bottom>top.bottom;
+  })){
+   failures.push('At scroll position 800 the title, actions, and status stay in the frozen top.');
   }
-  if(groups.getBoundingClientRect().top<controls+16){
-   failures.push('The image group index must stick below the action area.');
+  if(groups.getBoundingClientRect().top<top.bottom+15.5){
+   failures.push('The image group index stays 16 px or more below the frozen top.');
   }
   frameElement.style.width='1382px';
   groups.querySelector('a span').textContent='admin-console-reviewer';
