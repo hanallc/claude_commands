@@ -54,6 +54,7 @@ Without `--item`, `next` returns the current item or claims the first available 
 `leave` releases a joined session's claim.
 The helper requires a verified process start to save a joined session's PID and start.
 A joined session keeps its claim while the saved PID runs with the saved start time.
+The helper releases the claim when the shared reader reports a zombie.
 The helper checks existing claims without reading the registry or a socket.
 Joined sessions can claim items, save decisions, and release claims while the owner is absent.
 The owner's claim stays with the owner.

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast, final
 from uuid import UUID, uuid4
 
-from scripts.lib import atomic_file, file_lock
+from scripts.lib import atomic_file, file_lock, process_start
 from scripts.message import sessions
 from scripts.production import staff
 
@@ -35,6 +35,11 @@ class Decision(TypedDict):
 class ReviewProcess(TypedDict):
     pid: int
     started: str
+
+
+def process_is_running(process: ReviewProcess) -> bool:
+    observed = process_start.process_start(process["pid"])
+    return isinstance(observed, process_start.Started) and observed.start == process["started"]
 
 
 class ActiveReview(TypedDict):
@@ -186,14 +191,14 @@ class ReviewStore:
     def remember_process(self, review: ActiveReview, identity: str) -> bool:
         observed = self.liveness(identity)
         saved = review["participants"].get(identity)
-        if saved is not None and (
-            not isinstance(observed, sessions.LiveSessionProcess)
-            or (observed.pid == saved["pid"] and not isinstance(observed.started, str))
-        ):
-            observed = sessions.process_liveness(saved["pid"], saved["started"])
-        if not isinstance(observed, sessions.LiveSessionProcess) or not isinstance(observed.started, str):
+        process = saved
+        if isinstance(observed, sessions.LiveSessionProcess):
+            if isinstance(observed.started, str):
+                process = ReviewProcess(pid=observed.pid, started=observed.started)
+            elif saved is not None and observed.pid != saved["pid"]:
+                process = None
+        if process is None or not process_is_running(process):
             raise ReviewError("Cannot confirm your process. Try again when your session is live.")
-        process = ReviewProcess(pid=observed.pid, started=observed.started)
         if saved == process:
             return False
         review["participants"][identity] = process
@@ -206,8 +211,7 @@ class ReviewStore:
             if holder == owner:
                 continue
             saved = review["participants"].get(holder)
-            if saved is None or not isinstance(sessions.process_liveness(saved["pid"], saved["started"]),
-                                               sessions.LiveSessionProcess):
+            if saved is None or not process_is_running(saved):
                 del claims[index]
         if len(claims) != count:
             _save(path, review)
