@@ -157,6 +157,17 @@ def run_claim(candidate: Path, case: ClaimCase, foreign_pid: int = 1) -> None:
     if case is ClaimCase.OWNER_REPLACEMENT:
         _claim_after_other_owner(candidate)
         return
+    probes: list[tuple[int, int, type[BaseException] | None]] = []
+    kill = os.kill
+
+    def record_kill(pid: int, signal_number: int, /) -> None:
+        try:
+            kill(pid, signal_number)
+        except BaseException as error:
+            probes.append((pid, signal_number, type(error)))
+            raise
+        probes.append((pid, signal_number, None))
+
     with ExitStack() as fixture:
         if case is ClaimCase.UNREADABLE_LEASE:
             lease.chmod(0)
@@ -172,6 +183,8 @@ def run_claim(candidate: Path, case: ClaimCase, foreign_pid: int = 1) -> None:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if case is ClaimCase.STAGED_REPLACEMENT:
             _replace_checked_tree(fixture, candidate)
+        if case is ClaimCase.FOREIGN_OWNER:
+            _ = fixture.enter_context(mock.patch.object(os, "kill", record_kill))
         try:
             with build_folders.tool_folder(candidate.name, candidate.parent) as claimed:
                 print(claimed.name)
@@ -180,6 +193,12 @@ def run_claim(candidate: Path, case: ClaimCase, foreign_pid: int = 1) -> None:
             if case is not ClaimCase.STAGED_REPLACEMENT:
                 raise
             print("replacement refused")
+    if case is ClaimCase.FOREIGN_OWNER:
+        outcomes = [(number, outcome) for pid, number, outcome in probes if pid == foreign_pid]
+        assert any(number == 0 for number, _ in outcomes), f"the claim did not probe foreign lease owner PID {foreign_pid}"
+        assert all(outcome is PermissionError for _, outcome in outcomes), (
+            f"the claim expected PermissionError for foreign lease owner PID {foreign_pid}, got {outcomes}"
+        )
 
 
 class ToolFolderRemovalFixture(unittest.TestCase):
