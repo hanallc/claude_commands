@@ -47,13 +47,20 @@ The guest sends runner records on the reply descriptor.
 The route publishes each change to the module count.
 The count excludes type checks.
 Older guest gate code can return its result without sending progress records.
-If the guest run fails before the start line, the route returns `GuestNotStarted` with the cause.
-The queue can then give the gate to the next named target.
-For a placed gate, `copies.py run` keeps the copy lease and uses its original placement request again.
-The gate must exit with status 79 and write a claim failure that matches the current assignment.
-After the queue settles that attempt, the gate starts with the replacement assignment.
+If a guest attempt fails without a confirmed start, the gate exits with status 79 and reports the exact assignment.
+If the gate consumed permission and sent no arm command, it saves proof that the guest did not start.
+If the permission reply is lost, the gate checks for saved consumption with the exact launch claim.
+The queue checks that the holder ended and that the attempt has no recorded start.
+For a placed gate, `copies.py run` keeps the copy lease and submits the original placement request again.
+The queue keeps the original rank and assigns the next available candidate other than the guest.
+The queue saves the retry decision and restores it after a restart.
+The old guest attempt holds its slot until the queue reads exact end proof and checks that no start remains pending.
 If the claim failure is missing or invalid, `copies.py run` reports `Gate placement blocked` and returns status 79.
-If the guest run fails after that line, the gate fails and reports the guest and the reason.
+If a confirmed guest start has no result, the gate exits with status 80 and requests settlement.
+If the gate loses the permission reply and cannot confirm consumption, it exits with status 80.
+After consumption, a failure to release the launch holder or save the refusal also returns status 80.
+A Mac Linux gate with status 80 requests settlement without retrying.
+The queue keeps the guest slot until settlement and ends the attempt without a retry.
 A stream failure reports its status and up to 1200 characters from standard error.
 A stream timeout reports the diagnostics it received before the deadline.
 A reply that the route cannot read also names its first 200 characters.
@@ -63,13 +70,14 @@ The probe, arm, gate stream, and cleanup retry an inner SSH connect reset or ref
 The Mac gives the inner SSH client a private log and deletes it when the shell exits.
 When SSH exits 255 and the log contains only the connect error, the shell reports the error with a reserved status.
 The route checks the reserved status, the Mac marker, and empty standard output before it retries.
+The gate stream also retries status 0 with the exact connect diagnostic and no reply data.
 The probe, arm, and gate stream allow three attempts within the unreachable wait, with one second between attempts.
 The arm covers the gate stream's connect window and allows time for the arm reply and guest lock setup.
 The gate stream sends the remaining connect time to the Mac after the outer SSH hop starts the Mac shell.
 The Mac applies that time to the inner SSH hop. The sender declines the inner hop when less than one second remains.
 The local stream enforces the deadline until the guest accepts the command.
 The guest acceptance line starts the transfer timeout and the bundle upload.
-If the deadline expires before acceptance, the queue can try another target after the guest confirms cleanup.
+If the deadline expires before acceptance, the queue uses the retry rule for an unconfirmed start.
 Cleanup continues until it gets end proof or the proof deadline expires.
 It waits one second between the first three connect attempts, then uses the normal proof interval before a new group.
 An interrupt preserves the proof deadline and the count of attempts in the current group.

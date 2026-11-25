@@ -61,7 +61,7 @@ from scripts.production.gate_routes import SuiteMode
 from scripts.buildlog import repository, store
 from scripts.lib import test_phase
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
+from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER, MAC_LINUX_START_UNCONFIRMED
 from scripts.lib.build_steps import gate_job_from_process
 
 from scripts.build_queue.scope_activity import (
@@ -217,6 +217,7 @@ PLACEMENT_REASON_TEXT = {
     "mac_linux_backoff": "the guest is in retry backoff",
     "mac_linux_reading_required": "the queue needs a newer guest reading",
     MAC_LINUX_NO_ANSWER: "the Mac does not answer",
+    MAC_LINUX_START_UNCONFIRMED: "the Mac Linux guest did not confirm a start",
     "busy": "the target is busy",
     "off": "the target is off",
     "disk": "the target needs more disk space",
@@ -1763,6 +1764,26 @@ def _placement_history_applies(saved: records.SavedPlacementAssignment, request:
                  or assignment.owner == request.owner and assignment.since == request.since))
 
 
+def _guest_start_observed(saved: records.SavedPlacementAssignment) -> bool:
+    return saved.guest_execution_observed or isinstance(saved.confirmed_guest_start, records.ConfirmedGuestStart)
+
+
+def _guest_retry_released(saved: records.SavedPlacementAssignment) -> bool:
+    report = saved.terminal_report
+    return (is_mac_linux_guest(saved.assignment.destination)
+            and isinstance(saved.permission, placement.PermissionConsumed)
+            and saved.guest_proof_required and not _guest_start_observed(saved)
+            and isinstance(saved.retry, placement.RetryAt)
+            and isinstance(report, placement.TerminalAttemptReport)
+            and report.outcome == placement.PrelaunchRefused(MAC_LINUX_START_UNCONFIRMED))
+
+
+def _guest_retry_applies(saved: records.SavedPlacementAssignment, request: wire.PlacementRequest) -> bool:
+    assignment = saved.assignment
+    return (_guest_retry_released(saved) and assignment.episode == request.episode
+            and assignment.owner == request.owner and assignment.since == request.since)
+
+
 @dataclass(frozen=True)
 class GuestWaitLimitUnavailable:
     """The configuration has no usable Mac Linux wait limit."""
@@ -2258,7 +2279,8 @@ class AdmissionServer:
     def _check_saved_remote_slots(self) -> None:
         guests = {key: saved for key, saved in self.assignments.items() if _holds_consumed_guest_slot(saved)}
         self.manual_guest_settlement = {key for key, saved in guests.items()
-            if len(guests) > 1 or self.current_assignments.get(saved.assignment.episode) != key}
+            if len(guests) > 1
+            or self.current_assignments.get(saved.assignment.episode) != key and not _guest_retry_released(saved)}
         guest_episodes = {guests[key].assignment.episode for key in self.manual_guest_settlement}
         scalers = {key for key, saved in self.assignments.items() if _holds_scaler_slot(saved)
                    and (saved.assignment.episode in guest_episodes
@@ -5316,7 +5338,8 @@ done
                 or self._reused_guest_timeout(request) is not None):
             return False
         return not any(saved.assignment.episode == request.episode
-            and (_holds_consumed_guest_slot(saved) or _holds_scaler_slot(saved)
+            and (_holds_consumed_guest_slot(saved) and not _guest_retry_applies(saved, request)
+                 or _holds_scaler_slot(saved)
                  or isinstance(saved.state, placement.ClosedAssignment)
                  and saved.state.reason in ("completed", "cancelled")
                  and _placement_history_applies(saved, request))
@@ -5351,6 +5374,9 @@ done
     def _target_retry(self, request: wire.PlacementRequest,
                       destination: placement.PlacementDestination, keys: PlacementEvidenceKeys
                       ) -> placement.RetryDecision | placement.EvidenceNeeded | RetryAfterAvailability:
+        if is_mac_linux_guest(destination) and any(_guest_retry_applies(saved, request)
+                                                  for saved in self.assignments.values()):
+            return placement.DoNotRetry(MAC_LINUX_START_UNCONFIRMED)
         saved = next((saved for saved in reversed(self.assignments.values())
             if saved.assignment.destination == destination and isinstance(saved.state, placement.ClosedAssignment)
             and _placement_history_applies(saved, request)), None)
@@ -5722,6 +5748,8 @@ done
         guest_waiting = False
         for key, guest in self.assignments.items():
             if guest.assignment.episode != request.episode or not is_mac_linux_guest(guest.assignment.destination):
+                continue
+            if _guest_retry_applies(guest, request):
                 continue
             if _holds_consumed_guest_slot(guest):
                 guest_waiting = True
@@ -6170,9 +6198,10 @@ done
         The no-run report can close a legacy attempt if no start is pending.
         A fresh process read checks the gate because the last system reading can still show it.
         """
-        return (saved.assignment.destination.target == "mac-linux"
+        return (is_mac_linux_guest(saved.assignment.destination)
                 and isinstance(saved.permission, placement.PermissionConsumed)
-                and isinstance(request.claim, placement.NoProviderClaim) and request.reason == MAC_LINUX_NO_ANSWER
+                and isinstance(request.claim, placement.NoProviderClaim)
+                and request.reason in (MAC_LINUX_NO_ANSWER, MAC_LINUX_START_UNCONFIRMED)
                 and not saved.guest_execution_observed
                 and isinstance(saved.guest_start, records.GuestStartNotReported)
                 and isinstance(saved.confirmed_guest_start, records.GuestStartNotRecorded)
@@ -6441,6 +6470,15 @@ done
             return
         expired = self._expire_guest_replacement(saved, checked_at=settled_at)
         report = expired.terminal_report
+        if _guest_start_observed(saved) and (isinstance(report, placement.NoTerminalReport)
+                or isinstance(report.outcome, placement.AttemptDeclined | placement.PrelaunchRefused)):
+            report = placement.TerminalAttemptReport(
+                placement.AttemptCancelled("The Mac Linux guest ended without a verdict"),
+                placement.DispatchPathSettled(), self.clock.now())
+        if (isinstance(report, placement.NoTerminalReport) and saved.guest_proof_required
+                and self._placement_owner_live(assignment.owner)):
+            # The gate can report its failure after the settlement probe completes.
+            return
         terminal = (replace(report, path=placement.DispatchPathSettled())
                     if isinstance(report, placement.TerminalAttemptReport) else self._lost_report())
         # Keep the settlement time for a reused submission after the worker forgets the attempt.
@@ -6452,7 +6490,8 @@ done
     def _expire_guest_replacement(self, saved: records.SavedPlacementAssignment, *,
                                   checked_at: float | None = None) -> records.SavedPlacementAssignment:
         report = saved.terminal_report
-        if (not isinstance(report, placement.TerminalAttemptReport)
+        if (_guest_retry_released(saved) or _guest_start_observed(saved)
+                or not isinstance(report, placement.TerminalAttemptReport)
                 or not isinstance(report.outcome, placement.AttemptDeclined | placement.PrelaunchRefused)):
             return saved
         limit = _guest_wait_limit()
@@ -6643,6 +6682,25 @@ done
             return [self._placement_status(assignment, check_lifetime=False)]
         guest = is_mac_linux_guest(assignment.destination)
         current = self.current_assignments.get(assignment.episode) == key
+        if isinstance(request, wire.ClaimFailure) and request.reason == MAC_LINUX_START_UNCONFIRMED:
+            if _guest_retry_released(saved) and isinstance(request.claim, placement.NoProviderClaim):
+                return [self._placement_status(assignment, check_lifetime=False)]
+            previous = saved.terminal_report
+            if (not current or not _holds_consumed_guest_slot(saved) or not saved.guest_proof_required
+                    or not self._guest_took_no_run(saved, request)
+                    or isinstance(previous, placement.TerminalAttemptReport)
+                    and previous.outcome != GUEST_SETTLEMENT_REQUESTED):
+                return [self._placement_status(assignment, "The queue cannot release this guest attempt for retry",
+                                               check_lifetime=False)]
+            now = self.clock.now()
+            report = placement.TerminalAttemptReport(placement.PrelaunchRefused(request.reason),
+                placement.DispatchPathPending("Mac Linux settlement is pending"), now)
+            self.assignments[key] = replace(saved, terminal_report=report, retry=placement.RetryAt(now),
+                                            remote_start_hold=records.RemoteStartHoldEnded())
+            del self.current_assignments[assignment.episode]
+            self.persist()
+            self._schedule_pass()
+            return [self._placement_status(assignment, check_lifetime=False)]
         if guest and not current:
             return [self._placement_status(assignment, "the attempt is no longer current", check_lifetime=False)]
         guest_holds_slot = _holds_consumed_guest_slot(saved)
@@ -6654,7 +6712,7 @@ done
                              and isinstance(request.claim, placement.NoProviderClaim))
             if (current
                     and (local_decline or isinstance(saved.permission, placement.PermissionAvailable)
-                         or self._guest_took_no_run(saved, request)
+                         or request.reason == MAC_LINUX_NO_ANSWER and self._guest_took_no_run(saved, request)
                          or assignment.destination.provider == "scaler"
                          and (request.claim == saved.provider or isinstance(request.claim, placement.NoProviderClaim)))
                     and isinstance(saved.state, placement.CurrentAssignment)):
