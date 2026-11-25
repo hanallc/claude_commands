@@ -62,17 +62,26 @@ def read_new_item_limits() -> NewItemLimits:
     def limit(key: str) -> int:
         return min(settings.value(key, conf.positive_whole), settings.whole_upper_bound(key))
 
+    return _new_item_limits(limit, settings.whole_upper_bound)
+
+
+def read_saved_item_limits() -> NewItemLimits:
+    """Read the base upper bounds for checks against a saved item."""
+    upper_bound = conf.read("review_links").whole_upper_bound
+    return _new_item_limits(upper_bound, upper_bound)
+
+
+def _new_item_limits(read: Callable[[str], int], upper_bound: Callable[[str], int]) -> NewItemLimits:
     total_image_key = "new_item.max_total_image_bytes"
     bug_state_key = "new_item.max_bug_page_state_bytes"
-    total_image_bytes = limit(total_image_key)
-    page_data = _page_data_limits(limit)
-    body_bytes = _body_budget(total_image_bytes, page_data.bytes, limit(bug_state_key))
-    body_read_bytes = _body_budget(settings.whole_upper_bound(total_image_key),
-                                   settings.whole_upper_bound("new_item.max_page_data_bytes"),
-                                   settings.whole_upper_bound(bug_state_key))
+    total_image_bytes = read(total_image_key)
+    page_data = _page_data_limits(read)
+    body_bytes = _body_budget(total_image_bytes, page_data.bytes, read(bug_state_key))
+    body_read_bytes = _body_budget(upper_bound(total_image_key), upper_bound("new_item.max_page_data_bytes"),
+                                   upper_bound(bug_state_key))
     return NewItemLimits(
-        limit("new_item.max_words_chars"), limit("new_item.max_images"), limit("new_item.max_image_bytes"),
-        total_image_bytes, page_data, limit("new_item.max_page_url_chars"), limit("page_capture.max_active"),
+        read("new_item.max_words_chars"), read("new_item.max_images"), read("new_item.max_image_bytes"),
+        total_image_bytes, page_data, read("new_item.max_page_url_chars"), read("page_capture.max_active"),
         body_bytes, body_read_bytes)
 
 

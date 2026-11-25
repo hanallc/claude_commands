@@ -283,7 +283,7 @@ class ListDraftSend:
     """Read a List draft for filing or verify a retry against the saved item."""
 
     request_id: str
-    prepare: Callable[[], ListDraftFiling]
+    prepare: Callable[[NewItemLimits], ListDraftFiling]
     check_first_send: Callable[[], None] = lambda: None
     preview: ListPreviewRequest = NoRequestedListPreview.ABSENT
 
@@ -1646,7 +1646,7 @@ def _matches_list_retry(folder: Path, send: ListDraftSend, intent: new_item_dial
     if item.details.capture_intent != intent:
         return False
     try:
-        filing = send.prepare()
+        filing = send.prepare(limits)
         request = filing.request
         if request.kind == SubmissionKind.PROPOSAL:
             request = replace(request, page_recipient=new_item_dialog.PageRecipient.SELECTED)
@@ -1687,7 +1687,8 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
                 if item.details.page != "list":
                     raise SubmissionConflict("This draft belongs to another page.")
                 _check_capture_target(capture_target, item.destination)
-                edited = not _matches_list_retry(folder, send, capture_intent, item, initial_delivery, limits)
+                saved_item_limits = new_item_dialog.read_saved_item_limits()
+                edited = not _matches_list_retry(folder, send, capture_intent, item, initial_delivery, saved_item_limits)
                 return _complete_receipt(folder, item.destination, lookup.hint, item.record, edited=edited)
         alias = folder / "list-receipt-key"
         try:
@@ -1703,7 +1704,7 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
         if isinstance(capture_target, ScopedSubmissionKey):
             raise SubmissionConflict("This screenshot belongs to another item.")
         send.check_first_send()
-        filing = send.prepare()
+        filing = send.prepare(limits)
         request = filing.request
         if request.page != "list" or request.request_id != send.request_id:
             raise SubmissionError("Invalid List draft request.")
@@ -1776,7 +1777,7 @@ def submit(
     if request.page == "list":
         if BROWSER_DRAFT_ID.fullmatch(request.request_id):
             filing = ListDraftFiling(request, screenshot, capture_requested, refusal)
-            return _submit_list_draft(ListDraftSend(request.request_id, lambda: filing), members, limits=limits,
+            return _submit_list_draft(ListDraftSend(request.request_id, lambda _: filing), members, limits=limits,
                                       capture_intent=capture_intent, capture_target=capture_target, initial_delivery=initial_delivery)
         return _submit(request, members=members, limits=limits, screenshot=screenshot,
                        capture_requested=capture_requested, refusal=refusal,

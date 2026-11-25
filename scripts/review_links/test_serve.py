@@ -694,10 +694,15 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(options["page_owner"], owner.id)
             recipients = cast(list[dict[str, object]], options["recipients"])
             self.assertNotIn(other.id, [row["id"] for row in recipients])
-            response = self.new_item_http(self.new_item_body(request), finished=True)
-            self.assertEqual(response.status, 200, response.body)
-            replay = cast(dict[str, object], json.loads(response.body))
-            self.assertEqual(replay, {**saved, "version": replay["version"]})
+            configuration = conf.path("review_links")
+            original_limit = conf.read("review_links").whole("new_item.max_words_chars")
+            for words_limit in (original_limit, 1):
+                with self.subTest(words_limit=words_limit):
+                    _ = write_config_fixture(configuration, f"new_item.max_words_chars={words_limit}\n")
+                    response = self.new_item_http(self.new_item_body(request), finished=True)
+                    self.assertEqual(response.status, 200, response.body)
+                    replay = cast(dict[str, object], json.loads(response.body))
+                    self.assertEqual(replay, {**saved, "version": replay["version"]})
 
         self.assertEqual(cache.get().records[cast(str, saved["key"])].owner, other.id)
         self.assertEqual(len(investigation.records(other.id)), 1)
@@ -1149,13 +1154,15 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_each_console_send_path_holds_a_marked_send_and_no_other_path_does(self) -> None:
         marked = {send_hold.HOLD_HEADER: "1"}
-        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\nnew_item.max_total_image_bytes=1\n")
         _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
         _ = self.enterContext(patch.object(change_browser, "browser_manifest", return_value=("token", "")))
         browser = f"/{change_page.CONSOLE_FOLDER}/changes.html"
-        for path in [*sorted(serve.HELD_SEND_PATHS), browser]:
-            with self.subTest(path=path), patch.object(serve.ReviewLinksHandler, "_write_post") as write:
-                status, hold, fields = self.held_http("POST", path, b"outcome=works", headers=marked)
+        requests = [(path, b"outcome=works") for path in [*sorted(serve.HELD_SEND_PATHS), browser]]
+        requests.append((review_page.NEW_ITEM_PATH, b"{}" + b" " * (1024 * 1024)))
+        for path, body in requests:
+            with self.subTest(path=path, size=len(body)), patch.object(serve.ReviewLinksHandler, "_write_post") as write:
+                status, hold, fields = self.held_http("POST", path, body, headers=marked)
                 self.assertEqual((status, hold), (202, "held"), fields)
                 write.assert_not_called()
                 undo = f"{send_hold.HOLD_PATH}/{fields['hold']}/undo"
@@ -1183,18 +1190,25 @@ class ReviewLinksServerTests(unittest.TestCase):
         return answer
 
     def test_a_marked_send_without_one_exact_size_is_refused_and_not_held(self) -> None:
-        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        configuration = conf.path("review_links")
+        _ = write_config_fixture(configuration, "undo_seconds=60\n")
         _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
-        # The first three are refused before the body is read, so they send no body.
-        for case, headers, body, reason in (
-            ("two sizes", ["Content-Length: 5", "Content-Length: 5"], b"", b"The send has no valid size."),
-            ("chunked", ["Content-Length: 5", "Transfer-Encoding: chunked"], b"", b"The send has no valid size."),
-            ("too large", [f"Content-Length: {new_item_dialog.read_new_item_limits().body_bytes + 1}"], b"", b"The send is empty or too large."),
-            ("short body", ["Content-Length: 100"], b"words", b"The send is incomplete."),
+        oversized = new_item_dialog.read_new_item_limits().body_read_bytes + 1
+        for case, headers, body, status, reason, override in (
+            ("two sizes", ["Content-Length: 5", "Content-Length: 5"], b"", b"400",
+             b"The send has no valid size.", ""),
+            ("chunked", ["Content-Length: 5", "Transfer-Encoding: chunked"], b"", b"400",
+             b"The send has no valid size.", ""),
+            ("too large", [f"Content-Length: {oversized}"], b"", b"400", b"The send is empty or too large.", ""),
+            ("short body", ["Content-Length: 100"], b"words", b"400", b"The send is incomplete.", ""),
+            ("unusable limits", ["Content-Length: 100"], b"", b"503", b"Send limits are unavailable. Send again.",
+             "new_item.max_images=0\n"),
         ):
             with self.subTest(case=case):
+                if override:
+                    _ = write_config_fixture(configuration, override)
                 answer = self.raw_held_post(headers, body)
-                self.assertEqual(answer.split(b" ", 2)[1], b"400", answer[:300])
+                self.assertEqual(answer.split(b" ", 2)[1:2], [status], answer[:300])
                 self.assertIn(reason, answer)
         self.assertEqual(list((self.root / send_hold.HOLD_FOLDER).glob("*.json")), [])
 
@@ -1486,9 +1500,6 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(len(read_new_item_notices(log)), 1)
                 if change_mapping:
                     _ = conf.path("producer_map").write_text("", encoding="utf-8")
-                code = new_item.main(arguments)
-                self.assertTrue(self.new_item_posts.wait_until_none_run())
-                self.assertEqual(posts, [posts[0]] * 3)
             else:
                 self.assertEqual(code, new_item.Outcome.FAILED)
                 self.assertEqual(output.getvalue(), "")
@@ -1496,11 +1507,16 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(investigation.records(owner.id), [])
                 self.assertEqual(the_list.records(morty.id), [])
                 self.assertEqual(read_new_item_notices(log), [])
+            with redirect_stderr(StringIO()) as filed_errors:
                 code = new_item.main(arguments)
                 self.assertTrue(self.new_item_posts.wait_until_none_run())
+            if fail_retry:
+                self.assertEqual(posts, [posts[0]] * 3)
+            else:
                 refused, retried = posts
                 self.assertNotEqual(refused, retried)
-        self.assertEqual(code, new_item.Outcome.FILED, errors.getvalue())
+        self.assertEqual(code, new_item.Outcome.FILED, filed_errors.getvalue())
+        self.assertNotIn("new_item:", filed_errors.getvalue())
         key, = [key for key, record in cache.get().records.items() if record.type == review_type]
         title = filed_words.splitlines()[0]
         self.assertEqual((cache.get().records[key].title, cache.get().records[key].owner), (title, owner.id))

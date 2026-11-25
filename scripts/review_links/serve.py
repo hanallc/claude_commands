@@ -1692,10 +1692,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             request: new_item_dialog.NewItemRequest | new_item_dialog.UnverifiedDraftRetry | None = None
             refusal: new_item_dialog.SubmissionError | None = None
 
-            def read_submission() -> new_item_dialog.NewItemRequest:
+            def read_submission(submission_limits: new_item_dialog.NewItemLimits) -> new_item_dialog.NewItemRequest:
                 try:
                     item = new_item_dialog.read_request(
-                        fields, has_capture="capture_key" in fields and not has_capture_metadata, limits=limits)
+                        fields, has_capture="capture_key" in fields and not has_capture_metadata, limits=submission_limits)
                 except new_item_dialog.SubmissionError:
                     raise
                 except (ValueError, RecursionError) as error:
@@ -1710,7 +1710,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     if not valid_token:
                         raise new_item_dialog.SubmissionScreenshotExpired()
                     check_live_body_size()
-                    request = read_submission()
+                    request = read_submission(limits)
                     if ("capture_key" not in fields and request.page_state is not None
                             and request.page_state.include_screenshot):
                         if browser_draft:
@@ -1774,11 +1774,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT
                 pending = False
                 if list_draft_id:
-                    def prepare_list_draft() -> review_submissions.ListDraftFiling:
+                    def prepare_list_draft(submission_limits: new_item_dialog.NewItemLimits) -> review_submissions.ListDraftFiling:
                         nonlocal request, screenshot
                         if refusal is not None:
                             raise refusal
-                        item = read_submission()
+                        item = read_submission(submission_limits)
                         request = item
                         if not key and item.page_state is not None and item.page_state.include_screenshot:
                             raise new_item_dialog.SubmissionScreenshotExpired()
@@ -2521,7 +2521,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(400, {"reason": "The send has no valid size."})
             return
         size = int(lengths[0])
-        if not 0 < size <= new_item_dialog.read_new_item_limits().body_bytes:
+        try:
+            limits = new_item_dialog.read_new_item_limits()
+        except conf.Unusable as error:
+            print(f"review-links send hold limits: {error}", file=sys.stderr)
+            self.close_connection = True
+            self.json_response(503, {"reason": "Send limits are unavailable. Send again."})
+            return
+        if not 0 < size <= limits.body_read_bytes:
             self.json_response(400, {"reason": "The send is empty or too large."})
             return
         body = self.rfile.read(size)

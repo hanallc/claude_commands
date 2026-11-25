@@ -3671,9 +3671,8 @@ with (patch.object(conf, 'read', read_config),
                               ('arm', ('probe', 'arm')), ('probe', ('probe',))):
             with self.subTest(stage=stage), patch.dict(os.environ, {f'FIXTURE_SSH_{stage.upper()}': 'reset'}):
                 _ = self.trace.write_text('')
-                route = self.route()
-                result = self.not_started(route)
-                self.assertIn('Connection reset by peer after 1 connect attempt', result)
+                reason = self.unconfirmed(self.route())
+                self.assertIn('Connection reset by peer after 1 connect attempt', reason)
                 self.assert_guest_clean(*events)
 
     def test_zero_exit_with_empty_reply_retries_only_the_exact_inner_connect_diagnostic(self) -> None:

@@ -843,3 +843,26 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 **Ruled out:**
 - A stall-watch fallback for absent sender limits: the packaged fallback on main read the same live file, so main sent no alert either.
 - A built path that hides the pushover rows from the phone-send scan: the module took the test-helper name.
+
+### Phase 21 — Review of the commits outside any phase  · status: done
+
+**Depends on:** Phase 20
+
+#### Work Order
+
+**Goal:** Review the four parts of tip 6f7fe87082 that no phase review covered, so the tip can merge with a recorder trial line.
+
+**Spec:**
+1. `3005f4c88c`: the route test for the connect attempt limit expects the result main gave at that time for a run-stage connect failure. The `bddc0d6195` join reverted this expectation, because main changed the result again (GuestNotStarted with settlement).
+2. `df4d3ed225`: bob's names for two new keys. `report.edited_crate_max_crates` becomes `report.max_edited_crates`, and `module_cost.output_replay_limit_bytes` becomes `module_cost.max_output_replay_bytes`. The config, README, docs, readers and tests change together. Values do not change. nate approved the 26 key names (item 224).
+3. `805a9d4e6b`: test fixtures write each config file that the code under test reads (`user_zone.conf`, `review_links.conf`). `rebuild_row._read_cache` calls `cache_path(config)` again, as main does, so tests that patch `cache_path` take effect. The config name resolves through `conf.path`.
+4. The conflict resolutions of the main join merges `87cf9564c8`, `8cea319225`, `aa972aee9e`, `bddc0d6195` and `6f7fe87082`. Each keeps main's behavior and reapplies the branch's config moves: config reads through `conf.read`/`conf.path`, no code defaults, and the configured limits.
+
+**Invariants:**
+1. Each new key's value equals the literal it replaces.
+2. No key that exists on main changes, is renamed or is deleted.
+3. No code default is added, and no new refusal is added.
+
+**State:** none.
+
+**Acceptance gate:** green `copies.py run --affected` of 6f7fe87082 (done, 780 modules); `fixture_conf_keys` 0 missing; `git merge-tree` against main clean.
