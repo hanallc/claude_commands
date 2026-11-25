@@ -20,6 +20,7 @@ import unittest
 from unittest import mock
 
 from scripts.lib import build_folder_lock, build_folders
+from scripts.lib.process_start import Gone, Started, Unreadable, proc_table_start
 from scripts.lib.removal_bwrap_test_support import BuildMount, LINUX_CHECKOUT, RemovalSandbox
 from scripts.lint.test_removal_bwrap import CANARY, PROBE_MOUNT, PROBE_OUTSIDE
 
@@ -41,7 +42,7 @@ import sys
 sys.path.insert(0, sys.argv[1])
 from scripts.lib.test_build_folders_bwrap import ClaimCase, run_claim
 
-run_claim(Path(sys.argv[2]), ClaimCase(sys.argv[3]))
+run_claim(Path(sys.argv[2]), ClaimCase(sys.argv[3]), *map(int, sys.argv[4:]))
 """
 
 
@@ -73,15 +74,16 @@ def _check_missing_pid(pid: int) -> None:
     raise AssertionError(f"fixture process {pid} still exists")
 
 
-def _lease_owner(case: ClaimCase) -> int:
+def _lease_owner(case: ClaimCase, foreign_pid: int) -> int:
     if case is ClaimCase.LIVE_OWNER:
         return os.getpid()
     if case is ClaimCase.FOREIGN_OWNER:
-        assert Path("/proc/1").stat().st_uid != os.geteuid()
+        assert foreign_pid > 0
+        assert (Path("/proc") / str(foreign_pid)).stat().st_uid != os.geteuid()
         try:
-            os.kill(1, 0)
+            os.kill(foreign_pid, 0)
         except PermissionError:
-            return 1
+            return foreign_pid
         raise AssertionError("the claim process can signal the foreign lease owner")
     child = subprocess.run([sys.executable, "-B", "-c", "import os; print(os.getpid())"],
                            check=True, capture_output=True, text=True, timeout=10)
@@ -128,13 +130,24 @@ def _claim_after_other_owner(candidate: Path) -> None:
     print(Path(second.getvalue().strip()).name)
 
 
-def run_claim(candidate: Path, case: ClaimCase) -> None:
+def run_claim(candidate: Path, case: ClaimCase, foreign_pid: int = 0) -> None:
     """Run the real claim with the selected fixture state."""
     lease = build_folders.lease_path(candidate)
-    _ = lease.write_text(json.dumps({"pid": _lease_owner(case)}))
+    _ = lease.write_text(json.dumps({"pid": _lease_owner(case, foreign_pid)}))
     if case is ClaimCase.OWNER_REPLACEMENT:
         _claim_after_other_owner(candidate)
         return
+    probes: list[tuple[int, int, type[BaseException] | None]] = []
+    kill = os.kill
+
+    def record_kill(pid: int, signal_number: int, /) -> None:
+        try:
+            kill(pid, signal_number)
+        except BaseException as error:
+            probes.append((pid, signal_number, type(error)))
+            raise
+        probes.append((pid, signal_number, None))
+
     with ExitStack() as fixture:
         if case is ClaimCase.UNREADABLE_LEASE:
             lease.chmod(0)
@@ -150,6 +163,8 @@ def run_claim(candidate: Path, case: ClaimCase) -> None:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if case is ClaimCase.STAGED_REPLACEMENT:
             _replace_checked_tree(fixture, candidate)
+        if case is ClaimCase.FOREIGN_OWNER:
+            _ = fixture.enter_context(mock.patch.object(os, "kill", record_kill))
         try:
             with build_folders.tool_folder(candidate.name, candidate.parent) as claimed:
                 print(claimed.name)
@@ -158,6 +173,12 @@ def run_claim(candidate: Path, case: ClaimCase) -> None:
             if case is not ClaimCase.STAGED_REPLACEMENT:
                 raise
             print("replacement refused")
+    if case is ClaimCase.FOREIGN_OWNER:
+        outcomes = [(number, outcome) for pid, number, outcome in probes if pid == foreign_pid]
+        assert any(number == 0 for number, _ in outcomes), f"the claim did not probe foreign lease owner PID {foreign_pid}"
+        assert all(outcome is PermissionError for _, outcome in outcomes), (
+            f"the claim expected PermissionError for foreign lease owner PID {foreign_pid}, got {outcomes}"
+        )
 
 
 @unittest.skipUnless(sys.platform == "linux", "requires Linux bubblewrap")
@@ -298,14 +319,62 @@ class ToolFolderRemovalTests(unittest.TestCase):
     def test_keeps_a_folder_with_a_live_lease_owner(self) -> None:
         self.assert_kept(ClaimCase.LIVE_OWNER)
 
+    def foreign_lease_identity(self, process: Path) -> tuple[str, int]:
+        pid = int(process.name)
+        identity = proc_table_start(pid, process.parent)
+        if isinstance(identity, Gone):
+            self.fail(f"Foreign lease owner PID {pid} disappeared")
+        if isinstance(identity, Unreadable):
+            self.fail(f"Cannot read the start time for foreign lease owner PID {pid}: {identity.reason}")
+        if not isinstance(identity, Started):
+            self.fail(f"Foreign lease owner PID {pid} exited")
+        try:
+            owner = process.stat().st_uid
+        except OSError as error:
+            self.fail(f"Cannot read the UID for foreign lease owner PID {pid}: {error}")
+        return identity.start, owner
+
     def test_keeps_a_folder_with_a_foreign_lease_owner(self) -> None:
+        uid = os.geteuid()
+        for process in Path("/proc").iterdir():
+            if not process.name.isdecimal():
+                continue
+            try:
+                owner = process.stat().st_uid
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            if owner != uid:
+                break
+        else:
+            self.skipTest("not run: the guest sandbox shows no process of another owner")
+
+        foreign_pid = int(process.name)
         sandbox = self.sandbox()
         candidate = sandbox.host_path(self.candidate(sandbox))
+        start, before_owner = self.foreign_lease_identity(process)
+        self.assertEqual(before_owner, owner, f"Foreign lease owner PID {foreign_pid} changed UID before the claim")
+        result = self.claim_with_host_pids(sandbox, candidate, foreign_pid)
+        after_start, after_owner = self.foreign_lease_identity(process)
+        self.assertEqual(after_start, start, f"Foreign lease owner PID {foreign_pid} changed start time during the claim")
+        self.assertEqual(after_owner, before_owner, f"Foreign lease owner PID {foreign_pid} changed UID during the claim")
+        self.assert_canary(candidate / "old" / "output")
+        self.assert_claim(result, "proof-2")
+
+    def test_foreign_lease_owner_case_skips_when_no_foreign_process_is_visible(self) -> None:
+        processes = [Path("/proc/self"), Path("/proc") / str(os.getpid())]
+        with (mock.patch.object(Path, "iterdir", return_value=iter(processes)),
+              mock.patch.object(self, "sandbox", side_effect=AssertionError("the claim started")),
+              self.assertRaises(unittest.SkipTest) as skipped):
+            self.test_keeps_a_folder_with_a_foreign_lease_owner()
+        self.assertEqual(str(skipped.exception), "not run: the guest sandbox shows no process of another owner")
+
+    def claim_with_host_pids(self, sandbox: RemovalSandbox, candidate: Path,
+                             foreign_pid: int) -> subprocess.CompletedProcess[str]:
         bubblewrap = shutil.which("bwrap")
         self.assertIsNotNone(bubblewrap)
         assert bubblewrap is not None
         # Keep host PIDs visible. Only the fixture has a writable bind.
-        result = subprocess.run([
+        return subprocess.run([
             bubblewrap, "--unshare-user", "--unshare-net", "--unshare-ipc", "--unshare-uts", "--die-with-parent",
             "--ro-bind", "/", "/", "--bind", str(sandbox.fixture), str(sandbox.fixture), "--clearenv",
             "--hostname", "natedev", "--chdir", str(sandbox.fixture),
@@ -313,10 +382,8 @@ class ToolFolderRemovalTests(unittest.TestCase):
             "--setenv", "CONF_DIR", str(sandbox.host_path(sandbox.home / "config")),
             "--setenv", "CLAUDE_DISABLE_DATACLASS_CODE_CACHE", "1",
             str(Path(sys.executable).resolve()), "-B", "-c", RUN_CLAIM, str(sandbox.checkout), str(candidate),
-            ClaimCase.FOREIGN_OWNER.value,
+            ClaimCase.FOREIGN_OWNER.value, str(foreign_pid),
         ], check=False, capture_output=True, text=True, timeout=90)
-        self.assert_canary(candidate / "old" / "output")
-        self.assert_claim(result, "proof-2")
 
     def test_keeps_a_folder_with_a_held_lock(self) -> None:
         self.assert_kept(ClaimCase.HELD_LOCK)

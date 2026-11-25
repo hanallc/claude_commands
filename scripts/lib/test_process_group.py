@@ -319,7 +319,11 @@ class ShellProcessGroupTests(PrivateGroupFixture):
 
     def cancel_step(self, function: str, child: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
         verify = self.root / "scripts/direct/verify.sh"
-        definitions = shell_functions(verify, "save_verify_exit_stderr", "finish_exit_diagnostics", function)
+        definitions = shell_functions(
+            verify, "first_free_fd", "save_verify_exit_stderr", "finish_exit_diagnostics", "wait_for_verify_child",
+            "wait_for_verify_step_group", "finish_verify_temp_allocation", "close_verify_session_temp",
+            "stop_verify_step", function,
+        )
         watch = self.root / "watch"
         watch.mkdir(exist_ok=True)
         driver = """
