@@ -500,7 +500,7 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                 use.command = receive.command
                 copies.register_remote(replacement)
                 self.assertEqual(copies.mirror_run(use), 0)
-                self.remove_trees_through_cli("beta")
+                copies.remove_trees("beta")
                 self.assertFalse(tree.exists())
 
     def test_failed_admission_after_recovery_keeps_the_received_owner(self) -> None:
