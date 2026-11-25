@@ -512,11 +512,14 @@ def _paused_resume_needs_message(row: staff.StaffRow) -> bool:
 def _forward_resume(row: staff.StaffRow, options: CommandLine) -> int | None:
     """Resume a staff row on its configured workstation."""
     machine = stop_resume.member_machine(row)
-    if machine and unit_machine_is_local(machine):
-        return None
     if not machine:
+        if options.production:
+            # Keep the local lookup for production units without a recorded machine.
+            return None
         print(f"{row.name}: resume refused because the staff row has no machine", file=sys.stderr)
         return 1
+    if unit_machine_is_local(machine):
+        return None
     if options.here:
         print(f"{row.name}: session is on {machine}", file=sys.stderr)
         return 1
