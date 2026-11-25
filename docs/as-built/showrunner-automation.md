@@ -640,6 +640,7 @@ An empty optional time removes that time.
 7. Clear its unread time with `mark-read --id L<n> --source <source>`.
 8. Print the table with `list`.
 9. Ask nate for a Go with `ask L<n> --kind go|approval --target <staff id> --what <text> --why <text> [--config]`.
+10. Withdraw an open ask with `withdraw-ask L<n> --ask A<k> --reason "<text>"`.
 
 `ask` adds an `Ask` to the item's `asks` field and prints `L<n> A<k>`.
 The ids are `A1`, `A2` and on for each item.
@@ -648,6 +649,10 @@ Only the item's producer or morty can open an ask. The target must have a staff 
 Each ask stores the kind, What, Why, the target, the config flag, the opened time, the closed time and the go id.
 The frontmatter stores the asks as JSON. Old records without the field load with no asks and are not written.
 An open ask makes the item unread, and the log gets an “Ask opened” line.
+Only the item's producer or morty can withdraw an ask.
+Withdrawal closes the ask without a go id and saves a withdrawal flag.
+The log records “Ask withdrawn” with the ask, the caller's staff name and the reason.
+The List removes the button for the withdrawn ask. `go_check.py` refuses it.
 The List page Go closes the ask with its go id and logs a “Go given” line; see review-links.md, [Asks for nate's Go](review-links.md#asks-for-nates-go).
 When no ask that shows a box stays open, the item becomes read if it has no other unread change.
 An ask whose target has no staff row shows no box.

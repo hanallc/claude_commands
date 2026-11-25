@@ -279,6 +279,8 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
         body = content.action + ": " + html.escape(", ".join(content.keys)) + by
     elif isinstance(content, the_list.EvidenceCopyRemoved):
         body = f"Removed the migration copy of {content.copy} from {FIELD_LABELS['evidence']}" + by
+    elif isinstance(content, the_list.AskWithdrawn):
+        body = f"Ask {html.escape(content.ask.ask_id)} withdrawn" + by + " " + html.escape(content.reason)
     elif isinstance(content, (the_list.AskOpened, the_list.GoGiven)):
         ask = content.ask
         target = names.html(ask.target, owner_name(names.members, ask.target))

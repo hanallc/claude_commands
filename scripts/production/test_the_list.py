@@ -1262,6 +1262,62 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(self.command(*args), (0, f"{item.id} A2\n", ""))
         self.assertEqual([ask.ask_id for ask in the_list.load(MORTY.id, item.id).asks], ["A1", "A2"])
 
+    def test_withdraw_ask_requires_the_producer_or_morty(self) -> None:
+        item = self.add(changes={"producer": BOB.id})
+        args = ("withdraw-ask", item.id, "--reason", "The merge is complete.", "--ask")
+        for number, session in enumerate((BOB.current_session, MORTY.current_session), 1):
+            ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge.",
+                                   why="The merge needs nate's go.", config=False, requester=MORTY.id, source="morty")
+            self.assertEqual(ask.ask_id, f"A{number}")
+            with patch.object(staff, "runtime_id", return_value=OWNER.current_session):
+                code, output, error = self.command(*args, ask.ask_id)
+                self.assertEqual((code, output), (1, ""))
+                self.assertEqual(len(error.splitlines()), 1)
+            with patch.object(staff, "runtime_id", return_value=""):
+                self.assertEqual(self.command(*args, ask.ask_id),
+                                 (1, "", "the_list: the current session has no staff row\n"))
+            self.assertEqual(the_list.open_asks(the_list.load(MORTY.id, item.id)), (ask,))
+            with patch.object(staff, "runtime_id", return_value=session):
+                self.assertEqual(self.command(*args, ask.ask_id), (0, f"withdrew {item.id} {ask.ask_id}\n", ""))
+            self.assertEqual(the_list.open_asks(the_list.load(MORTY.id, item.id)), ())
+
+    def test_withdraw_ask_appends_one_log_entry(self) -> None:
+        item = self.add(changes={"producer": BOB.id})
+        ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.APPROVAL, target=OWNER.id, what="Publish.",
+                               why="The release needs approval.", config=False, requester=BOB.id, source=BOB.name)
+        before = the_list.load(MORTY.id, item.id)
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        earlier_log = path.read_bytes().split(b"## Log\n\n", 1)[1].splitlines()
+        reason = "The release is complete."
+        with patch.object(staff, "runtime_id", return_value=BOB.current_session):
+            self.assertEqual(self.command("withdraw-ask", item.id, "--ask", ask.ask_id, "--reason", reason),
+                             (0, f"withdrew {item.id} {ask.ask_id}\n", ""))
+        saved = the_list.load(MORTY.id, item.id)
+        closed = replace(ask, closed=START, withdrawn=True)
+        self.assertEqual(saved.asks, (closed,))
+        self.assertEqual(saved.log, (*before.log, the_list.ItemChange(START, the_list.AskWithdrawn(closed, reason), BOB.name)))
+        self.assertEqual(path.read_bytes().split(b"## Log\n\n", 1)[1].splitlines()[:-1], earlier_log)
+
+    def test_withdraw_ask_refuses_closed_unknown_and_empty_reason(self) -> None:
+        item = self.add()
+        ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge.",
+                               why="The merge needs nate's go.", config=False, requester=MORTY.id, source="morty")
+        closed = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge.",
+                                  why="The merge needs nate's go.", config=False, requester=MORTY.id, source="morty")
+        _ = the_list.give_go(MORTY.id, item.id, closed.ask_id, "0" * 32, source="nate")
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        before = path.read_bytes()
+        with patch.object(staff, "runtime_id", return_value=MORTY.current_session):
+            for ask_id, reason, expected in (
+                (closed.ask_id, "The merge is complete.", f"{item.id} has no open ask {closed.ask_id}"),
+                ("A3", "The merge is complete.", f"{item.id} has no open ask A3"),
+                (ask.ask_id, "  ", "--reason must have one nonempty line"),
+            ):
+                with self.subTest(ask_id=ask_id):
+                    self.assertEqual(self.command("withdraw-ask", item.id, "--ask", ask_id, "--reason", reason),
+                                     (1, "", f"the_list: {expected}\n"))
+                    self.assertEqual(path.read_bytes(), before)
+
     def test_go_keeps_other_unread_changes_unread(self) -> None:
         def go(item: the_list.ListItem) -> the_list.ListItem:
             ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge.",

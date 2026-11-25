@@ -242,6 +242,7 @@ class Ask:
     opened: datetime
     closed: Timestamp = NoTimestamp.UNSET
     go_id: str = ""
+    withdrawn: bool = False
 
     @property
     def is_open(self) -> bool:
@@ -438,6 +439,12 @@ class AskOpened:
 
 
 @dataclass(frozen=True)
+class AskWithdrawn:
+    ask: Ask
+    reason: str
+
+
+@dataclass(frozen=True)
 class GoGiven:
     """Keep the closed ask with the go id of nate's click."""
 
@@ -454,7 +461,7 @@ class GoNotDelivered:
 
 PageActivity = PageFeedback | PageRequest | QuestionRequestReceipt | UnparkNoChangeReceipt
 ListEvent = (FieldChange | QuestionAnswered | QuestionClosed | MarkedRead | Reopened | Unparked
-             | ReviewLinksChanged | EvidenceCopyRemoved | AskOpened | GoGiven | GoNotDelivered | PageActivity)
+             | ReviewLinksChanged | EvidenceCopyRemoved | AskOpened | AskWithdrawn | GoGiven | GoNotDelivered | PageActivity)
 LogContent = str | ListEvent
 
 
@@ -732,8 +739,10 @@ def _validate_ask(ask: Ask) -> None:
     _ = staff_id(ask.target, "ask target")
     for moment in (ask.opened, ask.closed):
         _validate_time(moment)
-    if ask.is_open == bool(ask.go_id) or any(char.isspace() for char in ask.go_id):
-        raise ListError("only a closed ask has a go id, without spaces")
+    if ask.withdrawn and ask.is_open:
+        raise ListError("a withdrawn ask needs a close time")
+    if bool(ask.go_id) != (not ask.is_open and not ask.withdrawn) or any(char.isspace() for char in ask.go_id):
+        raise ListError("only a closed ask with a Go has a go id, without spaces")
 
 
 def _validate_asks(asks: tuple[Ask, ...]) -> None:
@@ -744,9 +753,13 @@ def _validate_asks(asks: tuple[Ask, ...]) -> None:
 
 
 def _stored_ask(ask: Ask) -> dict[str, object]:
-    return {"ask_id": ask.ask_id, "kind": ask.kind.value, "what": ask.what, "why": ask.why, "target": ask.target,
-            "config": ask.config, "opened": ask.opened.isoformat(), "closed": _time_text(ask.closed),
-            "go_id": ask.go_id}
+    fields: dict[str, object] = {
+        "ask_id": ask.ask_id, "kind": ask.kind.value, "what": ask.what, "why": ask.why, "target": ask.target,
+        "config": ask.config, "opened": ask.opened.isoformat(), "closed": _time_text(ask.closed), "go_id": ask.go_id,
+    }
+    if ask.withdrawn:
+        fields["withdrawn"] = True
+    return fields
 
 
 _ASK_FIELDS: frozenset[str] = frozenset(("ask_id", "kind", "what", "why", "target", "config", "opened", "closed", "go_id"))
@@ -754,7 +767,9 @@ _ASK_FIELDS: frozenset[str] = frozenset(("ask_id", "kind", "what", "why", "targe
 
 def _read_ask(value: object) -> Ask:
     fields = _json_fields(value)
-    if fields.keys() != _ASK_FIELDS:
+    withdrawn = fields.get("withdrawn") is True
+    expected = _ASK_FIELDS | {"withdrawn"} if withdrawn else _ASK_FIELDS
+    if fields.keys() != expected:
         raise ListError("invalid List ask")
     texts = {name: fields[name] for name in _ASK_FIELDS if name != "config"}
     if not all(isinstance(text, str) for text in texts.values()) or not isinstance(fields["config"], bool):
@@ -763,7 +778,7 @@ def _read_ask(value: object) -> Ask:
     if text["kind"] not in AskKind:
         raise ListError("invalid List ask kind")
     ask = Ask(text["ask_id"], AskKind(text["kind"]), text["what"], text["why"], staff.StaffId(text["target"]),
-              fields["config"], _required_time(text["opened"]), time_value(text["closed"]), text["go_id"])
+              fields["config"], _required_time(text["opened"]), time_value(text["closed"]), text["go_id"], withdrawn)
     _validate_ask(ask)
     return ask
 
@@ -1064,6 +1079,8 @@ def _log_content(content: LogContent) -> dict[str, object]:
         return {"action": "Removed Evidence copy", "copy": content.copy}
     if isinstance(content, AskOpened):
         return {"action": "Ask opened", "ask": _stored_ask(content.ask)}
+    if isinstance(content, AskWithdrawn):
+        return {"action": "Ask withdrawn", "ask": _stored_ask(content.ask), "reason": content.reason}
     if isinstance(content, GoGiven):
         return {"action": "Go given", "ask": _stored_ask(content.ask)}
     if isinstance(content, GoNotDelivered):
@@ -1146,16 +1163,22 @@ def _read_log_line(line: str, number: int) -> ItemChange:
                 if not ask.is_open:
                     raise ListError("an opened ask has no close time")
                 content = AskOpened(ask)
+            case {"action": "Ask withdrawn", "ask": value, "reason": str(reason)} if len(fields) == 3:
+                ask = _read_ask(value)
+                if not ask.withdrawn:
+                    raise ListError("an ask withdrawal needs a withdrawn ask")
+                _line(reason, "withdrawal reason")
+                content = AskWithdrawn(ask, reason)
             case {"action": "Go given", "ask": value} if len(fields) == 2:
                 ask = _read_ask(value)
-                if ask.is_open:
-                    raise ListError("a Go closes its ask")
+                if not ask.go_id:
+                    raise ListError("a Go needs a closed ask with a go id")
                 content = GoGiven(ask)
             case {"action": "Go not delivered", "ask": value, "recipient": str(recipient)} if len(fields) == 3:
                 ask = _read_ask(value)
                 _ = staff_id(recipient, "Go recipient")
-                if ask.is_open:
-                    raise ListError("an undelivered Go closes its ask")
+                if not ask.go_id:
+                    raise ListError("an undelivered Go needs a closed ask with a go id")
                 content = GoNotDelivered(ask, staff.StaffId(recipient))
             case {"feedback": feedback} if len(fields) == 1:
                 content = _read_page_activity(_json_fields(feedback), source, receipt=False)
@@ -1928,6 +1951,27 @@ def add_ask(keeper: staff.StaffId, identity: str, *, kind: AskKind, target: staf
     return _change(keeper, identity, edit, lambda changed: AskOpened(changed.asks[-1]), source).item.asks[-1]
 
 
+def withdraw_ask(keeper: staff.StaffId, identity: str, ask_id: str, reason: str, *, caller: staff.StaffRow) -> None:
+    """Close an open ask and record the reason under the item lock."""
+    reason = reason.strip()
+    _line(reason, "--reason")
+    console_text.require(reason, "list field", refusal=ListError)
+
+    def edit(item: ListItem, moment: datetime) -> ListItem:
+        if caller.id not in (keeper, item.producer):
+            raise ListError("only the item's producer or morty can withdraw an ask")
+        _open(item)
+        if not any(ask.ask_id == ask_id for ask in open_asks(item)):
+            raise ListError(f"{identity} has no open ask {ask_id}")
+        return replace(item, asks=tuple(replace(ask, closed=moment, withdrawn=True) if ask.ask_id == ask_id else ask
+                                        for ask in item.asks))
+
+    def event(changed: ListItem) -> AskWithdrawn:
+        return AskWithdrawn(next(ask for ask in changed.asks if ask.ask_id == ask_id), reason)
+
+    _ = _change(keeper, identity, edit, event, caller.name)
+
+
 def give_go(keeper: staff.StaffId, identity: str, ask_id: str, go_id: str, *, source: str) -> ListEdit:
     """Close the ask with the go id; mark the item read when no answerable ask stays open.
 
@@ -1983,7 +2027,7 @@ def log_go_not_delivered(keeper: staff.StaffId, identity: str, go_id: str, recip
         return replace(item, updated=NoTimestamp.UNSET)
 
     def event(changed: ListItem) -> GoNotDelivered:
-        ask = next((ask for ask in changed.asks if not ask.is_open and ask.go_id == go_id), None)
+        ask = next((ask for ask in changed.asks if ask.go_id and ask.go_id == go_id), None)
         if ask is None:
             raise ListError("no closed ask has this go id")
         return GoNotDelivered(ask, recipient)
@@ -2591,6 +2635,10 @@ def main(argv: list[str] | None = None) -> int:
     _ = ask.add_argument("--what", required=True, help="the one change that nate approves")
     _ = ask.add_argument("--why", required=True, help="why the session needs nate's word")
     _ = ask.add_argument("--config", action="store_true", help="the change is a settings.json, CLAUDE.md or config change")
+    withdrawal = commands.add_parser("withdraw-ask", help="withdraw an open List ask")
+    _ = withdrawal.add_argument("id", help="the List item ID, such as L1")
+    _ = withdrawal.add_argument("--ask", required=True, help="the ask ID, such as A1")
+    _ = withdrawal.add_argument("--reason", required=True, help="why the ask is no longer needed")
     for name in ("add", "update", "park", "unpark", "close", "reopen", "mark-read", "clean-evidence", "link", "unlink", "list"):
         command = commands.add_parser(name)
         if name != "list":
@@ -2635,7 +2683,8 @@ def main(argv: list[str] | None = None) -> int:
         if add_evidence is not None:
             _line(add_evidence, "evidence to add")
         record = staff.snapshot()
-        caller = record.by_current_session(staff.caller_identity())
+        session = staff.runtime_id() if name == "withdraw-ask" else staff.caller_identity()
+        caller = record.by_current_session(session) if session or name != "withdraw-ask" else None
         if caller is None:
             raise ListError("the current session has no staff row")
         if caller.kind != "producer":
@@ -2657,9 +2706,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         morty = producer_id(record, "morty")
         keeper = morty
-        if name == "ask":
+        if name in ("ask", "withdraw-ask"):
             identity = cast(str, args.id)
             identity = f"L{identity}" if identity.isascii() and identity.isdecimal() else identity
+            if name == "withdraw-ask":
+                ask_id = cast(str, args.ask)
+                withdraw_ask(keeper, identity, ask_id, cast(str, args.reason), caller=caller)
+                print(f"withdrew {identity} {ask_id}")
+                return 0
             target = staff.StaffId(cast(str, args.target))
             if record.by_id(target) is None:
                 raise ListError("--target must name a staff id")
