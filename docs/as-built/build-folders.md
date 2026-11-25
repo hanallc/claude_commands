@@ -296,7 +296,9 @@ The parent starts only `setpriv`. The SSH child reads the time limit after it ch
 The child uses `SUDO_UID` and `SUDO_GID` for all writes and removals.
 It starts with no supplementary groups or capabilities. The command refuses a root run without the sudo identity.
 The sudo list shows each gate folder that would move to disk. It shows the count and size of those folders.
-Review the list. When it has approved moves, it ends with `To move these folders, run:` and the complete sudo command.
+Review the list. When it has approved moves, it ends with three lines.
+The first gives the count and size of the folders that would move, for example `5 folders, 0.07 GiB, would move from memory to disk.`
+Then it prints `To move these folders, run:` and the complete sudo command.
 Copy the command to move the approved folders.
 Use the standard cleanup command for other removal rows.
 The command reads the configured places from `config/disks.conf`.

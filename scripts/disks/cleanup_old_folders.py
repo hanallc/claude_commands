@@ -3469,9 +3469,16 @@ def show_apply_command(local: HostList, mac: HostList | MacListUnavailable | Loc
     sudo = mode is CleanupMode.MOVE_GATE_GIT
     outcome = WouldMove if sudo else WouldRemove
     rows = chain(local.rows, mac.rows) if not sudo and isinstance(mac, HostList) else local.rows
-    if any(isinstance(row.outcome, outcome) for row in rows):
+    applied = [row for row in rows if isinstance(row.outcome, outcome)]
+    if applied:
         prefix = "sudo " if sudo else ""
         scope = " --host-list" if host_list else ""
+        if sudo:
+            gib = sum(row.size or 0 for row in applied) / (1 << 30)
+            unknown = sum(row.size is None for row in applied)
+            note = f" (size unknown for {unknown})" if unknown else ""
+            folders = "folder" if len(applied) == 1 else "folders"
+            print(f"{len(applied)} {folders}, {gib:.2f} GiB{note}, would move from memory to disk.")
         print(f"To {'move' if sudo else 'remove'} these folders, run:")
         print(f'{prefix}"$(command -v python3)" -IB "$HOME/.claude/scripts/disks/cleanup_old_folders.py"'
               + f"{scope} --go {approval}")

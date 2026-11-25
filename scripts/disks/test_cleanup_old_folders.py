@@ -648,11 +648,29 @@ assert not loaded, sorted(loaded)
             self.assertEqual(cleanup.run_cli((), run_ssh=self.unreachable), 0)
         approval = self.list_digest(output.getvalue())
         self.assertIn("would move to disk", output.getvalue())
-        self.assertEqual(output.getvalue().splitlines()[-2:], [
+        self.assertEqual(output.getvalue().splitlines()[-3:], [
+            "1 folder, 0.00 GiB, would move from memory to disk.",
             "To move these folders, run:",
             'sudo "$(command -v python3)" -IB "$HOME/.claude/scripts/disks/cleanup_old_folders.py"'
             + f" --go {approval}",
         ])
+
+    def test_move_count_line_counts_only_the_moving_folders(self) -> None:
+        cleanup = cleanup_old_folders
+        gib = 1 << 30
+        rows = (cleanup.Row(Path("/dev/shm/t-a"), 3 * gib // 2, cleanup.WouldMove(Path("/build/a"), "a")),
+                cleanup.Row(Path("/dev/shm/t-b"), gib // 2, cleanup.WouldMove(Path("/build/b"), "b")),
+                cleanup.Row(Path("/dev/shm/t-c"), None, cleanup.WouldMove(Path("/build/c"), "c")),
+                cleanup.Row(Path("/dev/shm/t-d"), 7 * gib, cleanup.WouldRemove("d")))
+        local = cleanup.HostList(cleanup.Machine.NATEDEV, rows)
+        with redirect_stdout(io.StringIO()) as output:
+            cleanup.show_apply_command(local, local, "f" * 64, mode=cleanup.CleanupMode.MOVE_GATE_GIT,
+                                       host_list=False)
+        self.assertEqual(output.getvalue().splitlines()[0],
+                         "3 folders, 2.00 GiB (size unknown for 1), would move from memory to disk.")
+        with redirect_stdout(io.StringIO()) as output:
+            cleanup.show_apply_command(local, local, "f" * 64, mode=cleanup.CleanupMode.STANDARD, host_list=False)
+        self.assertNotIn("would move from memory to disk", output.getvalue())
 
     @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
     def test_the_worker_applies_only_with_the_invoking_user_ids(self) -> None:
