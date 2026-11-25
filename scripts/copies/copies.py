@@ -1468,6 +1468,7 @@ class DirectCommandCopy:
 
 GATE_SCRIPT = "scripts/production/gate.py"
 GATE_CHECK_HELP = 3
+GATE_CHECK_REFUSED = 4
 GATE_CHECK_PROGRAM = """
 import argparse
 from importlib.util import find_spec
@@ -1475,7 +1476,8 @@ from pathlib import Path
 import sys
 
 root = Path.cwd()
-copy_run = sys.argv[2] == "run"
+help_status, refusal_status, parser_directory, launcher, mode, *arguments = sys.argv[1:]
+parser_root = Path(parser_directory)
 
 class Parser(argparse.ArgumentParser):
     def error(self, message):
@@ -1484,40 +1486,58 @@ class Parser(argparse.ArgumentParser):
     def parse_args(self, args=None, namespace=None):
         parsed = super().parse_args(args, namespace)
         repo = getattr(parsed, "repo", ".")
-        if copy_run:
+        if mode == "run":
             if repo == "{tree}":
                 parsed.repo = "."
             elif Path(repo) != Path("."):
                 self.error("The gate --repo must stay in the prepared source. Use --repo '{tree}'.")
         return parsed
 
-sys.path.insert(0, str(root))
+sys.argv[0] = str(parser_root / "scripts/production" / launcher)
+sys.path.insert(0, str(parser_root))
 spec = find_spec("scripts.production.gate")
-if spec is None or spec.origin is None or Path(spec.origin) != root / "scripts/production/gate.py":
-    raise SystemExit("Use the gate module from the prepared source.")
+if spec is None or spec.origin is None or Path(spec.origin) != parser_root / "scripts/production/gate.py":
+    raise SystemExit("Use the gate module from the selected checkout.")
 from scripts.production.gate import check_prepared_gate_source
 
 try:
-    check_prepared_gate_source(sys.argv[3:], Parser(prog="gate.py", allow_abbrev=False), root)
+    check_prepared_gate_source(arguments, Parser(prog=launcher, allow_abbrev=False), root)
 except SystemExit as error:
     if error.code == 0:
-        raise SystemExit(int(sys.argv[1])) from None
+        raise SystemExit(int(help_status)) from None
+    if error.code == 1:
+        raise SystemExit(int(refusal_status)) from None
     raise
 """
 
 
 def gate_command_source_check(command: Sequence[str], *,
                               numbered_copy: bool = False) -> Callable[[Path], None] | None:
-    """Select the check for the exact relative gate script path."""
+    """Select the parser checkout for a gate script."""
     program = parse_command_program(command, keep_path=True)
-    if isinstance(program, OtherCommand) or program[0] != GATE_SCRIPT:
+    if isinstance(program, OtherCommand):
         return None
-    _, arguments = program
+    script, arguments = program
+    launcher = Path(script)
+    if launcher.name not in MERGE_GATE_PROGRAMS:
+        return None
+    relative = Path(GATE_SCRIPT).with_name(launcher.name)
+    launcher_checkout = None
+    if launcher.is_absolute():
+        from scripts.lib.python_startup.sitecustomize import checkout_root
+
+        root = checkout_root(str(launcher.parent))
+        if not root or launcher.parent.resolve() / launcher.name != Path(root) / relative or not launcher.is_file():
+            return None
+        launcher_checkout = Path(root)
+    elif script not in (relative.as_posix(), f"{{tree}}/{relative.as_posix()}"):
+        return None
 
     def check(source: Path) -> None:
-        path = source.resolve() / GATE_SCRIPT
+        parser_root = launcher_checkout if launcher_checkout is not None else source.resolve()
+        path = parser_root / GATE_SCRIPT
         if path.resolve() != path:
-            raise CopyError(f"Use the regular {GATE_SCRIPT} file in the prepared source.")
+            raise CopyError(f"Use the regular {GATE_SCRIPT} file in {parser_root}.")
         if not path.is_file():
             return
         try:
@@ -1529,12 +1549,16 @@ def gate_command_source_check(command: Sequence[str], *,
             return
         mode = "run" if numbered_copy else "gate-step"
         result = subprocess.run(
-            [sys.executable, "-IB", "-c", GATE_CHECK_PROGRAM, str(GATE_CHECK_HELP), mode, *arguments],
+            [sys.executable, "-IB", "-c", GATE_CHECK_PROGRAM, str(GATE_CHECK_HELP), str(GATE_CHECK_REFUSED),
+             str(parser_root), launcher.name, mode, *arguments],
             cwd=source, capture_output=True, text=True,
         )
         if result.returncode == GATE_CHECK_HELP:
             print(result.stdout, end="")
             raise SystemExit(0)
+        if result.returncode == GATE_CHECK_REFUSED:
+            _ = sys.stderr.write(result.stderr)
+            raise SystemExit(1)
         if result.returncode:
             raise CopyError(result.stderr.rstrip() or f"Gate argument check exited with status {result.returncode}.")
 

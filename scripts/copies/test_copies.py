@@ -2494,6 +2494,52 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertEqual(result.stderr, "copies: --module needs --tests-only or --affected\n")
         admit.assert_not_called()
 
+    def test_run_reports_the_gate_refusal_for_an_invalid_nightly_owner(self) -> None:
+        from scripts.production import gate
+
+        _ = self.commit_gate_validator()
+        arguments = ("--nightly", "--merge-branch", "builds", "--unit", "Bad!")
+        with (mock.patch.object(gate, "checked_gate_target", return_value=gate.NO_GATE_ASSIGNMENT),
+              redirect_stderr(io.StringIO()) as direct_errors):
+            self.assertEqual(gate.main(arguments), 1)
+        command = (sys.executable, "scripts/production/gate.py", *arguments)
+        with mock.patch.object(first_step, "admitted_run",
+                               side_effect=first_step.FirstStepRefused("Fixture reached admission")) as admit:
+            result = self.run_cli(command=command)
+        admit.assert_not_called()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, direct_errors.getvalue())
+        self.assertEqual(result.stderr, "REFUSED: 'Bad!': owner must match [a-z0-9][a-z0-9_-]*\n")
+
+    def test_run_checks_the_absolute_merge_gate_parser_against_the_snapshot(self) -> None:
+        _ = self.commit_gate_script("""\
+            def check_prepared_gate_source(arguments, parser, source):
+                parser.error("The snapshot parser ran")
+            """)
+        launcher = Path(__file__).resolve().parents[1] / "production/merge_gate.py"
+        arguments = ("--checkout", "{tree}", "--tests-only", "--module", "copies/test_copies.py")
+        with mock.patch.object(first_step, "admitted_run",
+                               side_effect=first_step.FirstStepRefused("Fixture reached admission")) as admit:
+            refused = self.run_cli(command=(sys.executable, str(launcher), *arguments))
+            admit.assert_not_called()
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("--module 'copies/test_copies.py' does not name a test module", refused.stderr)
+
+            snapshot = self.run_cli(command=(sys.executable, "{tree}/scripts/production/gate.py", *arguments))
+            admit.assert_not_called()
+            self.assertEqual(snapshot.returncode, 2)
+            self.assertEqual(snapshot.stderr, "copies: The snapshot parser ran\n")
+
+            module = self.source / "scripts/copies/test_copies.py"
+            module.parent.mkdir()
+            module.touch()
+            _ = self.git(self.source, "add", str(module))
+            _ = self.git(self.source, "commit", "-qm", "Add the named module to the snapshot")
+            result = self.run_cli(command=(sys.executable, str(launcher), *arguments))
+            admit.assert_called_once()
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stderr, "copies: Fixture reached admission\n")
+
     def test_run_refuses_a_module_with_the_scripts_prefix_before_admission(self) -> None:
         _ = self.commit_gate_validator()
         with mock.patch.object(first_step, "admitted_run") as admit:
@@ -2573,7 +2619,7 @@ with patch.object(subprocess, 'run', pause_clone):
 
             assert sys.argv[1:] == ["--targeted", str(Path.cwd())]
             """)
-        for script in (str(self.source / "scripts/production/gate.py"), "{tree}/scripts/production/gate.py",
+        for script in (str(self.source / "scripts/production/gate.py"), "{tree}/./scripts/production/gate.py",
                        "./scripts/production/gate.py"):
             with self.subTest(script=script):
                 run_gate = mock.Mock(side_effect=launch_copy_fixture)

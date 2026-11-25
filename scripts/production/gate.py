@@ -3846,6 +3846,12 @@ def check_prepared_gate_source(arguments: Sequence[str], parser: argparse.Argume
         _ = parse_nightly_arguments(arguments, parser)
         return
     args = parse_gate_arguments(arguments, parser, repo_default=".")
+    if args.nightly and args.unit:
+        try:
+            _ = _nightly_unit(args)
+        except copies.CopyError as error:
+            print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+            raise SystemExit(1) from None
     if not args.modules:
         return
     repo = (source / Path(args.repo).expanduser()).resolve()
