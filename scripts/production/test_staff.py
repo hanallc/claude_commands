@@ -816,6 +816,51 @@ class DocumentLookupTests(StaffCommandTestCase):
 
 
 class StaffTests(StaffCommandTestCase):
+    def test_staff_row_without_pending_resume_uses_the_named_state(self) -> None:
+        _, unit, _ = self.tree()
+        encoded = unit.to_json()
+        self.assertNotIn("resume_pending", encoded)
+        self.assertEqual(staff.StaffRow.from_json(encoded).resume_pending, staff.NoPendingResume())
+
+    def test_resume_transaction_saves_the_pause_and_checks_the_key_on_completion(self) -> None:
+        _, unit, _ = self.tree()
+        pause = staff.Paused("2026-11-24T08:31:00-08:00", "operator", "review", keep_workers=True,
+                             unknown_fields={"future": "hold data"})
+        paused = staff.set_hold(unit.id, pause)
+        started = self.cli("begin-resume", unit.id, "--record", json.dumps(pause.to_json()), "--json")
+        pending = staff.StaffRow.from_json(cast(object, json.loads(started.stdout)))
+        key = f"agents-resume:{unit.id}:{pause.since}"
+        self.assertEqual(pending.paused, staff.Active())
+        self.assertEqual(pending.resume_pending, staff.ResumePending(key, pause))
+        self.assertEqual(staff.by_id(unit.id), pending)
+        self.assertEqual(staff.finish_resume(unit.id, "another-key"), pending)
+        self.assertEqual(staff.finish_resume(unit.id, key, restore_pause=True), paused)
+
+        _ = staff.begin_resume(unit.id, pause)
+        newer_pause = replace(pause, since="2026-11-24T08:45:00-08:00")
+        _ = staff.set_hold(unit.id, newer_pause)
+        finished = self.cli("finish-resume", unit.id, "--resume-key", key, "--restore-pause", "--json")
+        self.assertEqual(staff.StaffRow.from_json(cast(object, json.loads(finished.stdout))), replace(paused, paused=newer_pause))
+
+    def test_pause_keeps_the_worker_mode_in_the_staff_record(self) -> None:
+        _, unit, _ = self.tree()
+        hold = staff.Paused("2026-11-24", "caller", "maintenance", keep_workers=True,
+                            unknown_fields={"future": "field"})
+        kept = staff.set_hold(str(unit.id), hold)
+        self.assertEqual(staff.by_id(unit.id), kept)
+        self.assertEqual(staff.StaffSnapshot.decode(staff.snapshot().encode()).by_id(unit.id), kept)
+        self.assertEqual(hold.to_json()["keep_workers"], True)
+        self.assertEqual(hold.to_json()["future"], "field")
+        self.assertEqual(staff.pause(str(unit.id), "other reason", keep_workers=True), kept)
+
+        paused = staff.pause(str(unit.id), "other reason")
+        self.assertEqual(paused.paused, replace(hold, keep_workers=False))
+        self.assertEqual(staff.by_id(unit.id), paused)
+        self.assertEqual(staff.pause(str(unit.id), "maintenance", keep_workers=True), paused)
+        encoded = replace(hold, keep_workers=False).to_json()
+        self.assertNotIn("keep_workers", encoded)
+        self.assertFalse(staff.Paused.from_json(encoded).keep_workers)
+
     def test_retired_producer_keeps_its_id_through_unrelated_writes_and_snapshot_round_trips(self) -> None:
         producer = fixture_member("producer", name="planner")
         mark = staff.RetiredProducer("claude:sonnet:high")

@@ -29,8 +29,9 @@ from unittest.mock import ANY, Mock, call, patch
 from uuid import UUID, uuid4
 
 from scripts.lib.fixture_test_support import set_up_fixture
-from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
+from scripts.agents import detached_run_process, detached_runs, restart_support, shutdown, stop_resume, worker_lifecycle
 from scripts.agents import pane_record
+from scripts.agents.test_support import write_machine_config
 from scripts.astra import astra_roles
 from scripts.herdr import herdr_types, pane_launch
 from scripts.accounts import accounts
@@ -622,7 +623,7 @@ class WorkerCommandTests(unittest.TestCase):
         folder = path.parent
         delivery = send.Result("sent", "the holder received the result")
 
-        def resume(_row: staff.StaffRow, _plan: worker.WorkerResume) -> worker.ExitCode:
+        def resume(_opened: worker_panes.OpenWorker, _plan: worker.WorkerResume) -> worker.ExitCode:
             saved = cast(dict[str, object], json.loads(path.read_text()))
             self.assertEqual(saved["status"], "finished")
             return worker.ExitCode.OK
@@ -814,9 +815,9 @@ class WorkerCommandTests(unittest.TestCase):
                             self.fixture.world.locations[pane]["terminal_id"] = "replacement-terminal"
                     return result
 
-                def resume(row: staff.StaffRow, plan: worker.WorkerResume) -> worker.ExitCode:
+                def resume(opened: worker_panes.OpenWorker, plan: worker.WorkerResume) -> worker.ExitCode:
                     del plan
-                    events.append(row.name)
+                    events.append(opened.row.name)
                     return worker.ExitCode.OK
 
                 with redirect_stderr(io.StringIO()) as errors:
@@ -991,7 +992,7 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(report.restored, set())
         dispatch = progress_history.active_dispatch(row.id, self.run_dir)
         assert isinstance(dispatch, progress_history.ActiveDispatch)
-        self.assertIsInstance(worker.resume_receipt(row, dispatch),
+        self.assertIsInstance(worker.resume_receipt(row, dispatch, run=self.run_dir),
                               worker.DispatchAwaitingReply if accepted else worker.DispatchNotSubmitted)
         self.assertEqual(len(self.fixture.world.launches), launches)
         resume.assert_not_called()
@@ -1261,12 +1262,12 @@ class WorkerCommandTests(unittest.TestCase):
         parked_before = worker_panes.worker_pass(row, self.run_dir)
         resumed: list[worker.WorkerResume] = []
 
-        def capture_resume(_member: staff.StaffRow, plan: worker.WorkerResume) -> worker.ExitCode:
+        def capture_resume(_opened: worker_panes.OpenWorker, plan: worker.WorkerResume) -> worker.ExitCode:
             self.assertEqual(plan.step, worker.UnsubmittedAssignment(replacement, ("assign.sh",)))
             resumed.append(plan)
             return worker.ExitCode.OK
 
-        def record_resume(_member: staff.StaffRow, plan: worker.WorkerResume) -> worker.ExitCode:
+        def record_resume(_opened: worker_panes.OpenWorker, plan: worker.WorkerResume) -> worker.ExitCode:
             resumed.append(plan)
             return worker.ExitCode.OK
 
@@ -1429,7 +1430,7 @@ class WorkerCommandTests(unittest.TestCase):
         steps: list[worker.WorkerResume] = []
         launches = len(self.fixture.world.launches)
 
-        def capture_resume(_member: staff.StaffRow, plan: worker.WorkerResume,
+        def capture_resume(_opened: worker_panes.OpenWorker, plan: worker.WorkerResume,
                            **_options: object) -> worker.ExitCode:
             steps.append(plan)
             if evidence in ("previous pass", "previous stage"):
@@ -1461,6 +1462,75 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(steps, [])
             self.assertEqual(len(self.fixture.world.launches), launches)
 
+
+    def test_restore_continues_an_active_pass_after_production_pause_and_resume(self) -> None:
+        self.agent.without_done = True
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane, _ = self.agent.submitted[-1]
+        row = self.agent.row(pane)
+        dispatch = progress_history.active_dispatch(row.id, self.run_dir)
+        assert isinstance(dispatch, progress_history.ActiveDispatch)
+        parent = self.fixture.parent
+        owner = staff.snapshot().parent_of(parent)
+        assert owner is not None
+        write_machine_config(self.fixture.root / "conf")
+        running = stop_resume.ClaudeUp(str(parent.current_session), "w1:p0", "fixture")
+        with (patch.dict(os.environ, {"USER_ZONE": "UTC"}),
+              patch.object(herdr, "reboot_lock_path", return_value=self.fixture.root / "reboot.lock"),
+              patch.object(stop_resume, "running_on_account", return_value=running),
+              patch.object(restart_support, "send_message", return_value={"kind": "sent"}) as send_message,
+              redirect_stderr(io.StringIO()) as lifecycle_errors):
+            self.assertEqual(shutdown.main(["pause", "--production", owner.name, "--why", "review"]),
+                             0, lifecycle_errors.getvalue())
+            self.assertEqual(self.fixture.world.stops, [str(row.current_session)])
+            self.assertIsInstance(self.fixture.parent.paused, staff.Paused)
+            state = worker_panes.observe_worker(parent.id, row, staff.snapshot())
+            self.assertIsInstance(state, worker_panes.StoppedWorker)
+            self.assertEqual(shutdown.main(["resume", "--production", owner.name]), 0, lifecycle_errors.getvalue())
+        self.assertIsInstance(self.fixture.parent.paused, staff.Active)
+        send_message.assert_called_with(f"session:{parent.current_session}", "agents lifecycle",
+                                        "Continue where you stopped. Resume your existing workers. Do not open new workers.",
+                                        key=ANY, recipient_kind=None, once_per_key=True)
+        state = worker_panes.observe_worker(parent.id, row, staff.snapshot())
+        self.assertIsInstance(state, worker_panes.StoppedWorker)
+        notices = len(self.fixture.prompts())
+
+        with patch.object(self.fixture.world, "tab_sessions", return_value=[]) as tabs:
+            code, _, errors = self.command("restore")
+        self.assertEqual(code, worker.ExitCode.OK, errors)
+        tabs.assert_not_called()
+        prompt, = self.fixture.prompts()[notices:]
+        self.assertEqual(prompt[2], pane)
+        self.assertIn(f"Continue pass {dispatch.instance_id} in this conversation.", prompt[3])
+        self.assertEqual(staff.by_id(row.id), row)
+
+        self.agent.without_done = False
+        self.agent.complete(pane)
+        self.assertIs(self.finish(), turn_end.TurnOutcome.DONE)
+        self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.NoActiveDispatch)
+
+    def test_restore_recovers_a_complete_pass_after_another_pass_result(self) -> None:
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane, _ = self.agent.submitted[-1]
+        row = self.agent.row(pane)
+        path, result = self.detached_record(row, "other-check")
+        result.update(pane_dispatch_id="other-pass", delivery=f"sent: worker {row.name} at {pane}")
+        atomic_file.write_text_atomic(path, json.dumps(result))
+        self.agent.append(pane, "user", "Detached run: other-check\nRun finished: private verification")
+        dispatch = progress_history.active_dispatch(row.id, self.run_dir)
+        assert isinstance(dispatch, progress_history.ActiveDispatch)
+        with patch.object(worker_panes, "worker_run", return_value=self.run_dir.parent / "newer") as latest_run:
+            self.assertIsInstance(worker.resume_receipt(row, dispatch, run=self.run_dir), worker.DispatchComplete)
+        latest_run.assert_not_called()
+        _ = self.fixture.world.stop(row, self.fixture.world)
+        launches, prompts = len(self.fixture.world.launches), len(self.fixture.prompts())
+
+        code, _, errors = self.command("restore")
+        self.assertEqual((code, errors), (worker.ExitCode.OK, ""))
+        self.assertEqual(len(self.fixture.world.launches), launches)
+        self.assertEqual(len(self.fixture.prompts()), prompts)
+        self.assertEqual(self.reply.read_text().strip(), self.agent.replies[-1])
+        self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.NoActiveDispatch)
 
     def assert_restore_live_run(self, *, active: bool) -> None:
         from scripts.whoami import agent_accounts
@@ -1580,14 +1650,14 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(current, replace(busy.row, name="renamed-impl") if renamed else busy.row)
                 return
             self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers restored\n", ""))
-        resume.assert_called_once_with(replace(busy.row, role=staff.KnownWorkerRole("impl")),
-            worker.WorkerResume(worker.UnsubmittedAssignment(dispatch_id, ("assign.sh", "--to", busy.row.name))))
         self.assertEqual(self.fixture.staff_state(), before[0])
         self.assertEqual(len(self.fixture.world.launches), before[1] + 1)
         states = {state.row.id: state for state in worker_panes.observe(self.fixture.parent.id, staff.snapshot())}
         self.assertIsInstance(states[busy.row.id], worker_panes.OpenWorker)
         resumed = states[busy.row.id]
         assert isinstance(resumed, worker_panes.OpenWorker)
+        resume.assert_called_once_with(resumed,
+            worker.WorkerResume(worker.UnsubmittedAssignment(dispatch_id, ("assign.sh", "--to", busy.row.name))))
         self.assertEqual(resumed.pane, busy.pane)
         self.assertEqual(resumed.terminal, busy.terminal)
         self.assertIsInstance(states[idle.row.id], worker_panes.ClosedWorker)
@@ -1661,7 +1731,9 @@ class WorkerCommandTests(unittest.TestCase):
         launches = len(self.fixture.world.launches)
         with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume:
             self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.OK)
-        resume.assert_called_once_with(replace(opened.row, role=staff.KnownWorkerRole("impl")),
+        resumed = worker_panes.observe_worker(self.fixture.parent.id, opened.row, staff.snapshot())
+        self.assertIsInstance(resumed, worker_panes.OpenWorker)
+        resume.assert_called_once_with(resumed,
             worker.WorkerResume(worker.UnsubmittedAssignment(active.instance_id, active.launcher_command)))
         self.assertEqual(len(self.fixture.world.launches), launches)
         self.assertEqual(self.agent.submitted, [])
@@ -1736,6 +1808,47 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertCountEqual(result.panes, [PaneWorkerResume(busy.row.id, UnsubmittedAssignment("dispatch-impl", ("assign.sh", "same command"))),
                                              PaneWorkerResume(idle.row.id, IdleWorker())])
         self.assertEqual(result.results, [])
+
+    def test_resume_workers_keeps_only_the_step_with_an_unreadable_result(self) -> None:
+        from scripts.lib.resume_message import BusyPass, PaneWorkerResume
+
+        first, second = sorted((self.opened("impl"), self.opened("fix")), key=lambda opened: opened.row.id)
+        steps: dict[staff.StaffId, PaneWorkerResume] = {}
+        paths: dict[staff.StaffId, Path] = {}
+        for opened, run_id in ((first, "first-check"), (second, f"second-check@{second.row.id}")):
+            row = opened.row
+            dispatch = progress_history.begin_dispatch(self.run_dir, slot=row.name, phase="8", role="impl",
+                worker_name=row.name, worker_id=row.id, launcher_command=["assign.sh"], prompt=self.prompt,
+                kind="impl", lens="")
+            self.agent.append(opened.pane, "user", f"End your final reply with DONE {dispatch}.")
+            self.agent.append(opened.pane, "assistant", f"Report.\nDONE {dispatch}")
+            self.agent.append(opened.pane, "user", f"Detached run: {run_id}\nRun finished: private verification")
+            step = PaneWorkerResume(row.id, BusyPass(dispatch))
+            path, result = self.detached_record(row, run_id)
+            result.update(pane_dispatch_id="other-pass", delivery=f"sent: worker {row.name} at {opened.pane}")
+            atomic_file.write_text_atomic(path, json.dumps(result))
+            steps[row.id] = step
+            paths[row.id] = path
+
+        broken = paths[first.row.id].with_name("old.json")
+        atomic_file.write_text_atomic(broken, "{")
+        with redirect_stderr(io.StringIO()) as errors:
+            resumes = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
+        self.assertEqual(resumes.panes, [])
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn(f"anomaly: {broken}: worker state unreadable", errors.getvalue())
+
+        for row in (first.row, second.row):
+            path = paths[row.id]
+            with self.subTest(path=path):
+                saved = path.read_text()
+                atomic_file.write_text_atomic(path, "{")
+                with redirect_stderr(io.StringIO()) as errors:
+                    resumes = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
+                self.assertEqual(resumes.panes, [steps[row.id]])
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertIn(f"anomaly: {path}: worker state unreadable", errors.getvalue())
+                atomic_file.write_text_atomic(path, saved)
 
     def test_resume_workers_keeps_a_claude_child_launcher_without_a_native_pass(self) -> None:
         from scripts.lib.resume_message import BusyPass, IdleWorker, PaneWorkerResume, Resumable, Unavailable, resume_message
@@ -4715,7 +4828,7 @@ class WorkerCommandTests(unittest.TestCase):
             pass_recorder.DispatchDelivery(line, dispatch, str(self.reply)))
         self.agent.append(opened.pane, "user", line)
 
-        def resume_and_move(_row: staff.StaffRow, _plan: worker.WorkerResume) -> worker.ExitCode:
+        def resume_and_move(_opened: worker_panes.OpenWorker, _plan: worker.WorkerResume) -> worker.ExitCode:
             _ = staff.update_current_session(parent.current_session, moved)
             return worker.ExitCode.OK
 
@@ -7185,7 +7298,7 @@ class WorkerCommandTests(unittest.TestCase):
         with (patch.object(self.fixture.world, "tab_sessions", return_value=[]),
               patch.object(self.fixture.world, "prompt") as prompt):
             plan = worker.WorkerResume(worker.UnsubmittedAssignment("saved-pass", ("assign.sh",)))
-            self.assertEqual(worker._resume_launcher(opened.row, plan),  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(worker._resume_launcher(opened, plan),  # pyright: ignore[reportPrivateUsage]
                              worker.DispatchEvidenceUnknown("director session is unavailable"))
         prompt.assert_not_called()
 

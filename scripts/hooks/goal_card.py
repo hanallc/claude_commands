@@ -1,4 +1,4 @@
-"""Add a producer's ready goal card to a typed prompt."""
+"""Supply context and clear compaction markers for Codex prompts."""
 
 from __future__ import annotations
 
@@ -34,8 +34,8 @@ def context(record: staff.StaffSnapshot, *, is_typed: Callable[[], bool]) -> str
         return ""
 
 
-def _producer_fields(session_id: str) -> dict[str, object] | None:
-    """Find the current producer session in the local staff record."""
+def _session_fields(session_id: str) -> dict[str, object] | None:
+    """Find the current session in the local staff record."""
     path = os.path.expanduser(os.environ.get("STAFF_FILE") or "~/.local/state/staff/staff.json")
     try:
         with open(path, encoding="utf-8") as record:
@@ -52,12 +52,18 @@ def _producer_fields(session_id: str) -> dict[str, object] | None:
         if isinstance(entry, dict):
             fields = cast(dict[str, object], entry)
             if fields.get("current_session", fields.get("id")) == session_id:
-                return fields if fields.get("kind") == "producer" and "retired_producer" not in fields else None
+                return fields if "retired_producer" not in fields else None
     return None
 
 
+def _emit_context(text: str) -> None:
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit", "additionalContext": text,
+    }}))
+
+
 def main() -> None:
-    """Clear compaction and add any goal card in the same Codex hook."""
+    """Clear compaction and add the hold or goal context."""
     try:
         value = cast(object, json.load(sys.stdin))
     except (ValueError, RecursionError):
@@ -74,15 +80,24 @@ def main() -> None:
         clear(session_id)
     except (OSError, ValueError):
         pass
-    if (payload.get("hook_event_name") != "UserPromptSubmit" or "agent_id" in payload
-            or not isinstance(prompt, str)):
+    if payload.get("hook_event_name") != "UserPromptSubmit":
         return
-    fields = _producer_fields(session_id)
-    if fields is None:
+    fields = _session_fields(session_id)
+    if fields is None or ("paused" not in fields and fields.get("kind") != "producer"):
         return
 
     from scripts.hooks import conversation_pause
     from scripts.production import staff
+
+    try:
+        record = staff.StaffSnapshot((staff.StaffRow.from_json(fields),))
+    except (OSError, ValueError, RecursionError):
+        return
+    if conversation_pause.director_turn(session_id, record=record) is conversation_pause.DirectorTurn.HOLD:
+        _emit_context(conversation_pause.DIRECTOR_HOLD_CONTEXT)
+        return
+    if "agent_id" in payload or not isinstance(prompt, str):
+        return
 
     def is_typed() -> bool:
         source = conversation_pause.prompt_source(
@@ -96,15 +111,9 @@ def main() -> None:
         return (source is conversation_pause.PromptSource.TYPED
                 and not prompt.partition("\n")[2].startswith("Sender native id: "))
 
-    try:
-        record = staff.StaffSnapshot((staff.StaffRow.from_json(fields),))
-    except (OSError, ValueError, RecursionError):
-        return
     card = context(record, is_typed=is_typed)
     if card:
-        print(json.dumps({"hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit", "additionalContext": card,
-        }}))
+        _emit_context(card)
 
 
 if __name__ == "__main__":

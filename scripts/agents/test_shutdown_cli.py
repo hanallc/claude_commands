@@ -146,6 +146,8 @@ class AgentsUsageTests(unittest.TestCase):
                          ["help", "status", "pause", "exit", "pause", "resume", "resume", "resume", "retire", "rename", "move",
                           "reboot", "restart", "stop", "remove-stray", "transfer", "add-producer", "set-model"])
         self.assertIn("resume NAME", output)
+        self.assertIn("pause NAME [--finish-step] [--keep-workers] --why TEXT", output)
+        self.assertIn("pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] [--keep-workers] --why TEXT", output)
         self.assertIn("resume PRODUCER --resend-opening-prompt", output)
         self.assertIn("transfer NAME [--model MODEL --effort EFFORT]", output)
         self.assertIn("add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]", output)

@@ -3860,7 +3860,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         if fallback:
             active = progress_history.active_dispatch(row.id, self.run_dir)
             assert isinstance(active, progress_history.ActiveDispatch)
-            self.assertIsInstance(worker.resume_receipt(row, active), worker.DispatchAwaitingReply)
+            self.assertIsInstance(worker.resume_receipt(row, active, run=self.run_dir), worker.DispatchAwaitingReply)
         self.assertEqual(self.native_stop(row, ordinary), 0)
         self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "active")
 

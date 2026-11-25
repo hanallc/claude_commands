@@ -87,8 +87,6 @@ class LiveAccountUnproved(ResumeFailed):
 
 
 class RowStarter(Protocol):
-    def start_row(self, row: StaffRow, record: StaffSnapshot, client: herdr.Herdr, *,
-                  target_account: str | accounts.AccountSelection) -> str: ...
     def session_launch(self, identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]: ...
     def producer_launch(self, row: StaffRow) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]: ...
     def producer_resume(self, row: StaffRow, entry: pane_record.PaneLaunch
@@ -1364,7 +1362,7 @@ def _pane_command(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, ac
 
 
 def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch,
-                      account: str, message: str) -> Never:
+                      account: str, message: str, *, codex_prompt: bool = False) -> Never:
     """Replace the foreground command with the saved account launch."""
     kind = pane_launch.saved_kind(entry)
     environment = accounts.launch_shell_environment(Path(entry["cwd"]))
@@ -1386,7 +1384,7 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
     if kind == "claude":
         arguments = models_registry.claude_arguments(arguments, environment)
     command = [program, *trust_arguments(kind, entry["cwd"], arguments)]
-    if message and kind == "claude":
+    if message and (kind == "claude" or codex_prompt):
         command.append(message)
     os.chdir(entry["cwd"])
     row = staff.initial_snapshot().by_member_reference(entry["session_id"])
@@ -1399,12 +1397,16 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
         except (staff.StaffUnreadable, staff.StaffNotFound) as error:
             print(f"anomaly: {row.id}: pane home is unavailable: {error}", file=sys.stderr)
     try:
+        if codex_prompt and row is not None and isinstance(row.paused, staff.Paused):
+            _ = staff.resume(str(row.id))
         os.execvpe(program, command, staff.child_environment(environment))
     except OSError:
         if row is not None and row.home != selected_home and isinstance(row.home, staff.SessionHome):
             _ = staff.set_home(row.id, row.home)
         if row is not None and isinstance(row.exited, staff.Exited):
             _ = staff.set_hold(str(row.id), row.exited)
+        if codex_prompt and row is not None and isinstance(row.paused, staff.Paused):
+            _ = staff.set_hold(str(row.id), row.paused)
         raise
 
 
@@ -1570,8 +1572,13 @@ def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
                    and reference.casefold() in row.name.casefold()})[:5]
 
 
+PAUSED_CONTINUATION = "Continue where you stopped."
+
+
 def resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
+           keep_workers: bool = False,
            client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
+    """Resume the director alone when keep_workers is true."""
     with ExitStack() as locks:
         try:
             locks.enter_context(herdr.reboot_lock())
@@ -1581,7 +1588,7 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
         except (conf.Unusable, herdr.RebootLockBusy) as error:
             return ResumeFailed(session, str(error))
         with staff.row_operation(session):
-            return _resume(session, why=why, to=to, requester=requester, client=client)
+            return _resume(session, why=why, to=to, requester=requester, keep_workers=keep_workers, client=client)
 
 
 @dataclass(frozen=True)
@@ -1635,10 +1642,11 @@ def _unrecorded_codex_launch(identity: str) -> pane_record.PaneLaunch | SessionN
 
 
 def _resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
+            keep_workers: bool = False,
             client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     names = LaunchNames.read()
-    result = _resume_from_names(session, names, why=why, to=to, requester=requester, client=client)
-    if isinstance(result, ClaudeUp):
+    result = _resume_from_names(session, names, why=why, to=to, requester=requester, keep_workers=keep_workers, client=client)
+    if isinstance(result, ClaudeUp) and not keep_workers:
         members = [row for row in names.tab_record.rows
                    if row.current_session == result.session_id or row.id == session or row.name == session]
         if len(members) == 1:
@@ -1651,7 +1659,7 @@ def _resume(session: str, *, why: str = "resumed by name", to: str | None = None
 
 
 def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | None, requester: str,
-                       client: herdr.Herdr | herdr.LaunchClientSource) -> ResumeResult:
+                       keep_workers: bool, client: herdr.Herdr | herdr.LaunchClientSource) -> ResumeResult:
     record = names.tab_record
     retired = next((row for row in record.retired_producers if session in (row.name, row.id, row.current_session)), None)
     if retired is not None:
@@ -1704,7 +1712,7 @@ def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | 
             return ResumeFailed(session, "ambiguous name; candidates: " + ", ".join(identities))
         if identities:
             session = identities[0]
-    result = _resume_once(session, why=why, to=to, requester=requester, names=names, client=client)
+    result = _resume_once(session, why=why, to=to, requester=requester, names=names, keep_workers=keep_workers, client=client)
     if isinstance(result, SessionNotFound) and not matches:
         nearby = _nearby_resume_names(session, names)
         suffix = "; candidates: " + ", ".join(nearby) if nearby else ""
@@ -1761,7 +1769,7 @@ def _enrolled_showrunner_worker(row: staff.StaffRow, record: staff.StaffSnapshot
 
 
 def _resume_once(session: str, *, why: str, to: str | None = None, requester: str = "",
-                 names: LaunchNames,
+                 names: LaunchNames, keep_workers: bool = False,
                  client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     began = monotonic()
     identity = session
@@ -1850,14 +1858,19 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     return ResumeFailed(identity, "a unit owner is still live")
                 case unit_lookup.ProvedAbsentUnit():
                     pass
-        mode = worker_mode() if row is not None else NO_WORKERS
+        mode = worker_mode() if row is not None and not keep_workers else NO_WORKERS
         if isinstance(mode, WorkersHeld) and row is not None and row.kind == "worker" and kind == "codex":
             return ResumeFailed(identity, "no-worker mode keeps Codex workers stopped")
         if row is None and entry is None:
             return SessionNotFound(session)
         if row is not None and (entry is None or _enrolled_showrunner_worker(row, names.tab_record)):
-            restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
-            pane = restart.start_row(row, names.tab_record, client, target_account=to or "")
+            from scripts.agents import restart
+
+            if keep_workers:
+                pane = restart.start_row(row, names.tab_record, client, target_account=to or "",
+                                         worker_scope=restart.WorkerRestartScope.SELECTED_ROWS)
+            else:
+                pane = restart.start_row(row, names.tab_record, client, target_account=to or "")
             result = running_on_account(identity, pane, kind=kind)
             if isinstance(result, ClaudeUp):
                 return replace(result, elapsed_seconds=monotonic() - began, start_state=ClaudeStartState.STARTED)
@@ -1943,11 +1956,13 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 detached = detached_runs.resume_context(run / detached_runs.DETACHED_RUNS_DIR, row.name)
             elif isinstance(mode, WorkersHeld):
                 workers = mode
-            elif row is not None:
+            elif row is not None and not keep_workers:
                 workers = worker.resume_workers(row.id, names.tab_record)
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
-        if isinstance(own, worker.UnsubmittedAssignment):
+        if keep_workers:
+            message = ""
+        elif isinstance(own, worker.UnsubmittedAssignment):
             message = launcher_prompt(row.id, own.dispatch_id, own.command) if row is not None else ""
             if detached:
                 message += "\n" + detached
@@ -1969,6 +1984,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     entries[tab.pane_id] = pending
                     pane_record.save(client.session, entries)
             attempt_pane = tab.pane_id
+            if keep_workers:
+                _exec_in_own_pane(tab, entry, label, script_prompt(PAUSED_CONTINUATION), codex_prompt=True)
             _exec_in_own_pane(tab, entry, label, message)
         started: herdr.AgentLaunched | sessions.LiveSessionProcess
         if kind == "codex":

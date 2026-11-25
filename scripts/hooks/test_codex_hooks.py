@@ -48,11 +48,13 @@ COMPACTION_COMMAND = ('"$HOME/.claude/scripts/lib/py" '
                       '"$HOME/.claude/scripts/hooks/pre-compact-marker.py" --family codex')
 COMPACTION_GROUP: dict[str, object] = {"matcher": "*",
     "hooks": [{"type": "command", "command": COMPACTION_COMMAND, "timeout": 10}]}
-CLEAR_TURN_COMMAND = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/goal_card.py" '
-                      '2>/dev/null || true')
+GOAL_CARD_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/goal_card.py"'
+CLEAR_TURN_COMMAND = codex_hooks.PROMPT_COMMAND
 CLEAR_END_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/compaction-marker-clear.py"'
 CLEAR_TURN_GROUP: dict[str, object] = {"matcher": "*",
     "hooks": [{"type": "command", "command": CLEAR_TURN_COMMAND, "timeout": 10}]}
+DIRECTOR_HOLD_COMMAND = ('"$HOME/.claude/scripts/lib/py" '
+                         '"$HOME/.claude/scripts/hooks/conversation_pause.py" codex-director-hold')
 CLEAR_END_GROUP: dict[str, object] = {"matcher": "*",
     "hooks": [{"type": "command", "command": CLEAR_END_COMMAND, "timeout": 10}]}
 TURN_END_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/../herdr/turn_end.py"'
@@ -373,13 +375,14 @@ class CodexHookInstallerTests(unittest.TestCase):
         ])
         self.assertEqual(len(self.groups()), 4)
 
-    def test_install_replaces_both_old_prompt_commands_and_keeps_custom_trust(self) -> None:
+    def test_install_replaces_old_prompt_commands_and_keeps_custom_trust(self) -> None:
         custom = {"type": "command", "command": "custom-prompt", "timeout": 10}
         old = [
             {"type": "command", "command": '"$HOME/.claude/scripts/hooks/compaction-marker-clear.sh"',
              "timeout": 10},
-            {"type": "command", "command": '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/goal_card.py"',
-             "timeout": 10},
+            {"type": "command", "command": GOAL_CARD_COMMAND, "timeout": 10},
+            {"type": "command", "command": GOAL_CARD_COMMAND + " 2>/dev/null || true", "timeout": 10},
+            {"type": "command", "command": DIRECTOR_HOLD_COMMAND, "timeout": 10},
         ]
         group: dict[str, object] = {"matcher": "*", "hooks": [*old, custom]}
         _ = self.hooks_file.write_text(json.dumps({"hooks": {"UserPromptSubmit": [group]}}), encoding="utf-8")
@@ -461,7 +464,8 @@ class CodexHookInstallerTests(unittest.TestCase):
             f"{self.hooks_file}:session_start:0:0", f"{self.hooks_file}:subagent_start:0:0",
             f"{self.hooks_file}:session_start:1:0", f"{self.hooks_file}:post_tool_use:{len(original)}:0",
             f"{self.hooks_file}:pre_compact:0:0", f"{self.hooks_file}:user_prompt_submit:0:0",
-            f"{self.hooks_file}:post_compact:0:0", f"{self.hooks_file}:stop:0:0",
+            f"{self.hooks_file}:post_compact:0:0",
+            f"{self.hooks_file}:stop:0:0",
         ])
         self.assertEqual(len(self.trust()), 12)
 

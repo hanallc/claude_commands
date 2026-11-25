@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import cast, final, override
 
-from scripts.hooks import codex_hooks, compaction_marker
+from scripts.hooks import codex_hooks, compaction_marker, conversation_pause
 from scripts.production import goal, staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 
@@ -28,14 +28,16 @@ class CodexPromptHookTests(StaffTestCase):
     def installation(self) -> Path:
         return Path.home() / ".claude"
 
-    def invoke(self, session: staff.StaffId, prompt: str = "What is the main goal?", *, profile: bool = False
+    def invoke(self, session: staff.StaffId, prompt: str = "What is the main goal?", *,
+               profile: bool = False, worker_prompt: bool = False
                ) -> subprocess.CompletedProcess[str]:
         command = ["sh", "-c", COMMAND]
         if profile:
             command = [str(self.installation / "scripts/lib/py"), str(CHECKOUT / "scripts/hooks/goal_card.py")]
         environment = {**os.environ, "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner"),
                        "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "pause"),
-                       "PYTHONPROFILEIMPORTTIME": "1" if profile else ""}
+                       "PYTHONPROFILEIMPORTTIME": "1" if profile else "",
+                       "UNIT_TEAM_ROLE": "fixture-worker" if worker_prompt else "", "STAFF_ID": ""}
         return subprocess.run(command, env=environment, text=True, capture_output=True,
                               input=json.dumps({"hook_event_name": "UserPromptSubmit", "prompt": prompt,
                                                 "session_id": session}), timeout=5, check=False)
@@ -130,6 +132,50 @@ class CodexPromptHookTests(StaffTestCase):
             "hookEventName": "UserPromptSubmit", "additionalContext": "Publish the panel",
         }})
 
+    def test_worker_without_markers_exits_before_the_launcher(self) -> None:
+        row = self.worker()
+        launcher = self.installation / "scripts/lib/py"
+        launcher.parent.mkdir(parents=True)
+        ran = Path.home() / "launcher-ran"
+        _ = launcher.write_text('#!/bin/sh\n: > "$HOME/launcher-ran"\n', encoding="utf-8")
+        launcher.chmod(0o755)
+
+        result = self.invoke(row.current_session, worker_prompt=True)
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertFalse(ran.exists())
+
+    def test_worker_with_a_marker_clears_it_through_the_registered_hook(self) -> None:
+        row = self.worker()
+        self.installation.symlink_to(CHECKOUT, target_is_directory=True)
+        marker = self.marker(row.current_session)
+        other_marker = self.marker("another-session")
+
+        result = self.invoke(row.current_session, worker_prompt=True)
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertFalse(marker.exists())
+        self.assertTrue(other_marker.is_file())
+
+    def test_paused_director_gets_hold_context_and_clears_the_marker(self) -> None:
+        owner = fixture_member("showrunner", name="fixture-production")
+        director = fixture_member("unit", name="fixture-team", parent=owner.id)
+        _ = staff.pause(str(director.id), "maintenance", keep_workers=True)
+        self.installation.symlink_to(CHECKOUT, target_is_directory=True)
+        marker = self.marker(director.current_session)
+
+        result = self.invoke(director.current_session)
+
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertFalse(marker.exists())
+        self.assertEqual(cast(object, json.loads(result.stdout)), {"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit", "additionalContext": conversation_pause.DIRECTOR_HOLD_CONTEXT,
+        }})
+
+        _ = staff.resume(str(director.id))
+        result = self.invoke(director.current_session)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+
     def test_launcher_failure_is_silent(self) -> None:
         row = self.worker()
         _ = self.marker(row.current_session)
@@ -141,7 +187,7 @@ class CodexPromptHookTests(StaffTestCase):
         )
         launcher.chmod(0o755)
 
-        result = self.invoke(row.current_session)
+        result = self.invoke(row.current_session, worker_prompt=True)
 
         self.assertTrue((Path.home() / "launcher-ran").is_file())
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
