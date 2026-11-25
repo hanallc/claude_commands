@@ -17,19 +17,20 @@ from collections.abc import Generator
 import contextlib
 import fcntl
 import json
-import math
 from dataclasses import dataclass
 import os
 import select
+import selectors
 import signal
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from typing import TypedDict, cast
+from typing import TextIO, TypedDict, cast
 import uuid
 
 from scripts.build_hold import override_guard
@@ -38,8 +39,8 @@ from scripts.build_queue import admission_wire as wire
 from scripts.lib import conf, process_group
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import claim_state, mac_test
-from scripts.mac_test.mac_transport import (MacPlacement, RemoteRun, RemoteState, remote_command, stop_command,
-                                            stop_remote, stream_remote)
+from scripts.mac_test.mac_transport import (BATCH_MODE, MacPlacement, RemoteRun, RemoteState, placement_value,
+                                            remote_command, stop_command, stop_remote, stream_remote)
 
 
 def admission_command() -> list[str]:
@@ -269,6 +270,179 @@ def shell_session() -> OwningSession | NoOwningSession:
     return OwningSession(session) if session else NoOwningSession()
 
 
+def smoke_session(placement: MacPlacement, command: list[str], ssh: contextlib.ExitStack) -> subprocess.Popen[str]:
+    """Run the numbered copy with the SSH input open."""
+    work = f"MAC_PLACEMENT={shlex.quote(placement_value(placement))} {shlex.join(command)}"
+    process = ssh.enter_context(subprocess.Popen(
+        ["ssh", *BATCH_MODE, placement.host, "/bin/zsh -f -c " + shlex.quote(work)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace"))
+    _ = ssh.callback(stop_command, process)
+    return process
+
+
+@dataclass(frozen=True)
+class SmokeNotReady:
+    pass
+
+
+@dataclass(frozen=True)
+class SmokeConnectionLost:
+    pass
+
+
+@dataclass(frozen=True)
+class SmokeFinalStatus:
+    status: int
+
+
+@dataclass(frozen=True)
+class SmokeMissingStatus:
+    pass
+
+
+@dataclass(frozen=True)
+class SmokeInvalidStatus:
+    pass
+
+
+@dataclass(frozen=True)
+class SmokeStatusReadTimedOut:
+    seconds: float
+
+
+SmokeResult = (SmokeNotReady | SmokeConnectionLost | SmokeFinalStatus | SmokeMissingStatus
+               | SmokeInvalidStatus | SmokeStatusReadTimedOut)
+
+
+def smoke_status_path(episode: str) -> Path:
+    """Name the status file inside this run's Mac scratch folder."""
+    from scripts.lib import copy_record
+
+    if uuid.UUID(hex=episode).hex != episode:
+        raise ValueError("the Mac smoke run has an invalid episode")
+    return copy_record.root() / f"mac-smoke-{episode}" / "status"
+
+
+def take_smoke_status(episode: str) -> int:
+    """Return the status and remove its scratch folder."""
+    path = smoke_status_path(episode)
+    try:
+        status = path.read_bytes()
+    except FileNotFoundError:
+        return 1
+    shutil.rmtree(path.parent)
+    _ = sys.stdout.buffer.write(b"mac_smoke_status=" + status)
+    return 0
+
+
+def read_smoke_ready(output: TextIO, episode: str) -> bool:
+    ready = f"mac_smoke_ready={episode}\n"
+    for line in output:
+        if line == ready:
+            return True
+        print(line, end="", flush=True)
+    return False
+
+
+def read_smoke_result(placement: MacPlacement, ssh_status: int, *, ready: bool) -> SmokeResult:
+    """Read and remove the status file after the first SSH command ends."""
+    if not ready:
+        return SmokeNotReady()
+    if ssh_status:
+        return SmokeConnectionLost()
+    command = ('exec "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/mac_test/mac_queue_run.py"'
+               f' smoke-status {shlex.quote(placement.episode)}')
+    timeout = conf.read("mac_test").number("probe_timeout_s")
+    try:
+        result = subprocess.run(
+            ["ssh", *BATCH_MODE, placement.host, "/bin/zsh -f -c " + shlex.quote(command)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return SmokeStatusReadTimedOut(timeout)
+    if result.returncode or not result.stdout:
+        return SmokeMissingStatus()
+    prefix = b"mac_smoke_status="
+    if result.stdout.startswith(prefix) and result.stdout.endswith(b"\n"):
+        status = result.stdout[len(prefix):-1]
+        if 1 <= len(status) <= 3 and status.isdigit() and int(status) <= 255:
+            return SmokeFinalStatus(int(status))
+    return SmokeInvalidStatus()
+
+
+def run_smoke_copy(command: list[str]) -> int:
+    """Publish the copy command's exit code after the lease closes."""
+    from scripts.lib import scratch
+
+    episode = os.environ["MAC_PLACEMENT"].partition("/")[0]
+    status_file = smoke_status_path(episode)
+    status_file.unlink(missing_ok=True)
+    result = subprocess.run(command)
+    status = result.returncode if result.returncode >= 0 else 128 - result.returncode
+    status_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    now = time.time()
+    # The hourly sweep lists an orphaned status folder for manual removal after it expires.
+    scratch.write_record(status_file.parent, scratch.task_or_default("", now), now, throwaway=True)
+    write_text_atomic(status_file, f"{status}\n", new_file_mode=0o600)
+    return 0
+
+
+def run_smoke_work(work: str, cleanup: str) -> int:
+    """Stop the smoke work on SSH EOF and settle the copy before its lease ends."""
+    from scripts.lib.build_folders import COPY_KEEP_ENV
+
+    episode = os.environ["MAC_PLACEMENT"].partition("/")[0]
+    home = Path.home()
+    incoming = sys.stdin.fileno()
+    if select.select([incoming], [], [], 0)[0]:
+        return 1
+    environment = dict(os.environ)
+    checkout = Path.cwd()
+    keep_file = Path(os.environ[COPY_KEEP_ENV])
+    _ = keep_file.write_text("Mac smoke checkout clearance is unconfirmed.\n")
+    descriptor, token = tempfile.mkstemp(prefix=".mac-smoke-launch-", dir=checkout)
+    os.close(descriptor)
+    environment["MAC_SMOKE_LAUNCH_TOKEN"] = token
+    os.chdir(home)
+    locks = tuple(int(number) for number in os.environ.get("COPIES_COMMAND_LEASE_FDS", "").split(",") if number)
+    group = subprocess.Popen(["/bin/zsh", "-c", work], cwd=checkout, start_new_session=True,
+                             env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, pass_fds=locks)
+    assert group.stdout is not None
+    output = group.stdout.fileno()
+    disconnected = False
+    try:
+        while True:
+            ready, _, _ = select.select([incoming, output], [], [])
+            if incoming in ready:
+                disconnected = True
+                break
+            chunk = os.read(output, 65536)
+            if not chunk:
+                _ = group.wait()
+                break
+            _ = sys.stdout.buffer.write(chunk)
+            _ = sys.stdout.buffer.flush()
+    finally:
+        if group.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process_group.send_process_group(group.pid, signal.SIGKILL)
+            _ = group.wait()
+        _ = group.stdout.close()
+        cleared = subprocess.run(["/bin/zsh", "-c", cleanup, "cleanup-copy", str(checkout)], cwd=home,
+                                 env=environment, stdin=subprocess.DEVNULL)
+    if disconnected:
+        return 1
+    status = group.wait()
+    if status < 0:
+        status = 128 - status
+    status = status or (cleared.returncode if cleared.returncode >= 0 else 128 - cleared.returncode)
+    release_timeout = conf.read("production").whole("mac_run_status_grace_seconds")
+    print(f"\nmac_smoke_ready={episode}", flush=True)
+    if not select.select([incoming], [], [], release_timeout)[0]:
+        print(f"mac queue: the copy release timed out after {release_timeout}s", file=sys.stderr)
+        return status or 1
+    return status if os.read(incoming, 1) == b"\n" else status or 1
+
+
 def run(args: Arguments) -> int:
     since = time.time()
     # A block admits its holding unit's workers, so each kind checks the block as the unit's session.
@@ -338,6 +512,9 @@ def run_attempt(
         callback_environment = dict(os.environ)
         cleanup_leased = False
         mac_run = args.is_mac_run
+        smoke: subprocess.Popen[str] | None = None
+        smoke_ready = False
+        cleaned = False
         try:
             while True:
                 code, output, errors = capture_command(admission_command() + placement_arguments(episode, since, pid,
@@ -402,8 +579,16 @@ def run_attempt(
                         status = 1
                         if args.owned_close and not on_close:
                             raise ValueError("the run needs a close hook")
-                        status = stream_remote(remote_command(placement, args.cwd, command, on_close,
-                                                              owned_close=args.owned_close), remote, ssh)
+                        if mac_run:
+                            smoke = smoke_session(placement, command, ssh)
+                            remote.state = RemoteState.LIVE
+                            assert smoke.stdin is not None and smoke.stdout is not None
+                            smoke_ready = read_smoke_ready(cast(TextIO, smoke.stdout), placement.episode)
+                            if smoke_ready:
+                                status = 0
+                        else:
+                            status = stream_remote(remote_command(placement, args.cwd, command, on_close,
+                                                                  owned_close=args.owned_close), remote, ssh)
             if isinstance(block, mac_test.ClaimDenied):
                 print(block.reason)
                 status = MAC_RUN_REFUSED_STATUS
@@ -411,10 +596,9 @@ def run_attempt(
             print(f"mac queue: {error}", file=sys.stderr)
             status = 2
         finally:
-            if not args.owned_close:
+            safe = remote.state != RemoteState.LIVE or smoke_ready
+            if not safe and not args.owned_close and not mac_run:
                 ssh.close()
-            safe = remote.state != RemoteState.LIVE
-            if not safe and not args.owned_close:
                 try:
                     safe = stop_remote(placement, remote)
                 except OSError:
@@ -432,8 +616,44 @@ def run_attempt(
                         safe = False
                 else:
                     safe = True
-                    (directory / "run.json").unlink()
-            # Owned cleanup uses the close hook while SSH still holds its input open.
+                    cleaned = True
+            if smoke is not None:
+                assert smoke.stdin is not None and smoke.stdout is not None
+                try:
+                    with contextlib.suppress(BrokenPipeError):
+                        if smoke_ready and sys.exception() is None:
+                            # Release the copy after local cleanup. EOF alone means the connection ended.
+                            _ = smoke.stdin.write("\n")
+                            smoke.stdin.flush()
+                    with contextlib.suppress(BrokenPipeError):
+                        smoke.stdin.close()
+                    for line in cast(TextIO, smoke.stdout):
+                        print(line, end="", flush=True)
+                    smoke_result = read_smoke_result(placement, smoke.wait(), ready=smoke_ready)
+                    match smoke_result:
+                        case SmokeFinalStatus(remote_status):
+                            remote.state = RemoteState.EXITED
+                            status = remote_status or status
+                            safe = True
+                        case _:
+                            match smoke_result:
+                                case SmokeNotReady():
+                                    detail = "the Mac returned no valid final status because the ready line is missing"
+                                case SmokeConnectionLost():
+                                    detail = "the SSH connection closed before the Mac run ended"
+                                case SmokeStatusReadTimedOut(seconds):
+                                    detail = f"the Mac status read timed out after {seconds:g} seconds"
+                                case SmokeMissingStatus() | SmokeInvalidStatus():
+                                    detail = "the Mac returned no valid final status"
+                            print(f"mac queue: {detail}", file=sys.stderr)
+                            status = 255
+                            safe = False
+                except (OSError, ValueError) as error:
+                    print(f"mac queue: the Mac smoke session did not finish: {error}", file=sys.stderr)
+                    status = status or 2
+                    safe = False
+            if cleaned and safe:
+                (directory / "run.json").unlink()
             ssh.close()
             mirror.close()
             # A Mac placement has no local grant, so the run returns it with a cancel that names the result.
@@ -483,6 +703,23 @@ def watch_caller(caller: int, queue: int) -> int:
     return 2
 
 
+def watcher_ready(output: int, timeout: float) -> bool:
+    expected = b"ready\n"
+    received = b""
+    deadline = time.monotonic() + timeout
+    with selectors.DefaultSelector() as readiness:
+        _ = readiness.register(output, selectors.EVENT_READ)
+        while received != expected:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not readiness.select(remaining):
+                return False
+            chunk = os.read(output, len(expected) - len(received))
+            received += chunk
+            if not chunk or not expected.startswith(received):
+                return False
+    return True
+
+
 @contextlib.contextmanager
 def caller_watch(caller: int) -> Generator[None]:
     pid = os.getpid()
@@ -504,11 +741,10 @@ def caller_watch(caller: int) -> Generator[None]:
         with watcher:
             try:
                 assert watcher.stdout is not None
-                output = watcher.stdout.fileno()
-                readiness = select.poll()
-                readiness.register(output, select.POLLIN)
-                grace = conf.read("mac_gate").number("terminate_grace_seconds")
-                if not readiness.poll(math.ceil(grace * 1000)) or os.read(output, 6) != b"ready\n":
+                config = conf.read("mac_gate")
+                startup_timeout = config.whole("placement_check_timeout_seconds")
+                grace = config.number("terminate_grace_seconds")
+                if not watcher_ready(watcher.stdout.fileno(), startup_timeout):
                     raise ValueError("the Mac queue caller watch did not start")
 
                 def monitor() -> None:
@@ -551,6 +787,12 @@ def main(argv: list[str] | None = None) -> int:
     words = sys.argv[1:] if argv is None else argv
     if len(words) == 3 and words[0] == "watch-caller":
         return watch_caller(int(words[1]), int(words[2]))
+    if len(words) == 3 and words[0] == "smoke-work":
+        return run_smoke_work(words[1], words[2])
+    if len(words) > 1 and words[0] == "smoke-copy":
+        return run_smoke_copy(words[1:])
+    if len(words) == 2 and words[0] == "smoke-status":
+        return take_smoke_status(words[1])
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--what", required=True)
     _ = parser.add_argument("--kind", choices=("shot", "install", "probe", "run"), required=True)

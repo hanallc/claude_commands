@@ -241,7 +241,12 @@ command takes `--phase <id>`: a named older open phase reads and writes its
 parked file, so its repair never moves the newest phase's ledger. A named phase
 that is not open exits with `Phase <id> is not open (open phases: …)`; with two
 or more open and none named, `<N> phases are open (<ids>); name one with
---phase`. `assign_claude.py` passes the assigned phase to `landed` and `abandon`. Findings get stable
+--phase`. `decision` and `status` also take a closed phase by its newest ledger.
+`open` takes a late finding for a closed phase: it writes the parked ledger of
+the newest instance that the run started, which `review-trial` reads.
+`open --accepted` records a late finding that is already fixed, with the
+`finding_verdict` event that `verdict` writes. It refuses an open or unnamed
+phase and `--held-for-decision`. `assign_claude.py` passes the assigned phase to `landed` and `abandon`. Findings get stable
 ids (`F001…`) that survive across rounds, so "the same finding came back" is a
 fact the script can check rather than a judgment the unit director has to make.
 Repair states are `open`, `repair_in_flight`, `fixed_pending_review`, `accepted`, and `routed`.
@@ -314,7 +319,7 @@ The parser requires three parts and nonblank run and finding ids.
 It accepts an empty phase instance id and preserves the `finding_route_closed` event format.
 
 ```text
-findings.py open --session-dir <dir> [--phase <id>] --severity blocker|minor|nit --title <text> --caught-by worker|main|both [--file <path>] [--line <N>] [--detail <text>]
+findings.py open --session-dir <dir> [--phase <id>] --severity blocker|minor|nit --title <text> --caught-by worker|main|both [--file <path>] [--line <N>] [--detail <text>] [--accepted]
 findings.py verdict --session-dir <dir> [--phase <id>] --id <F00N> --state accepted|still_open|reopened [--evidence <hunk>]
 findings.py gate --session-dir <dir> [--phase <id>]
 findings.py dispatch --session-dir <dir> [--phase <id>] --covers F001,F002,... --accepted-checks "<checks or none: reason>" [--keep F001=<category>:<evidence>]
@@ -326,12 +331,13 @@ progress_history.py start-run --session-dir <dir> --working-dir <dir> [--plan-do
 progress_history.py start-phase --session-dir <dir> --phase-id <id> --phase-title <title> [--work-order-file <path>] [--started-at <ISO with zone>]
 pass_record.py start-pass ...        # launcher only
 pass_record.py finish-pass ...       # launcher only, or --orphaned-launcher --status canceled
-progress_history.py start-activity --session-dir <dir> --label <label> --activity <text>
-progress_history.py finish-activity --session-dir <dir> [--status completed|error|canceled|interrupted] [--result <outcome>]
+progress_history.py start-activity --session-dir <dir> --label <label> --activity <text> [--started-at <ISO with zone>]
+progress_history.py finish-activity --session-dir <dir> [--status completed|error|canceled|interrupted] [--result <outcome>] [--finished-at <ISO with zone>]
 progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
 progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>] [--tables]
 progress_history.py eta --session-dir <dir> --time <t> [--phase-id <id>] [--earliest <t> --latest <t>] --basis stated|checkpoint|eta-command
 progress_history.py finish-phase --session-dir <dir> --status completed|stopped|error [--phase-id <id>] [--finished-at <ISO with zone>]
+progress_history.py checkpoint --session-dir <dir> --phase-id <id> --commit <full hash> --closed  # Record a missed checkpoint for a finished phase.
 progress_history.py drop-phase --session-dir <dir> --phase-id <id> --reason <text>
 progress_history.py finish-run ...
 progress_history.py review-trial --session-dir <dir> [--phase-id <id>]
@@ -376,6 +382,9 @@ Both events carry `backfilled: true` and `recorded_at`.
 The time must be in the past or present.
 The finish must follow the start.
 The phase table excludes those events from gap samples.
+`start-activity --started-at` and `finish-activity --finished-at` follow the same rules.
+An activity cannot start before its phase starts.
+A back-dated start closes the active activity as `interrupted` at that time, or at the present time if the active activity started later.
 
 For production plans, `start-phase`, every `progress` report, `finish-phase`,
 and `finish-run` end by asking `phase_table.py refresh` to rewrite the unit's

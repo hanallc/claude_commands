@@ -94,6 +94,7 @@ WORDS: Mapping[str | type[object], str | WaitWords] = {
         "{count} runs wait because the queue needs new memory estimates before they can start."),
     records.ReadingUnavailable: WaitWords("1 run waits because the queue cannot check whether it can start.",
         "{count} runs wait because the queue cannot check whether they can start."),
+    records.MachineChoiceWait: WaitWords("1 run waits for a machine choice.", "{count} runs wait for a machine choice."),
     records.NatedevHeld: WaitWords("1 run waits for the hold on natedev to end.",
         "{count} runs wait for the hold on natedev to end."),
     records.MemoryPressure: WaitWords("1 run waits while other work on the machine needs memory.",
@@ -316,7 +317,7 @@ class WaitingCheckout:
     may_wait_on_mac: bool = False
 
 
-def waiting_cause(step: records.WaitingStep) -> records.WaitReason:
+def waiting_cause(step: records.WaitingStep) -> records.WaitingStepReason:
     return step.reason.cause if isinstance(step.reason, records.HeadAdmissionStatus) else step.reason
 
 
@@ -333,8 +334,6 @@ def active_checkouts(reading: records.QueueRead) -> frozenset[CheckoutUse | Wait
                      for step in reading.view.waiting if step.folder)
     if isinstance(reading, wire.CloudQueueRead):
         checkouts.update(CheckoutUse(row.identity.folder, row.owner) for row in reading.cloud if row.identity.folder)
-        checkouts.update(WaitingCheckout(row.identity.folder, row.owner.pid, row.since)
-                         for row in reading.repository_slots if row.identity.folder)
     return frozenset(checkouts)
 
 
@@ -712,7 +711,7 @@ class MacRefresh:
 
 @dataclass(frozen=True)
 class VisibleWait:
-    source: queue_view.WaitingBuild | wire.CloudRow | wire.RepositorySlotRow
+    source: queue_view.WaitingBuild | wire.CloudRow
     name: str
 
 
@@ -723,10 +722,8 @@ def visible_waits(model: queue_view.QueueModel, local_names: Mapping[int, str],
     for entry in queue_view.waiting_builds(model):
         if isinstance(entry, queue_view.WaitingBuild):
             name = local_names.get(entry.position, "")
-        elif isinstance(entry, wire.CloudRow):
-            name = cloud_names.get(entry.owner, "")
         else:
-            name = entry.identity.unit or entry.identity.name
+            name = cloud_names.get(entry.owner, "")
         waits.append(VisibleWait(entry, clean_label(name)))
     return tuple(waits)
 
@@ -748,7 +745,7 @@ def policy_label(key: str) -> str:
     return recorded_origin(key).removeprefix("https://")
 
 
-def wait_words(reason: records.WaitReason | wire.CloudSlotWait) -> WaitWords:
+def wait_words(reason: records.WaitingStepReason | wire.CloudSlotWait) -> WaitWords:
     if isinstance(reason, records.RunLimitWait):
         name = policy_label(reason.repository)
         machine = clean_label(reason.machine)
@@ -1005,7 +1002,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     waiting_origins = {(waiter["pid"], waiter["since"]): origin for _, waiter in reading.ordered
                        if (origin := recorded_origin(waiter.get("repo_identity", "")))}
 
-    def record_wait(destination: WaitGroups, reason: records.WaitReason | wire.CloudSlotWait, name: str) -> None:
+    def record_wait(destination: WaitGroups, reason: records.WaitingStepReason | wire.CloudSlotWait, name: str) -> None:
         # Keep each policy group separate without publishing private keys.
         policy_index = (policy_wait_indices.setdefault(reason.repository, len(policy_wait_indices) + 1)
                         if isinstance(reason, records.RunLimitWait) else 0)
@@ -1018,18 +1015,6 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 name = short_name(origins.resolve("", entry.identity.folder))
                 destination = row(name).aws.waits if name else metric_waits.setdefault("cloud", {})
                 record_wait(destination, entry.wait, visible.name)
-            continue
-        if isinstance(entry, wire.RepositorySlotRow):
-            name = (short_name(origins.resolve("", entry.identity.folder))
-                    or short_name(recorded_origin(entry.wait.repository)) or policy_label(entry.wait.repository))
-            if entry.machine in mac_targets:
-                name = mac_row_name(entry.wait.repository)
-                destination = row(name).mac.waits if name else mac_waits
-            elif entry.machine == local:
-                destination = row(name).natedev.waits if name else local_waits
-            else:
-                destination = row(name).aws.waits if name and entry.machine in saved.aws_targets else remote_wait(entry.machine)
-            add_wait(destination, WAIT_WORDS["run_limit_full"], visible.name)
             continue
         step = entry.step
         pinned = step.route.target if isinstance(step.route, target_config.PinnedTarget) else local

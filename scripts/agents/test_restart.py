@@ -2420,7 +2420,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
               patch.object(os, "link", side_effect=publish_claim),
               patch.object(Path, "read_bytes", read_file),
               patch.object(io, "FileIO", side_effect=open_log),
-              patch.object(restart, "_notify_log_claim", side_effect=ready),
+              patch.object(stop_resume, "notify_ready", side_effect=ready),
               patch.object(staff, "initial_snapshot", side_effect=snapshot),
               patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows(list(rows))),
               patch.object(restart, "stop_row", side_effect=stop_row) as stop,
@@ -2486,9 +2486,12 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         write_text_atomic(run / unit_runs.STATE_FILE, json.dumps({unit_runs.OWNER_FIELD: owner.id, "pass": {}}))
         state = worker_panes.OpenWorker(child, "w1:p1", "terminal", herdr.AgentStatus.IDLE)
         shutdown_record.save([str(child.id)])
+        before = worker.PaneWorkerStates([worker_panes.ClosedWorker(child)], [run])
+        after = worker.PaneWorkerStates([state], [run])
         with (patch.object(staff, "initial_snapshot", return_value=record), staff.supplied_snapshot(record),
+              patch.object(staff, "authority_snapshot", return_value=record),
               patch.object(staff, "local_snapshot", return_value=record),
-              patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates([state], [run])),
+              patch.object(worker, "_read_workers", side_effect=[before, after]),
               patch.object(worker_panes, "worker_run", return_value=run),
               patch.object(worker_panes, "_transcript_messages", return_value=["user:\nOne moment."]) as messages,
               patch.object(worker_panes, "close") as close, redirect_stdout(io.StringIO()) as output):
@@ -2524,6 +2527,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             return ["user:\nOne moment."]
 
         with (patch.object(staff, "initial_snapshot", return_value=record), staff.supplied_snapshot(record),
+              patch.object(staff, "authority_snapshot", return_value=record),
               patch.object(staff, "local_snapshot", return_value=record),
               patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates(states, [run])),
               patch.object(worker_panes, "worker_run", return_value=run),
@@ -2553,16 +2557,27 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         director = herdr.TabSession("w1:p0", owner.name, "", owner.current_session)
         shutdown_record.save([str(child.id)])
         with (patch.object(staff, "initial_snapshot", return_value=record), staff.supplied_snapshot(record),
+              patch.object(staff, "authority_snapshot", return_value=record),
               patch.object(staff, "local_snapshot", return_value=record),
               patch.object(worker, "resume_receipt", return_value=worker.DispatchNotSubmitted()) as receipt,
               patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates([state], [current, previous])),
               patch.object(worker_panes, "worker_run", return_value=current),
               patch.object(herdr.Herdr, "tab_sessions", return_value=[director]),
-              patch.object(herdr.Herdr, "prompt") as send, redirect_stdout(io.StringIO()) as output):
+              patch.object(herdr.Herdr, "prompt") as send,
+              patch.object(worker, "_dispatch_transcript", return_value=worker.TranscriptReceipt(
+                  worker.DispatchNotSubmitted(), frozenset())) as transcript,
+              redirect_stdout(io.StringIO()) as output):
             dispatch = progress_history.begin_dispatch(previous, slot=child.name, phase="46", role="impl",
                 worker_name=child.name, worker_id=child.id, launcher_command=["assign.sh"], prompt=prompt, kind="impl", lens="")
+            delivery = pass_record.DispatchDelivery(f"End your final reply with DONE {dispatch}.", dispatch, "")
+            progress_history.save_dispatch_delivery(previous, dispatch, delivery)
+
+            def accept_assignment(*_args: object, **_kwargs: object) -> None:
+                transcript.return_value = worker.TranscriptReceipt(worker.DispatchSubmitted(), frozenset())
+
+            send.side_effect = accept_assignment
             self.assertEqual(shutdown.main(["restart"]), 0)
-        receipt.assert_called_once_with(child, progress_history.ActiveDispatch(dispatch, ("assign.sh",)))
+        receipt.assert_called_once_with(child, progress_history.ActiveDispatch(dispatch, ("assign.sh",)), run=previous)
         send.assert_called_once_with(director.pane_id, resume_message.launcher_prompt(child.id, dispatch, ("assign.sh",)),
                                      target=str(owner.current_session))
         self.assertIn("1 of 1 sessions back", output.getvalue())
@@ -2584,6 +2599,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
         saved = [str(child.id)]
         shutdown_record.save(saved)
         with (live_detached_run(previous, former), patch.object(staff, "initial_snapshot", return_value=record),
+              patch.object(staff, "authority_snapshot", return_value=record),
               staff.supplied_snapshot(record), patch.object(staff, "local_snapshot", return_value=record),
               patch.object(worker, "_read_workers", return_value=worker.PaneWorkerStates([state], [current, previous])),
               patch.object(worker_panes, "worker_run", return_value=current),
@@ -2628,6 +2644,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
 
         recover = turn_end.recover_completion
         with (patch.object(staff, "initial_snapshot", return_value=record), staff.supplied_snapshot(record),
+              patch.object(staff, "authority_snapshot", return_value=record),
               patch.object(staff, "local_snapshot", return_value=record),
               patch.object(staff, "backend", return_value=staff.ClaudeBackend()),
               patch.object(worker_admission, "transcript_source", return_value=source),
@@ -2682,6 +2699,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             return json.dumps({"type": role, "message": {"role": role, "content": text}}) + "\n"
 
         with (patch.object(staff, "initial_snapshot", return_value=record), staff.supplied_snapshot(record),
+              patch.object(staff, "authority_snapshot", return_value=record),
               patch.object(staff, "local_snapshot", return_value=record),
               patch.object(staff, "backend", return_value=staff.ClaudeBackend()),
               patch.object(worker_admission, "transcript_source", return_value=source),

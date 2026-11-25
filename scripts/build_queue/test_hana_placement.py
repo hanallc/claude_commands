@@ -131,7 +131,9 @@ class HanaQueueTests(unittest.TestCase):
             _ = fixture.run_pass()
             _ = fixture.connect(request).replies()
             self.assertTrue(published.wait(TEST_HANG_GUARD_SECS))
-            assignment = assignment_for(fixture, request)
+            reply, = fixture.connect(request).replies()
+            assert isinstance(reply, wire.Assignment), reply
+            assignment = reply.assignment
             holder = coordinator_holder(assignment)
             self.assertIsInstance(hana_placement.claim_assigned(assignment, holder, controller), hana_placement.HanaClaimPending)
             tick((1, 1) if warm else (1, 1, 1, 1))

@@ -48,6 +48,7 @@ from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.unit_runs_test_support import bind_private_run_roots
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import session_records, sessions, session_send
 from scripts.message.sessions import SessionRecord
 from scripts.production import (
@@ -68,7 +69,7 @@ from scripts.production.staff_test_support import (
 )
 from scripts.agents import shutdown, remote, stop_resume, restart, pane_record as staff_pane_record, pane_record, producer_transfer
 from scripts.agents.stop_results import StopResult
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 
 from scripts.production import rename_test_support as support
 from scripts.production.rename_test_support import (
@@ -141,6 +142,8 @@ class AgentsUsageTests(unittest.TestCase):
                          ["help", "status", "pause", "exit", "pause", "resume", "resume", "resume", "retire", "rename", "move",
                           "reboot", "restart", "stop", "remove-stray", "transfer", "add-producer", "set-model"])
         self.assertIn("resume NAME", output)
+        self.assertIn("pause NAME [--finish-step] [--keep-workers] --why TEXT", output)
+        self.assertIn("pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] [--keep-workers] --why TEXT", output)
         self.assertIn("resume PRODUCER --resend-opening-prompt", output)
         self.assertIn("transfer NAME [--model MODEL --effort EFFORT]", output)
         self.assertIn("add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]", output)
@@ -196,6 +199,27 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                     code, output, errors = self.invoke(arguments)
                     self.assertEqual((code, errors), (0, ""))
                     self.assertIn("agents select-model TARGET MODEL", output)
+
+    def test_subcommand_help_shows_its_usage_and_guidance(self) -> None:
+        cases = (
+            ("move", "usage: agents move [-h] [--dry-run] [--why WHY] SESSION_OR_GROUP ACCOUNT",
+             "Move Claude sessions to <claudeN>.", ("default",)),
+            ("set-model", "usage: agents set-model [-h] ROLE MODEL [EFFORT]",
+             "Example: agents set-model producers fable high", ()),
+        )
+        for command, usage, guidance, forbidden_text in cases:
+            with self.subTest(command=command):
+                result = subprocess.run(
+                    [sys.executable, str(Path(__file__).with_name("shutdown.py")), command, "--help"],
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                    env={**os.environ, "COLUMNS": "100"},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                lines = [line for line in result.stdout.splitlines() if line]
+                self.assertEqual(lines[:2], [usage, guidance])
+                for forbidden in forbidden_text:
+                    self.assertNotIn(forbidden, result.stdout)
 
     def test_unknown_command_prints_usage_and_exits_two(self) -> None:
         status, output, errors = self.invoke(["unknown-command"])
@@ -339,7 +363,6 @@ mac.platform=darwin
 mac.hosts=Nates-MacBook-Pro-2023
 """,
     "scratch": """\
-visible_root=~/rust/repro
 holds_file=~/.local/state/scratch/holds.json
 # whole: 1..
 default_life_seconds=86400
@@ -394,9 +417,6 @@ names.test-all=test all
 names.test-modules=test named
 prose.gate=the gate
 prose.build=release build
-owned.default={unit} {step}
-owned.showrunner-default=showrunner {step}
-owned.ci-default=CI {step}
 """,
     "showrunners": """\
 # range: 0..100
@@ -421,7 +441,7 @@ def shutdown_fixture_configuration(root: Path) -> dict[str, str]:
         if not destination.exists():
             if stem == "copies":
                 content = content.replace("~/remote-mirrors", str(root / "remote-mirrors"))
-            _ = destination.write_text(content, encoding="utf-8")
+            _ = write_config_fixture(destination, content)
     return {"CONF_DIR": str(root), "COPIES_CONFIG": str(root / "copies.conf"),
             "BUILD_TARGETS_CONFIG": str(root / "build_targets.conf")}
 
@@ -492,14 +512,6 @@ def session(session_id: str, name: str, pid: int) -> SessionRecord:
 
 @final
 class MoveTests(unittest.TestCase):
-    def test_help_teaches_only_numbered_claude_targets(self) -> None:
-        output = io.StringIO()
-        with redirect_stdout(output), self.assertRaises(SystemExit) as result:
-            _ = shutdown.main(["move", "--help"])
-        self.assertEqual(result.exception.code, 0)
-        self.assertIn("<claudeN>", output.getvalue())
-        self.assertNotIn("default", output.getvalue())
-
     def test_session_delegates_once_with_the_reason_and_preserves_the_result(self) -> None:
         with mock.patch.object(accounts, "main", return_value=1) as move:
             code = shutdown.main(["move", "TEST-nightly-review", "claude 2", "--why", "weekly limit"])
@@ -829,7 +841,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
-            self.assertNotIn("busy", output)
+            self.assertNotIn(": busy; held by ", output)
             self.assert_slot_held(tree)
             self.assertTrue(tree.exists())
         self.assertTrue(self.worktree.is_dir())
@@ -838,7 +850,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
-            self.assertNotIn("busy", output)
+            self.assertNotIn(": busy; held by ", output)
             self.assert_slot_held(tree)
         code, output = self.retire()
         self.assertEqual(code, 0, output)
@@ -856,7 +868,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
     def test_recovery_recreates_the_checkout_after_manual_removal(self) -> None:
         base = git(self.checkout, "rev-parse", "main")
         record = worktrees.new_record(self.worktree, "alpha-branch", self.checkout, base, "alpha", "main")
-        record_path = worktrees.record_file(self.worktree)
+        record_path = worktree_records.record_file(self.worktree)
         worktrees.write_record(record)
         code, output = self.retire()
         self.assertEqual(code, 0, output)
@@ -865,7 +877,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
-        self.assertEqual(worktrees.read_record(record_path), record)
+        self.assertEqual(worktree_records.read_record(record_path), record)
 
         unit = shutdown.recovery_find_unit("alpha", str(self.unit_staff_id))
         assert isinstance(unit, shutdown.RetiredUnitRecovery)
@@ -876,7 +888,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertEqual(git(self.worktree, "branch", "--show-current"), record.branch)
         self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), base)
         layout = worktrees.output_record("origin", "alpha", "worktree")
-        self.assertEqual(worktrees.read_record(record_path), replace(record, layout=layout))
+        self.assertEqual(worktree_records.read_record(record_path), replace(record, layout=layout))
         self.assertEqual((self.worktree / "target").readlink(), layout.output)
 
     def test_retirement_refuses_a_rebase_in_the_main_checkout(self) -> None:
@@ -3913,7 +3925,7 @@ class UnitRenameTests(UnitRenameFixture):
         internal.symlink_to(source, target_is_directory=True)
         alias.symlink_to(internal, target_is_directory=True)
         with mock.patch.dict(os.environ, self.env):
-            record = worktrees.new_record(source, "alpha-director", worktrees.main_checkout(source), "base",
+            record = worktrees.new_record(source, "alpha-director", worktree_records.main_checkout(source), "base",
                                           "alpha", "demo")
             worktrees.write_record(replace(record, layout=worktrees.output_record("origin", "alpha", "director")))
             identity = worktrees.FolderIdentity.read(source)
@@ -3979,7 +3991,7 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertFalse((new_output / copy_lock.name).exists())
         self.assertEqual(git_files.at(copy.path).git_dir, copy_git)
         with mock.patch.dict(os.environ, self.env):
-            self.assertEqual(worktrees.read_record(worktrees.record_file(destination)).branch, "gamma-director")
+            self.assertEqual(worktree_records.read_record(worktree_records.record_file(destination)).branch, "gamma-director")
             journal = worktrees.read_move(worktrees.move_file(alias))
             self.assertEqual((journal.move.new, journal.move.unit), (new_internal, "gamma"))
             self.assertFalse(worktrees.move_file(internal).exists())
@@ -3988,7 +4000,7 @@ class UnitRenameTests(UnitRenameFixture):
             self.assertEqual(journal.stage, worktrees.MoveStage.PLANNED)
             self.assertEqual(worktrees.worktree_output(destination),
                              worktrees.output_record("origin", "gamma", "director"))
-            self.assertFalse(worktrees.record_file(source).exists())
+            self.assertFalse(worktree_records.record_file(source).exists())
 
     def test_bare_unit_rename_rerun_keeps_the_callers_unit_and_leaves_the_foreign_unit_unchanged(self) -> None:
         parent = next(row for row in staff.find(kind="showrunner") if row.name == "demo")

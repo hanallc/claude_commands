@@ -19,6 +19,7 @@
       "Read(~/.claude3/projects/**/tool-results/**)",
       "Read(~/.claude4/projects/**/tool-results/**)",
       "Read(~/.claude5/projects/**/tool-results/**)",
+      "Read(~/.claude6/projects/**/tool-results/**)",
       "Bash(cargo *)",
       "Bash(cargo-berth *)",
       "Bash(gh *)",
@@ -56,6 +57,7 @@
       "Edit(~/.claude3/**)",
       "Edit(~/.claude4/**)",
       "Edit(~/.claude5/**)",
+      "Edit(~/.claude6/**)",
       "Edit(~/Library/Application Support/**)",
       "Edit(//tmp/claude/**)",
       "Read(~/.cargo/registry/src**)",
@@ -527,6 +529,7 @@
         "~/.claude3",
         "~/.claude4",
         "~/.claude5",
+        "~/.claude6",
         "~/.local/state/gh-1password",
         "~/.local/state/plan-delegate",
         "~/Library/Application Support",
@@ -548,7 +551,7 @@
   },
   "feedbackDrafts": "quiet",
   "alwaysThinkingEnabled": true,
-  "autoCompactWindow": 308800,
+  "autoCompactWindow": 283800,
   "askUserQuestionTimeout": "never",
   "remote": {
     "defaultEnvironmentId": "env_01DRVkPj3Ec3qaNwfki4iyms"

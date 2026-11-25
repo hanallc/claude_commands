@@ -222,8 +222,8 @@ always=always-there
         self.assertEqual(self.noted, [])
         self.assertEqual(len(self.pushed), 1)
         title, body, ask = self.pushed[0]
-        self.assertEqual(title, "quota_alert: codex1 now uses paid credits")
-        self.assertIn("60,498", body)
+        self.assertEqual(title, "codex1 now spends paid credits: 60,498 left")
+        self.assertEqual(body, "")
         self.assertEqual(ask.need, "decision")
         with quota_alert.state_file() as state:
             self.assertIn("codex1", state["episodes"])
@@ -679,7 +679,7 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
                     commands.clear()
                     launch.reset_mock()
                     _ = quota_alert.run_workers_next_moves(readings, self.now + timedelta(seconds=1))
-                    launch.assert_called_once_with("codex3", f"auto: {head.id}")
+                    launch.assert_called_once_with("codex3", f"auto: {head.id}", cause="auto", user_command=False)
                     self.assertEqual([command[0] for command in commands], ["systemctl", "systemd-run"])
                     self.assertEqual(role_map.read_role_map().workers, "codex3")
                     self.assertEqual(next_moves.read_next_moves(), (head,))

@@ -67,6 +67,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import build_folders, copy_record, unit_runs
 from scripts.production import staff
 from scripts.agents import worker_lifecycle
+from scripts.worktree import worktree_records
 
 from scripts.direct import recorder_state  # noqa: E402
 
@@ -405,11 +406,19 @@ def home_worktree(directory: Path) -> Path:
     return _phase_run_home(directory).root
 
 
+def phase_worktree_override(directory: Path) -> Path | None:
+    """Read the saved checkout path if the phase has an override."""
+    path = directory / WORKTREE_FILE
+    try:
+        checkout = path.read_text(encoding="utf-8").strip() if path.is_file() else ""
+    except FileNotFoundError:
+        return None
+    return Path(checkout) if checkout else None
+
+
 def phase_worktree(directory: Path) -> KnownPhaseWorktree:
     """Read the explicit checkout override or the unit folder from staff."""
-    path = directory / WORKTREE_FILE
-    root = Path(path.read_text(encoding="utf-8").strip()) if path.is_file() else home_worktree(directory)
-    return KnownPhaseWorktree(root)
+    return KnownPhaseWorktree(phase_worktree_override(directory) or home_worktree(directory))
 
 
 def claimed_launch_directory(directory: Path, requested: Path) -> Path:
@@ -430,7 +439,11 @@ class _ModelWorktreePath(NamedTuple):
 def _model_worktree_path(root: Path) -> _ModelWorktreePath | ValueError:
     """Return the model path and its names, or the error that explains the mismatch."""
     try:
-        repo, unit, short_name = root.relative_to(copy_record.worktree_root()).parts
+        worktree_root = copy_record.worktree_root()
+        parts = root.relative_to(worktree_root).parts if root.is_relative_to(worktree_root) else ()
+        if len(parts) != 3:
+            return ValueError(f"the checkout is not at {worktree_root / '<repo>/<unit>/<short name>'}")
+        repo, unit, short_name = parts
         model_path = build_folders.worktree_path(repo, unit, short_name).absolute()
         if root != model_path.resolve():
             return ValueError("the checkout is outside the worktree model")
@@ -443,26 +456,32 @@ def _require_model_worktree(
     root: Path, owner_unit: str, *,
     fix: str = "Restore the recorded branch, or run worktrees.py make <repo word> <unit> <new short name>.",
 ) -> None:
-    from scripts.worktree import worktrees
-
     try:
         model = _model_worktree_path(root)
         if isinstance(model, ValueError):
             raise model
         repo, unit, short_name, model_path = model
-        if unit != owner_unit and not worktrees.has_unit_word(owner_unit, unit):
+        if unit != owner_unit and not worktree_records.has_unit_word(owner_unit, unit):
             raise ValueError(f"the checkout is for unit {unit!r}, and the run belongs to {owner_unit!r}")
-        record = worktrees.checkout_record(model_path)
-        if (record is None or record.stage is not worktrees.MakeStage.DONE
-                or not isinstance(record.layout, worktrees.RecordedWorktreeOutput)
+        record = worktree_records.checkout_record(model_path)
+        if (record is None or record.stage is not worktree_records.MakeStage.DONE
+                or not isinstance(record.layout, worktree_records.RecordedWorktreeOutput)
                 or (record.layout.unit, record.layout.short_name) != (unit, short_name)):
             raise ValueError("no completed worktree record matches the checkout")
-        main = worktrees.main_checkout_for_word(repo)
-        if Path(record.repo).resolve() != main or not worktrees.registered_checkout(root, main, record.branch):
+        main = worktree_records.main_checkout_for_word(repo)
+        if Path(record.repo).resolve() != main or not worktree_records.registered_checkout(root, main, record.branch):
             raise ValueError(
                 f"the checkout does not belong to the main checkout for {repo!r} on its recorded branch {record.branch!r}")
-    except (OSError, ValueError, worktrees.Refused) as error:
+    except (OSError, ValueError, worktree_records.Refused) as error:
         raise StateRefused(f"{root}: {error}. {fix}") from error
+
+
+def read_baseline_file(path: Path) -> str | None:
+    """Read the phase baseline. Return None if the file is absent."""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
 
 
 def _validate_retained_baseline(directory: Path, root: Path) -> bool:
@@ -471,10 +490,11 @@ def _validate_retained_baseline(directory: Path, root: Path) -> bool:
     legacy_baseline = directory.parent.parent / BASELINE_FILE
     if legacy_baseline.is_file() and _read_located_phase_state(directory).directory == legacy_baseline.parent:
         baseline = legacy_baseline
-    if not baseline.exists():
+    recorded = read_baseline_file(baseline)
+    if recorded is None:
         return False
     try:
-        _ = commit_id(root, baseline.read_text().strip())
+        _ = commit_id(root, recorded)
     except StateRefused as refused:
         raise StateRefused(f"phase baseline {baseline} is not a commit in {root}: {refused}") from refused
     return True
@@ -534,8 +554,8 @@ class _RecordedCheckout(NamedTuple):
 def _recorded_checkout(directory: Path, home_root: Path) -> _NoRecordedCheckout | _RecordedCheckout:
     if not _has_recorded_checkout(directory):
         return _NoRecordedCheckout()
-    override = directory / WORKTREE_FILE
-    root = Path(override.read_text(encoding="utf-8").strip()).resolve() if override.is_file() else home_root
+    override = phase_worktree_override(directory)
+    root = override.resolve() if override is not None else home_root
     git_root = repository_root(root)
     available = git_root is not None and git_root.resolve() == root
     # An empty folder can remain after checkout removal. The claim can replace it.

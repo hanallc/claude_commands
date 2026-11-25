@@ -32,6 +32,7 @@ IMAGE_SOURCE_HASH = ROOT / 'scripts/aws_target/hana_image.sha256'
 UNSHIPPED_IMPORTS = {
     'build_queue/admission_client.py': {'accounts/__init__.py', 'accounts/outage_alerts.py',
         'message/send_budget.py', 'message/send_result.py', 'message/session_send.py', 'notify/push_texts.py'},
+    'build_queue/first_step.py': {'build_hold/build_hold.py'},
     'build_queue/slot_wait.py': {'hooks/checkpoint_gate.py', 'lib/shell_test_support.py'},
     'build_queue/snapshot_codec.py': {'message/unit_labels.py'},
     'build_queue/step_estimator.py': {'lint/tmp_sweep.py'},
@@ -113,7 +114,6 @@ class HanaRenderTests(unittest.TestCase):
                 + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n'
                 + 'patterns.tool={purpose}\npatterns.tool.fixture-guest={purpose}{suffix}\n'
                 + 'roots.build=/default/build\nroots.build.fixture-guest=/fixture/build\n'
-                + 'roots.slots.fixture-guest=/fixture/slots\n'
                 + 'slots.fixture-guest.hana.max=3\nslots.fixture-guest.hana.max_bytes=1000\n')
             _ = folders.write_text(folder_values)
             (checkout / 'config').mkdir(exist_ok=True)

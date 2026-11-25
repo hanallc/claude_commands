@@ -9,7 +9,9 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,9 +22,10 @@ from typing import ClassVar, cast, override
 from unittest.mock import call, patch
 from urllib.parse import parse_qs, urlencode
 
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib import atomic_file, conf, file_lock, process_start
+from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
@@ -31,6 +34,7 @@ from scripts.review_links.test_page_question import FakeQuestionTransport, quest
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import change_page, console, image_store, images, list_page, page_frame, serve
 from scripts.review_links import question_record
+from scripts.review_links.server_test_support import started_review_server
 
 SEND_MESSAGE = change_page.send_message
 PNG = bytes.fromhex('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c63606060f80f00010401005fe5c34b0000000049454e44ae426082')
@@ -88,6 +92,27 @@ class ImagesFixture(unittest.TestCase):
 
     def register(self, caption: str = "The nav shows Images. Look at the left column.") -> image_store.ImageRecord:
         return images.register(self.shot, caption, self.owner_id(), "Phase console-images")
+
+    def run_firefox(self, handler: type[BaseHTTPRequestHandler], name: str, *, timeout: int = 45,
+                    release: Callable[[], None] = lambda: None) -> None:
+        """Serve one headless Firefox screenshot load; release frees held requests before the server stops."""
+        with ThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+            # Join the handlers before the fixture folder is deleted.
+            server.daemon_threads = False
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                profile = self.temporary / f"{name}-profile"
+                profile.mkdir()
+                run = run_process_group(["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                                         "--window-size", "1200,900", "--screenshot", str(self.temporary / f"{name}.png"),
+                                         f"http://127.0.0.1:{server.server_port}/"],
+                                        timeout=timeout)
+                self.assertEqual(run.returncode, 0, run.stderr)
+            finally:
+                release()
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
 
 
 class ImagesNewsTests(ImagesFixture):
@@ -152,7 +177,7 @@ class ChangeImageTests(ImagesFixture):
             _ = Path(shot).write_bytes(PNG)
             return subprocess.CompletedProcess(arguments, 0, "", "")
 
-        with patch("scripts.review_links.image_store.subprocess.run", side_effect=chrome) as run:
+        with patch("scripts.review_links.image_store.run_process_group", side_effect=chrome) as run:
             identity = image_store.register_output(output)
         self.assertEqual(run.call_count, 2)
         self.assertTrue(image_store.change_image(self.root, identity))
@@ -175,7 +200,7 @@ class ChangeImageTests(ImagesFixture):
                     _ = Path(shot).write_bytes(PNG)
                     return subprocess.CompletedProcess(arguments, 0, "", "")
 
-                with patch("scripts.review_links.image_store.subprocess.run", side_effect=chrome) as run:
+                with patch("scripts.review_links.image_store.run_process_group", side_effect=chrome) as run:
                     identity = image_store.register_output(output)
                 self.assertEqual(run.call_count, 2)
                 self.assertTrue(image_store.change_image(self.root, identity))
@@ -270,7 +295,7 @@ class ImagesTests(ImagesFixture):
         self.assertNotIn("start.get('show')", source)
         self.assertIn("card.remove();", source)
         self.assertIn("home.insertBefore(card, next?.parentNode === home ? next : null);", source)
-        self.assertIn("status.textContent = 'Not sent: ' + error.message;", source)
+        self.assertIn("status.textContent = undone ? error.message : 'Not sent: ' + error.message;", source)
         self.assertIn("new FormData(form, event.submitter)", source)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
@@ -337,7 +362,7 @@ class ImagesTests(ImagesFixture):
  check(!zoom.open, 'a backdrop click closes the zoom');
  link.click();zoom.dispatchEvent(new Event('cancel', {cancelable:true}));
  check(!zoom.open, 'the native cancel event closes the zoom');
- const actions = [['approved', ''], ['not approved', ''], ['feedback', 'Too dark.'],
+ const actions = [['approved', ''], ['feedback', 'Too dark.'],
                   ['question', 'Which check passed?'], ['feedback', 'Please retry.']];
  for (const [action, words] of actions) {
   const previous = list();
@@ -485,28 +510,76 @@ class ImagesTests(ImagesFixture):
             def log_message(self, format: str, *args: object) -> None:
                 pass
 
-        with ThreadingHTTPServer(("127.0.0.1", 0), BrowserProbe) as server:
-            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
-            thread.start()
-            try:
-                profile = self.temporary / "browser-profile"
-                profile.mkdir()
-                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                                      "--window-size", "1200,900", "--screenshot", str(self.temporary / "browser.png"),
-                                      f"http://127.0.0.1:{server.server_port}/"],
-                                     capture_output=True, text=True, timeout=45)
-                self.assertEqual(run.returncode, 0, run.stderr)
-            finally:
-                server.shutdown()
-                thread.join(TEST_HANG_GUARD_SECS)
+        self.run_firefox(BrowserProbe, "browser", release=probe_complete.set)
         self.assertEqual(results, [[]], "The browser must complete every check without a failure.")
-        self.assertEqual(len(gets), 13, "Load, update, reload, update, one refresh per POST, and the later update.")
+        self.assertEqual(len(gets), 12, "Load, update, reload, update, one refresh per POST, and the later update.")
         self.assertEqual([(post["action"], post["feedback"]) for post in posts], [
-            (["approved"], [""]), (["not approved"], [""]), (["feedback"], ["Too dark."]),
+            (["approved"], [""]), (["feedback"], ["Too dark."]),
             (["question"], ["Which check passed?"]), (["feedback"], ["Please retry."]),
             (["feedback"], ["Retry after refresh fails."]), (["feedback"], ["Keep until next feedback."]),
             (["feedback"], ["Routine feedback."]),
         ])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_undo_returns_the_card_and_says_edit_and_send_again(self) -> None:
+        _ = self.register()
+        owner = self.owner
+        assert owner is not None
+        name = "Shot owner " + "W" * 80
+        members = staff.StaffSnapshot((replace(owner, name=name),))
+        probe = r"""<script>
+(async () => {
+ const failures = [], check = (ok, text) => { if (!ok) failures.push(text); };
+ const realFetch = window.fetch.bind(window), host = window.top.document, posts = [];
+ const until = async (test, label) => {
+  const end = performance.now() + 8000;
+  while (!test()) {
+   if (performance.now() > end) throw new Error(label);
+   await new Promise(resolve => setTimeout(resolve, 20));
+  }
+ };
+ window.fetch = async (path, options = {}) => {
+  if (String(path).endsWith('/undo')) return Response.json({outcome: 'undone'});
+  if (options.method !== 'POST') return new Promise(() => {});
+  posts.push(new URLSearchParams(options.body));
+  return Response.json({hold: 'a'.repeat(24), seconds: 30}, {status: 202, headers: {'X-Send-Hold': 'held'}});
+ };
+ try {
+  const card = document.querySelector('[data-images] article'), form = card.querySelector('form');
+  const status = form.querySelector('[data-image-status]');
+  form.elements.feedback.value = 'Too dark.';
+  const view = host.defaultView;
+  check(view.innerWidth === 390 && view.matchMedia('(prefers-color-scheme: dark)').matches,
+        'The browser uses the phone width and dark theme.');
+  for (const action of ['feedback', 'approved']) {
+   form.requestSubmit(form.querySelector('button[value="' + action + '"]'));
+   await until(() => host.querySelector('[data-send-undo] button'), 'The Undo toast did not show.');
+   const toast = host.querySelector('[data-send-undo]'), text = toast.querySelector('span');
+   const button = toast.querySelector('button'), box = toast.getBoundingClientRect();
+   check(text.textContent === 'Sent to ' + __RECEIVER__ + '.' && button.textContent === 'Undo',
+         'The toast names the image owner and offers Undo.');
+   check(box.left >= 0 && box.right <= view.innerWidth && button.getBoundingClientRect().right < box.right,
+         'The phone viewport shows the toast and its button.');
+   const style = view.getComputedStyle(text);
+   check(text.clientHeight > parseFloat(style.lineHeight) && text.scrollWidth <= text.clientWidth,
+         'The full receiver name wraps inside the toast.');
+   check(view.getComputedStyle(toast).backgroundColor === 'rgb(20, 27, 40)' &&
+         style.color === 'rgb(228, 234, 244)', 'The toast uses its dark colors.');
+   button.click();
+   await until(() => status.textContent === 'Undone. Edit and send again.', 'The card did not say Undone.');
+   check(card.isConnected && form.elements.feedback.value === 'Too dark.', 'After Undo the card returns with its words.');
+  }
+  check(posts.map(post => post.get('action')).join(',') === 'feedback,approved', 'Undo sends nothing more.');
+ } catch (error) {
+  failures.push(String(error));
+ }
+ await realFetch('/results', {method: 'POST', body: JSON.stringify(failures)});
+})();
+</script>"""
+        with patch.object(staff, "snapshot", return_value=members):
+            page = images.render(self.status).decode()
+        page = page.replace("</body>", probe.replace("__RECEIVER__", json.dumps(name)) + "</body>")
+        self.assertEqual(firefox_probe_results(page.encode(), window_size=(390, 860), dark=True), [[]])
 
     def test_card_shows_the_caption_details_image_feedback_field_and_the_answer_buttons(self) -> None:
         record = self.register("Look at <the> cards")
@@ -517,7 +590,7 @@ class ImagesTests(ImagesFixture):
         token = images.request_token("token", record["id"])
         self.assertEqual(without_role_colors(card), (
             f'<article id="image-{record['id']}" data-image="{record['id']}"'
-            + f' data-owner="{record['owner']}" data-owner-name="shot-owner">'
+            + f' data-owner="{record['owner']}" data-owner-name="shot-owner" data-send-receiver="shot-owner">'
             + '<h2 class="caption">Look at &lt;the&gt; cards</h2><dl class="image-details">'
             + '<dt>Owner:</dt><dd>shot-owner (unit)</dd><dt>For  :</dt><dd>Phase console-images</dd>'
             + '<dt>Added:</dt><dd><time datetime="2026-11-15T03:09:00+00:00">Nov 14, 2026, 22:09</time></dd></dl>'
@@ -529,7 +602,6 @@ class ImagesTests(ImagesFixture):
             + f'<textarea id="feedback-{record['id']}" name="feedback" rows="3"></textarea>'
             + '<div class="review-actions"><div class="review-action-group"><span>Closes the item</span><div>'
             + '<button type="submit" name="action" value="approved">Approved</button>'
-            + '<button type="submit" name="action" value="not approved">Not Approved</button>'
             + '<button type="submit" name="action" value="feedback">Send Feedback</button>'
             + '</div></div><div class="review-action-group"><span>The item returns to you</span><div>'
             + '<button type="submit" name="action" value="question">Ask question</button></div></div></div>'
@@ -575,11 +647,13 @@ class ImagesTests(ImagesFixture):
         token = images.request_token(images.console_token(self.root), record["id"])
         return urlencode({"image": record["id"], "token": token, "feedback": feedback, "action": action})
 
-    def test_approved_and_not_approved_send_the_answer_with_feedback_only_when_written(self) -> None:
+    def test_approved_and_feedback_send_the_answer_with_feedback_only_when_written(self) -> None:
         for action, first, feedback, lines in (
                 ("approved", "your image is approved.", "", ()),
-                ("not approved", "your image is not approved.", "  The counts are wrong. ", ("Feedback: The counts are wrong.",))):
-            with self.subTest(action=action):
+                ("approved", "your image is approved.", "  The counts are right. ", ("Feedback: The counts are right.",)),
+                ("feedback", "your image is not approved. The feedback follows.", "  The counts are wrong. ",
+                 ("Feedback: The counts are wrong.",))):
+            with self.subTest(action=action, feedback=feedback):
                 self.sent.clear()
                 record = self.register("After: the panel.")
                 self.submit(self.feedback_body(record, feedback, action))
@@ -592,6 +666,13 @@ class ImagesTests(ImagesFixture):
                 self.assertIn("feedback_at", image_store.read_record(self.root / image_store.IMAGES_FOLDER / record["id"]))
                 self.assertNotIn(record["id"], images.render(self.status).decode())
 
+    def test_a_card_from_before_i21_that_posts_not_approved_gets_a_clear_refusal(self) -> None:
+        record = self.register()
+        with self.assertRaisesRegex(question_record.AnswerRefused, "^Not Approved was removed. Use Send Feedback.$"):
+            self.submit(self.feedback_body(record, "", "not approved"))
+        self.assertEqual(self.sent, [])
+        self.assertIn(record["id"], images.render(self.status).decode())
+
     def test_feedback_goes_to_the_owner_session_and_hides_the_image_but_keeps_it(self) -> None:
         record = self.register("After: the panel. Look at the counts.")
         self.submit(self.feedback_body(record, "  The counts are wrong.  "))
@@ -600,7 +681,7 @@ class ImagesTests(ImagesFixture):
         recipient, sender, message = self.sent[0]
         self.assertEqual((recipient, sender), (f"session:{self.owner.current_session}", "images"))
         self.assertEqual(message, "\n".join((
-            "From the user (via the Images page): feedback on your image.",
+            "From the user (via the Images page): your image is not approved. The feedback follows.",
             "Feedback: The counts are wrong.",
             f"Image: http://127.0.0.1:8765/images/{record['id']}/image.png",
             "Caption: After: the panel. Look at the counts.",
@@ -640,7 +721,7 @@ class ImageQuestionTests(ImagesFixture):
             'action': 'question', 'feedback': words}))
 
     def test_feedback_completion_keeps_an_answer_received_during_delivery_visible_and_new(self) -> None:
-        for action in ('feedback', 'approved', 'not approved'):
+        for action in ('feedback', 'approved'):
             with self.subTest(action=action):
                 record = self.register()
                 pages = tuple(page for page in console.read_pages() if page.identity == 'images')
@@ -842,8 +923,9 @@ class ImageQuestionTests(ImagesFixture):
         self.assertIn('Which check passed?', card)
         self.assertIn('&lt;Passed&gt; &amp; checked', card)
         self.assertNotIn('waiting for an answer', card)
-        for action in ('approved', 'not approved', 'feedback', 'question'):
+        for action in ('approved', 'feedback', 'question'):
             self.assertIn(f'name="action" value="{action}"', card)
+        self.assertNotIn('value="not approved"', card)
         self.assertEqual(images.waiting_images(console.NewsRequest(self.root)), frozenset((record['id']+':Q1',)))
         self.assertEqual(console.news(self.root, pages, 'changes'), ('images',))
         self.assertEqual(console.news(self.root, pages, 'images'), ())
@@ -1201,7 +1283,7 @@ async (find, whenPageShows, check) => {
  check(card().querySelector('img') !== null, 'The image returns with the answer.');
  check(!card().querySelector('[data-question] [role="status"]'), 'The answer has no delivery notice.');
  const actions = [...card().querySelectorAll('button[name="action"]:enabled')].map(button => button.value);
- check(actions.join() === 'approved,not approved,feedback,question', 'All four answer buttons return.');
+ check(actions.join() === 'approved,feedback,question', 'All three answer buttons return.');
  check(count() === '2', 'The owner count includes the returned card.');
  card().querySelector('form').elements.feedback.value = 'Which check failed?';
  card().querySelector('form').requestSubmit(ask());
@@ -1522,23 +1604,11 @@ async (find, whenPageShows, check, controlRefresh) => {
             def log_message(self, format: str, *args: object) -> None:
                 pass
 
-        with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
-            # Join the handlers before the fixture folder is deleted.
-            server.daemon_threads = False
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            try:
-                profile = self.temporary / 'question-browser-profile'
-                profile.mkdir()
-                done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                    '--window-size', '1200,900', '--screenshot', str(self.temporary/'question-browser.png'),
-                    f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=60)
-                self.assertEqual(done.returncode, 0, done.stderr)
-            finally:
-                complete.set()
-                first_delivery_released.set()
-                server.shutdown()
-                thread.join(TEST_HANG_GUARD_SECS)
+        def release() -> None:
+            complete.set()
+            first_delivery_released.set()
+
+        self.run_firefox(Probe, 'question-browser', timeout=60, release=release)
         self.assertEqual(results, [[]])
         return requests
 
@@ -1621,10 +1691,12 @@ class ImagePairTests(ImagesFixture):
         before, after = (f"/images/{record['id']}/before.png", f"/images/{record['id']}/after.webp")
         self.assertTrue(card.startswith(f'<article id="image-{record['id']}" class="pair" data-image='))
         self.assertIn(
-            '<div class="image-pair">'
-            + f'<figure><figcaption>Before</figcaption><a data-image-zoom href="{before}" target="_blank" rel="noopener">'
+            '<div class="image-pair" data-image-zoom-group>'
+            + '<figure><figcaption>Before</figcaption>'
+            + f'<a data-image-zoom data-image-zoom-label="Before" href="{before}" target="_blank" rel="noopener">'
             + f'<img src="{before}" alt="Before: Look at &lt;the&gt; counts" loading="lazy"></a></figure>'
-            + f'<figure><figcaption>After</figcaption><a data-image-zoom href="{after}" target="_blank" rel="noopener">'
+            + '<figure><figcaption>After</figcaption>'
+            + f'<a data-image-zoom data-image-zoom-label="After" href="{after}" target="_blank" rel="noopener">'
             + f'<img src="{after}" alt="After: Look at &lt;the&gt; counts" loading="lazy"></a></figure></div>'
             + '<form method="post" data-image-form>', card)
         self.assertEqual((card.count("<form"), card.count('value="approved"'), card.count('value="feedback"'),
@@ -1632,6 +1704,12 @@ class ImagePairTests(ImagesFixture):
         page = images.render(self.status).decode()
         self.assertEqual(page.count(page_frame.ZOOM_STYLE), 1)
         self.assertEqual(page.count(page_frame.ZOOM_SCRIPT), 1)
+        # Hover or keyboard focus shows an arrow button's tip; a turned-off button shows none.
+        focus_tip = "[data-image-zoom-step]:not([disabled]):focus-visible [data-image-zoom-tip]{visibility:visible}"
+        hover_tip = ("@media (hover:hover){[data-image-zoom-step]:not([disabled]):hover [data-image-zoom-tip]"
+                     "{visibility:visible}}")
+        self.assertIn(focus_tip, page_frame.ZOOM_STYLE)
+        self.assertIn(hover_tip, page_frame.ZOOM_STYLE)
         self.assertNotIn("<figure>", images.card(self.register(), "token", staff.snapshot(), 3))
         # A narrow card stacks the pair, before on top.
         self.assertIn("@container (max-width:599px){.image-pair{grid-template-columns:minmax(0,1fr)}}", images.STYLE)
@@ -1645,10 +1723,118 @@ class ImagePairTests(ImagesFixture):
         self.assertLess(page.index(before), page.index(after))
         self.assertIn("The counts now match.", page)
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_the_arrow_keys_and_buttons_show_the_before_and_after_pictures_in_the_large_view(self) -> None:
+        _ = self.register_pair()
+        _ = self.register()
+        probe = """<script>
+(async () => {
+ const failures = [], check = (ok, text) => { if (!ok) failures.push(text); };
+ const zoom = document.querySelector('[data-image-zoom-dialog]');
+ const label = zoom.querySelector('[data-image-zoom-badge]');
+ const [before, after] = document.querySelectorAll('[data-image-zoom-group] a[data-image-zoom]');
+ const press = key => zoom.dispatchEvent(new KeyboardEvent('keydown', {key, bubbles:true, cancelable:true}));
+ const shows = (link, text, step) => {
+  check(zoom.open && zoom.querySelector('img').src === link.href, step + ' shows the ' + text + ' picture');
+  check(!label.hidden && label.textContent === text, step + ' badges the picture ' + text);
+  check(zoom.getAttribute('aria-label') === link.querySelector('img').alt, step + ' names the zoom ' + text);
+ };
+ const [left, right] = zoom.querySelectorAll('[data-image-zoom-step]');
+ const tip = button => button.querySelector('[data-image-zoom-tip]');
+ const tipShown = button => getComputedStyle(tip(button)).visibility === 'visible';
+ after.click();
+ shows(after, 'After', 'A click on After');
+ check(!left.hidden && !left.disabled && left.getAttribute('aria-label') === 'Show Before', 'The left button shows Before');
+ check(!right.hidden && right.disabled, 'The right button is off on the last picture');
+ check(getComputedStyle(right).opacity === '0.3', 'An off button is dim');
+ check(left.getAttribute('aria-keyshortcuts') === 'ArrowLeft' && right.getAttribute('aria-keyshortcuts') === 'ArrowRight',
+       'Each button names its key for a screen reader');
+ check(tip(left).textContent === 'Press ← to show Before' && tip(left).querySelector('kbd').textContent === '←',
+       'The left tip names the key and the picture');
+ check(!tipShown(left), 'The tip is hidden until hover or focus');
+ left.focus();
+ left.click();
+ shows(before, 'Before', 'A click on the left button');
+ check(left.disabled && !right.disabled && tip(right).textContent === 'Press → to show After',
+       'On the first picture the left button is off and the right tip names After');
+ check(document.activeElement === zoom, 'A button that turns off returns focus to the large view');
+ right.click();
+ shows(after, 'After', 'A click on the right button');
+ press('ArrowRight');
+ shows(after, 'After', 'The right arrow on the last picture');
+ press('ArrowLeft');
+ shows(before, 'Before', 'The left arrow');
+ press('ArrowLeft');
+ shows(before, 'Before', 'The left arrow on the first picture');
+ press('ArrowRight');
+ shows(after, 'After', 'The right arrow');
+ zoom.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowLeft', altKey:true, bubbles:true, cancelable:true}));
+ shows(after, 'After', 'Alt and the left arrow');
+ const list = document.querySelector('[data-images]');
+ list.replaceWith(list.cloneNode(true));
+ const [freshBefore, freshAfter] = document.querySelectorAll('[data-image-zoom-group] a[data-image-zoom]');
+ press('ArrowLeft');
+ shows(freshBefore, 'Before', 'The left arrow after a page refresh');
+ press('Escape');
+ check(!zoom.open && document.activeElement === freshAfter, 'Escape returns focus to the link that opened the zoom');
+ const single = document.querySelector('article:not(.pair) a[data-image-zoom]');
+ single.click();
+ check(zoom.open && label.hidden && label.textContent === '', 'A single image has no badge');
+ check(left.hidden && right.hidden, 'A single image has no arrow buttons');
+ press('ArrowLeft');
+ check(zoom.querySelector('img').src === single.href, 'The arrows keep a single image');
+ press('Escape');
+ const frame = document.createElement('iframe');
+ frame.src = '/mac';
+ await new Promise(done => { frame.onload = done; document.body.append(frame); });
+ const mac = frame.contentDocument;
+ mac.querySelector('[data-image-zoom-group] a[data-image-zoom]').click();
+ const macTip = mac.querySelector('[data-image-zoom-step="1"] [data-image-zoom-tip]');
+ check(macTip.textContent === 'Press ▶ to show After', 'On a Mac the tip names the ▶ key');
+ await fetch('/results', {method:'POST', body:JSON.stringify(failures)});
+})().catch(error => fetch('/results', {method:'POST', body:JSON.stringify([String(error)])}));
+</script><img src="/probe-complete" alt="" hidden>"""
+        rendered = images.render(self.status).decode()
+        page = rendered.replace("</body>", probe + "</body>").encode()
+        # Firefox has no userAgentData, so navigator.platform alone selects the Mac keys.
+        mac_platform = "<script>Object.defineProperty(Navigator.prototype,'platform',{get:()=>'MacIntel'})</script>"
+        mac_page = rendered.replace("<head>", "<head>" + mac_platform, 1).encode()
+        results: list[list[str]] = []
+        complete = threading.Event()
+
+        class Probe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/probe-complete":
+                    # Keep Firefox alive until the checks report their result.
+                    if not complete.wait(20):
+                        self.send_error(504, "The browser checks did not complete.")
+                        return
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                pages = {"/": page, "/mac": mac_page}
+                body, kind = (pages[self.path], "text/html; charset=utf-8") if self.path in pages else (PNG, "image/png")
+                self.send_response(200)
+                self.send_header("Content-Type", kind)
+                self.end_headers()
+                _ = self.wfile.write(body)
+
+            def do_POST(self) -> None:
+                payload = self.rfile.read(int(self.headers["Content-Length"])).decode()
+                results.append(cast(list[str], json.loads(payload)))
+                complete.set()
+                self.send_response(204)
+                self.end_headers()
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        self.run_firefox(Probe, "pair-zoom", release=complete.set)
+        self.assertEqual(results, [[]], "The browser must complete every check without a failure.")
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_image_pair_stays_side_by_side_at_1024_pixels(self) -> None:
-        from scripts.review_links.test_accounts_page import firefox_probe_results
-
         _ = self.register_pair()
         owner = self.owner
         assert owner is not None
@@ -1662,7 +1848,7 @@ class ImagePairTests(ImagesFixture):
   frameElement.style.height='800px';
   document.querySelector('[data-image-layout]').style.minHeight='300vh';
   const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
-  const heading=document.querySelector('.page-heading'), groups=document.querySelector('[data-image-groups]');
+  const actions=document.querySelector('[data-page-actions]'), groups=document.querySelector('[data-image-groups]');
   for(const top of [0,64,800]){
    scrollTo({top,behavior:'instant'});
    await painted();
@@ -1672,13 +1858,26 @@ class ImagePairTests(ImagesFixture):
     failures.push('The Images pair must fit side by side at 1024 px and scroll position '+top+'.');
    }
   }
-  const space=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-heading-space'));
-  if(!heading.hasAttribute('data-page-heading-stuck') || Math.abs(heading.getBoundingClientRect().top-space)>=1){
-   failures.push('At scroll position 800 the heading row must stick at the top.');
+  const space=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-actions-space'));
+  const controls=Math.max(...[...actions.children].map(control=>control.getBoundingClientRect().bottom));
+  if(Math.abs(actions.getBoundingClientRect().top-space)>=1 || document.querySelector('.page-heading').getBoundingClientRect().bottom>0){
+   failures.push('At scroll position 800 the action area must stick at the top and the title must scroll away.');
   }
-  if(groups.getBoundingClientRect().top<heading.getBoundingClientRect().bottom+16){
-   failures.push('The image group index must stick below the heading row.');
+  if(groups.getBoundingClientRect().top<controls+16){
+   failures.push('The image group index must stick below the action area.');
   }
+  frameElement.style.width='1382px';
+  groups.querySelector('a span').textContent='admin-console-reviewer';
+  await painted();
+  for(const cell of groups.querySelectorAll('a > span')){
+   const tops=new Set(), text=document.createTreeWalker(cell,NodeFilter.SHOW_TEXT), range=document.createRange();
+   while(text.nextNode()){
+    range.selectNodeContents(text.currentNode);
+    for(const rect of range.getClientRects()) tops.add(Math.round(rect.top));
+   }
+   if(tops.size!==1) failures.push('The group cell "'+cell.textContent+'" must stay on one line at 1382 px.');
+  }
+  if(groups.scrollWidth>groups.clientWidth) failures.push('The image group index must not scroll sideways at 1382 px.');
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
@@ -1704,9 +1903,8 @@ class ImagesServerTests(ImagesFixture):
         super().setUp()
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
         with patch.object(change_page, "recover_pending"):
-            server = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
+            server = self.enterContext(started_review_server(("127.0.0.1", 0), self.root))
         self.port = server.server_port
-        self.addCleanup(server.server_close)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         self.addCleanup(thread.join, TEST_HANG_GUARD_SECS)

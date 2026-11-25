@@ -21,7 +21,7 @@ from scripts.production import session_pane
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.herdr import herdr
-from scripts.message import review_hold
+from scripts.message import review_hold, send
 from scripts.message.relay_identity import relay_session_name
 from scripts.production.unit_lookup import Place
 from scripts.hooks import hook_dispatch, review_hold_delivery
@@ -75,6 +75,54 @@ class ConversationPauseRegistrationTests(unittest.TestCase):
 
 
 class ConversationPauseTests(ConversationPauseFixture):
+    def test_review_release_reads_one_active_director_state(self) -> None:
+        director = fixture_member("showrunner", name="director")
+        pause = staff.Paused("2026-11-24T08:31:00-08:00", "operator", "review", keep_workers=True)
+        _ = staff.set_hold(director.id, pause)
+        row = staff.begin_resume(director.id, pause)
+        assert isinstance(row.resume_pending, staff.ResumePending)
+        session = str(director.current_session)
+        key = row.resume_pending.key
+        self.write_review_config("on")
+        with (patch.dict(os.environ, self.environment),
+              patch.object(send, "STATE", self.root / "message-state")):
+            review_hold.set_count(session, 2, 100, self.fail, record_keys=review_hold_delivery.record_keys)
+            message = review_hold.ReviewMessage("shutdown", 101, "Continue where you stopped.",
+                                                key=key, once_per_key=True)
+            with review_hold.route(session, message, urgent=False, record_keys=review_hold_delivery.record_keys) as route:
+                assert isinstance(route, review_hold.OpenReview)
+                route.keep(message)
+            reply = self.run_prompt("Continue review.", now=161, extra={"session_id": session})
+            held_file = review_hold.held_file(session)
+            contents = held_file.read_text()
+        self.assertEqual(reply.returncode, 0, reply.stderr)
+        self.assertNotIn("review hold:", reply.stderr)
+        expected_header = contents.splitlines()[0]
+        self.assertEqual(json.loads(reply.stdout), {"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": review_hold.held_notice(1, held_file, expected_header),
+        }})
+        self.assertEqual(contents.count("Continue where you stopped."), 1)
+        self.assertEqual(staff.by_id(director.id), row)
+
+    def test_claude_prompt_adds_the_hold_only_for_the_paused_director(self) -> None:
+        owner = fixture_member("showrunner", name="production")
+        director = fixture_member("unit", name="selected", parent=owner.id)
+        child = fixture_member("worker", name="impl", parent=director.id)
+        _ = staff.pause(str(director.id), "maintenance", keep_workers=True)
+        prompt = cross_session(child.name, "The worker finished the review.")
+
+        def submit(session_id: str) -> str:
+            result = self.run_prompt(prompt, extra={"session_id": session_id})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout
+
+        context = conversation_pause.DIRECTOR_HOLD_CONTEXT
+        self.assertIn(context, submit(director.current_session))
+        self.assertNotIn(context, submit(child.current_session))
+        _ = staff.resume(str(director.id))
+        self.assertNotIn(context, submit(director.current_session))
+
     def test_unreadable_staff_reports_the_error_and_keeps_the_native_timer_pause(self) -> None:
         other = self.create_instance("showrunner-other", session_id="another-owner")
         for failure in ("invalid JSON", "directory"):
@@ -634,10 +682,12 @@ class ConversationPauseTests(ConversationPauseFixture):
                                                            record_keys=review_hold_delivery.record_keys) as release:
             assert isinstance(release, review_hold.ReleasedMessages)
             self.assertEqual(release.new_message, message)
-            batch = review_hold.numbered_entries(release.messages)
-            self.assertIn("Held update.", batch)
-            self.assertIn("New update.", batch)
-            self.assertNotIn("After the idle limit.", batch)
+            entries = review_hold.numbered_entries(release.messages)
+            self.assertIn("Held update.", entries)
+            self.assertIn("New update.", entries)
+            self.assertNotIn("After the idle limit.", entries)
+            notice = review_hold.file_release(SESSION, release, 161, batch_only=False)
+            batch = notice + "\n\n" + review_hold.numbered_entries((message,))
             typed = self.parsed_reply(self.run_prompt("Continue the review.", now=161))
             self.assertEqual(typed, {
                 "systemMessage": f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
@@ -648,8 +698,38 @@ class ConversationPauseTests(ConversationPauseFixture):
             })
             reply = self.run_prompt(cross_session("Later peer", batch), now=161)
             self.assertEqual((reply.returncode, reply.stdout, reply.stderr), (0, "", ""))
+            state = self.root / ".local/state/adhoc_review/.holds" / f"{SESSION}.json"
+            self.assertIs(cast(dict[str, object], json.loads(state.read_text(encoding="utf-8")))["release_pending"], False)
+            late = self.parsed_reply(self.run_prompt(cross_session("Review peer", "A late report."), now=161))
+            self.assertEqual(late["decision"], "block")
             release.accepted_at = 161.0
-        self.assertEqual(self.end_review(162), [])
+        self.assertEqual(len(self.end_review(162)), 1)
+        filed = self.held_file().read_text(encoding="utf-8")
+        self.assertLess(filed.index("Held update."), filed.index("A late report."))
+        self.assertNotIn("New update.", filed)
+
+    def test_a_release_batch_passes_the_restarted_hold_and_a_late_message_waits(self) -> None:
+        self.open_review()
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Held update."), now=101))
+        self.assertEqual(kept["decision"], "block")
+        emitted: list[str] = []
+        with patch.dict(os.environ, self.environment):
+            review_hold.record_user_prompt(SESSION, 170, emitted.append, record_keys=review_hold_delivery.record_keys)
+        self.assertEqual(emitted, [self.notice(1, "Released at 00:02:50 UTC")])
+        notice = self.notice(1, "Released at 00:02:51 UTC")
+        entry = "1. Later peer\n   Sent: 00:02 UTC\n   Sender native id: session:later\n   New report."
+        for path, body in (("relay", f"{notice}\nSender native id: session:later\n\n{entry}"),
+                           ("postmaster", "Later peer: Messages from the review\nSender native id: session:later\n"
+                                          + f"Tag: 0123abcd\n\n{notice}\n\n{entry}")):
+            with self.subTest(path=path):
+                reply = self.run_prompt(cross_session("Later peer", body), now=171)
+                self.assertEqual((reply.returncode, reply.stdout, reply.stderr), (0, "", ""))
+        late = self.parsed_reply(self.run_prompt(cross_session("Review peer", "A late report."), now=172))
+        self.assertEqual(late["decision"], "block")
+        self.assertEqual(len(self.end_review(173)), 1)
+        filed = self.held_file().read_text(encoding="utf-8")
+        self.assertEqual(filed.count("A late report."), 1)
+        self.assertNotIn("New report.", filed)
 
     def test_failed_idle_release_restores_its_messages_before_newer_review_messages(self) -> None:
         self.open_review()

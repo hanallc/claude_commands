@@ -38,7 +38,7 @@ from datetime import date, datetime
 from enum import Enum
 from functools import cached_property
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import Literal, TypeVar, cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_text_atomic  # noqa: E402
@@ -53,6 +53,7 @@ from scripts.production import change_routing, delivery_state, session_staff, sh
 from scripts.production.production_doc import ProductionDocument, Refusal, production_field
 from scripts.review_links import image_store, review_events, review_later
 from scripts.agents import remote
+from scripts.worktree import worktrees
 
 TRAILER = "Change-Review"
 COVERS = f"{TRAILER}-Covers"
@@ -95,6 +96,10 @@ _CHECKPOINT = re.compile(r"^checkpoint\((?P<branch>[^)]+)\):")
 _HASH = re.compile(r"\b[0-9a-f]{7,40}\b")
 # The columns an older row keeps its merge hash in, in the order they are read.
 HASH_COLUMNS = ("Merged", "On the Mac build")
+SCRATCH_NOT_REMOVED = "scratch not removed:"
+TRY_FOLDER_NOT_CHECKED = "try folder not checked:"
+# A verdict intent stays for a retry while a line starts with one of these.
+RETRY_PREFIXES = (SCRATCH_NOT_REMOVED, TRY_FOLDER_NOT_CHECKED)
 lists_directory = change_routing.lists_directory
 PREFIX = "change-review - "
 FENCE = "---"
@@ -567,9 +572,35 @@ def _print_warning(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+@dataclass
+class _ReadinessCommits:
+    pending: dict[Path, tuple[str, int]] = field(default_factory=dict)
+    failures: dict[Path, str] = field(default_factory=dict)
+
+    def add(self, path: Path, subject: str, rows: list[str]) -> None:
+        previous, count = self.pending.get(path, (subject, 0))
+        self.pending[path] = (subject if rows else previous, count + len(rows))
+
+    def commit(self) -> None:
+        for path, (subject, _) in self.pending.items():
+            try:
+                with _list_lock(path):
+                    _commit([path], subject, readiness=self)
+            except OSError as error:
+                self.failures[path] = next(iter(str(error).splitlines()), type(error).__name__)
+
+    def report(self) -> None:
+        for path, reason in self.failures.items():
+            count = self.pending[path][1]
+            label = "row" if count == 1 else "rows"
+            _print_warning(f"change review: {path}: {count} new {label} saved. The commit attempt failed ({reason})."
+                           + " The next successful write commits the list.")
+
+
 def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], Result],
           what: Callable[[Result], str], *, report_warning: Callable[[str], None] = _print_warning,
-          publish: Callable[[Path, str], None] | None = None) -> Result:
+          publish: Callable[[Path, str], None] | None = None,
+          defer_commit: Callable[[Path, str, Result], None] | None = None) -> Result:
     """Change the list's lines under the lock, then write and commit them.
 
     A change that raises an error writes nothing. The lock is the list's directory.
@@ -587,11 +618,16 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
                 _sort(path, lines)
                 _stamp(path, lines, production, day)
                 (publish or write_text_atomic)(path, "".join(lines))
-        _commit([path], f"{_owner(path)} {what(result)}", report_warning=report_warning)
+        subject = f"{_owner(path)} {what(result)}"
+        if defer_commit is None:
+            _commit([path], subject, report_warning=report_warning)
+        else:
+            defer_commit(path, subject, result)
         return result
 
 
-def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str], None] = _print_warning) -> None:
+def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str], None] = _print_warning,
+            readiness: _ReadinessCommits | None = None) -> None:
     """Commit only the lists through Git plumbing, without refreshing the index."""
     folder = paths[0].parent
 
@@ -643,7 +679,10 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
                         raise ChangeReviewError(updated.stderr.strip() or "git update-ref failed")
     except (ChangeReviewError, OSError) as error:
         reason = next(iter(str(error).splitlines()), type(error).__name__)
-        report_warning(f"change review: {paths[0]} written but not committed: {reason}; the next write commits it")
+        if readiness is None:
+            report_warning(f"change review: {paths[0]} written but not committed: {reason}; the next write commits it")
+        else:
+            readiness.failures[paths[0]] = reason
 
 
 def _table(path: Path, lines: list[str], section: str) -> tuple[list[str], int, int]:
@@ -763,7 +802,8 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
                 record: staff.StaffSnapshot, repo: Path = _CURRENT_REPO,
                 on_hold: Callable[[PublicationChange], None] | None = None,
                 merge_changes: Sequence[PublicationChange] = (), added_at: datetime | None = None,
-                on_image_problem: Callable[[PublicationChange, str], None] = _refuse_image_problem) -> list[str]:
+                on_image_problem: Callable[[PublicationChange, str], None] = _refuse_image_problem,
+                readiness: _ReadinessCommits | None = None) -> list[str]:
     """Add changes to To review with fixed staff IDs from record.
 
     owners supplies production documents; producers supplies fixed staff IDs for plain Visible changes.
@@ -857,7 +897,8 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
             visible = [WrittenReviewRow(path, row) for row in pending_rows]
             raise ReviewListDurabilityUnconfirmed(path, visible, error) from error
 
-    rows = _edit(path, production, day, write, what, publish=publish)
+    rows = _edit(path, production, day, write, what, publish=publish,
+                 defer_commit=readiness.add if readiness is not None else None)
     for name in sorted(unregistered):
         print(f"change review: no staff row for unit {name}; Producer stays empty")
     return rows
@@ -1976,10 +2017,11 @@ def _append_review_log(path: Path, lines: list[str], row: str, event: review_eve
 
 
 def record_review_log(path: Path, row: str, words: str, production: Path, who: str = "nate", *,
-                      feedback_request_id: str = "") -> None:
+                      feedback_request_id: str = "",
+                      event_time: datetime | Literal["write-time"] = "write-time") -> None:
     """Keep the user's Review action in the authoritative table row."""
     now = datetime.now().astimezone(user_zone())
-    event = review_events.ReviewLog(now, who, words, feedback_request_id)
+    event = review_events.ReviewLog(now if event_time == "write-time" else event_time, who, words, feedback_request_id)
     _edit(path, production, now.date(), lambda lines: _append_review_log(path, lines, row, event),
           lambda _: f"review {row}")
 
@@ -2001,15 +2043,38 @@ def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:
 
 
 def end_row_scratch(path: Path, row: str) -> list[str]:
-    """End the scratch task of `row` and return any error.
+    """End the scratch task and the try folder of `row`.
 
+    Return the error lines and the kept try folder lines.
     A verdict ends the row either way: a row returned to its unit comes back as a new row.
     """
     try:
         _ = scratch.end(f"row:{_owner(path)}-{row}")
-        return []
+        lines: list[str] = []
     except (conf.Unusable, scratch.ScratchError, OSError) as error:
-        return [f"scratch not removed: {error}"]
+        lines = [f"{SCRATCH_NOT_REMOVED} {error}"]
+    return lines + end_try_folder(path, row)
+
+
+def end_try_folder(path: Path, row: str) -> list[str]:
+    """Remove the try folder `try-<row>` of the row's Producer; return one line for each kept folder or error.
+
+    An empty Producer cell names the list's showrunner, and only a filled cell reads staff.
+    """
+    local = row.rpartition("/")[2]
+    try:
+        found = next((item for item in review_rows(path) if item["#"] == local), None)
+        identity = found.get(PRODUCER, "").strip() if found is not None else ""
+        team = _owner(path)
+        if identity:
+            producer = change_routing.producer_row(staff.snapshot(), staff.StaffId(identity))
+            if isinstance(producer, change_routing.UnroutedChange):
+                return [f"{TRY_FOLDER_NOT_CHECKED} {producer.note}"]
+            team = producer.name
+        return worktrees.remove_named(team, f"try-{local}")
+    except Exception as error:
+        first_line = str(error).partition("\n")[0]
+        return [f"{TRY_FOLDER_NOT_CHECKED} {first_line}"]
 
 
 class VerdictDurabilityUnconfirmed(RuntimeError):
@@ -2140,7 +2205,7 @@ class PendingVerdictCleanup:
                     return []
                 closeout(self.load(self.intent, self.path.parent.resolve()))
                 lines = end_row_scratch(self.path, self.row)
-                if not any(line.startswith('scratch not removed:') for line in lines):
+                if not any(line.startswith(RETRY_PREFIXES) for line in lines):
                     self.intent.unlink(missing_ok=True)
                 return lines
         except Exception as error:
@@ -2186,32 +2251,8 @@ def _validation_fault_event(production: Path, verdict: str) -> review_events.Rev
 @contextmanager
 def clear_change_later(path: Path, row: str) -> Generator[None, None, None]:
     """Clear the Later time before publishing the change state."""
-    target = review_later.path()
-    if not target.is_file():
+    with review_later.cleared(f"{_owner(path)}/{row}"):
         yield
-        return
-    key = f"{_owner(path)}/{row}"
-    with file_lock.exclusive(target.with_suffix('.lock')):
-        stored = review_later.times()
-        if key not in stored:
-            yield
-            return
-        encoded = {key: until.isoformat() for key, until in stored.items()}
-        until = encoded.pop(key)
-        try:
-            write_text_atomic(target, json.dumps(encoded) + '\n')
-        except AtomicDurabilityUnconfirmed:
-            encoded[key] = until
-            write_text_atomic(target, json.dumps(encoded) + '\n')
-            raise
-        try:
-            yield
-        except AtomicDurabilityUnconfirmed:
-            raise
-        except OSError:
-            encoded[key] = until
-            write_text_atomic(target, json.dumps(encoded) + '\n')
-            raise
 
 
 def _cleared_validation(delivery: Path, slots: delivery_state.DeliverySlots) -> str:
@@ -2468,7 +2509,21 @@ def list_ready_rows(repo: Path, production: Path, merge_branch: str, *,
                     review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
                     selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
                     known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[WrittenReviewRow]:
-    """Add live changes on origin/main, or release one completed step of one merge."""
+    """Add live changes on origin/main, or release one completed step of one merge.
+
+    Try the vault lock once per list after the scan. Report each list that could not be committed.
+    """
+    commits = _ReadinessCommits()
+    try:
+        return _scan_ready_rows(repo, production, merge_branch, review_list, record, selection, known_producer, commits)
+    finally:
+        commits.commit()
+        commits.report()
+
+
+def _scan_ready_rows(repo: Path, production: Path, merge_branch: str, review_list: Path | None,
+                     record: staff.StaffSnapshot | None, selection: ReadinessScan | CompletedStep,
+                     known_producer: KnownMergeProducer | UnknownProducer, commit_report: _ReadinessCommits) -> list[WrittenReviewRow]:
     repo = repo.expanduser().resolve()
     try:
         fetched = subprocess.run(["git", "-C", str(repo), "fetch", "origin", "main"],
@@ -2590,7 +2645,8 @@ def list_ready_rows(repo: Path, production: Path, merge_branch: str, *,
             try:
                 written = append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
                                       on_hold=note if isinstance(selection, ReadinessScan) else None,
-                                      merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem)
+                                      merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem,
+                                      readiness=commit_report)
             except ReviewListDurabilityUnconfirmed as error:
                 raise ReviewListDurabilityUnconfirmed(path, [*rows, *error.written_rows], error) from error
             except (ChangeReviewError, OSError, UnicodeError) as error:

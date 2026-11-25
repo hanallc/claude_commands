@@ -29,7 +29,7 @@ An addressed reviewer's lens comes from dispatch evidence.
 **The retired-name check.** `scripts/production/roles_audit.py check` exits non-zero and names the file and line of each retired name outside a kept context. It also fails on a printed fixed-display label. On a clean tree it prints nothing and exits 0. `check --prose` also prints `role words in sentences: N` and the list.
 
 - `scripts/production/role_terms.toml` holds the terms: `name`, `kind`, `defined_in`, `other_names`, `kept`, `other_meaning_files` and each term's retired and inflected forms.
-- `test_repository_sources_have_no_unkept_retired_names` in `test_roles_audit.py` runs the check on repository sources, so each merge gate runs it. It reads no home-state records.
+- `test_repository_sources_have_no_unkept_retired_names` in `test_roles_audit.py` runs the check on repository sources, so each gate runs it. It reads no home-state records.
 - `parse_terms` validates `kind`, `defined_in` and `other_meaning_files` and keeps none of them.
 
 **Speed of the check.**
@@ -58,7 +58,7 @@ An addressed reviewer's lens comes from dispatch evidence.
 
 ## Why
 
-- **A merge-gate check, not a periodic review.** A retired name that returns fails at once, in the change that brought it back.
+- **A gate check, not a periodic review.** A retired name that returns fails at once, in the change that brought it back.
 - **Per-file kept contexts.** Global path masking would hide a returning name in a kept file.
 - **Explicit inflected forms.** A general English plural rule would match words with other meanings.
 - **No count in a plain check.** The sentence count is not a finding, and it sets a floor of about 2.5 s.

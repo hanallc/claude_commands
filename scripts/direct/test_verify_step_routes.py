@@ -53,6 +53,59 @@ printf '%s\n' "$VERIFY_CALL_TEXT"
 
 
 class VerifyStepRoutesTests(VerifyStepRoutesFixture):
+    def test_verb_list_runs_in_order_with_one_run_identity(self) -> None:
+        self.prepare_repository()
+        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
+        previous = admission.server.handle_request
+        requests: dict[str, wire.PlacementRequest] = {}
+
+        def handle(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                   ) -> list[wire.Reply]:
+            if isinstance(request, wire.PlacementRequest):
+                _ = requests.setdefault(request.identity.step, request)
+            return previous(request, connection)
+
+        self.fixture.environment["BUILDLOG_OFF"] = "0"
+        with mock.patch.object(admission.server, "handle_request", side_effect=handle):
+            result = self.run_verify("test,lint,doc", "sample")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(list(requests), ["nextest", "mend", "clippy", "doc"])
+        run = requests["nextest"].run
+        self.assertIsInstance(run, wire.RunIdentity)
+        assert isinstance(run, wire.RunIdentity)
+        self.assertEqual([requests[step].run for step in ("mend", "clippy")], [run, run])
+        # Doc uses the same run identity for its queue rank.
+        self.assertEqual(requests["doc"].run, run)
+        rows = cast(list[dict[str, object]], self.fixture.call_records())
+        self.assertEqual([row["verb"] for row in rows], ["test", "lint", "doc"])
+        self.assertEqual([row.get("run_id") for row in rows], [f"{run.pid}:{run.start_time}"] * 3)
+        self.assertEqual(len({row["id"] for row in rows}), 3)
+        self.assert_removed()
+
+    def test_verb_list_prepares_only_the_first_requested_step(self) -> None:
+        request_path = self.fixture.root / "request.json"
+        self.fixture.environment.update({
+            "BUILDLOG_FIRST_STEP_REQUEST": str(request_path),
+            "BUILDLOG_FIRST_STEP_EPISODE": "first-verb",
+            "BUILDLOG_FIRST_STEP_SINCE": "1",
+        })
+        result = self.run_verify("test,lint", "sample")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        request = wire.parse_request(request_path.read_text())
+        assert isinstance(request, wire.PlacementRequest)
+        self.assertEqual((request.episode, request.identity.step), ("first-verb", "nextest"))
+        self.assertEqual(self.mac_rows(), [])
+        self.assert_removed()
+
+    def test_verb_list_stops_at_the_first_failure_and_returns_its_status(self) -> None:
+        self.fixture.environment.update({"TEST_MAC_ALLOWED": "0", "TEST_LOCAL_STATUS": "41"})
+        result = self.run_verify("test,lint,doc", "sample")
+        self.assertEqual(result.returncode, 41, result.stdout + result.stderr)
+        steps = [event["args"] for event in self.fixture.cargo_events()]
+        self.assertEqual(sum(args[:2] == ["nextest", "run"] for args in steps), 1)
+        self.assertTrue(all(args[0] in ("metadata", "nextest") for args in steps), steps)
+        self.assert_removed()
+
     def test_check_uses_mac_during_hold_and_removes_record(self) -> None:
         result = self.run_verify("check", "sample")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

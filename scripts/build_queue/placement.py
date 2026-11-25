@@ -149,6 +149,7 @@ class UnknownAssignedSettingsGeneration:
 SETTINGS_REFUSAL_REASONS = frozenset({"off", "repo"})
 # The claim failure reason when the assigned Mac Linux guest took no run.
 MAC_LINUX_NO_ANSWER = "mac_linux_no_answer"
+MAC_LINUX_START_UNCONFIRMED = "mac_linux_start_unconfirmed"
 
 
 @dataclass(frozen=True)
@@ -163,6 +164,33 @@ class DispatchPathPending:
 
 
 DispatchPathState = DispatchPathSettled | DispatchPathPending
+
+
+@dataclass(frozen=True)
+class Available:
+    """The scaler can take a gate in this pass."""
+
+
+@dataclass(frozen=True)
+class Unavailable:
+    """The scaler cannot take a gate in this pass."""
+    reason: str
+
+
+@dataclass(frozen=True)
+class Settled:
+    """The scaler no longer holds the attempt."""
+
+
+@dataclass(frozen=True)
+class Pending:
+    """The scaler still holds the attempt."""
+    reason: str
+
+
+def scaler_attempt_number(attempt: str) -> int:
+    """Convert the queue's hexadecimal attempt ID to the scaler's integer ID."""
+    return int(attempt, 16)
 
 
 @dataclass(frozen=True)
@@ -526,8 +554,7 @@ def retry_decision(destination: PlacementDestination, reason: str | execution_id
         return DoNotRetry(reason)
     if reason in SETTINGS_REFUSAL_REASONS or reason in ("no_tests", "linux_only", "local_flag", "command"):
         return DoNotRetry(reason)
-    # A Mac Linux guest that took no run waits like a Mac decline, so the retry goes to another machine first.
-    remote_decline = destination.provider == "mac" or reason == MAC_LINUX_NO_ANSWER
+    remote_decline = destination.provider == "mac"
     delay = 180 if remote_decline and reason not in ("busy", "blocked", "disk") else 0
     return RetryAt(now + delay)
 

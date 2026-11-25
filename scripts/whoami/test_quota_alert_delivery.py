@@ -19,7 +19,6 @@ from scripts.lib.test_models_registry import write_registry
 from scripts.accounts import role_map
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.message import send_budget
-from scripts.agents import remote
 from scripts.whoami import quota_alert_test_support as support
 from scripts.whoami import quota_alert
 from scripts.notify import review
@@ -56,7 +55,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         for summary, text, ask in self.pushed:
             self.assertLess(len(summary), 45)
             self.assertLess(len("Action: " + ask.action + "\n" + text), 500)
-            self.assertTrue(remote.local_machine() in ask.action or "chatgpt.com/codex/settings/usage" in ask.action)
+            self.assertTrue("natedev Claude session" in ask.action or "chatgpt.com/codex/settings/usage" in ask.action)
             self.assertLessEqual(text.count("recommended"), 1)
 
     def test_every_user_push_states_its_action_as_send_py_requires(self) -> None:
@@ -72,9 +71,8 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         for title in notes:
             _ = sends.pop(title)
         self.assertEqual(sends, {
-            "quota_alert: codex1 now uses paid credits": ("decision", ActionRequired(
-                "To stop it, remove codex1 from codex_credit_accounts in ~/.claude/config/accounts.conf on "
-                + role_map.ROLE_MAP_HOST)),
+            "codex1 uses credits: balance unknown": ("decision", ActionRequired(
+                "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts codex2 codex3 codex4")),
             "Codex work stopped for lack of usage": ("decision", ActionRequired(REFUSAL_ACTION)),
         })
 

@@ -20,11 +20,12 @@ from unittest import mock
 
 from scripts.build_queue import memory_files
 from scripts.build_queue.test_memory_hover import RAM_FIXTURE, SWAP_FIXTURE
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states
 from scripts.disks import disks_page, slots
 from scripts.production import staff
 from scripts.review_links import staff_names
 from scripts.lib import file_lock, test_hang_guard
+from scripts.lib.process_group import run_process_group
 from scripts.review_links import page_frame, test_page_frame
 
 GIB = 1 << 30
@@ -627,8 +628,8 @@ const localStorage={getItem:()=>null};
         assert start is not None
         scenario = scenario.replace("START", start[0])
         node = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
-        done = subprocess.run([node, "--unhandled-rejections=strict", "-e",
-                               environment + functions + page_frame.REFRESH_SCRIPT + scenario],
+        done = subprocess.run([node, "--unhandled-rejections=strict", "-"],
+                              input=environment + functions + page_frame.REFRESH_SCRIPT + scenario,
                               capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual((done.returncode, done.stdout.strip()), (0, "PASS"), done.stderr)
 
@@ -828,11 +829,11 @@ async function checkSessionLayout() {
                         profile = Path(directory) / f"profile-{width}"
                         profile.mkdir()
                         _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
-                        done = subprocess.run(
+                        done = run_process_group(
                             ["firefox", "--headless", "--no-remote", "--profile", str(profile),
                              "--window-size", f"{width},900", "--screenshot", str(profile / "disks.png"),
                              f"http://127.0.0.1:{server.server_port}/"],
-                            capture_output=True, text=True, timeout=45, check=False)
+                            timeout=45)
                         self.assertEqual(done.returncode, 0, done.stderr)
                         self.assertEqual(results, [{"width": width, "failures": []}])
             finally:
@@ -863,7 +864,7 @@ async function checkSessionLayout() {
 
     def test_a_slot_shows_the_builds_tooltip_without_a_title_field(self) -> None:
         row = {"name": "report integrate", "unit": "report", "showrunner": "builds", "started_at": NOW - 60,
-               "key": "run", "used": 2.0, "slot": 1, "slot_folder": "hana/report/1", "slot_machine": "natedev",
+               "key": "run", "used": 2.0, "slot_folder": "hana/report/1", "slot_machine": "natedev",
                "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
         builds = {"read_at": NOW, "walk": [row], "waiters": [], "ram": RAM_FIXTURE, "swap": SWAP_FIXTURE}
         body = cast(str, self.run_drive("""
@@ -879,7 +880,7 @@ async function checkSessionLayout() {
         # the build queue so they share code and data".
         now = NOW
         step = {"name": "report integrate", "unit": "report", "showrunner": "builds", "started_at": now - 600, "used": 2.0,
-                "slot": 1, "slot_folder": "hana/report/1", "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
+                "slot_folder": "hana/report/1", "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
         builds = {"read_at": now, "waiters": [], "swap_by": [], "ram": RAM_FIXTURE, "swap": SWAP_FIXTURE,
                   "walk": [{**step, "key": "mac-run", "slot_machine": "mac"}, {**step, "key": "run", "slot_machine": "natedev"},
                            {**step, "key": "free-run", "slot_folder": "hana/report/2", "slot_machine": "natedev"}]}

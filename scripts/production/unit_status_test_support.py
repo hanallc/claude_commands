@@ -1,6 +1,7 @@
 """Seeded unit-status shell fixtures with static fake-host responses."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.lib.checkout_test_support import copy_runtime
 
 from scripts.agents import remote
@@ -153,7 +154,7 @@ class UnitStatusFixture(unittest.TestCase):
         _ = shutil.copy2(SCRIPT.parents[1] / "message/process_table.py", message / "process_table.py")
         (root / "config").mkdir()
         _ = shutil.copy2(SCRIPT.parents[2] / "config/session_retries.toml", root / "config/session_retries.toml")
-        _ = shutil.copy2(SCRIPT.parents[2] / "config/staff.conf", root / "config/staff.conf")
+        _ = copy_config_file_fixture(SCRIPT.parents[2] / "config/staff.conf", root / "config/staff.conf")
         _write_executable(message / "notifier.sh", 'print -r -- "$*" >> "$NOTIFIER_CALL_LOG"\nprint -r -- "$NOTIFIER_HEALTH_TEXT"\nexit "$NOTIFIER_HEALTH_EXIT"\n')
         hooks = root / "scripts/hooks"
         hooks.mkdir()

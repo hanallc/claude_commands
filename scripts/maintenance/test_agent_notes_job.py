@@ -66,7 +66,7 @@ class JobTests(unittest.TestCase):
         append.assert_not_called()
         detach.assert_called_once_with(["batch", "--target", "claude5", "--why", "auto: head", "--cause", "auto",
             "--warn-seconds", "0", "--request-id", ANY,
-            "--source-account", "member=claude4", "--", "member"], "move")
+            "--source-account", "member=claude4", "--", "member"], "move", log=ANY, log_fd=ANY)
 
     def test_successful_parts_are_saved_and_a_rerun_retries_only_the_failure(self) -> None:
         def part(name: Part, _cadence: Schedule, _deadline: float) -> job.PartResult:

@@ -1,7 +1,7 @@
 """Check remote copy removal, admission and recovery through their entry points."""
 from __future__ import annotations
 
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import replace
@@ -18,7 +18,6 @@ import subprocess
 import sys
 import tempfile
 from threading import Event
-from types import SimpleNamespace
 from typing import ClassVar, TextIO, cast, final, override
 import unittest
 from unittest import mock
@@ -32,9 +31,10 @@ from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.copies.copies_test_support import mirror_arguments, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
 from scripts.lint import sweep
-from scripts.lib import conf, scratch
+from scripts.lib import build_folders, conf, scratch
 from scripts.lib import process_start as process_identity
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.fork_test_support import ForkChildren
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture
@@ -42,7 +42,21 @@ from scripts.mac_test import eligibility, offload
 from scripts.mac_test import mac_test, claim_state
 from scripts.mac_test import floor_claims
 from scripts.build_targets import target_config
-from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
+from scripts.production.cli_fixture import ImmutableGitSeed
+
+
+@contextmanager
+def interrupt_descriptor_removal(moment: str, payload: str) -> Generator[None]:
+    operation, name = ("rmdir", payload) if moment == "payload" else ("unlink", floor_claims.MIRROR_RECORD)
+    remove = os.rmdir if operation == "rmdir" else os.unlink
+
+    def remove_then_stop(path: str | Path, *, dir_fd: int | None = None) -> None:
+        remove(path, dir_fd=dir_fd)
+        if dir_fd is not None and path == name:
+            raise InterruptedError("removal stopped")
+
+    with mock.patch.object(os, operation, side_effect=remove_then_stop):
+        yield
 
 
 @final
@@ -222,7 +236,7 @@ class RemoteEntryTests(unittest.TestCase):
                 path = paths.claims / name
                 _ = path.write_text(json.dumps(fields))
                 with self.assertRaisesRegex(copies.CopyError, "busy"):
-                    copies.remove_trees("alpha")
+                    self.remove_trees_through_cli("alpha")
                 self.assertTrue(self.mirror.exists())
                 path.unlink()
 
@@ -250,7 +264,7 @@ class RemoteEntryTests(unittest.TestCase):
             self.assertEqual(request.owner, "gate-owner")
             mirror = self.mirror_record(request.owner)
             self.assertEqual(publish_mirror(mirror), 0)
-        copies.remove_trees("gate-owner")
+        self.remove_trees_through_cli("gate-owner")
         self.assertFalse(self.mirror.exists())
         self.assertEqual(copies.owned_remote_mirrors("gate-owner"), [])
 
@@ -263,21 +277,8 @@ class RemoteEntryTests(unittest.TestCase):
                 folder.mkdir()
                 _ = (folder / "file").write_text("data")
                 args = mirror_arguments(mirror, "mirror-remove")
-                remove = shutil.rmtree
-                unlink = Path.unlink
-
-                def remove_payload(path: Path) -> None:
-                    remove(path)
-                    raise InterruptedError("removal stopped")
-
-                def remove_record(path: Path, missing_ok: bool = False) -> None:
-                    unlink(path, missing_ok=missing_ok)
-                    if path == self.mirror / ".copy-record.json":
-                        raise InterruptedError("removal stopped")
-
-                patch = (mock.patch.object(shutil, "rmtree", side_effect=remove_payload) if moment == "payload"
-                         else mock.patch.object(Path, "unlink", autospec=True, side_effect=remove_record))
-                with patch, self.assertRaisesRegex(InterruptedError, "removal stopped"):
+                with (interrupt_descriptor_removal(moment, folder.name),
+                      self.assertRaisesRegex(InterruptedError, "removal stopped")):
                     _ = copies.mirror_remove(args)
                 self.assertTrue(copies.remote_record_path(mirror).exists())
                 with self.assertRaisesRegex(copies.CopyError, "another owner"):
@@ -302,7 +303,7 @@ class RemoteEntryTests(unittest.TestCase):
         self.assertEqual(publish_mirror(other), 0)
         with copies.standing(owner, self.source, copies.CommittedSource("HEAD")) as tree:
             pass
-        copies.remove_trees(owner)
+        self.remove_trees_through_cli(owner)
         self.assertTrue(tree.exists())
         self.assertFalse(self.mirror.exists())
         self.assertEqual(copies.owned_remote_mirrors(owner), [])
@@ -310,15 +311,29 @@ class RemoteEntryTests(unittest.TestCase):
         self.assertEqual(copies.owned_remote_mirrors("beta-unit"), [other])
 
     def remove_trees_through_cli(self, owner: str) -> None:
-        """Run the real remote CLI without another SSH interpreter."""
+        """Run the remote removal in a child with warm imports."""
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
         def remote_cli(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
-            command = shlex.split(arguments[-1].partition("; copies_status=")[0])[2:]
-            answer = invoke_cli(copies, lambda: copies.main(command), command, os.environ, self.root,
-                                combined_output=not bool(options.get("capture_output")))
+            if arguments[0] != "ssh" or "; copies_status=" not in arguments[-1]:
+                return run(arguments, **options)
+            command_text = arguments[-1].partition("; copies_status=")[0]
+            command = shlex.split(command_text)[2:]
+            timeout = cast(float, options["timeout"])
+
+            def remove() -> int:
+                os.chdir(self.root)
+                return copies.main(command)
+
+            with ForkChildren() as children:
+                try:
+                    answer = children.start(remove).result(timeout=timeout)
+                except TimeoutError as error:
+                    raise subprocess.TimeoutExpired(arguments, timeout) from error
             return subprocess.CompletedProcess(arguments, answer.returncode,
                                                answer.stdout + f"\nrc={answer.returncode}\n", answer.stderr)
 
-        with mock.patch.object(copies, "subprocess", SimpleNamespace(run=remote_cli)):
+        with mock.patch.object(subprocess, "run", side_effect=remote_cli):
             copies.remove_trees(owner)
 
     def save_interrupted_mirror(self, mirror: copies.RemoteMirror, key: tuple[str, str]) -> None:
@@ -350,20 +365,8 @@ class RemoteEntryTests(unittest.TestCase):
         payload = tree / "old-payload"
         payload.mkdir()
         _ = (payload / "file").write_text("old content")
-        remove, unlink = shutil.rmtree, Path.unlink
-
-        def remove_payload(path: Path) -> None:
-            remove(path)
-            raise InterruptedError("removal stopped")
-
-        def remove_record(path: Path, missing_ok: bool = False) -> None:
-            unlink(path, missing_ok=missing_ok)
-            if path == tree / ".copy-record.json":
-                raise InterruptedError("removal stopped")
-
-        patch = (mock.patch.object(shutil, "rmtree", side_effect=remove_payload) if moment == "payload"
-                 else mock.patch.object(Path, "unlink", autospec=True, side_effect=remove_record))
-        with patch, self.assertRaisesRegex(InterruptedError, "removal stopped"):
+        with (interrupt_descriptor_removal(moment, payload.name),
+              self.assertRaisesRegex(InterruptedError, "removal stopped")):
             _ = copies.mirror_remove(mirror_arguments(mirror, "mirror-remove"))
         _ = (tree / "leftover").write_text("partly removed content")
         authority = tree.parent / ("." + tree.name + ".copy-removing.json")
@@ -371,6 +374,67 @@ class RemoteEntryTests(unittest.TestCase):
         self.assertEqual((tree / ".copy-record.json").exists(), moment == "payload")
         self.save_interrupted_mirror(mirror, key)
         return authority
+
+    def test_receive_keeps_removal_authority_when_the_guard_refuses(self) -> None:
+        mirror = self.mirror_record()
+        self.assertEqual(publish_mirror(mirror), 0)
+        payload = self.mirror / "old-content"
+        _ = payload.write_text("keep")
+        authority = floor_claims.removal_authority_path(self.mirror)
+        receive = mirror_arguments(mirror, "mirror-receive")
+        with mock.patch.object(build_folders, "may_remove_folder_tree", return_value=False):
+            with self.assertRaisesRegex(copies.CopyError, "guarded removal refused"):
+                _ = copies.mirror_remove(mirror_arguments(mirror, "mirror-remove"))
+            self.assertTrue(authority.is_file())
+            with self.assertRaisesRegex(copies.CopyError, "guarded removal refused"):
+                _ = copies.mirror_run(receive)
+        self.assertTrue(authority.is_file())
+        self.assertEqual(payload.read_text(), "keep")
+
+    def test_receive_recovers_the_mirror_left_by_sigkill_after_staging(self) -> None:
+        original = self.mirror_record()
+        self.assertEqual(publish_mirror(original), 0)
+        tree = self.mirror
+        _ = (tree / "old-payload").write_text("old content")
+        authority = floor_claims.removal_authority_path(tree)
+        record = tree / floor_claims.MIRROR_RECORD
+        write_text_atomic(authority, record.read_text())
+        receive = mirror_arguments(replace(original, owner="beta", session="beta-session"), "mirror-receive")
+        rename = build_folders._rename_without_replacing  # pyright: ignore[reportPrivateUsage]
+
+        def stop_after_staging(directory: int, source: str, destination: str) -> None:
+            rename(directory, source, destination)
+            if source == tree.name:
+                os.kill(os.getpid(), signal.SIGKILL)
+
+        def interrupted_receive() -> int:
+            with mock.patch.object(build_folders, "_rename_without_replacing", side_effect=stop_after_staging):
+                return copies.mirror_run(receive)
+
+        with ForkChildren() as children:
+            answer = children.start(interrupted_receive).result()
+        self.assertEqual(answer.returncode, -signal.SIGKILL, answer.stderr)
+        self.assertFalse(tree.exists())
+        [staged] = [path for path in tree.parent.glob(".removing-*") if path.is_dir()]
+        status = staged.stat()
+        self.assertEqual((staged / "old-payload").read_text(), "old content")
+        self.assertEqual(build_folders.StagedRemoval.read(floor_claims.read_mirror_record(authority)),
+                         build_folders.StagedRemoval(staged.name, status.st_dev, status.st_ino))
+
+        with staged.with_suffix(".lock").open("rb") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(copies.CopyError, "the staged mirror could not be removed"):
+                _ = copies.mirror_run(receive)
+            self.assertFalse(tree.exists())
+            self.assertTrue(authority.exists())
+
+        self.assertEqual(copies.mirror_run(receive), 0)
+        self.assertFalse(staged.exists())
+        self.assertFalse(staged.with_suffix(".lock").exists())
+        self.assertFalse(build_folders.lease_path(staged).exists())
+        self.assertFalse(authority.exists())
+        self.assertFalse((tree / "old-payload").exists())
+        self.assertEqual(floor_claims.read_mirror_record(record)["owner"], original.owner)
 
     def test_receive_refills_interrupted_removal_before_another_owner_uses_and_removes(self) -> None:
         for moment in ("payload", "record"):
@@ -479,8 +543,8 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
         clear = copies.clear_mirror_content
         unlink = Path.unlink
 
-        def clear_content(path: Path) -> None:
-            clear(path)
+        def clear_content(path: Path, pending: dict[str, object]) -> None:
+            clear(path, pending)
             if stage == "clear":
                 raise InterruptedError("receive stopped")
 
@@ -578,7 +642,7 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                 self.assertIsInstance(result, offload.DeclinedMacRun)
                 self.assertEqual(copies.owned_remote_mirrors("alpha"), [original])
                 self.assertEqual(copies.owned_remote_mirrors("new-owner"), [])
-                copies.remove_trees("alpha")
+                self.remove_trees_through_cli("alpha")
                 self.assertFalse(Path(original.path).exists())
                 self.assertEqual(copies.owned_remote_mirrors("alpha"), [])
 

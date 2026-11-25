@@ -3,22 +3,25 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import json
 import os
 import platform
+import re
 import secrets
 import subprocess
 import sys
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from http.client import HTTPConnection, HTTPException
+from pathlib import Path
 from typing import Literal, cast
 
-from scripts.lib import conf, main_publish
-from scripts.production import investigation, producer_map, staff, the_list
+from scripts.lib import atomic_file, conf, main_publish
+from scripts.lib.file_lock import exclusive
+from scripts.production import investigation, producer_map, staff
 from scripts.review_links import for_you, new_item_dialog, review_page
 
-SOURCE = "nate via /new_item"
 OPTIONS_TARGET = f"{review_page.NEW_ITEM_PATH}?page=list"
 FORM = "/new_item <type> <assignee> <description> [extra, such as a time]"
 MAY_BE_FILED = "The item may be filed. Check the List before a retry."
@@ -31,16 +34,21 @@ class ItemType(StrEnum):
     PROPOSAL = "proposal"
     EFFICIENCY = "efficiency"
     FEEDBACK = "feedback"
+    ENHANCEMENT = "enhancement"
 
 
-# The console server takes four kinds. Feedback and efficiency file as an investigation.
-FILED_KINDS: dict[ItemType, new_item_dialog.SubmissionKind] = {
+type _NewItemRequestKind = new_item_dialog.SubmissionKind | Literal["enhancement"]
+
+
+# The server files Feedback, Efficiency and Enhancement as investigations.
+FILED_KINDS: dict[ItemType, _NewItemRequestKind] = {
     ItemType.BUG: new_item_dialog.SubmissionKind.BUG,
     ItemType.QUESTION: new_item_dialog.SubmissionKind.QUESTION,
     ItemType.INVESTIGATION: new_item_dialog.SubmissionKind.INVESTIGATION,
     ItemType.PROPOSAL: new_item_dialog.SubmissionKind.PROPOSAL,
     ItemType.EFFICIENCY: new_item_dialog.SubmissionKind.INVESTIGATION,
     ItemType.FEEDBACK: new_item_dialog.SubmissionKind.INVESTIGATION,
+    ItemType.ENHANCEMENT: "enhancement",
 }
 
 
@@ -130,16 +138,12 @@ def producer_question(member: staff.StaffRow, missing: producer_map.NoProducer, 
     return f"{question}\n{producers}"
 
 
-def result_line(item_type: ItemType, member: staff.StaffRow, mapped: producer_map.MappedProducer,
-                members: staff.StaffSnapshot, *, this_session: bool, list_key: str) -> str:
-    """Say who does the work, who tracks it and why, and the List item number."""
-    to = unit_of(member, members) + (", this session" if this_session else "")
-    producer = ""
-    if member.kind != "producer":
-        why = "set for" if mapped.set_by == member else "from"
-        producer = f" Producer: {mapped.producer.name} ({why} {mapped.set_by.name})."
-    number = list_key.partition("/")[2].removeprefix("L")
-    return f"{item_type.value.capitalize()} → {to}.{producer} List item {number}."
+def producer_line(member: staff.StaffRow, mapped: producer_map.MappedProducer) -> str:
+    """Name the producer selected for a new filing."""
+    if member.kind == "producer":
+        return ""
+    why = "set for" if mapped.set_by == member else "from"
+    return f" Producer: {mapped.producer.name} ({why} {mapped.set_by.name})."
 
 
 def console_address() -> for_you.ConsoleAddress:
@@ -220,31 +224,76 @@ def recipient_for(member: staff.StaffRow, options: Options, members: staff.Staff
     return found
 
 
-def request_body(options: Options, kind: new_item_dialog.SubmissionKind, recipient: Recipient, words: str) -> bytes:
+def request_body(options: Options, kind: _NewItemRequestKind, recipient: staff.StaffId, words: str,
+                 assignee: staff.StaffId, request_id: str) -> bytes:
     """Send the List window fields for a new List draft."""
     return json.dumps({
-        "token": options.token, "request_id": "r6-" + secrets.token_hex(16), "kind": kind.value,
-        "recipient_id": recipient.id, "words": words, "evidence": {"kind": "none"}, "images": [],
-        "page": "list", "page_recipient": new_item_dialog.PageRecipient.SELECTED.value,
+        "token": options.token, "request_id": request_id, "kind": kind,
+        "recipient_id": recipient, "words": words, "evidence": {"kind": "none"}, "images": [],
+        "page": "list", "page_recipient": new_item_dialog.PageRecipient.SELECTED.value, "list_assignee": assignee,
     }).encode()
 
 
+@dataclass(frozen=True)
+class PendingListDraft:
+    """Keep the request ID and recipient while the result is uncertain."""
+
+    request_id: str
+    recipient: staff.StaffId
+
+
+@dataclass(frozen=True)
+class NoPendingListDraft:
+    """The command has no draft with an uncertain result."""
+
+
+def draft_path(address: for_you.ConsoleAddress, session: str, assignee: staff.StaffId,
+               kind: _NewItemRequestKind, words: str) -> Path:
+    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "new-item"
+    scope = json.dumps([address.host, address.port, session, assignee, kind, words])
+    return state / hashlib.sha256(scope.encode()).hexdigest()
+
+
+def read_pending_draft(path: Path) -> PendingListDraft | NoPendingListDraft:
+    try:
+        fields = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return NoPendingListDraft()
+    if (len(fields) != 2 or not re.fullmatch(r"r6-[0-9a-f]{32}", fields[0])
+            or not fields[1]):
+        raise OSError("Cannot read the pending New item draft.")
+    return PendingListDraft(fields[0], staff.StaffId(fields[1]))
+
+
+def save_pending_draft(path: Path, recipient: staff.StaffId) -> PendingListDraft:
+    draft = PendingListDraft("r6-" + secrets.token_hex(16), recipient)
+    atomic_file.write_text_atomic(path, f"{draft.request_id}\n{draft.recipient}\n", new_file_mode=0o600)
+    return draft
+
+
+def post_item(address: for_you.ConsoleAddress, options: Options, kind: _NewItemRequestKind,
+              draft: PendingListDraft, words: str, assignee: staff.StaffId) -> ServerReply:
+    """Retry an unconfirmed POST with the same draft ID and recipient."""
+    def send(current: Options) -> ServerReply:
+        return exchange(address, "POST", review_page.NEW_ITEM_PATH,
+                        request_body(current, kind, draft.recipient, words, assignee, draft.request_id))
+
+    try:
+        reply = send(options)
+    except ServerUnavailable:
+        reply = send(options)
+    else:
+        if reply.status == 503:
+            reply = send(options)
+    if reply.status == 403 and reply.fields.get("code") == "stale_token":
+        reply = send(read_options(address))
+    return reply
+
+
 def words_text(item_type: ItemType, description: str, extra: str) -> str:
-    """A type that files as another server kind names itself first; feedback files as the window files it."""
-    marked = FILED_KINDS[item_type].value != item_type.value and item_type != ItemType.FEEDBACK
-    first = f"{item_type.value.capitalize()}: {description.strip()}" if marked else description.strip()
+    """Add the Efficiency prefix and append any extra words."""
+    first = f"Efficiency: {description.strip()}" if item_type == ItemType.EFFICIENCY else description.strip()
     return first + (f"\n\n{extra.strip()}" if extra.strip() else "")
-
-
-def set_assignee(list_key: str, member: staff.StaffRow, mapped: producer_map.MappedProducer) -> None:
-    """The List item names a unit assignee and takes the assignee's producer, not the recipient's."""
-    keeper, _, identity = list_key.partition("/")
-    item = the_list.load(staff.StaffId(keeper), identity)
-    changes: the_list.ItemChanges = {"unit": member.name} if member.kind == "unit" else {}
-    if mapped.producer.id != item.producer:
-        changes["producer"] = mapped.producer.id
-    if changes:
-        _ = the_list.update(staff.StaffId(keeper), identity, changes, source=SOURCE)
 
 
 class Arguments(argparse.Namespace):
@@ -261,7 +310,7 @@ def main(arguments: list[str] | None = None) -> int:
         print(usage())
         return Outcome.USAGE
     if platform.system() == "Darwin":
-        # The List fields are written on natedev, so the Mac sends the whole command there with its session.
+        # The Mac uses the natedev staff snapshot and console address.
         return main_publish.forward("review_links/new_item.py", [*argv, "--session", staff.caller_identity()],
                                     label="new_item", ssh_program=os.environ.get("ZONE_SSH") or "ssh")
     parser = argparse.ArgumentParser(prog="new_item.py", description=__doc__)
@@ -280,36 +329,55 @@ def main(arguments: list[str] | None = None) -> int:
         if isinstance(member, producer_map.UnknownMember):
             print(unknown_name(member, members))
             return Outcome.UNKNOWN_NAME
-        mapped = producer_map.producer_for(member.id, members)
-        if isinstance(mapped, producer_map.NoProducer):
-            print(producer_question(member, mapped, members))
-            return Outcome.NO_PRODUCER
-        address = console_address()
-        options = read_options(address)
-        recipient = recipient_for(member, options, members)
-        if isinstance(recipient, Refusal):
-            print(f"new_item: {recipient.reason}", file=sys.stderr)
-            return Outcome.REFUSED
-        reply = exchange(address, "POST", review_page.NEW_ITEM_PATH, request_body(
-            options, FILED_KINDS[item_type], recipient, words_text(item_type, args.description, args.extra)))
-        list_key = reply.fields.get("list_key")
-        if reply.status != 200 or not isinstance(list_key, str):
+        caller = members.by_current_session(args.session) if args.session else None
+        to = unit_of(member, members) + (", this session" if caller is not None and caller.id == member.id else "")
+        result = f"{item_type.value.capitalize()} → {to}."
+        kind = FILED_KINDS[item_type]
+        words = words_text(item_type, args.description, args.extra)
+        try:
+            address = console_address()
+        except ServerUnavailable:
+            mapped = producer_map.producer_for(member.id, members)
+            if isinstance(mapped, producer_map.NoProducer):
+                print(producer_question(member, mapped, members))
+                return Outcome.NO_PRODUCER
+            raise
+        path = draft_path(address, args.session, member.id, kind, words)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with exclusive(path.with_suffix(".lock")):
+            draft = read_pending_draft(path)
+            if isinstance(draft, NoPendingListDraft):
+                mapped = producer_map.producer_for(member.id, members)
+                if isinstance(mapped, producer_map.NoProducer):
+                    print(producer_question(member, mapped, members))
+                    return Outcome.NO_PRODUCER
+                options = read_options(address)
+                recipient = recipient_for(member, options, members)
+                if isinstance(recipient, Refusal):
+                    print(f"new_item: {recipient.reason}", file=sys.stderr)
+                    return Outcome.REFUSED
+                draft = save_pending_draft(path, recipient.id)
+                result += producer_line(member, mapped)
+            else:
+                options = read_options(address)
+            reply = post_item(address, options, kind, draft, words, member.id)
+            refused = reply.status == 400 or reply.status == 409 and reply.fields.get("code") != "already_filed"
+            if reply.status == 200 or refused:
+                path.unlink()
+        if reply.status != 200:
             print(f"new_item: {_server_error(reply)}", file=sys.stderr)
             return Outcome.FAILED
     except (ServerUnavailable, OSError, ValueError, staff.StaffRefused) as error:
         print(f"new_item: {error}", file=sys.stderr)
         return Outcome.FAILED
-    caller = members.by_current_session(args.session) if args.session else None
-    filed = result_line(item_type, member, mapped, members,
-                        this_session=caller is not None and caller.id == member.id, list_key=list_key)
-    if member.id != recipient.id:
-        try:
-            set_assignee(list_key, member, mapped)
-        except (OSError, ValueError, staff.StaffRefused) as error:
-            print(f"new_item: filed, but the List item does not name the assignee and its producer: {filed} {error}",
-                  file=sys.stderr)
-            return Outcome.FAILED
-    print(filed)
+    number = reply.fields.get("list_number")
+    if type(number) is int and number > 0:
+        filed = f"List item {number}."
+    else:
+        review_id = reply.fields.get("id")
+        shown = review_id if isinstance(review_id, str) and review_id else "a Review item"
+        filed = f"Filed as {shown}. The console server returned no List number."
+    print(f"{result} {filed}")
     return Outcome.FILED
 
 

@@ -25,6 +25,7 @@ MAX_PAGE_SECTIONS = 16
 MAX_PAGE_SECTION_ROWS = 128
 MAX_BUG_PAGE_STATE_BYTES = 512 * 1024
 MAX_PAGE_URL_LENGTH = 8192
+BUILD_EVIDENCE_LIMITS = {"title": 300, "label": 200, "text": 4_000, "tipEntries": 64}
 IMAGE_FORMATS = {"image/png": "png", "image/jpeg": "jpeg", "image/gif": "gif", "image/webp": "webp"}
 
 
@@ -101,13 +102,16 @@ class MemorySegment:
     label: str
     gib: float
     tone: MemoryTone
+    text: str | None = None
 
 
 @dataclass(frozen=True)
 class MemoryReading:
-    free_for_next_gib: float
-    queue_cap_gib: float
+    free_for_next_gib: float | None
+    queue_cap_gib: float | None
     segments: tuple[MemorySegment, ...]
+    free_text: str | None = None
+    cap_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -178,7 +182,17 @@ def evidence_fields(evidence: Evidence) -> dict[str, object]:
     """Preserve the fields used by existing request digests."""
     if isinstance(evidence, PageDataEvidence):
         return {**evidence.page_data(), "kind": evidence.kind}
-    return cast(dict[str, object], asdict(evidence))
+    fields = cast(dict[str, object], asdict(evidence))
+    if isinstance(evidence, BuildStepEvidence):
+        # Keep the digest of requests saved before display text was added.
+        memory = cast(dict[str, object], fields["memory"])
+        for field_name in ("free_text", "cap_text"):
+            if memory[field_name] is None:
+                del memory[field_name]
+        for segment in cast(tuple[dict[str, object], ...], memory["segments"]):
+            if segment["text"] is None:
+                del segment["text"]
+    return fields
 
 
 @dataclass(frozen=True)
@@ -288,7 +302,7 @@ class PageRecipient(StrEnum):
 @dataclass(frozen=True)
 class NewItemRequest:
     request_id: str
-    kind: SubmissionKind
+    kind: SubmissionKind | Literal["enhancement"]
     recipient_id: staff.StaffId
     words: str
     evidence: Evidence
@@ -432,6 +446,14 @@ def _gib(value: object) -> float:
     return float(cast(float, value))
 
 
+def _optional_gib(value: object) -> float | None:
+    return None if value is None else _gib(value)
+
+
+def _optional_memory_text(value: object) -> str | None:
+    return None if value is None else _text(value, "Displayed memory", 32)
+
+
 def _time(value: str) -> datetime:
     result = datetime.fromisoformat(value)
     if result.utcoffset() is None:
@@ -450,12 +472,12 @@ def _tip_entry(value: object) -> TipEntry:
     row = _mapping(value, "Tooltip entry")
     match row.get("kind"):
         case "caption":
-            return TipCaption(_text(row.get("text"), "Tooltip caption", 4000))
+            return TipCaption(_text(row.get("text"), "Tooltip caption", BUILD_EVIDENCE_LIMITS["text"]))
         case "field":
-            return TipField(_text(row.get("label"), "Tooltip label", 200),
-                            _text(row.get("value"), "Tooltip value", 4000, allow_empty=True))
+            return TipField(_text(row.get("label"), "Tooltip label", BUILD_EVIDENCE_LIMITS["label"]),
+                            _text(row.get("value"), "Tooltip value", BUILD_EVIDENCE_LIMITS["text"], allow_empty=True))
         case "detail":
-            return TipDetail(_text(row.get("text"), "Tooltip detail", 4000))
+            return TipDetail(_text(row.get("text"), "Tooltip detail", BUILD_EVIDENCE_LIMITS["text"]))
         case _:
             raise SubmissionError("Select a valid tooltip entry type.")
 
@@ -488,25 +510,28 @@ def read_evidence(value: object) -> Evidence:
             captured_at = _text(data.get("captured_at"), "Capture time", 80)
             _ = _time(captured_at)
             cells = tuple(
-                BuildCell(_text(cell.get("label"), "Cell label", 200),
-                          _text(cell.get("value"), "Cell value", 4000, allow_empty=True))
+                BuildCell(_text(cell.get("label"), "Cell label", BUILD_EVIDENCE_LIMITS["label"]),
+                          _text(cell.get("value"), "Cell value", BUILD_EVIDENCE_LIMITS["text"], allow_empty=True))
                 for entry in _entries(data.get("cells"), "Row cells", 32)
                 for cell in (_mapping(entry, "Row cell"),))
             memory = _mapping(data.get("memory"), "Memory reading")
             segments = tuple(
-                MemorySegment(_text(segment.get("label"), "Memory label", 200),
-                              _gib(segment.get("gib")), MemoryTone(segment.get("tone")))
+                MemorySegment(_text(segment.get("label"), "Memory label", BUILD_EVIDENCE_LIMITS["label"]),
+                              _gib(segment.get("gib")), MemoryTone(segment.get("tone")),
+                              _optional_memory_text(segment.get("text")))
                 for entry in _entries(memory.get("segments"), "Memory segments", 32)
                 for segment in (_mapping(entry, "Memory segment"),))
             return BuildStepEvidence(
-                captured_at, _text(data.get("step_id"), "Step ID", 300),
-                _text(data.get("title"), "Step title", 300),
-                _text(data.get("owner"), "Step owner", 300, allow_empty=True), cells,
-                MemoryReading(_gib(memory.get("free_for_next_gib")), _gib(memory.get("queue_cap_gib")),
-                              segments),
-                _text(data.get("tip_title"), "Tooltip title", 300),
-                _text(data.get("tip_status"), "Tooltip status", 300, allow_empty=True),
-                tuple(_tip_entry(entry) for entry in _entries(data.get("tip"), "Tooltip entries", 64)))
+                captured_at, _text(data.get("step_id"), "Step ID", BUILD_EVIDENCE_LIMITS["title"]),
+                _text(data.get("title"), "Step title", BUILD_EVIDENCE_LIMITS["title"]),
+                _text(data.get("owner"), "Step owner", BUILD_EVIDENCE_LIMITS["title"], allow_empty=True), cells,
+                MemoryReading(_optional_gib(memory.get("free_for_next_gib", "")),
+                              _optional_gib(memory.get("queue_cap_gib", "")),
+                              segments, _optional_memory_text(memory.get("free_text")),
+                              _optional_memory_text(memory.get("cap_text"))),
+                _text(data.get("tip_title"), "Tooltip title", BUILD_EVIDENCE_LIMITS["title"]),
+                _text(data.get("tip_status"), "Tooltip status", BUILD_EVIDENCE_LIMITS["title"], allow_empty=True),
+                tuple(_tip_entry(entry) for entry in _entries(data.get("tip"), "Tooltip entries", BUILD_EVIDENCE_LIMITS["tipEntries"])))
         case _:
             raise SubmissionError("Select a valid evidence type.")
 
@@ -604,7 +629,8 @@ def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
     """Decode the JSON fields for Send."""
     data = _mapping(value, "New item")
     page = _text(data.get("page", ""), "Console page", 32, allow_empty=True)
-    kind = read_kind(data.get("kind"))
+    kind_value = data.get("kind")
+    kind = "enhancement" if kind_value == "enhancement" else read_kind(kind_value)
     if page and page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Open the New item dialog from a page owner.")
     try:
@@ -751,30 +777,45 @@ def read_request_id(value: object) -> str:
     return identity
 
 
-def read_words(value: object, label: str) -> str:
-    return _text(value, label, MAX_WORDS_LENGTH)
+def read_words(value: object, label: str, *, kind: SubmissionKind | Literal["enhancement"] | None = None) -> str:
+    """Check the user's words before adding the Enhancement prefix."""
+    words = _text(value, label, MAX_WORDS_LENGTH)
+    return f"Enhancement: {words.lstrip()}" if kind == "enhancement" else words
 
 
+
+_SPARKLES = """<!-- @license lucide-static v0.468.0 - ISC -->
+<svg aria-hidden="true" focusable="false" class="lucide lucide-sparkles"
+    xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+    fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z" />
+  <path d="M20 3v4" />
+  <path d="M22 5h-4" />
+  <path d="M4 17v2" />
+  <path d="M5 18H3" />
+</svg>"""
 
 KINDS = ((SubmissionKind.BUG, "Bug", "bug"),
          (SubmissionKind.QUESTION, "Question", "circle-help"),
          ("feedback", "Feedback", "message-circle-question"),
          (SubmissionKind.PROPOSAL, "Proposal", "lamp"),
-         (SubmissionKind.INVESTIGATION, "Investigation", "microscope"))
+         (SubmissionKind.INVESTIGATION, "Investigation", "microscope"),
+         ("enhancement", "Enhancement", "sparkles"))
 
 
 def render() -> str:
-    """Render the dialog that the page owner button opens."""
+    """Render the dialog for the page owner and Builds row buttons."""
     chips = "".join(
         f'<label class="new-item-chip" data-kind="{kind}"><input type="radio" name="kind" value="{kind}">'
-        + f'<span data-button-face>{page_frame.icon_svg(icon)}<span data-kind-label>{label}</span></span></label>'
+        + f'<span data-button-face>{_SPARKLES if icon == "sparkles" else page_frame.icon_svg(icon)}'
+        + f'<span data-kind-label>{label}</span></span></label>'
         for kind, label, icon in KINDS)
     limits = json.dumps({"types": list(IMAGE_FORMATS), "images": MAX_IMAGES,
                          "imageBytes": MAX_IMAGE_BYTES,
                          "totalImageBytes": MAX_TOTAL_IMAGE_BYTES, "pageDataBytes": MAX_PAGE_DATA_BYTES,
                          "pageRows": MAX_PAGE_ROWS, "pageSections": MAX_PAGE_SECTIONS,
                          "sectionRows": MAX_PAGE_SECTION_ROWS,
-                         "pageUrlLength": MAX_PAGE_URL_LENGTH})
+                         "pageUrlLength": MAX_PAGE_URL_LENGTH, "buildEvidence": BUILD_EVIDENCE_LIMITS})
     body = f'''
    <fieldset><legend>Type</legend><div class="new-item-chips">{chips}</div></fieldset>
    <fieldset data-recipient-group><legend>To</legend>
@@ -786,6 +827,7 @@ def render() -> str:
     placeholder="Type your words. You can paste an image." required></textarea>
    <section class="page-state-box sent-details" data-sent-details aria-labelledby="sent-details-title">
     <h4 id="sent-details-title">Sent with your words</h4>
+    <div class="new-item-evidence" data-evidence hidden></div>
     <div data-bug-page-state hidden>
      <dl class="page-state"></dl>
      <p data-visible-text>Page data and visible text</p>
@@ -809,15 +851,13 @@ def render() -> str:
   <footer>
    <p data-send-disabled role="status" hidden></p>
    <p class="new-item-error" role="alert" hidden></p>
-   <p id="new-item-saved" role="status" hidden></p>
-   <div data-send-controls><button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button></div>
-   <div data-saved-controls hidden><button type="button" data-done aria-describedby="new-item-saved">Done</button></div>
+   <div><button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button></div>
   </footer>
 '''
     dialog = page_frame.console_dialog('review-new-item', 'new-item-title', 'New item', body,
                                        footer=footer, form=True, body_class='new-item-body')
     return (f'<style>{STYLE}{PAGE_STATE_STYLE}</style>{dialog}'
-            f'<script>{SCRIPT.replace("__LIMITS__", limits)}</script>')
+            f'<script>{page_frame.HELD_SEND_SCRIPT}{SCRIPT.replace("__LIMITS__", limits)}</script>')
 
 
 PAGE_STATE_STYLE = '''
@@ -838,107 +878,147 @@ PAGE_STATE_STYLE = '''
 
 STYLE = '''
 /* Keep the page at the same scroll position when a save adds a row. */
-:root:has(#review-new-item[open]) { overflow-anchor: none; }
-#review-new-item button:where(:not([data-close])) { margin: 0; min-height: 0; font: inherit; cursor: pointer; }
-#review-new-item button:disabled { opacity: .55; cursor: default; }
-#review-new-item button:focus-visible, #review-new-item textarea:focus-visible,
-#review-new-item input:focus-visible + span { outline: 2px solid var(--accent, #3987e5); outline-offset: 2px; }
-#review-new-item .new-item-body:not([hidden]) {
+:root:has(:is(#review-new-item,[data-new-item-draft])[open]) { overflow-anchor: none; }
+:is(#review-new-item,[data-new-item-draft]) button:where(:not([data-close])) { margin: 0; min-height: 0; font: inherit; cursor: pointer; }
+:is(#review-new-item,[data-new-item-draft]) button:disabled { opacity: .55; cursor: default; }
+:is(#review-new-item,[data-new-item-draft]) button:focus-visible, :is(#review-new-item,[data-new-item-draft]) textarea:focus-visible,
+:is(#review-new-item,[data-new-item-draft]) input:focus-visible + span { outline: 2px solid var(--accent, #3987e5); outline-offset: 2px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-body {
  display: grid; align-content: start; gap: 18px;
 }
-#review-new-item fieldset { min-inline-size: 0; margin: 0; padding: 0; border: 0; }
-#review-new-item legend, #review-new-item h3 {
+:is(#review-new-item,[data-new-item-draft]) fieldset { min-inline-size: 0; margin: 0; padding: 0; border: 0; }
+:is(#review-new-item,[data-new-item-draft]) legend, :is(#review-new-item,[data-new-item-draft]) h3 {
  margin: 0 0 8px; padding: 0; font-size: 11px; line-height: 1.3; font-weight: 500;
  text-transform: uppercase; color: var(--ink-3, #9a988f);
 }
-#review-new-item .new-item-chips { display: flex; flex-wrap: wrap; gap: 8px; }
-#review-new-item .new-item-chip { position: relative; display: inline-flex; max-width: 100%; }
-#review-new-item .new-item-chip[hidden] { display: none; }
-#review-new-item .new-item-chip input {
+:is(#review-new-item,[data-new-item-draft]) .new-item-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip { position: relative; display: inline-flex; max-width: 100%; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[hidden] { display: none; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip input {
  position: absolute; width: 1px; height: 1px; padding: 0; margin: 0; opacity: 0;
 }
-#review-new-item .new-item-chip > span {
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip > span {
  display: flex; align-items: center; gap: 7px; padding: 7px 14px; border-radius: 999px;
  border: 1px solid var(--line, #34332f); color: var(--ink-2, #c3c2b7);
  font-size: 14px; overflow-wrap: anywhere; cursor: pointer;
 }
-#review-new-item .new-item-chip input:checked + span,
-#review-new-item button[type="submit"], #review-new-item [data-done] {
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip input:checked + span,
+:is(#review-new-item,[data-new-item-draft]) button[type="submit"] {
  background: #2670c5; color: white; border-color: transparent;
 }
-#review-new-item .new-item-chip svg { width: 16px; height: 16px; flex: none; }
-#review-new-item .new-item-chip[data-kind="question"] { --item-icon: #af90ed; }
-#review-new-item .new-item-chip[data-kind="proposal"] { --item-icon: #ed7da9; }
-#review-new-item .new-item-chip[data-kind="investigation"] { --item-icon: #1cc1b5; }
-#review-new-item .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
-#review-new-item .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
-#review-new-item [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
-#review-new-item [data-recipient-group] { display: flow-root; }
-#review-new-item [data-recipient-group] > legend { float: left; margin-right: 12px; }
-#review-new-item [data-owner-reason] {
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip svg { width: 16px; height: 16px; flex: none; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="question"] { --item-icon: #af90ed; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="proposal"] { --item-icon: #ed7da9; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="investigation"] { --item-icon: #1cc1b5; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="enhancement"] { --item-icon: #efbd63; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
+:is(#review-new-item,[data-new-item-draft]) [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
+:is(#review-new-item,[data-new-item-draft]) [data-recipient-group] { display: flow-root; }
+:is(#review-new-item,[data-new-item-draft]) [data-recipient-group] > legend { float: left; margin-right: 12px; }
+:is(#review-new-item,[data-new-item-draft]) [data-owner-reason] {
  margin: 0 0 8px; font-size: 12px; line-height: 1.2; text-align: right; text-wrap: balance; overflow-wrap: anywhere;
  color: var(--ink-3, #9a988f);
 }
-#review-new-item [data-recipients-status], #review-new-item [data-recipients] { clear: both; }
-#review-new-item textarea {
+:is(#review-new-item,[data-new-item-draft]) [data-recipients-status], :is(#review-new-item,[data-new-item-draft]) [data-recipients] { clear: both; }
+:is(#review-new-item,[data-new-item-draft]) textarea {
  display: block; width: 100%; min-width: 0; margin: 0; padding: 10px 12px; resize: vertical;
  border: 1px solid var(--line, #34332f); border-radius: 8px;
  background: var(--bg, #121211); color: inherit; font: 16px/1.45 system-ui, sans-serif;
 }
-#review-new-item textarea::placeholder { color: var(--ink-3, #9a988f); }
-#review-new-item[data-page-bug] textarea { resize: none; }
-#review-new-item .new-item-page-capture:not([hidden]) { display: flex; align-items: center; gap: 9px; margin: 0; }
-#review-new-item .new-item-page-capture input { margin: 0; width: 16px; height: 16px; accent-color: var(--accent); }
-#review-new-item h2:focus { outline: none; }
-#review-new-item .sent-details h4 { margin: 0 0 11px; }
-#review-new-item [data-bug-page-state] { margin: 0 0 12px; padding: 0 0 12px; border-bottom: 1px solid var(--line); }
-#review-new-item [data-bug-page-state] dd { min-width: 0; overflow-wrap: anywhere; }
-#review-new-item .sent-details p { margin: 8px 0 0; font-size: 13px; color: var(--ink-2); }
-#review-new-item .sent-details .new-item-page-capture { font-size: 14px; }
-#review-new-item .sent-details .new-item-previews { margin-top: 10px; }
-#review-new-item .capture-slot {
+:is(#review-new-item,[data-new-item-draft]) textarea::placeholder { color: var(--ink-3, #9a988f); }
+:is(#review-new-item,[data-new-item-draft])[data-page-bug] textarea { resize: none; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-page-capture:not([hidden]) { display: flex; align-items: center; gap: 9px; margin: 0; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-page-capture input { margin: 0; width: 16px; height: 16px; accent-color: var(--accent); }
+:is(#review-new-item,[data-new-item-draft]) h2:focus { outline: none; }
+:is(#review-new-item,[data-new-item-draft]) .sent-details h4 { margin: 0 0 11px; }
+:is(#review-new-item,[data-new-item-draft]) [data-bug-page-state] { margin: 0 0 12px; padding: 0 0 12px; border-bottom: 1px solid var(--line); }
+:is(#review-new-item,[data-new-item-draft]) [data-bug-page-state] dd { min-width: 0; overflow-wrap: anywhere; }
+:is(#review-new-item,[data-new-item-draft]) .sent-details p { margin: 8px 0 0; font-size: 13px; color: var(--ink-2); }
+:is(#review-new-item,[data-new-item-draft]) .sent-details .new-item-page-capture { font-size: 14px; }
+:is(#review-new-item,[data-new-item-draft]) .sent-details .new-item-previews { margin-top: 10px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-evidence {
+ background: #141413; color: #f0efec; border: 1px solid #34332f; border-radius: 8px;
+ padding: 10px; font-size: 12px; min-width: 0; overflow-wrap: anywhere;
+}
+:is(#review-new-item,[data-new-item-draft]) .new-item-evidence h4 { font-size: inherit; margin: 0 0 4px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-evidence-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0 8px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-muted { color: #c3c2b7; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-cells {
+ display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 10px; margin: 7px 0 10px;
+}
+:is(#review-new-item,[data-new-item-draft]) .new-item-cells div { min-width: 0; max-width: 100%; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-cells dt { font-weight: 600; color: #c3c2b7; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-cells dd, :is(#review-new-item,[data-new-item-draft]) .new-item-tip dd { margin: 0; white-space: pre-wrap; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-memory { padding: 8px 0; border-block: 1px solid #34332f; margin-bottom: 8px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-memory p { margin: 0; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-memory strong { font-size: 16px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-cap { color: #ef7372; font-weight: 650; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-memory-bar { display: flex; height: 12px; margin: 6px 0; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-memory-bar span { min-width: 0; background: var(--segment); border-radius: 2px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-memory-legend { display: flex; flex-wrap: wrap; gap: 3px 12px; color: #c3c2b7; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-memory-legend span::before {
+ content: ''; display: inline-block; width: 7px; height: 7px; margin-right: 4px;
+ border-radius: 2px; background: var(--segment);
+}
+:is(#review-new-item,[data-new-item-draft]) [data-tone="build"] { --segment: #3987e5; }
+:is(#review-new-item,[data-new-item-draft]) [data-tone="free"] { --segment: #199e70; }
+:is(#review-new-item,[data-new-item-draft]) [data-tone="tools"] { --segment: #c98500; }
+:is(#review-new-item,[data-new-item-draft]) [data-tone="system"] { --segment: #9585e0; }
+:is(#review-new-item,[data-new-item-draft]) [data-tone="other"] { --segment: #6c6b66; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-tip {
+ background: #242422; color: #f0efec; border: 1px solid #34332f; border-radius: 8px;
+ padding: 10px 12px; font-size: .85rem; line-height: 1.45;
+}
+:is(#review-new-item,[data-new-item-draft]) .new-item-tip dl { margin: 0; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-tip dl > div {
+ display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 12px;
+}
+:is(#review-new-item,[data-new-item-draft]) .new-item-tip dd { text-align: right; font-variant-numeric: tabular-nums; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-tip p { margin: 3px 0; color: #c3c2b7; white-space: pre-wrap; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-tip h4 { font-weight: 700; }
+:is(#review-new-item,[data-new-item-draft]) .capture-slot {
  position: relative; width: min(320px, 100%); aspect-ratio: 1440 / 1000; margin-top: 10px;
  overflow: hidden; background: var(--card); border-radius: 7px; border: 1px solid var(--line);
 }
-#review-new-item .capture-slot a, #review-new-item [data-taking] { position: absolute; inset: 0; }
-#review-new-item .capture-slot img { display: block; width: 100%; height: 100%; object-fit: contain; }
-#review-new-item .capture-slot a span {
+:is(#review-new-item,[data-new-item-draft]) .capture-slot a, :is(#review-new-item,[data-new-item-draft]) [data-taking] { position: absolute; inset: 0; }
+:is(#review-new-item,[data-new-item-draft]) .capture-slot img { display: block; width: 100%; height: 100%; object-fit: contain; }
+:is(#review-new-item,[data-new-item-draft]) .capture-slot a span {
  position: absolute; right: 8px; bottom: 8px; padding: 4px 8px; font-size: 12px;
  border: 1px solid var(--line); border-radius: 5px; background: var(--bg); color: var(--ink);
 }
-#review-new-item .capture-slot a:is(:hover, :focus-visible) span { border-color: var(--accent); }
-#review-new-item [data-taking]:not([hidden]) {
+:is(#review-new-item,[data-new-item-draft]) .capture-slot a:is(:hover, :focus-visible) span { border-color: var(--accent); }
+:is(#review-new-item,[data-new-item-draft]) [data-taking]:not([hidden]) {
  display: flex; justify-content: center; align-items: center; gap: 9px; color: var(--ink-2); font-size: 14px;
 }
-#review-new-item .capture-spinner {
+:is(#review-new-item,[data-new-item-draft]) .capture-spinner {
  width: 14px; height: 14px; border: 2px solid var(--line);
  border-top-color: var(--accent); border-right-color: var(--accent); border-radius: 50%;
 }
-#review-new-item .new-item-previews:not([hidden]) { display: flex; flex-wrap: wrap; gap: 8px; }
-#review-new-item .new-item-preview {
+:is(#review-new-item,[data-new-item-draft]) .new-item-previews:not([hidden]) { display: flex; flex-wrap: wrap; gap: 8px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-preview {
  position: relative; border: 1px solid var(--line, #34332f); border-radius: 7px;
  max-width: 100%; background: var(--bg, #121211);
 }
-#review-new-item .new-item-preview img { display: block; width: 145px; height: 80px; object-fit: contain; }
-#review-new-item .new-item-preview button {
+:is(#review-new-item,[data-new-item-draft]) .new-item-preview img { display: block; width: 145px; height: 80px; object-fit: contain; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-preview button {
  position: absolute; top: 3px; right: 3px; width: 28px; height: 28px; padding: 0;
  border: 1px solid #6c6b66; border-radius: 5px; background: #1a1a19; color: #f0efec;
 }
-#review-new-item footer { padding-block: 0 20px; }
-#review-new-item footer > div {
+:is(#review-new-item,[data-new-item-draft]) footer { padding-block: 0 20px; }
+:is(#review-new-item,[data-new-item-draft]) footer > div {
  display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--line, #34332f);
  padding-top: 14px;
 }
-#review-new-item footer button {
+:is(#review-new-item,[data-new-item-draft]) footer button {
  min-height: 38px; padding: 6px 14px; border: 1px solid var(--ink-3, #9a988f); border-radius: 8px;
  background: transparent; color: inherit;
 }
-#review-new-item [data-send-disabled] { margin: 0 0 8px; color: var(--ink-2); }
-#review-new-item .new-item-error { color: var(--error, #ef7372); margin: 0 0 8px; overflow-wrap: anywhere; }
-#review-new-item #new-item-saved { margin: 0 0 12px; }
+:is(#review-new-item,[data-new-item-draft]) [data-send-disabled] { margin: 0 0 8px; color: var(--ink-2); }
+:is(#review-new-item,[data-new-item-draft]) .new-item-error { color: var(--error, #ef7372); margin: 0 0 8px; overflow-wrap: anywhere; }
 @media (max-width: 480px) {
- #review-new-item footer { padding-bottom: 14px; }
- #review-new-item .new-item-body { gap: 14px; }
+ :is(#review-new-item,[data-new-item-draft]) footer { padding-bottom: 14px; }
+ :is(#review-new-item,[data-new-item-draft]) .new-item-body { gap: 14px; }
 }
 '''
 
@@ -946,18 +1026,52 @@ STYLE = '''
 SCRIPT = r'''(() => {
  const endpoint = '/console/review/new-item';
  const limits = __LIMITS__;
- const dialog = document.querySelector('#review-new-item');
- const heading = dialog.querySelector('#new-item-title');
+ const original = document.querySelector('#review-new-item');
+ const template = original.cloneNode(true);
+ const drafts = [];
+ const listSendKey = 'console.list.pending-send';
+ const listDraftPrefix = listSendKey + '.';
+ const listDraftId = /^r6-[0-9a-f]{32}$/;
+ let nextDraft = 0;
+
+ function storedListDraft() {
+  try {
+   const legacy = sessionStorage.getItem(listSendKey);
+   if (legacy !== null) {
+    try {
+     const draft = listDraftId.test(legacy) ? {id: legacy, recipient: null} : JSON.parse(legacy);
+     if (typeof draft?.id === 'string' && listDraftId.test(draft.id)) {
+      const key = listDraftPrefix + draft.id;
+      if (sessionStorage.getItem(key) === null)
+       sessionStorage.setItem(key, typeof draft.recipient === 'string' ? draft.recipient : '');
+     }
+    } catch (_) {}
+    sessionStorage.removeItem(listSendKey);
+   }
+   for (let index = 0; index < sessionStorage.length; index++) {
+    const key = sessionStorage.key(index);
+    if (!key.startsWith(listDraftPrefix)) continue;
+    const id = key.slice(listDraftPrefix.length);
+    if (!listDraftId.test(id) || drafts.some(draft => draft.id === id)) continue;
+    return {id, recipient: sessionStorage.getItem(key) || null};
+   }
+  } catch (_) {}
+  return null;
+ }
+
+function bindDraft(dialog, fresh = false) {
+ const heading = dialog.querySelector('h2');
  heading.tabIndex = -1;
  const form = dialog.querySelector('form'), body = dialog.querySelector('.new-item-body');
  const recipientChips = dialog.querySelector('[data-recipients]');
  const recipientStatus = dialog.querySelector('[data-recipients-status]');
  const recipientGroup = dialog.querySelector('[data-recipient-group]');
  const ownerReason = dialog.querySelector('[data-owner-reason]');
- const ownerReasonText = ownerReason.querySelector('#review-new-item-owner-reason');
+ const ownerReasonText = ownerReason.querySelector('span');
  const words = form.elements.words, previews = dialog.querySelector('[data-previews]');
  const includePage = form.elements.include_page, sentDetails = dialog.querySelector('[data-sent-details]');
  const bugStateBox = dialog.querySelector('[data-bug-page-state]');
+ const evidenceBox = sentDetails.querySelector('[data-evidence]');
  const slot = dialog.querySelector('[data-capture-slot]'), shot = slot.querySelector('[data-shot]');
  const preview = shot.querySelector('img'), taking = slot.querySelector('[data-taking]');
  const fallback = sentDetails.querySelector('[data-fallback]');
@@ -965,18 +1079,16 @@ SCRIPT = r'''(() => {
  const expired = sentDetails.querySelector('[data-capture-expired]');
  const send = dialog.querySelector('[type="submit"]'), error = dialog.querySelector('.new-item-error');
  const sendNotice = dialog.querySelector('[data-send-disabled]');
- const confirmation = dialog.querySelector('#new-item-saved'), done = dialog.querySelector('[data-done]');
- const sendControls = dialog.querySelector('[data-send-controls]'), savedControls = done.parentElement;
  const fields = [...form.querySelectorAll('fieldset'), words, includePage, dialog.querySelector('[data-close]'),
                  dialog.querySelector('[data-cancel]')];
- const listSendKey = 'console.list.pending-send';
- const listDraftId = /^r6-[0-9a-f]{32}$/;
  let launcher, opening, token, recipients, images = [], sending = false;
- let draftId, keepDraft = false, ownerPage = '';
+ let draftId, keepDraft = false, canRecoverFiling = false, ownerPage = '';
  // Null means the user must choose again. An empty string means the page has no default.
  let selectedRecipient = '';
  let pageOwner = '';
- let captureSession, pageContext, savedItem, deferredCapture, pendingItem, pendingEdited = false;
+ let captureSession, pageContext, deferredCapture, pendingItem, pendingEdited = false;
+
+ let source = '', evidence = {kind: 'none'}, tipPreview = null;
 
  function node(tag, text = '', css = '') {
   const element = document.createElement(tag);
@@ -985,13 +1097,66 @@ SCRIPT = r'''(() => {
   return element;
  }
 
+ function captionAndValue(label, value) {
+  const row = node('div');
+  row.append(node('dt', label), node('dd', value));
+  return row;
+ }
+
+ function showEvidence() {
+  evidenceBox.replaceChildren();
+  evidenceBox.hidden = evidence.kind !== 'build-step';
+  if (evidenceBox.hidden) return;
+  const heading = node('div', '', 'new-item-evidence-heading');
+  heading.append(node('h4', evidence.title), node('span', evidence.owner, 'new-item-muted'));
+  const cells = node('dl', '', 'new-item-cells');
+  for (const cell of evidence.cells) cells.append(captionAndValue(cell.label, cell.value));
+
+  const memory = node('div', '', 'new-item-memory');
+  memory.append(node('h4', 'Overall memory'));
+  const figures = node('div', '', 'new-item-evidence-heading'), free = node('p');
+  free.append(node('strong', evidence.memory.free_text || 'unavailable'), ' Free for the next step');
+  figures.append(free, node('p', 'Queue cap ' + (evidence.memory.cap_text || 'unavailable'), 'new-item-cap'));
+  memory.append(figures);
+  const bar = node('div', '', 'new-item-memory-bar');
+  bar.setAttribute('aria-hidden', 'true');
+  const legend = node('div', '', 'new-item-memory-legend');
+  for (const segment of evidence.memory.segments) {
+   const section = node('span'), key = node('span', segment.label + ' ' + (segment.text || 'unavailable'));
+   section.dataset.tone = key.dataset.tone = segment.tone;
+   section.style.flexGrow = String(segment.gib);
+   bar.append(section);
+   legend.append(key);
+  }
+  if (legend.childElementCount) memory.append(bar, legend);
+
+  if (tipPreview) {
+   evidenceBox.append(heading, cells, memory, tipPreview);
+   return;
+  }
+  const tip = node('div', '', 'new-item-tip'), tipHeading = node('div', '', 'new-item-evidence-heading');
+  tipHeading.append(node('h4', evidence.tip_title), node('strong', evidence.tip_status));
+  tip.append(tipHeading);
+  let table = null;
+  for (const entry of evidence.tip) {
+   if (entry.kind === 'field') {
+    if (!table) { table = node('dl'); tip.append(table); }
+    table.append(captionAndValue(entry.label, entry.value));
+   } else {
+    table = null;
+    tip.append(node('p', entry.text));
+   }
+  }
+  evidenceBox.append(heading, cells, memory, tip);
+ }
+
  function setError(reason) {
   error.textContent = reason;
   error.hidden = !reason;
  }
 
  function updateSend() {
-  send.disabled = !!savedItem || sending || !token || (!pendingItem &&
+  send.disabled = sending || !token || (!pendingItem &&
     (!recipientChips.querySelector('input:checked') || !words.value.trim() || words.value.length > words.maxLength));
  }
 
@@ -1032,6 +1197,7 @@ SCRIPT = r'''(() => {
 
  function editDraft(event) {
   if (sending) return;
+  // A retry can confirm the original request after the user edits the draft from a lost response.
   if (pendingItem) pendingEdited = true;
   if (event?.target.name === 'kind') {
    showRecipients();
@@ -1135,16 +1301,17 @@ SCRIPT = r'''(() => {
   token = data.token;
   sendNotice.textContent = data.send_disabled || '';
   sendNotice.hidden = !data.send_disabled;
-  includePage.closest('label').hidden = !sendNotice.hidden;
+  includePage.closest('label').hidden = !pageContext || !sendNotice.hidden;
   recipients = data.recipients;
   pageOwner = data.page_owner || '';
   ownerReasonText.textContent = data.page_owner_reason || '';
   showRecipients();
  }
 
- async function post(payload, keepalive = false) {
-  const response = await fetch(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                          body: JSON.stringify(payload), keepalive});
+ async function post(payload, {keepalive = false, hold = false, receiver} = {}) {
+  const options = {method: 'POST', headers: {'Content-Type': 'application/json'},
+                   body: JSON.stringify(payload), keepalive};
+  const response = await (hold ? heldFetch(endpoint, options, receiver) : fetch(endpoint, options));
   return responseData(response, 'Could not send this item.');
  }
 
@@ -1265,7 +1432,8 @@ SCRIPT = r'''(() => {
   const seconds = Number(status?.dataset.renderSeconds ?? NaN);
   const data = visiblePageData();
   return {
-   place: location.pathname + location.search + location.hash,
+   // The page frame adds the open window under New item, so the screenshot shows it.
+   place: window.pageCapturePlace?.(dialog) ?? location.pathname + location.search + location.hash,
    viewport: viewport(),
    data,
    state: {url: clip(location.href, limits.pageUrlLength), title: data.title,
@@ -1283,7 +1451,7 @@ SCRIPT = r'''(() => {
   const bug = isPageBug();
   dialog.toggleAttribute('data-page-bug', Boolean(bug));
   words.rows = bug ? 3 : 4;
-  bugStateBox.hidden = !bug;
+  bugStateBox.hidden = !bug || !pageContext;
   fallback.textContent = bug ? 'Screenshot unavailable.' : fallbackText;
   if (!bug || !pageContext) return;
   const {state} = pageContext;
@@ -1306,7 +1474,7 @@ SCRIPT = r'''(() => {
 
  function showSentDetails() {
   const image = captureSession?.image;
-  const include = includePage.checked && sendNotice.hidden;
+  const include = Boolean(pageContext) && includePage.checked && sendNotice.hidden;
   const unavailable = include && (image === null || !hasCaptureSpace(image));
   slot.hidden = !include || unavailable;
   taking.hidden = !!image;
@@ -1320,7 +1488,7 @@ SCRIPT = r'''(() => {
  }
 
  function startCapture(renewed = false) {
-  if ((savedItem && !renewed) || !pageContext || !includePage.checked || !token || captureSession) return;
+  if (!pageContext || !includePage.checked || !token || captureSession) return;
   const {place, viewport} = pageContext;
   const capture = deferredCapture || {key: ensureDraftId() + randomNonce(), request: {place, ...viewport}};
   const session = {token, renewed, capture, sent: Boolean(deferredCapture), page: ownerPage,
@@ -1384,7 +1552,7 @@ SCRIPT = r'''(() => {
   clearCapturePreview(session);
   showSentDetails();
   if (!used && !session.sent) {
-   void session.key.then(key => key && post({token: session.token, discard_capture: key}, true)).catch(() => {});
+   void session.key.then(key => key && post({token: session.token, discard_capture: key}, {keepalive: true})).catch(() => {});
   }
  }
 
@@ -1395,62 +1563,48 @@ SCRIPT = r'''(() => {
   session.image = null;
  }
 
- function storedListDraft() {
-  try {
-   const stored = sessionStorage.getItem(listSendKey);
-   if (!stored) return null;
-   if (listDraftId.test(stored)) return {id: stored, recipient: null};
-   const draft = JSON.parse(stored);
-   if (typeof draft?.id !== 'string' || !listDraftId.test(draft.id)) return null;
-   const recipient = typeof draft.recipient === 'string' && draft.recipient ? draft.recipient : null;
-   return {id: draft.id, recipient};
-  } catch (_) { return null; }
- }
-
  function storeListDraft() {
-  if (ownerPage !== 'list' || !draftId) return;
+  if (ownerPage !== 'list' || !draftId || !canRecoverFiling) return;
   try {
-   sessionStorage.setItem(listSendKey, JSON.stringify({id: draftId, recipient: selectedRecipient}));
+   sessionStorage.setItem(listDraftPrefix + draftId, selectedRecipient || '');
   } catch (_) {}
  }
 
- function finishDraft() {
-  draftId = deferredCapture = pendingItem = undefined;
-  pendingEdited = false;
+ function removeListDraft() {
   if (ownerPage === 'list') {
-   try { sessionStorage.removeItem(listSendKey); } catch (_) {}
+   try { sessionStorage.removeItem(listDraftPrefix + draftId); } catch (_) {}
   }
  }
 
- function showConfirmation(item) {
-  savedItem = item;
-  const saved = Boolean(item);
-  confirmation.textContent = saved ? 'Saved ' + item.id + '.' : '';
-  confirmation.hidden = savedControls.hidden = !saved;
-  body.hidden = sendControls.hidden = saved;
-  updateSend();
-  if (saved) done.focus();
+ function finishDraft() {
+  removeListDraft();
+  draftId = deferredCapture = pendingItem = undefined;
+  canRecoverFiling = pendingEdited = false;
+ }
+
+ function hideDialog() {
+  dialog.close();
+  if (launcher?.isConnected) launcher.focus({preventScroll: true});
  }
 
  function close({sent = false} = {}) {
-  if (!dialog.open || sending) return;
-  const result = savedItem;
+  if (sending || (!sent && !dialog.open)) return;
   discardCapture();
   opening.abort();
-  dialog.close();
-  keepDraft = !sent && !result && Boolean(pendingItem || words.value || images.length);
+  if (dialog.open) hideDialog();
+  keepDraft = !sent && Boolean(pendingItem || words.value || images.length);
   if (!keepDraft) {
-   if (ownerPage !== 'list' || !storedListDraft()) finishDraft();
+   if (ownerPage !== 'list' || !canRecoverFiling) finishDraft();
    for (const image of images) URL.revokeObjectURL(image.url);
    images = [];
    previews.replaceChildren();
    previews.hidden = true;
+   source = '';
   }
-  if (launcher?.isConnected) launcher.focus({preventScroll: true});
   launcher = null;
-  if (result) {
-   showConfirmation();
-   dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: result}));
+  if (fresh && !keepDraft) {
+   dialog.remove();
+   drafts.splice(drafts.indexOf(draft), 1);
   }
  }
 
@@ -1462,24 +1616,35 @@ SCRIPT = r'''(() => {
   updateSend();
  }
 
- async function open(trigger, page) {
-  if (dialog.open || sending) return;
+ async function open(trigger, page, key, {kind = 'bug', recipientName = '',
+                                        capture = {kind: 'none'}, shownTip = null} = {}) {
+  if (dialog.open) {
+   words.focus({preventScroll: true});
+   return;
+  }
+  if (sending) return;
+  source = key;
+  if (!keepDraft) {
+   evidence = structuredClone(capture);
+   tipPreview = shownTip;
+  }
   if (pendingItem) page = pendingItem.page;
   ownerPage = page;
-  pageContext = collectPageContext();
+  pageContext = page ? collectPageContext() : null;
   launcher = trigger;
   token = '';
-  if (ownerPage === 'list' && !draftId) {
+  if (ownerPage === 'list' && !draftId && !keepDraft) {
    const stored = storedListDraft();
    if (stored) {
     draftId = stored.id;
     selectedRecipient = stored.recipient;
+    canRecoverFiling = true;
    }
   }
   const newDraft = !keepDraft && !draftId;
   if (newDraft) selectedRecipient = '';
   sendNotice.hidden = true;
-  includePage.closest('label').hidden = false;
+  includePage.closest('label').hidden = !pageContext;
   recipients = null;
   recipientChips.replaceChildren();
   pageOwner = '';
@@ -1487,10 +1652,11 @@ SCRIPT = r'''(() => {
   if (!keepDraft) {
    form.reset();
    setError('');
-   form.elements.kind.value = 'bug';
+   form.elements.kind.value = kind;
   }
   recipientStatus.textContent = 'Loading recipients…';
   recipientStatus.hidden = false;
+  showEvidence();
   showBugPage();
   showSentDetails();
   updateSend();
@@ -1503,7 +1669,10 @@ SCRIPT = r'''(() => {
   try {
    const data = await loadOptions(controller.signal);
    if (controller.signal.aborted) return;
-   if (newDraft) selectedRecipient = data.page_owner || '';
+   if (newDraft) {
+    selectedRecipient = (ownerPage ? data.page_owner
+     : data.recipients.find(recipient => recipient.name === recipientName)?.id) || '';
+   }
    setOptions(data);
    startCapture();
    showSentDetails();
@@ -1513,22 +1682,15 @@ SCRIPT = r'''(() => {
  }
 
  form.addEventListener('input', editDraft);
- window.addEventListener('pagehide', () => { if (!sending) discardCapture(); });
- window.addEventListener('pageshow', event => {
-  if (event.persisted && dialog.open) startCapture();
- });
  bindConsoleDialog(dialog, close);
- for (const control of dialog.querySelectorAll('[data-cancel], [data-done]')) {
-  control.addEventListener('click', () => close());
- }
+ dialog.querySelector('[data-cancel]').addEventListener('click', () => close());
  async function submissionPayload() {
   if (pendingItem) return pendingItem;
   const type = form.elements.kind.value, recipient = recipientChips.querySelector('input:checked');
   if (!recipient) throw new Error('Select a recipient.');
   const kind = type === 'feedback' ? 'investigation' : type;
   const payload = {request_id: ensureDraftId(), kind, recipient_id: recipient.value, words: words.value,
-                   page: ownerPage, page_recipient: 'selected'};
-  storeListDraft();
+                   ...(ownerPage && {page: ownerPage, page_recipient: 'selected'})};
   let key = '';
   if (!deferredCapture && !slot.hidden && !taking.hidden) deferredCapture = captureSession?.capture;
   if (!deferredCapture && !slot.hidden && !shot.hidden) {
@@ -1536,8 +1698,9 @@ SCRIPT = r'''(() => {
    if (!key) throw new Error('The screenshot is unavailable.');
   }
   const bug = isPageBug();
-  const data = bug || deferredCapture || !fallback.hidden ? pageContext.data : {kind: 'none'};
-  const state = bug && pageContext.state;
+  const data = evidence.kind !== 'none' ? evidence
+   : pageContext && (bug || deferredCapture || !fallback.hidden) ? pageContext.data : {kind: 'none'};
+  const state = bug && pageContext?.state;
   const files = await Promise.all(images.map(image => pastedData(image.file)));
   if (deferredCapture && captureSession?.capture === deferredCapture) captureSession.sent = true;
   const item = {...payload, evidence: data, images: files,
@@ -1551,13 +1714,21 @@ SCRIPT = r'''(() => {
   event.preventDefault();
   if (send.disabled) return;
   const onList = ownerPage === 'list';
-  let saved, usedPreview = false;
+  const couldRecoverFiling = canRecoverFiling;
+  let saved, submittedKind, usedPreview = false;
   setError('');
   setSending(true);
+  hideDialog();
   try {
    const item = await submissionPayload();
+   submittedKind = item.kind;
    usedPreview = Boolean(item.capture_key && !item.defer_capture);
-   const sendItem = () => post({...item, token});
+   const sendItem = () => {
+    const receiver = canRecoverFiling ? undefined : recipients?.find(recipient => recipient.id === item.recipient_id)?.name;
+    canRecoverFiling = true;
+    storeListDraft();
+    return post({...item, kind: submittedKind, token}, {hold: true, receiver});
+   };
    let result;
    try {
     result = await sendItem();
@@ -1565,7 +1736,7 @@ SCRIPT = r'''(() => {
     if (onList || !failure?.staleToken) throw failure;
     const fresh = await loadOptions(opening.signal);
     setOptions(fresh);
-    if (!pendingItem && selectedRecipient !== item.recipient_id) return;
+    if (!pendingItem && selectedRecipient !== item.recipient_id) throw failure;
     result = await sendItem();
    }
    if (typeof result.id !== 'string' || !/^[QPI][1-9][0-9]*$/.test(result.id)) {
@@ -1573,9 +1744,17 @@ SCRIPT = r'''(() => {
    }
    saved = result;
   } catch (failure) {
+   dialog.showModal();
    if (failure?.definiteRefusal && !failure.staleToken) {
     pendingItem = deferredCapture = undefined;
     pendingEdited = false;
+   }
+   // After an Undo, the next Send builds the item again from the edited words.
+   if (failure instanceof SendUndone) {
+    pendingItem = undefined;
+    pendingEdited = false;
+    canRecoverFiling = couldRecoverFiling;
+    if (!canRecoverFiling) removeListDraft();
    }
    if (failure?.filedId) {
     discardCapture();
@@ -1601,31 +1780,73 @@ SCRIPT = r'''(() => {
   } finally {
    setSending(false);
   }
-  if (saved) {
-   const keepEdits = pendingEdited;
-   discardCapture(usedPreview);
-   finishDraft();
-   if (keepEdits) {
-    setError('Saved ' + saved.id + '. Your edits are still in the dialog.');
-    dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
-    startCapture();
-    updateSend();
-    send.focus();
-   } else if (onList) {
-    close({sent: true});
-    dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
-   } else {
-    showConfirmation(saved);
-    dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
-   }
-  } else {
+  if (!saved) {
    send.focus();
+   return;
   }
+  const keepEdits = pendingEdited;
+  discardCapture(usedPreview);
+  finishDraft();
+  if (keepEdits) {
+   dialog.showModal();
+   setError('Saved ' + saved.id + '. Your edits are still in the dialog.');
+   dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
+   startCapture();
+   updateSend();
+   send.focus();
+   return;
+  }
+  close({sent: true});
+  const target = dialog.isConnected ? dialog : document;
+  if (!onList) target.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
+  target.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
  });
 
+ const draft = {
+  dialog, open,
+  get id() { return draftId; },
+  get source() { return source; },
+  get sending() { return sending; },
+  pagehide() { if (!sending) discardCapture(); },
+  pageshow() { if (dialog.open) startCapture(); },
+ };
+ return draft;
+}
+
+ drafts.push(bindDraft(original));
+ function newDraft() {
+  const dialog = template.cloneNode(true), suffix = '-' + (++nextDraft);
+  dialog.dataset.newItemDraft = '';
+  dialog.id += suffix;
+  for (const element of dialog.querySelectorAll('[id]')) element.id += suffix;
+  for (const element of [dialog, ...dialog.querySelectorAll('[aria-labelledby]')])
+   element.setAttribute('aria-labelledby', element.getAttribute('aria-labelledby') + suffix);
+  original.after(dialog);
+  const draft = bindDraft(dialog, true);
+  drafts.push(draft);
+  return draft;
+ }
+ window.addEventListener('pagehide', () => drafts.forEach(draft => draft.pagehide()));
+ window.addEventListener('pageshow', event => {
+  if (event.persisted) drafts.forEach(draft => draft.pageshow());
+ });
+ function openDraft(trigger, page, key, options) {
+  const active = drafts.find(draft => draft.dialog.open && draft.dialog.contains(trigger));
+  if (!active && drafts.some(draft => draft.dialog.open)) return null;
+  const available = drafts.filter(draft => !draft.sending);
+  const draft = active || available.findLast(draft => draft.source === key)
+   || available.findLast(draft => !draft.source) || newDraft();
+  void draft.open(trigger, page, key, options);
+  return draft.dialog;
+ }
+ window.reviewNewItem = {
+  open: ({trigger, kind = 'question', recipientName, evidence: capture, tipPreview: shownTip}) =>
+   openDraft(trigger, '', 'step:' + capture.step_id, {kind, recipientName, capture, shownTip}),
+  evidenceLimits: Object.freeze(limits.buildEvidence)
+ };
  document.addEventListener('click', event => {
   const trigger = event.target.closest('[data-owner-new]');
   const page = trigger?.closest('[data-page-owner]')?.dataset.pageOwner;
-  if (page) void open(trigger, page);
+  if (page) openDraft(trigger, page, 'page:' + page);
  });
 })();'''

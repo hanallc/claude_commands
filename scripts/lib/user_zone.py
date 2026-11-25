@@ -14,7 +14,7 @@ except FileNotFoundError:
 
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib import conf_reads
@@ -56,9 +56,12 @@ def zone_label(moment: datetime | None = None) -> str:
     return at.tzname() or user_zone_name()
 
 
-def shown_time(moment: datetime) -> str:
-    """A time as the user reads it on a page: Nov 15, 2026, 08:45 (24-hour, the user's zone)."""
-    return moment.astimezone(user_zone()).strftime("%b %d, %Y, %H:%M")
+def shown_time(moment: datetime, zone: tzinfo | None = None, *, labeled: bool = False) -> str:
+    """A time as the user reads it on a page: Nov 15, 2026, 08:45 (24-hour, the user's zone).
+
+    A caller that already holds a zone passes it. `labeled` adds the zone label: Nov 15, 2026, 08:45 PST.
+    """
+    return moment.astimezone(zone or user_zone()).strftime("%b %d, %Y, %H:%M" + (" %Z" if labeled else ""))
 
 
 def main() -> int:

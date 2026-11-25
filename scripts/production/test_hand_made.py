@@ -25,16 +25,27 @@ from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import (admission_client, admission_protocol as wire, admission_records, execution_identity,
                                  placement, queue_lines, queue_place, step_estimator)
 from scripts.build_queue.queue_place import HeldReservation, PopenArguments, QueuePlaceRefused
+from scripts.build_targets import mac_linux
 from scripts.buildlog import record, treekey
-from scripts.lib import build_steps, conf, models_registry, nix_env
+from scripts.lib import build_steps, conf, conf_reads, models_registry, nix_env
 from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
+from scripts.lint.memory_test_support import shifted_config_lines
 from scripts.notify import review
 from scripts.mac_test.claim_state import WholeMacScope
 from scripts.production import hand_made, hand_made_limit
-from scripts.production.hand_made_route import PROGRAM_VARIABLES, Line, Machine, Placed, ProgramPlace, Refused
+from scripts.production.hand_made_route import (PROGRAM_VARIABLES, Line, Machine, MachineRun, Output, Placed, Program,
+                                                ProgramPlace, Refused)
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-REGISTRY_TEXT = (REPOSITORY / "config/models.conf").read_text()
+REGISTRY_TEXT = """\
+[cli.hand_made]
+claude.model=opus:high
+claude.role=units
+# range: 5e-324..
+check_time_limit_seconds=90
+# whole: 1..
+max_script_bytes=65536
+"""
 SCRIPT = 'print("hand made ran")\n'
 YES = {"verdict": "yes", "reason": "The script only prints a line."}
 NO = {"verdict": "no", "reason": "The script removes a folder outside the checkout."}
@@ -61,7 +72,20 @@ class FakePlace:
         return [argv[argv.index("--") + 1:] for argv in self.started]
 
 
-# The variables of a caller, such as the merge gate, that change the output folder or the compiler of a run.
+@dataclass
+class FakeGuestRun:
+    """A guest run that writes the program words as its output."""
+    program: Program
+    peak_bytes: int | None = None
+    started_at: float | None = None
+
+    def run(self, output: Output) -> int:
+        self.started_at = time.time()
+        output.write(" ".join(self.program.argv).encode() + b"\n")
+        return 0
+
+
+# The variables of a caller, such as the gate, that change the output folder or the compiler of a run.
 BUILD_VARIABLES = ("CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC_WRAPPER", "SCCACHE_DIR")
 
 
@@ -400,24 +424,41 @@ class HandMadeTests(AttemptCase):
         self.assertEqual(gzip.decompress(log.read_bytes()), b"first\n" + (b"x" * 999 + b"\n") * 300)
 
     def test_the_program_gets_only_the_listed_variables_and_the_model_sees_the_shown_ones(self) -> None:
+        shift_log = conf_reads.CONF_SHIFT_READ_LOG
+        active_log = os.environ.get(shift_log)
         removed = {"RUSTC_WORKSPACE_WRAPPER": "/nonexistent/wrapper", "RUSTFLAGS": "-Zcode", "GIT_CONFIG_COUNT": "1",
-                   "GIT_CONFIG_KEY_0": "hand.made", "GIT_CONFIG_VALUE_0": "x", "BASH_FUNC_x%%": "() {  echo x\n}"}
-        shown = {"PKG_CONFIG_PATH": "/nonexistent/pkgconfig", "RUSTC_WRAPPER": "/nonexistent/rustc-wrapper"}
-        with mock.patch.dict(os.environ, removed | shown):
+                   "GIT_CONFIG_KEY_0": "hand.made", "GIT_CONFIG_VALUE_0": "x", "BASH_FUNC_x%%": "() {  echo x\n}",
+                   "SCCACHE_DIR": "/nonexistent/cache", "SCCACHE_CACHE_SIZE": "77G",
+                   "SCCACHE_SERVER_UDS": "/nonexistent/cache.sock",
+                   shift_log: str(self.root / "excluded-shift.log")}
+        wrappers = {"RUSTC_WRAPPER": "sccache", "CARGO_BUILD_RUSTC_WRAPPER": "sccache"}
+        shown = {"PKG_CONFIG_PATH": "/nonexistent/pkgconfig"}
+        with (mock.patch.dict(os.environ, removed | wrappers | shown),
+              mock.patch.object(self.line.place, "popen", wraps=self.line.place.popen) as launch):
             status, _ = self.attempt((sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"))
         self.assertEqual(status, 0)
+        launch.assert_called_once()
+        environment = cast(dict[str, str], launch.call_args.kwargs["env"])
+        self.assertFalse(removed.keys() & environment.keys())
         program = cast(dict[str, str], json.loads(self.output.getvalue()))
-        # The read limit adds the socket of the private sccache server and the cargo offline mode, and bwrap sets
-        # PWD to the checkout.
-        self.assertLessEqual(set(program), PROGRAM_VARIABLES | hand_made.SHOWN_VARIABLES | {"SCCACHE_SERVER_UDS", "CARGO_NET_OFFLINE", "PWD"})
-        self.assertEqual((program["HOME"], program["PATH"], program["TMPDIR"], program["SCCACHE_SERVER_UDS"]),
-                         (os.environ["HOME"], os.environ["PATH"], "/tmp", "/tmp/sccache.sock"))
+        # The gate adds this log to the child environment after the program filter runs.
+        if shift_log in program:
+            self.assertEqual(program[shift_log], active_log)
+            del program[shift_log]
+        self.assertLessEqual(set(program), PROGRAM_VARIABLES | hand_made.SHOWN_VARIABLES
+                             | wrappers.keys() | {"CARGO_NET_OFFLINE", "PWD"})
+        self.assertEqual((program["HOME"], program["PATH"], program["TMPDIR"]),
+                         (os.environ["HOME"], os.environ["PATH"], "/tmp"))
+        self.assertFalse(removed.keys() & program.keys())
+        for name in wrappers:
+            self.assertEqual(program[name], "")
         self.assertLessEqual(shown.items(), program.items())
         prefix = "Variables that the program gets and that can change the code it runs (JSON): "
         lines = [line for line in self.calls[0][-1].splitlines() if line.startswith(prefix)]
         self.assertEqual(len(lines), 1)
-        self.assertLessEqual(shown.items(), cast(dict[str, str], json.loads(lines[0][len(prefix):])).items())
-        self.assertNotIn("RUSTFLAGS", self.calls[0][-1])
+        shown_to_model = cast(dict[str, str], json.loads(lines[0][len(prefix):]))
+        self.assertLessEqual(shown.items(), shown_to_model.items())
+        self.assertFalse((removed.keys() | wrappers.keys()) & shown_to_model.keys())
 
     def test_the_run_starts_the_first_path_match_and_no_later_one(self) -> None:
         first, second = self.root / "a", self.root / "b"
@@ -433,7 +474,7 @@ class HandMadeTests(AttemptCase):
             status, errors = self.attempt(("helper",))
         # bwrap starts the program by its path, so the failed start ends the attempt with no run.
         self.assertEqual(status, hand_made.REFUSED_EXIT)
-        self.assertIn(hand_made_limit.BWRAP_FAILED.format(status=1), errors)
+        self.assertIn(mac_linux.BWRAP_FAILED.format(status=1), errors)
         self.assertEqual(self.line.place.programs(), [[str(first / "helper")]])
         self.assertFalse(mark.exists())
 
@@ -591,20 +632,30 @@ class HandMadeTests(AttemptCase):
         self.assertEqual(row["refusal"], "queue place: admission service unavailable")
         self.assertEqual(row["verdict"], "yes")
 
-    def test_the_guest_takes_no_run_until_it_has_a_read_limit(self) -> None:
-        cause = "mac-linux cannot take the run: the guest has no read limit yet"
-        status, errors = self.attempt(machines=("mac-linux",))
-        self.assertIn(cause, errors)
-        row = self.assert_no_run(status, cause)
-        self.assertEqual(row["refusal"], cause)
-        # The attempt ends at once: no model call and no queue line.
-        self.assertEqual((self.calls, self.line.requests), ([], []))
+    def test_the_guest_takes_the_run_when_the_queue_places_it_there(self) -> None:
+        taken: list[Program] = []
+
+        @contextmanager
+        def guest_route(line: Line, placed: Placed, program: Program) -> Generator[MachineRun]:
+            taken.append(program)
+            try:
+                yield FakeGuestRun(program)
+            finally:
+                line.close(placed, 0, "")
+
+        # The guest route is a fixture, and the guest refusal of this host is not read; the guest route tests
+        # run the real refusal and route.
+        self.routes["mac-linux"] = Machine(guest_route)
+        self.line.answers = [remote("mac-linux")]
         status, errors = self.attempt(machines=("natedev", "mac-linux"))
         self.assertEqual(status, 0, errors)
-        self.assertIn(f"{cause}; the run stands only in the lines of the other machines", errors)
-        self.assertEqual([request.machines for request in self.line.requests], [("natedev",)])
-        self.assertEqual(self.line.entered, ["natedev-reservation"])
-        self.assertEqual(self.rows()[-1]["machine"], "natedev")
+        self.assertNotIn("cannot take the run", errors)
+        self.assertEqual([request.machines for request in self.line.requests], [("natedev", "mac-linux")])
+        self.assertEqual([program.argv for program in taken], [(sys.executable, "check.py")])
+        self.assertEqual((self.line.entered, self.line.closed), ([], [("mac-linux", 0, "")]))
+        self.assertEqual(self.output.getvalue(), f"{sys.executable} check.py\n".encode())
+        row = self.only_row()
+        self.assertEqual((row["machine"], row["status"]), ("mac-linux", 0))
 
     def test_failed_program_status_is_the_attempt_status(self) -> None:
         status, _ = self.attempt((sys.executable, "-c", "import sys; print('out'); sys.exit(3)"))
@@ -993,6 +1044,9 @@ class ProgramFileTests(unittest.TestCase):
         self.assertEqual(self.start("cargo", "build"), self.bin / "cargo")
 
     def test_a_checkout_that_is_the_checker_repository_keeps_its_wrapper_and_is_refused(self) -> None:
+        # The limit binds no checkout that holds the home folder. A guest test copy holds its run home, so the
+        # test gives a home outside the checker.
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": "/nonexistent-home"})))
         self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
         _ = self.next_cargo()
         checker = hand_made_limit.CHECKER
@@ -1101,8 +1155,28 @@ class ProgramFileTests(unittest.TestCase):
 @final
 class SettingsTests(unittest.TestCase):
     def test_repository_registry_section_has_the_four_keys(self) -> None:
+        text = models_registry.registry_text(REPOSITORY / "config/models.conf")
+        section = models_registry.parse_registry(text)[hand_made.SECTION]
+        self.assertEqual(set(section), {"claude.model", "claude.role", "check_time_limit_seconds", "max_script_bytes"})
+
+    def test_read_settings_uses_the_pinned_registry(self) -> None:
         self.assertEqual(hand_made.read_settings(REGISTRY_TEXT),
                          hand_made.CheckSettings("opus", "high", "units", 90.0, 65536))
+
+    def test_read_settings_records_both_shifted_values(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        registry = root / "models.conf"
+        _ = registry.write_text("\n".join(shifted_config_lines(REGISTRY_TEXT)) + "\n", encoding="utf-8")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)})))
+        log = root / "shifts.log"
+        self.addCleanup(conf_reads.set_shift_read_log, conf_reads.set_shift_read_log(str(log)))
+
+        self.assertEqual(hand_made.read_settings(models_registry.registry_text()),
+                         hand_made.CheckSettings("opus", "high", "units", 112.5, 65537))
+        self.assertEqual(log.read_text(encoding="utf-8").splitlines(), [
+            "models.conf:check_time_limit_seconds: 90 -> 112.50",
+            "models.conf:max_script_bytes: 65536 -> 65537",
+        ])
 
     def test_bad_settings_are_refusals(self) -> None:
         cases = {
@@ -1208,6 +1282,7 @@ class BuildsPageTests(unittest.TestCase):
             assert isinstance(waiting, wire.PlacementWait)
             self.assertIsInstance(waiting.wait, wire.PlacementResourceWait)
             fixture.allow_next_start()
+            _ = fixture.run_pass()
             granted, = fixture.server.handle_request(request)
             assert isinstance(granted, wire.LocalPlacementGranted)
             fixture.release(granted.grant)

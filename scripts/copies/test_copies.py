@@ -23,7 +23,8 @@ from unittest import mock
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.copies.workspace_test_support import registered_workspace
-from scripts.build_queue import slot_wait
+from scripts.build_queue import first_step, slot_wait
+from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
@@ -68,6 +69,29 @@ class ImportTests(unittest.TestCase):
             capture_output=True, text=True, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class RunCopyTests(unittest.TestCase):
+    def test_gate_cleanup_error_keeps_the_gate_status(self) -> None:
+        command = ["python3", "scripts/production/gate.py", "--tests-only"]
+        tree = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for status in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS):
+            with self.subTest(status=status), redirect_stderr(io.StringIO()) as errors:
+                run_gate = mock.Mock(return_value=subprocess.CompletedProcess(command, status))
+                admitted = mock.Mock(spec=first_step.FirstStepAdmission, run_gate=run_gate)
+
+                @contextmanager
+                def command_copy() -> Generator[copies.AdmittedCommandCopy]:
+                    yield copies.AdmittedCommandCopy(tree, admitted)
+                    raise copies.CopyError("cannot release gate placement")
+
+                with (mock.patch.object(copies, "caller_owner", return_value="fixture"),
+                      mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+                      mock.patch.object(copies, "_command_copy", return_value=command_copy())):
+                    result = copies.main(["run", "--repo", str(tree), "--commit", "HEAD", "--", *command])
+                self.assertEqual(result, status)
+                run_gate.assert_called_once()
+                self.assertEqual(errors.getvalue(), "Gate cleanup failed. cannot release gate placement\n")
 
 
 class StandingTests(unittest.TestCase):
@@ -144,7 +168,6 @@ record_lock_attempts=3
 repo_depth=3
 repo_skip=target node_modules .git
 suffix_length=6
-visible_root={home / 'rust/repro'}
 """)
         _ = write_config_fixture(configuration / "nix_env.conf", """\
 command_timeout_seconds=600
@@ -238,6 +261,52 @@ source_check_seconds=1
     def run_cli(self, *options: str, command: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
         return self.cli("run", "--repo", str(self.source),
                         "--commit", "HEAD", *options, "--", *(command or ("true",)))
+
+    def test_run_keeps_a_numbered_copy_with_the_childs_reason(self) -> None:
+        reason = "checkout exit is unconfirmed"
+        result = self.run_cli(command=(
+            sys.executable, "-c",
+            "import os, pathlib, sys; pathlib.Path(os.environ['COPIES_KEEP_FILE']).write_text(sys.argv[1])",
+            reason,
+        ))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        first = self.gates / "1"
+        self.assertEqual(build_folders.build_folder_state(first), "kept")
+        self.assertEqual(first.with_name("1.keep").read_text(), reason)
+        self.assertIs(build_folders.folder_lease_fields(first)["released"], False)
+        listing = self.cli("list")
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        row = next(line.split("\t") for line in listing.stdout.splitlines() if str(first) in line)
+        self.assertEqual(row[7], "kept")
+        with build_folders.folder_removal_lease(first) as lease:
+            self.assertIsInstance(lease, build_folders.RefusedRemovalLease)
+        location = self.base / "command-location"
+        next_run = self.run_cli(command=(
+            sys.executable, "-c", "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text(str(pathlib.Path.cwd()))",
+            str(location),
+        ))
+        self.assertEqual(next_run.returncode, 0, next_run.stderr)
+        self.assertEqual(Path(location.read_text()), self.gates / "2")
+        self.assertTrue(first.is_dir())
+
+    def test_run_reuses_a_numbered_copy_when_the_child_leaves_no_reason(self) -> None:
+        result = self.run_cli(command=(
+            sys.executable, "-c",
+            "import os, pathlib; path = pathlib.Path(os.environ['COPIES_KEEP_FILE']); "
+            + "assert path.is_absolute() and not path.exists(); path.touch(); raise SystemExit(7)",
+        ))
+        self.assertEqual(result.returncode, 7, result.stderr)
+        first = self.gates / "1"
+        self.assertEqual(build_folders.build_folder_state(first), "free")
+        self.assertFalse(first.with_name("1.keep").exists())
+        self.assertIs(build_folders.folder_lease_fields(first)["released"], True)
+        location = self.base / "command-location"
+        next_run = self.run_cli(command=(
+            sys.executable, "-c", "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text(str(pathlib.Path.cwd()))",
+            str(location),
+        ))
+        self.assertEqual(next_run.returncode, 0, next_run.stderr)
+        self.assertEqual(Path(location.read_text()), first)
 
     def test_claude_and_codex_workers_use_their_unit_owner(self) -> None:
         unit = next(row for row in staff.local_snapshot().rows if row.kind == "unit")
@@ -1116,9 +1185,11 @@ with patch.object(subprocess, 'run', pause_clone):
 
         remove = scratch.remove
 
+        original = clone.stat()
+
         def check_retry(path: Path) -> None:
-            self.assertEqual(path, clone)
-            with busy.open("rb") as other, self.assertRaises(BlockingIOError):
+            self.assertTrue(os.path.samestat(path.stat(), original))
+            with (path / busy.relative_to(clone)).open("rb") as other, self.assertRaises(BlockingIOError):
                 fcntl.flock(other, fcntl.LOCK_SH | fcntl.LOCK_NB)
             with self.assertRaises(BlockingIOError):
                 _ = build_folders.create_build_folder(request)
@@ -1260,7 +1331,7 @@ with patch.object(subprocess, 'run', pause_clone):
         remove = scratch.remove
 
         def delete(folder: Path) -> None:
-            self.assertTrue(scratch.removal_mark(folder).exists())
+            self.assertTrue(scratch.removal_mark(checkout).exists())
             self.assert_clone_project_removed(checkout, paths)
             remove(folder)
 
@@ -2396,6 +2467,13 @@ with patch.object(subprocess, 'run', pause_clone):
                 path, commit = lines[0].removeprefix("published: ").rsplit(" ", 1)
                 self.assertEqual(commit, self.head)
                 self.assertEqual(Path(path).read_bytes(), b"same artifact")
+
+    def test_run_refuses_a_named_gate_without_a_test_mode_before_admission(self) -> None:
+        with mock.patch.object(first_step, "admitted_run") as admit:
+            result = self.run_cli(command=("./scripts/lib/py", "scripts/production/gate.py", "--module", "x"))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, "copies: --module needs --tests-only or --affected\n")
+        admit.assert_not_called()
 
     def test_run_uses_tree_cwd_substitution_and_command_exit_status(self) -> None:
         output = self.base / "command-result.json"

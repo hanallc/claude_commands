@@ -23,7 +23,7 @@ from enum import Enum
 from functools import cached_property
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, IO, Literal, NewType, Protocol, Self, TypeVar, cast
+from typing import TYPE_CHECKING, ClassVar, IO, Literal, NewType, Protocol, Self, TypeVar, cast, override
 from uuid import UUID
 
 from scripts.lib import git_files
@@ -198,6 +198,11 @@ class StaffAbsent(StaffUnreadable):
 class StaffRefused(Exception):
     """A requested change would break the staff rules."""
 
+    def __init__(self, *args: object, holder: str = "") -> None:
+        super().__init__(*args)
+        # The process that holds a busy row, as "pid N: command"; empty when unknown.
+        self.holder: str = holder
+
 
 class UpkeepRowBusy(StaffRefused):
     """Herdr upkeep did not release the row within the wait time."""
@@ -350,6 +355,49 @@ class HoldRecord:
 class Paused(HoldRecord):
     """The director holds at its prompt."""
 
+    keep_workers: bool = False
+
+    @override
+    def to_json(self) -> dict[str, object]:
+        fields = super().to_json()
+        if self.keep_workers:
+            fields["keep_workers"] = True
+        return fields
+
+    @classmethod
+    @override
+    def from_json(cls, value: object) -> Self:
+        hold = super().from_json(value)
+        unknown = hold.unknown_fields.copy()
+        keep_workers = unknown.pop("keep_workers", False)
+        if not isinstance(keep_workers, bool):
+            raise StaffUnreadable("paused keep_workers must be a boolean")
+        return replace(hold, keep_workers=keep_workers, unknown_fields=unknown)
+
+
+@dataclass(frozen=True)
+class NoPendingResume:
+    """The director has no continuation to recover."""
+
+
+@dataclass(frozen=True)
+class ResumePending:
+    key: str
+    original_pause: Paused
+
+    def to_json(self) -> dict[str, object]:
+        return {"key": self.key, "original_pause": self.original_pause.to_json()}
+
+    @classmethod
+    def from_json(cls, value: object) -> ResumePending:
+        if not isinstance(value, dict):
+            raise StaffUnreadable("pending resume must be an object")
+        fields = cast(dict[str, object], value)
+        key = fields.get("key")
+        if not isinstance(key, str) or not key:
+            raise StaffUnreadable("pending resume requires a key")
+        return cls(key, Paused.from_json(fields.get("original_pause")))
+
 
 @dataclass(frozen=True)
 class Exited(HoldRecord):
@@ -391,6 +439,7 @@ class StaffRow:
     run: OpenRun | NoRun = field(default_factory=NoRun, kw_only=True)
     unit_type: UnitDetails | NotUnit = field(default_factory=NotUnit, kw_only=True)
     retirement: RetiredProducer | Active = field(default_factory=Active, kw_only=True)
+    resume_pending: ResumePending | NoPendingResume = field(default_factory=NoPendingResume, kw_only=True)
     unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
     def reports_to(self, identity: StaffId) -> bool:
@@ -422,6 +471,8 @@ class StaffRow:
             value["paused"] = self.paused.to_json()
         if isinstance(self.exited, Exited):
             value["exited"] = self.exited.to_json()
+        if isinstance(self.resume_pending, ResumePending):
+            value["resume_pending"] = self.resume_pending.to_json()
         if isinstance(self.retirement, RetiredProducer):
             value["retired_producer"] = self.retirement.profile
         return value
@@ -460,6 +511,7 @@ class StaffRow:
         parsed_home = SessionHome(Path(home)) if isinstance(home, str) and Path(home).is_absolute() else HomeUnknown()
         known_fields = {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused", "exited", "run", "unit_type"}
         known_fields.add("retired_producer")
+        known_fields.add("resume_pending")
         retirement: RetiredProducer | Active = Active()
         if "retired_producer" in fields:
             profile = fields["retired_producer"]
@@ -482,6 +534,8 @@ class StaffRow:
                    run=OpenRun(Path(run)) if isinstance(run, str) else NoRun(), retirement=retirement,
                    paused=Paused.from_json(fields["paused"]) if "paused" in fields else Active(),
                    exited=Exited.from_json(fields["exited"]) if "exited" in fields else Active(),
+                   resume_pending=ResumePending.from_json(fields["resume_pending"])
+                   if "resume_pending" in fields else NoPendingResume(),
                    unknown_fields=_unknown_fields(fields, known_fields))
 
 
@@ -939,8 +993,12 @@ def row_operation(reference: str) -> Generator[None]:
         yield
 
 
+def _holder_fields() -> dict[str, object]:
+    return {"pid": os.getpid(), "command": shlex.join(sys.argv)}
+
+
 def _write_slot_holder(lock: IO[bytes]) -> None:
-    holder = {"pid": os.getpid(), "command": shlex.join(sys.argv)}
+    holder = _holder_fields()
     with suppress(OSError):
         os.ftruncate(lock.fileno(), 0)
         _ = lock.write((json.dumps(holder) + "\n").encode("utf-8"))
@@ -1006,8 +1064,9 @@ def _acquire_slot(lock: IO[bytes], name: str) -> None:
                         raise UpkeepRowBusy(f"Herdr upkeep still holds {name} (pid {upkeep_pid})") from error
                     time.sleep(min(0.05, remaining))
                     continue
-            suffix = f" (pid {holder[0]}: {holder[1]})" if holder else ""
-            raise StaffRefused(f"{name}: another operation holds this row{suffix}") from error
+            named = f"pid {holder[0]}: {holder[1]}" if holder else ""
+            raise StaffRefused(f"{name}: another operation holds this row" + (f" ({named})" if named else ""),
+                               holder=named) from error
 
 
 def wait_for_upkeep_row(row: StaffRow, deadline: float) -> None:
@@ -1133,14 +1192,13 @@ def mark_row_move(key: str, target: str) -> Generator[None]:
             _ = stream.truncate()
             stream.flush()
 
-        pid = os.getpid()
-        owner = process_start.process_start(pid)
-        write({"pid": pid, "start": owner.start, "target": target}
-              if isinstance(owner, process_start.Started) else {})
+        holder = _holder_fields()
+        owner = process_start.process_start(os.getpid())
+        write(holder | {"start": owner.start, "target": target} if isinstance(owner, process_start.Started) else holder)
         try:
             yield
         finally:
-            write({})
+            write(holder)
 
 
 def _joined_operation(path: Path, variable: str = "STAFF_OPERATION_FD") -> bool:
@@ -2220,7 +2278,13 @@ def set_hold(reference: str, hold: Paused | Exited | Active) -> StaffRow:
         if row is None:
             raise StaffNotFound(StaffId(reference))
         if isinstance(hold, Paused):
-            changed = replace(row, paused=row.paused if isinstance(row.paused, Paused) else hold, exited=Active())
+            paused = row.paused
+            if isinstance(paused, Paused):
+                if paused.keep_workers and not hold.keep_workers:
+                    paused = replace(paused, keep_workers=False)
+            else:
+                paused = hold
+            changed = replace(row, paused=paused, exited=Active())
         elif isinstance(hold, Exited):
             changed = replace(row, exited=row.exited if isinstance(row.exited, Exited) else hold, paused=Active())
         else:
@@ -2231,16 +2295,19 @@ def set_hold(reference: str, hold: Paused | Exited | Active) -> StaffRow:
     return _transaction(edit)
 
 
-def _hold(reference: str, why: str, state: type[Paused] | type[Exited]) -> StaffRow:
+def _hold(reference: str, why: str, state: type[Paused] | type[Exited], *, keep_workers: bool = False) -> StaffRow:
     from scripts.lib.user_zone import user_zone
 
     caller = by_current_session(runtime_id())
-    return set_hold(reference, state(datetime.now(user_zone()).isoformat(), caller.name if caller else "", why))
+    since = datetime.now(user_zone()).isoformat()
+    name = caller.name if caller else ""
+    hold = Paused(since, name, why, keep_workers=keep_workers) if state is Paused else Exited(since, name, why)
+    return set_hold(reference, hold)
 
 
-def pause(reference: str, why: str) -> StaffRow:
+def pause(reference: str, why: str, *, keep_workers: bool = False) -> StaffRow:
     """Record the director's pause request."""
-    return _hold(reference, why, Paused)
+    return _hold(reference, why, Paused, keep_workers=keep_workers)
 
 
 def exit(reference: str, why: str) -> StaffRow:
@@ -2251,6 +2318,46 @@ def exit(reference: str, why: str) -> StaffRow:
 def resume(reference: str) -> StaffRow:
     """Remove the pause or exit record."""
     return set_hold(reference, Active())
+
+
+def begin_resume(identity: StaffId, pause: Paused) -> StaffRow:
+    """Save the continuation and clear the matching pause in one write."""
+    if not is_owner():
+        return _remote_row(["begin-resume", identity, "--record", json.dumps(pause.to_json())])
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, identity)
+        if isinstance(row.resume_pending, ResumePending):
+            return row
+        if row.paused != pause or isinstance(row.exited, Exited):
+            raise StaffRefused(f"{row.name}: the pause changed")
+        pending = ResumePending(f"agents-resume:{identity}:{pause.since}", pause)
+        changed = replace(row, paused=Active(), resume_pending=pending)
+        rows[rows.index(row)] = changed
+        return changed
+
+    return _transaction(edit)
+
+
+def finish_resume(identity: StaffId, key: str, *, restore_pause: bool = False) -> StaffRow:
+    """Settle the matching continuation and preserve any newer hold."""
+    if not is_owner():
+        return _remote_row(["finish-resume", identity, f"--resume-key={key}",
+                            *(["--restore-pause"] if restore_pause else [])])
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, identity)
+        pending = row.resume_pending
+        if isinstance(pending, NoPendingResume) or pending.key != key:
+            return row
+        pause = row.paused
+        if restore_pause and isinstance(pause, Active) and isinstance(row.exited, Active):
+            pause = pending.original_pause
+        changed = replace(row, paused=pause, resume_pending=NoPendingResume())
+        rows[rows.index(row)] = changed
+        return changed
+
+    return _transaction(edit)
 
 
 def set_worktree(unit: StaffId, worktree: PresentWorktree | RemovedWorktree, *,
@@ -2581,6 +2688,8 @@ class _Arguments:
     marker: str = ""
     profile: str = ""
     hold_record: str = ""
+    resume_key: str = ""
+    restore_pause: bool = False
     home: str = ""
     runtime_id: str = ""
     new_id: str = ""
@@ -2636,6 +2745,15 @@ def _parser() -> argparse.ArgumentParser:
     _ = hold.add_argument("--state", choices=("paused", "exited", "active"), required=True)
     _ = hold.add_argument("--record", dest="hold_record", default="{}")
     _ = hold.add_argument("--json", action="store_true")
+    begin_resume_cmd = verbs.add_parser("begin-resume", help=argparse.SUPPRESS)
+    _ = begin_resume_cmd.add_argument("target")
+    _ = begin_resume_cmd.add_argument("--record", dest="hold_record", required=True)
+    _ = begin_resume_cmd.add_argument("--json", action="store_true")
+    finish_resume_cmd = verbs.add_parser("finish-resume", help=argparse.SUPPRESS)
+    _ = finish_resume_cmd.add_argument("target")
+    _ = finish_resume_cmd.add_argument("--resume-key", required=True)
+    _ = finish_resume_cmd.add_argument("--restore-pause", action="store_true")
+    _ = finish_resume_cmd.add_argument("--json", action="store_true")
     show = verbs.add_parser("show", help="show the production staff")
     _ = show.add_argument("--kind", choices=_KINDS)
     _ = show.add_argument("--live", action="store_true", help="show live member identities")
@@ -2752,6 +2870,10 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
         hold = (Paused.from_json(_decode(arguments.hold_record)) if arguments.state == "paused" else
                 Exited.from_json(_decode(arguments.hold_record)) if arguments.state == "exited" else Active())
         return set_hold(arguments.target, hold)
+    if arguments.verb == "begin-resume":
+        return begin_resume(StaffId(arguments.target), Paused.from_json(_decode(arguments.hold_record)))
+    if arguments.verb == "finish-resume":
+        return finish_resume(StaffId(arguments.target), arguments.resume_key, restore_pause=arguments.restore_pause)
     if arguments.verb == "ensure-worker":
         assert arguments.parent is not None
         return ensure_worker(native_id(arguments.target), arguments.name, StaffId(arguments.parent))

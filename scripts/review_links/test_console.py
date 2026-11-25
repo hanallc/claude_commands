@@ -4,7 +4,6 @@ from __future__ import annotations
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import replace
-import subprocess
 import threading
 import json
 import os
@@ -21,14 +20,15 @@ from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import memory_feed
 from scripts.disks import disks_page
 from scripts.lib import conf
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lib.process_group import run_process_group
+from scripts.lint.memory_test_support import copy_config_file_fixture, write_config_fixture
 from scripts.production import investigation, staff
 from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links import (
     change_browser, change_page, console, for_you, investigations_page, page_frame, record_table, review_link,
     review_submissions,
 )
-from scripts.review_links.test_accounts_page import firefox_probe_results
+from scripts.review_links.browser_test_support import firefox_probe_results
 
 
 class ConsoleMarkup(HTMLParser):
@@ -56,8 +56,8 @@ class ConsoleTests(unittest.TestCase):
         self.configuration = self.root / "config"
         self.configuration.mkdir()
         for stem in ("console", "review_links", "change_review"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf",
-                                self.configuration / f"{stem}.conf")
+            _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / f"config/{stem}.conf",
+                                         self.configuration / f"{stem}.conf")
         _ = write_config_fixture(self.configuration / "console.conf",
             "page.accounts.label=Accounts\npage.accounts.title=Accounts\npage.accounts.icon=users\n"
             + "page.accounts.url=python:scripts.review_links.accounts_page:page_url\n"
@@ -715,10 +715,10 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
             profile = Path(temporary) / 'profile'
             profile.mkdir()
             _ = (profile / 'user.js').write_text('user_pref("ui.systemUsesDarkTheme",1);')
-            result = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+            result = run_process_group(['firefox', '--headless', '--no-remote', '--profile', str(profile),
                                      '--window-size', f'{width},800', '--screenshot', str(Path(temporary) / 'page.png'),
                                      f'http://127.0.0.1:{server.server_port}/?page=list&at.list=%2Fpage%3Ffilter%3Dmine&extra=kept'],
-                                    capture_output=True, text=True, timeout=40)
+                                    timeout=40)
             case.assertEqual(result.returncode, 0, result.stderr)
         finally:
             server.shutdown()

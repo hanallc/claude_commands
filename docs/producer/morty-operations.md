@@ -2,8 +2,9 @@
 
 State root: `~/rust/hanadocs/morty`.
 Write List items through `the_list.py`.
-The assigned producer writes the latest status, next step, and ETA.
-Morty keeps add, close, park, and reassign for all items.
+The assigned producer writes the title, done when, unit, latest status, next step, ETA, state, next check and evidence.
+Each producer adds, parks, closes and reopens its own items.
+Morty keeps reassign, and add, park, close and reopen for all items.
 Read status for items assigned to another producer from The List.
 `checkins.json` holds the current schedule, outstanding inquiries, and the active timer. Keep only its latest state.
 
@@ -79,7 +80,7 @@ Refresh an existing link after its source changes.
 ## Local constraints
 
 Do not edit the live `~/.claude` checkout. Use an isolated worktree for shared code changes.
-Do not run builds for status. Required phase and merge checks remain the owners' work.
+Do not run builds for status. The owners run the required phase checks and gate jobs.
 The review pool is retired. Use current owner roles.
 Use `session labels` instead of `unit-marks` in text for nate.
 Keep tunable operational values in configuration. Do not start unrelated cleanup.

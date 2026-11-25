@@ -5,12 +5,15 @@ import hashlib
 import importlib
 import json
 import string
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
 from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.lib.conf import UseConfiguredValue
+from scripts.lib.display_text import display_field
 from scripts.message import session_send
 from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
 
@@ -25,6 +28,7 @@ TEMPLATE_REQUIRED = "phone pushes require --text-id: decision.choices for choice
 @dataclass(frozen=True)
 class ActionTemplate:
     text: str
+    omit_when_empty: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,7 +107,10 @@ class RenderedPush:
     def message(self) -> str:
         if self.one_line:
             return self.title
-        return first_line(self.action, self.session) + "\n" + self.body if self.header else self.body
+        if not self.header:
+            return self.body
+        header = first_line(self.action, self.session)
+        return f"{header}\n{self.body}" if self.body else header
 
 
 def catalog() -> tuple[PushText, ...]:
@@ -116,6 +123,9 @@ def catalog() -> tuple[PushText, ...]:
             raise ValueError(f"{entry.id}: examples need distinct names and must not be empty")
         if not entry.header and (isinstance(entry.action, ActionTemplate) or isinstance(entry.session, SessionTemplate)):
             raise ValueError(f"{entry.id}: an entry without a header cannot state an action or a session")
+        if (isinstance(entry.action, ActionTemplate) and entry.action.omit_when_empty
+                and isinstance(entry.session, SessionTemplate)):
+            raise ValueError(f"{entry.id}: an entry that omits an empty action cannot state a session")
         if entry.one_line and (isinstance(entry.action, ActionTemplate) or isinstance(entry.session, SessionTemplate)
                                or entry.body):
             raise ValueError(f"{entry.id}: a one-line entry cannot state an action, a session or a body")
@@ -180,11 +190,18 @@ def render_entry(entry: PushText, given: dict[str, str]) -> RenderedPush:
     values = expanded.displayed
     if fields != set(values):
         raise ValueError(f"{entry.id}: missing values {sorted(fields - set(values))}; extra values {sorted(set(values) - fields)}")
-    action = ActionRequired(entry.action.text.format(**values)) if isinstance(entry.action, ActionTemplate) else NoActionRequired()
+    action: UserAction = NoActionRequired()
+    header = entry.header
+    if isinstance(entry.action, ActionTemplate):
+        action_text = entry.action.text.format(**values)
+        if action_text or not entry.action.omit_when_empty:
+            action = ActionRequired(action_text)
+        else:
+            header = False
     return RenderedPush(entry.id, entry.sender.format(**values), entry.need,
                         entry.title.format(**values), action, entry.body.format(**values), expanded.supplied,
                         SessionLine(entry.session.text.format(**values)) if isinstance(entry.session, SessionTemplate) else NO_SESSION_LINE,
-                        entry.header, entry.one_line)
+                        header, entry.one_line)
 
 
 def render(id: str, **values: str) -> RenderedPush:
@@ -243,6 +260,24 @@ def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "
     if timeout:
         command.extend(["--timeout", str(timeout)])
     return command
+
+
+def send_user_push(rendered: RenderedPush, *, sender: str, key: str, clears_when: str, send_timeout_s: float,
+                   options: tuple[str, ...] = ()) -> bool:
+    """Send one outage phone push to the user, with its clear check. Print the reason when send.py refuses it."""
+    from scripts.lib.process_failure import failure_detail
+
+    command = user_send_argv(rendered, sender=sender, key=key)
+    command.extend(["--clears-when", clears_when, *options, "--recipient-key", "user"])
+    try:
+        sent = subprocess.run(command, capture_output=True, text=True, timeout=send_timeout_s, check=False)
+        if sent.returncode == 0:
+            return True
+        reason = failure_detail(sent)
+    except (OSError, subprocess.SubprocessError) as error:
+        reason = str(error)
+    print(f"{sender}: phone push {key} failed: {display_field(reason)}", file=sys.stderr)
+    return False
 
 
 def user_retire_argv(sender: str, key: str) -> list[str]:
@@ -330,6 +365,8 @@ def fingerprint(entry: PushText) -> str:
              "body": entry.body, "examples": examples}
     if isinstance(entry.session, SessionTemplate):
         value["session"] = entry.session.text
+    if isinstance(entry.action, ActionTemplate) and entry.action.omit_when_empty:
+        value["action"]["omit_when_empty"] = True
     if not entry.header:
         value["header"] = False
     if entry.one_line:

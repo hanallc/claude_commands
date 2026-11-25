@@ -213,7 +213,6 @@ Mac host and SSH settings remain in `mac_test.conf`.
 
 | Key | Meaning |
 | --- | --- |
-| `visible_root` | Root for visible scratch folders. |
 | `holds_file` | File that records scratch holds. |
 | `default_life_seconds` | Lifetime of a scratch folder without an explicit task. |
 | `repo_depth` | Maximum folder depth for the repository scan. |
@@ -604,9 +603,9 @@ Rsync replaces complete files and preserves this host's append files.
 | `swap_rows` | `6` | Show this many of the largest swap users; one line sums the rest. |
 | `report_refresh_seconds` | `300` | Read the history charts and top costs again after this many seconds. |
 | `remote_memory_light` / `remote_memory_dark` | `#626a78` / `#a0a8b6` | Color memory bars that do not count against natedev. |
-| `machine_natedev_light` / `machine_natedev_dark` | `#6243a6` / `#bba0ef` | Color the natedev name in the Machine column. |
-| `machine_mac_light` / `machine_mac_dark` | `#526b13` / `#b5ca72` | Color the mac name in the Machine column. |
-| `machine_aws_light` / `machine_aws_dark` | `#855126` / `#dbaa7d` | Color the aws name in the Machine column. |
+| `machine_natedev_light` / `machine_natedev_dark` | `#6243a6` / `#bba0ef` | Color the natedev name. |
+| `machine_mac_light` / `machine_mac_dark` | `#526b13` / `#b5ca72` | Color the mac and mac-linux names. |
+| `machine_aws_light` / `machine_aws_dark` | `#855126` / `#dbaa7d` | Color the aws and hana-aws names. |
 
 Configuration values use six hexadecimal digits without `#`.
 The text colors exceed 4.5:1 contrast against both backgrounds in their theme.
@@ -859,7 +858,8 @@ The command edits no tracked file.
 
 ### Cloud gate regions
 
-`cloud_gate.conf` uses `enabled=on` for cloud gates and `enabled=off` to run merge gates and targeted tests on natedev.
+`cloud_gate.conf` uses `enabled=on` for cloud gates.
+With `enabled=off`, gate jobs and targeted tests without a placement assignment run on natedev.
 `enabled=off` also refuses the pinned `hana-gpu` route and stops the hourly placement-score reads.
 `cloud_gate.conf` sets `regions` to all 19 regions of `spot_candidate_regions`.
 The first region must match the home region in `aws_target.conf`.
@@ -886,8 +886,8 @@ The command includes configured types and the r7a.8xlarge, m8a.8xlarge, and c8a.
 `remove-images` changes the home image and keeps regional stacks and copied images.
 
 The gate uses `gate` and `test-affected` as step names.
-`gate.py --affected` runs the affected modules.
+`gate.py --affected` requires the prepared handoff from `copies.py run`.
+It runs the affected modules in that copy.
 `build_steps.conf` defines `names.gate`, `names.test-affected`, and `prose.gate`.
-Its owner keys are `owned.gate`, `owned.test-affected`, and `owned.showrunner-gate`.
 `build_admission.conf` defines `program_first_peak_gib.gate` and `program_first_peak_gib.test-affected`.
 It also defines `peak_hold_seconds.gate` and `peak_hold_seconds.test-affected`.

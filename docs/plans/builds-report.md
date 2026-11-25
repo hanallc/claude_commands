@@ -1361,7 +1361,7 @@ From the user (via builds), 2026-11-13, with screenshots /tmp/claude/scratch/use
 
 #### As-built
 
-- New `owned.*` keys in `config/build_steps.conf`: `owned.default={unit} {step}`, `owned.showrunner-default=showrunner {step}` and `owned.ci-default=CI {step}`. `StepNames.for_owner` reads them through the one phase 70 naming path. An unknown owner keeps its current name.
+- New `owned.*` keys in `config/build_steps.conf`: `owned.default={unit} {step}`, `owned.showrunner-default=showrunner {step}` and `owned.ci-default=CI {step}`. `StepNames.for_owner` reads them through the one phase 70 naming path. An unknown owner keeps its current name. Later removed: ownersay dropped the template reader, and ownedkeys deleted the `[owned]` keys.
 - Every Running and Queued row on natedev, the Mac and AWS uses these names. The small text is the showrunner name, or the CI label for a CI row.
 - A CI row's Unit cell reads "CI" (director decision). A missing CI field (runner, job) is left out, so a live Mac CI row reads "hana CI": the Mac script cannot read the runner environment (director decision).
 - Every tooltip, swap tooltips included, names the showrunner and the unit, or CI. The custom and native tooltips share one owner field list.
@@ -1392,9 +1392,9 @@ From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/user-
 
 #### As-built
 
-- `target_availability.py` reads `targets.target_snapshots()` once for each page reading. `availability_rows` gives one row for each Mac block ("Blocked") and each natedev hold ("Held"), with holder, unit, showrunner, reason, since and until. An unreachable or unreadable target gives an "Unavailable" row. A free or busy target has no row.
+- `target_availability.py` reads `targets.target_snapshots()` once for each page reading. `availability_rows` gives one row for each Mac block ("Blocked") and each natedev hold ("Held"), with holder, unit, showrunner, reason, since and until. An unreachable or unreadable target gives an "Unavailable" row. Each kept claim of a blocked, free or running target gives a "Kept" row: `Kept for cleanup: <repository> <what>`, its holder session when known, and its start time, with the date for a start before today. A blocked target shows its kept claims after its "Blocked" row. A free or running target with no kept claim has no row.
 - The "Target availability" card on the Builds page shows these rows. A narrow view puts the reason, owner, since and until in that order.
-- `MacRoutes.line` gives the "Mac: ..." tooltip line for natedev rows and waiters: kind not offloaded, natedev only, excluded (policy), blocked, busy, unreachable, state unreadable, or no recorded block or claim. It reads `build_targets.step_policy` once for each (folder, package, kind) in a reading. Backoff and unreadable state are not policy; the state line names them.
+- `MacRoutes.line` gives the "Mac: ..." tooltip line for natedev rows and waiters: kind not offloaded, natedev only, excluded (policy), blocked, busy, unreachable, state unreadable, or no recorded block or claim. A guest claim is not in the Mac state, so the busy note of a running or free Mac state lists each claim that holds work in the claim folder (`working_claims`), mirror and guest. `MacRoutes.holds` then gives `busy with mac-linux <step>` for the guest claim's repository, as `repository_jobs` does for a running Mac. It reads `build_targets.step_policy` once for each (folder, package, kind) in a reading. Backoff and unreadable state are not policy; the state line names them.
 - Cost: `step_policy` runs local git reads, 5–25 ms for each repository in each 3 s reading. Accepted, because a cache across readings would hide a config change.
 - `ssh_target_snapshot` puts a block before a failed probe, running jobs and backoff. `read_backoff(strict=True)` returns `UnreadableBackoff`; the non-strict read does not change.
 - The idle alert says "MAC BLOCKED by ...". When the card shows the block, the page omits the block sentence from the alert (`BlockText.OMITTED`); admission diagnostics stay.
@@ -1815,7 +1815,7 @@ Name each action only from the data the page has. Drop the h/day sum plots, or m
 
 #### Phase 100 — Top costs as sentences, sum plots under Details
 
-The Builds page no longer shows the Build history plots, details and moments (buildsteady, C1780); Top 3 costs remains. The as-built notes below describe the code from before that change.
+The Builds page no longer shows the Build history plots, details and moments (buildsteady, C1780); Top 3 costs remains. Top 3 costs, Swap and memory pressure, and Leftover processes now open from icon buttons in the page heading, each in a dialog (item 222). The as-built notes below describe the code from before those changes.
 
 ##### Phase 100 as-built
 
@@ -1971,7 +1971,7 @@ As built:
 
 - Shared code: `memory_live.html` marks its tooltip rules and its tooltip code with `shared:step-tip:start` and `shared:step-tip:end`. The code part holds `field`, `tooltipRows`, `tooltipHtml`, a new `tipRowsHtml`, a new `placeTipAt` and a new `hoverTips`, which holds the hover and click handlers. The Builds page now calls `hoverTips`; `showTip`, `hideTip` and `placeTip` stay as names.
 - `disks_page.shared_step_tip` reads both marked parts from the Builds page source at publish. The Disks page puts the rules in its style and the code in one function, so the names of the two pages do not collide.
-- Shared data: each Builds row in a slot carries `slot_folder` and `slot_machine` beside `slot` (`memory_feed.build_slot`). The Disks settings carry `builds_data`, the link from the Disks folder to the Builds `memory.json`. The page reads it at start and at each poll interval while it shows.
+- Shared data: each Builds row in a slot carries `slot_folder` and `slot_machine` (`memory_feed.build_slot`). The Disks settings carry `builds_data`, the link from the Disks folder to the Builds `memory.json`. The page reads it at start and at each poll interval while it shows.
 - `scripts/build_queue/memory_files.py` holds the Builds page source, its data file name and its output folder. The Disks publisher reads them without the 0.4 s import of `memory_feed`.
 - A held slot that a Builds step runs in shows that step's tooltip, the same HTML as on the Builds page. The Builds data must be newer than `page.builds_max_age_seconds` (30). Any other slot shows its name and state, repository, size, last use, its user and showrunner, and the nightly sweep note. A repository band shows its slot count, size, slots in use and limit.
 - The Slots and Sessions titles carry an info mark and a definition tooltip. The slot definition takes the sweep age from `slots.unused_days`; the slot report now carries `machine` and `unused_days`.

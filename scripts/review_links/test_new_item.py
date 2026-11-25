@@ -1,4 +1,4 @@
-"""The /new_item command files through a fake console server and resolves each assignee."""
+"""Test how /new_item sends a request and reports the List number."""
 from __future__ import annotations
 
 import io
@@ -9,14 +9,16 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Literal, NoReturn, cast, override
 from unittest import mock
+from urllib.parse import urlencode
 
-from scripts.production import producer_map, staff, the_list
-from scripts.lib import main_publish
-from scripts.review_links import for_you, new_item, new_item_dialog, review_page, review_submissions
-
+from scripts.agents.remote import local_machine
+from scripts.lib import conf, main_publish
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.production import staff, the_list
+from scripts.production.staff_test_support import fixture_member
+from scripts.review_links import for_you, new_item, new_item_dialog, review_page, review_submissions, test_serve
 
 def member(identity: str, kind: staff.Kind, name: str, parent: staff.StaffRow | None = None) -> staff.StaffRow:
     reports: staff.ReportsTo | staff.StaffRoot = staff.ReportsTo(parent.id) if parent is not None else staff.StaffRoot()
@@ -35,12 +37,10 @@ HIDDEN = member("10000000-0000-4000-8000-000000000007", "showrunner", "hidden")
 CARGO_STYLE = member("10000000-0000-4000-8000-000000000008", "unit", "style", CARGO)
 SPACETIME_STYLE = member("10000000-0000-4000-8000-000000000009", "unit", "style", SPACETIME)
 MORTY = member("01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a", "producer", "morty")
-MEMBERS = staff.StaffSnapshot((DWIGHT, BOB, SPACETIME, MODELS, NATEDEV, POSTMASTER, CARGO, TILE, HIDDEN,
-                               CARGO_STYLE, SPACETIME_STYLE), retired_producers=(MORTY,))
+ROWS = (DWIGHT, BOB, SPACETIME, MODELS, NATEDEV, POSTMASTER, CARGO, TILE, HIDDEN, CARGO_STYLE, SPACETIME_STYLE)
+MEMBERS = staff.StaffSnapshot(ROWS, retired_producers=(MORTY,))
 TO_ROW = (SPACETIME, NATEDEV, CARGO, DWIGHT, BOB)
 ADDRESS = for_you.ConsoleAddress("192.0.2.1", 8765)
-LIST_KEY = f"{SPACETIME.id}/L3"
-SET_ASSIGNEE = new_item.set_assignee
 EXCHANGE = new_item.exchange
 
 
@@ -66,6 +66,8 @@ class FakeServer:
     def __init__(self) -> None:
         self.posts: list[dict[str, object]] = []
         self.reads: int = 0
+        self.list_number: int | None = 3
+        self.review_key: str | None = "fixture-key"
 
     def exchange(self, _address: for_you.ConsoleAddress, method: Literal["GET", "POST"], target: str,
                  body: bytes = b"") -> new_item.ServerReply:
@@ -76,31 +78,32 @@ class FakeServer:
                 {"id": row.id, "name": row.name, "proposal": row.kind != "producer"} for row in TO_ROW]})
         assert target == review_page.NEW_ITEM_PATH
         self.posts.append(cast(dict[str, object], json.loads(body)))
-        return new_item.ServerReply(200, {"id": "I7", "key": "fixture-key", "version": "1", "list_key": LIST_KEY})
+        fields: dict[str, object] = {"id": "I7", "version": "1"}
+        if self.review_key is not None:
+            fields["key"] = self.review_key
+        if self.list_number is not None:
+            fields["list_number"] = self.list_number
+        return new_item.ServerReply(200, fields)
 
 
-class NewItemTests(unittest.TestCase):
+class ServerFixture(unittest.TestCase):
+    """Patch the console server, the address and the producer map for each test."""
+
     config: Path = Path()
+    folder: Path = Path()
     server: FakeServer = FakeServer()
-    assignee_updates: list[tuple[str, staff.StaffRow, producer_map.MappedProducer]] = []
 
     @override
     def setUp(self) -> None:
-        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.config = folder / "producer_map.conf"
+        self.folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.config = self.folder / "producer_map.conf"
         _ = self.config.write_text("# The producer of a showrunner or of a unit.\n", encoding="utf-8")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(folder)})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.folder),
+                                                                        "XDG_STATE_HOME": str(self.folder / "state")})))
         self.server = FakeServer()
         _ = self.enterContext(mock.patch.object(new_item, "exchange", side_effect=self.server.exchange))
         _ = self.enterContext(mock.patch.object(for_you, "console_address", return_value=ADDRESS))
         _ = self.enterContext(mock.patch("platform.system", return_value="Linux"))
-        _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=MEMBERS))
-        self.assignee_updates = []
-
-        def set_assignee(list_key: str, assignee: staff.StaffRow, mapped: producer_map.MappedProducer) -> None:
-            self.assignee_updates.append((list_key, assignee, mapped))
-
-        _ = self.enterContext(mock.patch.object(new_item, "set_assignee", side_effect=set_assignee))
 
     def map_row(self, row: staff.StaffRow, producer: staff.StaffRow) -> None:
         with self.config.open("a", encoding="utf-8") as stream:
@@ -112,19 +115,26 @@ class NewItemTests(unittest.TestCase):
             code = new_item.main([*arguments, "--session", "another-session"]) if arguments else new_item.main([])
         return code, output.getvalue(), errors.getvalue()
 
+
+class NewItemTests(ServerFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=MEMBERS))
+
     def test_no_arguments_print_the_usage(self) -> None:
         code, output, _ = self.run_main()
         self.assertEqual(code, new_item.Outcome.USAGE)
         self.assertEqual(output.splitlines(), [
             "/new_item <type> <assignee> <description> [extra, such as a time]",
-            "Types: bug, question, investigation, proposal, efficiency, feedback",
+            "Types: bug, question, investigation, proposal, efficiency, feedback, enhancement",
             "Assignee: a producer, a showrunner or a unit",
         ])
         self.assertEqual((self.server.reads, self.server.posts), (0, []))
 
-    def test_six_types_and_each_files_as_a_server_kind(self) -> None:
+    def test_seven_types_and_each_files_as_a_server_kind(self) -> None:
         self.assertEqual([kind.value for kind in new_item.ItemType],
-                         ["bug", "question", "investigation", "proposal", "efficiency", "feedback"])
+                         ["bug", "question", "investigation", "proposal", "efficiency", "feedback", "enhancement"])
         investigation = new_item_dialog.SubmissionKind.INVESTIGATION
         self.assertEqual(new_item.FILED_KINDS[new_item.ItemType.FEEDBACK], investigation)
         self.assertEqual(new_item.FILED_KINDS[new_item.ItemType.EFFICIENCY], investigation)
@@ -135,8 +145,7 @@ class NewItemTests(unittest.TestCase):
                 code, output, _ = self.run_main(item_type.value.upper(), "bob", "Check the chart.")
                 self.assertEqual(code, 0)
                 self.assertEqual(output, f"{item_type.value.capitalize()} \u2192 bob. List item 3.\n")
-                self.assertEqual(self.server.posts[-1]["kind"], new_item.FILED_KINDS[item_type].value)
-                # Only efficiency files as another kind with a mark; feedback files as the window files it.
+                self.assertEqual(self.server.posts[-1]["kind"], new_item.FILED_KINDS[item_type])
                 words = "Efficiency: Check the chart." if item_type == new_item.ItemType.EFFICIENCY else "Check the chart."
                 self.assertEqual(self.server.posts[-1]["words"], words)
         with self.assertRaises(SystemExit):
@@ -146,7 +155,7 @@ class NewItemTests(unittest.TestCase):
         code, output, _ = self.run_main("bug", "bob", "A waiting row has no drag grip.")
         self.assertEqual((code, output), (0, "Bug \u2192 bob. List item 3.\n"))
         self.assertEqual(self.server.posts[0]["recipient_id"], BOB.id)
-        self.assertEqual(self.assignee_updates, [])
+        self.assertEqual(self.server.posts[0]["list_assignee"], BOB.id)
 
     def test_a_showrunner_with_a_row_files_nate_extra_words_as_written(self) -> None:
         self.map_row(SPACETIME, DWIGHT)
@@ -155,7 +164,7 @@ class NewItemTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(output, "Question \u2192 spacetime. Producer: dwight (set for spacetime). List item 3.\n")
         self.assertEqual(self.server.posts[0]["words"], "Can the server start with no saved world?\n\nAnswer by Monday.")
-        self.assertEqual(self.assignee_updates, [])
+        self.assertEqual(self.server.posts[0]["list_assignee"], SPACETIME.id)
 
     def test_a_unit_uses_its_showrunner_row(self) -> None:
         self.map_row(SPACETIME, DWIGHT)
@@ -163,7 +172,7 @@ class NewItemTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(output, "Bug \u2192 models, a unit of spacetime. Producer: dwight (from spacetime). List item 3.\n")
         self.assertEqual(self.server.posts[0]["recipient_id"], SPACETIME.id)
-        self.assertEqual(self.assignee_updates, [(LIST_KEY, MODELS, producer_map.MappedProducer(DWIGHT, SPACETIME))])
+        self.assertEqual(self.server.posts[0]["list_assignee"], MODELS.id)
 
     def test_a_unit_row_wins_over_its_showrunner_row(self) -> None:
         self.map_row(NATEDEV, DWIGHT)
@@ -173,7 +182,7 @@ class NewItemTests(unittest.TestCase):
         self.assertEqual(output,
                          "Proposal \u2192 postmaster, a unit of natedev. Producer: bob (set for postmaster). List item 3.\n")
         self.assertEqual(self.server.posts[0]["recipient_id"], NATEDEV.id)
-        self.assertEqual(self.assignee_updates, [(LIST_KEY, POSTMASTER, producer_map.MappedProducer(BOB, POSTMASTER))])
+        self.assertEqual(self.server.posts[0]["list_assignee"], POSTMASTER.id)
 
     def test_an_item_for_this_session_says_so(self) -> None:
         output, errors = io.StringIO(), io.StringIO()
@@ -243,6 +252,17 @@ class NewItemTests(unittest.TestCase):
         self.assertEqual((code, output), (1, ""))
         self.assertTrue(errors.startswith("new_item: cannot find the console server address: "), errors)
 
+        self.map_row(POSTMASTER, MORTY)
+        cases = (
+            ("cargo-liner", "cargo-liner has no producer yet. Which producer?"),
+            ("postmaster", "The row of postmaster names morty, who is not active. Which producer for postmaster?"),
+        )
+        for assignee, question in cases:
+            with self.subTest(assignee=assignee), mock.patch.object(for_you, "console_address", side_effect=lookup):
+                result = self.run_main("bug", assignee, "Fix the chart.")
+                self.assertEqual(result, (new_item.Outcome.NO_PRODUCER, f"{question}\ndwight / bob\n", ""))
+        self.assertEqual((self.server.reads, self.server.posts), (0, []))
+
     def test_a_post_without_a_reply_says_to_check_the_list(self) -> None:
         with mock.patch("scripts.review_links.new_item.HTTPConnection", new=SilentConnection):
             cases: tuple[tuple[Literal["GET", "POST"], bool], ...] = (("POST", True), ("GET", False))
@@ -255,14 +275,15 @@ class NewItemTests(unittest.TestCase):
         arguments = ["bug", "models", "Fix the chart.", "Today."]
         output = io.StringIO()
         with (mock.patch("platform.system", return_value="Darwin"),
-                mock.patch.dict(os.environ, {"ZONE_SSH": "fixture-ssh", "CLAUDE_CODE_SESSION_ID": "mac-session"}),
+                mock.patch.dict(os.environ, {"ZONE_SSH": "fixture-ssh", "CODEX_THREAD_ID": "",
+                                             "CLAUDE_CODE_SESSION_ID": "mac-session"}),
                 mock.patch.object(main_publish, "forward", return_value=0) as forward, redirect_stdout(output)):
             self.assertEqual(new_item.main(arguments), 0)
             self.assertEqual(new_item.main([]), new_item.Outcome.USAGE)
         forward.assert_called_once_with("review_links/new_item.py", [*arguments, "--session", "mac-session"],
                                         label="new_item", ssh_program="fixture-ssh")
         self.assertEqual(output.getvalue(), new_item.usage() + "\n")
-        self.assertEqual((self.server.reads, self.server.posts, self.assignee_updates), (0, [], []))
+        self.assertEqual((self.server.reads, self.server.posts), (0, []))
 
     def test_post_body_has_the_window_fields(self) -> None:
         self.map_row(MODELS, BOB)
@@ -274,28 +295,96 @@ class NewItemTests(unittest.TestCase):
         self.assertEqual(body, {
             "token": "fixture-token", "kind": "proposal", "recipient_id": SPACETIME.id,
             "words": "Add a chart.\n\nNext week.", "evidence": {"kind": "none"}, "images": [],
-            "page": "list", "page_recipient": "selected"})
+            "page": "list", "page_recipient": "selected", "list_assignee": MODELS.id})
         request = new_item_dialog.read_request({**body, "request_id": request_id})
         self.assertEqual((request.kind, request.recipient_id, request.page_recipient),
                          (new_item_dialog.SubmissionKind.PROPOSAL, SPACETIME.id, new_item_dialog.PageRecipient.SELECTED))
 
-    def test_set_assignee_names_the_unit_and_gives_the_assignee_producer(self) -> None:
-        item = cast(the_list.ListItem, cast(object, SimpleNamespace(producer=DWIGHT.id)))
-        updates: list[tuple[staff.StaffId, str, the_list.ItemChanges, str]] = []
 
-        def update(keeper: staff.StaffId, identity: str, changes: the_list.ItemChanges, *, source: str) -> the_list.ListItem:
-            updates.append((keeper, identity, changes, source))
-            return item
+    def test_a_reply_without_a_list_number_reports_the_saved_review_item(self) -> None:
+        self.server.list_number = None
+        code, output, errors = self.run_main("bug", "bob", "A waiting row has no drag grip.")
+        self.assertEqual((code, errors), (new_item.Outcome.FILED, ""))
+        self.assertEqual(output, "Bug → bob. Filed as I7. The console server returned no List number.\n")
 
-        with mock.patch.object(the_list, "load", return_value=item), mock.patch.object(the_list, "update", side_effect=update):
-            SET_ASSIGNEE(LIST_KEY, MODELS, producer_map.MappedProducer(DWIGHT, SPACETIME))
-            SET_ASSIGNEE(LIST_KEY, MODELS, producer_map.MappedProducer(BOB, MODELS))
-            SET_ASSIGNEE(LIST_KEY, NATEDEV, producer_map.MappedProducer(DWIGHT, NATEDEV))
-            SET_ASSIGNEE(LIST_KEY, NATEDEV, producer_map.MappedProducer(BOB, NATEDEV))
-        self.assertEqual(updates, [
-            (SPACETIME.id, "L3", {"unit": "models"}, new_item.SOURCE),
-            (SPACETIME.id, "L3", {"unit": "models", "producer": BOB.id}, new_item.SOURCE),
-            (SPACETIME.id, "L3", {"producer": BOB.id}, new_item.SOURCE)])
+    def test_enhancement_with_no_producer_saves_nothing(self) -> None:
+        code, output, errors = self.run_main("enhancement", "tile", "Show the next check in the row.")
+        self.assertEqual((code, errors), (new_item.Outcome.NO_PRODUCER, ""))
+        self.assertIn("Which producer?", output)
+        self.assertEqual((self.server.reads, self.server.posts), (0, []))
+        drafts = (self.folder / "state/new-item").glob("*")
+        self.assertEqual([draft for draft in drafts if draft.suffix != ".lock"], [])
+
+    def test_a_reply_without_a_review_key_reports_the_list_number(self) -> None:
+        self.server.review_key = None
+        code, output, errors = self.run_main("bug", "bob", "A waiting row has no drag grip.")
+        self.assertEqual((code, output, errors), (new_item.Outcome.FILED, "Bug → bob. List item 3.\n", ""))
+
+    def test_a_reply_without_a_review_key_or_list_number_exits_filed(self) -> None:
+        self.server.review_key = ""
+        self.server.list_number = None
+        code, output, errors = self.run_main("bug", "bob", "A waiting row has no drag grip.")
+        self.assertEqual((code, errors), (new_item.Outcome.FILED, ""))
+        self.assertEqual(output, "Bug → bob. Filed as I7. The console server returned no List number.\n")
+
+    def test_a_list_write_failure_after_filing_keeps_the_draft(self) -> None:
+        def exchange(address: for_you.ConsoleAddress, method: Literal["GET", "POST"], target: str,
+                     body: bytes = b"") -> new_item.ServerReply:
+            reply = self.server.exchange(address, method, target, body)
+            if method == "POST" and len(self.server.posts) <= 2:
+                return new_item.ServerReply(503, {"error": "No space left on device"})
+            return reply
+
+        arguments = ("bug", "bob", "A waiting row has no drag grip.")
+        with mock.patch.object(new_item, "exchange", side_effect=exchange):
+            code, output, errors = self.run_main(*arguments)
+            self.assertEqual((code, output), (new_item.Outcome.FAILED, ""))
+            self.assertIn("No space left on device", errors)
+            self.assertEqual(self.run_main(*arguments),
+                             (new_item.Outcome.FILED, "Bug → bob. List item 3.\n", ""))
+        self.assertEqual(len(self.server.posts), 3)
+        self.assertEqual(self.server.posts, [self.server.posts[0]] * 3)
+
+
+class NewItemServerTests(unittest.TestCase):
+    def test_identical_words_create_separate_list_rows_and_review_links(self) -> None:
+        server = test_serve.ReviewLinksServerTests()
+        self.addCleanup(server.doCleanups)
+        server.setUp()
+        case = server.review_fixture()
+        document = server.root.parent / "bob"
+        document.mkdir()
+        bob = fixture_member("producer", name="bob", doc=staff.LiveDoc(local_machine(), document))
+        morty = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\n")
+        _ = conf.path("producer_map").write_text("# Producers use their own rows.\n", encoding="utf-8")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        address = for_you.ConsoleAddress("127.0.0.1", server.port)
+        output, errors = io.StringIO(), io.StringIO()
+        words = "A waiting row has no drag grip."
+        arguments = ["bug", bob.name, words, "--session", "another-session"]
+        with (mock.patch.object(server.server, "review_cache", cache),
+              mock.patch.object(server.server, "delivery_status", case.status),
+              mock.patch.object(server.server.RequestHandlerClass, "log_request"),
+              mock.patch.object(for_you, "console_address", return_value=address),
+              mock.patch("platform.system", return_value="Linux"),
+              redirect_stdout(output), redirect_stderr(errors)):
+            for _ in range(2):
+                self.assertEqual(new_item.main(arguments), new_item.Outcome.FILED, errors.getvalue())
+                self.assertTrue(server.new_item_posts.wait_until_none_run())
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(output.getvalue().splitlines(), ["Bug → bob. List item 1.", "Bug → bob. List item 2."])
+        first, second = the_list.records(morty.id, include_closed=True)
+        self.assertEqual((first.number, second.number), (1, 2))
+        first_key, = first.reviews
+        second_key, = second.reviews
+        self.assertNotEqual(first_key, second_key)
+        reviews = cache.get().records
+        for item, key in ((first, first_key), (second, second_key)):
+            self.assertEqual((item.owner, item.producer, item.unit, item.title), (bob.id, bob.id, "", words))
+            self.assertIn(urlencode({"jump": key}), item.evidence)
+            self.assertEqual((reviews[key].owner, reviews[key].title), (bob.id, words))
 
 
 if __name__ == "__main__":

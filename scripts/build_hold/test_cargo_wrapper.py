@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -13,8 +14,9 @@ import sys
 import tempfile
 import unittest
 from typing import override
+from unittest import mock
 
-from scripts.lib import test_hang_guard
+from scripts.lib import build_folder_lock, build_folders, test_hang_guard
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.build_hold import cargo_folder
@@ -199,6 +201,35 @@ class CargoWrapperTest(unittest.TestCase):
         self.assertTrue(self.python_log.exists())
         self.assertFalse(self.scope_log.exists())
 
+    def test_cargo_retries_when_the_output_parent_moves_after_lock_open(self) -> None:
+        parent = self.root / "output-root" / "unit"
+        parent.mkdir(parents=True)
+        output = parent / "target"
+        former = parent.with_name("former-unit")
+        workspace = cargo_folder.CargoWorkspace(self.cwd, str(self.home), self.cwd, self.cwd)
+        open_lock = build_folder_lock.open_lock
+        module = cargo_folder.__name__
+
+        def move_parent(path: Path, directory: int, *, create: bool) -> int:
+            descriptor = open_lock(path, directory, create=create)
+            if path == output and not former.exists():
+                _ = parent.rename(former)
+            return descriptor
+
+        with (ExitStack() as locks,
+              mock.patch.object(build_folders, "build_root", return_value=parent.parent),
+              mock.patch.object(build_folder_lock, "open_lock", side_effect=move_parent),
+              mock.patch(f"{module}._workspace", return_value=workspace),
+              mock.patch.object(cargo_folder, "assigned_output", return_value=cargo_folder.LinkedOutput(output)),
+              mock.patch(f"{module}._check_paths"), mock.patch(f"{module}._stamp_assignment"),
+              mock.patch("scripts.worktree.worktrees.git_exclude.ensure_excluded")):
+            checked = cargo_folder.check_step(["check"], self.cwd, locks, self.env, enforce=True)
+            self.assertIsInstance(checked, cargo_folder.CheckedOutputLock)
+            assert isinstance(checked, cargo_folder.CheckedOutputLock)
+            self.assertTrue(former.is_dir())
+            self.assertTrue(os.path.samestat(os.fstat(checked.descriptor), output.with_suffix(".lock").stat()))
+            self.assertEqual(build_folders.build_folder_state(output), "held")
+
     def test_non_building_commands_start_with_no_python_and_no_queue_request(self) -> None:
         _ = (self.hold / "holder").write_text("held")
         for args in (
@@ -355,16 +386,24 @@ class CargoWrapperTest(unittest.TestCase):
                 self.assert_queue(args)
 
     def test_existing_build_scope_skips_hold_and_queue(self) -> None:
-        _ = self.cgroup.write_text("0::/user.slice/builds.slice/run-42.scope\n")
         _ = (self.hold / "holder").write_text("held")
-        done = self.invoke("test")
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assert_cargo(["test"])
-        self.assertFalse(self.scope_log.exists())
-        self.assertFalse(self.hold_log.exists())
-        self.assertFalse(self.python_log.exists())
-        self.assertFalse(self.queue_log.exists())
-        self.assertFalse(self.folder_log.exists())
+        detached_step = "/user.slice/builds.slice/builds-detached.slice/builds-detached-7.slice/run-42.scope"
+        base = dict(self.env)
+        for cgroup, variables in (
+            ("/user.slice/builds.slice/run-42.scope", {}),
+            (detached_step, {"BUILDLOG_STEP_SCOPE": f"/sys/fs/cgroup{detached_step}"}),
+        ):
+            with self.subTest(cgroup=cgroup):
+                _ = self.cgroup.write_text(f"0::{cgroup}\n")
+                self.env = {**base, **variables}
+                done = self.invoke("test")
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assert_cargo(["test"])
+                self.assertFalse(self.scope_log.exists())
+                self.assertFalse(self.hold_log.exists())
+                self.assertFalse(self.python_log.exists())
+                self.assertFalse(self.queue_log.exists())
+                self.assertFalse(self.folder_log.exists())
 
     def test_layout_refusal_stops_before_queue_admission(self) -> None:
         self.env["FOLDER_EXIT"] = "1"
@@ -392,9 +431,11 @@ class CargoWrapperTest(unittest.TestCase):
             ["nextest", "run", "--", "--help"],
         ))
         cases: list[tuple[list[str], dict[str, str]]] = [(args, {}) for args in calls]
+        # The value of the own scope starts cargo at once; a value from another scope is stale.
+        own_scope = "/sys/fs/cgroup" + self.cgroup.read_text().strip().removeprefix("0::")
         cases.extend((["build"], variables) for variables in (
             {"CARGO_FOLDER_CHECKED": "1"}, {"CARGO_FOLDER_CHECKED": "0"}, {"BUILDLOG_STEP_SCOPE": "/step.scope"},
-            {"BUILDLOG_STEP_SCOPE": ""}))
+            {"BUILDLOG_STEP_SCOPE": own_scope}, {"BUILDLOG_STEP_SCOPE": ""}))
         base = dict(self.env)
         for args, variables in cases:
             with self.subTest(args=args, variables=variables):
@@ -441,16 +482,26 @@ class CargoWrapperTest(unittest.TestCase):
         # A hidden entry must also cause a hold check.
         _ = (self.hold / ".holder").write_text("held")
         self.env["HOLD_EXIT"] = "1"
-        for cgroup in (
-            "0::/user.slice/app-agents.slice/session.scope\n",
-            "0::/user.slice/builds.slice/builds-detached.slice/run-42.scope\n",
+        detached_run = "/user.slice/builds.slice/builds-detached.slice/run-42.scope"
+        other_step = "/sys/fs/cgroup/user.slice/builds.slice/builds-detached.slice/run-43.scope"
+        # A parent folder is not the step scope: only an equal folder starts cargo at once.
+        parent_slice = "/sys/fs/cgroup/user.slice/builds.slice/builds-detached.slice"
+        base = dict(self.env)
+        for cgroup, variables in (
+            ("/user.slice/app-agents.slice/session.scope", {}),
+            (detached_run, {}),
+            (detached_run, {"BUILDLOG_STEP_SCOPE": other_step}),
+            (detached_run, {"BUILDLOG_STEP_SCOPE": parent_slice}),
         ):
-            with self.subTest(cgroup=cgroup):
-                _ = self.cgroup.write_text(cgroup)
+            with self.subTest(cgroup=cgroup, variables=variables):
+                _ = self.cgroup.write_text(f"0::{cgroup}\n")
+                self.env = {**base, **variables}
                 done = self.invoke("test")
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertEqual(done.stderr, "cargo stderr\n")
                 self.assertTrue(self.hold_log.exists())
+                # A stale value from another scope does not skip the folder step.
+                self.assertTrue(self.folder_log.exists())
                 self.assert_cargo(["test"])
                 self.assert_queue(["test"])
 

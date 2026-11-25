@@ -15,6 +15,7 @@ import unittest
 from typing import cast, final, override
 from unittest import mock
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.aws_target import admin_secrets, box, deploy
 from scripts.lib import conf
 
@@ -44,8 +45,9 @@ class AdminSecretTests(unittest.TestCase):
         self.credentials = self.root / 'credentials'
         _ = self.credentials.write_text('[build-scaler]\naws_access_key_id=scaler-id\naws_secret_access_key=scaler-secret\n')
         self.credentials.chmod(0o600)
-        _ = self.settings.write_text(
+        _ = write_config_fixture(self.settings,
             f'admin_secret_file={self.path}\ndeployment_profile=build-admin\n'
+            + f'deployment_price_file={self.root / "price"}\n'
             + '# range: 0.001..\naws_timeout_s=30\n')
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'GNUPGHOME': str(self.home),
             'AWS_SHARED_CREDENTIALS_FILE': str(self.credentials), 'AWS_SESSION_TOKEN': '', 'AWS_SECURITY_TOKEN': ''})))

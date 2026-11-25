@@ -23,17 +23,17 @@ The same file holds `allow.<path>=<reason>` entries under `[allow-list]`, with
 paths relative to `scripts/`. `copies.load_config().allow_list` supplies these
 entries to the guard's scan. The guard does not read configuration separately.
 
-`config/build_folders.conf` sets the slot root and pool limits.
-The `slots.wait_seconds` setting limits the wait for a slot.
-The root uses `roots.slots.<machine>`, with `roots.slots` as the default.
-`config/build_folders.conf` sets no slot root for natedev.
-The limit uses `slots.<machine>.<repository>.max`, with `slots.<machine>.default_max` as the default.
-Owners on the same machine share the pool for a repository.
-Each checkout uses `<slot-root>/<repository>-slot<N>`. The lease records the owner.
+`config/build_folders.conf` sets the build root.
+The root uses `roots.build.<machine>`, with `roots.build` as the default.
+Each checkout uses `<roots.build>/<repository>/<unit>/<N>`.
+The lock `<N>.lock` and the lease `<N>.lease.json` are beside the checkout. The lease records the owner.
+The unit is the caller's staff unit name. Without a staff row, the unit is the owner.
+The maker takes the lowest free existing number or makes the smallest missing number. No setting limits the count.
 The repository name comes from the last part of its origin URL, with the `.git` suffix removed.
+A `repo_word.<name>` setting in `build_folders.conf` replaces that name.
 Local origins, including relative paths and `file://` URLs, lead to the source repository's identity.
 A cycle of local origins is an error.
-A repository without an origin uses its main checkout's folder name.
+A repository without an origin cannot take a copy.
 Linked worktrees and local clones use the same identity.
 
 The CLI reads the calling session's local staff row.
@@ -41,12 +41,12 @@ A worker uses its parent unit's row id.
 A caller without a staff row receives an error.
 Text owners enter through one boundary as staff row ids or fixed role names.
 
-## Slot preparation
+## Copy preparation
 
-The slot lease covers checkout preparation and caller use. Command children inherit the lease descriptors.
+The copy lease covers checkout preparation and caller use. Command children inherit the lock descriptor.
 Preparation selects the requested commit and applies the source and merge policies.
 The checkout remains after use. A later caller can reuse its build output.
-See [Repository copies](copies.md) for slot cleanup and build output details.
+See [Repository copies](copies.md) for copy cleanup and build output details.
 
 ## Reset and build output
 
@@ -104,8 +104,8 @@ Cache marking does not follow a caller's replacement target symlink.
 
 ## Acquisition and cleanup
 
-Acquisition waits for a free slot when all slots in the configured pool are busy.
-The slot lease releases when preparation fails or the caller ends.
+Acquisition does not wait for a copy. When a copy is busy, the maker tries the next number.
+The copy lease releases when preparation fails or the caller ends.
 
 Each prepared checkout and standing cache has a `.gate.json` record:
 
@@ -135,7 +135,7 @@ Run targeted tests with the source worktree's uncommitted changes and a merge, i
   --commit HEAD \
   --apply-uncommitted ~/worktrees/claude-build-followups-verify \
   --merge origin/builds -- \
-  ~/.claude/scripts/lib/py ~/.claude/scripts/production/targeted_test.py --checkout '{tree}'
+  ./scripts/lib/py scripts/production/gate.py --affected
 ```
 
 `run --repo R --commit C [--apply-uncommitted W] [--merge REF] [--publish PATH ...]
@@ -153,8 +153,9 @@ Stdout prints `published: <absolute path> <full commit>` for each file.
 A path that does not exist prints `copies: publish: <path> not built` on stderr.
 A copy failure ends the scratch folder and prints `copies: publish: <error>` on stderr.
 Publication never changes the exit status of `run`.
-The scratch deadline removes the folder; the hourly sweep does the removal.
-The scratch default task has a random suffix, so `scratch.end()` removes only this folder.
+After the scratch deadline, the hourly sweep lists the eligible folder for vetted manual removal.
+The default scratch task has a random suffix.
+`scratch.end()` records task completion and keeps the folder for vetted manual removal.
 The folder is outside the cache root, so a unit reads it with no permission prompt.
 `/hana_shot` launches a gate build with the `published:` path as `--binary`.
 A unit never copies from a gate checkout's `target`.
@@ -317,8 +318,7 @@ TMPDIR cleanup at reboot removes checkouts left by killed gate processes.
 
 `copies.py` creates and refreshes mirrors for Mac, Linux, and AWS targets.
 `offload.py` requests a mirror through this API.
-`mac_run.sh` creates and registers its test clone through the same implementation.
-Neither caller has a copy-creation exception.
+`mac_run.sh` requests a numbered copy on the Mac through `copies.py run`.
 
 `remote_lease_path(mirror)` names the lease beside the mirror's registry record.
 The claim service reads `/proc/locks` once and reports held mirrors by host, path, and session.
@@ -370,11 +370,12 @@ Mac claims still use one slot.
 Offload records use `owning_session.owning_session()` before the shell session fallback.
 Busy refusals can therefore name the unit director's session.
 
-After confirmed clone cleanup, `mac_run.sh` calls `copies.py unregister-remote` for both registry records.
-It removes the Mac's `localhost` record before the natedev record.
+`mac_run.sh` clears the numbered copy's keep file only after `stop-checkout` confirms the copy is clear.
+The queue retries scratch cleanup for an old smoke run with `argv.json.state`.
+It keeps the run record and receipt if cleanup fails.
+If the record names a task without a checkout path, the callback lists the record for manual cleanup.
 `unregister-remote` accepts only `--host` and `--path`.
 `mirror-remove` accepts `--host`; receive and use accept the command arguments.
-A failed clone cleanup keeps both records.
 A marked mirror probe starts no remote Python and skips `mirror_local_path`.
 An unmarked probe keeps the existing path check and metadata creation.
 

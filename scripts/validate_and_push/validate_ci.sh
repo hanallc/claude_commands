@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+VALIDATE_CI_DIR="${BASH_SOURCE[0]%/*}"
+[[ "$VALIDATE_CI_DIR" != "${BASH_SOURCE[0]}" ]] || VALIDATE_CI_DIR=.
+# shellcheck source=/dev/null
+source "$VALIDATE_CI_DIR/../lib/buildlog_run.sh"
+buildlog_initialize_run "$VALIDATE_CI_DIR/../lib/py" "$VALIDATE_CI_DIR/../direct/step_record.py"
+
 # Single bottom layer for cargo invocations: scripts/lint owns every command's
 # flags (lint CLI over invoke.sh); this script only picks subcommands.
 # LINT_CONFIG_FORCE=1 is set on each step that must never be skipped by

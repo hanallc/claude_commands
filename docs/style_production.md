@@ -243,7 +243,7 @@ Reconciliation processes predecessors first.
 The ledger repeats the disjoint-footprint proof inside the assignment transaction.
 Widening, finding follow or replace, base or tip changes, and checkpoint writes revalidate the footprints under the same write lock.
 A conflict or unreadable footprint cancels the write. Resume and the gate recheck before publishing
-work. Merge checks again, including after the predecessor has merged. These
+work. The ledger checks again at merge time, including after the predecessor merges. These
 checks include both bases and checkpoints, the live unit and style tips, and
 the tickets' actual committed paths, so later references and unplanned edits
 cannot bypass the original check. An existing overlapping pair waits for
@@ -286,7 +286,7 @@ contains main nor is its ancestor, a rename or copy anywhere in the range, or
 an unknown crate for a selected file holds refill closed. The pushed tip is `origin/<branch point>`, or the
 local branch when the repository has no `origin`. The checkouts share one
 repository, so the local branch can hold a parent merge whose gate is still
-running. Reconcile and the hand-off merge check read the same pushed tip.
+running. Reconcile and handoff verification read the same pushed tip.
 Report a waiting state once and end the turn blocked until sync, a board retry
 message, or `ticket <id> merged; refill.` wakes the director. `ticket merge`
 sends that wake to every unit waiting for sync. Refill records its wait before
@@ -537,11 +537,9 @@ Exit 1 means the trees differ; run the five steps:
    Without a package, lint checks the workspace with mend, rustfmt, and Clippy.
    Clippy uses `--all-targets --all-features` and the workspace lint config.
    Nothing rewrites the tree: mend runs in report mode and rustfmt with `--check`.
-   `copies.standing` holds a repository slot through lint and cleanup.
-   The machine shares the repository pool across owners.
-   Each `<repository>-slot<N>` checkout keeps its own `target/`.
+   `copies.standing` holds a numbered copy through lint and cleanup.
+   Each copy at `<roots.build>/<repository>/<unit>/<N>` keeps its own `target/`.
    A missing or swept cache builds cold. Lint leaves `CARGO_TARGET_DIR` unset.
-   `config/build_folders.conf` sets the slot root and the repository or machine default limit.
    See [Standing gate checkouts](as-built/gate-checkouts.md).
    It records per-file diagnostics once per tool; disabled or incomplete checks
    grant no successful coverage. Exit 0 means clean, every tool recorded passing;

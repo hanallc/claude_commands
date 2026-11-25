@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import unittest
 from unittest import mock
@@ -12,6 +13,8 @@ from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixtu
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.lib.fixture_test_support import register_fixture_class_cleanup, set_up_fixture
+from scripts.lib.git_test_support import commit_repository
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 TARGETS = r'''
@@ -83,7 +86,7 @@ with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: 
 from scripts.direct.step_row_test_support import read_step_row
 record = read_step_row(call_id)
 with Path(os.environ["TEST_MAC_EVENTS"]).open("a") as output:
-    output.write(json.dumps({"args": words, "record": record}) + "\n")
+    output.write(json.dumps({"args": words, "record": record, "run": os.environ.get("BUILDLOG_RUN", "")}) + "\n")
 verb = words[words.index("--verb") + 1] if "--verb" in words else "nextest"
 needs_repair = ((verb == "clippy" and os.environ.get("TEST_REQUIRE_CLIPPY_FIX") == "1")
                 or (verb == "mend-check" and os.environ.get("TEST_REQUIRE_MEND_FIX") == "1"))
@@ -194,6 +197,23 @@ class VerifyStepRoutesFixture(unittest.TestCase):
             source = settings.read_text()
             _ = settings.write_text(source.replace("linux_only.case=", "linux_only.case=sample"))
         return self.fixture.verify(*words)
+
+    def prepare_repository(self, *paths: str) -> None:
+        git = shutil.which("git")
+        assert git is not None
+        stub = self.fixture.bin_directory / "git"
+        stub.unlink()
+        stub.symlink_to(git)
+        git_config = self.fixture.root / "git-config"
+        _ = git_config.write_text("[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = /nonexistent/fixture-gpg\n")
+        self.fixture.environment.update({"GIT_CONFIG_GLOBAL": str(git_config), "GIT_CONFIG_NOSYSTEM": "1"})
+        _ = subprocess.run([git, "init", "-q", "-b", "main"], cwd=self.fixture.root,
+                           env=self.fixture.environment, check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = commit_repository(self.fixture.root, "fixture", "Cargo.toml", "src", *paths, env=self.fixture.environment)
+        _ = (self.fixture.root / ".git/info/exclude").write_text("/*\n!/Cargo.toml\n!/src/\n")
+        metadata = cast(dict[str, object], json.loads(self.fixture.environment["TEST_METADATA"]))
+        metadata["target_directory"] = str(self.fixture.root / "target")
+        self.fixture.environment["TEST_METADATA"] = json.dumps(metadata)
 
     def mac_rows(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for line in self.mac_events.read_text().splitlines()] if self.mac_events.exists() else []
