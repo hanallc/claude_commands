@@ -65,7 +65,9 @@ run_once() {
 }
 '''
             script += functions(VERIFY, ("sync_token_state", "token_acquired", "release_token",
-                                          "release_wait_claim", "step_writes_tree", "step_can_retry", "finish_step_token", "run", "run_step"))
+                                          "record_token_wait", "stop_token_renewer", "release_wait_claim",
+                                          "step_writes_tree", "step_can_retry", "finish_step_token", "run", "run_step",
+                                          "wait_for_verify_child", "wait_for_verify_step_group"))
             script += "\n" + functions(INVOKE, ("sweep_after_step",)) + "\n" + body
             return subprocess.run(
                 ["bash", "-c", script], env={**environment, "TEST_BOARD": str(VERIFY.with_name("board.sh"))},
