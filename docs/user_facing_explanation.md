@@ -109,7 +109,7 @@ Put a fact for later use, such as steps after an install, in the report after th
 5. **Recommendation.** Name the recommended outcome and the goal or failure it addresses. Include meaningful costs or restrictions.
 6. **Implementation mapping.** Add the proposed name or a short code example if it makes the decision more precise.
 7. **Still pending.** Name nearby decisions that could appear settled. Say where you will handle them if known.
-8. **Choices.** Follow the shared Choices rules below. Include the exact choices `elaborate / simplify` on every item.
+8. **Choices.** Follow the shared Choices rules below. Include the exact choices `elaborate / simplify / read messages` on every item.
 
 Labels after **The point** are optional.
 
@@ -126,7 +126,7 @@ Should the editor move to another monitor or stay hidden, or should the applicat
 If the editor stays hidden, you cannot use it. A replacement depends on when the application opens it.
 I recommend moving the current editor automatically so you can keep editing.
 
-move automatically (recommended — you can keep editing) / leave hidden / let the application replace it / elaborate / simplify
+move automatically (recommended — you can keep editing) / leave hidden / let the application replace it / elaborate / simplify / read messages
 ```
 
 ### Small example
@@ -140,7 +140,7 @@ A newer build of your demo comes to your Mac at about 12:15 PST.
 It adds one thing that you can see: a jack that a tool blocks shows no green outline for a held plug.
 A bump brings it only some minutes sooner, and other runs then wait longer.
 
-no bump (recommended — a bump saves only some minutes) / bump / elaborate / simplify
+no bump (recommended — a bump saves only some minutes) / bump / elaborate / simplify / read messages
 ```
 
 ### Reader test
