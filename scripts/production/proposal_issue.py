@@ -170,24 +170,33 @@ def pending_review_reply(issue: Issue) -> bool:
     return not review_is_done(issue) and review_mark(issue) == ReviewMark.WAITING
 
 
+def _submission_reply_is_repeat(issue: Issue, key: new_item_dialog.ScopedSubmissionKey, words: str,
+                                token: str, owner: staff.StaffId, events: tuple[ReviewLog, ...]) -> bool:
+    origin = review_submission(issue)
+    if (proposal_owner(issue, issue.value("proposed_by")) != owner or issue.value(NUMBER_FIELD) != key.item_id
+            or not isinstance(origin, new_item_dialog.ReviewSubmission) or origin.request_id != key.request_id):
+        raise new_item_dialog.SubmissionError("The selected Proposal changed.")
+    new_item_dialog.require_reply_token(origin, token)
+    latest = next((entry.words for entry in reversed(events)
+                   if entry.words.startswith(("Answer: ", "question: "))), "")
+    repeated = not review_is_done(issue) and isinstance(review_mark(issue), NoMark) and latest == words
+    if not repeated and not pending_review_reply(issue):
+        raise new_item_dialog.SubmissionError("This item no longer accepts this reply.")
+    return repeated
+
+
 @dataclass(frozen=True)
 class ProposalSubmissionReply:
     owner: staff.StaffId
     key: new_item_dialog.ScopedSubmissionKey
     token: str
+    selected: Issue
 
-
-@dataclass(frozen=True)
-class NoProposalSubmissionReply:
-    pass
-
-
-_NO_SUBMISSION_REPLY = NoProposalSubmissionReply()
 
 def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, today: date, who: str = "nate", *,
                   check: Callable[[], object] | None = None, waiting_why: str = "", check_state: Callable[[], None] = lambda: None,
                   new_reply_proof: reply_tokens.ReplyTokenProof | reply_tokens.MintReplyProof = reply_tokens.MINT_REPLY_PROOF,
-                  submission_reply: ProposalSubmissionReply | NoProposalSubmissionReply = _NO_SUBMISSION_REPLY) -> bool:
+                  submission_reply: ProposalSubmissionReply | None = None) -> bool:
     """Append one Review page log line and change its mark. Returns False for an exact repeat."""
     reason = review_events.require_waiting_why(waiting_why) if change == ReviewMark.WAITING or waiting_why else ""
     with issue_lock(path):
@@ -196,26 +205,15 @@ def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, 
         issue = Issue(path, frontmatter(path))
         check_state()
         before = review_log(issue)
-        if isinstance(submission_reply, ProposalSubmissionReply):
-            origin = review_submission(issue)
-            key = submission_reply.key
-            if (proposal_owner(issue, issue.value("proposed_by")) != submission_reply.owner or issue.value(NUMBER_FIELD) != key.item_id
-                    or not isinstance(origin, new_item_dialog.ReviewSubmission) or origin.request_id != key.request_id):
-                raise new_item_dialog.SubmissionError("The selected Proposal changed.")
-            new_item_dialog.require_reply_token(origin, submission_reply.token)
-            latest = next((entry.words for entry in reversed(before)
-                           if entry.words.startswith(("Answer: ", "question: "))), "")
-            closed = review_is_done(issue)
-            repeated = not closed and isinstance(review_mark(issue), NoMark) and latest == words
-            if not repeated and not pending_review_reply(issue):
-                raise new_item_dialog.SubmissionError("This item no longer accepts this reply.")
-            if repeated:
-                return False
+        if submission_reply is not None:
             assert isinstance(words, str)
-            console_text.require(words.removeprefix("Answer: "), "reply", identity=f"{path}/{key.request_id}",
-                                 refusal=Refusal)
+            if _submission_reply_is_repeat(issue, submission_reply.key, words,
+                                           submission_reply.token, submission_reply.owner, before):
+                return False
+            if issue != submission_reply.selected:
+                raise new_item_dialog.SubmissionError("The selected Proposal changed.")
         lines_to_append = (words,) if isinstance(words, str) else words
-        if not isinstance(submission_reply, ProposalSubmissionReply) and issue.value("review_submission") and any(
+        if submission_reply is None and issue.value("review_submission") and any(
                 line.startswith("Answer: ") for line in lines_to_append):
             raise new_item_dialog.SubmissionError("Use the scoped reply from the Review item.")
         events = before
@@ -511,8 +509,22 @@ def file_review_proposal(folder: Path, recipient: staff.StaffId, title: str, wor
 
 def reply_to_submission(path: Path, key: new_item_dialog.ScopedSubmissionKey, words: str, token: str, *,
                         owner: staff.StaffId) -> bool:
-    return record_review(path, "Answer: " + words, NoMark(), datetime.now(user_zone()).date(), owner,
-                         submission_reply=ProposalSubmissionReply(owner, key, token))
+    return prepare_submission_reply(path, key, words, token, owner=owner)()
+
+
+def prepare_submission_reply(path: Path, key: new_item_dialog.ScopedSubmissionKey, words: str, token: str, *,
+                             owner: staff.StaffId) -> Callable[[], bool]:
+    """Review the reply and return a function that checks and saves it."""
+    selected = Issue(path, frontmatter(path))
+    reply = "Answer: " + words
+    if not _submission_reply_is_repeat(selected, key, reply, token, owner, review_log(selected)):
+        console_text.require(words, "reply", identity=f"{path}/{key.request_id}", refusal=Refusal)
+
+    def save() -> bool:
+        return record_review(path, reply, NoMark(), datetime.now(user_zone()).date(), owner,
+                             submission_reply=ProposalSubmissionReply(owner, key, token, selected))
+
+    return save
 
 
 def edit_rules(path: Path, urls: list[str], today: date) -> list[str]:

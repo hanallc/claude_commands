@@ -711,6 +711,57 @@ class ChangePageTests(unittest.TestCase):
             ]), 0)
         self.assertEqual(ssh.call_args.kwargs["timeout"], 143)
 
+    def test_native_review_replies_release_the_delivery_lock_and_recheck_the_question(self) -> None:
+        from scripts.production import investigation
+
+        report = investigation.file(self.unit.id, "Why did it stop?", "Find the cause.",
+                                    waiting_why="The owner must find the cause.")
+        keys = (self.file_user_question(), f"investigation/{report.owner}/{report.id}")
+        status = change_page.DeliveryStatus(self.root)
+        words = "The new layout is ready."
+        for key in keys:
+            with self.subTest(key=key):
+                item = next(item for item in review_items.read(self.root) if item.key == key)
+                followup = "Check the new layout."
+                if isinstance(item.source, review_items.QuestionSource):
+                    delivery, _ = review_actions.question_action(item, "question", followup, status)
+                else:
+                    delivery, _ = review_actions.investigation_action(item, "question", followup, status)
+                assert isinstance(delivery, change_page.MessageDelivery)
+                delivery = review_actions.track_question(delivery, key, followup, status)
+                change_page.deliver(delivery, status)
+                page, row = delivery.page, delivery.row
+                slots = status.slots(page, row)
+                assert isinstance(slots.question, change_page.OpenQuestion)
+                original = slots.question
+                source = page.review_list
+                before = source.read_bytes()
+
+                def read_draft(*_args: object, **_kwargs: object) -> review.QuestionAccepted:
+                    with (self.root / ".review-link-delivery.lock").open("r") as handle:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with status.locked():
+                        replacement = replace(original, question_id="replacement")
+                        status.write_slots(page, row, replace(slots, question=replacement))
+                    return review.QuestionAccepted(words)
+
+                with patch.object(review, "review_question", side_effect=read_draft) as reader:
+                    with self.assertRaisesRegex(question_record.AnswerRefused, "does not match"):
+                        _ = change_page.answer_item(key, words, original.question_id, status)
+                reader.assert_called_once()
+                self.assertEqual(source.read_bytes(), before)
+                self.assertEqual(status.slots(page, row).question, replace(original, question_id="replacement"))
+
+                with status.locked():
+                    status.write_slots(page, row, slots)
+                with patch.object(review, "review_question", return_value=review.QuestionAccepted(words)) as reader:
+                    self.assertTrue(change_page.answer_item(key, words, original.question_id, status))
+                    self.assertFalse(change_page.answer_item(key, words, original.question_id, status))
+                reader.assert_called_once()
+                self.assertIn(words, source.read_text())
+                self.assertEqual(status.slots(page, row).question,
+                                 change_page.AnsweredQuestion(original.question_id, original.text, words))
+
     def test_answer_question_keeps_internal_line_breaks_and_an_identical_rerun_changes_nothing(self) -> None:
         status = change_page.DeliveryStatus(self.root)
         question = status.ask(self.page, 'C1', 'Which steps?')

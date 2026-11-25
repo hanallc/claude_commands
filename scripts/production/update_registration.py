@@ -2409,21 +2409,29 @@ def _submission_reply_target(path: Path, key: new_item_dialog.ScopedSubmissionKe
 
 def reply_to_submission(path: Path, key: new_item_dialog.ScopedSubmissionKey, words: str, token: str, *,
                         owner: staff.StaffId) -> bool:
-    """Apply a reply to the current wait on a question sent by the user."""
+    """Review and save a reply to a question sent by the user."""
+    return prepare_submission_reply(path, key, words, token, owner=owner)()
+
+
+def prepare_submission_reply(path: Path, key: new_item_dialog.ScopedSubmissionKey, words: str, token: str, *,
+                             owner: staff.StaffId) -> Callable[[], bool]:
+    """Review the reply and return a function that checks and saves it."""
     selected, repeated = _submission_reply_target(path, key, words, token, owner)
-    if repeated:
-        return False
-    unavailable = review_console_reply(selected, words, key.request_id)
-    with (outstanding_lock(state_root() / "outstanding" / (owner + ".json")),
-          _question_number_lock(owner)):
-        current, repeated = _submission_reply_target(path, key, words, token, owner)
-        if repeated:
-            return False
-        if current != selected:
-            raise new_item_dialog.SubmissionError("The selected Question changed.")
-        record_followup_reply(current.item, words, current.owner, review_unavailable=unavailable)
-        write_question_record(current)
-        return True
+    unavailable = None if repeated else review_console_reply(selected, words, key.request_id)
+
+    def save() -> bool:
+        with (outstanding_lock(state_root() / "outstanding" / (owner + ".json")),
+              _question_number_lock(owner)):
+            current, same_answer = _submission_reply_target(path, key, words, token, owner)
+            if same_answer:
+                return False
+            if current != selected:
+                raise new_item_dialog.SubmissionError("The selected Question changed.")
+            record_followup_reply(current.item, words, current.owner, review_unavailable=unavailable)
+            write_question_record(current)
+            return True
+
+    return save
 
 
 def _native_reply_target(record: QuestionRecord, text: str, question_id: str
@@ -2442,19 +2450,28 @@ def _native_reply_target(record: QuestionRecord, text: str, question_id: str
 
 
 def reply_record(record: QuestionRecord, text: str, who: str, *, identities: QuestionStaff, question_id: str = '') -> None:
-    """Answer the exact record under its owner's lock and keep the answer in its log."""
+    """Review and save the reply to the selected question."""
+    prepare_reply_record(record, text, who, identities=identities, question_id=question_id)()
+
+
+def prepare_reply_record(record: QuestionRecord, text: str, who: str, *,
+                         identities: QuestionStaff, question_id: str = '') -> Callable[[], None]:
+    """Review the reply and return a function that checks and saves it."""
     if not text.strip():
         raise RegistrationFailure("reply", "the reply is empty")
     scope = question_scope(record.owner, identities.record)
     selected, exchange = _native_reply_target(record, text, question_id)
     unavailable = review_console_reply(selected, text, question_id)
-    with outstanding_lock(outstanding_path(scope)), _question_number_lock(record.owner):
-        current, current_exchange = _native_reply_target(record, text, question_id)
-        if (current, current_exchange) != (selected, exchange):
-            raise RegistrationFailure("reply", "The selected Question changed.")
-        record_followup_reply(current.item, text, who, review_unavailable=unavailable)
-        _ = _publish_question(current)
-    report("reply", "ok", f"{scope.name}: {current.item['text']}: back on the open-questions list with the reply")
+    def save() -> None:
+        with outstanding_lock(outstanding_path(scope)), _question_number_lock(record.owner):
+            current, current_exchange = _native_reply_target(record, text, question_id)
+            if (current, current_exchange) != (selected, exchange):
+                raise RegistrationFailure("reply", "The selected Question changed.")
+            record_followup_reply(current.item, text, who, review_unavailable=unavailable)
+            _ = _publish_question(current)
+        report("reply", "ok", f"{scope.name}: {current.item['text']}: back on the open-questions list with the reply")
+
+    return save
 
 
 def reply(production: QuestionScope, words: str | ByQuestionKey, text: str, *,

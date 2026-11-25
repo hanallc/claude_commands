@@ -3277,38 +3277,44 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
             row = source.record.id
         else:
             path, row = efficiency_reviews.path(source.path), decision_store.efficiency_identity(item)
-        page = status.metadata_page(ReviewPage(path, path.parent, (row,), ''))
-        row = page.rows[0]
-        if isinstance(source, (review_items.ProposalSource, review_items.EfficiencySource)):
-            slots = status.slots(page, row)
-            if not isinstance(slots.question, NoQuestion) or question_id:
-                if isinstance(status.question_for_reply(slots, question_id, words.strip()), AnsweredQuestion):
-                    return False
+        page = ReviewPage(path, path.parent, (row,), '')
+        text = words.strip()
+        slots = status.slots(page, row)
+        selected = slots.question
+        tracked = not isinstance(selected, NoQuestion) or bool(question_id)
+        if tracked and isinstance(status.question_for_reply(slots, question_id, text), AnsweredQuestion):
+            return False
+
+        save: Callable[[], object] | None = None
+        if isinstance(source, review_items.QuestionSource):
+            save = update_registration.prepare_reply_record(
+                source.record, words, who, identities=update_registration.QuestionStaff.read(), question_id=question_id)
+        elif isinstance(source, review_items.InvestigationSource):
+            save = investigation.prepare_answer(
+                source.record.owner, source.record.id, words, question_id=question_id)
+        else:
             console_text.require(words, "reply", identity=f"{path}/{row}/{question_id}",
                                  refusal=question_record.AnswerRefused)
+
         with status.locked():
             slots = status.slots(page, row)
-            tracked = not isinstance(slots.question, NoQuestion) or bool(question_id)
-            if tracked:
-                question = status.question_for_reply(slots, question_id, words.strip())
-                if isinstance(question, AnsweredQuestion):
-                    return False
-            if isinstance(source, review_items.QuestionSource):
-                identities = update_registration.QuestionStaff.read()
-                update_registration.reply_record(source.record,words,who,identities=identities,question_id=question_id)
-                changed = True
-            elif isinstance(source, review_items.InvestigationSource):
-                _ = investigation.answer(source.record.owner,source.record.id,words,question_id=question_id)
+            question = slots.question
+            if tracked and isinstance(status.question_for_reply(slots, question_id, text), AnsweredQuestion):
+                return False
+            if question != selected:
+                raise question_record.AnswerRefused("The current question changed.")
+            page = status.metadata_page(page)
+            if save is not None:
+                _ = save()
                 changed = True
             else:
                 try:
-                    changed = decision_store.answer(item,words,who)
+                    changed = decision_store.answer(item, words, who)
                 except decision_store.NoOpenQuestion as error:
                     raise question_record.AnswerRefused(str(error)) from error
-            if tracked:
-                question = slots.question
-                assert isinstance(question, OpenQuestion)
-                status.write_slots(page, row, replace(slots, question=AnsweredQuestion(question.question_id, question.text, words.strip())))
+            if isinstance(question, OpenQuestion):
+                status.write_slots(page, row, replace(slots, question=AnsweredQuestion(question.question_id,
+                                                                                       question.text, text)))
             return changed
     if isinstance(source,review_items.ChangeSource):
         assert isinstance(source.assignment.production,Path)

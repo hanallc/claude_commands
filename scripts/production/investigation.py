@@ -376,8 +376,14 @@ def file(owner: staff.StaffId, title: str, question: str, *, waiting_why: str = 
 
 def answer(owner: staff.StaffId, identity: str, text: str, *, question_id: str = '') -> Investigation:
     """Save an answer and refuse a stale Review exchange ID."""
-    item, _ = _answer(_store(owner), identity, text, question_id)
-    return item
+    return prepare_answer(owner, identity, text, question_id=question_id)()
+
+
+def prepare_answer(owner: staff.StaffId, identity: str, text: str, *,
+                   question_id: str = '') -> Callable[[], Investigation]:
+    """Review the answer and return a function that checks and saves it."""
+    save = _prepare_answer(_store(owner), identity, text, question_id)
+    return lambda: save()[0]
 
 
 @dataclass(frozen=True)
@@ -395,8 +401,14 @@ _NATIVE_REPLY = NativeReply()
 
 def answer_submission(path: Path, key: new_item_dialog.ScopedSubmissionKey, text: str, token: str, *,
                       owner: staff.StaffId) -> bool:
-    _, changed = _answer(_store(owner), key.item_id, text, "", SubmissionReply(key, token), source=path)
-    return changed
+    return prepare_submission_reply(path, key, text, token, owner=owner)()
+
+
+def prepare_submission_reply(path: Path, key: new_item_dialog.ScopedSubmissionKey, text: str, token: str, *,
+                             owner: staff.StaffId) -> Callable[[], bool]:
+    """Review the scoped reply and return a function that checks and saves it."""
+    save = _prepare_answer(_store(owner), key.item_id, text, "", SubmissionReply(key, token), source=path)
+    return lambda: save()[1]
 
 
 def _answer_target(store: Investigations, identity: str, text: str, question_id: str,
@@ -428,26 +440,30 @@ def _answer_target(store: Investigations, identity: str, text: str, question_id:
     return path, item, repeated
 
 
-def _answer(store: Investigations, identity: str, text: str, question_id: str,
-            reply: SubmissionReply | NativeReply = _NATIVE_REPLY, *, source: Path | None = None) -> tuple[Investigation, bool]:
+def _prepare_answer(store: Investigations, identity: str, text: str, question_id: str,
+                    reply: SubmissionReply | NativeReply = _NATIVE_REPLY, *,
+                    source: Path | None = None) -> Callable[[], tuple[Investigation, bool]]:
     if not text.strip():
         raise InvestigationError("answer must not be empty")
     selected_path, selected, repeated = _answer_target(store, identity, text, question_id, reply, source)
-    if repeated:
-        return selected, False
-    exchange = reply.key.request_id if isinstance(reply, SubmissionReply) else question_id
-    console_text.require(text, "investigation answer", identity=f"{selected_path}/{exchange}",
-                         refusal=InvestigationError)
-    with store.locked():
-        path, item, repeated = _answer_target(store, identity, text, question_id, reply, source)
-        if repeated:
-            return item, False
-        if (path, item) != (selected_path, selected):
-            raise InvestigationError("The selected investigation changed.")
-        item = replace(item, state=InvestigationState.ANSWER_READY, answered=_now(), answer=text,
-                       log=(*item.log, ReviewLog(datetime.now(timezone.utc), str(store.owner), "Answer: "+text)))
-        _ = _save(store, item, path)
-        return item, True
+    if not repeated:
+        exchange = reply.key.request_id if isinstance(reply, SubmissionReply) else question_id
+        console_text.require(text, "investigation answer", identity=f"{selected_path}/{exchange}",
+                             refusal=InvestigationError)
+
+    def save() -> tuple[Investigation, bool]:
+        with store.locked():
+            path, item, same_answer = _answer_target(store, identity, text, question_id, reply, source)
+            if same_answer:
+                return item, False
+            if (path, item) != (selected_path, selected):
+                raise InvestigationError("The selected investigation changed.")
+            item = replace(item, state=InvestigationState.ANSWER_READY, answered=_now(), answer=text,
+                           log=(*item.log, ReviewLog(datetime.now(timezone.utc), str(store.owner), "Answer: "+text)))
+            _ = _save(store, item, path)
+            return item, True
+
+    return save
 
 
 def mark_read(owner: staff.StaffId, identity: str, words: str = "", *,

@@ -999,6 +999,10 @@ The owner’s answer returns that item to Open.
 The answer stays in the item log.
 Owners use `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"` for all five types.
 The Console text check runs before the answer is saved.
+
+For native replies, the model reads the draft outside the delivery lock.
+For scoped replies, the model reads the draft outside the recipient and record locks.
+The writer checks the selected record again under the locks before it saves the reply.
 Questions and investigations use the check in their own writers.
 A failed draft leaves the question open and returns each rule and quote to the writer.
 The review log records the reason if the model is unavailable.

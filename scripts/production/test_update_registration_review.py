@@ -48,20 +48,20 @@ class RegistrationTests(RegistrationFixture):
             with self.assertRaisesRegex(registration.RegistrationFailure, "question held for review: Choose compiler: Which target"):
                 _ = self.run_questions(state)
         self.assertEqual([path.read_bytes() for path in (outstanding, history, pending)], before)
-        self.assertEqual(reviewer.call_args_list[0].args, (review.QuestionKey("example", "Retry build"), full))
-        accepted = "Build 42 failed on natedev.\nRetry (recommended) or stop?"
+        self.assertEqual(reviewer.call_args_list[0], mock.call(
+            review.QuestionKey("example", "Retry build"), "## Retry build\n\n" + full, console_kind="question"))
         with mock.patch.object(review, "review_question", side_effect=[
-                review.QuestionAccepted(accepted), review.QuestionAccepted("Use stable (recommended) or nightly?")]):
+                review.QuestionAccepted(full), review.QuestionAccepted("Use stable (recommended) or nightly?")]):
             output = self.run_questions(state)
-        self.assertIn("reviewed question: " + accepted, output)
+        self.assertIn("reviewed question: " + full, output)
         rows = self.open_rows()
         question = next(row for row in rows if row["text"] == "Retry build")
         self.assertEqual(question["question"], full)
-        self.assertEqual(question["reviewed"], accepted)
+        self.assertEqual(question["reviewed"], full)
         lines = [cast(dict[str, str], json.loads(line)) for line in history.read_text().splitlines()]
-        self.assertEqual(lines[1]["reviewed"], accepted)
+        self.assertEqual(lines[1]["reviewed"], full)
 
-    def test_question_rewrite_recheck_failure_keeps_registration_files_unchanged_and_revision(self) -> None:
+    def test_question_rewrite_holds_registration_files_unchanged_until_revision(self) -> None:
         outstanding = self.outstanding()
         _ = outstanding.write_text("[]")
         history = outstanding.with_suffix(".history.jsonl")
@@ -75,9 +75,8 @@ class RegistrationTests(RegistrationFixture):
         responses = iter([
             review.VerdictRecord(verdict="rewrite", title="", action=None, body=rewritten, questions=[],
                 failed_rules=[{"rule": "reader-starts-cold", "quote": original}]),
-            review.VerdictRecord(verdict="ask", title="", action=None, body=rewritten, questions=["Which machine?"],
-                failed_rules=[{"rule": "reader-starts-cold", "quote": "build 42"}]),
-            review.VerdictRecord(verdict="send", title="", action=None, body=original, questions=[], failed_rules=[])])
+            review.VerdictRecord(verdict="send", title="", action=None, body="## Retry build\n\n" + rewritten,
+                questions=[], failed_rules=[])])
         calls: list[tuple[list[str], float, dict[str, str]]] = []
         def runner(argv: list[str], *, timeout: float,
                    env: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -89,21 +88,25 @@ class RegistrationTests(RegistrationFixture):
             self.assertEqual(Path(argv[0]).name, "claude")
             return subprocess.CompletedProcess(argv, 0, json.dumps(next(responses)), "")
         real_review = review.review_question
-        def question_review(key: review.QuestionKey, question: str) -> review.QuestionOutcome:
-            return real_review(key, question, runner=runner)
+        def question_review(key: review.QuestionKey, question: str, *, console_kind: str) -> review.QuestionOutcome:
+            return real_review(key, question, runner=runner, console_kind=console_kind)
         with (mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.state / "notify")}),
               mock.patch.object(review, "GUIDE", self.root),
               mock.patch.object(review, "reviewer_environment", return_value=({}, "claude2")),
               mock.patch.object(review, "reviewer_binary", return_value=review.ResolvedReviewerBinary(self.root / "claude")),
               mock.patch.object(review, "review_question", side_effect=question_review)):
-            with self.assertRaisesRegex(registration.RegistrationFailure, "Which machine"):
+            with self.assertRaisesRegex(registration.RegistrationFailure, "reader-starts-cold: Retry it"):
                 _ = self.run_questions(state)
             self.assertEqual([path.read_bytes() for path in paths], before)
-            self.assertTrue((self.state / "notify/questions" / (review.QuestionKey("example", "Retry build").digest + ".json")).exists())
-            self.assertIn("reviewed question: " + original, self.run_questions(state))
+            hold = self.state / "notify/questions" / (review.QuestionKey("example", "Retry build").digest + ".json")
+            self.assertTrue(hold.exists())
+            state = self.question_state([{"text": "Retry build", "question": rewritten}])
+            self.assertIn("reviewed question: " + rewritten, self.run_questions(state))
+            self.assertFalse(hold.exists())
         prompts = [call[0][-1] for call in calls if Path(call[0][0]).name == "claude"]
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("Console text kind: question\nDraft:\n## Retry build\n\n" + original, prompts[0])
         self.assertIn("Revision: true", prompts[-1])
-        self.assertEqual(len(prompts), 3)
         self.assertTrue(all(0 < call[1] <= review.review_timeout_seconds() for call in calls))
 
     def test_later_registration_keeps_reviewed_and_unavailable_questions_and_recall_is_multiline(self) -> None:
@@ -144,19 +147,17 @@ class RegistrationTests(RegistrationFixture):
             assert isinstance(questions, list)
             self.assertIn(" ".join(full.split()), questions)
 
-    def test_blank_reviewer_rewrite_stores_original_as_review_unavailable(self) -> None:
+    def test_blank_reviewer_rewrite_holds_the_original_draft(self) -> None:
         question = "Retry build 42?"
         state = self.question_state([{"text": "Retry build", "question": question}])
         real_review = review.review_question
         for body in ("", " \n\t"):
             with self.subTest(body=body):
                 self.write_open_for("example")
-                decisions: list[review.VerdictRecord] = [
-                    review.VerdictRecord(verdict="rewrite", title="", action=None, body=body, questions=[],
-                        failed_rules=[{"rule": "reader-starts-cold", "quote": question}]),
-                    review.VerdictRecord(verdict="send", title="", action=None, body=body,
-                        questions=[], failed_rules=[])]
+                decision = review.VerdictRecord(verdict="rewrite", title="", action=None, body=body, questions=[],
+                    failed_rules=[{"rule": "reader-starts-cold", "quote": question}])
                 calls: list[tuple[list[str], float, dict[str, str]]] = []
+
                 def runner(argv: list[str], *, timeout: float,
                            env: dict[str, str]) -> subprocess.CompletedProcess[str]:
                     calls.append((argv.copy(), timeout, env.copy()))
@@ -165,24 +166,24 @@ class RegistrationTests(RegistrationFixture):
                     if argv[0] == "bash":
                         return subprocess.CompletedProcess(argv, 0, "agent=sonnet effort=high", "")
                     self.assertEqual(Path(argv[0]).name, "claude")
-                    return subprocess.CompletedProcess(argv, 0, json.dumps(decisions.pop(0)), "")
-                def question_review(key: review.QuestionKey, text: str) -> review.QuestionOutcome:
-                    return real_review(key, text, runner=runner)
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(decision), "")
+
+                def question_review(key: review.QuestionKey, text: str, *, console_kind: str) -> review.QuestionOutcome:
+                    return real_review(key, text, runner=runner, console_kind=console_kind)
+
                 with (mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.state / "notify")}),
                       mock.patch.object(review, "GUIDE", self.root),
                       mock.patch.object(review, "reviewer_environment", return_value=({}, "claude2")),
                       mock.patch.object(review, "reviewer_binary", return_value=review.ResolvedReviewerBinary(self.root / "claude")),
                       mock.patch.object(review, "review_question", side_effect=question_review)):
-                    output = self.run_questions(state)
+                    with self.assertRaisesRegex(registration.RegistrationFailure, "rewrite needs nonempty text"):
+                        _ = self.run_questions(state)
                 self.assertEqual(len([call for call in calls if Path(call[0][0]).name == "claude"]), 1)
-                rows = self.read_items()
-                self.assertEqual(len(rows), 1)
-                self.assertIsInstance(rows[0], registration.ReviewUnavailableOutstandingQuestion)
-                row = rows[0]
-                assert isinstance(row, registration.ReviewUnavailableOutstandingQuestion)
-                self.assertEqual(row.question, question)
-                self.assertIn("rewrite needs nonempty text", row.reason)
-                self.assertIn("reviewed question: " + question, output)
+                self.assertEqual(self.read_items(), [])
+                hold = self.state / "notify/questions" / (review.QuestionKey("example", "Retry build").digest + ".json")
+                saved = cast(review.QuestionHoldRecord, json.loads(hold.read_text()))
+                self.assertEqual(saved["question"], "## Retry build\n\n" + question)
+                self.assertIn("rewrite needs nonempty text", saved["details"])
 
     def test_reviewed_question_without_instance_does_not_create_a_timer_directory(self) -> None:
         question = "Retry build 42?"
@@ -204,7 +205,8 @@ class RegistrationTests(RegistrationFixture):
             "Reminder", "Reminder"])
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(first)) as reviewer:
             _ = self.run_questions(state)
-        reviewer.assert_called_once_with(review.QuestionKey("example", "Retry build"), first)
+        reviewer.assert_called_once_with(review.QuestionKey("example", "Retry build"), "## Retry build\n\n" + first,
+                                         console_kind="question")
         rows = self.open_rows()
         self.assertCountEqual([row["text"] for row in rows], ["Retry build", "Reminder"])
         question = next(row for row in rows if row["text"] == "Retry build")

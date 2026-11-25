@@ -282,14 +282,17 @@ class RegistrationTests(RegistrationFixture):
 
     def test_ask_files_a_units_question_with_its_review_and_shows_the_asker(self) -> None:
         full = "Keep the old key binding? Keep (recommended — users know it) or drop it."
-        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(full + " Reviewed.")):
-            printed = self.run_ask("alpha: keep the old key binding?", full, "alpha")
-        self.assertIn("filed question: " + full + " Reviewed.", printed)
+        title = "alpha: keep the old key binding?"
+        draft = f"## {title}\n\n{full}"
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(draft)) as reader:
+            printed = self.run_ask(title, full, "alpha")
+        reader.assert_called_once_with(review.QuestionKey("example", title), draft, console_kind="question")
+        self.assertIn("filed question: " + full + "\n", printed)
         self.assertNotIn("reviewed question:", printed)
         rows = self.open_rows()
         self.assertEqual([(row["text"], row["asked_by"], row["question"]) for row in rows],
                          [("alpha: keep the old key binding?", self.fixture_staff_id("alpha"), full)])
-        self.assertEqual(rows[0]["reviewed"], full + " Reviewed.")
+        self.assertEqual(rows[0]["reviewed"], full)
         history = self.outstanding().with_suffix(".history.jsonl").read_text()
         self.assertIn("alpha: keep the old key binding?", history)
         listed = self.open_lines()
