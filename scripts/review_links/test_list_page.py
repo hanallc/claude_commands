@@ -689,10 +689,14 @@ document.body.append(result);
   document.querySelector('[data-owner-new]').click();
   const includePage=dialog.querySelector('[name="include_page"]');
   if(includePage.checked) includePage.click();
-  await until(dialog,()=>dialog.querySelector('[name="recipient_id"]:checked'));
+  const producer=()=>[...dialog.querySelectorAll('[name="recipient_id"]')]
+   .find(input=>input.value===__PRODUCER__);
+  await until(dialog,producer);
   dialog.querySelector('[name="kind"][value="investigation"]').click();
   words.value=__WORDS__;
   words.dispatchEvent(new Event('input',{bubbles:true}));
+  if(!send.disabled) throw new Error('Send is available before a producer is selected.');
+  producer().click();
   let filed=false;
   document.addEventListener('review-item-created',()=>{filed=true;},{once:true});
   const settled=()=>filed || dialog.open && !error.hidden && !send.disabled;
@@ -711,7 +715,8 @@ document.body.append(result);
  }
  document.body.append(result);
 })();
-</script>""".replace("__WORDS__", json.dumps(words)).replace("__RETRY__", json.dumps(lose_reply))
+</script>""".replace("__PRODUCER__", json.dumps(MORTY.id)).replace(
+            "__WORDS__", json.dumps(words)).replace("__RETRY__", json.dumps(lose_reply))
 
         @final
         class Probe(serve.ReviewLinksHandler):
