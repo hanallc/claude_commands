@@ -1756,6 +1756,7 @@ background:var(--ink-2);border-radius:50%}
 }
 [data-list-count]{margin-bottom:8px;color:var(--ink-2);font-size:13px;text-align:right;overflow-wrap:anywhere}
 [data-linked-item]{margin-top:16px}
+[data-linked-item]:has([data-list-item][data-send-held]){display:none}
 [data-linked-item] h2{font-size:14px;margin:0 0 8px}
 [data-linked-item] th{padding:8px}
 .list-number-column{width:6%}
@@ -1851,7 +1852,7 @@ const searchFields=Object.entries(''' + json.dumps(SEARCH_FIELDS) + r''').map(([
 const deliveryParking=''' + json.dumps(the_list.ParkUntilDelivered.DELIVERED) + r''';
 const isParked=data=>data.parked==='true' || data.parked===deliveryParking;
 const chipFor=data=>{
- if(data.state==='Closed' || data.undoPending==='true') return;
+ if(data.state==='Closed' || data.undoPending==='true' || data.sendHeld!==undefined) return;
  const parked=isParked(data);
  return chipsByQueue[questionQueue(queuesByState[data.state],data.openAsk==='true' || data.unread==='true' && data.unreadAnswer==='true',
   parked,data.unreadDelivery==='true',data.openQuestion==='true')];
@@ -2269,7 +2270,7 @@ function bindFeedbackForm(form){
    let focusChoice;
    const trackFocus=event=>{if(event.target!==document.body) focusChoice=event.target;};
    if(hadFocus) document.addEventListener('focusin',trackFocus);
-   let saved=false,refused=false,retried=false,stale=false,focusParkedAfterClose=false,nextForm;
+   let saved=false,refused=false,retried=false,stale=false,focusParkedAfterClose=false,focusDraft=false,nextForm;
    const clearsUnread=action==='read' || usesWords,unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
    const releasesLink=action==='read' || parks || action==='remove' || (action==='unpark' && heldSave);
    let restoreLink;
@@ -2287,6 +2288,7 @@ function bindFeedbackForm(form){
     if(releasesLink) restoreLink=tableView.releaseLink(key);
     return tableView.startAction(item);
    });
+   const hold=holdCard(item,hidden=>{if(hidden) tableView.applyAction();});
    const hidUnread=clearsUnread && wasVisible && item.hidden;
    const showUnparkResult=result=>{
     const unparked=result.unpark_outcome==='cleared';
@@ -2299,7 +2301,7 @@ function bindFeedbackForm(form){
     const options={method:'POST',body:data,signal:parks ? listRequestSignal() : undefined};
     const receiver=action==='tell' ? attempt.recipientName : current.dataset.sendReceiver;
     const response=await (usesWords || heldSave
-     ? heldFetch(actionPath,options,saveAction ? null : receiver)
+     ? hold.post(actionPath,options,saveAction ? null : receiver)
      : fetch(actionPath,options));
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parks && action!=='remove'));
     if(!parks) saved=response.ok;
@@ -2325,6 +2327,7 @@ function bindFeedbackForm(form){
     saved=true;
     if(stale){
      if(tableView.openItem?.dataset.key===key) return;
+     hold.restore();
      tableView.preserveRecordRowTop(()=>{
       applySavedState(result,{metadataOnly:true});
       if(action==='unpark') showUnparkResult(result);
@@ -2334,6 +2337,7 @@ function bindFeedbackForm(form){
     }
     const closes=parks || action==='remove' || result.detail_closed;
     if(closes){
+     hold.restore();
      tableView.preserveRecordRowTop(()=>{
       nextForm=applySavedState(result,{keepDetailFocus:changesParking,hasDetail:true});
       closeSavedCard();
@@ -2358,6 +2362,7 @@ function bindFeedbackForm(form){
     stale=!tableView.currentItemRequest(request);
     if(stale) return;
     const hasDetail=typeof text==='string' && Boolean(revision);
+    hold.restore();
     tableView.preserveRecordRowTop(()=>{
      nextForm=applySavedState(result,{keepDetailFocus:changesParking,hasDetail});
      if(hasDetail){
@@ -2386,9 +2391,11 @@ function bindFeedbackForm(form){
     delete item.dataset.undoPending;
     // An undone send saved nothing, so the item returns to its state before Send and keeps the words.
     const undone=error instanceof SendUndone;
+    focusDraft=undone;
     if(undone) refused=true;
     if(saved){
      if(stale) return;
+     if(hold.restore()) tableView.applyAction();
      tableView.preserveRecordRowTop(()=>{
       if(parks || action==='remove'){
        if(action==='remove') closedKeys.add(key);
@@ -2414,6 +2421,7 @@ function bindFeedbackForm(form){
      // A failed read back after a retry does not show that the server refused the park.
      if(retried && !current) refused=false;
     }
+    hold.restore();
     tableView.preserveRecordRowTop(()=>{
      let restore=refused || releasesLink,confirmedByReadback=false;
      if(current){
@@ -2441,6 +2449,7 @@ function bindFeedbackForm(form){
     });
    }
    finally{
+    if(hold.restore()) tableView.applyAction();
     if(saved || refused) unconfirmed.delete(attempt);
     tableView.preserveRecordRowTop(()=>{
      setCardSubmitting(form,false,stale ? form : recordDetails(item));syncTell();
@@ -2473,6 +2482,11 @@ function bindFeedbackForm(form){
      if(listOwnsFocus() && document.activeElement===document.body && parkToggle.getClientRects().length && !parkToggle.disabled){
       parkToggle.focus({preventScroll:true});
      }
+    }
+    if(focusDraft && tableView.currentItemRequest(request)){
+     await tableView.rowSettled(item);
+     if(tableView.currentItemRequest(request))
+      recordDetails(item).querySelector('textarea[name="words"]')?.focus();
     }
     if(!stale && hadFocus && !item.hidden && document.activeElement===document.body)
      await tableView.rowSettled(item);
@@ -2718,6 +2732,10 @@ function showReviewCard(card){
  card.restoreHost=fitReviewDialog();
  reviewClose.disabled=card.frame.hasAttribute('data-saving');
  reviewDialog.showModal();
+ if(card.frame.hasAttribute('data-focus-review-draft')){
+  card.frame.removeAttribute('data-focus-review-draft');
+  card.frame.contentDocument?.querySelector('[data-review-form] textarea[name="feedback"]')?.focus();
+ }
 }
 function hideReviewCard(card){
  if(activeReview!==card) return;
@@ -2770,10 +2788,11 @@ document.addEventListener('click',event=>{
  const link=event.target instanceof Element && event.target.closest('a[data-list-review-card]');
  if(!link || event.defaultPrevented || event.button!==0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
  event.preventDefault();
- if(activeReview) return;
+ const href=link.href;
+ if(activeReview || [...reviewDialog.querySelectorAll('iframe[data-saving]')].some(frame=>frame.src===href)) return;
  const frame=document.createElement('iframe');
  frame.title='Review card';
- frame.src=link.href;
+ frame.src=href;
  const card={frame,link:reviewLinkPlace(link)};
  activeReview=card;
  frame.addEventListener('load',()=>{

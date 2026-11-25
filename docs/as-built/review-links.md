@@ -1380,6 +1380,7 @@ Expanding or collapsing a row preserves the table filters and sort order.
 A linked Review card opens over the expanded row.
 An answer that supports **Undo** closes the card at once.
 **Undo** or a failed answer reopens the card with its draft and the result message.
+**Undo** focuses the feedback field.
 A successful answer refreshes the List.
 The List shows the item count above the table.
 
@@ -2098,9 +2099,9 @@ The server checks the token.
 **Approved** needs no text. **Send Feedback** refuses empty text with **Enter feedback first.** and keeps the card.
 Feedback always means that the image is not approved, so the page has no separate **Not Approved** button.
 A card loaded before that change can still post `not approved`; the server refuses it with **Not Approved was removed. Use Send Feedback.**
-The browser shows the shared Undo toast while the server holds the send.
-Undo keeps the card and the typed words. The server saves no answer for an undone send.
-After the hold, the card fades when the server confirms the send.
+The card leaves the page when the shared Undo toast appears.
+**Undo** restores the card and focuses the feedback field with the typed words.
+The server saves no answer for an undone send.
 The page skips its refresh while a send runs.
 An image leaves the page while each open question has a live sender or confirmed acceptance.
 The page also hides an image while the server recovers its verified delivery on startup.
@@ -2683,16 +2684,19 @@ The stack scrolls when it would extend within 24 px of the top edge.
 The toast uses the console colors.
 The toast moves to the top open modal dialog, or to the page, so no dialog covers it or makes it inert.
 The toast stays clear for the first half of the time and then fades out. The bar becomes shorter over the full time.
+Images, Review, and List hide the item while the Undo toast is available.
 **Undo** posts `/send-hold/<id>/undo`. The server replaces the saved request with an undone mark and answers 200.
 A repeated Undo, after a lost answer, also gets 200.
 The page then shows "Undone. Edit and send again." and keeps the draft.
+**Undo** restores the item. If the item is still open, **Undo** focuses its editable draft field.
+A failed send restores the item and its draft with the failure message.
 The New item dialog and the linked Review card reopen with the draft.
 You can open a new draft or another linked card while a send waits.
 The List keeps a separate recovery slot for each unresolved draft in the browser tab.
 If the server confirms a linked card save and its response is unreadable, the List shows the refresh error.
 A successful List refresh clears the error.
 A change browser answer goes back in the list with an **Open it** button.
-Undo restores the Review or List row in the current sort order and keeps its draft.
+**Undo** restores the Review or List row in the current sort order.
 Undo after Unpark restores the row to Parked.
 Held Unpark hides a linked parked row during the hold. Undo restores the row and its link.
 Undo returns to a skipped question if the user stays at the next question.

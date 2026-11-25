@@ -630,7 +630,7 @@ function apply() {
 // One row for each run of shown images from the same owner; the row opens the first image of the run.
 function showGroups() {
   const rows = [];
-  list.querySelectorAll('article[data-owner]:not([hidden])').forEach(card => {
+  list.querySelectorAll('article[data-owner]:not([hidden],[data-send-held])').forEach(card => {
     const last = rows[rows.length - 1];
     if (last && last.owner === card.dataset.owner) { last.count++; return; }
     rows.push({owner: card.dataset.owner, card, count: 1});
@@ -803,9 +803,10 @@ async function submit(event) {
   if (!key) showActionFailure(status);
   saveDrafts();
   const card = form.closest('article');
+  const hold = holdCard(card, hidden => { if (hidden) apply(); });
   let postFailed = false, retryable = true;
   try {
-    const response = await heldFetch(location.pathname, {method: 'POST', body}, card.dataset.sendReceiver);
+    const response = await hold.post(location.pathname, {method: 'POST', body}, card.dataset.sendReceiver);
     if (!response.ok) {
       retryable = response.status >= 500;
       const reason = await response.json().then(body => body.reason, () => '');
@@ -833,9 +834,13 @@ async function submit(event) {
         notice.hidden = false;
       }
       if (request.key) state.attempts.delete(request.key);
-      await motion.removeCard(card, apply);
+      if (hold.restore()) {
+        card.remove();
+        apply();
+      } else await motion.removeCard(card, apply);
     }
   } catch (error) {
+    hold.restore();
     postFailed = true;
     const undone = error instanceof SendUndone;
     const message = undone ? error.message : 'Not sent: ' + error.message;
