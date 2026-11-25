@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Send roster groups a message, with one concurrent delivery per recipient.
 
-  broadcast.py [--here] --from NAME (--all TEXT | --showrunners TEXT | [--production SHOWRUNNER] --units TEXT |
+  broadcast.py [--here] --from NAME (--all TEXT | --producers TEXT | --showrunners TEXT | [--production SHOWRUNNER] --units TEXT |
                            --agents TEXT | [--of UNIT] --workers TEXT | --top-level TEXT)...
 
 Overlapping groups receive the text of the last selecting flag. The sender is
@@ -30,9 +30,10 @@ MESSAGE = Path(__file__).resolve().parent.parent / "message"
 from scripts.message import roster  # noqa: E402
 from scripts.lib import names as display_names  # noqa: E402
 from scripts.message import send_result, session_send, sessions
+from scripts.production import staff
 
 SEND = Path(os.environ.get("BROADCAST_SEND") or session_send.SEND_SCRIPT)
-USAGE = ("usage: broadcast.py [--here] --from <your session> (--all TEXT | --showrunners TEXT | [--production SHOWRUNNER] --units TEXT"
+USAGE = ("usage: broadcast.py [--here] --from <your session> (--all TEXT | --producers TEXT | --showrunners TEXT | [--production SHOWRUNNER] --units TEXT"
          + " | --agents TEXT | [--of UNIT] --workers TEXT | --top-level TEXT)...")
 # One relay peaked at 272 MB when measured (2026-10-07), so this many together hold about 6.5 GB.
 AT_ONCE = 24
@@ -41,6 +42,11 @@ AT_ONCE = 24
 @dataclass(frozen=True)
 class AllRoles:
     """Every role in the roster."""
+
+
+@dataclass(frozen=True)
+class Producers:
+    """Every producer in the roster."""
 
 
 @dataclass(frozen=True)
@@ -81,10 +87,10 @@ class TopLevel:
     """Claude sessions that receive top-level announcements."""
 
 
-BroadcastGroup = AllRoles | Showrunners | UnitDirectors | UnitsOfProduction | Agents | Workers | WorkersOfUnit | TopLevel
-Outcome = Literal["sent", "kept", "no live session", "NOT sent"]
+BroadcastGroup = AllRoles | Producers | Showrunners | UnitDirectors | UnitsOfProduction | Agents | Workers | WorkersOfUnit | TopLevel
+Outcome = Literal["sent", "kept", "held", "no live session", "NOT sent"]
 FLAGS: dict[str, BroadcastGroup] = {
-    "--all": AllRoles(), "--showrunners": Showrunners(), "--units": UnitDirectors(),
+    "--all": AllRoles(), "--producers": Producers(), "--showrunners": Showrunners(), "--units": UnitDirectors(),
     "--agents": Agents(), "--workers": Workers(), "--top-level": TopLevel(),
     # Internal replay spellings keep unscoped groups independent of earlier scopes.
     "--all-workers": Workers(),
@@ -122,10 +128,14 @@ def recipients() -> list[roster.RosterEntry]:
     return result.entries
 
 
-def selects(group: BroadcastGroup, entry: roster.RosterEntry) -> bool:
+def selects(group: BroadcastGroup, entry: roster.RosterEntry, producer_sessions: Collection[str] = ()) -> bool:
     match group:
         case AllRoles():
             return True
+        case Producers():
+            if isinstance(entry.thread, roster.CodexThread):
+                return entry.thread.thread_id in producer_sessions
+            return isinstance(entry.session, roster.ClaudeSession) and entry.session.session_id in producer_sessions
         case Showrunners():
             return entry.role == "showrunner"
         case UnitDirectors():
@@ -192,19 +202,26 @@ def _unreachable(entry: roster.RosterEntry, reach: roster.CannotReceiveMessages)
 
 def _broadcast(
     sender: str, texts: Mapping[BroadcastGroup, str], entries: Sequence[roster.RosterEntry],
-    scope: roster.RosterScope = roster.ALL_MACHINES,
+    scope: roster.RosterScope, producer_sessions: Collection[str],
 ) -> list[Delivery]:
     if not texts:
         return []
     last = ending(texts, scope)
-    chosen: list[tuple[roster.RosterEntry, str]] = []
+    chosen: list[tuple[roster.RosterEntry, str, bool]] = []
+    producer_addresses: set[str] = set()
     for entry in entries:
-        versions = [text for group, text in texts.items() if selects(group, entry)]
-        if versions:
-            chosen.append((entry, versions[-1]))
+        groups = [group for group in texts if selects(group, entry, producer_sessions)]
+        if not groups:
+            continue
+        is_producer = Producers() in groups
+        if is_producer and isinstance(entry.reach, roster.Messageable):
+            if entry.reach.address in producer_addresses:
+                continue
+            producer_addresses.add(entry.reach.address)
+        chosen.append((entry, texts[groups[-1]], is_producer))
 
-    def deliver(chosen_entry: tuple[roster.RosterEntry, str]) -> Delivery:
-        entry, text = chosen_entry
+    def deliver(chosen_entry: tuple[roster.RosterEntry, str, bool]) -> Delivery:
+        entry, text, is_producer = chosen_entry
         shown = roster.shown_name(entry)
         recipient = Recipient(shown.render(), shown.address)
         match entry.reach:
@@ -215,6 +232,8 @@ def _broadcast(
                     outcome, detail = _send(address, sender, f"{text}\n\n{last}", "--here")
                 except OSError as error:
                     return Delivery(recipient, "NOT sent", str(error))
+                if outcome == "kept" and is_producer:
+                    return Delivery(recipient, "held", detail)
                 return Delivery(recipient, outcome, detail)
 
     with ThreadPoolExecutor(max_workers=AT_ONCE) as pool:
@@ -283,6 +302,8 @@ def _production_group(target: str, entries: Sequence[roster.RosterEntry]) -> Uni
 
 
 def _group_name(group: BroadcastGroup) -> str:
+    if isinstance(group, Producers):
+        return "producers"
     loaded = display_names.runtime_names()
     if not isinstance(loaded, display_names.Names):
         return type(group).__name__
@@ -355,7 +376,7 @@ def _remote_broadcast(sender: str, texts: Mapping[BroadcastGroup, str]) -> list[
     deliveries: list[Delivery] = []
     for line in done.stdout.splitlines():
         status = line.partition(": ")[0].rpartition(" - ")[2]
-        outcome = cast(Outcome, status) if status in {"sent", "kept", "NOT sent", "no live session"} else "no live session"
+        outcome = cast(Outcome, status) if status in {"sent", "kept", "held", "NOT sent", "no live session"} else "no live session"
         deliveries.append(Delivery(PeerOutput(host, line), outcome, ""))
     for line in done.stderr.splitlines():
         deliveries.append(Delivery(PeerOutput(host, line), "no live session", ""))
@@ -374,12 +395,20 @@ def _orchestrate(
     peer_texts = _machine_texts(texts, here=False)
     candidates = [entry for entry in entries
                   if not roster.is_closed_worker(entry) and not roster.is_sender(entry, identity)]
+    deliveries: list[Delivery] = []
+    producer_sessions: frozenset[str] = frozenset()
     with ThreadPoolExecutor(max_workers=2) as pool:
         peer = (pool.submit(_remote_broadcast, sender, peer_texts)
                 if isinstance(scope, roster.AllMachines) and peer_texts else None)
-        deliveries = _broadcast(sender, here_texts, candidates, scope)
+        if Producers() in here_texts:
+            try:
+                producer_sessions = frozenset(row.current_session for row in staff.initial_snapshot().find(kind="producer"))
+            except staff.StaffUnreadable as error:
+                deliveries.append(Delivery(Recipient("producers"), "NOT sent", f"staff membership: {error}"))
+                del here_texts[Producers()]
+        deliveries.extend(_broadcast(sender, here_texts, candidates, scope, producer_sessions))
         for group in here_texts:
-            if not any(selects(group, entry) for entry in candidates):
+            if not any(selects(group, entry, producer_sessions) for entry in candidates):
                 deliveries.append(Delivery(GroupWithoutMembers(group), "no live session", ""))
         if peer is not None:
             deliveries.extend(peer.result())

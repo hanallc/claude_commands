@@ -11,8 +11,11 @@ Treat `$ARGUMENTS` as the user's message. Send it without changes. Show the comm
 
 `~/.claude/scripts/lib/py ~/.claude/scripts/production/broadcast.py --from <your session name> --all "From the user (via <your session name>): <message>"`
 
-It reaches every showrunner, unit director, Claude or Codex worker, and freestanding agent on both machines. Each is told everyone has it, so nobody passes it on.
+It reaches all roster groups on both machines, including producers. Each recipient sees who received the message and a request to keep it in that group.
 
-When part of the message does not concern one role, give that role its own version after `--all`, leaving out only that part: `--showrunners "<text>"`, `--units "<text>"` or `--agents "<text>"`.
+Put a role flag after `--all` to give a group its own version. Omit only the part that does not concern that group.
+Use `--showrunners "<text>"`, `--units "<text>"`, or `--agents "<text>"`.
 
 One session: `send.py --to <name>`, with `--machine <other machine>` on the other machine (/message). The user: /alert_user.
+
+`/producer:announce` reaches producers. `/showrunner:announce` reaches showrunners. `/unit:announce` reaches unit directors.
