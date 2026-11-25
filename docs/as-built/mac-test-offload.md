@@ -331,7 +331,8 @@ The message names the block, idle claim, free Mac, disk exclusion, or unreachabl
 It lists the waiting steps and their wait evidence.
 The views place the same `MAC IDLE` alert first.
 `MAC UNREACHABLE` shows the retry deadline while the connection backoff is active.
-After the deadline, the `failed_probe` mark keeps the alert visible.
+After the deadline, running Mac CI counts as work when eligible steps wait.
+The `failed_probe` mark keeps the alert visible when the watch finds no work.
 The line says that the last probe failed.
 `MAC IDLE WATCH` identifies unreadable or stale state.
 The unreachable state sends the message after `alert_seconds` while eligible steps wait.

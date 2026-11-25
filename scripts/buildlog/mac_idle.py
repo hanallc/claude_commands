@@ -324,19 +324,23 @@ def mac_work(paths: MacIdlePaths, now: float, *, waiting_for_mac: bool = False
             until = 0.0
         if not math.isfinite(until):
             return MacStateUnreadable("unreachable_until is not finite")
-        if until > now or (paths.mac_state / "failed_probe").exists():
+        if until > now:
             return MacUnreachable(until)
-        if not isinstance(block, mac_test.NoMacBlock):
-            return IdleReservation("blocked", block.holder, block.reason, block.delivery, live)
-        if live:
-            claim = live[0].record
-            holder = claim.get("holder_session", "")
-            delivery = mac_test.RecordedSession(holder, holder) if holder else mac_test.HolderQueue("unknown")
-            return IdleReservation("claim_idle", holder, claim["what"], delivery, live)
+        failed_probe = (paths.mac_state / "failed_probe").exists()
+        if not failed_probe:
+            if not isinstance(block, mac_test.NoMacBlock):
+                return IdleReservation("blocked", block.holder, block.reason, block.delivery, live)
+            if live:
+                claim = live[0].record
+                holder = claim.get("holder_session", "")
+                delivery = mac_test.RecordedSession(holder, holder) if holder else mac_test.HolderQueue("unknown")
+                return IdleReservation("claim_idle", holder, claim["what"], delivery, live)
         if waiting_for_mac:
             config = mac_test.read_config()
             if config.ci_repo and isinstance(mac_test.ci_activity(config), mac_test.CiMacJobRunning):
                 return NatedevJobOnMac()
+        if failed_probe:
+            return MacUnreachable(until)
         return FreeMac(sum(mac_test.run_is_kept(claim.record) for claim in claims))
     except (OSError, ValueError, UnicodeError) as error:
         return MacStateUnreadable(str(error))

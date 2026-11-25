@@ -414,6 +414,19 @@ done
 
         self.assertEqual(mac_idle.mac_work(self.paths, 1240), mac_idle.FreeMac(0))
 
+    def test_running_mac_ci_takes_precedence_over_a_failed_probe_after_backoff(self) -> None:
+        _ = (self.paths.mac_state / "failed_probe").write_text("failed\n")
+        _ = (self.paths.mac_state / "unreachable_until").write_text("1180\n")
+
+        with mock.patch.object(mac_test, "ci_activity", return_value=mac_test.CI_MAC_JOB_RUNNING) as ci:
+            self.assertEqual(mac_idle.mac_work(self.paths, 1179, waiting_for_mac=True),
+                             mac_idle.MacUnreachable(1180))
+            self.assertEqual(mac_idle.mac_work(self.paths, 1240), mac_idle.MacUnreachable(1180))
+            ci.assert_not_called()
+            self.assertIsInstance(mac_idle.mac_work(self.paths, 1240, waiting_for_mac=True),
+                                  mac_idle.NatedevJobOnMac)
+            ci.assert_called_once()
+
     def block(self, holder: str = "research", detail: str = "P15 F11 L0 run", *, terminal: bool = False) -> None:
         since = datetime.fromtimestamp(1000, timezone.utc)
         delivery = (mac_test.HolderQueue(holder) if terminal else
