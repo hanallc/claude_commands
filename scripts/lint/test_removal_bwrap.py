@@ -245,7 +245,7 @@ class RemovalProofTests(unittest.TestCase):
             self.assertRegex(preview.stdout, rf"{str(git_work)!r}\t[0-9]+\tholds Git work: the owner saves it,")
         self.assertIn(f"{model.parent.parent.as_posix()!r}\tunknown\tcontains a model folder", preview.stdout)
         self.assert_canaries(sandbox, (payload, *keep))
-        approval = preview.stdout.splitlines()[-1].removeprefix("Digest: ")
+        approval = next(line.removeprefix("Digest: ") for line in preview.stdout.splitlines() if line.startswith("Digest: "))
         refused = run_cleanup("--go", "0" * 64)
         self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
         self.assertIn("list digest changed", refused.stderr)
