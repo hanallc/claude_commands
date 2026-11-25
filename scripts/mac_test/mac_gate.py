@@ -12,6 +12,7 @@ import json
 import os
 import re
 from pathlib import Path
+import plistlib
 import select
 import shlex
 import signal
@@ -49,6 +50,7 @@ RESULT_PREFIX = 'mac_gate_result='
 CLEANUP_ERROR_PREFIX = 'mac_gate_cleanup_error='
 QUEUE_COMMAND = (sys.executable, str(Path(__file__).with_name('mac_queue_run.py')))
 MAC_TIME_LIMIT_S = 3600
+HDIUTIL_TIMEOUT_S = 20
 
 
 class CheckoutCleanup(StrEnum):
@@ -180,6 +182,58 @@ def release_gate_folder_lease(path: Path, retained: os.stat_result, owner_pid: i
                 del sidecars[name]
 
 
+def run_hdiutil(*arguments: str) -> bytes:
+    return subprocess.check_output(['/usr/bin/hdiutil', *arguments], stdin=subprocess.DEVNULL,
+                                   stderr=subprocess.PIPE, timeout=HDIUTIL_TIMEOUT_S)
+
+
+def attached_gate_images(folder: Path) -> list[dict[str, object]]:
+    reply = ledger.mapping(cast(object, plistlib.loads(run_hdiutil('info', '-plist'))))
+    images = reply.get('images')
+    if not isinstance(images, list):
+        raise ValueError('hdiutil returned no image list')
+    attached: list[dict[str, object]] = []
+    for entry in cast(list[object], images):
+        image = ledger.mapping(entry)
+        source = image.get('image-path')
+        if isinstance(source, str) and Path(source).is_absolute():
+            backing_file = Path(source).resolve()
+            if backing_file != folder and backing_file.is_relative_to(folder):
+                attached.append(image)
+    return attached
+
+
+def detach_gate_images(path: Path, retained: os.stat_result) -> bool:
+    """Detach the images stored in the retained gate folder."""
+    try:
+        if not stat.S_ISDIR(retained.st_mode) or not build_folders.may_remove_build_path(path):
+            return False
+        with build_folders.folder_removal_lease(path, wait=False, create=True, transient_lock=True) as lease:
+            if not isinstance(lease, build_folders.HeldFolderRemovalLease) or lease.folder != path:
+                return False
+            folder = path.resolve(strict=True)
+            if not os.path.samestat(retained, folder.lstat()):
+                return False
+            images = attached_gate_images(folder)
+            if not images:
+                return True
+            for image in images:
+                entities = image.get('system-entities')
+                if not isinstance(entities, list):
+                    continue
+                for entry in cast(list[object], entities):
+                    device = ledger.mapping(entry).get('dev-entry')
+                    if isinstance(device, str) and re.fullmatch(r'/dev/disk[0-9]+', device):
+                        if not os.path.samestat(retained, path.lstat()) or path.resolve() != folder:
+                            return False
+                        with suppress(OSError, subprocess.SubprocessError):
+                            _ = run_hdiutil('detach', '-force', device)
+                        break
+            return not attached_gate_images(folder)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return False
+
+
 def stop_guest(journal: Path, deadline: float, *, task_ended: bool = False) -> None:
     """Recover the guest's recorded resources or check the groups after task cleanup."""
     try:
@@ -224,7 +278,8 @@ def stop_guest(journal: Path, deadline: float, *, task_ended: bool = False) -> N
         except FileNotFoundError:
             retained = None
         with suppress(FileNotFoundError):
-            if not build_folders.remove_build_folder(path, wait=False, expected=retained):
+            detached = retained is None or sys.platform != 'darwin' or detach_gate_images(path, retained)
+            if not detached or not build_folders.remove_build_folder(path, wait=False, expected=retained):
                 if retained is not None:
                     release_gate_folder_lease(path, retained, owner_pid)
                 raise GateRefused(f'The Mac kept its gate folder {path}')
@@ -532,6 +587,8 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
                cancellation: gate.MacGateCancellation | UseCallerProcessLifetime,
                ) -> MacGateResult | str:
     """Wait for a Mac placement in queue order and run the assigned modules."""
+    from scripts.mac_test.mac_transport import MAC_GATE_EXIT_STATUS_FD
+
     try:
         repo = repo.resolve()
         with ExitStack() as cleanup:
@@ -560,9 +617,12 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
             command[2:2] = ['--caller-fd', str(caller)]
             if cancelled.poll(0):
                 return 'The Mac gate was cancelled'
+            guest_status = cleanup.enter_context(tempfile.TemporaryFile())
+            status_fd = guest_status.fileno()
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                        text=True, encoding='utf-8', errors='replace', start_new_session=True,
-                                       pass_fds=(caller,))
+                                       env={**os.environ, MAC_GATE_EXIT_STATUS_FD: str(status_fd)},
+                                       pass_fds=(caller, status_fd))
             with process:
                 try:
                     output, _ = process.communicate(timeout=MAC_TIME_LIMIT_S)
@@ -575,7 +635,8 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
             status = process.returncode
             assert status is not None
             cleanup_error = queue_cleanup_error(lines, folder)
-            if was_cancelled or (status and not (cleanup_error and 'mac_exit=0' in lines)):
+            _ = guest_status.seek(0)
+            if was_cancelled or (status and not (cleanup_error and guest_status.read() == b'0\n')):
                 return queue_failure(lines, folder, status, cancelled=was_cancelled)
             results = [line.removeprefix(RESULT_PREFIX) for line in lines if line.startswith(RESULT_PREFIX)]
             if len(results) != 1:
