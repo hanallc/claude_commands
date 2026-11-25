@@ -56,7 +56,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.addCleanup(self.end_group, command)
         send_process_group(command, signal.SIGTERM)
         try:
-            output, errors = process.communicate(timeout=5)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         except subprocess.TimeoutExpired:
             surviving: list[dict[str, object]] = []
             for group in sorted(self.started_groups):
@@ -72,7 +72,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
                       + json.dumps(surviving) + "\n" + saved + "\n" + log)
         # The supervisor is outside the command group: it records the status and delivers the result.
         self.assertEqual(process.returncode, 0, output + errors)
-        self.wait_for_group_exit(command, timeout=5)
+        self.wait_for_group_exit(command)
         record = cast(CompletedLintRun, json.loads((self.control / "lint-run.json").read_text()))
         log = (self.control / "lint-run.log").read_text()
         self.assertEqual((record["status"], record["exit_code"]), ("finished", 143), log)
@@ -101,11 +101,11 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
                 self.assert_resources_held()
                 send_process_group(process.pid, signal.SIGTERM)
                 try:
-                    output, errors = process.communicate(timeout=5)
+                    output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 except subprocess.TimeoutExpired:
                     self.fail(f"lint {stage} did not stop after the group received SIGTERM")
                 self.assertEqual(process.returncode, 143, output + errors)
-                self.wait_for_group_exit(process.pid, timeout=5)
+                self.wait_for_group_exit(process.pid)
                 self.assert_resources_released()
                 self.assert_no_cache_verdict()
 
@@ -121,10 +121,13 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.started_groups.add(command)
         self.addCleanup(self.end_group, command)
         send_process_group(command, signal.SIGTERM)
-        wait_until((self.control / "cleanup-started").exists, self.control, timeout=5)
+        self.wait_for_cleanup()
         # The supervisor dies while verify cleans up, so the reaper must wait for the command group.
         send_process_group(process.pid, signal.SIGTERM)
-        output, errors = process.communicate(timeout=5)
+        try:
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        except subprocess.TimeoutExpired:
+            self.fail("The lint supervisor did not exit after SIGTERM.")
         self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
         path = self.control / "lint-run.json"
         with (patch.object(detached_runs, "_runs_dir", return_value=self.control),
@@ -136,7 +139,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
             self.assertNotIn("exit_code", pending)
             delivery.assert_not_called()
             _ = release.touch()
-            self.wait_for_group_exit(command, timeout=5)
+            self.wait_for_group_exit(command)
             self.assert_resources_released()
             self.assert_no_cache_verdict()
             self.assertEqual(detached_runs.reap_orphans(str(self.board)), ["lint-run"])
@@ -165,6 +168,12 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
             + '    esac\n'
             + 'fi\nexec ' + shlex.quote(real_move) + ' "$@"\n')
 
+    def wait_for_cleanup(self, *processes: subprocess.Popen[str]) -> None:
+        try:
+            wait_until((self.control / "cleanup-started").exists, self.control, processes=processes)
+        except TimeoutError:
+            self.fail("The lint fixture did not publish cleanup-started.")
+
     def test_second_term_during_cleanup_removes_the_step_record(self) -> None:
         self.pause_state_move()
         process = self.start_verify("lint", TEST_BLOCK_STAGE="mend")
@@ -172,13 +181,15 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.assert_resources_held()
         _ = (self.control / "cleanup-armed").touch()
         process.send_signal(signal.SIGTERM)
-        wait_until((self.control / "cleanup-started").exists, self.control, timeout=5,
-                   processes=(process,))
+        self.wait_for_cleanup(process)
         process.send_signal(signal.SIGTERM)
         _ = (self.control / "cleanup-release").touch()
-        output, errors = process.communicate(timeout=5)
+        try:
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        except subprocess.TimeoutExpired:
+            self.fail("Lint did not exit after the second SIGTERM and the cleanup release.")
         self.assertEqual(process.returncode, 143, output + errors)
-        self.wait_for_group_exit(process.pid, timeout=5)
+        self.wait_for_group_exit(process.pid)
         self.assert_resources_released()
         self.assert_no_cache_verdict()
 
@@ -194,7 +205,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         _ = release.touch()
         output, errors = process.communicate(timeout=10)
         self.assertEqual(process.returncode, 143, output + errors)
-        self.wait_for_group_exit(process.pid, timeout=5)
+        self.wait_for_group_exit(process.pid)
         records = self.root / "verify-steps"
         self.assertEqual(list(records.glob("*.json")), [])
         self.assertEqual(list(records.glob("*.state")), [])
