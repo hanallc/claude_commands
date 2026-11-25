@@ -1697,8 +1697,11 @@ runpy.run_path(str(script), run_name='__main__')
         # also when the screen shows a description or the outside warning.
         for pane in ("", BASH_PROMPT, OUTSIDE_PROMPT):
             self.assertEqual(stall_watch.prompt_request(pane, call), "run rm -f b1e4yc8b9.txt")
-        edit = stall_watch.PendingTool("toolu_1", "Edit", {"file_path": "/home/natepiano/rust/x/src/panes.py"}, START)
-        self.assertEqual(stall_watch.prompt_request("", edit), "edit panes.py")
+        for path, request in (("/home/natepiano/rust/x/src/panes.py", "edit panes.py"),
+                              ("/home/natepiano/rust/x/src/line\nbreak.py", "edit line break.py")):
+            with self.subTest(path=path):
+                edit = stall_watch.PendingTool("toolu_1", "Edit", {"file_path": path}, START)
+                self.assertEqual(stall_watch.prompt_request("", edit), request)
         # A tool the transcript cannot word falls back to the prompt on screen.
         other = stall_watch.PendingTool("toolu_1", "WebFetch", {"url": "https://example.com"}, START)
         self.assertEqual(stall_watch.prompt_request(EDIT_PROMPT, other), "edit panes.py")
@@ -1964,10 +1967,18 @@ runpy.run_path(str(script), run_name='__main__')
         self.assertEqual(stall_watch.prompt_request(BASH_PROMPT, pending), "run cargo build -p cargo-handler")
         long = stall_watch.PendingTool("x", "Bash", {"command": "echo " + "y" * 120}, START)
         self.assertEqual(stall_watch.prompt_request("", long), "run echo " + "y" * 84 + "…")
-        rendered = push_texts.render(stall_watch.PROMPT_TEXT_ID, unit="handler", machine="natedev",
-                                     since="09:01 AST", request="run cargo build -p cargo-handler")
-        self.assertEqual(rendered.body, "handler asks to run cargo build -p cargo-handler. It has waited since 09:01 AST."
-                         + "\n\nYes: it does that and goes on.\n\nNo: it does not, and asks you what to do instead.")
+        for unit, title in (("handler", "handler is stuck at a permission prompt"),
+                            ("cargo-handler", "cargo-handler stuck at a permission prompt"),
+                            ("cargo-handler-worker", "cargo-handler-… stuck at a permission prompt")):
+            with self.subTest(unit=unit):
+                rendered = push_texts.render(stall_watch.PROMPT_TEXT_ID, unit=unit, machine="natedev",
+                                             since="09:01 AST", request="run cargo build -p cargo-handler")
+                self.assertEqual(rendered.title, title)
+                self.assertLessEqual(len(rendered.title), 44)
+                self.assertEqual(rendered.body, "It asks to run cargo build -p cargo-handler.")
+                self.assertEqual(rendered.message, f"Session: {unit}\n"
+                                 + f"Action: On natedev, open the {unit} herdr tab and answer its prompt\n"
+                                 + "It asks to run cargo build -p cargo-handler.")
 
     def test_blocked_turn_end_waits_for_a_new_unblocked_status(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)

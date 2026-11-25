@@ -17,6 +17,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.lib import conf
+from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff
@@ -331,11 +332,8 @@ class PageStatusTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the Builds paused badge.")
     def test_builds_paused_badge_matches_main_and_stays_visible(self) -> None:
         from scripts.build_queue import memory_feed
-        from scripts.review_links import console_theme
 
-        source = console_theme.with_theme((SCRIPTS / "build_queue" / "memory_live.html").read_text(encoding="utf-8"))
-        page = (page_frame.template(source, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", "15")
-                .replace("__BUILD_LIMIT_ICONS__", json.dumps(memory_feed.build_limit_icons())))
+        page = memory_feed.page_document(15)
         markup = page_frame.with_owner(page.encode(), "builds", PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)), lambda: "")
         # The page stays paused, so the status line does not stick and nothing moves.
         paused = (b'<script>document.addEventListener("DOMContentLoaded",()=>setPaused(true));</script>'
@@ -584,11 +582,11 @@ def firefox_screenshot(page: bytes, width: int, height: int) -> bytes:
         (root / "profile").mkdir()
         document = root / "page.html"
         _ = document.write_bytes(page)
-        run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(root / "profile"),
-                              "--window-size", f"{width},{height}", "--screenshot", str(root / "page.png"),
-                              document.as_uri()],
-                             capture_output=True, text=True, timeout=45,
-                             env={**os.environ, "MOZ_HEADLESS_WIDTH": str(width), "MOZ_HEADLESS_HEIGHT": str(height)})
+        run = run_process_group(["firefox", "--headless", "--no-remote", "--profile", str(root / "profile"),
+                                 "--window-size", f"{width},{height}", "--screenshot", str(root / "page.png"),
+                                 document.as_uri()],
+                                timeout=45,
+                                env={**os.environ, "MOZ_HEADLESS_WIDTH": str(width), "MOZ_HEADLESS_HEIGHT": str(height)})
         if run.returncode:
             raise AssertionError(run.stderr)
         return (root / "page.png").read_bytes()
@@ -887,22 +885,17 @@ class PageWindowTests(unittest.TestCase):
   check(copy!==null && dialog.contains(copy),'The New item button over New item belongs to its window.');
   await painted();
   check(dialog.open && dialog.matches(':modal') && onTop(dialog),'A second press keeps New item open on top.');
-  const words=dialog.querySelector('textarea[name="words"]'),done=dialog.querySelector('[data-done]');
+  const words=dialog.querySelector('textarea[name="words"]');
   check(document.activeElement===words,'A second press moves the focus to the words box.');
   words.value='A saved item.';
   words.dispatchEvent(new Event('input',{bubbles:true}));
   const send=dialog.querySelector('[type="submit"]');
   await until(()=>!send.disabled,'Send');
+  let saved;
+  dialog.addEventListener('review-item-created',event=>{saved=event.detail.id;},{once:true});
   send.click();
-  await until(()=>dialog.querySelector('#new-item-saved').textContent==='Saved Q7.' && !words.checkVisibility(),
-   'the Saved state');
-  check(pressNewItem('over the saved item')!==null,'The press reaches New item in the Saved state.');
-  await painted();
-  check(dialog.open && document.activeElement===done,'In the Saved state a press moves the focus to Done.');
-  check(dialog.getBoundingClientRect().top>=actionsBottom(),'New item starts below the action area.');
-  dialog.querySelector('[data-cancel]').click();
-  await painted();
-  check(!dialog.open && !document.querySelector('[data-page-window-actions]'),'Closing New item removes the copy.');
+  await until(()=>saved==='Q7','the saved item ID');
+  check(!dialog.open && !document.querySelector('[data-page-window-actions]'),'Send closes New item and removes the copy.');
   check(document.activeElement===document.querySelector('[data-page-actions] [data-owner-new]'),
    'Focus returns to the New item button on the page.');
   // On a phone, New item is taller than the view. It stays centered, and its height clears the copy.
@@ -918,6 +911,7 @@ class PageWindowTests(unittest.TestCase):
    'At 390 px New item stays centered below the action area.');
   // A picture load or a resize measures New item again. The measure keeps the scroll of its body.
   const body=dialog.querySelector('.new-item-body');
+  words.style.minHeight='1000px';
   body.scrollTop=1e4;
   await painted();
   const end=body.scrollTop;

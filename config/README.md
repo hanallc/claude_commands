@@ -960,7 +960,8 @@ The command includes configured types and the r7a.8xlarge, m8a.8xlarge, and c8a.
 `remove-images` changes the home image and keeps regional stacks and copied images.
 
 The gate uses `gate` and `test-affected` as step names.
-`gate.py --affected` runs the affected modules.
+`gate.py --affected` requires the prepared handoff from `copies.py run`.
+It runs the affected modules in that copy.
 `build_steps.conf` defines `names.gate`, `names.test-affected`, and `prose.gate`.
 `build_admission.conf` defines `program_first_peak_gib.gate` and `program_first_peak_gib.test-affected`.
 It also defines `peak_hold_seconds.gate` and `peak_hold_seconds.test-affected`.

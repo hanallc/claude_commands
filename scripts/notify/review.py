@@ -1316,7 +1316,7 @@ def best_version(draft: Draft, outcome: ReviewOutcome) -> Draft:
     return draft
 
 
-def print_review(draft: Draft, outcome: ReviewOutcome, stamp: str = "") -> None:
+def print_review(draft: Draft, outcome: ReviewOutcome, stamp: str = "", *, header: bool = True) -> None:
     verdict = "send"
     failed: list[str] = []
     if isinstance(outcome, Unreviewed):
@@ -1332,9 +1332,12 @@ def print_review(draft: Draft, outcome: ReviewOutcome, stamp: str = "") -> None:
         verdict, failed = "withhold", outcome.failed_rules
     version = best_version(draft, outcome)
     print(f"{stamp + ' ' if stamp else ''}{verdict}; failed rules: {', '.join(failed) or 'none'}")
-    print(version.title)
-    print(first_line(version.action, version.session))
-    print(version.body)
+    if version.title:
+        print(version.title)
+    if header:
+        print(first_line(version.action, version.session))
+    if version.body:
+        print(version.body)
     if isinstance(outcome, (Rewritten, Questions, Unreviewed, Failed, Withheld)):
         for failure in outcome.failures:
             print("failure: " + json.dumps({"rule": failure.rule, "quote": failure.quote}))
@@ -1586,7 +1589,7 @@ def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_
             if timeout_seconds is None:
                 timeout_seconds = review_timeout_seconds()
             outcome = _review(draft, False, runner, timeout_seconds=timeout_seconds, check_template_fit=False)
-            print_review(draft, outcome, f"{entry.id}/{example.name}")
+            print_review(draft, outcome, f"{entry.id}/{example.name}", header=rendered.header and not rendered.one_line)
             log_review(draft, outcome, dry=True, text_id=entry.id)
             passed = isinstance(outcome, Approved) and outcome.draft == draft
             failed |= not passed

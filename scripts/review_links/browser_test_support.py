@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import tempfile
 import threading
 import unittest
@@ -16,6 +15,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.lib import conf
+from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.review_links import console
@@ -54,7 +54,8 @@ def status_configuration() -> Generator[None]:
             yield
 
 
-def firefox_probe_results(page: bytes) -> list[list[str]]:
+def firefox_probe_results(page: bytes, *, window_size: tuple[int, int] | None = None,
+                          dark: bool = False) -> list[list[str]]:
     """Load the page in a headless Firefox frame and return the failure lists its probe posts."""
     results: list[list[str]] = []
     complete = threading.Event()
@@ -88,9 +89,17 @@ def firefox_probe_results(page: bytes) -> list[list[str]]:
         try:
             profile = Path(temporary) / "profile"
             profile.mkdir()
-            run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                                  "--screenshot", str(Path(temporary) / "page.png"), f"http://127.0.0.1:{server.server_port}/"],
-                                 capture_output=True, text=True, timeout=45)
+            options: list[str] = []
+            environment = os.environ.copy()
+            if window_size is not None:
+                width, height = window_size
+                options.extend(("--window-size", f"{width},{height}"))
+                environment.update(MOZ_HEADLESS_WIDTH=str(width), MOZ_HEADLESS_HEIGHT=str(height))
+            if dark:
+                _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
+            run = run_process_group(["firefox", "--headless", "--no-remote", "--profile", str(profile), *options,
+                                     "--screenshot", str(Path(temporary) / "page.png"), f"http://127.0.0.1:{server.server_port}/"],
+                                    timeout=45, env=environment)
             if run.returncode:
                 raise AssertionError(run.stderr)
         finally:
@@ -380,11 +389,11 @@ window.fetch=async(url,options={})=>{
         try:
             profile = Path(temporary) / 'profile'
             profile.mkdir()
-            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                                   '--window-size', '1600,900',
-                                   '--screenshot', str(Path(temporary) / 'page.png'),
-                                   f'http://127.0.0.1:{server.server_port}/?page={identity}'],
-                                  capture_output=True, text=True, timeout=45)
+            done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                                      '--window-size', '1600,900',
+                                      '--screenshot', str(Path(temporary) / 'page.png'),
+                                      f'http://127.0.0.1:{server.server_port}/?page={identity}'],
+                                     timeout=45)
             case.assertEqual(done.returncode, 0, done.stderr)
         finally:
             server.shutdown()

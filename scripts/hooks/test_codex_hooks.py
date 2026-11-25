@@ -317,13 +317,7 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertIn('\n  "hooks":', self.hooks_file.read_text())
         calls = self.calls()
         self.assertEqual([call["method"] for call in calls],
-                         ["initialize", "hooks/list", "config/batchWrite", "hooks/list",
-                          "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
-                          "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
-                          "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
-                          "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
-                          "config/batchWrite", "hooks/list", "config/batchWrite", "hooks/list",
-                          "config/batchWrite", "hooks/list"])
+                         ["initialize", "hooks/list"] + ["config/batchWrite", "hooks/list"] * 12)
         initialize = cast(dict[str, object], calls[0]["params"])
         client = cast(dict[str, object], initialize["clientInfo"])
         capabilities = cast(dict[str, object], initialize["capabilities"])
@@ -347,8 +341,12 @@ class CodexHookInstallerTests(unittest.TestCase):
         self.assertEqual(self.groups("SubagentStart"), [STE_GROUP])
         self.assertEqual(self.groups("PreCompact"), [COMPACTION_GROUP])
         self.assertIn(f"compaction-marker codex hook: trusted {self.hooks_file}:pre_compact:0:0", result.stdout)
+        self.assertEqual(self.groups("UserPromptSubmit"), [CLEAR_TURN_GROUP])
+        self.assertIn(f"compaction-clear-turn codex hook: trusted {self.hooks_file}:user_prompt_submit:0:0", result.stdout)
+        prompt_handlers = [entry for entry in self.listed_handlers() if entry["eventName"] == "userPromptSubmit"]
+        self.assertEqual([(entry["matcher"], entry["trustStatus"], entry["enabled"]) for entry in prompt_handlers],
+                         [(None, "trusted", True)])
         for event, listed_event, group, name, key, matcher in (
-            ("UserPromptSubmit", "userPromptSubmit", CLEAR_TURN_GROUP, "compaction-clear-turn", "user_prompt_submit", None),
             ("PostCompact", "postCompact", CLEAR_END_GROUP, "compaction-clear-end", "post_compact", "*"),
             ("Stop", "stop", TURN_END_GROUP, "turn-end", "stop", None),
         ):
@@ -895,7 +893,8 @@ class CodexHookInstallerTests(unittest.TestCase):
                           "build-hold-guard codex hook: absent", "ste codex hook: absent",
                           "ste-subagent codex hook: absent", "queue-start codex hook: absent",
                           "queue-tools codex hook: absent", "compaction-marker codex hook: absent",
-                          "compaction-clear-turn codex hook: absent", "compaction-clear-end codex hook: absent",
+                          "compaction-clear-turn codex hook: absent",
+                          "compaction-clear-end codex hook: absent",
                           "turn-end codex hook: absent"])
 
     def test_check_reports_absent_untrusted_modified_and_disabled(self) -> None:

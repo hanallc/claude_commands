@@ -249,6 +249,10 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
         "Bound the process walk that collects memory readings.",
     ),
     InternalLiteral(
+        "scripts/build_queue/progress_profile.py", "_LOG_CHUNK_BYTES",
+        "Read a progress log in fixed chunks.",
+    ),
+    InternalLiteral(
         "scripts/buildlog/index.py", "MARK_BYTES",
         "Use a fixed sample to identify an unchanged log prefix.",
     ),
@@ -430,7 +434,6 @@ KEY_FORM_KEYS: tuple[KeyException, ...] = tuple(
             "prefixes.verify-hold",
             "prefixes.verify-tree",
             "slots.Nates-MacBook-Pro-2023.cargo-liner.max",
-            "slots.natedev.cargo-liner.max",
         )),
         ("build_steps", "The build steps use hyphenated step names.", ExceptionLifetime.PERMANENT, (
             "about.between-steps",
@@ -456,7 +459,6 @@ KEY_FORM_KEYS: tuple[KeyException, ...] = tuple(
             "about.compiler-cache",
             "about.gate-job",
             "about.mac-unavailable",
-            "about.repository-slot",
             "about.test-affected",
             "about.test-all",
             "about.test-modules",
@@ -664,10 +666,4 @@ COMMENT_LIMIT_FILES: tuple[FileException, ...] = tuple(
     )
 )
 
-BLANK_LINE_FILES: tuple[FileException, ...] = (
-    FileException(
-        "config/the_list.conf",
-        "Item 229 and listadd change this file.",
-        RemoveInPhase("Production and direct literals to config"),
-    ),
-)
+BLANK_LINE_FILES: tuple[FileException, ...] = ()

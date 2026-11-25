@@ -22,15 +22,16 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lib import conf
 from scripts.notify import pushover
 from scripts.notify import review
 from scripts.notify import push_texts
 from scripts.notify import push_reference
-from scripts.production import review_regime
 from scripts.notify import silence
 from scripts.notify.test_review import FakeReviewer, verdict, with_footer
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,
                          NoActionRequired, SessionLine, NO_SESSION_LINE, split_session, first_line, parse_user_action, refused_at)
+from scripts.whoami import agent_accounts
 
 REAL_REVIEW = review.review
 REAL_PARENT_SOURCE = pushover.parent_source
@@ -265,8 +266,16 @@ class PushoverTests(unittest.TestCase):
             read.assert_not_called()
 
     def test_kept_questions_drop_closed_and_reopened_but_post_open_or_unreadable_records(self) -> None:
-        for status in ("closed", "reopened", "open", "missing", "unreadable"):
-            with self.subTest(status=status):
+        cases = (
+            ("closed", False),
+            ("closed", True),
+            ("reopened", False),
+            ("open", False),
+            ("missing", False),
+            ("unreadable", False),
+        )
+        for status, keep_notice in cases:
+            with self.subTest(status=status, keep_notice=keep_notice):
                 path = self.keys.parent / "question-release.md"
                 since = "2026-11-03T12:01" if status == "reopened" else "2026-11-03T12:00"
                 _ = path.write_text("---\nrecord_type: question\nstatus: " + ("closed" if status == "closed" else "open")
@@ -283,13 +292,24 @@ class PushoverTests(unittest.TestCase):
                     posted.append(data)
                     return 200, b'{"status":1}'
                 self.silence_on()
+                if keep_notice:
+                    notice: silence.KeptPush = {
+                        "source": "hana", "priority": "0", "title": "Build done", "message": "The build passed.",
+                        "detail": "", "key": "build-done", "text_id": "",
+                    }
+                    self.assertIsInstance(silence.keep_here(notice), silence.Kept)
                 self.assertIsInstance(silence.keep_here(push), silence.Kept)
                 with redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(silence.off(lambda _argv: 0, lambda kept: pushover.post_kept(kept, self.keys, post)), 0)
                 self.assertEqual(silence.read_kept(), [])
                 if status in ("closed", "reopened"):
-                    self.assertEqual(posted, [])
-                    self.assertIn("0 kept pushes delivered; 1 dropped", output.getvalue())
+                    if keep_notice:
+                        titles = [urllib.parse.parse_qs(data.decode())["title"][0] for data in posted]
+                        self.assertEqual(titles, ["Build done"])
+                        self.assertEqual(output.getvalue().splitlines()[-1], "silence off; 1 kept push delivered; 1 dropped")
+                    else:
+                        self.assertEqual(posted, [])
+                        self.assertIn("0 kept pushes delivered; 1 dropped", output.getvalue())
                     row = self.log_lines()[-1]
                     self.assertEqual((row["outcome"], row["key"], row["template"], row["reference"]),
                                      ("dropped: question " + status, "question-key", "decision.choices", reference))
@@ -343,30 +363,6 @@ class PushoverTests(unittest.TestCase):
                 read.assert_not_called()
                 keys.assert_not_called()
 
-    def test_kept_review_watch_uses_acknowledged_and_release_counts_drops_separately(self) -> None:
-        for acknowledged in (None, "2026-11-03T13:00:00-05:00"):
-            with self.subTest(acknowledged=acknowledged):
-                self.silence_on()
-                watch: silence.KeptPush = {"source": "review-watch", "priority": "0", "title": "Review report",
-                    "message": "Report details", "detail": "", "key": "watch", "text_id": "review_watch.acknowledge",
-                    "reference": {"kind": "review_watch"}}
-                legacy: silence.KeptPush = {**watch, "key": "legacy", "reference": {"kind": "none"}}
-                for push in (watch, legacy):
-                    self.assertIsInstance(silence.keep_here(push), silence.Kept)
-                posted: list[bytes] = []
-                def post(_url: str, data: bytes) -> tuple[int, bytes]:
-                    posted.append(data)
-                    return 200, b'{"status":1}'
-                with (mock.patch.object(review_regime, "acknowledged", return_value=acknowledged) as read,
-                      redirect_stdout(io.StringIO()) as output):
-                    self.assertEqual(silence.off(lambda _argv: 0, lambda push: pushover.post_kept(push, self.keys, post)), 0)
-                read.assert_called_once()
-                self.assertEqual(len(posted), 1 if acknowledged else 2)
-                self.assertIn("1 kept push delivered; 1 dropped" if acknowledged else "2 kept pushes delivered", output.getvalue())
-                self.assertEqual(silence.read_kept(), [])
-                if acknowledged:
-                    self.assertEqual(self.log_lines()[-2]["outcome"], "dropped: report acknowledged")
-
     def test_reference_survives_admission_review_and_silence_without_an_immediate_release_check(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
         path = self.keys.parent / "question-admission.md"
@@ -407,21 +403,18 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(silence.read_kept(), [])
         self.assertEqual(posted, [footed(push["message"], "legacy-owner", "none (free text)")])
 
-    def test_decision_templates_review_agent_values_at_each_send(self) -> None:
-        for text_id in ("decision.choices", "review_watch.acknowledge"):
-            entry = next(entry for entry in push_texts.catalog() if entry.id == text_id)
-            argv = ["--text-id", text_id, *(item for key, value in entry.examples[0].values.items()
-                     for item in ("--value", f"{key}={value}"))]
-            if text_id == "decision.choices":
-                path = self.keys.parent / "question-example.md"
-                _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"2026-11-03T12:00"}\n---\n')
-                argv += ["--question", str(path)]
-            with (self.subTest(text_id=text_id), mock.patch.object(review, "review", side_effect=approve) as read,
-                  redirect_stdout(io.StringIO())):
-                code, form = self.run_send(argv)
-            self.assertEqual(code, 0)
-            read.assert_called_once()
-            self.assertIn(f"Template: {text_id}", form["message"][0])
+    def test_decision_template_reviews_agent_values_at_each_send(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
+        path = self.keys.parent / "question-example.md"
+        _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"2026-11-03T12:00"}\n---\n')
+        argv = ["--text-id", entry.id, "--question", str(path),
+                *(item for key, value in entry.examples[0].values.items() for item in ("--value", f"{key}={value}"))]
+        with (mock.patch.object(review, "review", side_effect=approve) as read,
+              redirect_stdout(io.StringIO())):
+            code, form = self.run_send(argv)
+        self.assertEqual(code, 0)
+        read.assert_called_once()
+        self.assertIn(f"Template: {entry.id}", form["message"][0])
 
     def test_catalog_session_reaches_the_post_and_review_record(self) -> None:
         entry = push_texts.PushText("test", "shutdown", "decision", "Owner is blocked",
@@ -698,12 +691,41 @@ class PushoverTests(unittest.TestCase):
     def assert_footer(self, message: str, sender: str, template: str) -> None:
         self.assertEqual(message.splitlines()[-2:], ["", f"Sent by: {sender} · Template: {template}"])
 
-    def test_cold_keys_template_has_only_its_action_and_delivery_footer(self) -> None:
-        code, form = self.run_send(["--text-id", "github.keys_cold", "--value", "sender=hana",
-                                    "--value", "machine=natedev"])
-        self.assertEqual(code, 0)
-        self.assertEqual(form["title"], ["GitHub keys locked on natedev"])
-        self.assertEqual(form["message"], [footed("Action: Run github-warmup in a terminal on natedev", "hana", "github.keys_cold")])
+    def test_registered_templates_post_the_expected_title_and_message(self) -> None:
+        for text_id, example_name, sender, priority, title, message in (
+                ("github.keys_cold", "typical", "hana", "2", "GitHub keys locked on natedev",
+                 "Action: Run github-warmup in a terminal on natedev"),
+                ("nightly.assigned", "tests_failed", "sdlc", "0", "Nightly check failed", "Fix assigned to: staff."),
+                ("nightly.assigned", "types_failed", "sdlc", "0", "Nightly check failed", "Fix assigned to: types."),
+                ("nightly.not_run", "fetch_failed", "nightly", "0", "Nightly check did not run",
+                 "Why: git fetch of main failed: ssh connection timed out.\nNext run: Tue 11-24 00:53 PST."),
+                ("nightly.not_run", "cold_credentials", "nightly", "0", "Nightly check did not run",
+                 "Action: In a terminal on natedev, run github-warmup\n"
+                 + "Why: GitHub credentials are cold.\nNext run: Tue 11-24 00:53 PST.")):
+            with self.subTest(text_id=text_id, example=example_name):
+                entry = next(item for item in push_texts.catalog() if item.id == text_id)
+                values = next(example.values for example in entry.examples if example.name == example_name)
+                argv = ["--text-id", text_id, *(item for key, value in values.items() for item in ("--value", f"{key}={value}"))]
+                code, form = self.run_send(argv)
+                self.assertEqual(code, 0)
+                self.assertEqual(form["priority"], [priority])
+                self.assertEqual(form["title"], [title])
+                self.assertEqual(form["message"], [footed(message, sender, text_id)])
+
+    def test_action_only_templates_keep_their_approved_text(self) -> None:
+        entries = {entry.id: entry for entry in push_texts.catalog()}
+        for template, values, title, message in (
+            ("auto_mode.refused", entries["auto_mode.refused"].examples[0].values,
+             "modules: 2 commands refused; its build waits",
+             "Session: modules\nAction: On natedev, in the modules pane, type: Go: run the refused commands"),
+        ):
+            with self.subTest(template=template):
+                argv = ["--text-id", template, *(item for key, value in values.items()
+                                                for item in ("--value", f"{key}={value}"))]
+                code, form = self.run_send(argv)
+                self.assertEqual(code, 0)
+                self.assertEqual(form["title"], [title])
+                self.assertEqual(form["message"], [footed(message, values["sender"], template)])
 
     def test_emergency_agent_text_is_withheld_when_review_names_a_fixed_template(self) -> None:
         failure = review.RuleFailure("use-registered-template:mac.locked", "Every Mac screenshot is black.")
@@ -716,9 +738,7 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual((code, form), (6, {}))
 
     def test_every_post_ends_with_its_sender_then_its_template(self) -> None:
-        entry = next(item for item in push_texts.catalog() if item.id == "nixos.ups_battery")
-        registered = ["--text-id", entry.id, *(item for key, value in entry.examples[0].values.items()
-                                                for item in ("--value", f"{key}={value}"))]
+        registered = ["--text-id", "nixos.ups_battery", "--value", "charge=30", "--value", "minutes=5"]
         for argv, sender, template in (
                 (registered, "ups", "nixos.ups_battery"),
                 (["--no-action", "Build done", "The build passed."], PARENT, "fixture.admitted"),
@@ -748,6 +768,39 @@ class PushoverTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             self.assertEqual(silence.off(lambda _argv: 0, lambda push: pushover.post_kept(push, self.keys, post)), 0)
         self.assertEqual(posted, [footed("No action needed.\nThe build passed.", "build-followups", "test.kept")])
+
+        action = "Action: To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts "
+        for text_id, account, read_fails, legacy, expected in (
+                ("quota.paid_credits", "codex2", False, False, "codex3"),
+                ("quota.paid_credits_queued", "codex2", False, True, "codex3"),
+                ("quota.paid_credits_queued", "codex2", True, False, "none"),
+                ("quota.paid_credits_queued", "codex12345678901234567890", False, False, "codex3")):
+            with self.subTest(text_id=text_id, account=account, read_fails=read_fails, legacy=legacy):
+                posted.clear()
+                self.silence_on()
+                argv = ["--text-id", text_id, "--value", "sender=quota_alert", "--value", f"account={account}",
+                        "--value", "machine=natedev", "--value", "credits=25,345", "--value", "refill=Tue 02:33 AST"]
+                if text_id == "quota.paid_credits":
+                    argv.extend(["--value", "next_reset=Sat 16:40 AST"])
+                with (mock.patch.object(agent_accounts, "codex_credit_accounts", return_value=frozenset({account})) as read,
+                      redirect_stdout(io.StringIO())):
+                    self.assertEqual(self.run_send(argv), (0, {}))
+                    kept = silence.read_kept()
+                    self.assertEqual([push["message"].strip() for push in kept], [action + "none"])
+                    if legacy:
+                        saved = {**kept[0], "detail": "registered text"}
+                        _ = silence.kept_file().write_text(json.dumps(saved) + "\n")
+                    before_release = len(self.log_lines())
+                    read.reset_mock()
+                    read.return_value = frozenset({account, "codex3"})
+                    read.side_effect = conf.Unusable("accounts config unavailable") if read_fails else None
+                    self.assertEqual(silence.off(lambda _argv: 0, lambda push: pushover.post_kept(push, self.keys, post)), 0)
+                    read.assert_called_once_with()
+                self.assertEqual(posted, [footed(action + expected, "quota_alert", text_id)])
+                outcomes = [str(line["outcome"]) for line in self.log_lines()[before_release:]]
+                self.assertTrue(outcomes[-1].startswith("sent, kept during silence"))
+                warning = "anomaly: kept paid-credit action uses the saved account list: accounts config unavailable"
+                self.assertEqual(outcomes[:-1], [warning] if read_fails else [])
 
     def test_an_empty_sender_is_refused_and_nothing_is_posted(self) -> None:
         for source in ("", "  ", "send.py in ", None):
@@ -971,9 +1024,9 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(form["priority"], ["2"])
         detail = f"registered text, approved {approved}"
-        rendered = push_texts.render_entry(entry, values)
-        self.assertEqual(form["title"], [rendered.title])
-        self.assertEqual(form["message"], [footed(rendered.message, rendered.sender, entry.id)])
+        self.assertEqual(push_texts.render_entry(entry, values).values, {"charge": "80", "minutes": "20"})
+        self.assertEqual(form["title"], ["Power out: natedev on battery, 20 min left"])
+        self.assertEqual(form["message"], [footed("Action: Save your open work on natedev now.", "ups", entry.id)])
         self.assertEqual(self.reviews()[0]["detail"], detail)
         self.assertEqual(self.log_lines()[-1]["outcome"], "sent, " + detail)
         self.assertNotIn("failed review", output.getvalue())

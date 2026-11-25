@@ -8,6 +8,7 @@ from html import unescape
 import json
 from pathlib import Path
 import re
+import os
 import shutil
 import subprocess
 from typing import cast, override
@@ -17,6 +18,7 @@ from unittest import mock
 from scripts.aws_target import aws_page, cloud_gate, console_help, ledger, ledger_test_support, quota_requests, run_cost, spot_table
 from scripts.aws_target.aws_cli import AwsCli
 from scripts.lib import conf
+from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.review_links import page_frame
 
@@ -358,12 +360,13 @@ class AwsCombinedTableTests(PageCostFixture):
 })();
 </script>"""
         _ = page.write_text(page.read_text().replace('</body>', probe + '</body>', 1))
-        result = subprocess.run([
+        result = run_process_group([
             'google-chrome', '--headless', '--no-sandbox', '--disable-gpu', '--disable-background-networking',
             '--no-first-run', '--host-resolver-rules=MAP * ~NOTFOUND', f'--user-data-dir={self.root / "chrome"}',
             '--window-size=760,1000',
             '--dump-dom', page.as_uri() + query,
-        ], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=True)
+        ], timeout=TEST_HANG_GUARD_SECS)
+        result.check_returncode()
         marker = re.search(r'<p id="table-checks">(.*?)</p>', result.stdout)
         assert marker is not None, 'The browser must finish the table checks.'
         self.assertEqual(unescape(marker[1]), 'passed')
@@ -984,13 +987,16 @@ class AwsPageGateTimePriceTests(ledger_test_support.CostFixture):
                 comparisons = run_cost.gate_comparisons(self.state, now, conf.read(config), conf.read(self.settings))
                 self.assertEqual(comparisons, expected)
 
-    def test_page_refresh_redraws_the_break_even_table_and_region_filter(self) -> None:
+    def test_page_refresh_redraws_prices_regions_and_saved_quota_requests(self) -> None:
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
         before = spot_table.Table('Break-even', ('Region', 'USD/min'), frozenset({1}),
                                   (('us-east-2', '0.0100'),), 'rows')
         after = replace(before, rows=(('us-east-2', '0.0900'), ('test-new-region', 'no current price')))
         with mock.patch.object(aws_page, 'gate_time_price_table', side_effect=(before, after)):
             first = aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings).read_text()
+            request = quota_requests.OpenQuotaRequest('us-east-2', 'L-FIXTURE', 'Fixture Spot',
+                '32', 'PENDING', '', '')
+            quota_requests.save(self.state, {request.quota: (request,)}, now + 1, complete=True)
             second = aws_page.publish(self.state, now + 1, self.root / 'page', settings_path=self.settings).read_text()
         script = first.rsplit('<script>', 1)[1].split('</script>', 1)[0].replace(page_frame.REFRESH_SCRIPT, '')
         fixture = r'''
@@ -1017,10 +1023,15 @@ launchState.append(new Element());
 ids.set("launch-state", launchState);
 function parse(html) {
   return {getElementById(id) {
+    if (id === "quota-requests") {
+      const content = html.split('<div id="quota-requests">')[1].split('\n  <details id="quota-help">')[0];
+      return {innerHTML: content.trimEnd().slice(0, -"</div>".length)};
+    }
     const start = '<script id="' + id + '" type="application/json">';
     return {textContent: html.split(start)[1].split("</script>")[0]};
   }};
 }
+ids.set("quota-requests", parse(first).getElementById("quota-requests"));
 const document = {
   getElementById(id) {
     if (id.endsWith("-data")) return parse(first).getElementById(id);
@@ -1045,15 +1056,75 @@ function words(node) {
 (async () => {
   const table = ids.get("gate-time-price");
   assert.match(words(table), /0\.0100/);
+  assert.match(ids.get("quota-requests").innerHTML, /No saved quota requests/);
   const result = await reload();
   assert.equal(result.readAt, data.read_at);
   assert.doesNotMatch(words(table), /0\.0100/);
   assert.match(words(table), /0\.0900/);
   assert.match(words(table), /test-new-region/);
   assert.match(words(ids.get("regions")), /test-new-region/);
+  assert.match(ids.get("quota-requests").innerHTML, /Fixture Spot.*PENDING/);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 '''
         node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
         source = f'const first = {json.dumps(first)};\nconst second = {json.dumps(second)};\n' + fixture + script + check
         result = subprocess.run([node, '-'], input=source, capture_output=True, text=True, timeout=20, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class AwsWaitingQuotaTests(ledger_test_support.CostFixture):
+    def test_page_shows_open_requests_and_links_from_the_saved_record(self) -> None:
+        now = ledger_test_support.instant('2026-01-15T12:00:00Z')
+        request = quota_requests.OpenQuotaRequest('us-east-1', 'L-FIXTURE', 'Fixture Spot & GPU',
+            '32', 'CASE_OPENED', 'fixture-case-id', '2026-01-15T10:00:00+00:00')
+        quota_requests.save(self.state, {request.quota: (request,)}, now, complete=True)
+        with mock.patch.dict(os.environ, {'USER_ZONE': 'America/New_York'}):
+            page = aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings)
+        html = page.read_text(encoding='utf-8')
+        block = html.split('<h3 id="waiting-quota-title">Waiting on you</h3>', 1)[1].split('</section>', 1)[0]
+        self.assertIn('Record updated 2026-01-15 07:00:00 EST.', block)
+        self.assertIn('See the case list for the case status.', unescape(re.sub(r'<[^>]+>', '', block)))
+        self.assertIn('<td>us-east-1</td>', block)
+        self.assertIn(f'<a href="{console_help.quota_page_url(request.region, request.quota_code)}">Fixture Spot &amp; GPU</a>', block)
+        self.assertIn('<td class="n">32</td><td>CASE_OPENED</td><td>2026-01-15 05:00:00 EST</td>', block)
+        self.assertIn(f'<a href="{console_help.CASE_LIST_URL}">case list</a>', block)
+        self.assertNotIn('fixture-case-id', html)
+
+    def test_waiting_requests_are_visible_before_closed_quota_help(self) -> None:
+        now = ledger_test_support.instant('2026-01-15T12:00:00Z')
+        request = quota_requests.OpenQuotaRequest('us-east-1', 'L-FIXTURE', 'Fixture Spot',
+            '32', 'PENDING', '', '')
+        quota_requests.save(self.state, {request.quota: (request,)}, now, complete=True)
+        page = aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings)
+        section = page.read_text(encoding='utf-8').split('<section class="card" id="prices-quotas">', 1)[1]
+        visible, details = section.split('<details id="quota-help">', 1)
+        self.assertIn('id="quota-requests"', visible)
+        self.assertIn('Waiting on you', visible)
+        self.assertNotIn('Waiting on you', details.split('</details>', 1)[0])
+
+    def test_waiting_requests_use_shared_words_and_one_case_link(self) -> None:
+        now = ledger_test_support.instant('2026-01-15T12:00:00Z')
+        request = quota_requests.OpenQuotaRequest('us-east-1', 'L-FIXTURE', 'Fixture Spot',
+            '32', 'PENDING', '', '')
+        quota_requests.save(self.state, {request.quota: (request, request)}, now, complete=True)
+        with (mock.patch.object(console_help, 'WAITING_QUOTA_HEADING', 'Fixture heading', create=True),
+              mock.patch.object(console_help, 'QUOTA_CASE_STATUS', 'Open {case_list} for details.', create=True),
+              mock.patch.object(console_help, 'CASE_LIST_LABEL', 'fixture cases', create=True)):
+            block = aws_page.waiting_quota_requests(self.state)
+        self.assertIn('>Fixture heading</h3>', block)
+        self.assertIn(f'Open <a href="{console_help.CASE_LIST_URL}">fixture cases</a> for details.', block)
+        self.assertEqual(block.count(console_help.CASE_LIST_URL), 1)
+        self.assertNotIn('<th>Cases</th>', block)
+
+    def test_page_has_no_list_without_open_requests(self) -> None:
+        now = ledger_test_support.instant('2026-01-15T12:00:00Z')
+        folder = self.root / 'page'
+        page = aws_page.publish(self.state, now, folder, settings_path=self.settings)
+        missing = page.read_text(encoding='utf-8')
+        self.assertIn('No saved quota requests.', missing)
+        self.assertNotIn('Waiting on you', missing)
+        quota_requests.save(self.state, {}, now, complete=True)
+        page = aws_page.publish(self.state, now, folder, settings_path=self.settings)
+        closed = page.read_text(encoding='utf-8')
+        self.assertNotIn('Waiting on you', closed)
+        self.assertIn('<div id="quota-requests"></div>', closed)

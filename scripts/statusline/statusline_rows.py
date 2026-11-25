@@ -6,20 +6,11 @@ except FileNotFoundError:
     pass
 
 import sys
-from scripts.statusline import assignment, rebuild_row
+from scripts.statusline import assignment
 
 
 def main() -> None:
-    """Pass the action count and shell arguments to the status line renderer."""
-    source = sys.argv[1]
-    if source == "--for-you-console":
-        args = assignment.status_action_args(remote=True)
-        rebuild = rebuild_row.read("statusline")
-    else:
-        rebuild = rebuild_row.read("statusline")
-        args = assignment.status_action_args(remote=False, rebuild=rebuild)
-    sys.argv[1:2] = args
-    assignment.main(rebuild)
+    assignment.render_status(remote=sys.argv.pop(1) == "--for-you-console")
 
 
 if __name__ == "__main__":

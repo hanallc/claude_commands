@@ -401,8 +401,13 @@ The launcher fixture replaces non-Git commands; the formatter still runs real ta
 `scripts/production/gate.py` merges a checkpoint into the production's merge branch.
 It tests all modules before it pushes the merge.
 It discovers every `scripts/**/test_*.py` module outside `__pycache__`.
-`scripts/production/gate.py --affected --checkout TREE [--full]` runs a unit's targeted tests through the same runner.
-`python3 -m scripts.production.gate` accepts the same options.
+Run a unit's targeted tests with `copies.py run` and `scripts/production/gate.py --affected`.
+A direct `--affected` call prints the `copies.py run` command on standard error and exits with status 1.
+The command uses the Git worktree root and its current `HEAD` commit.
+The inner gate command always has one `--repo '{tree}'` option for the prepared checkout.
+This option replaces any `--repo` or `--checkout` options from the direct call.
+The gate requires a handoff from `copies.py run` or `copies.py gate-step` before it starts placement or tests.
+`./scripts/lib/py -m scripts.production.gate` accepts the same options.
 The former `merge_gate.py` and `targeted_test.py` entry points remain available until their removal.
 `build_steps.command_job` reads these command forms for the memory feed and copy lease names.
 It names integration, promotion, nightly tests, all tests, affected tests, or selected modules from the arguments.
@@ -479,10 +484,11 @@ Cleanup stops the confirmed groups and removes the journal, even when the tempor
 The receipt stays with a retained checkout.
 See [Mac gate cleanup](mac-test-offload.md#mac-gate-cleanup) for the queue callbacks.
 
-### Targeted tests: `scripts/production/targeted_test.py`
+### Targeted tests
 
-The entry has its own parser and description.
-It shares the suite arguments, signal wrapper, copy lock, and suite runner with `merge_gate.py`.
+Run `gate.py --affected` through `copies.py run` from the unit worktree root.
+Use the command in `<FinalGate/>` in `docs/direct/final_gate_commit.md`.
+`scripts/production/targeted_test.py` passes its arguments to `gate.py --affected`.
 `SuiteMode.TARGETED` enables selection and takes the `test-affected` admission step.
 `SuiteMode.GATE` runs all modules and takes the `gate` step.
 Both modes accept `--full` because existing repository callers use it.
@@ -504,8 +510,10 @@ This record changes no selection and refuses no run.
 ### The gate: `scripts/production/merge_gate.py`
 
 **Invocation.** `gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
-The six merge flags are required unless `--tests-only`, `--promote-only`, or `--nightly` is given.
+The six merge flags are required for a checkpoint merge.
+Use `--tests-only` for a merge-line test run and `--affected` for a unit test run.
 Use one `--module <suite>/<module>` for each module with `--tests-only` or `--affected`.
+`copies.py run` refuses a named gate without either mode before it requests placement.
 Use the module names that the gate prints.
 A standalone named run on natedev waits for the build hold to clear and takes one local admission reservation.
 A named run on natedev uses the build hold exemption for the unit in `max_runs.exempt_unit`.
@@ -632,10 +640,12 @@ The 03:00 timer calls this path.
 Each green exit sends `nightly.result`.
 An exit before the checks start sends `nightly.not_run`.
 The result names the branch, finish time, type result and full test result.
-The failure text names the reason on one line within the message limit.
+The failure push shows `Nightly check did not run`, the reason, and the next run time in the user's time zone.
+The gate reads the schedule from `claude-nightly.timer`.
+The gate limits the reason so the next run time and footer fit in the push.
 Both pushes use need `note` and the key `nightly-result`.
-The result requires no action. The failure text includes an action.
-The gate says the next nightly run tries again. The cold credentials example directs the user to run `github-warmup`.
+The gate sends the failure push without an action line.
+The timer keeps the `github-warmup` action line when GitHub credentials are cold.
 Silence keeps only the newest push on that key and delivers it when silence ends.
 The gate reads `nightly_result_push` and `nightly_result_modules` from `config/gate.conf` at use.
 `nightly_result_push=off` disables all nightly result pushes. The default is `on`.
@@ -679,8 +689,7 @@ The command accepts a unit director of any production.
 `UNIT` accepts the staff ID, a `<production>/<unit>` path, or the name of an sdlc unit.
 The command confirms receipt if the original notice has no delivery confirmation.
 It saves the assignment before it sends `nightly.assigned`.
-The push places the receipt and assignment status before the failure list.
-The phone retains that status when it truncates a long failure list.
+The push shows the title `Nightly check failed` and one body line that names the assigned unit.
 A rerun prints `unchanged` after the sender accepts the push.
 Both automatic and manual assignment send a user push.
 The push names the assignee when the receipt is confirmed.

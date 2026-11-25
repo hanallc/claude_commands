@@ -6,7 +6,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from contextlib import redirect_stderr
 from dataclasses import replace
 from io import StringIO
-import subprocess
 import threading
 import json
 import os
@@ -23,6 +22,7 @@ from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import memory_feed
 from scripts.disks import disks_page
 from scripts.lib import conf
+from scripts.lib.process_group import run_process_group
 from scripts.lint.memory_test_support import copy_config_file_fixture, write_config_fixture
 from scripts.production import investigation, staff
 from scripts.production.change_routing import UnavailableProduction
@@ -726,10 +726,10 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
             profile = Path(temporary) / 'profile'
             profile.mkdir()
             _ = (profile / 'user.js').write_text('user_pref("ui.systemUsesDarkTheme",1);')
-            result = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+            result = run_process_group(['firefox', '--headless', '--no-remote', '--profile', str(profile),
                                      '--window-size', f'{width},800', '--screenshot', str(Path(temporary) / 'page.png'),
                                      f'http://127.0.0.1:{server.server_port}/?page=list&at.list=%2Fpage%3Ffilter%3Dmine&extra=kept'],
-                                    capture_output=True, text=True, timeout=40)
+                                    timeout=40)
             case.assertEqual(result.returncode, 0, result.stderr)
         finally:
             server.shutdown()

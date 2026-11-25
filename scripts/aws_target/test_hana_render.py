@@ -115,7 +115,6 @@ class HanaRenderTests(unittest.TestCase):
                 + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n'
                 + 'patterns.tool={purpose}\npatterns.tool.fixture-guest={purpose}{suffix}\n'
                 + 'roots.build=/default/build\nroots.build.fixture-guest=/fixture/build\n'
-                + 'roots.slots.fixture-guest=/fixture/slots\n'
                 + 'slots.fixture-guest.hana.max=3\nslots.fixture-guest.hana.max_bytes=1000\n')
             _ = folders.write_text(folder_values)
             (checkout / 'config').mkdir(exist_ok=True)

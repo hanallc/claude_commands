@@ -4,8 +4,8 @@ The hook also points the method compile of `dataclasses` at a shared code cache.
 dataclasses compiles the generated methods of each class from source at import.
 On 2026-11-14 that compile was 45-80% of the import CPU of the hot CLIs
 (direct.assign 278 of 428 ms). The cache keeps the marshal code of each source
-in /var/tmp/dataclass-code-<uid>/<cache tag>. tmp_sweep.py prunes the entries that no
-process read in lint.conf `dataclass_code_days` days.
+in /var/tmp/dataclass-code-<uid>/<cache tag>.
+The tmp sweep lists entries for vetted manual removal after `dataclass_code_days` days without a read.
 """
 
 from __future__ import annotations
@@ -624,7 +624,8 @@ def _user_test_manager_available() -> bool:
 
 
 def _direct_test_limit_line(seconds: int) -> str:
-    return f"stopped at the {seconds}-second direct test limit; run longer tests with targeted_test.py --module"
+    return (f"stopped at the {seconds}-second direct test limit. "
+            "Run longer tests with copies.py run and gate.py --affected --module.")
 
 
 def _start_direct_test_watchdog(seconds: int) -> None:

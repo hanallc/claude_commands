@@ -99,6 +99,8 @@ class ForYouSnapshot:
     rows: tuple[ForYouRow, ...]
     unavailable: tuple[UnavailableSource, ...]
     rebuild_machines: tuple[str, ...] = ()
+    comparison_refresh_due: bool = False
+    comparison_deadline: int = 0
 
     @property
     def open_count(self) -> KnownOpenCount | UnavailableOpenCount:
@@ -128,6 +130,21 @@ def _request(value: Mapping[str, object], names: Mapping[str, str], waiting_work
                           names.get(concerns, concerns), created_at, waiting_work(concerns), requester)
 
 
+def _watch_completed_requests(watch: need.SourceWatch) -> None:
+    """Track archive changes for the cache without reading completed requests."""
+    folder = need.needs_folder() / "done"
+    watch.watch(folder)
+    try:
+        for path in folder.iterdir():
+            if path.suffix == ".json":
+                watch.watch(path)
+    except FileNotFoundError:
+        if not watch.verified_absence(folder):
+            watch.mark_incomplete()
+    except OSError:
+        watch.mark_incomplete()
+
+
 def action_row(record: UserAction, requester: str) -> ForYouRow:
     """Project one stored action for Review and the notifier."""
     return ForYouRow(record.key, "action", record.title, record.command, record.machine, record.cwd,
@@ -136,10 +153,15 @@ def action_row(record: UserAction, requester: str) -> ForYouRow:
                      requester_reference=record.requested_by)
 
 
-def source_paths() -> tuple[Path, ...]:
+def action_source_paths() -> tuple[Path, Path, Path]:
+    needs = need.needs_folder()
+    return ActionStore().folder, needs, needs / "done"
+
+
+def source_paths(config: Path | None = None) -> tuple[Path, ...]:
     """Watch the native action sources and the rebuild comparison."""
-    config = conf.path("statusline")
-    paths = (ActionStore().folder, need.needs_folder(), config)
+    config = conf.path("statusline") if config is None else config
+    paths = (*action_source_paths(), config)
     try:
         cache = rebuild_row.cache_path(config)
         return (*paths, cache, rebuild_row.changes_path(cache))
@@ -147,15 +169,30 @@ def source_paths() -> tuple[Path, ...]:
         return paths
 
 
+def _open_phase_ids(folder: Path, watch: need.SourceWatch | None) -> list[str]:
+    if watch is None:
+        return recorder_state.read_open_phase_ids(folder)
+    path = folder / recorder_state.STATE_FILENAME
+    watch.watch(path)
+    try:
+        return recorder_state.open_phase_ids(recorder_state.read_state(path))
+    except FileNotFoundError:
+        if not watch.verified_absence(path):
+            raise
+        return []
+
+
 def read(config: Path | None = None, *,
          rebuild: rebuild_row.RebuildAnswer | None = None, members: staff.StaffSnapshot | None = None,
-         include_running_revision: bool = True) -> ForYouSnapshot:
+         include_running_revision: bool = True, watch: need.SourceWatch | None = None) -> ForYouSnapshot:
     """Project both stores and the comparison cache without running a rebuild or a refresh."""
     config = conf.path("statusline") if config is None else config
     unavailable: list[UnavailableSource] = []
     names: dict[str, str] = {}
     members_by_reference: dict[str, staff.StaffRow] = {}
     try:
+        if watch is not None and members is None:
+            watch.watch(staff.record_path())
         members = staff.snapshot() if members is None else members
         for member in members.rows:
             names[str(member.id)] = member.name
@@ -181,7 +218,7 @@ def read(config: Path | None = None, *,
                 holder = members_by_reference.get(str(member.parent.id), member)
             if isinstance(holder.run, staff.OpenRun):
                 try:
-                    work = ", ".join(recorder_state.read_open_phase_ids(holder.run.path)) or "Not recorded"
+                    work = ", ".join(_open_phase_ids(holder.run.path, watch)) or "Not recorded"
                 except (OSError, ValueError) as error:
                     unavailable.append(UnavailableSource(f"staff work {reference}", str(error)))
         work_by_reference[reference] = f"{name}: {work}"
@@ -189,12 +226,15 @@ def read(config: Path | None = None, *,
 
     rows: list[ForYouRow] = []
     try:
-        for record in ActionStore().list():
+        store = ActionStore()
+        for record in store.list() if watch is None else store.list(watch=watch.watch):
             rows.append(action_row(record, names.get(record.requested_by, record.requested_by)))
     except (OSError, ValueError) as error:
         unavailable.append(UnavailableSource("actions", str(error)))
 
-    answer = rebuild if rebuild is not None else rebuild_row.read(config)
+    answer = rebuild if rebuild is not None else rebuild_row.read(config, watch=watch)
+    if watch is not None:
+        _watch_completed_requests(watch)
     pending: tuple[RebuildRequest, ...] = ()
     needs = answer.needs
     if isinstance(needs, rebuild_row.RebuildNeedsNotRead):
@@ -247,17 +287,21 @@ def read(config: Path | None = None, *,
             active[0].created_at if active else "", "open", "automatic", "", active,
             requester_reference=next(iter(requesters)) if len(requesters) == 1 else "",
             running_revision=change.active_revision if change is not None else ""))
-    return ForYouSnapshot(tuple(rows), tuple(unavailable), answer.machines)
+    return ForYouSnapshot(tuple(rows), tuple(unavailable), answer.machines, answer.refresh_due,
+                          answer.comparison_deadline)
 
 
 def read_for_status_line(config: Path | None = None, *,
-                         rebuild: rebuild_row.RebuildAnswer | None = None) -> ForYouSnapshot:
+                         rebuild: rebuild_row.RebuildAnswer | None = None,
+                         watch: need.SourceWatch | None = None) -> ForYouSnapshot:
     """Keep the waiting rebuild names if a read exceeds the recursion limit."""
     try:
-        return read(config, rebuild=rebuild, include_running_revision=False)
+        return read(config, rebuild=rebuild, include_running_revision=False, watch=watch)
     except RecursionError as error:
-        answer = rebuild if rebuild is not None else rebuild_row.read(config if config is not None else "statusline")
-        return ForYouSnapshot((), (UnavailableSource("For you", str(error)),), answer.machines)
+        answer = rebuild if rebuild is not None else rebuild_row.read(
+            config if config is not None else "statusline", watch=watch)
+        return ForYouSnapshot((), (UnavailableSource("For you", str(error)),), answer.machines, answer.refresh_due,
+                              answer.comparison_deadline)
 
 
 def global_action_count(rebuild: rebuild_row.RebuildAnswer | None = None) -> str:

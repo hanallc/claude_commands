@@ -2565,7 +2565,8 @@ The cutover removal commit deletes the script after the run.
 **Spec:**
 1. Change `scripts/lint/tmp_sweep.py` and its floor callers to measurement and alarms. They delete nothing. Keep the floor take in `scripts/lint/sweep.py` on Cargo build output under `/build/cargo` and `/build/paths`.
 2. Send each eligible one-off to the maker's lock and rescue path (`build_folders`). Keep explicit maker cleanup.
-   `tmp_sweep.py --apply` (`apply_cleanup_plan()` at `scripts/lint/tmp_sweep.py:1456`, which deletes through `remove_entry()` at line 1162 and `remove_idle_entry()` at line 1185) is explicit cleanup of a saved plan: route each entry through the same maker path. Keep no direct delete in it.
+   Run `tmp_sweep.py --plan <new-plan.json>` to record each candidate and the reason for the assessment.
+   Review the list that the hourly sweep publishes through `removal_guard.py` for vetted manual removal.
 3. Retire each competing managed-folder delete path after its legacy users drain.
 4. Keep `~/.cache` out of every root. Add no cleanup tool.
 5. Unfinished trim records: `_hold_floor_pass()` runs `recover_pending_trims()` before it reads free space (`scripts/lint/sweep.py:4481`), and `TrimTake.recover()` deletes the remaining paired output (`sweep.py:2051`). Both stay, because the floor take on Cargo build output stays.
@@ -2583,7 +2584,19 @@ The cutover removal commit deletes the script after the run.
 - `impl` owns `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py` and the documentation.
 - `test` owns both test modules and the alarm, cleanup and saved-plan fixtures.
 
-**Acceptance gate:** a low-disk check keeps every fixture folder and still takes Cargo build output under `/build/cargo` and `/build/paths`; the floor alarm still sends once per crossing; explicit maker cleanup still rescues and removes an unlocked one-off; `tmp_sweep.py --apply` on a saved plan removes through the maker path and keeps a locked one; a saved `deleting` trim intent on Cargo output still finishes. Run the sweep, tmp sweep, folder audit and source enforcement tests. The full gate runs after the final migration.
+**Acceptance gate**
+
+- A low-disk check keeps every temporary fixture folder.
+- The check still takes Cargo build output under `/build/cargo` and `/build/paths`.
+- The floor alarm sends once per crossing.
+- Explicit maker cleanup rescues and removes an unlocked one-off.
+- The tmp sweep lists eligible entries for vetted manual removal.
+- The tmp sweep keeps each locked entry off the list.
+- The removal guard accepts only approved build rows for removal.
+- A saved `deleting` trim intent on Cargo output still finishes.
+
+Run the sweep, tmp sweep, folder audit and source enforcement tests.
+Run the full gate after the final migration.
 
 ### Phase 132 — hana_shot launch refuses a new app at the local app cap  · status: done
 **Source:** builds showrunner 2026-11-15 23:1x, natedev decision after the 11-15 swap peak: 8 research `hana_shot.py launch` apps on ports 15820-15827 pushed swap to 36.6 GiB at 16:15 EST. An interim step; queue's memory gate for app launches (queue phase A) replaces it.
