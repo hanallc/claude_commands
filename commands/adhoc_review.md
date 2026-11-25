@@ -156,7 +156,7 @@ For a shared review, run these steps as the owner:
 
 1. Run `end OWNER REVIEW` to close claims and read the final decisions.
 2. Save those decisions in the decision document. Update existing entries by item ID.
-3. Run `finish OWNER REVIEW` after the save succeeds.
+3. Run `end OWNER REVIEW --finish` after the save succeeds.
 
 If wrap-up stops, use `resume` to recover the IDs. If it returns `closing`, repeat these steps.
 

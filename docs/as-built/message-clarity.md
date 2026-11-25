@@ -52,14 +52,13 @@ The owner uses `claim` and `decide`. A joined session uses `next` and `record`.
 Both claim commands return items in review order with stable IDs and saved decisions.
 Without `--item`, `next` returns the current item or claims the first available item.
 `leave` releases a joined session's claim.
-The helper requires a verified process start to save the PID and start.
+The helper requires a verified process start to save a joined session's PID and start.
 The helper checks the saved identity when the registry has no record or omits the start for the saved PID.
-The registry can confirm that the owner is live through a socket.
-The helper keeps claims when it cannot confirm that the process ended.
-When the owner exits, the record remains available for `resume`.
-Joined sessions cannot claim items while the owner is absent.
+The helper releases a joined session's claim when it confirms that the process ended.
+Joined sessions can claim items, save decisions, and release claims while the owner is absent.
+The owner's claim stays with the owner.
 The owner's `end` freezes the shared record and returns the final decisions.
-The owner runs `finish` after saving the decisions in the decision document.
+Only the owner's `end --finish` removes the shared record. The owner saves the decisions first.
 Each session keeps its own message hold and item count.
 Joined sessions apply the count after `join`, `next`, and `record`.
 

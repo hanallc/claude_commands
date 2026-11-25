@@ -153,11 +153,6 @@ def _read(path: Path) -> ActiveReview:
     return review
 
 
-def _remove(path: Path) -> None:
-    atomic_file.remove_dead_temporary_files(path)
-    path.unlink()
-
-
 @final
 class ReviewStore:
     def __init__(self, root: Path, liveness: Callable[[str], SessionLiveness]) -> None:
@@ -179,7 +174,6 @@ class ReviewStore:
             review = ActiveReview(id=uuid4().hex, started=date.today().isoformat(), source=source,
                                   items=items, order=[str(index) for index in range(1, len(items) + 1)],
                                   claims={}, decisions={}, participants={})
-            _ = self.remember_process(review, owner)
             _save(path, review)
             return self.handle(owner, path, review)
 
@@ -214,22 +208,13 @@ class ReviewStore:
         review["participants"][identity] = process
         return True
 
-    def prune_claims(self, path: Path, review: ActiveReview, actor: str) -> None:
+    def prune_claims(self, path: Path, review: ActiveReview, actor: str, owner: str) -> None:
         ended = [index for index, holder in review["claims"].items()
-                 if holder != actor and isinstance(self.session_state(review, holder), sessions.SessionNotLive)]
+                 if holder not in (actor, owner) and isinstance(self.session_state(review, holder), sessions.SessionNotLive)]
         if ended:
             for index in ended:
                 del review["claims"][index]
             _save(path, review)
-
-    def check_owner(self, actor: str, owner: str, review: ActiveReview) -> None:
-        if actor == owner:
-            return
-        observed = self.session_state(review, owner)
-        if isinstance(observed, sessions.SessionNotLive):
-            raise ReviewError("The review owner has ended their session.")
-        if isinstance(observed, sessions.SessionLivenessUnknown):
-            raise ReviewError(f"Cannot confirm the review owner's session: {observed.reason}")
 
     def join(self, actor: str, owner: str) -> ReviewHandle:
         with self.locked_path(owner) as path:
@@ -238,10 +223,9 @@ class ReviewStore:
                 if actor != owner:
                     raise ReviewError("This review has ended.")
                 return self.handle(owner, path, review)
-            self.check_owner(actor, owner, review)
-            if self.remember_process(review, actor):
+            if actor != owner and self.remember_process(review, actor):
                 _save(path, review)
-            self.prune_claims(path, review, actor)
+            self.prune_claims(path, review, actor, owner)
             return self.handle(owner, path, review)
 
     @contextmanager
@@ -259,17 +243,17 @@ class ReviewStore:
                     raise ReviewError("This review has ended.")
                 yield path, review
                 return
-            self.check_owner(actor, owner, review)
             if actor != owner and actor not in review["participants"]:
                 raise ReviewError("Join this review before you use its items.")
-            self.prune_claims(path, review, actor)
+            self.prune_claims(path, review, actor, owner)
             yield path, review
 
     def claim(self, actor: str, owner: str, review_id: str, requested: int | NextItem) -> ClaimedItem | NoAvailableItem:
         with self.opened(actor, owner, review_id) as (path, review):
-            return self._claim(path, review, actor, requested)
+            return self._claim(path, review, actor, owner, requested)
 
-    def _claim(self, path: Path, review: ActiveReview, actor: str, requested: int | NextItem) -> ClaimedItem | NoAvailableItem:
+    def _claim(self, path: Path, review: ActiveReview, actor: str, owner: str,
+               requested: int | NextItem) -> ClaimedItem | NoAvailableItem:
         claims = review["claims"]
         current = next((index for index, holder in claims.items() if holder == actor), "")
         if isinstance(requested, int):
@@ -284,7 +268,8 @@ class ReviewStore:
         if not index:
             count = remaining(review)
             return NoAvailableItem(state="busy" if count else "complete", remaining=count, items=review_tasks(review))
-        _ = self.remember_process(review, actor)
+        if actor != owner:
+            _ = self.remember_process(review, actor)
         if current and current != index:
             del claims[current]
         claims[index] = actor
@@ -311,7 +296,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     _ = start.add_argument("--items", required=True, type=Path, help="Read a JSON array from a file or from stdin (-).")
     _ = commands.add_parser("join").add_argument("staff_name")
     _ = commands.add_parser("resume")
-    for verb in ("claim", "decide", "next", "record", "split", "add", "show", "leave", "end", "finish"):
+    for verb in ("claim", "decide", "next", "record", "split", "add", "show", "leave", "end"):
         command = commands.add_parser(verb)
         _ = command.add_argument("owner")
         _ = command.add_argument("review")
@@ -327,6 +312,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         elif verb == "split":
             _ = command.add_argument("item", type=int)
             _ = command.add_argument("subitems", nargs="+")
+        elif verb == "end":
+            _ = command.add_argument("--finish", action="store_true", help="Remove the review after saving its decisions.")
     return parser.parse_args(argv)
 
 
@@ -360,17 +347,19 @@ def run(store: ReviewStore, actor: str, args: argparse.Namespace) -> None:
         print(json.dumps(store.claim(actor, owner_id, review_id, cast(int | NextItem, args.item))))
         return
 
-    if verb in ("end", "finish") and actor != owner_id:
+    if verb == "end" and actor != owner_id:
         raise ReviewError("Only the owner can end the review. Use leave to release your claim.")
-    with store.opened(actor, owner_id, review_id, wrap_up=verb in ("end", "finish")) as (path, review):
-        if verb == "finish":
+    with store.opened(actor, owner_id, review_id, wrap_up=verb == "end") as (path, review):
+        if verb == "end":
+            if cast(bool, args.finish):
+                if not review.get("closing"):
+                    raise ReviewError("End the review and save the final decisions first.")
+                atomic_file.remove_dead_temporary_files(path)
+                path.unlink()
+                return
             if not review.get("closing"):
-                raise ReviewError("End the review and save the final decisions first.")
-            _remove(path)
-            return
-        if verb == "end" and not review.get("closing"):
-            review["closing"] = True
-            _save(path, review)
+                review["closing"] = True
+                _save(path, review)
         if verb in ("show", "end"):
             print(decision_document(review), end="")
             return
