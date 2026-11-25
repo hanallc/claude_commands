@@ -1205,7 +1205,8 @@ class FixtureCPU(unittest.TestCase):
                 self.assertEqual(fixture.timed.stdout, fixture.standard.stdout)
                 self.assertEqual(normalized_output(fixture.timed.stderr), normalized_output(fixture.standard.stderr))
         self.assertIn("DeprecationWarning: fixture warning", self.outcomes.timed.stderr)
-        with tempfile.TemporaryDirectory() as directory:
+        with (tempfile.TemporaryDirectory() as directory,
+              tempfile.TemporaryDirectory() as outside_directory):
             root = Path(directory)
             runner = root / "scripts/test_times/module_run.py"
             copy_test_runner(root)
@@ -1223,7 +1224,7 @@ class FixtureCPU(unittest.TestCase):
             output = root / "times.json"
             environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(folder), str(root))),
                            "TEST_TIMES_OUT": str(output)}
-            for working_directory in (root, folder, Path("/home")):
+            for working_directory in (root, folder, Path(outside_directory)):
                 with self.subTest(case="package name", cwd=working_directory):
                     result = subprocess.run(
                         [str(root / "scripts/lib/py"), str(runner), str(folder), "test_package_name.py"],
