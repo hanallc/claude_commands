@@ -2724,16 +2724,16 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
         try:
             delivery = _deliver(record, command_result(record), worker_input=worker_input,
                                 resume_parked=resume_parked, input_lock=input_lock)
-        except (Exception, SystemExit, KeyboardInterrupt):
-            _alert_failed_push(path, check_receipt=True)
+        except (Exception, SystemExit, KeyboardInterrupt) as error:
+            detail = " ".join(str(error).splitlines()) or type(error).__name__
+            _alert_late_delivery_failure(path, detail)
             raise
         if ownership is ResultPassOwnership.OTHER_PASS:
             continue
         if isinstance(delivery, ConfirmedPaneResult):
             return delivery
         if _result_push_failed(delivery):
-            # This submission can run after the supervisor exits.
-            _alert_failed_push(path, check_receipt=True)
+            _alert_late_delivery_failure(path)
         if _worker_result_pending(delivery):
             return WorkerResultReplay.RETRY
         if delivery.startswith("already delivered: ") and not isinstance(resume_parked, ParkedWorkerDelivery):
@@ -2741,51 +2741,66 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
     return WorkerResultReplay.NONE
 
 
+def _alert_late_delivery_failure(path: Path, error: str = "") -> None:
+    """Record a late delivery error and alert after the supervisor exits."""
+    with _delivery_lock(path):
+        record = _read_record(path)
+        if record["status"] != "finished" or detached_run_process.supervises(record["pid"], path):
+            return
+        saved = record.get("delivery", "")
+        if error and saved.startswith(DEFERRED_WORKER_RESULT):
+            record["delivery"] = _save_delivery(path, FAILED_WORKER_SUBMISSION + error, if_current=saved)
+        _alert_failed_push_locked(path, record, check_receipt=True)
+
+
 def _alert_failed_push(path: Path, *, check_receipt: bool = False) -> None:
+    with _delivery_lock(path):
+        _alert_failed_push_locked(path, _read_record(path), check_receipt=check_receipt)
+
+
+def _alert_failed_push_locked(path: Path, record: RunRecord, *, check_receipt: bool) -> None:
     """Send the alert and record its outcome under the delivery lock."""
     from scripts.message import send
 
-    with _delivery_lock(path):
-        record = _read_record(path)
-        if not _needs_push_retry(record):
+    if not _needs_push_retry(record):
+        return
+    delivery = record.get("delivery", "")
+    state = ("Result delivery is unconfirmed. The result may have arrived."
+             if delivery.startswith(UNCONFIRMED_WORKER_RESULT) else "Result delivery failed.")
+    text = (f"Detached run {record['run_id']}. {state}\n"
+            f"Run: {record['label']}\n"
+            f"Worker: {record['worker']}\n"
+            f"Result: {_exit_words(command_result(record))}\n"
+            f"Delivery: {delivery}")
+    try:
+        membership = staff.snapshot()
+        if (check_receipt and delivery.startswith(UNCONFIRMED_WORKER_RESULT)
+                and _unconfirmed_result_received(record, membership, delivery)):
+            _ = _save_delivery(path, f"already delivered: {record['run_id']}")
             return
-        delivery = record.get("delivery", "")
-        state = ("Result delivery is unconfirmed. The result may have arrived."
-                 if delivery.startswith(UNCONFIRMED_WORKER_RESULT) else "Result delivery failed.")
-        text = (f"Detached run {record['run_id']}. {state}\n"
-                f"Run: {record['label']}\n"
-                f"Worker: {record['worker']}\n"
-                f"Result: {_exit_words(command_result(record))}\n"
-                f"Delivery: {delivery}")
+        state_path = Path(record["director_dir"] or record["session_dir"]) / unit_runs.STATE_FILE
+        lookup_error = ""
         try:
-            membership = staff.snapshot()
-            if (check_receipt and delivery.startswith(UNCONFIRMED_WORKER_RESULT)
-                    and _unconfirmed_result_received(record, membership, delivery)):
-                _ = _save_delivery(path, f"already delivered: {record['run_id']}")
-                return
-            state_path = Path(record["director_dir"] or record["session_dir"]) / unit_runs.STATE_FILE
-            lookup_error = ""
-            try:
-                fields = worker_lifecycle.read_json_object(state_path)
-            except worker_lifecycle.WorkerStateUnreadable as error:
-                fields = {}
-                lookup_error = str(error)
-            owner = unit_runs.run_owner(fields, membership)
-            director = owner if isinstance(owner, staff.StaffRow) else membership.owner_of(record["staff_id"])
-            if director is None or director.kind not in ("unit", "showrunner"):
-                raise worker_admission.RunOwnerUnavailable(lookup_error or f"{state_path}: no director staff row")
-            with staff.supplied_snapshot(membership):
-                alert = send.send(send.parse(["--to", str(director.id), "--from", "detached-runs",
-                                              "--timeout", str(send_budget.seconds()), "--text", text]))
-            if alert.outcome not in ("sent", "queued", "skipped"):
-                raise RuntimeError(f"{alert.outcome}: {alert.detail}")
-        except (Exception, SystemExit) as error:
-            detail = " ".join(str(error).splitlines())
-            print(f"anomaly: {record['run_id']}: could not alert the director: {detail}", file=sys.stderr, flush=True)
-        with record_lock(path):
-            record = _read_record(path)
-            record["push_alert_attempted"] = True
-            write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+            fields = worker_lifecycle.read_json_object(state_path)
+        except worker_lifecycle.WorkerStateUnreadable as error:
+            fields = {}
+            lookup_error = str(error)
+        owner = unit_runs.run_owner(fields, membership)
+        director = owner if isinstance(owner, staff.StaffRow) else membership.owner_of(record["staff_id"])
+        if director is None or director.kind not in ("unit", "showrunner"):
+            raise worker_admission.RunOwnerUnavailable(lookup_error or f"{state_path}: no director staff row")
+        with staff.supplied_snapshot(membership):
+            alert = send.send(send.parse(["--to", str(director.id), "--from", "detached-runs",
+                                          "--timeout", str(send_budget.seconds()), "--text", text]))
+        if alert.outcome not in ("sent", "queued", "skipped"):
+            raise RuntimeError(f"{alert.outcome}: {alert.detail}")
+    except (Exception, SystemExit) as error:
+        detail = " ".join(str(error).splitlines())
+        print(f"anomaly: {record['run_id']}: could not alert the director: {detail}", file=sys.stderr, flush=True)
+    with record_lock(path):
+        record = _read_record(path)
+        record["push_alert_attempted"] = True
+        write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
 
 
 def _retry_failed_push(path: Path) -> None:

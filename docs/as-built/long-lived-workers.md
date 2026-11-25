@@ -786,8 +786,9 @@ The start lock serializes orphan scans.
 The reaper saves an ended orphan as finished before it makes one delivery attempt.
 The reaper alerts the director if a finished run still has a failed push and its supervisor is gone.
 Before the reaper alerts for an unconfirmed push, it checks for a receipt.
-The worker event checks for a receipt and alerts the director if its attempt to deliver a finished result fails.
-This alert covers delivery after the supervisor exits.
+After the supervisor exits, a worker event records a delivery error even if it occurs before pane input.
+The worker event checks for a receipt and alerts the director if delivery fails or remains unconfirmed.
+A live supervisor retains control of retries and alerts.
 A deferred replay keeps a saved push failure.
 The supervisor uses the retry count and delay in `detached_runs.conf` after it releases the completion lock.
 The supervisor sends again only when the previous attempt sent nothing.
