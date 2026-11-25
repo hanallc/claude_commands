@@ -9102,6 +9102,69 @@ window.fetch=async(_url,options)=>{
                     self.browser_action_sequence(steps, add_item=False, window_size=(500, 900))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_ask_button_toast_and_delivery_name_the_producer(self) -> None:
+        item = self.add("Check the assigned item", number=1)
+        _ = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        root = self.root / "reviews"
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=1\n")
+        script = r"""
+(async()=>{
+ const row=document.querySelector('[data-number="1"]');
+ row.querySelector('.list-toggle').click();
+ const form=recordDetails(row).querySelector('[data-feedback-form]');
+ const ask=form.querySelector('[value="question"]');
+ const label=ask.getAttribute('aria-label');
+ const toast=new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   const text=document.querySelector('[data-send-undo] span');
+   if(text){observer.disconnect();resolve(text.textContent);}
+  });
+  observer.observe(document.body,{childList:true,subtree:true});
+ });
+ const sent=new Promise(resolve=>{
+  const request=window.fetch;
+  window.fetch=async(url,options)=>{
+   const response=await request(url,options);
+   if(String(url).startsWith('/send-hold/') && response.status!==202){
+    const result=await response.clone().json();
+    resolve(response.ok && !result.send_failure && !result.no_message);
+   }
+   return response;
+  };
+ });
+ form.elements.words.value='Which check passed?';
+ form.elements.words.dispatchEvent(new Event('input',{bubbles:true}));
+ if(ask.disabled) throw new Error('Ask question is disabled.');
+ ask.click();
+ return [label,await toast,await sent];
+})()
+"""
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(list_page, "counts_strip", return_value=""),
+              patch.object(session_pane, "session_place"),
+              patch.object(unrouted_alert, "message_outcome", return_value=question_outcome()) as send,
+              started_review_server(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            browser = self.chrome()
+            try:
+                browser.navigate(f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}")
+                result = browser.command("Runtime.evaluate", {"expression": script, "awaitPromise": True,
+                                                               "returnByValue": True}, browser.session)
+                self.assertNotIn("exceptionDetails", result)
+                self.assertEqual(cast(dict[str, object], result["result"])["value"],
+                                 [f"Ask question, {DWIGHT.name}", f"Sent to {DWIGHT.name}.", True])
+            finally:
+                browser.navigate("about:blank")
+                server.shutdown()
+                thread.join()
+        send.assert_called_once()
+        assert send.call_args is not None
+        self.assertEqual(send.call_args.args[0], f"session:{DWIGHT.current_session}")
+        self.assertIn("Which check passed?", cast(str, send.call_args.args[2]))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_tell_undo_toast_names_the_signed_producer(self) -> None:
         item = self.add("Check the assigned item", number=1)
         steps = r"""
