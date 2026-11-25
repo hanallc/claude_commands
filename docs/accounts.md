@@ -12,29 +12,31 @@ The status line's first row shows its current staff assignment and path; its sec
 
 ## Preventive login sittings
 
-The weekly reminder asks you to renew Claude logins before their server end dates.
-The first sitting is Tuesday, November 17, 2026, at 10:00 EST.
-Later sittings occur every seven days.
-The reminder selects accounts whose earliest stored end date is within ten days of the sitting.
-It compares the dates on natedev and the Mac.
-When none is within ten days, it selects the account with the earliest end date.
-It sends no sitting reminder when no account has a stored date.
-A missed sitting produces only the latest sitting reminder.
+The first sitting is Tuesday, November 17, 2026, at 07:00 PST.
+`login_sitting_interval_days` in `config/accounts.conf` sets the interval between sittings.
+Each sitting selects the account with the earliest unreported login end on natedev or the Mac.
+The reminder includes only the unreported end dates for that account.
+When all stored ends are reported or no dates are available, the sitting sends no reminder.
+If the timer misses a sitting, it processes only the latest sitting.
 
-The push lists each selected account and its known end date on each machine.
-For each selected account:
+For the selected account, follow these steps.
 
 1. Sign out of claude.ai in the browser.
 2. Sign in as that account.
 3. On each named machine, run `/login` in a Claude session on that account.
 
-One sitting renews the account on both machines.
 A token refresh does not extend the server end date.
-An additional safety reminder covers an unreported login within three days of its end date.
-The safety reminder does not repeat for the same machine, account, and end date.
-Both reminders respect notification silence.
+The timer records when it first sees a later stored end on each machine.
+The new end enters the reminder list in date order.
+The time from the observation to the new end gives the remaining login lifetime at observation.
+
+The safety push covers unreported ends within `login_safety_margin_days` of expiry.
+Only the safety push can name more than one account.
+Both reminder types respect notification silence. Silence retains each batch under its own key.
+The timer retires a reminder batch when every end date in it has changed.
+It keeps a batch with a date that still needs a reminder.
 Only natedev sends these reminders.
-It reads peer dates at most once per hour and retains the last good dates when the Mac is unavailable.
+It reads Mac dates at the configured interval and retains the last successful dates if the Mac is unavailable.
 
 ## Trusted worktrees
 

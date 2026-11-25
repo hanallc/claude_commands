@@ -18,7 +18,7 @@ This document describes the implementation and its constraints.
 | `scripts/accounts/role_map.py` | The shared role map, its transport, cache, locks, and change history. |
 | `scripts/accounts/next_moves.py` | Ordered moves, holds, positional edits, and validation. |
 | `scripts/accounts/refusal_watch.py` | Refusal detection, login renewal, queued moves, and automatic group moves. |
-| `scripts/accounts/login_sittings.py` | Weekly and safety reminders from stored Claude login end dates. |
+| `scripts/accounts/login_sittings.py` | Scheduled and safety reminders from stored Claude login end dates. |
 | `scripts/accounts/refusals.py` | Provider refusals and the freshness of usage readings. |
 | `scripts/accounts/moves.py` | Move outcomes, waits, assignment routing, and replay evidence. |
 | `scripts/accounts/unit_watchdog.py` | Recovery from pane launch records and fresh session liveness. |
@@ -117,35 +117,47 @@ The last successful peer read time and dates remain available after a failed att
 | --- | --- | --- |
 | `login_sitting_machine` | `natedev` | The machine that sends reminders. |
 | `login_sitting_first` | `2026-11-17T10:00:00-05:00` | The first sitting. |
-| `login_sitting_interval_days` | `7` | The interval between sittings. |
-| `login_sitting_window_days` | `10` | The selection window after a sitting. |
+| `login_sitting_interval_days` | `5` | The interval between sittings. |
 | `login_safety_margin_days` | `3` | The immediate reminder margin. |
 | `login_peer_read_minutes` | `60` | The minimum interval between peer attempts. |
 | `login_peer_read_timeout_seconds` | `30` | The peer command limit. |
 
 Each pass reads these settings through `conf.read`.
-The earliest end on either machine selects the account for a sitting.
-The sitting push includes both known machine dates for that account.
-When no account is within the window, the push selects the account with the earliest end.
-No known dates means no sitting push.
+The earliest unreported end on either machine selects one account for a sitting.
+The sitting push includes only unreported machine dates for that account.
+An accepted push marks its dates as reported.
+When a login renews, the old end leaves the list and the new end takes its place in date order.
+When all current dates are reported, the sitting sends no push.
 The latest sitting replaces any missed sittings.
+`_next_login_request` returns the account, machine, login end, and sitting date for each unreported date of the selected account.
 Safety pushes include only machine, account, and end-date combinations that no accepted push has named.
+Only a safety push can name more than one account.
 An unknown date never enters either list.
 
 The atomic state file is `accounts_home()/.local/state/accounts/login_sittings.json`.
-It holds the latest completed sitting, named login dates, peer dates, and peer read and attempt times.
-Each save removes a named record only when the same machine and account have a different known end date.
+It holds the latest completed sitting, named login dates, peer dates, peer read times, and peer attempt times.
+It also holds the last observed end for each machine and account, plus the key and dates of each accepted batch.
+When an end moves later, it saves the observation time and the new end.
+The difference gives the login lifetime from the observation time.
+The probe attempt file `login_renewals.json` tracks attempts to recover expired or missing logins.
+An observation removes a named record only when the same machine and account have a different known end date.
 A missing date keeps the named record.
 Cached peer dates remain current evidence until the next successful peer read replaces them.
 The module saves each peer attempt and its result before it reads local dates.
 It contains no credential or login identity.
 `locked_history` holds the lock in `login_sittings/` beside the state file throughout each pass.
-The lock covers state reads, local and peer reads, sends, and saves.
-A busy pass performs no account reads or sends.
+The lock covers state reads, local and peer reads, sends, retirements, and saves.
+A busy pass performs no account reads, sends, or retirements.
 The module records a sitting after an accepted push or an empty selection.
 A failed push leaves its sitting and named dates unrecorded for another attempt.
 The `accounts.login_sitting` catalog entry supplies both push kinds as normal notes.
-The `login-sitting` and `login-safety` keys replace older retained pushes of the same kind.
+The key uses the push kind and the machine, account, and end date for each entry in the batch.
+A retry of the same batch uses the same key. Silence retains different batches under different keys.
+The timer checks saved observations after the read attempts, even if a read fails.
+It retires a batch when the saved end differs for every date in it.
+It uses `send.py retire` with the batch key and the same sender as the push.
+It removes the batch from state after successful retirement. A failed retirement keeps the batch for the next pass.
+It keeps a batch with a current or unknown date.
 Delivery uses `push_texts.user_send_argv` and checks `send_result.send_outcome`.
 It never sets `--through-silence`.
 The push formats dates in the user's zone.

@@ -47,6 +47,19 @@ The expiry template requires current approval before sending.
 
 Claude sends no weekly session alert, 30-minute repeat, showrunner relay, `Quota restored:` notice or instruction to start no new work. `/quota_ack` and its acknowledgement state are removed. `/quota_refresh` still refreshes readings when the user reports a reset; routing restoration is recorded in the moves journal without a session notice. A scheduled move consumes its entry when its group selection is recorded, keeps the usual safe shutdown/showrunner notices, and sends no phone alert.
 
+## Claude login reminders
+
+The notes timer checks stored Claude login end dates on natedev and the Mac.
+`login_sitting_interval_days` sets the interval between sittings.
+Each sitting selects the account with the earliest unreported end.
+The push names that account and its unreported ends.
+An accepted push marks those dates as reported.
+Renewal replaces the old end with a later end in date order.
+The timer records when it first sees the later end.
+Only the safety reminder can name several accounts.
+It covers unreported login ends within three days.
+Both reminders respect notification silence. Silence retains each batch under its own key.
+
 ## Token notices
 
 The quota check sends one `quota.token_expiry` reminder per token in each configured window.

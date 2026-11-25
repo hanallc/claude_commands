@@ -27,6 +27,14 @@ machines at once, then commits it on main and pulls the Mac, without a test or
 release cycle. Moving an unchanged value from code
 to config needs no approval and does not use `/tune`.
 
+## accounts.conf
+
+`login_sitting_first` sets the first sitting and its time zone offset.
+`login_sitting_interval_days` sets the number of days between sittings.
+Each sitting selects the account with the earliest unreported login end.
+`login_safety_margin_days` sets the number of days before a login end that requires a safety reminder.
+Only the safety reminder can name more than one account.
+
 ## machines.conf
 
 `aliases` lists the workstation SSH aliases.
