@@ -886,6 +886,7 @@ This deadline relies on the two clocks agreeing. The reserve estimates time for 
 Slow setup, clock differences, or a transport failure can prevent natedev from receiving the result in time.
 On disconnect or timeout, the supervisor stops the sweep process group and waits for the sweep process to exit.
 The supervisor sends a cleanup record after the worker exits. It also sends one if the deadline passed before startup.
+If `SIGKILL` ends the worker, the supervisor exits with status 137 and sends no record.
 Natedev reports an unsuccessful sweep without that record as unconfirmed cleanup.
 Natedev also reports unconfirmed cleanup if SSH times out, loses the connection, or leaves no result.
 An SSH retry waits for `floor.lock` within its deadline before it reads mirror leases and claims.
