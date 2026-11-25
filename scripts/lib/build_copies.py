@@ -76,7 +76,7 @@ def _git(source: Path, *arguments: str, pass_fds: Sequence[int] = (), accepted: 
     try:
         result = subprocess.run(["git", "-C", str(source), *arguments],
                                 capture_output=True, text=True,
-                                pass_fds=pass_fds,
+                                pass_fds=tuple(dict.fromkeys((*pass_fds, *build_folders.held_build_folder_descriptors()))),
                                 timeout=timeout)
     except subprocess.TimeoutExpired as error:
         raise CopyGitFailure(f"git {' '.join(arguments)} in {source}: timed out after {timeout:g} seconds") from error
@@ -86,23 +86,23 @@ def _git(source: Path, *arguments: str, pass_fds: Sequence[int] = (), accepted: 
 
 
 
-def source_checkout(source: Path, *, pass_fds: Sequence[int] = ()) -> Path:
+def source_checkout(source: Path) -> Path:
     """Read the main checkout, including repositories with separate Git metadata."""
     # --show-cdup prints a line only inside a work tree: the path from source to its top.
     common, current, bare, *cdup = _git(source, "rev-parse", "--path-format=absolute", "--git-common-dir",
-                                       "--git-dir", "--is-bare-repository", "--show-cdup", pass_fds=pass_fds).splitlines()
+                                       "--git-dir", "--is-bare-repository", "--show-cdup").splitlines()
     if common == current and bare == "false":
         if cdup:
             return (source / cdup[0]).resolve()
-        return Path(_git(source, "rev-parse", "--show-toplevel", pass_fds=pass_fds).strip())
-    first = _git(source, "worktree", "list", "--porcelain", pass_fds=pass_fds).splitlines()[0]
+        return Path(_git(source, "rev-parse", "--show-toplevel").strip())
+    first = _git(source, "worktree", "list", "--porcelain").splitlines()[0]
     checkout = Path(first.removeprefix("worktree "))
     configured = _git(source, "--git-dir", common, "config", "--default", str(checkout),
-                      "--get", "core.worktree", pass_fds=pass_fds).strip()
+                      "--get", "core.worktree").strip()
     return (Path(common) / configured).resolve()
 
 
-def _persistent_source(source: Path, hold: Callable[[Path], tuple[int, ...]]) -> Path:
+def _persistent_source(source: Path, hold: Callable[[Path], None]) -> Path:
     seen: set[Path] = set()
     while True:
         record_path = copy_record.record_path(source)
@@ -117,36 +117,36 @@ def _persistent_source(source: Path, hold: Callable[[Path], tuple[int, ...]]) ->
         if not isinstance(original, str) or not original or not Path(original).is_dir():
             raise CopyGitFailure(f"copies: {source} has no available persistent source; create its pool from the original repository")
         original_path = Path(original)
-        source = source_checkout(original_path, pass_fds=hold(original_path))
+        hold(original_path)
+        source = source_checkout(original_path)
 
 
 @contextmanager
-def _copy_commit(repository: Path, source: Path, commit: str, *, repository_descriptors: tuple[int, ...],
-                 source_descriptors: tuple[int, ...]) -> Generator[None]:
+def _copy_commit(repository: Path, source: Path, commit: str) -> Generator[None]:
     """Retain one imported commit in the owner repository until the take ends."""
     if git_files.at(repository).common_dir == git_files.at(source).common_dir:
         yield
         return
     reference = f"refs/build-copies/take-{uuid4().hex}"
-    previous = _git(repository, "rev-parse", "HEAD", pass_fds=repository_descriptors)
+    previous = _git(repository, "rev-parse", "HEAD")
     try:
         _ = _git(repository, "fetch", "--no-tags", "--no-write-fetch-head", "--force", "--",
-                 str(source), f"{commit}:{reference}", pass_fds=(*repository_descriptors, *source_descriptors))
-        if not _git(repository, "merge-base", reference, previous, pass_fds=repository_descriptors, accepted=(0, 1)):
+                 str(source), f"{commit}:{reference}")
+        if not _git(repository, "merge-base", reference, previous, accepted=(0, 1)):
             raise CopyRepositoryMismatch(repository, source)
         yield
     finally:
-        _ = _git(repository, "update-ref", "-d", reference, pass_fds=repository_descriptors)
+        _ = _git(repository, "update-ref", "-d", reference)
 
 
-def _rescue(path: Path, descriptor: int, output: Sequence[str] = ()) -> None:
+def _rescue(path: Path, output: Sequence[str] = ()) -> None:
     """Save the source work, but not target, the use stamp or the `output` folders."""
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     name = f"{path.name}-{stamp}"
     generated = [path / "target", path / build_folders.COPY_USE_STAMP, *(path / folder for folder in output)]
     try:
         _ = git_rescue.rescue(path, name, generated=generated,
-                             pass_fds=(descriptor,))
+                             pass_fds=build_folders.held_build_folder_descriptors())
     except git_rescue.RescueError as error:
         if "status" not in error.command or "index" not in error.stderr:
             raise
@@ -155,9 +155,10 @@ def _rescue(path: Path, descriptor: int, output: Sequence[str] = ()) -> None:
             saved_index = Path(backup.name)
         _ = index.replace(saved_index)
         try:
+            descriptor = build_folders.build_folder_lock_fd(path)
             _ = _git(path, "read-tree", "HEAD", pass_fds=(descriptor,))
             _ = git_rescue.rescue(path, name, generated=generated,
-                                 pass_fds=(descriptor,))
+                                 pass_fds=build_folders.held_build_folder_descriptors())
         except BaseException:
             _ = saved_index.replace(index)
             raise
@@ -236,28 +237,25 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
               purpose: str, selection: CopySelection = LOWEST_FREE_COPY) -> Generator[LeasedCopy]:
     """Take the assigned number or the first free copy."""
     with ExitStack() as sources, ExitStack() as unit_claim:
-        def hold_source(path: Path) -> tuple[int, ...]:
-            descriptors = sources.enter_context(build_folders.git_source_claims(path))
-            for descriptor in descriptors:
+        def hold_source(path: Path) -> None:
+            for descriptor in sources.enter_context(build_folders.git_source_claims(path)):
                 _ = sources.enter_context(build_folders.inherit_build_lock(descriptor))
-            return descriptors
 
         try:
-            source_descriptors = hold_source(source)
-            repository = _persistent_source(source_checkout(source, pass_fds=source_descriptors), hold_source)
-            repository_descriptors = source_descriptors if repository == source else hold_source(repository)
+            hold_source(source)
+            repository = _persistent_source(source_checkout(source), hold_source)
+            if repository != source:
+                hold_source(repository)
         except build_folders.BuildFolderClaimHeld as error:
             raise build_folders.CopySourceBusy(str(error)) from error
         name = build_folders.repo_word(repository)
-        revision = _git(source, "rev-parse", "--verify", "--end-of-options", f"{commit}^{{commit}}",
-                        pass_fds=source_descriptors)
-        if _git(source, "ls-tree", revision, "--", "target", build_folders.COPY_USE_STAMP, pass_fds=source_descriptors):
+        revision = _git(source, "rev-parse", "--verify", "--end-of-options", f"{commit}^{{commit}}")
+        if _git(source, "ls-tree", revision, "--", "target", build_folders.COPY_USE_STAMP):
             raise CopyGitFailure(f"{revision}: the commit tracks a reserved copy path")
         parent = build_folders.unit_folder(name, unit)
         checkout = build_folders.CopyCheckout(repository, revision)
         numbers = (selection.number,) if isinstance(selection, ExactCopyRequest) else _copy_order(parent)
-        _ = sources.enter_context(_copy_commit(repository, source, revision, repository_descriptors=repository_descriptors,
-                                               source_descriptors=source_descriptors))
+        _ = sources.enter_context(_copy_commit(repository, source, revision))
         _ = unit_claim.enter_context(build_folders.unit_allocation_lock(parent, exclusive=False))
         for number in numbers:
             spec = build_folders.BuildFolderSpec(kind="copy", parent=build_folders.build_root(),
@@ -295,7 +293,7 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 except CopyGitFailure as error:
                     if isinstance(error.__cause__, subprocess.TimeoutExpired):
                         raise
-                    _rescue(path, descriptor)
+                    _rescue(path)
                     rescued = True
                     untracked = _git(path, *scan, "--exclude-standard", pass_fds=(descriptor,))
                 if any(name.endswith("/") for name in untracked.split("\0")):
@@ -308,11 +306,11 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 _exclude_copy_target(path, descriptor)
                 if not rescued:
                     output = _git(path, *scan, "--ignored", pass_fds=(descriptor,))
-                    _rescue(path, descriptor, [entry for entry in output.split("\0") if entry.endswith("/")])
-                _ = _git(path, "update-index", "--really-refresh", pass_fds=(descriptor,), accepted=(0, 1))
-                _ = _git(path, "checkout", "--force", "--detach", revision, pass_fds=(descriptor,))
+                    _rescue(path, [entry for entry in output.split("\0") if entry.endswith("/")])
+                _ = _git(path, "update-index", "--really-refresh", accepted=(0, 1))
+                _ = _git(path, "checkout", "--force", "--detach", revision)
                 _ = _git(path, "clean", "-ffx", "--exclude=/target",
-                         f"--exclude=/{build_folders.COPY_USE_STAMP}", pass_fds=(descriptor,))
+                         f"--exclude=/{build_folders.COPY_USE_STAMP}")
                 target.mkdir(exist_ok=True)
                 build_folders.record_numbered_copy_source(path, repository, revision)
                 yield LeasedCopy(path, name, number, MappingProxyType({
@@ -628,10 +626,11 @@ def main(argv: Sequence[str]) -> int:
                 print(copy.path, flush=True)
                 _ = sys.stdin.read(1)
                 return 0
+            descriptor = build_folders.build_folder_lock_fd(copy.path)
             environment = {**os.environ, **copy.env, "BUILD_FOLDER": str(copy.path),
-                           "BUILD_FOLDER_LOCK_FD": copy.env[build_folders.NUMBERED_COPY_LOCK_ENV]}
+                           "BUILD_FOLDER_LOCK_FD": str(descriptor)}
             return build_folders.run_build_command(command, path=copy.path, environment=environment,
-                                                   pass_fds=copy.pass_fds)
+                                                   pass_fds=build_folders.held_build_folder_descriptors())
     except (OSError, ValueError, CopyGitFailure, subprocess.SubprocessError) as error:
         print(f"copies: {error}", file=sys.stderr)
         return 1
