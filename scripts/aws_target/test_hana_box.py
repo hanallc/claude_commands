@@ -243,7 +243,7 @@ class HanaBoxTests(CostFixture):
         self.ready()
         self.controller.bind_execution('execution-one')
         self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleaseRefused)
-        reference = placement.ProviderClaimReference('ssh', 'fixture-target', RepositoryScope('hana', 'fixture-repository', 1),
+        reference = placement.ProviderClaimReference('ssh', 'fixture-target', RepositoryScope('hana', 'fixture-repository'),
             'execution-one', 'fixture-episode', 'fixture-attempt')
         settled = hana_execution.settle_unpublished_claim(self.state, reference,
             release_claim=lambda: self.controller.release('execution-one'), reason='The capture was refused')

@@ -56,7 +56,7 @@ class SshEligibilityTests(unittest.TestCase):
             + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.hana=linux-part\n")
         _ = write_config_fixture(self.root / "linux.conf",
-                              "offload=on\nhost=fake-linux\nkinds=test,check,doc\nslots=2\nslots.hana=2\n", template="mac_test")
+                              "offload=on\nhost=fake-linux\nkinds=test,check,doc\n", template="mac_test")
         _ = (self.root / "Cargo.toml").write_text('[package]\nname="linux-part"\nversion="0.1.0"\n')
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **environment, "HOME": str(self.root), "MAC_TEST_CONFIG": str(self.root / "mac_test.conf"),
@@ -256,12 +256,6 @@ class SshEligibilityTests(unittest.TestCase):
         _ = table.write_text(table.read_text().replace("targets=mac,natedev,linux", "targets=mac,natedev,linux,spare")
                              + "kind.spare=ssh\nplatform.spare=linux\nsettings.spare=spare.conf\n")
 
-    def required_slot(self, claim: mac_test.HeldClaim) -> int:
-        if "slot" not in claim.record:
-            self.fail("The Linux claim has no slot")
-        return claim.record["slot"]
-
-
     def test_wait_release_matches_the_acquired_attempt(self) -> None:
         self.assertEqual(self.reserve(), 0)
         paths = mac_test.state_paths("linux")
@@ -313,7 +307,6 @@ class SshEligibilityTests(unittest.TestCase):
 
     def test_capacity_exclusions_keep_the_memory_leave_route_available(self) -> None:
         self.occupy(71)
-        self.occupy(72)
         self.assertEqual(self.decision(), "any_target")
         with mock.patch.object(mac_test, "free_now", return_value="blocked"):
             self.assertEqual(self.decision(), "any_target")
@@ -360,11 +353,8 @@ class SshEligibilityTests(unittest.TestCase):
         self.assertEqual(self.linux()[1:3], ["excluded", "backoff"])
         self.assertEqual(self.commands, [])
 
-    def test_all_occupied_slots_exclude_target_before_ssh(self) -> None:
+    def test_occupied_repository_excludes_target_before_ssh(self) -> None:
         self.occupy(71)
-        self.assertEqual(self.linux()[1], "eligible")
-        self.occupy(72)
-        self.commands.clear()
         self.assertEqual(self.linux()[1:3], ["excluded", "busy"])
         self.assertEqual(self.commands, [])
 
