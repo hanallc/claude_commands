@@ -120,7 +120,13 @@ class SharedReviewTests(unittest.TestCase):
         self.assertIn("1. First choice → Accept\n   Pending: update the plan", document)
         self.assertIn("2. Second choice → Defer", document)
         self.assertTrue(Path(review["document"]).read_text().endswith(document))
-        self.assertEqual(json.loads(self.cli(CLONE, "next", *handle)), {"state": "complete", "remaining": 0})
+        self.assertEqual(json.loads(self.cli(CLONE, "next", *handle)), {
+            "state": "complete", "remaining": 0, "items": [
+                {"item": 1, "text": "First choice\nDetails",
+                 "decision": {"words": "Accept", "actions": "Pending: update the plan"}},
+                {"item": 2, "text": "Second choice", "decision": {"words": "Defer", "actions": ""}},
+            ],
+        })
 
     def test_next_keeps_a_live_claim_missing_from_the_registry(self) -> None:
         review = self.start("first")
@@ -182,7 +188,34 @@ class SharedReviewTests(unittest.TestCase):
         self.assertTrue(path.exists())
         self.liveness[OWNER] = sessions.SessionNotLive()
         self.assertIn("ended their session", self.cli(CLONE, "join", "bob", expected=2))
-        self.assertFalse(path.exists())
+        self.assertTrue(path.exists())
+
+    def test_owner_exit_preserves_joined_decisions_for_resume(self) -> None:
+        review = self.start("first", "second")
+        handle = (review["owner"], review["review"])
+        _ = self.cli(CLONE, "join", "bob")
+        _ = self.cli(CLONE, "next", *handle)
+        _ = self.cli(CLONE, "record", *handle, "1", "Accept")
+        record = Path(review["document"])
+        before = record.read_text()
+        self.liveness[OWNER] = sessions.SessionNotLive()
+        self.processes[PIDS[OWNER]] = sessions.SessionNotLive()
+        for verb in ("show", "next"):
+            self.assertIn("ended their session", self.cli(CLONE, verb, *handle, expected=2))
+        self.assertEqual(record.read_text(), before)
+        self.liveness[OWNER] = sessions.LiveSessionProcess(126, "resumed-owner")
+        self.assertEqual(json.loads(self.cli(OWNER, "resume")), {**review, "remaining": 1})
+        self.assertIn("1. first → Accept", self.cli(OWNER, "show", *handle))
+        self.assertEqual(json.loads(self.cli(CLONE, "next", *handle))["item"], 2)
+
+    def test_owner_claim_checks_the_saved_start_when_the_registry_omits_it(self) -> None:
+        review = self.start("first")
+        handle = (review["owner"], review["review"])
+        self.liveness[OWNER] = sessions.LiveSessionProcess(PIDS[OWNER])
+        self.processes[PIDS[OWNER]] = sessions.SessionNotLive()
+        self.assertIn("Cannot confirm your process", self.cli(OWNER, "claim", *handle, expected=2))
+        self.processes[PIDS[OWNER]] = sessions.LiveSessionProcess(PIDS[OWNER], self.process_start(PIDS[OWNER]))
+        self.assertEqual(json.loads(self.cli(OWNER, "claim", *handle))["item"], 1)
 
     def test_solo_command_keeps_its_document_announcement_todos_and_wrap_up(self) -> None:
         text = self.command_text()
@@ -360,12 +393,19 @@ class SharedReviewTests(unittest.TestCase):
         self.assertEqual(json.loads(self.cli(CLONE, "next", *handle))["remaining"], 2)
         self.assertEqual(json.loads(self.cli(CLONE, "record", *handle, "1", "Accept")), {"remaining": 1})
         _ = self.cli(OWNER, "claim", *handle)
-        self.assertEqual(json.loads(self.cli(CLONE, "next", *handle)), {"state": "busy", "remaining": 1})
+        self.assertEqual(json.loads(self.cli(CLONE, "next", *handle)), {
+            "state": "busy", "remaining": 1, "items": [
+                {"item": 1, "text": "First choice", "decision": {"words": "Accept", "actions": ""}},
+                {"item": 2, "text": "Second choice"},
+            ],
+        })
         flow = self.command_text().split("## Join a review\n", 1)[1].split("## Step 1", 1)[0]
+        self.assertNotIn("`show OWNER REVIEW`", flow)
         contract = (
             "Apply `remaining` from `join` with the Step 3 status command.",
             "Run `next OWNER REVIEW` to claim an item.",
             "Apply `remaining` from `next` before you handle the result, including `busy` or `complete`.",
+            "Read the decisions in the returned `items`.",
             "On `busy`,",
             "On `complete`,",
             "Set this session's count to zero. Use the held message steps in Step 5.",

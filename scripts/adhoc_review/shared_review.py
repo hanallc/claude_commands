@@ -65,7 +65,7 @@ class ReviewTask(TypedDict):
 
 class ClaimResult(TypedDict):
     remaining: int
-    items: NotRequired[list[ReviewTask]]
+    items: list[ReviewTask]
 
 
 class ClaimedItem(ClaimResult):
@@ -192,12 +192,13 @@ class ReviewStore:
     def session_state(self, review: ActiveReview, identity: str) -> SessionLiveness:
         observed = self.liveness(identity)
         if isinstance(observed, sessions.LiveSessionProcess):
-            return observed
+            if isinstance(observed.started, str):
+                return observed
+            observed = sessions.SessionLivenessUnknown("The registry has no verified process start.")
         saved = review["participants"].get(identity)
         if saved is None:
             return (observed if isinstance(observed, sessions.SessionLivenessUnknown)
                     else sessions.SessionLivenessUnknown("No saved process identity."))
-        # The registry can lose a record before the process exits.
         process = sessions.process_liveness(saved["pid"], saved["started"])
         if isinstance(process, sessions.LiveSessionProcess) or isinstance(observed, sessions.SessionNotLive):
             return process
@@ -221,12 +222,11 @@ class ReviewStore:
                 del review["claims"][index]
             _save(path, review)
 
-    def check_owner(self, actor: str, owner: str, path: Path, review: ActiveReview) -> None:
+    def check_owner(self, actor: str, owner: str, review: ActiveReview) -> None:
         if actor == owner:
             return
         observed = self.session_state(review, owner)
         if isinstance(observed, sessions.SessionNotLive):
-            _remove(path)
             raise ReviewError("The review owner has ended their session.")
         if isinstance(observed, sessions.SessionLivenessUnknown):
             raise ReviewError(f"Cannot confirm the review owner's session: {observed.reason}")
@@ -238,7 +238,7 @@ class ReviewStore:
                 if actor != owner:
                     raise ReviewError("This review has ended.")
                 return self.handle(owner, path, review)
-            self.check_owner(actor, owner, path, review)
+            self.check_owner(actor, owner, review)
             if self.remember_process(review, actor):
                 _save(path, review)
             self.prune_claims(path, review, actor)
@@ -259,7 +259,7 @@ class ReviewStore:
                     raise ReviewError("This review has ended.")
                 yield path, review
                 return
-            self.check_owner(actor, owner, path, review)
+            self.check_owner(actor, owner, review)
             if actor != owner and actor not in review["participants"]:
                 raise ReviewError("Join this review before you use its items.")
             self.prune_claims(path, review, actor)
@@ -267,10 +267,7 @@ class ReviewStore:
 
     def claim(self, actor: str, owner: str, review_id: str, requested: int | NextItem) -> ClaimedItem | NoAvailableItem:
         with self.opened(actor, owner, review_id) as (path, review):
-            result = self._claim(path, review, actor, requested)
-            if actor == owner:
-                result["items"] = review_tasks(review)
-            return result
+            return self._claim(path, review, actor, requested)
 
     def _claim(self, path: Path, review: ActiveReview, actor: str, requested: int | NextItem) -> ClaimedItem | NoAvailableItem:
         claims = review["claims"]
@@ -286,14 +283,14 @@ class ReviewStore:
                                      if number not in claims and number not in review["decisions"]), "")
         if not index:
             count = remaining(review)
-            return NoAvailableItem(state="busy" if count else "complete", remaining=count)
+            return NoAvailableItem(state="busy" if count else "complete", remaining=count, items=review_tasks(review))
         _ = self.remember_process(review, actor)
         if current and current != index:
             del claims[current]
         claims[index] = actor
         _save(path, review)
         return ClaimedItem(state="claimed", item=int(index), text=review["items"][int(index) - 1],
-                           remaining=remaining(review))
+                           remaining=remaining(review), items=review_tasks(review))
 
 
 def add_items(review: ActiveReview, items: list[str], after: int | AppendItems) -> None:

@@ -20,9 +20,9 @@ For `/adhoc_review join bob`, run `join bob` on the owner's machine.
 
 Apply `remaining` from `join` with the Step 3 status command.
 
-1. Run `show OWNER REVIEW` before each item to read the decisions.
-2. Run `next OWNER REVIEW` to claim an item. Use `--item N` to revisit one.
-3. Apply `remaining` from `next` before you handle the result, including `busy` or `complete`.
+1. Run `next OWNER REVIEW` to claim an item. Use `--item N` to revisit one.
+2. Apply `remaining` from `next` before you handle the result, including `busy` or `complete`.
+3. Read the decisions in the returned `items`.
 4. On `busy`, say another session holds the remaining items. Wait for the user to continue.
 5. On `complete`, proceed to `leave` below.
 6. Apply Step 3.5 when needed. Use the split, explanation, and choice instructions in Step 4.
