@@ -35,7 +35,7 @@ import uuid
 from typing import Literal, Protocol, cast, final
 
 from scripts.agents import detached_runs, pane_record, shutdown_record, worker_lifecycle
-from scripts.herdr import herdr_types, pane_launch
+from scripts.herdr import herdr_types, pane_launch, pass_notices
 from scripts.accounts import accounts, session_state
 from scripts.direct import progress_history, recorder_state
 from scripts.herdr import worker_panes
@@ -2286,8 +2286,33 @@ def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBacken
                          _answer_digest(script_prompt(text)), question_call if status is herdr.AgentStatus.BLOCKED else "")
 
 
+def _answer_ended_pass(row: staff.StaffRow, run: Path, passed: dict[str, object],
+                       record: staff.StaffSnapshot, after_unlock: ExitStack) -> ExitCode:
+    name = WorkerName.parse(row.name)
+    instance = pass_recorder.string(passed.get("instance_id"))
+    delivery = pass_recorder.dispatch_delivery(passed)
+    started = passed.get("started_at")
+    director = record.parent_of(row)
+    if (passed.get("status") not in ("completed", "error", "interrupted") or not instance or not delivery.line
+            or not isinstance(started, (int, float)) or director is None):
+        return _refuse_answer(name, "no active pass")
+    receipt = dispatch_receipt(row, delivery.line, delivery.completion_id or instance, run=run, require_transcript=True)
+    if isinstance(receipt, DispatchEvidenceUnknown):
+        return _refuse_answer(name, f"completion evidence is unavailable: {receipt.reason}", ExitCode.UNCERTAIN)
+    if (not isinstance(receipt, (DispatchWaitingForRuns, DispatchAwaitingReply))
+            or waiting_recovery(receipt) is not CompletionRecovery.WAITING_ON_REPLY):
+        return _refuse_answer(name, "no active pass")
+    keys = detached_runs.stage_ended_pass_results(run, row, director, instance=instance, started=started, ids=receipt.runs)
+    if not keys:
+        return _refuse_answer(name, "the ended pass has no verified finished run to forward", ExitCode.UNCERTAIN)
+    for key in keys:
+        _ = after_unlock.callback(pass_notices.retry_result, run, instance, key)
+    print(f"{row.name}: queued {len(keys)} detached run {'result' if len(keys) == 1 else 'results'} for {director.name}")
+    return ExitCode.OK
+
+
 def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
-    with worker_panes.worker_lock(parent, name) as hold:
+    with ExitStack() as after_unlock, worker_panes.worker_lock(parent, name) as hold:
         if isinstance(hold, worker_panes.Kept):
             return _busy_dispatch(f"{name.value}: {hold.blocker}. Use assign.sh for new work.")
         record = staff.snapshot()
@@ -2299,9 +2324,11 @@ def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
         active = progress_history.active_dispatch(row.id, run)
         if isinstance(active, progress_history.ActiveDispatchUnavailable):
             return _refuse_answer(name, "the active pass is unavailable", ExitCode.UNCERTAIN)
-        if isinstance(active, progress_history.NoActiveDispatch):
-            return _refuse_answer(name, "no active pass")
         passed = worker_panes.worker_pass(row, run, record=record)
+        if isinstance(active, progress_history.NoActiveDispatch):
+            if not hold.owns(row):
+                return _refuse_answer(name, "the worker changed", ExitCode.UNCERTAIN)
+            return _answer_ended_pass(row, run, passed, record, after_unlock)
         delivery = pass_recorder.dispatch_delivery(passed)
         if passed.get("instance_id") != active.instance_id or not all((delivery.line, delivery.completion_id, delivery.reply_file)):
             return _refuse_answer(name, "the active pass has no saved delivery")

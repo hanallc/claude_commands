@@ -4332,6 +4332,53 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(self.command("end", row.name), (0, "done\n", ""))
         self.assertIsNone(staff.by_id(row.id))
 
+    def test_answer_forwards_results_that_block_assignment_after_the_pass_ends(self) -> None:
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane, _ = self.agent.submitted[-1]
+        row = self.agent.row(pane)
+        instance = str(worker_panes.worker_pass(row, self.run_dir)["instance_id"])
+        for run_id, delivery in (("delivered", f"sent: worker {row.name} at {pane}"),
+                                 ("undelivered", "deferred: worker is stopped")):
+            path, record = self.detached_record(row, run_id)
+            record.update(pane_dispatch_id=instance, delivery=delivery, exit_code=7, completion_pending=True)
+            atomic_file.write_text_atomic(path, json.dumps(record))
+        self.agent.append(pane, "user", "Detached run: delivered\nRun finished: private verification")
+        self.agent.append(pane, "assistant", "The check failed.")
+        self.fixture.world.locations[pane]["agent_status"] = "idle"
+        state = self.run_dir / unit_runs.STATE_FILE
+        fields = cast(dict[str, object], json.loads(state.read_text()))
+        pass_recorder.pass_slots(fields)["impl"]["status"] = "interrupted"
+        atomic_file.write_text_atomic(state, json.dumps(fields))
+        self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.NoActiveDispatch)
+
+        following = self.run_dir / "next-prompt.md"
+        atomic_file.write_text_atomic(following, "Start the next assignment.\n")
+        assign_next = ("assign", "impl", str(following), "--name", row.name, "--slot", "impl", "--phase", "8",
+                       "--kind", "assign", "--session-dir", str(self.run_dir), "--launcher-command", '["assign.sh"]')
+        code, output, errors = self.command(*assign_next)
+        self.assertEqual((code, output), (worker.ExitCode.BUSY, ""))
+        self.assertIn(worker.CompletionRecovery.WAITING_ON_REPLY.value, errors)
+
+        ended = state.read_bytes()
+        self.agent.notice_failures = 1
+        code, output, errors_text = self.command("answer", row.name, "--text", "Report the result.")
+        self.assertEqual(code, 0)
+        self.assertIn("queued 2 detached run results", output)
+        self.assertIn("director message failed", errors_text)
+        self.assertEqual(state.read_bytes(), ended)
+        self.assertEqual(self.agent.answers, [])
+        self.assertEqual(len(self.agent.notices), 1)
+        self.assertEqual(self.command(*assign_next), (0, "submitted\n", ""))
+        self.assertNotEqual(worker_panes.worker_pass(row, self.run_dir)["instance_id"], instance)
+
+        self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        for run_id in ("delivered", "undelivered"):
+            notice, = [notice for notice in self.agent.notices if f"Detached run: {run_id}\n" in notice]
+            self.assertIn("Result: FAIL (exit 7)", notice)
+        delivered_notices = self.agent.notices.copy()
+        self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        self.assertEqual(self.agent.notices, delivered_notices)
+
     def test_waiting_recovery_names_reap_a_live_run_or_a_new_done(self) -> None:
         reply = worker.DispatchSubmitted()
         awaiting = worker.DispatchAwaitingReply("reply", ("late",), worker.NoMatchingDone.UNRECORDED)
