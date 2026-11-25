@@ -23,7 +23,7 @@ from unittest import mock
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.copies.workspace_test_support import registered_workspace
-from scripts.build_queue import first_step, slot_wait
+from scripts.build_queue import admission_client, first_step, slot_wait
 from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
@@ -215,7 +215,7 @@ source_check_seconds=1
         environment = {key: value for key, value in os.environ.items()
                        if not key.startswith(("GIT_", "COPIES_STEP_")) and key not in (
                            "UNIT_RUN_DIR", "CARGO_BUILD_BUILD_DIR", "CARGO_TARGET_DIR", "COPIES_RUN_PID",
-                           "BASH_ENV", "STAFF_CONFIG")}
+                           "BASH_ENV", "STAFF_CONFIG", admission_client.RESERVED_STEP_ENV)}
         environment.update({
             **slot_configuration.environment,
             "HOME": str(home),
