@@ -901,7 +901,7 @@ with mock.patch.object(scratch.time, "sleep", side_effect=announce_wait):
               mock.patch.object(gate, "finish_gate_job", wraps=gate.finish_gate_job) as finished):
             result = self.run_gate("--tests-only", "--full")
         finished.assert_called_once()
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("UNRESOLVED: could not remove", result.stderr)
         self.assertTrue(children)
         self.assertTrue(all(child.is_dir() for child in children), children)

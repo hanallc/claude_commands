@@ -825,8 +825,10 @@ gate.run_suites(Path.cwd(), full=True)
                 return finish(job, status)
 
             with (mock.patch.object(gate, "finish_gate_job", side_effect=finish_with_held_lease),
-                  self.assertRaises(gate.GateRecoveryUnresolved)):
-                _ = gate.run_suites(self.checkout)
+                  redirect_stderr(io.StringIO()) as report):
+                run = gate.run_suites(self.checkout)
+            self.assertTrue(run.passed, run.jobs)
+            self.assertIn("UNRESOLVED: could not remove", report.getvalue())
             [folder] = held
             self.assertEqual((folder / "held-output").read_text(), "the holder owns this file")
             self.assertEqual(build_folders.build_folder_state(folder), "held")
@@ -847,8 +849,10 @@ gate.run_suites(Path.cwd(), full=True)
                 return finish(job, status)
 
             with (mock.patch.object(gate, "finish_gate_job", side_effect=finish_with_nested_lease),
-                  self.assertRaisesRegex(gate.GateRecoveryUnresolved, "UNRESOLVED: could not remove")):
-                _ = gate.run_suites(self.checkout)
+                  redirect_stderr(io.StringIO()) as report):
+                run = gate.run_suites(self.checkout)
+            self.assertTrue(run.passed, run.jobs)
+            self.assertIn("UNRESOLVED: could not remove", report.getvalue())
             [nested] = held
             folder = nested.parent
             self.assertEqual((nested / "output").read_text(), "the holder owns this file")
@@ -865,15 +869,15 @@ gate.run_suites(Path.cwd(), full=True)
                     recovery_scope = (gate.gate_recovery(self.checkout) if scope == "shared"
                                       else gate.private_gate_recovery(self.checkout, parent))
                     with (redirect_stderr(io.StringIO()) as report,
-                          self.assertRaisesRegex(gate.GateRecoveryUnresolved, "UNRESOLVED: could not remove"),
                           recovery_scope as recovery,
                           mock.patch.object(build_folders, "may_remove_build_path", return_value=False) as remove,
                           gate.gate_temporary(recovery, "merge-gate", parent) as folder):
                         self.assertTrue(folder.is_dir())
                     remove.assert_called_once_with(folder)
-                    self.assertEqual(report.getvalue().splitlines(), [
-                        f"kept for a manual removal list: {folder} (gate, the gate could not remove its folder)"
-                    ])
+                    kept, unresolved = report.getvalue().splitlines()
+                    self.assertEqual(kept,
+                                     f"kept for a manual removal list: {folder} (gate, the gate could not remove its folder)")
+                    self.assertIn(f"UNRESOLVED: could not remove {folder}", unresolved)
                     self.assertTrue(folder.is_dir())
                     saved = cast(dict[str, object], json.loads(recovery.path.read_text()))
                     self.assertEqual(saved["folders"], [str(folder)])
@@ -892,11 +896,12 @@ gate.run_suites(Path.cwd(), full=True)
             unlink(name, dir_fd=dir_fd)
 
         with mock.patch.dict(os.environ, self.environment, clear=True):
-            with (self.assertRaisesRegex(gate.GateRecoveryUnresolved, "fixture cannot remove the child"),
+            with (redirect_stderr(io.StringIO()) as report,
                   gate.gate_recovery(self.checkout) as recovery,
                   mock.patch.object(os, "unlink", side_effect=fail_child),
                   gate.gate_temporary(recovery, "merge-gate", self.root) as folder):
                 self.write(folder / "blocked-child", "keep")
+            self.assertRegex(report.getvalue(), r"(?m)^UNRESOLVED: .*fixture cannot remove the child")
             self.assertEqual((folder / "blocked-child").read_text(), "keep")
             marker = folder / build_folders.RECOVERY_MARKER
             retained_marker = build_folders.recovery_marker_sidecar(folder)
@@ -938,8 +943,10 @@ gate.run_suites(Path.cwd(), full=True)
                 return finish(job, status)
 
             with (mock.patch.object(gate, "finish_gate_job", side_effect=lock_before_allocation),
-                  self.assertRaises(gate.GateRecoveryUnresolved)):
-                _ = gate.run_suites(self.checkout)
+                  redirect_stderr(io.StringIO()) as report):
+                run = gate.run_suites(self.checkout)
+            self.assertTrue(run.passed, run.jobs)
+            self.assertIn("UNRESOLVED: could not remove", report.getvalue())
             [lock] = locks
             self.assertTrue(lock.is_file())
             self.assertFalse(lock.with_suffix("").exists())
@@ -952,6 +959,7 @@ gate.run_suites(Path.cwd(), full=True)
     def test_top_level_lease_keeps_folder_and_record_after_modules_finish(self) -> None:
         self.supply_jobserver(b"Q")
         finish = gate.finish_gate_job
+        report_entries = gate.report_gate_removal_entries
         folders: list[Path] = []
         with mock.patch.dict(os.environ, self.environment, clear=True), ExitStack() as holder:
             def keep_gate_lease(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
@@ -962,9 +970,17 @@ gate.run_suites(Path.cwd(), full=True)
                     folders.append(folder)
                 return finish(job, status)
 
+            def report_while_reserved(folder: Path) -> tuple[Path, ...]:
+                if folder in folders:
+                    self.assertTrue(self.admission.server.reservations)
+                return report_entries(folder)
+
             with (mock.patch.object(gate, "finish_gate_job", side_effect=keep_gate_lease),
-                  self.assertRaises(gate.GateRecoveryUnresolved)):
-                _ = gate.run_suites(self.checkout, max_running_jobs=1)
+                  mock.patch.object(gate, "report_gate_removal_entries", side_effect=report_while_reserved),
+                  redirect_stderr(io.StringIO()) as report):
+                run = gate.run_suites(self.checkout, max_running_jobs=1)
+            self.assertTrue(run.passed, run.jobs)
+            self.assertIn("UNRESOLVED: could not remove", report.getvalue())
             self.assert_all_modules_started()
             [folder] = folders
             self.assertEqual(build_folders.build_folder_state(folder), "held")
@@ -990,9 +1006,11 @@ gate.run_suites(Path.cwd(), full=True)
 
         with (mock.patch.dict(os.environ, self.environment, clear=True),
               mock.patch.object(build_folder_lock, "open_lock", side_effect=refuse_open),
-              mock.patch.object(gate, "finish_gate_job", side_effect=refuse_after_finish)):
-            with self.assertRaisesRegex(gate.GateRecoveryUnresolved, "fixture refuses the module lock"):
-                _ = gate.run_suites(self.checkout)
+              mock.patch.object(gate, "finish_gate_job", side_effect=refuse_after_finish),
+              redirect_stderr(io.StringIO()) as report):
+            run = gate.run_suites(self.checkout)
+            self.assertTrue(run.passed, run.jobs)
+            self.assertRegex(report.getvalue(), r"(?m)^UNRESOLVED: .*fixture refuses the module lock")
             [folder] = blocked
             self.assertTrue(folder.with_name(folder.name + ".lock").is_file())
             _ = self.assert_unresolved_folder_cleanup([folder.parent, folder])
@@ -1017,8 +1035,7 @@ gate.run_suites(Path.cwd(), full=True)
                             raise PermissionError("fixture refuses the lease file")
                         unlink(path, dir_fd=dir_fd)
 
-                    with (self.assertRaisesRegex(gate.GateRecoveryUnresolved, "fixture refuses the lease file"),
-                          mock.patch.object(os, "unlink", side_effect=refuse_lease_file)):
+                    with mock.patch.object(os, "unlink", side_effect=refuse_lease_file):
                         cleanup.close()
                     self.assertFalse(folder.exists())
                     self.assertTrue(blocked.is_file())
@@ -1026,9 +1043,10 @@ gate.run_suites(Path.cwd(), full=True)
                 saved = cast(dict[str, object], json.loads(recovery.path.read_text()))
                 self.assertEqual(saved["folders"], [str(folder)])
                 self.assertIs(saved["finished"], False)
-                [notice] = report.getvalue().splitlines()
+                notice, unresolved = report.getvalue().splitlines()
                 self.assertTrue(notice.startswith("kept for a manual removal list: "))
                 self.assertIn(str(blocked), notice)
+                self.assertRegex(unresolved, r"^UNRESOLVED: .*fixture refuses the lease file")
 
     def test_failed_gate_removes_its_folder(self) -> None:
         parent = self.root / "gate-temporary"

@@ -798,6 +798,7 @@ class GateRecovery:
     rollback_source: str = ""
     finished: bool = False
     unresolved: bool = False
+    retained_folders: set[Path] = field(default_factory=set, init=False)
     rollback_deadline: float | None = None
     register_job: Callable[[RunningGateJob], None] | None = None
     scope: str = ""
@@ -1334,7 +1335,8 @@ def gate_recovery(repo: Path) -> Generator[GateRecovery]:
             yield recovery
         finally:
             ACTIVE_GATE_RECOVERY.reset(token)
-            if not (recovery.unresolved or recovery.groups or recovery.tokens or recovery.rollback or recovery.scope):
+            if not (recovery.unresolved or recovery.retained_folders or recovery.groups or recovery.tokens
+                    or recovery.rollback or recovery.scope):
                 recovery.finish()
 
 
@@ -1357,7 +1359,8 @@ def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
         try:
             yield recovery
         finally:
-            if not (recovery.unresolved or recovery.groups or recovery.tokens or recovery.rollback or recovery.scope):
+            if not (recovery.unresolved or recovery.retained_folders or recovery.groups or recovery.tokens
+                    or recovery.rollback or recovery.scope):
                 recovery.finish()
             keep = recovery.path.exists()
             ACTIVE_GATE_RECOVERY.reset(token)
@@ -1375,9 +1378,13 @@ def recoverable_gate_folder(
     recovery: GateRecovery, request: build_folders.UniqueBuildFolder | build_folders.BuildFolderSpec,
 ) -> Generator[Path]:
     """Keep the recovery record and marker until the folder is removed."""
+    folder: Path | None = None
+
+    def keep_folder() -> bool:
+        return recovery.unresolved or any(path.parent == folder for path in recovery.retained_folders)
+
     with ExitStack() as cleanup:
-        folder = cleanup.enter_context(build_folders.temporary_build_folder(
-            request, keep=lambda: recovery.unresolved, children=True))
+        folder = cleanup.enter_context(build_folders.temporary_build_folder(request, keep=keep_folder, children=True))
         try:
             recovery.folders.append(str(folder))
             recovery.save()
@@ -1387,13 +1394,15 @@ def recoverable_gate_folder(
         finally:
             try:
                 cleanup.close()
-                if not recovery.unresolved:
+                if not keep_folder():
                     check_gate_folder_removal(recovery, folder)
-            except build_folders.TemporaryFolderRemovalUnresolved as error:
-                recovery.unresolved = True
-                with suppress(OSError):
-                    _ = report_gate_removal_entries(folder)
-                raise GateRecoveryUnresolved(str(error)) from error
+            except (build_folders.TemporaryFolderRemovalUnresolved, GateRecoveryUnresolved) as error:
+                recovery.retained_folders.add(folder)
+                if isinstance(error, build_folders.TemporaryFolderRemovalUnresolved):
+                    with suppress(OSError):
+                        _ = report_gate_removal_entries(folder)
+                reason = str(error).removeprefix("UNRESOLVED: ")
+                print(f"UNRESOLVED: {reason}", file=sys.stderr, flush=True)
             except BaseException:
                 recovery.unresolved = True
                 raise
@@ -2387,13 +2396,15 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     folder_tool = "g" if mode is SuiteMode.GATE else "t"
     module_number = 0
     hold_check = hold if hold is not None else NoBuildHoldCheck()
+    # Close the gate folders before releasing the slot pool and reservation.
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, gate_parent)) as recovery, record_on_abort(recovery),
-          gate_temporary(recovery, folder_tool, gate_parent) as temporary,
-          ExitStack() as module_folders,
-          (nullcontext(local_grant.suite_place()) if placed else
-           gate_reservation(repo, temporary, hold_check, type_dirs=type_dirs, mode=mode) if needs_shared_slots
-           else nullcontext(None)) as reservation,
-          (shared_cpu_pool() if needs_shared_slots else nullcontext(NoSharedCPU())) as cpu_pool):
+          ExitStack() as capacity, ExitStack() as folders):
+        temporary = folders.enter_context(gate_temporary(recovery, folder_tool, gate_parent))
+        module_folders = folders.enter_context(ExitStack())
+        reservation = (local_grant.suite_place() if placed else
+                       capacity.enter_context(gate_reservation(repo, temporary, hold_check, type_dirs=type_dirs, mode=mode))
+                       if needs_shared_slots else None)
+        cpu_pool = capacity.enter_context(shared_cpu_pool()) if needs_shared_slots else NoSharedCPU()
         if reservation is not None:
             scope_prefix = publish_gate_scope(recovery, reservation, scope_prefix)
         # The wall time and the time limit start here, after the queue admits the gate.
@@ -2650,8 +2661,6 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 raise
             for job in running:
                 job.output.close()
-                if isinstance(job.cpu_slot, SharedCPUSlot):
-                    job.cpu_slot.release()
             if shared and not named:
                 save_measures(timings_path, timings)
                 save_measures(cpu_path, cpu_measures)
