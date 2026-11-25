@@ -1029,11 +1029,13 @@ region_transfer_usd={"us-west-1":0.00015}
         self.assertEqual(len(self.notices), 2)
         self.assertNotEqual(self.notices[0][0], self.notices[1][0])
         streak = ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])
-        self.assertEqual((streak['action_key'], streak['action_created']), (opened.key, True))
+        replacement, = (record for record in actions.list() if record.status == 'open')
+        self.assertNotEqual(replacement.key, opened.key)
+        self.assertEqual((streak['action_key'], streak['action_created']), (replacement.key, True))
         self.clock.advance(interval)
         self.failure = ''
         self.assertEqual(self.snapshot(), 0)
-        self.assertEqual(actions.get(opened.key).status, 'withdrawn')
+        self.assertEqual(actions.get(replacement.key).status, 'withdrawn')
 
     def test_timeout_keeps_the_price_read_action_open(self) -> None:
         self.failure = 'describe-spot-price-history'
@@ -1048,6 +1050,37 @@ region_transfer_usd={"us-west-1":0.00015}
         failure, = aws_target.snapshot_failures(aws_target.read_snapshot(self.state))
         self.assertEqual(failure.error, 'TimeoutExpired')
         self.assertEqual(actions.list(), (opened,))
+
+    def test_new_price_read_streak_replaces_the_open_action_after_failed_withdrawal(self) -> None:
+        self.configure_gate('spot_candidate_regions=us-east-2\n')
+        self.failure = 'all'
+        actions = action.ActionStore()
+        interval = conf.read(self.settings).whole('price_refresh_seconds')
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        old, = actions.list()
+        self.assertEqual(old.waits, 'Test runs on AWS in us-east-2')
+
+        self.clock.advance(interval)
+        self.failure = ''
+        with (mock.patch.object(action.ActionStore, 'withdraw', side_effect=OSError('Fixture withdrawal failure.')),
+              redirect_stderr(StringIO())):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), (old,))
+
+        self.clock.advance(interval)
+        self.configure_gate('spot_candidate_regions=us-west-2\n')
+        self.failure = 'all'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        opened, = (record for record in actions.list() if record.status == 'open')
+        self.assertNotEqual(opened.key, old.key)
+        self.assertTrue(opened.reason.startswith('AWS refused the price read in us-west-2. '))
+        self.assertNotIn('us-east-2', opened.reason)
+        self.assertEqual(opened.waits, 'Test runs on AWS in us-west-2')
+        withdrawn = actions.get(old.key)
+        self.assertEqual((withdrawn.status, withdrawn.withdraw_reason),
+                         ('withdrawn', 'A new refused read replaced this action.'))
 
     def test_action_store_errors_keep_the_snapshot_and_push(self) -> None:
         self.failure = 'describe-spot-price-history'
