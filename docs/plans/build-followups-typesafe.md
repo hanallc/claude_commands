@@ -446,3 +446,14 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 - A SQLite busy timeout given to `connect` applies again to each statement and to commit; bound a write with one absolute deadline.
 
 **Ruled out:** a timeout raised after a durable commit; converting every late SQLite error to a timeout; capturing verifier output through a pipe, which a background child holds open.
+
+### Phase 9r — repair change rows C552 and C426  · status: done
+
+Source: the natedev showrunner, 2026-11-24 21:22 PST, after fault verdicts on two rows of this unit.
+
+**Goal:** the TypeSafe guide meets its 150-line limit, and `score_issues.py blind --help` explains how to write and score a blind sheet.
+
+**Spec:**
+- `docs/typesafe.md`: 150 lines or fewer. Keep every fact.
+- `scripts/issue_score/score_issues.py`: `blind --help` explains how to write a shuffled A/B sheet, set each pick to A, B or same, and score it with `blind-score`. `blind-score --help` names the sheet and the results file. Each argument has help text.
+- Acceptance: `wc -l docs/typesafe.md` prints 150 or less; both help texts show the steps above; basedpyright on `score_issues.py` reads `0 errors, 0 warnings, 0 notes`; the `--affected` gate passes.
