@@ -97,13 +97,6 @@ def source_checkout(source: Path) -> Path:
     return (Path(common) / configured).resolve()
 
 
-def configured_maximum(settings: conf.ConfigRead, machine: str, repository: str) -> int:
-    """Read the Mac claim limit for the repository or the machine's default limit."""
-    host = conf.host_key_name(machine)
-    key = f"slots.{host}.{repository}.max"
-    return settings.whole(key if key in settings.values() else f"slots.{host}.default_max")
-
-
 def _persistent_source(source: Path) -> Path:
     seen: set[Path] = set()
     while True:

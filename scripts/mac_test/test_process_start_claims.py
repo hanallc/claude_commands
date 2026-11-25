@@ -161,22 +161,22 @@ class ClaimProcessStartTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             paths = mac_test.StatePaths(root, "box", platform="linux")
-            scope = mac_test.RepositoryScope("hana", "repo-key", 2)
+            scope = mac_test.RepositoryScope("hana", "repo-key")
             record: mac_test.RemoteJobClaim = {
                 "claim_id": "claim-a", "episode": "episode-a", "attempt": "attempt-a",
                 "submitting_session": "old-session", "pid": 41, "proc_start": "41000",
                 "what": "nextest hana", "worktree": ".", "since": "2026-11-04T00:00:00+00:00",
-                "repo_name": scope.name, "repo_key": scope.key, "slot": scope.slot,
+                "repo_name": scope.name, "repo_key": scope.key,
                 "remote_host": "fixture-box",
             }
-            path = mac_test.claim_path(paths, scope)
+            canonical = mac_test.claim_path(paths, scope)
+            path = canonical.with_name(canonical.stem + ".slot-2.json")
             path.parent.mkdir()
             mac_test.write_json(path, record)
             held, = mac_test.read_claims(paths)
             args = mac_test.CliArguments()
             args.pid, args.worktree = 42, str(root)
             args.claim_id, args.episode, args.attempt = record["claim_id"], record["episode"], record["attempt"]
-            args.leased_slots = [scope.slot]
             session = OwningSession("cleanup-session")
 
             def read_start(pid: int) -> identity.ProcessStart:
@@ -202,13 +202,11 @@ class ClaimProcessStartTests(unittest.TestCase):
 
     def test_adoption_refusal_names_the_failed_check_without_changing_the_reservation(self) -> None:
         checks = ("runner pid start", "no reservation", "reservation count", "scope", "pid", "identity",
-                  "submitting session", "remote host", "proc_start", "worktree", "remote missing", "block state",
-                  "leased slot")
+                  "submitting session", "remote host", "proc_start", "worktree", "remote missing", "block state")
         for check in checks:
             with self.subTest(check=check), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                paths = (mac_test.StatePaths(root, "box", platform="linux") if check == "leased slot"
-                         else mac_test.StatePaths(root))
+                paths = mac_test.StatePaths(root)
                 scope = mac_test.RepositoryScope("hana", "fixture-hana-key")
                 session = OwningSession("fixture-session")
                 record: mac_test.ProcessBoundClaim = {
@@ -227,9 +225,6 @@ class ClaimProcessStartTests(unittest.TestCase):
                     args.remote = "fixture-mac"
                 if check == "submitting session":
                     session = OwningSession("foreign-session")
-                if check == "leased slot":
-                    record["slot"] = 2
-                    args.leased_slots = [1]
                 if check != "no reservation":
                     mac_test.write_json(paths.run, {**record, "remote_host": "fixture-mac"} if check == "remote host"
                                         else record)
@@ -249,19 +244,19 @@ class ClaimProcessStartTests(unittest.TestCase):
                 with mock.patch.object(identity, "process_start", side_effect=read_start), redirect_stderr(errors), \
                         redirect_stdout(io.StringIO()):
                     result = mac_test.adopt_wait_claim(args, paths, scope, session=session)
-                self.assertEqual(result, mac_test.ClaimDenied(11 if check == "leased slot" else 12,
+                self.assertEqual(result, mac_test.ClaimDenied(12,
                                                              f"cannot adopt the Mac claim: {check}", to_stderr=True))
                 self.assertEqual(errors.getvalue(), "")
                 self.assertEqual(mac_test.read_claims(paths), before)
 
-    def test_assigned_claims_keep_provider_overlap_rules_and_never_substitute_a_linux_slot(self) -> None:
+    def test_assigned_claims_keep_provider_overlap_rules(self) -> None:
         hana = mac_test.RepositoryScope("hana", "https://fixture.invalid/team/hana")
         other = mac_test.RepositoryScope("other", "https://fixture.invalid/team/other")
         cases: tuple[tuple[Literal["mac", "ssh"], claim_state.ClaimScope, claim_state.ClaimScope, list[int], int], ...] = (
             ("mac", hana, hana, [0, 11], 1),
             ("mac", hana, other, [0, 0], 2),
             ("mac", mac_test.WHOLE_MAC, hana, [0, 11], 0),
-            ("ssh", mac_test.RepositoryScope("hana", "repo-key", 1), mac_test.RepositoryScope("hana", "repo-key", 1), [0, 11], 1),
+            ("ssh", mac_test.RepositoryScope("hana", "repo-key"), mac_test.RepositoryScope("hana", "repo-key"), [0, 11], 1),
         )
         for provider, first_scope, second_scope, expected, expected_authorizations in cases:
             with self.subTest(provider=provider, first=first_scope, second=second_scope), PlacementFixture() as fixture:
@@ -269,10 +264,8 @@ class ClaimProcessStartTests(unittest.TestCase):
                 _ = (fixture.root / "build_targets.conf").write_text(
                     "targets=mac,box\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                     + "kind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n" + UNREACHABLE_WAIT_FIXTURE)
-                _ = write_config_fixture(fixture.root / "box.conf", "offload=on\nslots=2\n", template="mac_test")
+                _ = write_config_fixture(fixture.root / "box.conf", "offload=on\n", template="mac_test")
                 _ = write_config_fixture(fixture.root / "machines.conf", "mac.hosts=fixture-mac\n")
-                _ = write_config_fixture(fixture.root / "build_folders.conf",
-                                         "# whole: 1..\nslots.fixture-mac.default_max=1\n")
                 paths = mac_test.StatePaths(fixture.root / "provider", target,
                     platform="macos" if provider == "mac" else "linux")
                 assignments: list[placement.PlacementAssignment] = []
@@ -281,7 +274,7 @@ class ClaimProcessStartTests(unittest.TestCase):
                 for scope in (first_scope, second_scope):
                     request = placement_request(fixture)
                     destination = placement.PlacementDestination(provider, target, "fixture-host", scope,
-                        scope.slot if provider == "ssh" and isinstance(scope, mac_test.RepositoryScope) else 0)
+                        1 if provider == "ssh" else 0)
                     request = replace(request, constraints=replace(request.constraints,
                         candidates=(placement.PlacementCandidate(destination),)))
                     _ = publish_candidate(fixture, request)
@@ -307,7 +300,7 @@ class ClaimProcessStartTests(unittest.TestCase):
                 held = mac_test.read_claims(paths)
                 self.assertEqual(len(held), expected.count(0))
                 if provider == "ssh":
-                    self.assertEqual([claim.scope.slot for claim in held if isinstance(claim.scope, mac_test.RepositoryScope)], [1])
+                    self.assertEqual([claim.scope for claim in held], [first_scope])
                 authorizations = 0
                 for request, assigned, status in zip(requests, assignments, statuses, strict=True):
                     if status != 0:

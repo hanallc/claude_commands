@@ -745,7 +745,7 @@ if "--assignment-file" in arguments:''', 1)
         _ = self.prepare_target_wait(pauses=1)
         root = self.fixture.root
         settings = root / "linux-box.conf"
-        _ = write_config_fixture(settings, "offload=on\nhost=fake-linux\nkinds=test,check\nslots=1\n"
+        _ = write_config_fixture(settings, "offload=on\nhost=fake-linux\nkinds=test,check\n"
                                  + f"probe_timeout_s={TARGET_PROBE_TIMEOUT_SECONDS}\n",
                                  template="mac_test")
         _ = (root / "build_targets.conf").write_text(

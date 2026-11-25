@@ -451,7 +451,7 @@ def shutdown_fixture_configuration(root: Path) -> dict[str, str]:
 
 
 def retirement_copies_environment(root: Path) -> dict[str, str]:
-    private = build_slots_test_support.private_slot_config(root, repository="fixture", default_maximum=2)
+    private = build_slots_test_support.private_slot_config(root)
     return {**private.environment, "HOME": str(root), "SCRATCH_COPIES_ROOT": str(root / "copies")}
 
 

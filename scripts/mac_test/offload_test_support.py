@@ -222,10 +222,6 @@ def main() -> int:
             record = {"remote_host": record["remote_host"], **saved.record, "pid": owner_pid, "proc_start": proc_start}
         elif "--mac-repository" in arguments:
             repository = claim_state.mac_repository_record(json.loads(arguments[arguments.index("--mac-repository") + 1]))
-            if "--leased-slot" in arguments:
-                slot = int(arguments[arguments.index("--leased-slot") + 1])
-                repository = repository.for_slot(slot)
-                record["slot"] = slot
             path = paths.claims / repository.claim_file
             record.update(repo_name=repository.mirror_name, repo_key=repository.key, mac_repository=repository.record())
         if "--copy" in arguments:
@@ -463,7 +459,7 @@ class OffloadCommandFixture(unittest.TestCase):
         host = values.get("host", self.config["host"])
         provider: Literal["mac", "ssh"] = "mac" if target == "mac" else "ssh"
         scope = (claim_state.target_claim_scope(claim_state.StatePaths(self.state_directory), str(repository))
-                 if provider == "mac" else claim_state.RepositoryScope(repository.name, "", 1))
+                 if provider == "mac" else claim_state.RepositoryScope(repository.name))
         destination = placement.PlacementDestination(provider, target, host, scope, 1 if provider == "ssh" else 0)
         local = admission.request(owner=owner, episode=uuid.uuid4().hex, step=verb)
         source_path = source.root if isinstance(source, offload.StagedDocSnapshot) else repository
@@ -964,7 +960,7 @@ raise SystemExit(offload.main())
         """Register the trusted Linux target box and return its runner options."""
         settings = self.root / "box.conf"
         _ = write_config_fixture(settings, "".join(f"{name}={value}\n" for name, value in {
-            **self.config, "slots": "1", "slots.hana": "1", "kinds": "test,check,lint,doc,build",
+            **self.config, "kinds": "test,check,lint,doc,build",
             "parity.rustc": "fixture", "parity.nextest": "fixture", "parity.mend": "fixture",
             "parity.scripts_commit": "fixture"}.items()), template="mac_test")
         registry = self.root / "build_targets.conf"

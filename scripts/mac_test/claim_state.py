@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 from subprocess import SubprocessError
 import sys
+from urllib.parse import unquote
 from typing import TYPE_CHECKING, Literal, NotRequired, Self, TypedDict, cast, override
 from uuid import uuid4
 
@@ -264,7 +265,6 @@ class ClaimOwnerRecord(TypedDict):
     copy: NotRequired[bool]
     repo_key: NotRequired[str]
     repo_name: NotRequired[str]
-    slot: NotRequired[int]
     mac_repository: NotRequired[MacRepositoryRecord]
     transfers: NotRequired[list[TransferBytes]]
 
@@ -324,6 +324,7 @@ class RemoteJobClaim(ClaimOwnerRecord):
     cleanup_pending: NotRequired[bool]
     cleanup_request_id: NotRequired[str]
     instance_generation: NotRequired[str]
+    slot: NotRequired[Literal[1]]  # The Hana adapter still writes this field.
     replaced_reservation: NotRequired[ReplacedMacReservation]
 
 
@@ -336,7 +337,6 @@ class RepositoryScope:
 
     name: str
     key: str = ""
-    slot: int = 0
 
 
 @dataclass(frozen=True)
@@ -376,8 +376,8 @@ class MacMirrorIdentity:
     fence_directory: str
     fence_generation: str = field(default="", kw_only=True)
 
-    def for_slot(self, slot: int) -> Self:
-        fence = mac_claim_stem(self.key, slot)
+    def for_new_claim(self) -> Self:
+        fence = mac_claim_stem(self.key)
         return replace(self, claim_file=f"{fence}.json", fence_directory=fence, fence_generation="")
 
     def for_remote_claim(self) -> Self:
@@ -475,9 +475,8 @@ def mac_claim_key(key: str) -> str:
     return key
 
 
-def mac_claim_stem(key: str, slot: int) -> str:
-    digest = sha256(key.encode()).hexdigest()
-    return f"{digest}!{slot}" if slot else digest
+def mac_claim_stem(key: str) -> str:
+    return sha256(key.encode()).hexdigest()
 
 
 def valid_mac_path_component(value: object) -> bool:
@@ -539,6 +538,9 @@ def mac_repository_record(value: object) -> MacRepositoryIdentity | CleanupOnlyM
     if not all(valid_mac_path_component(field) for field in (mirror, file, fence)):
         raise StateReadError("invalid Mac repository path")
     assert isinstance(mirror, str) and isinstance(file, str) and isinstance(fence, str)
+    # Keep the saved fence for an old numbered Mac claim.
+    if "!" in fence and not re.fullmatch(r"[a-f0-9]{64}![1-9][0-9]*", fence):
+        raise StateReadError("invalid Mac fence directory")
     if file != f"{fence}.json":
         raise StateReadError("the Mac claim file and fence directory differ")
     generation = fields.get("fence_generation", "")
@@ -593,7 +595,7 @@ class HeldClaim:
         """Match the scope from an assignment with the same claim identity."""
         if self.scope == scope:
             return True
-        if isinstance(scope, RepositoryScope) and self.record.get("slot", 0) == scope.slot:
+        if isinstance(scope, RepositoryScope):
             if scope.key:
                 return mac_claim_key(self.record.get("repo_key", "")) == mac_claim_key(scope.key)
             return self.record.get("repo_name") == scope.name
@@ -768,7 +770,6 @@ class StatePaths:
         self.retired_reservations: Path = directory / "retired-reservations"
         self.wait_locations: Path = directory / "wait-locations"
         self.block: Path = directory / "block.json"
-        self.affinity: Path = directory / "affinity"
 
 
 def state_paths(target: str = "") -> StatePaths:
@@ -872,11 +873,6 @@ def decode_run(values: dict[str, object], path: Path, *, moved_from_claim: bool 
         record["repo_key"] = required_string(values, "repo_key", path)
     if "repo_name" in values or "repo_key" in values:
         record["repo_name"] = required_string(values, "repo_name", path)
-    if "slot" in values:
-        slot = values["slot"]
-        if type(slot) is not int or slot < 1:
-            raise StateReadError(f"{path} has an invalid slot")
-        record["slot"] = slot
     if "mac_repository" in values:
         try:
             saved = mac_repository_record(values["mac_repository"])
@@ -905,6 +901,9 @@ def decode_run(values: dict[str, object], path: Path, *, moved_from_claim: bool 
         if not generation:
             raise StateReadError(f'{path} has an invalid instance_generation')
         remote['instance_generation'] = generation
+        slot = values.get('slot')
+        if type(slot) is int and slot == 1:
+            remote['slot'] = 1
     if "cleanup_pending" in values:
         if values["cleanup_pending"] is not True:
             raise StateReadError(f"{path} has an invalid cleanup_pending")
@@ -981,7 +980,7 @@ def mac_repository_identity(worktree: str) -> ResolvedMacMirror | WholeMacScope:
     if not valid_mac_path_component(mirror):
         return WHOLE_MAC
     key = mac_claim_key(source.key)
-    fence = mac_claim_stem(key, 0)
+    fence = mac_claim_stem(key)
     return ResolvedMacMirror(key, mirror, f"{fence}.json", fence, worktree)
 
 
@@ -1030,7 +1029,7 @@ def scopes_overlap(first: ClaimScope, second: ClaimScope, *, mac: bool = False) 
         same_repository = mac_claim_key(first.key) == mac_claim_key(second.key) if mac else first.key == second.key
     else:
         same_repository = first.name == second.name
-    return same_repository and (not first.slot or not second.slot or first.slot == second.slot)
+    return same_repository
 
 
 def cleanup_scope_is_known(paths: StatePaths, claim: HeldClaim) -> bool:
@@ -1267,6 +1266,12 @@ def mark_wait_released(path: Path, values: dict[str, object]) -> None:
     write_text_atomic(path, json.dumps({**values, "wait_released": True}) + "\n")
 
 
+def legacy_linux_claim_name(path: Path) -> tuple[str, int]:
+    """Use the saved file name to find the old Linux mirror."""
+    match = re.fullmatch(r"(.+)\.slot-([1-9][0-9]*)", path.stem)
+    return (match[1], int(match[2])) if match else (path.stem, 1)
+
+
 def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
     """Read saved claim scopes from oldest to newest."""
     held: list[HeldClaim] = []
@@ -1278,13 +1283,13 @@ def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
         if isinstance(record, NoRun):
             continue
         key = record.get("repo_key", "")
-        if paths.platform == "macos" and not key:
-            scope: ClaimScope = WHOLE_MAC
+        if paths.platform == "macos":
+            name = (record["mac_repository"]["mirror_name"] if "mac_repository" in record else record.get("repo_name", ""))
+            scope: ClaimScope = RepositoryScope(name, key) if key else WHOLE_MAC
         elif "repo_name" in record:
-            name = (record["mac_repository"]["mirror_name"] if "mac_repository" in record else record["repo_name"])
-            scope = RepositoryScope(name, key, record.get("slot", 0))
+            scope = RepositoryScope(record["repo_name"], key)
         else:
-            scope = WHOLE_MAC if path == paths.run else RepositoryScope(path.stem)
+            scope = WHOLE_MAC if path == paths.run else RepositoryScope(unquote(legacy_linux_claim_name(path)[0]))
         held.append(HeldClaim(scope, path, record))
     return tuple(sorted(held, key=lambda claim: datetime.fromisoformat(claim.record["since"])))
 
@@ -1340,7 +1345,6 @@ class WaitClaimCheck(StrEnum):
     WORKTREE = "worktree"
     REMOTE_MISSING = "remote missing"
     BLOCK_STATE = "block state"
-    LEASED_SLOT = "leased slot"
 
     @property
     def diagnostic(self) -> str:
