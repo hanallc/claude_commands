@@ -421,7 +421,11 @@ Merge and tests-only runs skip basedpyright.
 The daily `--nightly` run checks all of `scripts`, including hooks.
 The queue reservation and the runner governor use separate configuration keys.
 Gate startup checks recovery records for dead gate processes across checkouts.
-A `--tests-only` gate runs its cleanup before it exits on SIGTERM.
+Every gate mode runs its cleanup before it exits on SIGTERM when the default handler is active.
+Guests that call `run_suites` directly also clean up their suites before they exit on SIGTERM.
+The gate preserves an existing SIGTERM handler.
+After cleanup, the gate exits with SIGTERM.
+The nightly skips its build folder sweep when SIGTERM stops the gate.
 Successful recovery removes a record if it names no retained folders.
 Recovery reports retained folders for manual removal and keeps their finished record.
 The scanner skips finished records on later runs.
@@ -561,7 +565,11 @@ A refusal prints `REFUSED: <reason>` to stderr and exits 1.
 **Run, then check before push.** `run_suites` runs. Then `settings.json` at HEAD must match the approved blob prefix (`--settings-blob`, an 8–40 hex hash), and `origin/main` must be an ancestor of HEAD. Only then does the gate push the merge branch and print `Pushed <branch>: <short hash>`.
 A checkpoint rerun accepts its own recorded merge only for the same checkpoint, exact merge commit and original parents, with the remote branch still an ancestor of its base; it reruns the gate checks and pushes that commit, using a separate push recovery record rather than the test pass ledger.
 
-**Red, errors and signals.** Any exception after the merge, including red suites and `KeyboardInterrupt`, goes to `rollback_merge(repo, baseline)`. It aborts an in-progress merge and runs `git reset --keep <merge HEAD before the merge>`. If tracked files changed during the gate block that reset, it restores them to the merge tree and retries once; if the retry also fails, it reports `merge NOT undone; merge commit <hash>; blocking files: ...`. `rollback_signals()` turns SIGTERM and SIGHUP into `GateRefused`, so they roll back the same way; SIGINT arrives as `KeyboardInterrupt`.
+**Red, errors and signals.** A red suite or an error after the merge calls `rollback_merge(repo, baseline)`.
+It aborts an in-progress merge and runs `git reset --keep <merge HEAD before the merge>`.
+If tracked changes block the reset, it restores the affected files to the merge tree and tries once more.
+If the reset still fails, it reports `merge NOT undone; merge commit <hash>; blocking files: ...`.
+After SIGTERM or `KeyboardInterrupt`, the gate keeps the pending rollback for recovery.
 
 **Build holds.** SharedMachine waits before jobs, merging, and promotion while another session's natedev hold applies.
 The gate uses `build_targets.caller_holds_only_own`, so the sole holder runs at once.
@@ -790,6 +798,11 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
 - **CPU scope.** Once per run, the gate probes `systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- true` with a 10 s timeout. On success it puts the same prefix before each test module's argv, including reruns. The `types` job has no prefix. The scope replaces itself with the command, so the module keeps the `Popen` PID, process group and memory sampling. `builds.slice` has CPUWeight=20; the gate adds no nice value. It skips the prefix when `BUILDLOG_SCOPE=0`, `/proc/self/cgroup` contains `/builds.slice/`, or the probe fails. One line reports the scope or the skip reason.
 - Each attempt has its own `TMPDIR` in a numbered folder such as `m0001`.
   The parent holds the gate lease and uses a `g-*` name for a gate or a `t-*` name for affected tests.
+  The gate reads the owner identity before it masks signals for allocation.
+  The gate checks the new directory identity before it records the owner and directory in the lease.
+  The lease records the owner PID, directory device, and inode.
+  It includes the process start and, on Linux, the boot identity when the gate can read them.
+  Lease readers continue to accept older records.
   Both modes use the configured gate root for top-level runs.
   If that root contains the calling module folder, the nested gate uses the module folder as its parent.
   The outer gate removes the nested gate files when it removes the module folder.

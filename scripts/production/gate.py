@@ -978,31 +978,33 @@ def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
 
 @contextmanager
 def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator[Path]:
+    request = build_folders.GateSuiteFolder(f"{tool}-", build_folders.ExplicitBuildParent(parent))
     with ExitStack() as cleanup:
-        with cancellation.defer_cleanup_signals():
-            request = build_folders.UniqueBuildFolder(f"{tool}-", build_folders.ExplicitBuildParent(parent))
-            folder = cleanup.enter_context(build_folders.temporary_build_folder(request))
-            recovery.folders.append(str(folder))
-            recovery.save()
+        folder: Path | None = None
         try:
+            with cancellation.defer_cleanup_signals():
+                folder = cleanup.enter_context(build_folders.temporary_build_folder(request))
+                recovery.folders.append(str(folder))
+                recovery.save()
             yield folder
         finally:
             try:
                 cleanup.close()
             finally:
-                try:
-                    remaining = build_folders.temporary_allocation_entries(folder)
-                except OSError:
-                    report_retained_gate_folder(str(folder), "the gate could not confirm removal")
-                else:
-                    if folder in remaining:
-                        report_retained_gate_folder(str(folder), "the gate could not remove its folder")
-                    elif remaining:
-                        paths = ", ".join(map(str, remaining))
-                        report_retained_gate_folder(paths, "the gate could not remove its lease files")
+                if folder is not None:
+                    try:
+                        remaining = build_folders.temporary_allocation_entries(folder)
+                    except OSError:
+                        report_retained_gate_folder(str(folder), "the gate could not confirm removal")
                     else:
-                        recovery.folders.remove(str(folder))
-                        recovery.save()
+                        if folder in remaining:
+                            report_retained_gate_folder(str(folder), "the gate could not remove its folder")
+                        elif remaining:
+                            paths = ", ".join(map(str, remaining))
+                            report_retained_gate_folder(paths, "the gate could not remove its lease files")
+                        else:
+                            recovery.folders.remove(str(folder))
+                            recovery.save()
 
 
 def typecheck_venv_path() -> Path:
@@ -1691,6 +1693,35 @@ def report_retained_gate_test_folders(tmpfs: Path) -> None:
             report_retained_gate_folder(str(folder), "an earlier test fixture created this folder")
 
 
+_GATE_RECEIVED_SIGTERM: ContextVar[bool] = ContextVar("gate_received_sigterm", default=False)
+
+
+@contextmanager
+def unwind_gate_on_sigterm() -> Generator[None]:
+    """Finish test cleanup before the default SIGTERM action."""
+    if (threading.current_thread() is not threading.main_thread()
+            or signal.getsignal(signal.SIGTERM) != signal.SIG_DFL):
+        yield
+        return
+    token = _GATE_RECEIVED_SIGTERM.set(False)
+
+    def terminate(number: int, _frame: object) -> None:
+        if not _GATE_RECEIVED_SIGTERM.get():
+            _ = _GATE_RECEIVED_SIGTERM.set(True)
+            raise SystemExit(128 + number)
+
+    try:
+        _ = signal.signal(signal.SIGTERM, terminate)
+        yield
+    finally:
+        _ = signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        terminated = _GATE_RECEIVED_SIGTERM.get()
+        _GATE_RECEIVED_SIGTERM.reset(token)
+        if terminated:
+            signal.raise_signal(signal.SIGTERM)
+
+
+@unwind_gate_on_sigterm()
 def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
@@ -3688,30 +3719,6 @@ def run_named_modules(repo: Path, names: Sequence[str], mode: SuiteMode, *,
                       time_limit=gate_record.NoGateTimeLimit("named modules"))
 
 
-@contextmanager
-def unwind_gate_on_sigterm() -> Generator[None]:
-    """Finish test cleanup before the default SIGTERM action."""
-    if (threading.current_thread() is not threading.main_thread()
-            or signal.getsignal(signal.SIGTERM) != signal.SIG_DFL):
-        yield
-        return
-    terminated = False
-
-    def terminate(number: int, _frame: object) -> None:
-        nonlocal terminated
-        if not terminated:
-            terminated = True
-            raise SystemExit(128 + number)
-
-    try:
-        _ = signal.signal(signal.SIGTERM, terminate)
-        yield
-    finally:
-        _ = signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        if terminated:
-            signal.raise_signal(signal.SIGTERM)
-
-
 def run_tests_only(args: GateArguments, mode: SuiteMode, target: GateTarget) -> int:
     try:
         repo = Path(args.repo).expanduser().resolve()
@@ -3903,7 +3910,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if isinstance(target, NoGateAssignment) and (args.promote_only or args.modules
                 and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)):
             target = "natedev"
-        with (unwind_gate_on_sigterm() if args.tests_only else nullcontext()):
+        with unwind_gate_on_sigterm():
             return run_gate_command(args, target)
     except GatePlacementIncomplete as error:
         print(error, file=sys.stderr, flush=True)
@@ -3929,9 +3936,12 @@ def run_gate_command(args: GateArguments, target: GateTarget) -> int:
             with gate_cleanup_scope(scratch.copy_lock(checkout), gate_recovery(checkout)):
                 return merge_checkpoint(args, target)
         if args.nightly:
-            with gate_cleanup_scope(scratch.copy_lock(checkout), admission_records.default_owner(args.unit)) as cleanup:
-                _ = cleanup.callback(_sweep_nightly_build_folders)
-                return nightly(args, target)
+            with gate_cleanup_scope(scratch.copy_lock(checkout), admission_records.default_owner(args.unit)):
+                try:
+                    return nightly(args, target)
+                finally:
+                    if not _GATE_RECEIVED_SIGTERM.get():
+                        _sweep_nightly_build_folders()
         with scratch.copy_lock(checkout):
             promote(args)
             production, review_list = change_review_list(args)

@@ -242,6 +242,48 @@ class UniqueBuildFolder:
 
 
 @dataclass(frozen=True)
+class _NoGateBootIdentity:
+    """The gate has no boot identity to publish."""
+
+
+@dataclass(frozen=True)
+class _GateSuiteOwner:
+    """Identify the process that requests a gate suite folder."""
+
+    pid: int
+    start: process_start.ProcessStart
+    boot: str | _NoGateBootIdentity
+
+    @classmethod
+    def current(cls) -> _GateSuiteOwner:
+        pid = os.getpid()
+        start = process_start.process_start(pid)
+        if sys.platform == "darwin":
+            return cls(pid, start, _NoGateBootIdentity())
+        try:
+            return cls(pid, start, boot_identity())
+        except (OSError, ValueError):
+            return cls(pid, start, _NoGateBootIdentity())
+
+    def publish(self, path: Path, directory: int, folder: os.stat_result) -> None:
+        fields = _read_folder_lease(path, directory)
+        fields.update(pid=self.pid, device=folder.st_dev, inode=folder.st_ino)
+        if isinstance(self.start, process_start.Started):
+            fields["process_start"] = self.start.start
+        if isinstance(self.boot, str):
+            fields["boot_id"] = self.boot
+        _publish_lease(path, directory, fields)
+
+
+@final
+@dataclass(frozen=True)
+class GateSuiteFolder(UniqueBuildFolder):
+    """Read the owner identity before allocating a gate suite folder."""
+
+    owner: _GateSuiteOwner = field(default_factory=_GateSuiteOwner.current, init=False)
+
+
+@dataclass(frozen=True)
 class StableOwnerFolder:
     """The request holds the name, parent, and mode for an owner folder."""
     name: str
@@ -2028,6 +2070,10 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                             if not stat.S_ISDIR(os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mode):
                                 raise
                     allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                    if isinstance(original, GateSuiteFolder):
+                        if made_inode is None or not stat.S_ISDIR(allocated.st_mode) or not os.path.samestat(made_inode, allocated):
+                            raise OSError(errno.ESTALE, "the gate suite folder changed during allocation", str(path))
+                        original.owner.publish(path, directory, allocated)
                     if isinstance(original, (LinkedEditableRepository, RemoteEditableRepository)):
 
                         if isinstance(original, LinkedEditableRepository):

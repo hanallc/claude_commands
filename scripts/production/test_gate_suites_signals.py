@@ -489,6 +489,74 @@ gate.start_gate_job = stop_after_start
         self.assertEqual(self.jobserver_tokens(), b"Q")
         self.assert_gate_released()
 
+    def test_guest_sigterm_removes_the_suite_folder_and_lease(self) -> None:
+        saved_folder = self.state / "guest-suite-folder"
+        preamble = f"""from contextlib import contextmanager
+from scripts.lib import build_folders
+allocate = gate.gate_temporary
+
+@contextmanager
+def terminate_after_allocation(*args):
+    with allocate(*args) as folder:
+        assert build_folders.lease_path(folder).is_file()
+        Path({str(saved_folder)!r}).write_text(str(folder))
+        signal.raise_signal(signal.SIGTERM)
+        yield folder
+
+gate.gate_temporary = terminate_after_allocation
+gate.run_suites(Path({str(self.checkout)!r}), machine=gate.WholeMachine())
+"""
+        result = subprocess.run(self.gate_command(preamble=preamble), cwd=self.root, env=self.environment,
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
+        folder = Path(saved_folder.read_text())
+        self.assertEqual(build_folders.temporary_allocation_entries(folder), ())
+
+    def test_sigterm_at_allocation_mask_release_clears_the_recovery_entry(self) -> None:
+        marker = self.state / "allocation"
+        parent = self.root / "gate-allocating"
+        parent.mkdir()
+        preamble = f"""save = gate.GateRecovery.save
+
+def signal_after_folder_save(recovery):
+    save(recovery)
+    if recovery.folders:
+        assert signal.SIGTERM in signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        Path({str(marker)!r}).write_text(str(recovery.path) + '\\n' + recovery.folders[0])
+        signal.raise_signal(signal.SIGTERM)
+        assert signal.SIGTERM in signal.sigpending()
+
+gate.GateRecovery.save = signal_after_folder_save
+with gate.unwind_gate_on_sigterm(), gate.gate_recovery(Path({str(self.checkout)!r})) as recovery:
+    recovery.rollback = {self.base!r}
+    with gate.gate_temporary(recovery, "merge-gate", Path({str(parent)!r})):
+        raise AssertionError("the gate entered the suite after SIGTERM")
+"""
+        result = subprocess.run(self.gate_command(preamble=preamble), cwd=self.root, env=self.environment,
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
+        record_path, folder = map(Path, marker.read_text().splitlines())
+        record = cast(dict[str, object], json.loads(record_path.read_text()))
+        self.assertEqual(record["rollback"], self.base)
+        self.assertEqual(record["folders"], [])
+        self.assertEqual(build_folders.temporary_allocation_entries(folder), ())
+
+    def test_nightly_skips_the_sweep_on_sigterm(self) -> None:
+        sweep_started = self.state / "nightly-sweep"
+        preamble = f"""from contextlib import nullcontext
+
+def terminate_nightly(*args):
+    signal.raise_signal(signal.SIGTERM)
+    raise AssertionError("the nightly continued after SIGTERM")
+
+gate.scratch.copy_lock = lambda checkout: nullcontext()
+gate.nightly = terminate_nightly
+gate._sweep_nightly_build_folders = lambda: Path({str(sweep_started)!r}).touch()
+"""
+        result = self.run_gate("--nightly", own_process=True, preamble=preamble)
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
+        self.assertFalse(sweep_started.exists())
+
     @gate_suites("hooks", "lib")
     def test_stop_with_pending_modules_returns_owned_slot_and_reservation(self) -> None:
         self.assertTrue(self.fixture_root.is_relative_to(Path("/tmp").resolve()))
@@ -580,6 +648,15 @@ gate.run_gate_suites = whole_gate
                     fields = Path(f"/proc/{leftover}/stat").read_text().rsplit(")", 1)[1].split()
                     self.assertEqual(fields[2:4], [str(leftover), str(leftover)])
                     self.assertEqual(self.jobserver_tokens(), b"")
+                    records = set(active_runs.glob("*/*.json")) - previous_records
+                    self.assertEqual(len(records), 1)
+                    record_path, = records
+                    live = cast(dict[str, object], json.loads(record_path.read_text()))
+                    folders = [Path(folder) for folder in cast(list[str], live["folders"])]
+                    self.assertTrue(folders)
+                    for folder in folders:
+                        self.assertTrue(folder.is_dir())
+                        self.assertTrue(build_folders.lease_path(folder).is_file())
                     process.send_signal(sig)
                     output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(process.returncode, -sig, output + errors)
@@ -592,9 +669,14 @@ gate.run_gate_suites = whole_gate
                     record = cast(dict[str, object], json.loads(record_path.read_text()))
                     self.assertEqual(record["pid"], process.pid)
                     self.assertEqual(record["rollback"], self.base)
-                    folders = [Path(folder) for folder in cast(list[str], record["folders"])]
-                    self.assertTrue(folders)
-                    self.assertTrue(all(folder.is_dir() for folder in folders))
+                    if sig == signal.SIGTERM:
+                        self.assertEqual(record["folders"], [])
+                        for folder in folders:
+                            self.assertEqual(build_folders.temporary_allocation_entries(folder), ())
+                        self.assertEqual(self.jobserver_tokens(), b"Q")
+                    else:
+                        self.assertEqual(record["folders"], live["folders"])
+                        self.assertTrue(all(folder.is_dir() for folder in folders))
                     (self.state / "hold-module").unlink()
                     (self.state / "leak-child").unlink()
                     if sig == signal.SIGTERM:
@@ -613,10 +695,13 @@ gate.run_gate_suites = whole_gate
                     self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
                     self.assert_process_stopped(child)
                     self.assert_process_stopped(leftover)
-                    self.assertTrue(all(folder.is_dir() for folder in folders))
-                    saved = cast(dict[str, object], json.loads(record_path.read_text()))
-                    self.assertEqual(saved["folders"], record["folders"])
-                    self.assertIs(saved["finished"], True)
+                    if sig == signal.SIGTERM:
+                        self.assertFalse(record_path.exists())
+                    else:
+                        self.assertTrue(all(folder.is_dir() for folder in folders))
+                        saved = cast(dict[str, object], json.loads(record_path.read_text()))
+                        self.assertEqual(saved["folders"], record["folders"])
+                        self.assertIs(saved["finished"], True)
                     self.assertEqual(self.jobserver_tokens(), b"Q")
                     self.assert_not_pushed()
                 finally:
