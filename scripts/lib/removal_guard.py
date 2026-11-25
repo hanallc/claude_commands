@@ -15,11 +15,11 @@ import hmac
 import json
 import os
 import re
+import secrets
 import stat
 import sys
-import tempfile
 import time
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -28,6 +28,9 @@ from typing import Protocol, cast, final
 
 from scripts.buildlog.repository import repo_name
 from scripts.lib import conf
+from scripts.lib.atomic_file import (
+    AtomicDurabilityUnconfirmed, TEMPORARY_NAME, remove_abandoned_temporary_file, write_text_atomic,
+)
 from scripts.lib.build_folder_lock import USER_REMOVAL_ROOTS
 from scripts.production import staff
 
@@ -329,9 +332,106 @@ def read(*, mount_reader: Callable[[], tuple[Path, ...]] | None = None,
                         tuple(form for _, form in setting.value), names or known_names(), mount_snapshot(mount_reader))
 
 
+class BuildRemoval(Enum):
+    BY_FORM = "the build folder matches a removal form"
+
+
+class CleanupRemoval(Enum):
+    PLAIN = "no Git metadata"
+    SAVED_CHECKOUT = "one saved Git checkout"
+
+
+class CheckedCleanupPath(Protocol):
+    """Provide the open parent and identity check for one exact path."""
+
+    @property
+    def path(self) -> Path: ...
+    @property
+    def parent(self) -> int: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def info(self) -> os.stat_result: ...
+    @property
+    def mount(self) -> str: ...
+    def recheck(self) -> None: ...
+
+
+class ApprovedCleanupEntry(Protocol):
+    @property
+    def stamp(self) -> tuple[int, ...]: ...
+    @property
+    def children(self) -> tuple[str, ...]: ...
+
+
+@dataclass(frozen=True)
+class ApprovedCleanup:
+    entries: Mapping[Path, ApprovedCleanupEntry]
+    kind: CleanupRemoval
+
+
+@dataclass(frozen=True)
+class CleanupTarget:
+    checked: CheckedCleanupPath
+    approval: ApprovedCleanup
+
+
+class PartialCleanup(OSError):
+    """Keep the completed deletions when a later removal fails."""
+
+    def __init__(self, error: OSError | Refused, deleted: Sequence[Path]) -> None:
+        super().__init__(str(error))
+        self.deleted: tuple[Path, ...] = tuple(deleted)
+
+
+class RemovalPass(Enum):
+    CHECK = "check without removal"
+    DELETE = "check and remove"
+
+
 def remove(checked: CheckedEntry, *, account: Callable[[str, os.stat_result], None] | None = None) -> None:
+    """Remove a checked build folder."""
+    _remove(checked, BuildRemoval.BY_FORM, account)
+
+
+def remove_cleanup(checked: CheckedCleanupPath, approval: ApprovedCleanup, *additional: CleanupTarget,
+                   before_delete: Callable[[], None] | None = None) -> None:
+    """Remove the exact entries approved for cleanup."""
+    targets = (CleanupTarget(checked, approval), *additional)
+    for target in targets:
+        _remove(target.checked, target.approval, None, mode=RemovalPass.CHECK)
+    if before_delete is not None:
+        before_delete()
+    deleted: list[Path] = []
+
+    def record(path: str, _info: os.stat_result) -> None:
+        deleted.append(Path(path))
+
+    try:
+        for target in targets:
+            _remove(target.checked, target.approval, record)
+    except (OSError, Refused) as error:
+        if deleted:
+            raise PartialCleanup(error, deleted) from error
+        raise
+
+
+def _matches_cleanup_stamp(expected: tuple[int, ...], info: os.stat_result, unlinked: int) -> bool:
+    current = _stamp(info)
+    if unlinked:
+        # Removing an approved hard link changes the other links' count and ctime.
+        current = (*current[:4], current[4] + unlinked, *current[5:-1], expected[-1])
+    return current == expected
+
+
+def _remove(checked: CheckedEntry | CheckedCleanupPath, approval: ApprovedCleanup | BuildRemoval,
+            account: Callable[[str, os.stat_result], None] | None, *, mode: RemovalPass = RemovalPass.DELETE) -> None:
     """Remove the checked entry below the held parent descriptor."""
+    checked.recheck()
+    cleanup = isinstance(approval, ApprovedCleanup)
+    saved_git = (isinstance(approval, ApprovedCleanup) and approval.kind is CleanupRemoval.SAVED_CHECKOUT)
     parents: list[tuple[int, str, Identity]] = []
+    unlinked: dict[Identity, int] = {}
 
     def check_position() -> None:
         checked.recheck()
@@ -340,6 +440,10 @@ def remove(checked: CheckedEntry, *, account: Callable[[str, os.stat_result], No
 
     def visit(parent: int, name: str, path: Path, before: os.stat_result) -> None:
         key = identity(before)
+        if isinstance(approval, ApprovedCleanup):
+            expected = approval.entries.get(path)
+            if expected is None or not _matches_cleanup_stamp(expected.stamp, before, unlinked.get(key, 0)):
+                raise ChangedEntry(f"entry changed before removal: {path}")
         if key[0] != checked.info.st_dev:
             raise Refused(RefusalReason.MOUNT, str(path))
         if stat.S_ISDIR(before.st_mode):
@@ -347,17 +451,40 @@ def remove(checked: CheckedEntry, *, account: Callable[[str, os.stat_result], No
             try:
                 if mount_id(folder) != checked.mount:
                     raise Refused(RefusalReason.MOUNT, str(path))
-                if identity(os.fstat(folder)) != key:
+                opened = os.fstat(folder)
+                if identity(opened) != key or (cleanup and _stamp(opened) != _stamp(before)):
                     raise ChangedEntry(f"folder changed before open: {path}")
                 parents.append((parent, name, key))
                 try:
-                    for child in os.listdir(folder):
-                        if child.casefold() == ".git":
-                            raise ChangedEntry("the folder contains Git metadata")
+                    names = os.listdir(folder)
+                    in_saved_git = saved_git and path.is_relative_to(checked.path / ".git")
+                    if not in_saved_git:
+                        git_names = {child.casefold() for child in names}
+                        if saved_git and path == checked.path and ".git" in names:
+                            git_names.discard(".git")
+                        if ".git" in git_names or (cleanup and {"head", "objects", "refs"} <= git_names):
+                            raise ChangedEntry("holds Git work" if cleanup else "the folder contains Git metadata")
+                    if isinstance(approval, ApprovedCleanup) and tuple(sorted(names)) != approval.entries[path].children:
+                        raise ChangedEntry(f"entries changed before removal: {path}")
+                    marker_last = saved_git and path == checked.path and ".git" in names
+                    if marker_last:
+                        names.remove(".git")
+                    if cleanup:
+                        names.sort()
+                    for child in names:
                         info = os.stat(child, dir_fd=folder, follow_symlinks=False)
                         visit(folder, child, path / child, info)
+                    if marker_last:
+                        if mode is RemovalPass.DELETE and os.listdir(folder) != [".git"]:
+                            raise ChangedEntry(f"entries changed before removal: {path}")
+                        marker = os.stat(".git", dir_fd=folder, follow_symlinks=False)
+                        visit(folder, ".git", path / ".git", marker)
                 finally:
                     _ = parents.pop()
+                if mode is RemovalPass.CHECK:
+                    if _stamp(os.fstat(folder)) != _stamp(before):
+                        raise ChangedEntry(f"folder changed before removal: {path}")
+                    return
                 check_position()
                 require_identity(parent, name, key)
                 os.rmdir(name, dir_fd=parent)
@@ -373,19 +500,29 @@ def remove(checked: CheckedEntry, *, account: Callable[[str, os.stat_result], No
                         raise Refused(RefusalReason.MOUNT, str(path))
                 finally:
                     os.close(leaf)
+            if mode is RemovalPass.CHECK:
+                return
             check_position()
-            require_identity(parent, name, key)
+            if cleanup:
+                if _stamp(os.stat(name, dir_fd=parent, follow_symlinks=False)) != _stamp(before):
+                    raise ChangedEntry(f"entry changed before removal: {path}")
+            else:
+                require_identity(parent, name, key)
             os.unlink(name, dir_fd=parent)
+            if isinstance(approval, ApprovedCleanup) and before.st_nlink > 1:
+                unlinked[key] = unlinked.get(key, 0) + 1
         if account is not None:
             account(str(path), before)
 
-    checked.recheck()
-    if checked.form.empty:
+    if isinstance(checked, CheckedEntry) and checked.form.empty:
         os.rmdir(checked.name, dir_fd=checked.parent)
         if account is not None:
             account(str(checked.path), checked.info)
     else:
-        visit(checked.parent, checked.name, checked.path, checked.info)
+        info = (os.stat(checked.name, dir_fd=checked.parent, follow_symlinks=False) if cleanup else checked.info)
+        if identity(info) != identity(checked.info):
+            raise ChangedEntry(f"entry changed before removal: {checked.path}")
+        visit(checked.parent, checked.name, checked.path, info)
 
 
 def _mac_mount_points() -> tuple[Path, ...]:
@@ -458,6 +595,23 @@ class Tool(Enum):
 
 
 LIST_DIRECTORY = Path(".local/state/removal-lists")
+LIST_NAME_TOKEN_BYTES = 16
+LIST_NAME_TOKEN = re.compile(rf"[0-9a-f]{{{2 * LIST_NAME_TOKEN_BYTES}}}")
+LIST_TOOL_NAMES = frozenset(tool.value for tool in Tool)
+
+
+def remove_abandoned_list_staging(folder: Path) -> None:
+    """Remove staged removal lists whose writers have ended."""
+    with os.scandir(folder) as entries:
+        for entry in entries:
+            match = TEMPORARY_NAME.fullmatch(entry.name)
+            if match is None or not match["target"].endswith(".jsonl"):
+                continue
+            tool, _, token = match["target"].removesuffix(".jsonl").rpartition("-")
+            if tool not in LIST_TOOL_NAMES or LIST_NAME_TOKEN.fullmatch(token) is None:
+                continue
+            if entry.is_file(follow_symlinks=False):
+                remove_abandoned_temporary_file(Path(entry.path), int(match["pid"]))
 
 
 class ListMode(Enum):
@@ -592,22 +746,17 @@ class RemovalList:
     def publish(self) -> Path:
         folder = Path.home() / LIST_DIRECTORY
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=folder,
-                                         prefix=f"{self.tool.value}-", suffix=".jsonl", delete=False) as output:
-            staged = Path(output.name)
-            try:
-                for row in self.rows.values():
-                    _ = output.write(row.line() + "\n")
-                output.flush()
-                os.fsync(output.fileno())
-                if self.published is ListPublication.PENDING:
-                    self.published = staged
-                else:
-                    _ = staged.replace(self.published)
-            except BaseException:
-                staged.unlink(missing_ok=True)
-                raise
-        return self.published
+        remove_abandoned_list_staging(folder)
+        path = self.published
+        if path is ListPublication.PENDING:
+            path = folder / f"{self.tool.value}-{secrets.token_hex(LIST_NAME_TOKEN_BYTES)}.jsonl"
+        try:
+            write_text_atomic(path, "".join(row.line() + "\n" for row in self.rows.values()), new_file_mode=0o600)
+        except AtomicDurabilityUnconfirmed:
+            self.published = path
+            raise
+        self.published = path
+        return path
 
     def report(self) -> None:
         path = self.publish()

@@ -55,6 +55,7 @@ from scripts.mac_test.offload_test_commands import install_nextest_log_writer
 from scripts.mac_test.offload_test_support import (
     CLAIM_STUB, OffloadCommandFixture, FILTER, FIXTURE_MIRROR_ROOT, HANA, HANA_COMMAND_PATTERN, split_mac_run_command,
 )
+from scripts.mac_test.test_floor_sweep import install_floor_sweep_stub
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -1467,10 +1468,15 @@ class OffloadCommandTests(OffloadCommandFixture):
                 self.assertIn("alternate-mac:.local/state/mac-test/test-mirror/hana/", copied)
 
     def test_low_disk_declines_after_probe(self) -> None:
+        install_floor_sweep_stub(self)
         self.fixture["probe_lines"] = ["free_gib=59", "host=Mac", "rc=0"]
         self.sync_fixture()
         self.assert_declined(self.command(), "disk")
         self.assertEqual(self.events_for("rsync"), [])
+        [arguments] = [event["args"] for event in self.events_for("ssh")
+                       if "sweep.py --mac-floor-deadline " in event["args"][-1]]
+        self.assertIn("-tt", arguments)
+        self.assertEqual(arguments[arguments.index("-S") + 1], "none")
 
     def test_battery_power_does_not_decline_mac_tests(self) -> None:
         self.assertNotIn("pmset", offload.probe_script(eligibility.KnownRepository("hana")))

@@ -3284,15 +3284,16 @@ class ActionTest(unittest.TestCase):
         remove.assert_called_once_with(tree, repo)
 
     def test_a_verdict_keeps_a_dirty_try_folder_and_names_the_command(self) -> None:
-        tree, repo = self.try_folder()
+        tree = self.try_folder()[0]
         _ = (tree / "notes.txt").write_text("work")
         with mock.patch.object(worktrees, "remove_git_checkout") as remove:
             code, output, _ = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76",
                                   "--verdict", "no")
         remove.assert_not_called()
         self.assertEqual(code, 0)
-        self.assertIn(f"{tree} kept: dirty worktree: ?? notes.txt. Save the work, then run: env --chdir={repo} ", output)
-        self.assertIn(f"worktrees.py remove {tree}\n", output)
+        command = shlex.join([str(Path.home() / ".claude/scripts/lib/py"),
+                              str(Path.home() / ".claude/scripts/worktree/worktrees.py"), "remove", str(tree)])
+        self.assertIn(f"{tree} kept: dirty worktree: ?? notes.txt. Save the work, then run: {command}\n", output)
         self.assertTrue((tree / "notes.txt").is_file())
 
     def test_an_empty_producer_removes_the_list_showrunners_try_folder_without_a_staff_read(self) -> None:

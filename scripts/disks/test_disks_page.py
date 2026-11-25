@@ -40,8 +40,8 @@ def folder(name: str, size: int, children: list[dict[str, object]] | None = None
 
 
 TREE = folder("/build", 100 * GIB, [
-    folder("cargo", 60 * GIB, [folder("slot1", 30 * GIB, [folder("debug", 20 * GIB)]), folder("slot2", 20 * GIB),
-                               folder("slot3", 5 * GIB), folder("slot4", 4 * GIB)]),
+    folder("cargo", 60 * GIB, [folder("1", 30 * GIB, [folder("debug", 20 * GIB)]), folder("2", 20 * GIB),
+                               folder("3", 5 * GIB), folder("4", 4 * GIB)]),
     folder("paths", 30 * GIB, [folder("home", 2 * GIB)]),
     folder("small", 3 * GIB),
 ])
@@ -133,7 +133,7 @@ class DisksPageTests(unittest.TestCase):
         # The user, 11-16: the size filter is for the top level only; the Other row opens.
         rows = self.rows(10 * GIB, ["/build/cargo"])
         self.assertEqual([(row["name"], row["depth"], row["kind"]) for row in rows], [
-            ("/build/cargo", 0, "open"), ("slot1", 1, "shut"), ("slot2", 1, "leaf"), ("slot3", 1, "leaf"), ("slot4", 1, "leaf"),
+            ("/build/cargo", 0, "open"), ("1", 1, "shut"), ("2", 1, "leaf"), ("3", 1, "leaf"), ("4", 1, "leaf"),
             ("Files and small folders", 1, "files"), ("/build/paths", 0, "shut"), ("/build/small", 0, "leaf"),
             ("Files and small folders", 0, "files")])
         rows = self.rows(31 * GIB, ["other:/build", "/build/paths"])
@@ -145,9 +145,9 @@ class DisksPageTests(unittest.TestCase):
             ("/build/small", 1, "leaf", 3, 40, 90), ("Files and small folders", 1, "files", 7, 40, 93)])
 
     def test_each_row_starts_where_the_row_before_it_ends_inside_its_parent(self) -> None:
-        rows = self.rows(GIB, ["/build/cargo", "/build/cargo/slot1"])
+        rows = self.rows(GIB, ["/build/cargo", "/build/cargo/1"])
         debug = next(row for row in rows if row["name"] == "debug")
-        self.assertEqual((debug["path"], debug["start"], debug["parentStart"]), ("/build/cargo/slot1/debug", 0, 0))
+        self.assertEqual((debug["path"], debug["start"], debug["parentStart"]), ("/build/cargo/1/debug", 0, 0))
         top = [row for row in rows if row["depth"] == 0]
         self.assertEqual([row["start"] for row in top], [0, 60 * GIB, 90 * GIB, 93 * GIB])
         self.assertEqual(sum(cast(int, row["size"]) for row in top), 100 * GIB)

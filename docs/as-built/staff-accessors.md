@@ -189,6 +189,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/build_queue/admission_records.py` | read | caller_identity |
 | `scripts/build_queue/admission_client.py` | read | snapshot, by_id, StaffId; resolve BUILDLOG_OWNER_STAFF_ID only when the caller has no session identity |
 | `scripts/build_queue/admission_service.py` | read | local_snapshot, by_member_reference, unit_by_worktree, by_worktree |
+| `scripts/build_queue/kill_action.py` | read | snapshot, by_current_session, parent_of. Find the run owner and the recipient for the Kill notice. |
 | `scripts/build_queue/memory_feed.py` | read | supplied_snapshot, StaffId, by_member_reference, by_id, unit_by_worktree, by_worktree |
 | `scripts/build_queue/snapshot_codec.py` | read | StaffSnapshot, StaffId, by_id; resolves a stored caller staff id to its current name from the snapshot a reader supplies |
 | `scripts/direct/assign.py` | read | runtime_id |
@@ -213,6 +214,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/direct/verify_token_wait_test_support.py` | read | caller_identity; fixture child runs keep the runner's session |
 | `scripts/direct/worker_state.py` | read | StaffRow |
 | `scripts/direct/workers.py` | read | initial_snapshot, local_snapshot |
+| `scripts/disks/cleanup_old_folders.py` | read | snapshot, StaffSnapshot, StaffRefused, PresentWorktree |
 | `scripts/hana_shot/hana_shot.py` | read | local_snapshot, runtime_id |
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
 | `scripts/herdr/herdr_sessions.py` | read | initial_snapshot |

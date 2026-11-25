@@ -52,7 +52,7 @@ from xml.etree import ElementTree
 from scripts.aws_target import aws_page, machines_page
 from scripts.agents import remote
 from scripts.agents.remote import local_machine
-from scripts.build_queue import memory_feed
+from scripts.build_queue import kill_action, memory_feed
 from scripts.for_you.action import ActionStore
 from scripts.message import send_result, session_send
 from scripts.review_links.test_page_question import question_outcome
@@ -8011,6 +8011,65 @@ class ReviewLinksServerTests(unittest.TestCase):
             status, _ = self.post(serve.QUEUE_MOVE_PATH, json.dumps(undo_content), origin=origin, headers=headers)
             self.assertEqual(status, 409)
             move.assert_called_once_with(undo, 3)
+    def test_build_kill_requires_origin_operator_token_and_bounded_body(self) -> None:
+        settings = self.root.parent / "kill-config"
+        settings.mkdir()
+        _ = write_config_fixture(settings / "review_links.conf",
+                                 "page_refresh_seconds=17\n# whole: 1024..65536\nkill.request_bytes=4096")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(settings)})))
+        origin = f"http://127.0.0.1:{self.port}"
+        token = self.server.new_item_token
+        reference, handle = "a" * 64, "b" * 64
+        form = {"token": token, "reference": reference, "handle": handle, "words": "Use the next slot."}
+        result: kill_action.KillResult = {"reference": reference, "step": "check", "pid": 17,
+            "stop": kill_action.StopState.STOPPED, "delivery": kill_action.DeliveryState.QUEUED,
+            "time": "19:41 EST", "recipient_name": "fixture", "recipient_role": "worker"}
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "builds_operator", return_value=False) as operator,
+              patch.object(self.server.kill_actions, "options", return_value=({}, [])) as options,
+              patch.object(self.server.kill_actions, "stop", return_value=result) as stop):
+            self.assertEqual(self.request(kill_action.PATH).status, 403)
+            options.assert_not_called()
+            self.assertEqual(self.post(kill_action.PATH, urlencode(form), origin=origin)[0], 403)
+            operator.return_value = True
+            response = self.request(kill_action.PATH)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(response.body), {"token": token, "offers": {}, "results": [],
+                                                          "refresh_seconds": 17})
+            options.assert_called_once_with(17)
+            for sent_origin, values, expected in (
+                ("", form, 403),
+                ("http://wrong.invalid", form, 403),
+                (origin, {**form, "token": "wrong"}, 403),
+                (origin, {**form, "words": "x" * 4097}, 400),
+            ):
+                with self.subTest(origin=sent_origin, status=expected):
+                    self.assertEqual(self.post(kill_action.PATH, urlencode(values), origin=sent_origin)[0], expected)
+            stop.assert_not_called()
+            status, body = self.post(kill_action.PATH, urlencode(form), origin=origin)
+            self.assertEqual((status, json.loads(body)), (200, {"result": result}))
+            stop.assert_called_once_with(reference, handle, form["words"])
+
+    def test_builds_operator_checks_the_peer_against_the_local_owner(self) -> None:
+        settings = self.root.parent / "operator-config"
+        settings.mkdir()
+        _ = write_config_fixture(settings / "review_links.conf", "operator_login=local-node-owner")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(settings)})))
+        peer = ("100.64.0.17", 43210)
+        whois = ["tailscale", "whois", "--json", "--proto=tcp", "100.64.0.17:43210"]
+        status = ["tailscale", "status", "--json"]
+        for user, tags, local_tags, allowed in ((52, [], [], True), (53, [], [], False),
+                                               (52, ["tag:shared"], [], False),
+                                               (52, [], ["tag:shared"], False)):
+            with self.subTest(user=user, tags=tags, local_tags=local_tags):
+                remote = subprocess.CompletedProcess(whois, 0, json.dumps(
+                    {"Node": {"Tags": tags}, "UserProfile": {"ID": user, "LoginName": "fixture"}}))
+                local = subprocess.CompletedProcess(status, 0, json.dumps(
+                    {"Self": {"UserID": 52, "Tags": local_tags}}))
+                with patch.object(subprocess, "run", side_effect=(remote, local)) as run:
+                    self.assertIs(serve.builds_operator(peer), allowed)
+                self.assertEqual(run.call_args_list[0].args[0], whois)
+                self.assertEqual(run.call_count, 1 if tags else 2)
 
     def test_console_tune_requires_the_origin_and_token(self) -> None:
         key = "faster_box_max_cost_ratio"
@@ -9330,6 +9389,7 @@ class ServerStartupTests(unittest.TestCase):
 class ReviewLinksConfigTests(unittest.TestCase):
     def test_service_polls_read_settings_only_when_a_check_is_due(self) -> None:
         server = serve.ReviewLinksServer.__new__(serve.ReviewLinksServer)
+        server.kill_actions = cast(kill_action.KillActions, Mock(spec=kill_action.KillActions))
         server.mode = serve.ServerMode.LIVE
         server.next_attachment_retry = 105.0
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
