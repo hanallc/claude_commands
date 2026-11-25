@@ -24,7 +24,9 @@ from typing import Never, cast, override
 from unittest import mock
 from contextlib import AbstractContextManager, chdir, nullcontext, redirect_stdout
 
+from scripts.buildlog.store import host_name
 from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, git_files, scratch, unit_runs, process_group
+from scripts.lib.build_copies_test_support import write_private_build_roots
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, FixtureConfigValues, config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
@@ -940,6 +942,7 @@ class BuildFolderTests(unittest.TestCase):
             + "patterns.legacy-stable={purpose}\nnames.repository_key_length=8\n"
             + "patterns.tool={purpose}{suffix}\npatterns.named={showrunner}-{unit}/{work}-{purpose}\n"
             + "prefixes.verify-hold=verify-hold.{owner}.\nprefixes.admit-test=admit-test-\n")
+        write_private_build_roots(config / "build_folders.conf", private, host_name())
         _ = write_config_fixture(config / "scratch.conf", "suffix_length=6\n")
 
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -2728,6 +2731,7 @@ assert not loaded, loaded
         original = config.read_text()
         fallback = self.root / "fallback/build_folders.conf"
         _ = write_config_fixture(fallback, "prefixes.verify-hold=verify-hold.{owner}.\n", template="build_folders")
+        write_private_build_roots(fallback, self.root.parent, host_name())
         config.unlink()
         original_path = cast(Callable[[str], Path], getattr(conf, "_repository_path"))
 
