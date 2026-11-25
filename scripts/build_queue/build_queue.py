@@ -19,6 +19,8 @@ from scripts.buildlog import store
 from scripts.lint import memory_admit
 from scripts.message import unit_labels
 
+USAGE = "Usage: /build:bump <position|session|folder> | clear [unit]"
+
 
 def record(directory: Path, action: person_actions.SetBump | person_actions.ClearBump,
            unit: str, actor: str, reason: str) -> int:
@@ -81,7 +83,37 @@ def select_step(directory: Path, selector: str) -> SelectedStep | admission_reco
     return admission_records.NoWaiter()
 
 
-def bump(selector: str, actor: str) -> int:
+@dataclass(frozen=True)
+class BumpCommand:
+    words: list[str]
+    why: str | admission_protocol.WordsNotGiven
+
+
+@dataclass(frozen=True)
+class UsageRefused:
+    text: str
+
+
+def parse_command(arguments: list[str]) -> BumpCommand | UsageRefused:
+    words: list[str] = []
+    why: str | admission_protocol.WordsNotGiven = admission_protocol.WORDS_NOT_GIVEN
+    remaining = iter(arguments)
+    for argument in remaining:
+        if argument == "--words":
+            given = next(remaining, None)
+            if given is None:
+                return UsageRefused("build bump: --words needs the user's words")
+            why = given
+        elif argument.startswith("--words="):
+            why = argument.removeprefix("--words=")
+        elif argument == "--run":
+            return UsageRefused("build bump: use /build:bump <position|session|folder>")
+        else:
+            words.append(argument)
+    return BumpCommand(words, why)
+
+
+def bump(selector: str, actor: str, why: str) -> int:
     directory = store.root() / "admission"
     selected = select_step(directory, selector)
     if isinstance(selected, admission_records.HeldPlace):
@@ -102,15 +134,19 @@ def bump(selector: str, actor: str) -> int:
     if not step_key:
         print(f"build queue: waiting step {selector} has no queue key")
         return 3
-    return record(directory, person_actions.SetBump(step_key, selected.place), unit, actor, "the user's bump")
+    return record(directory, person_actions.SetBump(step_key, selected.place), unit, actor, why)
 
 
 def main() -> int:
-    words = sys.argv[1:]
+    command = parse_command(sys.argv[1:])
+    if isinstance(command, UsageRefused):
+        print(command.text)
+        return 3
+    words = command.words
     if not words or words == ["--help"]:
         from scripts.build_queue.memory_feed import page_link
 
-        print("Usage: /build:bump <position|session|folder> | clear [unit]")
+        print(USAGE)
         return page_link()
     if words[0] == "clear":
         if len(words) > 2:
@@ -121,10 +157,14 @@ def main() -> int:
         return 3
     try:
         actor = admission_records.queue_command_actor()
+        why = person_actions.asked_words(command.why, actor)
+        if isinstance(why, admission_protocol.Refused):
+            print(f"build queue: {why.reason}")
+            return 3
         if words[0] != "clear":
-            return bump(words[0], actor)
+            return bump(words[0], actor, why)
         unit = words[1] if len(words) == 2 else ""
-        return record(store.root() / "admission", person_actions.ClearBump(), unit, actor, "the user's clear")
+        return record(store.root() / "admission", person_actions.ClearBump(), unit, actor, why)
     except person_actions.UnknownBumpUnit as error:
         print(f"build queue: {error}")
         return 3

@@ -64,6 +64,34 @@ class FloorSweepTests(unittest.TestCase):
     def sweep(self) -> offload.MacDiskReady | offload.SweepShort | offload.SweepFailed:
         return offload.ensure_mac_disk_floor(self.controller, eligibility.read_config(self.settings), self.repository, self.before)
 
+    def test_host_probe_reads_disk_and_saved_mirror_processes_in_one_command(self) -> None:
+        _ = write_config_fixture(self.settings, "host=fixture-mac\nmirror_root=~/fixture-mirrors\n")
+        scans = self.root / "scans"
+        commands = (
+            "df() { printf 'header\\nfs a b 164\\n'; }\n"
+            + "hostname() { printf 'fixture-mac\\n'; }\n"
+            + "pgrep() { return 1; }\n"
+            + f"lsof() {{ printf 'scan\\n' >> {shlex.quote(str(scans))}; "
+            + "printf 'p41\\nn/home/fixture/fixture-mirrors/old\\np42\\nn/home/fixture/fixture-mirrors/new\\n'; }\n"
+            + """ps() { printf 'fixture-start-%s\\n' "$2"; }""" + "\n"
+        )
+
+        def capture(arguments: list[str], _deadline: offload.CommandDeadline) -> offload.CommandOutput:
+            self.assertEqual((arguments[0], arguments[-2]), ("ssh", "fixture-mac"))
+            result = subprocess.run(["/bin/sh", "-c", commands + arguments[-1]],
+                                    capture_output=True, text=True, timeout=5, check=False)
+            return offload.CommandOutput(result.returncode, result.stdout, result.stderr)
+
+        settings = eligibility.probe_settings(conf.read(self.settings))
+        with mock.patch.object(self.controller, "capture", side_effect=capture) as command:
+            snapshot = offload.probe_mac_host(self.controller, settings, "mac", ("old", "new", "absent"))
+        self.assertEqual(snapshot, offload.MacHostProbeSnapshot(offload.ProbeSnapshot(164, "fixture-mac"), {
+            "old": offload.MacMirrorProcess(41, "fixture-start-41"),
+            "new": offload.MacMirrorProcess(42, "fixture-start-42"),
+        }, {}))
+        self.assertEqual(scans.read_text().splitlines(), ["scan"])
+        command.assert_called_once()
+
     def test_two_callers_share_one_sweep_and_both_read_after_it(self) -> None:
         entered = threading.Event()
         release = threading.Event()
