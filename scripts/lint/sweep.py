@@ -2255,7 +2255,8 @@ def unit_age(group: Group, now: float) -> tuple[float, float]:
     return (-int((now - group.last_used) // DAY_SECONDS), group.compiled)
 
 
-def remove_checked_entry(checked: removal_guard.CheckedEntry) -> ConfirmedDeletion:
+def remove_checked_entry(checked: removal_guard.CheckedEntry,
+                         lease: build_folders.FreeFolderRemovalLease) -> ConfirmedDeletion:
     freed = removed = 0
     device_bytes: dict[int, int] = {}
 
@@ -2268,9 +2269,14 @@ def remove_checked_entry(checked: removal_guard.CheckedEntry) -> ConfirmedDeleti
         removed += result.removed
         device_bytes[entry.device] = device_bytes.get(entry.device, 0) + result.bytes
 
+    def delete(staged: build_folders.CheckedRemovalTree) -> None:
+        removal_guard.remove(replace(checked, path=staged.path, parent=staged.parent, name=staged.path.name),
+                             account=account)
+
     failures = 0
     try:
-        removal_guard.remove(checked, account=account)
+        if not lease.remove_tree(checked.path, checked.info, wait=False, delete=delete):
+            failures = 1
     except (OSError, removal_guard.Refused) as error:
         print(f"kept {checked.path}: {removal_guard.single_line(error)}")
         failures = 1
@@ -2307,7 +2313,7 @@ def reclaim(group: FloorTake, scan: Scan, remaining: dict[InodeKey, int],
 
 
 @contextmanager
-def form_folder_locks(path: Path) -> Generator[str]:
+def form_folder_locks(path: Path) -> Generator[str | build_folders.FreeFolderRemovalLease]:
     """Check existing leases, busy marks, and Cargo locks without adding files."""
     with build_folders.folder_removal_lease(path, children=True, wait=False) as lease:
         if isinstance(lease, build_folders.RefusedRemovalLease):
@@ -2329,7 +2335,7 @@ def form_folder_locks(path: Path) -> Generator[str]:
                     yield f"the Cargo lock is busy: {locks.path}"
                     return
                 try:
-                    yield ""
+                    yield lease
                 finally:
                     release(locks.held)
             finally:
@@ -2481,9 +2487,10 @@ def assess_form_folders(guard: removal_guard.RemovalGuard, plan: removal_guard.R
                     collect(Path(inner.path))
     for _, path in sorted(candidates):
         try:
-            with guard.check(path) as checked, form_folder_locks(path) as busy:
+            with guard.check(path) as checked, form_folder_locks(path) as lease:
                 checked.recheck()
-                if reason := busy or form_folder_use(path, guard):
+                reason = lease if isinstance(lease, str) else form_folder_use(path, guard)
+                if reason:
                     print(f"kept {str(path)!r}: {reason}")
                     continue
                 size = directory_blocks(str(path))
@@ -2501,14 +2508,16 @@ def remove_listed_output(row: removal_guard.ListedEntry, guard: removal_guard.Re
         return removal_guard.Kept("a whole build folder must match the selected path")
     path = str(row.path)
     settings = conf.read("lint")
-    with guard.check(row.path) as checked, form_folder_locks(row.path) as busy:
+    with guard.check(row.path) as checked, form_folder_locks(row.path) as lease:
         checked.recheck()
-        if reason := busy or form_folder_use(row.path, guard):
+        if isinstance(lease, str):
+            return removal_guard.Kept(lease)
+        if reason := form_folder_use(row.path, guard):
             return removal_guard.Kept(reason)
         if form_last_used(row.path, checked.info.st_mtime) > row.assessed_ns / 1_000_000_000:
             return removal_guard.Kept("the build folder was used after assessment")
         row.verify(checked)
-        account = remove_checked_entry(checked)
+        account = remove_checked_entry(checked, lease)
         cause = "floor take" if row.reason == "below the free-space floor" else "budget take"
         extent = "partial" if account.failures else "whole"
         stamp_error = ""

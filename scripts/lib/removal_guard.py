@@ -31,8 +31,9 @@ from scripts.lib import conf
 from scripts.lib.atomic_file import (
     AtomicDurabilityUnconfirmed, TEMPORARY_NAME, remove_abandoned_temporary_file, write_text_atomic,
 )
-from scripts.lib.build_folders import OWNER_MARKER
 from scripts.production import staff
+
+OWNER_MARKER = ".build-folder-owner.json"
 
 PATH_TEMPLATES_KEY = "removal.path_templates"
 CARGO_TAG = "CACHEDIR.TAG"

@@ -34,7 +34,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertEqual(len(self.noted), 1)
         self.assertEqual(self.noted[0].body, "")
         self.assertEqual(self.noted[0].title, "claude2 has 2% left with no move")
-        self.assertEqual(self.noted[0].action, ActionRequired("Set a move on the Accounts page"))
+        self.assertEqual(self.noted[0].action, ActionRequired("In the natedev session, type /agents move <group> <account>."))
         for minute, left in ((4, "1"), (32, "1"), (120, "null"), (122, "1")):
             _ = self.alert([self.note("claude2.md", "active", left)], self.now + timedelta(minutes=minute))
         self.assertEqual(len(self.noted), 1)

@@ -557,13 +557,12 @@ always=director
                     codex_readings=self.stale_workers_target_readings(now))
             push, = self.zero_pushes()
             self.assertEqual(push.id, "quota.paid_credits_queued")
-            self.assertIn("codex1", push.body)
-            for forbidden in ("codex2", "codex3", "Claude", "Within minutes", "workers move"):
-                self.assertNotIn(forbidden, push.body)
+            self.assertEqual(push.title, "codex1 uses credits until move: 6,370 left")
+            self.assertEqual(push.body, "")
             from scripts.notify.push_texts import render
             self.assertEqual(push, render("quota.paid_credits_queued", **push.values))
-            self.assertEqual(set(push.values), {"sender", "account", "machine", "credits", "refill"})
-            self.assertIn("workers stop and wait for your queued move", push.body)
+            self.assertEqual(set(push.values), {"sender", "account", "machine", "credits", "refill", "credit_accounts"})
+            self.assertEqual(push.values["credit_accounts"], "codex2 codex3 codex4")
             _ = self.note(1, "off")
             _ = self.alert(self.now + timedelta(minutes=4),
                 spare_accounts=((3, 0, "0"),))

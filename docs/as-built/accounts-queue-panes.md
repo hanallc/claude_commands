@@ -5,6 +5,7 @@
 The `unit-board@nate-local` plugin has no pane and registers no command.
 Use `/build:page` for running steps, waiting steps, memory use, and Mac idle alerts.
 Use `/build:bump <position|session|folder>` to set a waiting unit's priority.
+Use `/build:bump --run <position|session|folder>` to raise only the run of that step.
 Use `/build:bump clear [unit]` to remove priority.
 Use Hana console, Accounts to see the accounts board.
 `/showrunner:units` prints the Units table through `scripts/production/unit_phases.py`.

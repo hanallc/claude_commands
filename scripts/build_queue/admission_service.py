@@ -47,6 +47,7 @@ from scripts.build_queue import ci_job_start
 from scripts.build_queue import placement
 from scripts.build_queue import step_estimator
 from scripts.build_queue import progress_profile as progress
+from scripts.build_queue import memory_trace
 from scripts.build_queue import cloud_progress
 from scripts.build_queue import person_actions, queue_snapshot
 from scripts.build_targets import target_config
@@ -61,7 +62,7 @@ from scripts.production.gate_routes import SuiteMode
 from scripts.buildlog import repository, store
 from scripts.lib import test_phase
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
+from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER, MAC_LINUX_START_UNCONFIRMED
 from scripts.lib.build_steps import gate_job_from_process
 
 from scripts.build_queue.scope_activity import (
@@ -217,6 +218,7 @@ PLACEMENT_REASON_TEXT = {
     "mac_linux_backoff": "the guest is in retry backoff",
     "mac_linux_reading_required": "the queue needs a newer guest reading",
     MAC_LINUX_NO_ANSWER: "the Mac does not answer",
+    MAC_LINUX_START_UNCONFIRMED: "the Mac Linux guest did not confirm a start",
     "busy": "the target is busy",
     "off": "the target is off",
     "disk": "the target needs more disk space",
@@ -373,7 +375,8 @@ class SystemReadings:
             host = gate.read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
             window = conf.read("build_admission").whole("agent_swap_window_seconds")
             returning = self.swap_in.read(Path(os.environ.get("BUILDLOG_VMSTAT", "/proc/vmstat")), time.monotonic(), window)
-            return replace(host, swap_in_window_bytes=returning) if isinstance(returning, int) else returning
+            return (replace(host, swap_in_window_bytes=returning, swap_in_window_seconds=window)
+                    if isinstance(returning, int) else returning)
         except (OSError, ValueError, conf.Unusable) as error:
             return records.ReadingUnavailable(str(error) or "memory reading unavailable")
 
@@ -765,8 +768,11 @@ class ReplayLedger(dict[str, ReplayEntry]):
 class PendingAdmission:
     episode: str
     need_source: records.NeedSource
+    # The step was the first queued row in queue order.
     is_head: bool
     wait_seconds: float
+    # The default exists only so that outbox entries saved before this field decode.
+    passed: gate.PassedRows | gate.PassedNotRecorded = gate.PassedNotRecorded()
 
 
 @dataclass(frozen=True)
@@ -1183,7 +1189,8 @@ class OperatingSystemReader:
     """One thread publishes complete readings at the existing pass cadence."""
 
     def __init__(self, plan: SystemReadingPlan, initial: SystemEvidence,
-                 readings: Readings, proc: Proc, clock: Clock, wake: int) -> None:
+                 readings: Readings, proc: Proc, clock: Clock, wake: int, *,
+                 traces: memory_trace.TraceCapture | memory_trace.TracesOff = memory_trace.TRACES_DISABLED) -> None:
         self.plan: SystemReadingPlan = plan
         self.reading: SystemEvidence = initial
         self.readings: Readings = readings
@@ -1193,6 +1200,8 @@ class OperatingSystemReader:
         self.lock: threading.Lock = threading.Lock()
         self.stopped: threading.Event = threading.Event()
         self.requested: threading.Event = threading.Event()
+        self.traces: memory_trace.TraceWorker | memory_trace.TracesOff = (
+            memory_trace.TraceWorker(traces) if isinstance(traces, memory_trace.TraceCapture) else traces)
         self.failure: Exception | NoReadingFailure = NoReadingFailure()
         self.thread: threading.Thread = threading.Thread(target=self._read, name="admission-readings", daemon=True)
         self.thread.start()
@@ -1210,7 +1219,35 @@ class OperatingSystemReader:
                 self.requested.set()
 
     def request_read(self) -> None:
-        self.requested.set()
+        with self.lock:
+            self.requested.set()
+
+    def register_trace(self, record: ReservationRecord, argv: tuple[str, ...], host: str, wall: float) -> None:
+        if (isinstance(self.traces, memory_trace.TraceWorker) and isinstance(record.place, wire.LocalPlace)
+                and record.repo == "hana" and record.repo_identity and record.step == "nextest"
+                and record.sidecar and record.need > 0 and argv):
+            width = records.UnspecifiedTestWidth() if isinstance(record.test_width, records.NoTestWidth) else record.test_width
+            shape = memory_trace.HanaTraceShape(host, record.repo_identity, argv, width)
+            self.traces.submit(memory_trace.TraceGrant(record.reservation_id, shape, reservation_row(record),
+                                                       wall, self.clock.monotonic()))
+
+    def release_trace(self, record: ReservationRecord, ending: ReservationEnding,
+                      wall: float) -> None:
+        if (isinstance(self.traces, memory_trace.TraceWorker) and isinstance(record.place, wire.LocalPlace)
+                and record.repo == "hana" and record.step == "nextest" and record.sidecar):
+            status = ending.status if isinstance(ending, ReleaseStatus) else memory_trace.ExitStatusUnavailable()
+            self.traces.release(record.reservation_id, wall, status)
+
+    def record_trace_reserves(self, explanation: records.QueueExplanation) -> None:
+        if isinstance(self.traces, memory_trace.TraceWorker):
+            running = (entry for entry in explanation.running if gate.running_has_reservation(entry.step))
+            reserves = {row["reservation_id"]: entry.promise for row, entry in
+                        zip(explanation.decided_from.reservations, running, strict=True)
+                        if row["repo"] == "hana" and row["step"] == "nextest" and row.get("scoped", False)
+                        and "reservation_id" in row and isinstance(entry.step.measured, records.MeasuredMemory)
+                        and isinstance(entry.step.measured.peak_history, records.TestPhaseStarted)}
+            if reserves:
+                self.traces.submit(reserves)
 
     def raise_failure(self) -> None:
         with self.lock:
@@ -1219,15 +1256,17 @@ class OperatingSystemReader:
             raise failure
 
     def _read(self) -> None:
+        last_read = self.clock.monotonic()
         while not self.stopped.is_set():
             with self.lock:
                 plan = self.plan
             interval = plan.config.waiting_pass_seconds if plan.waiting else plan.config.running_pass_seconds
-            _ = self.requested.wait(interval)
-            self.requested.clear()
+            full_deadline = last_read + interval
+            _ = self.requested.wait(max(0.0, full_deadline - self.clock.monotonic()))
             if self.stopped.is_set():
-                return
+                break
             with self.lock:
+                self.requested.clear()
                 plan = self.plan
             try:
                 reading = read_system(plan, self.readings, self.proc, self.clock)
@@ -1238,11 +1277,14 @@ class OperatingSystemReader:
                 with self.lock:
                     self.reading = reading
             os.eventfd_write(self.wake, 1)
+            last_read = self.clock.monotonic()
 
     def close(self) -> None:
         self.stopped.set()
         self.requested.set()
         self.thread.join()
+        if isinstance(self.traces, memory_trace.TraceWorker):
+            self.traces.close()
 
 
 @dataclass(frozen=True)
@@ -1716,16 +1758,44 @@ class NoPendingPriorityRoster:
 
 
 @dataclass(frozen=True)
+class PriorityRosterRead:
+    """The unit labels of the roster and the actor that asked."""
+    labels: Mapping[str, gate.UnitMembership]
+    asker: records.Asker
+
+
+@dataclass(frozen=True)
 class PendingPriorityRoster:
     change: OrderedQueueChange
-    result: Future[Mapping[str, gate.UnitMembership]]
+    why: str
+    result: Future[PriorityRosterRead]
 
 
-def read_priority_roster(result: Future[Mapping[str, gate.UnitMembership]], wake: int) -> None:
-    """Read the roster without changing service state."""
+@dataclass(frozen=True)
+class PriorityRosterNotRead:
+    """A clear needs no roster; only a set reads it."""
+
+
+PRIORITY_ROSTER_NOT_READ = PriorityRosterNotRead()
+
+
+@dataclass(frozen=True)
+class PriorityHistoryReadable:
+    """The last priority history read or write worked."""
+
+
+@dataclass(frozen=True)
+class PriorityHistoryUnreadable:
+    """A priority history read or write failed with this text; the change waits until a write works."""
+    error: str
+
+
+def read_priority_roster(result: Future[PriorityRosterRead], actor: str, wake: int) -> None:
+    """Read the roster and the actor that asked without changing service state."""
     try:
         try:
-            result.set_result(gate.priority_labels(gate.RosterUnits()))
+            result.set_result(PriorityRosterRead(gate.priority_labels(gate.RosterUnits()),
+                                                 records.actor_asker(actor, records.queue_staff())))
         except Exception as error:
             result.set_exception(error)
         os.eventfd_write(wake, 1)
@@ -1761,6 +1831,26 @@ def _placement_history_applies(saved: records.SavedPlacementAssignment, request:
                  or not is_mac_linux_guest(assignment.destination)
                  or not isinstance(saved.permission, placement.PermissionConsumed)
                  or assignment.owner == request.owner and assignment.since == request.since))
+
+
+def _guest_start_observed(saved: records.SavedPlacementAssignment) -> bool:
+    return saved.guest_execution_observed or isinstance(saved.confirmed_guest_start, records.ConfirmedGuestStart)
+
+
+def _guest_retry_released(saved: records.SavedPlacementAssignment) -> bool:
+    report = saved.terminal_report
+    return (is_mac_linux_guest(saved.assignment.destination)
+            and isinstance(saved.permission, placement.PermissionConsumed)
+            and saved.guest_proof_required and not _guest_start_observed(saved)
+            and isinstance(saved.retry, placement.RetryAt)
+            and isinstance(report, placement.TerminalAttemptReport)
+            and report.outcome == placement.PrelaunchRefused(MAC_LINUX_START_UNCONFIRMED))
+
+
+def _guest_retry_applies(saved: records.SavedPlacementAssignment, request: wire.PlacementRequest) -> bool:
+    assignment = saved.assignment
+    return (_guest_retry_released(saved) and assignment.episode == request.episode
+            and assignment.owner == request.owner and assignment.since == request.since)
 
 
 @dataclass(frozen=True)
@@ -2043,6 +2133,7 @@ class AdmissionServer:
                  fault: Callable[[str], None] = _no_fault, socket_path: Path | None = None,
                  capture_root: Path = CARGO_CAPTURE_ROOT,
                  host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None,
+                 trace_policy: memory_trace.MemoryTracePolicy | memory_trace.TracesOff = memory_trace.TRACES_DISABLED,
                  job_start_reader: Callable[[wire.Owner], records.CiJobStart] | None = None) -> None:
         state_dir = state_dir.resolve()
         self.writes: ServiceStateWrites = ServiceStateWrites(state_dir)
@@ -2129,12 +2220,14 @@ class AdmissionServer:
         self.bumps: person_actions.BumpProgress = person_actions.BumpProgress()
         self.pending_priority: PendingPriorityRoster | NoPendingPriorityRoster = NoPendingPriorityRoster()
         self.queue_changes: deque[OrderedQueueChange] = deque()
+        self.priority_history: PriorityHistoryReadable | PriorityHistoryUnreadable = PriorityHistoryReadable()
         self.last_diagnostics: tuple[records.ConfigurationDiagnostic, ...] = ()
         self._pending_replies: dict[str, list[wire.Reply]] = {}
         self._persisted: str = ""
         self.durable_encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         self.published: PublishedReplies | NoPass = NoPass()
         self.system_reader: SystemReader | NoSystemReader = NoSystemReader()
+        self.trace_policy: memory_trace.MemoryTracePolicy | memory_trace.TracesOff = trace_policy
         self.system_evidence: SystemEvidence | NoPass = NoPass()
         self.owner_confirmation_reading: object = object()
         self.owner_confirmations: dict[int, OwnerStartReading] = {}
@@ -2181,18 +2274,28 @@ class AdmissionServer:
         self._restore()
         _ = self.run_pass()
 
-    def _finish_priority(self) -> None:
-        if isinstance(self.priority, records.NoQueuePriority):
-            return
-        transition = self.priority.transition
-        if isinstance(transition, records.SettledPriority):
-            return
+    def _settle_priority(self) -> bool:
+        """Write the history row of a pending priority change; False while the write fails."""
+        priority = self.priority
+        if isinstance(priority, records.NoQueuePriority) or isinstance(priority.transition, records.SettledPriority):
+            return True
         self.writes.require(store.root())
-        gate.finish_priority_transition(self.priority)
-        self.priority = (records.QueuePriority(self.priority.entries) if self.priority.entries
-                         else records.NO_QUEUE_PRIORITY)
+        try:
+            gate.finish_priority_transition(priority)
+        except (OSError, ValueError) as error:
+            self._report_history_error("a priority change waits for its history row", error)
+            return False
+        self.priority_history = PriorityHistoryReadable()
+        self.priority = records.QueuePriority(priority.entries) if priority.entries else records.NO_QUEUE_PRIORITY
         self.persist()
+        return True
 
+    def _report_history_error(self, waits: str, error: OSError | ValueError) -> None:
+        """Print each distinct history error once."""
+        unreadable = PriorityHistoryUnreadable(str(error))
+        if self.priority_history != unreadable:
+            print(f"memory admission: {waits}: {error}", file=sys.stderr)
+        self.priority_history = unreadable
 
     def _restore(self) -> None:
         path = self.state_dir / "state.json"
@@ -2241,7 +2344,7 @@ class AdmissionServer:
                 self._watch_owner(record.owner)
                 self._watch_scope(lifetime, episode)
         self._prune_places()
-        self._finish_priority()
+        _ = self._settle_priority()
         for request in self.placement_requests.values():
             self.prerequisites[request.episode] = (placement.TokenNotRequired()
                 if isinstance(request.prerequisite, placement.TokenNotRequired) else placement.TokenRequired())
@@ -2258,7 +2361,8 @@ class AdmissionServer:
     def _check_saved_remote_slots(self) -> None:
         guests = {key: saved for key, saved in self.assignments.items() if _holds_consumed_guest_slot(saved)}
         self.manual_guest_settlement = {key for key, saved in guests.items()
-            if len(guests) > 1 or self.current_assignments.get(saved.assignment.episode) != key}
+            if len(guests) > 1
+            or self.current_assignments.get(saved.assignment.episode) != key and not _guest_retry_released(saved)}
         guest_episodes = {guests[key].assignment.episode for key in self.manual_guest_settlement}
         scalers = {key for key, saved in self.assignments.items() if _holds_scaler_slot(saved)
                    and (saved.assignment.episode in guest_episodes
@@ -3939,6 +4043,9 @@ class AdmissionServer:
         ordered = self._published_queue_order(ordered, hidden)
         reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
                           diagnostics=self.last_diagnostics)
+        if (isinstance(self.trace_policy, memory_trace.MemoryTracePolicy)
+                and isinstance(self.system_reader, OperatingSystemReader)):
+            self.system_reader.record_trace_reserves(reading.explanation)
         local = {path: replace(step, verify=row.get("verify", step.verify))
                  for (path, row), step in zip(reading.ordered, reading.view.waiting, strict=True)}
         held_reasons = {records.waiter_owner(self.waiters[episode].row): reason
@@ -4143,6 +4250,8 @@ class AdmissionServer:
                         "is_head": pending.is_head,
                         "wait_seconds": pending.wait_seconds,
                 }
+                if isinstance(pending.passed, gate.PassedRows):
+                    event["passed"] = pending.passed
                 gate.append_queue_time(self.state_dir, cast(dict[str, object], codec.snapshot_value(event)), admitted_at)
                 self.fault("after_admitted_append")
             else:
@@ -4254,13 +4363,18 @@ class AdmissionServer:
                 reply: wire.Admitted | wire.LaunchAdmitted = admission
                 self.ledger[request.episode] = ReplayEntry(reply, now)
             else:
-                result = self.last_result
-                candidate = result.policy.queued_head if isinstance(result, gate.PassResult) else gate.NoQueuedHead()
+                # Every caller admits after the pass that set last_result, so it is the admitting walk.
+                result, inputs = self.last_result, self.last_inputs
+                started = records.waiter_owner(waiting.row)
+                candidate: gate.QueuedHead | gate.NoQueuedHead = gate.NoQueuedHead()
+                passed: gate.PassedRows | gate.PassedNotRecorded = gate.PassedNotRecorded()
+                if isinstance(result, gate.PassResult) and isinstance(inputs, records.QueueInputs):
+                    candidate = result.policy.queued_head
+                    passed = gate.passed_rows(result.policy.walk, started, inputs.pending_remote_starts)
                 source = request.profile.peak.source
                 self.lifecycle_outbox = (*self.lifecycle_outbox, PendingAdmission(request.episode, source,
-                    isinstance(candidate, gate.QueuedHead)
-                        and records.waiter_owner(candidate.waiter) == records.waiter_owner(waiting.row),
-                    max(0.0, now - waiting.row["since"])))
+                    isinstance(candidate, gate.QueuedHead) and records.waiter_owner(candidate.waiter) == started,
+                    max(0.0, now - waiting.row["since"]), passed))
                 if (line := self._gate_gap_start(admission, now)) is not None:
                     gap_starts.append(line)
                 self._save_gate_rank(admission, waiting.row.get("move_id", ""))
@@ -4301,6 +4415,10 @@ class AdmissionServer:
         for line in gap_starts:
             print(line, file=sys.stderr, flush=True)
         for waiting, reply in zip(waiters, replies, strict=True):
+            request = waiting.request
+            if isinstance(reply, wire.Admitted) and isinstance(request, wire.AdmitRequest) and isinstance(
+                    self.system_reader, OperatingSystemReader):
+                self.system_reader.register_trace(self.reservations[request.episode], request.argv, self.host, now)
             self._remove_waiter(waiting, reply)
 
     def _end(self, episode: str, ending: ReservationEnding) -> None:
@@ -4330,6 +4448,8 @@ class AdmissionServer:
             self._clear_wait_rank(record.owner, record.queue_waiter["since"], episode)
         ended_at = (step_estimator.epoch(record.finalization["ended_at"])
                     if isinstance(record.finalization, dict) else self.clock.now())
+        if isinstance(self.system_reader, OperatingSystemReader):
+            self.system_reader.release_trace(record, ending, ended_at)
         if record.episode.startswith("uid:"):
             self._sample_runner(record, 0, ended_at)
         self.progress_history.finish(record.reservation_id, ended_at, ended_at - step_estimator.HISTORY_DAYS * 86400)
@@ -5316,7 +5436,8 @@ done
                 or self._reused_guest_timeout(request) is not None):
             return False
         return not any(saved.assignment.episode == request.episode
-            and (_holds_consumed_guest_slot(saved) or _holds_scaler_slot(saved)
+            and (_holds_consumed_guest_slot(saved) and not _guest_retry_applies(saved, request)
+                 or _holds_scaler_slot(saved)
                  or isinstance(saved.state, placement.ClosedAssignment)
                  and saved.state.reason in ("completed", "cancelled")
                  and _placement_history_applies(saved, request))
@@ -5351,6 +5472,9 @@ done
     def _target_retry(self, request: wire.PlacementRequest,
                       destination: placement.PlacementDestination, keys: PlacementEvidenceKeys
                       ) -> placement.RetryDecision | placement.EvidenceNeeded | RetryAfterAvailability:
+        if is_mac_linux_guest(destination) and any(_guest_retry_applies(saved, request)
+                                                  for saved in self.assignments.values()):
+            return placement.DoNotRetry(MAC_LINUX_START_UNCONFIRMED)
         saved = next((saved for saved in reversed(self.assignments.values())
             if saved.assignment.destination == destination and isinstance(saved.state, placement.ClosedAssignment)
             and _placement_history_applies(saved, request)), None)
@@ -5722,6 +5846,8 @@ done
         guest_waiting = False
         for key, guest in self.assignments.items():
             if guest.assignment.episode != request.episode or not is_mac_linux_guest(guest.assignment.destination):
+                continue
+            if _guest_retry_applies(guest, request):
                 continue
             if _holds_consumed_guest_slot(guest):
                 guest_waiting = True
@@ -6170,9 +6296,10 @@ done
         The no-run report can close a legacy attempt if no start is pending.
         A fresh process read checks the gate because the last system reading can still show it.
         """
-        return (saved.assignment.destination.target == "mac-linux"
+        return (is_mac_linux_guest(saved.assignment.destination)
                 and isinstance(saved.permission, placement.PermissionConsumed)
-                and isinstance(request.claim, placement.NoProviderClaim) and request.reason == MAC_LINUX_NO_ANSWER
+                and isinstance(request.claim, placement.NoProviderClaim)
+                and request.reason in (MAC_LINUX_NO_ANSWER, MAC_LINUX_START_UNCONFIRMED)
                 and not saved.guest_execution_observed
                 and isinstance(saved.guest_start, records.GuestStartNotReported)
                 and isinstance(saved.confirmed_guest_start, records.GuestStartNotRecorded)
@@ -6441,6 +6568,15 @@ done
             return
         expired = self._expire_guest_replacement(saved, checked_at=settled_at)
         report = expired.terminal_report
+        if _guest_start_observed(saved) and (isinstance(report, placement.NoTerminalReport)
+                or isinstance(report.outcome, placement.AttemptDeclined | placement.PrelaunchRefused)):
+            report = placement.TerminalAttemptReport(
+                placement.AttemptCancelled("The Mac Linux guest ended without a verdict"),
+                placement.DispatchPathSettled(), self.clock.now())
+        if (isinstance(report, placement.NoTerminalReport) and saved.guest_proof_required
+                and self._placement_owner_live(assignment.owner)):
+            # The gate can report its failure after the settlement probe completes.
+            return
         terminal = (replace(report, path=placement.DispatchPathSettled())
                     if isinstance(report, placement.TerminalAttemptReport) else self._lost_report())
         # Keep the settlement time for a reused submission after the worker forgets the attempt.
@@ -6452,7 +6588,8 @@ done
     def _expire_guest_replacement(self, saved: records.SavedPlacementAssignment, *,
                                   checked_at: float | None = None) -> records.SavedPlacementAssignment:
         report = saved.terminal_report
-        if (not isinstance(report, placement.TerminalAttemptReport)
+        if (_guest_retry_released(saved) or _guest_start_observed(saved)
+                or not isinstance(report, placement.TerminalAttemptReport)
                 or not isinstance(report.outcome, placement.AttemptDeclined | placement.PrelaunchRefused)):
             return saved
         limit = _guest_wait_limit()
@@ -6643,6 +6780,25 @@ done
             return [self._placement_status(assignment, check_lifetime=False)]
         guest = is_mac_linux_guest(assignment.destination)
         current = self.current_assignments.get(assignment.episode) == key
+        if isinstance(request, wire.ClaimFailure) and request.reason == MAC_LINUX_START_UNCONFIRMED:
+            if _guest_retry_released(saved) and isinstance(request.claim, placement.NoProviderClaim):
+                return [self._placement_status(assignment, check_lifetime=False)]
+            previous = saved.terminal_report
+            if (not current or not _holds_consumed_guest_slot(saved) or not saved.guest_proof_required
+                    or not self._guest_took_no_run(saved, request)
+                    or isinstance(previous, placement.TerminalAttemptReport)
+                    and previous.outcome != GUEST_SETTLEMENT_REQUESTED):
+                return [self._placement_status(assignment, "The queue cannot release this guest attempt for retry",
+                                               check_lifetime=False)]
+            now = self.clock.now()
+            report = placement.TerminalAttemptReport(placement.PrelaunchRefused(request.reason),
+                placement.DispatchPathPending("Mac Linux settlement is pending"), now)
+            self.assignments[key] = replace(saved, terminal_report=report, retry=placement.RetryAt(now),
+                                            remote_start_hold=records.RemoteStartHoldEnded())
+            del self.current_assignments[assignment.episode]
+            self.persist()
+            self._schedule_pass()
+            return [self._placement_status(assignment, check_lifetime=False)]
         if guest and not current:
             return [self._placement_status(assignment, "the attempt is no longer current", check_lifetime=False)]
         guest_holds_slot = _holds_consumed_guest_slot(saved)
@@ -6654,7 +6810,7 @@ done
                              and isinstance(request.claim, placement.NoProviderClaim))
             if (current
                     and (local_decline or isinstance(saved.permission, placement.PermissionAvailable)
-                         or self._guest_took_no_run(saved, request)
+                         or request.reason == MAC_LINUX_NO_ANSWER and self._guest_took_no_run(saved, request)
                          or assignment.destination.provider == "scaler"
                          and (request.claim == saved.provider or isinstance(request.claim, placement.NoProviderClaim)))
                     and isinstance(saved.state, placement.CurrentAssignment)):
@@ -6790,11 +6946,11 @@ done
             return "queue moves require the service account"
         if isinstance(request, (wire.BuildHistoryRequest, wire.ViewRequest, wire.ExplainRequest, wire.MineRequest)):
             return ""
-        key = (request.episode if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.RepositorySlotRequest))
+        key = (request.episode if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest))
                else request.request_id)
         if not key.startswith(f"uid:{uid}:"):
             return "request belongs to another account"
-        if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.RepositorySlotRequest)):
+        if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest)):
             if self._account(request.owner) != uid or not self._live(request.owner):
                 return "owner belongs to another account or no longer exists"
             if isinstance(request, wire.AdmitRequest) and isinstance(request.run, wire.RunIdentity):
@@ -6896,8 +7052,6 @@ done
             status = status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider,
                                                       permission, report)
             return [status_wire.PlacementStatusReply(status)]
-        if isinstance(request, wire.RepositorySlotRequest):
-            return [wire.Refused("Repository copy capacity no longer requires admission")]
         if isinstance(request, wire.VerifyRunSlotRequest):
             # Older clients can still ask. Only a local memory grant takes a slot.
             return [wire.Ok()]
@@ -7169,13 +7323,16 @@ done
                     return []
             self.queue_changes.append(OrderedQueueChange(request, connections))
             return []
+        why = person_actions.asked_words(request.why, request.actor)
+        if isinstance(why, wire.Refused):
+            return self._mutation_reply(request.request_id, why)
         if isinstance(request, wire.PrioritySetRequest) and request.unit.strip():
-            result: Future[Mapping[str, gate.UnitMembership]] = Future()
-            self.pending_priority = PendingPriorityRoster(OrderedQueueChange(request, connections), result)
-            threading.Thread(target=read_priority_roster, args=(result, os.dup(self.priority_events)),
+            result: Future[PriorityRosterRead] = Future()
+            self.pending_priority = PendingPriorityRoster(OrderedQueueChange(request, connections), why, result)
+            threading.Thread(target=read_priority_roster, args=(result, request.actor, os.dup(self.priority_events)),
                              daemon=True, name="priority-roster").start()
             return []
-        return self._apply_queue_change(request, {})
+        return self._apply_queue_change(request, why, PRIORITY_ROSTER_NOT_READ)
 
     def _finish_priority_roster(self) -> None:
         pending = self.pending_priority
@@ -7183,7 +7340,7 @@ done
             return
         self.pending_priority = NoPendingPriorityRoster()
         self._complete_queue_change(pending.change,
-            lambda: self._apply_queue_change(pending.change.request, pending.result.result()))
+            lambda: self._apply_queue_change(pending.change.request, pending.why, pending.result.result()))
         self._continue_queue_changes()
 
     def _continue_queue_changes(self) -> None:
@@ -7211,38 +7368,40 @@ done
                 for reply in replies:
                     self._send(connection, reply)
 
-    def _apply_queue_change(self, request: QueueChange,
-                            labels: Mapping[str, gate.UnitMembership]) -> list[wire.Reply]:
+    def _apply_queue_change(self, request: QueueChange, why: str,
+                            roster: PriorityRosterRead | PriorityRosterNotRead) -> list[wire.Reply]:
         key = request.request_id
+        if not self._settle_priority():
+            return [wire.Refused("the last priority change waits for its history row; the queue priority did not change")]
         configuration = self._take_configuration()
         entries = self._priority_entries()
+        asker = None
         if isinstance(request, wire.PrioritySetRequest):
-            if not request.unit.strip():
+            if not request.unit.strip() or isinstance(roster, PriorityRosterNotRead):
                 return self._mutation_reply(key, wire.Refused("unit is required"))
-            if any(entry["unit"] == request.unit for entry in entries):
+            if any(not records.is_run_entry(entry) and entry["unit"] == request.unit for entry in entries):
                 return self._mutation_reply(key, wire.Ok())
             rows = [waiting.row for waiting in self.waiters.values()]
             rows.extend(record.queue_waiter for record in self.reservations.values())
             recorded_names = [(row.get("session_id", ""), name) for row in rows if (name := self._priority_name(row))]
             recorded_sessions = {session for session, _ in recorded_names}
-            known_names = {label.unit for session, label in labels.items() if session not in recorded_sessions}
+            known_names = {label.unit for session, label in roster.labels.items() if session not in recorded_sessions}
             known_names.update(name for _, name in recorded_names)
             if request.unit == "—" or request.unit not in known_names:
                 return self._mutation_reply(key, wire.Refused(
                     f"unknown unit {request.unit}; the queue priority did not change"))
             action = "set"
-            why = request.why
+            asker = roster.asker
         else:
             if not request.unit and not entries:
                 _ = self._priority_history_end(self.clock.now())
                 return self._mutation_reply(key, wire.Ok())
             action = "clear"
-            why = ", ".join(entry["why"] for entry in entries if not request.unit or entry["unit"] == request.unit)
-        if refusal := self._change_priority(action, request.unit, why, request.actor, key, self.clock.now()):
+        if refusal := self._change_priority(action, request.unit, why, request.actor, key, self.clock.now(), asker=asker):
             return self._mutation_reply(key, wire.Refused(refusal))
         self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
         self.persist()
-        self._finish_priority()
+        _ = self._settle_priority()
         _ = self._run_pass(configuration)
         return [self.ledger[key].reply]
 
@@ -7252,19 +7411,22 @@ done
     def _priority_history_end(self, at: float) -> int:
         return store.read_last_whole_row_end(store.host_file(self.host, at))
 
-    def _change_priority(self, action: Literal["set", "clear"], unit: str, why: str,
-                         actor: str, key: str, written_at: float) -> str:
+    def _change_priority(self, action: Literal["set", "clear"], unit: str, why: str, actor: str,
+                         key: str, written_at: float, *, asker: records.Asker | None = None) -> str:
         entries = self._priority_entries()
         if action == "set":
-            if any(entry["unit"] == unit for entry in entries):
+            if any(not records.is_run_entry(entry) and entry["unit"] == unit for entry in entries):
                 return ""
-            entry: records.PriorityEntry = {"unit": unit, "why": why, "set_at": written_at, "set_by": actor}
+            if asker is None:
+                asker = records.actor_asker(actor, records.queue_staff())
+            entry: records.UnitPriorityEntry = {"kind": "UnitPriorityEntry", "unit": unit, "why": why,
+                "set_at": written_at, "set_by": actor, "asker": asker}
             entries = (*entries, entry)
         else:
             kept = tuple(entry for entry in entries if unit and entry["unit"] != unit)
             if kept == entries:
                 return f"unknown unit {unit}; the queue priority did not change" if unit else ""
-            unit = unit or ", ".join(entry["unit"] for entry in entries)
+            unit = unit or ", ".join(dict.fromkeys(entry["unit"] for entry in entries))
             entries = kept
         at = self.clock.now()
         month_row_end = self._priority_history_end(at)
@@ -7291,8 +7453,9 @@ done
         return "the step left the queue"
 
     def _apply_bumps(self) -> None:
+        if not self._settle_priority():
+            return
         for offset, bump in person_actions.pending_bumps(self.state_dir, self.bumps.offset):
-            self._finish_priority()
             action = bump.action
             place = self._bump_place(action.step_key, bump.unit) if isinstance(action, person_actions.SetBump) else None
             refusal = place if isinstance(place, str) else ""
@@ -7313,7 +7476,8 @@ done
                 refusals = (*refusals, person_actions.BumpNotApplied(bump.unit, refusal))
             self.bumps = person_actions.BumpProgress(offset, refusals, moves)
             self.persist()
-            self._finish_priority()
+            if not self._settle_priority():
+                return
 
     def _mutation_reply(self, key: str, reply: wire.Ok | wire.Refused | wire.QueueMoveConflict,
                         reservation: str = "") -> list[wire.Reply]:
@@ -7790,12 +7954,17 @@ done
             initial = self.system_evidence
             if not isinstance(initial, SystemEvidence):
                 initial = read_system(plan, self.readings, self.proc, self.clock)
-            self.system_reader = OperatingSystemReader(plan, initial, self.readings, self.proc, self.clock, self.reading_events)
+            traces = (memory_trace.TraceCapture(memory_trace.TraceStore(self.state_dir / "memory_traces", self.trace_policy),
+                        self.progress_captures.root, self.boot_id, self.clock)
+                      if isinstance(self.trace_policy, memory_trace.MemoryTracePolicy) else self.trace_policy)
+            self.system_reader = OperatingSystemReader(plan, initial, self.readings, self.proc, self.clock,
+                                                       self.reading_events, traces=traces)
             for descriptor, watch in list(self.watchers.items()):
                 if isinstance(watch, ScopeWatch):
                     self._unwatch(descriptor)
 
     def serve_forever(self) -> None:
+        self.start()
         self.start_reader()
         watchdog = int(os.environ.get("WATCHDOG_USEC", "0"))
         timeout = watchdog / 2_000_000 if watchdog > 0 else float("inf")
@@ -8063,7 +8232,8 @@ def main() -> int:
         if args.command == "export-priority":
             export_priority(args.state_dir)
             return 0
-        server = AdmissionServer(args.state_dir, SystemClock(), SystemReadings(), SystemProc())
+        server = AdmissionServer(args.state_dir, SystemClock(), SystemReadings(), SystemProc(),
+                                 trace_policy=memory_trace.read_policy())
         try:
             server.serve_forever()
         finally:
