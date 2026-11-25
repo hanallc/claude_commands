@@ -121,6 +121,9 @@ If the page has no default recipient, the button opens the dialog with no recipi
 Select a recipient to enable Send.
 Select any other chip to change the recipient.
 Proposal limits the row to recipients with a native proposal folder.
+The proposal writer checks the title and body before it creates the record.
+`proposal_issue.py number` checks an existing draft before it assigns a number.
+Generated style decisions use their own filing path.
 When the selected recipient becomes unavailable, the dialog clears the selection and disables Send until you choose a recipient.
 Changing the type or reopening a kept draft preserves this empty selection.
 Feedback uses the native Investigation record.
@@ -994,6 +997,10 @@ A question from Open moves the item to Waiting.
 The owner’s answer returns that item to Open.
 The answer stays in the item log.
 Owners use `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"` for all five types.
+The Console text check runs before the answer is saved.
+Questions and investigations use the check in their own writers.
+A failed draft leaves the question open and returns each rule and quote to the writer.
+The review log records the reason if the model is unavailable.
 Each new request supplies a question ID to identify the pending exchange.
 The existing question ID rule refuses a reply to a superseded exchange.
 `update_registration.py reply` and `investigation.py answer` apply this rule before they save a native answer.
@@ -1904,6 +1911,7 @@ A showrunner or unit registers each image, or a before and after pair, with one 
   `config/review_links.conf` sets the wait, the terminal rows and the band height.
 - The owner is the staff id that made the image. The command refuses an id that is not in the staff record.
 - The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files and refuses an empty caption.
+- The fast Console text check reads the caption before the command copies any image.
 - It copies the image to `<review root>/images/<12-hex id>/image<suffix>` with a private `.review-link-image.json` record.
   A pair copies `before<suffix>` and `after<suffix>` to one folder with one record and one id.
   The record keeps the after image in `file` and the before image in `before`.

@@ -31,6 +31,8 @@ from typing import IO, Literal, NotRequired, TypedDict, cast, overload
 from urllib.parse import parse_qs, urlsplit
 from weakref import WeakSet, WeakValueDictionary, finalize
 
+from scripts.console_text import check as console_text
+
 from scripts.agents import remote
 from scripts.lib import build_folders, process_start
 from scripts.lib.boot_identity import boot_identity
@@ -1657,6 +1659,8 @@ class DeliveryStatus:
             if record.get("Verdict"):
                 raise question_record.AnswerRefused("this row already has a saved answer")
             production = row_production(page, record)
+            console_text.require(text, "reply", identity=f"{page.review_list}/{row}/{question_id}",
+                                 refusal=question_record.AnswerRefused)
             completed = AnsweredQuestion
             if isinstance(question, OpenFeedback):
                 completed = CompletedFeedback
@@ -3290,6 +3294,8 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
                 _ = investigation.answer(source.record.owner,source.record.id,words,question_id=question_id)
                 changed = True
             else:
+                console_text.require(words, "reply", identity=f"{path}/{row}/{question_id}",
+                                     refusal=question_record.AnswerRefused)
                 try:
                     changed = decision_store.answer(item,words,who)
                 except decision_store.NoOpenQuestion as error:
@@ -3312,10 +3318,11 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
 
 
 def _forward_reply(machine: str, key: str, words: str, token: str) -> int:
+    from scripts.notify.review import review_timeout_seconds
     arguments = shlex.join(["answer-question", "--item=" + key, "--question=" + token, "--text=" + words])
     command = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" ' + arguments
     result = subprocess.run(["ssh", "-o", "BatchMode=yes", machine, command], stdin=subprocess.DEVNULL,
-                            capture_output=True, text=True, timeout=30, check=False)
+                            capture_output=True, text=True, timeout=30 + review_timeout_seconds(), check=False)
     if result.stdout:
         print(result.stdout, end="")
     if result.stderr:

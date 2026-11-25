@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TextIO, cast, override
 from unittest.mock import patch
 
+from scripts.notify import review
 from scripts.production import investigation, staff
 from scripts.review_links import change_page, new_item_dialog, reply_tokens, review_page, test_review_page
 
@@ -35,9 +36,10 @@ class InvestigationTests(unittest.TestCase):
         staff_file = self.root / "staff.json"
         _ = staff_file.write_text(json.dumps({"schema": 1, "rows": [RUNNER.to_json(), OWNER.to_json(), OTHER.to_json()]}))
         _ = self.enterContext(patch.object(reply_tokens, "platform", "linux"))
+        _ = self.enterContext(patch.object(review, "reviewer_environment", side_effect=OSError("Fixture reviewer.")))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "STAFF_FILE": str(staff_file), "SHOWRUNNER_STATE_DIR": str(self.root / "state"),
-            "REVIEW_LINKS_ROOT": str(self.root / 'reviews'),
+            "REVIEW_LINKS_ROOT": str(self.root / 'reviews'), "NOTIFY_STATE_DIR": str(self.root / "notify"),
             "XDG_STATE_HOME": str(self.root / "key-state"),
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": OWNER.current_session})))
 
@@ -49,6 +51,25 @@ class InvestigationTests(unittest.TestCase):
                 arguments.extend(["--waiting-why", "The owner must complete the investigation."])
             result = investigation.main(arguments)
         return result, output.getvalue(), errors.getvalue()
+
+    def test_answer_refuses_a_draft_and_records_a_model_outage(self) -> None:
+        self.assertEqual(self.command("file", "--title", "Find the cause", "--question", "Why did it stop?")[0], 0)
+        before = investigation.load(OWNER.id, "I1")
+        directory = self.root / "notify"
+        with (patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(directory)}),
+              patch.object(review, "_review", return_value=review.Unreviewed("reviewer unavailable")) as reader):
+            code, _, errors = self.command("answer", "--id", "I1", "--text", "Read /tmp/result.txt.")
+            self.assertEqual(code, 1)
+            self.assertIn("Revise the investigation answer draft. omit-file-path: /tmp/result.txt", errors)
+            self.assertEqual(investigation.load(OWNER.id, "I1"), before)
+            reader.assert_not_called()
+
+            answer = "The download stopped when the disk filled."
+            code, _, errors = self.command("answer", "--id", "I1", "--text", answer)
+            self.assertEqual(code, 0, errors)
+            self.assertEqual(investigation.load(OWNER.id, "I1").answer, answer)
+            self.assertIn("unreviewed: reviewer unavailable", (directory / "review.jsonl").read_text())
+            reader.assert_called_once()
 
     def test_file_answer_read_and_list(self) -> None:
         question = "Find the cause.\r\n\n## Answer\n\nThis heading is part of the question.\n"

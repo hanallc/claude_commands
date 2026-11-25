@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo
 
+from scripts.console_text import check as console_text
+
 from scripts.lib import conf
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, sync_folder, write_text_atomic
 from scripts.lib.user_zone import user_zone, zone_label
@@ -2214,6 +2216,7 @@ class _ListQuestionStore:
             allowed = (self.keeper, question.recipient_id(self.keeper))
             if answerer is NoQuestionAnswerer.ABSENT or answerer.member.id not in (*allowed, answerer.morty):
                 raise question_record.AnswerRefused("Only the question recipient or morty can answer.")
+            console_text.require(answer.text, "list field", refusal=question_record.AnswerRefused)
             questions = tuple(replace(saved, answer=answer) if saved.question_id == question_id else saved
                               for saved in current.questions)
             moment = now()
@@ -2485,6 +2488,12 @@ def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot, add_evi
     if isinstance(related_to, list):
         changes["related_to"] = tuple(int(text.removeprefix("L").removeprefix("#")) for text in cast(list[str], related_to))
     _check_cli_text_limits(changes, add_evidence)
+    descriptions = (value.text for value in (changes.get("eta"), changes.get("next_check"))
+                    if isinstance(value, (EtaDescription, CheckCondition)))
+    console_text.require((changes.get("title", ""), changes.get("next_step", ""), changes.get("latest_status", ""),
+                          changes.get("evidence", ""), changes.get("done_when", ""), add_evidence or "",
+                          *descriptions, *(dependency.condition for dependency in changes.get("blocked_by", ()))),
+                         "list field", refusal=ListError)
     return changes
 
 
@@ -2654,8 +2663,10 @@ def main(argv: list[str] | None = None) -> int:
             target = staff.StaffId(cast(str, args.target))
             if record.by_id(target) is None:
                 raise ListError("--target must name a staff id")
+            what, why = cast(str, args.what), cast(str, args.why)
+            console_text.require((what, why), "list field", refusal=ListError)
             opened = add_ask(keeper, identity, kind=AskKind(cast(str, args.kind)), target=target,
-                             what=cast(str, args.what), why=cast(str, args.why), config=cast(bool, args.config),
+                             what=what, why=why, config=cast(bool, args.config),
                              requester=caller.id, source=caller.name)
             print(f"{identity} {opened.ask_id}")
             return 0
@@ -2758,7 +2769,9 @@ def main(argv: list[str] | None = None) -> int:
         elif name == "unpark":
             _ = unpark(keeper, cast(str, args.id), source=source, assigned_to=assigned_to)
         elif name == "close":
-            _ = close(keeper, cast(str, args.id), cast(str, args.words), source=source, assigned_to=assigned_to)
+            words = cast(str, args.words)
+            console_text.require(words, "list field", refusal=ListError)
+            _ = close(keeper, cast(str, args.id), words, source=source, assigned_to=assigned_to)
         elif name == "reopen":
             _ = reopen(keeper, cast(str, args.id), source=source, assigned_to=assigned_to)
         else:

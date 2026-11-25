@@ -20,6 +20,7 @@ from typing import final, override
 from unittest import mock
 
 from scripts.agents.remote import local_machine
+from scripts.notify import review
 from scripts.production import proposal_issue
 from scripts.production.issues import Issue, frontmatter
 from scripts.production import proposals_folder, record_store, staff, unit_names
@@ -71,9 +72,12 @@ class ProposalIssueTests(unittest.TestCase):
         home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.runtime = home / ".local/state/proposal-issue/locks"
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=home))
+        _ = self.enterContext(mock.patch.object(
+            review, "review_question", return_value=review.QuestionAccepted("Fixture review passed.")))
         _ = self.enterContext(mock.patch.object(reply_tokens, "platform", "linux"))
         self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "XDG_RUNTIME_DIR": str(self.runtime),
                                                      "XDG_STATE_HOME": str(home / "key-state"),
+                                                     "NOTIFY_STATE_DIR": str(home / "notify"),
                                                      "SHOWRUNNER_STATE_DIR": str(home / "showrunners"),
                                                      "REVIEW_LINKS_ROOT": str(home / "review-links")}))
         members: tuple[tuple[str, staff.Kind], ...] = (
@@ -97,6 +101,10 @@ class ProposalIssueTests(unittest.TestCase):
         recipient = next(row.id for row in staff.snapshot().rows if row.name == "hana")
         token = "r" + "b" * 42
         details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (), token)
+        with self.assertRaisesRegex(proposal_issue.Refusal, "omit-file-path: /tmp/layout.png"):
+            _ = proposal_issue.file_review_proposal(folder, recipient, "Next proposal", "Read /tmp/layout.png.",
+                                                    "hana answers this", details)
+        self.assertEqual(list(folder.glob("*.md")), [original])
         issue = proposal_issue.file_review_proposal(folder, recipient, "Next proposal", "Words",
                                                     "hana answers this", details)
         self.assertEqual(issue.value("proposal_id"), "P2")
@@ -315,6 +323,25 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertNotIn("review_due", text)
         _ = self.run_cli("urgency", str(self.issue), "--level", "normal")
         self.assertNotIn("review_", self.issue.read_text())
+
+    def test_number_refuses_a_draft_then_numbers_the_revision(self) -> None:
+        draft = VAULT_ISSUE + "\nRead /tmp/proof.txt.\n"
+        _ = self.issue.write_text(draft)
+        with (mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.root / "notify")}),
+              mock.patch.object(review, "review_question",
+                                return_value=review.QuestionAccepted("Use the new layout.")) as reader):
+            code, _, errors = self.run_cli("number", str(self.issue))
+            self.assertEqual(code, 2)
+            self.assertIn("Revise the proposal draft. omit-file-path: /tmp/proof.txt", errors)
+            self.assertEqual(self.issue.read_text(), draft)
+            reader.assert_not_called()
+
+            _ = self.issue.write_text(VAULT_ISSUE + "\nUse the new layout.\n")
+            code, _, errors = self.run_cli("number", str(self.issue))
+            self.assertEqual(code, 0, errors)
+            self.assertIn("P1", frontmatter(self.issue)[proposal_issue.NUMBER_FIELD])
+            self.assertIn("Use the new layout.", self.issue.read_text())
+            reader.assert_called_once()
 
     def run_cli(self, *argv: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()

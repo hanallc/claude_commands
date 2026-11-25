@@ -209,6 +209,31 @@ class TheListTests(unittest.TestCase):
         self.assertIn("| # | Owner | Producer | Item | State | Next step | ETA | Update |", self.command("list")[1])
         self.assertIn('| 106 | show | morty | The page: "List" | Delivered;', self.command("list")[1])
 
+    def test_add_and_update_check_visible_fields_before_writing(self) -> None:
+        add = ("add", "--source", "morty", "--owner", RUNNER.id, "--title", "Keep the display usable")
+        before = the_list.records(MORTY.id)
+        code, _, errors = self.command(*add, "--next-step", "Read /tmp/proof.txt.", "--latest-status", "Saved at 9ab82dea.")
+        self.assertEqual(code, 1)
+        self.assertIn("omit-file-path: /tmp/proof.txt", errors)
+        self.assertIn("omit-commit-hash: 9ab82dea", errors)
+        self.assertIn("Revise the list field draft.", errors)
+        self.assertEqual(the_list.records(MORTY.id), before)
+
+        code, output, errors = self.command(*add, "--next-step", "Check both labels.")
+        self.assertEqual(code, 0, errors)
+        identity = output.strip()
+        item = the_list.load(MORTY.id, identity)
+        self.assertEqual(item.next_step, "Check both labels.")
+        update = ("update", "--source", "morty", "--id", identity)
+        code, _, errors = self.command(*update, "--add-evidence", "Read /tmp/screen.png.")
+        self.assertEqual(code, 1)
+        self.assertIn("omit-file-path: /tmp/screen.png", errors)
+        self.assertEqual(the_list.load(MORTY.id, identity), item)
+
+        code, _, errors = self.command(*update, "--add-evidence", "Both labels are visible.")
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(the_list.load(MORTY.id, identity).evidence, "Both labels are visible.")
+
     def test_text_limits_on_add_and_update(self) -> None:
         cases = (
             ("latest-status", "latest_status", "max_chars.latest_status"),

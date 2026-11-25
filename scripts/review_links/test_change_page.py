@@ -1,6 +1,8 @@
 """Test page publication, HTTP forms, verdict calls and checkpoint routing."""
 from __future__ import annotations
 
+from scripts.console_text import check as console_text
+from scripts.notify import review
 from scripts.production.change_review_test_support import fixture_image, fixture_row_image, pictured_changes, registered_fixture_image
 
 import fcntl
@@ -648,6 +650,30 @@ class ChangePageTests(unittest.TestCase):
             self.assertNotIn('<pre>', body)
         self.assertIn('p{white-space:pre-wrap;', selected)
 
+    def test_answer_question_holds_a_draft_before_saving_the_answer(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        question = status.ask(self.page, "C1", "What happens next?")
+        assert isinstance(question, change_page.QuestionDelivery)
+        arguments = ["answer-question", "--production", "page-owner", "--list", str(self.review_list),
+                     "--row", "C1", "--question", question.question_id, "--text"]
+        path = status.path(self.page, "C1")
+        before = path.read_bytes()
+        with (patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.temporary / "notify")}),
+              patch.object(review, "review_question",
+                           return_value=review.QuestionAccepted("The window stays open.")) as reader):
+            errors = StringIO()
+            with redirect_stderr(errors):
+                self.assertEqual(change_page.main([*arguments, "Read /tmp/report.txt."]), 1)
+            self.assertIn("Revise the reply draft. omit-file-path: /tmp/report.txt", errors.getvalue())
+            self.assertEqual(path.read_bytes(), before)
+            reader.assert_not_called()
+
+            self.assertEqual(change_page.main([*arguments, "The window stays open."]), 0)
+            saved = status.slots(self.page, "C1").question
+            self.assertEqual(saved, change_page.AnsweredQuestion(
+                question.question_id, question.text, "The window stays open."))
+            reader.assert_called_once()
+
     def test_answer_question_keeps_internal_line_breaks_and_an_identical_rerun_changes_nothing(self) -> None:
         status = change_page.DeliveryStatus(self.root)
         question = status.ask(self.page, 'C1', 'Which steps?')
@@ -749,6 +775,9 @@ class ChangePageTests(unittest.TestCase):
 
     def set_up_review(self, *, changes: int, legacy_links: bool = False) -> None:
         self.temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="change-page-test-")))
+        _ = self.enterContext(patch.object(
+            review, "review_question", return_value=review.QuestionAccepted("Fixture review passed.")))
+        self.enterContext(patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.temporary / "notify")}))
         if legacy_links:
             cache_home = self.temporary / "cache"
             seed_interpreter_cache(cache_home)
@@ -1709,11 +1738,12 @@ class ChangePageTests(unittest.TestCase):
             ):
                 with self.subTest(kind=kind, block=name):
                     title = f'{kind}: {name}'
-                    result = self.command(change_review, change_review.main, [
-                        'add', '--repo', str(self.repo), '--production', 'page-owner',
-                        '--list', str(self.review_list), '--change', title,
-                        '--check', before + block + after, '--see', 'The command stays exact', '--image', fixture_image(),
-                    ])
+                    with patch.object(console_text, "require"):
+                        result = self.command(change_review, change_review.main, [
+                            'add', '--repo', str(self.repo), '--production', 'page-owner',
+                            '--list', str(self.review_list), '--change', title,
+                            '--check', before + block + after, '--see', 'The command stays exact', '--image', fixture_image(),
+                        ])
                     self.assertEqual(result.returncode, 0, result.stderr)
                     row = next(row for row in change_review.pending(self.review_list) if row['Change'] == title)
                     self.assertEqual(row[change_review.CHECK], before + block + after + ' You see: The command stays exact')

@@ -9,7 +9,7 @@ Use this standard for all text that Nate reads on the Console.
 5. Describe what each thing does. Omit phase numbers, step letters, unit names, branches, files, test names, and run IDs.
 6. Show one short command only when Nate must run it. Put it in backticks after the label `Run this command:`.
 7. Put a number that affects the answer in the point or the first fact line. Give its unit.
-8. Name a thing by where Nate sees it on the screen, for example "the round info icon on the rear panel of a tool". Do not use the name that the team gave it.
+8. Name a thing by Nate's own word for it. If he has no word, name it by where he sees it on the screen. Do not use a name that the team gave it, a code name or a new word.
 9. Do not give a behavior as a fact when Nate did not ask for it. Say that it is an addition, and give the choice to remove it.
 10. Read the title and the point as a new reader. Check that the reader knows why the item exists and what each choice does.
 

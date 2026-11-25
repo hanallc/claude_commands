@@ -28,6 +28,7 @@ from typing import TextIO, cast, override
 from unittest import mock
 
 
+from scripts.notify import review
 from scripts.production import change_review
 from scripts.lib import conf, copy_record, file_lock, main_push_lock, session_folder
 from scripts.lib.atomic_file import write_text_atomic
@@ -109,6 +110,10 @@ def setUpModule() -> None:
         "UNIT_HISTORY_DIR": str(folder / "history"), copy_record.ROOT_ENV: str(folder / "scratch"),
         copy_record.COPIES_ENV: str(folder / "copies"),
         scratch.HOLDS_ENV: str(folder / "holds.json")}, clear=True))
+
+    _ = unittest.enterModuleContext(mock.patch.object(
+        review, "review_question", return_value=review.QuestionAccepted("Fixture review passed.")))
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(folder / "notify")}))
     _ = unittest.enterModuleContext(mock.patch.object(sys.modules[__name__], "PRODUCTION", home / DEMO_DOC))
     _ = fixture_member("showrunner", name="fixture")
     _ = fixture_member("showrunner", name="demo", runtime_id=DEMO_ID,
@@ -2776,6 +2781,22 @@ class ActionTest(unittest.TestCase):
         self.path = root / "change-review.md"
         _ = self.path.write_text(LIST, encoding="utf-8")
         self.fresh = root / "change-review" / "change-review - natedev.md"
+
+    def test_add_and_edit_hold_a_draft_and_store_the_revision(self) -> None:
+        for action in ("add", "edit"):
+            with self.subTest(action=action):
+                command = (action, "--production", DOC, "--list", str(self.path),
+                           "--change", "Keep the icons visible", "--see", "Both icons stay visible.")
+                if action == "edit":
+                    command += ("--row", "C76")
+                before = self.path.read_bytes()
+                code, _, errors = run_with_image(*command, "--check", "Read /tmp/icons.png.")
+                self.assertEqual(code, 1)
+                self.assertIn("Revise the change draft. omit-file-path: /tmp/icons.png", errors)
+                self.assertEqual(self.path.read_bytes(), before)
+                code, _, errors = run_with_image(*command, "--check", "Open the panel.")
+                self.assertEqual(code, 0, errors)
+                self.assertIn("Keep the icons visible", self.path.read_text())
 
     def test_add_requires_an_image_and_adds_the_image_column_to_a_list(self) -> None:
         original = """## To review

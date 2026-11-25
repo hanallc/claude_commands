@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from typing import Literal
 
 from scripts.notify import review
@@ -105,3 +106,21 @@ def check(text: str, kind: Kind, *, key: review.QuestionKey | None = None,
     if kind in _FAST_ONLY:
         return review.QuestionAccepted(text)
     return review.review_question(key or review.QuestionKey(kind, text), text, console_kind=kind)
+
+
+def require(text: str | Sequence[str], kind: Kind, *, identity: str = "", title: str = "",
+            refusal: type[Exception] = ValueError) -> None:
+    """Refuse a failed draft. Use a sequence for separate fields that need only the fast check."""
+    key = review.QuestionKey(f"{kind}/{identity}", "") if identity else None
+    drafts = (text,) if isinstance(text, str) else text
+    reasons: list[str] = []
+    for draft in drafts:
+        if not draft.strip():
+            continue
+        result = check(draft, kind, key=key, title=title)
+        if isinstance(result, (review.QuestionReviewFailed, review.QuestionAwaitingFacts)):
+            details = result.questions if isinstance(result, review.QuestionAwaitingFacts) else result.details
+            reasons.extend(details)
+            reasons.extend(f"{failure.rule}: {failure.quote}" for failure in result.failures)
+    if reasons:
+        raise refusal(f"Revise the {kind} draft. " + "; ".join(reasons))

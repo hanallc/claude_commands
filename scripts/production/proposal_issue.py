@@ -29,6 +29,8 @@ from pathlib import Path
 from typing import cast
 
 
+from scripts.console_text import check as console_text
+
 from scripts.lib import atomic_file, urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production.issues import ALL_FIELDS, PROPOSAL_TAG, Issue, frontmatter, header_fields
@@ -209,6 +211,9 @@ def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, 
                 raise new_item_dialog.SubmissionError("This item no longer accepts this reply.")
             if repeated:
                 return False
+            assert isinstance(words, str)
+            console_text.require(words.removeprefix("Answer: "), "reply", identity=f"{path}/{key.request_id}",
+                                 refusal=Refusal)
         lines_to_append = (words,) if isinstance(words, str) else words
         if not isinstance(submission_reply, ProposalSubmissionReply) and issue.value("review_submission") and any(
                 line.startswith("Answer: ") for line in lines_to_append):
@@ -410,7 +415,12 @@ def number(paths: list[Path], today: date) -> list[str]:
                 continue
             folder = issue.path.parent.resolve()
             content = record_store.lines_with_endings(text)
-            header = Issue(issue.path, header_fields(content[1:_closing_fence(content, issue.path)]))
+            end = _closing_fence(content, issue.path)
+            header = Issue(issue.path, header_fields(content[1:end]))
+            body = "".join(content[end + 1:]).strip()
+            title = issue.path.stem
+            console_text.require(f"## {title}\n\n{body}", "proposal", identity=str(issue.path),
+                                 title=title, refusal=Refusal)
             owner = proposal_owner(header, "") or _proposal_owner(folder, header.value("proposed_by"))
             ceiling += 1
             identity = f"P{ceiling}"
@@ -459,6 +469,8 @@ def file_review_proposal(folder: Path, recipient: staff.StaffId, title: str, wor
                          details: new_item_dialog.ReviewSubmission, *,
                          before_write: Callable[[str, Path], None] = lambda _id, _path: None) -> Issue:
     """File the user's proposal with a P number in the existing vault."""
+    console_text.require(f"## {title}\n\n{words}", "proposal", identity=f"{recipient}/{details.request_id}",
+                         title=title, refusal=Refusal)
     slug = " ".join(re.sub(r"[^\w ]", " ", title.lower()).split())[:50].rstrip() or "proposal"
     today = datetime.now(user_zone()).date()
     why = review_events.require_waiting_why(waiting_why)

@@ -240,6 +240,19 @@ class ImagesTests(ImagesFixture):
                 _ = images.register(image, caption, owner, "Change sdlc/C1")
         self.assertEqual(list((self.root / image_store.IMAGES_FOLDER).glob("*")) if (self.root / image_store.IMAGES_FOLDER).exists() else [], [])
 
+    def test_register_refuses_a_caption_and_stores_the_revision(self) -> None:
+        command = ["register", "--image", str(self.shot), "--owner", self.owner_id(), "--change", "sdlc/C9"]
+        errors = StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(images.main([*command, "--caption", "Read /tmp/proof.png."]), 1)
+        self.assertIn("Revise the image caption draft. omit-file-path: /tmp/proof.png", errors.getvalue())
+        self.assertEqual(images.records(self.root), [])
+
+        caption = "The larger cards show both labels."
+        with redirect_stdout(StringIO()):
+            self.assertEqual(images.main([*command, "--caption", caption]), 0)
+        self.assertEqual([record["caption"] for record in images.records(self.root)], [caption])
+
     def test_command_prints_the_image_and_console_links_and_deletes(self) -> None:
         output = StringIO()
         with redirect_stdout(output):

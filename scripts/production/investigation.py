@@ -19,6 +19,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import cast, override
 
+from scripts.console_text import check as console_text
+
 from scripts.lib import atomic_file
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_routing, delivery_state, record_store, staff
@@ -428,6 +430,9 @@ def _answer(store: Investigations, identity: str, text: str, question_id: str,
             raise InvestigationError(f"{identity}: cannot answer an investigation in state {item.state}")
         if repeated:
             return item, False
+        exchange = reply.key.request_id if isinstance(reply, SubmissionReply) else question_id
+        console_text.require(text, "investigation answer", identity=f"{path}/{exchange}",
+                             refusal=InvestigationError)
         item = replace(item, state=InvestigationState.ANSWER_READY, answered=_now(), answer=text,
                        log=(*item.log, ReviewLog(datetime.now(timezone.utc), str(store.owner), "Answer: "+text)))
         _ = _save(store, item, path)

@@ -18,6 +18,8 @@ from types import MappingProxyType
 from typing import cast
 from urllib.parse import parse_qs
 
+from scripts.console_text import check as console_text
+
 from scripts.lib import atomic_file, conf, file_lock
 from scripts.lib.user_zone import shown_time
 from scripts.production.delivery_state import QuestionSendState
@@ -138,6 +140,7 @@ def register(image: Path, caption: str, owner: staff.StaffId, subject: str,
         raise ValueError("the caption is empty; say the change in the fewest plain words that stay accurate")
     if staff.snapshot().by_id(owner) is None:
         raise ValueError(f"no staff record for owner {owner}")
+    console_text.require(caption, "image caption")
     return image_store.register_file(image, images_root(review_link.review_root().resolve()),
                                      caption, str(owner), subject, before=before)
 

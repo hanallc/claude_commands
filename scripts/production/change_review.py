@@ -41,6 +41,8 @@ from pathlib import Path
 from typing import Literal, TypeVar, cast
 from zoneinfo import ZoneInfo
 
+from scripts.console_text import check as console_text
+
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_text_atomic  # noqa: E402
 from scripts.lib import build_folders, conf, main_push_lock, scratch, unit_runs  # noqa: E402
 from scripts.direct.progress_history import load_events  # noqa: E402
@@ -2798,13 +2800,16 @@ def _list(options: CommandLine) -> Path:
     return Path(options.list).expanduser() if options.list else production_list(options.production)
 
 
-def _visible(options: CommandLine) -> Visible:
+def _visible(options: CommandLine, identity: str) -> Visible:
     """The change, how to try it and what the user sees, from --change, --check and --see."""
     change = _words("change", options.change)
     for name, value in (("check", options.check), ("see", options.see)):
         if not value.strip():
             _ = _words(name, value)
-    return Visible(change, options.check.strip(), options.see.strip())
+    item = Visible(change, options.check.strip(), options.see.strip())
+    console_text.require(f"## {item.change}\n\n{item.check}\n\nYou see: {item.see}", "change",
+                         identity=identity, title=item.change, refusal=ChangeReviewError)
+    return item
 
 
 def _register_image(image: str, output: str) -> str:
@@ -2937,7 +2942,7 @@ def _batch_item(value: object, index: int, day: date, review_root: Path,
         options.change, options.check, options.see = text("change"), text("check"), text("see")
         options.image, options.output = text("image"), text("output")
         item = (KeepRowText() if (options.image or options.output) and not any((options.change, options.check, options.see))
-                else _visible(options))
+                else _visible(options, f"{path}/{target.row}"))
         existing = next((row for row in review_rows(path) if row["#"] == target.row), None)
         if existing is None:
             raise RowNotListed(f"{target.row} is not on the list to review")
@@ -3104,7 +3109,7 @@ def _run(options: CommandLine) -> int:
             if merged:
                 _require_main(repo, merged)
             path = _list(options)
-            item, rank = _visible(options), _rank_option(options, path)
+            item, rank = _visible(options, f'{path.resolve()}/add'), _rank_option(options, path)
             if options.image or options.output:
                 item = replace(item, image=_register_image(options.image, options.output))
             record = staff.snapshot()
@@ -3121,7 +3126,7 @@ def _run(options: CommandLine) -> int:
         case "edit":
             target = _row_option(options)
             edited_item = (KeepRowText() if (options.image or options.output) and not any((options.change, options.check, options.see))
-                           else _visible(options))
+                           else _visible(options, f"{target.path.resolve()}/{target.row}"))
             image = _register_image(options.image, options.output) if options.image or options.output else ""
             print(edit_row(target.path, target.row, edited_item, today(), production_doc(options.production), image=image))
         case "show":
