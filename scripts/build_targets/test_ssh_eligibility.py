@@ -278,6 +278,19 @@ class SshEligibilityTests(unittest.TestCase):
         self.assertEqual(candidate.destination.host, "alternate-fixture")
         self.assertEqual(candidate.settings, explicit)
         remote.assert_called_once()
+        self.assertEqual(cast(target_config.SshTarget, remote.call_args.args[0]).settings, alternate)
+        self.assertEqual(remote.call_args.args[1], explicit)
+
+        with mock.patch.object(build_targets, "fixed_remote_candidates",
+                               wraps=build_targets.fixed_remote_candidates) as remote:
+            routed = build_targets.fixed_placement_constraints(
+                self.root, "linux-part", "check", ("cargo", "check"), NoOwningSession(), "source",
+                provider_settings=explicit)
+        candidates = {row.destination.target: row for row in routed.candidates}
+        self.assertEqual(candidates["linux"].destination.host, "fake-linux")
+        self.assertIsInstance(candidates["linux"].settings, placement.ConfiguredProviderSettings)
+        for call in remote.call_args_list:
+            self.assertIsInstance(cast(object, call.args[1]), placement.ConfiguredProviderSettings)
 
     def test_fixed_ssh_candidate_resolves_state_after_reading_transport(self) -> None:
         """Fixed placement candidates row 11."""
@@ -303,9 +316,12 @@ class SshEligibilityTests(unittest.TestCase):
         from scripts.direct.step_selection import Pinned
 
         linux = target_config.configured_ssh_target("linux")
-        candidates = build_targets.fixed_placement_constraints(
-            self.root, "linux-part", "check", ("cargo", "check"), NoOwningSession(), "source",
-            routing=targets.LocalRequired("fixture requires local execution"), selection=Pinned(linux.name))
+        with mock.patch.object(eligibility, "configured_step_policy",
+                               wraps=eligibility.configured_step_policy) as policy:
+            candidates = build_targets.fixed_placement_constraints(
+                self.root, "linux-part", "check", ("cargo", "check"), NoOwningSession(), "source",
+                routing=targets.LocalRequired("fixture requires local execution"), selection=Pinned(linux.name))
+        policy.assert_not_called()
         candidate = next(candidate for candidate in candidates.candidates if candidate.destination.target == linux.name)
         self.assertEqual(candidate.destination.host, "fake-linux")
         self.assertEqual(candidate.eligibility, placement.FixedExclusion("fixture requires local execution"))

@@ -316,10 +316,12 @@ class EligibilityTests(IsolatedTargetTest):
             + "kind.natedev=local\nplatform.natedev=linux\n")
         _ = (self.root / "linux.conf").write_text("host=fixture-linux\n")
         output = io.StringIO()
-        with (mock.patch.object(eligibility, "repository_identity") as identity,
+        with (mock.patch.object(targets, "mac_policy_eligibility", wraps=targets.mac_policy_eligibility) as mac_policy,
+              mock.patch.object(eligibility, "repository_identity") as identity,
               mock.patch.object(eligibility, "read_target_settings") as settings,
               redirect_stdout(output)):
             self.assertEqual(build_targets.command_eligible(self.root, "fixture"), 0)
+        mac_policy.assert_not_called()
         identity.assert_not_called()
         settings.assert_not_called()
         self.assertEqual([line.split("\t")[:3] for line in output.getvalue().splitlines()],

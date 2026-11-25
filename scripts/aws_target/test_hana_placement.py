@@ -123,14 +123,24 @@ class HanaPlacementTests(CostFixture):
     def test_refused_route_precedes_controller_and_target_state(self) -> None:
         """Hana read_evidence row 3."""
         paths = claim_state.state_paths(self.target.name)
-        text_setting(self.workload, 'enabled', 'off')
-        with (mock.patch.object(adapter, 'controller_for', wraps=adapter.controller_for) as controller,
-              mock.patch.object(claim_state, 'locked', wraps=claim_state.locked) as lock):
-            self.assertEqual(self.eligibility(), placement.FixedExclusion('off'))
-        controller.assert_not_called()
-        lock.assert_not_called()
-        self.assertFalse(paths.directory.exists())
-        self.assertEqual(self.provider.calls, [])
+        workload = self.workload.read_text()
+        for key, value, reason in (
+            ('enabled', 'off', 'off'),
+            ('repository_identity', 'https://fixture.invalid/other', 'repo'),
+            ('kinds', 'lint', 'command'),
+        ):
+            with self.subTest(reason=reason):
+                _ = self.workload.write_text(workload)
+                text_setting(self.workload, key, value)
+                with (mock.patch.object(adapter, 'controller_for', wraps=adapter.controller_for) as controller,
+                      mock.patch.object(claim_state, 'state_paths', wraps=claim_state.state_paths) as resolve,
+                      mock.patch.object(claim_state, 'locked', wraps=claim_state.locked) as lock):
+                    self.assertEqual(self.eligibility(), placement.FixedExclusion(reason))
+                controller.assert_not_called()
+                resolve.assert_not_called()
+                lock.assert_not_called()
+                self.assertFalse(paths.directory.exists())
+                self.assertEqual(self.provider.calls, [])
 
     def test_claim_directory_and_lock_exist_before_the_lifecycle_read(self) -> None:
         """Hana read_evidence row 7."""
@@ -217,16 +227,19 @@ class HanaPlacementTests(CostFixture):
         self.assertIsInstance(self.claim(), hana.HanaClaimPending)
         self.clock.advance(1)
         self.assertEqual(self.controller.tick(), box.Lifecycle.STARTING)
-        with mock.patch.object(hana_spend, 'preview_placement_start',
-                               wraps=hana_spend.preview_placement_start) as preview:
+        with (mock.patch.object(hana_spend, 'preview_placement_start',
+                                wraps=hana_spend.preview_placement_start) as preview,
+              mock.patch.object(ledger.CostLedger, 'locked_snapshot',
+                                autospec=True, side_effect=ledger.CostLedger.locked_snapshot) as ledger_read):
             self.assertEqual(self.eligibility(), placement.TemporaryExclusion('starting'))
         preview.assert_not_called()
+        ledger_read.assert_not_called()
 
     def test_invalid_preview_time_precedes_the_ledger_lock(self) -> None:
         """Hana read_evidence row 48."""
         self.clock.now = -1
         with mock.patch.object(ledger.CostLedger, 'locked_snapshot',
-                               wraps=ledger.CostLedger.locked_snapshot) as lock:
+                               autospec=True, side_effect=ledger.CostLedger.locked_snapshot) as lock:
             snapshot = self.evidence(self.request())
         assert isinstance(snapshot, placement.FreshHostEvidence)
         self.assertEqual(snapshot.eligibility,
@@ -304,13 +317,16 @@ class HanaPlacementTests(CostFixture):
 
         with (mock.patch.object(hana, 'fixed_policy', wraps=hana.fixed_policy) as policy,
               mock.patch.object(hana, 'controller_for', wraps=hana.controller_for) as controller,
-              mock.patch.object(self.controller, 'inspect', wraps=self.controller.inspect) as inspect):
+              mock.patch.object(self.controller, 'inspect', wraps=self.controller.inspect) as inspect,
+              mock.patch.object(self.controller, 'image_is_current',
+                                wraps=self.controller.image_is_current) as image):
             result = build_targets.ssh_target_eligibility(
                 self.target, self.root, 'hana', 'test', targets.ANY_ELIGIBLE_TARGET)
         self.assertEqual(result, targets.ExcludedTarget(self.target, 'command'))
         policy.assert_called_once()
         controller.assert_not_called()
         inspect.assert_not_called()
+        image.assert_not_called()
 
     def test_ssh_hana_resource_lock_conflict_skips_lifecycle_read(self) -> None:
         """SSH dispatch row 9."""
@@ -886,9 +902,13 @@ with hana_command_lock(directory) as access:
         paths = claim_state.state_paths(self.target.name)
         before = self.controller.path.read_bytes()
         other = box.HanaController(self.state, self.settings, self.root / 'other.conf', self.provider)
-        with mock.patch.object(claim_state, 'locked', wraps=claim_state.locked) as lock:
+        with (mock.patch.object(claim_state, 'state_paths', wraps=claim_state.state_paths) as resolve,
+              mock.patch.object(claim_state, 'locked', wraps=claim_state.locked) as lock,
+              mock.patch.object(other, 'request', wraps=other.request) as request):
             result = hana.claim_assigned(self.assignment, self.holder, other, worktree=str(self.root))
         self.assertEqual(result, hana.HanaClaimRefused('The lifecycle controller differs from the assigned workload'))
+        resolve.assert_not_called()
+        request.assert_not_called()
         lock.assert_not_called()
         self.assertFalse(paths.directory.exists())
         self.assertEqual(self.controller.path.read_bytes(), before)
@@ -923,13 +943,18 @@ with hana_command_lock(directory) as access:
     def test_foreign_target_claim_refuses_before_controller_lock(self) -> None:
         """Hana claim_assigned row 5."""
         from scripts.aws_target import controller_lock
+        from scripts.aws_target import hana_execution
+
         self.assertIsInstance(self.claim(), hana.HanaClaimPending)
         before = self.controller.path.read_bytes()
         other = replace(self.assignment, episode='another-episode')
         with (mock.patch.object(box, 'hana_work_lock', wraps=controller_lock.hana_work_lock) as lock,
-              mock.patch.object(self.controller, 'request', wraps=self.controller.request) as request):
+              mock.patch.object(self.controller, 'request', wraps=self.controller.request) as request,
+              mock.patch.object(hana_execution, 'execution_command_settled',
+                                wraps=hana_execution.execution_command_settled) as settled):
             result = hana.claim_assigned(other, self.holder, self.controller, worktree=str(self.root))
         self.assertEqual(result, hana.HanaClaimRefused(box.HANA_CLAIM_BUSY))
+        settled.assert_not_called()
         lock.assert_not_called()
         request.assert_not_called()
         self.assertEqual(self.controller.path.read_bytes(), before)
@@ -1092,9 +1117,11 @@ with hana_command_lock(directory) as access:
         before = self.controller.path.read_bytes()
         claim, = claim_state.read_claims(claim_state.state_paths(self.target.name))
         text_setting(self.workload, 'host', 'changed-host')
-        with mock.patch.object(claim_state, 'locked', wraps=claim_state.locked) as lock:
+        with (mock.patch.object(claim_state, 'state_paths', wraps=claim_state.state_paths) as resolve,
+              mock.patch.object(claim_state, 'locked', wraps=claim_state.locked) as lock):
             result = hana.release_assigned(self.assignment, self.holder, self.controller)
         self.assertEqual(result, hana.HanaClaimReleaseRefused('The assigned Hana transport differs from the lifecycle controller'))
+        resolve.assert_not_called()
         lock.assert_not_called()
         self.assertTrue(claim.path.is_file())
         self.assertEqual(self.controller.path.read_bytes(), before)
@@ -1280,21 +1307,34 @@ with hana_command_lock(directory) as access:
 
         with (mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()),
               mock.patch.object(self.controller, 'release', side_effect=release_then_damage) as released,
+              mock.patch.object(self.controller, 'image_is_current',
+                                wraps=self.controller.image_is_current) as image,
               mock.patch.object(hana_spend, 'preview_placement_start',
                                wraps=hana_spend.preview_placement_start) as preview):
             evidence = self.evidence(self.request())
         assert isinstance(evidence, placement.HostEvidenceUnavailable)
         self.assertEqual(evidence.reason, 'The Hana lifecycle evidence is unavailable')
         released.assert_called_once_with(reference.claim_id)
+        image.assert_not_called()
         preview.assert_not_called()
 
     def test_foreign_lifecycle_claim_keeps_diagnostic_and_skips_preview(self) -> None:
         """Hana read_evidence row 38."""
         adopted = self.ready()
         claim, = claim_state.read_claims(claim_state.state_paths(self.target.name))
-        with mock.patch.object(hana_spend, 'preview_placement_start',
-                               wraps=hana_spend.preview_placement_start) as preview:
+        from scripts.aws_target import hana_execution
+
+        trace = mock.Mock()
+        with (mock.patch.object(hana_execution, 'read_claim_execution',
+                                wraps=hana_execution.read_claim_execution) as journal,
+              mock.patch.object(self.controller, 'image_is_current',
+                                wraps=self.controller.image_is_current) as image,
+              mock.patch.object(hana_spend, 'preview_placement_start',
+                                wraps=hana_spend.preview_placement_start) as preview):
+            trace.attach_mock(journal, 'journal')
+            trace.attach_mock(image, 'image')
             evidence = self.evidence(replace(self.request(), episode='other'))
+        self.assertEqual([call[0] for call in trace.mock_calls], ['journal', 'image'])
         assert isinstance(evidence, placement.FreshHostEvidence)
         self.assertEqual(evidence.eligibility, placement.TemporaryExclusion('busy'))
         self.assertEqual(evidence.claims, (adopted.reserved.claim,))
@@ -1360,11 +1400,14 @@ with hana_command_lock(directory) as access:
         with (mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()),
               mock.patch.object(self.controller, 'inspect_for_settlement',
                                 wraps=self.controller.inspect_for_settlement) as inspect,
+              mock.patch.object(hana_execution, 'replay_execution_settlement',
+                                wraps=hana_execution.replay_execution_settlement) as replay,
               mock.patch.object(hana_execution, '_journal_lock',
                                 wraps=getattr(hana_execution, '_journal_lock')) as journal):
             result = adapter.recover_assigned_execution(self.assignment, self.holder, self.controller)
         self.assertEqual(result, hana_execution.HanaSettlementPending('The Hana lifecycle claim remains unresolved'))
         inspect.assert_called_once()
+        replay.assert_not_called()
         journal.assert_not_called()
         self.assertEqual(self.controller.path.read_bytes(), before)
 
@@ -1641,11 +1684,13 @@ class HanaGpuPlacementTests(CostFixture):
         transport = HanaGpuNextestTransport(self.gpu_settings, 'hana-gpu')
         settings = conf.read(self.gpu_settings)
         with (mock.patch.object(conf.ConfigRead, 'words', autospec=True) as selections,
+              mock.patch.object(adapter, 'gpu_command_matches', wraps=adapter.gpu_command_matches) as command,
               mock.patch.object(adapter, 'gpu_setup', wraps=adapter.gpu_setup) as setup):
             result = adapter.gpu_step(transport, 'foreign-key', self.package, 'test', self.command,
                                       configuration=settings)
         self.assertEqual(result, placement.FixedExclusion('This target requires the Hana repository'))
         selections.assert_not_called()
+        command.assert_not_called()
         setup.assert_not_called()
 
     def test_gpu_setup_checks_the_switch_before_saved_grants(self) -> None:
@@ -1654,11 +1699,13 @@ class HanaGpuPlacementTests(CostFixture):
 
         text_setting(self.gpu_settings, 'enabled', 'off')
         transport = HanaGpuNextestTransport(self.gpu_settings, 'hana-gpu')
-        with (mock.patch.object(target_config, 'ssh_target_state_directory',
+        with (mock.patch.object(conf.ConfigRead, 'words', autospec=True) as selections,
+              mock.patch.object(target_config, 'ssh_target_state_directory',
                                wraps=target_config.ssh_target_state_directory) as paths,
               mock.patch.object(claim_state, 'read_json_object', wraps=claim_state.read_json_object) as grants):
             result = adapter.gpu_setup(transport)
         self.assertIsInstance(result, hana.HanaStepRefused)
+        selections.assert_not_called()
         paths.assert_not_called()
         grants.assert_not_called()
 
@@ -1676,6 +1723,9 @@ class HanaGpuPlacementTests(CostFixture):
         request = wire.PlacementRequest(self.assignment.episode, self.assignment.owner, 0,
             records.StepProfile(self.package, 'nextest', 'source', records.ExpectedPeak(1024, 'fallback', 0)),
             constraints)
+        paths = claim_state.state_paths(dest.target)
+        paths.directory.mkdir(parents=True)
+        _ = paths.block.write_text('{')
         calls = mock.Mock()
         with (mock.patch.object(placement, 'FixedExclusion', wraps=placement.FixedExclusion) as fixed,
               mock.patch.object(claim_state, 'locked', wraps=claim_state.locked) as lock,
@@ -1685,7 +1735,7 @@ class HanaGpuPlacementTests(CostFixture):
             result = adapter.read_gpu_evidence(transport, key, request)
         self.assertEqual(result.eligibility, placement.FixedExclusion(adapter.GPU_SELECTION_REQUIRED))
         self.assertEqual(calls.mock_calls, [('exclude', (adapter.GPU_SELECTION_REQUIRED,), {}),
-                                           ('lock', (claim_state.state_paths(dest.target).lock,), {})])
+                                           ('lock', (paths.lock,), {})])
         block.assert_not_called()
 
     def test_wrong_gpu_pin_is_fixed_before_the_claim_scan(self) -> None:
@@ -1702,6 +1752,9 @@ class HanaGpuPlacementTests(CostFixture):
         request = wire.PlacementRequest(self.assignment.episode, self.assignment.owner, 0,
             records.StepProfile(self.package, 'nextest', 'source', records.ExpectedPeak(1024, 'fallback', 0)),
             constraints)
+        paths = claim_state.state_paths(dest.target)
+        paths.directory.mkdir(parents=True)
+        _ = paths.block.write_text('{')
         calls = mock.Mock()
         reason = 'This target requires --target hana-gpu'
         with (mock.patch.object(placement, 'FixedExclusion', wraps=placement.FixedExclusion) as fixed,
@@ -1712,7 +1765,7 @@ class HanaGpuPlacementTests(CostFixture):
             result = adapter.read_gpu_evidence(transport, key, request)
         self.assertEqual(result.eligibility, placement.FixedExclusion(reason))
         self.assertEqual(calls.mock_calls, [('exclude', (reason,), {}),
-                                           ('lock', (claim_state.state_paths(dest.target).lock,), {})])
+                                           ('lock', (paths.lock,), {})])
         block.assert_not_called()
 
     def test_ssh_gpu_routing_and_pin_refuse_before_repository_lookup(self) -> None:
@@ -1955,16 +2008,18 @@ class HanaGpuPlacementTests(CostFixture):
         with (mock.patch.object(trial, 'trial_root', return_value=self.trials),
               mock.patch.object(trial, 'prepare_locked', side_effect=prepare),
               mock.patch.object(trial, 'held_trial', wraps=trial.held_trial) as lease,
-              mock.patch.object(trial, 'ssh_target_state_directory', return_value=self.account_dir),
+              mock.patch.object(trial, 'ssh_target_state_directory', return_value=self.account_dir) as directory,
               mock.patch.object(conf, 'path', wraps=conf.path) as settings,
               mock.patch.object(cloud_gate, 'service_command', side_effect=command),
               mock.patch.object(subprocess, 'run', side_effect=worker) as execute,
               self.assertRaisesRegex(ValueError, 'service did not start')):
-            trace.attach_mock(lease, 'lease')
-            trace.attach_mock(execute, 'execute')
+            for name, spy in (('directory', directory), ('settings', settings), ('lease', lease), ('execute', execute)):
+                trace.attach_mock(spy, name)
             _ = trial.run_nextest(self.root, 'HEAD', request, launch=launch)
-        self.assertIn(mock.call('aws_target'), settings.call_args_list)
-        self.assertEqual([call[0] for call in trace.mock_calls], ['lease', 'execute'])
+        self.assertEqual(trace.mock_calls[:3],
+                         [('directory', ('aws',), {}), ('settings', ('aws_target',), {}), ('lease', (folder,), {})])
+        self.assertEqual([call[0] for call in trace.mock_calls if call[0] in ('lease', 'execute')],
+                         ['lease', 'execute'])
 
     def test_assigned_service_validates_trial_identity_before_launch(self) -> None:
         """GPU assigned trial handoff row 7."""

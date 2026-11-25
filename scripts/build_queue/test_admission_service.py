@@ -2113,16 +2113,18 @@ class LocalHoldPlacementTests(unittest.TestCase):
             key = fixture.server.host_evidence_key(request, candidate.destination)
             fixture.server.host_requests[key] = request
             backoff.unlink(missing_ok=True)
+            trace = mock.Mock()
             with (mock.patch.object(service, "mac_linux_backoff", wraps=service.mac_linux_backoff) as probe,
                   mock.patch.object(mac_test, "blocking_claim_block", wraps=mac_test.blocking_claim_block) as block,
+                  mock.patch.object(mac_linux, "read_settings", wraps=mac_linux.read_settings) as settings,
                   mock.patch.object(mac_linux, "read_guest_main", return_value=mac_linux.EmptyGuestMain()) as ssh):
+                for name, spy in (("backoff", probe), ("block", block), ("settings", settings), ("ssh", ssh)):
+                    trace.attach_mock(spy, name)
                 seen = fixture.server.read_provider_evidence(key)
             assert isinstance(seen, placement.FreshHostEvidence)
             self.assertEqual(seen.eligibility, placement.AllowedHost())
             self.assertIsInstance(service.mac_linux_backoff(fixture.clock.now()), service.MacLinuxReadyForProbe)
-            probe.assert_called_once()
-            block.assert_called_once()
-            ssh.assert_called_once()
+            self.assertEqual([call[0] for call in trace.mock_calls], ["backoff", "block", "settings", "ssh"])
 
     def test_guest_checks_legacy_mac_block_before_reading_guest_settings(self) -> None:
         """Admission mac-linux guest row 4."""
@@ -2243,13 +2245,16 @@ class LocalHoldPlacementTests(unittest.TestCase):
             context = cast(ContextVar[object], getattr(service, "_MAC_HOST_PROBE_CYCLE"))
             token = context.set(make_cycle(fixture.admission.clock.now(), 0, (key,)))
             try:
+                trace = mock.Mock()
                 with (mock.patch.object(claim_state, "state_paths", wraps=claim_state.state_paths) as paths,
                       mock.patch.object(claim_state, "read_claims", wraps=claim_state.read_claims) as claims,
                       mock.patch.object(offload, "probe_mac_host", return_value=offload.UNAVAILABLE_PROBE)):
+                    trace.attach_mock(paths, "paths")
+                    trace.attach_mock(claims, "claims")
                     seen = server.read_provider_evidence(key)
                 self.assertIsInstance(seen, placement.FreshHostEvidence)
-                self.assertEqual(paths.call_count, 3)
-                self.assertEqual(claims.call_count, 2)
+                self.assertEqual([call[0] for call in trace.mock_calls],
+                                 ["paths", "claims", "claims", "paths", "paths"])
             finally:
                 context.reset(token)
 
@@ -2446,14 +2451,19 @@ class LocalHoldPlacementTests(unittest.TestCase):
             })
             key = fixture.server.host_evidence_key(request, destination)
             fixture.server.host_requests[key] = request
+            trace = mock.Mock()
             with (mock.patch.object(target_config, "read_targets", return_value=(target,)),
                   mock.patch.object(build_targets, "ssh_target_eligibility", return_value=target_config.EligibleTarget(target)),
                   mock.patch.object(claim_state, "state_paths", return_value=paths),
                   mock.patch.object(claim_state, "target_claim_scope", wraps=claim_state.target_claim_scope) as scope,
+                  mock.patch.object(mac_test, "claim_blocks_scope", wraps=mac_test.claim_blocks_scope) as match,
                   mock.patch.object(mac_test, "run_holds_work", wraps=mac_test.run_holds_work) as held):
+                trace.attach_mock(scope, "scope")
+                trace.attach_mock(match, "match")
                 seen = fixture.server.read_provider_evidence(key)
             assert isinstance(seen, placement.FreshHostEvidence)
             scope.assert_called_once_with(paths, str(repository))
+            self.assertEqual([call[0] for call in trace.mock_calls], ["scope", "match"])
             held.assert_not_called()
             self.assertEqual(seen.holder, placement.ResourceHolderUnknown())
 
@@ -2571,8 +2581,14 @@ class LocalHoldPlacementTests(unittest.TestCase):
                 "since": "2026-11-01T12:00:00+00:00",
             }
             mac_test.write_json(paths.claims / "fixture.json", record)
-            with mock.patch.object(server, "_observe_provider_execution",
-                                   wraps=getattr(server, "_observe_provider_execution")) as observation:
+            observe = cast(Callable[..., execution_identity.ExecutionEvidence],
+                           getattr(server, "_observe_provider_execution"))
+
+            def observe_after_unlock(*arguments: object) -> execution_identity.ExecutionEvidence:
+                with claim_state.locked(paths.lock, wait=False):
+                    return observe(*arguments)
+
+            with mock.patch.object(server, "_observe_provider_execution", side_effect=observe_after_unlock) as observation:
                 seen = server.read_provider_evidence(read_key)
             assert isinstance(seen, placement.FreshHostEvidence)
             adopted, = seen.claims

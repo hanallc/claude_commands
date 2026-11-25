@@ -89,28 +89,31 @@ class StepOneRows(unittest.TestCase):
         """Admission Mac disk recovery callback row 4."""
         with fixtures.PlacementFixture() as fixture:
             server = fixture.server
-            threads, record = self.recovery_threads()
+            threads: list[threading.Thread] = []
+            completion_lock: list[bool] = []
+            recovery_cleared: list[bool] = []
             mac, ssh = (mock.Mock(spec=service.HostEvidenceWorker) for _index in range(2))
             keys = (("mac", "fixture-mac"), ("ssh", "fixture-linux"))
             server.host_targets[keys[0]] = mac
             server.host_targets[keys[1]] = ssh
 
             def interval() -> float:
-                self.assertNotIn("fixture-mac", server.mac_disk_recoveries)
-                acquired = server.mac_recovery_lock.acquire(blocking=False)
-                if acquired:
-                    server.mac_recovery_lock.release()
-                self.assertFalse(acquired)
+                completion_lock.append(server.mac_recovery_lock.locked())
+                recovery_cleared.append("fixture-mac" not in server.mac_disk_recoveries)
                 return 2
 
             try:
-                with (mock.patch.object(threading.Thread, "start", record),
-                      mock.patch.object(server, "_waiting_pass_interval", side_effect=interval) as retry):
-                    _ = self.request_recovery(server, lambda: None)
+                with mock.patch.object(server, "_waiting_pass_interval", side_effect=interval) as retry:
+                    # Start the callback after the submitter releases the lock.
+                    with mock.patch.object(threading.Thread, "start", autospec=True, side_effect=threads.append):
+                        _ = self.request_recovery(server, lambda: None)
                     thread, = threads
+                    thread.start()
                     thread.join(TEST_HANG_GUARD_SECS)
                     self.assertFalse(thread.is_alive())
                 retry.assert_called_once()
+                self.assertEqual(completion_lock, [True], "The completion callback must hold mac_recovery_lock")
+                self.assertEqual(recovery_cleared, [True])
                 self.assertEqual(server.mac_disk_retry_at["fixture-mac"], fixture.clock.monotonic() + 2)
                 cast(mock.Mock, mac.expedite_all).assert_called_once_with()
                 self.assertEqual(ssh.mock_calls, [])

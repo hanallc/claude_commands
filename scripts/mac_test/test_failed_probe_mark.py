@@ -137,10 +137,12 @@ class FailedProbeTests(OffloadCommandFixture):
         controller = offload.ProcessController()
         controller.claim_identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
         paths = mac_test.state_paths("box")
-        with (mock.patch.object(controller, "capture") as ssh,
+        with (mock.patch.object(offload, "remote_mirror", wraps=offload.remote_mirror) as mirror,
+              mock.patch.object(controller, "capture") as ssh,
               mock.patch.object(offload, "write_text_atomic", wraps=write_text_atomic) as write,
               self.assertRaisesRegex(ValueError, "requires execution settings")):
             _ = offload.probe_mac(controller, settings, self.identity, "box")
+        mirror.assert_not_called()
         ssh.assert_not_called()
         write.assert_not_called()
         self.assertFalse((paths.directory / "pending-starts").exists())
@@ -176,10 +178,12 @@ class FailedProbeTests(OffloadCommandFixture):
             self.assertEqual(arguments[0], "ssh")
             self.assertEqual(arguments[-2], config.host)
             self.assertEqual(deadline, offload.CommandTimeLimit(config.probe_timeout_s))
+            lock.assert_not_called()
             self.assertFalse(lock_path.exists())
             return offload.CommandOutput(0, "rc=0\nfree_gib=123\nhost=fixture-host\n", "")
 
-        with mock.patch.object(controller, "capture", side_effect=capture) as ssh:
+        with (mock.patch.object(controller, "capture", side_effect=capture) as ssh,
+              mock.patch.object(claim_state, "locked", wraps=claim_state.locked) as lock):
             result = offload.probe_mac(controller, config, self.identity)
         ssh.assert_called_once()
         self.assertEqual(result, offload.ProbeSnapshot(123, "fixture-host"))
@@ -191,10 +195,15 @@ class FailedProbeTests(OffloadCommandFixture):
         with (mock.patch.object(controller, "capture", side_effect=[
                   offload.CommandOutput(0, "", ""),
                   offload.CommandOutput(1, "linux_startup=unresolved\n", "")]) as ssh,
+              mock.patch.object(offload, "parse_probe", wraps=offload.parse_probe) as parse,
+              mock.patch.object(offload, "_record_probe_failure",
+                                wraps=getattr(offload, "_record_probe_failure")) as failure,
               mock.patch.object(claim_state, "locked", wraps=claim_state.locked) as lock):
             result = offload.probe_mac(controller, config, self.identity, "box")
         self.assertEqual(result, offload.UnresolvedSlotStartup())
         self.assertEqual(ssh.call_count, 2)
+        parse.assert_not_called()
+        failure.assert_not_called()
         lock.assert_not_called()
         self.assertFalse((mac_test.state_paths("box").directory / "failed_probe").exists())
 

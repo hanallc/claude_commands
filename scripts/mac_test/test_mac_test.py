@@ -1224,10 +1224,14 @@ finally:
         paths = claim_state.StatePaths(self.state_directory, "mac-linux", platform="linux")
         with (mock.patch.dict(os.environ, self.environment, clear=True),
               mock.patch.object(eligibility, "read_backoff") as backoff,
+              mock.patch.object(claim_state, "submitting_session", wraps=claim_state.submitting_session) as session,
+              mock.patch.object(mac_test, "blocking_claim_block") as block,
               mock.patch.object(mac_test, "target_claim_scope") as scope,
               mock.patch.object(mac_test, "read_claims") as claims):
             self.assertEqual(mac_test.free_now(paths, self.config_path, self.root), "off")
         backoff.assert_not_called()
+        session.assert_not_called()
+        block.assert_not_called()
         scope.assert_not_called()
         claims.assert_not_called()
         self.assertFalse(paths.lock.exists())
@@ -1237,11 +1241,13 @@ finally:
         paths = claim_state.StatePaths(self.state_directory)
         with (mock.patch.dict(os.environ, self.environment, clear=True),
               mock.patch.object(mac_test, "blocking_claim_block") as block,
-              mock.patch.object(mac_test, "read_claims") as claims):
+              mock.patch.object(mac_test, "read_claims") as claims,
+              mock.patch.object(claim_state, "locked", wraps=claim_state.locked) as lock):
             self.assertEqual(mac_test.free_now(paths, self.config_path, self.root,
                 mac_kind=mac_test.MacClaimKind.GUEST, mac_scope=claim_state.WHOLE_MAC), "state")
         block.assert_not_called()
         claims.assert_not_called()
+        lock.assert_not_called()
         self.assertFalse(paths.lock.exists())
 
     def test_native_guest_checks_failed_probe_and_skips_version_decline(self) -> None:

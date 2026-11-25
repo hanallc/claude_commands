@@ -52,11 +52,13 @@ class ConfTests(unittest.TestCase):
         """Configuration reading and recovery row 2."""
         self.write("# whole: 1..4\namount=2\n# whole: 5..8\namount.fixture=6\n")
         with (mock.patch("scripts.lib.conf.socket.gethostname", return_value="fixture"),
+              mock.patch.object(conf, "_repository_path", wraps=getattr(conf, "_repository_path")) as repository,
               mock.patch.object(conf, "_committed_files") as history,
               redirect_stderr(io.StringIO()) as warning):
             settings = conf.read(self.path)
             self.assertEqual(settings.whole("amount"), 6)
             self.assertEqual(settings.value("absent", int, default=3), 3)
+        repository.assert_not_called()
         history.assert_not_called()
         self.assertEqual(warning.getvalue(), "")
 
@@ -65,11 +67,13 @@ class ConfTests(unittest.TestCase):
         self.history()
         contents = "# whole: 1..4\namount=8\n"
         self.write(contents)
-        with (mock.patch.object(conf, "_committed_files") as history,
+        with (mock.patch.object(conf, "_repository_path", wraps=getattr(conf, "_repository_path")) as repository,
+              mock.patch.object(conf, "_committed_files") as history,
               redirect_stderr(io.StringIO()) as warning,
               self.assertRaises(conf.Unusable) as failure):
             _ = conf.read(self.path).value("amount", int, recover_invalid=False)
         self.assertIn("amount='8'", str(failure.exception))
+        repository.assert_not_called()
         history.assert_not_called()
         self.assertEqual(warning.getvalue(), "")
         self.assertEqual(self.path.read_text(), contents)

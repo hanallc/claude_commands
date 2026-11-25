@@ -29,6 +29,7 @@ from scripts.build_targets import build_targets, mac_linux, target_config
 from scripts.copies import copies
 from scripts.direct import phase_wait_holder
 from scripts.lib import conf, process_start as process_identity
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS
 from scripts.mac_test import claim_state, eligibility, mac_queue_run, mac_test, offload
 from scripts.production.gate_routes import SuiteMode
@@ -958,19 +959,22 @@ sys.exit(71)
         with (mock.patch.object(process_start, "process_start",
                                 return_value=process_start.Started(record["proc_start"])) as owner,
               mock.patch.object(claim_state, "retire_replaced_reservation",
-                                wraps=claim_state.retire_replaced_reservation) as retire):
+                                wraps=claim_state.retire_replaced_reservation) as retire,
+              mock.patch.object(claim_state, "write_text_atomic", wraps=write_text_atomic) as write):
             claims, _retained = claim_state.sweep_mac_replacements(self.paths, (claim,))
         self.assertEqual(claims, (claim,))
         owner.assert_called_once_with(record["pid"])
+        write.assert_not_called()
         retire.assert_not_called()
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(old.read_text(), "unmodified\n")
 
     def test_replacement_sweep_writes_cleanup_state_only_for_pending_start(self) -> None:
         """Interrupted Mac claim replacement sweep row 6."""
-        for pending in (True, False):
-            with self.subTest(pending=pending):
-                paths = claim_state.StatePaths(self.root / ("pending" if pending else "settled"))
+        for state in ("pending", "settled", "write-failed"):
+            with self.subTest(state=state):
+                pending = state != "settled"
+                paths = claim_state.StatePaths(self.root / state)
                 mirror = claim_state.MacRepositoryIdentity("key", "fixture", "fixture.json", "fixture",
                     claim_state.KnownMacHistoryKey("history"), fence_generation="a" * 32)
                 path = paths.claims / mirror.claim_file
@@ -988,6 +992,17 @@ sys.exit(71)
                     marker.parent.mkdir(parents=True)
                     marker.touch()
                 claim = claim_state.HeldClaim(claim_state.RepositoryScope("fixture", "key"), path, record)
+                if state == "write-failed":
+                    before = path.read_bytes()
+                    with (claim_state.locked(paths.lock), redirect_stderr(StringIO()) as error,
+                          mock.patch.object(claim_state, "write_text_atomic",
+                                            side_effect=OSError("fixture write failed")) as write):
+                        claims, retained = claim_state.sweep_mac_replacements(paths, (claim,))
+                    write.assert_called_once()
+                    self.assertEqual((claims, retained), ((claim,), set()))
+                    self.assertEqual(path.read_bytes(), before)
+                    self.assertIn("fixture write failed", error.getvalue())
+                    continue
                 with claim_state.locked(paths.lock):
                     claims, retained = claim_state.sweep_mac_replacements(paths, (claim,))
                 self.assertEqual(retained, set())

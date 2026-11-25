@@ -67,11 +67,13 @@ class FloorSweepTests(unittest.TestCase):
     def test_ready_disk_reading_skips_the_sweep_lock_file(self) -> None:
         """Mac disk sweep row 2."""
         config = eligibility.read_config(self.settings)
-        with (mock.patch.object(fcntl, "flock", wraps=fcntl.flock) as lock,
+        with (mock.patch.object(eligibility, "state_directory", wraps=eligibility.state_directory) as state,
+              mock.patch.object(fcntl, "flock", wraps=fcntl.flock) as lock,
               mock.patch.object(self.controller, "capture") as command):
             self.assertEqual(offload.ensure_mac_disk_floor(
                 self.controller, config, self.repository, offload.ProbeSnapshot(100, "fake-mac")),
                 offload.MacDiskReady(100))
+        state.assert_not_called()
         lock.assert_not_called()
         command.assert_not_called()
         self.assertFalse((self.root / "state").exists())

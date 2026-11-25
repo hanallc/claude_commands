@@ -14,6 +14,7 @@ from unittest import mock
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.lib import build_folders
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import tmp_sweep
 from scripts.mac_test import floor_claims
@@ -45,7 +46,7 @@ class MirrorLeaseOrderTests(unittest.TestCase):
         worker.chmod(0o700)
         script = copies.mirror_probe_setup(str(self.tree))
         done = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True,
-                              timeout=TEST_HANG_GUARD_SECS)
+                              env={**os.environ, "HOME": str(self.root)}, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertFalse(called.exists())
 
@@ -81,11 +82,18 @@ class MirrorLeaseOrderTests(unittest.TestCase):
         holder = self.remote_mirror("saved-holder")
         caller = self.remote_mirror("caller")
         copies.register_remote(holder)
+        from scripts.lib import file_lock
+
+        trace = mock.Mock()
         with (copies.remote_lease(holder),
+              mock.patch.object(file_lock, "exclusive", wraps=file_lock.exclusive) as lock,
               mock.patch.object(copies, "read_remote_mirror", wraps=copies.read_remote_mirror) as read):
+            trace.attach_mock(lock, "lock")
+            trace.attach_mock(read, "record")
             with self.assertRaisesRegex(copies.BusyRemoteMirror, "held by session saved-holder"):
                 with copies.remote_lease(caller):
                     self.fail("The caller acquired the held lease")
+        self.assertEqual([call[0] for call in trace.mock_calls], ["lock", "record"])
         read.assert_called_once_with(copies.remote_record_path(holder))
 
     def test_process_scan_runs_while_both_mirror_leases_are_held(self) -> None:
@@ -109,9 +117,11 @@ class MirrorLeaseOrderTests(unittest.TestCase):
         _ = session.write_text("saved-holder\n")
         with (mock.patch.object(copies, "scan_mirror_processes",
                                return_value=copies.MirrorProcessScan(tmp_sweep.ProcessUsesIncomplete(), frozenset())),
+              mock.patch.object(copies, "write_text_atomic", wraps=write_text_atomic) as publish,
               self.assertRaisesRegex(copies.CopyError, "held by session saved-holder")):
             with copies.local_mirror_lease(self.tree, "caller"):
                 self.fail("The caller acquired a mirror with an unreadable process scan")
+        publish.assert_not_called()
         self.assertEqual(session.read_text(), "saved-holder\n")
 
     def test_probe_setup_sees_mirror_and_session_before_publishing_metadata(self) -> None:

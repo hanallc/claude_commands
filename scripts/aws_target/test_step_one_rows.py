@@ -476,8 +476,20 @@ class GpuHandoffRows(unittest.TestCase):
 
     def test_assigned_trial_keeps_its_lease_after_root_unlock(self) -> None:
         """GPU assigned trial handoff row 3."""
+        from collections.abc import Generator
+        from contextlib import contextmanager
+
         events = mock.Mock()
         stop = ValueError("stop at preparation")
+        trial_lock = trial.trial_lock
+
+        @contextmanager
+        def check_acquisition(folder: Path, *, exclusive: bool = False) -> Generator[None]:
+            if not exclusive:
+                with file_lock.exclusive(self.trials / "controller.lock", wait=False) as lock:
+                    self.assertIs(lock, file_lock.LockResult.BUSY, "Take the trial lease before the root unlock")
+            with trial_lock(folder, exclusive=exclusive):
+                yield
 
         def prepare(_repo: Path, _commit: str, folder: Path, _request: trial.HanaGpuNextestRequest) -> None:
             self.assertEqual(folder, self.folder)
@@ -488,7 +500,7 @@ class GpuHandoffRows(unittest.TestCase):
             raise stop
 
         with (mock.patch.object(trial, "control_lock", wraps=control_lock) as root,
-              mock.patch.object(trial, "trial_lock", wraps=trial.trial_lock) as lease,
+              mock.patch.object(trial, "trial_lock", side_effect=check_acquisition) as lease,
               mock.patch.object(trial, "prepare_locked", side_effect=prepare),
               self.assertRaisesRegex(ValueError, "stop at preparation")):
             events.attach_mock(root, "root")

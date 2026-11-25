@@ -922,6 +922,22 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         self.assertEqual([call[0] for call in calls.mock_calls], ["capacity", "delegate"])
         self.assertEqual(delegate.call_args.kwargs["answer"], "free")
 
+        _ = self.write_config(
+            "targets=fixture-linux\nkind.fixture-linux=ssh\nplatform.fixture-linux=linux\n"
+            + "settings.fixture-linux=mac_test.conf\n")
+        linux = target_config.configured_ssh_target("fixture-linux")
+        routing = targets.LocalRequired("fixture requires Linux")
+        with (mock.patch.object(mac_test, "free_now", wraps=mac_test.free_now) as capacity,
+              mock.patch.object(build_targets, "mac_target_eligibility") as delegate,
+              mock.patch.object(build_targets, "ssh_target_config") as execution_settings,
+              mock.patch.object(offload, "probe_reachability") as probe):
+            result = build_targets.ssh_target_eligibility(linux, self.root, "portable", "test", routing)
+        self.assertEqual(result, targets.ExcludedTarget(linux, routing.reason))
+        capacity.assert_called_once()
+        delegate.assert_not_called()
+        execution_settings.assert_not_called()
+        probe.assert_not_called()
+
     def test_mac_local_requirement_resolves_session_before_returning(self) -> None:
         """macOS target eligibility row 4."""
         target = target_config.SshTarget("mac", "macos", self.settings)
@@ -930,6 +946,8 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         with (mock.patch.object(claim_state, "submitting_session",
                                wraps=claim_state.submitting_session) as session,
               mock.patch.object(build_targets, "step_policy") as policy,
+              mock.patch.object(eligibility, "read_config", wraps=eligibility.read_config) as settings,
+              mock.patch.object(mac_test, "free_now", wraps=mac_test.free_now) as capacity,
               mock.patch.object(offload, "probe_mac") as probe):
             result = build_targets.mac_target_eligibility(
                 target, self.root, "portable", "test", routing, request_disk_recovery=query,
@@ -937,6 +955,8 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         self.assertEqual(result, targets.ExcludedTarget(target, routing.reason))
         session.assert_called_once_with(WAITING_SESSION)
         policy.assert_not_called()
+        settings.assert_not_called()
+        capacity.assert_not_called()
         query.assert_not_called()
         probe.assert_not_called()
 
@@ -948,6 +968,7 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         target = target_config.SshTarget("mac", "macos", self.settings)
         query = mock.Mock()
         with (mock.patch.object(offload, "probe_mac") as probe,
+              mock.patch.object(mac_test, "free_now", wraps=mac_test.free_now) as capacity,
               mock.patch.object(conf, "_committed_files", return_value=())):
             result = build_targets.mac_target_eligibility(
                 target, self.root, "portable", "test", targets.ANY_ELIGIBLE_TARGET,
@@ -958,6 +979,7 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
                 _ = build_targets.mac_target_eligibility(
                     target, self.root, "portable", "test", targets.ANY_ELIGIBLE_TARGET,
                     answer="bad", request_disk_recovery=query, configuration=conf.read(self.settings))
+        capacity.assert_not_called()
         query.assert_not_called()
         probe.assert_not_called()
 
@@ -1116,9 +1138,12 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         output = io.StringIO()
         with (redirect_stdout(output),
               mock.patch.object(build_targets, "local_target", wraps=build_targets.local_target) as local,
+              mock.patch.object(target_config, "configured_ssh_target",
+                                wraps=target_config.configured_ssh_target) as remote,
               mock.patch.object(build_targets, "ssh_target_eligibility") as ssh):
             self.assertEqual(build_targets.command_eligibility(args), 0)
         local.assert_called_once_with()
+        remote.assert_not_called()
         ssh.assert_not_called()
         self.assertEqual(output.getvalue().splitlines(),
                          ["natedev_only pinned to natedev", "natedev\teligible\t-\t-\t-"])
