@@ -15,7 +15,7 @@ import unittest
 from typing import cast, override
 from unittest import mock
 
-from scripts.lib import build_folders, testing_folders
+from scripts.lib import build_folders, session_folder, testing_folders, unit_runs
 from scripts.lib.checkout_test_support import (STANDALONE_TEST_STARTUP, copy_test_runner,
                                               direct_test_fixture_environment, run_gate_test_fixture,
                                               without_user_test_manager)
@@ -104,6 +104,53 @@ class TestRunFolderTests(unittest.TestCase):
         output.mkdir(parents=True)
         (checkout / "target").symlink_to(output, target_is_directory=True)
         self.assert_run_uses_output(shim, output)
+
+    def test_a_worktree_run_keeps_state_in_each_session_root(self) -> None:
+        checkout = self.root / "worktrees/claude/verify/work"
+        output = self.root / "build/claude/verify/work"
+        shim = self.checkout_shim(checkout)
+        output.mkdir(parents=True)
+        (checkout / "target").symlink_to(output, target_is_directory=True)
+        current = self.root / "session"
+        former = self.root / "former"
+        roots = {session_folder.ROOT_ENV: str(current), session_folder.FORMER_ROOT_ENV: str(former)}
+        for session in (current / "verify", former / "abc-123"):
+            with self.subTest(session=session):
+                scratchpad = session / "claude-1000" / "note.txt"
+                scratchpad.parent.mkdir(parents=True)
+                _ = scratchpad.write_text("session state")
+                record = session_folder.FolderRecord(owner="verify", session_id="abc-123")
+                session_folder.write_record(session, record)
+                with mock.patch.dict(self.fixture_environment, {**roots, "TMPDIR": str(session)}):
+                    self.assert_run_uses_output(shim, output)
+                self.assertFalse((session / "test-runs").exists())
+                self.assertEqual(scratchpad.read_text(), "session state")
+                self.assertEqual(session_folder.read_record(session), record)
+
+    def test_an_unassigned_checkout_refuses_session_and_shared_build_parents(self) -> None:
+        checkout = self.root / "unassigned"
+        checkout.mkdir()
+        build = self.root / "build"
+        current = self.root / "session"
+        former = self.root / "former"
+        unit_root = self.root / "unit"
+        former_unit_root = self.root / "delegate"
+        old_run = build / "test-runs" / "r-old"
+        alias = self.root / "session-alias"
+        alias.symlink_to(current / "verify", target_is_directory=True)
+        roots = {session_folder.ROOT_ENV: str(current), session_folder.FORMER_ROOT_ENV: str(former)}
+        self.enterContext(mock.patch.multiple(unit_runs, RUN_ROOT=unit_root, FORMER_RUN_ROOT=former_unit_root))
+        for inherited, marker in ((current / "verify", ""), (former / "abc-123", ""),
+                                  (unit_runs.run_temp_path(unit_root / "run-id"), ""),
+                                  (unit_runs.run_temp_path(former_unit_root / "run-id"), ""),
+                                  (build, ""), (old_run, str(old_run)), (alias, "")):
+            with self.subTest(inherited=inherited), mock.patch.dict(os.environ, {
+                **self.environment(), **roots, "TMPDIR": str(inherited), testing_folders.RUN_FOLDER_ENV: marker,
+            }):
+                with self.assertRaisesRegex(build_folders.InvalidFolderForm, "require an assigned build output"):
+                    _ = testing_folders.prepare_test_runs_parent(checkout)
+        for parent in (current, former, unit_root, former_unit_root, build):
+            self.assertFalse(parent.exists())
 
     def test_a_numbered_copy_run_uses_its_own_target(self) -> None:
         checkout = self.root / "build/claude/verify/7"

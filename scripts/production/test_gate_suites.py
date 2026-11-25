@@ -160,7 +160,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
                     self.assertEqual(received[position:position + 1], [(f"session:{owner.current_session}", report)])
         self.assertEqual(len(received), 2)
 
-    def test_cpu_slot_wait_returns_to_the_runner_at_its_deadline(self) -> None:
+    def test_cpu_token_wait_returns_to_the_runner_at_its_deadline(self) -> None:
         reader, writer = os.pipe()
         self.addCleanup(os.close, reader)
         self.addCleanup(os.close, writer)

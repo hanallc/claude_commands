@@ -15,7 +15,7 @@ from scripts.aws_target import hana_provider, hana_transport
 from scripts.aws_target.aws_cli import AwsCli, AwsUnavailable
 from scripts.aws_target.ledger_test_support import install_aws_fixture_settings
 from scripts.lib import conf
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 
 
 class HanaTransportPolicyTests(unittest.TestCase):
@@ -23,7 +23,7 @@ class HanaTransportPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             install_aws_fixture_settings(root / 'config')
-            private = private_slot_config(root)
+            private = private_copy_config(root)
             with mock.patch.dict(os.environ, private.environment):
                 settings = Path(private.environment['CONF_DIR']) / 'hana_aws.conf'
                 _ = settings.write_text(

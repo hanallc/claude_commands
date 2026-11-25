@@ -17,7 +17,7 @@ from scripts.aws_target import config as aws_config, hana_box, hana_placement, s
 from scripts.build_queue import admission_protocol as wire, admission_records as records
 from scripts.build_queue import placement, queue_view, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
-from scripts.build_queue.slot_wait import public_queue_text
+from scripts.build_queue.queue_wait import public_queue_text
 from scripts.build_targets import target_config, targets
 from scripts.build_targets.execution_transport import HanaControlTransport, HanaGpuNextestTransport
 from scripts.buildlog import charts, machine_facts, repository, store
