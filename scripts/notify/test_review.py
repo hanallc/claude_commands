@@ -292,6 +292,21 @@ class LocalReviewTests(unittest.TestCase):
                     self.assertIsInstance(outcome, (review.QuestionAwaitingFacts, review.QuestionReviewFailed))
                     self.assertTrue((review.state_path() / "questions" / (key.digest + ".json")).exists())
 
+    def test_console_rewrite_with_an_unmatched_quote_holds_the_draft(self) -> None:
+        key = review.QuestionKey("demo", "Open the page")
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Step B opens the page.", False)
+        reason = "The reviewer gave a quote that does not match the draft."
+        runner = FakeReviewer(verdict(draft, "rewrite", body="The page opens.",
+                                      failed_rules=[{"rule": "omit-team-words", "quote": "Step C"}]))
+
+        result = review.review_question(key, draft.body, runner=runner, console_kind="reply")
+
+        self.assertEqual(result, review.QuestionReviewFailed(draft.body, (reason,)))
+        hold = review.state_path() / "questions" / f"{key.digest}.json"
+        self.assertEqual(json.loads(hold.read_text(encoding="utf-8")), {
+            "slug": key.name, "text": key.text, "question": draft.body, "details": [reason],
+        })
+
     def test_unavailable_question_review_preserves_original_and_logs_reason(self) -> None:
         draft = review.Draft("demo", "0", "", NoActionRequired(), "Retry build 42?", False)
         runner = FakeReviewer(verdict(draft), failure="timeout")

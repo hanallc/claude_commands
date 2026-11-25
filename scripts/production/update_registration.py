@@ -61,7 +61,6 @@ class InputError(Exception):
 
 STARTED = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
 UNREADABLE_LIST = "needs-user list unreadable"
-PLUMBING = re.compile(r"\b(?:berth|reservations?|incursions?|holders?|file holds?|file clash\w*|writers?|testers?|retak\w*|re-?shoot\w*)\b", re.IGNORECASE)
 
 @dataclass(frozen=True)
 class DueNow:
@@ -221,15 +220,6 @@ def check_question_title(text: str) -> ValidQuestionTitle | RefusedQuestionTitle
     return ValidQuestionTitle(text)
 
 
-def plumbing(line: str) -> str | None:
-    """Why the line fails the plumbing check, or None when it passes."""
-    found = PLUMBING.search(line)
-    if found is None:
-        return None
-    return (f"{found.group(0)!r} is the production's own plumbing or shorthand, which the user never sees; "
-            + "say what changes in the app, or leave it out")
-
-
 def read_ranking(fields: dict[str, object], where: str) -> Ranking:
     """An item's `urgency`, `due`, `marked` and `follows`; none of them is a normal item."""
     follows = fields.get("follows", "")
@@ -264,12 +254,15 @@ def read_followups(value: object, where: str) -> tuple[Followup, ...]:
         if not isinstance(entry, dict):
             raise InputError(f"{where}.followups[{index}]: expected an object")
         fields = cast(dict[str, object], entry)
-        check_keys(fields, {"followup", "reply", "question_id", "replied_at"}, f"{where}.followups[{index}]")
+        location = f"{where}.followups[{index}]"
+        check_keys(fields, {"followup", "reply", "question_id", "replied_at", "review_unavailable"}, location)
         followup, reply = fields.get("followup"), fields.get("reply")
         if not isinstance(followup, str) or not isinstance(reply, str) or not followup.strip() or not reply.strip():
             raise InputError(f"{where}.followups[{index}]: expected the follow-up and its reply")
         if "question_id" in fields and (not isinstance(fields["question_id"], str) or not fields["question_id"]):
             raise InputError(f"{where}.followups[{index}].question_id: expected an ID")
+        if "review_unavailable" in fields and not isinstance(fields["review_unavailable"], str):
+            raise InputError(f"{location}.review_unavailable: expected reason text")
         if "replied_at" in fields:
             try:
                 stamp = fields["replied_at"]
@@ -414,6 +407,7 @@ class FollowupExchange(TypedDict):
     reply: str
     question_id: NotRequired[str]
     replied_at: NotRequired[str]
+    review_unavailable: NotRequired[str]
 
 
 class OutstandingItem(TypedDict):
@@ -1975,9 +1969,6 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
     if parts["choices"] and (len(parts["choices"]) < 2 or not parts["recommend"].strip()):
         raise RegistrationFailure("ask", "a question with choices needs at least two --choice and one --recommend")
     question = question_text(parts)
-    problem = plumbing(text)
-    if problem is not None:
-        raise RegistrationFailure("ask", f"{text}: {problem}")
     outstanding = outstanding_path(production)
     if any(entry["text"] == text for entry in open_entries(production, identities)):
         raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
@@ -2346,19 +2337,23 @@ def set_waiting_why(record: QuestionRecord, text: str) -> None:
         write_question_record(current)
 
 
-def answer_followup(entry: OutstandingItem, text: str) -> None:
+def answer_followup(entry: OutstandingItem, text: str, *, review_unavailable: str | None = None) -> None:
     """Move one pending follow-up into its answered exchanges."""
     pending = entry.pop("followup", None)
     if pending is None:
         raise RegistrationFailure("reply", f"{entry['text']}: no follow-up waits for a reply")
-    entry["followups"] = [*entry.get("followups", []), FollowupExchange(followup=pending["text"], reply=text.strip())]
+    exchange = FollowupExchange(followup=pending["text"], reply=text.strip())
+    if review_unavailable is not None:
+        exchange["review_unavailable"] = review_unavailable
+    entry["followups"] = [*entry.get("followups", []), exchange]
 
 
-def record_followup_reply(entry: OutstandingItem, words: str, who: str) -> None:
+def record_followup_reply(entry: OutstandingItem, words: str, who: str, *,
+                          review_unavailable: str | None = None) -> None:
     """Save the reply and its log position together."""
     events = review_events.decode(entry.get("review_log", ""))
     exchange = len(entry.get("followups", []))
-    answer_followup(entry, words)
+    answer_followup(entry, words, review_unavailable=review_unavailable)
     entry.setdefault("reply_log_positions", {})[str(exchange)] = len(events)
     event = review_events.ReviewLog(datetime.now().astimezone(user_zone()), who, "Answer: " + words)
     entry["answered_at"] = event.time.isoformat()
@@ -2414,8 +2409,8 @@ def reply_to_submission(path: Path, key: new_item_dialog.ScopedSubmissionKey, wo
             raise new_item_dialog.SubmissionError("This item no longer accepts this reply.")
         if repeated:
             return False
-        require_console_reply(current, words, key.request_id)
-        record_followup_reply(current.item, words, current.owner)
+        unavailable = review_console_reply(current, words, key.request_id)
+        record_followup_reply(current.item, words, current.owner, review_unavailable=unavailable)
         write_question_record(current)
         return True
 
@@ -2435,8 +2430,8 @@ def reply_record(record: QuestionRecord, text: str, who: str, *, identities: Que
             _ = delivery_state.question_exchange_for_reply(exchange, question_id, text.strip())
         if "followup" not in current.item:
             raise RegistrationFailure("reply", f"{current.item['text']}: no open follow-up waits for a reply")
-        require_console_reply(current, text, question_id)
-        record_followup_reply(current.item, text, who)
+        unavailable = review_console_reply(current, text, question_id)
+        record_followup_reply(current.item, text, who, review_unavailable=unavailable)
         _ = _publish_question(current)
     report("reply", "ok", f"{scope.name}: {current.item['text']}: back on the open-questions list with the reply")
 
@@ -2614,7 +2609,8 @@ def question_review_details(outcome: review.QuestionAwaitingFacts | review.Quest
     return "; ".join((*details, *(f"{failure.rule}: {failure.quote}" for failure in outcome.failures)))
 
 
-def require_console_reply(record: QuestionRecord, text: str, exchange: str) -> None:
+def review_console_reply(record: QuestionRecord, text: str, exchange: str) -> str | None:
+    """Hold a failed draft or return the reason the reviewer was unavailable."""
     from scripts.console_text import check as console_text
     from scripts.notify import review
 
@@ -2623,6 +2619,7 @@ def require_console_reply(record: QuestionRecord, text: str, exchange: str) -> N
     outcome = console_text.check(text, "reply", key=key)
     if isinstance(outcome, (review.QuestionAwaitingFacts, review.QuestionReviewFailed)):
         raise RegistrationFailure("reply", "reply held for review: " + question_review_details(outcome))
+    return outcome.reason if isinstance(outcome, review.QuestionReviewUnavailable) else None
 
 
 def questions(production: Production, path: Path | None, *, identities: QuestionStaff | None = None) -> None:
@@ -2667,11 +2664,11 @@ def replace_outstanding(production: Production, outstanding: Path, replacement: 
     refused: list[str] = []
     for text in items_by_text:
         checked = check_question_title(text)
-        problem = checked.reason if isinstance(checked, RefusedQuestionTitle) else plumbing(text)
-        if problem is not None and text in previous:
-            report("questions", "reword", f"{text}: {problem}")
-        elif problem is not None:
-            refused.append(f"{text}: {problem}")
+        if isinstance(checked, RefusedQuestionTitle):
+            if text in previous:
+                report("questions", "reword", f"{text}: {checked.reason}")
+            else:
+                refused.append(f"{text}: {checked.reason}")
     if refused:
         raise RegistrationFailure("questions", "; ".join(refused))
     for item in items_by_text.values():

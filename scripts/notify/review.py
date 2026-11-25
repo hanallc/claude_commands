@@ -659,7 +659,12 @@ def code_failures(draft: Draft) -> list[RuleFailure]:
     return failures
 
 
-def supported_failures(value: object, draft: Draft, *, reply: bool = False) -> list[RuleFailure]:
+class UnmatchedConsoleQuote(ValueError):
+    """A Console review cites text absent from the draft."""
+
+
+def supported_failures(value: object, draft: Draft, *, reply: bool = False,
+                       console: bool = False) -> list[RuleFailure]:
     if not isinstance(value, list):
         raise ValueError("failed_rules")
     original = [draft.body] if reply else [draft.title, first_line(draft.action, draft.session) + "\n" + draft.body]
@@ -669,9 +674,12 @@ def supported_failures(value: object, draft: Draft, *, reply: bool = False) -> l
     for item in cast(list[object], value):
         record = _object(item)
         rule, quote = _text(record, "rule"), _text(record, "quote")
+        matched = bool(quote) and any(quote in text for text in original)
+        if console and not matched:
+            raise UnmatchedConsoleQuote("The reviewer gave a quote that does not match the draft.")
         if rule in CODE_RULES:
             continue
-        if rule and quote and any(quote in text for text in original) and all(item.rule != rule for item in failures):
+        if rule and matched and all(item.rule != rule for item in failures):
             failures.append(RuleFailure(rule, quote))
     if not reply:
         failures.extend(code_failures(draft))
@@ -680,11 +688,13 @@ def supported_failures(value: object, draft: Draft, *, reply: bool = False) -> l
 
 def validate(value: object, draft: Draft, revision: bool,
              metadata: ReviewMetadata = DEFAULT_METADATA, *, reply: bool = False,
-             question: bool = False) -> ReviewOutcome:
+             question: bool = False, console: bool = False) -> ReviewOutcome:
     content_only = reply or question
     failures: list[RuleFailure] = []
     try:
         record = _object(value)
+        if console:
+            failures = supported_failures(record.get("failed_rules"), draft, reply=True, console=True)
         verdict = _text(record, "verdict")
         if verdict not in ("send", "rewrite", "ask", "withhold") or (content_only and verdict == "withhold"):
             raise ValueError("verdict")
@@ -714,7 +724,8 @@ def validate(value: object, draft: Draft, revision: bool,
         if not content_only and len(first_line(action, session) + "\n" + body) > 1024:
             raise ValueError("message exceeds 1024")
         questions = _strings(record.get("questions"), "questions")
-        failures = supported_failures(record.get("failed_rules"), draft, reply=content_only)
+        if not console:
+            failures = supported_failures(record.get("failed_rules"), draft, reply=content_only)
         failed = [failure.rule for failure in failures]
         if len(questions) > 3:
             raise ValueError("questions exceeds 3")
@@ -748,6 +759,8 @@ def validate(value: object, draft: Draft, revision: bool,
                 raise ValueError("ask needs questions")
             return Questions(version, questions, failed, metadata, tuple(failures))
         return Rewritten(version, failed, metadata, tuple(failures))
+    except UnmatchedConsoleQuote as error:
+        return Failed(draft, [str(error)], metadata)
     except ValueError as error:
         if not failures:
             try:
@@ -870,7 +883,8 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
         match call.outcome:
             case StructuredAnswer(value=value):
                 return validate(value, draft, revision, details(), reply=isinstance(context, ReplyContext),
-                                question=isinstance(context, QuestionReview))
+                                question=isinstance(context, QuestionReview),
+                                console=isinstance(context, QuestionReview) and bool(context.console_kind))
             case ModelTimeout():
                 return Unreviewed("timeout", details())
             case ModelExit(code=code):

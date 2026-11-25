@@ -708,6 +708,26 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(self.question_rows()[-1].get("followups"),
                          [{"followup": "Which file holds it?", "reply": words}])
 
+    def test_reply_saves_the_reason_when_the_console_reviewer_times_out(self) -> None:
+        self.file_question()
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            _ = registration.followup(read_production("example"), "Choose the layout", "Where is the setting?")
+        words = "Use the layout settings."
+        with mock.patch.object(review, "review_question",
+                               return_value=review.QuestionReviewUnavailable(words, "timeout")):
+            replied = self.run_command("reply", "--item", "Choose the layout", "--text", words)
+
+        self.assertEqual(replied.returncode, 0, replied.stdout + replied.stderr)
+        row, = self.question_rows()
+        self.assertNotIn("review_unavailable", row)
+        self.assertEqual(row["followups"], [
+            {"followup": "Where is the setting?", "reply": words, "review_unavailable": "timeout"},
+        ])
+        opened = self.run_command("open")
+        self.assertEqual(opened.returncode, 0, opened.stdout + opened.stderr)
+        self.assertIn("1 due, 0 deferred", opened.stdout)
+        self.assertIn(f"Reply: {words}", opened.stdout)
+
     def test_reminder_replacement_and_answer_preserve_the_filed_question(self) -> None:
         self.file_question()
         state = self.question_state(["Review the release notes"])

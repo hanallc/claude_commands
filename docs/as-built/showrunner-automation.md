@@ -489,6 +489,9 @@ Each local Promote checkout must exist before the command pushes.
   Metadata changes and verdicts can update existing imageless rows; the image rule applies only to new rows and visible content edits.
   This write rule has no date exception; `problem()` retains its date rule for commit checks.
   `add` requires `--image` or `--output` and records ready changes that have no checkpoint line.
+  The Console text check reads the change, the check steps, and the result before `add` or a text edit writes the row.
+  A batch checks its text edits before any list write.
+  The review log records the reason if the model is unavailable.
   `--image` accepts a PNG path or a registered image id.
   `batch` checks all edits before any list write and names every row without an image.
   `edit` keeps an existing image and requires an image when the row has none.
@@ -588,6 +591,8 @@ Investigations retain their existing format and command behavior.
 `ListItem` stores the number, title, owner, unit, state, next check, ETA, unread time, and parked time.
 It also stores dependencies, related numbers, requester, opened time, updated time, closed time, and closing words.
 The body stores the next step, latest status, evidence, completion condition, and log.
+The CLI checks text fields with the fast Console text check before saving them.
+This includes closing words, the text of Go requests, and answers to List questions.
 Length fields preserve headings and line endings inside each text section.
 The log keeps dated changes in file order, newest last, with the source on each line.
 The Added line preserves initial field values, including state, ETA, next step, and latest status.
@@ -775,6 +780,7 @@ Other state changes receive one refusal line.
 
 1. File an investigation with `investigation.py file --title "<one line>" --question "<full question>" --waiting-why "<reason>"`.
 2. Save its answer with `investigation.py answer --id I<n> --text "<answer>"`.
+   The Console text check runs before the answer is saved. The review log records any model outage.
 3. Mark its answer read with `investigation.py read --id I<n>`.
 4. List waiting investigations with `investigation.py list`.
 5. Include read investigations with `investigation.py list --all`.
@@ -818,7 +824,9 @@ A missing folder uses its nearest existing parent until the folder appears.
 - `ask --ask "<one line>" [--context "<why now>"] [--item "<entry>" ...] [--recommend "<choice and why>"] [--choice "<answer>" ...] [--unit <unit>]` files a reviewed question without a reply to the user.
   The [Console text standard](../console_text_standard.md) applies to `ask` and to answers and replies from the writer.
   The fast check tests text patterns before the existing model reviewer reads the draft.
+  The model reader checks the words in the draft.
   The filing command returns the failed rules and quotes to the writer. The hold keeps the draft.
+  A quote that differs from the draft keeps the draft on hold.
   If the model is unavailable, `ask` records the reason.
   The record keeps the parts in `parts` and their full text in `question`.
   The Review page shows question parts as sections: the items as a numbered list, links as links, and each choice as a radio item that fills the answer box.
@@ -856,6 +864,7 @@ A missing folder uses its nearest existing parent until the folder appears.
   A question with a follow-up that waits for its reply is not due: `open` lists it as `waiting for the asker's reply since <time>`, and `/next` and the page leave it out.
   `reply` finds the one question with exactly that text and a waiting follow-up, in this production or a production below it.
   It keeps the follow-up and the reply in `followups`, and the question is due again with both shown.
+  If the reviewer is unavailable, the reply record keeps the reason in `review_unavailable`.
   The Python `followup` API requires `waiting_why`; the Review action uses the user's question text automatically.
   It prints `reply: ok — <showrunner name>: <text>: back on the open-questions list with the reply`.
 - `withdraw --item <text>` removes one open item with exactly that text from this production or a production below it.
@@ -1249,6 +1258,8 @@ An unstaffed session requires an explicit native id and an explicit unit name.
   With no rows, it prints `no open proposals`.
 
 - **Nightly list (`scripts/nightly_review/candidates.py`, `/showrunner:nightly`, user 2026-10-12).** Prints one Markdown table, `| Pick | Night | Area | Candidate | Gain per week | State |`, of every nightly-review candidate still open. The ledger (`nightly-review/ledger.md` under `XDG_STATE_HOME`, else `~/.local/state`) is the one record. A night's proposal and each of its Also found and Noted items is a line of its own, `- <night> <scope>[, also found|, noted]: <title> [gain/week: <gain>] [by: <staff id>] — <state>`, open while it ends `proposed` or `deferred`. `record()` writes the ` [by: <staff id>]` tag only when the caller is a unit director. Printing changes no file but the vault note below.
+  The fast Console text check reads each new candidate's title, target, and gain.
+  A failed draft leaves the ledger and note unchanged. A deferral also checks its reason before saving.
   Recording prints and flushes new entries before it publishes the complete ledger atomically. An interrupted print leaves them available on retry. A partial final candidate from an interrupted append is replaced on rerun; proposed, deferred, accepted, declined, done and relayed states count as recorded, including the dated outcomes written by `/next`.
   - **Order.** `rank` reads the tag: `N min` or `N h` is user-visible time, `N%` is a share of tokens, and a line with no tag or other words is unmeasured. Time comes before tokens, each largest first; unmeasured lines come last, in the ledger's order. `/next efficiency` takes its candidates and their order from this table.
   - **Pick.** Row one reads `recommended` only when its gain is measured; with nothing measured no row is marked.
