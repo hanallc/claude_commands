@@ -875,7 +875,7 @@ class GateRecovery:
         if pending:
             report_gate_recovery(self.path, "the FIFO has an interrupted slot operation")
 
-    def recover(self) -> None:
+    def recover(self, *, keep_record: bool = False) -> None:
         """Stop recorded groups, return tokens, and undo the merge."""
         if self.finished:
             self.release_folder_markers()
@@ -970,16 +970,16 @@ class GateRecovery:
                 print(f"Recovered gate {self.pid}: merge undone, not pushed", flush=True)
             if self.tokens:
                 return
-            self.save_finished()
+            self.save_finished(keep_record=keep_record)
         self.release_folder_markers()
 
     def finish(self) -> None:
         self.save_finished()
         self.release_folder_markers()
 
-    def save_finished(self) -> None:
-        """Keep the recovery record when it names retained folders."""
-        if self.folders:
+    def save_finished(self, *, keep_record: bool = False) -> None:
+        """Keep the record when the caller requests it or the record names retained folders."""
+        if keep_record or self.folders:
             self.finished = True
             self.save()
         else:
@@ -1126,7 +1126,7 @@ def recover_gate_directory(directory: Path, *, own_directory: Path) -> None:
 
 
 def recover_private_gate_runs(root: Path) -> None:
-    """Read whole-machine records under the tool folder lease."""
+    """Recover earlier whole-machine runs and report their folders."""
     for folder in sorted(root.glob(f"{build_folders.GATE_RECOVERY_TOOL}*")):
         if not build_folders.gate_recovery_folder(folder.name):
             continue
@@ -1134,24 +1134,23 @@ def recover_private_gate_runs(root: Path) -> None:
             status = folder.stat(follow_symlinks=False)
         except FileNotFoundError:
             continue
-        if status.st_uid != os.geteuid() or not stat.S_ISDIR(status.st_mode) or not (folder / "run.json").is_file():
+        path = folder / "run.json"
+        if status.st_uid != os.geteuid() or not stat.S_ISDIR(status.st_mode) or not path.is_file():
             continue
 
-        def recover_folder() -> bool:
-            try:
-                current = folder.stat(follow_symlinks=False)
-            except FileNotFoundError:
-                return True
-            if not os.path.samestat(current, status):
-                return False
-            path = folder / "run.json"
-            recover_gate_record(path)
-            if path.exists():
-                return False
-            return True
-
         try:
-            _ = build_folders.remove_build_folder(folder, prepare=recover_folder, expected=status, wait=False)
+            with build_folder_lock.folder_parent(folder, root, create=False) as parent, ExitStack() as leases:
+                lease = build_folders._hold_free_lease(folder, parent, leases, wait=False, create=True)  # pyright: ignore[reportPrivateUsage]
+                if not isinstance(lease, build_folders.HeldFolderRemovalLease):
+                    continue
+                current = os.stat(folder.name, dir_fd=parent, follow_symlinks=False)
+                if not os.path.samestat(current, status):
+                    continue
+                # The record prevents the allocator from reusing the folder.
+                recover_gate_record(path, keep_record=True)
+                report_retained_gate_folder(str(folder), "an earlier gate made this recovery folder")
+        except FileNotFoundError:
+            continue
         except (GateRecoveryIdentityUnreadable, OSError) as error:
             report_gate_recovery(folder, error)
 
@@ -1254,7 +1253,7 @@ def report_gate_recovery(path: Path, error: Exception | str) -> None:
     print(f"UNRESOLVED: {reason}. Record: {path}", flush=True)
 
 
-def recover_gate_record(path: Path) -> None:
+def recover_gate_record(path: Path, *, keep_record: bool = False) -> None:
     try:
         recovery = read_gate_recovery(path)
         if recovery is None:
@@ -1275,7 +1274,7 @@ def recover_gate_record(path: Path) -> None:
         return
     active = ACTIVE_GATE_RECOVERY.set(recovery)
     try:
-        recovery.recover()
+        recovery.recover(keep_record=keep_record)
     except (GateRecoveryUnresolved, OSError) as error:
         report_gate_recovery(recovery.path, error)
     finally:

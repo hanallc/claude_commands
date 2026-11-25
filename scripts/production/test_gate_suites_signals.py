@@ -672,7 +672,7 @@ sys.stdin.read(1)
                     older = replace(recovery, path=older_folder / "run.json", folders=[])
                     older.save()
                     output = io.StringIO()
-                    with redirect_stdout(output):
+                    with redirect_stdout(output), redirect_stderr(io.StringIO()) as report:
                         run = gate.run_suites(self.checkout, machine=machine, full=True)
                     self.assertTrue(run.passed, output.getvalue())
                     saved = gate.read_gate_recovery(recovery.path)
@@ -680,7 +680,35 @@ sys.stdin.read(1)
                     self.assertTrue(saved.finished)
                     self.assertEqual(saved.folders, [str(work)])
                     self.assertTrue(work.is_dir())
-                    self.assertFalse(older_folder.exists())
+                    self.assertTrue(older_folder.is_dir())
+                    self.assertIn(
+                        f"kept for a manual removal list: {older_folder} (gate, an earlier gate made this recovery folder)",
+                        report.getvalue().splitlines(),
+                    )
+
+    def test_private_recovery_keeps_and_reports_finished_and_unfinished_folders(self) -> None:
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            root = build_folders.configured_gate_root()
+            tool = build_folders.GATE_RECOVERY_TOOL
+            folders = (root / tool, root / f"{tool}-2")
+            earlier = [
+                gate.GateRecovery(folder / "run.json", str(self.checkout), 424242, "earlier-owner", finished=finished)
+                for folder, finished in zip(folders, (False, True), strict=True)
+            ]
+            for folder, recovery in zip(folders, earlier, strict=True):
+                folder.mkdir()
+                recovery.save()
+            with (mock.patch.object(gate, "process_start", return_value=Gone()),
+                  redirect_stderr(io.StringIO()) as report):
+                gate.recover_gate_runs(self.checkout)
+
+            self.assertEqual(report.getvalue().splitlines(), [
+                f"kept for a manual removal list: {folder} (gate, an earlier gate made this recovery folder)"
+                for folder in folders
+            ])
+            for folder, recovery in zip(folders, earlier, strict=True):
+                self.assertTrue(folder.is_dir())
+                self.assertEqual(gate.read_gate_recovery(recovery.path), replace(recovery, finished=True))
 
     def test_module_timeout_removes_fixture_and_nested_gate_folders(self) -> None:
         parent = self.root / "nested-temporary"
