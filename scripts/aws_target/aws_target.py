@@ -131,11 +131,9 @@ def snapshot_permission_failure(failure: SnapshotFailure) -> bool:
 
 
 def snapshot_failure_push(failures: Sequence[SnapshotFailure]) -> push_texts.RenderedPush:
-    """Name each regional permission error and its repair."""
-    lines: list[str] = []
-    for failure in failures:
-        lines.append(f'AWS refused the {failure.region} {failure.read} read.')
-    return push_texts.render('aws.snapshot_failed', failures='\n'.join(lines))
+    """Send the region and read name for each permission error."""
+    reads = [{'region': failure.region, 'read': failure.read} for failure in failures]
+    return push_texts.render('aws.snapshot_failed', failures=json.dumps(reads))
 
 
 def gpu_price_sizes(values: conf.ConfigRead) -> tuple[str, ...]:
