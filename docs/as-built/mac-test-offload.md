@@ -547,11 +547,12 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   After success, the runner sends the full output and deletes the file.
   After failure, it reports the saved path and sends a tail of `nextest_failure_tail_bytes` bytes (65,536 by default).
   It also sends the last nextest Summary line, up to `nextest_failure_summary_bytes` bytes (1,024 by default).
-  The hourly Mac `tmp_sweep.py` job removes closed, owned logs after `nextest_failure_log_days` days (seven by default).
+  The hourly Mac `tmp_sweep.py` job lists closed, owned logs for vetted manual removal after `nextest_failure_log_days` days (seven by default).
   It measures age from the failure time or, for an interrupted run, the last write time.
   On the Mac, read a saved log with `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/nextest_log.py read PATH`.
   The reader holds a shared lock until the copy ends.
-  The sweep holds an exclusive lock during removal and also checks for open files with `lsof`.
+  The sweep checks for open files with `lsof`.
+  It takes an exclusive lock before it lists a log.
   If the log writer cannot start nextest, the runner reports a setup failure.
 - `stream_mac_run` holds a `mac_exit=<n>` marker with a status from 0 to 255.
   Later ordinary output invalidates the held marker.
@@ -692,7 +693,10 @@ The queue removes its run record and receipt after the callback confirms cleanup
 
 ### The showrunner's Mac build — `scripts/production/mac_run.sh`
 
-It claims the Mac after its reach probe (`mac_test.py claim --pid $$ --what "mac run <sha9>" --worktree $repo --wait 600`), so the claim is the repository's; claim exit 10, 11 or 12 prints the claim's line and exits 9. When the clone already holds the commit, nothing is sent and the clone checks it out. `INT`, `TERM` and `HUP` run `stop_mac_run` (one ssh call that ends the clone's builds and test processes and removes its temp files), release, and exit 128 plus the signal.
+After its reach probe, `mac_run.sh` requests a Mac placement for the repository.
+It sends a bundle if the Mac source lacks the requested commit.
+`copies.py run` holds a numbered copy for the smoke test.
+If SSH input closes during the test, the Mac helper stops the smoke process group and checks the copy.
 
 ### Which packages belong on the Mac — `scripts/mac_test/audit.py`
 
@@ -822,10 +826,25 @@ An empty configured capacity raises `ConfigError`.
 The policy supplies a fallback only when both capacity keys are absent.
 The Mac retains its single slot per repository.
 
-`mac_run.sh` creates its task-owned clone through `copies.py`.
-It preserves both registrations until process exit and scratch cleanup succeed.
-It then removes the Mac registration before the natedev registration.
-Failed clone cleanup retains both registrations.
+The Terminal launcher enters the numbered copy before it checks its per-run token.
+Cleanup removes the token before `stop-checkout` scans the copy.
+The copy stays kept if `stop-checkout` cannot confirm it is clear.
+The Mac wrapper removes any old `status` file before it starts `copies.py run`.
+The file path is `<scratch root>/mac-smoke-<episode>/status` on the Mac.
+If SSH leaves the folder behind, the hourly scratch sweep lists it for vetted manual removal after its default lifetime.
+The test and cleanup read stdin from `/dev/null`.
+After remote cleanup, the worker reports readiness and holds the copy until it receives a newline after local cleanup.
+SSH EOF before the newline stops active work and prevents a zero exit code.
+The worker uses the run's `mac_run_status_grace_seconds` limit from the Mac's `production.conf` for the release wait.
+If this limit expires, the worker returns a failure and lets the copy lease close.
+After `copies.py run` returns, the wrapper writes its exit code to a temporary file and renames it to `status`.
+The exit code includes any copy lease close failure.
+After the first SSH call ends, the queue reads the status and removes its scratch folder through a separate SSH call.
+The queue reads the file only after readiness and requires the first SSH call to finish without a connection error.
+The second SSH call uses `probe_timeout_s` from `config/mac_test.conf`.
+The queue returns 255 and keeps the run record if the connection fails or the read cannot return a valid status.
+For an old scratch run, the callback confirms checkout clearance before it ends the task and removes both registry rows.
+The queue removes the old run record and receipt after successful cleanup.
 
 [Gate checkouts](gate-checkouts.md#remote-mirrors) defines the mirror metadata, lock order, recovery, process scans, registry commands, and probe behavior.
 Candidate leases precede the shared scan, so a process that starts before lease acquisition protects its mirror.

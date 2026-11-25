@@ -330,11 +330,8 @@ class PageStatusTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the Builds paused badge.")
     def test_builds_paused_badge_matches_main_and_stays_visible(self) -> None:
         from scripts.build_queue import memory_feed
-        from scripts.review_links import console_theme
 
-        source = console_theme.with_theme((SCRIPTS / "build_queue" / "memory_live.html").read_text(encoding="utf-8"))
-        page = (page_frame.template(source, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", "15")
-                .replace("__BUILD_LIMIT_ICONS__", json.dumps(memory_feed.build_limit_icons())))
+        page = memory_feed.page_document(15)
         markup = page_frame.with_owner(page.encode(), "builds", PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)), lambda: "")
         # The page stays paused, so the status line does not stick and nothing moves.
         paused = (b'<script>document.addEventListener("DOMContentLoaded",()=>setPaused(true));</script>'
