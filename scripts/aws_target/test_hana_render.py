@@ -48,7 +48,7 @@ UNSHIPPED_IMPORTS = {
     'lint/memory_admit.py': {'message/unit_labels.py'},
     'mac_test/claim_state.py': {'buildlog/transfer_bytes.py'},
     'production/staff.py': {'agents/worker_lifecycle.py', 'agents/remote.py', 'lib/operation_environment.py',
-        'accounts/__init__.py', 'accounts/role_map.py'},
+        'accounts/__init__.py', 'accounts/role_map.py', 'message/address.py'},
 }
 
 

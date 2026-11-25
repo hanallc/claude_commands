@@ -20,13 +20,14 @@ from scripts.agents import pane_record
 
 class SessionStartPaneRecordTests(StaffTestCase):
     def record_start(self, arguments: list[str], session_id: str, *,
-                     process_info: dict[str, object] | None = None) -> None:
+                     process_info: dict[str, object] | None = None, defer_fork: str = "") -> None:
         namespace = runpy.run_path(str(Path(__file__).with_name('session-start-pane-record.py')))
         main = cast(Callable[[], None], namespace['main'])
         payload = {'session_id': session_id, 'cwd': str(self.root), 'source': 'startup'}
         with (mock.patch.dict(os.environ, {
                   'HERDR_ENV': '1', 'HERDR_PANE_ID': 'w16:p3', 'HERDR_SESSION': 'agents',
                   'CLAUDE_CONFIG_DIR': str(self.root / 'account'),
+                  pane_launch.CLAUDE_FORK_NAME_ENV: defer_fork,
               }),
               mock.patch('sys.stdin', io.StringIO(json.dumps(payload))),
               mock.patch.object(pane_record, 'process_arguments', return_value=arguments),
@@ -129,3 +130,13 @@ class SessionStartPaneRecordTests(StaffTestCase):
         self.assertEqual(entry['session_id'], session_id)
         self.assertEqual(entry['cwd'], str(self.root))
         self.assertEqual(entry['model'], 'sonnet')
+
+    def test_clone_start_waits_for_admission_and_an_ordinary_resume_still_records(self) -> None:
+        identity = fixture_runtime_id("new-clone")
+        source = fixture_runtime_id("clone-source")
+        self.record_start(["claude", "--resume", source, "--fork-session", "-n", "copy"],
+                          identity, defer_fork="copy")
+        self.assertEqual(pane_record.read_strict("agents"), {})
+        self.record_start(["claude", "--resume", identity, "-n", "copy"], identity, defer_fork="copy")
+        entry = cast(pane_launch.NativePaneLaunch, pane_record.read_strict("agents")["w16:p3"])
+        self.assertEqual(entry["session_id"], identity)

@@ -8452,12 +8452,12 @@ class PaneWorkerMoveTests(unittest.TestCase):
                                      config / "accounts.conf")
         for name in ("detached_runs.conf", "postmaster.conf"):
             _ = write_config_fixture(config / name)
-        _ = (config / "direct.conf").write_text("# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
-                                               + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
-                                               + "# range: 1..1800\nWORKER_COMPACT_SECONDS=300\n"
-                                               + "# range: 0.01..600\nWORKER_PUBLISH_LOCK_SECONDS=15\n"
-                                               + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
-        _ = (config / "shutdown.conf").write_text("# whole: 1..300\nSTOP_GRACE_SECONDS=2\n# whole: 1..300\nKILL_GRACE_SECONDS=5\n# whole: 1..300\nMOVE_STOP_MARGIN_SECONDS=10\n")
+        _ = (config / "direct.conf").write_text("# range: 0.1..0.9\nworker_split_ratio=0.667\n"
+                                               + "# whole: 1..\nunit_compact_above_tokens=43000\n"
+                                               + "# range: 1..1800\nworker_compact_seconds=300\n"
+                                               + "# range: 0.01..600\nworker_publish_lock_seconds=15\n"
+                                               + "# range: 1..600\npane_agent_start_seconds=90\n")
+        _ = (config / "shutdown.conf").write_text("# whole: 1..300\nstop_grace_seconds=2\n# whole: 1..300\nkill_grace_seconds=5\n# whole: 1..300\nmove_stop_margin_seconds=10\n")
         registry = write_registry(config / "models.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(config), "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",

@@ -101,3 +101,33 @@ def ensure_excluded(checkout: Path, pattern: str) -> None:
     except (OSError, UnicodeError) as error:
         raise ExcludeRefused(f"{exclude}: cannot write exclude entry: {error}") from error
     require_untracked_ignored(checkout, path)
+
+
+def ensure_exact_excluded(checkout: Path, path: str) -> None:
+    """Check and install an anchored exclusion for a file or directory."""
+    pattern = _exact_pattern(checkout, path)
+    require_untracked_ignored(checkout, path, planned_pattern=pattern)
+    ensure_excluded(checkout, pattern)
+
+
+def _exact_pattern(checkout: Path, path: str) -> str:
+    if (not path or Path(path).is_absolute() or ".." in Path(path).parts
+            or any(character in path for character in "\r\n*?[\\") or path.endswith(" ")):
+        raise ExcludeRefused(f"{checkout}: cannot exclude {path!r} as an exact path")
+    return f"/{path}"
+
+
+def remove_exact_exclusion(checkout: Path, path: str) -> None:
+    """Remove just the anchored exclusion for the former live file."""
+    pattern = _exact_pattern(checkout, path)
+    common_dir = _common_dir(checkout)
+    exclude = common_dir / "info" / "exclude"
+    try:
+        with exclude_lock_path(common_dir).open("a", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            existing = _read_exclude(exclude)
+            remaining = "".join(line for line in existing.splitlines(keepends=True) if line.rstrip("\r\n") != pattern)
+            if remaining != existing:
+                write_text_atomic(exclude, remaining)
+    except (OSError, UnicodeError) as error:
+        raise ExcludeRefused(f"{exclude}: cannot remove exclude entry: {error}") from error
