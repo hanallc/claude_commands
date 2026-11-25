@@ -773,6 +773,9 @@ class PendingAdmission:
     wait_seconds: float
     # The default exists only so that outbox entries saved before this field decode.
     passed: gate.PassedRows | gate.PassedNotRecorded = gate.PassedNotRecorded()
+    room: int | None = None
+    loan: int | None = None
+    fit: Literal["free", "loan"] | None = None
 
 
 @dataclass(frozen=True)
@@ -1223,18 +1226,23 @@ class OperatingSystemReader:
             self.requested.set()
 
     def register_trace(self, record: ReservationRecord, argv: tuple[str, ...], host: str, wall: float) -> None:
-        if (isinstance(self.traces, memory_trace.TraceWorker) and isinstance(record.place, wire.LocalPlace)
-                and record.repo == "hana" and record.repo_identity and record.step == "nextest"
-                and record.sidecar and record.need > 0 and argv):
+        if (not isinstance(self.traces, memory_trace.TraceWorker) or not isinstance(record.place, wire.LocalPlace)
+                or not record.sidecar or record.need <= 0):
+            return
+        shape: memory_trace.HanaTraceShape | memory_trace.GeneralTraceShape
+        if record.repo == "hana" and record.step == "nextest" and record.repo_identity and argv:
             width = records.UnspecifiedTestWidth() if isinstance(record.test_width, records.NoTestWidth) else record.test_width
             shape = memory_trace.HanaTraceShape(host, record.repo_identity, argv, width)
-            self.traces.submit(memory_trace.TraceGrant(record.reservation_id, shape, reservation_row(record),
-                                                       wall, self.clock.monotonic()))
+        else:
+            shape = memory_trace.GeneralTraceShape(host, record.repo_identity or record.worktree or record.repo,
+                                                  record.step, argv)
+        self.traces.submit(memory_trace.TraceGrant(record.reservation_id, shape, reservation_row(record),
+                                                   wall, self.clock.monotonic()))
 
     def release_trace(self, record: ReservationRecord, ending: ReservationEnding,
                       wall: float) -> None:
         if (isinstance(self.traces, memory_trace.TraceWorker) and isinstance(record.place, wire.LocalPlace)
-                and record.repo == "hana" and record.step == "nextest" and record.sidecar):
+                and record.sidecar and record.need > 0):
             status = ending.status if isinstance(ending, ReleaseStatus) else memory_trace.ExitStatusUnavailable()
             self.traces.release(record.reservation_id, wall, status)
 
@@ -3653,6 +3661,12 @@ class AdmissionServer:
                       if isinstance(head, gate.QueuedHead) else "")
         head_need = head.waiter["need"] if isinstance(head, gate.QueuedHead) else 0
         starts = [row for row in result.rows if isinstance(row.admission, gate.ProposedAdmission)]
+        # Each decision records room before its start. The loan comes from runs active before the pass.
+        loan = None
+        if self.host == "natedev" and starts:
+            room = result.policy.room
+            loan = (records.growth_loan_bytes((part.memory for part in room.runs), policy.build_reserve_share_percent)
+                    if isinstance(room, records.MemoryRoom) else 0)
         for decision in starts:
             episode = by_owner[decision.owner]
             waiting = self.waiters.get(episode)
@@ -3673,7 +3687,8 @@ class AdmissionServer:
             proposed = cast(gate.ProposedAdmission, decision.admission)
             self.spacing = proposed.spacing
             self._admit([waiting], config, self.configuration.peak_history_share_percent,
-                        cargo_folder=cargo_folder, verify_slots=verify_slots)
+                        cargo_folder=cargo_folder, verify_slots=verify_slots,
+                        room=decision.decision.room.room if loan is not None else None, loan=loan)
         self.persist()
         visible_order = self._visible_queue_order(self._full_queue_order(captured.ranked_waiters))
         published = self._project_replies(visible_order)
@@ -4252,6 +4267,8 @@ class AdmissionServer:
                 }
                 if isinstance(pending.passed, gate.PassedRows):
                     event["passed"] = pending.passed
+                if pending.room is not None and pending.loan is not None and pending.fit is not None:
+                    event.update(room=pending.room, loan=pending.loan, fit=pending.fit)
                 gate.append_queue_time(self.state_dir, cast(dict[str, object], codec.snapshot_value(event)), admitted_at)
                 self.fault("after_admitted_append")
             else:
@@ -4352,7 +4369,7 @@ class AdmissionServer:
 
     def _admit(self, waiters: list[WaitingAdmission], config: records.MemoryConfig, share_percent: int, *,
                cargo_folder: placement.CargoFolder | placement.NoCargoFolder,
-               verify_slots: Mapping[str, VerifyRunSlot]) -> None:
+               verify_slots: Mapping[str, VerifyRunSlot], room: int | None = None, loan: int | None = None) -> None:
         now = self.clock.now()
         prepared = [self._prepare_admission(waiting, now, config, share_percent, cargo_folder) for waiting in waiters]
         replies: list[wire.Admitted | wire.LaunchAdmitted] = []
@@ -4372,9 +4389,12 @@ class AdmissionServer:
                     candidate = result.policy.queued_head
                     passed = gate.passed_rows(result.policy.walk, started, inputs.pending_remote_starts)
                 source = request.profile.peak.source
+                fit: Literal["free", "loan"] | None = None
+                if room is not None and loan is not None:
+                    fit = "free" if admission.need <= room - loan else "loan"
                 self.lifecycle_outbox = (*self.lifecycle_outbox, PendingAdmission(request.episode, source,
                     isinstance(candidate, gate.QueuedHead) and records.waiter_owner(candidate.waiter) == started,
-                    max(0.0, now - waiting.row["since"]), passed))
+                    max(0.0, now - waiting.row["since"]), passed, room=room, loan=loan, fit=fit))
                 if (line := self._gate_gap_start(admission, now)) is not None:
                     gap_starts.append(line)
                 self._save_gate_rank(admission, waiting.row.get("move_id", ""))

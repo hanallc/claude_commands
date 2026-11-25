@@ -284,6 +284,15 @@ def earlyoom_kills(start: datetime, end: datetime) -> list[EarlyoomKill] | Journ
     return kills
 
 
+def kernel_oom_kills(start: datetime, end: datetime, *,
+                     current_boot_only: bool = False) -> list[tuple[datetime, str]] | JournalUnavailable:
+    args = ["-k"] if current_boot_only else ["_TRANSPORT=kernel"]
+    messages = journal_messages(args, start, end)
+    if messages is JournalUnavailable.VALUE:
+        return messages
+    return [(at, message) for at, message in messages if "oom-kill:" in message]
+
+
 def nearest_snapshot(connection: sqlite3.Connection, instant: datetime) -> SnapshotNearInstant:
     left = stored_bound(instant - timedelta(seconds=SNAPSHOT_DISTANCE_S))
     right = stored_bound(instant + timedelta(seconds=SNAPSHOT_DISTANCE_S))
@@ -379,12 +388,12 @@ def window_report(connection: sqlite3.Connection, start: datetime, end: datetime
     else:
         lines.append(f"earlyoom kills: {len(early)}")
         lines.extend(f"{local_time(kill.at)} {kill.command} pid {kill.pid}" for kill in early)
-    kernel_messages = journal_messages(["-k"], start, end)
-    if kernel_messages is JournalUnavailable.VALUE:
+    kernel = kernel_oom_kills(start, end, current_boot_only=True)
+    if kernel is JournalUnavailable.VALUE:
         lines.append("kernel OOM kills: journal unavailable")
     else:
         oom = [match.group(1) if (match := OOM_MEMCG.search(message)) else ""
-               for _, message in kernel_messages if "oom-kill:" in message]
+               for _, message in kernel]
         builds = sum(path.endswith("/builds.slice") for path in oom)
         ci = sum(path.endswith("/hana-ci.slice") for path in oom)
         lines.append(f"kernel OOM kills: {len(oom)} (builds {builds}, CI {ci}, elsewhere {len(oom) - builds - ci})")

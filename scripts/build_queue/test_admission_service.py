@@ -6247,10 +6247,28 @@ class QueueLifecycleTests(unittest.TestCase):
             # A token-waiting row is not a queued row, so the later step is still the first queued row.
             self.assertTrue(rows[later.owner.pid]["is_head"])
 
+    def test_admitted_event_records_the_room_and_growth_loan_from_the_walk(self) -> None:
+        for need, fit in ((GIB, "free"), (2 * GIB, "loan")):
+            with self.subTest(fit=fit), AdmissionFixture() as fixture:
+                self.assertEqual(fixture.server.host, "natedev")
+                fixture.configure(build_reserve_share_percent=80)
+                owner = fixture.proc.spawn()
+                sidecar = fixture.scope(owner)
+                running = replace(fixture.request(owner=owner, need=6 * GIB, step="lint"), sidecar=str(sidecar))
+                _ = only_admitted(fixture.server.handle_request(running))
+                fixture.allow_next_start()
+                fixture.free(9 * GIB)
+                grant = only_admitted(fixture.server.handle_request(fixture.request(need=need, step="lint")))
+                row = self.events(fixture, "admitted")[-1]
+                self.assertEqual(row["reservation_id"], grant.reservation)
+                self.assertEqual((row["need"], row["room"], row["loan"], row["fit"]), (need, 2 * GIB, GIB, fit))
+
     def test_an_outbox_admission_saved_without_passed_decodes_as_not_recorded(self) -> None:
         saved = cast(dict[str, object], codec.snapshot_value(
-            service.PendingAdmission("episode", "measured", True, 1.0, gate.PassedRows(1, 0, 0, 0, 0, 0))))
-        del saved["passed"]
+            service.PendingAdmission("episode", "measured", True, 1.0, gate.PassedRows(1, 0, 0, 0, 0, 0),
+                                     room=11, loan=3, fit="loan")))
+        for key in ("passed", "room", "loan", "fit"):
+            del saved[key]
         pending = codec.parse_snapshot_value(saved, service.PendingAdmission)
         self.assertEqual(pending, service.PendingAdmission("episode", "measured", True, 1.0, gate.PassedNotRecorded()))
 
@@ -11255,12 +11273,13 @@ class ScopedMemoryTrace:
 class MemoryTraceCaptureTests(unittest.TestCase):
     def grant(self, fixture: AdmissionFixture, *, repository: str = "hana",
               step: str = "nextest", scoped: bool = True,
+              argv: tuple[str, ...] = ("cargo", "nextest", "run", "--test-threads", "8"),
               policy: memory_trace.MemoryTracePolicy = TRACE_POLICY) -> ScopedMemoryTrace:
         server = fixture.server
         request = fixture.request(step=step, width=records.RequestedTestWidth(8))
         sidecar = fixture.root / f"sample-{request.owner.pid}.cgroup"
         request = replace(request, sidecar=str(sidecar) if scoped else "",
-                          argv=("cargo", "nextest", "run", "--test-threads", "8"),
+                          argv=argv,
                           profile=replace(request.profile, repo=repository,
                               repository=records.RepositoryIdentity(f"git-root:{repository}", repository)))
         _ = server.run_pass()
@@ -11354,6 +11373,31 @@ class MemoryTraceCaptureTests(unittest.TestCase):
         assert isinstance(trace, memory_trace.MemoryTrace)
         self.assertIsInstance(trace.state, memory_trace.TraceEnd)
         return trace
+
+    def test_non_nextest_scope_records_memory_until_release_without_a_log(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture, repository="fixture", step="lint", argv=("verify.sh", "lint", "fixture"))
+
+            def increase_memory() -> None:
+                write_scope(run.scope, members=(run.request.owner.pid,), current=8 * GIB, anonymous=5 * GIB)
+
+            def release() -> None:
+                self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest(
+                    "lint-release", run.grant.reservation, 0)), [wire.Ok()])
+
+            with mock.patch.object(progress, "CaptureReader", side_effect=AssertionError("lint opened a progress log")):
+                self.drive(fixture, run, 61, ((28, increase_memory), (60.5, release)))
+            trace = self.sealed(run)
+            shape = memory_trace.GeneralTraceShape(fixture.server.host, "git-root:fixture", "lint", run.request.argv)
+            self.assertEqual(trace.header.general, shape)
+            self.assertEqual(trace.header.shape_key, memory_trace.shape_key(shape))
+            self.assertEqual([sample.elapsed_ms for sample in trace.compile_samples], list(range(0, 60001, 2000)))
+            self.assertEqual([sample.program_bytes for sample in trace.compile_samples], [2 * GIB] * 14 + [5 * GIB] * 17)
+            self.assertEqual(trace.test_samples, ())
+            assert isinstance(trace.state, memory_trace.TraceEnd)
+            self.assertEqual(trace.state.coverage, memory_trace.WholeRun())
+            path, = (run.store.root / "finished").glob(f"*/*-{run.grant.reservation}.jsonl")
+            print(f"General lint trace, 31 samples over 60 seconds: {path.stat().st_size} bytes")
 
     def test_full_read_publishes_while_release_seal_is_blocked(self) -> None:
         with AdmissionFixture() as fixture:
