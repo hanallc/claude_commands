@@ -1333,8 +1333,8 @@ run_step() {
             if [[ -n "${VERIFY_SESSION_STEP_TEMP:-}" ]]; then
                 export TMPDIR="$VERIFY_SESSION_STEP_TEMP"
             fi
-            if [[ -n "$VERIFY_SESSION_TEMP_FD" ]]; then
-                exec {VERIFY_SESSION_TEMP_FD}<&-
+            if [[ -n "${VERIFY_SESSION_TEMP_FD:-}" ]]; then
+                eval "exec $VERIFY_SESSION_TEMP_FD<&-"
             fi
             # The step and all of its children use the run output streams.
             [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
@@ -1757,17 +1757,25 @@ VERIFY_SESSION_TEMP_PREVIOUS_JOB=""
 VERIFY_SESSION_TEMP_FD=""
 VERIFY_SESSION_STEP_TEMP=""
 
+first_free_fd() {
+    local fd=$1
+    while [[ -e "/dev/fd/$fd" || -L "/dev/fd/$fd" ]]; do
+        fd=$((fd + 1))
+    done
+    printf '%s\n' "$fd"
+}
+
 finish_verify_temp_allocation() {
-    local latest_job=${!:-} pid=$VERIFY_SESSION_TEMP_PID
-    if [[ -z "$pid" && "$VERIFY_SESSION_TEMP_PENDING" == 1 && "$latest_job" != "$VERIFY_SESSION_TEMP_PREVIOUS_JOB" ]]; then
+    local latest_job=${!:-} pid=${VERIFY_SESSION_TEMP_PID:-} pending=${VERIFY_SESSION_TEMP_PENDING:-0}
+    if [[ -z "$pid" && "$pending" == 1 && "$latest_job" != "$VERIFY_SESSION_TEMP_PREVIOUS_JOB" ]]; then
         pid=$latest_job
     fi
-    if [[ -n "$VERIFY_SESSION_TEMP_INPUT" ]]; then
-        exec {VERIFY_SESSION_TEMP_INPUT}>&-
+    if [[ -n "${VERIFY_SESSION_TEMP_INPUT:-}" ]]; then
+        eval "exec $VERIFY_SESSION_TEMP_INPUT>&-"
         VERIFY_SESSION_TEMP_INPUT=""
     fi
     if [[ -n "$pid" ]]; then
-        if [[ "$VERIFY_SESSION_TEMP_PENDING" == 1 ]]; then kill -TERM "$pid" 2>/dev/null || true; fi
+        if [[ "$pending" == 1 ]]; then kill -TERM "$pid" 2>/dev/null || true; fi
         wait "$pid" 2>/dev/null || true
         VERIFY_SESSION_TEMP_PID=""
     fi
@@ -1776,11 +1784,11 @@ finish_verify_temp_allocation() {
 
 close_verify_session_temp() {
     finish_verify_temp_allocation
-    if [[ -n "$VERIFY_SESSION_TEMP_FD" ]]; then
+    if [[ -n "${VERIFY_SESSION_TEMP_FD:-}" ]]; then
         if [[ -n "$VERIFY_SESSION_STEP_TEMP" ]]; then
             "$PY" "$BUILD_HELPER_ROOT/direct/verify_temp.py" remove "$VERIFY_SESSION_STEP_TEMP" <&"$VERIFY_SESSION_TEMP_FD" || true
         fi
-        exec {VERIFY_SESSION_TEMP_FD}<&-
+        eval "exec $VERIFY_SESSION_TEMP_FD<&-"
         VERIFY_SESSION_TEMP_FD=""
     fi
 }
@@ -1798,15 +1806,18 @@ wait_for_verify_child() {
 }
 
 wait_for_verify_step_group() {
-    while [[ -n "$VERIFY_SESSION_TEMP_FD" ]] && kill -0 -- "-$1" 2>/dev/null; do
-        "$PY" "$BUILD_HELPER_ROOT/direct/verify_temp.py" wait-group "$1" {VERIFY_SESSION_TEMP_FD}<&- &
+    while [[ -n "${VERIFY_SESSION_TEMP_FD:-}" ]]; do
+        (
+            eval "exec $VERIFY_SESSION_TEMP_FD<&-"
+            exec "$PY" "$BUILD_HELPER_ROOT/direct/verify_temp.py" wait-group "$1"
+        ) &
         if wait_for_verify_child "$!"; then return 0; fi
     done
 }
 
 open_verify_session_temp() {
     [[ -z "$VERIFY_SESSION_STEP_TEMP" ]] || return 0
-    local output="" reply="" folder="" reason="the helper did not report a temporary folder"
+    local output="" reply="" folder="" fd reason="the helper did not report a temporary folder"
     VERIFY_SESSION_TEMP_PREVIOUS_JOB=${!:-}
     VERIFY_SESSION_TEMP_PENDING=1
     coproc VERIFY_TEMP_LEASE {
@@ -1818,20 +1829,21 @@ open_verify_session_temp() {
     VERIFY_SESSION_TEMP_INPUT=${VERIFY_TEMP_LEASE[1]:-}
     output=${VERIFY_TEMP_LEASE[0]:-}
     if [[ -n "$output" ]] && IFS= read -r -u "$output" reply; then
-        exec {output}<&-
+        eval "exec $output<&-"
         case "$reply" in
             'ready '*)
                 folder=${reply#ready }
                 # Take the shell's lock before the allocator releases its lock.
-                if { exec {VERIFY_SESSION_TEMP_FD}<"$folder.lock"; } 2>/dev/null &&
-                        "$PY" "$BUILD_HELPER_ROOT/direct/verify_temp.py" claim "$folder" <&"$VERIFY_SESSION_TEMP_FD"; then
-                    VERIFY_SESSION_STEP_TEMP=$folder
-                    VERIFY_SESSION_TEMP_PENDING=0
-                    finish_verify_temp_allocation
-                    return 0
-                fi
-                if [[ -n "$VERIFY_SESSION_TEMP_FD" ]]; then
-                    exec {VERIFY_SESSION_TEMP_FD}<&-
+                fd=$(first_free_fd 74)
+                if eval "exec $fd<\"\$folder.lock\"" 2>/dev/null; then
+                    VERIFY_SESSION_TEMP_FD=$fd
+                    if "$PY" "$BUILD_HELPER_ROOT/direct/verify_temp.py" claim "$folder" <&"$fd"; then
+                        VERIFY_SESSION_STEP_TEMP=$folder
+                        VERIFY_SESSION_TEMP_PENDING=0
+                        finish_verify_temp_allocation
+                        return 0
+                    fi
+                    eval "exec $fd<&-"
                     VERIFY_SESSION_TEMP_FD=""
                 fi
                 reason="the temporary folder lock changed"
@@ -2449,7 +2461,7 @@ start_tree_watch() {
     if [[ "$CMD" == test ]]; then if [[ -n "${ARGS[0]}" ]]; then scope=(--package "${ARGS[0]}"); fi; fi
     trap 'cancel_tree_run' USR2
     (
-        if [[ -n "$VERIFY_SESSION_TEMP_FD" ]]; then exec {VERIFY_SESSION_TEMP_FD}<&-; fi
+        if [[ -n "${VERIFY_SESSION_TEMP_FD:-}" ]]; then eval "exec $VERIFY_SESSION_TEMP_FD<&-"; fi
         [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
         exec "$PY" "$TREE_WATCH_SCRIPT" "$TREE_WATCH_DIR/start" "$TREE_WATCH_DIR/fired" "$$" --signal-parent \
             ${scope[@]+"${scope[@]}"} --
@@ -2491,7 +2503,7 @@ doc_tree() {
 }
 
 doc_checkout() {
-    local top=$1 tree=$2 ssh_caller=${3:-} writer reader status=0 lease_fd=74
+    local top=$1 tree=$2 ssh_caller=${3:-} writer reader status=0 lease_fd
     local ssh_source_py='
 from pathlib import Path
 import sys
@@ -2522,9 +2534,7 @@ with copies.remote_step_source(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
         if (( status != 0 )); then return "$status"; fi
         return 2
     fi
-    while [[ -e "/dev/fd/$lease_fd" || -L "/dev/fd/$lease_fd" ]]; do
-        lease_fd=$((lease_fd + 1))
-    done
+    lease_fd=$(first_free_fd 74)
     if ! eval "exec $lease_fd>&$writer"; then
         step_close_checkout stop
         return 2
@@ -2766,7 +2776,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     MAC_RUNNER_PRIOR_JOB=${!:-}
     MAC_RUNNER_LAUNCHING=1
     (
-        if [[ -n "$VERIFY_SESSION_TEMP_FD" ]]; then exec {VERIFY_SESSION_TEMP_FD}<&-; fi
+        if [[ -n "${VERIFY_SESSION_TEMP_FD:-}" ]]; then eval "exec $VERIFY_SESSION_TEMP_FD<&-"; fi
         [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
         if [[ -n "$MAC_SOURCE_ROOT" && "$runner_root" == "$MAC_SOURCE_ROOT" ]]; then
             if [[ "$runner" != /* ]]; then runner=$PWD/$runner; fi
@@ -3685,7 +3695,7 @@ start_copy_watch() {
         watch_args+=(--filter-run)
     fi
     (
-        if [[ -n "$VERIFY_SESSION_TEMP_FD" ]]; then exec {VERIFY_SESSION_TEMP_FD}<&-; fi
+        if [[ -n "${VERIFY_SESSION_TEMP_FD:-}" ]]; then eval "exec $VERIFY_SESSION_TEMP_FD<&-"; fi
         [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
         exec "$PY" "$MAC_COPY_WATCH" "${watch_args[@]}" -- "${NEXTEST_ARGS[@]}"
     ) &
@@ -4686,12 +4696,9 @@ if [[ "$CMD" == test ]]; then
 fi
 save_verify_exit_stderr() {
     VERIFY_EXIT_STDERR_FD=""
-    # Find a free descriptor before duplicating stderr.
     {
-        local fd=74
-        while [[ -e "/dev/fd/$fd" || -L "/dev/fd/$fd" ]]; do
-            fd=$((fd + 1))
-        done
+        local fd
+        fd=$(first_free_fd 74)
         if eval "exec $fd>&1"; then
             VERIFY_EXIT_STDERR_FD=$fd
         fi
@@ -4863,7 +4870,7 @@ verify_exit() {
     exec 2>>"${exit_diagnostics:-/dev/null}" || true
     EXIT_STATUS=$1
     set +e
-    if [[ -n "$VERIFY_SESSION_TEMP_FD" ]]; then
+    if [[ -n "${VERIFY_SESSION_TEMP_FD:-}" ]]; then
         trap '' INT TERM HUP
         stop_verify_step TERM
     fi
