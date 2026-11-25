@@ -2001,10 +2001,8 @@ const saved=new Map(),bodies=new Map(),bodyRequests=new Map();
 const pendingSaves=new Map(),recovering=new Map();
 const scrollDepartures=new Set();
 const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
-const missingReview='This review is no longer on the Review page.';
 let focusAfterLoad=null,firstRequest=firstReviewCard;
 let deferredLink=null,revealCreated=null,newItemRefresh;
-let missingCard=false;
 function allEntries(){return [...index.values()];}
 function isInvestigation(entry){return entry.type==='investigation' || entry.type==='bug';}
 function rowOwners(entry){
@@ -2129,6 +2127,8 @@ const showsByType=new Map(''' + json.dumps(tuple(SHOWS_BY_TYPE.items())) + r''')
 const showChoices=type=>showsByType.get(type) ?? showValues;
 const mountReviewRow=entry=>reviewCardSummary(entry,Number(content.dataset.titleLimit),
  filterRow('type').querySelector('[data-filter-value="'+entry.type+'"] .review-icon').outerHTML);
+const missingReview='This review is no longer on the Review page.';
+let missingCard=false;
 const view=createRecordTable({...reviewPlaceOptions,content:()=>content,
  entries:allEntries,mount:mountReviewRow,mounted:()=>loadBodies(),
  retainDetailState:(previous,row)=>{
@@ -2245,16 +2245,17 @@ function applyReviewSummary(row,entry){
  return focused ? toggle : null;
 }
 function applyReviewDetail(key,row,detail,text,bodyVersion=''){
- let body=text,focus=null;
+ const template=document.createElement('template');
+ template.innerHTML=text;
+ const summary=template.content.querySelector('[data-review-summary]');
+ let focus=null;
  if(bodyVersion && bodyVersion!==content.dataset.version){
-  const template=document.createElement('template');
-  template.innerHTML=text;
-  const summary=template.content.querySelector('[data-review-summary]');
   const entry=summary && readIndex(JSON.parse(summary.textContent)).get(key);
   if(!entry) throw new Error('The item has no summary for its snapshot.');
-  focus=applyReviewSummary(row,entry);body=template.content;
+  focus=applyReviewSummary(row,entry);
  }
- installReviewBody(row,body);
+ summary?.remove();
+ installReviewBody(row,template.content);
  const departure=saved.get(key);
  if(departure?.closes && departure.awaitingSnapshot)
   detail.querySelector('[data-review-form]')?.remove();

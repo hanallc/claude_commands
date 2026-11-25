@@ -681,7 +681,7 @@ window.fetch=(url,options)=>{
                 snapshot = review_page.build_snapshot(self.root)
                 self.assert_index_title(snapshot.records[key], title)
                 self.assertEqual(snapshot.title_limit, len(title))
-                detail = snapshot.body(key).decode().split('data-review-body>', 1)[1]
+                detail = snapshot.render_body(snapshot.records[key], snapshot.assets).decode().split('data-review-body>', 1)[1]
                 self.assertEqual(detail.count(title), 1)
                 self.assertNotIn('<h3>Item</h3>', detail)
 
@@ -701,7 +701,8 @@ window.fetch=(url,options)=>{
         source.record.item['parts'] = update_registration.QuestionParts(
             ask=ask, context='Choose the width.', items=[], choices=[], recommend='')
         update_registration.write_question_record(source.record)
-        detail = review_page.build_snapshot(self.root).body(key).decode()
+        snapshot = review_page.build_snapshot(self.root)
+        detail = snapshot.render_body(snapshot.records[key], snapshot.assets).decode()
         self.assertIn('<h3>Item</h3><p>'+title+'</p>', detail)
         self.assertEqual(detail.count(title), 1)
         self.assertEqual(detail.count(ask), 1)
@@ -3833,7 +3834,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
         row = change_page.answer_row(page, 'C1')
         self.assertEqual(review_events.decode(row['Review log']), (entry,))
         waiting = review_page.build_snapshot(self.root)
-        self.assertEqual(waiting.body(key).count(words.encode()), 1)
+        self.assertEqual(waiting.render_body(waiting.records[key], waiting.assets).count(words.encode()), 1)
 
     def test_both_change_pages_refuse_a_second_handoff(self) -> None:
         key = 'page-owner/C1'
@@ -8565,15 +8566,17 @@ window.fetch=async()=>({headers:new Headers(),ok:true,text:async()=>MARKUP});
    ['2026-12-08T7',fallback],['2026-12-08T24:00',fallback],['2026-12-08T23:60',fallback],
    ['2026-12-08T',fallback],['2027-02-29T09:00',fallback],['2026-12-08T1730','2026-12-08T17:30']
   ]){
-   const original=row(),wall=recordDetails(original).querySelector('[name="later"]');
+   const original=row(),version=original.dataset.bodyVersion;
+   const wall=recordDetails(original).querySelector('[name="later"]');
    wall.value=draft;wall.dispatchEvent(new Event('input',{bubbles:true}));
    dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
    const end=performance.now()+8000;
-   while(recordDetails(row()).querySelector('[data-review-form]')===wall.form){
-    if(performance.now()>end) throw new Error('The new form did not load.');
+   while(row().dataset.bodyLoaded!=='true' || row().dataset.bodyVersion===version){
+    if(performance.now()>end) throw new Error('The card did not refresh.');
     await new Promise(resolve=>requestAnimationFrame(resolve));
    }
    const current=row(),form=await readyReviewCard(current);
+   check(form===wall.form,'Refresh keeps the Later form.');
    check(current!==original && form.elements.later.value===draft,'Refresh restores '+draft);
    const toggle=form.querySelector('[data-later-toggle]'),chooser=form.querySelector('[data-later-custom]');
    toggle.click();form.querySelector('[data-later-choose]').click();
