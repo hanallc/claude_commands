@@ -525,14 +525,12 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   The runner prints `mac_test: running on the Mac (macOS, host <host>); tree copied in <N> s`.
   Nextest exit 4 becomes `NoTestMatchedOnMac` and runner exit 75.
   The runner prints `mac_test: no test matched on the Mac; running on natedev instead`.
-- **Abandoned compiler sessions.** Before a build on a Mac or Linux target, the step removes old abandoned compiler sessions and their locks.
+- **Abandoned compiler sessions.** Before a build on the Mac, the step removes old abandoned compiler sessions and their locks.
   It removes them only from its own mirror's default build folder.
   `abandoned_session_minutes` sets the minimum age.
   The bounded walk skips `deps`, `build`, `.fingerprint`, and `examples`.
   It preserves recent sessions and finished sessions.
   A Mac step skips this removal when it has an explicit `--target-dir`.
-  A Linux step skips this removal when `--target-dir` selects another folder.
-  A Linux step checks tool versions before this removal.
   A missing target or a failed removal does not stop the build.
 - **Cleanup.** After `echo mac_exit=$?` the remote command runs a cleanup step whatever the tests returned. When the verb arguments name `--target-dir` (or `--target-dir=`), it prints `mac_cleanup=skipped`. Otherwise it reads free GiB with `df -g "$HOME"`: below `free_floor_gib` it runs `rm -rf -- "$HOME"/.local/state/mac-test/mirror/<repo>/target` and prints `mac_cleanup=0` or the `rm` status; at or above the floor, or when `df` gives no number, it prints `mac_cleanup=kept` and the output stays for the next run. That path is the only thing it removes.
 - **Nextest output.** The Mac saves both output streams in a private file under `~/.local/state/mac-test/logs`.

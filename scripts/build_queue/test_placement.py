@@ -4665,16 +4665,19 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             settings, request, destination = self.target_settings_fixture(fixture)
             healthy_settings = fixture.root / "mac_test.conf"
             _ = write_config_fixture(healthy_settings, "host=healthy\nkinds=check\n")
-            destination = replace(destination, target="healthy", host="healthy")
+            _ = mac_claim_request(fixture)
+            scope = RepositoryScope("hana", HANA_REPOSITORY)
+            destination = replace(destination, provider="mac", target="healthy", host="healthy", scope=scope)
             request = replace(request, constraints=replace(request.constraints,
                 candidates=(placement.PlacementCandidate(destination),)))
             registry = fixture.root / "build_targets.conf"
+            _ = registry.write_text(registry.read_text().replace("platform.healthy=linux", "platform.healthy=macos"))
 
             def check_healthy() -> None:
                 target = records.effective_target("healthy", placement.ConfiguredProviderSettings())
-                self.assertEqual(target, target_config.SshTarget("healthy", "linux", healthy_settings))
-                self.assertEqual(claim_state.state_paths("healthy").platform, "linux")
-                with mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")):
+                self.assertEqual(target, target_config.SshTarget("healthy", "macos", healthy_settings))
+                self.assertEqual(claim_state.state_paths("healthy").platform, "macos")
+                with mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "healthy")):
                     evidence = self.read_target(fixture, request)
                 assert isinstance(evidence, placement.FreshHostEvidence), evidence
                 self.assertEqual(evidence.eligibility, ALLOWED_HOST)
@@ -4871,8 +4874,10 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             broken = "\n".join("floor_sweep_timeout_s=broken" if line.startswith("floor_sweep_timeout_s=") else line
                                for line in good.splitlines()) + "\n"
             _ = settings.write_text(broken)
-            with (mock.patch.object(mac_test, "free_now", return_value="bad"),
-                  mock.patch.object(build_targets, "start_probe_recovery") as start):
+            state = eligibility.state_directory(destination.target)
+            state.mkdir(parents=True, exist_ok=True)
+            (state / "failed_probe").touch()
+            with mock.patch.object(build_targets, "start_probe_recovery") as start:
                 evidence = self.read_target(fixture, request)
                 assert isinstance(evidence, placement.FreshHostEvidence), evidence
                 self.assertEqual(evidence.eligibility, ALLOWED_HOST)
@@ -4889,8 +4894,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 controller.mac_repository = mirror.claim_repository()
                 return offload.FreshMacClaim(1)
 
-            with (mock.patch.object(mac_test, "free_now", return_value="bad"),
-                  mock.patch.object(copies, "remote_lease", return_value=nullcontext()),
+            with (mock.patch.object(copies, "remote_lease", return_value=nullcontext()),
                   mock.patch.object(offload, "request_mirror"),
                   mock.patch.object(offload, "claim_for_run", side_effect=claim),
                   mock.patch.object(offload, "copy_tracked_scripts", return_value=True),

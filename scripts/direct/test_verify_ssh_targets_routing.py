@@ -195,34 +195,47 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
         self.assertEqual(self.last_call()["mac_reason"], "")
         self.assertEqual(len(self.local_runs()), 1)
 
-    def test_free_linux_target_takes_a_queued_test_without_a_local_hold(self) -> None:
+    def test_free_mac_target_takes_a_queued_test_without_a_local_hold(self) -> None:
+        self.configure("mac,natedev")
+        self.enable_mac()
         _ = self.hold_memory()
         result = self.verify("test", "sample", "--no-cache")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         event, = self.ssh_events()
-        self.assertEqual(event["target"], "linux")
+        self.assertEqual(event["target"], "mac")
         self.assertTrue(event["reserved"])
         self.assertTrue(event["same_path"])
         self.assertGreater(event["owner"], 0)
         self.assertEqual(event["slot"], 1)
-        self.assertEqual(event["result_type"], "PassedOnTarget")
+        self.assertEqual(event["result_type"], "PassedOnMac")
         self.assertEqual(event["memory_reservation"], "")
         self.assertEqual(self.local_runs(), [])
-        self.assertEqual(self.routing_record()["target"], "linux")
+        self.assertEqual(self.routing_record()["target"], "mac")
 
-    def test_linux_slot_takes_a_queued_check_without_a_local_hold(self) -> None:
+    def test_mac_slot_takes_a_queued_check_without_a_local_hold(self) -> None:
+        self.configure("mac,natedev")
+        self.enable_mac()
         _ = self.hold_memory()
         result = self.verify("check", "sample", "--no-cache")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         event, = self.ssh_events()
-        self.assertEqual(event["target"], "linux")
+        self.assertEqual(event["target"], "mac")
         self.assertTrue(event["reserved"])
         self.assertTrue(event["same_path"])
         self.assertEqual(event["memory_reservation"], "")
-        self.assertEqual(event["actions"][:3], ["claim:0", "scripts-copy", "source-copy"])
-        self.assertLess(event["actions"].index("source-copy"), event["actions"].index("probe"))
+        self.assertEqual(event["actions"][:4], ["claim:0", "probe", "source-copy", "run"])
         self.assertFalse(any(row["args"][:1] == ["check"] for row in self.cargo_events()))
-        self.assertEqual(self.routing_record()["target"], "linux")
+        self.assertEqual(self.routing_record()["target"], "mac")
+
+    def test_pinned_linux_ssh_refuses_test_and_check_without_contact(self) -> None:
+        self.configure("natedev,linux")
+        for kind in ("test", "check"):
+            with self.subTest(kind=kind):
+                result = self.verify(kind, "sample", "--target", "linux")
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("target linux refused: target does not permit this command", result.stderr)
+                self.assertEqual(self.ssh_events(), [])
+                self.assertEqual(self.local_runs(), [])
 
     def test_held_local_target_does_not_block_linux_check(self) -> None:
         _ = self.routing_fixture()

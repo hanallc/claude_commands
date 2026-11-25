@@ -745,7 +745,12 @@ def command_probe_backoff(name: str, *, probe: bool) -> int:
         return 0
     if not probe:
         return 1
-    config = ssh_target_config(target_config.configured_ssh_target(name))
+    target = target_config.configured_ssh_target(name)
+    if target.platform == "linux":
+        if target.name != eligibility.MAC_LINUX_TARGET:
+            print(eligibility.LINUX_SSH_OFFLOAD_REFUSED, file=sys.stderr)
+        return 1
+    config = ssh_target_config(target)
     # A target without an offload probe keeps its backoff until its own route clears it.
     if isinstance(config, ExcludedTarget):
         return 1
@@ -1257,6 +1262,12 @@ def command_reserve(args: CliArguments) -> int:
             target = target_config.configured_ssh_target(name)
             if settings != str(target.settings):
                 destination.unlink()
+                return 1
+            if target.platform == "linux":
+                from scripts.mac_test import eligibility
+
+                destination.unlink()
+                print(eligibility.LINUX_SSH_OFFLOAD_REFUSED, file=sys.stderr)
                 return 1
             config = ssh_target_config(target)
             if not isinstance(config, ExcludedTarget):

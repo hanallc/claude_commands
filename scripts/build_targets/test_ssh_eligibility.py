@@ -35,6 +35,9 @@ from scripts.aws_target.ledger_test_support import REAL_POPEN, instant
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture
 
 
+REAL_MAC_PROBE = offload.probe_mac
+
+
 class SshEligibilityTests(unittest.TestCase):
     root: Path = Path()
     commands: list[list[str]] = []
@@ -103,6 +106,13 @@ class SshEligibilityTests(unittest.TestCase):
         self.assertEqual(argv[-1], "true", "Routing must not evaluate a shell")
         return offload.CommandOutput(0 if self.reachable else 255, "", "")
 
+    def capture_mac_probe(self, arguments: Sequence[str], _deadline: offload.CommandDeadline) -> offload.CommandOutput:
+        self.commands.append(list(arguments))
+        self.assertEqual(arguments[0], "ssh")
+        self.assertEqual(arguments[-1], offload.probe_script(eligibility.KnownRepository("hana")))
+        return offload.CommandOutput(0, "free_gib=100\nhost=fixture\nrc=0\n", "") if self.reachable else (
+            offload.CommandOutput(255, "", "fixture connection failed"))
+
     def answer(self, kind: str = "test", local: bool = False) -> list[list[str]]:
         output = io.StringIO()
         arguments = ["build_targets.py", "eligible", "--kind", kind, "--repo-root", str(self.root),
@@ -120,12 +130,19 @@ class SshEligibilityTests(unittest.TestCase):
     def linux(self, kind: str = "test", local: bool = False) -> list[str]:
         return next(row for row in self.answer(kind, local) if row[0] == "linux")
 
-    def occupy(self, pid: int) -> None:
+    def occupy(self, pid: int, target: str = "linux") -> None:
         args = mac_test.CliArguments()
-        args.target, args.worktree, args.pid = "linux", str(self.root), pid
-        args.what, args.remote = "check hana", "fake-linux"
+        args.target, args.worktree, args.pid = target, str(self.root), pid
+        args.what, args.remote = "check hana", f"fake-{target}"
         with redirect_stdout(io.StringIO()):
-            self.assertEqual(mac_test.command_claim(args, mac_test.state_paths("linux")), 0)
+            self.assertEqual(mac_test.command_claim(args, mac_test.state_paths(target)), 0)
+
+    def enable_mac_for_tests(self) -> None:
+        _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.hana=\n")
+
+    def mac_probe_commands(self) -> None:
+        _ = self.enterContext(mock.patch.object(offload, "probe_mac", new=REAL_MAC_PROBE))
+        _ = self.enterContext(mock.patch.object(offload.ProcessController, "capture", side_effect=self.capture_mac_probe))
 
     def decision(self) -> str:
         output = io.StringIO()
@@ -251,19 +268,20 @@ class SshEligibilityTests(unittest.TestCase):
 
     def add_spare_target(self) -> None:
         _ = write_config_fixture(self.root / "spare.conf",
-                                 "offload=on\nhost=fake-spare\nkinds=test,check,doc\n", template="mac_test")
+                                 "offload=on\nhost=fake-spare\n", template="mac_test")
         table = self.root / "build_targets.conf"
         _ = table.write_text(table.read_text().replace("targets=mac,natedev,linux", "targets=mac,natedev,linux,spare")
-                             + "kind.spare=ssh\nplatform.spare=linux\nsettings.spare=spare.conf\n")
+                             + "kind.spare=ssh\nplatform.spare=macos\nsettings.spare=spare.conf\n")
 
     def test_wait_release_matches_the_acquired_attempt(self) -> None:
-        self.assertEqual(self.reserve(), 0)
-        paths = mac_test.state_paths("linux")
+        self.enable_mac_for_tests()
+        self.assertEqual(self.reserve("mac"), 0)
+        paths = mac_test.state_paths("mac")
         fields = (self.root / "reservation.identity").read_text().split("\t")
         previous = claim_state.ClaimIdentity(fields[0], fields[1], fields[2])
         self.assertEqual(build_targets.command_release_wait(501, identity=previous), 0)
         (self.root / "reservation.tsv").unlink()
-        self.assertEqual(self.reserve(), 0)
+        self.assertEqual(self.reserve("mac"), 0)
         current, = mac_test.read_claims(paths)
         fields = (self.root / "reservation.identity").read_text().split("\t")
         acquired = claim_state.ClaimIdentity(fields[0], fields[1], fields[2])
@@ -295,7 +313,9 @@ class SshEligibilityTests(unittest.TestCase):
         self.assertEqual(self.decision(), "any_target")
         self.assertEqual(self.commands, [])
 
-    def test_unreachable_linux_target_keeps_the_memory_leave_route(self) -> None:
+    def test_unreachable_mac_keeps_the_memory_leave_route(self) -> None:
+        self.enable_mac_for_tests()
+        self.mac_probe_commands()
         self.reachable = False
         self.assertEqual(self.decision(), "any_target")
         self.assertTrue(self.commands)
@@ -312,19 +332,21 @@ class SshEligibilityTests(unittest.TestCase):
             self.assertEqual(self.decision(), "any_target")
         self.assertEqual(self.commands, [])
 
-    def test_linux_only_work_keeps_linux_capacity_without_a_mac(self) -> None:
+    def test_linux_only_work_keeps_local_capacity_without_ssh(self) -> None:
         rows = self.answer()
         self.assertEqual([row[0] for row in rows], ["mac", "natedev", "linux"])
         self.assertEqual(rows[0][1:3], ["excluded", "linux_only"])
-        self.assertEqual(rows[2][1:3], ["eligible", "-"])
+        self.assertEqual(rows[1][1:3], ["eligible", "-"])
+        self.assertEqual(rows[2][1:3], ["excluded", "target does not permit this command"])
         self.assertEqual([row[4] for row in rows], ["macos", "-", "linux"])
-        self.assertTrue(self.commands)
+        self.assertEqual(self.commands, [])
 
-    def test_linux_test_check_and_doc_need_no_mac_repository_setting(self) -> None:
+    def test_linux_ssh_refuses_test_check_and_doc_before_contact(self) -> None:
         self.mac_offload_off()
         for kind in ("test", "check", "doc"):
             with self.subTest(kind=kind):
-                self.assertEqual(self.linux(kind)[1], "eligible")
+                self.assertEqual(self.linux(kind)[1:3], ["excluded", "target does not permit this command"])
+        self.assertEqual(self.commands, [])
 
     def test_local_only_request_excludes_every_ssh_target(self) -> None:
         rows = self.answer(local=True)
@@ -339,36 +361,39 @@ class SshEligibilityTests(unittest.TestCase):
                 self.assertEqual(self.linux(kind)[1], "excluded")
         self.assertEqual(self.commands, [])
 
-    def test_configured_kinds_are_read_on_each_eligibility_check(self) -> None:
-        self.mac_offload_off()
-        self.assertEqual(self.linux("check")[1], "eligible")
-        _ = write_config_fixture(self.root / "linux.conf", "offload=on\nkinds=test,doc\n")
-        self.assertEqual(self.linux("check")[1], "excluded")
-
-    def test_mac_backoff_does_not_exclude_linux_but_linux_backoff_does(self) -> None:
+    def test_mac_backoff_is_specific_to_each_target(self) -> None:
+        self.add_spare_target()
         offload.write_backoff(10**12, "mac")
-        self.assertEqual(self.linux()[1], "eligible")
+        with mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "spare")) as probe:
+            self.assertEqual(next(row for row in self.answer() if row[0] == "spare")[1], "eligible")
+        probe.assert_called_once()
         self.commands.clear()
-        offload.write_backoff(10**12, "linux")
-        self.assertEqual(self.linux()[1:3], ["excluded", "backoff"])
+        offload.write_backoff(10**12, "spare")
+        self.assertEqual(next(row for row in self.answer() if row[0] == "spare")[1:3], ["excluded", "backoff"])
         self.assertEqual(self.commands, [])
 
     def test_occupied_repository_excludes_target_before_ssh(self) -> None:
-        self.occupy(71)
-        self.assertEqual(self.linux()[1:3], ["excluded", "busy"])
+        self.enable_mac_for_tests()
+        self.occupy(71, "mac")
+        target = target_config.configured_ssh_target("mac")
+        self.assertEqual(mac_test.free_now(mac_test.state_paths("mac"), target.settings, self.root), "busy")
         self.assertEqual(self.commands, [])
 
     def test_unreachable_host_is_excluded_without_shell_evaluation(self) -> None:
+        self.enable_mac_for_tests()
+        self.mac_probe_commands()
         self.reachable = False
-        self.assertEqual(self.linux()[1:3], ["excluded", "unreachable"])
+        self.assertEqual(next(row for row in self.answer() if row[0] == "mac")[1:3], ["excluded", "unreachable"])
         self.assertTrue(self.commands)
 
     def test_queue_retries_never_evaluate_or_reserve_a_shell(self) -> None:
+        self.enable_mac_for_tests()
+        self.mac_probe_commands()
         with mock.patch.object(mac_test, "command_claim", side_effect=AssertionError("Routing cannot reserve")):
             for _ in range(3):
-                self.assertEqual(self.linux()[1], "eligible")
+                self.assertEqual(next(row for row in self.answer() if row[0] == "mac")[1], "eligible")
         self.assertTrue(self.commands)
-        self.assertEqual(mac_test.read_claims(mac_test.state_paths("linux")), ())
+        self.assertEqual(mac_test.read_claims(mac_test.state_paths("mac")), ())
 
 
 if __name__ == "__main__":

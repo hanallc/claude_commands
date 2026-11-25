@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -93,6 +94,129 @@ class DevShellTests(unittest.TestCase):
         with mock.patch.object(subprocess, 'run', return_value=result) as evaluate:
             _ = dev_shell.prepare_shell(self.root / 'workspace', self.root / 'cache', 'default', 3)
         self.assertEqual(evaluate.call_args.kwargs['pass_fds'], ())
+
+    def cache_workspace(self) -> Path:
+        workspace = self.root / "workspace"
+        (workspace / "nix").mkdir()
+        _ = (workspace / "nix/shell.nix").write_text("{}\n")
+        (workspace / "src").mkdir()
+        (workspace / "target").mkdir()
+        _ = (workspace / "private.conf").write_text("private fixture\n")
+        _ = (workspace / "target/large-build").write_text("build fixture\n")
+        _ = (self.root / "bin/nix").write_text(
+            "#!/usr/bin/env bash\n"
+            + "printf '%s\\n' \"$*\" >> \"$NIX_CALLS\"\n"
+            + '[[ -z "$NIX_FAILS" ]] || exit 1\n'
+            + "printf '%s\\n' 'export TEST_SHELL_PROOF=loaded'\n")
+        return workspace
+
+    def prepare_cached_shell(self, workspace: Path, selector: str = "ci", **extra: str) -> dev_shell.ShellEnvironment:
+        with mock.patch.dict(os.environ, {**self.environment, "NIX_FAILS": "", **extra}, clear=True):
+            return dev_shell.prepare_shell(workspace, self.root / "cache", selector, 3)
+
+    def shell_calls(self) -> list[str]:
+        return (self.root / "calls").read_text().splitlines()
+
+    def use_cached_shell(self, workspace: Path, shell: dev_shell.ShellEnvironment) -> tuple[str, str, str]:
+        script = 'source "$1"\nwarm=no\nif [[ -f target/warm-proof ]]; then warm=yes; fi\n'
+        script += 'printf "warm\\n" > target/warm-proof\nprintf "%s\\n" "$TEST_SHELL_PROOF" "$warm" "$PWD"\n'
+        result = subprocess.run(["bash", "-c", script, "shell-test", str(shell.exports)],
+                                cwd=workspace, capture_output=True, text=True, check=True)
+        proof, warm, cwd = result.stdout.splitlines()
+        return proof, warm, cwd
+
+    def test_shell_inputs_exclude_source_build_files_and_private_files(self) -> None:
+        workspace = self.cache_workspace()
+        _ = (workspace / "src/main.rs").write_text("fn main() {}\n")
+        shell = self.prepare_cached_shell(workspace)
+
+        calls = self.shell_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].endswith(f"path:{shell.inputs}#ci"))
+        inputs = sorted(path.relative_to(shell.inputs).as_posix() for path in shell.inputs.rglob("*") if path.is_file())
+        self.assertEqual(inputs, ["flake.lock", "flake.nix", "nix/shell.nix"])
+        self.assertEqual(self.use_cached_shell(workspace, shell)[0], "loaded")
+
+    def test_unchanged_inputs_reuse_exports_and_the_build_mirror(self) -> None:
+        workspace = self.cache_workspace()
+        first = self.prepare_cached_shell(workspace)
+        _ = self.use_cached_shell(workspace, first)
+        _ = (workspace / "src/main.rs").write_text('fn main() { println!("changed"); }\n')
+
+        _, warm, cwd = self.use_cached_shell(workspace, self.prepare_cached_shell(workspace))
+
+        self.assertEqual(len(self.shell_calls()), 1)
+        self.assertEqual(warm, "yes")
+        self.assertEqual(cwd, str(workspace))
+        self.assertTrue((workspace / "target/warm-proof").is_file())
+
+    def test_shell_content_and_path_changes_invalidate_exports(self) -> None:
+        workspace = self.cache_workspace()
+        _ = self.prepare_cached_shell(workspace)
+        _ = (workspace / "nix/shell.nix").write_text("{ changed = true; }\n")
+        _ = self.prepare_cached_shell(workspace)
+        _ = (workspace / "nix/shell.nix").rename(workspace / "nix/renamed.nix")
+        _ = self.prepare_cached_shell(workspace)
+
+        self.assertEqual(len(self.shell_calls()), 3)
+
+    def test_shell_selector_change_invalidates_exports(self) -> None:
+        workspace = self.cache_workspace()
+        _ = self.prepare_cached_shell(workspace)
+        _ = self.prepare_cached_shell(workspace, "other")
+
+        calls = self.shell_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[-1].endswith("#other"))
+
+    def test_each_top_level_flake_input_change_invalidates_exports(self) -> None:
+        workspace = self.cache_workspace()
+        _ = self.prepare_cached_shell(workspace)
+        for count, name in enumerate(("flake.nix", "flake.lock"), start=2):
+            with self.subTest(name=name):
+                path = workspace / name
+                _ = path.write_text(path.read_text() + "\n")
+                _ = self.prepare_cached_shell(workspace)
+                self.assertEqual(len(self.shell_calls()), count)
+
+    def test_partial_cache_directory_requires_a_new_evaluation(self) -> None:
+        workspace = self.cache_workspace()
+        key = dev_shell.shell_key(workspace, "ci")
+        partial = self.root / "cache" / key / "inputs"
+        for name in ("flake.nix", "flake.lock", "nix/shell.nix"):
+            path = partial / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_text((workspace / name).read_text())
+
+        shell = self.prepare_cached_shell(workspace)
+
+        self.assertEqual(len(self.shell_calls()), 1)
+        self.assertEqual(self.use_cached_shell(workspace, shell)[0], "loaded")
+
+    def test_missing_store_path_in_cached_exports_requires_a_new_evaluation(self) -> None:
+        workspace = self.cache_workspace()
+        first = self.prepare_cached_shell(workspace)
+        missing = "/nix/store/00000000000000000000000000000000-fixture-collected-shell/bin"
+        self.assertFalse(Path(missing).exists())
+        _ = first.exports.write_text(f"export PATH={shlex.quote(missing)}:$PATH\nexport TEST_SHELL_PROOF=stale\n")
+
+        shell = self.prepare_cached_shell(workspace)
+
+        self.assertEqual(len(self.shell_calls()), 2)
+        self.assertEqual(self.use_cached_shell(workspace, shell)[0], "loaded")
+
+    def test_failed_evaluation_never_publishes_usable_exports(self) -> None:
+        workspace = self.cache_workspace()
+        with self.assertRaises(subprocess.CalledProcessError) as failure:
+            shell = self.prepare_cached_shell(workspace, NIX_FAILS="1")
+            _ = self.use_cached_shell(workspace, shell)
+        self.assertFalse((workspace / "target/warm-proof").exists(), str(failure.exception))
+        self.assertNotIn("mac_exit=0\n", str(failure.exception))
+        self.assertEqual(list((self.root / "cache").rglob("exports.sh")), [])
+
+        shell = self.prepare_cached_shell(workspace)
+        self.assertEqual(self.use_cached_shell(workspace, shell)[0], "loaded")
+        self.assertEqual(len(self.shell_calls()), 2)
 
     def test_invoke_adds_the_folders_last_and_only_outside_a_nix_shell(self) -> None:
         library = self.root / "lib"

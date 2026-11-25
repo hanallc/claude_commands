@@ -118,6 +118,38 @@ class FolderInvocationTests(NotificationGuardedTestCase):
         read_config.assert_not_called()
         probe.assert_not_called()
 
+    def test_linux_ssh_retry_probe_refuses_and_keeps_backoff(self) -> None:
+        target = target_config.SshTarget("linux", "linux", Path("unused.conf"))
+        with (mock.patch.object(target_config, "configured_ssh_target", return_value=target),
+              mock.patch.object(eligibility, "read_backoff", return_value=eligibility.ActiveBackoff()),
+              mock.patch.object(offload, "probe_reachability") as probe,
+              mock.patch.object(offload, "record_reachable") as record,
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(build_targets.command_probe_backoff(target.name, probe=True), 1)
+        self.assertEqual(errors.getvalue(), "target does not permit this command\n")
+        probe.assert_not_called()
+        record.assert_not_called()
+
+    def test_saved_linux_ssh_reservation_refuses_a_live_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = target_config.SshTarget("linux", "linux", root / "linux.conf")
+            destination = root / "reservation"
+            _ = destination.write_text(f"{target.name}\t{target.settings}\n")
+            args = build_targets.CliArguments()
+            args.target, args.kind, args.repo_root = target.name, "test", str(root)
+            args.reservation_file, args.pid = str(destination), os.getpid()
+            identity = claim_state.ClaimIdentity("saved", "episode", "attempt")
+            with (mock.patch.object(target_config, "configured_ssh_target", return_value=target),
+                  mock.patch.object(build_targets, "wait_claim_identity", return_value=identity) as read,
+                  mock.patch.object(build_targets, "publish_wait_reservation") as publish,
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(build_targets.command_reserve(args), 1)
+            self.assertEqual(errors.getvalue(), "target does not permit this command\n")
+            self.assertFalse(destination.exists())
+            read.assert_not_called()
+            publish.assert_not_called()
+
     def test_verify_commands_open_each_config_once(self) -> None:
         code = """import io, json, os, runpy, sys
 from contextlib import redirect_stdout

@@ -529,8 +529,10 @@ fi
     def test_stopped_recovery_releases_its_claim_and_the_next_step_can_recover(self) -> None:
         self.fixture["probe_status"] = 255
         with redirect_stderr(io.StringIO()):
-            self.assertIsInstance(self.probe(), offload.UnavailableProbe)
+            self.assertIsInstance(self.probe("mac"), offload.UnavailableProbe)
         self.healthy()
+        self.config.update({f"parity.{name}": "fixture" for name in ("rustc", "nextest", "mend", "scripts_commit")})
+        self.sync_config()
         self.install_script_copy_tools()
         ready = self.install_probe_gate()
         reaped = threading.Event()
@@ -545,10 +547,10 @@ fi
             return result
 
         _ = self.enterContext(mock.patch.object(os, "waitpid", side_effect=observe_reap))
-        build_targets.start_probe_recovery(target_config.configured_ssh_target("box"), self.repository, "hana", "test")
+        build_targets.start_probe_recovery(target_config.configured_ssh_target("mac"), self.repository, "hana", "test")
         with ready.open() as notification:
             self.assertEqual(notification.readline(), "ready\n")
-        claim, = mac_test.read_claims(mac_test.state_paths("box"))
+        claim, = mac_test.read_claims(mac_test.state_paths("mac"))
 
         def stop_recovery_group() -> None:
             try:
@@ -558,20 +560,20 @@ fi
 
         self.addCleanup(stop_recovery_group)
         os.kill(claim.record["pid"], signal.SIGTERM)
-        with (eligibility.state_directory("box") / "recovery-probe.lock").open("a") as lock:
+        with (eligibility.state_directory("mac") / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-        self.assertEqual(mac_test.read_claims(mac_test.state_paths("box")), ())
-        self.assertEqual(self.free(), "bad")
+        self.assertEqual(mac_test.read_claims(mac_test.state_paths("mac")), ())
+        self.assertEqual(self.free("mac"), "bad")
         self.assertTrue(reaped.wait(5), "the recovery child was not reaped")
         pid, status = statuses[0]
         self.assertEqual(pid, claim.record["pid"])
         self.assertEqual(os.waitstatus_to_exitcode(status), 143)
-        result = build_targets.ssh_target_eligibility(target_config.configured_ssh_target("box"),
+        result = build_targets.ssh_target_eligibility(target_config.configured_ssh_target("mac"),
             self.repository, "hana", "test", targets.ANY_ELIGIBLE_TARGET, new_step=True)
         self.assertIsInstance(result, targets.EligibleTarget)
-        with (eligibility.state_directory("box") / "recovery-probe.lock").open("a") as lock:
+        with (eligibility.state_directory("mac") / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-        self.assertEqual(self.free(), "free")
+        self.assertEqual(self.free("mac"), "free")
 
     def test_recovery_preserves_the_repository_decline_when_tools_still_differ(self) -> None:
         self.fixture["probe_status"] = 255
