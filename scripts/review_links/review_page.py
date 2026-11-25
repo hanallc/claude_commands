@@ -1020,12 +1020,15 @@ def for_you_details(item: ReviewItem, row: for_you.ForYouRow, inputs: ReviewBody
     asker = inputs.names.html(row.requester_reference, requester) if rebuild else inputs.names.html(item.owner, requester)
     if rebuild and not row.requests:
         asker = 'Found by the system check'
+    completion = 'Manual'
+    if row.completion == 'automatic':
+        completion = 'Automatic after rebuild' if rebuild else 'Automatic'
     fields = (
         ('Machine', html.escape(row.machine)),
         ('Working directory', html.escape(row.cwd or 'Not recorded')),
         ('Asked by' if rebuild else 'Requester', asker),
         *(() if rebuild else (('Waiting work', html.escape(row.waits)),)),
-        ('Completion', 'Automatic after rebuild' if row.completion == 'automatic' else 'Manual'),
+        ('Completion', completion),
     )
     metadata = '<dl class="page-state">'+''.join(f'<dt>{label}</dt><dd>{text}</dd>' for label, text in fields)+'</dl>'
     reason = section('Reason', row.reason) if row.reason else ''
@@ -1046,9 +1049,10 @@ def for_you_details(item: ReviewItem, row: for_you.ForYouRow, inputs: ReviewBody
         reason = '<section><h3>Why</h3>' + history + comparison + '</section>'
         if not row.running_revision:
             reason += '<p class="rebuild-secondary">The running revision is unknown.</p>'
+    form_item = replace(item, actions=('done',)) if row.kind == 'action' and row.status == 'open' else item
     return ('<div class="list-panel review-panel for-you"><div data-review-body>'
             +page_frame.copy_code_block(row.command)+reason+evidence+link+'</div><div>'+metadata+'</div>'
-            +form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets),
+            +form(form_item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets),
                   routes=change_browser.send_route_attributes({"done": None}))+'</div>')
 
 
@@ -1316,7 +1320,7 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         item = read_current()
         source = item.source
         if (outcome != 'done' or not isinstance(source, review_items.ForYouSource)
-                or source.row.kind != 'action' or source.row.completion != 'manual'):
+                or source.row.kind != 'action'):
             raise question_record.AnswerRefused('Choose an action on this card.')
         if source.row.status == 'done':
             return change_page.NoMessageDelivery(), 'Done'

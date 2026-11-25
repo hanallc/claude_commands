@@ -706,6 +706,8 @@ The saved script name identifies the callback.
 The current callback invokes the installed Mac gate script to stop the attempt.
 It checks the saved checkout path even if the attempt folder is absent.
 For older inline checkouts without a journal, it checks for test processes before removal.
+Cleanup checks the disk device and mount before it makes one detach attempt per gate image.
+A failed detach reports the error and keeps the gate folder.
 Custom callbacks use their saved path.
 The queue removes its run record and receipt after the callback confirms cleanup.
 
