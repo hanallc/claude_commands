@@ -1946,9 +1946,9 @@ def keyed_question(production: QuestionScope, identities: QuestionStaff, key: st
     return matches[0] if matches else None
 
 
-def numbered_question(owner: staff.StaffId, identity: str, folder: Path) -> QuestionRecord | None:
+def numbered_question(owner: staff.StaffId, identity: str, *folders: Path) -> QuestionRecord | None:
     """Read one staff question by its fixed owner and number."""
-    return _find_question(owner, identity, "questions", folder)
+    return _find_question(owner, identity, "questions", *folders)
 
 def _ask_recipient(production: QuestionScope, text: str, parts: QuestionParts,
                    identities: QuestionStaff, outgoing: QuestionFromReview) -> QuestionRecord:

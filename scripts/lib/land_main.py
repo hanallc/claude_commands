@@ -136,6 +136,13 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
         sha = checked("rev-parse", "--verify", f"{commit}^{{commit}}")
         _ = checked("fetch", "origin", branch)
         origin = checked("rev-parse", "FETCH_HEAD")
+        default = git("symbolic-ref", "refs/remotes/origin/HEAD")
+        if not default.returncode:
+            default_branch = default.stdout.strip().removeprefix("refs/remotes/origin/")
+        else:
+            origin_head = checked("ls-remote", "--symref", "origin", "HEAD")
+            redirect, _, _ = origin_head.partition("\tHEAD")
+            default_branch = redirect.removeprefix("ref: refs/heads/") if redirect.startswith("ref: refs/heads/") else "main"
         pushed: Pushed | AlreadyLanded
         if origin == sha:
             pushed = AlreadyLanded()
@@ -144,19 +151,18 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
         else:
             if git("merge-base", "--is-ancestor", origin, sha).returncode:
                 raise NotFastForward(f"origin/{branch} does not fast-forward to {sha}")
-            git_timeout = time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None
-            try:
-                behavior_check.require_review(behavior_check.GitRange(checkout, origin, sha), timeout=git_timeout)
-            except (behavior_check.BehaviorCheckError, OSError) as error:
-                raise LandError(str(error)) from error
+            if branch == default_branch:
+                git_timeout = time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None
+                try:
+                    behavior_check.require_review(behavior_check.GitRange(checkout, origin, sha), timeout=git_timeout)
+                except (behavior_check.BehaviorCheckError, OSError) as error:
+                    raise LandError(str(error)) from error
             _ = checked("push", "origin", f"{sha}:refs/heads/{branch}")
             pushed = Pushed()
-        default = git("symbolic-ref", "refs/remotes/origin/HEAD")
-        default_branch = default.stdout.strip().removeprefix("refs/remotes/origin/") if not default.returncode else "main"
-        root = Path(checked("rev-parse", "--show-toplevel"))
-        hook = root / ".claude/config/post_push.sh"
         if branch != default_branch:
             return Landed(sha, branch, pushed, HookSkipped())
+        root = Path(checked("rev-parse", "--show-toplevel"))
+        hook = root / ".claude/config/post_push.sh"
         if not hook.is_file():
             return Landed(sha, branch, pushed, HookAbsent())
         record = Path(checked("rev-parse", "--path-format=absolute", "--git-common-dir")) / "post-push-completed"

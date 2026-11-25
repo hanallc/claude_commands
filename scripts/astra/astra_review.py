@@ -20,11 +20,15 @@ import os
 import subprocess
 import sys
 import time
+from tempfile import mkdtemp
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 from scripts.astra import astra_work, design_roles  # noqa: E402
-from scripts.lib import unit_runs
+from scripts.herdr import herdr, herdr_types, pane_launch
+from scripts.lib import file_lock, unit_runs
 from scripts.production import staff, worker
 from scripts.direct import progress_history, recorder_state
 from scripts.lib.atomic_file import write_text_atomic
@@ -85,23 +89,54 @@ def tail(text: str) -> str:
     return "\n".join(text.strip().splitlines()[-ERROR_TAIL_LINES:])
 
 
-def _managed_review(review: Path, log: Path, target: str, cwd: Path) -> int:
+def review_attempt_folder() -> Path:
+    root = unit_runs.ASTRA_RUN_ROOT
+    root.mkdir(parents=True, exist_ok=True)
+    return Path(mkdtemp(prefix="behavior-", dir=root))
+
+
+def consultation_active(run: Path) -> bool:
+    try:
+        session = (run / "consultation-session").read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return False
+    client = herdr.Herdr(session)
+    name = f"astra-reviewer-{run.name}"
+    try:
+        launches = pane_launch.read_strict(pane_launch.record_directory() / f"{session}.json")
+        review_panes = {identity for identity, launch in launches.items()
+                        if cast(Mapping[str, object], launch).get("name") == name}
+        return any(isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneRunning)
+                   for pane in client.panes() if pane.get("label") == name or pane["pane_id"] in review_panes)
+    except herdr_types.HerdrFailure as error:
+        raise OSError(f"Cannot check the review pane in {session}: {error}") from error
+
+
+def _managed_review(review: Path, log: Path, target: str, cwd: Path,
+                    dispatch_lock: file_lock.ExclusiveLock | None) -> int:
     """Run one managed review through assign.sh."""
     run = log.parent
+    name = f"astra-reviewer{os.getpid()}"
+    if dispatch_lock is not None and target == "consultation-pane":
+        name = f"astra-reviewer-{run.name}"
+        write_text_atomic(run / "consultation-session", herdr.shared_session() + "\n", new_file_mode=0o600)
+    # Keep the lock until the launcher exits if its caller stops.
     with log.open("w", encoding="utf-8") as output:
         result = subprocess.run([
             "bash", str(SCRIPTS / "direct/assign.sh"), "--role", "review", "--operation", "astra-review",
             "--target", target, "--policy", "astra-reviewer",
-            "--new-worker", f"astra-reviewer{os.getpid()}", "--session-dir", str(run), "--cwd", str(cwd),
+            "--new-worker", name, "--session-dir", str(run), "--cwd", str(cwd),
             "--prompt", str(run / "prompt.md"), "--reply-file", str(review.resolve()), "--log", str(run / "turn.log"),
             "--model", MODEL, "--effort", REASONING,
-        ], stdout=output, stderr=subprocess.STDOUT, text=True, check=False)
+        ], stdout=output, stderr=subprocess.STDOUT, text=True, check=False,
+            pass_fds=() if dispatch_lock is None else (dispatch_lock.descriptor,))
     if result.returncode == 0 and log.read_text(encoding="utf-8").splitlines()[-1:] == ["submitted"]:
         return worker.DispatchSubmission.SUBMITTED
     return result.returncode
 
 
-def run_review(review: Path, prompt: str, log: Path, *, cwd: Path | None = None) -> int:
+def run_review(review: Path, prompt: str, log: Path, *, cwd: Path | None = None,
+               dispatch_lock: file_lock.ExclusiveLock | None = None) -> int:
     """Run each review through its explicit assign.sh target."""
     manager = staff.runtime_id()
     caller = staff.snapshot().by_current_session(manager) if manager else None
@@ -109,7 +144,7 @@ def run_review(review: Path, prompt: str, log: Path, *, cwd: Path | None = None)
     if caller is not None and caller.kind in ("unit", "showrunner"):
         target = "staff-worker"
     write_text_atomic(log.parent / "prompt.md", prompt)
-    return _managed_review(review, log, target, cwd if cwd is not None else Path.cwd())
+    return _managed_review(review, log, target, cwd if cwd is not None else Path.cwd(), dispatch_lock)
 
 
 submitted_review = design_roles.submitted_review

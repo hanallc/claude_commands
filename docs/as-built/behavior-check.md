@@ -6,9 +6,16 @@ Run `scripts/lib/py scripts/production/behavior_check.py find --repo CHECKOUT --
 
 The finder reads Python test functions and Rust functions with test attributes. It skips new tests and tests that move with the same text.
 
-The key hashes the test IDs and their old and new text. A merge with the same test changes uses the same key.
+The key hashes the origin identity, the whole patch, and the old and new test text.
+A merge with the same patch in the same repository uses the same key.
 
-`land_main.py` fetches the destination under the push lock. Before the push it checks the fetched tip against the commit. Only a clear or Yes record permits the push when the range changes an existing test.
+`land_main.py` checks default-branch pushes against the fetched tip under the push lock.
+The PR script checks the range from the merge base to the PR head.
+It reads the head and base again before merge and supplies the checked head to GitHub.
+
+A clear record names the saved reviewer reply.
+The gate checks that the reply has a finding of no user decision for each changed test.
+For a Yes record, the gate reads the answer in the original question.
 
 The showrunner state root stores the records in `behavior_checks/`. Each record has one key and one state. The states are clear, waiting, Yes, and No.
 

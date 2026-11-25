@@ -10,14 +10,17 @@ import sys
 from typing import cast
 
 from scripts.astra import astra_review, astra_work
-from scripts.direct import progress_history
-from scripts.herdr import worker_panes
-from scripts.lib import file_lock, urgency
+from scripts.direct import pass_record, progress_history, recorder_state
+from scripts.lib import file_lock, unit_runs, urgency
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.showrunner_state import state_root
 from scripts.production import behavior_check, staff, update_registration, worker
 from scripts.production.production_doc import Refusal
 from scripts.review_links import review_events
+
+
+YES_CHOICE = "Yes. Land the change."
+NO_CHOICE = "No. Keep the current behavior."
 
 
 @dataclass(frozen=True)
@@ -112,37 +115,67 @@ Read only. Do not edit files, run builds or tests, send messages, or file a ques
 """
 
 
-def reviewer_reply(change: behavior_check.GitRange, tests: behavior_check.ChangedTests,
-                   pointer: Path) -> str | ReviewPending:
-    """Start the review once and recover the completed reply on a later call."""
+class ReviewNeedsDispatch:
+    """The prior review never started or ended without a usable reply."""
+
+
+def review_folder(pointer: Path) -> Path:
+    folder = Path(pointer.read_text(encoding="utf-8").strip()).resolve()
+    if folder.parent != unit_runs.ASTRA_RUN_ROOT.resolve():
+        raise behavior_check.BehaviorCheckError(f"{pointer}: invalid review folder")
+    return folder
+
+
+def save_reply(folder: Path, text: str) -> Path:
+    saved = folder / "completed-reply.txt"
+    write_text_atomic(saved, text, new_file_mode=0o600)
+    return saved
+
+
+def recover_reply(folder: Path) -> Path | ReviewPending | ReviewNeedsDispatch:
+    saved = folder / "completed-reply.txt"
+    if saved.is_file():
+        return saved
+    reply = folder / "review.md"
     try:
-        folder = Path(pointer.read_text(encoding="utf-8").strip())
+        state = recorder_state.read_state(pass_record.state_path(folder))
     except FileNotFoundError:
-        folder = astra_review.run_folder()
-        folder.chmod(0o700)
-        prompt = prepare_review(change, tests, folder)
-        reply = folder / "review.md"
-        log = folder / "codex.log"
-        write_text_atomic(pointer, str(folder) + "\n")
-        result = astra_review.run_review(reply, prompt, log, cwd=change.repo)
-        if result is worker.DispatchSubmission.SUBMITTED:
-            return ReviewPending(folder)
-        if result != 0:
-            if result != worker_panes.ExitCode.UNCERTAIN:
-                pointer.unlink()
-            raise behavior_check.BehaviorCheckError(f"The reviewer exited with status {result}. See {log}.")
-        text = reply.read_text(encoding="utf-8")
-        write_text_atomic(folder / "completed-reply.txt", text, new_file_mode=0o600)
-        return text
+        if (folder / "consultation-session").is_file() and reply.is_file():
+            return save_reply(folder, reply.read_text(encoding="utf-8"))
+        return ReviewPending(folder) if astra_review.consultation_active(folder) else ReviewNeedsDispatch()
+    completed = progress_history.read_completed_reply(folder, reply)
+    if isinstance(completed, progress_history.ValidatedDispatchReply):
+        return save_reply(folder, completed.text)
+    if any(item.get("status") == "active" for item in pass_record.pass_slots(state).values()):
+        return ReviewPending(folder)
+    return ReviewNeedsDispatch()
+
+
+def reviewer_reply(change: behavior_check.GitRange, tests: behavior_check.ChangedTests,
+                   pointer: Path, lock: file_lock.ExclusiveLock) -> Path | ReviewPending:
+    """Recover the prior reply or start one review while the lock is held."""
     try:
-        return (folder / "completed-reply.txt").read_text(encoding="utf-8")
+        folder = review_folder(pointer)
     except FileNotFoundError:
         pass
-    try:
-        completed = progress_history.read_completed_reply(folder, folder / "review.md")
-    except FileNotFoundError:
+    else:
+        prior = recover_reply(folder)
+        if isinstance(prior, ReviewPending):
+            return prior
+        if isinstance(prior, Path) and (folder / "review-key").read_text(encoding="ascii").strip() == tests.key:
+            return prior
+    folder = astra_review.review_attempt_folder()
+    prompt = prepare_review(change, tests, folder)
+    write_text_atomic(folder / "review-key", tests.key + "\n", new_file_mode=0o600)
+    reply = folder / "review.md"
+    log = folder / "codex.log"
+    write_text_atomic(pointer, str(folder) + "\n", new_file_mode=0o600)
+    result = astra_review.run_review(reply, prompt, log, cwd=change.repo, dispatch_lock=lock)
+    if result is worker.DispatchSubmission.SUBMITTED:
         return ReviewPending(folder)
-    return completed.text if isinstance(completed, progress_history.ValidatedDispatchReply) else ReviewPending(folder)
+    if result != 0:
+        raise behavior_check.BehaviorCheckError(f"The reviewer exited with status {result}. See {log}.")
+    return save_reply(folder, reply.read_text(encoding="utf-8"))
 
 
 def asking_staff(reference: str, identities: update_registration.QuestionStaff) -> tuple[update_registration.QuestionScope, str]:
@@ -183,7 +216,7 @@ def ask(key: str, evidence: list[SpecifiedBehavior], reference: str) -> behavior
                 items.append(item)
     parts = update_registration.QuestionParts(
         ask="Allow this change?", context="The change waits for your answer.", items=items,
-        choices=["Yes. Land the change.", "No. Keep the current behavior."],
+        choices=[YES_CHOICE, NO_CHOICE],
         recommend="No. Keep the behavior you set.",
     )
     record = update_registration.ask(scope, title, parts, unit,
@@ -192,27 +225,47 @@ def ask(key: str, evidence: list[SpecifiedBehavior], reference: str) -> behavior
     question = record.item.get("review_id", "")
     if not question:
         raise behavior_check.BehaviorCheckError("The filed question has no number.")
-    return behavior_check.Waiting(question, record.path, record.owner)
+    return behavior_check.Waiting(question, record.owner)
 
 
-def refresh_answer(key: str, waiting: behavior_check.Waiting) -> behavior_check.Waiting | behavior_check.Answered:
-    owner = staff.StaffId(waiting.owner)
-    record = update_registration.numbered_question(owner, waiting.question_id, waiting.question_path.parent)
-    if record is None or record.item.get("request_key") != key:
-        raise behavior_check.BehaviorCheckError(f"Cannot read the behavior question {waiting.question_id}.")
+def question_answer(key: str, owner: str, number: str) -> behavior_check.Waiting | behavior_check.Answered:
+    record = update_registration.numbered_question(staff.StaffId(owner), number)
+    if record is None or record.owner != owner or record.item.get("request_key") != key:
+        raise behavior_check.BehaviorCheckError(f"Cannot read the behavior question {number}.")
     if record.status != "closed":
-        return waiting
+        return behavior_check.Waiting(number, owner)
+    parts = record.item.get("parts")
+    choices = parts["choices"] if parts is not None else []
     for event in reversed(review_events.decode(record.item.get("review_log", ""))):
         if event.who == "nate" and event.words.casefold().startswith("answer:"):
             words = event.words.partition(":")[2].strip()
-            if re.fullmatch(r"(yes|no)\.?", words, re.IGNORECASE):
-                answer = behavior_check.Answered(waiting.question_id,
-                                                behavior_check.Approval(words.casefold().removesuffix(".")),
-                                                words, event.time)
-                behavior_check.write_record(key, answer)
-                return answer
+            approval = {YES_CHOICE: behavior_check.Approval.YES, NO_CHOICE: behavior_check.Approval.NO}.get(words)
+            if words in choices and approval is not None:
+                return behavior_check.Answered(number, owner, approval, words, event.time)
             break
-    raise behavior_check.BehaviorCheckError(f"{waiting.question_id} closed without a Yes or No answer.")
+    raise behavior_check.BehaviorCheckError(f"{number} closed without one of its filed choices.")
+
+
+def refresh_answer(key: str, waiting: behavior_check.Waiting) -> behavior_check.Waiting | behavior_check.Answered:
+    answer = question_answer(key, waiting.owner, waiting.question_id)
+    if isinstance(answer, behavior_check.Answered):
+        behavior_check.write_record(key, answer)
+    return answer
+
+
+def verify_approval(tests: behavior_check.ChangedTests, record: behavior_check.Clear | behavior_check.Answered) -> bool:
+    try:
+        if isinstance(record, behavior_check.Clear):
+            folder = review_folder(behavior_check.record_path(tests.key).with_suffix(".run"))
+            reply = folder / "completed-reply.txt"
+            return (record.reply == reply and reply.resolve() == reply
+                    and (folder / "review-key").read_text(encoding="ascii").strip() == tests.key
+                    and not parse_reply(reply.read_text(encoding="utf-8"), tests))
+        answer = question_answer(tests.key, record.owner, record.question_id)
+        return isinstance(answer, behavior_check.Answered) and answer.approval is behavior_check.Approval.YES
+    except (behavior_check.BehaviorCheckError, update_registration.InputError, update_registration.RegistrationFailure,
+            Refusal, staff.StaffRefused, OSError, ValueError):
+        return False
 
 
 def report(key: str, record: behavior_check.LandingRecord | behavior_check.NoReview) -> int:
@@ -232,29 +285,34 @@ def report(key: str, record: behavior_check.LandingRecord | behavior_check.NoRev
 def run(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, key: str, reference: str) -> int:
     path = behavior_check.record_path(key)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with file_lock.exclusive(path.with_suffix(".lock"), wait=False) as lock:
-        if lock is file_lock.LockResult.BUSY:
-            print(f"{key} already has a behavior check in progress.")
-            return 1
+    lock = file_lock.take_exclusive(path.with_suffix(".lock"))
+    if lock is file_lock.LockResult.BUSY:
+        print(f"{key} already has a behavior check in progress.")
+        return 1
+    try:
         record = behavior_check.read_record(key)
         if isinstance(record, behavior_check.Waiting):
             return report(key, refresh_answer(key, record))
-        if record is not behavior_check.NoReview.MISSING:
+        if isinstance(record, behavior_check.Clear) and not verify_approval(tests, record):
+            path.unlink()
+        elif record is not behavior_check.NoReview.MISSING:
             return report(key, record)
         pointer = path.with_suffix(".run")
-        reply = reviewer_reply(change, tests, pointer)
+        reply = reviewer_reply(change, tests, pointer, lock)
         if isinstance(reply, ReviewPending):
             print(f"The land waits for the independent review in {reply.run}.")
             print(f"After the reply arrives, run {change.command('run', production=reference)}")
             return 1
         try:
-            evidence = parse_reply(reply, tests)
+            evidence = parse_reply(reply.read_text(encoding="utf-8"), tests)
         except behavior_check.BehaviorCheckError:
             pointer.unlink()
             raise
         record = ask(key, evidence, reference) if evidence else behavior_check.Clear(reply)
         behavior_check.write_record(key, record)
         return report(key, record)
+    finally:
+        lock.close()
 
 
 def status(key: str) -> int:
@@ -271,14 +329,14 @@ def status(key: str) -> int:
         return report(key, record)
 
 
-def execute(action: str, change: behavior_check.GitRange, tests: behavior_check.ChangedTests,
+def execute(action: str, change: behavior_check.GitRange, tests: behavior_check.ChangedTests | behavior_check.NoChangedTests,
             key: str, production: str) -> int:
     """Run the review command and report errors from its record stores."""
     try:
-        if action == "run":
+        if action == "run" and isinstance(tests, behavior_check.ChangedTests):
             return run(change, tests, key, production)
         return status(key)
     except (behavior_check.BehaviorCheckError, update_registration.InputError, update_registration.RegistrationFailure,
-            Refusal, staff.StaffRefused, OSError, ValueError) as error:
+            Refusal, staff.StaffRefused, recorder_state.OldRecorderState, OSError, ValueError) as error:
         print(f"behavior_check: {error}", file=sys.stderr)
         return 1

@@ -9,7 +9,7 @@ import sys
 from typing import cast, override
 from unittest import mock
 
-from scripts.lib import land_main, main_push_lock
+from scripts.lib import land_main, main_push_lock, unit_runs
 from scripts.lib.rerun_test_support import SCRIPTS, ScriptRepositoryTestCase
 from scripts.production import behavior_check
 
@@ -181,18 +181,40 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
         self.assertEqual(self.hook_runs(), [f"{self.repo}|{commit}|main"])
         self.assertEqual(record.read_text(), commit + "\n")
 
-    def test_a_feature_branch_lands_without_running_the_default_branch_hook(self) -> None:
+    def test_a_feature_branch_skips_the_behavior_check_even_with_an_altered_test(self) -> None:
         self.install_hook()
+        test = self.write(self.repo / "test_feature.py", "def test_fixture():\n    assert 1\n")
+        _ = self.git("add", test.name)
+        _ = self.next_commit()
         _ = self.git("push", "origin", "HEAD:refs/heads/feature")
+        _ = self.write(test, "def test_fixture():\n    assert 2\n")
         main = self.git("rev-parse", "origin/main").stdout.strip()
         commit = self.next_commit()
-        result = land_main.land(self.repo, commit, "feature")
+        with mock.patch.object(behavior_check, "require_review", wraps=behavior_check.require_review) as check:
+            result = land_main.land(self.repo, commit, "feature")
+        check.assert_not_called()
         self.assertIsInstance(result.push, land_main.Pushed)
         self.assertIsInstance(result.hook, land_main.HookSkipped)
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/feature").stdout.split()[0], commit)
         self.assertEqual(self.git("rev-parse", "origin/main").stdout.strip(), main)
         self.assertEqual(self.hook_runs(), [])
         self.assertFalse(self.completion().exists())
+
+    def test_the_remote_default_branch_requires_review_without_a_local_origin_head(self) -> None:
+        test = self.write(self.repo / "test_default.py", "def test_fixture():\n    assert 1\n")
+        _ = self.git("add", test.name)
+        base = self.next_commit()
+        _ = self.git("push", "origin", "HEAD:refs/heads/trunk", "HEAD:refs/heads/main")
+        _ = self.git("--git-dir", str(self.remote), "symbolic-ref", "HEAD", "refs/heads/trunk")
+        _ = self.write(test, "def test_fixture():\n    assert 2\n")
+        head = self.next_commit()
+        with self.assertRaisesRegex(land_main.LandError, "no review is on record"):
+            _ = land_main.land(self.repo, head, "trunk")
+        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/trunk").stdout.split()[0], base)
+        with mock.patch.object(behavior_check, "require_review", wraps=behavior_check.require_review) as check:
+            result = land_main.land(self.repo, head, "main")
+        check.assert_not_called()
+        self.assertIsInstance(result.push, land_main.Pushed)
 
     def test_a_checkout_without_a_hook_lands_and_reports_the_absent_hook(self) -> None:
         commit = self.next_commit()
@@ -225,9 +247,11 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
         _ = self.write(test, "def test_fixture():\n    assert 2\n")
         head = self.next_commit("alter a test\n")
         change = behavior_check.GitRange(self.repo, base, head)
-        key = behavior_check.changed_tests(change).key
-        no = behavior_check.Answered("Q1", behavior_check.Approval.NO, "No", datetime.now(timezone.utc))
-        waiting = behavior_check.Waiting("Q1", self.root / "question.md", "fixture-id")
+        tests = behavior_check.changed_tests(change)
+        assert isinstance(tests, behavior_check.ChangedTests)
+        key = tests.key
+        no = behavior_check.Answered("Q1", "fixture-id", behavior_check.Approval.NO, "No", datetime.now(timezone.utc))
+        waiting = behavior_check.Waiting("Q1", "fixture-id")
         for record in (behavior_check.NoReview.MISSING, waiting, no):
             with self.subTest(record=record):
                 if record is not behavior_check.NoReview.MISSING:
@@ -237,9 +261,14 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
                 self.assertIn("test_approval.py::test_fixture", str(refused.exception))
                 self.assertIn(change.command("run"), str(refused.exception))
                 self.assertEqual(self.git("ls-remote", "origin", "main").stdout.split()[0], base)
-        yes = behavior_check.Answered("Q1", behavior_check.Approval.YES, "Yes", datetime.now(timezone.utc))
-        for record in (behavior_check.Clear("No user decision found."), yes):
-            with self.subTest(record=record):
-                behavior_check.write_record(key, record)
-                self.assertIsInstance(land_main.land(self.repo, head).push, land_main.Pushed)
-                _ = self.git("push", "--force", "origin", f"{base}:refs/heads/main")
+        behavior_check.write_record(key, behavior_check.Clear(self.root / "reply.txt"))
+        with self.assertRaisesRegex(land_main.LandError, "no valid proof"):
+            _ = land_main.land(self.repo, head)
+
+        folder = self.root / "review"
+        reply = self.write(folder / "completed-reply.txt", '[{"test":"test_approval.py::test_fixture","finding":"none"}]')
+        _ = self.write(folder / "review-key", key)
+        _ = self.write(behavior_check.record_path(key).with_suffix(".run"), str(folder))
+        behavior_check.write_record(key, behavior_check.Clear(reply))
+        with mock.patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root):
+            self.assertIsInstance(land_main.land(self.repo, head).push, land_main.Pushed)
