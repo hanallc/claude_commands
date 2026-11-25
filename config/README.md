@@ -303,14 +303,11 @@ Cloud gates use `cloud_gate.conf` and `gate-deployment.json`; they do not depend
 `host=aws-build` names the Tailscale SSH host. `region` selects the AWS region.
 The controller reads the instance ID from `deployment.json`.
 `credentials_profile=build-scaler` names the user's AWS CLI profile. This file contains no credential.
-`kinds=test,check,doc,lint,example,build` permits tests, checks, docs, lint judgments, examples, and builds.
-A build or final uses AWS only when a flag pins the command.
 An empty `ci_repo` disables GitHub calls.
 
 `monthly_limit_usd` and `daily_limit_usd` are the user's spending limits. `aws_target.conf` holds each value on one line.
 The AWS Budget must read `monthly_limit_usd`. Code must never raise either limit.
 The spending reserve and maximum drain time come from `limit_reserve_usd` and `drain_max_minutes`.
-Each repository budget stays within the 32 GiB build budget.
 The fixed and hourly costs are estimates from the design's queue replay.
 
 Cloud gates use `~/.claude/config/aws_target.conf` for the account money check, regardless of the checkout's `CONF_DIR`.
@@ -520,8 +517,7 @@ A retained `.linux-run.json` marker includes boot identity. Recovery preserves n
 
 Commands read the SSH, retry, storage, hold and claim settings from this file.
 Block and claim settings use the same units as `mac_test.conf`.
-`build_budget_gib`, `target_budget_gib` and `free_floor_gib` use GiB.
-`target_budget_gib.<repo>` sets the storage budget for one repository.
+`free_floor_gib` uses GiB.
 
 Configured SSH targets use `~/.local/state/build-targets/<target>/` for claims, locks, blocks and retry records.
 The Mac retains `~/.local/state/mac-test/` and its existing fixture overrides.
@@ -536,7 +532,6 @@ The origin name does not change legacy Mac mirror or claim paths.
 Origins with the same repository name take turns on the Mac.
 Each SSH target permits one claim per repository.
 Mac and mac-linux work share this limit.
-Linux runs use the first mirror and its `target` folder.
 Cleanup uses the saved mirror for each old numbered claim.
 Takeover retries require cleanup until the owner releases the claim.
 Another worktree of the same repository can take over a lost run.
@@ -714,48 +709,6 @@ MCP server definitions for reference when setting up Claude Code on a new machin
 ## orphans_expected.json
 
 Files that the `/orphans` command should ignore when checking for unreferenced scripts and configs. Lists scripts and config files that are intentionally not referenced by any command.
-
-## Linux development shells
-
-Linux SSH targets use the admission repository name for `devshell.<repo>`, `skip.<repo>`, and `target_budget_gib.<repo>`.
-The source directory name still selects the legacy Mac mirror and claim.
-`kinds=test,check,doc,lint,example,build` permits tests, checks, docs, lint judgments, examples, and builds on Linux targets.
-
-`devshell` selects the default shell. `devshell.hana=ci` selects Hana's CI shell.
-`shell_cache` gives the cache path relative to the remote home.
-`shell_timeout_s` bounds shell evaluation.
-The Linux probe first checks SSH within `probe_timeout_s`.
-Its shell probe then permits `shell_timeout_s` plus `probe_timeout_s` for evaluation and the probe reply.
-The SSH connection still uses `connect_timeout_s`.
-This adds one short SSH call per Linux probe.
-The runner hashes `flake.nix`, `flake.lock`, `nix/` paths, file contents, and the selector.
-It evaluates only this small copy. It publishes exports after successful evaluation.
-An unchanged shell key reuses exports while their referenced Nix store paths exist.
-Missing store paths force a new evaluation. Each claimed slot retains its own warm build folder.
-
-`parity.rustc`, `parity.nextest`, `parity.mend`, and `parity.scripts_commit` can pin the public tool versions and script commit.
-An empty pin uses the sender's version. A mismatch prevents execution.
-`aws_target.conf` sets `version_pin_file=nixos hosts/aws-build.nix`.
-A version refusal names each mismatched tool, both versions, and this file.
-The verify output and the step attempt record keep this reason.
-The sender transfers every tracked file under `scripts/` and `config/` before the probe.
-It checks their contents and commit before and after transfer. A dirty script set prevents execution.
-Source transfers include untracked files and omit ignored paths, Git metadata, and the target folder.
-Directory transfers delete removed source files from warm mirrors.
-The probe checks disk capacity, the script commit, and tool versions inside the selected shell.
-The runner checks tool versions again before execution. A mismatch permits local fallback without a test result.
-The local trust rules must permit shell evaluation before the sender claims Linux capacity.
-`build_budget_gib` bounds the repository build folder budgets on disk.
-After each step, the runner uses the existing lint budget sweep on the selected build folder.
-The sweep removes the least recently used output and keeps the remaining output warm.
-Only a disk floor violation removes the whole folder.
-The runner adds no size scan beside the sweep. Explicit build folders must remain inside the claimed slot.
-The `.linux-run.json` marker identifies the runner and its process group before shell evaluation starts.
-Cleanup checks the runner's process start time and the token inherited by its children.
-Cleanup ignores zombies and retains ownership when it cannot inspect a live process.
-Remaining children report `mac_cleanup=unconfirmed`. The sender confirms their termination before it releases the claim.
-Disk cleanup failures retain the separate `mac_cleanup=1` result.
-`leftover_timeout_s` bounds cleanup confirmation. Failed confirmation retains the claim.
 
 ## dev_shell.conf
 

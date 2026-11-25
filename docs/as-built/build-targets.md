@@ -198,7 +198,8 @@ Lint repairs run on natedev, including under `lint --mac`. The one exception is 
 | build | build | build |
 | final | check, nextest | check, test |
 
-Linux targets permit only kinds listed in their settings.
+Verify refuses plain Linux SSH offload.
+Hana check and clippy steps use the Hana control transport.
 Remote builds print `binary: <target>:<path>`.
 An unpinned final keeps the local clean-tree and compiler checks and can save a pass.
 A pinned final runs both steps on its target and keeps the clean-tree check.

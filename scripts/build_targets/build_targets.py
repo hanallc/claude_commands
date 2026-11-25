@@ -682,23 +682,19 @@ def command_recover_probe(args: CliArguments) -> int:
 
     with os.fdopen(args.recovery_fd):
         target = target_config.configured_ssh_target(args.target)
+        if target.platform == "linux":
+            print(eligibility.LINUX_SSH_OFFLOAD_REFUSED, file=sys.stderr)
+            return 1
         config = ssh_target_config(target)
         if isinstance(config, ExcludedTarget):
             return 0
-        mac_repository: claim_state.MacRepositoryIdentity | claim_state.WholeMacScope = claim_state.WHOLE_MAC
-        if target.platform == "macos":
-            mirror = claim_state.mac_repository_identity(args.repo_root)
-            if isinstance(mirror, claim_state.WholeMacScope):
-                return 0
-            saved = mirror.claim_repository()
-            if not isinstance(saved, claim_state.MacRepositoryIdentity):
-                return 0
-            mac_repository = saved
-            repository = eligibility.KnownRepository(mac_repository.mirror_name, mac_repository.key)
-        else:
-            repository = eligibility.repository_identity(Path(args.repo_root))
-        if isinstance(repository, eligibility.UnknownRepository):
+        mirror = claim_state.mac_repository_identity(args.repo_root)
+        if isinstance(mirror, claim_state.WholeMacScope):
             return 0
+        mac_repository = mirror.claim_repository()
+        if not isinstance(mac_repository, claim_state.MacRepositoryIdentity):
+            return 0
+        repository = eligibility.KnownRepository(mac_repository.mirror_name, mac_repository.key)
         paths = mac_test.state_paths(target.name)
         if mac_test.free_now(paths, target.settings, Path(args.repo_root), mac_repository=mac_repository) != "bad":
             return 0
@@ -715,26 +711,23 @@ def command_recover_probe(args: CliArguments) -> int:
                     except copies.BusyRemoteMirror:
                         return 0
                     claim = offload.claim_for_run(controller, config, request, repository,
-                        mac_repository=(mac_repository if isinstance(mac_repository, claim_state.MacRepositoryIdentity)
-                                        else claim_state.NO_SAVED_MAC_REPOSITORY))
+                        mac_repository=mac_repository)
                     if not isinstance(claim, offload.FreshMacClaim):
                         return 0
                     try:
                         saved = controller.mac_repository
-                        if target.platform == "macos" and not isinstance(saved, claim_state.MacRepositoryIdentity):
+                        if not isinstance(saved, claim_state.MacRepositoryIdentity):
                             return 0
-                        if isinstance(saved, claim_state.MacRepositoryIdentity):
-                            if saved.mirror_name != repository.name:
-                                return 0
-                            repository = eligibility.KnownRepository(saved.mirror_name, saved.key)
+                        if saved.mirror_name != repository.name:
+                            return 0
+                        repository = eligibility.KnownRepository(saved.mirror_name, saved.key)
                         if not offload.copy_tracked_scripts(controller, config):
                             return 0
                         selected = replace(request, slot=claim.slot)
                         copied = offload.copy_tree_with_key(controller, config, selected, repository)
                         if isinstance(copied, offload.TreeCopyFailed):
                             return 0
-                        _ = offload.probe_mac(controller, config, repository, target.name, claim.slot,
-                                              record_version_decline=False)
+                        _ = offload.probe_mac(controller, config, repository, target.name, claim.slot)
                     finally:
                         _ = offload.release_claim(controller, target.name)
         except offload.OffloadInterrupted as interrupted:
@@ -967,41 +960,18 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         if snapshot.state not in (hana_box.Lifecycle.READY, hana_box.Lifecycle.IDLE_STOPPED):
             return ExcludedTarget(target, 'starting' if snapshot.state == hana_box.Lifecycle.STARTING else 'recovery')
         return EligibleTarget(target)
-    if target.platform == "macos" or isinstance(routing, LocalRequired):
-        answer = mac_test.free_now(mac_test.state_paths(target.name), target.settings, repo_root, session=session,
-                                 configuration=configuration, mac_scope=mac_scope,
-                                 recover_mac_backoff=recover_mac_backoff)
-        if new_step and not recover_mac_backoff and not isinstance(selection, Pinned) and answer == "bad":
-            start_probe_recovery(target, repo_root, package, kind)
-        if target.platform == "macos":
-            return mac_target_eligibility(target, repo_root, package, kind, routing, answer=answer,
-                                          configuration=configuration, session=session, mac_scope=mac_scope,
-                                          recover_mac_backoff=recover_mac_backoff,
-                                          request_disk_recovery=request_disk_recovery)
-        return ExcludedTarget(target, cast(LocalRequired, routing).reason)
-    config = configuration if isinstance(configuration, conf.ConfigRead) else ssh_target_config(target)
-    if isinstance(config, ExcludedTarget):
-        return config
-    for step in eligibility.remote_step_kinds(kind):
-        policy = eligibility.mac_step_eligibility(config, repo_root, package,
-            remote_verb(cast(StepKind, step)), target.name, kind=step)
-        if isinstance(policy, eligibility.IneligibleMacStep):
-            return ExcludedTarget(target, policy.reason)
-    paths = mac_test.state_paths(target.name)
-    answer = mac_test.free_now(paths, target.settings, repo_root, session=session,
-                                 configuration=configuration)
-    if new_step and not isinstance(selection, Pinned) and answer == "bad":
+    if target.platform != "macos":
+        reason = routing.reason if isinstance(routing, LocalRequired) else eligibility.LINUX_SSH_OFFLOAD_REFUSED
+        return ExcludedTarget(target, reason)
+    answer = mac_test.free_now(mac_test.state_paths(target.name), target.settings, repo_root, session=session,
+                             configuration=configuration, mac_scope=mac_scope,
+                             recover_mac_backoff=recover_mac_backoff)
+    if new_step and not recover_mac_backoff and not isinstance(selection, Pinned) and answer == "bad":
         start_probe_recovery(target, repo_root, package, kind)
-    if answer not in ("free", "bad"):
-        return ExcludedTarget(target, answer)
-    if answer == "bad":
-        return EligibleTarget(target)
-    from scripts.mac_test import offload
-
-    probe_settings = eligibility.probe_settings(config) if isinstance(config, conf.ConfigRead) else config
-    if isinstance(offload.probe_reachability(offload.ProcessController(), probe_settings), offload.UnreachableHost):
-        return ExcludedTarget(target, "unreachable")
-    return EligibleTarget(target)
+    return mac_target_eligibility(target, repo_root, package, kind, routing, answer=answer,
+                                  configuration=configuration, session=session, mac_scope=mac_scope,
+                                  recover_mac_backoff=recover_mac_backoff,
+                                  request_disk_recovery=request_disk_recovery)
 
 
 def ssh_target_config(target: SshTarget) -> eligibility.OffloadConfig | ExcludedTarget:

@@ -655,25 +655,17 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
         lint.parent.mkdir(parents=True)
         _ = lint.write_text("#!/bin/bash\n(cd /; exec sleep 600) &\nprintf 'SHELL %s\\n' \"$$\"\nprintf 'CHILD %s\\n' \"$!\"\nwait\n")
         lint.chmod(0o755)
-        exports = self.root / "exports"
-        _ = exports.write_text("export HOME=" + shlex.quote(str(tool_home)) + "\n")
         program = '''
-from pathlib import Path
-import os, sys
-from unittest import mock
+import os
+import subprocess
+import sys
 from scripts.mac_test import linux_runner
-root, exports = Path(sys.argv[1]), Path(sys.argv[2])
 print('RUNNER', os.getpid(), flush=True)
-values = dict(kinds='test', devshell='default', shell_cache='cache', shell_timeout_s='1',
-              build_budget_gib='20', target_budget_gib='10', free_floor_gib='1', abandoned_session_minutes='1')
-with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner.ShellEnvironment('key', exports, exports)),
-      mock.patch.object(linux_runner, 'output_free_bytes', return_value=100 * 1024**3),
-      mock.patch.object(linux_runner, 'trim_build_folder', return_value=0)):
-    linux_runner.execute_slot(root, values, 'repository', 'nextest', (), 'call', 'tree')
+subprocess.run(['bash', sys.argv[1]], check=True, pass_fds=linux_runner.execution_descriptors())
 '''
         command = [sys.executable, str(Path(copies.__file__)), "mirror-use", "--path", mirror.path,
                    "--owner", mirror.owner, "--repository", mirror.repository.name,
-                   "--session", mirror.session, "--", sys.executable, "-c", program, mirror.path, str(exports)]
+                   "--session", mirror.session, "--", sys.executable, "-c", program, str(lint)]
         owner: subprocess.Popen[str] = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                  start_new_session=True)
         runner, shell, child = 0, 0, 0

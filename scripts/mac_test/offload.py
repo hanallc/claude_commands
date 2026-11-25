@@ -2035,31 +2035,6 @@ def expected_linux_parity(controller: ProcessController, config: OffloadConfig) 
             "mend": expected["mend"], "scripts_commit": expected["scripts_commit"]}
 
 
-def recorded_linux_version_mismatch(controller: ProcessController, config: OffloadConfig,
-                                    target: str) -> str:
-    """Compare the tree with the tools recorded by deployment without contacting the box."""
-    from scripts.mac_test import linux_runner
-    try:
-        raw = cast(object, json.loads((target_config.ssh_target_state_directory(target) / "box-tools.json").read_text()))
-        if not isinstance(raw, dict):
-            return ""
-        versions = cast(dict[str, object], raw).get("versions")
-        if not isinstance(versions, dict):
-            return ""
-        entries = cast(dict[str, object], versions)
-        if any(not isinstance(value, str) for value in entries.values()):
-            return ""
-        actual = {key: linux_runner.normalize_tool_version(cast(str, value)) for key, value in entries.items()}
-        expected = expected_linux_parity(controller, config)
-        if isinstance(expected, UnavailableToolParity):
-            return ""
-        selected = {key: linux_runner.normalize_tool_version(value) for key, value in (
-            ("rustc", expected["rustc"]), ("nextest", expected["nextest"]), ("mend", expected["mend"])) if key in actual}
-        return linux_runner.version_mismatch(target, actual, selected, config.values.get("version_pin_file", ""))
-    except (OSError, ValueError, UnicodeError):
-        return ""
-
-
 def write_version_decline(target: str, repository_name: str) -> None:
     path = eligibility.linux_version_decline_path(target, repository_name)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2254,28 +2229,18 @@ def probe_mac(
     repository: KnownRepository,
     target: str = "mac",
     slot: int = 1,
-    *, record_version_decline: bool = True,
 ) -> ProbeResult:
     def succeeded(probe: ProbeSnapshot) -> ProbeSnapshot:
         record_reachable(target, probe_started_ns=probe_started_ns)
         return probe
 
-    linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform)
+    if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
+        return UnavailableProbe(eligibility.LINUX_SSH_OFFLOAD_REFUSED)
     probe_started_ns = time.time_ns()
-    if linux:
-        if not isinstance(config, OffloadConfig):
-            raise ValueError("The Linux shell probe requires execution settings")
-        from scripts.mac_test import linux_runner
-        script = linux_runner.probe_command_script(remote_mirror(repository, target, slot), runner_values(config, target),
-                                                   repository.policy_name)
-        if isinstance(probe_reachability(controller, config), UnreachableHost):
-            return _record_probe_failure(target, "SSH reachability check failed")
-        timeout_s = linux_runner.positive_setting(config.values, "shell_timeout_s") + config.probe_timeout_s
-    else:
-        script = probe_script(repository, target, slot)
-        timeout_s = config.probe_timeout_s
+    script = probe_script(repository, target, slot)
+    timeout_s = config.probe_timeout_s
     identity = controller.claim_identity
-    watch_root = offload_mirror_root.get() if not linux else None
+    watch_root = offload_mirror_root.get()
     if isinstance(identity, claim_state.ClaimIdentity):
         path = pending_start_path(target, identity, scope_key=controller.claim_scope_key)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2290,32 +2255,13 @@ def probe_mac(
         [*ssh_prefix(config), script],
         CommandTimeLimit(timeout_s),
     )
-    if (linux and isinstance(result, CommandOutput)
-            and result.stdout.strip() == "linux_startup=unresolved"):
-        return UnresolvedSlotStartup()
     if isinstance(result, CommandOutput) and result.status == 0:
         probe = parse_probe(result.stdout)
         if isinstance(probe, ProbeSnapshot):
             if watch_root is not None:
                 with suppress(OSError, claim_state.StateReadError):
                     save_mac_watch_origin(controller, config.host, watch_root, result.stdout)
-            if not linux or not isinstance(config, OffloadConfig):
-                return succeeded(probe)
-            expected = expected_linux_parity(controller, config)
-            values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
-            if not isinstance(expected, UnavailableToolParity) and all(values.get(key) == expected[key] for key in ("nextest", "mend", "scripts_commit")):
-                return succeeded(probe)
-            from scripts.mac_test import linux_runner
-            detail = (linux_runner.version_mismatch(target, values,
-                      {"nextest": expected["nextest"], "mend": expected["mend"]},
-                      config.values.get("version_pin_file", ""))
-                      if not isinstance(expected, UnavailableToolParity) else "")
-            if detail:
-                print(detail, file=sys.stderr, flush=True)
-                if record_version_decline:
-                    write_version_decline(target, repository.name)
-                return UnavailableProbe(detail)
-            return _record_probe_failure(target, "public tools or tracked scripts differ")
+            return succeeded(probe)
     return _record_probe_failure(target, _probe_failure_reason(result, timeout_s))
 
 
@@ -2580,16 +2526,6 @@ def remote_test_command(
 ) -> str:
     clear_environment = (result_environment.read_policy().clear_remote_environment()
                          if request.verb == "nextest" and request.environment else "")
-    if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform):
-        from scripts.mac_test import linux_runner
-        words = request.nextest_words
-        return linux_runner.command_script(
-            remote_mirror(repository, request.target, request.slot),
-            {**runner_values(config, request.target), "step_kind": request.kind or eligibility.verb_kind(request.verb)},
-            repository.policy_name, request.verb, words, request.call_id,
-            sent_tree_key.value if isinstance(sent_tree_key, KnownTreeKey) else "",
-            repository.key, request.environment, clear_environment,
-        )
     budget = config.values.get(
         f"mac_budget_gib.{repository.name}", config.default_target_budget_gib
     )
@@ -3139,65 +3075,23 @@ def claimed_run(
     from scripts.copies import copies
 
     release_allowed = True
-    sync_after_release = False
     evidence = controller.attempt_evidence
     evidence.slot = request.slot
     try:
-        linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform)
-        if linux and request.verb == "mend-fix":
-            return declined("target does not permit this command", started)
-        if linux:
-            expected = expected_linux_parity(controller, config)
-            if isinstance(expected, UnavailableToolParity):
-                return declined("state", started)
-            config = replace(config, values={**config.values, **{f"parity.{key}": value for key, value in expected.items()}})
-            if not copy_tracked_scripts(controller, config):
-                return DeclinedMacRun("copy", elapsed_seconds(started), controller.copy_failure_detail)
-            copy_started = time.monotonic()
-            copied = copy_tree_with_key(controller, config, request, repository)
-            if isinstance(copied, TreeCopyFailed):
-                return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
-            copy_seconds = elapsed_seconds(copy_started)
-            release_allowed = False
-            probe = probe_mac(controller, config, repository, request.target, request.slot)
-            if isinstance(probe, UnresolvedSlotStartup):
-                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
-                release_allowed = isinstance(checked, LeftoversEnded)
-                observe_cleanup(evidence, checked)
-                report_leftover_check(checked, request)
-                return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-            if isinstance(probe, UnavailableProbe):
-                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
-                release_allowed = isinstance(checked, LeftoversEnded)
-                observe_cleanup(evidence, checked)
-                report_leftover_check(checked, request)
-                if isinstance(checked, LeftoversRemain):
-                    return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-                if probe.detail:
-                    return DeclinedMacRun("state", elapsed_seconds(started), probe.detail)
-                write_backoff(time.time() + config.unreachable_backoff_s, request.target)
-                return declined("unreachable", started)
-            if isinstance(check_mac_disk_floor(probe, config.free_floor_gib), MacDiskShort):
-                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
-                release_allowed = isinstance(checked, LeftoversEnded)
-                observe_cleanup(evidence, checked)
-                report_leftover_check(checked, request)
-                return declined("disk", started)
-        else:
-            probe = probe_mac(controller, config, repository, request.target, request.slot)
-            if isinstance(probe, (UnavailableProbe, UnresolvedSlotStartup)):
-                write_backoff(time.time() + config.unreachable_backoff_s, request.target)
-                return declined("unreachable", started)
-            disk = ensure_mac_disk_floor(controller, config, repository, probe, request.target, request.slot)
-            if isinstance(disk, SweepFailed):
-                return DeclinedMacRun("disk", elapsed_seconds(started), disk.cause)
-            if isinstance(disk, SweepShort):
-                return declined("disk", started)
-            copy_started = time.monotonic()
-            copied = copy_tree_with_key(controller, config, request, repository)
-            if isinstance(copied, TreeCopyFailed):
-                return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
-            copy_seconds = elapsed_seconds(copy_started)
+        probe = probe_mac(controller, config, repository, request.target, request.slot)
+        if isinstance(probe, (UnavailableProbe, UnresolvedSlotStartup)):
+            write_backoff(time.time() + config.unreachable_backoff_s, request.target)
+            return declined("unreachable", started)
+        disk = ensure_mac_disk_floor(controller, config, repository, probe, request.target, request.slot)
+        if isinstance(disk, SweepFailed):
+            return DeclinedMacRun("disk", elapsed_seconds(started), disk.cause)
+        if isinstance(disk, SweepShort):
+            return declined("disk", started)
+        copy_started = time.monotonic()
+        copied = copy_tree_with_key(controller, config, request, repository)
+        if isinstance(copied, TreeCopyFailed):
+            return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
+        copy_seconds = elapsed_seconds(copy_started)
         try:
             history_key = evidence.repository_key
             step_command = remote_test_command(config, request, repository, copied.tree_key,
@@ -3211,11 +3105,9 @@ def claimed_run(
             if request.copy
             else f"running on the Mac (macOS, host {probe.hostname})"
         )
-        if linux:
-            running = f"running on {request.target} (Linux, host {probe.hostname})"
         print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
         copies.register_remote(request_mirror(config, request, repository))
-        routed_mac_command = not linux and isinstance(request.placement, AssignedOffloadRequest)
+        routed_mac_command = isinstance(request.placement, AssignedOffloadRequest)
         if isinstance(request.placement, AssignedOffloadRequest):
             from scripts.build_queue import admission_client, admission_protocol as wire
 
@@ -3239,14 +3131,11 @@ def claimed_run(
                         uuid.uuid4().hex, assignment, reference, holder))
                 except wire.AdmissionUnavailable as error:
                     print(f"mac_test: no launch permission from the queue: {error.reason}", file=sys.stderr, flush=True)
-                    if routed_mac_command:
-                        break
-                    evidence.execution = execution_identity.ExecutionEvidenceUnavailable("authorization response unavailable", time.time())
-                    return declined("state", started)
+                    break
                 if isinstance(permission, wire.FirstAuthorization):
                     evidence.launch_authorized = True
                     break
-                if routed_mac_command and isinstance(permission.permission, placement.PermissionConsumed):
+                if isinstance(permission.permission, placement.PermissionConsumed):
                     break
                 if (not isinstance(permission.state, placement.CurrentAssignment)
                         or not isinstance(permission.permission, placement.PermissionAvailable)):
@@ -3291,21 +3180,14 @@ def claimed_run(
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
-            if isinstance(remote_status, ToolVersionMismatch):
-                write_version_decline(request.target, repository.name)
-                return DeclinedMacRun("state", elapsed_seconds(started), remote_status.reason)
-            if linux and isinstance(remote_status, UnresolvedSlotStartup):
-                return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
             detail = (remote_status.detail if isinstance(remote_status, MissingMacStatus)
                       else "runner sent no final status")
             return LostMacRun(elapsed_seconds(started), detail)
-        if not linux:
-            eligibility.linux_version_decline_path(request.target, repository.name).unlink(missing_ok=True)
-        setup_failed = (isinstance(remote_status, MacNextestSetupFailed)
-                        or (linux and remote_status.status == os.EX_TEMPFAIL))
+        eligibility.linux_version_decline_path(request.target, repository.name).unlink(missing_ok=True)
+        setup_failed = isinstance(remote_status, MacNextestSetupFailed)
         fetched = (fetch_folder(controller, config, request, repository)
                    if not setup_failed and isinstance(request.fetch, FetchFolder) else FetchNotRun())
-        if (not linux and isinstance(remote_status, ReportedMacStatus) and isinstance(request.fetch, FetchFolder)
+        if (isinstance(remote_status, ReportedMacStatus) and isinstance(request.fetch, FetchFolder)
                 and not isinstance(remote_status.cleanup, CleanupStreamTimedOut)):
             arguments = [*ssh_prefix(config),
                 copies.remote_use_command(request_mirror(config, request, repository),
@@ -3325,11 +3207,9 @@ def claimed_run(
             report_leftover_check(checked, request)
         elif not isinstance(remote_status.cleanup, CleanupStreamTimedOut):
             release_allowed = True
-        sync_after_release = linux
         seconds = elapsed_seconds(started)
-        if isinstance(remote_status, MacNextestSetupFailed) or setup_failed:
-            if not linux:
-                evidence.execution = execution_identity.ExecutionNotStarted()
+        if isinstance(remote_status, MacNextestSetupFailed):
+            evidence.execution = execution_identity.ExecutionNotStarted()
             if routed_mac_command and not release_allowed:
                 # A retry would run beside the Mac claim that this run still holds.
                 return MacCleanupUnconfirmed(seconds, "nextest setup failed and its cleanup did not end")
@@ -3357,12 +3237,6 @@ def claimed_run(
         if release_allowed and isinstance(controller.pending, SettledDispatchOperations):
             if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
                 _ = release_claim(controller, request.target)
-            if sync_after_release:
-                from scripts.buildlog import sync as buildlog_sync
-
-                with transfer_bytes.measure_transfers(evidence.traffic):
-                    buildlog_sync.sync_target(request.target)
-
 
 def hana_source_key(source_root: Path) -> execution_identity.SourceIdentity:
     """Read the caller's current source without installing a remote snapshot."""
@@ -3793,82 +3667,66 @@ def run_offload(
         return run_hana_offload(controller, config, request, started)
     from scripts.copies import copies
 
-    linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform)
+    if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform):
+        return declined(eligibility.LINUX_SSH_OFFLOAD_REFUSED, started)
     mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository = claim_state.NO_SAVED_MAC_REPOSITORY
     policy_repository: claim_state.MacRepositoryIdentity | claim_state.ResolveMacRepository = claim_state.RESOLVE_MAC_REPOSITORY
     retire_wait = False
-    if not linux:
-        history_key = buildlog_repository.repository_key(str(request.repo_root))
-        controller.attempt_evidence.repository_key = history_key
-        if isinstance(request.admission, MacClaimFromWait):
-            admission = request.admission
-            try:
-                paths = claim_state.state_paths(request.target)
-                claims = claim_state.read_claims(paths)
-            except claim_state.StateReadError:
-                return declined("state", started)
-            held = next((claim for claim in claims
-                if claim_state.claim_identity(claim.record) == admission.identity
-                and ("replaced_reservation" not in claim.record
-                     or claim_state.claim_uses_legacy_fence(claim.record))), None)
-            if held is None:
+    history_key = buildlog_repository.repository_key(str(request.repo_root))
+    controller.attempt_evidence.repository_key = history_key
+    if isinstance(request.admission, MacClaimFromWait):
+        admission = request.admission
+        try:
+            paths = claim_state.state_paths(request.target)
+            claims = claim_state.read_claims(paths)
+        except claim_state.StateReadError:
+            return declined("state", started)
+        held = next((claim for claim in claims
+            if claim_state.claim_identity(claim.record) == admission.identity
+            and ("replaced_reservation" not in claim.record
+                 or claim_state.claim_uses_legacy_fence(claim.record))), None)
+        if held is None:
+            retire_wait = True
+        else:
+            saved = claim_state.saved_mac_repository(held.record)
+            if isinstance(saved, claim_state.MacRepositoryIdentity) and "remote_host" not in held.record:
+                policy_repository = saved
+            elif "remote_host" not in held.record:
                 retire_wait = True
             else:
-                saved = claim_state.saved_mac_repository(held.record)
-                if isinstance(saved, claim_state.MacRepositoryIdentity) and "remote_host" not in held.record:
-                    policy_repository = saved
-                elif "remote_host" not in held.record:
-                    retire_wait = True
-                else:
-                    cleanup = adopt_wait_for_cleanup(controller, config, request, saved, held.record["remote_host"], started)
-                    if not isinstance(cleanup, ClaimReleaseConfirmed):
-                        return cleanup
-                    if isinstance(request.placement, AssignedOffloadRequest):
-                        return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-                    cleanup_takeover = False
-                    request = replace(request, admission=UnclaimedMacRun())
-        if retire_wait or isinstance(request.admission, UnclaimedMacRun):
-            resolved = claim_state.mac_repository_identity(str(request.repo_root))
-            if isinstance(resolved, claim_state.WholeMacScope):
-                return declined("repo" if config.enabled else "off", started)
-            executable = resolved.claim_repository(history_key=claim_state.mac_history_key(history_key))
-            if not isinstance(executable, claim_state.MacRepositoryIdentity):
-                return declined(claim_state.MAC_HISTORY_KEY_UNAVAILABLE if config.enabled else "off", started)
-            mac_repository = policy_repository = executable
+                cleanup = adopt_wait_for_cleanup(controller, config, request, saved, held.record["remote_host"], started)
+                if not isinstance(cleanup, ClaimReleaseConfirmed):
+                    return cleanup
+                if isinstance(request.placement, AssignedOffloadRequest):
+                    return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+                cleanup_takeover = False
+                request = replace(request, admission=UnclaimedMacRun())
+    if retire_wait or isinstance(request.admission, UnclaimedMacRun):
+        resolved = claim_state.mac_repository_identity(str(request.repo_root))
+        if isinstance(resolved, claim_state.WholeMacScope):
+            return declined("repo" if config.enabled else "off", started)
+        executable = resolved.claim_repository(history_key=claim_state.mac_history_key(history_key))
+        if not isinstance(executable, claim_state.MacRepositoryIdentity):
+            return declined(claim_state.MAC_HISTORY_KEY_UNAVAILABLE if config.enabled else "off", started)
+        mac_repository = policy_repository = executable
     decision = eligibility.mac_step_eligibility(config, request.repo_root, request.package, request.verb,
                                                request.target, kind=request.kind, mac_repository=policy_repository)
     if isinstance(decision, IneligibleMacStep):
         return declined(decision.reason, started)
     repository = decision
-    if linux and not trusted_linux_source(request.repo_root):
-        return declined("repo", started)
-    if linux:
-        controller.attempt_evidence.repository_key = repository.key or store.UNKNOWN_IDENTITY
-        detail = recorded_linux_version_mismatch(controller, config, request.target)
-        decline_path = eligibility.linux_version_decline_path(request.target, repository.name)
-        if detail:
-            write_version_decline(request.target, repository.name)
-            return DeclinedMacRun("state", elapsed_seconds(started), detail)
-        decline_path.unlink(missing_ok=True)
-
-    admission_slot = 1
-    if linux and isinstance(request.placement, AssignedOffloadRequest):
-        admission_slot = request.placement.assignment.destination.slot or 1
     try:
         with ExitStack() as admission_leases:
-            if not linux:
-                root_token = offload_mirror_root.set(mac_mirror_root())
-                _ = admission_leases.callback(offload_mirror_root.reset, root_token)
+            root_token = offload_mirror_root.set(mac_mirror_root())
+            _ = admission_leases.callback(offload_mirror_root.reset, root_token)
             try:
-                mirror = request_mirror(config, replace(request, slot=admission_slot), repository)
+                mirror = request_mirror(config, replace(request, slot=1), repository)
                 admission_leases.enter_context(copies.remote_lease(mirror))
             except copies.BusyRemoteHost:
                 return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
             except copies.BusyRemoteMirror:
                 write_mirror_busy(config, repository.name, request.target)
                 return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-            result = leased_offload(controller, config, request, repository, started, linux, admission_leases,
-                                    admission_slot=admission_slot,
+            result = leased_offload(controller, config, request, repository, started, admission_leases,
                                     mac_repository=mac_repository, retire_wait=retire_wait,
                                     cleanup_takeover=cleanup_takeover)
         if isinstance(result, ClaimReleaseConfirmed):
@@ -3967,72 +3825,40 @@ def claim_refusal(controller: ProcessController, request: OffloadRequest, claim:
 
 
 def leased_offload(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
-                   repository: KnownRepository, started: float, linux: bool,
-                   lease: ExitStack, *, admission_slot: int,
+                   repository: KnownRepository, started: float,
+                   lease: ExitStack, *,
                    mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository
                    = claim_state.NO_SAVED_MAC_REPOSITORY,
                    retire_wait: bool = False,
                    cleanup_takeover: bool = True) -> MacOffloadResult | ClaimReleaseConfirmed:
-    from scripts.copies import copies
-
     claim = claim_for_run(controller, config, request, repository,
                           mac_repository=mac_repository, retire_wait=retire_wait)
     claim_from_wait = isinstance(request.admission, MacClaimFromWait)
-    # Adopt a transferred reservation only once.
     request = replace(request, admission=UnclaimedMacRun())
-    while isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
-        if not linux:
-            if not cleanup_takeover:
-                return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-            lease.close()
-            if isinstance(claim, TakenOverMacClaim):
-                with mac_cleanup_lease(controller.mac_repository, claim.host, request.target):
-                    return cleanup_taken_over_claim(controller, config, request, claim, repository, started)
-            return cleanup_taken_over_claim(controller, config, request, claim, repository, started)
-        with ExitStack() as cleanup_lease:
-            if isinstance(claim, TakenOverMacClaim) and (claim.slot != admission_slot or claim.host != config.host):
-                connection = replace(config.connection, host=claim.host)
-                mirror = request_mirror(replace(config, connection=connection), replace(request, slot=claim.slot), repository)
-                try:
-                    cleanup_lease.enter_context(copies.remote_lease(mirror))
-                except copies.BusyRemoteMirror:
-                    return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-            cleanup = cleanup_taken_over_claim(controller, config, request, claim, repository, started)
-        if not isinstance(cleanup, ClaimReleaseConfirmed):
-            return cleanup
-        if isinstance(request.placement, AssignedOffloadRequest):
+    if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
+        if not cleanup_takeover:
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-        claim_from_wait = False
-        claim = claim_for_run(controller, config, request, repository, mac_repository=mac_repository)
+        lease.close()
+        if isinstance(claim, TakenOverMacClaim):
+            with mac_cleanup_lease(controller.mac_repository, claim.host, request.target):
+                return cleanup_taken_over_claim(controller, config, request, claim, repository, started)
+        return cleanup_taken_over_claim(controller, config, request, claim, repository, started)
     if isinstance(claim, MacClaimNotConfirmed):
         return claim_refusal(controller, request, claim, started, claim_from_wait=claim_from_wait)
     if isinstance(claim, LegacyWaitClaimReleased):
         controller.attempt_evidence.provider = placement.NoProviderClaim()
         return DeclinedMacRun("source_changed", elapsed_seconds(started),
                               "the current repository differs from the retired reservation's assignment")
-    if linux and claim.slot != admission_slot:
-        mirror = request_mirror(config, replace(request, slot=claim.slot), repository)
-        try:
-            lease.enter_context(copies.remote_lease(mirror))
-        except copies.BusyRemoteMirror:
-            _ = release_claim(controller, request.target)
-            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     saved = controller.mac_repository
-    if not linux and not isinstance(saved, claim_state.MacRepositoryIdentity):
+    if not isinstance(saved, claim_state.MacRepositoryIdentity):
         _ = release_claim(controller, request.target)
         return declined("state", started)
-    if isinstance(saved, claim_state.MacRepositoryIdentity):
-        if repository.legacy_mirror_name != saved.mirror_name:
-            _ = release_claim(controller, request.target)
-            return DeclinedMacRun("state", elapsed_seconds(started), "The claim has a different mirror than the lease")
-        repository = KnownRepository(saved.mirror_name, saved.key)
+    if repository.legacy_mirror_name != saved.mirror_name:
+        _ = release_claim(controller, request.target)
+        return DeclinedMacRun("state", elapsed_seconds(started), "The claim has a different mirror than the lease")
+    repository = KnownRepository(saved.mirror_name, saved.key)
     selected = replace(request, slot=claim.slot)
-    result = claimed_run(controller, config, selected, repository, started)
-    if linux and isinstance(result, PassedOnMac):
-        return PassedOnTarget(result.seconds, result.build_target_directory)
-    if linux and isinstance(result, FailedOnMac):
-        return FailedOnTarget(result.status, result.seconds)
-    return result
+    return claimed_run(controller, config, selected, repository, started)
 
 
 @contextmanager
@@ -4395,7 +4221,11 @@ def main() -> int:
         settings = str(target_settings)
     from scripts.aws_target import hana_placement as hana
 
-    transport = hana.read_execution_transport(eligibility.configured_ssh_target(request.target or 'mac'))
+    target = eligibility.configured_ssh_target(request.target or 'mac')
+    transport = hana.read_execution_transport(target)
+    if not isinstance(transport, hana.HanaControlTransport) and not target_config.uses_legacy_mac_layout(target.platform):
+        return write_result(declined(eligibility.LINUX_SSH_OFFLOAD_REFUSED, time.monotonic()),
+                            request.result, request.last_decline, request.verb, request.target, fetch=request.fetch)
     config: OffloadConfig | hana.HanaControlTransport = (transport if isinstance(transport, hana.HanaControlTransport)
         else eligibility.read_config(Path(settings)) if settings else eligibility.read_config())
     if isinstance(request.placement, AssignedOffloadRequest):

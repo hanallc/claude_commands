@@ -1,5 +1,5 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Execute trusted source in a cached Linux development shell."""
+"""Run leased Linux commands and read process ownership."""
 
 from __future__ import annotations
 try:
@@ -7,7 +7,6 @@ try:
 except FileNotFoundError:
     pass
 
-import argparse
 from array import array
 from collections.abc import Generator, Mapping
 from contextlib import ExitStack, contextmanager
@@ -37,7 +36,6 @@ from scripts.lib.dev_shell import (
     shell_key as shell_key,
 )
 from scripts.mac_test import floor_claims
-from scripts.mac_test.abandoned_sessions import removal_script
 
 if TYPE_CHECKING:
     from scripts.copies import copies
@@ -243,10 +241,6 @@ def shell_environment_script(shell: ShellEnvironment) -> str:
             + 'if [[ -n ${shellHook-} ]]; then eval "$shellHook" || exit 75; fi\n')
 
 
-def policy_setting(values: dict[str, str], key: str, repository: str) -> str:
-    return values[f'{key}.{repository}'] if f'{key}.{repository}' in values else values[key]
-
-
 def normalize_tool_version(value: str) -> str:
     """Keep each nonempty version line in one common form."""
     return ' '.join(line.strip() for line in value.splitlines() if line.strip())
@@ -335,7 +329,6 @@ class SlotStartupRefused(RuntimeError):
 
 
 SLOT_PROCESSES_UNRESOLVED = 3
-STARTUP_REFUSAL_RECORD = 'linux_startup=unresolved'
 
 
 @dataclass(frozen=True)
@@ -553,58 +546,6 @@ def nextest_words_with_skip(
     return tuple(updated)
 
 
-def command_script(mirror: str, values: dict[str, str], repository: str, verb: str,
-                   words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str,
-                   test_environment: tuple[tuple[str, str], ...] = (),
-                   clear_environment: str = '') -> str:
-    arguments = ['.claude/scripts/lib/py', '.claude/scripts/mac_test/linux_runner.py', 'run',
-                 '--mirror', mirror, '--values', json.dumps(values), '--repository', repository,
-                 '--verb', verb, '--call-id', call_id, '--tree-key', tree_key]
-    if repo_identity:
-        arguments.extend(['--repo-identity', repo_identity])
-    for name, value in test_environment:
-        arguments.extend(['--env', name + '=' + value])
-    if clear_environment:
-        arguments.extend(['--clear-environment', clear_environment])
-    arguments.extend(['--', *words])
-    return shlex.join(arguments)
-
-
-def probe_command_script(mirror: str, values: dict[str, str], repository: str) -> str:
-    return shlex.join(['.claude/scripts/lib/py', '.claude/scripts/mac_test/linux_runner.py', 'probe',
-                       '--mirror', mirror, '--values', json.dumps(values), '--repository', repository])
-
-
-def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
-    """Read parity inside the same cached environment as the work."""
-    try:
-        with slot_run(mirror):
-            shell = prepare_shell(mirror, Path.home() / values['shell_cache'],
-                                  policy_setting(values, 'devshell', repository),
-                                  positive_setting(values, 'shell_timeout_s'),
-                                  pass_fds=execution_descriptors())
-            command = (shell_environment_script(shell)
-                       + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
-                       + probe_script(str(mirror.relative_to(Path.home())), shell_environment=True))
-            return subprocess.run(['bash', '-c', command], cwd=mirror, check=False,
-                                   pass_fds=execution_descriptors()).returncode
-    except SlotStartupRefused:
-        print(STARTUP_REFUSAL_RECORD, flush=True)
-        return 75
-
-
-def run(mirror: Path, values: dict[str, str], repository: str, verb: str,
-        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '',
-        test_environment: tuple[tuple[str, str], ...] = (),
-        clear_environment: str = '') -> int:
-    try:
-        with slot_run(mirror):
-            return execute_slot(mirror, values, repository, verb, words, call_id, tree_key, repo_identity, test_environment, clear_environment)
-    except SlotStartupRefused:
-        print(STARTUP_REFUSAL_RECORD, flush=True)
-        return 75
-
-
 def output_filesystem_paths(checkout: Path, environment: Mapping[str, str] | None = None) -> tuple[Path, ...]:
     """Resolve the checkout and its Cargo output filesystems."""
     outputs = read_cargo_output_roots(checkout, environment=environment)
@@ -627,38 +568,6 @@ def output_free_bytes(checkout: Path, environment: Mapping[str, str] | None = No
                     raise
                 path = path.parent
     return min(readings)
-
-
-def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
-    """Use the existing budget sweep without the machine-wide disk sweep."""
-    code = '\n'.join((
-        'import sys',
-        'from pathlib import Path',
-        'from scripts.lint import sweep',
-        'from scripts.lib import conf',
-        'config = conf.read(conf.path("lint"))',
-        'recent_seconds = int(config.number(sweep.RECENT_KEY) * 60)',
-        'import os',
-        'target = Path(sys.argv[1])',
-        'checkout = Path(os.environ["BUILDLOG_WORKSPACE"])',
-        'os.chdir(checkout)',
-        'selected = None if (checkout / "Cargo.toml").is_file() else str(target)',
-        'sys.exit(sweep.sweep_workspace(selected, config, False, recent_seconds / 60))',
-    ))
-    return subprocess.run([str(Path.home() / '.claude/scripts/lib/py'), '-c', code, str(target)],
-                          env={**os.environ, **environment}, check=False,
-                          pass_fds=execution_descriptors()).returncode
-
-
-def version_mismatch(target: str, actual: Mapping[str, str], expected: Mapping[str, str], pin_file: str) -> str:
-    """Name each tool mismatch and the configured file that controls its version."""
-    differences = [f"{name} box={actual.get(name, 'unavailable')} natedev={expected[name]}"
-                   for name in ('rustc', 'nextest', 'mend')
-                   if expected.get(name) and actual.get(name) != expected[name]]
-    if not differences:
-        return ''
-    hint = f'; move the box pins in {pin_file}' if pin_file else ''
-    return f'{target} version mismatch: ' + '; '.join(differences) + hint
 
 
 def toolchain_install_script(expected_rustc: str, target: str = 'linux') -> str:
@@ -703,168 +612,3 @@ def toolchain_install_script(expected_rustc: str, target: str = 'linux') -> str:
         '  ) 9>"${RUSTUP_HOME:-$HOME/.rustup}/$toolchain.lock" || exit 75',
         'fi',
     ))
-
-
-def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: str,
-        words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str = '',
-        test_environment: tuple[tuple[str, str], ...] = (),
-        clear_environment: str = '') -> int:
-    if verb not in ('nextest', 'check', 'doc', 'clippy', 'mend-check', 'build'):
-        raise ValueError('unsupported remote verb')
-    if verb == 'nextest':
-        words = nextest_words_with_skip(words, values.get(f'skip.{repository}', ''), insert_filter=True)
-    kind = values.get('step_kind') or ('test' if verb == 'nextest' else 'lint' if verb in ('clippy', 'mend-check') else verb)
-    if kind not in {word.strip() for word in values['kinds'].split(',')}:
-        raise ValueError(f'{kind}: target does not permit this command')
-    selector = policy_setting(values, 'devshell', repository)
-    shell = prepare_shell(mirror, Path.home() / values['shell_cache'], selector,
-                          positive_setting(values, 'shell_timeout_s'), pass_fds=execution_descriptors())
-    build_budget = positive_setting(values, 'build_budget_gib')
-    budget = float(policy_setting(values, 'target_budget_gib', repository))
-    if not math.isfinite(budget) or not 0 < budget <= build_budget:
-        raise ValueError('repository budget exceeds the build budget')
-    floor = positive_setting(values, 'free_floor_gib')
-    target = mirror / 'target'
-    boundary = words.index('--') if '--' in words else len(words)
-    for index, word in enumerate(words[:boundary]):
-        if word == '--target-dir' and index + 1 < boundary:
-            target = mirror / words[index + 1]
-        elif word.startswith('--target-dir='):
-            target = mirror / word.partition('=')[2]
-    target = target.resolve()
-    if target == mirror.resolve() or mirror.resolve() not in target.parents:
-        raise ValueError('the Linux build folder must stay inside its slot')
-    # Finish the recorder write before the completion marker lets natedev pull the records.
-    environment = {
-        'LINT_SWEEP_BUDGET_GIB': f'{budget:g}',
-        'BUILDLOG_CALLER': 'verify-linux', 'BUILDLOG_CALL_ID': call_id,
-        'BUILDLOG_TARGET': values.get('selected_target', ''),
-        'BUILDLOG_PINNED_TARGET': values.get('pinned_target', ''),
-        'BUILDLOG_SYNC': '1', 'LINT_SKIP_SWEEP': '1',
-        'CARGO_TARGET_DIR': str(target),
-        'BUILDLOG_WORKSPACE': str(mirror),
-    }
-    if verb == 'nextest':
-        environment.update(test_environment)
-    if tree_key:
-        environment['BUILDLOG_SENT_TREE_KEY'] = tree_key
-    if repo_identity:
-        environment['BUILDLOG_REPO_IDENTITY'] = repo_identity
-    if verb == 'doc':
-        environment['LINT_CONFIG_FORCE'] = '1'
-    assignments = ' '.join(f'{key}={shlex.quote(value)}' for key, value in environment.items())
-    parity: list[str] = ["mismatches=()"]
-    for name, invocation in (('rustc', 'rustc -V'), ('nextest', 'cargo nextest --version'),
-                             ('mend', 'cargo mend --version')):
-        expected = normalize_tool_version(values.get(f'parity.{name}', ''))
-        if expected:
-            parity.extend([
-                f'actual=$({invocation} 2>/dev/null) || actual=unavailable',
-                f'actual=$(printf \'%s\' "$actual" | {tool_version_filter()}) || exit 75',
-                f'if [ "$actual" != {shlex.quote(expected)} ]; then',
-                f'  mismatches+=("{name} box=$actual natedev="{shlex.quote(expected)})',
-                'fi',
-            ])
-    target_name = values.get('selected_target', '')
-    hint = values.get('version_pin_file', '')
-    advice = '; move the box pins in ' + hint if hint else ''
-    parity.extend([
-        'if (( ${#mismatches[@]} )); then',
-        f'  printf \'%s version mismatch: %s\' {shlex.quote(target_name)} "${{mismatches[0]}}" >&2',
-        '  for mismatch in "${mismatches[@]:1}"; do printf \'; %s\' "$mismatch" >&2; done',
-        f'  printf \'%s\\n\' {shlex.quote(advice)} >&2',
-        '  exit 75',
-        'fi',
-    ])
-    abandoned_sessions = (removal_script(shlex.quote(str(target)), int(values['abandoned_session_minutes'])) + '\n'
-                          if target == (mirror / 'target').resolve() else '')
-    print(f'linux_runner: mirror={mirror} shell_key={shell.key}', flush=True)
-    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-            ".linux-step-", build_folders.ExplicitBuildParent(mirror))) as step_directory:
-        started = step_directory / 'started'
-        toolchain_environment = step_directory / 'toolchain'
-        _ = toolchain_environment.write_text('')
-        command = (shell_environment_script(shell)
-                    + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
-                    + toolchain_install_script(normalize_tool_version(values.get('parity.rustc', '')), target_name) + '\n'
-                    + f'printf \'%s\' "${{RUSTUP_TOOLCHAIN-}}" > {shlex.quote(str(toolchain_environment))} || exit 75\n'
-                    + '\n'.join(parity) + '\n'
-                    + abandoned_sessions
-                    + (clear_environment + '\n' if verb == 'nextest' and clear_environment else '')
-                    + f'export {assignments}\n'
-                    + f': > {shlex.quote(str(started))} || exit 75\n'
-                    + f'exec "$HOME/.claude/scripts/lint/lint" {shlex.join([verb, *words])}')
-        completed = subprocess.run(['bash', '-c', command], cwd=mirror, check=False,
-                                   pass_fds=execution_descriptors())
-        status = completed.returncode if completed.returncode >= 0 else 128 - completed.returncode
-        step_started = started.exists()
-        toolchain = toolchain_environment.read_text()
-        if toolchain:
-            environment['RUSTUP_TOOLCHAIN'] = toolchain
-    try:
-        free = output_free_bytes(mirror, {**os.environ, **environment}) / (1024 ** 3)
-        if free < floor:
-            if target.exists():
-                shutil.rmtree(target)
-            cleanup = '0' if trim_build_folder(target, environment) == 0 else '1'
-        else:
-            trimmed = trim_build_folder(target, environment)
-            cleanup = 'kept' if trimmed == 0 else '1'
-    except OSError:
-        cleanup = '1'
-    if step_started:
-        print(f'mac_exit={status}', flush=True)
-    print(f'mac_cleanup={cleanup}', flush=True)
-    return status
-
-
-class RunnerArguments(argparse.Namespace):
-    def __init__(self) -> None:
-        super().__init__()
-        self.command: str = ''
-        self.mirror: str = ''
-        self.values: str = ''
-        self.repository: str = ''
-        self.verb: str = ''
-        self.call_id: str = ''
-        self.tree_key: str = ''
-        self.repo_identity: str = ''
-        self.environment: list[str] = []
-        self.clear_environment: str = ''
-        self.words: list[str] = []
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest='command', required=True)
-    runner = commands.add_parser('run')
-    probe = commands.add_parser('probe')
-    for command in (runner, probe):
-        _ = command.add_argument('--mirror', required=True)
-        _ = command.add_argument('--values', required=True)
-        _ = command.add_argument('--repository', required=True)
-    _ = runner.add_argument('--verb', required=True)
-    _ = runner.add_argument('--call-id', required=True)
-    _ = runner.add_argument('--tree-key', default='')
-    _ = runner.add_argument('--repo-identity', default='')
-    _ = runner.add_argument('--clear-environment', default='')
-    _ = runner.add_argument('--env', dest='environment', action='append', default=[])
-    _ = runner.add_argument('words', nargs=argparse.REMAINDER)
-    arguments = parser.parse_args(namespace=RunnerArguments())
-    values = cast(object, json.loads(arguments.values))
-    if not isinstance(values, dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in cast(dict[object, object], values).items()):
-        raise ValueError('target settings must contain strings')
-    if arguments.command == 'probe':
-        return probe_shell(Path.home() / arguments.mirror, cast(dict[str, str], values), arguments.repository)
-    words = arguments.words
-    return run(Path.home() / arguments.mirror, cast(dict[str, str], values),
-               arguments.repository, arguments.verb,
-               tuple(words[1:] if words[:1] == ['--'] else words),
-               arguments.call_id, arguments.tree_key, arguments.repo_identity,
-               tuple((name, value) for entry in arguments.environment
-                     for name, _, value in (entry.partition('='),)),
-               arguments.clear_environment)
-
-
-if __name__ == '__main__':
-    raise SystemExit(main())

@@ -4590,18 +4590,6 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 self.assertEqual(evidence.eligibility, placement.FixedExclusion("off"))
                 self.assertEqual(start.call_count, 2)
 
-    def test_linux_kinds_recovers_the_committed_command(self) -> None:
-        with PlacementFixture() as fixture:
-            settings, request, _destination = self.target_settings_fixture(fixture)
-            self.commit_settings(settings)
-            _ = settings.write_text(settings.read_text().replace("kinds=check", "kinds=broken"))
-            with (redirect_stderr(io.StringIO()) as warnings,
-                  mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", ""))):
-                evidence = self.read_target(fixture, request)
-            assert isinstance(evidence, placement.FreshHostEvidence), evidence
-            self.assertEqual(evidence.eligibility, ALLOWED_HOST)
-            self.assertEqual(warnings.getvalue().count("kinds='broken'"), 1)
-
     def test_overlapping_snapshots_report_each_bad_edit_once(self) -> None:
         with PlacementFixture() as fixture, conf.report_key_changes(), redirect_stderr(io.StringIO()) as warnings:
             settings, _request, _destination = self.target_settings_fixture(fixture)

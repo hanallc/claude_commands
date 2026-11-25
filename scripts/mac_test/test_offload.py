@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import fields, replace
 import io
 from pathlib import Path
@@ -457,11 +457,10 @@ subprocess.run([sys.executable, "-I", "-S", "-c", sys.argv[2], str(fd)], pass_fd
 
 class CompletedRunSyncTests(unittest.TestCase):
     def test_finished_runs_exchange_after_release_and_preserve_results(self) -> None:
-        for target in ("linux", "mac"):
-            for status in (0, 42):
-                for fails in (False, True):
-                    with self.subTest(target=target, status=status, fails=fails), tempfile.TemporaryDirectory() as directory:
-                        self.check_finished_run(Path(directory), target, status, fails)
+        for status in (0, 42):
+            for fails in (False, True):
+                with self.subTest(status=status, fails=fails), tempfile.TemporaryDirectory() as directory:
+                    self.check_finished_run(Path(directory), "mac", status, fails)
 
     def check_finished_run(self, root: Path, target: str, status: int, fails: bool) -> None:
         configured = target_config.SshTarget(target, "linux" if target == "linux" else "macos", root / "target.conf")
@@ -514,79 +513,6 @@ class CompletedRunSyncTests(unittest.TestCase):
             self.assertEqual(output.getvalue().count("exchange failed"), int(fails))
 
 
-class LocalVersionPreflightTests(unittest.TestCase):
-    def test_recorded_versions_decline_before_claim_copy_or_ssh(self) -> None:
-        self.check_record('{"versions":{"rustc":"rustc 1.99.1"}}', declined=True)
-
-    def test_matching_versions_continue_to_claim(self) -> None:
-        self.check_record('{"versions":{"rustc":" rustc 1.99.0 \\n"}}')
-
-    def test_later_match_removes_the_decline_record(self) -> None:
-        self.check_record('{"versions":{"rustc":"rustc 1.99.1"}}', declined=True, later_match=True)
-
-    def test_missing_and_unreadable_records_continue_to_claim(self) -> None:
-        for content in (None, 'invalid json', '{"versions":[]}'):
-            with self.subTest(content=content):
-                self.check_record(content)
-
-    def test_only_recorded_keys_are_compared(self) -> None:
-        self.check_record('{"versions":{"nextest":"nextest fixture","mend":"mend fixture"}}')
-
-    def check_record(self, content: str | None, *, declined: bool = False, later_match: bool = False) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            if content is not None:
-                _ = (root / "box-tools.json").write_text(content)
-            target = target_config.SshTarget("linux", "linux", root / "linux.conf")
-            config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("dummy", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
-                                          1, 1, 1, "1", {"version_pin_file": "box-pins.nix"})
-            request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", target="linux", holder_session="fixture-session")
-            controller = offload.ProcessController()
-            versions = {"rustc": "rustc 1.99.0", "nextest": "nextest fixture", "mend": "mend fixture", "git": "commit"}
-
-            def capture(arguments: Sequence[str], deadline: offload.CommandDeadline) -> offload.CommandOutput:
-                self.assertIsInstance(deadline, offload.CommandTimeLimit)
-                name = arguments[1] if arguments[0] == "cargo" else arguments[0]
-                return offload.CommandOutput(0, versions[name], "")
-
-            with (
-                mock.patch.object(eligibility, "mac_step_eligibility", return_value=HANA),
-                mock.patch.object(eligibility, "configured_ssh_target", return_value=target),
-                mock.patch.object(offload, "trusted_linux_source", return_value=True),
-                mock.patch.object(target_config, "ssh_target_state_directory", return_value=root),
-                mock.patch.object(controller, "capture", side_effect=capture),
-                mock.patch.object(offload, "claim_for_run", return_value=offload.MacClaimNotConfirmed("blocked", "", "")) as claim,
-                mock.patch.object(offload, "copy_tracked_scripts") as scripts_copy,
-                mock.patch.object(offload, "copy_tree_with_key") as tree_copy,
-                mock.patch.object(subprocess, "Popen", side_effect=AssertionError("No process expected")),
-                mock.patch.object(subprocess, "run", side_effect=AssertionError("No command expected")),
-                mock.patch.object(time, "monotonic", return_value=5),
-                mock.patch.object(time, "time", return_value=100),
-            ):
-                answer = offload.run_offload(controller, config, request, 1)
-                if declined:
-                    self.assertEqual(answer, offload.DeclinedMacRun("state", 4,
-                        "linux version mismatch: rustc box=rustc 1.99.1 natedev=rustc 1.99.0; move the box pins in box-pins.nix"))
-                    claim.assert_not_called()
-                    self.assertEqual(eligibility.linux_version_decline_path("linux", HANA.name), root / "version-decline-hana")
-                    self.assertTrue(offload.linux_version_declined_recently("linux", HANA.name, 60, 159))
-                    self.assertFalse(offload.linux_version_declined_recently("linux", HANA.name, 60, 160))
-                    if later_match:
-                        _ = (root / "box-tools.json").write_text('{"versions":{"rustc":"rustc 1.99.0"}}')
-                        _ = offload.run_offload(controller, config, request, 1)
-                        claim.assert_called_once_with(controller, config, request, HANA,
-                                                      mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
-                                                      retire_wait=False)
-                        self.assertFalse(eligibility.linux_version_decline_path("linux", HANA.name).exists())
-                else:
-                    claim.assert_called_once_with(controller, config, request, HANA,
-                                                  mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
-                                                  retire_wait=False)
-                    self.assertFalse(offload.linux_version_declined_recently("linux", HANA.name, 60, 100))
-            scripts_copy.assert_not_called()
-            tree_copy.assert_not_called()
-
-
 class OffloadSettingsTests(unittest.TestCase):
     root: Path = Path()
     settings: Path = Path()
@@ -609,38 +535,6 @@ class OffloadSettingsTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         _ = self.enterContext(mock.patch("subprocess.run", side_effect=AssertionError("No external command expected")))
         _ = self.enterContext(mock.patch("subprocess.Popen", side_effect=AssertionError("No external command expected")))
-
-    def test_fresh_claim_refusal_after_cleanup_does_not_report_failed_adoption(self) -> None:
-        controller = offload.ProcessController()
-        config = eligibility.read_config(self.settings)
-        admission = offload.MacClaimFromWait(41, claim_state.ClaimIdentity("claim-a", "episode-a", "attempt-a"),
-                                             NoOwningSession())
-        request = offload.OffloadRequest(self.root, "hana", "call", offload.NO_RESULT_FILE, (),
-                                         owner="verify", holder_session="fixture-session",
-                                         placement=offload.DirectOffloadRequest(), admission=admission)
-        fresh_error = "state unreadable: fixture block\n"
-        refusal = offload.read_claim_answer(offload.CommandOutput(12, "", fresh_error))
-        result_path = self.root / "result"
-        with (ExitStack() as lease,
-              mock.patch.object(offload, "claim_for_run", side_effect=(offload.TakenOverMacClaim("fixture-mac"), refusal)) as claim,
-              mock.patch.object(offload, "check_taken_over_claim", return_value=offload.LeftoversEnded()),
-              mock.patch.object(offload, "release_claim", return_value=offload.ClaimReleaseConfirmed()) as release,
-              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
-            result = offload.leased_offload(controller, config, request, HANA, time.monotonic(), True, lease,
-                                            admission_slot=1)
-            assert isinstance(result, offload.DeclinedMacRun)
-            self.assertEqual(offload.write_result(result, offload.ResultFile(result_path)), 75)
-
-        self.assertEqual(claim.call_args_list, [
-            mock.call(controller, config, request, HANA, mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
-                      retire_wait=False),
-            mock.call(controller, config, replace(request, admission=offload.UnclaimedMacRun()), HANA,
-                      mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY),
-        ])
-        release.assert_called_once_with(controller, request.target)
-        self.assertEqual(output.getvalue(), "mac_test: not running on the Mac (state)\n")
-        self.assertEqual(errors.getvalue(), fresh_error)
-        self.assertEqual(result_path.read_text().splitlines()[:2], ["mac=declined", "reason=state"])
 
     def test_mac_summary_write_failure_preserves_the_published_result(self) -> None:
         def place(request: offload.OffloadRequest, *_arguments: object) -> offload.OffloadRequest:
@@ -1374,6 +1268,23 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(len(self.events_for("ssh")), 2)
         self.assertEqual(len(self.events_for("rsync")), 1)
 
+    def test_linux_ssh_refuses_before_placement_or_commands(self) -> None:
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text(
+            "targets=builder\nkind.builder=ssh\nplatform.builder=linux\nsettings.builder=linux.conf\n"
+            + UNREACHABLE_WAIT_FIXTURE)
+        _ = write_config_fixture(self.root / "linux.conf", "offload=on\nkinds=test\n", template="mac_test")
+        self.environment["BUILD_TARGETS_CONFIG"] = str(registry)
+
+        with mock.patch.object(admission_client, "request_placement") as place:
+            result = self.command(runner_options=("--target", "builder"), direct_placement=True)
+
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "mac_test: not running on the builder (target does not permit this command)\n")
+        self.assertIn("reason=target does not permit this command", self.result_path.read_text().splitlines())
+        place.assert_not_called()
+        self.assertEqual(self.events(), [])
+
     def test_run_settings_selects_alternate_host_and_budget_over_environment_default(self) -> None:
         alternate = self.root / "alternate settings.conf"
         values = {**self.config, "host": "alternate-mac", "mac_budget_gib.hana": "8"}
@@ -1409,7 +1320,6 @@ class OffloadCommandTests(OffloadCommandFixture):
                     with (
                         mock.patch.object(eligibility, "mac_step_eligibility", return_value=HANA),
                         mock.patch.object(offload, "trusted_linux_source", return_value=True),
-                        mock.patch.object(offload, "recorded_linux_version_mismatch", return_value=""),
                         mock.patch.object(offload, "claim_for_run", return_value=offload.FreshMacClaim()),
                         mock.patch.object(offload, "expected_linux_parity", return_value={}),
                         mock.patch.object(offload, "copy_tracked_scripts", return_value=False) as scripts_copy,

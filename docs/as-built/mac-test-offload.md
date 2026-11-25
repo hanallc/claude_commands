@@ -466,33 +466,12 @@ The runner uses `rsync -rlp --safe-links` and publishes the completed copy throu
 Files return to `~/.local/state/mac-test/fetched/<call id>/<folder>`. Existing destinations are refused. A failure or signal removes the partial copy.
 A fetch result adds `fetch=fetched|missing|too_large|failed|not_run` to the result file.
 
-After a Linux run reports completion, natedev releases the repository claim before it calls `buildlog.sync.sync_target(target)`.
-The exchange selects one configured peer and preserves the host paths from `sync.hosts.<target>`.
-AWS rows arrive under `~/.local/state/buildlog/aws-build/` on natedev.
-The Linux runner uses `BUILDLOG_SYNC=1` to finish the local recorder write before it reports completion.
-This setting controls the recorder write; the box starts no connection.
-
-The exchange uses the existing sync lock without waiting for another exchange.
-A paused sync or a target without a host mapping causes no exchange.
-The exchange uses `sync.connect_timeout_s`, `sync.reach_timeout_s`, and `sync.rsync_timeout_s` from `config/build_targets.conf`.
-A failed exchange prints one line and leaves the hourly sync to retry.
-The run keeps its result and its measured duration before the exchange.
-The Mac keeps its existing hourly sync path.
-
-Tool parity uses one form for the sender, the probe, execution, and refusal messages.
-The normalizer strips each version line and joins nonempty lines with one space.
-This includes all lines from `cargo nextest --version`.
-
 Linux cleanup reads the real UID from `/proc/<pid>/status` before it reads process ownership evidence.
 It excludes processes from other users.
 Cleanup excludes processes that started before the recorded run and ancestors of the checking process.
 It also excludes direct children of another user, except children of PID 1.
 Slot processes keep their user, but an orphan can acquire PID 1 as its parent.
 Other same-user processes with unreadable evidence keep the slot busy.
-
-`verify-linux` steps use the repository claim and build budget for admission.
-They do not contact natedev's admission service or obey natedev's hold.
-The controller still checks spending before AWS admission.
 
 A missing completion marker reports the runner exit status when available.
 It does not prove a link failure.
@@ -831,17 +810,13 @@ It also carries the repository scope.
 `request_mirror` uses this supplied session without another lookup.
 Busy refusals can name the unit director's session.
 
-`offload.py` requests Mac, Linux, and AWS mirrors through `copies.py`.
+`offload.py` requests Mac mirrors through `copies.py`.
 Each SSH target permits one claim per repository.
 Native Mac and mac-linux work share this limit.
-On Linux targets, the sender publishes mirror ownership after admission succeeds.
-Failed admission preserves the mirror owner.
 The reader keeps the saved file and fence for each old numbered claim.
 An old live claim holds the repository.
 When a local owner ends, the reader releases its local claim.
 For each remote claim, the runner checks the saved mirror before release.
-New Linux claims use the first mirror.
-The runner takes the saved assignment's mirror lease before it adopts a Linux reservation.
 
 The Terminal launcher enters the numbered copy before it checks its per-run token.
 Cleanup removes the token before `stop-checkout` scans the copy.

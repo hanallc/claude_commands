@@ -9,7 +9,7 @@ Local fake tests do not prove live quota, capacity, or deployment state.
 
 ## Removed builder: 2026-11-10
 
-`builder-removal.json` records the removal. Commit `1b1fa1842` removed the target on 2026-11-10.
+`builder-removal.json` records the removal. Commit `1b1fa1842a` removed the permanent Linux AWS builder on 2026-11-10.
 The persistent `aws-build` instance, Tailscale device, and data volumes were removed.
 `routing.json` records `enabled: false`.
 The ledger and teardown retain historical records for the former builder.

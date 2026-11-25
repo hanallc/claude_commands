@@ -104,6 +104,20 @@ class FolderInvocationTests(NotificationGuardedTestCase):
             with self.assertRaises(ChildProcessError):
                 _ = real_waitpid(children[0], os.WNOHANG)
 
+    def test_linux_ssh_recovery_refuses_before_reading_probe_settings(self) -> None:
+        args = build_targets.CliArguments()
+        args.target = "linux"
+        args.recovery_fd = os.open(os.devnull, os.O_RDONLY)
+        target = target_config.SshTarget("linux", "linux", Path("unused.conf"))
+        with (mock.patch.object(target_config, "configured_ssh_target", return_value=target),
+              mock.patch.object(build_targets, "ssh_target_config") as read_config,
+              mock.patch.object(offload, "probe_mac") as probe,
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(build_targets.command_recover_probe(args), 1)
+        self.assertEqual(errors.getvalue(), "target does not permit this command\n")
+        read_config.assert_not_called()
+        probe.assert_not_called()
+
     def test_verify_commands_open_each_config_once(self) -> None:
         code = """import io, json, os, runpy, sys
 from contextlib import redirect_stdout
