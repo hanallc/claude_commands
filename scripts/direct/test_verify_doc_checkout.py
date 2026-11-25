@@ -23,7 +23,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.verify_doc_test_support import CARGO_STUB, VERIFY, VerifyDocFixture
 from scripts.direct.verify_mac_offload_test_support import processes_carrying, reap
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
-from scripts.lib import build_folders, build_slots
+from scripts.lib import build_folders, build_copies
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
 from scripts.production import staff
@@ -227,7 +227,7 @@ else:
             pass
         self.assertEqual(sweep_events.read_text().splitlines(), ["sweep started on 8", "sweep started on 74"])
 
-    def test_doc_waits_for_admission_without_a_slot_or_lease(self) -> None:
+    def test_doc_waits_for_admission_without_a_copy_or_lease(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
         waiting = Event()
         grants: list[wire.LocalPlacementGranted] = []
@@ -345,21 +345,21 @@ else:
         self.assertEqual(self.pass_records(), [])
         self.assertFalse(admission.caller_reservations())
 
-    def test_doc_uses_the_prepared_copy_without_taking_a_second_slot(self) -> None:
+    def test_doc_uses_the_prepared_copy_without_taking_a_second_copy(self) -> None:
         original = self.repo
-        with mock.patch.dict(os.environ, self.environment, clear=True), build_slots.take_copy(
-                original, "HEAD", showrunner="builds", unit="doc-test", work="prepared copy", purpose="doc") as slot:
-            self.repo: Path = slot.path
-            self.environment["BUILDLOG_PREPARED_COPY"] = str(slot.path)
-            self.environment["TEST_METADATA"] = self.environment["TEST_METADATA"].replace(str(original), str(slot.path))
+        with mock.patch.dict(os.environ, self.environment, clear=True), build_copies.take_copy(
+                original, "HEAD", showrunner="builds", unit="doc-test", work="prepared copy", purpose="doc") as copy:
+            self.repo: Path = copy.path
+            self.environment["BUILDLOG_PREPARED_COPY"] = str(copy.path)
+            self.environment["TEST_METADATA"] = self.environment["TEST_METADATA"].replace(str(original), str(copy.path))
             result = self.verify()
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(self.cargo_calls()[0]["cwd"], str(slot.path))
-            self.assertEqual(build_folders.build_folder_state(slot.path), "held")
+            self.assertEqual(self.cargo_calls()[0]["cwd"], str(copy.path))
+            self.assertEqual(build_folders.build_folder_state(copy.path), "held")
             self.assertEqual(list((self.root / "build").glob("*/*/*.lease.json")),
-                             [build_folders.lease_path(slot.path)])
+                             [build_folders.lease_path(copy.path)])
 
-    def test_doc_takes_its_own_slot_when_the_prepared_copy_names_another_tree(self) -> None:
+    def test_doc_takes_its_own_copy_when_the_prepared_copy_names_another_tree(self) -> None:
         self.environment["BUILDLOG_PREPARED_COPY"] = str(self.root / "another-copy")
         result = self.verify()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -372,9 +372,9 @@ else:
     def test_doc_with_an_old_copy_call_reports_that_verify_must_run_again(self) -> None:
         verify = self.root / "home/.claude/scripts/direct/verify.sh"
         source = verify.read_text(encoding="utf-8")
-        current = r'''set -- "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE" --tree "$VERIFY_SLOT_TREE" \
+        current = r'''set -- "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_COPY_SOURCE" --tree "$VERIFY_COPY_TREE" \
             --step "$CMD" -- "$@"'''
-        legacy = 'set -- "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE"'
+        legacy = 'set -- "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_COPY_SOURCE"'
         self.assertEqual(source.count(current), 1)
         _ = verify.write_text(source.replace(current, legacy), encoding="utf-8")
 

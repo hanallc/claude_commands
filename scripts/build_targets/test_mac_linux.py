@@ -38,7 +38,7 @@ from scripts.build_targets.mac_linux import send_guest_execution
 from scripts.buildlog import store, treekey
 from scripts.copies import copies
 from scripts.lib import atomic_file, build_folders, conf, process_group, process_start, scratch
-from scripts.lib.build_slots import SlotQueuePosition
+from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test
@@ -1092,7 +1092,9 @@ fi
         build = self.guest_home / 'build'
         self.assertLessEqual(set(self.guest_home.iterdir()), {main, build})
         self.assertFalse((main / '.git/mac-linux').exists())
-        self.assertEqual(list(build.rglob('mac-linux*')), [])
+        claim_locks = build / '.build-claim-locks'
+        self.assertEqual([path for path in build.rglob('mac-linux*')
+                          if not (path.name == 'mac-linux.lock' and path.is_relative_to(claim_locks))], [])
         self.assertEqual(self.trace.read_text(encoding='utf-8').splitlines(), list(events))
 
     def assert_bundle(self, run: mac_linux.MacLinuxGateRun, form: mac_linux.BundleForm,
@@ -1748,7 +1750,7 @@ fi
         path = self.root / 'assignment.json'
         grant = wire.Assignment(guest)
         admission_client.write_assignment(path, grant)
-        admitted = first_step.FirstStepAdmission(SlotQueuePosition(guest.episode, guest.since),
+        admitted = first_step.FirstStepAdmission(CopyQueuePosition(guest.episode, guest.since),
             first_step.OwnedGatePlacement(grant, submitted), path)
         pending = wire.DispatchStatus(guest, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
 

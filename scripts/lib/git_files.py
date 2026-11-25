@@ -6,9 +6,15 @@ that folder's `commondir` file names the shared Git folder.
 """
 from __future__ import annotations
 
+import codecs
+import errno
 import os
+import re
 import stat
-from collections.abc import Generator
+import subprocess
+import time
+from collections import deque
+from collections.abc import Callable, Generator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -38,6 +44,26 @@ class UnreadableGitFiles(GitFilesError):
 
 class MissingReferencedGitDirectory(UnreadableGitFiles):
     """The directory that a gitdir: line names is missing."""
+
+
+GIT_STORAGE_REASON = "the folder contains Git storage"
+
+
+def is_git_directory(folders: set[str], files: set[str]) -> bool:
+    """Recognize a bare Git directory or the directory for a linked checkout."""
+    return "HEAD" in files and ("objects" in folders or "commondir" in files)
+
+
+def has_git_storage(folder: Path, folders: set[str], files: set[str]) -> bool:
+    """Check the names and types in one directory for Git storage."""
+    if ".git" in folders or ".git" in files or is_git_directory(folders, files):
+        return True
+    if {"info", "pack"} <= folders or (folder.name == "info" and "alternates" in files):
+        return True
+    if folder.name == "pack":
+        return any(re.fullmatch(r"pack-(?:[0-9a-f]{40}|[0-9a-f]{64})\.pack", name) for name in files)
+    return len(folder.name) == 2 and bool(re.fullmatch(r"[0-9a-f]{2}", folder.name)) and any(
+        re.fullmatch(r"[0-9a-f]{38}|[0-9a-f]{62}", name) for name in files)
 
 
 @dataclass(frozen=True)
@@ -135,7 +161,10 @@ def _read_entry(path: Path, *, allow_directory: bool = False, errors: str = "str
 
 
 def _folder(path: Path, named_by: Path, *,
-            missing: type[UnreadableGitFiles] = UnreadableGitFiles) -> _ResolvedGitDirectory:
+            missing: type[UnreadableGitFiles] = UnreadableGitFiles,
+            on_link: Callable[[Path], None] | None = None) -> _ResolvedGitDirectory:
+    if on_link is not None:
+        _ = _path_links(path, on_link)
     try:
         found = path.resolve(strict=True)
         status = found.lstat()
@@ -148,9 +177,29 @@ def _folder(path: Path, named_by: Path, *,
     return _ResolvedGitDirectory(found, status)
 
 
-def at(toplevel: Path) -> Checkout:
+def _common_directory(git_dir: _ResolvedGitDirectory, on_link: Callable[[Path], None] | None) -> _ResolvedGitDirectory:
+    common = git_dir.path / "commondir"
+    if on_link is not None:
+        _ = _path_links(common, on_link)
+    try:
+        location = _read_entry(common).strip()
+    except FileNotFoundError:
+        return git_dir
+    if not location:
+        raise UnreadableGitFiles(common, "empty commondir path")
+    return _folder(git_dir.path / location, common, on_link=on_link)
+
+
+def objects_in_git_directory(git_dir: Path, *, on_link: Callable[[Path], None] | None = None) -> Path:
+    """Find the object directory for a bare or separate Git directory."""
+    return _common_directory(_folder(git_dir, git_dir, on_link=on_link), on_link).path / "objects"
+
+
+def at(toplevel: Path, *, on_link: Callable[[Path], None] | None = None) -> Checkout:
     """Read the checkout whose `.git` entry is in this folder, with no search of parent folders."""
     dot_git = toplevel / ".git"
+    if on_link is not None:
+        _ = _path_links(dot_git, on_link)
     try:
         entry = _read_entry(dot_git, allow_directory=True)
     except FileNotFoundError as error:
@@ -162,26 +211,21 @@ def at(toplevel: Path) -> Checkout:
         location = entry.removeprefix("gitdir:").strip()
         if not entry.startswith("gitdir:") or not location:
             raise UnreadableGitFiles(dot_git, "expected a gitdir: line")
-        git_dir = _folder(toplevel / location, dot_git, missing=MissingReferencedGitDirectory)
-    common = git_dir.path / "commondir"
-    try:
-        location = _read_entry(common).strip()
-    except FileNotFoundError:
-        return Checkout(toplevel.resolve(), git_dir.path, git_dir.path, git_dir.status, git_dir.status)
-    if not location:
-        raise UnreadableGitFiles(common, "empty commondir path")
-    common_dir = _folder(git_dir.path / location, common)
+        git_dir = _folder(toplevel / location, dot_git, missing=MissingReferencedGitDirectory, on_link=on_link)
+    common_dir = _common_directory(git_dir, on_link)
     return Checkout(toplevel.resolve(), git_dir.path, common_dir.path, git_dir.status, common_dir.status)
 
 
-def locate(folder: Path) -> Checkout:
+def locate(folder: Path, *, on_link: Callable[[Path], None] | None = None) -> Checkout:
     """Find the checkout that holds the folder, as `git -C <folder>` finds it."""
+    if on_link is not None:
+        _ = _path_links(folder.expanduser(), on_link)
     start = folder.expanduser().resolve()
     if not start.is_dir():
         raise NotACheckout(f"{folder}: not a folder")
     for toplevel in (start, *start.parents):
         try:
-            return at(toplevel)
+            return at(toplevel, on_link=on_link)
         except NotACheckout:
             continue
     raise NotACheckout(f"{folder}: not in a Git checkout")
@@ -376,3 +420,133 @@ def current_branch(folder: Path) -> str:
     """The checked-out branch, or "" for a detached HEAD, as `git branch --show-current` prints it."""
     found = head(locate(folder))
     return found.name if isinstance(found, OnBranch) else ""
+
+
+def _path_links(path: Path, on_link: Callable[[Path], None]) -> Path:
+    """Resolve the path and record every link that the lookup uses."""
+    anchor, *parts = path.absolute().parts
+    current = Path(anchor)
+    pending = deque(parts)
+    followed = 0
+    while pending:
+        part = pending.popleft()
+        if part == "..":
+            current = current.parent
+            continue
+        candidate = current / part
+        try:
+            target = Path(os.readlink(candidate))
+        except OSError as error:
+            if error.errno not in (errno.EINVAL, errno.ENOENT, errno.ENOTDIR):
+                raise
+            current = candidate
+            continue
+        on_link(candidate)
+        followed += 1
+        if followed > 40:
+            raise ValueError(f"{path}: too many symbolic links")
+        parts = list(target.parts)
+        if target.is_absolute():
+            current = Path(parts.pop(0))
+        pending.extendleft(reversed(parts))
+    return current
+
+
+@dataclass(frozen=True)
+class AlternateEvidence:
+    paths: tuple[Path, ...]
+    files: frozenset[Path]
+    unreadable: str
+
+
+def object_stores(objects: Path, cache: dict[Path, AlternateEvidence], deadline: float, *,
+                  hold: Callable[[Path], None] | None = None) -> tuple[set[Path], set[Path], str]:
+    """Find object stores and the files that they need. Hold paths before opening the alternates file."""
+    pending = [objects]
+    visited: set[Path] = set()
+    stores: set[Path] = set()
+    files: set[Path] = set()
+    unreadable = ""
+    while pending:
+        if time.monotonic() >= deadline:
+            return stores, files, unreadable or "the borrowed object scan timed out"
+        store = pending.pop()
+        stores.add(Path(os.path.abspath(store)))
+        links: set[Path] = set()
+        try:
+            folder = _path_links(store, links.add)
+        except (OSError, ValueError) as error:
+            files.update(links)
+            unreadable = unreadable or str(error)
+            continue
+        stores.add(folder)
+        files.update(links)
+        if hold is not None:
+            for path in (store, folder, *sorted(links)):
+                hold(path)
+        if folder in visited:
+            continue
+        visited.add(folder)
+        evidence = cache.get(folder)
+        if evidence is None:
+            evidence = cache[folder] = _read_alternates(folder, deadline, hold)
+        pending.extend(evidence.paths)
+        files.update(evidence.files)
+        unreadable = unreadable or evidence.unreadable
+    return stores, files, unreadable
+
+
+def _read_alternates(objects: Path, deadline: float, hold: Callable[[Path], None] | None) -> AlternateEvidence:
+    alternates = objects / "info/alternates"
+    files: set[Path] = set()
+    paths: list[Path] = []
+    reason = ""
+    try:
+        path = _path_links(alternates, files.add)
+        if os.path.lexists(alternates):
+            files.update((alternates, path))
+    except (OSError, ValueError) as error:
+        return AlternateEvidence((), frozenset(files), str(error))
+    if hold is not None:
+        for dependency in sorted(files):
+            hold(dependency)
+    try:
+        if not objects.is_dir():
+            raise ValueError(f"{objects} is not an object directory")
+        paths.extend(_read_alternate_paths(objects, alternates, path, deadline))
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        reason = str(error)
+    return AlternateEvidence(tuple(paths), frozenset(files), reason)
+
+
+def _read_alternate_paths(objects: Path, alternates: Path, path: Path, deadline: float) -> Generator[Path]:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError as error:
+        try:
+            _ = alternates.lstat()
+        except FileNotFoundError:
+            if alternates.parent.is_symlink():
+                _ = alternates.parent.resolve(strict=True)
+            return
+        raise ValueError(f"{alternates}: cannot open {path}") from error
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            while line := source.readline(65536):
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired("inspect local object storage", 0)
+                if len(line) == 65536 or b"\0" in line:
+                    raise ValueError(f"{path} has an invalid alternate")
+                if line != b"\n" and not line.startswith(b"#"):
+                    name = line.removesuffix(b"\n")
+                    if name.startswith(b'"'):
+                        if not re.fullmatch(rb'"(?:[^"\\]|\\(?:[abfnrtv"\\]|[0-3][0-7]{2}))*"', name):
+                            raise ValueError(f"{path} has an invalid quoted alternate")
+                        name, _ = codecs.escape_decode(name[1:-1])
+                        if not name or b"\0" in name:
+                            raise ValueError(f"{path} has an invalid alternate")
+                    yield objects / os.fsdecode(name)
+    finally:
+        os.close(descriptor)

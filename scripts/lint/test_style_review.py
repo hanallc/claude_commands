@@ -49,7 +49,7 @@ class PreparationTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / "lint.conf"
         _ = config.write_text("style_review=on\n")
-        _ = (self.root / "build_folders.conf").write_text("""\
+        _ = (self.root / "build_folders.conf").write_text(f"roots.build={self.root / 'build'}\n" + """\
 # whole: 1..
 names.suffix_length=11
 names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
