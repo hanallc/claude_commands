@@ -1253,16 +1253,15 @@ always=director
                 with self.subTest(id=entry.id, example=example.name):
                     rendered = render_entry(entry, example.values)
                     self.assertEqual((rendered.sender, rendered.need), (example.values["sender"], "decision"))
-                    self.assertIsInstance(rendered.action, ActionRequired)
-                    assert isinstance(rendered.action, ActionRequired)
-                    self.assertIn(f"remove {example.values['account']} from codex_credit_accounts", rendered.action.text)
-                    keys = {"sender", "account", "machine", "credits", "refill"}
+                    self.assertEqual(rendered.action, ActionRequired(
+                        f"To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts {example.values['credit_accounts']}"))
+                    keys = {"sender", "account", "machine", "credits", "refill", "credit_accounts"}
                     if entry.id == "quota.paid_credits":
                         keys.add("next_reset")
-                        self.assertIn("Claude", rendered.body)
+                        self.assertIn("now spends paid credits", rendered.title)
                     else:
-                        self.assertNotIn("Claude", rendered.body)
-                        self.assertIn("queued move", rendered.body)
+                        self.assertIn("uses credits until move", rendered.title)
+                    self.assertEqual(rendered.body, "")
                     self.assertEqual(set(example.values), keys)
 
     def test_codex_refusal_and_swap_advice_use_worker_wording_and_the_home_note_number(self) -> None:
