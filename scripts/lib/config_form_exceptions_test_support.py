@@ -280,6 +280,10 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
         "scripts/lib/python_startup/sitecustomize.py", "_GATE_ENVIRONMENT_LIMIT",
         "Bound environment reads during Python startup.",
     ),
+    InternalLiteral(
+        "scripts/lib/removal_guard.py", "LIST_NAME_TOKEN_BYTES",
+        "Name each removal list file with a fixed-size random token.",
+    ),
     ExternalLiteral(
         "scripts/message/postmaster.py", "MAX_SAFE_INTEGER",
         "JavaScript Number.MAX_SAFE_INTEGER limits exact integer exchange with the browser.",
