@@ -511,8 +511,17 @@ This record changes no selection and refuses no run.
 The six merge flags are required for a checkpoint merge.
 Use `--tests-only` for a merge-line test run and `--affected` for a unit test run.
 Use one `--module <suite>/<module>` for each module with `--tests-only` or `--affected`.
-`copies.py run` refuses a named gate without either mode before it requests placement.
-Use the module names that the gate prints.
+Give each path relative to `scripts/`, for example `lib/test_x.py`.
+`copies.py run` refuses a named gate without a test mode before placement.
+The check before placement applies to `scripts/production/gate.py` and `scripts/production/merge_gate.py`.
+The check accepts `.` path segments and an optional `{tree}/` prefix.
+These forms use the gate parser from the prepared source.
+Absolute launchers at these paths use the gate parser from the launcher's checkout.
+An invalid explicit nightly owner receives the same refusal and status as a direct gate run.
+Revisions without the validation entry point check arguments when the gate starts.
+Omit the inner `--repo` option or use `--repo .` or `--repo '{tree}'` to select the numbered copy.
+`gate-step` replaces `{tree}` with the prepared checkout path before validation and launch.
+The early check resolves only the named module paths in the snapshot.
 A standalone named run on natedev waits for the build hold to clear and takes one local admission reservation.
 A named run on natedev uses the build hold exemption for the unit in `max_runs.exempt_unit`.
 A named run on natedev uses a live ancestor's reservation when they share the admission queue or CPU pool.

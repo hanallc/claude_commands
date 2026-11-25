@@ -1381,7 +1381,8 @@ class PlacementTests(unittest.TestCase):
                 self.assertNotIn(replacement.attempt, attempts)
 
     def test_gate_retry_requests_each_persist_once(self) -> None:
-        with PlacementFixture(private_child_starts=True) as fixture:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
             request = scaler_gate_request(fixture)
             _ = publish_candidate(fixture, request)
             assignment = assignment_for(fixture, request)
