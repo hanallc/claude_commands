@@ -49,9 +49,6 @@ class PageSettings(TypedDict):
     cache_seconds: int
     poll_seconds: int
     wait_seconds: int
-    # The Builds page data file, relative to this page; a slot in use shows its step tooltip from it.
-    builds_data: str
-    builds_max_age_seconds: int
     names: dict[str, str]
 
 
@@ -72,14 +69,7 @@ def page_settings() -> PageSettings:
     return {"slider_min_gib": settings.number("slider.min_gib"), "slider_default_gib": settings.number("slider.default_gib"),
             "cache_seconds": settings.whole("cache_seconds"), "poll_seconds": settings.whole("page.poll_seconds"),
             "wait_seconds": settings.whole("measure.timeout_seconds") * len(drives),
-            "builds_data": builds_data_url(), "builds_max_age_seconds": settings.whole("page.builds_max_age_seconds"),
             "names": names}
-
-
-def builds_data_url() -> str:
-    """The Builds page data file as a link from the Disks page folder; both folders are under the review root."""
-    builds = memory_files.configured_output_folder(conf.read("memory_feed")) / memory_files.DATA_NAME
-    return Path(os.path.relpath(builds, output_folder())).as_posix()
 
 
 def shared_step_tip(source: str) -> StepTip:

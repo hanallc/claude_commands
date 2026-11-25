@@ -203,7 +203,7 @@ class LinuxShellTests(unittest.TestCase):
         self.settings = self.root / "linux.conf"
         _ = write_config_fixture(self.root / "mac_test.conf", template="mac_test")
         _ = write_config_fixture(self.settings,
-            "offload=on\nhost=fake-linux\nkinds=test,check,doc\nslots=2\n"
+            "offload=on\nhost=fake-linux\nkinds=test,check,doc\n"
             + "free_floor_gib=10\nbuild_budget_gib=32\ntarget_budget_gib=24\n"
             + "target_budget_gib.hana=31\ntarget_budget_gib.phase-copy=2\n"
             + "devshell.hana=ci\ndevshell.phase-copy=wrong\nskip.hana=test(gpu)\n"
@@ -1411,7 +1411,6 @@ class LinuxProcessTests(unittest.TestCase):
         run_command = subprocess.run
         open_process = subprocess.Popen
         dispatch = set_up_fixture(self.addCleanup, LinuxDispatchTests())
-        _ = dispatch.settings.write_text(dispatch.settings.read_text().replace("slots.hana=4", "slots.hana=1"))
         identity = eligibility.repository_identity(dispatch.source)
         if not isinstance(identity, eligibility.KnownRepository):
             self.fail("The fixture must have a repository identity")
@@ -2141,10 +2140,7 @@ class LinuxDispatchTests(unittest.TestCase):
         self.assertIn(os.getpid(), self.fixture.claims("linux"))
         self.assertNotIn("release", self.actions)
 
-    def test_copy_excludes_private_files_and_preserves_the_received_slot(self) -> None:
-        self.assertEqual(self.fixture.claim("linux", self.source, 101, remote=True)[0], 0)
-        first = self.fixture.claims("linux")[101]
-
+    def test_copy_excludes_private_files_and_uses_the_repository_mirror(self) -> None:
         result, _, _ = self.run_request(self.request())
 
         self.assertIsInstance(result, offload.PassedOnTarget)
@@ -2160,8 +2156,8 @@ class LinuxDispatchTests(unittest.TestCase):
             self.fail("The fixture must have a repository identity")
         command = next(argv[-1] for argv in self.commands if argv[0] == "ssh" and "--mirror" in argv[-1])
         words = shlex.split(command)
-        self.assertEqual(words[words.index("--mirror") + 1], offload.remote_mirror(identity, "linux", 2))
-        self.assertEqual(self.fixture.claims("linux"), {101: first})
+        self.assertEqual(words[words.index("--mirror") + 1], offload.remote_mirror(identity, "linux", 1))
+        self.assertFalse(self.fixture.claims("linux"))
 
     def assert_takeover_settles_before_release(self, old_identity: claim_state.ClaimIdentity) -> None:
         # One cleanup settles the old start and counts leftovers before the release.
@@ -2175,7 +2171,6 @@ class LinuxDispatchTests(unittest.TestCase):
         self.assertLess(settlements[0], release)
 
     def test_lost_run_keeps_ownership_until_confirmed_cleanup_and_a_fresh_claim(self) -> None:
-        _ = self.settings.write_text(self.settings.read_text().replace("slots.hana=4", "slots.hana=1"))
         self.stream_status = offload.MISSING_MAC_STATUS
         self.cleanup_reply = subprocess.CompletedProcess([], 255, "", "fixture cannot reach Linux")
 
@@ -2203,7 +2198,6 @@ class LinuxDispatchTests(unittest.TestCase):
         self.assertFalse(self.fixture.claims("linux"))
 
     def test_live_slot_children_block_new_work_until_cleanup_confirms_they_ended(self) -> None:
-        _ = self.settings.write_text(self.settings.read_text().replace("slots.hana=4", "slots.hana=1"))
         identity = eligibility.repository_identity(self.source)
         if not isinstance(identity, eligibility.KnownRepository):
             self.fail("The fixture must have a repository identity")
@@ -2266,29 +2260,37 @@ class LinuxDispatchTests(unittest.TestCase):
         self.assert_takeover_settles_before_release(old_identity)
         self.assertFalse(self.fixture.claims("linux"))
 
-    def test_deleted_worktree_cleanup_selects_only_the_retained_slot(self) -> None:
+    def test_offload_recovers_two_legacy_linux_claims_for_one_repository(self) -> None:
         old = self.fixture.repository("old-worktree", "https://example.com/team/hana.git", self.source)
-        self.assertEqual(self.fixture.claim("linux", old, 101, remote=True)[0], 0)
-        self.assertEqual(self.fixture.claim("linux", self.source, 102, remote=True)[0], 0)
-        before = self.fixture.claims("linux")
-        _ = self.settings.write_text(self.settings.read_text().replace("slots.hana=4", "slots.hana=2"))
+        paths = mac_test.state_paths("linux")
+        first_identity = claim_state.ClaimIdentity("claim-a", "episode-a", "attempt-a")
+        second_identity = claim_state.ClaimIdentity("claim-b", "episode-b", "attempt-b")
+        self.assertEqual(self.fixture.claim("linux", old, 101, remote=True, request_identity=first_identity)[0], 0)
+        first, = mac_test.read_claims(paths)
+        old_first = first.path.with_name(first.path.stem + ".slot-1.json")
+        mac_test.write_json(old_first, {**first.record, "slot": 1})
+        first.path.unlink()
+        self.fixture.dead.add(101)
+        self.assertEqual(self.fixture.claim("linux", self.source, 102, request_identity=second_identity)[0], 11)
+        old_second = first.path.with_name(first.path.stem + ".slot-2.json")
+        mac_test.write_json(old_second, {**first.record, "slot": 2, "pid": 102, "proc_start": "start-102",
+            "claim_id": second_identity.claim_id, "episode": second_identity.episode, "attempt": second_identity.attempt})
         (old / ".git").unlink()
         old.rmdir()
-        self.fixture.dead.add(101)
+        self.fixture.dead.add(102)
 
-        result, _, _ = self.run_request(self.request())
+        result, _, errors = self.run_request(self.request())
 
-        self.assertIsInstance(result, offload.PassedOnTarget)
-        self.assertEqual(self.actions[:4], ["claim:13", "cleanup", "release", "claim:0"])
-        cleanup = next(argv for argv in self.commands if argv[0] == "ssh" and "select_leftovers" in argv[-1])
+        self.assertIsInstance(result, offload.PassedOnTarget, errors)
+        self.assertEqual(self.actions[:7], ["claim:13", "cleanup", "release", "claim:13", "cleanup", "release", "claim:0"])
+        cleanup = [argv[-1] for argv in self.commands if argv[0] == "ssh" and "select_leftovers" in argv[-1]]
         identity = eligibility.repository_identity(self.source)
-        if not isinstance(identity, eligibility.KnownRepository):
-            self.fail("The fixture must have a repository identity")
-        self.assertIn(offload.remote_mirror(identity, "linux", 1), cleanup[-1])
-        self.assertNotIn(offload.remote_mirror(identity, "linux", 2), cleanup[-1])
-        self.assertNotIn("lsof", cleanup[-1])
-        self.assertNotIn("pgrep", cleanup[-1])
-        self.assertEqual(self.fixture.claims("linux"), {102: before[102]})
+        assert isinstance(identity, eligibility.KnownRepository)
+        for mirror_number, command in enumerate(cleanup[:2], start=1):
+            self.assertIn(offload.remote_mirror(identity, "linux", mirror_number), command)
+        self.assertFalse(old_first.exists())
+        self.assertFalse(old_second.exists())
+        self.assertFalse(self.fixture.claims("linux"))
 
     def test_unrelated_environment_does_not_gain_automatic_shell_approval(self) -> None:
         unrelated = self.fixture.repository("unrelated/project", "https://example.com/team/hana.git")

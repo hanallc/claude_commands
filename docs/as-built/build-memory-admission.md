@@ -671,9 +671,9 @@ Evidence expires after the existing waiting poll interval plus the target probe 
 Stale evidence prevents a new decision that needs it; it never releases a provider claim.
 Mac and SSH records retain their claim id, episode, attempt and submitting session through adoption.
 Release compares the exact claim identity under the provider lock.
-The Mac claim count uses `build_slots.configured_maximum` to read the repository limit or host default in `build_folders.conf`.
-The mac-linux gate shares the claude_commands repository limit with native Mac runs, even from a differently named checkout.
-Each guest uses a numbered claim. Mac mirror work uses the unnumbered claim.
+The Mac allows one claim per repository.
+Native Mac and mac-linux runs share that claim across all checkouts of the repository.
+New claims use unnumbered files. Adoption and cleanup can still use saved numbered claim files.
 The Mac resolves the repository before it takes the claim lock.
 The key follows local clone origins to the upstream repository. Git alternates supply objects only.
 The Mac runner reads the step history key from the submitting checkout. This read includes Git worktree URL rewrites.
@@ -2468,7 +2468,7 @@ The small text is empty when the showrunner is the same name as the unit.
 `queueRowLabels` gives the row start, the small text, and the `Step` and `Verify` cells from one place.
 For running rows, the table shows `Stage`, `Done`, `Dur`, `Verify`, `Step`, `Pid`, `Machine`, `vCPU`, and `Tokens`.
 The waiting table uses `#` and `Waiting`, and omits `Tokens`.
-The table has no `Unit` column and no `Slot` column. The feed sends no slot number; it sends only `slot_folder` and `slot_machine`, which the Disks page reads.
+The Disks page reads its own drive and session data.
 On 2026-11-23, Nate asked again for the Unit column to go because the row start shows the unit.
 At 10:00 he asked why the Slot column still showed; natedev has no slots, so each of its rows showed `—`.
 On 2026-11-23, Nate said: “where it is running should be what shows in the running column”.
