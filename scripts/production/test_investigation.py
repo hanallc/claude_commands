@@ -26,8 +26,9 @@ OWNER = staff.StaffRow(staff.StaffId("62ec2f46-df7a-40fd-b919-789581e63d53"), "u
                        current_session=staff.StaffId("07990246-10cf-440e-a32a-13e62f15b78b"), unit_type=staff.UnitDetails("direct"))
 OTHER = staff.StaffRow(staff.StaffId("4fc94517-b49f-4979-9308-37bb5cc90236"), "producer", "dwight", staff.StaffRoot(),
                        current_session=staff.StaffId("e289fc59-9b1f-44b2-bb22-beb7359f97bb"))
-MORTY = staff.StaffRow(staff.StaffId("fdab6975-69b4-44ec-b688-22f66d92aa67"), "producer", "morty", staff.StaffRoot(),
-                      current_session=staff.StaffId("e6183e17-a8ce-437f-93be-e2b3004a95cf"))
+LIST_KEEPER = staff.StaffRow(staff.StaffId("fdab6975-69b4-44ec-b688-22f66d92aa67"), "producer",
+                           "fixture-list-keeper", staff.StaffRoot(),
+                           current_session=staff.StaffId("e6183e17-a8ce-437f-93be-e2b3004a95cf"))
 
 
 class InvestigationTests(unittest.TestCase):
@@ -39,11 +40,11 @@ class InvestigationTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         staff_file = self.root / "staff.json"
         _ = staff_file.write_text(json.dumps({
-            "schema": 1, "rows": [row.to_json() for row in (RUNNER, OWNER, OTHER, MORTY)],
+            "schema": 1, "rows": [row.to_json() for row in (RUNNER, OWNER, OTHER, LIST_KEEPER)],
         }))
         configuration = self.root / "config"
         configuration.mkdir()
-        _ = (configuration / "console.conf").write_text(f"page.list.owner={MORTY.id}\n")
+        _ = (configuration / "console.conf").write_text(f"page.list.owner={LIST_KEEPER.id}\n")
         _ = (configuration / "producer_map.conf").write_text("")
         _ = self.enterContext(patch.object(reply_tokens, "platform", "linux"))
         _ = self.enterContext(patch.object(review, "reviewer_environment", side_effect=OSError("Fixture reviewer.")))
@@ -107,8 +108,8 @@ class InvestigationTests(unittest.TestCase):
         _ = (self.root / "config" / "producer_map.conf").write_text(f"{RUNNER.id}={OTHER.id}\n")
         self.assertEqual(self.command("file", "--title", title, "--question", question), (0, "I1\n", ""))
         item = investigation.load(OWNER.id, "I1")
-        row, = the_list.records(MORTY.id)
-        self.assertEqual(item.list_destination, investigation.ListDestination(MORTY.id, row.number))
+        row, = the_list.records(LIST_KEEPER.id)
+        self.assertEqual(item.list_destination, investigation.ListDestination(LIST_KEEPER.id, row.number))
         self.assertEqual((row.owner, row.producer), (OWNER.id, OTHER.id))
         self.assertEqual((item.owner, item.title, item.question, item.answer), (OWNER.id, title, question, ""))
         self.assertEqual(item.state, investigation.InvestigationState.OPEN)
@@ -318,7 +319,7 @@ class InvestigationTests(unittest.TestCase):
             self.assertEqual(self.command("read", "--id", "I1", "--owner", OWNER.id)[0], 0)
         self.assertEqual(investigation.load(OWNER.id, "I1").state, investigation.InvestigationState.READ)
         self.assertEqual(investigation.load(OTHER.id, "I14").state, investigation.InvestigationState.OPEN)
-        row, = the_list.records(MORTY.id)
+        row, = the_list.records(LIST_KEEPER.id)
         self.assertEqual((row.owner, row.producer), (OTHER.id, OTHER.id))
 
     def test_missing_callers_and_invalid_inputs_get_one_refusal_line(self) -> None:
@@ -401,10 +402,12 @@ class InvestigationTests(unittest.TestCase):
 
     def test_a_showrunner_owns_records_without_a_production_document(self) -> None:
         owner = replace(OWNER, kind="showrunner", parent=staff.StaffRoot(), unit_type=staff.NotUnit())
-        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [owner.to_json(), MORTY.to_json()]}))
+        _ = (self.root / "staff.json").write_text(json.dumps({
+            "schema": 1, "rows": [owner.to_json(), LIST_KEEPER.to_json()],
+        }))
         self.assertEqual(self.command("file", "--title", "Cause", "--question", "Why?"), (0, "I1\n", ""))
-        row, = the_list.records(MORTY.id)
-        self.assertEqual((row.owner, row.producer), (owner.id, MORTY.id))
+        row, = the_list.records(LIST_KEEPER.id)
+        self.assertEqual((row.owner, row.producer), (owner.id, LIST_KEEPER.id))
 
     def test_corrupt_records_keep_their_files_and_allocated_numbers(self) -> None:
         item = investigation.file(OWNER.id, "Cause", "Why?", waiting_why='The owner must complete the investigation.')

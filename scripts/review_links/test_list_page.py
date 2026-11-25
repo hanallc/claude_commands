@@ -2897,6 +2897,7 @@ document.body.append(result);
         config = self.root / "config"
         changes = self.root / "change-reviews"
         _ = shutil.copytree(self.browser_root / "config", config)
+        _ = write_config_fixture(config / "console.conf", f"page.list.owner={MORTY.id}\n")
         _ = (config / "change_review.conf").write_text(
             f"lists_directory={changes}\nreview_links_directory={self.root / 'reviews'}\n")
         environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
@@ -3394,7 +3395,7 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
                       + '<button name="action" value="question" disabled>Ask question</button>'
                       + '<button name="action" value="tell" disabled>Tell morty</button></div>', words)
         self.assertIn("!words.value.trim()", list_page.SCRIPT)
-        self.assertIn("const edit=()=>{draftStamp++;retain();};", list_page.SCRIPT)
+        self.assertIn("const edit=()=>{draftStamp++;retain();persistDraft();};", list_page.SCRIPT)
         self.assertIn("words.addEventListener('input',edit)", list_page.SCRIPT)
         self.assertIn("setCardSubmitting(form,false,stale ? form : recordDetails(item));syncTell()", list_page.SCRIPT)
         self.assertIn('rows="4"', words)
@@ -3486,7 +3487,9 @@ document.body.append(result);
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_status_counts_partition_all_items_with_and_without_unread(self) -> None:
-        states = [state for state in the_list.ItemState if state is not the_list.ItemState.SCHEDULED]
+        states = (the_list.ItemState.NEW, the_list.ItemState.WORKING, the_list.ItemState.BLOCKED,
+                  the_list.ItemState.WAITING_FOR_NATE, the_list.ItemState.DELIVERED, the_list.ItemState.DONE,
+                  the_list.ItemState.PAUSED, the_list.ItemState.CLOSED)
         for offset in (0, 8):
             for number, state in enumerate(states, start=1 + offset):
                 closed = state is the_list.ItemState.CLOSED
