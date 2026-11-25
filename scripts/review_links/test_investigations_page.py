@@ -1,5 +1,6 @@
 """Test investigation cards with private staff records and state folders."""
 from __future__ import annotations
+from scripts.console_text.test_support import accepting_console_text
 from scripts.lint.memory_test_support import write_config_fixture
 
 import io
@@ -40,6 +41,7 @@ class InvestigationsPageTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="investigations-page-test-")))
         config = self.root / "config"
         config.mkdir()

@@ -149,7 +149,6 @@ These scripts use the helper.
 
 - `rust_release.send_release_text(push)` sends `rust.*`.
 - `sweep.send_floor_alert` sends `sweep.disk_floor` through its phone branch.
-- `codex_winddown` sends `codex.reset_ready`.
 - `quota_alert` sends `quota.*`.
 - `restart_support.alert_user` sends `shutdown.*`. It is the only phone path in `scripts/agents/`.
 - `escalate.py` sends registered holds. It retains legacy free-text holds without delivery.

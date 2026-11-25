@@ -1701,7 +1701,8 @@ function pickerSummary(zone,at){
  return date.format(at)+' '+dateTimeClock(hour*60+minute);
 }
 let parkTimeListId=0;
-function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary,retryTime=()=>NaN}){
+function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary,retryTime=()=>NaN,
+                                  prepareMenu=()=>{},openCustom=false}){
  const currentZone=typeof zone==='function' ? zone : ()=>zone;
  const toggle=form.querySelector('[data-later-toggle]'),menu=form.querySelector('[data-later-menu]');
  const custom=menu.querySelector('[data-later-custom]'),chooseItem=menu.querySelector('[data-later-choose]');
@@ -1710,7 +1711,8 @@ function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary,retr
   if(!menu.hidden){closeDateTimePicker(menu,true);return;}
   showParkPresets(menu,settings());
   menu.hidden=false;toggle.setAttribute('aria-expanded','true');
-  items()[0].focus();
+  if(openCustom) choose();
+  else items()[0].focus();
  });
  const grid=custom.querySelector('[data-later-grid]'),time=custom.querySelector('[data-later-time]');
  const times=custom.querySelector('[data-later-times]'),timeChoices=custom.querySelector('[data-later-time-choices]');
@@ -1724,14 +1726,14 @@ function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary,retr
  const dayLabel=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',dateStyle:'full'});
  let selected=new Date(),display=new Date();
  const today=zone=>{const now=zoneParts(zone,Date.now());return new Date(Date.UTC(now.year,now.month-1,now.day));};
- const update=(normalize=false)=>{
+ const update=(normalize=false,edited=false)=>{
   const zone=currentZone();
   const minutes=dateTimeMinutes(time.value),valid=Number.isFinite(minutes);
   const clock=valid ? dateTimeClock(minutes) : '';
   time.setAttribute('aria-invalid',String(!valid));
   if(valid && normalize) time.value=clock;
   field.value=valid ? dayText(selected)+'T'+clock : '';
-  field.dispatchEvent(new Event('input',{bubbles:true}));
+  field.dispatchEvent(new CustomEvent('input',{bubbles:true,detail:{edited}}));
   const retry=retryTime();
   const at=Number.isFinite(retry) ? retry : valid ? dateTimeEpoch(zone,selected,minutes) : NaN;
   custom.querySelector('[data-later-summary]').textContent=Number.isFinite(at)
@@ -1750,7 +1752,7 @@ function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary,retr
  const acceptTime=option=>{
   time.value=option.textContent;
   showTimes(false);
-  update();
+  update(false,true);
  };
  timeChoices.addEventListener('mousedown',event=>event.preventDefault());
  timeChoices.addEventListener('click',()=>{
@@ -1784,7 +1786,7 @@ function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary,retr
    else showTimes(false);
   }
  });
- const draw=()=>{
+ const draw=(edited=false)=>{
   const zone=currentZone();
   const current=today(zone),currentText=dayText(current),selectedText=dayText(selected);
   const step=settings().step,now=zoneParts(zone,Date.now());
@@ -1826,9 +1828,9 @@ function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary,retr
    button.setAttribute('aria-selected',String(button.dataset.date===selectedText));
    button.tabIndex=button.dataset.date===tabDate ? 0 : -1;button.disabled=date<current;
    if(button.dataset.date===currentText) button.setAttribute('aria-current','date');
-   button.addEventListener('click',()=>{selected=date;draw();focusCalendar();});row.append(button);
+   button.addEventListener('click',()=>{selected=date;draw(true);focusCalendar();});row.append(button);
   }
-  update();
+  update(false,edited);
  };
  function choose(){
   const zone=currentZone(),draft=parseDateTimeDraft(field.value);
@@ -1840,7 +1842,7 @@ function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary,retr
   }
   const current=today(zone);
   display=new Date(selected<current ? current : selected);
-  custom.hidden=false;menu.dataset.choosing='true';draw();
+  custom.hidden=false;menu.dataset.choosing='true';prepareMenu();draw();
   focusCalendar();
  }
  chooseItem.addEventListener('click',choose);
@@ -1850,7 +1852,7 @@ function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary,retr
   draw();
   if(hadFocus && button.disabled) focusCalendar();
  }));
- time.addEventListener('input',()=>{showTimes(false);update();});
+ time.addEventListener('input',()=>{showTimes(false);update(false,true);});
  time.addEventListener('blur',()=>{showTimes(false);update(true);});
  toggle.parentElement.addEventListener('focusout',event=>{
   if(menu.hidden) return;
@@ -1872,7 +1874,7 @@ function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary,retr
   const date=new Date(day+'T00:00:00Z');
   date.setUTCDate(date.getUTCDate()+days);
   if(date<today(currentZone())) return;
-  selected=date;display=new Date(date);draw();focusCalendar();
+  selected=date;display=new Date(date);draw(true);focusCalendar();
  });
  menu.addEventListener('keydown',event=>{
   if(event.defaultPrevented || event.isComposing) return;
@@ -1880,7 +1882,7 @@ function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary,retr
      (event.repeat || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey)) return;
   if(event.key==='Escape'){event.preventDefault();closeDateTimePicker(menu,true);return;}
   if(custom.contains(event.target)){
-   if(event.key==='Enter' && event.target!==timeChoices){
+   if(event.key==='Enter' && (event.target===time || grid.contains(event.target))){
     event.preventDefault();update(true);if(!save.disabled) form.requestSubmit(save);
    }
    return;

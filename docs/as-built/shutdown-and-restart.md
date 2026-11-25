@@ -153,7 +153,8 @@ A Codex thread name is display text and selects no conversation.
 Unknown names return status 1.
 They list up to five close names from local units and showrunners when available.
 Ambiguous names return status 1 with up to five matching members.
-A remote member returns status 1 with its machine name.
+The command forwards a remote staff row to its configured workstation over SSH.
+The command returns status 1 when the row's machine is unknown or unreachable.
 A running session returns status 0 with an `unchanged` line that names its current account.
 Resume does not stop or move a running session.
 Unknown Codex process evidence prints an anomaly and does not block resume.
@@ -385,7 +386,10 @@ The push shows qualified names and gives a short command to retry pending moves.
 If the names and the phone footer exceed the push limit, the message gives a command to read the full list.
 The group and target identify the phone push for repeat suppression.
 `move_alert_repeat_minutes` sets the repeat window to 1,440 minutes by default.
-A standalone resume failure still sends its own keyed push.
+A standalone resume failure uses a keyed `shutdown.restart_failed` push.
+For a unit under watchdog recovery, the watchdog keeps the pending push with the outage.
+A failed detached start sends the push with its original key.
+A confirmed start clears the pending push.
 Each completed member records its outcome without waiting for other resumes.
 An early exit or failed resume uses the existing showrunner failure report.
 
@@ -491,6 +495,12 @@ A block is one user message, assistant message, tool call or tool result. A tool
 A Claude compaction summary is one block. A Codex compaction summary is encrypted, so only its time shows.
 The reader finds transcripts through `scripts/lib/transcripts.py` and reads from the end of the file in windows that double.
 `config/catch_up.conf` sets the default block count, the characters kept from one message, the tool line length and the first read window. Times use the user's zone.
+
+`scripts/agents/catch_up.py NATIVE_ID --user-prompts --near ISO_TIME [--minutes N]` reads typed prompts from the saved transcript.
+`near_minutes` in `config/catch_up.conf` sets the default window on each side of `ISO_TIME` to 10 minutes.
+If `ISO_TIME` has no offset, the reader uses the user's time zone.
+The reader prints each prompt in full with its time in the user's zone, in `%m-%d %H:%M:%S` format.
+It skips tool results, hook text, system reminders and messages from other sessions.
 
 ### Create a producer
 
