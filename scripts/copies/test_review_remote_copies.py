@@ -695,13 +695,12 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             self.assertGreater(runner, 0)
             self.assertGreater(child, 0)
             owner.terminate()
-            _ = owner.wait(timeout=TEST_HANG_GUARD_SECS)
+            _ = owner.wait(timeout=5)
             for pid in (runner, shell):
                 descriptor = os.pidfd_open(pid)
                 try:
                     os.kill(pid, signal.SIGKILL)
-                    self.assertTrue(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0],
-                                    f"process {pid} did not exit after SIGKILL")
+                    self.assertTrue(select.select([descriptor], [], [], 5)[0])
                 finally:
                     os.close(descriptor)
             with self.assertRaisesRegex(copies.CopyError, "holder-session"):
@@ -709,7 +708,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             self.assertTrue((self.mirror / ".copy-record.json").exists())
         finally:
             send_process_group(owner.pid, signal.SIGKILL)
-            _ = owner.communicate(timeout=TEST_HANG_GUARD_SECS)
+            _ = owner.communicate(timeout=5)
 
     def test_workspace_repairs_a_stale_lock_and_a_damaged_index(self) -> None:
         for damaged in (False, True):
@@ -947,8 +946,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
 
                     with mock.patch.object(controller, "complete_claim", side_effect=claim):
                         admission = executor.submit(offload.run_offload, controller, config, request, 0)
-                        self.assertTrue(attempted.wait(TEST_HANG_GUARD_SECS),
-                                        "admission did not reach the claim attempt")
+                        self.assertTrue(attempted.wait(timeout=5))
                         self.assertFalse(admission.done())
                         cancel.set()
                         result = admission.result(timeout=15)
