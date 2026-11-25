@@ -35,7 +35,7 @@ Claude's `Edit|MultiEdit|Write` PostToolUse group runs basedpyright and fn-lengt
 
 ### Codex registration and trust
 
-`scripts/hooks/codex_hooks.py install|check` manages thirteen handlers.
+`scripts/hooks/codex_hooks.py install|check` manages twelve handlers.
 The `queue-start` and `queue-tools` handlers run `codex-queue-drain.py` at `SessionStart` and `PostToolUse`.
 Both use matcher `*` and 10-second timeouts.
 `docs/as-built/session-roster.md` describes these handlers.
@@ -56,9 +56,6 @@ Both handlers delete only the input session's marker through the shared clear fu
 Codex 0.167.0 lists these events as `userPromptSubmit` and `postCompact`.
 It reports no matcher for `UserPromptSubmit` or `Stop`, so listing checks use `null` for those events.
 See [compaction markers](hook-dispatch.md#compaction-start-markers) for the marker format and retention setting.
-
-The `director-hold` handler runs `conversation_pause.py codex-director-hold` at `UserPromptSubmit` with a 10-second timeout.
-It adds the staff pause instruction to the prompt of a paused director.
 
 The `turn-end` handler runs `../herdr/turn_end.py` through the shared Python launcher at `Stop`, with a 10-second timeout.
 Codex supplies the event as JSON on stdin.
@@ -81,7 +78,7 @@ Claude registration in `settings.json` and Codex installation are separate deplo
 Claude's `SessionStart` registration runs `session-start-ste.py` with matcher `startup|resume|clear|compact`.
 Its `SubagentStart` registration runs the same script.
 On natedev and the Mac, `~/.codex`, `~/.codex1`, and `~/.codex2` share one `hooks.json`.
-Each home must trust its thirteen handlers separately.
+Each home must trust its twelve handlers separately.
 
 Codex 0.167.0 requires integer `timeout` values in `hooks.json`. A floating value such as `10.0` rejects the whole file, including fn-length, STE, and queue handlers. The installer rounds configured timeouts up to whole seconds. It also rounds existing floating timeouts up to integers in every handler, including user handlers. It keeps every other field of a user handler unchanged. This preserves their groups and indexes. The listed `timeoutSec` is then an integer. No older-version matching rule is used.
 
