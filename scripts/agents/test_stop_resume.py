@@ -1837,6 +1837,39 @@ class StopResumeTests(unittest.TestCase):
         result = stop_resume._resume_once(identity, why="test", names=LaunchNames(staff.StaffSnapshot(())))  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(result, stop_resume.SessionNotFound(identity))
 
+    def test_kept_worker_resume_starts_only_the_director(self) -> None:
+        from scripts.production import worker
+
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity,
+                             worktree=staff.PresentWorktree(remote.local_machine(), self.root),
+                             unit_type=staff.UnitDetails("direct"))
+        record = staff.StaffSnapshot((row,))
+        up = stop_resume.ClaudeUp(identity, "w1:p2", "claude3")
+        for saved in (True, False):
+            with self.subTest(saved=saved):
+                if not saved:
+                    pane_record.save("agents", {})
+                with (patch.object(staff, "initial_snapshot", return_value=record),
+                      patch.object(stop_resume, "running_on_account", side_effect=[sessions.SessionNotLive(), up]),
+                      patch.object(stop_resume, "_start_session", return_value=sessions.LiveSessionProcess(456)) as start_pane,
+                      patch.object(stop_resume, "_watch_resume"),
+                      patch.object(worker, "resume_workers") as worker_message,
+                      patch.object(restart, "start_row", return_value="w1:p2") as start_row,
+                      patch.object(shutdown_record, "remove_started") as remove):
+                    result = stop_resume.resume(str(row.id), keep_workers=True)
+                self.assertEqual(result, up, str(result))
+                worker_message.assert_not_called()
+                remove.assert_not_called()
+                if saved:
+                    start_pane.assert_called_once()
+                    self.assertEqual(start_pane.call_args.args[3], "")
+                    start_row.assert_not_called()
+                else:
+                    start_pane.assert_not_called()
+                    start_row.assert_called_once_with(row, record, self.client, target_account="",
+                        worker_scope=restart.WorkerRestartScope.SELECTED_ROWS)
+
     def test_admitted_pane_run_with_no_start_fails_after_one_attempt(self) -> None:
         with patch.object(self.client, "run", self.start):
             result = stop_resume.resume("alpha", why="maintenance")

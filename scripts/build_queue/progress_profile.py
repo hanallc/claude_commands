@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from contextlib import nullcontext
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import time
-from typing import cast
+from typing import BinaryIO, cast
 
 from scripts.lib.atomic_file import atomic_sample
 from scripts.lib import conf
@@ -229,6 +231,36 @@ TEST_START = re.compile(r"\bStarting\s+(\d+)\s+tests?\b")
 TEST_BAR = re.compile(r"\bRunning\s+\[[^\]]*\].*?\b(\d+)\s*/\s*(\d+)\s*:")
 
 
+@dataclass(frozen=True)
+class CompilingCrateUnavailable:
+    pass
+
+
+@dataclass(frozen=True)
+class TraceFrames:
+    """Keep the facts from complete Cargo and nextest output frames."""
+    last_compiling: str | CompilingCrateUnavailable = CompilingCrateUnavailable()
+    test_started: bool = False
+    test_completed: bool = False
+
+    def observe(self, frame: str, *, phase_allowed: bool = True) -> TraceFrames:
+        frame = frame.lstrip()
+        if frame.startswith("Compiling ") and (crate := parse.CRATE.match(frame)):
+            return replace(self, last_compiling=crate["crate"])
+        if not phase_allowed:
+            return self
+        if not self.test_started and (frame.startswith("Nextest run ID") or TEST_START.match(frame)):
+            return replace(self, test_started=True)
+        if not self.test_completed and parse.SUMMARY.match(frame):
+            return replace(self, test_completed=True)
+        return self
+
+
+@dataclass(frozen=True)
+class TraceFramesNotTracked:
+    pass
+
+
 @dataclass
 class CounterParser:
     """The parser retains counts, the current counter, and incomplete output text."""
@@ -236,12 +268,19 @@ class CounterParser:
     current: ProgressCounter | NoCounter = field(default_factory=NoCounter)
     previous_kind: str = ""
     tail: str = ""
+    trace_frames: TraceFrames | TraceFramesNotTracked = TraceFramesNotTracked()
+    tail_phase_allowed: bool = True
 
-    def consume(self, text: str, *, complete: bool = True) -> ProgressCounter | NoCounter:
+    def consume(self, text: str, *, complete: bool = True, phase_allowed: bool = True) -> ProgressCounter | NoCounter:
+        first_phase_allowed = phase_allowed and (not self.tail or self.tail_phase_allowed)
         frames = FRAME_SPLIT.split(self.tail + text)
         self.tail = "" if complete else frames.pop()[-65536:]
-        for frame in frames:
+        self.tail_phase_allowed = phase_allowed and (bool(frames) or first_phase_allowed)
+        for index, frame in enumerate(frames):
             frame = parse.ANSI.sub("", frame)
+            if isinstance(self.trace_frames, TraceFrames):
+                self.trace_frames = self.trace_frames.observe(
+                    frame, phase_allowed=first_phase_allowed if index == 0 else phase_allowed)
             match = CARGO_COUNTER.search(frame)
             kind = "build"
             starting = False
@@ -444,6 +483,10 @@ def progress_path(sidecar: Path, suffix: str) -> Path:
     return sidecar.with_suffix(".progress." + suffix)
 
 
+def written_since(stat: os.stat_result, scope_started_at: float) -> bool:
+    return stat.st_mtime >= scope_started_at
+
+
 def publish_counter(sidecar: Path, counter: ProgressCounter) -> None:
     atomic_sample(progress_path(sidecar, "json"), json.dumps(snapshot_value(counter), separators=(",", ":")))
 
@@ -467,6 +510,29 @@ class CaptureCursor:
     offset: int = 0
     parser: CounterParser = field(default_factory=CounterParser)
     result: ProgressCounter | NoCounter = field(default_factory=NoCounter)
+    caught_up: bool = False
+    phase_offset: int = 0
+
+
+@dataclass(frozen=True)
+class NoTraceCapture:
+    pass
+
+
+@dataclass(frozen=True)
+class TraceCaptureReading:
+    frames: TraceFrames
+    counter: ProgressCounter | NoCounter
+    caught_up: bool
+
+
+@dataclass(frozen=True)
+class RetainedTraceLog:
+    path: Path
+    stream: BinaryIO
+
+
+_LOG_CHUNK_BYTES = 65536
 
 
 @dataclass
@@ -475,24 +541,66 @@ class CaptureReader:
     root: Path
     touched: set[Path] = field(default_factory=set)
     cursors: dict[Path, CaptureCursor] = field(default_factory=dict)
+    track_trace: bool = False
+    retained: RetainedTraceLog | NoTraceCapture = field(default_factory=NoTraceCapture)
+    scope_started_at: float | None = None
 
-    def log_counter(self, path: Path) -> ProgressCounter | NoCounter:
+    def bind_trace_log(self, path: Path) -> None:
+        """Keep the log open and record where phase evidence starts."""
+        if self._retain_trace_log(path) and isinstance(retained := self.retained, RetainedTraceLog):
+            try:
+                _ = self._log_cursor(path, os.fstat(retained.stream.fileno()))
+            except OSError:
+                self.close_trace_log()
+
+    def _log_cursor(self, path: Path, stat: os.stat_result) -> CaptureCursor:
+        identity = (stat.st_dev, stat.st_ino)
+        cursor = self.cursors.get(path)
+        if cursor is None or cursor.identity != identity or stat.st_size < max(cursor.offset, cursor.phase_offset):
+            skip_phase_prefix = (cursor is None and self.scope_started_at is not None
+                                 and not written_since(stat, self.scope_started_at))
+            cursor = CaptureCursor(identity, parser=CounterParser(
+                trace_frames=TraceFrames() if self.track_trace else TraceFramesNotTracked()),
+                phase_offset=stat.st_size if skip_phase_prefix else 0)
+            self.cursors[path] = cursor
+        return cursor
+
+    def log_counter(self, path: Path, *, final: bool = False, replay_bytes: int = _LOG_CHUNK_BYTES
+                    ) -> ProgressCounter | NoCounter:
         self.touched.add(path)
         try:
-            with path.open("rb") as log:
-                stat = path.stat()
-                identity = (stat.st_dev, stat.st_ino)
-                cursor = self.cursors.get(path)
-                if cursor is None or cursor.identity != identity or stat.st_size < cursor.offset:
-                    cursor = CaptureCursor(identity)
-                    self.cursors[path] = cursor
+            retained = self.retained
+            held = isinstance(retained, RetainedTraceLog) and retained.path == path
+            if held and self.scope_started_at is not None:
+                _ = self._retain_trace_log(path, refresh=True)
+                retained = self.retained
+            with (nullcontext(retained.stream) if isinstance(retained, RetainedTraceLog) and held
+                  else path.open("rb")) as log:
+                stat = os.fstat(log.fileno()) if self.track_trace else path.stat()
+                cursor = self._log_cursor(path, stat)
                 _ = log.seek(cursor.offset)
-                data = log.read(65536)
-                cursor.offset += len(data)
-                if data:
-                    cursor.result = cursor.parser.consume(data.decode(errors="replace"), complete=False)
-            return cursor.result if cursor.offset >= stat.st_size else NoCounter("capture replay incomplete")
+                while replay_bytes > 0:
+                    # Keep compile details from the prefix. Skip its test markers.
+                    prefix_bytes = cursor.phase_offset - cursor.offset
+                    chunk_size = min(replay_bytes, _LOG_CHUNK_BYTES)
+                    if prefix_bytes > 0:
+                        chunk_size = min(chunk_size, prefix_bytes)
+                    data = log.read(chunk_size)
+                    cursor.offset += len(data)
+                    replay_bytes -= len(data)
+                    if self.track_trace and len(data) == chunk_size:
+                        stat = os.fstat(log.fileno())
+                    cursor.caught_up = cursor.offset >= stat.st_size
+                    if data or final and cursor.caught_up:
+                        cursor.result = cursor.parser.consume(data.decode(errors="replace"),
+                                                              complete=final and cursor.caught_up,
+                                                              phase_allowed=prefix_bytes <= 0)
+                    if cursor.caught_up or len(data) < chunk_size:
+                        break
+            return cursor.result if cursor.caught_up else NoCounter("capture replay incomplete")
         except OSError:
+            if self.track_trace and (cursor := self.cursors.get(path)) is not None:
+                cursor.caught_up = False
             return NoCounter("capture unavailable")
 
     def counter(self, identities: dict[int, str], boot_id: str) -> ProgressCounter | NoCounter:
@@ -526,12 +634,72 @@ class CaptureReader:
                     if Path(name).name != name or name in (".", ".."):
                         continue
                     log_path = account / name
+                    if self.track_trace and log_path in self.touched:
+                        continue
                     counter = self.log_counter(log_path)
                     if isinstance(counter, ProgressCounter):
                         found.append(counter)
                 except (OSError, UnicodeError, ValueError):
                     continue
         return found[0] if len(found) == 1 else NoCounter("missing or competing Cargo captures")
+
+
+    def _retain_trace_log(self, path: Path, *, refresh: bool = False) -> bool:
+        retained = self.retained
+        if isinstance(retained, RetainedTraceLog) and retained.path == path:
+            if not refresh:
+                return True
+            try:
+                if os.path.samestat(path.stat(), os.fstat(retained.stream.fileno())):
+                    return True
+            except OSError:
+                return True
+        try:
+            stream = path.open("rb")
+        except OSError:
+            return False
+        self.close_trace_log()
+        self.retained = RetainedTraceLog(path, stream)
+        return True
+
+    def _trace_reading(self, path: Path) -> TraceCaptureReading | NoTraceCapture:
+        cursor = self.cursors.get(path)
+        if cursor is None or isinstance(cursor.parser.trace_frames, TraceFramesNotTracked):
+            return NoTraceCapture()
+        return TraceCaptureReading(cursor.parser.trace_frames, cursor.parser.current, cursor.caught_up)
+
+    def trace_log(self, path: Path, *, final: bool = False, replay_bytes: int = _LOG_CHUNK_BYTES
+                  ) -> TraceCaptureReading | NoTraceCapture:
+        """Keep one capture open so release can read output after unlink."""
+        if not self._retain_trace_log(path):
+            return NoTraceCapture()
+        _ = self.log_counter(path, final=final, replay_bytes=replay_bytes)
+        return self._trace_reading(path)
+
+    def trace_terminal(self, identities: dict[int, str], boot_id: str) -> TraceCaptureReading | NoTraceCapture:
+        """Read the single terminal capture that matches the scope's process identities."""
+        self.touched.clear()
+        _ = self.counter(identities, boot_id)
+        if len(self.touched) == 1:
+            path = next(iter(self.touched))
+            reading = self._trace_reading(path) if self._retain_trace_log(path) else NoTraceCapture()
+        else:
+            reading = self.trace_tail() if not self.touched else NoTraceCapture()
+        if isinstance(self.retained, RetainedTraceLog):
+            self.touched.add(self.retained.path)
+        self.end_pass()
+        return reading
+
+    def trace_tail(self, *, final: bool = False, replay_bytes: int = _LOG_CHUNK_BYTES
+                   ) -> TraceCaptureReading | NoTraceCapture:
+        if isinstance(self.retained, RetainedTraceLog):
+            return self.trace_log(self.retained.path, final=final, replay_bytes=replay_bytes)
+        return NoTraceCapture()
+
+    def close_trace_log(self) -> None:
+        if isinstance(self.retained, RetainedTraceLog):
+            self.retained.stream.close()
+            self.retained = NoTraceCapture()
 
 
     def end_pass(self) -> None:

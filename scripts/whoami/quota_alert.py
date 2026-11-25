@@ -1952,10 +1952,12 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
         else:
             if isinstance(credits, agent_accounts.CreditsOn):
                 return WorkersMovedWithoutNotice()
+            from scripts.notify.push_catalog import codex_workers_moved_title
+
             uses_credits = accounts.codex_destination_uses_credits(chosen, now)
             return ZeroEpisodeNotice(id="quota.codex_workers_moved", values={
                 "account": label, "reset": reset_display(refusals.KnownReset(reset)), "target": chosen.label,
-                "transition": "Codex work now spends paid credits" if uses_credits else f"Codex work now uses {chosen.label}",
+                "transition": codex_workers_moved_title(label, chosen.label, uses_credits=uses_credits),
                 "funding": "its own paid credits" if uses_credits else f"{chosen.weekly_left:g}% weekly usage left"})
     if isinstance(credits, agent_accounts.CreditsOn):
         return _paid_credits_notice(label, report, chosen, reset)
@@ -2034,28 +2036,27 @@ def _credits_forecast_notice(label: str, report: Report, now: datetime) -> ZeroE
     horizon = "run-out unknown"
     if balance_text == "unlimited":
         horizon = "have no limit"
-        forecast = f"Codex account {label} has unlimited paid credits; its coding workers remain on paid usage with no credit limit."
+        forecast = "Paid credits have no limit."
     elif not math.isfinite(balance) or balance < 0:
-        forecast = f"Codex account {label} reports no credit balance; its coding workers remain on paid usage, but the run-out time is unknown."
+        forecast = "No credit balance; the run-out time is unknown."
     else:
         usage = run_out.credits_used(run_out.read_credit_readings(run_out.READINGS_LOG), label,
                                      since=now - timedelta(hours=1), until=now)
         if isinstance(usage, (run_out.NoCreditReading, run_out.UsageUnknown)):
-            reason = usage.reason if isinstance(usage, run_out.UsageUnknown) else "no numeric credit observations were recorded"
-            forecast = f"Coding workers on Codex account {label} remain on paid usage. Their hourly use is unknown because {reason}; {balance:,.0f} credits left."
+            forecast = f"{balance:,.0f} credits left; the run-out time is unknown."
         elif usage.used == 0:
             horizon = "use is zero"
-            forecast = f"Workers on Codex account {label} used no credits in the last hour; {balance:,.0f} paid credits left."
+            forecast = f"{balance:,.0f} credits left; none used in the last hour."
         else:
             until = _credits_run_out(balance, usage, now)
-            time = until.strftime("%a %Y-%m-%d %H:%M %Z")
-            horizon = until.strftime("until %a %H:%M %Z")
-            forecast = (f"Workers on Codex account {label} used {usage.used:,.0f} paid credits in the last hour; "
-                        + f"its {balance:,.0f} credits last until about {time}.")
+            time = until.strftime("%a %H:%M")
+            horizon = f"until {time} {until:%Z}"
+            forecast = f"{balance:,.0f} credits left; they run out about {time}."
     return ZeroEpisodeNotice(id="quota.codex_credits_forecast", values={"account": label, "horizon": horizon, "forecast": forecast, "destination": destination})
 
 
-def _current_notice(label: str, notice: ZeroEpisodeNotice, *, workers_queued: bool = False) -> ZeroEpisodeNotice:
+def _current_notice(label: str, notice: ZeroEpisodeNotice, credit_accounts: frozenset[str],
+                    *, workers_queued: bool = False) -> ZeroEpisodeNotice:
     """Copy pending facts for rendering; never persist the queued advice overlay."""
     values = dict(notice["values"])
     if "file" in values:
@@ -2068,12 +2069,15 @@ def _current_notice(label: str, notice: ZeroEpisodeNotice, *, workers_queued: bo
         outcome = {"work moves to Claude": _self_actualize_outcome(),
                    "workers wait for their next entry": QUEUED_WORKERS_OUTCOME}.get(outcome, outcome)
         values = {"account": values["account"], "outcome": outcome}
-    if workers_queued:
-        if notice["id"] == "quota.paid_credits":
-            return ZeroEpisodeNotice(id="quota.paid_credits_queued", values={key: values[key] for key in
-                ("sender", "account", "machine", "credits", "refill")})
-        if notice["id"] == "quota.codex_credits_forecast":
-            values["destination"] = "When credits run out, workers wait for the account move you queued."
+    if notice["id"] == "quota.paid_credits":
+        from scripts.notify.push_catalog import remaining_credit_accounts
+
+        values["credit_accounts"] = remaining_credit_accounts(label, credit_accounts)
+        if workers_queued:
+            del values["next_reset"]
+            return ZeroEpisodeNotice(id="quota.paid_credits_queued", values=values)
+    if workers_queued and notice["id"] == "quota.codex_credits_forecast":
+        values["destination"] = "When credits run out, workers wait for the account move you queued."
     return ZeroEpisodeNotice(id=notice["id"], values=values)
 
 
@@ -2111,7 +2115,8 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
         existing_episode = label in episodes
         if not existing_episode and not at_zero:
             return log
-        setting = agent_accounts.codex_credits_setting(label)
+        credit_accounts = agent_accounts.codex_credit_accounts()
+        setting = agent_accounts.CreditsOn() if label in credit_accounts else agent_accounts.CreditsOff()
 
         @cache
         def pick_destination() -> accounts.PickedAccount | accounts.NoAccountWithRoom:
@@ -2130,7 +2135,7 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
                 phone="due", forecast_at=stamp, notice=notice)
             if isinstance(setting, agent_accounts.CreditsOff) and workers_queued:
                 episodes[label]["credits_off_fallback"] = "waiting_for_next_entry"
-            current = _current_notice(label, notice, workers_queued=workers_queued)
+            current = _current_notice(label, notice, credit_accounts, workers_queued=workers_queued)
             rendered = render(current["id"], **current["values"])
             log.append(f"quota zero {label}: {rendered.title}" + (f"\n{rendered.body}" if rendered.body else ""))
         episode = episodes[label]
@@ -2160,7 +2165,7 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
             _ = episode.pop("forecast_phone", None)
             _ = episode.pop("forecast_notice", None)
             result = render(changed["id"], **changed["values"])
-            log.append(f"quota credits off {label}: {result.posted_body}")
+            log.append(f"quota credits off {label}: {result.posted_body or result.posted_title}")
 
         # Old opening notices used values that the current templates do not accept.
         if episode["notice"]["id"] not in ("quota.paid_credits", "quota.codex_workers_moved", "quota.codex_workers_stay",
@@ -2169,14 +2174,14 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
                 _zero_destination(label, now, prefer_weekly_room=True, included_only=True),
                 report.weekly_reset or datetime.fromisoformat(episode["weekly_reset"]))
         if episode["phone"] == "due":
-            episode["notice"] = _current_notice(label, episode["notice"])
-            notice = _current_notice(label, episode["notice"], workers_queued=workers_queued)
+            episode["notice"] = _current_notice(label, episode["notice"], credit_accounts)
+            notice = _current_notice(label, episode["notice"], credit_accounts, workers_queued=workers_queued)
             if notice["id"] != "quota.codex_refused" or (
                     not workers_queued and isinstance(accounts.pick("codex", now), accounts.NoAccountWithRoom)):
                 pushes.append((QuotaNote(label, render(notice["id"], **notice["values"])), "phone", episode["since"]))
         if at_zero and episode["credits"] == "on" and now - datetime.fromisoformat(episode["forecast_at"]) >= timedelta(hours=1):
             notice = _credits_forecast_notice(label, report, now)
-            current = _current_notice(label, notice, workers_queued=workers_queued)
+            current = _current_notice(label, notice, credit_accounts, workers_queued=workers_queued)
             rendered = render(current["id"], **current["values"])
             log.append(f"quota credits forecast {label}: {rendered.title}\n{rendered.body}")
             episode["forecast_at"] = stamp
@@ -2184,8 +2189,8 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
                 episode["forecast_phone"] = "due"
                 episode["forecast_notice"] = notice
         if episode.get("forecast_phone") == "due" and "forecast_notice" in episode:
-            episode["forecast_notice"] = _current_notice(label, episode["forecast_notice"])
-            notice = _current_notice(label, episode["forecast_notice"], workers_queued=workers_queued)
+            episode["forecast_notice"] = _current_notice(label, episode["forecast_notice"], credit_accounts)
+            notice = _current_notice(label, episode["forecast_notice"], credit_accounts, workers_queued=workers_queued)
             pushes.append((QuotaNote(label, render(notice["id"], **notice["values"])), "forecast_phone", episode["since"]))
     for push, field, since in pushes:
         delivery = tell_user(push.rendered)

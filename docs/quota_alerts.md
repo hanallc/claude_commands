@@ -11,7 +11,7 @@ See `docs/accounts.md` for the CLI, holds, and groups with more than one move.
 At 2% weekly or below, an in-use Claude account with an uncovered group sends one phone reminder per episode.
 For example, the title is “claude3 has 2% left with no move”.
 Both next-move reminders use the full account labels and show positive quota below 1% as `<1%`.
-The action is “Set a move on the Accounts page”.
+The action is “In the natedev session, type /agents move <group> <account>.”
 The reminder has no body.
 Only entries that target another account and have readable role history count as coverage.
 Entries that cover every group on the account suppress the reminder.
@@ -194,7 +194,9 @@ Advice reads the saved store.
 
 At 0% weekly with a future refill, the workers' selected account opens one zero episode. The catalog text is logged once and sent to the phone. A failed phone delivery retries every pass; sessions receive no copy. The separate low reminder remains one phone push per episode; it has no session alert or repeat. A scheduled move to Claude holds until its source reset and prevents the zero policy from undoing the move. A refill, fresh positive reading or selection of another account closes the zero episode silently.
 
-With a workers entry queued, credit notices name the queue, not a fallback; a known refusal reset waits on the current account until that reset. Retries keep the original empty-queue facts and apply queue advice only while a move is queued.
+With a workers entry queued, the paid credit title says that the account uses credits until the move.
+A known refusal reset makes the workers wait on the current account until that reset.
+Retries use the current queue state.
 
 With credits on and no queued workers entry, workers move only to a Codex account with included usage in each window.
 A missing 5-hour window means it has not been used.
@@ -203,10 +205,11 @@ That move sends no alert or move note.
 Without included room, workers spend their current account's paid credits.
 Each pass checks for included usage; available room causes a move and closes the paid episode without an alert.
 A queued move or open Claude fallback keeps control.
-The notice names the balance, refill, and destination when credits run out.
+The opening notice shows the balance in the title.
 With credits off, workers prefer included usage in both windows and the soonest weekly refill.
 Only when no account has weekly room can they move to another account's paid credits.
-The notice names that choice.
+The title of `quota.codex_workers_moved` names the exhausted account and the account that takes the work.
+If the target spends paid credits, the title says so.
 The pane move stops the live agent before it resumes the conversation.
 The request records `cause: credits off`, separately from provider refusal.
 Without room, or after a failed move, that pass routes Codex assignments to Claude.
@@ -230,11 +233,12 @@ While credits are on, an hourly forecast is logged; only the first hourly foreca
 The paid-credits opening notice uses `quota.paid_credits`.
 While a workers move is queued, every send and retry uses `quota.paid_credits_queued`.
 Workers spend credits until the move runs, or wait if credits run out or are turned off.
-The saved notice keeps the ordinary values.
-If the queue empties before a retry, that retry uses `quota.paid_credits` again.
-Old saved notices are rebuilt from the current account reading.
-Both notices give the action to remove the account from `codex_credit_accounts`.
-An episode rereads this setting on every pass.
+The episode saves the ordinary notice.
+If the queue empties before a retry, the retry uses `quota.paid_credits` again.
+The alert rebuilds old notices from the current account reading.
+Both notices give the `/tune accounts codex_credit_accounts` command to run in a natedev Claude session.
+The command lists the other credit accounts from the live config. If the list is empty, it uses `none`.
+Each alert pass reads the current setting.
 The first on-to-off change requests the credits-off move once, stops forecasts and repeats no opening alert.
 No-worker mode starts only when the workers account is exhausted and `accounts.pick` finds no other account with allowance or permitted credits, except at weekly zero with credits off, where a failed move counts as no room.
 Unknown capacity cannot confirm exhaustion.

@@ -73,8 +73,7 @@ advance_tick() {
     cp "$ticks/$tick/memory.stat" "$scope/memory.stat"
     cp "$ticks/$tick/cgroup.procs" "$scope/cgroup.procs"
 }
-sleep() {
-    [[ "$1" == 1 ]] || exit 91
+buildlog_wait_sample_tick() {
     printf '%s:%s\n' "$tick" "$(cat "$maximum")" >> "$ticks/observed"
     tick=$((tick + 1))
     if (( tick == 4 )); then

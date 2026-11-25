@@ -16,7 +16,6 @@ import os
 from pathlib import Path
 import signal
 import shlex
-import shutil
 import subprocess
 import sys
 import threading
@@ -216,7 +215,7 @@ def cleanup_queue_place_folders() -> None:
             continue
         try:
             if not path.is_symlink() and path.is_dir() and path.stat().st_uid == os.getuid():
-                _ = build_folders.remove_build_folder(path, lambda: shutil.rmtree(path))
+                _ = build_folders.remove_build_folder(path)
         except FileNotFoundError:
             pass
 

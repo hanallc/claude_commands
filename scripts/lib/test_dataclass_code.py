@@ -1,4 +1,4 @@
-"""Check the dataclass code cache that the startup hook installs and tmp_sweep.py prunes."""
+"""Check the dataclass code cache and the tmp sweep list for vetted manual removal."""
 from __future__ import annotations
 
 from collections.abc import Callable
