@@ -142,6 +142,8 @@ class AgentsUsageTests(unittest.TestCase):
                          ["help", "status", "pause", "exit", "pause", "resume", "resume", "resume", "retire", "rename", "move",
                           "reboot", "restart", "stop", "remove-stray", "transfer", "add-producer", "set-model"])
         self.assertIn("resume NAME", output)
+        self.assertIn("pause NAME [--finish-step] [--keep-workers] --why TEXT", output)
+        self.assertIn("pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] [--keep-workers] --why TEXT", output)
         self.assertIn("resume PRODUCER --resend-opening-prompt", output)
         self.assertIn("transfer NAME [--model MODEL --effort EFFORT]", output)
         self.assertIn("add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]", output)
@@ -445,7 +447,7 @@ def shutdown_fixture_configuration(root: Path) -> dict[str, str]:
 
 
 def retirement_copies_environment(root: Path) -> dict[str, str]:
-    private = build_slots_test_support.private_slot_config(root, repository="fixture", default_maximum=2)
+    private = build_slots_test_support.private_slot_config(root)
     return {**private.environment, "HOME": str(root), "SCRATCH_COPIES_ROOT": str(root / "copies")}
 
 

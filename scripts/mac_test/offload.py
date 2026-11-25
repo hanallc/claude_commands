@@ -811,6 +811,31 @@ class ProbeSnapshot:
 
 
 @dataclass(frozen=True)
+class MacMirrorProcess:
+    """One process observed in a saved Mac mirror."""
+
+    pid: int
+    start_time: str
+
+
+class MacMirrorSetup(Enum):
+    """The result of preparing a mirror for a step."""
+
+    READY = "ready"
+    FAILED = "failed"
+    UNREPORTED = "unreported"
+
+
+@dataclass(frozen=True)
+class MacHostProbeSnapshot:
+    """Disk space, mirror setup, and mirror processes from one SSH command."""
+
+    disk: ProbeSnapshot
+    processes: dict[str, MacMirrorProcess]
+    setup: dict[eligibility.LegacyMirrorName, MacMirrorSetup]
+
+
+@dataclass(frozen=True)
 class LeftoversEnded:
     """Both selectors completed and found no remaining remote work."""
 
@@ -1325,7 +1350,7 @@ class ProcessController:
                 self.claim_identity = identity
                 self.claim_scope_key = claim_state.claim_fence_scope_key(held.path, record)
                 self.mac_repository = claim_state.saved_mac_repository(record)
-                slot = record.get("slot", 1)
+                _, slot = claim_state.legacy_linux_claim_name(held.path)
                 if cleanup:
                     attempt.answer = TakenOverMacClaim(record["remote_host"], slot)
                 else:
@@ -1777,20 +1802,19 @@ def mirror_target(repository: KnownRepository, target: str, slot: int) -> str:
     return f"{remote_mirror(repository, target, slot)}/target"
 
 
+_MAC_DISK_PROBE = (
+    'free_gib=$(df -g "$HOME" | awk \'NR == 2 {print $4}\')\n'
+    'printf \'free_gib=%s\\nhost=%s\\nrc=0\\n\' "$free_gib" "$(hostname -s)"'
+)
+
+
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
     from scripts.copies import copies
 
     if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
         from scripts.mac_test import linux_runner
         return linux_runner.probe_script(remote_mirror(repository, target, slot))
-    return "\n".join(
-        (
-            copies.mirror_probe_setup(remote_mirror(repository, target, slot)),
-            "free_gib=$(df -g \"$HOME\" | awk 'NR == 2 {print $4}')",
-            "printf 'free_gib=%s\\nhost=%s\\nrc=0\\n' "
-            + '"$free_gib" "$(hostname -s)"',
-        )
-    )
+    return copies.mirror_probe_setup(remote_mirror(repository, target, slot)) + "\n" + _MAC_DISK_PROBE
 
 
 def parse_probe(output: str) -> ProbeResult:
@@ -1811,7 +1835,7 @@ def parse_probe(output: str) -> ProbeResult:
     return ProbeSnapshot(free_gib, hostname)
 
 
-def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots: tuple[int, ...] = (), *,
+def claim_arguments(request: OffloadRequest, config: OffloadConfig, *,
                     retire_wait: bool = False,
                     mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository
                     = claim_state.NO_SAVED_MAC_REPOSITORY) -> list[str]:
@@ -1823,7 +1847,6 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
         if isinstance(request.admission, UnclaimedMacRun):
             identity = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
                                                  assignment.episode, assignment.attempt)
-        leased_slots = (assignment.destination.slot,) if assignment.destination.slot else ()
     session = (request.holder_session if isinstance(request.admission, UnclaimedMacRun)
                else claim_state.session_id(request.admission.submitting_session))
     if isinstance(request.placement, AssignedOffloadRequest):
@@ -1854,7 +1877,6 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
         *(["--mac-repository", json.dumps(mac_repository.record())]
           if (retire_wait or isinstance(request.admission, UnclaimedMacRun))
           and isinstance(mac_repository, claim_state.MacRepositoryIdentity) else []),
-        *[word for slot in leased_slots for word in ("--leased-slot", str(slot))],
     ]
 
 
@@ -2150,6 +2172,82 @@ def save_mac_watch_origin(controller: ProcessController, host: str, root: MacMir
         write_text_atomic(path, json.dumps(record, separators=(",", ":")) + "\n")
 
 
+def _record_probe_failure(target: str, reason: str) -> UnavailableProbe:
+    mark = eligibility.state_directory(target) / "failed_probe"
+    try:
+        with claim_state.locked(mark.parent / PROBE_RESULT_LOCK_NAME, wait=False):
+            changed = not mark.exists()
+            write_text_atomic(mark, "failed\n")
+    except BlockingIOError:
+        return UNAVAILABLE_PROBE
+    if changed:
+        label = "Mac" if target in ("", "mac") else target
+        print(f"mac_test: could not reach the {label}: {reason}", file=sys.stderr, flush=True)
+    return UNAVAILABLE_PROBE
+
+
+def _probe_failure_reason(result: CapturedCommandResult, timeout_s: float) -> str:
+    if isinstance(result, CommandTimedOut):
+        return f"SSH probe timed out after {timeout_s:g} s"
+    if isinstance(result, CommandCouldNotStart):
+        return f"SSH probe could not start (time limit {timeout_s:g} s)"
+    if result.status != 0:
+        return next((line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
+                    f"SSH probe exited with status {result.status}")
+    return "the probe answer could not be read"
+
+
+def probe_mac_host(controller: ProcessController, config: eligibility.SshProbeSettings, target: str,
+                   mirrors: Sequence[str], *, setup_mirrors: Sequence[eligibility.LegacyMirrorName] = (),
+                   ) -> MacHostProbeSnapshot | UnavailableProbe:
+    """Read disk space, prepare step mirrors, and scan saved mirrors in one SSH command."""
+    from scripts.copies import copies
+
+    script: list[str] = []
+    if setup_mirrors:
+        root = mac_mirror_root()
+        for index, mirror in enumerate(setup_mirrors):
+            setup = copies.mirror_probe_setup(f"{root.relative}/{mirror}")
+            script.extend((f"if ( {setup} ); then", f"printf 'mirror_setup={index}\\tready\\n'",
+                           "else", f"printf 'mirror_setup={index}\\tfailed\\n'", "fi"))
+    script.append(_MAC_DISK_PROBE)
+    if mirrors:
+        script.append('if mac_cwd_records=$(lsof -a -u "$(id -u)" -d cwd -Fpn); then')
+        script.append('lsof() { printf "%s\\n" "$mac_cwd_records"; }')
+        for index, mirror in enumerate(mirrors):
+            selector = mirror_selector_script(KnownRepository(mirror), target)
+            script.extend(("(", selector, 'for pid in $(select_leftovers); do',
+                'start=$(ps -p "$pid" -o lstart=) || continue',
+                f"""printf 'mirror_process={index}\\t%s\\t%s\\n' "$pid" "$start" """,
+                "done", ")"))
+        script.append("fi")
+    started_ns = time.time_ns()
+    result = controller.capture([*ssh_prefix(config), "\n".join(script)], CommandTimeLimit(config.probe_timeout_s))
+    if isinstance(result, CommandOutput) and result.status == 0:
+        disk = parse_probe(result.stdout)
+        if isinstance(disk, ProbeSnapshot):
+            record_reachable(target, probe_started_ns=started_ns)
+            processes: dict[str, MacMirrorProcess] = {}
+            setups = dict.fromkeys(setup_mirrors, MacMirrorSetup.UNREPORTED)
+            for line in result.stdout.splitlines():
+                label, _, payload = line.partition("=")
+                if label not in ("mirror_setup", "mirror_process"):
+                    continue
+                index_text, tab, payload = payload.partition("\t")
+                if not (tab and index_text.isascii() and index_text.isdecimal()):
+                    continue
+                index = int(index_text)
+                if label == "mirror_setup":
+                    if index < len(setup_mirrors) and payload in ("ready", "failed"):
+                        setups[setup_mirrors[index]] = MacMirrorSetup(payload)
+                elif index < len(mirrors):
+                    pid_text, _, start_time = payload.partition("\t")
+                    if pid_text.isascii() and pid_text.isdecimal() and int(pid_text) > 0 and start_time.strip():
+                        _ = processes.setdefault(mirrors[index], MacMirrorProcess(int(pid_text), start_time.strip()))
+            return MacHostProbeSnapshot(disk, processes, setups)
+    return _record_probe_failure(target, _probe_failure_reason(result, config.probe_timeout_s))
+
+
 def probe_mac(
     controller: ProcessController,
     config: OffloadConfig | eligibility.SshProbeSettings,
@@ -2158,20 +2256,6 @@ def probe_mac(
     slot: int = 1,
     *, record_version_decline: bool = True,
 ) -> ProbeResult:
-    mark = eligibility.state_directory(target) / "failed_probe"
-
-    def failed(reason: str) -> UnavailableProbe:
-        try:
-            with claim_state.locked(mark.parent / PROBE_RESULT_LOCK_NAME, wait=False):
-                changed = not mark.exists()
-                write_text_atomic(mark, "failed\n")
-        except BlockingIOError:
-            return UNAVAILABLE_PROBE
-        if changed:
-            label = "Mac" if target in ("", "mac") else target
-            print(f"mac_test: could not reach the {label}: {reason}", file=sys.stderr, flush=True)
-        return UNAVAILABLE_PROBE
-
     def succeeded(probe: ProbeSnapshot) -> ProbeSnapshot:
         record_reachable(target, probe_started_ns=probe_started_ns)
         return probe
@@ -2185,7 +2269,7 @@ def probe_mac(
         script = linux_runner.probe_command_script(remote_mirror(repository, target, slot), runner_values(config, target),
                                                    repository.policy_name)
         if isinstance(probe_reachability(controller, config), UnreachableHost):
-            return failed("SSH reachability check failed")
+            return _record_probe_failure(target, "SSH reachability check failed")
         timeout_s = linux_runner.positive_setting(config.values, "shell_timeout_s") + config.probe_timeout_s
     else:
         script = probe_script(repository, target, slot)
@@ -2209,14 +2293,7 @@ def probe_mac(
     if (linux and isinstance(result, CommandOutput)
             and result.stdout.strip() == "linux_startup=unresolved"):
         return UnresolvedSlotStartup()
-    if isinstance(result, CommandTimedOut):
-        reason = f"SSH probe timed out after {timeout_s:g} s"
-    elif isinstance(result, CommandCouldNotStart):
-        reason = f"SSH probe could not start (time limit {timeout_s:g} s)"
-    elif result.status != 0:
-        reason = next((line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
-                      f"SSH probe exited with status {result.status}")
-    else:
+    if isinstance(result, CommandOutput) and result.status == 0:
         probe = parse_probe(result.stdout)
         if isinstance(probe, ProbeSnapshot):
             if watch_root is not None:
@@ -2238,9 +2315,8 @@ def probe_mac(
                 if record_version_decline:
                     write_version_decline(target, repository.name)
                 return UnavailableProbe(detail)
-            return failed("public tools or tracked scripts differ")
-        reason = "the probe answer could not be read"
-    return failed(reason)
+            return _record_probe_failure(target, "public tools or tracked scripts differ")
+    return _record_probe_failure(target, _probe_failure_reason(result, timeout_s))
 
 
 @dataclass(frozen=True)
@@ -2265,6 +2341,11 @@ def check_mac_disk_floor(probe: ProbeSnapshot, free_floor_gib: float) -> MacDisk
     return MacDiskShort(probe.free_gib, free_floor_gib)
 
 
+def mac_disk_floor(config: OffloadConfig | eligibility.SshProbeSettings) -> float:
+    return (config.free_floor_gib if isinstance(config, OffloadConfig)
+            else config.configuration.number("free_floor_gib"))
+
+
 @dataclass(frozen=True)
 class SweepShort:
     """The Mac remains below the disk minimum after the sweep."""
@@ -2284,8 +2365,7 @@ def ensure_mac_disk_floor(
     probe: ProbeSnapshot, target: str = "mac", slot: int = 1,
 ) -> MacDiskReady | SweepShort | SweepFailed:
     """Run one shared floor sweep, then read the Mac disk space again."""
-    floor = (config.free_floor_gib if isinstance(config, OffloadConfig)
-             else config.configuration.number("free_floor_gib"))
+    floor = mac_disk_floor(config)
     disk = check_mac_disk_floor(probe, floor)
     if isinstance(disk, MacDiskReady):
         return disk
@@ -2984,7 +3064,7 @@ def mac_cleanup_lease(saved: claim_state.SavedMacRepository,
 
 def claim_for_run(
     controller: ProcessController, config: OffloadConfig, request: OffloadRequest, repository: eligibility.RepositoryIdentity,
-    leased_slots: tuple[int, ...] = (), *,
+    *,
     retire_wait: bool = False,
     mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository = claim_state.NO_SAVED_MAC_REPOSITORY,
 ) -> MacClaimAnswer:
@@ -3009,7 +3089,7 @@ def claim_for_run(
             assigned.destination.provider, assigned.destination.target, assigned.destination.scope,
             identity.claim_id, identity.episode, identity.attempt)
     try:
-        controller.complete_claim(claim_arguments(request, config, leased_slots, retire_wait=retire_wait,
+        controller.complete_claim(claim_arguments(request, config, retire_wait=retire_wait,
                                                   mac_repository=mac_repository), attempt)
         if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
             if pending_start_path(request.target, controller.claim_identity, scope_key=controller.claim_scope_key).exists():
@@ -3771,26 +3851,24 @@ def run_offload(
             return DeclinedMacRun("state", elapsed_seconds(started), detail)
         decline_path.unlink(missing_ok=True)
 
+    admission_slot = 1
+    if linux and isinstance(request.placement, AssignedOffloadRequest):
+        admission_slot = request.placement.assignment.destination.slot or 1
     try:
         with ExitStack() as admission_leases:
             if not linux:
                 root_token = offload_mirror_root.set(mac_mirror_root())
                 _ = admission_leases.callback(offload_mirror_root.reset, root_token)
-            slots = (target_config.slot_capacity(config.values, repository.name,
-                     missing=target_config.MissingSlotCapacity.SINGLE_SLOT) if linux else 1)
-            leases: dict[int, ExitStack] = {}
-            selected_slots = ((request.placement.assignment.destination.slot or 1,)
-                              if isinstance(request.placement, AssignedOffloadRequest) else range(1, slots + 1))
-            for slot in selected_slots:
-                lease = ExitStack()
-                try:
-                    lease.enter_context(copies.remote_lease(request_mirror(config, replace(request, slot=slot), repository)))
-                except copies.BusyRemoteHost:
-                    return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-                except copies.BusyRemoteMirror:
-                    continue
-                leases[slot] = admission_leases.enter_context(lease)
-            result = leased_offload(controller, config, request, repository, started, linux, leases,
+            try:
+                mirror = request_mirror(config, replace(request, slot=admission_slot), repository)
+                admission_leases.enter_context(copies.remote_lease(mirror))
+            except copies.BusyRemoteHost:
+                return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+            except copies.BusyRemoteMirror:
+                write_mirror_busy(config, repository.name, request.target)
+                return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+            result = leased_offload(controller, config, request, repository, started, linux, admission_leases,
+                                    admission_slot=admission_slot,
                                     mac_repository=mac_repository, retire_wait=retire_wait,
                                     cleanup_takeover=cleanup_takeover)
         if isinstance(result, ClaimReleaseConfirmed):
@@ -3890,47 +3968,55 @@ def claim_refusal(controller: ProcessController, request: OffloadRequest, claim:
 
 def leased_offload(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
                    repository: KnownRepository, started: float, linux: bool,
-                   leases: dict[int, ExitStack], *,
+                   lease: ExitStack, *, admission_slot: int,
                    mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository
                    = claim_state.NO_SAVED_MAC_REPOSITORY,
                    retire_wait: bool = False,
                    cleanup_takeover: bool = True) -> MacOffloadResult | ClaimReleaseConfirmed:
-    if not leases:
-        write_mirror_busy(config, repository.name, request.target)
-        return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-    claim = claim_for_run(controller, config, request, repository, tuple(leases),
+    from scripts.copies import copies
+
+    claim = claim_for_run(controller, config, request, repository,
                           mac_repository=mac_repository, retire_wait=retire_wait)
     claim_from_wait = isinstance(request.admission, MacClaimFromWait)
-    # A transferred reservation can be adopted only once.
+    # Adopt a transferred reservation only once.
     request = replace(request, admission=UnclaimedMacRun())
-    if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
+    while isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
         if not linux:
             if not cleanup_takeover:
                 return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-            for lease in leases.values():
-                lease.close()
+            lease.close()
             if isinstance(claim, TakenOverMacClaim):
                 with mac_cleanup_lease(controller.mac_repository, claim.host, request.target):
                     return cleanup_taken_over_claim(controller, config, request, claim, repository, started)
             return cleanup_taken_over_claim(controller, config, request, claim, repository, started)
-        cleanup = cleanup_taken_over_claim(controller, config, request, claim, repository, started)
+        with ExitStack() as cleanup_lease:
+            if isinstance(claim, TakenOverMacClaim) and (claim.slot != admission_slot or claim.host != config.host):
+                connection = replace(config.connection, host=claim.host)
+                mirror = request_mirror(replace(config, connection=connection), replace(request, slot=claim.slot), repository)
+                try:
+                    cleanup_lease.enter_context(copies.remote_lease(mirror))
+                except copies.BusyRemoteMirror:
+                    return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+            cleanup = cleanup_taken_over_claim(controller, config, request, claim, repository, started)
         if not isinstance(cleanup, ClaimReleaseConfirmed):
             return cleanup
         if isinstance(request.placement, AssignedOffloadRequest):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
         claim_from_wait = False
-        claim = claim_for_run(controller, config, request, repository, tuple(leases), mac_repository=mac_repository)
-        if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
-            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+        claim = claim_for_run(controller, config, request, repository, mac_repository=mac_repository)
     if isinstance(claim, MacClaimNotConfirmed):
         return claim_refusal(controller, request, claim, started, claim_from_wait=claim_from_wait)
     if isinstance(claim, LegacyWaitClaimReleased):
         controller.attempt_evidence.provider = placement.NoProviderClaim()
         return DeclinedMacRun("source_changed", elapsed_seconds(started),
                               "the current repository differs from the retired reservation's assignment")
-    if claim.slot not in leases:
-        _ = release_claim(controller, request.target)
-        return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+    if linux and claim.slot != admission_slot:
+        mirror = request_mirror(config, replace(request, slot=claim.slot), repository)
+        try:
+            lease.enter_context(copies.remote_lease(mirror))
+        except copies.BusyRemoteMirror:
+            _ = release_claim(controller, request.target)
+            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     saved = controller.mac_repository
     if not linux and not isinstance(saved, claim_state.MacRepositoryIdentity):
         _ = release_claim(controller, request.target)
@@ -3940,9 +4026,6 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
             _ = release_claim(controller, request.target)
             return DeclinedMacRun("state", elapsed_seconds(started), "The claim has a different mirror than the lease")
         repository = KnownRepository(saved.mirror_name, saved.key)
-    for slot, lease in leases.items():
-        if slot != claim.slot:
-            lease.close()
     selected = replace(request, slot=claim.slot)
     result = claimed_run(controller, config, selected, repository, started)
     if linux and isinstance(result, PassedOnMac):

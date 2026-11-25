@@ -17,13 +17,13 @@ import os
 import subprocess
 import sys
 import uuid
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from typing import BinaryIO, Literal, Protocol, TypedDict, cast
+from typing import BinaryIO, Literal, NotRequired, Protocol, TypedDict, cast
 from itertools import chain
 
 from scripts.build_queue import admission_records as records, placement, progress_profile as progress, snapshot_codec as codec, step_estimator
@@ -251,6 +251,26 @@ class NoPositiveSample:
 LeftReason = Literal["cancelled", "owner_gone"]
 
 
+@dataclass(frozen=True)
+class PassedRows:
+    """Count the earlier waiting rows that a started step went past, by the cause that held each row.
+
+    Each row has one cause, in the order of the fields. The walk never starts a step past a
+    local row that waits for memory, so `memory` is always 0. A nonzero `memory` is a walk fault.
+    """
+    run_limit: int
+    cargo_token: int
+    other_machine: int
+    gpu: int
+    folder: int
+    memory: int
+
+
+@dataclass(frozen=True)
+class PassedNotRecorded:
+    """The admitted row has no count: the row is older than the count, or the step was not in the local walk."""
+
+
 class LifecycleEventIdentity[Kind: Literal["admitted", "left", "ended"]](QueueLifeIdentity):
     kind: Kind
     event_id: str
@@ -265,7 +285,9 @@ class AdmittedEvent(QueueLifeIdentity):
     wait_seconds: float
     need: int
     need_source: NeedSource
+    # The step was the first queued row in queue order.
     is_head: bool
+    passed: NotRequired[PassedRows]
 
 
 class LeftEvent(QueueLifeIdentity):
@@ -440,15 +462,19 @@ def resolve_queue_order(directory: Path, rows: list[tuple[Path, Waiter]], *, fin
 
 def apply_queue_priority(rows: Iterable[tuple[Path, Waiter]], context: QueueOrderContext
                          ) -> tuple[list[tuple[Path, RankedWaiter]], QueuePriority | NoQueuePriority]:
-    ranked = ((path, rank_waiter(row, unit_order(row.get("unit", ""), row.get("session_id", ""), context)))
+    ranked = ((path, rank_waiter(row, unit_order(row.get("unit", ""), row.get("session_id", ""), context,
+                                               run=row.get("build_run"))))
               for path, row in rows)
     return sort_waiters(ranked), context.priority
 
 
-def unit_order(unit: str, session_id: str, context: QueueOrderContext) -> PriorityUnit | NormalOrder:
+def unit_order(unit: str, session_id: str, context: QueueOrderContext, *,
+               run: LiveBuildRun | NoLiveBuildRun | None = None) -> PriorityUnit | NormalOrder:
     unit = queue_unit(unit, session_id, context.labels)
     entries = context.priority.entries if isinstance(context.priority, QueuePriority) else ()
-    return next((PriorityUnit(unit, index) for index, entry in enumerate(entries) if unit == entry["unit"]),
+    identity = run if run is not None else NoLiveBuildRun()
+    return next((PriorityUnit(unit, index) for index, entry in enumerate(entries)
+                 if records.entry_covers(entry, unit, identity)),
                 NormalOrder())
 
 
@@ -642,9 +668,8 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
     returning_swap = min(swapped_outside, host.swap_in_window_bytes)
     agent_swap_demand = (returning_swap * policy.agent_swap_share_percent + 99) // 100
     safety = policy.safety_bytes
-    holds = tuple(RunKeepAside(run,
-                  max(0, run.need - run.use.bytes) + run.held
-                  if isinstance(run.use, AnonymousRunUse) else run.need + run.held) for run in runs)
+    holds = tuple(RunKeepAside(run, records.keep_aside_parts(run, policy.build_reserve_share_percent).bytes)
+                  for run in runs)
     used = sum(run.use.bytes for run in runs if isinstance(run.use, AnonymousRunUse))
     kept = sum(run.bytes for run in holds)
     unavailable = tuple(run for run in runs if isinstance(run.use, RunUseUnavailable))
@@ -653,7 +678,7 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
                                  else max(0, used + ci_use + host.available - safety - agent_swap_demand))
     return MemoryRoom(host.available, safety, used, kept,
                       host.available - safety - kept - agent_swap_demand, cap, holds, total=host.total,
-                      ci_use=ci_use, agent_swap_demand=agent_swap_demand)
+                      ci_use=ci_use, agent_swap_demand=agent_swap_demand, returning_swap=returning_swap)
 
 
 def has_running_step(running: list[StepMemory]) -> bool:
@@ -1474,11 +1499,22 @@ def waiter_order(row: Waiter) -> tuple[int, float, float, int]:
 
 
 @dataclass(frozen=True)
+class HeldByRunLimit:
+    """The row waits for its repository run limit, or waits behind such a row (rule 8)."""
+
+
+@dataclass(frozen=True)
+class NotHeldByRunLimit:
+    """The run limit does not hold the row: it starts, or another cause holds it."""
+
+
+@dataclass(frozen=True)
 class WaiterAdmission:
     waiter: Waiter
     decision: AdmissionDecision
     state: QueuedWaiter | TokenWaitingWaiter
     cargo_folder: placement.CargoFolderFree | placement.CargoFolderWait = placement.CargoFolderFree()
+    run_limit_line: HeldByRunLimit | NotHeldByRunLimit = NotHeldByRunLimit()
 
 
 
@@ -1596,7 +1632,9 @@ class ReservationInterval:
     admitted_at: float
     need: int
     need_source: NeedSource
+    # The step was the first queued row in queue order.
     is_head: bool
+    passed: PassedRows | PassedNotRecorded
     end: ReservationEnded | StepStillOpen
 
 
@@ -1649,7 +1687,8 @@ def read_queue_lifetimes(directory: Path) -> tuple[QueueStepLifetime, ...]:
                     admitted = cast(AdmittedEvent, codec.parse_snapshot_value(row, AdmittedEvent))
                     reservation = admitted["reservation_id"]
                     intervals[reservation] = ReservationInterval(reservation, admitted["admitted_at"],
-                        admitted["need"], admitted["need_source"], admitted["is_head"], StepStillOpen())
+                        admitted["need"], admitted["need_source"], admitted["is_head"],
+                        admitted.get("passed", PassedNotRecorded()), StepStillOpen())
                     end = StepStillOpen()
                 elif kind == "ended":
                     ended = cast(EndedEvent, codec.parse_snapshot_value(row, EndedEvent))
@@ -2259,7 +2298,14 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             reused_slot=reused, room=RoomCheck(extra, checked_room, room_passes, basis=basis),
             gpu=gpu_wait, run_limit=run_wait)
         cargo_folder = placement.CargoFolderWait() if folder_busy else placement.CargoFolderFree()
-        decisions.append(WaiterAdmission(row, decision, state, cargo_folder))
+        # A row that waits for its own repository limit, or behind such a row, holds back no
+        # other repository, also when it is not ready or does not fit in memory. Its place as
+        # memory head starts only when its limit no longer holds it (rule 8).
+        held_by_run_limit = (not can_start and local and not folder_busy and isinstance(gpu_wait, GpuSlotFree) and (
+            records.waiter_owner(order_hold.waiter) in run_limit_waiters
+            if isinstance(order_hold, HeldBehindHead) else isinstance(run_wait, records.RunLimitWait)))
+        run_limit_line: HeldByRunLimit | NotHeldByRunLimit = HeldByRunLimit() if held_by_run_limit else NotHeldByRunLimit()
+        decisions.append(WaiterAdmission(row, decision, state, cargo_folder, run_limit_line))
         if can_start:
             memory_head_seen = True
             remaining += held + released - need
@@ -2271,12 +2317,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         elif local or folder_busy:
             if folder_busy and isinstance(first_folder_wait, NoWaiter):
                 first_folder_wait = records.stored_waiter(row)
-            # A row that waits for its own repository limit, or behind such a row, holds back no
-            # other repository, also when it is not ready or does not fit in memory. Its place as
-            # memory head starts only when its limit no longer holds it (rule 8).
-            if not folder_busy and isinstance(gpu_wait, GpuSlotFree) and (
-                    records.waiter_owner(order_hold.waiter) in run_limit_waiters
-                    if isinstance(order_hold, HeldBehindHead) else isinstance(run_wait, records.RunLimitWait)):
+            if held_by_run_limit:
                 run_limit_waiters[owner] = repository
                 _ = first_held_by_run_limit.setdefault(repository, row)
             else:
@@ -2287,6 +2328,38 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
                         ready and not folder_busy and isinstance(gpu_wait, GpuSlotWait)):
                     first_held_other_than_gpu = row
     return decisions
+
+
+PassedCause = Literal["run_limit", "cargo_token", "other_machine", "gpu", "folder", "memory"]
+
+
+def passed_rows(walk: Iterable[WaiterAdmission], started: str,
+                pending_remote_starts: frozenset[str]) -> PassedRows | PassedNotRecorded:
+    """Count the held rows ahead of the started step in the walk that admitted it."""
+    counts: Counter[PassedCause] = Counter()
+    for entry in walk:
+        owner = records.waiter_owner(entry.waiter)
+        if owner == started:
+            return PassedRows(counts["run_limit"], counts["cargo_token"], counts["other_machine"],
+                              counts["gpu"], counts["folder"], counts["memory"])
+        decision = entry.decision
+        if decision.state == "admit":
+            continue
+        cause: PassedCause
+        if isinstance(entry.run_limit_line, HeldByRunLimit):
+            cause = "run_limit"
+        elif isinstance(entry.state, TokenWaitingWaiter):
+            cause = "cargo_token"
+        elif not can_use_natedev(entry.waiter) or owner in pending_remote_starts:
+            cause = "other_machine"
+        elif isinstance(decision.gpu, GpuSlotWait):
+            cause = "gpu"
+        elif isinstance(entry.cargo_folder, placement.CargoFolderWait):
+            cause = "folder"
+        else:
+            cause = "memory"
+        counts[cause] += 1
+    return PassedNotRecorded()
 
 
 def wait_holder_identity(session_id: str, session_name: str, unit: str) -> records.WaitHolder:

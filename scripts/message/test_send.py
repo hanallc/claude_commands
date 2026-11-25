@@ -83,6 +83,9 @@ from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, fixture_session
 
 
+RELAY = send.relay
+
+
 def setUpModule() -> None:
     install_signal_pid_guard()
     install_guard_test_budget()
@@ -1164,12 +1167,6 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                     self.assertEqual(len(error.getvalue().splitlines()), 1)
                     read.assert_not_called()
 
-    def test_review_watch_gets_a_reference_without_a_new_caller_argument(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "review_watch.acknowledge")
-        options = send.parse(["--to", "user", "--text-id", entry.id,
-                              *(item for key, value in entry.examples[0].values.items() for item in ("--value", f"{key}={value}"))])
-        self.assertEqual(options.reference, {"kind": "review_watch"})
-
     def test_outcome_parser_preserves_first_header_payload_and_acknowledgement(self) -> None:
         acknowledged = send.acknowledged_skip_reason("shutdown-fixture", "2026-10-30T12:00:00+00:00")
         self.assertEqual(acknowledged, "key 'shutdown-fixture' acknowledged at 2026-10-30T12:00:00+00:00; `send.py reopen` to resume")
@@ -2205,6 +2202,153 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(self.held_text().count("Same update."), 1)
         self.assertEqual(self.relayed, [])
 
+    def test_interrupted_review_release_keeps_one_continuation(self) -> None:
+        _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
+        self.session("recipient", "Recipient")
+        at = send.now().timestamp()
+        key = "agents-resume:recipient:2026-11-24T08:31:00-08:00"
+        options = local_options(["--to", "session:recipient", "--key", key, "--once-per-key",
+                                 "--text", "Continue where you stopped."])
+        review_hold.set_count("recipient", 2, at, self.fail, record_keys=send.record_released_acceptances)
+        self.assertEqual(send.send(options).outcome, "kept")
+
+        # Leave the reservation that a stopped review process would leave before it files the messages.
+        path = review_hold.held_file("recipient").with_name("recipient.json")
+        reservation = cast(dict[str, object], json.loads(path.read_text()))
+        reservation["reserved"] = reservation["messages"]
+        reservation["messages"] = []
+        _ = path.write_text(json.dumps(reservation))
+        with send.key_states() as states:
+            del states[key]
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+
+        def interrupted(_notice: str) -> None:
+            self.assertTrue(send.once_accepted(key))
+            self.assertEqual(self.held_text().count("Continue where you stopped."), 1)
+            raise OSError("fixture notice interruption")
+
+        with self.assertRaisesRegex(OSError, "fixture notice interruption"):
+            review_hold.set_count("recipient", 0, at, interrupted, record_keys=send.record_released_acceptances)
+        released: list[str] = []
+        review_hold.set_count("recipient", 0, at + 30, released.append, record_keys=send.record_released_acceptances)
+        review_hold.set_count("recipient", 0, at + 60, released.append, record_keys=send.record_released_acceptances)
+        self.assertEqual(released, [held_notice(1, "recipient")])
+        self.assertEqual(self.held_text().count("Continue where you stopped."), 1)
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+        self.assertEqual(self.relayed, [])
+
+    def test_normal_mail_queues_when_an_offline_review_holds_a_continuation(self) -> None:
+        _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=1")
+        self.session("recipient", "Recipient")
+        at = send.now()
+        review_hold.set_count("recipient", 2, at.timestamp(), self.fail, record_keys=send.record_released_acceptances)
+        args = ["--to", "session:recipient"]
+        key = "agents-resume:recipient:2026-11-24T08:31:00-08:00"
+        continuation = local_options([*args, "--key", key, "--once-per-key",
+                                      "--text", "Continue where you stopped."])
+        self.assertEqual(send.send(continuation).outcome, "kept")
+        (self.root / "sessions/recipient.json").unlink()
+        with mock.patch.object(send, "now", return_value=at + timedelta(minutes=2)):
+            normal = send.send(local_options([*args, "--text", "An ordinary update."]))
+        self.assertEqual(normal.outcome, "queued")
+        self.session("recipient", "Recipient")
+        queued = send.pending("session:recipient")
+        self.assertIn("An ordinary update.", queued)
+        self.assertIn(held_notice(1, "recipient"), queued)
+        self.assertEqual(self.held_text().count("Continue where you stopped."), 1)
+
+    def test_once_queue_drain_records_acceptance_without_staff_calls_under_the_lock(self) -> None:
+        key = "agents-resume:recipient:2026-11-24T08:31:00-08:00"
+        options = local_options(["--to", "session:recipient", "--key", key, "--once-per-key",
+                                 "--text", "Continue where you stopped."])
+        self.assertEqual(send.send(options).outcome, "queued")
+        with send.key_states() as states:
+            del states[key]
+        self.session("recipient", "Recipient")
+        membership = staff.snapshot()
+
+        def read_staff() -> staff.StaffSnapshot:
+            with (self.root / ".lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return membership
+
+        with (mock.patch.object(staff, "snapshot", side_effect=read_staff) as read,
+              mock.patch.object(staff, "initial_snapshot", side_effect=AssertionError("unexpected staff read")),
+              mock.patch.object(staff, "set_hold", side_effect=AssertionError("unexpected staff write"))):
+            self.assertEqual(send.pending("session:recipient").count("Continue where you stopped."), 1)
+        read.assert_called_once_with()
+        self.assertEqual(send.pending("session:recipient"), "")
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+
+    def test_once_send_retries_definite_failure_and_stops_after_acceptance(self) -> None:
+        self.session("recipient", "Recipient")
+        key = "test-continuation"
+        options = local_options(["--to", "session:recipient", "--key", key, "--once-per-key",
+                                 "--text", "Continue where you stopped."])
+        self.outcome = send.Result("failed", "fixture delivery failure")
+        self.assertEqual(send.send(options), send.Result("failed", send.BEFORE_ACCEPTANCE + "fixture delivery failure"))
+        self.assertFalse(send.once_accepted(key))
+        self.outcome = send.Result("sent", "fixture delivery confirmed")
+        self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+
+    def test_once_send_reclaims_a_dead_owner_before_the_relay(self) -> None:
+        self.session("recipient", "Recipient")
+        key = "interrupted-before-relay"
+        options = local_options(["--to", "recipient", "--recipient-kind", "unit", "--key", key,
+                                 "--once-per-key", "--text", "Continue where you stopped."])
+        stop_in_child(lambda: send.send(options), send, "relay", when="before")
+
+        session_record = self.root / "sessions/recipient.json"
+        recorded = session_record.read_text(encoding="utf-8")
+        session_record.unlink()
+        self.assertEqual(send.send(options).outcome, "pending")
+        self.assertEqual(self.relayed, [])
+
+        _ = session_record.write_text(recorded, encoding="utf-8")
+        self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+        self.assertEqual([message.key for message in self.relayed], [key])
+
+    def test_once_send_recovers_a_relay_receipt_after_the_sender_dies(self) -> None:
+        self.session("recipient", "Recipient")
+        for confirmed in (False, True):
+            with self.subTest(confirmed=confirmed):
+                key = f"interrupted-after-relay-{confirmed}"
+                delivered = self.root / key
+                options = local_options(["--to", "session:recipient", "--key", key, "--once-per-key",
+                                         "--text", "Continue where you stopped."])
+
+                def forward(message: send.Message, *_args: object) -> send.RelayTransportResponse:
+                    claim = message.direct_relay_claim
+                    assert isinstance(claim, send.DirectRelayClaim)
+                    send.mark_direct_relay_write(claim)
+                    with delivered.open("a", encoding="utf-8") as log:
+                        _ = log.write(message.text + "\n")
+                    return send.RelayTransportResponse(0, "", "", message.to,
+                        send.RelayRequestForwarded("fixture-tool", send.agent_text(message, via_relay=True)))
+
+                with (mock.patch.object(send, "relay", RELAY),
+                      mock.patch.object(send, "claude_binary", return_value="fixture-claude"),
+                      mock.patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()),
+                      mock.patch.object(models_registry, "claude_model", return_value="fixture"),
+                      mock.patch("scripts.whoami.mac_fallback_token.prepare_child", return_value=False),
+                      mock.patch.object(send, "_bound_relay", side_effect=forward),
+                      mock.patch.object(send, "read_relay", return_value=send.CheckedRelayAcceptance("fixture-tool", "fixture"))):
+                    stop_in_child(lambda: send.send(options), send, "relay" if confirmed else "read_relay",
+                                  when="after" if confirmed else "before")
+                    result = send.send(options)
+                self.assertEqual(result.outcome, "skipped" if confirmed else "pending")
+                self.assertEqual(delivered.read_text(encoding="utf-8").splitlines(), ["Continue where you stopped."])
+
+    def test_once_send_allows_matching_message_and_recipient_keys(self) -> None:
+        self.session("recipient", "Recipient")
+        options = local_options(["--to", "session:recipient", "--key", "once", "--recipient-key", "once",
+                                 "--once-per-key", "--text", "Continue where you stopped."])
+        self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+        self.assertEqual(len(self.relayed), 1)
+
     def test_urgent_send_goes_through_an_open_review(self) -> None:
         _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
         self.session("recipient", "Recipient")
@@ -2909,6 +3053,64 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 self.assertEqual(peer.recv(1), b"")
         self.assertEqual(self.claims("race"), {})
         self.assertFalse((self.root / "queue").exists())
+
+    def test_once_relay_refuses_a_staff_move_during_lock_acquisition(self) -> None:
+        _, row = self.canonical_recipient()
+        path = Path(row["messagingSocketPath"])
+        path.unlink()
+        producer = staff.StaffRow(staff.StaffId("fixed-producer"), "producer", "planner", staff.StaffRoot(),
+                                  current_session=staff.StaffId(row["sessionId"]))
+        self.staff_rows[producer.id] = producer
+        replacement = replace(producer, current_session=staff.StaffId("replacement"))
+        key = "race"
+        locked = send.locked
+        move_on_lock = False
+
+        @contextmanager
+        def move_on_relay_lock() -> Generator[None]:
+            nonlocal move_on_lock
+            if move_on_lock:
+                move_on_lock = False
+                self.staff_rows[producer.id] = replacement
+            with locked():
+                yield
+
+        def launch(command: list[str], prompt: str, _timeout: float, _environment: dict[str, str],
+                   _cwd: Path) -> tuple[int, str, str]:
+            nonlocal move_on_lock
+            destination = cast(str, json.loads(next(line[6:] for line in prompt.splitlines()
+                                                   if line.startswith("- to: "))))
+            payload = guarded_payload(command, destination, "Private")
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(3)
+                client.connect(destination[4:])
+                move_on_lock = True
+                client.sendall(relay_wire(payload))
+                client.shutdown(socket.SHUT_WR)
+            return 0, stream(INIT, call(STAND_IN, target=destination), answer(OK)), ""
+
+        options = local_options(["--to", producer.id, "--recipient-kind", "producer", "--from", "test",
+                                 "--key", key, "--once-per-key", "--summary", "Private", "--text", "Private body."])
+        with (socket.socket(socket.AF_UNIX) as listener,
+              mock.patch.object(send, "relay", REAL_RELAY),
+              mock.patch.object(send, "claude_binary", return_value="/fixture/claude"),
+              mock.patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()),
+              mock.patch.object(models_registry, "claude_model", return_value="fixture"),
+              mock.patch.object(unit_lookup, "current_claude_record", REAL_CURRENT_CLAUDE_RECORD),
+              mock.patch.object(send, "locked", move_on_relay_lock),
+              mock.patch.object(send, "run", side_effect=launch)):
+            listener.bind(str(path))
+            listener.listen()
+            listener.settimeout(3)
+            result = send.send(options)
+            with listener.accept()[0] as old_peer:
+                old_peer.settimeout(3)
+                self.assertEqual(old_peer.recv(1), b"")
+        self.assertEqual(self.staff_rows[producer.id], replacement)
+        self.assertEqual(result, send.Result("failed", send.BEFORE_ACCEPTANCE
+                                             + "the session changed for staff ID fixed-producer"))
+        self.assertEqual(send.pending_deliveries(send.read_key_states().get(key, {"last": {}})), {})
+        self.assertEqual(self.claims(key), {})
 
     def test_raw_socket_queue_keeps_the_recipient_selected_before_replacement(self) -> None:
         canonical, row = self.canonical_recipient()
@@ -7421,14 +7623,16 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_paid_credits_template_takes_its_sender_from_this_session_else_the_script_name(self) -> None:
         _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "natedev"}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        _ = self.enterContext(mock.patch("scripts.whoami.agent_accounts.codex_credit_accounts",
+                                         return_value=frozenset({"codex2"})))
         # The session record wins over a name the caller gives.
         options = local_options(self.paid_credits_arguments("--value", "sender=quota_alert"))
-        self.assertEqual(options.summary, "natedev: codex2 now uses paid credits")
+        self.assertEqual(options.summary, "codex2 now spends paid credits: 25,345 left")
         self.assertEqual(options.need, "decision")
         self.assertIn("sender=natedev", options.values)
         self.assertEqual(options.action, ActionRequired(
-            "To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev"))
-        self.assertTrue((options.text or "").startswith("codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 EDT."))
+            "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts none"))
+        self.assertEqual(options.text, "")
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
         command = cast(list[str], run.call_args.args[0])
@@ -7436,9 +7640,9 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("sender=natedev", command)
         with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}):
             script = local_options(self.paid_credits_arguments("--from", "quota_alert"))
-            self.assertEqual(script.summary, "quota_alert: codex2 now uses paid credits")
+            self.assertEqual(script.summary, "codex2 now spends paid credits: 25,345 left")
             self.assertEqual(local_options(self.paid_credits_arguments("--value", "sender=quota_alert")).summary,
-                             "quota_alert: codex2 now uses paid credits")
+                             "codex2 now spends paid credits: 25,345 left")
             with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
                 _ = local_options(self.paid_credits_arguments())
             self.assertIn("needs a sender", errors.getvalue())
@@ -7449,12 +7653,14 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                      *(item for key, value in values.items() for item in ("--value", f"{key}={value}"))]
         _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "natedev"}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        _ = self.enterContext(mock.patch("scripts.whoami.agent_accounts.codex_credit_accounts",
+                                         return_value=frozenset({"codex2"})))
         options = local_options([*arguments, "--value", "sender=quota_alert"])
-        self.assertEqual(options.summary, "natedev: codex2 now uses paid credits")
+        self.assertEqual(options.summary, "codex2 uses credits until move: 25,345 left")
         self.assertEqual(options.need, "decision")
         self.assertEqual(options.action, ActionRequired(
-            "To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev"))
-        self.assertTrue((options.text or "").endswith("Turn off: workers stop and wait for your queued move."))
+            "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts none"))
+        self.assertEqual(options.text, "")
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
         command = cast(list[str], run.call_args.args[0])
@@ -7462,13 +7668,15 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("sender=natedev", command)
         with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}):
             self.assertEqual(local_options([*arguments, "--from", "quota_alert"]).summary,
-                             "quota_alert: codex2 now uses paid credits")
+                             "codex2 uses credits until move: 25,345 left")
             with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
                 _ = local_options(arguments)
             self.assertIn("quota.paid_credits_queued needs a sender", errors.getvalue())
 
     def test_a_free_text_paid_credit_push_is_held_with_the_template_call(self) -> None:
         self.writer_session()
+        _ = self.enterContext(mock.patch("scripts.whoami.agent_accounts.codex_credit_accounts",
+                                         return_value=frozenset({"codex2"})))
         for title, text, action in (("codex2 now spends paid credits", "It refills Tue.", "Choose in natedev terminal."),
                                     ("Codex workers", "They spend credits now.", "Remove codex2 from codex_credit_accounts"),
                                     ("Codex workers", "They now use Paid-Credit time.", "Choose in natedev terminal.")):

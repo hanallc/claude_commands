@@ -160,6 +160,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
 | `scripts/agents/codex_test_support.py` | read | CodexBackend (fixture) |
 | `scripts/agents/detached_runs.py` | read | local_snapshot |
+| `scripts/agents/restart_support.py` | read | Kind (type only); the continuation send names the recipient kind |
 | `scripts/agents/test_agent_exec.sh` | read | staff.json (shell) |
 | `scripts/astra/astra_review.py` | read | runtime_id |
 | `scripts/astra/astra_roles.py` | write | local_snapshot, set_worker_role |
@@ -201,7 +202,6 @@ The shared pane launch builder uses `set_home`.
 | `scripts/direct/verify_token_wait_test_support.py` | read | caller_identity; fixture child runs keep the runner's session |
 | `scripts/direct/worker_state.py` | read | StaffRow |
 | `scripts/direct/workers.py` | read | initial_snapshot, local_snapshot |
-| `scripts/disks/slots.py` | read | local_snapshot, by_id, StaffId, StaffUnreadable; `staff_names` names slot lease owners for the Disks page |
 | `scripts/hana_shot/hana_shot.py` | read | local_snapshot, runtime_id |
 | `scripts/herdr/herdr.py` | read | active, initial_snapshot, native_id, runtime_id |
 | `scripts/herdr/herdr_sessions.py` | read | initial_snapshot |
@@ -221,6 +221,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/hooks/staff_session_identity.py` | write | initial_snapshot, native_id, runtime_id, update_current_session |
 | `scripts/hooks/stop-direct-continue.py` | read | local_by_current_session, unit_command, local_snapshot; active_dispatch reads the worker's fixed staff ID |
 | `scripts/hooks/user-prompt-submit-conversation-pause.py` | read | StaffSnapshot (type); conversation_pause.session_staff reads the row |
+| `scripts/lib/python_startup/sitecustomize.py` | read | `TEST_RUNNER_FILES` lists `staff.py` for the removal guard in test checkouts. |
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/removal_guard.py` | read | snapshot, all_rows, StaffRefused, PresentWorktree, RemovedWorktree; known_names reads unit and repository names |
 | `scripts/lib/resume_message.py` | read | StaffId |
@@ -383,7 +384,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-The table has 228 accessor rows (41 write, 186 read, and 1 owner).
+The table has 240 accessor rows (41 write, 198 read, and 1 owner).
 
 ## Approved copies
 

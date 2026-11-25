@@ -598,13 +598,14 @@ notice to the unit director before any merge command runs:
    Stop a detached merge with `detached_runs.py stop --reason "<why>" <record>`.
    Keep each item's flags on its line.
    Use single commands for `--bump` and child handoffs.
-   Add one `--trailer <line>` per attribution line this session requires, `--regime trial` if the broad
-   review used the craft lens, `--holds <K>` (this phase's held checkpoints)
-   and `--merge-defects <D>` (the defect rows its merge design checks found in
-   its own work, moved ones included and rows the check calls older left out),
-   both counted from `LOG`, and `--excluded "no merge design check"` for a
-   phase no merge design check judged (`report` and `watch` leave it out). The
-   default regime is `after`; both counts default to zero. Give `--scratch
+   Add one `--trailer <line>` per required attribution line. Use
+   `--regime trial` if the broad review used the craft lens. The default regime is `after`.
+   Use `--holds <K>` for the number of held checkpoints in this phase.
+   Use `--merge-defects <D>` for the defects that the merge design checks found in the phase's work.
+   Include moved defects and exclude defects older than the phase.
+   Count holds and defects from `LOG`. Both counts default to zero.
+   Use `--excluded "no merge design check"` for a phase without a merge design check.
+   The `report` command excludes that phase. Give `--scratch
    <SCRATCH>` to keep its merge message and test log there. For a phase shrink
    notice, add `--shrink`. For a unit's closing documentation commit after its last phase merges, add `--as-built`.
    The scope check accepts Markdown paths that include the plan's change or deletion.
@@ -663,16 +664,13 @@ message.
    and unblocks fields. A failed promote still reports each place already
    reached. A rerun of the same hash resumes promotion.
 
-6. **After the push.** Run <CrossUnitChange/> when public items were renamed or removed or files
-   restructured. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/ci_points.py due
-   --production <showrunner name> --state-dir WAITING_STATE_DIR` after each code
-   merge; when it says due, run <CIPoint/>. Run `~/.claude/scripts/lib/py
-   ~/.claude/scripts/production/ci_points.py watch --production <showrunner name>
-   --state-dir WAITING_STATE_DIR` after each code checkpoint. Give the user its
-   table on the first alert. A shrink adds no review-ledger row or CI count. While the
-   watch exits 3, the `Review watch` finding needs the user. Run
-   `review_regime.py ack` only on the user's own acknowledgment. Pass `--no-ci`
-   to `due` when the production rules say CI does not apply.
+6. **After the push.** Run <CrossUnitChange/> if the merge renamed or removed
+   public items or changed the file structure. After each code merge, run
+   `~/.claude/scripts/lib/py ~/.claude/scripts/production/ci_points.py due
+   --production <showrunner name> --state-dir WAITING_STATE_DIR`.
+   Run <CIPoint/> when the result says CI is due. Pass `--no-ci` to `due` when
+   the production rules say CI does not apply. A shrink adds no review ledger
+   row or CI count.
 </MergeCheckpoint>
 
 ---
@@ -795,16 +793,14 @@ files for a small fix checkpoint. Log each point and its result. Pass
 
 **Mac run.** After every green CI on the merge branch, run its sha on the Mac
 in the background: `HANA_TEST_PURPOSE="CI promotion smoke" zsh ~/.claude/scripts/production/mac_run.sh <CHECKOUT> <sha> 60`.
-It builds, checks hana stays up 60 s, and stops it, then builds and runs each
-demo example (list in the script) for 20 s with the command you would type, so
-each starts from a task-owned scratch clone. The script ends its `gate:` task
-and removes the clone when the run ends. Exit 3 means the
-Mac is unreachable: skip it. Exit 9 means the Mac is blocked, busy with a test,
-or its coordination state cannot be read: skip the run; it is not an outage.
-It never gates a merge; a failure (7 hana, 8 an example) goes to the unit whose
-merge it was. Never skip it. For a separate test clone on either machine,
-use `copies.py clone <source> --task gate:<id>` and `scratch.py end --task gate:<id>`
-when the test ends; a phase task must name a real phase.
+The run builds in a numbered copy under `~/build/hana/<unit>/<n>` on the Mac.
+It runs Hana for 60 s and each configured demo example for 20 s.
+The run returns the copy after SSH input closes and the checkout passes its process check.
+If the check fails, the copy stays kept with the reason.
+Exit 3 means the Mac is unreachable. Exit 9 means the Mac is busy, blocked, or has unreadable state.
+The Mac run does not gate a merge.
+Send exit 7 for Hana or exit 8 for an example to the unit that owns the merge.
+For a separate numbered test copy, use `copies.py run --repo <source> --commit <sha> -- <command>`.
 </CIPoint>
 
 ---

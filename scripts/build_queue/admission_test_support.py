@@ -81,27 +81,6 @@ class FakeClock:
         self.on_sleep(seconds)
 
 
-class FixedSystemReader:
-    """Publish fixture evidence through the system reader interface."""
-
-    def __init__(self, latest: service.SystemEvidence) -> None:
-        self.latest: service.SystemEvidence = latest
-        self.plans: list[service.SystemReadingPlan] = []
-        self.requests: int = 0
-
-    def update(self, plan: service.SystemReadingPlan) -> None:
-        self.plans.append(plan)
-
-    def request_read(self) -> None:
-        self.requests += 1
-
-    def raise_failure(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
-
-
 class InjectedCrash(RuntimeError):
     """A test stops the loop at a persistence boundary."""
 
@@ -401,6 +380,26 @@ class SocketPeer:
 
 class RefillMark(threading.local):
     clear_pending: bool = False
+
+
+class FixedSystemReader:
+    """Publish private evidence without an operating-system reader."""
+    def __init__(self, latest: service.SystemEvidence) -> None:
+        self.latest: service.SystemEvidence = latest
+        self.plans: list[service.SystemReadingPlan] = []
+        self.requests: int = 0
+
+    def update(self, plan: service.SystemReadingPlan) -> None:
+        self.plans.append(plan)
+
+    def request_read(self) -> None:
+        self.requests += 1
+
+    def raise_failure(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
 
 
 class GaplessRefill:

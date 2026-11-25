@@ -222,8 +222,8 @@ always=always-there
         self.assertEqual(self.noted, [])
         self.assertEqual(len(self.pushed), 1)
         title, body, ask = self.pushed[0]
-        self.assertEqual(title, "quota_alert: codex1 now uses paid credits")
-        self.assertIn("60,498", body)
+        self.assertEqual(title, "codex1 now spends paid credits: 60,498 left")
+        self.assertEqual(body, "")
         self.assertEqual(ask.need, "decision")
         with quota_alert.state_file() as state:
             self.assertIn("codex1", state["episodes"])

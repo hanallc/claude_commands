@@ -37,24 +37,60 @@ Add `--dry-run` to print their names without stopping them.
 `agents` runs `scripts/agents/shutdown.py`.
 All lifecycle scripts use `scripts/agents/`.
 
-`agents pause NAME --why TEXT` stops the workers now.
+`agents pause NAME [--keep-workers] --why TEXT` pauses a director.
 The director finishes its current turn and holds at the prompt.
+By default, pause stops the workers.
+With `--keep-workers`, the workers continue their current work.
+The command refuses `--keep-workers` for Codex directors and offers the default pause.
+Codex support needs a runtime check that proves the hook through the worker result route.
+It reports each refusal and pauses the other selected directors.
 `agents exit NAME --why TEXT` stops the director and its workers.
 Both commands preserve the staff rows, tabs, and shells.
 Add `--finish-step` to wait for the workers' current tasks before stopping them.
 The staff row records the time, caller, and reason under `paused` or `exited`.
 The board shows that state.
-`agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` selects units within one production.
+The pause record includes `keep_workers` when pause keeps the workers.
+`agents status` names the kept workers with open agent panes.
+JSON status lists the names under `kept_workers`.
+`agents pause --production SHOWRUNNER [--except UNIT ...] [--keep-workers] --why TEXT` selects units within one production.
 `agents resume --production SHOWRUNNER` resumes its units.
-Resume removes a pause record and sends a running director one continuation message.
+It reports each held row and its holder when known.
+It resumes the available rows and returns exit 2 if a row lock blocks a resume.
+Resume sends a running director one continuation per pause.
+Resume saves the pending message and clears the pause in one staff write before calling the sender.
+A retry recovers the pending continuation even when the director is active.
+A durable send, queue entry, or review entry completes the pending resume.
+A remote send saves its destination before delivery.
+A retry checks the remote receipt before it looks for a live director.
+A lost reply keeps the resume pending until the sender can confirm acceptance.
+A retry can reclaim a relay if its owner died before the socket write.
+An unconfirmed socket write keeps the resume pending.
+Review release publishes the continuation once and can retry the notice.
+Resume skips worker restoration for a director paused with `--keep-workers`.
+A worker message to a paused director waits in the director's transcript until resume.
 A paused director on the other machine gets the continuation message without a local liveness read.
 The machine comes from its worktree or its showrunner document.
 A stopped paused director starts through the shared resume path, including its requested `--to` account.
-Queued or failed delivery restores the same pause record and returns failure.
+With `--keep-workers`, resume requires a live staff recipient for its continuation.
+If its socket is unavailable, the send fails and leaves no queued continuation.
+Definite delivery failure restores the same pause record.
+Uncertain delivery keeps the pending resume for a retry.
 A failed start or a start exception also restores the pause record.
+
+#### Continuation crash limits
+
+The rule is visible pending over double send.
+Claude Code has no atomic keyed input write, so a sender cannot prove whether a killed attempt was accepted.
+Three crash windows remain.
+
+1. A `send.py pending` drain killed after it flushes a queued continuation and before it rewrites the queue sends it again on the next drain. Every queued message has this window.
+2. The resume stays pending if the sender dies after it saves `relay-unconfirmed` and before `record_once` saves acceptance.
+3. A sender stopped after it saves the Mac destination and before SSH, followed by a director move, leaves the resume pending. A retry does not send.
+
+A pending resume exits non-zero and keeps its record.
 Resume starts an exited director through the shared role-account path and removes its exit record after success.
-The prompt hook retains a paused director's hold for every prompt source.
-It adds context without blocking or removing the message.
+The Claude prompt hook reads the director hold for every prompt source.
+It adds the hold instruction and preserves the message in the transcript.
 An own-pane resume resolves the agent executable before it removes the exit record.
 It executes that path directly. A missing executable retains the exit record.
 The stop hook skips the automatic continuation for that director.
@@ -648,7 +684,13 @@ Restore holds the dispatch lock across the record read, receipt read, and prompt
 Restore, named resume, and director notes use one receipt rule.
 An unsubmitted dispatch keeps the saved assign command and its saved prompt path.
 Director notes reuse shared dispatch history reads.
-A DONE line or a finished record closes the dispatch and suppresses its resume note and step.
+A matching DONE or a finished record suppresses the resume step for that pass.
+A later detached result from that pass still requires another matching DONE.
+Resume checks the later result records in the run that owns the dispatch.
+Resume preserves DONE when every later result belongs to another pass.
+Resume reports each unreadable record once. An unreadable record for a later result keeps that worker's transcript receipt.
+Restore uses the worker pane with the proved native identity for its continuation.
+It checks that the worker is idle. The prompt checks the native identity again before it sends input.
 The decision reads the record and transcript once per worker and uses the restart's shared run index.
 
 ## Launch names
