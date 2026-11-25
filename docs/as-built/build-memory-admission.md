@@ -1324,6 +1324,19 @@ Python's default SIGINT raises `KeyboardInterrupt` and runs the existing cleanup
 `defer_cleanup_signals` retains its signal mask during normal cleanup.
 It uses `pthread_sigmask` and installs no handler.
 
+### Tests outside the queue
+
+The Builds page lists live commands above the direct test CPU limit.
+It scans agent and detached scopes and excludes session launchers, agents, bare shells, and queued work.
+It also excludes commands with waiting or admitted descendants in a separate scope.
+The table shows Command, Owner, Pid, Age, Current CPU, and CPU total.
+An empty table shows “No test runs outside the queue now.”
+
+Current CPU shows a whole percent from the change in live process CPU between readings.
+The first reading shows a dash.
+CPU total shows whole seconds from live process CPU and the root command's reaped child CPU.
+Detached scopes use the cgroup CPU counter for both readings.
+
 ### Startup, cut-over, and rollback
 
 The system socket starts the system service as the user. The service runs outside `builds.slice` with `OOMScoreAdjust=-900`.
@@ -2171,6 +2184,69 @@ After all violations, the call exits 2 with no Cargo call except `metadata`.
 `read_metadata` reuses `GATE_METADATA`.
 `verify.sh example-test` exits 2 before any work.
 It prints `verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).`.
+
+### Stop a Builds run
+
+The Running table offers **Kill this run** for a verified natedev Cargo run with a detached run record.
+The confirmation shows the row, process tree, progress, and recorded caller.
+The server identifies the caller from the reservation's session ID and the current staff record.
+
+1. The feed publishes an opaque reference for each eligible reservation.
+2. The console supplies a handle if the detached record has `completion_after_slice_cleanup` and the server verifies the stop route.
+3. The server checks the handle and reads the run record when the operator confirms.
+4. The server reports **Run already ended** if the record shows completion or is missing on that read.
+5. If the record shows an active run, the server saves the accepted request, notice and verified stop route.
+6. The server requests the stop through `detached_runs.stop_command` with the record path and reason.
+7. The server saves **Stopped** before it sends the keyed notice.
+
+The detached helper stages the reason and the pass cancellation before TERM.
+A detached run with a saved slice uses `builds-detached-<id>.slice`.
+The helper checks `cgroup.events` for `populated 0` to confirm that the slice is empty.
+The supervisor sets `completion_after_slice_cleanup` when it publishes its process identity.
+It writes the completion stamp after the run slice is empty.
+Without the field, the page shows **Kill is not available for this run yet**.
+The supervisor finishes the record after the slice is empty.
+If the supervisor exits before it finishes the record, the normal reaper owns the result.
+Kill recovery asks the reaper to check the selected record.
+The reaper checks the saved supervisor PID and start time and confirms pending hold stops.
+It preserves the saved exit status and checks for a newer run of the same command.
+The page shows **Stopping** until the record confirms the stop.
+The server confirms the saved slice is empty before it sends the notice.
+If the detached record changes identity, the server saves **Stop unconfirmed**.
+The detached helper keeps the original run record until the server acknowledges its stop notice.
+If the server saved **Stopped**, it resumes only pending delivery.
+The server retains a verified handle for two `page_refresh_seconds` intervals.
+If the live row disappears, the retained handle can report an already ended run.
+The Tests outside the queue table offers **Kill this run** for local commands with a verified starter and stop path.
+The confirmation shows the command, PID, age, and starter.
+The server checks the handle against the current reading when the operator confirms.
+A command with a detached record uses the detached stop path and its slice check.
+For other commands, the server opens a pidfd and checks the PID and start time before it sends any signal.
+The server scans parent IDs to find descendants. It sends TERM to each process through its own pidfd.
+It keeps the identities of descendants that reparent during the stop.
+After the grace period, it sends KILL through the pidfds of processes that remain.
+The server saves **Stopped** only when the last scan finds no live process in the observed tree.
+The scan can miss a child that starts and reparents between readings.
+If a process remains, the result names its PID.
+If the server restarts during the stop, it saves **Stop unconfirmed**.
+The page shows **Stopping** while the command is still present in the reading.
+The row leaves the table when the feed no longer lists the command.
+If the stop fails, the row shows **Not stopped** and the reason.
+The control returns if the server still verifies the command.
+The server sends the keyed notice and the operator's words to the starter after it confirms the stop.
+Verify still has no Kill action because it creates only step scopes.
+The server retries pending actions during its existing maintenance cycle.
+It retries an unclear delivery result with the saved key.
+A queued or kept message appears as **Message queued**.
+The server supplies the first line of the notice.
+The operator can add words in the confirmation.
+The row shows **Stopping** while the run record shows an accepted stop is pending.
+**Message sent**, **Message queued**, and **Message failed** describe the delivery result.
+The page checks results at `page_refresh_seconds` intervals.
+The result stays visible outside the table when the row leaves.
+The page shows finished results for two refresh intervals.
+Gate, merge, remote, CI, service, and unowned rows show the unavailable tip on the PID.
+The targeted gate cleanup reaps module leaders and has no confirmation for all descendants.
 
 ## Invariants
 
