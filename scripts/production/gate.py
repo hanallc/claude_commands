@@ -997,8 +997,10 @@ def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator
                         start["process_start"] = owner.start.start
                     if isinstance(owner.boot, str):
                         start["boot_id"] = owner.boot
-                    with suppress(OSError, RuntimeError):
+                    try:
                         start["folder"] = str(folder.resolve())
+                    except (OSError, RuntimeError):
+                        pass
                     journal.start = start
                     gate_record.write_gate_folder_event(start)
             yield folder
@@ -1978,11 +1980,13 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             yield
             waited = hold.seconds if hold is not None else 0.0
             elapsed = time.monotonic() - began - (waited - initial_hold_seconds)
-            record(int(not suite_result().passed), aborted=False)
+            status = int(not suite_result().passed)
         except BaseException:
             if not isinstance(journal.start, GateFolderAllocation):
                 record(1, aborted=True)
             raise
+        else:
+            record(status, aborted=False)
         finally:
             _ACTIVE_GATE_FOLDER_JOURNAL.reset(token)
 

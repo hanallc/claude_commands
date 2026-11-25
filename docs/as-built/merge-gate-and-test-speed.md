@@ -438,8 +438,9 @@ Run `./scripts/lib/py -m scripts.test_times.gate_record [ROOT]` from the checkou
 The command reads direct suite folders with leases under ROOT or the configured gate root.
 It prints one JSON line per folder and leaves the files unchanged.
 The join uses the path, PID, process start, and boot identity.
-A matching start without a recorded end shows `killed`.
-A missing start or incomplete owner identity shows `no record`.
+A matching start without an end shows `running` if the current process matches the lease owner.
+Otherwise, a matching start without an end shows `killed`.
+A missing start, incomplete owner identity, or changed directory identity shows `no record`.
 Use kernel or earlyoom logs to identify the cause of a `killed` outcome.
 A recovery refusal in the gate's own checkout stops the gate.
 A clean tree with a recorded full pass on this host reuses its test modules.
@@ -815,7 +816,8 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   After it writes the lease, the gate appends a `gate_folder_start` line to the local host log.
   The line contains the folder path, lease owner identity, commit SHA, branch, and step.
   The `gate_run` line adds the same owner identity, `suite_folders`, and `end`.
-  Runs without timing history use a `gate_folder_end` line.
+  The gate attempts one timing line per suite run, even if SIGTERM interrupts the append.
+  The gate uses a `gate_folder_end` line when timing is unavailable or its write fails.
   The end is `normal`, `red`, or `sigterm`.
   Log errors report to stderr and preserve the gate verdict.
   The timing index continues to accept older run lines and skips the folder event lines.

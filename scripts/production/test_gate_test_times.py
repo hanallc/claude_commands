@@ -117,6 +117,24 @@ gate.gate_temporary = observe_folder
                 if end == "sigterm":
                     self.assertEqual(record["modules"], [])
 
+    def test_sigterm_during_the_timing_append_writes_one_end(self) -> None:
+        preamble = """from scripts.buildlog import store
+append = store.append_line
+
+def stop_after_timing_append(path, row):
+    append(path, row)
+    if row["kind"] == "gate_run":
+        signal.raise_signal(signal.SIGTERM)
+
+store.append_line = stop_after_timing_append
+"""
+        result = self.run_gate("--tests-only", "--full", own_process=True, preamble=preamble)
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
+        self.assertEqual(self.only_record().get("end"), "normal")
+        kinds = [row.get("kind") for path in Path(self.environment["BUILDLOG_DIR"]).glob("*/*.jsonl")
+                 for row in store.locked_rows(path)]
+        self.assertEqual(kinds.count("gate_folder_end"), 0)
+
     @gate_suites("hooks", "notify", "direct")
     def test_record_keeps_each_attempt_and_only_failed_or_slow_tests(self) -> None:
         self.configure_gate("merge_gate_governor_gib=5.5")

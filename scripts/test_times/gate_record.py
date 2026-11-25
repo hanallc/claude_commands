@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 import hashlib
 import json
 import math
+import os
 import sqlite3
+import stat
 import statistics
 from pathlib import Path
 import sys
@@ -15,6 +18,8 @@ import time
 from typing import Final, Literal, NotRequired, TypedDict, cast, get_args
 
 from scripts.lib import conf
+from scripts.lib.boot_identity import boot_identity
+from scripts.lib.process_start import Started, process_start
 
 
 TestStatus = Literal["pass", "fail", "error", "skip", "expected_failure", "unexpected_success"]
@@ -383,10 +388,11 @@ def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[Mod
     return modules
 
 
-def report_not_written(error: BaseException) -> None:
+def report_not_written(error: BaseException, *, record_name: str = "gate run") -> None:
     """Report a failed record on one line."""
     detail = " ".join(str(error).splitlines())
-    print(f"gate run not written: {detail}", file=sys.stderr)
+    with suppress(OSError, ValueError):
+        print(f"{record_name} not written: {detail}", file=sys.stderr, flush=True)
 
 
 def keep_failure_logs(record_id: str, host: str, epoch: float, modules: Sequence[ModuleRun],
@@ -427,14 +433,21 @@ def write_gate_run(run: GateRun, executions: Sequence[Execution]) -> None:
         store.append_line(store.host_file(host, epoch), entry)
     except Exception as error:
         report_not_written(error)
+        if "pid" in run and "suite_folders" in run and run["suite_folders"] and "end" in run:
+            end: GateFolderEnd = {"pid": run["pid"], "suite_folders": run["suite_folders"], "end": run["end"]}
+            if "process_start" in run:
+                end["process_start"] = run["process_start"]
+            if "boot_id" in run:
+                end["boot_id"] = run["boot_id"]
+            write_gate_folder_event(end)
 
 
 def write_gate_folder_event(event: GateFolderStart | GateFolderEnd) -> None:
     """Append a folder start or an end without timing history."""
-    from scripts.buildlog import record, store
-
     kind = "gate_folder_start" if "folder" in event else "gate_folder_end"
     try:
+        from scripts.buildlog import record, store
+
         epoch = time.time()
         host = store.host_name()
         store.append_line(store.host_file(host, epoch), {
@@ -442,7 +455,7 @@ def write_gate_folder_event(event: GateFolderStart | GateFolderEnd) -> None:
             "host": host, "at": store.utc_iso(epoch), **event,
         })
     except Exception as error:
-        print(f"{kind} not written: {' '.join(str(error).splitlines())}", file=sys.stderr)
+        report_not_written(error, record_name=kind)
 
 
 @dataclass(frozen=True)
@@ -461,7 +474,7 @@ def _lease_owner(fields: Mapping[str, object]) -> _GateLeaseOwner | None:
     return None
 
 
-GateFolderOutcome = GateEnd | Literal["killed", "no record"]
+GateFolderOutcome = GateEnd | Literal["running", "killed", "no record"]
 
 
 class GateFolderStatus(TypedDict):
@@ -470,6 +483,38 @@ class GateFolderStatus(TypedDict):
     sha: NotRequired[str]
     step: NotRequired[str]
     end: GateFolderOutcome
+
+
+def _folder_log_rows(path: Path) -> Iterator[dict[str, object]]:
+    """Read only complete rows within the file size at open, without a log lock."""
+    try:
+        handle = path.open("rb")
+    except FileNotFoundError:
+        return
+    with handle:
+        remaining = os.fstat(handle.fileno()).st_size
+        while remaining:
+            line = handle.readline(remaining)
+            if not line.endswith(b"\n"):
+                break
+            remaining -= len(line)
+            try:
+                row = cast(object, json.loads(line.decode("utf-8")))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if isinstance(row, dict):
+                yield cast(dict[str, object], row)
+
+
+def _matches_leased_folder(folder: Path, fields: Mapping[str, object]) -> bool:
+    device, inode = fields.get("device"), fields.get("inode")
+    if type(device) is not int or type(inode) is not int:
+        return False
+    try:
+        info = folder.lstat()
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and (device, inode) == (info.st_dev, info.st_ino)
 
 
 def gate_folder_status(root: Path) -> list[GateFolderStatus]:
@@ -494,7 +539,7 @@ def gate_folder_status(root: Path) -> list[GateFolderStatus]:
         status: GateFolderStatus = {"folder": str(folder), "pid": pid if type(pid) is int else None, "end": "no record"}
         statuses.append(status)
         owner = _lease_owner(fields)
-        if owner is not None:
+        if owner is not None and _matches_leased_folder(folder, fields):
             candidates[str(folder), owner] = status
     if not candidates:
         return statuses
@@ -502,7 +547,7 @@ def gate_folder_status(root: Path) -> list[GateFolderStatus]:
     ends: dict[tuple[str, _GateLeaseOwner], GateEnd] = {}
     host_logs = store.root() / store.host_name()
     for path in sorted(host_logs.glob("[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl")):
-        for row in store.locked_rows(path):
+        for row in _folder_log_rows(path):
             kind = row.get("kind")
             if kind not in ("gate_folder_start", "gate_run", "gate_folder_end"):
                 continue
@@ -513,16 +558,25 @@ def gate_folder_status(root: Path) -> list[GateFolderStatus]:
                 folder, sha, step = row.get("folder"), row.get("sha"), row.get("step")
                 if isinstance(folder, str) and isinstance(sha, str) and isinstance(step, str):
                     if (candidate := candidates.get((folder, owner))) is not None:
-                        candidate.update(sha=sha, step=step, end="killed")
+                        candidate.update(sha=sha, step=step)
             else:
                 folders, end = row.get("suite_folders"), row.get("end")
                 if isinstance(folders, list) and end in ("normal", "red", "sigterm"):
                     for folder in cast(list[object], folders):
                         if isinstance(folder, str) and (folder, owner) in candidates:
                             ends[folder, owner] = end
-    for key, end in ends.items():
-        if candidates[key]["end"] == "killed":
-            candidates[key]["end"] = end
+    current_boot = ""
+    with suppress(OSError, ValueError):
+        current_boot = boot_identity()
+    for key, candidate in candidates.items():
+        if "sha" not in candidate:
+            continue
+        if (end := ends.get(key)) is not None:
+            candidate["end"] = end
+            continue
+        _, owner = key
+        start = process_start(owner.pid) if owner.boot_id == current_boot else None
+        candidate["end"] = "running" if isinstance(start, Started) and start.start == owner.process_start else "killed"
     return statuses
 
 

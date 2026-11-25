@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
+import fcntl
 import gzip
 import io
 import json
@@ -11,6 +13,7 @@ import os
 import sqlite3
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 from typing import cast, override
 import unittest
 from unittest import mock
@@ -18,6 +21,8 @@ from unittest import mock
 
 from scripts.test_times import gate_record
 from scripts.buildlog import index, record, store
+from scripts.lib import build_folders
+from scripts.lib.process_start import Started
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.test_times.gate_record import ModuleTimes, TestTime
 from scripts.test_times.gate_record_test_support import fixture_executions, gate_run, module_times
@@ -324,7 +329,7 @@ class GateRecordTests(unittest.TestCase):
         self.assertNotEqual(rows[0]["id"], rows[1]["id"])
 
     def test_folder_status_matches_each_end_and_the_exact_lease_owner(self) -> None:
-        root = self.root / "gate"
+        root = self.root.resolve() / "gate"
         root.mkdir()
         expected: list[gate_record.GateFolderStatus] = []
         cases: tuple[tuple[str, gate_record.GateFolderOutcome], ...] = (
@@ -336,7 +341,8 @@ class GateRecordTests(unittest.TestCase):
             folder = root / name
             folder.mkdir()
             owner: gate_record.GateFolderOwner = {"pid": 12, "process_start": "100", "boot_id": "boot-a"}
-            lease: dict[str, object] = dict(owner)
+            info = folder.stat()
+            lease: dict[str, object] = {**owner, "device": info.st_dev, "inode": info.st_ino}
             if name == "t-other-pid":
                 lease["pid"] = 13
             if name == "t-reused-pid":
@@ -355,7 +361,7 @@ class GateRecordTests(unittest.TestCase):
             expected.append({"folder": str(folder), "pid": 12, "sha": name, "step": "gate", "end": outcome})
             if outcome == "sigterm":
                 gate_record.write_gate_folder_event({**owner, "suite_folders": [str(folder)], "end": outcome})
-            elif outcome != "killed":
+            elif outcome in ("normal", "red"):
                 run = gate_run()
                 run.update(pid=12, process_start="100", boot_id="boot-a", suite_folders=[str(folder)], end=outcome)
                 gate_record.write_gate_run(run, fixture_executions(run))
@@ -372,12 +378,106 @@ class GateRecordTests(unittest.TestCase):
         rows = [cast(object, json.loads(line)) for line in output.getvalue().splitlines()]
         self.assertCountEqual(rows, expected)
 
+    def write_leased_folder(self, folder: Path, owner: gate_record.GateFolderOwner) -> None:
+        folder.mkdir(parents=True)
+        info = folder.stat()
+        lease = {**owner, "device": info.st_dev, "inode": info.st_ino}
+        _ = folder.with_name(folder.name + ".lease.json").write_text(json.dumps(lease))
+        gate_record.write_gate_folder_event({**owner, "folder": str(folder), "sha": "sha",
+                                            "branch": "main", "step": "gate"})
+
+    def test_folder_report_streams_complete_lines_without_blocking_the_writer(self) -> None:
+        folder = self.root.resolve() / "gate/g-one"
+        owner: gate_record.GateFolderOwner = {"pid": 12, "process_start": "100", "boot_id": "boot-a"}
+        self.write_leased_folder(folder, owner)
+        [path] = list(self.buildlog.glob("*/*.jsonl"))
+        with path.open("a") as output:
+            _ = output.write(json.dumps({**owner, "kind": "gate_folder_end",
+                                         "suite_folders": [str(folder)], "end": "red"}))
+        lines: list[str] = []
+
+        def decode(line: str) -> object:
+            lines.append(line)
+            if '"kind":"gate_folder_start"' in line:
+                with path.open("ab") as writer:
+                    fcntl.flock(writer.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return cast(object, json.loads(line))
+
+        with (mock.patch.object(store, "locked_rows", side_effect=AssertionError("whole-log read")),
+              mock.patch.object(gate_record, "json", SimpleNamespace(loads=decode))):
+            [status] = gate_record.gate_folder_status(folder.parent)
+        self.assertEqual(status["end"], "killed")
+        self.assertEqual(len(lines), 1)
+
+    def test_folder_report_marks_only_the_matching_live_owner_as_running(self) -> None:
+        folder = self.root.resolve() / "gate/g-live"
+        owner: gate_record.GateFolderOwner = {"pid": 12, "process_start": "100", "boot_id": "boot-a"}
+        self.write_leased_folder(folder, owner)
+        for boot, start, expected in (("boot-a", "100", "running"), ("boot-a", "200", "killed"),
+                                      ("boot-b", "100", "killed")):
+            with (self.subTest(boot=boot, start=start),
+                  mock.patch.object(gate_record, "boot_identity", return_value=boot),
+                  mock.patch.object(gate_record, "process_start", return_value=Started(start)) as lookup):
+                [status] = gate_record.gate_folder_status(folder.parent)
+                self.assertEqual(status["end"], expected)
+                if boot == "boot-a":
+                    lookup.assert_called_once_with(12)
+                else:
+                    lookup.assert_not_called()
+
+    def test_folder_report_refuses_a_lease_for_a_replaced_directory(self) -> None:
+        folder = self.root.resolve() / "gate/g-replaced"
+        owner: gate_record.GateFolderOwner = {"pid": 12, "process_start": "100", "boot_id": "boot-a"}
+        self.write_leased_folder(folder, owner)
+        read_lease = build_folders.gate_folder_lease_fields
+
+        def replace_after_open(path: Path, root: Path) -> dict[str, object]:
+            fields = read_lease(path, root)
+            _ = folder.rename(folder.with_name("original"))
+            folder.mkdir()
+            return fields
+
+        with mock.patch.object(build_folders, "gate_folder_lease_fields", side_effect=replace_after_open):
+            self.assertEqual(gate_record.gate_folder_status(folder.parent),
+                             [{"folder": str(folder), "pid": 12, "end": "no record"}])
+
     def test_folder_start_write_failure_reports_on_one_line(self) -> None:
         output = io.StringIO()
         with redirect_stderr(output), mock.patch.object(store, "append_line", side_effect=OSError("disk\nfull")):
             gate_record.write_gate_folder_event({"folder": str(self.root / "g-test"), "pid": 12,
                                                 "sha": "sha", "branch": "main", "step": "gate"})
         self.assertEqual(output.getvalue(), "gate_folder_start not written: disk full\n")
+
+    def test_timing_append_failure_keeps_the_folder_end(self) -> None:
+        folder = self.root.resolve() / "gate/g-retained"
+        owner: gate_record.GateFolderOwner = {"pid": 12, "process_start": "100", "boot_id": "boot-a"}
+        self.write_leased_folder(folder, owner)
+        run = gate_run()
+        run.update(pid=12, process_start="100", boot_id="boot-a", suite_folders=[str(folder)], end="normal")
+        append = store.append_line
+
+        def refuse_timing(path: Path, row: Mapping[str, object]) -> None:
+            if row["kind"] == "gate_run":
+                raise OSError("timing append failed")
+            append(path, row)
+
+        with mock.patch.object(store, "append_line", side_effect=refuse_timing), redirect_stderr(io.StringIO()) as error:
+            gate_record.write_gate_run(run, fixture_executions(run))
+        self.assertEqual(error.getvalue(), "gate run not written: timing append failed\n")
+        [path] = list(self.buildlog.glob("*/*.jsonl"))
+        self.assertEqual([row["kind"] for row in store.locked_rows(path)], ["gate_folder_start", "gate_folder_end"])
+        [status] = gate_record.gate_folder_status(folder.parent)
+        self.assertEqual(status["end"], "normal")
+
+    def test_log_write_and_stderr_failure_leave_the_gate_result_alone(self) -> None:
+        run = gate_run()
+        with (mock.patch.object(store, "append_line", side_effect=OSError("log failed")),
+              redirect_stderr(io.StringIO()) as output,
+              mock.patch.object(output, "write", side_effect=BrokenPipeError("closed pipe")) as write):
+            gate_record.write_gate_folder_event({"folder": str(self.root / "g-test"), "pid": 12,
+                                                "sha": "sha", "branch": "main", "step": "gate"})
+            gate_record.write_gate_run(run, fixture_executions(run))
+        self.assertEqual(write.call_count, 2)
 
     def test_gate_write_keeps_the_used_threshold_and_counts_each_module_attempt(self) -> None:
         config = self.config / "test_times.conf"
