@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
+import fcntl
 from dataclasses import replace
 from io import StringIO
 import json
@@ -23,7 +24,7 @@ from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint import folder_audit, tmp_sweep
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import scratch
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
@@ -502,6 +503,22 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         with self.assertRaisesRegex(ValueError, 'no complete verdict and log'):
             cloud_gate.validate_result(result, request)
 
+    def test_dead_guest_cleanup_keeps_a_held_child_lease(self) -> None:
+        folder = self.root / "guest"
+        journal = folder / "run.json"
+        temporary = self.root / "temporary"
+        child = temporary / "child"
+        folder.mkdir()
+        child.mkdir(parents=True)
+        cloud_gate.save(journal, {"pid": 100, "start": "past", "groups": {}, "folders": [str(temporary)]})
+        with ((temporary / "child.lock").open("wb") as lock,
+              mock.patch.object(mac_gate, "running_owner", return_value=False)):
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(GateRefused, "kept its gate folder"):
+                mac_gate.stop_guest(journal, 0)
+            self.assertTrue(child.is_dir())
+            self.assertTrue((temporary / "child.lock").is_file())
+
     def test_dead_guest_cleanup_requires_group_identity(self) -> None:
         root = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
         root.mkdir(parents=True)
@@ -518,6 +535,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         guest.kill()
         _ = guest.wait(timeout=TEST_HANG_GUARD_SECS)
         with (mock.patch.object(Path, 'home', return_value=self.root),
+              mock.patch.dict(os.environ, config_environment(self.root / 'config')),
               mock.patch.object(scratch, 'end', return_value=[]) as end):
             with self.assertRaisesRegex(GateRefused, 'Cannot prove ownership'):
                 _ = mac_gate.stop_checkout(root)
