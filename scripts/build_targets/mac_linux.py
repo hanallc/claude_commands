@@ -2450,9 +2450,10 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
             owner = admission_records.request_owner(str(repo))
             unit = owner.unit
             if not unit:
-                if isinstance(owner, admission_records.OwnerNotGiven):
+                if (isinstance(owner, admission_records.OwnerNotGiven)
+                        or (owner.name == UNKNOWN_CALLER and not owner.session_id)):
                     raise GuestUnavailable('the gate has no owner unit for a numbered copy')
-                name = (owner.session_id or owner.name) if owner.name == UNKNOWN_CALLER else owner.name
+                name = owner.session_id if owner.name == UNKNOWN_CALLER else owner.name
                 # Staff names cannot be canonical UUIDs.
                 unit = str(uuid5(NAMESPACE_URL, f'{TARGET}:gate-copy-owner:{name}'))
         source = candidate_source(repo, selected)

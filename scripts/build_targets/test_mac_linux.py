@@ -32,6 +32,7 @@ from unittest.mock import Mock, call, patch
 from scripts.build_hold.owning_session import OwningSession
 from scripts.build_queue import admission_client, admission_protocol as wire, admission_records, admission_wire, execution_identity, first_step, mac_run, placement, progress_profile, queue_place
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
+from scripts.build_queue.snapshot_codec import UNKNOWN_CALLER
 from scripts.build_targets import build_targets, mac_linux, target_config
 from scripts.build_targets.mac_linux import send_guest_execution
 from scripts.buildlog import store, treekey
@@ -3945,6 +3946,23 @@ with (patch.object(conf, 'read', read_config),
               patch.object(admission_records, 'family_owner',
                            return_value=admission_records.OwnerNotGiven('systemd · fixture.service')),
               patch.object(admission_records, 'folder_owner', return_value='')):
+            result = self.route(gate_job=StepJob('test-nightly', branch='main'))
+        self.assertEqual(result, 'mac-linux: the gate has no owner unit for a numbered copy')
+        self.assertEqual(self.trace.read_text(), '')
+        self.assertEqual(self.consumed, ())
+
+    def test_unknown_caller_with_a_session_gets_a_numbered_copy(self) -> None:
+        owner = admission_records.QueueCaller('detached-nightly-session', UNKNOWN_CALLER, '')
+        with (patch.object(admission_records, 'request_owner', return_value=owner),
+              patch.dict(os.environ, {'FIXTURE_EXPECTED_UNIT': '269f6b52-0174-51c0-a5fc-a785808a5512'})):
+            result = self.route(gate_job=StepJob('test-nightly', branch='main'))
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_unknown_caller_without_a_session_refuses_before_guest_contact(self) -> None:
+        owner = admission_records.QueueCaller('', UNKNOWN_CALLER, '')
+        with patch.object(admission_records, 'request_owner', return_value=owner):
             result = self.route(gate_job=StepJob('test-nightly', branch='main'))
         self.assertEqual(result, 'mac-linux: the gate has no owner unit for a numbered copy')
         self.assertEqual(self.trace.read_text(), '')
