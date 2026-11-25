@@ -856,6 +856,51 @@ class ChangePageTests(unittest.TestCase):
                 self.assertNotIn(answer, target.read_text())
                 self.assertEqual(status.slots(page, row), slots)
 
+    def test_native_reply_refuses_an_unnumbered_proposal_changed_during_review(self) -> None:
+        from scripts.lib.user_zone import user_zone
+        from scripts.production import proposal_issue
+        from scripts.production.issues import Issue, frontmatter
+
+        members = staff.snapshot()
+        owner = self.showrunner_id
+        path = self.temporary / "proposal.md"
+        header = b"---\nstatus: open\nstage: backlog\nreview_state: waiting\n---\n"
+        original = header + b"Use the layout.\n"
+        replacement = header + b"Use the menu.\n"
+        _ = path.write_bytes(original)
+        proposal = review_items.proposal_item("proposal", Issue(path, frontmatter(path)), owner, owner,
+                                              "The layout", datetime.now(user_zone()), members)
+        row = path.stem
+        page = change_page.ReviewPage(path, path.parent, (row,), "")
+        status = change_page.DeliveryStatus(self.root)
+        slots = change_page.DeliverySlots(change_page.NoDelivery(), change_page.NoDelivery(),
+                                          change_page.OpenQuestion("Q1", "Which layout?", change_page.NoDelivery()))
+        with status.locked():
+            status.write_slots(page, row, slots)
+        answer = "Use the new layout."
+
+        def read_draft(*_args: object, **_options: object) -> review.QuestionAccepted:
+            with proposal_issue.issue_lock(path):
+                _ = path.write_bytes(replacement)
+            return review.QuestionAccepted(answer)
+
+        with (patch.object(review_items, "read", return_value=[proposal]),
+              patch.object(review, "review_question", side_effect=read_draft) as reader,
+              self.assertRaisesRegex(question_record.AnswerRefused, "The selected item changed")):
+            _ = change_page.answer_item(proposal.key, answer, "Q1", status)
+        reader.assert_called_once()
+        self.assertEqual(path.read_bytes(), replacement)
+        self.assertEqual(status.slots(page, row), slots)
+
+        _ = path.write_bytes(original)
+        with (patch.object(review_items, "read", return_value=[proposal]),
+              patch.object(review, "review_question", return_value=review.QuestionAccepted(answer)) as reader):
+            self.assertTrue(change_page.answer_item(proposal.key, answer, "Q1", status))
+        reader.assert_called_once()
+        self.assertIn(answer.encode(), path.read_bytes())
+        self.assertEqual(status.slots(page, row).question,
+                         change_page.AnsweredQuestion("Q1", "Which layout?", answer))
+
     def test_answer_question_keeps_internal_line_breaks_and_an_identical_rerun_changes_nothing(self) -> None:
         status = change_page.DeliveryStatus(self.root)
         question = status.ask(self.page, 'C1', 'Which steps?')

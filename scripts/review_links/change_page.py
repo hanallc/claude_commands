@@ -3285,7 +3285,7 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
         if tracked and isinstance(status.question_for_reply(slots, question_id, text), AnsweredQuestion):
             return False
 
-        save: Callable[[], object] | None = None
+        save: Callable[[], bool | investigation.Investigation | None]
         if isinstance(source, review_items.QuestionSource):
             save = update_registration.prepare_reply_record(
                 source.record, words, who, identities=update_registration.QuestionStaff.read(), question_id=question_id)
@@ -3293,6 +3293,7 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
             save = investigation.prepare_answer(
                 source.record.owner, source.record.id, words, question_id=question_id)
         else:
+            save = decision_store.prepare_answer(item, words, who)
             console_text.require(words, "reply", identity=f"{path}/{row}/{question_id}",
                                  refusal=question_record.AnswerRefused)
 
@@ -3304,14 +3305,10 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
             if question != selected:
                 raise question_record.AnswerRefused("The current question changed.")
             page = status.metadata_page(page)
-            if save is not None:
-                _ = save()
-                changed = True
-            else:
-                try:
-                    changed = decision_store.answer(item, words, who)
-                except decision_store.NoOpenQuestion as error:
-                    raise question_record.AnswerRefused(str(error)) from error
+            try:
+                changed = save() is not False
+            except decision_store.NoOpenQuestion as error:
+                raise question_record.AnswerRefused(str(error)) from error
             if isinstance(question, OpenQuestion):
                 status.write_slots(page, row, replace(slots, question=AnsweredQuestion(question.question_id,
                                                                                        question.text, text)))

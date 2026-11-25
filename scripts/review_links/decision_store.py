@@ -1,6 +1,7 @@
 """Write the Review page log and mark of a proposal or an efficiency in its own store."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 
 from scripts.lib.user_zone import user_zone
@@ -19,11 +20,13 @@ def efficiency_identity(item: review_items.ReviewItem) -> str:
 
 
 def record(item: review_items.ReviewItem, words: str, change: MarkChange, who: str = 'nate', *,
-           waiting_why: str = '', waiting_only: bool = False) -> bool:
+           waiting_why: str = '', waiting_only: bool = False,
+           check_content: Callable[[], None] = lambda: None) -> bool:
     """Write one log line and the mark in the proposal issue or the efficiency review file."""
     def check_state() -> None:
         if waiting_only:
             require_current_waiting(item)
+        check_content()
 
     source = item.source
     if isinstance(source, review_items.ProposalSource):
@@ -65,11 +68,31 @@ def stored_mark(item: review_items.ReviewItem) -> ReviewMark | NoMark:
     return efficiency_reviews.read(source.path).get(efficiency_identity(item),efficiency_reviews.EfficiencyReview()).mark
 
 
-def answer(item: review_items.ReviewItem, words: str, who: str) -> bool:
-    """Return the item to the user with the owner's answer; an exact repeat changes nothing."""
+def _prepare_content_check(item: review_items.ReviewItem) -> Callable[[], None]:
+    source = item.source
+    if not isinstance(source, review_items.ProposalSource) or source.record.value(proposal_issue.NUMBER_FIELD):
+        return lambda: None
+
+    path = source.record.path
+    original = path.read_bytes()
+
+    def check() -> None:
+        if path.read_bytes() != original:
+            raise NoOpenQuestion('The selected item changed.')
+
+    return check
+
+
+def prepare_answer(item: review_items.ReviewItem, words: str, who: str) -> Callable[[], bool]:
+    """Capture the unnumbered proposal before review and return the function that saves the answer."""
+    check_content = _prepare_content_check(item)
     line = 'Answer: '+words
-    if stored_mark(item) != ReviewMark.WAITING:
-        if item.log and item.log[-1].words == line:
-            return False
-        raise NoOpenQuestion('this item has no open question')
-    return record(item, line, NoMark(), who, waiting_only=True)
+
+    def save() -> bool:
+        if stored_mark(item) != ReviewMark.WAITING:
+            if item.log and item.log[-1].words == line:
+                return False
+            raise NoOpenQuestion('this item has no open question')
+        return record(item, line, NoMark(), who, waiting_only=True, check_content=check_content)
+
+    return save
