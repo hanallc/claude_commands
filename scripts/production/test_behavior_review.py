@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import io
 import json
 import os
@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.astra import astra_review
 from scripts.direct import pass_record, progress_history
-from scripts.lib import unit_runs
+from scripts.lib import process_start, unit_runs
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 from scripts.notify import review
 from scripts.production import behavior_check, behavior_review, session_staff, staff, update_registration, worker
@@ -22,6 +22,7 @@ from scripts.review_links import review_events
 
 
 CLEAR_REPLY = '[{"test":"test_fixture.py::test_move","finding":"none"}]'
+REVIEWER = "fixture-reviewer"
 
 
 class BehaviorReviewTests(ScriptRepositoryTestCase):
@@ -35,6 +36,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.environment["SHOWRUNNER_STATE_DIR"] = str(self.root / "showrunner")
+        self.environment["ASTRA_ROLES_STATE"] = str(self.root / "astra-roles")
         self.folder = self.root / "review-run"
         self.folder.mkdir()
         _ = self.enterContext(mock.patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root))
@@ -111,6 +113,9 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             code, output = self.cli("run", *args)
             self.assertEqual(code, 1, output)
             self.assertEqual(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
+            running = process_start.process_start(os.getpid())
+            assert isinstance(running, process_start.Started)
+            self.reviewer_process(running.start)
             self.pass_status("active")
             self.assertIn("waits for the independent review", self.cli("run", *args)[1])
             self.pass_status("completed")
@@ -122,7 +127,35 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertEqual(behavior_check.read_record(key), behavior_check.Clear(self.folder / "completed-reply.txt"))
 
     def pass_status(self, status: str) -> None:
-        _ = self.write(pass_record.state_path(self.folder), json.dumps({"pass": {"review": {"status": status}}}))
+        record = {"status": status, "delivery": {"actions": {"held_role": REVIEWER}}}
+        _ = self.write(pass_record.state_path(self.folder), json.dumps({"pass": {"review": record}}))
+
+    def reviewer_process(self, start: str) -> None:
+        path = Path(self.environment["ASTRA_ROLES_STATE"]) / f"{REVIEWER}.json"
+        _ = self.write(path, json.dumps({"staff_id": REVIEWER, "pid": os.getpid(), "pid_start": start}))
+
+    def test_a_dead_reviewer_or_reused_pid_allows_a_new_dispatch(self) -> None:
+        args, key = self.changed_range()
+        pointer = behavior_check.record_path(key).with_suffix(".run")
+        prior = self.root / "prior-review"
+        normal_folder = self.folder
+        self.reviewer_process("original-start")
+        self.reply(CLEAR_REPLY)
+        for observed in (process_start.Gone(), process_start.Zombie("original-start"),
+                         process_start.Started("different-start")):
+            with self.subTest(observed=type(observed).__name__):
+                _ = self.write(pointer, f"{prior}\n")
+                self.folder = prior
+                self.pass_status("active")
+                self.folder = normal_folder
+                with (mock.patch.object(process_start, "process_start", return_value=observed) as process,
+                      mock.patch.object(astra_review, "run_review", return_value=0) as runner):
+                    self.assertEqual(self.cli("run", *args), (0, f"{key} clear\n"))
+                process.assert_called_once_with(os.getpid())
+                runner.assert_called_once()
+                self.assertEqual(pointer.read_text().strip(), str(normal_folder))
+                behavior_check.record_path(key).unlink()
+                (normal_folder / "completed-reply.txt").unlink()
 
     def test_retries_replace_unstarted_and_failed_review_attempts(self) -> None:
         args, key = self.changed_range()
@@ -189,7 +222,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         _, key, waiting, question = self.filed_question()
         update_registration.write_question_record(replace(question, status="closed"))
         update_registration.record_review_log(question, "answer: Yes, please.")
-        self.assertIn("without one of its filed choices", self.cli("status", "--key", key)[1])
+        self.assertIn("without Yes, No, or one of its filed choices", self.cli("status", "--key", key)[1])
         for words, approval in ((behavior_review.YES_CHOICE, behavior_check.Approval.YES),
                                 (behavior_review.NO_CHOICE, behavior_check.Approval.NO)):
             with self.subTest(answer=words):
@@ -201,6 +234,57 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
                 self.assertEqual(self.cli("status", "--key", key)[0], 0 if approval is behavior_check.Approval.YES else 1)
                 self.assertEqual(behavior_check.read_record(key),
                                  behavior_check.Answered(waiting.question_id, waiting.owner, approval, words, event.time))
+
+    def test_plain_yes_and_no_set_the_verdict_and_other_answers_record_a_refusal(self) -> None:
+        args, key, waiting, question = self.filed_question()
+        update_registration.write_question_record(replace(question, status="closed"))
+        update_registration.record_review_log(question, "answer: Yes, please.")
+        status, reason = self.cli("status", "--key", key)
+        self.assertEqual(status, 1)
+        saved = behavior_check.read_record(key)
+        self.assertEqual(saved, behavior_check.InvalidAnswer(waiting.question_id, waiting.owner, reason.strip()))
+        self.assertIn(reason.strip(), self.cli("check", *args)[1])
+
+        update_registration.record_review_log(question, "answer:  yEs  ")
+        self.assertEqual(self.cli("status", "--key", key)[0], 0)
+        self.assertEqual(self.cli("check", *args), (0, ""))
+        behavior_check.write_record(key, waiting)
+        update_registration.record_review_log(question, "answer:  nO  ")
+        self.assertEqual(self.cli("status", "--key", key)[0], 1)
+        self.assertIn("answered No", self.cli("check", *args)[1])
+
+    def test_questions_with_the_same_test_title_keep_distinct_request_keys(self) -> None:
+        _, key, first, question = self.filed_question()
+        title = question.item["text"]
+        self.assertIn("test_move", title)
+        evidence = behavior_review.SpecifiedBehavior("test_fixture.py::test_move", "Move at once.",
+                                                      self.root / "decision.md", date(2026, 11, 23),
+                                                      "The move waits for the current step.")
+        second_key = "e" * 64
+        keys: list[review.QuestionKey] = []
+
+        def accept(key: review.QuestionKey, text: str) -> review.QuestionAccepted:
+            keys.append(key)
+            return review.QuestionAccepted(text)
+
+        with mock.patch.object(review, "review_question", side_effect=accept):
+            second = behavior_review.ask(second_key, [evidence], self.producer.name)
+            self.assertEqual(behavior_review.ask(second_key, [evidence], self.producer.name), second)
+            third_key = "d" * 64
+            third = behavior_review.ask(third_key, [evidence, replace(evidence, test="other.py::test_stop")],
+                                        self.producer.name)
+        self.assertEqual(len(keys), 2)
+        self.assertIn(second_key, keys[0].text)
+        self.assertIn(third_key, keys[1].text)
+        self.assertNotEqual(first.question_id, second.question_id)
+        scope = update_registration.ProducerQuestions(self.producer)
+        records = update_registration.native_question_records(scope, self.identities, strict=True)
+        by_id = {record.item.get("review_id"): record for record in records}
+        self.assertEqual(by_id[first.question_id].item.get("request_key"), key)
+        self.assertEqual(by_id[second.question_id].item.get("request_key"), second_key)
+        self.assertEqual(by_id[second.question_id].item["text"], title)
+        self.assertIn("test_move and 1 more test", by_id[third.question_id].item["text"])
+        self.assertTrue(all(record.status == "open" for record in records))
 
 
     def test_yes_requires_the_original_closed_question_and_the_users_yes(self) -> None:

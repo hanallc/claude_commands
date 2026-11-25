@@ -28,7 +28,7 @@ class BehaviorCheckTests(ScriptRepositoryTestCase):
         assert isinstance(changes, behavior_check.ChangedTests)
         return changes
 
-    def test_non_test_changes_use_only_the_name_diff(self) -> None:
+    def test_non_test_changes_use_only_the_tree_diff(self) -> None:
         base = self.git("rev-parse", "HEAD").stdout.strip()
         _ = self.write(self.repo / "application.py", "invalid Python that must not be parsed\n")
         head = self.commit_files()
@@ -123,8 +123,22 @@ class BehaviorCheckTests(ScriptRepositoryTestCase):
         self.assertNotEqual(first.key, second.key)
         _ = self.git("remote", "set-url", "origin", str(self.root / "other.git"))
         third = self.changes(base, head)
-        self.assertEqual((second.tests, second.patch_id), (third.tests, third.patch_id))
+        self.assertEqual((second.tests, second.files), (third.tests, third.files))
         self.assertNotEqual(second.key, third.key)
+
+    def test_edits_to_identical_code_blocks_have_distinct_keys(self) -> None:
+        test = self.write(self.repo / "test_fixture.py", "def test_fixture():\n    assert 1\n")
+        block = "a = 1\nb = 2\nc = 3\nvalue = 4\nd = 5\ne = 6\nf = 7\n"
+        code = self.write(self.repo / "application.py", block * 2)
+        base = self.commit_files()
+        _ = self.write(test, "def test_fixture():\n    assert 2\n")
+        edited = block.replace("value = 4", "value = 8")
+        _ = self.write(code, edited + block)
+        first = self.changes(base, self.commit_files())
+        _ = self.write(code, block + edited)
+        second = self.changes(base, self.commit_files())
+        self.assertEqual(first.tests, second.tests)
+        self.assertNotEqual(first.key, second.key)
 
     def test_a_class_decorator_changes_each_enclosed_python_test(self) -> None:
         original = ("class Demo:\n    def test_first(self):\n        pass\n"
@@ -162,3 +176,30 @@ fn conditional() {
         _ = self.write(target, new_test + other_test)
         self.assertEqual(self.changes(base, self.commit_files()).tests, (
             behavior_check.TestChange("test_before.py::test_fixture", old_test, new_test),))
+
+    def test_a_rust_module_attribute_changes_each_nested_test(self) -> None:
+        original = """#[cfg(test)]
+mod tests {
+    #![allow(dead_code)]
+    #[test]
+    fn first() {}
+    #[cfg(test)]
+    mod nested {
+        #[test]
+        fn second() {}
+    }
+}
+"""
+        path = self.write(self.repo / "src/lib.rs", original)
+        base = self.commit_files()
+        for before, after in (("#[cfg(test)]", "#[cfg(any())]"),
+                              ("#![allow(dead_code)]", "#![cfg(any())]")):
+            with self.subTest(attribute=before):
+                _ = self.write(path, original.replace(before, after, 1))
+                tests = self.changes(base, self.commit_files()).tests
+                self.assertEqual([test.test for test in tests], [
+                    "src/lib.rs::tests::first", "src/lib.rs::tests::nested::second"])
+                for test in tests:
+                    self.assertIn(before, test.old)
+                    self.assertEqual(test.new, test.old.replace(before, after, 1))
+                self.assertEqual(tests[1].old.count("#[cfg(test)]"), 2)

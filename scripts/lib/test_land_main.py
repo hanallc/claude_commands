@@ -51,7 +51,7 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
             with self.subTest(branch=branch):
                 if branch != "main":
                     _ = self.git("push", "origin", "HEAD:refs/heads/trunk")
-                    _ = self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+                    _ = self.git("--git-dir", str(self.remote), "symbolic-ref", "HEAD", "refs/heads/trunk")
                 commit = self.next_commit(branch + "\n")
                 nested = self.write(self.repo / "nested/fixture", "fixture\n").parent
                 result = land_main.land(nested, commit[:10], branch)
@@ -200,7 +200,7 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
         self.assertEqual(self.hook_runs(), [])
         self.assertFalse(self.completion().exists())
 
-    def test_the_remote_default_branch_requires_review_without_a_local_origin_head(self) -> None:
+    def test_the_remote_default_branch_requires_review_even_with_a_stale_local_head(self) -> None:
         test = self.write(self.repo / "test_default.py", "def test_fixture():\n    assert 1\n")
         _ = self.git("add", test.name)
         base = self.next_commit()
@@ -208,8 +208,14 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
         _ = self.git("--git-dir", str(self.remote), "symbolic-ref", "HEAD", "refs/heads/trunk")
         _ = self.write(test, "def test_fixture():\n    assert 2\n")
         head = self.next_commit()
-        with self.assertRaisesRegex(land_main.LandError, "no review is on record"):
-            _ = land_main.land(self.repo, head, "trunk")
+        nested = self.repo / "nested"
+        nested.mkdir()
+        for local_head in ("missing", "stale"):
+            with self.subTest(local_head=local_head):
+                if local_head == "stale":
+                    _ = self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+                with self.assertRaisesRegex(land_main.LandError, "no review is on record"):
+                    _ = land_main.land(nested, head, "trunk")
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/trunk").stdout.split()[0], base)
         with mock.patch.object(behavior_check, "require_review", wraps=behavior_check.require_review) as check:
             result = land_main.land(self.repo, head, "main")

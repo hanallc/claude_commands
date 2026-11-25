@@ -41,10 +41,10 @@ class GitRange(NamedTuple):
     base: str
     commit: str
 
-    def git(self, *args: str, timeout: float | None = None, data: bytes | None = None) -> bytes:
+    def git(self, *args: str, timeout: float | None = None) -> bytes:
         try:
             result = subprocess.run(["git", "-C", str(self.repo), *args],
-                                    capture_output=True, check=False, timeout=timeout, input=data)
+                                    capture_output=True, check=False, timeout=timeout)
         except subprocess.TimeoutExpired as error:
             raise BehaviorCheckError(f"git {args[0]} timed out after {error.timeout:g} seconds") from error
         if result.returncode:
@@ -56,15 +56,6 @@ class GitRange(NamedTuple):
         base = self.git("rev-parse", "--verify", "--end-of-options", f"{self.base}^{{commit}}")
         commit = self.git("rev-parse", "--verify", "--end-of-options", f"{self.commit}^{{commit}}")
         return GitRange(self.repo, base.decode("ascii").strip(), commit.decode("ascii").strip())
-
-    def patch_id(self, timeout: float | None) -> str:
-        patch = self.git("diff", "--binary", "--full-index", "--no-renames", "--no-color",
-                         "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--unified=3",
-                         "--src-prefix=a/", "--dst-prefix=b/", self.base, self.commit, "--", timeout=timeout)
-        result = self.git("patch-id", "--verbatim", timeout=timeout, data=patch).split()
-        if len(result) != 2:
-            raise BehaviorCheckError("Cannot identify the reviewed patch.")
-        return result[0].decode("ascii")
 
     def origin_identity(self, timeout: float | None) -> str:
         remote = os.fsdecode(self.git("remote", "get-url", "origin", timeout=timeout)).strip()
@@ -100,16 +91,22 @@ class NoChangedTests(StrEnum):
     EMPTY = "no altered or removed tests"
 
 
+class ChangedFile(NamedTuple):
+    path: str
+    old_blob: str
+    new_blob: str
+
+
 @dataclass(frozen=True)
 class ChangedTests:
     tests: tuple[TestChange, ...]
     repository: str
-    patch_id: str
+    files: tuple[ChangedFile, ...]
 
     @property
     def key(self) -> str:
         changes = sorted((change.test, change.old, change.new) for change in self.tests)
-        fields = (self.repository, self.patch_id, changes)
+        fields = (self.repository, sorted(self.files), changes)
         return hashlib.sha256(json.dumps(fields, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -193,12 +190,19 @@ def rust_test_attribute(tokens: list[RustToken], pairs: dict[int, int], first: i
     return position + 1 < end and rust_test_attribute(tokens, pairs, position + 1, end)
 
 
+class RustModule(NamedTuple):
+    end: int
+    name: str
+    attributes: tuple[tuple[int, int], ...]
+
+
 def rust_tests(source: str) -> Iterator[TestSpan]:
     tokens = rust_tokens(source)
     pairs = rust_pairs(tokens)
-    scopes: list[tuple[int, str]] = []
+    scopes: list[RustModule] = []
     index = 0
     first_attribute = -1
+    attribute_end = -1
     has_test = False
     while index < len(tokens):
         while scopes and scopes[-1][0] < index:
@@ -209,20 +213,37 @@ def rust_tests(source: str) -> Iterator[TestSpan]:
             end = pairs[index + 1]
             if first_attribute < 0:
                 first_attribute = token.offset
+            attribute_end = tokens[end].offset
             has_test = has_test or rust_test_attribute(tokens, pairs, index + 2, end)
             index = end + 1
             continue
         if words == "mod" and index + 2 in pairs and tokens[index + 2].words == "{":
-            scopes.append((pairs[index + 2], tokens[index + 1].words))
+            attributes: list[tuple[int, int]] = []
+            if first_attribute >= 0:
+                attributes.append((source.count("\n", 0, first_attribute), source.count("\n", 0, attribute_end) + 1))
+            body = index + 3
+            next_item = body
+            while (next_item + 2 in pairs
+                   and [part.words for part in tokens[next_item:next_item + 3]] == ["#", "!", "["]):
+                next_item = pairs[next_item + 2] + 1
+            if next_item > body:
+                attributes.append((source.count("\n", 0, tokens[body].offset),
+                                   source.count("\n", 0, tokens[next_item - 1].offset) + 1))
+            scopes.append(RustModule(pairs[index + 2], tokens[index + 1].words, tuple(attributes)))
+            first_attribute = -1
+            has_test = False
+            index = next_item
+            continue
         if has_test and words == "fn" and index + 1 < len(tokens):
-            name = "::".join([*(scope for _, scope in scopes), tokens[index + 1].words])
+            name = "::".join([*(scope.name for scope in scopes), tokens[index + 1].words])
             body = index + 2
             while body < len(tokens) and tokens[body].words not in ("{", ";"):
                 body = pairs.get(body, body) + 1
             if body in pairs and tokens[body].words == "{":
                 end = pairs[body]
                 yield TestSpan(name, source.count("\n", 0, first_attribute),
-                               source.count("\n", 0, tokens[end].offset) + 1)
+                               source.count("\n", 0, tokens[end].offset) + 1,
+                               tuple(attribute for scope in scopes for attribute in scope.attributes))
                 index = end
             has_test = False
             first_attribute = -1
@@ -250,7 +271,7 @@ def test_lines(path: str, blob: bytes) -> tuple[list[str], list[TestSpan]]:
 
 
 def test_blobs(change: GitRange, rev: str, paths: list[str], timeout: float | None) -> dict[str, str]:
-    entries = change.git("--literal-pathspecs", "ls-tree", "-r", "-z", rev, "--", *paths, timeout=timeout)
+    entries = change.git("--literal-pathspecs", "ls-tree", "--full-tree", "-r", "-z", rev, "--", *paths, timeout=timeout)
     blobs: dict[str, str] = {}
     for entry in entries.split(b"\0"):
         if entry:
@@ -274,8 +295,9 @@ def test_texts(path: str, lines: list[str], spans: list[TestSpan], touched: set[
             name = f"{path}::{span.name}"
             if name in tests:
                 raise BehaviorCheckError(f"more than one definition of {name}")
-            tests[name] = "".join(line for start, stop in (*span.decorators, (span.first, span.last))
-                                  for line in lines[start:stop])
+            included = {line for start, stop in (*span.decorators, (span.first, span.last))
+                        for line in range(start, stop)}
+            tests[name] = "".join(lines[line] for line in sorted(included))
     return tests
 
 
@@ -285,8 +307,8 @@ class TestPaths(NamedTuple):
 
 
 def test_paths(change: GitRange, paths: list[str], timeout: float | None) -> list[TestPaths]:
-    names = change.git("diff", "--name-status", "--find-renames", "--no-ext-diff", "-z",
-                       change.base, change.commit, "--", timeout=timeout)
+    names = change.git("diff", "--name-status", "--find-renames", "--no-ext-diff", "--no-relative",
+                       "--no-color", "-z", change.base, change.commit, "--", timeout=timeout)
     fields = iter(os.fsdecode(names).removesuffix("\0").split("\0"))
     candidates = set(paths)
     pairs: list[TestPaths] = []
@@ -303,9 +325,14 @@ def test_paths(change: GitRange, paths: list[str], timeout: float | None) -> lis
 
 def changed_tests(change: GitRange, *, timeout: float | None = None) -> ChangedTests | NoChangedTests:
     """Compare test line ranges across the exact trees."""
-    names = change.git("diff", "--name-only", "--no-renames", "--no-ext-diff", "-z",
-                       change.base, change.commit, "--", timeout=timeout)
-    paths = [name for name in os.fsdecode(names).split("\0") if is_test_file(name)]
+    raw = change.git("diff", "--raw", "--no-abbrev", "--no-renames", "--no-ext-diff", "--no-relative", "--no-color",
+                     "--ignore-submodules=none", "-z", change.base, change.commit, "--", timeout=timeout)
+    fields = iter(os.fsdecode(raw).removesuffix("\0").split("\0")) if raw else iter(())
+    files: list[ChangedFile] = []
+    for entry in fields:
+        _, _, old_blob, new_blob, _ = entry.split()
+        files.append(ChangedFile(next(fields), old_blob, new_blob))
+    paths = [file.path for file in files if is_test_file(file.path)]
     if not paths:
         return NoChangedTests.EMPTY
     pairs = test_paths(change, paths, timeout)
@@ -337,7 +364,7 @@ def changed_tests(change: GitRange, *, timeout: float | None = None) -> ChangedT
             edits_to_tests.append(TestChange(test, text, new.get(test, "")))
     if not edits_to_tests:
         return NoChangedTests.EMPTY
-    return ChangedTests(tuple(edits_to_tests), change.origin_identity(timeout), change.patch_id(timeout))
+    return ChangedTests(tuple(edits_to_tests), change.origin_identity(timeout), tuple(files))
 
 
 class Approval(StrEnum):
@@ -357,6 +384,13 @@ class Waiting:
 
 
 @dataclass(frozen=True)
+class InvalidAnswer:
+    question_id: str
+    owner: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class Answered:
     question_id: str
     owner: str
@@ -369,7 +403,7 @@ class NoReview(StrEnum):
     MISSING = "missing"
 
 
-type LandingRecord = Clear | Waiting | Answered
+type LandingRecord = Clear | Waiting | InvalidAnswer | Answered
 
 
 def record_path(key: str) -> Path:
@@ -390,6 +424,8 @@ def read_record(key: str) -> LandingRecord | NoReview:
                 return Clear(Path(reply))
             case {"state": "waiting", "question_id": str(question), "owner": str(owner)} if question and owner:
                 return Waiting(question, owner)
+            case {"state": "invalid_answer", "question_id": str(question), "owner": str(owner), "reason": str(reason)} if question and owner and reason:
+                return InvalidAnswer(question, owner, reason)
             case {"state": "yes" | "no" as answer, "question_id": str(question), "owner": str(owner), "answer": str(words), "time": str(time)} if question and owner and words.strip():
                 return Answered(question, owner, Approval(answer), words, datetime.fromisoformat(time))
             case _:
@@ -407,6 +443,8 @@ def write_record(key: str, record: LandingRecord) -> None:
         state = {"state": "clear", "reply": str(record.reply)}
     elif isinstance(record, Waiting):
         state = {"state": "waiting", **asdict(record)}
+    elif isinstance(record, InvalidAnswer):
+        state = {"state": "invalid_answer", **asdict(record)}
     else:
         state = {"state": record.approval, "question_id": record.question_id, "owner": record.owner, "answer": record.answer,
                  "time": record.time.isoformat()}
@@ -427,10 +465,12 @@ def require_review(change: GitRange, *, timeout: float | None = None) -> None:
         reason = "the saved approval has no valid proof"
     elif isinstance(record, Waiting):
         reason = f"waiting for the answer to {record.question_id}"
+    elif isinstance(record, InvalidAnswer):
+        reason = record.reason
     elif isinstance(record, Answered):
         reason = f"{record.question_id} was answered No"
     names = ", ".join(test.test for test in tests.tests)
-    raise BehaviorCheckError(f"Behavior check for {names}: {reason}.\nRun {change.command('run')}")
+    raise BehaviorCheckError(f"Behavior check for {names}: {reason.rstrip('.')}.\nRun {change.command('run')}")
 
 
 class BehaviorCommand(argparse.Namespace):

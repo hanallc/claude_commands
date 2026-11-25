@@ -110,6 +110,15 @@ def _git_config_environment(git_config: Sequence[str]) -> dict[str, str] | None:
     return environment
 
 
+def default_branch(origin_head: str) -> str:
+    """Read the advertised HEAD. Use main when the remote has no HEAD branch."""
+    for line in origin_head.splitlines():
+        ref, _, name = line.partition("\t")
+        if name == "HEAD" and ref.startswith("ref: refs/heads/"):
+            return ref.removeprefix("ref: refs/heads/")
+    return "main"
+
+
 def land(checkout: Path, commit: str, branch: str = "main", *,
          time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT,
          git_config: Sequence[str] = ()) -> Landed:
@@ -136,13 +145,7 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
         sha = checked("rev-parse", "--verify", f"{commit}^{{commit}}")
         _ = checked("fetch", "origin", branch)
         origin = checked("rev-parse", "FETCH_HEAD")
-        default = git("symbolic-ref", "refs/remotes/origin/HEAD")
-        if not default.returncode:
-            default_branch = default.stdout.strip().removeprefix("refs/remotes/origin/")
-        else:
-            origin_head = checked("ls-remote", "--symref", "origin", "HEAD")
-            redirect, _, _ = origin_head.partition("\tHEAD")
-            default_branch = redirect.removeprefix("ref: refs/heads/") if redirect.startswith("ref: refs/heads/") else "main"
+        remote_default = default_branch(checked("ls-remote", "--symref", "origin", "HEAD"))
         pushed: Pushed | AlreadyLanded
         if origin == sha:
             pushed = AlreadyLanded()
@@ -151,7 +154,7 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
         else:
             if git("merge-base", "--is-ancestor", origin, sha).returncode:
                 raise NotFastForward(f"origin/{branch} does not fast-forward to {sha}")
-            if branch == default_branch:
+            if branch == remote_default:
                 git_timeout = time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None
                 try:
                     behavior_check.require_review(behavior_check.GitRange(checkout, origin, sha), timeout=git_timeout)
@@ -159,7 +162,7 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
                     raise LandError(str(error)) from error
             _ = checked("push", "origin", f"{sha}:refs/heads/{branch}")
             pushed = Pushed()
-        if branch != default_branch:
+        if branch != remote_default:
             return Landed(sha, branch, pushed, HookSkipped())
         root = Path(checked("rev-parse", "--show-toplevel"))
         hook = root / ".claude/config/post_push.sh"

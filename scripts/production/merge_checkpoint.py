@@ -35,7 +35,7 @@ from uuid import uuid4
 
 from scripts.lib import build_folders, git_merge_tree
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production import change_review, checkpoint_gate, land_runs
+from scripts.production import behavior_check, change_review, checkpoint_gate, land_runs
 from scripts.worktree import worktree_records, worktrees
 from scripts.lib import land_main, mac_wake, main_publish, main_push_lock, scratch, waiting_rows
 from scripts.production.showrunners import owner_for
@@ -1111,9 +1111,18 @@ def push_git(production: ProductionDocument, tested_tip: str | bool) -> str:
     checkout = production.checkout
     tip = tested_tip if isinstance(tested_tip, str) else good(git(checkout, "rev-parse", "HEAD"), "push")
     before_merge_tip = good(git(checkout, "rev-parse", f"{tip}^1"), "push") if tested_tip is True else ""
+    branch = production.merge_branch
     with push_rollback(production, before_merge_tip, expected_tip=tip):
-        _ = good(git(checkout, "push", "origin", f"{tip}:refs/heads/{production.merge_branch}"), "push")
-    checkpoint_gate.report("push", "ok", f"{production.merge_branch} pushed at {tip}")
+        remote_head = good(git(checkout, "ls-remote", "--symref", "origin", "HEAD"), "push")
+        if branch == land_main.default_branch(remote_head):
+            base = good(git(checkout, "rev-parse", f"refs/remotes/origin/{branch}"), "push")
+            try:
+                behavior_check.require_review(behavior_check.GitRange(checkout, base, tip))
+            except (behavior_check.BehaviorCheckError, OSError) as error:
+                raise checkpoint_gate.Stop("push", "held", str(error),
+                                           "complete the behavior check and send the checkpoint again") from error
+        _ = good(git(checkout, "push", "origin", f"{tip}:refs/heads/{branch}"), "push")
+    checkpoint_gate.report("push", "ok", f"{branch} pushed at {tip}")
     end_pushed_worktrees(production)
     return tip
 

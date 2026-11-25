@@ -1538,7 +1538,9 @@ def store_questions(production: QuestionScope, entries: list[OutstandingItem], i
             item = entry.copy()
             row = question_member(production, item, identities)
             item["asked_by"] = row.id
-            selected = current.get(item.get("review_id", "")) or legacy.get((row.id, item["text"]))
+            selected = current.get(item.get("review_id", ""))
+            if selected is None and "request_key" not in item:
+                selected = legacy.get((row.id, item["text"]))
             if selected is None:
                 digest = hashlib.sha256(f"{owner}:{row.id}:{item['text']}".encode()).hexdigest()
                 path = record_store.free_record_path(folder.path / f"question-{row.id}-{digest[:16]}.md", names)
@@ -1585,14 +1587,15 @@ def migrate_questions(production: Production, *, identities: QuestionStaff | Non
     with outstanding_lock(path):
         legacy = legacy_entries(path)
         existing = open_entries(production, identities)
-        recorded = {(record.asker, record.item["text"]) for record in native_question_records(production, identities, strict=True)}
-        questions = {(question_member(production, entry, identities).id, entry["text"]): entry
+        recorded = {(record.asker, record.item["text"]) for record in native_question_records(production, identities, strict=True)
+                    if "request_key" not in record.item}
+        questions = {(question_member(production, entry, identities).id, entry["text"], entry.get("request_key", "")): entry
                      for entry in existing if "question" in entry}
         for entry in legacy:
             if "question" in entry:
                 key = (question_member(production, entry, identities).id, entry["text"])
-                if key not in questions and key not in recorded:
-                    questions[key] = entry
+                if key not in recorded:
+                    _ = questions.setdefault((*key, ""), entry)
         reminders = [entry for entry in legacy if "question" not in entry]
         def write_list() -> None:
             if any("question" in entry for entry in legacy):
@@ -1753,9 +1756,10 @@ def write_open_entries(production: QuestionScope, entries: list[OutstandingItem]
     path = outstanding_path(production)
     legacy = [entry for entry in legacy_entries(path) if "question" in entry]
     if legacy:
-        recorded = {(record.asker, record.item["text"]) for record in native_question_records(production, identities)}
+        recorded = {(record.asker, record.item["text"]) for record in native_question_records(production, identities)
+                    if "request_key" not in record.item}
         supplied = {(question_member(production, entry, identities).id, entry["text"])
-                    for entry in entries if "question" in entry}
+                    for entry in entries if "question" in entry and "request_key" not in entry}
         entries = list(entries)
         for entry in legacy:
             key = (question_member(production, entry, identities).id, entry["text"])
@@ -2007,10 +2011,11 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
     if problem is not None:
         raise RegistrationFailure("ask", f"{text}: {problem}")
     outstanding = outstanding_path(production)
-    if any(entry["text"] == text for entry in open_entries(production, identities)):
+    if not isinstance(outgoing, KeyedStaffQuestion) and any(
+            entry["text"] == text for entry in open_entries(production, identities)):
         raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
     # The review can take a minute, so it runs before the lock: `questions` is not held up by it.
-    accepted = review_open_question(production.name, QuestionForReview(text, "", question, rank))
+    accepted = review_open_question(production.name, QuestionForReview(text, "", question, rank), outgoing=outgoing)
     if isinstance(accepted, HeldRegistrationQuestion):
         raise RegistrationFailure("ask", f"question held for review: {text}: {accepted.details}")
     now = datetime.now(production.zone)
@@ -2028,12 +2033,13 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
                 return saved
             entry["request_key"] = outgoing.request_key
         entries = open_entries(production, identities)
-        if any(stored["text"] == text for stored in entries):
-            raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
-        if any("question" in stored and stored["text"] == text
-               and question_member(production, stored, identities).id == asker.id
-               for stored in legacy_entries(outstanding)):
-            raise RegistrationFailure("ask", f"{text}: a legacy question from this asker is already open")
+        if not isinstance(outgoing, KeyedStaffQuestion):
+            if any(stored["text"] == text for stored in entries):
+                raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
+            if any("question" in stored and stored["text"] == text
+                   and question_member(production, stored, identities).id == asker.id
+                   for stored in legacy_entries(outstanding)):
+                raise RegistrationFailure("ask", f"{text}: a legacy question from this asker is already open")
         entries.append(entry)
         with record_store.keep_file_on_error(outstanding.with_suffix(".history.jsonl")):
             write_open_entries(production, entries, identities, last=(entry,),
@@ -2629,10 +2635,13 @@ class ReviewUnavailableQuestion(NamedTuple):
 AcceptedQuestion = ReviewedQuestion | ReviewUnavailableQuestion
 
 
-def review_open_question(name: str, item: QuestionForReview) -> AcceptedQuestion | HeldRegistrationQuestion:
+def review_open_question(name: str, item: QuestionForReview, *,
+                         outgoing: QuestionFromStaff | KeyedStaffQuestion = _QUESTION_FROM_STAFF
+                         ) -> AcceptedQuestion | HeldRegistrationQuestion:
     # Copied registration trees can run reminder-only commands without notify installed.
     from scripts.notify import review
-    outcome = review.review_question(review.QuestionKey(name, item.text), item.question)
+    identity = f"{item.text} [{outgoing.request_key}]" if isinstance(outgoing, KeyedStaffQuestion) else item.text
+    outcome = review.review_question(review.QuestionKey(name, identity), item.question)
     if isinstance(outcome, review.QuestionAccepted):
         return ReviewedQuestion(item.text, outcome.question)
     if isinstance(outcome, review.QuestionReviewUnavailable):

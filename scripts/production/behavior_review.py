@@ -9,9 +9,9 @@ import re
 import sys
 from typing import cast
 
-from scripts.astra import astra_review, astra_work
+from scripts.astra import astra_review, astra_roles, astra_work
 from scripts.direct import pass_record, progress_history, recorder_state
-from scripts.lib import file_lock, unit_runs, urgency
+from scripts.lib import conf, file_lock, unit_runs, urgency
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.showrunner_state import state_root
 from scripts.production import behavior_check, staff, update_registration, worker
@@ -25,6 +25,7 @@ NO_CHOICE = "No. Keep the current behavior."
 
 @dataclass(frozen=True)
 class SpecifiedBehavior:
+    test: str
     quote: str
     source: Path
     day: date
@@ -62,7 +63,7 @@ def parse_reply(text: str, tests: behavior_check.ChangedTests) -> list[Specified
                     path = Path(source)
                     if not path.is_absolute() or not quote.strip() or not change.strip() or len(change.splitlines()) != 1:
                         raise ValueError(f"{test}: expected a quote, an absolute source path and one line about the change")
-                    evidence.append(SpecifiedBehavior(quote, path, date.fromisoformat(day), change.strip()))
+                    evidence.append(SpecifiedBehavior(test, quote, path, date.fromisoformat(day), change.strip()))
                 case _:
                     raise ValueError("invalid finding")
             if test not in missing:
@@ -146,8 +147,14 @@ def recover_reply(folder: Path) -> Path | ReviewPending | ReviewNeedsDispatch:
     completed = progress_history.read_completed_reply(folder, reply)
     if isinstance(completed, progress_history.ValidatedDispatchReply):
         return save_reply(folder, completed.text)
-    if any(item.get("status") == "active" for item in pass_record.pass_slots(state).values()):
-        return ReviewPending(folder)
+    for item in pass_record.pass_slots(state).values():
+        if item.get("status") != "active":
+            continue
+        if astra_roles.reviewer_process_running(pass_record.dispatch_delivery(item).actions.held_role):
+            return ReviewPending(folder)
+        completed = progress_history.read_completed_reply(folder, reply)
+        if isinstance(completed, progress_history.ValidatedDispatchReply):
+            return save_reply(folder, completed.text)
     return ReviewNeedsDispatch()
 
 
@@ -205,9 +212,14 @@ def ask(key: str, evidence: list[SpecifiedBehavior], reference: str) -> behavior
     else:
         owner, _, unit = owner.partition("\n")
         scope = update_registration.question_scope(owner, identities.record)
-    title = evidence[0].change
-    if isinstance(update_registration.check_question_title(title), update_registration.RefusedQuestionTitle):
-        title = "Allow this change?"
+    name = " ".join(evidence[0].test.rsplit("::", 1)[-1].split())
+    prefix = "Allow changes to "
+    remaining = len(evidence) - 1
+    suffix = "?"
+    if remaining:
+        suffix = f" and {remaining} more {'test' if remaining == 1 else 'tests'}?"
+    limit = conf.read_or_repository("production").whole("question_title_max_chars")
+    title = prefix + name[:max(0, limit - len(prefix) - len(suffix))] + suffix
     items: list[str] = []
     for finding in evidence:
         words = " ".join(finding.quote.splitlines())
@@ -228,7 +240,9 @@ def ask(key: str, evidence: list[SpecifiedBehavior], reference: str) -> behavior
     return behavior_check.Waiting(question, record.owner)
 
 
-def question_answer(key: str, owner: str, number: str) -> behavior_check.Waiting | behavior_check.Answered:
+def question_answer(key: str, owner: str, number: str) -> (
+    behavior_check.Waiting | behavior_check.Answered | behavior_check.InvalidAnswer
+):
     record = update_registration.numbered_question(staff.StaffId(owner), number)
     if record is None or record.owner != owner or record.item.get("request_key") != key:
         raise behavior_check.BehaviorCheckError(f"Cannot read the behavior question {number}.")
@@ -239,16 +253,20 @@ def question_answer(key: str, owner: str, number: str) -> behavior_check.Waiting
     for event in reversed(review_events.decode(record.item.get("review_log", ""))):
         if event.who == "nate" and event.words.casefold().startswith("answer:"):
             words = event.words.partition(":")[2].strip()
-            approval = {YES_CHOICE: behavior_check.Approval.YES, NO_CHOICE: behavior_check.Approval.NO}.get(words)
-            if words in choices and approval is not None:
+            approval = {"yes": behavior_check.Approval.YES, "no": behavior_check.Approval.NO}.get(words.casefold())
+            if approval is None and words in choices:
+                approval = {YES_CHOICE: behavior_check.Approval.YES, NO_CHOICE: behavior_check.Approval.NO}.get(words)
+            if approval is not None:
                 return behavior_check.Answered(number, owner, approval, words, event.time)
             break
-    raise behavior_check.BehaviorCheckError(f"{number} closed without one of its filed choices.")
+    return behavior_check.InvalidAnswer(number, owner, f"{number} closed without Yes, No, or one of its filed choices.")
 
 
-def refresh_answer(key: str, waiting: behavior_check.Waiting) -> behavior_check.Waiting | behavior_check.Answered:
+def refresh_answer(key: str, waiting: behavior_check.Waiting | behavior_check.InvalidAnswer) -> (
+    behavior_check.Waiting | behavior_check.Answered | behavior_check.InvalidAnswer
+):
     answer = question_answer(key, waiting.owner, waiting.question_id)
-    if isinstance(answer, behavior_check.Answered):
+    if answer != waiting:
         behavior_check.write_record(key, answer)
     return answer
 
@@ -277,6 +295,8 @@ def report(key: str, record: behavior_check.LandingRecord | behavior_check.NoRev
         return 0 if record.approval is behavior_check.Approval.YES else 1
     if isinstance(record, behavior_check.Waiting):
         print(f"The land waits for Nate's Yes or No on {record.question_id}.")
+    elif isinstance(record, behavior_check.InvalidAnswer):
+        print(record.reason)
     else:
         print(f"{key} has no review.")
     return 1
@@ -291,7 +311,7 @@ def run(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, key
         return 1
     try:
         record = behavior_check.read_record(key)
-        if isinstance(record, behavior_check.Waiting):
+        if isinstance(record, (behavior_check.Waiting, behavior_check.InvalidAnswer)):
             return report(key, refresh_answer(key, record))
         if isinstance(record, behavior_check.Clear) and not verify_approval(tests, record):
             path.unlink()
@@ -324,7 +344,7 @@ def status(key: str) -> int:
             print(f"{key} already has a behavior check in progress.")
             return 1
         record = behavior_check.read_record(key)
-        if isinstance(record, behavior_check.Waiting):
+        if isinstance(record, (behavior_check.Waiting, behavior_check.InvalidAnswer)):
             record = refresh_answer(key, record)
         return report(key, record)
 
