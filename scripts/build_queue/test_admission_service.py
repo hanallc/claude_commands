@@ -1854,6 +1854,733 @@ class LocalHoldPlacementTests(unittest.TestCase):
                 for worker in fixture.server.host_targets.values():
                     worker.thread.join(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
+    def test_claim_observation_checks_backoff_before_mirror_or_ssh(self) -> None:
+        """Admission per-claim SSH observation row 1."""
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.mac_test import claim_state, eligibility, offload
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            candidate, = request.constraints.candidates
+            destination = candidate.destination
+            config = fixture.root / "probe.conf"
+            _ = write_config_fixture(config, "probe_timeout_s=3\nconnect_timeout_s=10\n", template="mac_test")
+            configuration = conf.read(config)
+            claim_path = fixture.root / "fixture.slot-2.json"
+            record: claim_state.RemoteJobClaim = {
+                "claim_id": "claim", "episode": request.episode, "attempt": "attempt",
+                "submitting_session": "", "pid": request.owner.pid, "proc_start": request.owner.start_time,
+                "remote_host": "saved-host", "what": "fixture", "worktree": str(fixture.root),
+                "since": "2026-11-01T12:00:00+00:00",
+            }
+            observe = cast(Callable[[wire.PlacementRequest, placement.PlacementDestination, Path,
+                            claim_state.RemoteJobClaim, str, conf.ConfigRead], execution_identity.ExecutionEvidence],
+                           getattr(fixture.server, "_observe_provider_execution"))
+            path = eligibility.backoff_path("mac")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_text(f"{time.time() + 300}\n")
+            with (mock.patch.object(claim_state, "saved_mac_repository",
+                                    wraps=claim_state.saved_mac_repository) as mirror,
+                  mock.patch.object(subprocess, "run") as ssh,
+                  mock.patch.object(offload, "write_backoff", wraps=offload.write_backoff) as write):
+                result = observe(request, destination, claim_path, record, "macos", configuration)
+            self.assertEqual(result, execution_identity.ExecutionEvidenceUnavailable(
+                "provider retry backoff is active", fixture.clock.now()))
+            mirror.assert_not_called()
+            ssh.assert_not_called()
+            write.assert_not_called()
+
+    def test_claim_observation_requires_saved_mac_mirror_before_ssh(self) -> None:
+        """Admission per-claim SSH observation row 2."""
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.mac_test import claim_state, offload
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            candidate, = request.constraints.candidates
+            destination = candidate.destination
+            config = fixture.root / "probe.conf"
+            _ = write_config_fixture(config, "probe_timeout_s=3\nconnect_timeout_s=10\n", template="mac_test")
+            configuration = conf.read(config)
+            claim_path = fixture.root / "fixture.slot-2.json"
+            record: claim_state.RemoteJobClaim = {
+                "claim_id": "claim", "episode": request.episode, "attempt": "attempt",
+                "submitting_session": "", "pid": request.owner.pid, "proc_start": request.owner.start_time,
+                "remote_host": "saved-host", "what": "fixture", "worktree": str(fixture.root),
+                "since": "2026-11-01T12:00:00+00:00",
+            }
+            observe = cast(Callable[[wire.PlacementRequest, placement.PlacementDestination, Path,
+                            claim_state.RemoteJobClaim, str, conf.ConfigRead], execution_identity.ExecutionEvidence],
+                           getattr(fixture.server, "_observe_provider_execution"))
+            with (mock.patch.object(claim_state, "saved_mac_repository",
+                                    wraps=claim_state.saved_mac_repository) as mirror,
+                  mock.patch.object(subprocess, "run") as ssh,
+                  mock.patch.object(offload, "write_backoff", wraps=offload.write_backoff) as write):
+                result = observe(request, destination, claim_path, record, "macos", configuration)
+            self.assertEqual(result, execution_identity.ExecutionEvidenceUnavailable(
+                "the claim has no saved Mac mirror", fixture.clock.now()))
+            mirror.assert_called_once_with(record)
+            ssh.assert_not_called()
+            write.assert_not_called()
+
+    def test_linux_observation_requires_repository_before_ssh(self) -> None:
+        """Admission per-claim SSH observation row 3."""
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.mac_test import claim_state, eligibility, offload
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            candidate, = request.constraints.candidates
+            destination = replace(candidate.destination, provider="ssh", target="box", host="configured-host")
+            config = fixture.root / "probe.conf"
+            _ = write_config_fixture(config, "probe_timeout_s=3\nconnect_timeout_s=10\n", template="mac_test")
+            _ = (fixture.root / "build_targets.conf").write_text(
+                "targets=box\nkind.box=ssh\nplatform.box=linux\nsettings.box=probe.conf\n" + UNREACHABLE_WAIT_FIXTURE)
+            configuration = conf.read(config)
+            claim_path = fixture.root / "fixture.slot-2.json"
+            record: claim_state.RemoteJobClaim = {
+                "claim_id": "claim", "episode": request.episode, "attempt": "attempt",
+                "submitting_session": "", "pid": request.owner.pid, "proc_start": request.owner.start_time,
+                "remote_host": "saved-host", "what": "fixture", "worktree": str(fixture.root),
+                "since": "2026-11-01T12:00:00+00:00",
+            }
+            observe = cast(Callable[[wire.PlacementRequest, placement.PlacementDestination, Path,
+                            claim_state.RemoteJobClaim, str, conf.ConfigRead], execution_identity.ExecutionEvidence],
+                           getattr(fixture.server, "_observe_provider_execution"))
+            with (mock.patch.object(eligibility, "repository_identity", return_value=eligibility.UNKNOWN_REPOSITORY) as identity,
+                  mock.patch.object(subprocess, "run") as ssh,
+                  mock.patch.object(offload, "write_backoff", wraps=offload.write_backoff) as write):
+                result = observe(request, destination, claim_path, record, "linux", configuration)
+            self.assertEqual(result, execution_identity.ExecutionEvidenceUnavailable(
+                "repository execution scope is unavailable", fixture.clock.now()))
+            identity.assert_called_once_with(Path(request.constraints.repository))
+            ssh.assert_not_called()
+            write.assert_not_called()
+
+    def test_linux_observation_selects_the_recorded_slot_before_ssh(self) -> None:
+        """Admission per-claim SSH observation row 4."""
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.mac_test import claim_state, eligibility, offload
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            candidate, = request.constraints.candidates
+            destination = replace(candidate.destination, provider="ssh", target="box", host="configured-host")
+            config = fixture.root / "probe.conf"
+            _ = write_config_fixture(config, "probe_timeout_s=3\nconnect_timeout_s=10\n", template="mac_test")
+            _ = (fixture.root / "build_targets.conf").write_text(
+                "targets=box\nkind.box=ssh\nplatform.box=linux\nsettings.box=probe.conf\n" + UNREACHABLE_WAIT_FIXTURE)
+            configuration = conf.read(config)
+            claim_path = fixture.root / "fixture.slot-2.json"
+            record: claim_state.RemoteJobClaim = {
+                "claim_id": "claim", "episode": request.episode, "attempt": "attempt",
+                "submitting_session": "", "pid": request.owner.pid, "proc_start": request.owner.start_time,
+                "remote_host": "saved-host", "what": "fixture", "worktree": str(fixture.root),
+                "since": "2026-11-01T12:00:00+00:00",
+            }
+            observe = cast(Callable[[wire.PlacementRequest, placement.PlacementDestination, Path,
+                            claim_state.RemoteJobClaim, str, conf.ConfigRead], execution_identity.ExecutionEvidence],
+                           getattr(fixture.server, "_observe_provider_execution"))
+            repository = eligibility.KnownRepository("fixture", "fixture-key")
+            select_mirror = offload.mirror_selector_script
+
+            def capture(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                script = shlex.split(command[-1])[-1]
+                self.assertTrue(script.startswith(select_mirror(repository, "box", 2)))
+                self.assertIn('ps -p "$placement_pid" -o lstart=', script)
+                return subprocess.CompletedProcess(command, 0, "42\tfixture-start\n", "")
+
+            with (mock.patch.object(eligibility, "repository_identity", return_value=repository),
+                  mock.patch.object(offload, "mirror_selector_script", wraps=select_mirror) as selector,
+                  mock.patch.object(subprocess, "run", side_effect=capture) as ssh,
+                  mock.patch.object(offload, "write_backoff", wraps=offload.write_backoff) as write):
+                result = observe(request, destination, claim_path, record, "linux", configuration)
+            self.assertEqual(result, execution_identity.ObservedExecution(
+                execution_identity.ProcessExecution("saved-host", "", 42, "fixture-start")))
+            selector.assert_called_once_with(repository, "box", 2)
+            ssh.assert_called_once()
+            write.assert_not_called()
+
+    def test_claim_observation_uses_saved_host_and_registry_timeout(self) -> None:
+        """Admission per-claim SSH observation row 5."""
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.mac_test import claim_state, eligibility, offload
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            candidate, = request.constraints.candidates
+            destination = replace(candidate.destination, provider="ssh", target="box", host="configured-host")
+            config = fixture.root / "probe.conf"
+            _ = write_config_fixture(config, "probe_timeout_s=3\nconnect_timeout_s=10\n", template="mac_test")
+            _ = (fixture.root / "build_targets.conf").write_text(
+                "targets=box\nkind.box=ssh\nplatform.box=linux\nsettings.box=probe.conf\n" + UNREACHABLE_WAIT_FIXTURE)
+            configuration = conf.read(config)
+            claim_path = fixture.root / "fixture.slot-2.json"
+            record: claim_state.RemoteJobClaim = {
+                "claim_id": "claim", "episode": request.episode, "attempt": "attempt",
+                "submitting_session": "", "pid": request.owner.pid, "proc_start": request.owner.start_time,
+                "remote_host": "saved-host", "what": "fixture", "worktree": str(fixture.root),
+                "since": "2026-11-01T12:00:00+00:00",
+            }
+            observe = cast(Callable[[wire.PlacementRequest, placement.PlacementDestination, Path,
+                            claim_state.RemoteJobClaim, str, conf.ConfigRead], execution_identity.ExecutionEvidence],
+                           getattr(fixture.server, "_observe_provider_execution"))
+            with (mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("fixture")),
+                  mock.patch.object(eligibility, "probe_settings", wraps=eligibility.probe_settings) as settings,
+                  mock.patch.object(subprocess, "run",
+                                    return_value=subprocess.CompletedProcess(["ssh"], 0, "42\tfixture-start\n", "")) as ssh,
+                  mock.patch.object(offload, "write_backoff", wraps=offload.write_backoff) as write):
+                result = observe(request, destination, claim_path, record, "linux", configuration)
+            self.assertEqual(result, execution_identity.ObservedExecution(
+                execution_identity.ProcessExecution("saved-host", "", 42, "fixture-start")))
+            settings.assert_called_once()
+            ssh.assert_called_once()
+            command = cast(list[str], ssh.call_args.args[0])
+            self.assertEqual(command[-2], "saved-host")
+            self.assertEqual(command[command.index("-o", command.index("BatchMode=yes")) + 1], "ConnectTimeout=10")
+            self.assertEqual(ssh.call_args.kwargs["timeout"], 3)
+            write.assert_not_called()
+
+    def test_claim_observation_uses_first_valid_ssh_line_without_backoff(self) -> None:
+        """Admission per-claim SSH observation row 6."""
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.mac_test import claim_state, eligibility, offload
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            candidate, = request.constraints.candidates
+            destination = replace(candidate.destination, provider="ssh", target="box", host="configured-host")
+            config = fixture.root / "probe.conf"
+            _ = write_config_fixture(config, "probe_timeout_s=3\nconnect_timeout_s=10\n", template="mac_test")
+            _ = (fixture.root / "build_targets.conf").write_text(
+                "targets=box\nkind.box=ssh\nplatform.box=linux\nsettings.box=probe.conf\n" + UNREACHABLE_WAIT_FIXTURE)
+            configuration = conf.read(config)
+            claim_path = fixture.root / "fixture.slot-2.json"
+            record: claim_state.RemoteJobClaim = {
+                "claim_id": "claim", "episode": request.episode, "attempt": "attempt",
+                "submitting_session": "", "pid": request.owner.pid, "proc_start": request.owner.start_time,
+                "remote_host": "saved-host", "what": "fixture", "worktree": str(fixture.root),
+                "since": "2026-11-01T12:00:00+00:00",
+            }
+            observe = cast(Callable[[wire.PlacementRequest, placement.PlacementDestination, Path,
+                            claim_state.RemoteJobClaim, str, conf.ConfigRead], execution_identity.ExecutionEvidence],
+                           getattr(fixture.server, "_observe_provider_execution"))
+            with (mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("fixture")),
+                  mock.patch.object(subprocess, "run", side_effect=[
+                      subprocess.CompletedProcess(["ssh"], 0, "0\tbad\n42\tfixture-start\n43\tother\n", ""),
+                      subprocess.CompletedProcess(["ssh"], 0, "0\tbad\n42\t\n", "")]) as ssh,
+                  mock.patch.object(offload, "write_backoff", wraps=offload.write_backoff) as write):
+                first = observe(request, destination, claim_path, record, "linux", configuration)
+                second = observe(request, destination, claim_path, record, "linux", configuration)
+            self.assertEqual(first, execution_identity.ObservedExecution(
+                execution_identity.ProcessExecution("saved-host", "", 42, "fixture-start")))
+            self.assertEqual(second, execution_identity.ExecutionEvidenceUnavailable(
+                "remote execution remains unresolved", fixture.clock.now()))
+            self.assertEqual(ssh.call_count, 2)
+            write.assert_not_called()
+
+    def test_unrecorded_provider_request_refuses_before_claim_paths(self) -> None:
+        """Admission provider dispatch row 1."""
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.mac_test import claim_state
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            key = fixture.server.host_evidence_key(request, destination)
+            with (mock.patch.object(records, "effective_target", wraps=records.effective_target) as target,
+                  mock.patch.object(claim_state, "locked", wraps=claim_state.locked) as lock,
+                  mock.patch.object(claim_state, "sweep_mac_replacements",
+                                    wraps=claim_state.sweep_mac_replacements) as sweep):
+                seen = fixture.server.read_provider_evidence(key)
+            self.assertEqual(seen, placement.HostEvidenceUnavailable(
+                key, fixture.clock.now(), "the placement request is unavailable"))
+            target.assert_not_called()
+            lock.assert_not_called()
+            sweep.assert_not_called()
+
+    def test_guest_backoff_missing_mark_still_reaches_block_and_settings(self) -> None:
+        """Admission mac-linux guest row 3."""
+        from scripts.build_queue.test_placement import mac_linux_candidate, mac_linux_fixture, placement_request
+        from scripts.build_targets import mac_linux
+        from scripts.mac_test import mac_test
+
+        with AdmissionFixture() as fixture:
+            backoff = mac_linux_fixture(fixture)
+            request = placement_request(fixture)
+            candidate = mac_linux_candidate()
+            request = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
+            key = fixture.server.host_evidence_key(request, candidate.destination)
+            fixture.server.host_requests[key] = request
+            backoff.unlink(missing_ok=True)
+            with (mock.patch.object(service, "mac_linux_backoff", wraps=service.mac_linux_backoff) as probe,
+                  mock.patch.object(mac_test, "blocking_claim_block", wraps=mac_test.blocking_claim_block) as block,
+                  mock.patch.object(mac_linux, "read_guest_main", return_value=mac_linux.EmptyGuestMain()) as ssh):
+                seen = fixture.server.read_provider_evidence(key)
+            assert isinstance(seen, placement.FreshHostEvidence)
+            self.assertEqual(seen.eligibility, placement.AllowedHost())
+            self.assertIsInstance(service.mac_linux_backoff(fixture.clock.now()), service.MacLinuxReadyForProbe)
+            probe.assert_called_once()
+            block.assert_called_once()
+            ssh.assert_called_once()
+
+    def test_guest_checks_legacy_mac_block_before_reading_guest_settings(self) -> None:
+        """Admission mac-linux guest row 4."""
+        from scripts.build_queue.test_placement import mac_linux_candidate, mac_linux_fixture, placement_request
+        from scripts.build_targets import mac_linux
+        from scripts.mac_test import mac_test
+
+        with AdmissionFixture() as fixture:
+            backoff = mac_linux_fixture(fixture)
+            request = placement_request(fixture)
+            candidate = mac_linux_candidate()
+            request = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
+            key = fixture.server.host_evidence_key(request, candidate.destination)
+            fixture.server.host_requests[key] = request
+            backoff.unlink(missing_ok=True)
+            trace = mock.Mock()
+            with (mock.patch.object(mac_test, "blocking_claim_block", wraps=mac_test.blocking_claim_block) as block,
+                  mock.patch.object(mac_linux, "read_settings", wraps=mac_linux.read_settings) as settings,
+                  mock.patch.object(mac_linux, "read_guest_main", return_value=mac_linux.EmptyGuestMain()) as ssh):
+                trace.attach_mock(block, "block")
+                trace.attach_mock(settings, "settings")
+                trace.attach_mock(ssh, "ssh")
+                seen = fixture.server.read_provider_evidence(key)
+            assert isinstance(seen, placement.FreshHostEvidence)
+            self.assertEqual(seen.eligibility, placement.AllowedHost())
+            self.assertEqual([call[0] for call in trace.mock_calls], ["block", "settings", "ssh"])
+            paths = cast(mac_test.StatePaths, block.call_args.args[0])
+            self.assertEqual(paths.directory, mac_test.state_paths().directory)
+
+    def test_foreign_mac_block_prevents_guest_settings_read_and_ssh(self) -> None:
+        """Admission mac-linux guest row 5."""
+        from scripts.build_queue.test_placement import mac_linux_candidate, mac_linux_fixture, placement_request
+        from scripts.build_targets import mac_linux
+        from scripts.mac_test import mac_test
+
+        with AdmissionFixture() as fixture:
+            backoff = mac_linux_fixture(fixture)
+            request = placement_request(fixture)
+            candidate = mac_linux_candidate()
+            request = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
+            key = fixture.server.host_evidence_key(request, candidate.destination)
+            fixture.server.host_requests[key] = request
+            backoff.unlink(missing_ok=True)
+            paths = mac_test.state_paths()
+            paths.block.parent.mkdir(parents=True, exist_ok=True)
+            since = datetime.now(UTC)
+            mac_test.write_block(paths.block, mac_test.ActiveMacBlock(
+                "fixture", "private hold", since, since + timedelta(hours=1),
+                mac_test.RecordedSession("another-session", "fixture"), mac_test.NO_SHOWRUNNER,
+                "off_before", mac_test.FREE_MESSAGE_NOT_NEEDED))
+            with (mock.patch.object(mac_linux, "read_settings", wraps=mac_linux.read_settings) as settings,
+                  mock.patch.object(mac_linux, "read_guest_main") as ssh):
+                seen = fixture.server.read_provider_evidence(key)
+            assert isinstance(seen, placement.FreshHostEvidence)
+            self.assertEqual(seen.eligibility, placement.TemporaryExclusion("blocked"))
+            settings.assert_not_called()
+            ssh.assert_not_called()
+
+    def test_native_mac_cycle_reuses_one_failed_host_read(self) -> None:
+        """Admission provider dispatch row 5."""
+        from contextvars import ContextVar
+        from scripts.mac_test import claim_state
+
+        with self.mac_backoff_fixture(backoff=False) as fixture:
+            server = fixture.admission.server
+            key = fixture.key
+            make_cycle = cast(Callable[[float, int, tuple[placement.HostEvidenceKey, ...]], object],
+                              getattr(service, "_MacHostProbeCycle"))
+            context = cast(ContextVar[object], getattr(service, "_MAC_HOST_PROBE_CYCLE"))
+            token = context.set(make_cycle(fixture.admission.clock.now(), 0, (key,)))
+            try:
+                with (mock.patch.object(server, "_read_mac_host", side_effect=OSError("fixture read failed")) as read,
+                      mock.patch.object(claim_state, "locked", wraps=claim_state.locked) as lock):
+                    first = server.read_provider_evidence(key)
+                    second = server.read_provider_evidence(key)
+                self.assertEqual(first, placement.HostEvidenceUnavailable(
+                    key, fixture.admission.clock.now(), "fixture read failed"))
+                self.assertEqual(second, first)
+                read.assert_called_once()
+                lock.assert_not_called()
+            finally:
+                context.reset(token)
+
+    def test_shared_mac_policy_error_precedes_claim_paths_for_that_key(self) -> None:
+        """Admission provider dispatch row 7."""
+        from contextvars import ContextVar
+        from scripts.build_targets import build_targets
+        from scripts.mac_test import claim_state, offload
+
+        with self.mac_backoff_fixture(backoff=False) as fixture:
+            server = fixture.admission.server
+            key = fixture.key
+            make_cycle = cast(Callable[[float, int, tuple[placement.HostEvidenceKey, ...]], object],
+                              getattr(service, "_MacHostProbeCycle"))
+            context = cast(ContextVar[object], getattr(service, "_MAC_HOST_PROBE_CYCLE"))
+            token = context.set(make_cycle(fixture.admission.clock.now(), 0, (key,)))
+            try:
+                with (mock.patch.object(build_targets, "step_policy", side_effect=ValueError("fixture policy fault")),
+                      mock.patch.object(claim_state, "state_paths", wraps=claim_state.state_paths) as paths,
+                      mock.patch.object(offload, "probe_mac_host", return_value=offload.UNAVAILABLE_PROBE)):
+                    seen = server.read_provider_evidence(key)
+                self.assertEqual(seen, placement.HostEvidenceUnavailable(
+                    key, fixture.admission.clock.now(), "fixture policy fault"))
+                paths.assert_called_once_with("mac")
+            finally:
+                context.reset(token)
+
+    def test_shared_mac_read_resolves_paths_again_without_rereading_claims(self) -> None:
+        """Admission provider dispatch row 8."""
+        from contextvars import ContextVar
+        from scripts.mac_test import claim_state, offload
+
+        with self.mac_backoff_fixture(backoff=False) as fixture:
+            server = fixture.admission.server
+            key = fixture.key
+            make_cycle = cast(Callable[[float, int, tuple[placement.HostEvidenceKey, ...]], object],
+                              getattr(service, "_MacHostProbeCycle"))
+            context = cast(ContextVar[object], getattr(service, "_MAC_HOST_PROBE_CYCLE"))
+            token = context.set(make_cycle(fixture.admission.clock.now(), 0, (key,)))
+            try:
+                with (mock.patch.object(claim_state, "state_paths", wraps=claim_state.state_paths) as paths,
+                      mock.patch.object(claim_state, "read_claims", wraps=claim_state.read_claims) as claims,
+                      mock.patch.object(offload, "probe_mac_host", return_value=offload.UNAVAILABLE_PROBE)):
+                    seen = server.read_provider_evidence(key)
+                self.assertIsInstance(seen, placement.FreshHostEvidence)
+                self.assertEqual(paths.call_count, 3)
+                self.assertEqual(claims.call_count, 2)
+            finally:
+                context.reset(token)
+
+    def test_shared_mac_off_skips_recovery_and_ssh(self) -> None:
+        """Admission shared macOS reading row 6."""
+        from contextvars import ContextVar
+        from scripts.mac_test import offload
+
+        with self.mac_backoff_fixture(backoff=False) as fixture:
+            server = fixture.admission.server
+            key = fixture.key
+            make_cycle = cast(Callable[[float, int, tuple[placement.HostEvidenceKey, ...]], object],
+                              getattr(service, "_MacHostProbeCycle"))
+            context = cast(ContextVar[object], getattr(service, "_MAC_HOST_PROBE_CYCLE"))
+            token = context.set(make_cycle(fixture.admission.clock.now(), 0, (key,)))
+            try:
+                _ = write_config_fixture(conf.path("mac_test"), "offload=off\n", template="mac_test")
+                with (mock.patch.object(server, "_begin_mac_backoff_probe",
+                                        wraps=getattr(server, "_begin_mac_backoff_probe")) as recovery,
+                      mock.patch.object(offload, "probe_mac_host") as ssh):
+                    seen = server.read_provider_evidence(key)
+                assert isinstance(seen, placement.FreshHostEvidence)
+                self.assertEqual(seen.eligibility, placement.TemporaryExclusion("off"))
+                recovery.assert_not_called()
+                ssh.assert_not_called()
+            finally:
+                context.reset(token)
+
+    def test_shared_mac_backoff_from_ssh_wins_over_failed_probe(self) -> None:
+        """Admission shared macOS reading row 12."""
+        from contextvars import ContextVar
+        from scripts.mac_test import eligibility, offload
+
+        with self.mac_backoff_fixture(backoff=False) as fixture:
+            server = fixture.admission.server
+            key = fixture.key
+            make_cycle = cast(Callable[[float, int, tuple[placement.HostEvidenceKey, ...]], object],
+                              getattr(service, "_MacHostProbeCycle"))
+            context = cast(ContextVar[object], getattr(service, "_MAC_HOST_PROBE_CYCLE"))
+            token = context.set(make_cycle(fixture.admission.clock.now(), 0, (key,)))
+            try:
+                def fail_after_backoff(*_args: object, **_kwargs: object) -> offload.UnavailableProbe:
+                    fixture.backoff.parent.mkdir(parents=True, exist_ok=True)
+                    _ = fixture.backoff.write_text(f"{time.time() + 100}\n")
+                    return offload.UNAVAILABLE_PROBE
+
+                with (mock.patch.object(offload, "probe_mac_host", side_effect=fail_after_backoff) as ssh,
+                      mock.patch.object(eligibility, "read_backoff", wraps=eligibility.read_backoff) as read,
+                      mock.patch.object(offload, "write_backoff", wraps=offload.write_backoff) as write):
+                    seen = server.read_provider_evidence(key)
+                assert isinstance(seen, placement.FreshHostEvidence)
+                self.assertEqual(seen.eligibility, placement.TemporaryExclusion("backoff"))
+                self.assertEqual(read.call_count, 3)
+                ssh.assert_called_once()
+                write.assert_not_called()
+            finally:
+                context.reset(token)
+
+    def test_shared_mac_policy_exclusion_skips_capacity_and_disk_check(self) -> None:
+        """Admission shared macOS reading row 17."""
+        from contextvars import ContextVar
+        from scripts.build_targets import build_targets
+        from scripts.mac_test import mac_test, offload
+
+        with self.mac_backoff_fixture(backoff=False) as fixture:
+            server = fixture.admission.server
+            key = fixture.key
+            make_cycle = cast(Callable[[float, int, tuple[placement.HostEvidenceKey, ...]], object],
+                              getattr(service, "_MacHostProbeCycle"))
+            context = cast(ContextVar[object], getattr(service, "_MAC_HOST_PROBE_CYCLE"))
+            token = context.set(make_cycle(fixture.admission.clock.now(), 0, (key,)))
+            try:
+                _ = write_config_fixture(conf.path("mac_test"), "offload=off\n", template="mac_test")
+                with (mock.patch.object(mac_test, "free_now", wraps=mac_test.free_now) as capacity,
+                      mock.patch.object(build_targets, "mac_disk_recovery_eligibility",
+                                        wraps=build_targets.mac_disk_recovery_eligibility) as disk,
+                      mock.patch.object(offload, "probe_mac_host") as ssh):
+                    seen = server.read_provider_evidence(key)
+                assert isinstance(seen, placement.FreshHostEvidence)
+                self.assertEqual(seen.eligibility, placement.TemporaryExclusion("off"))
+                capacity.assert_not_called()
+                disk.assert_not_called()
+                ssh.assert_not_called()
+            finally:
+                context.reset(token)
+
+    def test_hana_dispatch_passes_one_configuration_and_skips_mac_claim_scan(self) -> None:
+        """Admission provider dispatch row 4."""
+        from scripts.aws_target import hana_placement
+        from scripts.aws_target.ledger_test_support import install_hana_spending_settings, text_setting
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.build_targets import build_targets, target_config
+        from scripts.mac_test import claim_state
+
+        with AdmissionFixture() as fixture:
+            settings = fixture.root / "hana.conf"
+            install_hana_spending_settings(settings)
+            text_setting(settings, "execution_transport", "hana-control")
+            text_setting(settings, "enabled", "off")
+            target = target_config.SshTarget("fixture", "linux", settings)
+            request = placement_request(fixture)
+            destination = replace(request.constraints.candidates[0].destination, provider="ssh", target=target.name)
+            candidate = placement.PlacementCandidate(destination, settings=placement.ExplicitProviderSettings(settings))
+            request = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
+            key = fixture.server.host_evidence_key(request, destination)
+            fixture.server.host_requests[key] = request
+            with (mock.patch.object(target_config, "read_targets", return_value=(target,)),
+                  mock.patch.object(target_config, "read_execution_transport",
+                                    wraps=target_config.read_execution_transport) as transport,
+                  mock.patch.object(hana_placement, "read_evidence", wraps=hana_placement.read_evidence) as hana,
+                  mock.patch.object(build_targets, "ssh_target_eligibility") as ssh,
+                  mock.patch.object(claim_state, "locked", wraps=claim_state.locked) as lock):
+                seen = fixture.server.read_provider_evidence(key)
+            assert isinstance(seen, placement.FreshHostEvidence)
+            self.assertEqual(seen.eligibility, placement.FixedExclusion("off"))
+            hana.assert_called_once()
+            transport.assert_called_once()
+            self.assertIs(cast(object, hana.call_args.kwargs["workload"]),
+                          cast(object, transport.call_args.kwargs["configuration"]))
+            ssh.assert_not_called()
+            lock.assert_not_called()
+
+    def test_per_key_mac_locks_and_sweeps_claims_after_eligibility(self) -> None:
+        """Admission provider dispatch row 9."""
+        from scripts.build_targets import build_targets
+        from scripts.mac_test import claim_state, offload
+
+        with self.mac_backoff_fixture(backoff=False) as fixture:
+            trace = mock.Mock()
+            observed = offload.ProbeSnapshot(80, "fixture-mac")
+            with (mock.patch.object(build_targets, "ssh_target_eligibility",
+                                    wraps=build_targets.ssh_target_eligibility) as route,
+                  mock.patch.object(offload, "probe_mac", return_value=observed) as probe,
+                  mock.patch.object(claim_state, "locked", wraps=claim_state.locked) as lock,
+                  mock.patch.object(claim_state, "sweep_mac_replacements",
+                                    wraps=claim_state.sweep_mac_replacements) as sweep):
+                for name, spy in (("route", route), ("probe", probe), ("lock", lock), ("sweep", sweep)):
+                    trace.attach_mock(spy, name)
+                seen = fixture.admission.server.read_provider_evidence(fixture.key)
+            assert isinstance(seen, placement.FreshHostEvidence)
+            self.assertEqual(seen.eligibility, placement.AllowedHost())
+            self.assertEqual([call[0] for call in trace.mock_calls], ["route", "probe", "lock", "sweep"])
+
+    def test_mac_capacity_recheck_sees_block_added_after_probe(self) -> None:
+        """Admission provider dispatch row 10."""
+        from scripts.mac_test import claim_state, mac_test, offload
+
+        with self.mac_backoff_fixture(backoff=False) as fixture:
+            def add_block(*_args: object) -> offload.ProbeSnapshot:
+                paths = claim_state.state_paths("mac")
+                paths.block.parent.mkdir(parents=True, exist_ok=True)
+                since = datetime.now(UTC)
+                mac_test.write_block(paths.block, mac_test.ActiveMacBlock(
+                    "fixture", "new hold", since, since + timedelta(hours=1),
+                    mac_test.RecordedSession("another-session", "fixture"), mac_test.NO_SHOWRUNNER,
+                    "off_before", mac_test.FREE_MESSAGE_NOT_NEEDED))
+                return offload.ProbeSnapshot(80, "fixture-mac")
+
+            trace = mock.Mock()
+            with (mock.patch.object(offload, "probe_mac", side_effect=add_block) as probe,
+                  mock.patch.object(mac_test, "free_now", wraps=mac_test.free_now) as capacity):
+                trace.attach_mock(probe, "probe")
+                trace.attach_mock(capacity, "capacity")
+                seen = fixture.admission.server.read_provider_evidence(fixture.key)
+            assert isinstance(seen, placement.FreshHostEvidence)
+            self.assertEqual(seen.eligibility, placement.TemporaryExclusion("blocked"))
+            self.assertEqual([call[0] for call in trace.mock_calls], ["capacity", "probe", "capacity"])
+
+    def test_linux_scope_is_resolved_again_before_selecting_a_holder(self) -> None:
+        """Admission provider dispatch row 11."""
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.build_targets import build_targets, target_config
+        from scripts.mac_test import claim_state, mac_test
+
+        with AdmissionFixture() as fixture:
+            repository = fixture.root / "source"
+            (repository / ".git").mkdir(parents=True)
+            settings = fixture.root / "linux.conf"
+            _ = write_config_fixture(settings, "host=fixture-linux\n", template="mac_test")
+            target = target_config.SshTarget("linux", "linux", settings)
+            request = placement_request(fixture)
+            destination = placement.PlacementDestination("ssh", "linux", "fixture-linux",
+                                                        claim_state.WHOLE_MAC)
+            candidate = placement.PlacementCandidate(destination, settings=placement.ExplicitProviderSettings(settings))
+            request = replace(request, constraints=replace(request.constraints,
+                repository=str(repository), candidates=(candidate,)))
+            paths = claim_state.StatePaths(fixture.root / "linux", "linux", platform="linux")
+            paths.claims.mkdir(parents=True)
+            mac_test.write_json(paths.claims / "unrelated.json", {
+                "claim_id": "unrelated", "episode": "other", "attempt": "other", "submitting_session": "",
+                "pid": request.owner.pid, "proc_start": request.owner.start_time, "holder_session": "unrelated",
+                "what": "wrong repository", "worktree": str(fixture.root / "other"), "repo_name": "unrelated",
+                "since": "2026-11-01T12:00:00+00:00",
+            })
+            key = fixture.server.host_evidence_key(request, destination)
+            fixture.server.host_requests[key] = request
+            with (mock.patch.object(target_config, "read_targets", return_value=(target,)),
+                  mock.patch.object(build_targets, "ssh_target_eligibility", return_value=target_config.EligibleTarget(target)),
+                  mock.patch.object(claim_state, "state_paths", return_value=paths),
+                  mock.patch.object(claim_state, "target_claim_scope", wraps=claim_state.target_claim_scope) as scope,
+                  mock.patch.object(mac_test, "run_holds_work", wraps=mac_test.run_holds_work) as held):
+                seen = fixture.server.read_provider_evidence(key)
+            assert isinstance(seen, placement.FreshHostEvidence)
+            scope.assert_called_once_with(paths, str(repository))
+            held.assert_not_called()
+            self.assertEqual(seen.holder, placement.ResourceHolderUnknown())
+
+    def test_kept_mac_claim_sets_cleanup_diagnostic_before_work_check(self) -> None:
+        """Admission provider dispatch row 12."""
+        from scripts.lib import process_start
+        from scripts.mac_test import claim_state, mac_test
+
+        with self.mac_backoff_fixture(backoff=False) as fixture:
+            server = fixture.admission.server
+            paths = claim_state.state_paths("mac")
+            paths.claims.mkdir(parents=True, exist_ok=True)
+            key = fixture.key
+            request = server.host_requests[key]
+            read_key = replace(key, command_kind="probe")
+            server.host_requests[read_key] = request
+            record: claim_state.RemoteJobClaim = {
+                "claim_id": "fixture", "episode": "another", "attempt": "attempt", "submitting_session": "",
+                "pid": request.owner.pid, "proc_start": request.owner.start_time, "remote_host": "fixture-mac",
+                "what": "fixture work", "worktree": request.constraints.repository,
+                "since": "2026-11-01T12:00:00+00:00",
+            }
+            record["cleanup_pending"] = True
+            mac_test.write_json(paths.claims / "fixture.json", record)
+            with (mock.patch.object(process_start, "process_start", return_value=process_start.Gone()),
+                  mock.patch.object(mac_test, "run_holds_work", wraps=mac_test.run_holds_work) as held):
+                seen = server.read_provider_evidence(read_key)
+            assert isinstance(seen, placement.FreshHostEvidence)
+            self.assertEqual(seen.provider_diagnostic, placement.BusyProviderDiagnostic(
+                "mac", "fixture work (kept for cleanup)", record["since"]))
+            held.assert_not_called()
+
+    def test_holder_scan_stops_at_first_foreign_live_session(self) -> None:
+        """Admission provider dispatch row 13."""
+        from scripts.lib import process_start
+        from scripts.mac_test import claim_state, mac_test
+
+        with self.mac_backoff_fixture(backoff=False) as fixture:
+            server = fixture.admission.server
+            paths = claim_state.state_paths("mac")
+            paths.claims.mkdir(parents=True, exist_ok=True)
+            key = fixture.key
+            request = server.host_requests[key]
+            read_key = replace(key, command_kind="probe")
+            server.host_requests[read_key] = request
+            record: claim_state.RemoteJobClaim = {
+                "claim_id": "fixture", "episode": "another", "attempt": "attempt", "submitting_session": "",
+                "pid": request.owner.pid, "proc_start": request.owner.start_time, "remote_host": "fixture-mac",
+                "what": "fixture work", "worktree": request.constraints.repository,
+                "since": "2026-11-01T12:00:00+00:00",
+            }
+            for index, owner in enumerate(("first-holder", "second-holder")):
+                entry: claim_state.RemoteJobClaim = {
+                    **record, "claim_id": owner, "holder_session": owner,
+                    "since": f"2026-11-01T12:00:0{index}+00:00",
+                }
+                mac_test.write_json(paths.claims / f"{owner}.json", entry)
+            with (mock.patch.object(process_start, "process_start",
+                                    return_value=process_start.Started(record["proc_start"])),
+                  mock.patch.object(mac_test, "run_holds_work", wraps=mac_test.run_holds_work) as held):
+                seen = server.read_provider_evidence(read_key)
+            assert isinstance(seen, placement.FreshHostEvidence)
+            self.assertEqual(seen.holder, placement.ResourceHolderSession("first-holder"))
+            held.assert_called_once()
+
+    def test_provider_projection_retains_cleanup_and_skips_local_claims(self) -> None:
+        """Admission provider dispatch row 14."""
+        from scripts.mac_test import claim_state, mac_test
+
+        with self.mac_backoff_fixture(backoff=False) as fixture:
+            server = fixture.admission.server
+            paths = claim_state.state_paths("mac")
+            paths.claims.mkdir(parents=True, exist_ok=True)
+            key = fixture.key
+            request = server.host_requests[key]
+            read_key = replace(key, command_kind="probe")
+            server.host_requests[read_key] = request
+            record: claim_state.RemoteJobClaim = {
+                "claim_id": "fixture", "episode": "another", "attempt": "attempt", "submitting_session": "",
+                "pid": request.owner.pid, "proc_start": request.owner.start_time, "remote_host": "fixture-mac",
+                "what": "fixture work", "worktree": request.constraints.repository,
+                "since": "2026-11-01T12:00:00+00:00",
+            }
+            record["cleanup_pending"] = True
+            mac_test.write_json(paths.claims / "remote.json", record)
+            waiting = {name: value for name, value in record.items() if name not in ("remote_host", "cleanup_pending")}
+            mac_test.write_json(paths.claims / "waiting.json", {**waiting, "claim_id": "local"})
+            with mock.patch.object(server, "_observe_provider_execution",
+                                   wraps=getattr(server, "_observe_provider_execution")) as observation:
+                seen = server.read_provider_evidence(read_key)
+            assert isinstance(seen, placement.FreshHostEvidence)
+            self.assertEqual(seen.claims, ())
+            cleanup, = seen.cleanup_claims
+            self.assertEqual(cleanup.reference.claim_id, record["claim_id"])
+            self.assertEqual(seen.executions, ((cleanup.reference, execution_identity.ExecutionEvidenceUnavailable(
+                "provider cleanup remains unresolved", fixture.admission.clock.now())),))
+            observation.assert_not_called()
+
+    def test_per_key_provider_observes_each_adopted_claim_once(self) -> None:
+        """Admission provider dispatch row 15."""
+        from scripts.mac_test import claim_state, mac_test
+
+        with self.mac_backoff_fixture(backoff=False) as fixture:
+            server = fixture.admission.server
+            paths = claim_state.state_paths("mac")
+            paths.claims.mkdir(parents=True, exist_ok=True)
+            key = fixture.key
+            request = server.host_requests[key]
+            read_key = replace(key, command_kind="probe")
+            server.host_requests[read_key] = request
+            record: claim_state.RemoteJobClaim = {
+                "claim_id": "fixture", "episode": "another", "attempt": "attempt", "submitting_session": "",
+                "pid": request.owner.pid, "proc_start": request.owner.start_time, "remote_host": "fixture-mac",
+                "what": "fixture work", "worktree": request.constraints.repository,
+                "since": "2026-11-01T12:00:00+00:00",
+            }
+            mac_test.write_json(paths.claims / "fixture.json", record)
+            with mock.patch.object(server, "_observe_provider_execution",
+                                   wraps=getattr(server, "_observe_provider_execution")) as observation:
+                seen = server.read_provider_evidence(read_key)
+            assert isinstance(seen, placement.FreshHostEvidence)
+            adopted, = seen.claims
+            self.assertEqual(adopted.reference.claim_id, record["claim_id"])
+            self.assertEqual(seen.executions, ((adopted.reference, execution_identity.ExecutionEvidenceUnavailable(
+                "the claim has no saved Mac mirror", fixture.admission.clock.now())),))
+            observation.assert_called_once()
+
     def test_failed_execution_probes_start_the_provider_backoff(self) -> None:
         from scripts.build_queue import placement
         from scripts.build_queue.test_placement import placement_request

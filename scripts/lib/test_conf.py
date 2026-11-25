@@ -48,6 +48,32 @@ class ConfTests(unittest.TestCase):
     def write(self, value: str) -> None:
         _ = self.path.write_text(value, encoding="utf-8")
 
+    def test_valid_host_value_and_default_skip_warning_and_history(self) -> None:
+        """Configuration reading and recovery row 2."""
+        self.write("# whole: 1..4\namount=2\n# whole: 5..8\namount.fixture=6\n")
+        with (mock.patch("scripts.lib.conf.socket.gethostname", return_value="fixture"),
+              mock.patch.object(conf, "_committed_files") as history,
+              redirect_stderr(io.StringIO()) as warning):
+            settings = conf.read(self.path)
+            self.assertEqual(settings.whole("amount"), 6)
+            self.assertEqual(settings.value("absent", int, default=3), 3)
+        history.assert_not_called()
+        self.assertEqual(warning.getvalue(), "")
+
+    def test_invalid_value_without_recovery_skips_warning_and_history(self) -> None:
+        """Configuration reading and recovery row 3."""
+        self.history()
+        contents = "# whole: 1..4\namount=8\n"
+        self.write(contents)
+        with (mock.patch.object(conf, "_committed_files") as history,
+              redirect_stderr(io.StringIO()) as warning,
+              self.assertRaises(conf.Unusable) as failure):
+            _ = conf.read(self.path).value("amount", int, recover_invalid=False)
+        self.assertIn("amount='8'", str(failure.exception))
+        history.assert_not_called()
+        self.assertEqual(warning.getvalue(), "")
+        self.assertEqual(self.path.read_text(), contents)
+
     def test_comments_start_only_at_a_line_start_or_after_whitespace(self) -> None:
         self.write("# comment=value\n  # indented=value\n"
                    + "color=#a0522d # comment\nname=brown\t# comment\n"

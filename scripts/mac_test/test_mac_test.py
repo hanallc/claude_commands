@@ -1216,6 +1216,49 @@ finally:
                 self.assertEqual(decoded[key], record[key])
         self.assertEqual(path.read_bytes(), before)
 
+    def test_disabled_guest_returns_before_scope_and_claim_reads(self) -> None:
+        """free_now row 3."""
+        from scripts.mac_test import eligibility
+
+        _ = (self.root / "build_targets.conf").write_text("enabled.mac-linux=off\n")
+        paths = claim_state.StatePaths(self.state_directory, "mac-linux", platform="linux")
+        with (mock.patch.dict(os.environ, self.environment, clear=True),
+              mock.patch.object(eligibility, "read_backoff") as backoff,
+              mock.patch.object(mac_test, "target_claim_scope") as scope,
+              mock.patch.object(mac_test, "read_claims") as claims):
+            self.assertEqual(mac_test.free_now(paths, self.config_path, self.root), "off")
+        backoff.assert_not_called()
+        scope.assert_not_called()
+        claims.assert_not_called()
+        self.assertFalse(paths.lock.exists())
+
+    def test_native_guest_requires_scope_before_block_or_claim_reads(self) -> None:
+        """free_now row 13."""
+        paths = claim_state.StatePaths(self.state_directory)
+        with (mock.patch.dict(os.environ, self.environment, clear=True),
+              mock.patch.object(mac_test, "blocking_claim_block") as block,
+              mock.patch.object(mac_test, "read_claims") as claims):
+            self.assertEqual(mac_test.free_now(paths, self.config_path, self.root,
+                mac_kind=mac_test.MacClaimKind.GUEST, mac_scope=claim_state.WHOLE_MAC), "state")
+        block.assert_not_called()
+        claims.assert_not_called()
+        self.assertFalse(paths.lock.exists())
+
+    def test_native_guest_checks_failed_probe_and_skips_version_decline(self) -> None:
+        """free_now row 33."""
+        from scripts.mac_test import eligibility
+
+        paths = claim_state.StatePaths(self.state_directory)
+        with (mock.patch.dict(os.environ, self.environment, clear=True),
+              mock.patch.object(eligibility, "read_failed_probe", wraps=eligibility.read_failed_probe) as failed,
+              mock.patch.object(eligibility, "linux_version_decline_path") as decline):
+            self.assertEqual(mac_test.free_now(paths, self.config_path, self.root,
+                mac_kind=mac_test.MacClaimKind.GUEST,
+                mac_scope=claim_state.RepositoryScope("fixture", "fixture-key")), "free")
+        failed.assert_called_once_with("mac")
+        decline.assert_not_called()
+        self.assertFalse(paths.lock.exists())
+
     def test_free_now_answers_from_local_state_alone(self) -> None:
         self.write_config(offload="off")
         self.assert_command(self.command("free-now"), 1, "off\n")

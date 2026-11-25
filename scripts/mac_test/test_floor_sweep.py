@@ -64,6 +64,65 @@ class FloorSweepTests(unittest.TestCase):
     def sweep(self) -> offload.MacDiskReady | offload.SweepShort | offload.SweepFailed:
         return offload.ensure_mac_disk_floor(self.controller, eligibility.read_config(self.settings), self.repository, self.before)
 
+    def test_ready_disk_reading_skips_the_sweep_lock_file(self) -> None:
+        """Mac disk sweep row 2."""
+        config = eligibility.read_config(self.settings)
+        with (mock.patch.object(fcntl, "flock", wraps=fcntl.flock) as lock,
+              mock.patch.object(self.controller, "capture") as command):
+            self.assertEqual(offload.ensure_mac_disk_floor(
+                self.controller, config, self.repository, offload.ProbeSnapshot(100, "fake-mac")),
+                offload.MacDiskReady(100))
+        lock.assert_not_called()
+        command.assert_not_called()
+        self.assertFalse((self.root / "state").exists())
+
+    def test_sweep_creates_its_directory_and_file_before_locking(self) -> None:
+        """Mac disk sweep row 3."""
+        state = self.root / "state"
+        path = state / "floor-sweep-mac.lock"
+        self.assertFalse(state.exists())
+        flock = fcntl.flock
+
+        def lock_file(stream: TextIO, operation: int) -> None:
+            self.assertEqual(path.read_text(), "")
+            self.assertEqual(os.fstat(stream.fileno()).st_ino, path.stat().st_ino)
+            flock(stream, operation)
+
+        with (mock.patch.object(fcntl, "flock", side_effect=lock_file) as lock,
+              mock.patch.object(self.controller, "capture", return_value=offload.CommandOutput(0, "", "")),
+              mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(105, "fake-mac"))):
+            self.assertEqual(self.sweep(), offload.MacDiskReady(105))
+        lock.assert_called_once()
+
+    def test_sweep_flushes_the_interrupted_marker_before_ssh(self) -> None:
+        """Mac disk sweep row 5."""
+        path = self.root / "state/floor-sweep-mac.lock"
+
+        def capture(_arguments: list[str], _deadline: offload.CommandDeadline) -> offload.CommandOutput:
+            self.assertEqual(path.read_text(), "floor sweep was interrupted")
+            with path.open("r") as locked_file, self.assertRaises(BlockingIOError):
+                fcntl.flock(locked_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return offload.CommandOutput(0, "", "")
+
+        with (mock.patch.object(self.controller, "capture", side_effect=capture) as command,
+              mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(105, "fake-mac"))):
+            self.assertEqual(self.sweep(), offload.MacDiskReady(105))
+        command.assert_called_once()
+
+    def test_sweep_replaces_the_marker_before_the_final_disk_read(self) -> None:
+        """Mac disk sweep row 8."""
+        path = self.root / "state/floor-sweep-mac.lock"
+
+        def recheck(*_arguments: object) -> offload.ProbeSnapshot:
+            self.assertEqual(path.read_text(), "floor sweep exited with status 1: permission denied")
+            return offload.ProbeSnapshot(105, "fake-mac")
+
+        with (mock.patch.object(self.controller, "capture",
+                               return_value=offload.CommandOutput(1, "", "permission denied")),
+              mock.patch.object(offload, "probe_mac", side_effect=recheck) as probe):
+            self.assertEqual(self.sweep(), offload.SweepFailed("floor sweep exited with status 1: permission denied"))
+        probe.assert_called_once()
+
     def test_host_probe_reads_disk_and_saved_mirror_processes_in_one_command(self) -> None:
         _ = write_config_fixture(self.settings, "host=fixture-mac\nmirror_root=~/fixture-mirrors\n")
         scans = self.root / "scans"

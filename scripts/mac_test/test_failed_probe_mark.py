@@ -101,6 +101,344 @@ class FailedProbeTests(OffloadCommandFixture):
         return build_targets.command_release_wait(os.getpid(),
             identity=claim_state.claim_identity(claim.record), session=NoOwningSession())
 
+    def test_probe_resolves_target_before_taking_its_start_stamp(self) -> None:
+        """offload.probe_mac row 1."""
+        calls: list[str] = []
+        resolve = eligibility.configured_ssh_target
+
+        def target(name: str) -> target_config.SshTarget:
+            calls.append("target")
+            return resolve(name)
+
+        def started() -> int:
+            calls.append("started")
+            return 100
+
+        def capture(_arguments: list[str], _deadline: offload.CommandDeadline) -> offload.CommandOutput:
+            calls.append("ssh")
+            return offload.CommandOutput(0, "rc=0\nfree_gib=42\nhost=fixture\n", "")
+
+        config = eligibility.read_config(self.config_path)
+        with (mock.patch.object(eligibility, "configured_ssh_target", side_effect=target),
+              mock.patch.object(time, "time_ns", side_effect=started),
+              mock.patch.object(offload.ProcessController, "capture", side_effect=capture),
+              mock.patch.object(offload, "record_reachable", wraps=offload.record_reachable) as reachable):
+            self.assertEqual(offload.probe_mac(offload.ProcessController(), config, self.identity),
+                             offload.ProbeSnapshot(42, "fixture"))
+        self.assertEqual(calls, ["target", "started", "target", "target", "ssh"])
+        reachable.assert_called_once_with("mac", probe_started_ns=100)
+
+    def test_linux_probe_requires_execution_settings_before_ssh_and_fence(self) -> None:
+        """offload.probe_mac row 2."""
+        from scripts.lib.atomic_file import write_text_atomic
+        from scripts.lib import conf
+
+        settings = eligibility.probe_settings(conf.read(self.linux_settings))
+        controller = offload.ProcessController()
+        controller.claim_identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
+        paths = mac_test.state_paths("box")
+        with (mock.patch.object(controller, "capture") as ssh,
+              mock.patch.object(offload, "write_text_atomic", wraps=write_text_atomic) as write,
+              self.assertRaisesRegex(ValueError, "requires execution settings")):
+            _ = offload.probe_mac(controller, settings, self.identity, "box")
+        ssh.assert_not_called()
+        write.assert_not_called()
+        self.assertFalse((paths.directory / "pending-starts").exists())
+
+    def test_mac_probe_resolves_mirror_before_writing_start_fence(self) -> None:
+        """offload.probe_mac row 5."""
+        from scripts.lib.atomic_file import write_text_atomic
+        from scripts.copies import copies
+
+        controller = offload.ProcessController()
+        controller.claim_identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
+        config = eligibility.read_config(self.config_path)
+        calls = mock.Mock()
+        with (mock.patch.object(offload, "mac_mirror_root", wraps=offload.mac_mirror_root) as mirror,
+              mock.patch.object(copies, "mirror_probe_setup", wraps=copies.mirror_probe_setup) as setup,
+              mock.patch.object(offload, "write_text_atomic", wraps=write_text_atomic) as write,
+              mock.patch.object(controller, "capture",
+                                return_value=offload.CommandOutput(0, "rc=0\nfree_gib=42\nhost=fixture\n", "")) as ssh):
+            for name, spy in (("mirror", mirror), ("setup", setup), ("write", write), ("ssh", ssh)):
+                calls.attach_mock(spy, name)
+            result = offload.probe_mac(controller, config, self.identity)
+        self.assertEqual(result, offload.ProbeSnapshot(42, "fixture"))
+        self.assertEqual([call[0] for call in calls.mock_calls], ["mirror", "setup", "write", "ssh"])
+
+    def test_probe_uses_bounded_ssh_before_claim_state_lock(self) -> None:
+        """offload.probe_mac row 7."""
+        controller = offload.ProcessController()
+        controller.claim_identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
+        config = eligibility.read_config(self.config_path)
+        lock_path = mac_test.state_paths().lock
+
+        def capture(arguments: list[str], deadline: offload.CommandDeadline) -> offload.CommandOutput:
+            self.assertEqual(arguments[0], "ssh")
+            self.assertEqual(arguments[-2], config.host)
+            self.assertEqual(deadline, offload.CommandTimeLimit(config.probe_timeout_s))
+            self.assertFalse(lock_path.exists())
+            return offload.CommandOutput(0, "rc=0\nfree_gib=123\nhost=fixture-host\n", "")
+
+        with mock.patch.object(controller, "capture", side_effect=capture) as ssh:
+            result = offload.probe_mac(controller, config, self.identity)
+        ssh.assert_called_once()
+        self.assertEqual(result, offload.ProbeSnapshot(123, "fixture-host"))
+
+    def test_unresolved_linux_startup_does_not_publish_probe_failure(self) -> None:
+        """offload.probe_mac row 8."""
+        controller = offload.ProcessController()
+        config = eligibility.read_config(self.linux_settings)
+        with (mock.patch.object(controller, "capture", side_effect=[
+                  offload.CommandOutput(0, "", ""),
+                  offload.CommandOutput(1, "linux_startup=unresolved\n", "")]) as ssh,
+              mock.patch.object(claim_state, "locked", wraps=claim_state.locked) as lock):
+            result = offload.probe_mac(controller, config, self.identity, "box")
+        self.assertEqual(result, offload.UnresolvedSlotStartup())
+        self.assertEqual(ssh.call_count, 2)
+        lock.assert_not_called()
+        self.assertFalse((mac_test.state_paths("box").directory / "failed_probe").exists())
+
+    def test_probe_failure_resolves_mark_path_after_ssh_before_lock(self) -> None:
+        """Probe result and backoff helpers row 5."""
+        controller = offload.ProcessController()
+        config = eligibility.read_config(self.config_path)
+        lock_path = mac_test.state_paths().directory / offload.PROBE_RESULT_LOCK_NAME
+        calls = mock.Mock()
+        with (mock.patch.object(eligibility, "state_directory", wraps=eligibility.state_directory) as directory,
+              mock.patch.object(claim_state, "locked", wraps=claim_state.locked) as lock,
+              mock.patch.object(controller, "capture", return_value=offload.COMMAND_TIMED_OUT) as ssh):
+            for name, spy in (("directory", directory), ("lock", lock), ("ssh", ssh)):
+                calls.attach_mock(spy, name)
+            result = offload.probe_mac(controller, config, self.identity)
+        self.assertEqual(result, offload.UNAVAILABLE_PROBE)
+        self.assertEqual([call[0] for call in calls.mock_calls], ["ssh", "directory", "lock"])
+        lock.assert_called_once_with(lock_path, wait=False)
+        self.assertEqual((lock_path.parent / "failed_probe").read_text(), "failed\n")
+
+    def test_failed_probe_does_not_wait_for_the_result_lock(self) -> None:
+        """Probe result and backoff helpers row 6."""
+        controller = offload.ProcessController()
+        config = eligibility.read_config(self.config_path)
+        lock_path = mac_test.state_paths().directory / offload.PROBE_RESULT_LOCK_NAME
+        with (claim_state.locked(lock_path),
+              mock.patch.object(controller, "capture", return_value=offload.COMMAND_TIMED_OUT),
+              mock.patch.object(claim_state, "locked", wraps=claim_state.locked) as lock):
+            result = offload.probe_mac(controller, config, self.identity)
+        self.assertEqual(result, offload.UNAVAILABLE_PROBE)
+        lock.assert_called_once_with(lock_path, wait=False)
+        self.assertFalse((lock_path.parent / "failed_probe").exists())
+
+    def test_backoff_write_obeys_the_caller_lock_mode(self) -> None:
+        """Probe result and backoff helpers row 9."""
+        path = eligibility.backoff_path("box")
+        lock_path = path.parent / offload.PROBE_RESULT_LOCK_NAME
+        deadline = time.time() + 60
+        with (claim_state.locked(lock_path),
+              mock.patch.object(claim_state, "locked", wraps=claim_state.locked) as lock):
+            offload.write_backoff(deadline, "box", wait=False)
+            lock.assert_called_once_with(lock_path, wait=False)
+            self.assertFalse(path.exists())
+        with mock.patch.object(claim_state, "locked", wraps=claim_state.locked) as lock:
+            offload.write_backoff(deadline, "box")
+        lock.assert_called_once_with(lock_path, wait=True)
+        self.assertEqual(path.read_text(), f"{deadline:.6f}\n")
+
+    def test_mac_probe_locks_claim_state_after_transport_for_watch_origin(self) -> None:
+        """offload.probe_mac row 10."""
+        from scripts.mac_test.mirror_root import MacMirrorRoot
+
+        config = eligibility.read_config(self.config_path)
+        controller = offload.ProcessController()
+        controller.claim_target = "mac"
+        identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
+        controller.claim_identity = identity
+        repository = claim_state.MacRepositoryIdentity("key", "fixture", "fixture.json", "fixture",
+                                                       claim_state.KnownMacHistoryKey("fixture-history"))
+        controller.mac_repository = repository
+        paths = claim_state.state_paths("mac")
+        path = paths.claims / repository.claim_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        machine = "f0000000-0000-0000-0000-000000000000"
+        root = MacMirrorRoot(".local/state/fixture-mirror")
+        record: claim_state.RemoteJobClaim = {
+            "claim_id": identity.claim_id, "episode": identity.episode, "attempt": identity.attempt,
+            "submitting_session": "", "pid": os.getpid(), "proc_start": "fixture-start", "what": "fixture",
+            "worktree": str(self.repository), "since": "2026-11-01T12:00:00+00:00", "remote_host": config.host,
+            "repo_key": repository.key, "repo_name": repository.mirror_name,
+            "mac_repository": repository.record(),
+        }
+        mac_test.write_json(path, record)
+        response = f"rc=0\nfree_gib=42\nhost=fixture\ndispatch_mac_id={machine}\n"
+        token = offload.offload_mirror_root.set(root)
+        self.addCleanup(offload.offload_mirror_root.reset, token)
+        trace = mock.Mock()
+        with (mock.patch.object(controller, "capture",
+                                return_value=offload.CommandOutput(0, response, "")) as ssh,
+              mock.patch.object(claim_state, "locked", wraps=claim_state.locked) as lock):
+            trace.attach_mock(ssh, "ssh")
+            trace.attach_mock(lock, "lock")
+            result = offload.probe_mac(controller, config, self.identity)
+        self.assertEqual(result, offload.ProbeSnapshot(42, "fixture"))
+        self.assertEqual([call[0] for call in trace.mock_calls], ["ssh", "lock", "lock"])
+        self.assertEqual(lock.call_args_list[0], mock.call(paths.lock))
+
+    def test_mac_probe_rereads_changed_claim_before_watch_publication(self) -> None:
+        """offload.probe_mac row 11."""
+        from scripts.mac_test.mirror_root import MacMirrorRoot
+
+        config = eligibility.read_config(self.config_path)
+        controller = offload.ProcessController()
+        controller.claim_target = "mac"
+        identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
+        controller.claim_identity = identity
+        repository = claim_state.MacRepositoryIdentity("key", "fixture", "fixture.json", "fixture",
+                                                       claim_state.KnownMacHistoryKey("fixture-history"))
+        controller.mac_repository = repository
+        paths = claim_state.state_paths("mac")
+        path = paths.claims / repository.claim_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        machine = "f0000000-0000-0000-0000-000000000000"
+        root = MacMirrorRoot(".local/state/fixture-mirror")
+        record: claim_state.RemoteJobClaim = {
+            "claim_id": identity.claim_id, "episode": identity.episode, "attempt": identity.attempt,
+            "submitting_session": "", "pid": os.getpid(), "proc_start": "fixture-start", "what": "fixture",
+            "worktree": str(self.repository), "since": "2026-11-01T12:00:00+00:00", "remote_host": config.host,
+            "repo_key": repository.key, "repo_name": repository.mirror_name,
+            "mac_repository": repository.record(),
+        }
+        mac_test.write_json(path, record)
+        response = f"rc=0\nfree_gib=42\nhost=fixture\ndispatch_mac_id={machine}\n"
+        token = offload.offload_mirror_root.set(root)
+        self.addCleanup(offload.offload_mirror_root.reset, token)
+        def capture(_command: list[str], _deadline: offload.CommandDeadline) -> offload.CommandOutput:
+            record["remote_host"] = "replacement-host"
+            mac_test.write_json(path, record)
+            return offload.CommandOutput(0, response, "")
+
+        with (mock.patch.object(controller, "capture", side_effect=capture),
+              mock.patch.object(claim_state, "read_run", wraps=claim_state.read_run) as read):
+            result = offload.probe_mac(controller, config, self.identity)
+        self.assertEqual(result, offload.ProbeSnapshot(42, "fixture"))
+        read.assert_called_once_with(path)
+        self.assertEqual(claim_state.read_run(path), record)
+
+    def test_mac_probe_saves_and_clears_the_exact_claims_watch_origin(self) -> None:
+        """offload.probe_mac row 12."""
+        from scripts.mac_test.mirror_root import MacMirrorRoot
+
+        config = eligibility.read_config(self.config_path)
+        controller = offload.ProcessController()
+        controller.claim_target = "mac"
+        identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
+        controller.claim_identity = identity
+        repository = claim_state.MacRepositoryIdentity("key", "fixture", "fixture.json", "fixture",
+                                                       claim_state.KnownMacHistoryKey("fixture-history"))
+        controller.mac_repository = repository
+        paths = claim_state.state_paths("mac")
+        path = paths.claims / repository.claim_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        machine = "f0000000-0000-0000-0000-000000000000"
+        root = MacMirrorRoot(".local/state/fixture-mirror")
+        record: claim_state.RemoteJobClaim = {
+            "claim_id": identity.claim_id, "episode": identity.episode, "attempt": identity.attempt,
+            "submitting_session": "", "pid": os.getpid(), "proc_start": "fixture-start", "what": "fixture",
+            "worktree": str(self.repository), "since": "2026-11-01T12:00:00+00:00", "remote_host": config.host,
+            "repo_key": repository.key, "repo_name": repository.mirror_name,
+            "mac_repository": repository.record(),
+        }
+        mac_test.write_json(path, record)
+        response = f"rc=0\nfree_gib=42\nhost=fixture\ndispatch_mac_id={machine}\n"
+        token = offload.offload_mirror_root.set(root)
+        self.addCleanup(offload.offload_mirror_root.reset, token)
+        with mock.patch.object(controller, "capture", side_effect=[
+                offload.CommandOutput(0, response, ""),
+                offload.CommandOutput(0, "rc=0\nfree_gib=42\nhost=fixture\n", "")]) as ssh:
+            self.assertEqual(offload.probe_mac(controller, config, self.identity),
+                             offload.ProbeSnapshot(42, "fixture"))
+            saved = claim_state.read_run(path)
+            assert not isinstance(saved, claim_state.NoRun)
+            self.assertEqual(saved.get("mac_watch_origin"), {"mirror_root": root.relative, "machine_id": machine})
+            self.assertEqual(offload.probe_mac(controller, config, self.identity),
+                             offload.ProbeSnapshot(42, "fixture"))
+        self.assertEqual(ssh.call_count, 2)
+        self.assertEqual(claim_state.read_run(path), record)
+
+    def test_interrupted_fresh_claim_releases_the_exact_claim(self) -> None:
+        """Probe recovery start and worker row 11."""
+        from collections.abc import Sequence
+
+        config = eligibility.read_config(self.config_path)
+        controller = offload.ProcessController()
+        request = offload.OffloadRequest(self.repository, "hana", "fixture", offload.NoResultFile(), (),
+                                         owner="fixture", holder_session="fixture-session")
+        identity = claim_state.ClaimIdentity("fixture", "episode", "attempt")
+
+        def claim(_arguments: Sequence[str], attempt: offload.LocalClaimAttempt) -> None:
+            controller.claim_identity = identity
+            attempt.answer = offload.FreshMacClaim()
+            attempt.interruption = offload.OffloadInterrupted(signal.SIGTERM)
+
+        def release(current: offload.ProcessController, target: str) -> int:
+            self.assertEqual(current.claim_identity, identity)
+            self.assertEqual(target, request.target)
+            return 0
+
+        with (mock.patch.object(controller, "complete_claim", side_effect=claim),
+              mock.patch.object(offload, "release_claim", side_effect=release) as released,
+              self.assertRaises(offload.OffloadInterrupted) as interrupted):
+            _ = offload.claim_for_run(controller, config, request, self.identity)
+        self.assertEqual(interrupted.exception.signal_number, signal.SIGTERM)
+        released.assert_called_once_with(controller, request.target)
+
+    def test_recovery_rejects_missing_saved_mirror_before_copying(self) -> None:
+        """Probe recovery start and worker row 12."""
+        from contextlib import nullcontext
+        from scripts.copies import copies
+
+        args = build_targets.CliArguments()
+        args.target = "mac"
+        args.kind = "check"
+        args.package = "hana"
+        args.repo_root = str(self.repository)
+        args.recovery_fd = os.open(os.devnull, os.O_RDONLY)
+        with (mock.patch.object(mac_test, "free_now", return_value="bad"),
+              mock.patch.object(offload, "interrupt_handlers", return_value=nullcontext()),
+              mock.patch.object(copies, "remote_lease", return_value=nullcontext()),
+              mock.patch.object(offload, "claim_for_run", return_value=offload.FreshMacClaim()) as claim,
+              mock.patch.object(offload, "copy_tracked_scripts", wraps=offload.copy_tracked_scripts) as copy,
+              mock.patch.object(offload, "release_claim") as release):
+            result = build_targets.command_recover_probe(args)
+        self.assertEqual(result, 0)
+        claim.assert_called_once()
+        copy.assert_not_called()
+        release.assert_called_once()
+
+    def test_script_copy_rechecks_cleanliness_and_head_before_remote_stamp(self) -> None:
+        """Probe recovery start and worker row 15."""
+        from collections.abc import Sequence
+
+        controller = offload.ProcessController()
+        config = eligibility.read_config(self.linux_settings)
+        commit = "a" * 40
+        commands: list[str] = []
+        replies = iter((
+            offload.CommandOutput(0, "scripts/mac_test/linux_runner.py\0", ""),
+            offload.CommandOutput(0, "", ""),
+            offload.CommandOutput(0, commit + "\n", ""),
+            offload.CommandOutput(0, "", ""),
+            offload.CommandOutput(1, "", ""),
+            offload.CommandOutput(0, "b" * 40 + "\n", ""),
+        ))
+
+        def capture(arguments: Sequence[str], *_options: object) -> offload.CommandOutput:
+            commands.append(arguments[3] if arguments[0] == "git" else arguments[0])
+            return next(replies)
+
+        with (mock.patch.object(controller, "capture_copy", side_effect=capture),
+              mock.patch.object(offload, "expected_linux_parity", return_value={"scripts_commit": commit})):
+            self.assertFalse(offload.copy_tracked_scripts(controller, config))
+        self.assertEqual(commands, ["ls-files", "diff", "rev-parse", "rsync", "diff", "rev-parse"])
+
     def test_two_mac_eligibility_reads_share_the_failure_backoff(self) -> None:
         target = target_config.configured_ssh_target("mac")
         for failure in (offload.COMMAND_COULD_NOT_START, offload.COMMAND_TIMED_OUT,

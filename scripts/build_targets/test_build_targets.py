@@ -906,6 +906,247 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         self.assertEqual(sweep.call_count, 1)
         return output.getvalue(), errors.getvalue()
 
+    def test_ssh_dispatch_reads_mac_capacity_before_delegating(self) -> None:
+        """macOS target eligibility row 3."""
+        target = target_config.SshTarget("mac", "macos", self.settings)
+        calls = mock.Mock()
+        with (mock.patch.object(mac_test, "free_now", wraps=mac_test.free_now) as capacity,
+              mock.patch.object(build_targets, "mac_target_eligibility",
+                               wraps=build_targets.mac_target_eligibility) as delegate,
+              mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(70, "fake-mac"))):
+            calls.attach_mock(capacity, "capacity")
+            calls.attach_mock(delegate, "delegate")
+            result = build_targets.ssh_target_eligibility(
+                target, self.root, "portable", "test", targets.ANY_ELIGIBLE_TARGET)
+        self.assertEqual(result, targets.EligibleTarget(target))
+        self.assertEqual([call[0] for call in calls.mock_calls], ["capacity", "delegate"])
+        self.assertEqual(delegate.call_args.kwargs["answer"], "free")
+
+    def test_mac_local_requirement_resolves_session_before_returning(self) -> None:
+        """macOS target eligibility row 4."""
+        target = target_config.SshTarget("mac", "macos", self.settings)
+        routing = targets.LocalRequired("fixture requires Linux")
+        query = mock.Mock()
+        with (mock.patch.object(claim_state, "submitting_session",
+                               wraps=claim_state.submitting_session) as session,
+              mock.patch.object(build_targets, "step_policy") as policy,
+              mock.patch.object(offload, "probe_mac") as probe):
+            result = build_targets.mac_target_eligibility(
+                target, self.root, "portable", "test", routing, request_disk_recovery=query,
+                session=WAITING_SESSION)
+        self.assertEqual(result, targets.ExcludedTarget(target, routing.reason))
+        session.assert_called_once_with(WAITING_SESSION)
+        policy.assert_not_called()
+        query.assert_not_called()
+        probe.assert_not_called()
+
+    def test_unreadable_mac_settings_refuse_before_disk_recovery(self) -> None:
+        """macOS target eligibility row 8."""
+        from scripts.lib import conf
+
+        _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=\nhost=\n", template="mac_test")
+        target = target_config.SshTarget("mac", "macos", self.settings)
+        query = mock.Mock()
+        with (mock.patch.object(offload, "probe_mac") as probe,
+              mock.patch.object(conf, "_committed_files", return_value=())):
+            result = build_targets.mac_target_eligibility(
+                target, self.root, "portable", "test", targets.ANY_ELIGIBLE_TARGET,
+                answer="bad", request_disk_recovery=query)
+            assert isinstance(result, targets.ExcludedTarget)
+            self.assertTrue(result.reason.startswith("state unreadable:"), result.reason)
+            with self.assertRaises(conf.Unusable):
+                _ = build_targets.mac_target_eligibility(
+                    target, self.root, "portable", "test", targets.ANY_ELIGIBLE_TARGET,
+                    answer="bad", request_disk_recovery=query, configuration=conf.read(self.settings))
+        query.assert_not_called()
+        probe.assert_not_called()
+
+    def test_bad_mac_queries_disk_recovery_before_any_probe(self) -> None:
+        """macOS target eligibility row 10."""
+        target = target_config.SshTarget("mac", "macos", self.settings)
+        disk = offload.MacDiskShort(50, 60)
+        calls = mock.Mock()
+        query = mock.Mock(return_value=build_targets.MacDiskRecoveryActive(disk))
+        with (mock.patch.object(eligibility, "read_config", wraps=eligibility.read_config) as settings,
+              mock.patch.object(offload, "probe_mac") as probe):
+            calls.attach_mock(settings, "settings")
+            calls.attach_mock(query, "query")
+            result = build_targets.mac_target_eligibility(
+                target, self.root, "portable", "test", targets.ANY_ELIGIBLE_TARGET,
+                answer="bad", request_disk_recovery=query)
+        self.assertEqual(result, build_targets.MacDiskRecoveryPending(target, "disk", disk))
+        self.assertEqual([call[0] for call in calls.mock_calls], ["settings", "query"])
+        self.assertEqual(query.call_args.args[1], build_targets.MacDiskRecoveryQuery())
+        probe.assert_not_called()
+
+    def test_mac_off_busy_and_unreadable_capacity_still_reach_the_probe(self) -> None:
+        """macOS target eligibility row 12."""
+        target = target_config.SshTarget("mac", "macos", self.settings)
+        for answer in ("off", "busy", "state", "bad"):
+            with (self.subTest(answer=answer),
+                  mock.patch.object(offload, "probe_mac", return_value=offload.UnresolvedSlotStartup()) as probe,
+                  mock.patch.object(offload, "write_backoff") as backoff):
+                result = build_targets.mac_target_eligibility(
+                    target, self.root, "portable", "test", targets.ANY_ELIGIBLE_TARGET,
+                    answer=answer, recover_mac_backoff=answer == "bad")
+                self.assertEqual(result, targets.ExcludedTarget(target, "busy"))
+                probe.assert_called_once()
+                backoff.assert_not_called()
+
+    def test_backoff_written_during_mac_probe_precedes_failure_publication(self) -> None:
+        """macOS target eligibility row 14."""
+        target = target_config.SshTarget("mac", "macos", self.settings)
+        path = eligibility.backoff_path("mac")
+
+        def answer(*_arguments: object) -> offload.UnavailableProbe:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_text(str(time.time() + 60))
+            return offload.UnavailableProbe("fixture failure")
+
+        with (mock.patch.object(offload, "probe_mac", side_effect=answer) as probe,
+              mock.patch.object(offload, "write_backoff") as write):
+            result = build_targets.mac_target_eligibility(
+                target, self.root, "portable", "test", targets.ANY_ELIGIBLE_TARGET, answer="free")
+        self.assertEqual(result, targets.ExcludedTarget(target, "backoff"))
+        probe.assert_called_once()
+        write.assert_not_called()
+
+    def test_basic_eligibility_reports_registry_error_without_rows(self) -> None:
+        """Basic eligibility row 6."""
+        _ = self.write_config("targets=mac\nkind.mac=invalid\n")
+        output, errors = io.StringIO(), io.StringIO()
+        with (redirect_stdout(output), redirect_stderr(errors),
+              mock.patch.object(build_targets, "print_eligible_target",
+                               wraps=build_targets.print_eligible_target) as row):
+            self.assertEqual(build_targets.command_eligible(self.root, "portable"), 2)
+        row.assert_not_called()
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("kind.mac", errors.getvalue())
+
+    def test_probe_mark_output_resolves_repository_before_publication(self) -> None:
+        """Eligibility CLI row 1."""
+        from scripts.lib import atomic_file
+
+        args = build_targets.CliArguments()
+        args.repo_root = str(self.root)
+        args.probe_marks_file = str(self.root / "probe-marks")
+        args.target = "natedev"
+        calls = mock.Mock()
+        with (mock.patch.object(eligibility, "repository_identity",
+                                return_value=eligibility.KnownRepository("hana")) as identity,
+              mock.patch.object(atomic_file, "write_text_atomic", wraps=atomic_file.write_text_atomic) as write,
+              redirect_stdout(io.StringIO())):
+            calls.attach_mock(identity, "identity")
+            calls.attach_mock(write, "write")
+            self.assertEqual(build_targets.command_eligibility(args), 0)
+        self.assertEqual([call[0] for call in calls.mock_calls], ["identity", "write"])
+        identity.assert_called_once_with(self.root)
+        self.assertIn("failed_probe", Path(args.probe_marks_file).read_text())
+
+    def test_probe_mark_output_resolves_target_paths_before_publication(self) -> None:
+        """Eligibility CLI row 2."""
+        from scripts.lib import atomic_file
+
+        args = build_targets.CliArguments()
+        args.repo_root = str(self.root)
+        args.probe_marks_file = str(self.root / "probe-marks")
+        args.target = "natedev"
+        failure = eligibility.state_directory("mac") / "failed_probe"
+        decline = eligibility.linux_version_decline_path("mac", "hana")
+        calls = mock.Mock()
+        with (mock.patch.object(eligibility, "state_directory", wraps=eligibility.state_directory) as directory,
+              mock.patch.object(eligibility, "linux_version_decline_path",
+                               wraps=eligibility.linux_version_decline_path) as version,
+              mock.patch.object(atomic_file, "write_text_atomic", wraps=atomic_file.write_text_atomic) as write,
+              redirect_stdout(io.StringIO())):
+            calls.attach_mock(directory, "directory")
+            calls.attach_mock(version, "decline")
+            calls.attach_mock(write, "write")
+            self.assertEqual(build_targets.command_eligibility(args), 0)
+        self.assertEqual([call[0] for call in calls.mock_calls], ["directory", "decline", "directory", "write"])
+        self.assertEqual(Path(args.probe_marks_file).read_text().splitlines(), [str(failure), str(decline)])
+
+    def test_eligibility_publishes_both_files_before_the_pinned_result(self) -> None:
+        """Eligibility CLI row 3."""
+        from scripts.lib import atomic_file
+
+        args = build_targets.CliArguments()
+        args.repo_root = str(self.root)
+        args.probe_marks_file = str(self.root / "probe-marks")
+        args.remote_kinds_file = str(self.root / "remote-kinds")
+        args.target = "natedev"
+        args.kind = "test"
+        calls = mock.Mock()
+        with (mock.patch.object(atomic_file, "write_text_atomic", wraps=atomic_file.write_text_atomic) as write,
+              mock.patch.object(build_targets, "local_target", wraps=build_targets.local_target) as local,
+              redirect_stdout(io.StringIO())):
+            calls.attach_mock(write, "write")
+            calls.attach_mock(local, "local")
+            self.assertEqual(build_targets.command_eligibility(args), 0)
+        self.assertEqual([call[0] for call in calls.mock_calls], ["write", "write", "local"])
+        self.assertTrue(Path(args.probe_marks_file).is_file())
+        self.assertEqual(Path(args.remote_kinds_file).read_text(), "nextest\ttest\n")
+
+    def test_eligibility_selects_pin_before_kind_and_kind_before_basic(self) -> None:
+        """Eligibility CLI row 4."""
+        args = build_targets.CliArguments()
+        args.repo_root = str(self.root)
+        args.package = "portable"
+        _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=\n", template="mac_test")
+        for target, kind, expected in (("natedev", "test", "pin"), ("", "test", "kind"), ("", "", "basic")):
+            with (self.subTest(target=target, kind=kind), redirect_stdout(io.StringIO()),
+                  mock.patch.object(build_targets, "command_pinned_eligible",
+                                   wraps=build_targets.command_pinned_eligible) as pin,
+                  mock.patch.object(build_targets, "command_kind_eligible",
+                                   wraps=build_targets.command_kind_eligible) as kind_check,
+                  mock.patch.object(build_targets, "command_eligible",
+                                   wraps=build_targets.command_eligible) as basic,
+                  mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "fake-mac"))):
+                args.target, args.kind = target, kind
+                self.assertEqual(build_targets.command_eligibility(args), 0)
+                self.assertEqual({name: call.call_count for name, call in
+                                  (("pin", pin), ("kind", kind_check), ("basic", basic))},
+                                 {name: int(name == expected) for name in ("pin", "kind", "basic")})
+
+    def test_pinned_natedev_uses_local_registration_and_skips_ssh(self) -> None:
+        """Eligibility CLI row 5."""
+        args = build_targets.CliArguments()
+        args.target = "natedev"
+        args.repo_root = str(self.root)
+        output = io.StringIO()
+        with (redirect_stdout(output),
+              mock.patch.object(build_targets, "local_target", wraps=build_targets.local_target) as local,
+              mock.patch.object(build_targets, "ssh_target_eligibility") as ssh):
+            self.assertEqual(build_targets.command_eligibility(args), 0)
+        local.assert_called_once_with()
+        ssh.assert_not_called()
+        self.assertEqual(output.getvalue().splitlines(),
+                         ["natedev_only pinned to natedev", "natedev\teligible\t-\t-\t-"])
+
+    def test_workspace_policy_follows_workspace_paths_and_skips_excluded_members(self) -> None:
+        """Shared SSH step policy row 9."""
+        from scripts.mac_test import cargo_manifest
+
+        (self.root / "dependency").mkdir()
+        dependency = self.root / "dependency/Cargo.toml"
+        manifest = self.root / "crates/portable/Cargo.toml"
+        excluded = self.root / "crates/excluded/Cargo.toml"
+        _ = (self.root / "Cargo.toml").write_text(
+            '[workspace]\nmembers=["crates/*"]\nexclude=["crates/excluded"]\n'
+            + '[workspace.dependencies]\nfixture={path="dependency"}\n')
+        _ = manifest.write_text('[package]\nname="portable"\nversion="0.1.0"\n'
+                                + '[dependencies]\nfixture={workspace=true}\n')
+        _ = dependency.write_text('[package]\nname="linux-part"\nversion="0.1.0"\n')
+        target = target_config.SshTarget("mac", "macos", self.settings)
+        with mock.patch.object(cargo_manifest, "toml_table", wraps=cargo_manifest.toml_table) as read:
+            result = build_targets.step_policy(target, self.root, "", "test", backoff=eligibility.NO_BACKOFF)
+        self.assertEqual(result, targets.ExcludedTarget(target, "linux_only"))
+        paths = [cast(Path, call.args[0]) for call in read.call_args_list]
+        self.assertEqual(paths.count(manifest), 1)
+        self.assertEqual(paths.count(dependency), 1)
+        self.assertLess(paths.index(manifest), paths.index(dependency))
+        self.assertNotIn(excluded, paths)
+
     def test_floor_sweep_admits_the_mac_after_a_disk_exclusion(self) -> None:
         for background in (False, True):
             with self.subTest(background=background):

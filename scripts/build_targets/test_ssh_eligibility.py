@@ -150,6 +150,166 @@ class SshEligibilityTests(unittest.TestCase):
         _ = (self.root / "mac_linux.conf").write_text("ssh.hops=mac linux-guest\nguest.user=gate-runner\n")
         return target_config.configured_ssh_target(eligibility.MAC_LINUX_TARGET)
 
+    def test_guest_execution_settings_refuse_before_transport_read(self) -> None:
+        """Linux target eligibility row 2."""
+        guest = self.add_mac_linux_guest()
+        with (mock.patch.object(target_config, "read_execution_transport",
+                               wraps=target_config.read_execution_transport) as transport,
+              mock.patch.object(build_targets, "start_probe_recovery") as recovery):
+            result = build_targets.ssh_target_config(guest)
+        self.assertEqual(result, targets.ExcludedTarget(guest, "The Mac Linux guest requires an exact queue assignment"))
+        transport.assert_not_called()
+        recovery.assert_not_called()
+        self.assertEqual(self.commands, [])
+
+    def test_linux_transport_is_read_again_before_execution_settings(self) -> None:
+        """Linux target eligibility row 3."""
+        from scripts.aws_target import hana_placement
+
+        linux = target_config.configured_ssh_target("linux")
+        calls = mock.Mock()
+        with (mock.patch.object(target_config, "read_execution_transport",
+                               wraps=target_config.read_execution_transport) as first_transport,
+              mock.patch.object(hana_placement, "read_execution_transport",
+                               wraps=hana_placement.read_execution_transport) as second_transport,
+              mock.patch.object(eligibility, "read_config", wraps=eligibility.read_config) as config,
+              mock.patch.object(build_targets, "start_probe_recovery") as recovery):
+            calls.attach_mock(first_transport, "dispatch_transport")
+            calls.attach_mock(second_transport, "execution_transport")
+            calls.attach_mock(config, "execution_settings")
+            result = build_targets.ssh_target_eligibility(
+                linux, self.root, "linux-part", "check", targets.ANY_ELIGIBLE_TARGET)
+        self.assertEqual(result, targets.EligibleTarget(linux))
+        self.assertEqual([call[0] for call in calls.mock_calls],
+                         ["dispatch_transport", "execution_transport", "dispatch_transport", "execution_settings"])
+        recovery.assert_not_called()
+
+    def test_inactive_backoff_returns_before_target_lookup(self) -> None:
+        """command_probe_backoff row 1."""
+        with (mock.patch.object(eligibility, "read_backoff", wraps=eligibility.read_backoff) as backoff,
+              mock.patch.object(build_targets, "ssh_target_config") as settings,
+              mock.patch.object(offload, "record_reachable") as reachable):
+            self.assertEqual(build_targets.command_probe_backoff("linux", probe=True), 0)
+        backoff.assert_called_once()
+        settings.assert_not_called()
+        reachable.assert_not_called()
+        self.assertEqual(self.commands, [])
+
+    def test_active_backoff_without_probe_skips_settings_and_publication(self) -> None:
+        """command_probe_backoff row 2."""
+        path = eligibility.backoff_path("linux")
+        deadline = f"{self.now + 3600}\n"
+        _ = path.write_text(deadline)
+        with (mock.patch.object(time, "time", return_value=float(self.now)),
+              mock.patch.object(build_targets, "ssh_target_config") as settings,
+              mock.patch.object(offload, "record_reachable") as reachable):
+            self.assertEqual(build_targets.command_probe_backoff("linux", probe=False), 1)
+        settings.assert_not_called()
+        reachable.assert_not_called()
+        self.assertEqual(self.commands, [])
+        self.assertEqual(path.read_text(), deadline)
+
+    def test_failed_backoff_probe_preserves_the_mark(self) -> None:
+        """command_probe_backoff row 4."""
+        self.reachable = False
+        path = eligibility.backoff_path("linux")
+        deadline = f"{self.now + 3600}\n"
+        _ = path.write_text(deadline)
+        calls = mock.Mock()
+        with (mock.patch.object(time, "time", return_value=float(self.now)),
+              mock.patch.object(time, "time_ns", return_value=self.now * 1_000_000_000) as clock,
+              mock.patch.object(offload, "probe_reachability", wraps=offload.probe_reachability) as probe,
+              mock.patch.object(offload, "record_reachable") as reachable):
+            calls.attach_mock(clock, "clock")
+            calls.attach_mock(probe, "probe")
+            self.assertEqual(build_targets.command_probe_backoff("linux", probe=True), 1)
+        self.assertEqual([call[0] for call in calls.mock_calls], ["clock", "probe"])
+        reachable.assert_not_called()
+        self.assertEqual(len(self.commands), 1)
+        self.assertEqual(path.read_text(), deadline)
+
+    def test_recovery_returns_before_claim_when_registration_excludes_transport(self) -> None:
+        """Probe recovery start and worker row 6."""
+        guest = self.add_mac_linux_guest()
+        args = build_targets.CliArguments()
+        args.target = guest.name
+        args.kind = "check"
+        args.repo_root = str(self.root)
+        args.recovery_fd = os.open(os.devnull, os.O_RDONLY)
+        with (mock.patch.object(build_targets, "ssh_target_config", wraps=build_targets.ssh_target_config) as settings,
+              mock.patch.object(claim_state, "locked", wraps=claim_state.locked) as lock,
+              mock.patch.object(offload, "claim_for_run") as claim):
+            self.assertEqual(build_targets.command_recover_probe(args), 0)
+        settings.assert_called_once_with(guest)
+        lock.assert_not_called()
+        claim.assert_not_called()
+        self.assertEqual(self.commands, [])
+
+    def test_recovery_missing_mirror_returns_before_claim_lock(self) -> None:
+        """Probe recovery start and worker row 7."""
+        args = build_targets.CliArguments()
+        args.target = "mac"
+        args.kind = "check"
+        args.repo_root = str(self.root)
+        args.recovery_fd = os.open(os.devnull, os.O_RDONLY)
+        with (mock.patch.object(claim_state, "mac_repository_identity", return_value=claim_state.WHOLE_MAC) as mirror,
+              mock.patch.object(claim_state, "locked", wraps=claim_state.locked) as lock,
+              mock.patch.object(offload, "claim_for_run") as claim):
+            self.assertEqual(build_targets.command_recover_probe(args), 0)
+        mirror.assert_called_once_with(str(self.root))
+        lock.assert_not_called()
+        claim.assert_not_called()
+        self.assertEqual(self.commands, [])
+
+    def test_fixed_candidates_apply_explicit_settings_only_to_the_pin(self) -> None:
+        """Fixed placement candidates row 3."""
+        from scripts.build_queue import placement
+        from scripts.direct.step_selection import Pinned
+
+        alternate = self.root / "alternate.conf"
+        _ = write_config_fixture(alternate, "host=alternate-fixture\noffload=on\nkinds=check\n", template="mac_test")
+        explicit = placement.ExplicitProviderSettings(alternate)
+        with mock.patch.object(build_targets, "fixed_remote_candidates",
+                               wraps=build_targets.fixed_remote_candidates) as remote:
+            result = build_targets.fixed_placement_constraints(
+                self.root, "linux-part", "check", ("cargo", "check"), NoOwningSession(), "source",
+                selection=Pinned("linux"), provider_settings=explicit)
+        candidate, = result.candidates
+        self.assertEqual(candidate.destination.host, "alternate-fixture")
+        self.assertEqual(candidate.settings, explicit)
+        remote.assert_called_once()
+
+    def test_fixed_ssh_candidate_resolves_state_after_reading_transport(self) -> None:
+        """Fixed placement candidates row 11."""
+        from scripts.direct.step_selection import Pinned
+
+        trace = mock.Mock()
+        with (mock.patch.object(target_config, "read_execution_transport",
+                               wraps=target_config.read_execution_transport) as transport,
+              mock.patch.object(claim_state, "state_paths", wraps=claim_state.state_paths) as paths):
+            trace.attach_mock(transport, "transport")
+            trace.attach_mock(paths, "paths")
+            result = build_targets.fixed_placement_constraints(
+                self.root, "linux-part", "check", ("cargo", "check"), NoOwningSession(), "source",
+                selection=Pinned("linux"))
+        self.assertEqual([call[0] for call in trace.mock_calls], ["transport", "paths"])
+        paths.assert_called_once_with("linux")
+        candidate, = result.candidates
+        self.assertEqual(candidate.destination.target, "linux")
+
+    def test_fixed_ssh_candidate_reads_host_before_local_exclusion(self) -> None:
+        """Fixed placement candidates row 13."""
+        from scripts.build_queue import placement
+        from scripts.direct.step_selection import Pinned
+
+        linux = target_config.configured_ssh_target("linux")
+        candidates = build_targets.fixed_placement_constraints(
+            self.root, "linux-part", "check", ("cargo", "check"), NoOwningSession(), "source",
+            routing=targets.LocalRequired("fixture requires local execution"), selection=Pinned(linux.name))
+        candidate = next(candidate for candidate in candidates.candidates if candidate.destination.target == linux.name)
+        self.assertEqual(candidate.destination.host, "fake-linux")
+        self.assertEqual(candidate.eligibility, placement.FixedExclusion("fixture requires local execution"))
+
     def test_mac_linux_guest_config_is_excluded_without_offload_settings(self) -> None:
         guest = self.add_mac_linux_guest()
         config = build_targets.ssh_target_config(guest)

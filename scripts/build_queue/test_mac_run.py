@@ -482,6 +482,59 @@ sys.exit(71)
                 self.assertEqual(claim_state.target_claim_scope(self.paths, str(checkout)),
                                  claim_state.RepositoryScope(".claude", REPOSITORY_KEY))
 
+    def test_mac_identity_walks_git_link_and_commondir_before_reading_origin(self) -> None:
+        """Run identity and process helpers row 3."""
+        from scripts.buildlog import repository
+
+        linked = self.root / "linked"
+        _ = subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "-q", "--detach", str(linked)],
+                           check=True)
+        nested = linked / "sub" / "folder"
+        nested.mkdir(parents=True)
+        with mock.patch.object(repository, "mac_source_repository", wraps=repository.mac_source_repository) as source:
+            identity = claim_state.mac_repository_identity(str(nested))
+        assert isinstance(identity, claim_state.ResolvedMacMirror)
+        self.assertEqual(identity.key, REPOSITORY_KEY)
+        source.assert_called_once_with(str(nested), str(self.repo / ".git"))
+        (linked / ".git").unlink()
+        source.reset_mock()
+        with mock.patch.object(repository, "mac_source_repository", source):
+            self.assertEqual(claim_state.mac_repository_identity(str(nested)), claim_state.WHOLE_MAC)
+        source.assert_not_called()
+
+    def test_linux_claim_scope_keeps_source_name_without_source_config(self) -> None:
+        """Run identity and process helpers row 5."""
+        from scripts.buildlog import repository
+
+        source = self.root / "source"
+        (source / ".git").mkdir(parents=True)
+        cloned = self.root / "clone"
+        git = cloned / ".git"
+        git.mkdir(parents=True)
+        _ = (git / "config").write_text(f'[remote "origin"]\nurl = {source}\n')
+        paths = claim_state.StatePaths(self.root / "state", "fixture", platform="linux")
+        with (mock.patch.object(repository, "source_git_dir", wraps=repository.source_git_dir) as follow,
+              mock.patch.object(repository, "repository_key", wraps=repository.repository_key) as key):
+            scope = claim_state.target_claim_scope(paths, str(cloned))
+        self.assertEqual(scope, claim_state.RepositoryScope("source"))
+        follow.assert_called_once_with(str(git))
+        key.assert_not_called()
+
+    def test_repository_key_reads_origin_before_falling_back_to_root_commit(self) -> None:
+        """Run identity and process helpers row 6."""
+        from scripts.buildlog import repository
+
+        path = self.repository("without-origin")
+        manifest = path / "Cargo.toml"
+        _ = manifest.write_text('[package]\nname="fixture"\nversion="0.1.0"\n')
+        commit = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
+                                check=True, capture_output=True, text=True).stdout.strip()
+        with mock.patch.object(repository, "output", wraps=repository.output) as git:
+            key = repository.repository_key(str(path))
+        self.assertEqual(key, f"git-root:{commit}")
+        self.assertEqual([cast(list[str], call.args[0])[3:] for call in git.call_args_list],
+                         [["remote", "get-url", "origin"], ["rev-list", "--max-parents=0", "--reverse", "HEAD"]])
+
     def test_mac_capacity_shares_global_alias_and_ssh_https_origins(self) -> None:
         for scope in ("GLOBAL", "SYSTEM"):
             config = self.root / scope
@@ -813,6 +866,138 @@ sys.exit(71)
         self.assertEqual(fresh.record["what"], "replacement")
         runner.claim_id, runner.episode, runner.attempt = fresh.record["claim_id"], fresh.record["episode"], fresh.record["attempt"]
         self.assertEqual(mac_test.command_release(runner, self.paths), 0)
+
+    def test_replacement_sweep_skips_linux_state_without_reading_owners(self) -> None:
+        """Interrupted Mac claim replacement sweep row 1."""
+        record: claim_state.RemoteJobClaim = {
+            "claim_id": "fixture", "episode": "episode", "attempt": "attempt", "submitting_session": "",
+            "pid": 123, "proc_start": "fixture-start", "remote_host": "fixture-mac", "what": "fixture",
+            "worktree": str(self.checkout), "since": "2026-11-01T12:00:00+00:00",
+            "replaced_reservation": {"file": "old.json", "fingerprint": "a" * 64},
+        }
+        path = self.paths.run
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mac_test.write_json(path, record)
+        claim = claim_state.HeldClaim(claim_state.WHOLE_MAC, path, record)
+        linux = claim_state.StatePaths(self.paths.directory, "fixture", platform="linux")
+        with (mock.patch.object(claim_state, "claim_pending_start", wraps=claim_state.claim_pending_start) as start,
+              mock.patch.object(claim_state, "retire_replaced_reservation",
+                                wraps=claim_state.retire_replaced_reservation) as retire):
+            claims, retained = claim_state.sweep_mac_replacements(linux, (claim,))
+        self.assertEqual((claims, retained), ((claim,), set()))
+        start.assert_not_called()
+        retire.assert_not_called()
+        self.assertTrue(path.is_file())
+
+    def test_replacement_sweep_skips_remote_claim_without_replacement(self) -> None:
+        """Interrupted Mac claim replacement sweep row 2."""
+        record: claim_state.RemoteJobClaim = {
+            "claim_id": "fixture", "episode": "episode", "attempt": "attempt", "submitting_session": "",
+            "pid": 123, "proc_start": "fixture-start", "remote_host": "fixture-mac", "what": "fixture",
+            "worktree": str(self.checkout), "since": "2026-11-01T12:00:00+00:00",
+            "replaced_reservation": {"file": "old.json", "fingerprint": "a" * 64},
+        }
+        path = self.paths.run
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mac_test.write_json(path, record)
+        claim = claim_state.HeldClaim(claim_state.WHOLE_MAC, path, record)
+        del record["replaced_reservation"]
+        mac_test.write_json(path, record)
+        before = path.read_bytes()
+        with (mock.patch.object(claim_state, "claim_pending_start", wraps=claim_state.claim_pending_start) as start,
+              mock.patch.object(claim_state, "retire_replaced_reservation",
+                                wraps=claim_state.retire_replaced_reservation) as retire):
+            claims, retained = claim_state.sweep_mac_replacements(self.paths, (claim,))
+        self.assertEqual((claims, retained), ((claim,), set()))
+        start.assert_not_called()
+        retire.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_pending_start_precedes_legacy_owner_read_in_sweep(self) -> None:
+        """Interrupted Mac claim replacement sweep row 3."""
+        record: claim_state.RemoteJobClaim = {
+            "claim_id": "fixture", "episode": "episode", "attempt": "attempt", "submitting_session": "",
+            "pid": 123, "proc_start": "fixture-start", "remote_host": "fixture-mac", "what": "fixture",
+            "worktree": str(self.checkout), "since": "2026-11-01T12:00:00+00:00",
+            "replaced_reservation": {"file": "old.json", "fingerprint": "a" * 64},
+        }
+        path = self.paths.run
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mac_test.write_json(path, record)
+        claim = claim_state.HeldClaim(claim_state.WHOLE_MAC, path, record)
+        pending = claim_state.claim_pending_start(self.paths, path, record)
+        pending.parent.mkdir(parents=True, exist_ok=True)
+        pending.touch()
+        with (mock.patch.object(claim_state, "claim_owner_ended", wraps=claim_state.claim_owner_ended) as owner,
+              mock.patch.object(claim_state, "claim_uses_legacy_fence",
+                                wraps=claim_state.claim_uses_legacy_fence) as fence):
+            claims, _retained = claim_state.sweep_mac_replacements(self.paths, (claim,))
+        fence.assert_called_once_with(record)
+        owner.assert_not_called()
+        saved, = claims
+        self.assertNotIn("replaced_reservation", saved.record)
+        self.assertTrue(pending.is_file())
+
+    def test_legacy_replacement_with_live_owner_preserves_both_files(self) -> None:
+        """Interrupted Mac claim replacement sweep row 4."""
+        record: claim_state.RemoteJobClaim = {
+            "claim_id": "fixture", "episode": "episode", "attempt": "attempt", "submitting_session": "",
+            "pid": 123, "proc_start": "fixture-start", "remote_host": "fixture-mac", "what": "fixture",
+            "worktree": str(self.checkout), "since": "2026-11-01T12:00:00+00:00",
+            "replaced_reservation": {"file": "old.json", "fingerprint": "a" * 64},
+        }
+        path = self.paths.run
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mac_test.write_json(path, record)
+        claim = claim_state.HeldClaim(claim_state.WHOLE_MAC, path, record)
+        from scripts.lib import process_start
+
+        old = self.paths.directory / "old.json"
+        _ = old.write_text("unmodified\n")
+        before = path.read_bytes()
+        with (mock.patch.object(process_start, "process_start",
+                                return_value=process_start.Started(record["proc_start"])) as owner,
+              mock.patch.object(claim_state, "retire_replaced_reservation",
+                                wraps=claim_state.retire_replaced_reservation) as retire):
+            claims, _retained = claim_state.sweep_mac_replacements(self.paths, (claim,))
+        self.assertEqual(claims, (claim,))
+        owner.assert_called_once_with(record["pid"])
+        retire.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(old.read_text(), "unmodified\n")
+
+    def test_replacement_sweep_writes_cleanup_state_only_for_pending_start(self) -> None:
+        """Interrupted Mac claim replacement sweep row 6."""
+        for pending in (True, False):
+            with self.subTest(pending=pending):
+                paths = claim_state.StatePaths(self.root / ("pending" if pending else "settled"))
+                mirror = claim_state.MacRepositoryIdentity("key", "fixture", "fixture.json", "fixture",
+                    claim_state.KnownMacHistoryKey("history"), fence_generation="a" * 32)
+                path = paths.claims / mirror.claim_file
+                path.parent.mkdir(parents=True)
+                record: claim_state.RemoteJobClaim = {
+                    "claim_id": "fixture", "episode": "episode", "attempt": "attempt", "submitting_session": "",
+                    "pid": 123, "proc_start": "fixture-start", "remote_host": "fixture-mac", "what": "fixture",
+                    "worktree": str(self.checkout), "since": "2026-11-01T12:00:00+00:00",
+                    "repo_name": mirror.mirror_name, "repo_key": mirror.key, "mac_repository": mirror.record(),
+                    "replaced_reservation": {"file": "old.json", "fingerprint": "a" * 64},
+                }
+                mac_test.write_json(path, record)
+                if pending:
+                    marker = claim_state.claim_pending_start(paths, path, record)
+                    marker.parent.mkdir(parents=True)
+                    marker.touch()
+                claim = claim_state.HeldClaim(claim_state.RepositoryScope("fixture", "key"), path, record)
+                with claim_state.locked(paths.lock):
+                    claims, retained = claim_state.sweep_mac_replacements(paths, (claim,))
+                self.assertEqual(retained, set())
+                self.assertEqual(path.exists(), pending)
+                if pending:
+                    saved, = claims
+                    self.assertEqual(saved.record, claim_state.read_run(path))
+                    self.assertNotIn("replaced_reservation", saved.record)
+                else:
+                    self.assertEqual(claims, ())
 
     def test_interrupted_replacement_retires_both_records_and_retries(self) -> None:
         self.exercise_interrupted_replacement(("retry", "inspect"))

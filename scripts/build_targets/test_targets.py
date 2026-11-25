@@ -309,6 +309,46 @@ class EligibilityTests(IsolatedTargetTest):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)})))
         _ = self.enterContext(mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")))
 
+    def test_linux_only_registry_skips_repository_policy(self) -> None:
+        """Basic eligibility row 2."""
+        _ = self.write_config(
+            "targets=linux,natedev\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n"
+            + "kind.natedev=local\nplatform.natedev=linux\n")
+        _ = (self.root / "linux.conf").write_text("host=fixture-linux\n")
+        output = io.StringIO()
+        with (mock.patch.object(eligibility, "repository_identity") as identity,
+              mock.patch.object(eligibility, "read_target_settings") as settings,
+              redirect_stdout(output)):
+            self.assertEqual(build_targets.command_eligible(self.root, "fixture"), 0)
+        identity.assert_not_called()
+        settings.assert_not_called()
+        self.assertEqual([line.split("\t")[:3] for line in output.getvalue().splitlines()],
+                         [["linux", "eligible", "-"], ["natedev", "eligible", "-"]])
+
+    def test_mixed_registry_resolves_repository_once_before_reading_mac_policy(self) -> None:
+        """Basic eligibility row 3."""
+        _ = write_config_fixture(self.settings, "linux_only.hana=\n", template="mac_test")
+        calls = mock.Mock()
+        output = io.StringIO()
+        with (mock.patch.object(targets, "read_targets", wraps=targets.read_targets) as registry,
+              mock.patch.object(eligibility, "repository_identity",
+                                return_value=eligibility.KnownRepository("hana")) as identity,
+              mock.patch.object(eligibility, "read_target_settings",
+                                wraps=eligibility.read_target_settings) as settings,
+              mock.patch.object(build_targets, "print_eligible_target",
+                                wraps=build_targets.print_eligible_target) as print_row,
+              redirect_stdout(output)):
+            calls.attach_mock(registry, "registry")
+            calls.attach_mock(identity, "repository")
+            calls.attach_mock(settings, "settings")
+            calls.attach_mock(print_row, "print_row")
+            self.assertEqual(build_targets.command_eligible(self.root, "hana"), 0)
+        self.assertEqual([call[0] for call in calls.mock_calls],
+                         ["registry", "repository", "settings", "print_row", "print_row"])
+        identity.assert_called_once_with(self.root)
+        self.assertEqual([line.split("\t")[:3] for line in output.getvalue().splitlines()],
+                         [["mac", "eligible", "-"], ["natedev", "eligible", "-"]])
+
     def test_eligibility_table_keeps_linux_and_excludes_each_mac_constraint(self) -> None:
         mac = targets.SshTarget("mac", "macos", self.settings)
         local = targets.LocalTarget("natedev", "linux")
