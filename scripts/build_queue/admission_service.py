@@ -8,7 +8,7 @@ except FileNotFoundError:
 from collections import deque
 from collections.abc import Generator, Iterable, Mapping
 from concurrent.futures import Future
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 import errno
 import hashlib
@@ -61,7 +61,7 @@ from scripts.production.gate_routes import SuiteMode
 from scripts.buildlog import repository, store
 from scripts.lib import test_phase
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
+from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER, MAC_LINUX_START_UNCONFIRMED
 from scripts.lib.build_steps import gate_job_from_process
 
 from scripts.build_queue.scope_activity import (
@@ -74,7 +74,9 @@ from scripts.accounts import outage_alerts
 
 if TYPE_CHECKING:
     from scripts.aws_target import ledger as aws_ledger
-    from scripts.mac_test.claim_state import RemoteJobClaim
+    from scripts.build_targets.build_targets import MacDiskRecoveryRequest, MacDiskRecoveryState
+    from scripts.mac_test import eligibility, offload
+    from scripts.mac_test.claim_state import HeldClaim, RemoteJobClaim
 
 
 
@@ -215,6 +217,7 @@ PLACEMENT_REASON_TEXT = {
     "mac_linux_backoff": "the guest is in retry backoff",
     "mac_linux_reading_required": "the queue needs a newer guest reading",
     MAC_LINUX_NO_ANSWER: "the Mac does not answer",
+    MAC_LINUX_START_UNCONFIRMED: "the Mac Linux guest did not confirm a start",
     "busy": "the target is busy",
     "off": "the target is off",
     "disk": "the target needs more disk space",
@@ -1260,6 +1263,59 @@ class DispatchEvidence:
     observed_monotonic: float
 
 
+@dataclass(frozen=True)
+class MacDiskRecoveryPendingEvidence(placement.FreshHostEvidence):
+    """The Mac stays excluded while disk recovery runs."""
+
+    disk: offload.MacDiskShort = field(kw_only=True)
+
+
+@dataclass(frozen=True)
+class _MacHostExcluded:
+    reason: str
+
+
+type _MacStepPolicy = eligibility.KnownRepository | target_config.ExcludedTarget | placement.HostEvidenceUnavailable
+
+
+@dataclass(frozen=True)
+class _MacHostReading:
+    observed_at: float
+    settings: eligibility.SshProbeSettings
+    policies: dict[placement.HostEvidenceKey, _MacStepPolicy]
+    claims: tuple[HeldClaim, ...]
+    probed_claims: dict[Path, HeldClaim]
+    probe: offload.MacHostProbeSnapshot | _MacHostExcluded
+
+
+@dataclass(frozen=True)
+class _MacHostUnreadable:
+    observed_at: float
+    reason: str
+
+
+@dataclass(frozen=True)
+class _MacHostNotRead:
+    pass
+
+
+@dataclass
+class _MacHostProbeCycle:
+    observed_at: float
+    refresh_generation: int
+    keys: tuple[placement.HostEvidenceKey, ...]
+    reading: _MacHostReading | _MacHostUnreadable | _MacHostNotRead = _MacHostNotRead()
+
+
+@dataclass(frozen=True)
+class _ReadProviderPerKey:
+    pass
+
+
+_MAC_HOST_PROBE_CYCLE: ContextVar[_MacHostProbeCycle | _ReadProviderPerKey] = ContextVar(
+    "mac_host_probe_cycle", default=_ReadProviderPerKey())
+
+
 class HostEvidenceWorker:
     """One target reader publishes evidence without blocking the service loop."""
 
@@ -1277,6 +1333,7 @@ class HostEvidenceWorker:
         self.dispatch_observations: dict[str, DispatchEvidence] = {}
         self.due: dict[placement.HostEvidenceKey, float] = {key: 0.0}
         self.subscriptions: dict[placement.HostEvidenceKey, object] = {key: object()}
+        self.refresh_generation: int = 0
         self.stopped: threading.Event = threading.Event()
         self.requested: threading.Event = threading.Event()
         self.thread: threading.Thread = threading.Thread(target=self._read, name="placement-evidence-" + key.destination.target, daemon=True)
@@ -1352,6 +1409,16 @@ class HostEvidenceWorker:
             self.due[key] = float("-inf")
         self.requested.set()
 
+    def expedite_all(self) -> None:
+        """Request a new probe of each subscribed key."""
+        with self.lock:
+            if self.stopped.is_set():
+                return
+            self.refresh_generation += 1
+            for key in self.due:
+                self.due[key] = float("-inf")
+        self.requested.set()
+
     def remove(self, key: placement.HostEvidenceKey) -> None:
         with self.lock:
             _ = self.due.pop(key, None)
@@ -1364,10 +1431,7 @@ class HostEvidenceWorker:
         self.requested.set()
 
     def _next_ready(self, now: float) -> tuple[placement.HostEvidenceKey, object] | float | None:
-        """Return the earliest due key and its subscription, or the delay until a key is due.
-
-        Each turn probes one key, so an expedited key waits for one probe at most.
-        """
+        """Return the earliest due key and its subscription, or the delay until a key is due."""
         ready = min(((due, order, key) for order, (key, due) in enumerate(self.due.items()) if due <= now),
                     default=None)
         if ready is not None:
@@ -1383,11 +1447,46 @@ class HostEvidenceWorker:
                 ready = self._next_ready(time.monotonic())
             if not isinstance(ready, tuple):
                 _ = self.requested.wait(ready)
+            elif ready[0].destination.provider == "mac":
+                if not self._probe_mac_cycle(ready[0]):
+                    return
             elif not self._probe(*ready):
                 return
 
+    def _probe_mac_cycle(self, first: placement.HostEvidenceKey) -> bool:
+        """Update every key that uses the same Mac connection and settings."""
+        with self.lock:
+            generation = self.refresh_generation
+            subscription = self.subscriptions.get(first)
+            if subscription is None:
+                return True
+            keys = {first: subscription}
+            keys.update({key: subscription for key, subscription in self.subscriptions.items()
+                         if (key.destination.host == first.destination.host
+                             and key.configuration_generation == first.configuration_generation
+                             and key.settings == first.settings)})
+        token = _MAC_HOST_PROBE_CYCLE.set(_MacHostProbeCycle(self.clock.now(), generation, tuple(keys)))
+        try:
+            for key, subscription in keys.items():
+                with self.lock:
+                    if self.stopped.is_set():
+                        return False
+                    if self.refresh_generation != generation:
+                        break
+                    if self.subscriptions.get(key) is not subscription:
+                        continue
+                if not self._probe(key, subscription):
+                    return False
+        finally:
+            _MAC_HOST_PROBE_CYCLE.reset(token)
+        return True
+
     def _probe(self, key: placement.HostEvidenceKey, subscription: object) -> bool:
         """Probe one key and publish its evidence. Return False when the worker stops."""
+        with self.lock:
+            cycle = _MAC_HOST_PROBE_CYCLE.get()
+            refresh_generation = (cycle.refresh_generation if isinstance(cycle, _MacHostProbeCycle)
+                                  else self.refresh_generation)
         observed_at = self.clock.now()
         try:
             evidence = self.probe(key)
@@ -1415,7 +1514,8 @@ class HostEvidenceWorker:
                         and (not is_mac_linux_guest(probe.saved.assignment.destination)
                              or self._settlement_time(probe.saved, attempt) is None)):
                     self.dispatch_observations[attempt] = observed
-            self.due[key] = time.monotonic() + self.interval
+            if refresh_generation == self.refresh_generation:
+                self.due[key] = time.monotonic() + self.interval
             if self.stopped.is_set():
                 return False
             try:
@@ -1662,6 +1762,26 @@ def _placement_history_applies(saved: records.SavedPlacementAssignment, request:
                  or not is_mac_linux_guest(assignment.destination)
                  or not isinstance(saved.permission, placement.PermissionConsumed)
                  or assignment.owner == request.owner and assignment.since == request.since))
+
+
+def _guest_start_observed(saved: records.SavedPlacementAssignment) -> bool:
+    return saved.guest_execution_observed or isinstance(saved.confirmed_guest_start, records.ConfirmedGuestStart)
+
+
+def _guest_retry_released(saved: records.SavedPlacementAssignment) -> bool:
+    report = saved.terminal_report
+    return (is_mac_linux_guest(saved.assignment.destination)
+            and isinstance(saved.permission, placement.PermissionConsumed)
+            and saved.guest_proof_required and not _guest_start_observed(saved)
+            and isinstance(saved.retry, placement.RetryAt)
+            and isinstance(report, placement.TerminalAttemptReport)
+            and report.outcome == placement.PrelaunchRefused(MAC_LINUX_START_UNCONFIRMED))
+
+
+def _guest_retry_applies(saved: records.SavedPlacementAssignment, request: wire.PlacementRequest) -> bool:
+    assignment = saved.assignment
+    return (_guest_retry_released(saved) and assignment.episode == request.episode
+            and assignment.owner == request.owner and assignment.since == request.since)
 
 
 @dataclass(frozen=True)
@@ -1989,6 +2109,8 @@ class AdmissionServer:
         self.host_targets: dict[tuple[str, str], HostEvidenceWorker] = {}
         self.mac_recovery_lock: threading.Lock = threading.Lock()
         self.mac_recovery_retry_at: dict[str, float] = {}
+        self.mac_disk_recoveries: dict[str, offload.MacDiskShort] = {}
+        self.mac_disk_retry_at: dict[str, float] = {}
         self.background_local_evidence: bool = host_probe is None
         self.host_observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
         self.host_requests: dict[placement.HostEvidenceKey, wire.PlacementRequest] = {}
@@ -2157,7 +2279,8 @@ class AdmissionServer:
     def _check_saved_remote_slots(self) -> None:
         guests = {key: saved for key, saved in self.assignments.items() if _holds_consumed_guest_slot(saved)}
         self.manual_guest_settlement = {key for key, saved in guests.items()
-            if len(guests) > 1 or self.current_assignments.get(saved.assignment.episode) != key}
+            if len(guests) > 1
+            or self.current_assignments.get(saved.assignment.episode) != key and not _guest_retry_released(saved)}
         guest_episodes = {guests[key].assignment.episode for key in self.manual_guest_settlement}
         scalers = {key for key, saved in self.assignments.items() if _holds_scaler_slot(saved)
                    and (saved.assignment.episode in guest_episodes
@@ -4334,6 +4457,10 @@ class AdmissionServer:
                 return placement.HostEvidenceUnavailable(key, evidence.observed_at, str(error))
             if self.clock.now() - evidence.observed_at > lifetime:
                 return placement.StaleHostEvidence(key, evidence.observed_at, "provider evidence expired")
+            if key.destination.provider == "mac" and isinstance(evidence.eligibility, placement.AllowedHost):
+                with self.mac_recovery_lock:
+                    if key.destination.host in self.mac_disk_recoveries:
+                        return replace(evidence, eligibility=placement.TemporaryExclusion("disk"))
         return evidence
 
     def _refresh_host_observations(self) -> None:
@@ -4450,13 +4577,14 @@ class AdmissionServer:
             timeout = self._host_probe_timeout(key)
             previous = self.host_observations.get(key)
             target = (key.destination.provider, key.destination.target)
-            reader = self.host_targets.get(target)
-            if reader is None:
-                reader = HostEvidenceWorker(key, lambda current: self.host_probe(current), self.clock,
-                    self.reading_events, interval)
-                self.host_targets[target] = reader
-            else:
-                reader.request(key)
+            with self.mac_recovery_lock:
+                reader = self.host_targets.get(target)
+                if reader is None:
+                    reader = HostEvidenceWorker(key, lambda current: self.host_probe(current), self.clock,
+                        self.reading_events, interval)
+                    self.host_targets[target] = reader
+                else:
+                    reader.request(key)
             self.host_readers[key] = HostEvidenceReader(key, reader, timeout)
             if previous is not None:
                 reader.publish(previous)
@@ -4485,6 +4613,152 @@ class AdmissionServer:
                 return False
             self.mac_recovery_retry_at[target] = float("inf")
             return True
+
+    def _request_mac_disk_recovery(self, host: str, request: MacDiskRecoveryRequest) -> MacDiskRecoveryState:
+        """Read the recovery state and start a sweep if requested."""
+        from scripts.build_targets.build_targets import MacDiskRecoveryActive, MacDiskRecoveryInactive, MacDiskSweep
+
+        def recover(sweep: Callable[[], None]) -> None:
+            try:
+                sweep()
+            except (OSError, ValueError) as error:
+                print(f"memory admission: Mac disk recovery failed: {error}", file=sys.stderr)
+            finally:
+                with self.mac_recovery_lock:
+                    del self.mac_disk_recoveries[host]
+                    # The immediate probe can still report low disk space.
+                    self.mac_disk_retry_at[host] = self.clock.monotonic() + self._waiting_pass_interval()
+                    for (provider, _), worker in self.host_targets.items():
+                        if provider == "mac":
+                            worker.expedite_all()
+
+        with self.mac_recovery_lock:
+            active = self.mac_disk_recoveries.get(host)
+            if active is not None:
+                disk = request.disk if isinstance(request, MacDiskSweep) else active
+                return MacDiskRecoveryActive(disk)
+            if (not isinstance(request, MacDiskSweep) or self.closed
+                    or self.clock.monotonic() < self.mac_disk_retry_at.get(host, 0)):
+                return MacDiskRecoveryInactive()
+            self.mac_disk_recoveries[host] = request.disk
+            try:
+                threading.Thread(target=recover, args=(request.run,), name="mac-disk-recovery", daemon=True).start()
+            except RuntimeError:
+                del self.mac_disk_recoveries[host]
+                raise
+            return MacDiskRecoveryActive(request.disk)
+
+    def _mac_step_policies(self, target: target_config.LocalTarget | target_config.SshTarget,
+                           configuration: conf.ConfigRead, cycle: _MacHostProbeCycle,
+                           ) -> dict[placement.HostEvidenceKey, _MacStepPolicy]:
+        """Select the mirrors required by the steps in this cycle."""
+        from scripts.build_targets import build_targets
+        from scripts.mac_test import eligibility
+
+        policies: dict[placement.HostEvidenceKey, _MacStepPolicy] = {}
+        for key in cycle.keys:
+            sent = key.command_kind
+            kind = eligibility.recorded_step_kind(key.step) if isinstance(sent, placement.CommandKindNotSent) else sent
+            if kind in placement.STEP_COMMAND_KINDS:
+                try:
+                    policies[key] = build_targets.step_policy(target, Path(key.repository), key.package, kind,
+                        backoff=eligibility.NO_BACKOFF, configuration=configuration)
+                except (OSError, UnicodeError, ValueError) as error:
+                    policies[key] = placement.HostEvidenceUnavailable(key, cycle.observed_at, str(error))
+        return policies
+
+    def _read_mac_host(self, target: target_config.LocalTarget | target_config.SshTarget,
+                       configuration: conf.ConfigRead, cycle: _MacHostProbeCycle) -> _MacHostReading:
+        """Read the Mac once and refresh the local claims after SSH."""
+        from scripts.mac_test import claim_state, eligibility
+
+        name = target.name
+        settings = eligibility.probe_settings(configuration)
+        policies = self._mac_step_policies(target, configuration, cycle)
+        setup_mirrors = sorted({policy.legacy_mirror_name for policy in policies.values()
+                                if isinstance(policy, eligibility.KnownRepository)})
+        paths = claim_state.state_paths(name)
+        with claim_state.locked(paths.lock):
+            probed_claims = {claim.path: claim for claim in claim_state.read_claims(paths)}
+        mirrors = sorted({mirror.mirror_name for claim in probed_claims.values()
+                          if claim.record.get("remote_host") == settings.host
+                          and not claim.record.get("cleanup_pending", False)
+                          and isinstance(mirror := claim_state.saved_mac_repository(claim.record),
+                                         claim_state.MacMirrorIdentity)})
+        probe = self._probe_mac_host(name, settings, mirrors, setup_mirrors)
+        with claim_state.locked(paths.lock):
+            claims, _ = claim_state.sweep_mac_replacements(paths, claim_state.read_claims(paths))
+        return _MacHostReading(cycle.observed_at, settings, policies, claims, probed_claims, probe)
+
+    def _probe_mac_host(self, name: str, settings: eligibility.SshProbeSettings, mirrors: list[str],
+                        setup_mirrors: list[eligibility.LegacyMirrorName],
+                        ) -> offload.MacHostProbeSnapshot | _MacHostExcluded:
+        """Run one shared command when the host permits a probe."""
+        from scripts.mac_test import eligibility, offload
+
+        configuration = settings.configuration
+        if not configuration.value("offload", conf.on_off) and not mirrors:
+            return _MacHostExcluded("off")
+        recover = self._begin_mac_backoff_probe(name)
+        try:
+            if not recover and isinstance(eligibility.read_backoff(time.time(), name), eligibility.ActiveBackoff):
+                return _MacHostExcluded("backoff")
+            probe = offload.probe_mac_host(offload.ProcessController(), settings, name, mirrors,
+                                           setup_mirrors=setup_mirrors)
+            if isinstance(eligibility.read_backoff(time.time(), name), eligibility.ActiveBackoff):
+                return _MacHostExcluded("backoff")
+            if isinstance(probe, offload.UnavailableProbe):
+                offload.write_backoff(time.time() + configuration.number("unreachable_backoff_s"), name, wait=not recover)
+                return _MacHostExcluded("unreachable")
+            return probe
+        finally:
+            if recover:
+                with self.mac_recovery_lock:
+                    self.mac_recovery_retry_at[name] = self.clock.monotonic() + self._waiting_pass_interval()
+
+    def _mac_step_eligibility(self, target: target_config.LocalTarget | target_config.SshTarget,
+                              key: placement.HostEvidenceKey,
+                              repository: eligibility.KnownRepository | target_config.ExcludedTarget,
+                              reading: _MacHostReading
+                              ) -> target_config.EligibleTarget | target_config.ExcludedTarget:
+        """Apply the step and session rules to the shared Mac reading."""
+        from scripts.build_targets import build_targets
+        from scripts.mac_test import claim_state, eligibility, mac_test, offload
+
+        if isinstance(repository, target_config.ExcludedTarget):
+            return repository
+        name = key.destination.target
+        paths = claim_state.state_paths(name)
+        settings = target.settings if isinstance(target, target_config.SshTarget) else eligibility.DEFAULT_MAC_SETTINGS
+        capacity = mac_test.free_now(paths, settings, Path(key.repository), session=key.session,
+                                    configuration=reading.settings.configuration,
+                                    mac_scope=key.destination.scope, recover_mac_backoff=True)
+        if capacity == "blocked":
+            return target_config.ExcludedTarget(target, capacity)
+        if isinstance(reading.probe, _MacHostExcluded):
+            return target_config.ExcludedTarget(target, reading.probe.reason)
+        if reading.probe.setup.get(repository.legacy_mirror_name) is not offload.MacMirrorSetup.READY:
+            return target_config.ExcludedTarget(target, "copy")
+        answer = build_targets.mac_disk_recovery_eligibility(
+            target, reading.settings, repository, reading.probe.disk, self._request_mac_disk_recovery)
+        if isinstance(answer, target_config.EligibleTarget) and capacity in ("busy", "state"):
+            return target_config.ExcludedTarget(target, capacity)
+        return answer
+
+    def _mac_claim_execution(self, reading: _MacHostReading, claim: HeldClaim, record: RemoteJobClaim
+                             ) -> execution_identity.ExecutionEvidence:
+        """Find the saved claim's process in the shared Mac reading."""
+        from scripts.mac_test import claim_state
+
+        mirror = claim_state.saved_mac_repository(record)
+        if not isinstance(mirror, claim_state.MacMirrorIdentity):
+            return execution_identity.ExecutionEvidenceUnavailable("the claim has no saved Mac mirror", reading.observed_at)
+        if (not isinstance(reading.probe, _MacHostExcluded) and claim == reading.probed_claims.get(claim.path)
+                and record["remote_host"] == reading.settings.host
+                and (process := reading.probe.processes.get(mirror.mirror_name)) is not None):
+            return execution_identity.ObservedExecution(execution_identity.ProcessExecution(
+                record["remote_host"], record.get("instance_generation", ""), process.pid, process.start_time))
+        return execution_identity.ExecutionEvidenceUnavailable("remote execution remains unresolved", reading.observed_at)
 
     def _read_target_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         """Read local hold policy or remote provider claims."""
@@ -4547,22 +4821,41 @@ class AdmissionServer:
                 return read_gpu_evidence(transport, key, request, configuration=configuration)
             if isinstance(transport, hana_placement.HanaControlTransport):
                 return hana_placement.read_evidence(key, request, transport=transport, workload=configuration)
-        sent = request.constraints.command_kind
-        kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
+        cycle = _MAC_HOST_PROBE_CYCLE.get()
+        shared: _MacHostReading | _ReadProviderPerKey = _ReadProviderPerKey()
+        if destination.provider == "mac" and isinstance(cycle, _MacHostProbeCycle):
+            if isinstance(cycle.reading, _MacHostNotRead):
+                try:
+                    cycle.reading = self._read_mac_host(target, configuration, cycle)
+                except (OSError, UnicodeError, ValueError) as error:
+                    cycle.reading = _MacHostUnreadable(cycle.observed_at, str(error))
+            if isinstance(cycle.reading, _MacHostUnreadable):
+                return placement.HostEvidenceUnavailable(key, cycle.reading.observed_at, cycle.reading.reason)
+            shared = cycle.reading
+        sent = key.command_kind
+        kind = recorded_step_kind(key.step) if isinstance(sent, placement.CommandKindNotSent) else sent
         eligibility: placement.HostEligibility
+        observed_at = shared.observed_at if isinstance(shared, _MacHostReading) else self.clock.now()
+        disk_recovery: build_targets.MacDiskRecoveryPending | build_targets.MacDiskRecoveryInactive
+        disk_recovery = build_targets.MacDiskRecoveryInactive()
         if build_targets.mac_run_bypasses_repository_policy(target, kind):
             eligibility = placement.AllowedHost()
         elif kind not in placement.STEP_COMMAND_KINDS:
             # The target can never run this command, so a pinned step refuses at once.
-            return placement.FreshHostEvidence(key, self.clock.now(), "", placement.FixedExclusion("command"))
+            return placement.FreshHostEvidence(key, observed_at, "", placement.FixedExclusion("command"))
         else:
-            if isinstance(target, target_config.SshTarget):
+            if isinstance(shared, _MacHostReading):
+                policy = shared.policies[key]
+                if isinstance(policy, placement.HostEvidenceUnavailable):
+                    return policy
+                answer = self._mac_step_eligibility(target, key, policy, shared)
+            elif isinstance(target, target_config.SshTarget):
                 recover = target.platform == "macos" and self._begin_mac_backoff_probe(target.name)
                 try:
                     answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
                         request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, new_step=True,
                         session=key.session, configuration=configuration, mac_scope=destination.scope,
-                        recover_mac_backoff=recover)
+                        recover_mac_backoff=recover, request_disk_recovery=self._request_mac_disk_recovery)
                 finally:
                     if recover:
                         with self.mac_recovery_lock:
@@ -4570,17 +4863,25 @@ class AdmissionServer:
             else:
                 answer = build_targets.mac_target_eligibility(target, Path(request.constraints.repository),
                     request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session,
-                    configuration=configuration, mac_scope=destination.scope)
+                    configuration=configuration, mac_scope=destination.scope,
+                    request_disk_recovery=self._request_mac_disk_recovery)
+            if isinstance(answer, build_targets.MacDiskRecoveryPending):
+                disk_recovery = answer
             eligibility = (placement.TemporaryExclusion(answer.reason)
                 if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
         paths = claim_state.state_paths(destination.target)
-        with claim_state.locked(paths.lock):
-            held, _ = claim_state.sweep_mac_replacements(paths, claim_state.read_claims(paths))
+        if isinstance(shared, _MacHostReading):
+            held = shared.claims
+        else:
+            with claim_state.locked(paths.lock):
+                held, _ = claim_state.sweep_mac_replacements(paths, claim_state.read_claims(paths))
         # Routing keeps a busy or blocked Mac eligible so a step can wait for it. Placement must
         # wait too, or each pass makes a new attempt that the Mac refuses. A Mac run skips the
         # repository policy, so this check is the only one that sees a block from another session.
         # An unreadable block or claim record also waits: it can hide a block.
-        if (isinstance(eligibility, placement.AllowedHost) and isinstance(target, target_config.SshTarget)
+        if (isinstance(eligibility, placement.AllowedHost)
+                and (isinstance(shared, _ReadProviderPerKey) or build_targets.mac_run_bypasses_repository_policy(target, kind))
+                and isinstance(target, target_config.SshTarget)
                 and target.platform == "macos"):
             mac_answer = mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
                                            session=key.session, configuration=configuration,
@@ -4633,9 +4934,15 @@ class AdmissionServer:
             adopted.append(placement.AdoptedProviderClaim(reference,
                 placement.ClaimHolderIdentity(self.host, record["pid"], record["proc_start"]),
                 session, record["remote_host"], record.get("instance_generation", "")))
-            executions.append((reference, self._observe_provider_execution(request, destination, reference,
-                record, paths.platform, configuration)))
-        return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
+            execution = (self._mac_claim_execution(shared, claim, record) if isinstance(shared, _MacHostReading)
+                         else self._observe_provider_execution(request, destination, reference, record, paths.platform, configuration))
+            executions.append((reference, execution))
+        observed_at = shared.observed_at if isinstance(shared, _MacHostReading) else self.clock.now()
+        evidence = (key, observed_at, generation, eligibility, tuple(adopted), tuple(cleanup),
+                    tuple(executions), holder, diagnostic)
+        if isinstance(disk_recovery, build_targets.MacDiskRecoveryPending):
+            return MacDiskRecoveryPendingEvidence(*evidence, disk=disk_recovery.disk)
+        return placement.FreshHostEvidence(*evidence)
 
     def _read_mac_linux_guest(self, key: placement.HostEvidenceKey) -> placement.FreshHostEvidence:
         from scripts.build_targets import mac_linux
@@ -5031,7 +5338,8 @@ done
                 or self._reused_guest_timeout(request) is not None):
             return False
         return not any(saved.assignment.episode == request.episode
-            and (_holds_consumed_guest_slot(saved) or _holds_scaler_slot(saved)
+            and (_holds_consumed_guest_slot(saved) and not _guest_retry_applies(saved, request)
+                 or _holds_scaler_slot(saved)
                  or isinstance(saved.state, placement.ClosedAssignment)
                  and saved.state.reason in ("completed", "cancelled")
                  and _placement_history_applies(saved, request))
@@ -5066,6 +5374,9 @@ done
     def _target_retry(self, request: wire.PlacementRequest,
                       destination: placement.PlacementDestination, keys: PlacementEvidenceKeys
                       ) -> placement.RetryDecision | placement.EvidenceNeeded | RetryAfterAvailability:
+        if is_mac_linux_guest(destination) and any(_guest_retry_applies(saved, request)
+                                                  for saved in self.assignments.values()):
+            return placement.DoNotRetry(MAC_LINUX_START_UNCONFIRMED)
         saved = next((saved for saved in reversed(self.assignments.values())
             if saved.assignment.destination == destination and isinstance(saved.state, placement.ClosedAssignment)
             and _placement_history_applies(saved, request)), None)
@@ -5438,6 +5749,8 @@ done
         for key, guest in self.assignments.items():
             if guest.assignment.episode != request.episode or not is_mac_linux_guest(guest.assignment.destination):
                 continue
+            if _guest_retry_applies(guest, request):
+                continue
             if _holds_consumed_guest_slot(guest):
                 guest_waiting = True
                 expired = self._expire_guest_replacement(guest)
@@ -5668,7 +5981,16 @@ done
                 elif (any(same_remote_resource(other, destination) for other in taken)
                         or self._held_for_older(request, destination, held, holds)):
                     continue
-                assignment = self._new_assignment(request, destination, remote_start_hold_seconds)
+                mac = destination.provider == "mac"
+                with self.mac_recovery_lock if mac else nullcontext():
+                    # A sweep can start after candidate selection.
+                    if mac and destination.host in self.mac_disk_recoveries:
+                        self.placement_eligibility[request.episode] = tuple(
+                            replace(item, eligibility=placement.TemporaryExclusion("disk"))
+                            if item.destination == destination else item
+                            for item in self.placement_eligibility[request.episode])
+                        continue
+                    assignment = self._new_assignment(request, destination, remote_start_hold_seconds)
                 taken.append(destination)
                 if isinstance(request.purpose, placement.SpeculativeCopy):
                     held_copy_destinations.append(candidate.destination)
@@ -5876,9 +6198,10 @@ done
         The no-run report can close a legacy attempt if no start is pending.
         A fresh process read checks the gate because the last system reading can still show it.
         """
-        return (saved.assignment.destination.target == "mac-linux"
+        return (is_mac_linux_guest(saved.assignment.destination)
                 and isinstance(saved.permission, placement.PermissionConsumed)
-                and isinstance(request.claim, placement.NoProviderClaim) and request.reason == MAC_LINUX_NO_ANSWER
+                and isinstance(request.claim, placement.NoProviderClaim)
+                and request.reason in (MAC_LINUX_NO_ANSWER, MAC_LINUX_START_UNCONFIRMED)
                 and not saved.guest_execution_observed
                 and isinstance(saved.guest_start, records.GuestStartNotReported)
                 and isinstance(saved.confirmed_guest_start, records.GuestStartNotRecorded)
@@ -6147,6 +6470,15 @@ done
             return
         expired = self._expire_guest_replacement(saved, checked_at=settled_at)
         report = expired.terminal_report
+        if _guest_start_observed(saved) and (isinstance(report, placement.NoTerminalReport)
+                or isinstance(report.outcome, placement.AttemptDeclined | placement.PrelaunchRefused)):
+            report = placement.TerminalAttemptReport(
+                placement.AttemptCancelled("The Mac Linux guest ended without a verdict"),
+                placement.DispatchPathSettled(), self.clock.now())
+        if (isinstance(report, placement.NoTerminalReport) and saved.guest_proof_required
+                and self._placement_owner_live(assignment.owner)):
+            # The gate can report its failure after the settlement probe completes.
+            return
         terminal = (replace(report, path=placement.DispatchPathSettled())
                     if isinstance(report, placement.TerminalAttemptReport) else self._lost_report())
         # Keep the settlement time for a reused submission after the worker forgets the attempt.
@@ -6158,7 +6490,8 @@ done
     def _expire_guest_replacement(self, saved: records.SavedPlacementAssignment, *,
                                   checked_at: float | None = None) -> records.SavedPlacementAssignment:
         report = saved.terminal_report
-        if (not isinstance(report, placement.TerminalAttemptReport)
+        if (_guest_retry_released(saved) or _guest_start_observed(saved)
+                or not isinstance(report, placement.TerminalAttemptReport)
                 or not isinstance(report.outcome, placement.AttemptDeclined | placement.PrelaunchRefused)):
             return saved
         limit = _guest_wait_limit()
@@ -6349,6 +6682,25 @@ done
             return [self._placement_status(assignment, check_lifetime=False)]
         guest = is_mac_linux_guest(assignment.destination)
         current = self.current_assignments.get(assignment.episode) == key
+        if isinstance(request, wire.ClaimFailure) and request.reason == MAC_LINUX_START_UNCONFIRMED:
+            if _guest_retry_released(saved) and isinstance(request.claim, placement.NoProviderClaim):
+                return [self._placement_status(assignment, check_lifetime=False)]
+            previous = saved.terminal_report
+            if (not current or not _holds_consumed_guest_slot(saved) or not saved.guest_proof_required
+                    or not self._guest_took_no_run(saved, request)
+                    or isinstance(previous, placement.TerminalAttemptReport)
+                    and previous.outcome != GUEST_SETTLEMENT_REQUESTED):
+                return [self._placement_status(assignment, "The queue cannot release this guest attempt for retry",
+                                               check_lifetime=False)]
+            now = self.clock.now()
+            report = placement.TerminalAttemptReport(placement.PrelaunchRefused(request.reason),
+                placement.DispatchPathPending("Mac Linux settlement is pending"), now)
+            self.assignments[key] = replace(saved, terminal_report=report, retry=placement.RetryAt(now),
+                                            remote_start_hold=records.RemoteStartHoldEnded())
+            del self.current_assignments[assignment.episode]
+            self.persist()
+            self._schedule_pass()
+            return [self._placement_status(assignment, check_lifetime=False)]
         if guest and not current:
             return [self._placement_status(assignment, "the attempt is no longer current", check_lifetime=False)]
         guest_holds_slot = _holds_consumed_guest_slot(saved)
@@ -6360,7 +6712,7 @@ done
                              and isinstance(request.claim, placement.NoProviderClaim))
             if (current
                     and (local_decline or isinstance(saved.permission, placement.PermissionAvailable)
-                         or self._guest_took_no_run(saved, request)
+                         or request.reason == MAC_LINUX_NO_ANSWER and self._guest_took_no_run(saved, request)
                          or assignment.destination.provider == "scaler"
                          and (request.claim == saved.provider or isinstance(request.claim, placement.NoProviderClaim)))
                     and isinstance(saved.state, placement.CurrentAssignment)):
