@@ -27,7 +27,7 @@ from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import Literal, NamedTuple, NotRequired, TypedDict, cast, overload
+from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast, overload
 from zoneinfo import ZoneInfo
 
 from scripts.production.production_doc import Production, Refusal, read_production
@@ -50,6 +50,9 @@ from scripts.usage import agents_log
 from scripts.lib import conf, names
 from scripts.lib.process_failure import failure_detail
 from scripts.agents.remote import local_machine
+
+if TYPE_CHECKING:
+    from scripts.notify import review
 
 
 class InputError(Exception):
@@ -1979,7 +1982,7 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
     if any(entry["text"] == text for entry in open_entries(production, identities)):
         raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
     # The review can take a minute, so it runs before the lock: `questions` is not held up by it.
-    accepted = review_open_question(production.name, QuestionForReview(text, "", question, rank))
+    accepted = review_open_question(production.name, QuestionForReview(text, "", question, rank), console=True)
     if isinstance(accepted, HeldRegistrationQuestion):
         raise RegistrationFailure("ask", f"question held for review: {text}: {accepted.details}")
     now = datetime.now(production.zone)
@@ -2411,6 +2414,7 @@ def reply_to_submission(path: Path, key: new_item_dialog.ScopedSubmissionKey, wo
             raise new_item_dialog.SubmissionError("This item no longer accepts this reply.")
         if repeated:
             return False
+        require_console_reply(current, words, key.request_id)
         record_followup_reply(current.item, words, current.owner)
         write_question_record(current)
         return True
@@ -2431,6 +2435,7 @@ def reply_record(record: QuestionRecord, text: str, who: str, *, identities: Que
             _ = delivery_state.question_exchange_for_reply(exchange, question_id, text.strip())
         if "followup" not in current.item:
             raise RegistrationFailure("reply", f"{current.item['text']}: no open follow-up waits for a reply")
+        require_console_reply(current, text, question_id)
         record_followup_reply(current.item, text, who)
         _ = _publish_question(current)
     report("reply", "ok", f"{scope.name}: {current.item['text']}: back on the open-questions list with the reply")
@@ -2586,16 +2591,38 @@ class ReviewUnavailableQuestion(NamedTuple):
 AcceptedQuestion = ReviewedQuestion | ReviewUnavailableQuestion
 
 
-def review_open_question(name: str, item: QuestionForReview) -> AcceptedQuestion | HeldRegistrationQuestion:
+def review_open_question(name: str, item: QuestionForReview, *,
+                         console: bool = False) -> AcceptedQuestion | HeldRegistrationQuestion:
     # Copied registration trees can run reminder-only commands without notify installed.
     from scripts.notify import review
-    outcome = review.review_question(review.QuestionKey(name, item.text), item.question)
+    key = review.QuestionKey(name, item.text)
+    if console:
+        from scripts.console_text import check as console_text
+        outcome = console_text.check(item.question, "question", key=key, title=item.text)
+    else:
+        outcome = review.review_question(key, item.question)
     if isinstance(outcome, review.QuestionAccepted):
         return ReviewedQuestion(item.text, outcome.question)
     if isinstance(outcome, review.QuestionReviewUnavailable):
         return ReviewUnavailableQuestion(item.text, outcome.question, outcome.reason)
+    return HeldRegistrationQuestion(question_review_details(outcome))
+
+
+def question_review_details(outcome: review.QuestionAwaitingFacts | review.QuestionReviewFailed) -> str:
+    from scripts.notify import review
     details = outcome.questions if isinstance(outcome, review.QuestionAwaitingFacts) else outcome.details
-    return HeldRegistrationQuestion("; ".join(details + tuple(f"{failure.rule}: {failure.quote}" for failure in outcome.failures)))
+    return "; ".join((*details, *(f"{failure.rule}: {failure.quote}" for failure in outcome.failures)))
+
+
+def require_console_reply(record: QuestionRecord, text: str, exchange: str) -> None:
+    from scripts.console_text import check as console_text
+    from scripts.notify import review
+
+    item = open_item_key(record) or record.item["text"]
+    key = review.QuestionKey("reply", f"{record.owner}/{item}/{exchange}")
+    outcome = console_text.check(text, "reply", key=key)
+    if isinstance(outcome, (review.QuestionAwaitingFacts, review.QuestionReviewFailed)):
+        raise RegistrationFailure("reply", "reply held for review: " + question_review_details(outcome))
 
 
 def questions(production: Production, path: Path | None, *, identities: QuestionStaff | None = None) -> None:
@@ -2722,9 +2749,9 @@ def main() -> int:
                                         help="the one-line item the count and lists name, at most question_title_max_chars characters (config/production.conf); the default is --ask")
             _ = subcommand.add_argument("--ask", required=True,
                                         help="the question in one line, at most question_title_max_chars characters (config/production.conf); the parts below give the page its layout")
-            _ = subcommand.add_argument("--context", default="", help="two sentences at most: why it is asked now and what waits on it")
+            _ = subcommand.add_argument("--context", default="", help="the point of the question")
             _ = subcommand.add_argument("--item", dest="items", action="append", default=[],
-                                        help="one fact, step or command; a command in backticks; repeat it")
+                                        help="one fact line; repeat for each fact")
             _ = subcommand.add_argument("--recommend", default="",
                                         help="one choice and the reason, in one sentence; required with --choice")
             _ = subcommand.add_argument("--choice", dest="choices", action="append", default=[],

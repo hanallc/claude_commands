@@ -816,7 +816,11 @@ A missing folder uses its nearest existing parent until the folder appears.
   A new question requires its full text and a review result before storage.
 
 - `ask --ask "<one line>" [--context "<why now>"] [--item "<entry>" ...] [--recommend "<choice and why>"] [--choice "<answer>" ...] [--unit <unit>]` files a reviewed question without a reply to the user.
-  The record keeps the parts in `parts` and the joined full text in `question`, so `/next`, messages and the review read one text.
+  The [Console text standard](../console_text_standard.md) applies to `ask` and to answers and replies from the writer.
+  The fast check tests text patterns before the existing model reviewer reads the draft.
+  The filing command returns the failed rules and quotes to the writer. The hold keeps the draft.
+  If the model is unavailable, `ask` records the reason.
+  The record keeps the parts in `parts` and their full text in `question`.
   The Review page shows question parts as sections: the items as a numbered list, links as links, and each choice as a radio item that fills the answer box.
   `--ask` is required and holds one line; `--text` defaults to it. There is no `--question` option.
   A question with `--choice` needs at least two of them and a `--recommend`; otherwise `ask` refuses before the review.

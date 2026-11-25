@@ -1,0 +1,107 @@
+"""Check Console text before a command publishes it."""
+from __future__ import annotations
+
+import re
+from typing import Literal
+
+from scripts.notify import review
+
+type Kind = Literal["question", "reply", "change", "proposal", "investigation answer",
+                    "efficiency candidate", "list field", "image caption"]
+
+_FAST_ONLY = frozenset(("efficiency candidate", "list field", "image caption"))
+_URL = re.compile(r"https?://[^\s<>()`]+")
+_PATH_PART = r"[\w.-]+"
+_PATH = re.compile(
+    rf"(?<![\w/])(?:(?:~|\.\.?)?/{_PATH_PART}(?:/{_PATH_PART})*"
+    + rf"|{_PATH_PART}/(?:{_PATH_PART}/)+{_PATH_PART}|{_PATH_PART}/[\w-]+\.{_PATH_PART})(?<!\.)"
+)
+_SESSION = re.compile(r"(?<![\w-])[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?![\w-])", re.I)
+_RUN = re.compile(
+    rf"(?<![\w-])\d{{8}}T\d{{6}}Z?-\d+(?:-[0-9a-f]{{4,}})?(?:@{_SESSION.pattern})?(?![\w-])",
+    re.I,
+)
+_COMMIT = re.compile(r"\b(?:[0-9a-f]{40}|[0-9a-f]{64}|"
+                     + r"(?=[0-9a-f]*[a-f])(?=[0-9a-f]*[0-9])[0-9a-f]{7,39})\b", re.I)
+_SHELL_FENCE = re.compile(r"```(?:sh|bash|zsh|shell|console)\s*$", re.I)
+_SHELL_LINE = re.compile(
+    r"\$\s+\S|[a-z./~][\w./~+-]*(?: +[^\s-]+)* +"
+    + r"(?:--?[a-zA-Z0-9][\w-]*(?:\s|=|$)|(?:\|\|?|&&|>>?)\s+\S)"
+)
+_CODE_COMMAND = re.compile(r"`(?:[a-z_][\w-]*|[\w./~+-]+\s+[^\n`]+)`")
+_ITEM = re.compile(r"^(?:\d+\. |[-*] )")
+_SENTENCE_END = re.compile(r"""[.!?]+["'’”)]*(?=\s|$)""")
+_YES_NO = re.compile(r"Choices:\s*\n- (yes|no)\b[^\n]*\n- (yes|no)\b[^\n]*\s*\Z", re.I)
+_COMMAND_LABEL = "Run this command:"
+
+
+def _length_failures(text: str, kind: Kind) -> list[review.RuleFailure]:
+    blocks = re.split(r"\n[ \t]*\n", text.strip())
+    point_index = int(len(blocks) > 1 and (kind == "question" or blocks[0].startswith("#")))
+    if blocks[point_index].strip("* ").casefold() == "the point" and len(blocks) > point_index + 1:
+        point_index += 1
+    point = blocks[point_index]
+    if kind == "question" and (_ITEM.match(point) or point.startswith(("Choices:", "Recommended:"))):
+        point = blocks[0]
+    failures: list[review.RuleFailure] = []
+    sentences = len(_SENTENCE_END.findall(point))
+    if _SENTENCE_END.split(point)[-1].strip():
+        sentences += 1
+    if sentences > 3:
+        failures.append(review.RuleFailure("point-at-most-three-sentences", point))
+    choices = _YES_NO.search(text)
+    if choices and choices[1].casefold() != choices[2].casefold():
+        facts = [line for line in text[:choices.start()].splitlines() if _ITEM.match(line)]
+        if len(facts) > 3:
+            failures.append(review.RuleFailure("yes-no-at-most-three-fact-lines", facts[3]))
+    return failures
+
+
+def fast_check(text: str, kind: Kind) -> tuple[review.RuleFailure, ...]:
+    """Return failed patterns with quotes. Put the question title in the first block."""
+    failures = _length_failures(text, kind)
+    command_allowed = used_command = shell_fence = False
+    for line in text.splitlines():
+        content = _ITEM.sub("", line.strip(), count=1)
+        if content.startswith(_COMMAND_LABEL):
+            command_allowed = not used_command
+            content = content.removeprefix(_COMMAND_LABEL).strip()
+        if not content:
+            continue
+        if _SHELL_FENCE.fullmatch(content):
+            shell_fence = True
+            continue
+        if content == "```":
+            shell_fence = command_allowed = False
+            continue
+        if shell_fence or _SHELL_LINE.match(content) or _CODE_COMMAND.fullmatch(content):
+            if command_allowed:
+                used_command = True
+            else:
+                failures.append(review.RuleFailure("command-for-user-only", content))
+            command_allowed = False
+            continue
+        command_allowed = False
+        visible = _URL.sub(" ", content)
+        for rule, pattern in (("omit-run-id", _RUN), ("omit-session-id", _SESSION),
+                              ("omit-file-path", _PATH), ("omit-commit-hash", _COMMIT)):
+            for match in pattern.finditer(visible):
+                failures.append(review.RuleFailure(rule, match[0]))
+            visible = pattern.sub(" ", visible)
+    return tuple(failures)
+
+
+def check(text: str, kind: Kind, *, key: review.QuestionKey | None = None,
+          title: str = "") -> review.QuestionOutcome:
+    """Run the filing check. Use a stable key to save the hold for a revised draft."""
+    failures = fast_check(text, kind)
+    if title and title not in text.splitlines():
+        failures += fast_check(title, "list field")
+    if failures:
+        outcome = review.QuestionReviewFailed(text, (), failures)
+        if key is not None:
+            review.save_question_review(key, outcome)
+        return outcome
+    if kind in _FAST_ONLY:
+        return review.QuestionAccepted(text)
+    return review.review_question(key or review.QuestionKey(kind, text), text, console_kind=kind)

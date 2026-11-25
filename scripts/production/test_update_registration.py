@@ -686,16 +686,27 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertIn("0 due, 0 deferred, 1 waiting for a reply", waiting.stdout)
         self.assertNotIn("Keep the layout?", self.run_command("next").stdout)
 
-        replied = self.run_command("reply", "--item", "Choose the layout", "--text", "The file is layout.toml.")
+        with mock.patch.dict(self.env, {"NOTIFY_STATE_DIR": str(self.state / "notify")}):
+            with mock.patch.object(review, "review_question") as reviewer:
+                held = self.run_command("reply", "--item", "Choose the layout", "--text", "Use /tmp/layout.toml.")
+        self.assertEqual(held.returncode, 2, held.stdout + held.stderr)
+        self.assertIn("reply held for review: omit-file-path: /tmp/layout.toml", held.stdout)
+        reviewer.assert_not_called()
+        self.assertIn("waiting for the asker's reply", self.run_command("open").stdout)
+
+        words = "Use the layout settings."
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(words)) as reviewer:
+            replied = self.run_command("reply", "--item", "Choose the layout", "--text", words)
+        self.assertEqual(reviewer.call_args.kwargs["console_kind"], "reply")
         self.assertEqual(replied.returncode, 0, replied.stdout + replied.stderr)
         self.assertIn("reply: ok", replied.stdout)
         again = self.run_command("reply", "--item", "Choose the layout", "--text", "Again")
         self.assertNotEqual(again.returncode, 0)
         listed = self.run_command("open")
         self.assertIn("1 due, 0 deferred", listed.stdout)
-        self.assertIn("Follow-up: Which file holds it?\nReply: The file is layout.toml.", listed.stdout)
+        self.assertIn(f"Follow-up: Which file holds it?\nReply: {words}", listed.stdout)
         self.assertEqual(self.question_rows()[-1].get("followups"),
-                         [{"followup": "Which file holds it?", "reply": "The file is layout.toml."}])
+                         [{"followup": "Which file holds it?", "reply": words}])
 
     def test_reminder_replacement_and_answer_preserve_the_filed_question(self) -> None:
         self.file_question()
@@ -805,6 +816,32 @@ class QuestionIdentityTests(RegistrationFixture):
                 table = self.run_command("questions-table")
                 self.assertEqual(table.returncode, 0, table.stdout + table.stderr)
                 self.assertIn(table_state, table.stdout)
+
+    def test_ask_holds_a_fast_failure_before_the_model_and_publication(self) -> None:
+        title = "Keep the layout?"
+        context = "Your layout settings are in /tmp/layout.toml."
+        notify = self.state / "notify"
+        with mock.patch.dict(self.env, {"NOTIFY_STATE_DIR": str(notify)}):
+            with mock.patch.object(review, "review_question") as reviewer:
+                result = self.run_command("ask", "--ask", title, "--context", context, "--unit", "alpha")
+            reviewer.assert_not_called()
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("question held for review: Keep the layout?: omit-file-path: /tmp/layout.toml", result.stdout)
+            self.assertEqual(list(self.issues.glob("*.md")), [])
+            key = review.QuestionKey(self.fixture_owner_name(), title)
+            hold = notify / "questions" / f"{key.digest}.json"
+            self.assertEqual(json.loads(hold.read_text()), {
+                "slug": key.name, "text": title, "question": title + "\n\n" + context,
+                "details": ["omit-file-path: /tmp/layout.toml"],
+            })
+
+            revised = "The new layout uses more space on your screen."
+            with mock.patch.object(review, "review_question",
+                                   return_value=review.QuestionAccepted(title + "\n\n" + revised)) as reviewer:
+                filed = self.run_command("ask", "--ask", title, "--context", revised, "--unit", "alpha")
+            self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
+            reviewer.assert_called_once_with(key, title + "\n\n" + revised, console_kind="question")
+            self.assertEqual(len(self.question_rows()), 1)
 
     def test_question_review_and_defer_keep_the_fixed_asker(self) -> None:
         held = review.QuestionAwaitingFacts("Keep the layout?", ("Which layout?",))
