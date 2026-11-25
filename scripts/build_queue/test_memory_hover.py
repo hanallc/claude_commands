@@ -624,7 +624,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(children[children.index(header) + 1].get("data-tip"), "wait:fixture-wait-0")
                 table_rows = root.findall(".//tbody/tr")
                 self.assertEqual([row.get("class") for row in table_rows],
-                                 ["tools", "", "", "room", "queue-head", "wait wait-first"])
+                                 ["", "", "room", "queue-head", "wait wait-first"])
                 self.assertEqual(root.findtext(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='place']"), "1")
                 self.assertEqual(root.findtext(".//div[@data-tip='wait:fixture-wait-0']//span[@class='name']"), "first")
                 self.assertEqual(step_text(root, ".//tr[@data-tip='wait:fixture-wait-0']/th[@class='step']"), "")
@@ -3047,6 +3047,7 @@ renderWalk = reading => { painted = reading; };
 
     def test_memory_tooltips_use_the_shared_aligned_grid(self) -> None:
         data = {"read_at": 400, "cap": 31, "psi": {"some": 3.2, "full": 0}, "limits": {"some": 10, "full": 2},
+                "ram": {**RAM_FIXTURE, "ci_services": [{"name": "hana-linux-1", "bytes": 512 * MIB}]},
                 "tokens": {"kind": "TokenPool", "total": 31, "free": 4, "memory_floor_bytes": 2 * GIB},
                 "walk": [program_memory_row(program_memory_fixture(started=True)),
                          {"name": "Mac nextest", "kind": "mac-build", "used": 2, "started_at": 340, "read_at": 380},
@@ -3090,6 +3091,7 @@ renderWalk = reading => { painted = reading; };
                       grids["wait:fixture-wait-0"])
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         self.assertRegex(page, r"\.tip \{[^}]*grid-template-columns: fit-content\(44%\) minmax\(0, 1fr\)")
+        self.assertNotRegex(page, r"\.tip\[data-build-tools-tip\] \{[^}]*grid-template-columns")
         self.assertIn(".tip :is(dt, dd) { overflow-wrap: anywhere; }", page)
         self.assertRegex(page, r"\.tip dt \{[^}]*text-align: left")
         self.assertRegex(page, r"\.tip dd \{[^}]*text-align: right")

@@ -2613,7 +2613,7 @@ Local builds, gate runs, and cloud rows use their recorded counters.
 Running lists admitted Hana CI Cargo steps.
 Running has no Build tools row or CI service row.
 The Build tools part of the memory bar includes the CI service memory.
-Its tooltip shows one line per runner with a usable reading.
+Its tooltip shows one line per running runner service.
 The taken total and cap include the CI service memory.
 Waiting rows use `#` in the first column for their queue place.
 Both sections use the same column widths.
@@ -2716,8 +2716,12 @@ A failed or old reading replaces the Mac run rows with one short `Mac builds` st
 The feed log retains raw errors; the page shows only the status and reading age.
 CI runner records supply the `hana CI` owner for their Running and Waiting steps.
 The feed matches each step's recorded runner unit to the CI runner records.
-It reads runner and Cargo memory in the same pass for the Build tools tooltip.
-If the service amounts exceed the saved CI charge, the tooltip shows the charge under Other build tools.
+The feed reads anonymous RAM from live runner processes outside admitted Cargo process trees and scopes.
+The Build tools tooltip and total use the sum of these service readings.
+The page cap and taken total include the same sum.
+Admission uses the saved CI charge from its queue pass.
+If a runner reading is unavailable, its tooltip line says so.
+If service readings are missing, Other build tools includes any saved CI charge that the service lines do not cover.
 The terminal queue view shows a `machine` column after `min` and before `pid`.
 The column uses `scripts.buildlog.store.host_name()`, the shared short host name.
 A narrow view omits the machine column before it reduces name space.

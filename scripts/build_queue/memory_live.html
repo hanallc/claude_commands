@@ -186,8 +186,7 @@ __PAGE_FRAME_STYLE__
 .tip dt, .tip dd { white-space: normal; overflow-wrap: anywhere; }
 .tip dt { max-width: min(13rem, 51vw); }
 .tip dd { min-width: 0; }
-.tip.build-tools-tip { grid-template-columns: fit-content(72%) minmax(0, 1fr); }
-.tip.build-tools-tip dt { max-width: none; }
+.tip[data-build-tools-tip] { width: min(31rem, var(--tip-width, 31rem)); max-width: none; }
 .tip .program-memory {
   --program-live: color-mix(in srgb, var(--accent) 72%, var(--bg));
   --program-past: color-mix(in srgb, var(--agents) 72%, var(--bg));
@@ -2179,15 +2178,15 @@ function tooltipRows(key, rawData) {
 }
 function tooltipHtml(key, data) {
   const rows = tooltipRows(key, data);
-  return rows.length ? tipRowsHtml(rows, key === 'tools' ? ' build-tools-tip' : '') : '';
+  return rows.length ? tipRowsHtml(rows, key === 'tools' && data.ram?.ci_services?.length > 0) : '';
 }
 function bumpMark(who, tip = "") {
   return `<span class="move-mark"${tip ? ` data-tip="${esc(tip)}" tabindex="0"` : ""}>` +
     '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 3h14M18 13l-6-6-6 6M12 7v14"/></svg>' +
     `<span>${esc(who)}</span></span>`;
 }
-function tipRowsHtml(rows, extraClass = "") {
-  return `<dl class="tip${extraClass}">${tipCellsHtml(rows)}</dl>`;
+function tipRowsHtml(rows, withCIServices = false) {
+  return `<dl class="tip"${withCIServices ? ' data-build-tools-tip=""' : ''}>${tipCellsHtml(rows)}</dl>`;
 }
 function tipCellsHtml(rows) {
   return rows.map(row => {

@@ -1638,6 +1638,7 @@ renderWalk(data);
 process.stdout.write(JSON.stringify({
   walk:data.walk.map(row=>tipText('row:'+row.key,data)),
   waiters:data.waiters.map(row=>tipText('wait:'+row.key,data)),
+  tools:[tipText('tools',data)],
   table:$("walk").innerHTML}));
 """
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
@@ -1645,7 +1646,7 @@ process.stdout.write(JSON.stringify({
             capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rendered = cast(dict[str, object], json.loads(result.stdout))
-        tips = {key: cast(list[list[str]], rendered[key]) for key in ("walk", "waiters")}
+        tips = {key: cast(list[list[str]], rendered[key]) for key in ("walk", "waiters", "tools")}
         return tips, cast(str, rendered["table"])
 
     def test_step_table_keeps_assignment_fields_with_report_tooltips(self) -> None:
@@ -1760,13 +1761,42 @@ process.stdout.write(JSON.stringify({
         self.assertIn('data-color-text="role.unit-director"', page.get("staff_names", {}).get(unit, ""))
 
     def test_ci_services_count_once_in_build_tools_at_any_size(self) -> None:
-        self.check_ci_service_ram(admission_records.GIB * 7 // 10, 16 * 1024 ** 2)
+        self.check_ci_service_ram(717 * 1024 ** 2, 16 * 1024 ** 2)
 
     def test_ci_cargo_growth_leaves_both_service_amounts_unchanged(self) -> None:
         overhead = 200 * 1024 ** 2
         self.check_ci_service_ram(overhead, overhead, cargo_growth=admission_records.GIB)
 
-    def check_ci_service_ram(self, overhead: int, idle_use: int, *, cargo_growth: int = 0) -> None:
+    def test_ci_cargo_growth_between_reads_keeps_the_service_amount(self) -> None:
+        mib = 1024 ** 2
+        self.check_ci_service_ram(200 * mib, 200 * mib, cargo_growth=admission_records.GIB, growth_after_slice_read=True)
+
+    def test_ci_service_lines_can_exceed_the_saved_charge(self) -> None:
+        mib = 1024 ** 2
+        self.check_ci_service_ram(201 * mib, 200 * mib, saved_charge=400 * mib)
+
+    def test_ci_service_with_unreadable_memory_keeps_its_line(self) -> None:
+        unit = self.root / "github-runner-hana-linux-1.service"
+        pid = 701
+        write_scope(unit, members=(pid,))
+        write_process(self.root / "proc", pid)
+        _ = (self.root / "proc" / str(pid) / "status").write_text("VmRSS: 1024 kB\n")
+        service, = memory_feed.ci_runner_service_ram((unit,), ())
+        self.assertEqual(service["name"], "hana-linux-1")
+        self.assertIsInstance(service["bytes"], admission_records.ReadingUnavailable)
+
+    def test_ci_tooltip_lines_add_to_the_build_tools_total(self) -> None:
+        mib = 1024 ** 2
+        self.check_ci_service_ram(205 * mib, 110 * mib, saved_charge=800 * mib,
+                                  expected_tooltip=["Build tools  0.3 GiB", "RAM that build tools use now\n"
+                                      + "rust-analyzer  0.0 GiB\n+ sccache  0.0 GiB\n"
+                                      + "+ hana CI service hana-linux-1  0.2 GiB\n"
+                                      + "+ hana CI service hana-linux-2  0.1 GiB\n"
+                                      + "+ Python tests  0.0 GiB\n+ Waiting runs  0.0 GiB"])
+
+    def check_ci_service_ram(self, overhead: int, idle_use: int, *, cargo_growth: int = 0,
+                             growth_after_slice_read: bool = False, saved_charge: int | None = None,
+                             expected_tooltip: list[str] | None = None) -> None:
         gib = admission_records.GIB
         cgroup = self.root / "ci"
         cargo_pid, compiler_pid = 702, 704
@@ -1778,29 +1808,38 @@ process.stdout.write(JSON.stringify({
                 root = cgroup / ("scoped" if scoped else "process")
                 busy, idle = (root / f"github-runner-hana-linux-{index}.service" for index in (1, 2))
                 cargo_now = cargo + cargo_growth
-                write_scope(busy, members=(701, cargo_pid, compiler_pid), current=cargo_now + overhead,
-                            anonymous=cargo_now + overhead)
+                # The runner counters can precede the Cargo process or scope counters.
+                runner_use = (cargo if growth_after_slice_read else cargo_now) + overhead
+                write_scope(busy, members=(701,) if scoped else (701, cargo_pid, compiler_pid),
+                            current=runner_use, anonymous=runner_use)
                 write_scope(idle, members=(703,), current=idle_use, anonymous=idle_use)
+                proc = self.root / "proc"
+                write_process(proc, 701, overhead)
+                write_process(proc, 703, idle_use)
                 if scoped:
                     scope = busy / "cargo.scope"
                     write_scope(scope, members=(cargo_pid, compiler_pid), current=cargo_now, anonymous=cargo_now)
                     source = admission_records.ScopeSource(scope, frozenset({cargo_pid}))
                 else:
-                    write_process(self.root / "proc", cargo_pid, cargo)
-                    write_process(self.root / "proc", compiler_pid, cargo_growth, parent=cargo_pid)
+                    write_process(proc, cargo_pid, cargo)
+                    write_process(proc, compiler_pid, cargo_growth, parent=cargo_pid)
                     source = admission_records.ProcessSource((admission_records.ProcessAnonymousUse(
                         cargo_pid, admission_records.AnonymousRunUse(cargo)),))
                 running = replace(inputs.running[0], pid=cargo_pid, ci_runner="hana-linux-1", measured=admission_records.MeasuredMemory(
                     cargo, anonymous=admission_records.AnonymousRunUse(cargo), anonymous_source=source))
+                charge = overhead + idle_use if saved_charge is None else saved_charge
                 service = admission_records.RunningStep("", "hana-ci.slice", "service", str(root), 0,
-                    admission_records.UnownedSliceMemory(overhead + idle_use,
-                        anonymous=admission_records.AnonymousRunUse(overhead + idle_use), cgroup=str(root),
+                    admission_records.UnownedSliceMemory(charge,
+                        anonymous=admission_records.AnonymousRunUse(charge), cgroup=str(root),
                         owner="hana-ci.slice", pid=701, job_state=RunningServiceJob(199_000)), pid=701)
                 reading = gate.queue_read_from(replace(inputs, reservations=reservations, running=(running, service)),
                                                admission_policy_fixture())
                 with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
                       mock.patch.object(memory_feed, "build_tool_ram", return_value=memory_feed.BuildToolRam(0, 0, 0))):
                     page = memory_feed.reading()
+                if expected_tooltip is not None:
+                    tips, _ = self.render_assignment_table(cast(dict[str, object], json.loads(memory_feed.page_json(page))))
+                    self.assertEqual(tips["tools"], [expected_tooltip])
                 ram = page["ram"]
                 self.assertEqual(ram.get("ci_services"), [{"name": "hana-linux-1", "bytes": overhead},
                                                           {"name": "hana-linux-2", "bytes": idle_use}])
