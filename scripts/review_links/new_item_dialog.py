@@ -1241,6 +1241,8 @@ SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''(() => {
  const browserDraftId = /^(?:r6|s1)-[0-9a-f]{32}$/;
  const submittedKey = 'console.new-item.submitted';
  const submittedPrefix = submittedKey + '.';
+ const reportDraftPrefix = source => 'console.report.pending-send.' + source + '.';
+ const isReportKind = kind => kind === 'bug' || kind === 'enhancement';
  let nextDraft = 0;
 
  function storedListDraft() {
@@ -1271,6 +1273,21 @@ SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''(() => {
     const stored = sessionStorage.getItem(key) || '';
     const route = stored.startsWith('{') ? JSON.parse(stored) : {recipient: stored || null};
     return {id, ...route, awaitingSend: state === null ? undefined : state === 'true'};
+   }
+  } catch (_) {}
+  return null;
+ }
+
+ function storedReportDraft(source) {
+  try {
+   const prefix = reportDraftPrefix(source);
+   for (let index = 0; index < sessionStorage.length; index++) {
+    const key = sessionStorage.key(index);
+    if (!key?.startsWith(prefix)) continue;
+    const id = key.slice(prefix.length);
+    if (!id.startsWith('r6-') || !browserDraftId.test(id) || drafts.some(draft => draft.id === id)) continue;
+    const item = JSON.parse(sessionStorage.getItem(key));
+    if (isReportKind(item?.kind)) return {id, kind: item.kind, recipient: item.recipient || null};
    }
   } catch (_) {}
   return null;
@@ -2014,6 +2031,9 @@ function bindDraft(dialog, fresh = false) {
  function finishDraft() {
   clearSubmittedDraft();
   forgetListDraft();
+  if (draftId && ownerPage !== 'list') {
+   try { sessionStorage.removeItem(reportDraftPrefix(source) + draftId); } catch (_) {}
+  }
   draftId = undefined;
   awaitingEarlierSend = awaitingNativeRecovery = false;
  }
@@ -2260,15 +2280,16 @@ function bindDraft(dialog, fresh = false) {
   if (!keepDraft || !submittedDraft) pageContext = ownerPage ? collectPageContext() : null;
   launcher = trigger;
   token = '';
-  if (ownerPage === 'list' && !draftId && !keepDraft) {
-   const stored = storedListDraft();
+  if (!draftId && !keepDraft) {
+   const stored = ownerPage === 'list' ? storedListDraft() : storedReportDraft(source);
    if (stored) {
     draftId = stored.id;
     selectedRecipient = stored.recipient;
+    if (stored.kind) kind = stored.kind;
     selectedAssignee = stored.assignee || '';
     // The shipped List dialog stores no Send state.
-    awaitingNativeRecovery = isShippedListDraft(stored);
-    awaitingEarlierSend = awaitingNativeRecovery || stored.awaitingSend === true;
+    awaitingNativeRecovery = ownerPage === 'list' && isShippedListDraft(stored);
+    awaitingEarlierSend = awaitingNativeRecovery || Boolean(stored.kind) || stored.awaitingSend === true;
    }
   }
   const newDraft = !keepDraft && !draftId;

@@ -1227,6 +1227,7 @@ class ListFilingUnavailable:
     """The List row has no producer that can take it."""
 
     reason: str
+    assignee: ListCommandAssignee | ListWindowAssignee = ListWindowAssignee.RECIPIENT
 
 
 def _list_filing_producer(member: staff.StaffRow, members: staff.StaffSnapshot
@@ -1268,7 +1269,7 @@ def _plan_list_filing(assignee: ListCommandAssignee | ListWindowAssignee, recipi
                       members: staff.StaffSnapshot) -> ListFilingRoute | ListFilingUnavailable:
     keeper = producer_map.find_member("morty", members, ("producer",))
     if isinstance(keeper, producer_map.UnknownMember) or keeper.name != "morty":
-        return ListFilingUnavailable("The List needs one active producer named morty.")
+        return ListFilingUnavailable("The List needs one active producer named morty.", assignee)
     member = recipient
     source = "nate via New item"
     if isinstance(assignee, ListCommandAssignee):
@@ -1279,7 +1280,7 @@ def _plan_list_filing(assignee: ListCommandAssignee | ListWindowAssignee, recipi
         source = "nate via /new_item"
     producer = _list_filing_producer(member, members)
     if isinstance(producer, ListFilingUnavailable):
-        return producer
+        return replace(producer, assignee=assignee)
     unit = member.name if member.kind == "unit" else ""
     return ListFilingRoute(keeper=keeper.id, owner=recipient.id, producer=producer.id,
                            unit=unit, source=source)
@@ -1296,13 +1297,13 @@ def assigned_member(assignment: new_item_dialog.Assignment, recipient: staff.Sta
     return row
 
 
-def _plan_producer_filing(member: staff.StaffRow, recipient: staff.StaffRow, request: NewItemRequest,
+def _plan_producer_filing(member: staff.StaffRow, recipient: staff.StaffRow, notice: new_item_dialog.Notice,
                           members: staff.StaffSnapshot) -> ListFilingRoute | ListFilingUnavailable:
     keeper = list_producer(conf.read_or_repository("console"), members)
     if isinstance(keeper, PageOwnerUnavailable):
         return ListFilingUnavailable("The List has no active producer.")
-    source = ("nate via /new_item" if isinstance(request.notice, new_item_dialog.SubmissionNotice)
-              and request.notice.from_command else "nate via New item")
+    source = ("nate via /new_item" if isinstance(notice, new_item_dialog.SubmissionNotice)
+              and notice.from_command else "nate via New item")
     return ListFilingRoute(keeper=keeper.id, owner=member.id, producer=recipient.id,
                            unit=member.name if member.kind == "unit" else "", source=source)
 
@@ -1313,7 +1314,7 @@ class NoListFiling:
 
 
 def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUnavailable | NoListFiling:
-    """Read the List filing plan for the first Send."""
+    """Read the saved List filing route or the assignee that still needs a route."""
     folder = _request_folder(saved.request_id)
     try:
         routing = (folder / "list-filing.json").read_text(encoding="utf-8")
@@ -1327,7 +1328,9 @@ def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUna
         return NoListFiling()
     reason = values.get("unavailable")
     if isinstance(reason, str):
-        return ListFilingUnavailable(reason)
+        assignee = (list_command_assignee(values["assignee"]) if "assignee" in values
+                    else ListWindowAssignee.RECIPIENT)
+        return ListFilingUnavailable(reason, assignee)
     keeper, owner, producer = values.get("keeper"), values.get("owner"), values.get("producer")
     unit, source = values.get("unit"), values.get("source")
     if not (isinstance(keeper, str) and isinstance(owner, str) and isinstance(producer, str)
@@ -1335,6 +1338,24 @@ def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUna
         raise OSError(f"Invalid List route for request {saved.request_id}.")
     return ListFilingRoute(keeper=staff.StaffId(keeper), owner=staff.StaffId(owner), producer=staff.StaffId(producer),
                            unit=unit, source=source)
+
+
+def retry_list_filing_route(saved: SavedSubmission, unavailable: ListFilingUnavailable,
+                            members: staff.StaffSnapshot) -> ListFilingRoute:
+    """Resolve the assignee again and save the route before reserving a List number."""
+    recipient = members.by_id(saved.owner)
+    if recipient is None:
+        raise OSError(f"The recipient for {saved.id} is unavailable.")
+    assignment = saved.details.assignment
+    if isinstance(assignment, new_item_dialog.ChosenAssignee):
+        member = assigned_member(assignment, recipient, members)
+        route = _plan_producer_filing(member, recipient, saved.details.notice, members)
+    else:
+        route = _plan_list_filing(unavailable.assignee, recipient, members)
+    if isinstance(route, ListFilingUnavailable):
+        raise OSError(f"Cannot file {saved.id} on the List: {route.reason}")
+    _write_request_file(_request_folder(saved.request_id) / "list-filing.json", route)
+    return route
 
 
 def list_filing_reservation(saved: SavedSubmission) -> Path:
@@ -2552,7 +2573,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             if producer_route:
                 member = assigned_member(request.assignment, recipient, current)
                 if isinstance(initial_delivery, InitialDelivery):
-                    route = _plan_producer_filing(member, recipient, request, current)
+                    route = _plan_producer_filing(member, recipient, request.notice, current)
             elif request.page == "list" and isinstance(initial_delivery, InitialDelivery):
                 route = _plan_list_filing(initial_delivery.list_assignee, recipient, current)
             pending_file = folder / "pending.json"
@@ -2595,7 +2616,10 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                 if isinstance(route, dict):
                     _write_request_file(folder / "list-filing.json", route)
                 elif isinstance(route, ListFilingUnavailable):
-                    _write_request_file(folder / "list-filing.json", {"unavailable": route.reason})
+                    fields = {"unavailable": route.reason}
+                    if isinstance(route.assignee, ListCommandAssignee):
+                        fields["assignee"] = route.assignee.id
+                    _write_request_file(folder / "list-filing.json", fields)
                 if isinstance(list_preview, RequestedListPreview) and isinstance(screenshot, new_item_dialog.PageScreenshot):
                     _write_request_file(folder / "list-preview.json",
                                         {"key": list_preview.key, "digest": screenshot.digest})

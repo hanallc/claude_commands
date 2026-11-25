@@ -31,7 +31,7 @@ from enum import Enum
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO, NamedTuple, cast, override
+from typing import BinaryIO, Literal, NamedTuple, cast, override
 from urllib.parse import SplitResult, parse_qs, unquote, urlsplit, urlunsplit
 
 # Detect file changes before the first stamp, including changes during imports.
@@ -2441,9 +2441,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             (identity,) = fields["item-state"]
             (keeper,) = fields.get("keeper", [])
             (park_request,) = fields.get("park-request", [""])
+            (not_fixed_request,) = fields.get("not-fixed-request", [""])
             with server.list_store_access(), server.staff_read_scope():
                 current = list_page.saved_action_state(keeper, identity, status=server.delivery_status,
                                                        park_request=park_request, include_detail=True,
+                                                       not_fixed_request=not_fixed_request,
                                                        review_records=server.list_review_records(),
                                                        top_priority=view.top_priority)
         except ValueError as error:
@@ -2457,6 +2459,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         """Save a List view's item action before the shared sender starts."""
         server = cast(ReviewLinksServer, self.server)
         fixture = server.mode is ServerMode.LIST_FIXTURE
+        fields: dict[str, list[str]] = {}
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 100000:
@@ -2470,6 +2473,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     server.root, body, server.delivery_status,
                     review_records=server.list_review_records(), include_detail=True,
                     top_priority=view.top_priority)
+        except the_list.RepairCheckRefused as error:
+            if fields.get("action") == [the_list.ReportVerdict.NOT_FIXED]:
+                receipt = list_page.NotFixedReceipt(request=error.request, state=list_page.NotFixedReceiptState.REFUSED)
+                self.json_response(400, {"reason": str(error), "not_fixed_receipt": receipt})
+            else:
+                self.browser_failure(400, str(error), error)
+            return
         except ValueError as error:
             self.browser_failure(400, str(error), error)
             return
@@ -2483,11 +2493,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         action = fields["action"][0]
         delivery = submission.delivery if isinstance(submission, list_page.ListUnparkSubmission) else submission
         pending = not isinstance(delivery, change_page.NoMessageDelivery)
-        state = {"read": "read", "question": "saved", "top": "saved"}.get(action, "sent")
+        repair_feedback = action == the_list.ReportVerdict.NOT_FIXED
+        state = "saved" if repair_feedback else {"read": "read", "question": "saved", "top": "saved"}.get(action, "sent")
         reply = {"state": state, "delivery_pending": pending, **saved_fields}
         if current is not None and isinstance(submission, list_page.ListUnparkSubmission):
             reply["unpark_outcome"] = submission.response_outcome(current).value
-        if self.headers.get(send_hold.REPLAY_HEADER) == "1":
+        if self.headers.get(send_hold.REPLAY_HEADER) == "1" or repair_feedback:
             try:
                 outcome = list_page.deliver_with_outcome(submission)
             except OSError as error:
@@ -2495,6 +2506,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 outcome = change_page.DeliveryUnconfirmed()
             reply.update(held_delivery_result(outcome, not pending))
             reply["delivery_pending"] = False
+            if repair_feedback and isinstance(delivery, list_page.ListFeedbackDelivery):
+                receipt_state = (list_page.NotFixedReceiptState.DELIVERED
+                                 if isinstance(outcome, change_page.DeliveryConfirmed)
+                                 else list_page.NotFixedReceiptState.ACCEPTED)
+                reply["not_fixed_receipt"] = list_page.NotFixedReceipt(request=delivery.request, state=receipt_state)
             self.json_response(200, reply)
             return
         with server.item_delivery(pending) as check:
@@ -2761,9 +2777,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if result is send_hold.HoldState.PENDING:
             self.json_response(202, {"pending": True}, hold=send_hold.HoldHeader.PENDING)
         elif result is send_hold.HoldState.UNDONE:
-            self.json_response(404, {"reason": "This send was undone."})
+            self.json_response(404, {"reason": "This send was undone."}, hold_outcome="undone")
         elif result is send_hold.HoldState.MISSING:
-            self.json_response(404, {"reason": "This send was undone or its result expired."})
+            self.json_response(404, {"reason": "This send was undone or its result expired."}, hold_outcome="missing")
         else:
             self.send_response(result.status)
             self.send_header("Content-Type", result.content_type)
@@ -2774,11 +2790,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             _ = self.wfile.write(result.body)
 
     def json_response(self, status: int, fields: Mapping[str, object], *,
-                      hold: send_hold.HoldHeader | None = None) -> None:
+                      hold: send_hold.HoldHeader | None = None,
+                      hold_outcome: Literal["undone", "missing"] | None = None) -> None:
         content = json.dumps(fields).encode("utf-8")
         self.send_response(status)
         if hold is not None:
             self.send_header("X-Send-Hold", hold.value)
+        if hold_outcome is not None:
+            self.send_header("X-Send-Hold-Outcome", hold_outcome)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
@@ -2883,6 +2902,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
 
             with reply_tokens.serving(self.store_folder):
                 try:
+                    recover("List report", review_actions.recover_interrupted_list_reports)
                     recover("delivery", partial(recover_changes, self.delivery_status))
                     recover("first message", partial(
                         review_actions.recover_submission_deliveries, self.delivery_status, review_page.PAGE_PATH))

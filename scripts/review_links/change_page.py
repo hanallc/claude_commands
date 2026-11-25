@@ -1861,8 +1861,11 @@ def answer_form(page: ReviewPage, notice: AnswerNotice, feedback_rows: int) -> s
     row = notice.row if notice.row in page.rows else page.rows[0]
     row_id = html.escape(row)
     buttons: list[str] = []
-    for value, label in (("works", "Works"), ("not works", "Does not work"),
-                         ("validate", "Ask showrunner to check"), ("question", "Ask a question"), ("feedback", "Send feedback")):
+    for verdict in page_frame.VerdictAction:
+        buttons.append(page_frame.verdict_button(page_frame.VerdictItemType.CHANGE, verdict,
+                                                selected=notice.outcome == verdict))
+    for value, label in (("validate", "Ask showrunner to check"), ("question", "Ask a question"),
+                         ("feedback", "Send feedback")):
         if value in ("validate", "question", "feedback") and isinstance(page, AssignedReviewPage) and isinstance(page.owner, change_routing.UnroutedChange):
             continue
         selected = 'aria-pressed="true" ' if notice.outcome == value else ""
@@ -2657,6 +2660,10 @@ class DeliveryFailure:
     error: str
 
 
+class UnconfirmedDelivery(DeliveryFailure):
+    """The sender has no final result for this recipient."""
+
+
 def review_delivery_key(source: Path, row: str, attempt: str, *, purpose: str = "message") -> str:
     """Identify one send across retries and server restarts."""
     identity = json.dumps((str(source.resolve()), row, attempt, purpose))
@@ -2679,11 +2686,12 @@ def send_with_retries(sender: str, recipients: tuple[staff.StaffId, ...], messag
             try:
                 result = send_to_staff(target, sender, message, key=key)
                 if result == "pending" and confirm:
-                    failures.append(DeliveryFailure(target, "The sender has not confirmed delivery."))
+                    failures.append(UnconfirmedDelivery(target, "The sender has not confirmed delivery."))
                 if result == "skipped" and skipped is not None:
                     skipped.add(target)
             except errors as error:
-                failures.append(DeliveryFailure(target, str(error)))
+                failure = UnconfirmedDelivery if confirm and isinstance(error, UnconfirmedSend) else DeliveryFailure
+                failures.append(failure(target, str(error)))
         remaining = tuple(failure.recipient for failure in failures if isinstance(failure.recipient, str))
         if remaining and attempt + 1 < tries:
             time.sleep(pause)
@@ -2791,6 +2799,47 @@ def scoped_reply_message(key: str, proof: reply_tokens.ReplyTokenProof, prefix: 
     return OutboundReviewMessage(prefix + reply_command(key, token), token)
 
 
+class ReportAwaitingList(OSError):
+    """Keep the first notice until its current report and List row are available."""
+
+
+def require_report_list_item(record: investigation.Investigation
+                             ) -> investigation.ListDestination | investigation.NoListDestination:
+    """Require the List row for a native report."""
+    destination = record.list_destination
+    if not record.belongs_on_list:
+        return destination
+    if not isinstance(destination, investigation.ListDestination):
+        raise ReportAwaitingList("The report still needs a List item.")
+    try:
+        matches = investigation.list_destination_has_submission(destination, record.submission_scope)
+    except (OSError, ValueError) as error:
+        raise ReportAwaitingList("The List item is unavailable.") from error
+    if not matches:
+        raise ReportAwaitingList("The List item does not match the report.")
+    return destination
+
+
+def list_report_delivery_prefix(record: investigation.Investigation, prefix: str) -> str:
+    """Open the report evidence on the List."""
+    destination = require_report_list_item(record)
+    if not isinstance(destination, investigation.ListDestination):
+        return prefix
+    text, separator, evidence = prefix.rpartition("\n\nEvidence in Review\n")
+    if not separator:
+        return prefix
+    try:
+        route = urlsplit(evidence)
+    except ValueError:
+        return prefix
+    item_key = parse_qs(route.fragment).get("item", [])
+    if (route.path != f"/{CONSOLE_FOLDER}/review.html" or not route.netloc or len(item_key) != 1
+            or re.fullmatch(r"investigation/[^/]+/" + re.escape(record.id), item_key[0]) is None):
+        return prefix
+    url = route._replace(path=page_frame.LIST_PAGE_PATH,
+                         fragment=page_frame.list_item_fragment(destination.keeper, destination.number)[1:])
+    return text + "\n\nEvidence on the List\n" + url.geturl()
+
 def outbound_review_message(delivery: MessageDelivery) -> OutboundReviewMessage:
     """Derive the token from the current reply proof."""
     from scripts.review_links import review_submissions
@@ -2802,10 +2851,23 @@ def outbound_review_message(delivery: MessageDelivery) -> OutboundReviewMessage:
     prefix, separator, command = delivery.message.rpartition("\n")
     if command != reply_command(scoped["key"]):
         raise ValueError("The saved Review reply command does not match its key.")
-    proof = review_submissions.current_reply_proof(scoped["key"])
+    key = scoped["key"]
+    if (isinstance(page, ReviewMessagePage) and page.saved.get("submission_request")
+            and key.startswith(("submission/bug/", "submission/investigation/"))):
+        try:
+            with review_submissions.scoped_submission(new_item_dialog.read_submission_key(key)) as current:
+                proof = current.details.reply_proof
+                if isinstance(current.record, investigation.Investigation):
+                    prefix = list_report_delivery_prefix(current.record, prefix)
+        except review_submissions.SavedSubmissionMissing as error:
+            raise ReportAwaitingList("The current report is unavailable.") from error
+    else:
+        proof = review_submissions.current_reply_proof(key)
+    if not isinstance(proof, reply_tokens.ReplyTokenProof):
+        raise reply_tokens.UnavailableReplyToken("The item has no proof for delivery.")
     if not reply_tokens.matches_reference(proof.sha256, reply_tokens.read_reference(scoped_reply_exchange(scoped))):
         raise reply_tokens.UnavailableReplyToken("The reply proof changed.")
-    return scoped_reply_message(scoped["key"], proof, prefix + separator)
+    return scoped_reply_message(key, proof, prefix + separator)
 
 
 def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, intent: DeliveryIntent,
@@ -2964,6 +3026,10 @@ def deliver_with_outcome(delivery: MessageDelivery | NoMessageDelivery, status: 
         return deliver_review_question(delivery, status, intent, question)
     try:
         outbound = outbound_review_message(delivery)
+    except ReportAwaitingList as error:
+        status.release_owned_claims((delivery.attempt,))
+        print(f"review-links delivery {delivery.row}: {error}", file=sys.stderr)
+        return DeliveryUnconfirmed()
     except (OSError, ValueError) as error:
         reason = " ".join(str(error).splitlines())
         failures = [DeliveryFailure(recipient, reason) for recipient in delivery.recipients]
@@ -3370,6 +3436,8 @@ def resend_submission_reply(reference: str) -> str:
         saved = review_submissions.renew_legacy_reply(located)
         if not saved.awaiting_reply:
             raise question_record.AnswerRefused("The item is not waiting for a reply.")
+        if isinstance(saved.record, investigation.Investigation):
+            _ = require_report_list_item(saved.record)
         proof = saved.details.reply_proof
         if not isinstance(proof, reply_tokens.ReplyTokenProof):
             raise question_record.AnswerRefused("The item has no proof for delivery.")
