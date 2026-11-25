@@ -774,7 +774,7 @@ class BroadcastTests(unittest.TestCase):
             })
             self.assertTrue(broadcast.report(deliveries))
 
-        read.assert_called_once_with(os.environ, roster.ThisMachine())
+        read.assert_called_once_with(os.environ, roster.ThisMachine(), membership=None)
         self.assertCountEqual([command[1] for command in self.sends()], ["session:id-hana", "session:id-trunk"])
         calls = self.ssh_calls()
         self.assertEqual(len(calls), 1)
