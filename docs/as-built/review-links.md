@@ -1270,25 +1270,31 @@ The mode is **self-actualizing** while `quota_state.no_worker_mode()` is on, and
 The mode and the quota are separate facts.
 Other lines show a gray Lucide minus icon; the total cell stays empty.
 An unavailable queue shows gray `unavailable`; selected Claude groups retain their buttons.
-The page uses the first targets from the status read.
-The menu title is **When <account> reaches <percent>%, move <group> to**.
-`next_move_percent` in `config/accounts.conf` sets the percent.
-The menu lists the other Claude accounts in board order, each with its weekly percent left when known.
-The current target has a highlight and `aria-checked="true"` with `role="menuitemradio"`.
-Arrow keys, Home and End move between the items.
-Escape, Tab, a click outside, a scroll, or a resize closes the menu.
-Focus returns to the arrow button.
-The menu stays inside the viewport.
-While the menu is open or a move save is pending, the status shows Paused and a refresh checks only the script version.
-A choice posts `group` and `to` to `/console/accounts.html` as form data.
-The server checks the group and the account note, then calls `next_moves.set_first_next_move()`.
-The new entry replaces the group's first next move, or becomes its only one, with no hold.
-When the group has an entry, **No next move** posts `group` and `clear=first`.
-The server calls `next_moves.remove_next_move()` at `FIRST_GROUP_POSITION`.
-It refuses a clear for an empty group.
-The cell then shows the next queued target, or `none`.
-Success clears the cached page and refreshes the `next` cell.
-A refused request returns 400 and a failed write returns 503, each with its reason.
+The page uses the first queued entry for each group from the status read.
+The arrow opens the **Next move of <group>** dialog.
+The radio group lists the other Claude accounts in board order.
+Each account shows its weekly percent left when known.
+The first queued entry supplies the target, percent, and quota measure.
+An empty group uses `next_move_percent` from `config/accounts.conf` and the **all models** measure.
+An unreadable queue shows **The next moves cannot be read now.**
+The dialog disables **Save** and **Move now** in that case.
+Editing a field changes only the form.
+Tab stays inside the dialog. Cancel and Escape discard edits and return focus to the arrow.
+The page pauses refresh while the dialog is open.
+**Save** sets the first entry to the selected target, percent, and measure.
+The dialog checks the percent range from 0 to 100.
+An invalid percent keeps the dialog open and shows **The settings were not saved. Try again.**
+**Save** with **No next move** removes the first entry and keeps later entries.
+**Move now** starts the CLI hand move in a detached process with the selected account as its target.
+The POST returns when the launcher accepts the request.
+The detached command claims the move before it changes the selected account.
+The Moves card shows the console origin and reports a refusal if another move holds the claim.
+The click leaves the next-move log unchanged. **No next move** disables the button.
+A failure shows a short message in the dialog and keeps the edits.
+Success closes the dialog and refreshes the board.
+Save sends `group`, `to`, `percent`, and `measure`. Clear sends `group` and `clear`.
+Move now sends `group` and `move_now` and requires the console origin.
+The POST logs the exact cause of a dialog action failure. The dialog uses its own messages.
 
 The Roles table columns are role, swatch, **busy, last 24 h**, account, next, busy, idle and total.
 The selected account appears first for each role and shows its own counts.

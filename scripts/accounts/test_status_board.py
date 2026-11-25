@@ -125,10 +125,10 @@ class StatusBoardTests(unittest.TestCase):
                         self.assertIsInstance(result.first_next_moves, accounts.NextMovesUnavailable)
                         self.assertIn("Upcoming moves: unavailable", result.upcoming_moves[0])
                     elif content == "[]":
-                        self.assertEqual(result.first_next_moves, accounts.FirstNextMoveTargets())
+                        self.assertEqual(result.first_next_moves, accounts.FirstNextMoveEntries())
                         self.assertEqual(result.upcoming_moves, ("Upcoming moves: none",))
                     else:
-                        self.assertEqual(result.first_next_moves, accounts.FirstNextMoveTargets({"units": "claude2", "workers": "codex2"}))
+                        self.assertEqual(result.first_next_moves, accounts.FirstNextMoveEntries({"units": first, "workers": workers}))
                         self.assertEqual(result.upcoming_moves, ("Upcoming moves:", *expected.splitlines()))
             with (patch.object(accounts, "_read_status", return_value=fixture()),
                   patch.object(role_map, "is_role_map_host", return_value=False),

@@ -50,6 +50,11 @@ class SaveFailed:
     reason: str
 
 
+@dataclass(frozen=True)
+class MoveInProgress:
+    """An active move blocks a new Move now request."""
+
+
 QUOTA_CLEAR_FILE = ".accounts-quota-cleared.json"
 
 
@@ -253,8 +258,15 @@ def save_color(key: str, value: str) -> Saved | Refused | SaveFailed:
     return Saved()
 
 
-def save_next_move(group: str, target: str) -> Saved | Refused | SaveFailed:
-    """Make the target the group's first next move at the configured percent."""
+def save_next_move_settings(group: str, target: str, percent: str, measure: str) -> Saved | Refused | SaveFailed:
+    try:
+        value = float(percent)
+        next_moves.check_next_move_percent(value)
+        quota_measure = next_moves.parse_quota_measure(measure)
+    except next_moves.NextMoveError as error:
+        return Refused(str(error))
+    except ValueError:
+        return Refused("next: percent must be from 0 to 100")
     if group not in ("units", "showrunners", "producers"):
         return Refused("Choose units, showrunners, or producers.")
     try:
@@ -262,9 +274,35 @@ def save_next_move(group: str, target: str) -> Saved | Refused | SaveFailed:
     except accounts.AccountsError as error:
         return Refused(" ".join(str(error).split()))
     try:
-        _ = next_moves.set_first_next_move(group, next_moves.console_next_move_percent(), target)
+        _ = next_moves.set_first_next_move(group, value, target, measure=quota_measure)
     except (OSError, ValueError) as error:
         return SaveFailed(" ".join(str(error).split()))
+    return Saved()
+
+
+def move_group_now(group: str, target: str) -> Saved | Refused | SaveFailed | MoveInProgress:
+    """Start the accounts hand move outside the request."""
+    from scripts.agents import stop_resume
+
+    if group not in ("units", "showrunners", "producers"):
+        return Refused("Choose units, showrunners, or producers.")
+    try:
+        _ = accounts.claude_account_dir(target)
+    except accounts.AccountsError as error:
+        return Refused(str(error))
+    try:
+        if any(move.active for move in moves.read_move_progress()):
+            return MoveInProgress()
+        _ = next_moves.read_next_moves()
+        _ = stop_resume.detach(["console-group-move", group, target], "move",
+                               program=Path(accounts.__file__), initiator=moves.MoveInitiator.CONSOLE)
+    except subprocess.CalledProcessError as error:
+        reason = cast(object, error.stderr)
+        return SaveFailed(reason.strip() if isinstance(reason, str) and reason.strip() else str(error))
+    except subprocess.TimeoutExpired as error:
+        return SaveFailed(str(error))
+    except (OSError, ValueError) as error:
+        return SaveFailed(str(error))
     return Saved()
 
 
@@ -329,7 +367,7 @@ def _next_cell(row: accounts.BoardRow, move: NextMove,
     if editable:
         content += (f'<button type="button" class="next-button" data-next-button data-next-target="{html.escape(target, quote=True)}" '
                     + f'data-move-account="{html.escape(editable["account"], quote=True)}" data-move-group="{editable["group"]}" '
-                    + f'aria-label="Choose the next account for {editable["group"]}" aria-haspopup="menu" aria-expanded="false">'
+                    + f'aria-label="Choose the next account for {editable["group"]}" aria-haspopup="dialog" aria-expanded="false">'
                     + page_frame.icon_svg("chevron-down") + '</button>')
     return content
 
@@ -641,6 +679,11 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
             labels_in_row_order.append(label)
     problems = "".join(f"<li>{html.escape(note.removeprefix('* '))}</li>" for note in reading.notes)
     targets_json = html.escape(json.dumps(targets), quote=True)
+    first = reading.first_next_moves
+    settings = ({group: [next_moves.format_next_move_percent(entry.at_percent), entry.measure.value]
+                 for group, entry in first.entries.items() if isinstance(entry, next_moves.ClaudeGroupMove)}
+                if isinstance(first, accounts.FirstNextMoveEntries) else None)
+    settings_json = html.escape(json.dumps(settings), quote=True)
     percent = next_moves.format_next_move_percent(next_moves.console_next_move_percent())
     descending = ("credits", "enabled")
     orders = {
@@ -652,7 +695,7 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
     return _split_card("Accounts", "accounts", "account", ACCOUNT_COLUMNS, rows, orders,
                        descending=descending,
                        attributes=(f' data-detail-columns="{ACCOUNT_DETAIL_COLUMNS}"'
-                                   f' data-move-percent="{percent}" data-move-targets="{targets_json}"'),
+                                   f' data-move-percent="{percent}" data-move-targets="{targets_json}" data-next-settings="{settings_json}"'),
                        after=f'<h2>Problems</h2><ul class="problems">{problems}</ul>' if problems else "")
 
 
@@ -1251,7 +1294,7 @@ def page() -> bytes:
             + f'{STYLE}</head><body><main data-refresh-seconds="{refresh_seconds}"'
             + f' data-request-timeout-seconds="{request_timeout}" data-retry-failure="{retry_failure}">'
             + page_frame.title("Accounts", "accounts", SCRIPT_VERSION)
-            + f'<div data-accounts>{body}</div></main>' + POPUP + MENU + QUOTA_PANEL
+            + f'<div data-accounts>{body}</div></main>' + POPUP + MOVE_DIALOG + QUOTA_PANEL
             + '<div class="model-tooltip" hidden aria-hidden="true"></div>'
             + f"<script>{SCRIPT}</script></body></html>").encode()
 
@@ -1394,17 +1437,36 @@ background:var(--bg);color:var(--ink);cursor:pointer}
 background:transparent;color:var(--ink-2);cursor:pointer}
 .next-button:focus-visible{background:var(--hover)}
 .next-button svg,.next-minus svg{width:14px;height:14px;vertical-align:middle}
-.move-menu button[aria-checked=true]{background:var(--hover)}
-.move-menu{position:fixed;z-index:5;margin:0;padding:6px;width:max-content;min-width:220px;max-width:calc(100vw - 16px);box-sizing:border-box;
+.move-dialog{position:fixed;inset:auto;margin:0;width:330px;max-width:calc(100vw - 16px);
+max-height:calc(100vh - 16px);overflow:auto;padding:14px 16px;box-sizing:border-box;
 border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);box-shadow:0 4px 20px var(--edge);
 font-size:.86rem;font-variant-numeric:tabular-nums}
-.move-menu[hidden]{display:none}
-.move-title{padding:6px 10px 8px;margin-bottom:4px;color:var(--ink-2);border-bottom:1px solid var(--line)}
-.move-menu button{display:flex;justify-content:space-between;gap:24px;width:100%;padding:6px 10px;border:0;border-radius:6px;
-background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
-.move-menu button:focus-visible{background:var(--hover);outline:none}
-.move-name{font-weight:600}.move-left{color:var(--ink-2)}.move-left.warning{color:var(--warning)}.move-left.error{color:var(--error)}
-.move-empty{padding:6px 10px;color:var(--ink-3)}
+.move-dialog::backdrop{background:transparent}
+.move-title{font-size:.98rem;font-weight:600}
+.move-current{margin:2px 0 12px;color:var(--ink-2)}
+.move-group{margin:0 0 14px;padding:0;border:0;min-width:0}
+.move-group legend{margin:0 0 4px;padding:0;font-size:.74rem;font-weight:600;letter-spacing:.06em;
+text-transform:uppercase;color:var(--ink-2)}
+.move-choice{display:flex;align-items:center;gap:9px;margin:0 -8px;padding:5px 8px;border-radius:6px}
+.move-choice:has(:checked){background:var(--hover)}
+.move-choice input{appearance:none;flex:none;box-sizing:border-box;width:14px;height:14px;margin:0;
+border:1.5px solid var(--ink-2);border-radius:50%}
+.move-choice input:checked{border-color:var(--accent);background:radial-gradient(circle,var(--accent) 0 3.2px,transparent 3.8px)}
+.move-name{font-weight:600}.move-left{margin-left:auto;color:var(--ink-2)}
+.move-left.warning{color:var(--warning)}.move-left.error{color:var(--error)}
+.move-when{display:flex;align-items:center;gap:7px;padding:2px 0 6px}
+.move-when input{appearance:textfield;box-sizing:border-box;width:3.8em;padding:3px 6px;border:1px solid var(--line);
+border-radius:6px;background:var(--bg);color:var(--ink);font:inherit;text-align:right}
+.move-when input::-webkit-inner-spin-button,.move-when input::-webkit-outer-spin-button{appearance:none}
+.move-hint{margin:0 0 12px;padding-top:10px;border-top:1px solid var(--line);color:var(--ink-2);line-height:1.45}
+.move-error{margin:0 0 12px;color:var(--error);overflow-wrap:anywhere}
+.move-actions{display:flex;align-items:center;gap:8px}
+.move-actions button{padding:5px 14px;border:1px solid var(--line);border-radius:7px;background:none;color:inherit;
+font:inherit;font-weight:600;cursor:pointer}
+.move-actions button:disabled{opacity:.5;cursor:default}
+.move-actions [data-move-submit]{border-color:var(--filter-selected-bg);background:var(--filter-selected-bg);color:var(--filter-selected-ink)}
+.move-actions [data-move-now]{margin-right:auto}
+.move-dialog :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .quota-icon{display:inline-grid;place-items:center;vertical-align:middle;width:22px;height:22px;margin:-3px 5px -3px 0;
 padding:2px;border:0;border-radius:5px;background:transparent;cursor:pointer}
 .quota-icon svg{width:16px;height:16px}
@@ -1437,8 +1499,28 @@ maxlength="7" spellcheck="false" autocomplete="off" required>
 <button type="button" data-color-save>Save</button>
 <button type="button" data-color-cancel>Cancel</button></div></dialog>'''
 
-MENU = ('<div class="move-menu" role="menu" tabindex="-1" aria-labelledby="move-title" hidden data-move-menu>'
-        + '<div id="move-title" class="move-title" data-move-title></div><div data-move-items></div></div>')
+MOVE_DIALOG = """<dialog class="move-dialog" aria-labelledby="move-title" data-move-dialog>
+<form novalidate>
+<div id="move-title" class="move-title"></div>
+<p class="move-current" data-move-current></p>
+<p class="move-error" hidden data-move-unavailable>The next moves cannot be read now.</p>
+<fieldset class="move-group"><legend>Move to</legend><div data-move-choices></div></fieldset>
+<fieldset class="move-group"><legend>When</legend>
+<div class="move-when">
+<span><span class="move-name" data-move-source></span> has</span>
+<input name="percent" aria-label="Percent left" type="number" inputmode="decimal" min="0" max="100" step="any" required>
+<span>% left of</span>
+</div>
+<label class="move-choice"><input type="radio" name="measure" value="all-models">all models</label>
+<label class="move-choice"><input type="radio" name="measure" value="fable">Fable</label>
+</fieldset>
+<p class="move-hint" data-move-instructions>Save keeps these settings.<span data-move-hint></span></p>
+<p class="move-error" role="alert" hidden data-move-error></p>
+<div class="move-actions">
+<button type="button" data-move-now>Move now</button>
+<button type="button" data-move-cancel>Cancel</button>
+<button type="submit" data-move-submit>Save</button>
+</div></form></dialog>"""
 
 QUOTA_PANEL = ('<div class="quota-panel" id="quota-panel" role="dialog" aria-labelledby="quota-title" hidden>'
                + '<strong id="quota-title"></strong><p data-quota-description></p>'
@@ -1572,12 +1654,16 @@ message.className='color-save-error';message.dataset.colorSaveError='';message.h
 message.setAttribute('role','status');message.setAttribute('aria-live','polite');
 document.querySelector('[data-page-status]').append(message);
 let selected=null;
-const menu=document.querySelector('[data-move-menu]'), menuItems=menu.querySelector('[data-move-items]');
-let menuRow=null, menuButton=null;
+const moveDialog=document.querySelector('[data-move-dialog]'), moveForm=moveDialog.querySelector('form');
+const moveChoices=moveForm.querySelector('[data-move-choices]'), moveNow=moveForm.querySelector('[data-move-now]');
+const moveError=moveForm.querySelector('[data-move-error]'), moveHint=moveForm.querySelector('[data-move-hint]');
+const moveSubmit=moveForm.querySelector('[data-move-submit]'), moveCancel=moveForm.querySelector('[data-move-cancel]');
+const movePercent=moveForm.elements.namedItem('percent');
+let moveButton=null, moveSaving=false;
 const pendingMoves=new Set();
 const quotaPanel=document.querySelector('#quota-panel'), quotaClear=quotaPanel.querySelector('[data-quota-clear]');
 let quotaButton=null, quotaSaving=false;
-const hold=()=>selected ? 'A color is being edited.' : menuRow ? 'An account move is being chosen.'
+const hold=()=>selected ? 'A color is being edited.' : moveButton ? 'An account move is being chosen.'
  : pendingSaves.size ? 'Colors are being saved.' : pendingMoves.size ? 'An account move is being saved.'
  : quotaSaving ? 'A quota alert is being cleared.' : quotaButton ? 'A quota alert is open.' : '';
 const sortSelector='th[aria-sort]';
@@ -1776,45 +1862,88 @@ popup.querySelector('[data-color-save]').addEventListener('click',()=>{
  if(pending.length===1) void publish(save);
 });
 addEventListener('resize',position);addEventListener('scroll',position,{passive:true});
-function closeMenu(){
- if(!menuRow) return;
- const button=menuButton;menuRow=null;menuButton=null;
- menu.hidden=true;menuItems.replaceChildren();button.setAttribute("aria-expanded","false");
+function closeMoveDialog(){
+ if(!moveButton || moveSaving) return;
+ const button=moveButton;
+ moveButton=null;moveDialog.close();button.setAttribute('aria-expanded','false');
  button.focus({preventScroll:true});updates.changed();
 }
-function menuItem([label,left,color,tone]){
- const item=document.createElement('button');
- item.type='button';item.setAttribute('role','menuitemradio');item.dataset.moveTarget=label;
- item.setAttribute('aria-checked',String(label===menuButton.dataset.nextTarget));
- const name=document.createElement('span'), room=document.createElement('span');
- name.className='move-name';name.textContent=label;if(color) name.style.color=color;
- room.className='move-left'+(tone==='default' ? '' : ' '+tone);room.textContent=left && left!=='—' ? left+' left' : '';
- item.append(name,room);return item;
+function moveAccountName(label,color){
+ const name=document.createElement('span');
+ name.className='move-name';name.textContent=label;
+ if(color) name.style.color=color;
+ return name;
 }
-function openMenu(button){
- const box=button.getBoundingClientRect();
- if(selected) close(true);
- const card=view.querySelector('[data-move-targets]');
- const account=button.dataset.moveAccount, group=button.dataset.moveGroup;
- const targets=JSON.parse(card.dataset.moveTargets).filter(([label])=>label!==account);
- menuRow=button.closest("tr");menuButton=button;button.setAttribute("aria-expanded","true");
- menu.querySelector('[data-move-title]').textContent='When '+account+' reaches '+card.dataset.movePercent+'%, move '+group+' to';
- const empty=document.createElement('div');
- empty.className='move-empty';empty.textContent='No other Claude account';
- menuItems.replaceChildren(...(targets.length ? targets.map(menuItem) : [empty]));
- if(button.dataset.nextTarget){
-  const clear=document.createElement('button');clear.type='button';clear.dataset.moveClear='first';
-  clear.setAttribute('role','menuitem');clear.textContent='No next move';menuItems.append(clear);
+function moveChoice([label,left,color,tone],target){
+ const choice=document.createElement('label'), radio=document.createElement('input');
+ choice.className='move-choice';radio.type='radio';radio.name='target';radio.value=label;
+ radio.checked=label===target;
+ choice.append(radio, label ? moveAccountName(label,color) : 'No next move');
+ if(left && left!=='—'){
+  const room=document.createElement('span');
+  room.className='move-left'+(tone==='default' ? '' : ' '+tone);room.textContent=left+' left';
+  choice.append(room);
  }
- menu.hidden=false;
- const size=menu.getBoundingClientRect();
- menu.style.left=Math.max(8,Math.min(box.left,innerWidth-size.width-8))+'px';
- menu.style.top=Math.max(8,Math.min(box.bottom,innerHeight-size.height-8))+'px';
- (menuItems.querySelector('button') || menu).focus({preventScroll:true});
+ return choice;
+}
+function updateMoveHint(){
+ const selected=moveChoices.querySelector(':checked');
+ moveNow.disabled=!selected?.value;
+ moveHint.replaceChildren();
+ if(selected?.value){
+  moveHint.append(' Move now moves the '+moveButton.dataset.moveGroup+' to ',
+   selected.nextElementSibling.cloneNode(true),' at once.');
+ }
+}
+function positionMoveDialog(){
+ if(!moveButton) return;
+ const box=moveButton.getBoundingClientRect(), size=moveDialog.getBoundingClientRect();
+ moveDialog.style.left=Math.max(8,Math.min(box.left,innerWidth-size.width-8))+'px';
+ const below=box.bottom+4, above=box.top-size.height-4, bottomEdge=innerHeight-size.height-8;
+ const top=below<=bottomEdge ? below : above>=8 ? above : Math.max(8,bottomEdge);
+ moveDialog.style.top=top+'px';
+}
+function openMoveDialog(button){
+ if(selected) close(true);
+ closeQuota(false);
+ const card=view.querySelector('[data-move-targets]');
+ const {moveAccount:account,moveGroup:group,nextTarget:target}=button.dataset;
+ const settings=JSON.parse(card.dataset.nextSettings), unavailable=settings===null;
+ const targets=JSON.parse(card.dataset.moveTargets);
+ const color=targets.find(([label])=>label===account)?.[2];
+ const choices=targets.filter(([label])=>label!==account);
+ if(target && !choices.some(([label])=>label===target)) choices.push([target,'','','default']);
+ moveButton=button;button.setAttribute('aria-expanded','true');
+ moveDialog.querySelector('#move-title').textContent='Next move of '+group;
+ moveForm.querySelector('[data-move-current]').replaceChildren('The '+group+' run on ',moveAccountName(account,color),' now.');
+ const source=moveForm.querySelector('[data-move-source]');
+ source.textContent=account;source.style.color=color ?? '';
+ moveChoices.replaceChildren();
+ for(const field of moveForm.querySelectorAll('fieldset')){
+  field.hidden=unavailable;field.disabled=unavailable;
+ }
+ moveForm.querySelector('[data-move-instructions]').hidden=unavailable;
+ moveForm.querySelector('[data-move-unavailable]').hidden=!unavailable;
+ moveSubmit.disabled=unavailable;
+ if(!unavailable){
+  moveChoices.append(...choices.map(choice=>moveChoice(choice,target)),moveChoice(['','','','default'],target));
+  const [percent,measure]=settings[group] ?? [card.dataset.movePercent,'all-models'];
+  movePercent.value=percent;
+  moveForm.elements.namedItem('measure').value=measure;
+ }
+ moveError.hidden=true;
+ updateMoveHint();
+ moveDialog.showModal();positionMoveDialog();
+ (moveChoices.querySelector(':checked') ?? moveCancel).focus({preventScroll:true});
  updates.abandon();
 }
 function keepMoveFocus(){
  const focused=document.activeElement;
+ if(focused?.matches('[data-next-button]')){
+  const group=focused.dataset.moveGroup;
+  return ()=>[...view.querySelectorAll('[data-next-button]')].find(button=>button.dataset.moveGroup===group)
+   ?.focus({preventScroll:true});
+ }
  if(focused?.matches('[data-retry-move]')){
   const {retryMove,moveMember}=focused.dataset;
   return ()=>[...view.querySelectorAll('[data-retry-move]')].find(button=>button.dataset.retryMove===retryMove
@@ -1857,33 +1986,65 @@ document.addEventListener('click',event=>{
 document.addEventListener('click',event=>{
  const button=event.target instanceof Element ? event.target.closest('[data-next-button]') : null;
  if(!button) return;
- const wasOpen=menuButton===button;closeMenu();if(!wasOpen) openMenu(button);
+ if(!moveButton) openMoveDialog(button);
 });
 document.addEventListener('keydown',event=>{
  const button=event.target instanceof Element ? event.target.closest('[data-next-button]') : null;
  if(!button || !['Enter',' '].includes(event.key)) return;
  event.preventDefault();button.click();
 });
-document.addEventListener('pointerdown',event=>{
- if(menuRow && !(event.target instanceof Node && (menu.contains(event.target) || menuButton.contains(event.target)))) closeMenu();
+moveChoices.addEventListener('change',updateMoveHint);
+moveCancel.addEventListener('click',closeMoveDialog);
+moveDialog.addEventListener('cancel',event=>{event.preventDefault();closeMoveDialog();});
+moveDialog.addEventListener('keydown',event=>{
+ if(event.key==='Escape'){event.preventDefault();closeMoveDialog();return;}
+ if(event.key!=='Tab') return;
+ const stops=[...moveForm.querySelectorAll('input:not(:disabled),button:not(:disabled)')]
+  .filter(control=>control.type!=='radio' || control.checked);
+ if(!stops.length){event.preventDefault();return;}
+ const at=stops.indexOf(document.activeElement), step=event.shiftKey ? -1 : 1;
+ if(at<0 || at+step<0 || at+step===stops.length){
+  event.preventDefault();stops[event.shiftKey ? stops.length-1 : 0].focus();
+ }
 });
-menu.addEventListener('click',event=>{
- const item=event.target instanceof Element ? event.target.closest('[data-move-target],[data-move-clear]') : null;
- if(!item || !menuRow) return;
- const form=item.dataset.moveClear ? {group:menuButton.dataset.moveGroup,clear:'first'}
-  : {group:menuButton.dataset.moveGroup,to:item.dataset.moveTarget};
- void saveMove(form);closeMenu();
-});
-menu.addEventListener('keydown',event=>{
- const items=[...menuItems.querySelectorAll('button')], at=items.indexOf(document.activeElement);
- if(event.key==='Escape' || event.key==='Tab'){event.preventDefault();closeMenu();return;}
- if(!items.length || !['ArrowDown','ArrowUp','Home','End'].includes(event.key)) return;
- event.preventDefault();
- const down=event.key==='ArrowDown';
- const next=event.key==='Home' ? 0 : event.key==='End' ? items.length-1
-  : at<0 ? (down ? 0 : items.length-1) : (at+(down ? 1 : -1)+items.length)%items.length;
- items[next].focus();
-});
+function showMoveFailure(now,busy,focus){
+ moveError.textContent=busy ? 'Another move is in progress. Try again when it ends.'
+  : now ? 'The move did not start. Try again.' : 'The settings were not saved. Try again.';
+ moveError.hidden=false;positionMoveDialog();focus.focus({preventScroll:true});
+}
+async function submitMoveDialog(now){
+ if(!moveButton || moveSaving || moveSubmit.disabled) return;
+ const {moveGroup:group,nextTarget:savedTarget}=moveButton.dataset;
+ const {target,percent,measure}=Object.fromEntries(new FormData(moveForm));
+ if(now && !target) return;
+ if(!target && !savedTarget){closeMoveDialog();return;}
+ if(!now && target && !movePercent.validity.valid){
+  showMoveFailure(false,false,movePercent);return;
+ }
+ const fields=now ? {group,move_now:target} : target ? {group,to:target,percent,measure} : {group,clear:'first'};
+ moveSaving=true;moveError.hidden=true;moveForm.setAttribute('aria-busy','true');
+ const focused=document.activeElement;
+ const controls=[...moveForm.querySelectorAll('fieldset,button:not(:disabled)')];
+ for(const control of controls) control.disabled=true;
+ let accepted=false;
+ let busy=false;
+ try{
+  const response=await fetch(location.pathname,{method:'POST',signal:pageRequestSignal(),
+   headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(fields)});
+  const result=await response.json();
+  busy=now && response.status===409 && result?.state==='move-in-progress';
+  accepted=response.ok && result?.state==='saved';
+ }catch{
+  // Use the action's message for a failed request.
+ }finally{
+  for(const control of controls) control.disabled=false;
+  moveSaving=false;moveForm.removeAttribute('aria-busy');
+  if(accepted){closeMoveDialog();void updates.refresh(true);}
+  else showMoveFailure(now,busy,focused);
+ }
+}
+moveNow.addEventListener('click',()=>void submitMoveDialog(true));
+moveForm.addEventListener('submit',event=>{event.preventDefault();void submitMoveDialog(false);});
 function closeQuota(restoreFocus){
  if(!quotaButton) return;
  const button=quotaButton;
@@ -1941,9 +2102,9 @@ quotaClear.addEventListener('click',async()=>{
  }
 });
 for(const name of ['resize','scroll']) addEventListener(name,()=>closeQuota(false),{passive:true});
-for(const name of ['resize','scroll','blur']) addEventListener(name,closeMenu,{passive:true});
+for(const name of ['resize','scroll']) addEventListener(name,positionMoveDialog,{passive:true});
 })();"""
-VERSION_PARTS = (POPUP, MENU, QUOTA_PANEL, STYLE, SCRIPT)
+VERSION_PARTS = (POPUP, MOVE_DIALOG, QUOTA_PANEL, STYLE, SCRIPT)
 SCRIPT_VERSION = page_version.script_version(*VERSION_PARTS)
 
 

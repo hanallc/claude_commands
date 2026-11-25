@@ -12,14 +12,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from importlib import import_module
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
+from uuid import uuid4
 from typing import TYPE_CHECKING, Literal, NotRequired, ReadOnly, TypedDict, Protocol, cast, override, assert_never
 
 from scripts.accounts import role_map, worker_names
 from scripts.agents.stop_results import MoveHandedOff, StopFailed
-from scripts.lib import process_start
+from scripts.lib import file_lock, process_start
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 
@@ -202,6 +203,9 @@ class MoveInitiator(Enum):
     HAND = "terminal"
 
 
+GROUP_MOVE_BUSY_REASON = "Another move is in progress. Try again when it ends."
+
+
 @dataclass(frozen=True)
 class MoveQueued:
     """The move has not started this member."""
@@ -332,7 +336,7 @@ def move_display_reason(cause: MoveCause, why: str) -> str:
     """Use only the safe parts of a recorded cause in the console."""
     if cause == "by hand":
         return ""
-    quota = re.fullmatch(r"(?:claude|codex)[1-9][0-9]* at ([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?)%", why)
+    quota = re.fullmatch(r"(?:claude|codex)[1-9][0-9]* at ([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?)%(?: Fable)?", why)
     if quota and 0 <= float(quota[1]) <= 100:
         return quota[0]
     if cause == "refusal":
@@ -502,6 +506,23 @@ def finish_move_progress(record: TrackedMove) -> None:
         path.unlink(missing_ok=True)
 
 
+def refusal_failure_kind(reason: str) -> MoveFailureKind:
+    """Give the failure kind of a refused move from its reason."""
+    return MoveFailureKind.MOVE_IN_PROGRESS if reason == GROUP_MOVE_BUSY_REASON else MoveFailureKind.OTHER
+
+
+def record_console_group_refusal(group: role_map.ClaudeGroup, target: str, reason: str) -> None:
+    """Record a refused request with no members to retry."""
+    now = datetime.now(timezone.utc)
+    destination = move_destination(target)
+    member = MoveMemberProgress(MoveMember(group, group),
+                                MemberMoveFailed(now, timedelta(), reason, destination,
+                                                 failure_kind=refusal_failure_kind(reason)),
+                                MoveMemberKind.REQUEST)
+    progress = MoveProgress(uuid4().hex, group, destination, "", MoveInitiator.CONSOLE, now, (member,))
+    finish_move_progress(TrackedMove(progress, own_claim_owner(), now))
+
+
 def visible_move_progress(record: TrackedMove) -> MoveProgress:
     progress = record.progress
     if not progress.active or _claim_owner_is_live(record.owner):
@@ -563,6 +584,27 @@ def claim_lock() -> Generator[None]:
         yield
     finally:
         os.close(descriptor)
+
+
+@contextmanager
+def group_move_lock(group: role_map.ClaudeGroup) -> Generator[file_lock.LockResult]:
+    """Keep the group selection stable while a move requests its members."""
+    path = store_file().parent / f"move-{group}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = file_lock.take_exclusive(path)
+    if lock is file_lock.LockResult.BUSY:
+        yield file_lock.LockResult.BUSY
+        return
+    try:
+        active = tuple(move for move in read_move_progress() if move.group == group and move.active)
+        console_busy = any(move.initiator is MoveInitiator.CONSOLE for move in active)
+        active_ids = {move.batch_id for move in active}
+        hand_busy = not console_busy and bool(active_ids) and any(
+            saved.request.request_id in active_ids and saved.request.target == f"group:{group}"
+            and claim_is_live(saved.request) for saved in pending_move_requests())
+        yield file_lock.LockResult.BUSY if console_busy or hand_busy else file_lock.LockResult.ACQUIRED
+    finally:
+        lock.release()
 
 
 def own_claim_owner() -> ClaimOwner:

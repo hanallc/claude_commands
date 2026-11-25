@@ -29,11 +29,11 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from collections import Counter, OrderedDict
 from contextvars import Context, ContextVar
 from collections.abc import Callable, Collection, Generator, Iterable, Mapping, Sequence
-from contextlib import closing, contextmanager, nullcontext, redirect_stderr
+from contextlib import ExitStack, closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from enum import Enum, auto
-from functools import cached_property
+from functools import cached_property, partial
 from pathlib import Path
 from threading import Lock
 from typing import override, TYPE_CHECKING, BinaryIO, Literal, NamedTuple, NotRequired, Protocol, TypedDict, TextIO, cast, overload
@@ -438,6 +438,15 @@ class AccountsError(ValueError):
         self.source: ObservedStateCause | NoObservedStateCause = source
 
 
+class GroupMoveBusy(AccountsError):
+    def __init__(self) -> None:
+        super().__init__(moves.GROUP_MOVE_BUSY_REASON)
+
+
+class GroupMoveTargetRefused(AccountsError):
+    """The move target failed a check before the selection changed."""
+
+
 class WorkerMovesStartFailed(AccountsError):
     """The detached worker runner did not start; its request remains pending."""
 
@@ -487,12 +496,14 @@ class CommandLine(argparse.Namespace):
     next_action: str = ""
     group: next_moves.NextMoveGroup = "units"
     percent: float = 0
+    measure: next_moves.QuotaMeasure = next_moves.QuotaMeasure.ALL_MODELS
     hold_mode: next_moves.HoldMode = next_moves.FixedHold(0)
     fallback_targets: list[str] = []
     next_expect: list[str] = []
     next_position: next_moves.GroupPosition = next_moves.GroupPosition(1)
     next_destination: next_moves.GroupPosition = next_moves.GroupPosition(1)
     insertion: next_moves.AppendToGroup | next_moves.InsertAt = next_moves.AppendToGroup()
+    replace_first: bool = False
     entries: str = ""
     action: str = ""
     label: str = ""
@@ -518,6 +529,7 @@ class CommandLine(argparse.Namespace):
     server: str = ""
     direction: McpDirection = "off"
     counts_lock: int = -1
+    move_log: Path = Path()
 
 
 class SwapDirectorOwner(TypedDict):
@@ -2687,23 +2699,70 @@ def _group_accounts(stored: StoredGroupSelections) -> GroupAccounts:
     return result
 
 
+@dataclass(frozen=True)
+class GroupSelectionClaim:
+    group: ClaudeGroup
+
+
+@dataclass(frozen=True)
+class AcquireGroupSelectionClaim:
+    """The caller needs a claim for the selection write."""
+
+
+ACQUIRE_GROUP_SELECTION_CLAIM = AcquireGroupSelectionClaim()
+
+
+@contextmanager
+def claim_group_selection(group: ClaudeGroup) -> Generator[GroupSelectionClaim]:
+    with moves.group_move_lock(group) as claim:
+        if claim is file_lock.LockResult.BUSY:
+            raise GroupMoveBusy()
+        yield GroupSelectionClaim(group)
+
+
 def set_group_account(group: ClaudeGroup, label: str, *, why: str,
                       now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW,
-                      origin: MoveOrigin = HAND_ORIGIN, move_id: str = "") -> GroupTransition:
+                      origin: MoveOrigin = HAND_ORIGIN, move_id: str = "",
+                      keep_claim: ExitStack | None = None, reuse_current: bool = False,
+                      prepare: Callable[[], None] | None = None,
+                      held_claim: GroupSelectionClaim | AcquireGroupSelectionClaim = ACQUIRE_GROUP_SELECTION_CLAIM) -> GroupTransition:
+    """Claim the selection and keep the claim through the move if the caller supplies a scope."""
     from uuid import uuid4
 
-    label = numbered_account_label(label, "claude").label
-    if role_map.is_role_map_host():
-        _ = claude_account_dir(label)
-    at = now if isinstance(now, datetime) else datetime.now(timezone.utc)
-    fields = move_origin_fields(origin)
-    selection = StoredGroupSelection(label=label, move_id=move_id or uuid4().hex,
-                                     cause=fields["cause"], window=fields["window"])
-    if "reset" in fields:
-        selection["reset"] = fields["reset"]
-    write_role_map(RoleMapChange(group, label, why, at.isoformat(), selection["move_id"],
-        fields["cause"], fields["window"], fields.get("reset", "")))
-    return GroupTransition(selection["move_id"], origin, RecordedTransitionReason(why), at)
+    with ExitStack() as selection:
+        local = role_map.is_role_map_host()
+        if isinstance(held_claim, GroupSelectionClaim):
+            if held_claim.group != group:
+                raise AccountsError("accounts: the claim belongs to another group")
+        elif local:
+            _ = selection.enter_context(claim_group_selection(group))
+        if prepare is not None:
+            prepare()
+        label = numbered_account_label(label, "claude").label
+        if local:
+            _ = claude_account_dir(label)
+        if reuse_current:
+            with role_map.supplied_role_map(read_role_map(fresh=True)):
+                transition = group_transition(group)
+                current = group_label(group_accounts(), group)
+            if isinstance(transition, GroupTransition) and current == label:
+                if keep_claim is not None:
+                    _ = keep_claim.enter_context(selection.pop_all())
+                return transition
+        at = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+        fields = move_origin_fields(origin)
+        decision = move_id or uuid4().hex
+        try:
+            write_role_map(RoleMapChange(group, label, why, at.isoformat(), decision,
+                fields["cause"], fields["window"], fields.get("reset", "")))
+        except AccountsError as error:
+            remote_error = error.__cause__.__cause__ if error.__cause__ is not None else None
+            if isinstance(remote_error, role_map.RemoteCommandRefused) and str(remote_error) == moves.GROUP_MOVE_BUSY_REASON:
+                raise GroupMoveBusy() from error
+            raise
+        if keep_claim is not None:
+            _ = keep_claim.enter_context(selection.pop_all())
+        return GroupTransition(decision, origin, RecordedTransitionReason(why), at)
 
 
 def placement_report(now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
@@ -3041,14 +3100,16 @@ class SessionBatchMove(Protocol):
                  moves.ExplicitMoveTarget.REQUESTED_ACCOUNT,
                  staff_members: Collection[staff.StaffId] = (),
                  user_command: bool = False,
-                 refused_members: Mapping[str, str] = ...) -> list[stop_results.MoveResult]: ...
+                 refused_members: Mapping[str, str] = ...,
+                 initiator: moves.MoveInitiator = moves.MoveInitiator.HAND) -> list[stop_results.MoveResult]: ...
 
 
 def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", live: Sequence[ListedSession] | None = None, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS,
                   intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget =
                   moves.ExplicitMoveTarget.REQUESTED_ACCOUNT,
                   staff_members: tuple[staff.StaffRow, ...] = (), user_command: bool = False,
-                  check_target: bool = True) -> tuple[SessionMoveOutcome, ...]:
+                  check_target: bool = True,
+                  initiator: moves.MoveInitiator = moves.MoveInitiator.HAND) -> tuple[SessionMoveOutcome, ...]:
     """Stop and resume each selected local owner through the shared move API.
 
     Only a user command sets user_command: the move then waits for a busy row and wins over an automatic move.
@@ -3066,6 +3127,8 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
     if not selected:
         return ()
     batch = cast(SessionBatchMove, import_module("scripts.agents.stop_resume").move_sessions)
+    if initiator is not moves.MoveInitiator.HAND:
+        batch = partial(batch, initiator=initiator)
     staff_ids = frozenset(row.id for row in staff_members)
     if isinstance(intent, moves.ExplicitMoveTarget) and check_target:
         checked = check_move_target(target, datetime.now(timezone.utc), account_config=account_config)
@@ -3542,8 +3605,11 @@ def _move_output(results: tuple[SessionMoveOutcome, ...],
 
 
 def _record_hand_refusal(member: str, target: str, refusal: MoveRefused, *, dry_run: bool,
-                         group: ClaudeGroup | Literal["single"] = "single", ambiguous: bool = False) -> MoveRefused:
-    if not dry_run:
+                         group: ClaudeGroup | Literal["single"] = "single", ambiguous: bool = False,
+                         initiator: moves.MoveInitiator = moves.MoveInitiator.HAND) -> MoveRefused:
+    if not dry_run and group != "single" and initiator is moves.MoveInitiator.CONSOLE:
+        moves.record_console_group_refusal(group, target, refusal.reason)
+    elif not dry_run:
         intent = moves.ExplicitMoveTarget.REQUESTED_ACCOUNT if group == "single" else moves.FollowGroupAccount(group)
         record = cast(Callable[[str, str, str, moves.FollowGroupAccount | moves.ExplicitMoveTarget, bool], None],
                       import_module("scripts.agents.stop_resume").record_refused_hand_move)
@@ -3552,7 +3618,10 @@ def _record_hand_refusal(member: str, target: str, refusal: MoveRefused, *, dry_
 
 
 @role_map.role_map_command
-def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: str = "", alerts: MoveAlerts = "user", account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
+def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: str = "", alerts: MoveAlerts = "user",
+               account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS,
+               initiator: moves.MoveInitiator = moves.MoveInitiator.HAND
+               ) -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
     """Select the group after target checks, then stop and resume each owner."""
     from scripts.production import staff
 
@@ -3560,52 +3629,66 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     del alerts
     target = note_file.canonical_label(target)
     now = datetime.now(timezone.utc)
-    checked = check_move_target(target, now, repair=not dry_run, account_config=account_config)
-    if isinstance(checked, MoveRefused):
-        return _record_hand_refusal(group, target, checked, dry_run=dry_run, group=group)
-    reason = why or f"{group} moved by hand"
-    transition = NoGroupTransition() if dry_run else group_transition(group)
-    if not dry_run and (isinstance(transition, NoGroupTransition) or group_label(group_accounts(), group) != target):
-        _ = set_group_account(group, target, why=reason)
-    members = group_move_members(group)
-    stopped = members.without_live_account
-    selected = [member for member in members.live if not session_on_account(member.session, target)
-                or (not dry_run and member.row.id in members.busy)]
-    selected_rows = (*(member.row for member in selected), *stopped)
-    ids = tuple(row.current_session for row in selected_rows)
-    if members.claude_registry_unreadable:
-        notices = (f"{group}: member list is incomplete because the Claude session registry is unreadable",)
-    else:
-        notices = (f"{group}: no live session moves",) if not ids else ()
-    notices += tuple(f"{row.name}: saved account is unknown; resume on {target}"
-                     for row in stopped if not isinstance(row.home, staff.SessionHome))
-    if group == "showrunners" and not members.claude_registry_unreadable:
-        if TYPE_CHECKING:
-            from scripts.agents import inventory
+    target_notices: tuple[str, ...] = ()
+
+    def prepare_target() -> None:
+        nonlocal target_notices
+        checked = check_move_target(target, now, repair=not dry_run, account_config=account_config)
+        if isinstance(checked, MoveRefused):
+            raise GroupMoveTargetRefused(checked.reason)
+        target_notices = checked.notices
+
+    with ExitStack() as claim:
+        reason = why or f"{group} moved by hand"
+        try:
+            if dry_run:
+                prepare_target()
+            else:
+                _ = set_group_account(group, target, why=reason, keep_claim=claim, reuse_current=True,
+                                      prepare=prepare_target)
+        except (GroupMoveBusy, GroupMoveTargetRefused) as error:
+            return _record_hand_refusal(group, target, MoveRefused(str(error)), dry_run=dry_run,
+                                        group=group, initiator=initiator)
+        members = group_move_members(group)
+        stopped = members.without_live_account
+        selected = [member for member in members.live if not session_on_account(member.session, target)
+                    or (not dry_run and member.row.id in members.busy)]
+        selected_rows = (*(member.row for member in selected), *stopped)
+        ids = tuple(row.current_session for row in selected_rows)
+        if members.claude_registry_unreadable:
+            notices = (f"{group}: member list is incomplete because the Claude session registry is unreadable",)
         else:
-            inventory = import_module("scripts.agents.inventory")
-        notices += tuple(
-            f"{runner.name}: no session runs under the id its update timer names; "
-            + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner.name)}"
-            for runner in inventory.showrunner_registrations().entries if runner.session_id not in members.running_sessions)
-    if dry_run:
-        return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",
-            *(move_preview_line(item.session, target) for item in selected),
-            *(f"{row.name}: {row.current_session} · resume on {target} (from {claude_config_label(row.home.path)})"
-              for row in stopped if isinstance(row.home, staff.SessionHome)), *notices))
-    rows = (*(member.row for member in members.live), *stopped)
-    # Only the user's move command calls move_group.
-    results = move_sessions(tuple(row.id for row in rows), target, why=reason, account_config=account_config,
-                            intent=moves.FollowGroupAccount(group), staff_members=rows, user_command=True) if rows else ()
-    reported = [(row, result) for row, result in zip(rows, results)
-                if not isinstance(result, stop_results.ClaudeUp)
-                or result.start_state != stop_results.ClaudeStartState.ALREADY_RUNNING]
-    ids = tuple(dict.fromkeys((*ids, *(row.current_session for row, _ in reported))))
-    names = {result.session_id: row.name for row, result in reported}
-    results = tuple(result for _, result in reported)
-    stdout, stderr, code = _move_output(results, (*checked.notices, *notices), names=names)
-    outcome = GroupMoveStartFailed if code else GroupMoveStarted
-    return outcome(ids, target, stdout, stderr, code, outcomes=results)
+            notices = (f"{group}: no live session moves",) if not ids else ()
+        notices += tuple(f"{row.name}: saved account is unknown; resume on {target}"
+                         for row in stopped if not isinstance(row.home, staff.SessionHome))
+        if group == "showrunners" and not members.claude_registry_unreadable:
+            if TYPE_CHECKING:
+                from scripts.agents import inventory
+            else:
+                inventory = import_module("scripts.agents.inventory")
+            notices += tuple(
+                f"{runner.name}: no session runs under the id its update timer names; "
+                + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner.name)}"
+                for runner in inventory.showrunner_registrations().entries if runner.session_id not in members.running_sessions)
+        if dry_run:
+            return GroupMoveDryRun(ids, (*target_notices, f"{group}: would select {target}",
+                *(move_preview_line(item.session, target) for item in selected),
+                *(f"{row.name}: {row.current_session} · resume on {target} (from {claude_config_label(row.home.path)})"
+                  for row in stopped if isinstance(row.home, staff.SessionHome)), *notices))
+        rows = (*(member.row for member in members.live), *stopped)
+        # Only the user's move command calls move_group.
+        results = move_sessions(tuple(row.id for row in rows), target, why=reason, account_config=account_config,
+                                intent=moves.FollowGroupAccount(group), staff_members=rows, user_command=True,
+                                initiator=initiator) if rows else ()
+        reported = [(row, result) for row, result in zip(rows, results)
+                    if not isinstance(result, stop_results.ClaudeUp)
+                    or result.start_state != stop_results.ClaudeStartState.ALREADY_RUNNING]
+        ids = tuple(dict.fromkeys((*ids, *(row.current_session for row, _ in reported))))
+        names = {result.session_id: row.name for row, result in reported}
+        results = tuple(result for _, result in reported)
+        stdout, stderr, code = _move_output(results, (*target_notices, *notices), names=names)
+        outcome = GroupMoveStartFailed if code else GroupMoveStarted
+        return outcome(ids, target, stdout, stderr, code, outcomes=results)
 
 
 def session_on_account(session: ListedSession | LiveGroupMember, label: str) -> bool:
@@ -4730,22 +4813,22 @@ def weekly_quotas(rows: Iterable[StatusRow]) -> dict[str, WeeklyQuota]:
 
 
 @dataclass(frozen=True)
-class FirstNextMoveTargets:
-    """Each group maps to its first queued target; an absent group has no entry."""
-    targets: dict[next_moves.NextMoveGroup, str] = field(default_factory=dict)
+class FirstNextMoveEntries:
+    """Each group maps to its first queued entry."""
+    entries: dict[next_moves.NextMoveGroup, next_moves.NextMove] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class NextMovesUnavailable:
-    """The local first targets could not be read."""
+    """The local next moves could not be read."""
     reason: str = "Next moves have not been read."
 
 
 @dataclass(frozen=True)
 class UpcomingMoves:
-    """One read supplies the upcoming list and the first targets."""
+    """One read supplies the upcoming list and each group's first entry."""
     lines: tuple[str, ...]
-    first: FirstNextMoveTargets | NextMovesUnavailable
+    first: FirstNextMoveEntries | NextMovesUnavailable
 
 
 @dataclass(frozen=True)
@@ -4758,7 +4841,7 @@ class StatusReading:
     represented_stderr: tuple[str, ...] = ()
     session_inputs: tuple[str, ...] = ()
     upcoming_moves: tuple[str, ...] = ()
-    first_next_moves: FirstNextMoveTargets | NextMovesUnavailable = field(default_factory=NextMovesUnavailable)
+    first_next_moves: FirstNextMoveEntries | NextMovesUnavailable = field(default_factory=NextMovesUnavailable)
     claude_registry_unreadable: bool = False
     live_claude_accounts: frozenset[tuple[str, str]] = frozenset()
 
@@ -5181,7 +5264,7 @@ class BoardNextMoveTarget:
 
 
 def account_board_next_move(
-    row: BoardRow, first: FirstNextMoveTargets | NextMovesUnavailable,
+    row: BoardRow, first: FirstNextMoveEntries | NextMovesUnavailable,
 ) -> BoardNextMoveTarget | NextMovesUnavailable | Literal["unselected", "none", "auto"]:
     """Find the next move state shared by rendering and sorting."""
     editable = row.get("group")
@@ -5191,8 +5274,8 @@ def account_board_next_move(
     if isinstance(first, NextMovesUnavailable):
         return first
     group = editable["group"] if editable else "workers"
-    if target := first.targets.get(group):
-        return BoardNextMoveTarget(target)
+    if entry := first.entries.get(group):
+        return BoardNextMoveTarget(next_moves.target_label(entry))
     return "none" if editable else "auto"
 
 
@@ -6250,13 +6333,12 @@ def _read_upcoming_moves() -> UpcomingMoves:
                 f"Upcoming moves: unavailable; {role_map.ROLE_MAP_HOST} unreachable",)
             return UpcomingMoves(lines, NextMovesUnavailable("First targets require the role-map host."))
         entries = next_moves.read_next_moves()
-        targets: dict[next_moves.NextMoveGroup, str] = {}
+        first_entries: dict[next_moves.NextMoveGroup, next_moves.NextMove] = {}
         for entry in entries:
-            if entry.group not in targets:
-                targets[entry.group] = next_moves.target_label(entry)
+            _ = first_entries.setdefault(entry.group, entry)
         upcoming = next_moves.render_next_moves(entries)
         lines = ("Upcoming moves: none",) if upcoming == "nothing set up" else ("Upcoming moves:", *upcoming.splitlines())
-        return UpcomingMoves(lines, FirstNextMoveTargets(targets))
+        return UpcomingMoves(lines, FirstNextMoveEntries(first_entries))
     except role_map.RoleMapUnavailable:
         reason = f"{role_map.ROLE_MAP_HOST} unreachable"
         return UpcomingMoves((f"Upcoming moves: unavailable; {reason}",), NextMovesUnavailable(reason))
@@ -7552,13 +7634,17 @@ def _parser() -> argparse.ArgumentParser:
     _ = next_writer.add_argument("entries")
     def insertion(text: str) -> next_moves.InsertAt:
         return next_moves.InsertAt(next_moves.GroupPosition(int(text)))
-    _ = next_writer.add_argument("--at", dest="insertion", type=insertion, default=next_moves.AppendToGroup())
+    next_write_mode = next_writer.add_mutually_exclusive_group()
+    _ = next_write_mode.add_argument("--at", dest="insertion", type=insertion, default=next_moves.AppendToGroup())
+    _ = next_write_mode.add_argument("--replace-first", action="store_true")
     next_command = commands.add_parser("next")
     next_verbs = next_command.add_subparsers(dest="next_action", required=True)
     next_add = next_verbs.add_parser("add")
     _ = next_add.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
     _ = next_add.add_argument("percent", type=float)
     _ = next_add.add_argument("label")
+    _ = next_add.add_argument("--measure", type=next_moves.parse_quota_measure, metavar="{all-models,fable}",
+                              default=next_moves.QuotaMeasure.ALL_MODELS)
     _ = next_add.add_argument("--else", dest="fallback_targets", action="append", default=[])
     hold_options = next_add.add_mutually_exclusive_group()
     _ = hold_options.add_argument("--hold-minutes", dest="hold_mode",
@@ -7618,6 +7704,11 @@ def _parser() -> argparse.ArgumentParser:
     _ = move_command.add_argument("--user-command", action="store_true", help=argparse.SUPPRESS)
     _ = move_command.add_argument("--no-alert", dest="alerts", action="store_const", const="none", default="user")
     _ = move_command.add_argument("--why", default="")
+    detached_group = commands.add_parser("console-group-move", help=argparse.SUPPRESS)
+    _ = detached_group.add_argument("--log", dest="move_log", type=Path, required=True)
+    _ = detached_group.add_argument("--requester", default="", help=argparse.SUPPRESS)
+    _ = detached_group.add_argument("group", choices=CLAUDE_GROUPS)
+    _ = detached_group.add_argument("label")
     for action in ("role", "env"):
         command = commands.add_parser(action)
         _ = command.add_argument("role")
@@ -7652,7 +7743,8 @@ def validate_next_move_target(entry: next_moves.NextMove) -> None:
 
 
 @role_map.role_map_command
-def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> int:
+def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS,
+         move_initiator: moves.MoveInitiator = moves.MoveInitiator.HAND) -> int:
     account_config = read_account_settings(account_config)
     parser = _parser()
     options = cast(CommandLine, parser.parse_args(argv))
@@ -7684,20 +7776,25 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
                 if len(entries) != 1:
                     raise AccountsError("accounts: next-write requires one entry")
                 entry = entries[0]
-                validate_next_move_target(entry)
-                next_moves.insert_next_move(entry, options.insertion)
-                print(next_moves.encode_next_moves(entries))
+                if options.replace_first:
+                    if not isinstance(entry, next_moves.ClaudeGroupMove):
+                        raise AccountsError("accounts: --replace-first requires a Claude group")
+                    _ = claude_account_dir(entry.to)
+                    entry = next_moves.set_first_next_move(entry.group, entry.at_percent, entry.to, measure=entry.measure)
+                else:
+                    validate_next_move_target(entry)
+                    next_moves.insert_next_move(entry, options.insertion)
+                print(next_moves.encode_next_moves((entry,)))
             return 0
         if options.action == "next":
             if options.next_action == "add":
                 if role_map.is_role_map_host():
-                    candidate = next_moves.decode_next_moves(json.dumps([dict(id="validation", group=options.group,
-                        at_percent=options.percent, **next_moves.encode_hold_mode(options.hold_mode), to=options.label,
-                        **{"else": options.fallback_targets},
-                        added_at=datetime.now(timezone.utc).isoformat())]))[0]
+                    candidate = next_moves.new_next_move(options.group, options.percent, options.label, options.hold_mode,
+                                                        fallback_targets=tuple(options.fallback_targets), measure=options.measure)
                     validate_next_move_target(candidate)
                 _ = next_moves.add_next_move(options.group, options.percent, options.label,
-                                             options.hold_mode, fallback_targets=tuple(options.fallback_targets), insertion=options.insertion)
+                                             options.hold_mode, fallback_targets=tuple(options.fallback_targets),
+                                             insertion=options.insertion, measure=options.measure)
                 print(next_moves.list_next_moves() if role_map.is_role_map_host()
                       else f"added {options.group} account move")
             elif options.next_action == "remove":
@@ -7734,7 +7831,12 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
             if options.action == "role-map-read":
                 print(role_map.encode_role_map(replace(read_role_map(), upcoming_moves=_upcoming_move_lines())))
             else:
-                write_role_map(role_map.decode_role_map_change(options.change))
+                change = role_map.decode_role_map_change(options.change)
+                if isinstance(change, RoleMapChange) and change.role in CLAUDE_GROUPS:
+                    with claim_group_selection(change.role):
+                        write_role_map(change)
+                else:
+                    write_role_map(change)
             return 0
         if options.detail and options.action != "status":
             raise AccountsError("--detail goes only with no action")
@@ -7753,6 +7855,12 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
             return 0
         if options.action == "exec":
             return exec_account(options.label, options.claude_args, probe=options.probe, account_config=account_config) or 0
+        if options.action == "console-group-move":
+            group = cast(ClaudeGroup, options.group)
+            with (options.move_log.open("a", encoding="utf-8") as output,
+                  redirect_stdout(output), redirect_stderr(output)):
+                return main(["move", group, options.label], account_config=account_config,
+                            move_initiator=moves.MoveInitiator.CONSOLE)
         if options.action == "move":
             if options.session == "workers":
                 if not options.label or options.source or options.target:
@@ -7766,7 +7874,8 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
                 # Only the workers branch reads the hidden --cause and --user-command.
                 if not options.label or options.source or options.target or options.cause or options.user_command:
                     raise AccountsError(f"move {'|'.join(CLAUDE_GROUPS)} requires <claudeN>")
-                moved = move_group(options.session, options.label, dry_run=options.dry_run, why=options.why, alerts=options.alerts, account_config=account_config)
+                moved = move_group(options.session, options.label, dry_run=options.dry_run, why=options.why,
+                                   alerts=options.alerts, account_config=account_config, initiator=move_initiator)
             else:
                 if not options.label or options.source or options.target or options.cause or options.user_command:
                     raise AccountsError("move requires <session-id|name> <claudeN>")

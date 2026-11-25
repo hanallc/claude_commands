@@ -443,6 +443,7 @@ Natedev is the only authority on which groups a machine may complete.
 Each natedev refusal pass that is not a dry run or a proof writes `~/.local/state/accounts/completion_plan.json`.
 The plan holds the pass time `at` and, for each permitted group, `target`, `cause`, `why` and `selected_at`.
 The plan leaves out a skipped group, a legacy selection and a target with an unresolved refusal for the group's model family.
+The plan also leaves out a group whose selection changed or whose claim is busy.
 Legacy selections stay natedev's job, because natedev upgrades them in the role map.
 `accounts completion-plan-read` prints the plan on natedev, and the Mac reads it through the role map ssh transport.
 The Mac pass first reads its local group members and stops before ssh when no member is live.
@@ -817,15 +818,45 @@ The page pauses refresh while the chooser is open.
 A board line of a selected Claude group carries its account and group.
 The Accounts table shows each next move beside its role.
 Sorting keeps each next move with its role.
-A selected Claude group shows its first target, or `none`, and an arrow button opens its move menu.
+A selected Claude group shows its first target, or `none`, and an arrow button opens its move dialog.
 A selected Codex workers line shows its first target, or `auto`, without a button.
 While it shows `auto`, each spare Codex line also shows `auto`; together these lines are the codex pair.
 `background.codex-pair` in `config/statusline.conf` tints the pair rows on the Accounts page.
 Other assignments show a minus icon.
-`StatusReading.first_next_moves` distinguishes first targets from an unavailable read with its reason.
-One queue read supplies the first targets for the Accounts page and the upcoming list for the text and JSON status output.
-Off the role-map host, first targets are unavailable.
-The menu marks the current target and can remove the group's first entry.
+`StatusReading.first_next_moves` contains each group's first entry or the reason the read failed.
+One queue read supplies those entries and the upcoming list for the text and JSON status output.
+The first entries are unavailable off the role-map host.
+The dialog reads the target, threshold, and quota measure from the group's first queued entry.
+Save keeps the hold mode, fallback accounts, and queue position.
+A change to the target, percent, or measure gives the rule a new ID.
+A change to the group, target, percent, or measure makes an old timer ineligible.
+The timer records these settings, the source account, and the selection ID.
+If a save stops after writing the queue, the watcher starts a new timer for the new rule.
+The watcher and list keep a matching hold's start and duration.
+The entry ID, hold mode, source account, selection ID, and percent must match.
+A hold without a saved target or measure matches only an all-models entry.
+The `measure` field in each Claude entry is `all-models` or `fable`.
+An older entry with no measure uses `all-models`.
+Use `accounts.py next add <group> <percent> <account> --measure fable` for a Fable threshold.
+The text list shows the measure only for a Fable entry.
+For a Fable threshold, the watcher checks the Fable weekly percent left on both accounts.
+If the source reading is unavailable, it reports `cannot read the Fable weekly window` and leaves the entry queued.
+**Move now** starts the hand group move. The click leaves the next-move log unchanged.
+The page checks active moves before launch.
+The role-map authority takes the same group claim for console, terminal, and watcher selections.
+A move on the authority keeps the claim while it requests its members.
+The authority also takes the claim when it receives a selection from the Mac.
+The claim covers the selection change on natedev. The Mac member requests run after the claim ends.
+A busy claim refuses a hand move with **Another move is in progress. Try again when it ends.**
+The Moves card shows this message for a refused console request.
+A watcher keeps its pending rule or refusal and tries again on its next pass.
+The watcher compares the account and transition under the claim before it writes a group decision.
+The claim does not yet cover inherited selections, member request admission, or the reset refresh.
+If either changed during the check, the watcher skips the decision and keeps the rule queued.
+Local completion checks the selection under the claim before it requests member moves.
+The member requests use the current account under the session row lock.
+An admitted hand move moves the group at once and restarts the last work.
+A later watcher pass can remove the first entry if its target is now the current account.
 Its `stale_at` is the next local midnight, when its reset text changes.
 The text table appends `Login ends` in the user's zone, with the same date format as `Weekly resets`.
 Each JSON account exports `login_ends_at` as an ISO 8601 UTC string, or null for an unknown date or Codex.
