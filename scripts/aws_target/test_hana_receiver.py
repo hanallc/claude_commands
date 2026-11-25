@@ -99,11 +99,11 @@ class HanaReceiverSettingsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             policy = directory / 'policy.conf'
-            write_policy(policy, directory / 'slots')
+            write_policy(policy, directory / 'copies')
             child = mock.Mock(pid=os.getpid())
             settings = hana_receiver.ReceiverSettings(10, 1, 83, 1048576, 120, 23)
             with mock.patch.object(subprocess, 'Popen', return_value=child) as launch:
-                _ = hana_receiver.GuestCommandSupervisor(settings, slot_policy=policy).start_source_update(
+                _ = hana_receiver.GuestCommandSupervisor(settings, copy_policy=policy).start_source_update(
                     request_for(b''), directory, ['systemd-run', '--uid=hana-runner', '--', *hana_receiver.BOOTSTRAP_COMMAND])
             arguments = cast(list[str], launch.call_args.args[0])
             self.assertIn('--property=RuntimeMaxSec=23', arguments)
@@ -128,7 +128,7 @@ class HanaReceiverSettingsTests(unittest.TestCase):
             (previous, hana_guest.CommandAdmissionRefusalCode.RUNTIME_ABI_MISMATCH,
              f'The Hana runtime ABI {previous} differs from the image ABI {hana_protocol.RUNTIME_ABI}'),
             (hana_protocol.RUNTIME_ABI, hana_guest.CommandAdmissionRefusalCode.PRE_COMMAND_FAILED,
-             'The image slot policy is invalid'),
+             'The image copy policy is invalid'),
         ):
             with self.subTest(abi=abi), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -145,7 +145,7 @@ class HanaReceiverSettingsTests(unittest.TestCase):
                 policy = root / 'policy.conf'
                 _ = policy.write_text('locks.probe_retry_seconds=invalid\n')
                 supervisor = MountedSupervisor(hana_receiver.ReceiverSettings(10, 1, 83, 1048576, 120, 23),
-                                              slot_policy=policy)
+                                              copy_policy=policy)
                 with mock.patch.object(subprocess, 'Popen') as launch:
                     observation = hana_receiver.receive_execution(settings,
                         {'deployment': 'deployment', 'start_token': 'start'}, envelope, supervisor,
@@ -176,7 +176,7 @@ class HanaReceiverSettingsTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     _ = hana_payload.unpack_payload(BytesIO(payload), request_for(payload).manifest, Path(temporary) / 'runtime')
 
-    def test_bootstrap_gives_the_runner_the_verified_source_and_image_slot_policy(self) -> None:
+    def test_bootstrap_gives_the_runner_the_verified_source_and_image_copy_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             bundle = b'fixture source bundle'
@@ -191,7 +191,9 @@ assert Path(__file__).is_relative_to(Path.home() / 'rust/hana/.git/hana-payload'
 assert sys.stdin.buffer.read() == Path(os.environ['FIXTURE_INPUT']).read_bytes()
 policy = (Path(os.environ['CONF_DIR']) / 'build_folders.conf').read_text()
 assert 'roots.build=/fixture/build' in policy
-assert '# whole: 1..\\nslots.aws-hana.hana.max=1\\n' in policy
+assert '# whole: 1..\\nhana.copies.max=1\\n' in policy
+assert '# whole: 1..\\nhana.copies.max_bytes=1073741824\\n' in policy
+assert 'hana.copies.max.aws-hana' not in policy
 assert '# range: 0..\\nlocks.probe_wait_seconds=0\\n' in policy
 assert '/bad' not in policy
 assert 'patterns.tool=fixture' in policy
@@ -202,7 +204,7 @@ print(args['--command-timeout-s'])
                 ('runtime/abi', f'{hana_protocol.RUNTIME_ABI}\n'.encode(), tarfile.REGTYPE),
                 ('runtime/config/build_folders.conf',
                  b'patterns.tool=fixture\nroots.build=/bad\nroots.build.aws-hana=/bad\n'
-                 + b'slots.aws-hana.hana.max.aws-hana=9\n',
+                 + b'hana.copies.max.aws-hana=9\n',
                  tarfile.REGTYPE))
             write_policy(root / 'policy.conf', Path('/fixture/build'))
             for label, cause in (
@@ -255,7 +257,7 @@ print(args['--command-timeout-s'])
             root = Path(temporary)
             home = root / 'home'
             mount = hana_payload.payload_mount(home)
-            write_policy(root / 'policy.conf', root / 'slots')
+            write_policy(root / 'policy.conf', root / 'copies')
             address = root / 'ready.sock'
             listener.bind(str(address))
             listener.listen()
@@ -283,7 +285,7 @@ with socket.socket(socket.AF_UNIX) as connection:
             stop = ['systemctl', '--user', 'stop', unit]
             self.addCleanup(subprocess.run, stop, capture_output=True, timeout=10, check=False)
             settings = hana_receiver.ReceiverSettings(10, 1, 83, 1048576, 120, 23)
-            supervisor = hana_receiver.GuestCommandSupervisor(settings, slot_policy=root / 'policy.conf')
+            supervisor = hana_receiver.GuestCommandSupervisor(settings, copy_policy=root / 'policy.conf')
             bash = shutil.which('bash')
             assert bash is not None
             environment_path = root / 'environment'
@@ -306,8 +308,8 @@ with socket.socket(socket.AF_UNIX) as connection:
 
 
 def write_policy(path: Path, build_root: Path) -> None:
-    _ = path.write_text(f'roots.build={build_root}\n# whole: 1..\nslots.aws-hana.hana.max=1\n'
-        + '# whole: 1..\nslots.aws-hana.hana.max_bytes=1073741824\n'
+    _ = path.write_text(f'roots.build={build_root}\n# whole: 1..\nhana.copies.max=1\n'
+        + '# whole: 1..\nhana.copies.max_bytes=1073741824\n'
         + '# range: 0..\nlocks.probe_wait_seconds=0\n# range: 0..\nlocks.probe_retry_seconds=0.005\n')
 
 
@@ -330,7 +332,7 @@ sys.path.insert(0, sys.argv[2])
 from scripts.aws_target import hana_payload
 
 root = Path(sys.argv[1])
-hana_payload.IMAGE_SLOT_POLICY = root / 'policy.conf'
+hana_payload.IMAGE_COPY_POLICY = root / 'policy.conf'
 raise SystemExit(hana_payload.main(1048576, 7, 23.5))
 ''', str(root), str(Path(__file__).resolve().parents[2])]
     env = {**os.environ, 'HOME': str(home), 'PATH': str(root) + ':' + os.environ['PATH'],

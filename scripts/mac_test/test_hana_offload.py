@@ -1152,7 +1152,7 @@ route_test
         objects.request = self.fixture.request
         objects.fail_fence = not refusal_in_fence_ack
         observation = hana_protocol.ConfirmedCommandAdmissionRefusal(
-            self.fixture.key, self.fixture.request.slot, False, 1000, reason, code)
+            self.fixture.key, self.fixture.request.copy_number, False, 1000, reason, code)
         monotonic = time.monotonic()
         boot_deadline = int(time.time()) + 200
         publish = objects.publish_execution
@@ -1289,7 +1289,7 @@ route_test
             observation = observe(key, timeout_s=timeout_s)
             if case == 'guest refusal' and observation.source_updated:
                 return hana_protocol.ConfirmedCommandAdmissionRefusal(
-                    key, observation.slot, observation.fenced, observation.observed_at, cause,
+                    key, observation.copy_number, observation.fenced, observation.observed_at, cause,
                     CommandAdmissionRefusalCode.PRE_COMMAND_FAILED)
             return observation
 

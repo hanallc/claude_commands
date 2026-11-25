@@ -24,7 +24,7 @@ def command_result(status: int = 0) -> result.HanaCommandResult:
 
 def expectation(value: result.HanaCommandResult) -> result.HanaResultExpectation:
     return result.HanaResultExpectation(value.key, value.source_key, value.commit, value.toolchain,
-                                        value.host, value.argv, value.slot)
+                                        value.host, value.argv, value.copy_number)
 
 
 class HanaResultTests(unittest.TestCase):
@@ -55,7 +55,7 @@ class HanaResultTests(unittest.TestCase):
             *(replace(value, key=replace(value.key, generation=other)) for other in (
                 HanaHostGeneration('other', 'start', 'boot'), HanaHostGeneration('deployment', 'other', 'boot'),
                 HanaHostGeneration('deployment', 'start', 'other'))),
-            replace(value, slot=2), replace(value, source_key='other'), replace(value, commit='c' * 40),
+            replace(value, copy_number=2), replace(value, source_key='other'), replace(value, commit='c' * 40),
             replace(value, toolchain='d' * 64), replace(value, argv=('cargo', 'check', '--no-default-features')),
             replace(value, host='other-host'))
         for changed in replacements:
@@ -70,7 +70,7 @@ class HanaResultTests(unittest.TestCase):
 
     def test_bad_wire_fields_never_decode_as_a_result(self) -> None:
         value = command_result()
-        for name, bad in (('version', True), ('status', True), ('slot', -1), ('argv', ['cargo', 1]),
+        for name, bad in (('version', True), ('status', True), ('copy_number', -1), ('argv', ['cargo', 1]),
                           ('stdout', '@@@'), ('started_at', float('nan')), ('finished_at', 1),
                           ('execution_seconds', -1), ('memory', {'bytes': True})):
             with self.subTest(name=name, bad=bad):

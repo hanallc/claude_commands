@@ -81,7 +81,7 @@ class FakeExecutionObjects:
         if self.missing_basis:
             evidence = execution_identity.ExecutionEvidenceUnavailable('MissingBasis: ' + json.dumps({
                 'repository': self.request.manifest.repository, 'commits': self.request.manifest.basis_commits}), 1000)
-        return hana_protocol.HanaCommandObservation(key, self.request.slot, self.accepted, self.fenced,
+        return hana_protocol.HanaCommandObservation(key, self.request.copy_number, self.accepted, self.fenced,
             self.terminated, self.lease_free, 1000, evidence, self.source_updated)
 
     def execution_result(self, key: result.HanaAttemptKey) -> bytes:
@@ -191,7 +191,7 @@ class HanaExecutionTests(unittest.TestCase):
         for code, reason, refused in rows:
             with self.subTest(code=code, reason=reason):
                 reply = (hana_protocol.ConfirmedCommandAdmissionRefusal(
-                    observation.key, observation.slot, observation.fenced, observation.observed_at, reason, code)
+                    observation.key, observation.copy_number, observation.fenced, observation.observed_at, reason, code)
                     if code is not None else replace(observation, accepted=True, terminated=True, lease_free=True,
                         evidence=execution_identity.ExecutionEvidenceUnavailable(reason, 1000)))
                 decoded = hana_protocol.decode_observation(hana_protocol.encode_observation(reply))
@@ -205,16 +205,16 @@ class HanaExecutionTests(unittest.TestCase):
                 b'"kind":"unavailable"', b'"kind":"unavailable","refusal_code":"invalid"'))
 
         confirmed = hana_protocol.ConfirmedCommandAdmissionRefusal(
-            observation.key, observation.slot, False, observation.observed_at, 'The payload could not start',
+            observation.key, observation.copy_number, False, observation.observed_at, 'The payload could not start',
             CommandAdmissionRefusalCode.PRE_COMMAND_FAILED)
         raw = hana_protocol.encode_observation(confirmed)
         for field in (b'accepted', b'terminated', b'lease_free'):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'confirmed departure'):
                 _ = hana_protocol.decode_observation(raw.replace(b'"' + field + b'":true', b'"' + field + b'":false'))
 
-    def test_codecs_reject_wrong_claim_source_command_and_boolean_slot(self) -> None:
+    def test_codecs_reject_wrong_claim_source_command_and_boolean_copy_number(self) -> None:
         for request in (replace(self.request, key=replace(self.key, claim_id='wrong')),
-                        replace(self.request, argv=('cargo', 'clippy')), replace(self.request, slot=True)):
+                        replace(self.request, argv=('cargo', 'clippy')), replace(self.request, copy_number=True)):
             with self.subTest(request=request), self.assertRaises(ValueError):
                 _ = hana_protocol.encode_request(request)
         with self.assertRaises(ValueError):
@@ -533,7 +533,7 @@ class HanaExecutionTests(unittest.TestCase):
                 if published:
                     _ = self.dispatch()
                     observation = hana_protocol.ConfirmedCommandAdmissionRefusal(
-                        self.key, self.request.slot, False, 1000, reason, CommandAdmissionRefusalCode.PRE_COMMAND_FAILED)
+                        self.key, self.request.copy_number, False, 1000, reason, CommandAdmissionRefusalCode.PRE_COMMAND_FAILED)
                     with mock.patch.object(self.objects, 'observe_execution', return_value=observation):
                         _ = execution.observe_execution(self.root, self.request, self.objects)
 

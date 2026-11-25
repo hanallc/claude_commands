@@ -71,16 +71,16 @@ def materialize_and_run(request: hana_protocol.HanaExecutionRequest, verified_bu
         if request.argv != request.manifest.argv:
             raise ValueError('The command differs from its source manifest')
         with source.materialize(request.manifest, source.read_limits(configuration), verified_bundle,
-                                number=request.slot, work=request.key.attempt) as leased:
+                                number=request.copy_number, work=request.key.attempt) as leased:
             if isinstance(leased, source.MissingBasis):
                 return hana_protocol.HanaExecutionRefused('MissingBasis: ' + json.dumps(
                     {'repository': leased.repository, 'commits': leased.commits}, separators=(',', ':')))
-            execution = linux_runner.LeasedSlotExecution(leased.copy, leased.descriptors)
+            execution = linux_runner.LeasedCopyExecution(leased.copy, leased.descriptors)
             with build_folders.leased_build_folder(build_folders.MainOutput(leased.copy.repository)) as main:
                 build_folders.mark_folder_use(main)
                 shell = linux_runner.prepare_shell(leased.path, main / 'shells', settings.shell, settings.shell_timeout_s,
                     pass_fds=linux_runner.execution_descriptors())
-                result = linux_runner.run_slot(execution, request.argv, dict(request.manifest.environment), shell=shell,
+                result = linux_runner.run_copy(execution, request.argv, dict(request.manifest.environment), shell=shell,
                     compiler_version=settings.compiler_version, free_floor_gib=settings.free_floor_gib,
                     output_max_bytes=output_max_bytes, timeout_s=settings.command_timeout_s, build_start_fd=build_start_fd)
             return hana_protocol.HanaCommandFinished(HanaCommandResult(request.key, request.source_key.key,
@@ -102,7 +102,7 @@ def materialize_source_update(request: hana_protocol.HanaExecutionRequest,
             raise ValueError('The source update requires the complete original capture')
         limits = source.read_limits(conf.read_or_repository('hana_aws'))
         with source.materialize(request.manifest, limits, verified_bundle,
-                                number=request.slot, work=request.key.attempt) as leased:
+                                number=request.copy_number, work=request.key.attempt) as leased:
             if isinstance(leased, source.MissingBasis):
                 raise ValueError('The complete source update still requires basis commits')
             return hana_protocol.HanaSourceUpdated(leased.identity)

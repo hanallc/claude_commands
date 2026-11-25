@@ -200,7 +200,7 @@ mount_timeout_seconds=15
     def test_command_uses_its_own_slice_and_configured_resource_limits(self) -> None:
         settings = replace(self.settings, enabled=True)
         guest.write_permit(settings, self.fresh(), expected_generation=0, paths=self.paths, clock=self.clock)
-        arguments = guest.admit_command(settings, ('cargo', 'check'), guest.DATA / 'slot/source',
+        arguments = guest.admit_command(settings, ('cargo', 'check'), guest.DATA / 'copy/source',
             mounted=True, clock=self.clock, uptime=self.uptime, paths=self.paths, start=lambda argv: argv)
         self.assertIn('--collect', arguments[:arguments.index('--')])
         self.assertIn('--slice=hana-work-' + self.generation + '.slice', arguments)
@@ -229,7 +229,7 @@ mount_timeout_seconds=15
         ):
             with self.subTest(reason=reason), self.assertRaisesRegex(refusal, reason):
                 _ = self.permit.write_text(json.dumps(asdict(permit)))
-                _ = guest.admit_command(settings, ('cargo', 'check'), guest.DATA / 'slot/source',
+                _ = guest.admit_command(settings, ('cargo', 'check'), guest.DATA / 'copy/source',
                     mounted=mounted, clock=self.clock, uptime=self.uptime, paths=self.paths, start=lambda argv: argv)
 
     def test_units_keep_guard_independent_and_bound_device_and_mount_waits(self) -> None:
@@ -385,7 +385,7 @@ mount_timeout_seconds=15
             guest.atomic_record(self.paths.fence, {'state': 'shutdown'})
         started: list[list[str]] = []
         with self.assertRaisesRegex(ValueError, 'Shutdown is fenced'):
-            guest.admit_command(settings, ('cargo', 'check'), guest.DATA / 'slot/source', mounted=True,
+            guest.admit_command(settings, ('cargo', 'check'), guest.DATA / 'copy/source', mounted=True,
                                 paths=self.paths, clock=self.clock, uptime=self.uptime, start=started.append)
         self.assertEqual(started, [])
 
@@ -408,7 +408,7 @@ mount_timeout_seconds=15
             return arguments
 
         with mock.patch.object(guest, 'read_permit', side_effect=read):
-            _ = guest.admit_command(settings, ('cargo', 'check'), guest.DATA / 'slot/source', mounted=True,
+            _ = guest.admit_command(settings, ('cargo', 'check'), guest.DATA / 'copy/source', mounted=True,
                                    paths=self.paths, clock=self.clock, uptime=self.uptime, start=start)
             self.now = self.fresh().expires_at + self.settings.permit_max_seconds
             guest.run_safety('watchdog', settings, clock=self.clock, uptime=self.uptime,

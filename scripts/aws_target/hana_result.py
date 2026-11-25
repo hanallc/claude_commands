@@ -55,7 +55,7 @@ class HanaCommandResult:
     toolchain: str
     host: str
     argv: tuple[str, ...]
-    slot: int
+    copy_number: int
     status: int
     stdout: bytes
     stderr: bytes
@@ -73,7 +73,7 @@ class HanaResultExpectation:
     toolchain: str
     host: str
     argv: tuple[str, ...]
-    slot: int
+    copy_number: int
 
 
 @dataclass(frozen=True)
@@ -121,7 +121,7 @@ def encode_result(result: HanaCommandResult) -> bytes:
     """Encode the result and preserve both output byte streams."""
     content = json.dumps({'version': 1, 'key': encode_attempt_key(result.key),
         'source_key': result.source_key, 'commit': result.commit, 'toolchain': result.toolchain,
-        'host': result.host, 'argv': result.argv, 'slot': result.slot, 'status': result.status,
+        'host': result.host, 'argv': result.argv, 'copy_number': result.copy_number, 'status': result.status,
         'stdout': base64.b64encode(result.stdout).decode('ascii'),
         'stderr': base64.b64encode(result.stderr).decode('ascii'), 'started_at': result.started_at,
         'finished_at': result.finished_at, 'execution_seconds': result.execution_seconds,
@@ -146,7 +146,7 @@ def decode_result(content: bytes) -> HanaCommandResult:
     peak = MeasuredPeak(integer_field(memory, 'bytes')) if 'bytes' in memory else PeakUnavailable(string_field(memory, 'reason'))
     result = HanaCommandResult(decode_attempt_key(row['key']), string_field(row, 'source_key'),
         string_field(row, 'commit'), string_field(row, 'toolchain'), string_field(row, 'host'),
-        tuple(cast(list[str], argv)), integer_field(row, 'slot'), integer_field(row, 'status'),
+        tuple(cast(list[str], argv)), integer_field(row, 'copy_number'), integer_field(row, 'status'),
         base64.b64decode(string_field(row, 'stdout', empty=True), validate=True),
         base64.b64decode(string_field(row, 'stderr', empty=True), validate=True),
         seconds_field(row, 'started_at'), seconds_field(row, 'finished_at'), seconds_field(row, 'execution_seconds'), peak)
@@ -164,7 +164,7 @@ def validate_result(result: HanaCommandResult, expected: HanaResultExpectation,
         return RejectedHanaResult('The Hana attempt or host generation changed')
     for name, actual, requested in (('source_key', result.source_key, expected.source_key),
             ('commit', result.commit, expected.commit), ('toolchain', result.toolchain, expected.toolchain),
-            ('host', result.host, expected.host), ('argv', result.argv, expected.argv), ('slot', result.slot, expected.slot)):
+            ('host', result.host, expected.host), ('argv', result.argv, expected.argv), ('copy_number', result.copy_number, expected.copy_number)):
         if actual != requested:
             return RejectedHanaResult(f'The Hana result {name} differs from the request')
     if current_source_key != expected.source_key:

@@ -1,3 +1,4 @@
+config/aws_target.conf
 config/build_folders.conf
 config/build_targets.conf
 config/hana_aws.conf

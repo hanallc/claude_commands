@@ -24,12 +24,12 @@ HANA_IMAGE_KEYS = (
 HANA_RUNTIME_KEYS = ('execution_shell', 'free_floor_gib', 'source_git_timeout_s', 'source_allowed_environment')
 COMMAND_TIMEOUT_KEY = 'loopback.command_timeout_s'
 SHELL_TIMEOUT_KEY = 'loopback.shell_timeout_s'
-SLOT_PROBE_KEYS = ('locks.probe_wait_seconds', 'locks.probe_retry_seconds')
-COPY_POLICY_KEYS = (hana_payload.BUILD_ROOT_KEY, *SLOT_PROBE_KEYS)
+FOLDER_POLICY_KEYS = (hana_payload.BUILD_ROOT_KEY, hana_payload.PROBE_WAIT_KEY, hana_payload.PROBE_RETRY_KEY)
 IMAGE_SETTINGS = {
     'hana_aws': HANA_IMAGE_KEYS,
     'build_targets': (COMMAND_TIMEOUT_KEY,),
-    'build_folders': COPY_POLICY_KEYS,
+    'build_folders': FOLDER_POLICY_KEYS,
+    'aws_target': hana_payload.COPY_LIMIT_KEYS,
 }
 IMAGE_FILE_LIST = Path('scripts/aws_target/hana_image.files')
 RUNTIME_FILE_LIST = Path('scripts/aws_target/hana_runtime.files')
@@ -174,20 +174,30 @@ def guest_files(checkout: Path, configuration: Path | conf.ConfigRead, device: P
     command_timeout = _resolved_read(targets, command_config, workload).value(
         COMMAND_TIMEOUT_KEY, float, recover_invalid=False)
     folders = checkout / 'config/build_folders.conf'
-    slot_config = conf.settings(resolved_config_text(
-        conf.settings(folders.read_text(encoding='utf-8')), COPY_POLICY_KEYS, alias))
-    root_setting = slot_config[hana_payload.BUILD_ROOT_KEY]
+    copy_config = conf.settings(resolved_config_text(
+        conf.settings(folders.read_text(encoding='utf-8')), FOLDER_POLICY_KEYS, alias))
+    aws = checkout / 'config/aws_target.conf'
+    limit_config = resolved_config_text(conf.settings(aws.read_text(encoding='utf-8')),
+                                       hana_payload.COPY_LIMIT_KEYS, alias)
+    limits = _resolved_read(aws, limit_config, workload)
+    limit_settings = conf.settings(limit_config)
+    for key in hana_payload.COPY_LIMIT_KEYS:
+        if not limit_settings[key].limit.startswith('# whole:'):
+            raise ValueError(f'{aws}: {key} requires a # whole: limit.')
+        _ = limits.value(key, conf.positive_whole, recover_invalid=False)
+    copy_config.update(limit_settings)
+    root_setting = copy_config[hana_payload.BUILD_ROOT_KEY]
     root = Path(root_setting.value)
     if root_setting.value.startswith('~/'):
         root = hana_guest.RUNNER_HOME / root.relative_to('~')
     if not root.is_absolute() or '..' in root.parts:
         raise ValueError(f'{folders}: The Hana build root must resolve to an absolute path.')
-    slot_config[hana_payload.BUILD_ROOT_KEY] = replace(root_setting, value=str(root))
-    slot_config_text = config_text(slot_config)
-    slot_policy = _resolved_read(folders, slot_config_text, workload)
-    wait_key, retry_key = SLOT_PROBE_KEYS
-    wait = slot_policy.value(wait_key, conf.decimal, recover_invalid=False)
-    retry = slot_policy.value(retry_key, conf.decimal, recover_invalid=False)
+    copy_config[hana_payload.BUILD_ROOT_KEY] = replace(root_setting, value=str(root))
+    copy_config_text = config_text(copy_config)
+    copy_policy = _resolved_read(folders, copy_config_text, workload)
+    wait_key, retry_key = hana_payload.PROBE_WAIT_KEY, hana_payload.PROBE_RETRY_KEY
+    wait = copy_policy.value(wait_key, conf.decimal, recover_invalid=False)
+    retry = copy_policy.value(retry_key, conf.decimal, recover_invalid=False)
     if wait < 0:
         raise ValueError(f'{folders}: {wait_key} must be nonnegative.')
     if float(retry) <= 0:
@@ -198,7 +208,7 @@ def guest_files(checkout: Path, configuration: Path | conf.ConfigRead, device: P
         *(RenderedGuestFile(Path(file.path.name), file.mode, file.content.encode()) for file in control),
         *(RenderedGuestFile(Path('runtime') / file.path, file.mode, file.content)
           for file in _listed_files(checkout, IMAGE_FILE_LIST)),
-        RenderedGuestFile(Path('runtime/config/build_folders.conf'), 0o644, slot_config_text.encode()),
+        RenderedGuestFile(Path('runtime/config/build_folders.conf'), 0o644, copy_config_text.encode()),
     )
 
 
@@ -217,8 +227,7 @@ def runtime_files(checkout: Path, configuration: Path | conf.ConfigRead) -> tupl
     image_roots = ('roots.temporary',)
     folder_defaults = _runtime_defaults(folders, alias)
     folder_config = config_text({key: setting for key, setting in folder_defaults.items()
-        if not any(key == base or key.startswith(base + '.') for base in (*image_roots, *COPY_POLICY_KEYS))
-        and not key.startswith('slots.')})
+        if not any(key == base or key.startswith(base + '.') for base in (*image_roots, *hana_payload.COPY_POLICY_KEYS))})
     files = {file.path: file for file in _listed_files(checkout, RUNTIME_FILE_LIST)}
     entry = files.pop(RUNNER_ENTRY)
     return (

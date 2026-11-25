@@ -18,9 +18,11 @@ CONTROL_MAX_BYTES = 65536
 # Reserve space for the wrapper, the permit, and both signed publication URLs.
 COMMAND_ENVELOPE_RESERVE_BYTES = 16 * 1024
 COMMAND_RESULT_PENDING = 'The command result is pending'
-RUNTIME_ABI = 2
+RUNTIME_ABI = 3
 REPOSITORY = 'hana'
 COPY_UNIT = 'aws-hana'
+COPY_MAX_KEY = 'hana.copies.max'
+COPY_MAX_BYTES_KEY = 'hana.copies.max_bytes'
 
 
 def main_checkout(home: Path) -> Path:
@@ -147,10 +149,10 @@ class SourceIdentity:
 
 @dataclass(frozen=True)
 class HanaExecutionRequest:
-    """The request binds exact source and command to one assigned slot."""
+    """The request binds exact source and command to one assigned copy."""
     key: HanaAttemptKey
     manifest: SourceManifest
-    slot: int
+    copy_number: int
     source_key: execution_identity.SourceKeyKnown
     argv: tuple[str, ...]
     link: LogicalStepLink
@@ -175,9 +177,9 @@ class HanaCommandEnvelope:
 
 @dataclass(frozen=True)
 class HanaFenceEnvelope:
-    """The fence prevents command acceptance for this exact attempt and slot."""
+    """The fence prevents command acceptance for this exact attempt and copy number."""
     key: HanaAttemptKey
-    slot: int
+    copy_number: int
     access: HanaExecutionAccess
 
 
@@ -185,7 +187,7 @@ class HanaFenceEnvelope:
 class HanaSourceUpdateEnvelope:
     """A complete source bundle repairs the original capture without command authority."""
     key: HanaAttemptKey
-    slot: int
+    copy_number: int
     manifest: SourceManifest
     access: HanaExecutionAccess
 
@@ -218,9 +220,9 @@ def decode_command_timing(value: object) -> HanaCommandTiming:
 
 @dataclass(frozen=True)
 class HanaCommandObservation:
-    """The guest reports acceptance, fencing, termination, and slot lease release."""
+    """The guest reports acceptance, fencing, termination, and copy lease release."""
     key: HanaAttemptKey
-    slot: int
+    copy_number: int
     accepted: bool
     fenced: bool
     terminated: bool
@@ -236,7 +238,7 @@ class ConfirmedCommandAdmissionRefusal:
     """The guest reports a pre-command refusal after it confirms departure."""
 
     key: HanaAttemptKey
-    slot: int
+    copy_number: int
     fenced: bool
     observed_at: float
     reason: str
@@ -286,10 +288,10 @@ def encode_envelope(envelope: HanaExecutionEnvelope) -> bytes:
                     'permission': asdict(envelope.permission), 'access': asdict(envelope.access)}
     elif isinstance(envelope, HanaSourceUpdateEnvelope):
         document = {'version': 1, 'action': 'source-update', 'key': hana_result.encode_attempt_key(envelope.key),
-                    'slot': envelope.slot, 'manifest': asdict(envelope.manifest), 'access': asdict(envelope.access)}
+                    'copy_number': envelope.copy_number, 'manifest': asdict(envelope.manifest), 'access': asdict(envelope.access)}
     else:
         document = {'version': 1, 'action': 'fence', 'key': hana_result.encode_attempt_key(envelope.key),
-                    'slot': envelope.slot, 'access': asdict(envelope.access)}
+                    'copy_number': envelope.copy_number, 'access': asdict(envelope.access)}
     content = encode_document(document)
     _ = decode_envelope(content)
     return content
@@ -318,19 +320,21 @@ def decode_envelope(content: bytes) -> HanaExecutionEnvelope:
         manifest = _decode_manifest(row.get('manifest'))
         if manifest.basis_commits:
             raise ValueError('A Hana source update requires a complete bundle')
-        return HanaSourceUpdateEnvelope(hana_result.decode_attempt_key(row.get('key')), _positive_integer(row, 'slot'), manifest, access)
+        return HanaSourceUpdateEnvelope(hana_result.decode_attempt_key(row.get('key')),
+                                        _positive_integer(row, 'copy_number'), manifest, access)
     if row.get('action') != 'fence':
         raise ValueError('The Hana command action is invalid')
-    return HanaFenceEnvelope(hana_result.decode_attempt_key(row.get('key')), _positive_integer(row, 'slot'), access)
+    return HanaFenceEnvelope(hana_result.decode_attempt_key(row.get('key')), _positive_integer(row, 'copy_number'), access)
 
 
 def encode_observation(observation: HanaExecutionObservation) -> bytes:
-    """Encode one observation with its exact attempt and slot."""
+    """Encode one observation with its exact attempt and copy number."""
     evidence = encode_evidence(observation.evidence)
     if isinstance(observation, ConfirmedCommandAdmissionRefusal):
         evidence['refusal_code'] = observation.refusal_code.value
-    row: dict[str, object] = {'version': 1, 'key': hana_result.encode_attempt_key(observation.key), 'slot': observation.slot,
-        'accepted': observation.accepted, 'fenced': observation.fenced, 'terminated': observation.terminated,
+    row: dict[str, object] = {'version': 1, 'key': hana_result.encode_attempt_key(observation.key),
+        'copy_number': observation.copy_number, 'accepted': observation.accepted,
+        'fenced': observation.fenced, 'terminated': observation.terminated,
         'lease_free': observation.lease_free, 'observed_at': observation.observed_at,
         'evidence': evidence, 'source_updated': observation.source_updated}
     if observation.timing:
@@ -349,7 +353,7 @@ def decode_observation(content: bytes) -> HanaExecutionObservation:
         flags.append(value)
     evidence_row = hana_result.object_fields(row['evidence'])
     key = hana_result.decode_attempt_key(row['key'])
-    slot = _positive_integer(row, 'slot')
+    copy_number = _positive_integer(row, 'copy_number')
     observed_at = hana_result.seconds_field(row, 'observed_at')
     evidence = decode_evidence(evidence_row)
     timing = decode_command_timing(row['timing']) if 'timing' in row else HanaCommandTiming()
@@ -359,8 +363,8 @@ def decode_observation(content: bytes) -> HanaExecutionObservation:
         if (not (accepted and terminated and lease_free) or source_updated
                 or not isinstance(evidence, execution_identity.ExecutionEvidenceUnavailable)):
             raise ValueError('A Hana command admission refusal needs confirmed departure and a cause')
-        return ConfirmedCommandAdmissionRefusal(key, slot, fenced, observed_at, evidence.reason, code, timing)
-    observation = HanaCommandObservation(key, slot, accepted, fenced, terminated, lease_free,
+        return ConfirmedCommandAdmissionRefusal(key, copy_number, fenced, observed_at, evidence.reason, code, timing)
+    observation = HanaCommandObservation(key, copy_number, accepted, fenced, terminated, lease_free,
                                          observed_at, evidence, source_updated, timing)
     if accepted and isinstance(evidence, execution_identity.ExecutionNotStarted):
         raise ValueError('An accepted Hana command needs execution evidence')
@@ -372,7 +376,7 @@ def decode_observation(content: bytes) -> HanaExecutionObservation:
 def request_fields(request: HanaExecutionRequest) -> dict[str, object]:
     """Keep the command binding at the transport boundary."""
     return {'version': 1, 'key': hana_result.encode_attempt_key(request.key), 'manifest': asdict(request.manifest),
-            'slot': request.slot, 'source_key': {'key': request.source_key.key}, 'argv': request.argv,
+            'copy_number': request.copy_number, 'source_key': {'key': request.source_key.key}, 'argv': request.argv,
             'link': asdict(request.link)}
 
 
@@ -400,7 +404,8 @@ def decode_request(content: bytes) -> HanaExecutionRequest:
     argv = row.get('argv')
     if not isinstance(argv, list) or not argv or any(not isinstance(word, str) or '\0' in word for word in cast(list[object], argv)):
         raise ValueError('The Hana command arguments are invalid')
-    request = HanaExecutionRequest(key, manifest, _positive_integer(row, 'slot'), source, tuple(cast(list[str], argv)), link)
+    request = HanaExecutionRequest(key, manifest, _positive_integer(row, 'copy_number'), source,
+                                   tuple(cast(list[str], argv)), link)
     if (request.argv != manifest.argv or key.claim_id != execution_identity.assigned_claim_id(key.episode, key.attempt)
             or link.episode != key.episode):
         raise ValueError('The Hana source, command, or attempt binding differs')

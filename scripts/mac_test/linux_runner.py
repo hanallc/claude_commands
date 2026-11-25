@@ -73,10 +73,10 @@ def slot_boot(lease: SlotRun, current_boot: str, *, require_boot_identity: bool 
 
 
 @dataclass(frozen=True)
-class LeasedSlotExecution:
-    """Execute with the maker's held slot and its Cargo environment."""
+class LeasedCopyExecution:
+    """Execute with the maker's held copy and its Cargo environment."""
 
-    slot: build_copies.LeasedCopy
+    copy: build_copies.LeasedCopy
     descriptors: tuple[int, ...]
 
 
@@ -106,7 +106,7 @@ def _pending_pipe_bytes(fd: int) -> int:
     return count[0]
 
 
-def capture_leased_command(command: list[str], execution: LeasedSlotExecution,
+def capture_leased_command(command: list[str], execution: LeasedCopyExecution,
                            environment: Mapping[str, str], output_max_bytes: int, *, timeout_s: float,
                            extra_descriptors: tuple[int, ...] = ()) -> LeasedCommandResult:
     """Capture output through command exit, including bytes still pending at exit."""
@@ -115,7 +115,7 @@ def capture_leased_command(command: list[str], execution: LeasedSlotExecution,
     started_at, started = time.time(), time.monotonic()
     deadline = started + timeout_s
     output = [bytearray(), bytearray()]
-    child = subprocess.Popen(command, cwd=execution.slot.path, env=dict(environment),
+    child = subprocess.Popen(command, cwd=execution.copy.path, env=dict(environment),
             pass_fds=tuple(dict.fromkeys((*execution_descriptors(), *execution.descriptors, *extra_descriptors))),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     assert child.stdout is not None and child.stderr is not None
@@ -171,14 +171,14 @@ def capture_leased_command(command: list[str], execution: LeasedSlotExecution,
 CARGO_START_ERROR = 'The guest could not start Cargo because the executable is missing from the prepared PATH'
 
 
-def run_slot(execution: LeasedSlotExecution, argv: tuple[str, ...], environment: Mapping[str, str], *,
+def run_copy(execution: LeasedCopyExecution, argv: tuple[str, ...], environment: Mapping[str, str], *,
              shell: ShellEnvironment, compiler_version: str, free_floor_gib: float,
              output_max_bytes: int, timeout_s: float, build_start_fd: int = -1) -> LeasedCommandResult:
     """Check shell and compiler parity before running the exact judgment command."""
-    slot = execution.slot
-    descriptor = build_folders.build_folder_lock_fd(slot.path)
+    copy = execution.copy
+    descriptor = build_folders.build_folder_lock_fd(copy.path)
     if descriptor not in execution.descriptors:
-        raise ValueError('The command lacks its maker slot descriptor')
+        raise ValueError('The command lacks its maker copy descriptor')
     if (argv[:2] not in (('cargo', 'check'), ('cargo', 'clippy'))
             or any(word == '--fix' or word.startswith('--fix=') for word in argv)
             or any('\0' in word for word in argv)):
@@ -187,25 +187,25 @@ def run_slot(execution: LeasedSlotExecution, argv: tuple[str, ...], environment:
         if word == '--target-dir':
             if index + 1 >= len(argv):
                 raise ValueError('The Cargo target directory is missing')
-            target = (slot.path / argv[index + 1]).resolve()
+            target = (copy.path / argv[index + 1]).resolve()
         elif word.startswith('--target-dir='):
-            target = (slot.path / word.partition('=')[2]).resolve()
+            target = (copy.path / word.partition('=')[2]).resolve()
         else:
             continue
-        if not target.is_relative_to(slot.path.resolve()) and target != slot.cargo_dir.resolve():
-            raise ValueError('The command output escapes its maker slot')
-    command_environment = {**os.environ, **environment, **slot.env,
-        'CARGO_TARGET_DIR': str(slot.path / 'target'), 'BUILD_FOLDER': str(slot.path),
+        if not target.is_relative_to(copy.path.resolve()) and target != copy.cargo_dir.resolve():
+            raise ValueError('The command output escapes its maker copy')
+    command_environment = {**os.environ, **environment, **copy.env,
+        'CARGO_TARGET_DIR': str(copy.path / 'target'), 'BUILD_FOLDER': str(copy.path),
         'BUILD_FOLDER_LOCK_FD': str(descriptor)}
-    if min(shutil.disk_usage(slot.path).free, shutil.disk_usage(slot.cargo_dir).free) < free_floor_gib * 1024**3:
+    if min(shutil.disk_usage(copy.path).free, shutil.disk_usage(copy.cargo_dir).free) < free_floor_gib * 1024**3:
         raise ValueError('The command lacks the required free disk space')
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-            '.leased-step-', build_folders.ExplicitBuildParent(slot.cargo_dir))) as stage:
+            '.leased-step-', build_folders.ExplicitBuildParent(copy.cargo_dir))) as stage:
         started = stage / 'started'
         report_start = f"printf '\\n' >&{build_start_fd} || exit 75\n" if build_start_fd >= 0 else ''
         close_report = f' {build_start_fd}>&-' if build_start_fd >= 0 else ''
         assignments = ' '.join(f'{name}={shlex.quote(value)}' for name, value in
-                               {**environment, **slot.env, 'CARGO_TARGET_DIR': str(slot.path / 'target')}.items())
+                               {**environment, **copy.env, 'CARGO_TARGET_DIR': str(copy.path / 'target')}.items())
         script = (shell_environment_script(shell)
             + '\nunset RUSTUP_TOOLCHAIN\n'
             + toolchain_install_script('rustc ' + compiler_version, 'hana') + '\n'

@@ -382,7 +382,7 @@ class HanaQueueTests(unittest.TestCase):
             accepted_completion = proof == 'accepted completion with changed source'
             evidence = execution_identity.ExecutionEvidenceUnavailable(
                 'The command ended' if accepted_completion else reason, fixture.clock.now())
-            observation = hana_protocol.HanaCommandObservation(observed_attempt, dispatch.slot, True,
+            observation = hana_protocol.HanaCommandObservation(observed_attempt, dispatch.copy_number, True,
                 accepted_completion, True, True, fixture.clock.now(), evidence, False)
             journal: dict[str, object] = {'version': 1, 'request': hana_protocol.request_fields(dispatch), 'phase': 'fenced',
                 'publication_attempted': True, 'command_settled': False, 'evidence': hana_protocol.encode_evidence(evidence)}

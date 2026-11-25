@@ -301,7 +301,7 @@ def _checked_observation(row: dict[str, object], request: hana_protocol.HanaExec
                          ) -> hana_protocol.HanaExecutionObservation | HanaObservationUnavailable:
     try:
         observation = hana_protocol.decode_observation(hana_protocol.encode_document(hana_result.object_fields(row['observation'])))
-        if observation.key != request.key or observation.slot != request.slot:
+        if observation.key != request.key or observation.copy_number != request.copy_number:
             raise ValueError('The Hana observation belongs to another dispatch')
         return observation
     except (OSError, ValueError, KeyError, TypeError):
@@ -397,7 +397,7 @@ def dispatch_execution(directory: Path, request: hana_protocol.HanaExecutionRequ
     assignment = adopted.reserved.assignment
     if (request.key != HanaAttemptKey(assignment.episode, assignment.attempt,
             execution_identity.assigned_claim_id(assignment.episode, assignment.attempt), adopted.generation)
-            or request.slot != assignment.destination.slot or request.source_key != assignment.source_key
+            or request.copy_number != assignment.destination.slot or request.source_key != assignment.source_key
             or adopted.reserved.claim.reference.claim_id != execution or not judgment_command(request.argv)):
         return execution_identity.HanaCommandAdmissionRefused('The Hana dispatch differs from the adopted assignment')
     try:
@@ -492,8 +492,8 @@ def observe_execution(directory: Path, request: hana_protocol.HanaExecutionReque
     """Observe the same dispatch without creating another executable publication."""
     try:
         observation = objects.observe_execution(request.key)
-        if observation.key != request.key or observation.slot != request.slot:
-            raise ValueError('The Hana observation belongs to another attempt or slot')
+        if observation.key != request.key or observation.copy_number != request.copy_number:
+            raise ValueError('The Hana observation belongs to another attempt or copy')
         with _journal_lock(directory, request.key.claim_id):
             row = _read_journal(directory, request.key.claim_id)
             if row['command_settled'] is True:
@@ -516,7 +516,8 @@ def publish_source_update(directory: Path, request: hana_protocol.HanaExecutionR
     if manifest != replace(original, bundle_sha256=manifest.bundle_sha256,
                            bundle_url=manifest.bundle_url, basis_commits=()):
         raise ValueError('The Hana source update changes the captured source or command')
-    envelope = hana_protocol.HanaSourceUpdateEnvelope(request.key, request.slot, manifest, objects.execution_access(request.key))
+    envelope = hana_protocol.HanaSourceUpdateEnvelope(request.key, request.copy_number, manifest,
+                                                      objects.execution_access(request.key))
     content = hana_protocol.encode_envelope(envelope)
     with _journal_lock(directory, request.key.claim_id):
         row = _read_journal(directory, request.key.claim_id)
@@ -544,7 +545,7 @@ def accept_result(directory: Path, request: hana_protocol.HanaExecutionRequest, 
 
     result = hana_result.decode_result(content)
     expected = hana_result.HanaResultExpectation(request.key, request.source_key.key, request.manifest.commit,
-        request.manifest.toolchain, host, request.argv, request.slot)
+        request.manifest.toolchain, host, request.argv, request.copy_number)
     with _journal_lock(directory, request.key.claim_id):
         row = _read_journal(directory, request.key.claim_id)
         if _journal_request(row) != request:
@@ -637,7 +638,7 @@ def replay_execution_settlement(directory: Path, assignment: placement.Placement
         row = _read_journal(directory, reference.claim_id)
         request = _journal_request(row)
         if ((request.key.episode, request.key.attempt) != (reference.episode, reference.attempt)
-                or request.source_key != assignment.source_key or request.slot != assignment.destination.slot):
+                or request.source_key != assignment.source_key or request.copy_number != assignment.destination.slot):
             return HanaSettlementPending('The Hana journal differs from the assignment')
         if isinstance(retained_generation, placement.NoProviderClaim) and row['command_settled'] is True:
             settled = _finish_execution_settlement(directory, request)
@@ -664,8 +665,8 @@ def _await_fence_acknowledgement(request: hana_protocol.HanaExecutionRequest, ob
     while (remaining := window.deadline - time.monotonic()) > 0:
         try:
             observation = objects.observe_execution(request.key, timeout_s=remaining)
-            if (observation.key == request.key and observation.slot == request.slot and _fence_acknowledged(observation)
-                    and time.monotonic() <= window.deadline):
+            if (observation.key == request.key and observation.copy_number == request.copy_number
+                    and _fence_acknowledged(observation) and time.monotonic() <= window.deadline):
                 return observation
         except (OSError, ValueError, RuntimeError, KeyError, TypeError):
             # A later read can confirm the fence after a failed read.
@@ -742,7 +743,7 @@ def settle_execution(directory: Path, request: hana_protocol.HanaExecutionReques
             row['phase'] = 'fenced'
             _save_journal(directory, execution, row)
         if fence_needed and not isinstance(objects, SavedTerminalProofOnly):
-            fence = hana_protocol.HanaFenceEnvelope(request.key, request.slot, objects.execution_access(request.key))
+            fence = hana_protocol.HanaFenceEnvelope(request.key, request.copy_number, objects.execution_access(request.key))
             try:
                 objects.publish_execution(hana_protocol.encode_envelope(fence))
             except (OSError, ValueError, RuntimeError):

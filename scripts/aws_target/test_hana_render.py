@@ -113,9 +113,14 @@ class HanaRenderTests(unittest.TestCase):
                 + '# range: 0.001..60\nlocks.probe_wait_seconds.fixture-guest=0.4\n'
                 + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n'
                 + 'patterns.tool={purpose}\npatterns.tool.fixture-guest={purpose}{suffix}\n'
-                + 'roots.build=/default/build\nroots.build.fixture-guest=/fixture/build\n'
-                + 'slots.fixture-guest.hana.max=3\nslots.fixture-guest.hana.max_bytes=1000\n')
+                + 'roots.build=/default/build\nroots.build.fixture-guest=/fixture/build\n')
             _ = folders.write_text(folder_values)
+            aws = image_inputs / 'config/aws_target.conf'
+            aws_values = ('# whole: 1..\nhana.copies.max=2\n'
+                + '# whole: 1..\nhana.copies.max.fixture-guest=1\n'
+                + '# whole: 1..\nhana.copies.max_bytes=1000\n'
+                + 'aws_timeout_s=10\n')
+            _ = aws.write_text(aws_values)
             (checkout / 'config').mkdir(exist_ok=True)
             for path in (targets, folders):
                 _ = shutil.copyfile(path, checkout / 'config' / path.name)
@@ -178,7 +183,8 @@ class HanaRenderTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE((image_runtime / path).stat().st_mode), 0o644)
             self.assertEqual((image_runtime / 'config/build_folders.conf').read_text(),
                 'roots.build=/fixture/build\n# range: 0.001..60\nlocks.probe_wait_seconds=0.4\n'
-                + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n')
+                + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n'
+                + '# whole: 1..\nhana.copies.max=1\n# whole: 1..\nhana.copies.max_bytes=1000\n')
             receiver = cast(dict[str, object], json.loads((output / 'receiver.json').read_text()))
             self.assertEqual(receiver['result_transfer_timeout_s'], 83)
             self.assertEqual(receiver['command_timeout_s'], 23)
@@ -229,6 +235,10 @@ class HanaRenderTests(unittest.TestCase):
                 (folders, 'roots.build.fixture-guest', True),
                 (folders, 'roots.build', False),
                 (folders, 'patterns.tool', False),
+                (aws, 'hana.copies.max.fixture-guest', True),
+                (aws, 'hana.copies.max', False),
+                (aws, 'hana.copies.max_bytes', True),
+                (aws, 'aws_timeout_s', False),
             ):
                 with self.subTest(file=path.name, key=key):
                     self.assertEqual(hana_render.affects_guest_config(key, path), effective)
@@ -294,6 +304,16 @@ class HanaRenderTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, re.escape(key.removesuffix('.fixture-guest'))):
                         _ = hana_render.guest_digest(configuration_path, checkout=image_inputs)
             _ = folders.write_text(folder_values)
+            for key, value in (('hana.copies.max.fixture-guest', 1), ('hana.copies.max_bytes', 1000)):
+                with self.subTest(key=key):
+                    row = f'{key}={value}\n'
+                    _ = aws.write_text(aws_values.replace(row, f'{key}={value + 1}\n'))
+                    self.assertNotEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
+                    for bad in (f'# whole: 1..\n{key}=0\n', row):
+                        _ = aws.write_text(aws_values.replace('# whole: 1..\n' + row, bad))
+                        with self.assertRaisesRegex(ValueError, re.escape(key.removesuffix('.fixture-guest'))):
+                            _ = hana_render.guest_digest(configuration_path, checkout=image_inputs)
+            _ = aws.write_text(aws_values)
             with self.subTest('Change the effective result transfer timeout'):
                 _ = configuration_path.write_text(original.replace(
                     'result_transfer_timeout_s.fixture-guest=83', 'result_transfer_timeout_s.fixture-guest=89'))

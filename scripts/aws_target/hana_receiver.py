@@ -59,7 +59,7 @@ class CommandSupervisor(Protocol):
     def mounted(self) -> bool: ...
     def start(self, envelope: hana_protocol.HanaCommandEnvelope, directory: Path, arguments: list[str]) -> execution_identity.HanaCommandAdmissionRefused | None: ...
     def stop(self, directory: Path) -> None: ...
-    def departure(self, directory: Path, slot: int) -> CommandDeparture: ...
+    def departure(self, directory: Path, copy_number: int) -> CommandDeparture: ...
     def outcome(self, directory: Path) -> hana_protocol.HanaRunOutcome: ...
     def start_source_update(self, request: hana_protocol.HanaExecutionRequest, directory: Path, arguments: list[str]) -> execution_identity.HanaCommandAdmissionRefused | None: ...
     def source_outcome(self, directory: Path) -> hana_protocol.HanaSourceUpdateOutcome: ...
@@ -101,10 +101,10 @@ def source_update_directory(directory: Path) -> Path:
 class GuestCommandSupervisor:
     """Root supervises the unit while the unit owns all source and compiler processes."""
 
-    def __init__(self, settings: ReceiverSettings, *, slot_policy: Path = hana_payload.IMAGE_SLOT_POLICY,
+    def __init__(self, settings: ReceiverSettings, *, copy_policy: Path = hana_payload.IMAGE_COPY_POLICY,
                  clock: Callable[[], float] = time.time) -> None:
         self.settings: ReceiverSettings = settings
-        self.slot_policy: Path = slot_policy
+        self.copy_policy: Path = copy_policy
         self.timeout_s: int = settings.aws_timeout_s
         self.clock: Callable[[], float] = clock
         self.children: dict[Path, subprocess.Popen[bytes]] = {}
@@ -121,7 +121,7 @@ class GuestCommandSupervisor:
     def _start(self, request: hana_protocol.HanaExecutionRequest, directory: Path, arguments: list[str],
                action: str, output_max_bytes: int) -> execution_identity.HanaCommandAdmissionRefused | None:
         try:
-            _ = hana_payload.read_slot_policy(self.slot_policy)
+            _ = hana_payload.read_copy_policy(self.copy_policy)
         except ValueError as error:
             return execution_identity.HanaCommandAdmissionRefused(str(error))
         try:
@@ -223,7 +223,7 @@ class GuestCommandSupervisor:
         if result.returncode == 0:
             guest.atomic_record(directory / 'stopped.json', {'stopped': True})
 
-    def departure(self, directory: Path, slot: int) -> CommandDeparture:
+    def departure(self, directory: Path, copy_number: int) -> CommandDeparture:
         try:
             response = subprocess.run(['systemctl', 'show', command_unit(directory),
                 '--property=LoadState,ActiveState,ControlGroup,Job,Result'], capture_output=True,
@@ -254,10 +254,10 @@ class GuestCommandSupervisor:
             terminated = empty_group and launcher_ended
             lease_free = False
             if terminated:
-                policy = hana_payload.read_slot_policy(self.slot_policy)
+                policy = hana_payload.read_copy_policy(self.copy_policy)
                 probe_timing = build_folder_lock.ProbeTiming(policy.probe_wait_seconds, policy.probe_retry_seconds)
                 lease_free = build_folder_lock.probe(
-                    policy.copy_path(slot), policy.build_root, lambda: probe_timing) == 'free'
+                    policy.copy_path(copy_number), policy.build_root, lambda: probe_timing) == 'free'
                 if lease_free:
                     timing['lease_free_at'] = self.clock()
             if launcher_ended:
@@ -327,9 +327,9 @@ def receive_source_update(settings: guest.SafetySettings, envelope: hana_protoco
     outcome = supervisor.outcome(directory)
     if not isinstance(outcome, hana_protocol.HanaExecutionRefused) or not outcome.reason.startswith('MissingBasis: '):
         raise ValueError('The source update requires a MissingBasis outcome')
-    departure = supervisor.departure(directory, envelope.slot)
+    departure = supervisor.departure(directory, envelope.copy_number)
     if not (departure.terminated and departure.lease_free):
-        raise ValueError('The original unit must release its exact slot before source preparation')
+        raise ValueError('The original unit must release its exact copy before source preparation')
     permission = hana_result.object_fields(record.get('permission'))
     boot = hana_result.string_field(permission, 'boot_id')
     generation = hana_result.string_field(permission, 'generation')
@@ -374,7 +374,7 @@ def receive_execution(settings: guest.SafetySettings, descriptor: dict[str, obje
                       uptime: Callable[[], float] = time.monotonic) -> hana_protocol.HanaExecutionObservation:
     """Accept once or fence the exact attempt under one durable command lock."""
     key = envelope.request.key if isinstance(envelope, hana_protocol.HanaCommandEnvelope) else envelope.key
-    slot = envelope.request.slot if isinstance(envelope, hana_protocol.HanaCommandEnvelope) else envelope.slot
+    copy_number = envelope.request.copy_number if isinstance(envelope, hana_protocol.HanaCommandEnvelope) else envelope.copy_number
     if (key.generation.deployment != descriptor.get('deployment')
             or key.generation.start_token != descriptor.get('start_token')
             or key.generation.boot_id != guest.read_identity(paths.boot_id)
@@ -387,7 +387,7 @@ def receive_execution(settings: guest.SafetySettings, descriptor: dict[str, obje
         record: dict[str, object]
         try:
             record = hana_result.object_fields(cast(object, json.loads(record_path.read_text())))
-            if record.get('slot') != slot or hana_result.decode_attempt_key(record.get('key')) != key:
+            if record.get('copy_number') != copy_number or hana_result.decode_attempt_key(record.get('key')) != key:
                 raise ValueError('The saved command identity differs')
             if (any(type(record.get(name)) is not bool for name in ('accepted', 'fenced', 'refused'))
                     or not (record['accepted'] or record['fenced'])):
@@ -396,7 +396,7 @@ def receive_execution(settings: guest.SafetySettings, descriptor: dict[str, obje
                    ('source_update_started', 'source_updated', 'source_update_launch_refused')):
                 raise ValueError('The saved source update state is invalid')
         except FileNotFoundError:
-            record = {'key': hana_result.encode_attempt_key(key), 'slot': slot,
+            record = {'key': hana_result.encode_attempt_key(key), 'copy_number': copy_number,
                       'accepted': False, 'fenced': False, 'refused': False,
                       'source_update_started': False, 'source_updated': False}
         if isinstance(envelope, hana_protocol.HanaFenceEnvelope):
@@ -442,7 +442,7 @@ def receive_execution(settings: guest.SafetySettings, descriptor: dict[str, obje
                 guest.atomic_record(record_path, record)
         accepted, fenced = record['accepted'] is True, record['fenced'] is True
         departure = (CommandDeparture(True, True) if not accepted or record['refused'] is True
-                     else supervisor.departure(directory, slot))
+                     else supervisor.departure(directory, copy_number))
         saved_timing = hana_protocol.decode_command_timing(record.get('timing', {}))
         timing: hana_protocol.HanaCommandTiming = {**departure.timing, **saved_timing}
         if timing != saved_timing:
@@ -453,7 +453,7 @@ def receive_execution(settings: guest.SafetySettings, descriptor: dict[str, obje
             update_directory = source_update_directory(directory)
             launch_refused = record.get('source_update_launch_refused') is True
             source_departure = (CommandDeparture(True, True) if launch_refused
-                                else supervisor.departure(update_directory, slot))
+                                else supervisor.departure(update_directory, copy_number))
             departure = CommandDeparture(departure.terminated and source_departure.terminated,
                                          departure.lease_free and source_departure.lease_free)
             if departure.terminated and departure.lease_free:
@@ -470,16 +470,16 @@ def receive_execution(settings: guest.SafetySettings, descriptor: dict[str, obje
                 else:
                     reason = (source_outcome.reason if isinstance(source_outcome, hana_protocol.HanaSourceUpdateRefused)
                               else 'The Hana source repair returned a different source identity')
-                    return confirmed_refusal(key, slot, fenced, clock(), reason, timing=timing)
+                    return confirmed_refusal(key, copy_number, fenced, clock(), reason, timing=timing)
         elif accepted and departure.terminated and departure.lease_free:
             if record['refused'] is True:
                 reason = hana_result.string_field(record, 'reason')
                 code = guest.CommandAdmissionRefusalCode(hana_result.string_field(record, 'refusal_code'))
-                return confirmed_refusal(key, slot, fenced, clock(), reason, code, timing=timing)
+                return confirmed_refusal(key, copy_number, fenced, clock(), reason, code, timing=timing)
             outcome = supervisor.outcome(directory)
             if isinstance(outcome, hana_protocol.HanaExecutionRefused):
                 if not outcome.reason.startswith('MissingBasis: '):
-                    return confirmed_refusal(key, slot, fenced, clock(), outcome.reason, timing=timing)
+                    return confirmed_refusal(key, copy_number, fenced, clock(), outcome.reason, timing=timing)
                 if not fenced:
                     reason = outcome.reason
             elif isinstance(outcome, hana_protocol.HanaExecutionLost) and not fenced:
@@ -487,16 +487,16 @@ def receive_execution(settings: guest.SafetySettings, descriptor: dict[str, obje
         observed_at = clock()
         evidence = (execution_identity.ExecutionEvidenceUnavailable(reason, observed_at) if accepted
                     else execution_identity.ExecutionNotStarted())
-        return hana_protocol.HanaCommandObservation(key, slot, accepted, fenced, departure.terminated,
+        return hana_protocol.HanaCommandObservation(key, copy_number, accepted, fenced, departure.terminated,
                                 departure.lease_free, observed_at, evidence, record.get('source_updated') is True,
                                 timing)
 
 
-def confirmed_refusal(key: hana_result.HanaAttemptKey, slot: int, fenced: bool, observed_at: float, reason: str,
+def confirmed_refusal(key: hana_result.HanaAttemptKey, copy_number: int, fenced: bool, observed_at: float, reason: str,
                       code: guest.CommandAdmissionRefusalCode = guest.CommandAdmissionRefusalCode.PRE_COMMAND_FAILED, *,
                       timing: hana_protocol.HanaCommandTiming
                       ) -> hana_protocol.ConfirmedCommandAdmissionRefusal:
-    return hana_protocol.ConfirmedCommandAdmissionRefusal(key, slot, fenced, observed_at,
+    return hana_protocol.ConfirmedCommandAdmissionRefusal(key, copy_number, fenced, observed_at,
         ' '.join(reason.splitlines())[:1024] or 'Hana could not start the build', code, timing)
 
 
@@ -723,7 +723,7 @@ def _control_step(step: Callable[[], None]) -> ControlStepCompleted | ControlSte
 
 def run_receiver(settings: guest.SafetySettings, transport: ReceiverSettings,
                  *, paths: guest.GuestPaths = guest.GUEST_PATHS,
-                 slot_policy: Path = hana_payload.IMAGE_SLOT_POLICY,
+                 copy_policy: Path = hana_payload.IMAGE_COPY_POLICY,
                  fetch: Callable[[Request, int], bytes] = transfer, pause: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.time, keep_running: Callable[[], bool] = lambda: True) -> None:
     """Read root-only IMDS user data once per boot and publish scoped acknowledgements."""
@@ -736,7 +736,7 @@ def run_receiver(settings: guest.SafetySettings, transport: ReceiverSettings,
         return
     boot_deadline = hana_result.integer_field(descriptor, 'expires')
     timeout = transport.aws_timeout_s
-    supervisor = GuestCommandSupervisor(transport, slot_policy=slot_policy, clock=clock)
+    supervisor = GuestCommandSupervisor(transport, copy_policy=copy_policy, clock=clock)
     uploads: dict[hana_result.HanaAttemptKey, subprocess.Popen[bytes]] = {}
 
     def process_permit() -> None:
