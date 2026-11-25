@@ -720,14 +720,16 @@ class RemoteCopiesTests(unittest.TestCase):
         self.mirror.mkdir(parents=True)
         with self.open_file_process(self.root / "outside/output") as child:
             copies.mark_mirror(self.mirror, "alpha", "repository", "group-session", process_group=os.getpgid(child.pid))
-            cwd = Path("/proc") / str(child.pid) / "cwd"
+            cwd = f"/proc/{child.pid}/cwd"
+            cwd_paths = (cwd, os.fsencode(cwd))
             readlink = os.readlink
 
-            def unreadable_readlink(path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
-                                    *, dir_fd: int | None = None) -> str:
-                if os.fsdecode(path) == str(cwd):
+            def unreadable_readlink[PathText: (str, bytes)](
+                path: PathText | os.PathLike[PathText], *, dir_fd: int | None = None,
+            ) -> PathText:
+                if os.fspath(path) in cwd_paths:
                     raise PermissionError(str(path))
-                return readlink(os.fsdecode(path), dir_fd=dir_fd)
+                return readlink(path, dir_fd=dir_fd)
 
             with mock.patch.object(os, "readlink", unreadable_readlink):
                 with self.assertRaisesRegex(copies.CopyError, "busy.*group-session"):

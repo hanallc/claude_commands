@@ -1147,7 +1147,7 @@ def require_safe_git_config(common_dir: Path, git_dir: Path, worktree: Path, bou
     for path, content in configs.items():
         with isolated_git_config():
             values = subprocess.run(
-                ("git", *git_read_options(), "config", "--file", "-", "--no-includes", "--null", "--list"),
+                ("git", "config", "--file", "-", "--no-includes", "--null", "--list"),
                 cwd="/", input=content.encode("utf-8", "surrogateescape"), capture_output=True, check=False)
         if values.returncode:
             raise GitCleanupRefused("review only: cannot read local Git config")
