@@ -43,6 +43,26 @@ These fields do not change the recipient, reply name, or message key.
 
 ### Messages during an ad hoc review
 
+`/adhoc_review join <staff name>` opens the owner's review on the same machine.
+The owner keeps the decision document from the solo workflow.
+If sharing cannot start, the owner continues the solo review.
+The helper stores the shared record at `~/.local/state/adhoc_review/.shared/<owner-session-id>.md` with mode `0600`.
+One file lock covers changes to the item list, claims, and decisions in the shared record.
+The owner uses `claim` and `decide`. A joined session uses `next` and `record`.
+Both claim commands return items in review order with stable IDs and saved decisions.
+Without `--item`, `next` returns the current item or claims the first available item.
+`leave` releases a joined session's claim.
+The helper requires a verified process start to save a joined session's PID and start.
+A joined session keeps its claim while the saved PID runs with the saved start time.
+The helper releases the claim when the shared reader reports a zombie.
+The helper checks existing claims without reading the registry or a socket.
+Joined sessions can claim items, save decisions, and release claims while the owner is absent.
+The owner's claim stays with the owner.
+The owner's `end` freezes the shared record and returns the final decisions.
+Only the owner's `end --finish` removes the shared record. The owner saves the decisions first.
+Each session keeps its own message hold and item count.
+Joined sessions apply the count after `join`, `next`, and `record`.
+
 `review_hold=off` in `config/send.conf` disables message holding for all sessions.
 The next prompt or session start delivers any messages still held.
 Use `/tune` to set `review_hold=on` when message holding can resume.
@@ -446,7 +466,7 @@ New escalate holds retain their registered template and values.
   - `texts --ask --id X` saves one request per pane under `text-asks` in the notify state folder.
     The command saves the request before it shows the examples. If the save fails, the command clears the request for the pane.
   - `text_asks.answer()` accepts a typed approval from the focused pane and session that made the request.
-    The request expires after `TEXT_ASK_MINUTES`. The prompt must start with yes, go, ok, approve or approved and contain no negation.
+    The request expires after `text_ask_minutes`. The prompt must start with yes, go, ok, approve or approved and contain no negation.
     The function refuses approval after a script sends printable keys to the pane during the request or within one request time limit before it.
     The function deletes the request before it saves the user's exact words under `text-approvals`.
     The prompt hook still needs to call this function before it can record live approvals.
@@ -649,7 +669,7 @@ The `start` and `fixed` commands send no follow-up push.
 | `questions/<digest>.json` | Held registration questions |
 | `template-fixes/`, `template-fix-errors.jsonl` | Daily template-fix stamps and errors |
 
-- `config/notify.conf` holds `REVIEW_TIMEOUT_SECONDS=60` and an optional `TEMPLATE_FIX_SESSION`. `review.NOTIFY_CONFIG` is a module constant, and tests patch it.
+- `config/notify.conf` holds `review_timeout_seconds=60` and an optional `TEMPLATE_FIX_SESSION`. `review.NOTIFY_CONFIG` is a module constant, and tests patch it.
 - Worker agents are called "workers", not "seats". Worker naming and its migration are in `docs/as-built/long-lived-workers.md` and `docs/accounts.md`, not here.
 
 ## Invariants
@@ -672,7 +692,7 @@ The `start` and `fixed` commands send no follow-up push.
 
 ## Calibration and gotchas
 
-**Time limits** (R = `REVIEW_TIMEOUT_SECONDS`, default 60; P = `pushover.TIMEOUT_S`, 15), all from `review.delivery_waits()`:
+**Time limits** (R = `review_timeout_seconds`, default 60; P = `pushover.TIMEOUT_S`, 15), all from `review.delivery_waits()`:
 
 | Helper | Formula | At R=60 |
 | --- | --- | --- |

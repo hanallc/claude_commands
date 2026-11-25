@@ -76,7 +76,7 @@ def _profile(profiles: dict[str, str], name: str) -> models_registry.ProducerPro
         raise ValueError(f"{path}: producers.{name}: {error}") from error
 
 
-def _check_name(name: str) -> None:
+def check_name(name: str) -> None:
     if name.casefold() == "morty":
         raise ValueError("morty: reserved producer name")
     staff.validate_name("producer", name)
@@ -84,7 +84,7 @@ def _check_name(name: str) -> None:
         raise ValueError(f"{name!r}: invalid producer name")
 
 
-def _require_free_name(name: str, record: staff.StaffSnapshot, *,
+def require_free_name(name: str, record: staff.StaffSnapshot, *,
                        own: staff.StaffRow | None = None, pane: str = "") -> None:
     key = name.casefold()
     if any(row.name.casefold() == key and (own is None or row.id != own.id) for row in record.all_rows):
@@ -135,7 +135,7 @@ def _create_readme(path: Path, text: str) -> None:
 
 def add(name: str, *, model: str = "", effort: str = "", job: str = "") -> int:
     """Save the creation request before it changes the registry or document."""
-    _check_name(name)
+    check_name(name)
     if len(job.splitlines()) > 1 or "\n" in job or "\r" in job:
         raise ValueError("--job must contain one line")
     folder = stop_resume.producer_folder(name)
@@ -168,10 +168,10 @@ def add(name: str, *, model: str = "", effort: str = "", job: str = "") -> int:
             if name in profiles and profiles[name] != profile.value():
                 raise ValueError(f"{name}: its producer settings changed during creation")
             _check_key(name, profiles, own=name)
-            _require_free_name(name, record, own=own, pane=_text(reservation, "pane") if reservation else "")
+            require_free_name(name, record, own=own, pane=_text(reservation, "pane") if reservation else "")
         else:
             _check_key(name, profiles)
-            _require_free_name(name, record)
+            require_free_name(name, record)
             profile = _new_profile(model, effort)
             _ = models_registry.producer_settings(name, *profile)
             template = TEMPLATE.read_text(encoding="utf-8")
@@ -229,7 +229,7 @@ def _require_no_admission(name: str) -> None:
 
 def rename(old: str, new: str, repair_displays: Callable[[staff.StaffRow], bool]) -> int:
     """Move the key and repair displays without moving the document."""
-    _check_name(new)
+    check_name(new)
     path = _path("rename", old)
     with staff.slot_operation("producer-lifecycle", old):
         record = staff.initial_snapshot()
@@ -266,10 +266,10 @@ def rename(old: str, new: str, repair_displays: Callable[[staff.StaffRow], bool]
             if saved:
                 profile = models_registry.parse_producer_profile(_text(saved, "profile"))
                 folder = Path(_text(saved, "folder"))
-                _require_free_name(new, record, own=row)
+                require_free_name(new, record, own=row)
             elif row.name != new:
                 _check_key(new, profiles, own=row.name)
-                _require_free_name(new, record, own=row)
+                require_free_name(new, record, own=row)
                 previous = row.name
                 profile = _profile(profiles, previous)
                 _write(path, {"staff": row.id, "name": new, "old": previous,

@@ -62,7 +62,7 @@ def upkeep() -> None:
         if producers:
             offset = int(time.time() // cadence.interval_seconds) % len(producers)
             producers = producers[offset:] + producers[:offset]
-        start_seconds = conf.read("shutdown").number("START_SECONDS")
+        start_seconds = conf.read("shutdown").number("start_seconds")
         for row in producers:
             if shutdown_record.active():
                 break

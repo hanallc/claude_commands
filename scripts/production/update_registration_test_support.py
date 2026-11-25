@@ -23,10 +23,11 @@ from typing import ClassVar, TypedDict, cast, override
 from scripts.production import update_registration
 registration = update_registration
 from scripts.production import showrunners as showrunners
-from scripts.production import staff, unit_names
+from scripts.production import production_admission, staff, unit_names
 from scripts.production.production_doc import read_production as read_production
 from scripts.production.cli_fixture import invoke_cli, production_paths
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import (
     fixture_member, isolated_staff_file, recorded_showrunner, showrunner_launch, showrunner_relationship,
@@ -95,6 +96,7 @@ class RegistrationFixture(unittest.TestCase):
     fixture_snapshot: ClassVar[Path]
     command_snapshot: ClassVar[Path]
     needs_command_copy: ClassVar[bool] = False
+    seed_admission: ClassVar[bool] = True
 
     @classmethod
     @override
@@ -132,7 +134,8 @@ class RegistrationFixture(unittest.TestCase):
         self.config = self.root / "showrunners.json"
         self.doc = self.checkout / "docs/plans/registration-notes.md"
         bin_dir = self.root / "bin"
-        self.env = {**os.environ, "HOME": str(self.home), "USER_ZONE": "America/Los_Angeles", "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+        self.env = {**fixture_git_environment(root.parent), "HOME": str(self.home), "USER_ZONE": "America/Los_Angeles",
+                    "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
                     "REGISTRATION_TEST_STATE": str(self.state), "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
                     "USAGE_STATE_DIR": str(self.state / "usage"),
@@ -183,6 +186,12 @@ class RegistrationFixture(unittest.TestCase):
                            worktree=staff.PresentWorktree(remote.local_machine(), alpha))
         _ = self.git("add", ".")
         _ = self.git("commit", "-m", "initial")
+        if self.seed_admission:
+            self.capture_fixture_admission()
+
+    def capture_fixture_admission(self) -> None:
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            _ = production_admission.capture_rollout_inventory([self.owner_id])
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
         process = subprocess.run(["git", *args], cwd=cwd or self.checkout, env=self.env if self.env else None,

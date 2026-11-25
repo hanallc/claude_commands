@@ -11,6 +11,7 @@ import shutil
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Generator
+from dataclasses import replace
 from pathlib import Path
 from datetime import datetime
 from typing import IO, cast, final, override
@@ -609,17 +610,21 @@ class QuestionIdentityTests(RegistrationFixture):
         self.file_question()
         owner = staff.by_id(self.asker_id)
         assert owner is not None and isinstance(owner.parent, staff.ReportsTo)
-        _ = staff.set_doc(owner.parent.id, staff.LiveDoc("macbook", self.doc))
-        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
-            production = showrunner_footer.Production("example", self.doc, "America/Los_Angeles",
-                                                  showrunners.owner_for("example"))
-            errors = io.StringIO()
-            with redirect_stderr(errors):
-                self.assertEqual(showrunner_footer.open_questions([production]), 0)
-            self.assertIn("questions: unavailable", errors.getvalue())
-            self.assertEqual(registration.read_open_items(self.outstanding()), [])
-            self.assertIn(self.doc, footer_counts.sources(self.doc))
-        refused = self.run_command("ask", "--text", "Choose the compiler", "--ask", "Use it?")
+        parent = owner.parent.id
+        record = staff.snapshot()
+        rows = tuple(replace(row, doc=staff.LiveDoc("macbook", self.doc)) if row.id == parent else row
+                     for row in record.rows)
+        with staff.supplied_snapshot(replace(record, rows=rows)):
+            with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+                production = showrunner_footer.Production("example", self.doc, "America/Los_Angeles",
+                                                      showrunners.owner_for("example"))
+                errors = io.StringIO()
+                with redirect_stderr(errors):
+                    self.assertEqual(showrunner_footer.open_questions([production]), 0)
+                self.assertIn("questions: unavailable", errors.getvalue())
+                self.assertEqual(registration.read_open_items(self.outstanding()), [])
+                self.assertIn(self.doc, footer_counts.sources(self.doc))
+            refused = self.run_command("ask", "--text", "Choose the compiler", "--ask", "Use it?")
         self.assertEqual(refused.returncode, 2)
         self.assertIn("no showrunner staff row", refused.stdout + refused.stderr)
 

@@ -99,8 +99,10 @@ On `merge`:
 
 1. **Run on the default branch** (the CI branch was `direct/<plan-slug>`): run
    `/validate_and_push` here with no options; its own PR path applies when branch
-   rules require one. After its push succeeds, delete the CI branch with
-   `git push origin --delete direct/<plan-slug>`, since no worktree owns it.
+   rules require one. After its push succeeds, set `FULL_BRANCH_REF` to
+   `refs/heads/direct/<plan-slug>` and `EXPECTED_COMMIT` to the final green CI point's SHA.
+   Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/origin_deletion.py "$PWD" origin "$FULL_BRANCH_REF" "$EXPECTED_COMMIT"`.
+   Report the origin result.
 2. **Run on its own branch:** never switch this worktree's branch. Find the
    worktree holding the default branch with `git worktree list`. If it is clean,
    merge there — `git -C <that worktree> merge --ff-only <run branch>`, or

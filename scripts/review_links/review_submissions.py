@@ -149,7 +149,7 @@ class ListWindowAssignee(Enum):
 
 @dataclass(frozen=True)
 class InitialDelivery:
-    """Request the first message after the native record exists."""
+    """File a console item and send its first message."""
 
     evidence_origin: str = ""
     list_assignee: ListCommandAssignee | ListWindowAssignee = ListWindowAssignee.RECIPIENT
@@ -423,7 +423,7 @@ def _restore_saved_image(images: Path, saved: NativeSubmissionDestination, uploa
     atomic_file.write_bytes_atomic(folder / upload.reference.file, upload.data, mode=0o600)
     if not (folder / image_store.RECORD).is_file():
         image_store.write_record(folder, {
-            "id": upload.reference.id, "file": upload.reference.file, "caption": "", "owner": saved.recipient_id,
+            "id": upload.reference.id, "file": upload.reference.file, "title": "", "look_for": [], "owner": saved.recipient_id,
             "subject": "Review request " + saved.request_id,
             "registered_at": datetime.now(UTC).isoformat(timespec="seconds"),
         })
@@ -620,13 +620,16 @@ def _image_fingerprints(uploads: tuple[_ImageUpload, ...]) -> tuple[tuple[str, s
     return tuple((upload.extension, upload.digest) for upload in uploads)
 
 
-def _fingerprint(payload: list[object]) -> str:
+def _fingerprint(payload: list[object], *,
+                 notice: new_item_dialog.Notice = new_item_dialog.DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW) -> str:
+    if isinstance(notice, new_item_dialog.SubmissionNotice):
+        payload = [*payload, asdict(notice)]
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
-def _legacy_draft_fingerprint(draft_id: str, kind: str, words: str,
-                              images: tuple[tuple[str, str], ...]) -> str:
-    return _fingerprint([draft_id, kind, words, images])
+def _legacy_draft_fingerprint(request_id: str, request: NewItemRequest, words: str,
+                              uploads: tuple[_ImageUpload, ...]) -> str:
+    return _fingerprint([request_id, request.kind, words, _image_fingerprints(uploads)], notice=request.notice)
 
 
 def _submission_fingerprint(request: NewItemRequest, words: str, uploads: tuple[_ImageUpload, ...]) -> str:
@@ -635,7 +638,9 @@ def _submission_fingerprint(request: NewItemRequest, words: str, uploads: tuple[
         payload.append(request.page)
     if request.page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
         payload.append(request.page_recipient)
-    return _fingerprint(payload)
+    if request.page_recipient == new_item_dialog.PageRecipient.PRODUCER:
+        payload.append(new_item_dialog.assignment_id(request.assignment))
+    return _fingerprint(payload, notice=request.notice)
 
 
 def _write_request_file(path: Path, fields: Mapping[str, object]) -> None:
@@ -1253,6 +1258,28 @@ def _plan_list_filing(assignee: ListCommandAssignee | ListWindowAssignee, recipi
                            unit=unit, source=source)
 
 
+def assigned_member(assignment: new_item_dialog.Assignment, recipient: staff.StaffRow,
+                    members: staff.StaffSnapshot) -> staff.StaffRow:
+    """Resolve the assignee from the selected producer route."""
+    if isinstance(assignment, new_item_dialog.ProducerAssigns) or assignment.id == recipient.id:
+        return recipient
+    row = members.rows_by_id.get(assignment.id)
+    if row is None or row.kind not in producer_map.ASSIGNEE_KINDS or not _page_owner_is_active(row, members):
+        raise SubmissionConflict("The assignee is unavailable. Choose another assignee.")
+    return row
+
+
+def _plan_producer_filing(member: staff.StaffRow, recipient: staff.StaffRow, request: NewItemRequest,
+                          members: staff.StaffSnapshot) -> ListFilingRoute | ListFilingUnavailable:
+    keeper = list_producer(conf.read_or_repository("console"), members)
+    if isinstance(keeper, PageOwnerUnavailable):
+        return ListFilingUnavailable("The List has no active producer.")
+    source = ("nate via /new_item" if isinstance(request.notice, new_item_dialog.SubmissionNotice)
+              and request.notice.from_command else "nate via New item")
+    return ListFilingRoute(keeper=keeper.id, owner=member.id, producer=recipient.id,
+                           unit=member.name if member.kind == "unit" else "", source=source)
+
+
 @dataclass(frozen=True)
 class NoListFiling:
     """This request has no List row to write or skip."""
@@ -1532,8 +1559,11 @@ def _send_recipient(address: SubmissionAddress, page: str, members: staff.StaffS
         configured = _configured_list_producer(conf.read_or_repository("console"), members)
         if not isinstance(configured, staff.StaffRow) or configured.id != identity:
             raise SubmissionConflict("The List owner is unavailable. Open New item again.")
-    elif choice == new_item_dialog.PageRecipient.SELECTED:
-        return selected_recipient(identity, members)
+    elif choice in (new_item_dialog.PageRecipient.SELECTED, new_item_dialog.PageRecipient.PRODUCER):
+        row = selected_recipient(identity, members)
+        if choice == new_item_dialog.PageRecipient.PRODUCER and row.kind != "producer":
+            raise SubmissionError("Pick a producer.")
+        return row
     elif page and page != "list":
         configured = page_owner(page, conf.read_or_repository("console"), members)
         if isinstance(configured, PageOwnerUnavailable):
@@ -1581,6 +1611,19 @@ class RecipientOption(TypedDict):
     proposal: bool
 
 
+class AssigneeOption(TypedDict):
+    id: staff.StaffId
+    name: str
+
+
+class NewItemRoutingOptions(TypedDict):
+    recipients: list[RecipientOption]
+    assignees: list[AssigneeOption]
+    page_owner: staff.StaffId
+    page_owner_reason: str
+    page_assignee: staff.StaffId
+
+
 def proposal_folder(recipient: staff.StaffRow, members: staff.StaffSnapshot) -> Path | NoNativeFolder:
     from scripts.production import proposals_folder
 
@@ -1591,6 +1634,8 @@ def proposal_folder(recipient: staff.StaffRow, members: staff.StaffSnapshot) -> 
             raise _UnreadableOwnerDocument(recipient, recipient.doc.path, error, members) from error
         if folder is not None:
             return folder
+    if recipient.kind == "producer":
+        return record_store.state_root() / recipient.id / "proposals"
     return NoNativeFolder(SubmissionKind.PROPOSAL)
 
 
@@ -1625,14 +1670,50 @@ def recipient_options(members: staff.StaffSnapshot, *,
                       owner: staff.StaffRow | PageOwnerUnavailable = _NO_PAGE_OWNER
                       ) -> list[RecipientOption]:
     """List active recipients and indicate who can receive proposals."""
-    options: list[RecipientOption] = []
-    for row in _recipient_choices(members, owner=owner):
+    return [_recipient_option(row, members) for row in _recipient_choices(members, owner=owner)]
+
+
+def _recipient_option(row: staff.StaffRow, members: staff.StaffSnapshot) -> RecipientOption:
+    try:
+        can_receive_proposals = isinstance(proposal_folder(row, members), Path)
+    except OSError:
+        can_receive_proposals = False
+    return RecipientOption(id=row.id, name=row.name, proposal=can_receive_proposals)
+
+
+def new_item_routing(page: str, settings: conf.ConfigRead, members: staff.StaffSnapshot) -> NewItemRoutingOptions:
+    """Resolve producer choices and the preferred assignee from the current staff."""
+    producers: dict[staff.StaffId, staff.StaffRow] = {}
+    for row in sorted(staff.active(members, "producer"), key=lambda row: row.name.casefold()):
         try:
-            can_receive_proposals = isinstance(proposal_folder(row, members), Path)
+            if _page_owner_is_active(row, members) and _submission_owner_is_active(row, members):
+                producers[row.id] = row
         except OSError:
-            can_receive_proposals = False
-        options.append(RecipientOption(id=row.id, name=row.name, proposal=can_receive_proposals))
-    return options
+            continue
+    assignees = {row.id: row for row in members.rows if row.kind in ("showrunner", "unit")
+                 and _page_owner_is_active(row, members)}
+    # The List owner keeps the List. The List does not choose an assignee.
+    key = f"page.{page}.owner"
+    designated = staff.StaffId(settings.values(key).get(key, "")) if page != "list" else staff.StaffId("")
+    producer = producers.get(designated)
+    owner = assignees.get(designated) or producer
+    if producer is not None:
+        assignees[producer.id] = producer
+    elif owner is not None:
+        mapped = _list_filing_producer(owner, members)
+        if isinstance(mapped, staff.StaffRow):
+            producer = producers.get(mapped.id)
+    reason = ""
+    if owner is not None and producer is not None:
+        reason = (f"{producer.name} owns this page." if producer.id == owner.id
+                  else f"{producer.name} is the producer of {owner.name}, the owner of this page.")
+    parent = staff.ReportsTo(owner.id) if owner is not None else None
+    ordered = sorted(assignees.values(), key=lambda row: (row != owner, row.parent != parent, row.name.casefold()))
+    return NewItemRoutingOptions(
+        recipients=[_recipient_option(row, members) for row in producers.values()],
+        assignees=[AssigneeOption(id=row.id, name=row.name) for row in ordered],
+        page_owner=producer.id if producer is not None else staff.StaffId(""), page_owner_reason=reason,
+        page_assignee=owner.id if owner is not None else staff.StaffId(""))
 
 
 def _file_question_for_remote_owner(recipient: staff.StaffRow, title: str, members: staff.StaffSnapshot,
@@ -2025,7 +2106,9 @@ def _browser_payload_hash(request: NewItemRequest, words: str, evidence: Evidenc
                             asdict(request.page_state) if request.page_state else None, digest]
     if isinstance(delivery, InitialDelivery) and isinstance(delivery.list_assignee, ListCommandAssignee):
         fields.append(delivery.list_assignee.id)
-    return _fingerprint(fields)
+    if request.page_recipient == new_item_dialog.PageRecipient.PRODUCER:
+        fields.append(new_item_dialog.assignment_id(request.assignment))
+    return _fingerprint(fields, notice=request.notice)
 
 
 @dataclass(frozen=True)
@@ -2066,7 +2149,7 @@ def _list_draft_replay(folder: Path, send: ListDraftSend, intent: new_item_dialo
     try:
         filing = send.prepare()
         request = filing.request
-        if request.kind == SubmissionKind.PROPOSAL:
+        if request.kind == SubmissionKind.PROPOSAL and request.page_recipient != new_item_dialog.PageRecipient.PRODUCER:
             request = replace(request, page_recipient=new_item_dialog.PageRecipient.SELECTED)
         if request.page != "list" or request.request_id != send.request_id or filing.refusal is not None:
             return ListDraftReplay()
@@ -2085,14 +2168,24 @@ def _list_draft_replay(folder: Path, send: ListDraftSend, intent: new_item_dialo
         elif isinstance(requested, RequestedListPreview) and isinstance(screenshot, new_item_dialog.NoPageScreenshot):
             return ListDraftReplay()
         uploads = _decode_images(request.images)
+        saved_digest = item.destination.payload_hash
         if item.destination.request_id.startswith(send.request_id + "-"):
             digest = _browser_payload_hash(request, words, evidence, uploads, screenshot, delivery)
+            matches = saved_digest == digest
+            if (not matches and isinstance(request.notice, new_item_dialog.SubmissionNotice)
+                    and request.notice.from_command and isinstance(item.details.notice, new_item_dialog.DefaultSubmissionNotice)):
+                legacy = replace(request, notice=item.details.notice)
+                matches = saved_digest == _browser_payload_hash(legacy, words, evidence, uploads, screenshot, delivery)
         else:
             earlier_id = "r2-" + send.request_id[3:]
-            digest = _legacy_draft_fingerprint(earlier_id, request.kind, words, _image_fingerprints(uploads))
+            matches = saved_digest == _legacy_draft_fingerprint(earlier_id, request, words, uploads)
+            if (not matches and request.notice == new_item_dialog.SubmissionNotice("feedback")
+                    and isinstance(item.details.notice, new_item_dialog.DefaultSubmissionNotice)):
+                legacy = replace(request, notice=item.details.notice)
+                matches = saved_digest == _legacy_draft_fingerprint(earlier_id, legacy, words, uploads)
         if isinstance(screenshot, new_item_dialog.PageScreenshot):
             uploads = (*uploads, _ImageUpload(PAGE_SCREENSHOT, "png", screenshot.png))
-        return ListDraftReplay(uploads, item.destination.payload_hash == digest, item.details.capture_intent == intent)
+        return ListDraftReplay(uploads, matches, item.details.capture_intent == intent)
     except SubmissionError:
         return ListDraftReplay()
 
@@ -2134,30 +2227,38 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
 
 def _recover_pre_upgrade_native_draft(draft_folder: Path, address: SubmissionAddress, words: str,
                                       uploads: tuple[_ImageUpload, ...], members: staff.StaffSnapshot | None, *,
-                                      request_kind: str,
+                                      request: NewItemRequest,
                                       capture_target: ScopedSubmissionKey | new_item_dialog.NoBoundCaptureTarget
                                       ) -> SavedSubmission | None:
     """Recover a native record from the base draft format."""
     legacy_id = "r2-" + address.request_id[3:]
-    fingerprint = _legacy_draft_fingerprint(legacy_id, request_kind, words, _image_fingerprints(uploads))
-    folder = _request_folder(f"r4-{fingerprint}")
-    if not folder.is_dir():
-        return None
+    exact = _legacy_draft_fingerprint(legacy_id, request, words, uploads)
+    fingerprints = [exact]
+    default_notice = new_item_dialog.DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW
+    if request.notice == new_item_dialog.SubmissionNotice("feedback"):
+        legacy = replace(request, notice=default_notice)
+        fingerprints.append(_legacy_draft_fingerprint(legacy_id, legacy, words, uploads))
     address = replace(address, request_id=legacy_id)
-    with exclusive(folder / ".lock"):
-        for candidate in _list_draft_candidates(folder, address, fingerprint):
-            with _locked_request(candidate, members, list_recipient=address.recipient_id) as lookup:
-                item = _saved_draft(lookup, list_recipient=address.recipient_id)
-                if item is None or address.recipient_id not in (item.destination.recipient_id, item.destination.owner):
-                    continue
-                saved = item.destination
-                _claim_recovered_native_draft(draft_folder, saved)
-                _check_capture_target(capture_target, saved)
-                completed = _complete_receipt(_request_folder(saved.request_id), saved, lookup.hint, item.record,
-                                              edited=True, retry_uploads=uploads,
-                                              payload_matches=saved.payload_hash == fingerprint)
-                _ = _publish_recovered_native_draft(draft_folder, saved)
-                return completed
+    for fingerprint in fingerprints:
+        folder = _request_folder(f"r4-{fingerprint}")
+        if not folder.is_dir():
+            continue
+        with exclusive(folder / ".lock"):
+            for candidate in _list_draft_candidates(folder, address, fingerprint):
+                with _locked_request(candidate, members, list_recipient=address.recipient_id) as lookup:
+                    item = _saved_draft(lookup, list_recipient=address.recipient_id)
+                    if item is None or address.recipient_id not in (item.destination.recipient_id, item.destination.owner):
+                        continue
+                    if fingerprint != exact and item.details.notice != default_notice:
+                        continue
+                    saved = item.destination
+                    _check_capture_target(capture_target, saved)
+                    _claim_recovered_native_draft(draft_folder, saved)
+                    completed = _complete_receipt(_request_folder(saved.request_id), saved, lookup.hint, item.record,
+                                                  edited=True, retry_uploads=uploads,
+                                                  payload_matches=saved.payload_hash == fingerprint)
+                    _ = _publish_recovered_native_draft(draft_folder, saved)
+                    return completed
     return None
 
 
@@ -2240,16 +2341,24 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     request_id = read_request_id(request.request_id)
     submitted_draft_id = request_id
     kind = SubmissionKind.INVESTIGATION if request.kind == "enhancement" else read_kind(request.kind)
+    notice = request.notice
+    if isinstance(notice, new_item_dialog.DefaultSubmissionNotice) and request.kind == "enhancement":
+        notice = new_item_dialog.SubmissionNotice("enhancement")
     if request.page and request.page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Open the New item dialog from a page owner.")
     if not request.page and request.page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
         raise SubmissionError("Select a recipient from the New item dialog.")
-    if request.page and kind == SubmissionKind.PROPOSAL:
+    producer_route = request.page_recipient == new_item_dialog.PageRecipient.PRODUCER
+    if isinstance(request.assignment, new_item_dialog.ChosenAssignee) and not producer_route:
+        raise SubmissionError("Select a producer for the assignee.")
+    if request.page and kind == SubmissionKind.PROPOSAL and not producer_route:
         request = replace(request, page_recipient=new_item_dialog.PageRecipient.SELECTED)
     legacy_draft = DRAFT_ID.fullmatch(request_id) is not None
     browser_draft = BROWSER_DRAFT_ID.fullmatch(request_id) is not None
     list_draft = browser_draft and request.page == "list"
     legacy_list_draft = legacy_draft and request.page == "list"
+    if producer_route and legacy_draft:
+        raise SubmissionError("Open New item again to select a producer.")
     if request_id.startswith(("r2-", "r3-", "r4-", "r5-", "r6-")) and not (legacy_draft or browser_draft):
         raise SubmissionError("Invalid draft request ID.")
     address = (SubmissionAddress(kind, request.recipient_id, request_id) if legacy_draft or browser_draft
@@ -2259,7 +2368,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     uploads = _decode_images(request.images)
     if list_draft:
         previous = _recover_pre_upgrade_native_draft(_request_folder(request_id), address, words, uploads, members,
-                                                    request_kind=request.kind, capture_target=capture_target)
+                                                    request=request, capture_target=capture_target)
         if previous is not None:
             return previous
     state = request.page_state
@@ -2274,7 +2383,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     if browser_draft:
         payload_hash = _browser_payload_hash(request, words, evidence, uploads, screenshot, initial_delivery)
     elif legacy_draft:
-        payload_hash = _legacy_draft_fingerprint(request_id, request.kind, words, _image_fingerprints(uploads))
+        payload_hash = _legacy_draft_fingerprint(request_id, request, words, uploads)
     else:
         payload_hash = _submission_fingerprint(replace(request, evidence=evidence), words, uploads)
     if isinstance(screenshot, new_item_dialog.PageScreenshot):
@@ -2370,18 +2479,29 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             assert current is not None
             recipient = lookup.recipient
             assert recipient is not None
+            if isinstance(initial_delivery, InitialDelivery) and recipient.kind != "producer":
+                # A pending record can resume with its original recipient and payload.
+                if (not isinstance(hint, (PendingFiling, NativeSubmissionDestination))
+                        or not (folder / "pending.json").is_file()
+                        or isinstance(hint, NativeSubmissionDestination) and hint.owner != recipient.id):
+                    raise SubmissionError("Pick a producer.")
+                _check_same_request(hint, request, payload_hash)
             destination = proposal_folder(recipient, current) if kind == SubmissionKind.PROPOSAL else NoNativeFolder(kind)
             if kind == SubmissionKind.PROPOSAL and isinstance(destination, NoNativeFolder):
                 raise SubmissionError("Select a recipient with a native proposal folder.")
             route: ListFilingRoute | ListFilingUnavailable | NoListFiling = NoListFiling()
-            if request.page == "list" and isinstance(initial_delivery, InitialDelivery):
+            if producer_route:
+                member = assigned_member(request.assignment, recipient, current)
+                if isinstance(initial_delivery, InitialDelivery):
+                    route = _plan_producer_filing(member, recipient, request, current)
+            elif request.page == "list" and isinstance(initial_delivery, InitialDelivery):
                 route = _plan_list_filing(initial_delivery.list_assignee, recipient, current)
             pending_file = folder / "pending.json"
             images = tuple(upload.reference for upload in uploads)
             proof = reply_tokens.mint()
             details = ReviewSubmission(request_id, payload_hash, evidence, images, proof.sha256,
                                        page=request.page, page_state=request.page_state, capture_intent=capture_intent,
-                                       reply_token_nonce=proof.nonce,
+                                       reply_token_nonce=proof.nonce, notice=notice, assignment=request.assignment,
                                        image_digests=tuple((upload.reference.id, upload.digest) for upload in uploads))
             title = submission_title(words)
             destinations: list[NativeSubmissionDestination] = []

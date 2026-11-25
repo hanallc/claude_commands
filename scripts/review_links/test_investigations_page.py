@@ -9,6 +9,7 @@ import os
 from contextlib import redirect_stderr
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import unittest
 from typing import cast, override
@@ -125,6 +126,45 @@ class InvestigationsPageTests(unittest.TestCase):
         _ = investigation.mark_read(ORPHAN, read.id)
         body = investigations_page.render(self.root / "reviews").decode()
         assert_status_states(self, body, 15)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_mark_read_shows_only_a_failure(self) -> None:
+        ready = self.file(UNIT.id, "Check the result", "2026-11-16T13:05:00+00:00")
+        _ = investigation.answer(UNIT.id, ready.id, "The result is ready.")
+        page = investigations_page.render(self.root / "reviews").decode()
+        setup = '''<script>
+let refused=true;
+window.fetch=async(_path,options)=>{
+ if(options?.method!=='POST') return new Promise(()=>{});
+ return {ok:!refused,json:async()=>({reason:'The answer changed.'})};
+};
+</script>'''
+        probe = '''<script>
+(async()=>{
+ const card=document.querySelector('article'),form=card.querySelector('form');
+ const status=form.querySelector('[data-save-status]');
+ const button=form.querySelector('button');
+ const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
+ form.requestSubmit(button);
+ await flush();
+ const failure=card.dataset.state==='answer ready' && !card.hidden && !button.disabled &&
+  !status.hidden && status.textContent==='Not saved: The answer changed.';
+ refused=false;
+ form.requestSubmit(button);
+ await flush();
+ const success=card.dataset.state==='read' && card.hidden && !form.isConnected &&
+  status.hidden && !status.textContent && !document.querySelector('[data-empty]').hidden;
+ const result=document.createElement('p');result.id='probe-result';
+ result.textContent=failure && success ? 'PASS' : 'FAIL';document.body.append(result);
+})();
+</script>'''
+        fixture = self.root / "mark-read.html"
+        _ = fixture.write_text(page.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>'))
+        result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
+            '--user-data-dir=' + str(self.root / 'chrome'), '--virtual-time-budget=1000',
+            '--dump-dom', fixture.as_uri()], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('<p id="probe-result">PASS</p>', result.stdout)
 
     def test_order_uses_answer_time_then_filed_time_then_read_time(self) -> None:
         items: list[investigation.Investigation] = []
