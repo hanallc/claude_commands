@@ -3767,25 +3767,8 @@ def _sweep_nightly_build_folders() -> None:
                       + " ".join(str(notice_error).splitlines()), flush=True)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    prepared = os.environ.get("BUILDLOG_PREPARED_COPY")
-    handed_off = copies.take_prepared_gate_handoff()
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
-        nightly_parser = argparse.ArgumentParser(prog=f"gate.py {arguments[0]}", allow_abbrev=False)
-        if arguments[0] == "nightly-assigned":
-            _ = nightly_parser.add_argument("--unit", required=True)
-            _ = nightly_parser.add_argument("--result", default="")
-        class NightlyArguments(argparse.Namespace):
-            unit: str = ""
-            result: str = ""
-        options = nightly_parser.parse_args(arguments[1:], namespace=NightlyArguments())
-        try:
-            return assign_nightly_red(options.unit, options.result) if arguments[0] == "nightly-assigned" else check_nightly_assignments()
-        except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
-            print(f"REFUSED: {error}", file=sys.stderr, flush=True)
-            return 1
-    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+def gate_argument_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=prog, description=__doc__, allow_abbrev=False)
     add_suite_arguments(parser)
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):
         _ = parser.add_argument(f"--{name}", default="")
@@ -3803,10 +3786,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--nightly", action="store_true", help="fetch and fully test origin/<merge-branch> in a shared clone")
     _ = parser.add_argument("--promote-only", action="store_true",
                             help="only promote origin/<merge-branch> to main and the Mac (needs --merge-branch)")
+    return parser
+
+
+def _parse_gate_arguments(arguments: Sequence[str], *, prog: str | None = None) -> GateArguments:
+    parser = gate_argument_parser(prog=prog)
     args = cast(GateArguments, parser.parse_args(arguments))
-    args.command = ("gate.py", *arguments)
-    args.gate_job = gate_job_for_command(args.command)
-    args.prepared_copy = bool(handed_off and prepared and Path(prepared) == Path(args.repo).expanduser().resolve())
     if args.affected and (args.tests_only or args.nightly or args.promote_only or args.promote):
         parser.error("--affected cannot be combined with --tests-only, --nightly or promotion")
     if args.promote_only and not args.merge_branch:
@@ -3825,6 +3810,52 @@ def main(argv: Sequence[str] | None = None) -> int:
         missing = [name.replace("_", "-") for name in required if not getattr(args, name)]
         if missing:
             parser.error(f"required: {', '.join('--' + name for name in missing)}")
+    return args
+
+
+NIGHTLY_SUBCOMMANDS = frozenset({"nightly-assigned", "nightly-check"})
+# copies.py reads this line before it starts the argument check.
+GATE_ARGUMENT_CHECK = "--check-gate-arguments"
+
+
+def _check_gate_arguments(arguments: Sequence[str], *, prog: str) -> int:
+    """Check gate options before admission. Leave nightly subcommands to main."""
+    if arguments and arguments[0] in NIGHTLY_SUBCOMMANDS:
+        return 0
+    args = _parse_gate_arguments(arguments, prog=prog)
+    if args.nightly and args.unit:
+        try:
+            _ = _nightly_unit(args)
+        except copies.CopyError as error:
+            print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+            return 1
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if len(arguments) >= 2 and arguments[0] == GATE_ARGUMENT_CHECK:
+        return _check_gate_arguments(arguments[2:], prog=arguments[1])
+    prepared = os.environ.get("BUILDLOG_PREPARED_COPY")
+    handed_off = copies.take_prepared_gate_handoff()
+    if arguments and arguments[0] in NIGHTLY_SUBCOMMANDS:
+        nightly_parser = argparse.ArgumentParser(prog=f"gate.py {arguments[0]}", allow_abbrev=False)
+        if arguments[0] == "nightly-assigned":
+            _ = nightly_parser.add_argument("--unit", required=True)
+            _ = nightly_parser.add_argument("--result", default="")
+        class NightlyArguments(argparse.Namespace):
+            unit: str = ""
+            result: str = ""
+        options = nightly_parser.parse_args(arguments[1:], namespace=NightlyArguments())
+        try:
+            return assign_nightly_red(options.unit, options.result) if arguments[0] == "nightly-assigned" else check_nightly_assignments()
+        except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+            return 1
+    args = _parse_gate_arguments(arguments)
+    args.command = ("gate.py", *arguments)
+    args.gate_job = gate_job_for_command(args.command)
+    args.prepared_copy = bool(handed_off and prepared and Path(prepared) == Path(args.repo).expanduser().resolve())
     try:
         if args.affected and not args.prepared_copy:
             try:

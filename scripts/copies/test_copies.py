@@ -72,6 +72,20 @@ class ImportTests(unittest.TestCase):
 
 
 class RunCopyTests(unittest.TestCase):
+    def test_gate_main_and_submit_check_report_the_same_mode_error(self) -> None:
+        from scripts.production import gate
+
+        arguments = ["--affected", "--tests-only"]
+        with (mock.patch.object(sys, "argv", ["gate.py"]),
+              redirect_stderr(io.StringIO()) as direct_errors, self.assertRaises(SystemExit) as direct_exit):
+            _ = gate.main(arguments)
+        with redirect_stderr(io.StringIO()) as submit_errors, self.assertRaises(SystemExit) as submit_exit:
+            _ = gate.main([gate.GATE_ARGUMENT_CHECK, "gate.py", *arguments])
+        self.assertEqual(direct_exit.exception.code, 2)
+        self.assertEqual(submit_exit.exception.code, 2)
+        self.assertEqual(submit_errors.getvalue(), direct_errors.getvalue())
+        self.assertIn("--affected cannot be combined with --tests-only", submit_errors.getvalue())
+
     def test_gate_cleanup_error_keeps_the_gate_status(self) -> None:
         command = ["python3", "scripts/production/gate.py", "--tests-only"]
         tree = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -2467,11 +2481,150 @@ with patch.object(subprocess, 'run', pause_clone):
                 self.assertEqual(Path(path).read_bytes(), b"same artifact")
 
     def test_run_refuses_a_named_gate_without_a_test_mode_before_admission(self) -> None:
-        with mock.patch.object(first_step, "admitted_run") as admit:
+        repository = Path(__file__).resolve().parents[2]
+        with (mock.patch.object(copies, "requested_source", return_value=nullcontext(repository)),
+              mock.patch.object(copies, "commit_at", return_value=self.head),
+              mock.patch.object(first_step, "admitted_run") as admit):
             result = self.run_cli(command=("./scripts/lib/py", "scripts/production/gate.py", "--module", "x"))
         self.assertEqual(result.returncode, 2)
-        self.assertEqual(result.stderr, "copies: --module needs --tests-only or --affected\n")
+        self.assertTrue(result.stderr.endswith(
+            "gate.py: error: --module needs --tests-only or --affected\n"), result.stderr)
         admit.assert_not_called()
+
+    def test_run_reports_an_unknown_gate_option_before_admission(self) -> None:
+        repository = Path(__file__).resolve().parents[2]
+        with (mock.patch.object(copies, "requested_source", return_value=nullcontext(repository)),
+              mock.patch.object(copies, "commit_at", return_value=self.head),
+              mock.patch.object(first_step, "gate_targets", return_value=("natedev",)),
+              mock.patch.object(first_step, "admitted_run",
+                                side_effect=copies.CopyError("fixture reached admission")) as admit):
+            result = self.run_cli(command=("./scripts/lib/py", "scripts/production/gate.py",
+                                           "--tests-only", "--unknown-gate-option"))
+        admit.assert_not_called()
+        self.assertEqual(result.returncode, 2)
+        self.assertTrue(result.stderr.endswith(
+            "gate.py: error: unrecognized arguments: --unknown-gate-option\n"), result.stderr)
+
+    def test_run_refuses_a_missing_module_value_before_help_and_admission(self) -> None:
+        repository = Path(__file__).resolve().parents[2]
+        with (mock.patch.object(copies, "requested_source", return_value=nullcontext(repository)),
+              mock.patch.object(copies, "commit_at", return_value=self.head),
+              mock.patch.object(first_step, "gate_targets", return_value=("natedev",)),
+              mock.patch.object(first_step, "admitted_run",
+                                side_effect=copies.CopyError("fixture reached admission")) as admit):
+            result = self.run_cli(command=("./scripts/lib/py", "scripts/production/gate.py",
+                                           "--tests-only", "--module", "--help"))
+        admit.assert_not_called()
+        self.assertEqual(result.returncode, 2)
+        self.assertTrue(result.stderr.endswith(
+            "gate.py: error: argument --module: expected one argument\n"), result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_run_refuses_an_absolute_gate_path_before_snapshot_or_admission(self) -> None:
+        launcher = str(self.source / "scripts/lib/py")
+        gate = self.source / "scripts/production/gate.py"
+        with (mock.patch.object(copies, "requested_source", wraps=copies.requested_source) as snapshot,
+              mock.patch.object(first_step, "gate_targets", return_value=("natedev",)),
+              mock.patch.object(first_step, "admitted_run",
+                                side_effect=copies.CopyError("fixture reached admission")) as admit):
+            refusal = self.run_cli(command=(launcher, str(gate), "--affected", "--checkout", "{tree}"))
+            admit.assert_not_called()
+            snapshot.assert_not_called()
+            self.assertEqual(refusal.returncode, 2)
+            self.assertIn("./scripts/lib/py scripts/production/gate.py ...", refusal.stderr)
+
+            legacy = self.run_cli(command=("python3", str(gate.with_name("merge_gate.py")),
+                                           "--checkout", "{tree}", "--tests-only"))
+            snapshot.assert_called_once()
+            admit.assert_called_once()
+            self.assertEqual(legacy.stderr, "copies: fixture reached admission\n")
+
+    def commit_gate_check_fixture(self, body: str) -> None:
+        script = self.source / "scripts/production/gate.py"
+        script.parent.mkdir(parents=True)
+        _ = script.write_text('GATE_ARGUMENT_CHECK = "--check-gate-arguments"\n' + dedent(body))
+        shim = self.source / "scripts/lib/py"
+        shim.parent.mkdir()
+        _ = shim.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -S "$@"\n')
+        shim.chmod(0o700)
+        _ = self.git(self.source, "add", "scripts")
+        _ = self.git(self.source, "commit", "-m", "Add a gate argument check fixture")
+
+    def test_run_continues_after_gate_check_prints_to_stdout(self) -> None:
+        self.commit_gate_check_fixture("""\
+            import argparse
+            import os
+            import sys
+
+            assert os.path.samestat(os.fstat(0), os.stat(os.devnull))
+            print(f"checked {sys.argv[-1]}", file=sys.stderr)
+            print("launcher started")
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--tests-only", action="store_true")
+            parser.parse_args(sys.argv[3:])
+            """)
+        for option in ("--tests-only", "-h", "--help"):
+            with (self.subTest(option=option),
+                  mock.patch.object(first_step, "gate_targets", return_value=("natedev",)),
+                  mock.patch.object(first_step, "admitted_run",
+                                    side_effect=copies.CopyError("fixture reached admission")) as admit):
+                result = self.run_cli(command=("./scripts/lib/py", "scripts/production/gate.py", option))
+                admit.assert_called_once()
+                self.assertEqual(result.stderr, f"checked {option}\ncopies: fixture reached admission\n")
+                self.assertEqual(result.stdout, "")
+
+    def test_run_checks_absolute_merge_gate_with_its_own_parser(self) -> None:
+        launcher = Path(__file__).resolve().parents[2] / "scripts/production/merge_gate.py"
+        with (mock.patch.object(first_step, "gate_targets", return_value=("natedev",)),
+              mock.patch.object(first_step, "admitted_run",
+                                side_effect=copies.CopyError("fixture reached admission")) as admit):
+            result = self.run_cli(command=("python3", str(launcher), "--checkout", "{tree}",
+                                           "--tests-only", "--unknown-gate-option"))
+        admit.assert_not_called()
+        self.assertEqual(result.returncode, 2)
+        self.assertTrue(result.stderr.endswith(
+            "merge_gate.py: error: unrecognized arguments: --unknown-gate-option\n"), result.stderr)
+
+    def test_run_checks_gate_arguments_from_the_requested_commit(self) -> None:
+        self.commit_gate_check_fixture("""\
+            from pathlib import Path
+            import sys
+
+            assert sys.argv[1:] == [GATE_ARGUMENT_CHECK, "gate.py", "--tests-only"]
+            assert Path.cwd() == Path(__file__).resolve().parents[2]
+            print("gate.py: error: this commit refuses --tests-only", file=sys.stderr)
+            raise SystemExit(2)
+            """)
+        revision = self.git(self.source, "rev-parse", "HEAD")
+        _ = self.git(self.source, "revert", "--no-edit", revision)
+        with (mock.patch.object(first_step, "gate_targets", return_value=("natedev",)),
+              mock.patch.object(first_step, "admitted_run",
+                                side_effect=copies.CopyError("fixture reached admission")) as admit):
+            result = self.cli("run", "--repo", str(self.source), "--commit", revision, "--",
+                              "./scripts/lib/py", "scripts/production/gate.py", "--tests-only")
+        admit.assert_not_called()
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, "gate.py: error: this commit refuses --tests-only\n")
+
+    def test_run_refuses_an_invalid_nightly_owner_before_admission(self) -> None:
+        from scripts.production import gate
+
+        arguments = ("--nightly", "--merge-branch", "builds", "--unit", "Bad!")
+        with (mock.patch.object(gate, "checked_gate_target", return_value=gate.NO_GATE_ASSIGNMENT),
+              redirect_stderr(io.StringIO()) as direct_errors):
+            direct_status = gate.main(arguments)
+        repository = Path(__file__).resolve().parents[2]
+        with (mock.patch.object(copies, "requested_source", return_value=nullcontext(repository)),
+              mock.patch.object(copies, "commit_at", return_value=self.head),
+              mock.patch.object(first_step, "gate_targets", return_value=("natedev",)),
+              mock.patch.object(first_step, "admitted_run",
+                                side_effect=copies.CopyError("fixture reached admission")) as admit):
+            result = self.run_cli(command=("./scripts/lib/py", "scripts/production/gate.py", *arguments))
+        admit.assert_not_called()
+        self.assertEqual(result.returncode, direct_status)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, direct_errors.getvalue())
+        self.assertIn("owner must match", result.stderr)
 
     def test_run_uses_tree_cwd_substitution_and_command_exit_status(self) -> None:
         output = self.base / "command-result.json"
