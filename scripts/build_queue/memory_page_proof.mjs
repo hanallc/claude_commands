@@ -2839,7 +2839,8 @@ try {
             await show(readings.mac_three);
             const macProof=await evaluate(`(() => {
               const rows=latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build');
-              const unit=document.querySelector('#barwrap').getBoundingClientRect().width/latest.total;
+              const track=document.querySelector('#walk .track').getBoundingClientRect();
+              const unit=track.width/(latest.ram.total_bytes/GIB);
               return rows.map(({row,index})=>{
                 const chart=document.querySelector('.wrow[data-run="'+proofRun(index)+'"]');
                 const table=document.querySelector('.walk-table tr[data-tip="'+proofTip('row',index)+'"]');
@@ -2865,7 +2866,8 @@ try {
             assert.deepEqual(macLabels.map(row=>row.jobs),['—','12','6']);
             for(const row of macProof) {
               assert.equal(row.stage,'building');
-              assert.ok(Math.abs(row.used-row.expected)<1);
+              assert.ok(Math.abs(row.used-row.expected)<1,
+                `Mac bar for ${row.name} at ${width} px in ${theme} mode is ${row.used} px. Expected ${row.expected} px.`);
               assert.equal(row.hatched,false);
               assert.equal(row.underBar,false);
               assert.ok(Math.abs(row.chartTop-row.tableTop)<1);
