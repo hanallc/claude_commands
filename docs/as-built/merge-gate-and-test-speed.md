@@ -820,6 +820,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   After it writes the lease, the gate appends a `gate_folder_start` line to the local host log.
   The line contains the folder path, lease owner identity, commit SHA, branch, and step.
   The `gate_run` line adds the same owner identity, `suite_folders`, and `end`.
+  Checkpoint runs keep the default SIGTERM disposition so recovery keeps the rollback record.
   If SIGTERM starts cleanup, the gate records a `sigterm` end.
   The gate defers SIGTERM, SIGINT, and SIGHUP until it marks the end write complete.
   If a stop signal interrupts end setup, the gate writes the same end as the abort path.
@@ -828,6 +829,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   A sync error after a complete append leaves the `gate_run` line as the only end.
   The end is `normal`, `red`, or `sigterm`.
   Log errors report to stderr and preserve the gate verdict.
+  If the fallback end write also fails, the gate reports the original error once.
   The timing index continues to accept older run lines and skips the folder event lines.
   Both modes use the configured gate root for top-level runs.
   If that root contains the calling module folder, the nested gate uses the module folder as its parent.

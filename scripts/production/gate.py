@@ -1740,7 +1740,7 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
     except Exception as error:
         gate_record.report_not_written(error)
         if not isinstance(folder_start, GateFolderAllocation):
-            gate_record.write_gate_folder_event(gate_folder_end(folder_start, end))
+            gate_record.write_gate_folder_event(gate_folder_end(folder_start, end), report_failure=False)
         return
     gate_record.write_gate_run(run, recorded_executions)
 
@@ -1853,7 +1853,6 @@ def unwind_gate_on_sigterm() -> Generator[None]:
             restore_handlers()
 
 
-@unwind_gate_on_sigterm()
 def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
@@ -2056,7 +2055,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     folder_tool = "g" if mode is SuiteMode.GATE else "t"
     module_number = 0
     hold_check = hold if hold is not None else NoBuildHoldCheck()
-    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, gate_parent)) as recovery, record_suite(),
+    with (unwind_gate_on_sigterm() if source != "checkpoint" else nullcontext(),
+          (gate_recovery(repo) if shared else private_gate_recovery(repo, gate_parent)) as recovery, record_suite(),
           gate_temporary(recovery, folder_tool, gate_parent) as temporary,
           ExitStack() as module_folders,
           (nullcontext(local_grant.suite_place()) if placed else
@@ -4233,7 +4233,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if isinstance(target, NoGateAssignment) and (args.promote_only or args.modules
                 and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)):
             target = "natedev"
-        with unwind_gate_on_sigterm():
+        checkpoint = not (args.affected or args.tests_only or args.nightly or args.promote_only)
+        with unwind_gate_on_sigterm() if not checkpoint else nullcontext():
             return run_gate_command(args, target)
     except GatePlacementIncomplete as error:
         print(error, file=sys.stderr, flush=True)

@@ -1,7 +1,6 @@
 """Read module times and append gate runs to the build log."""
 from __future__ import annotations
 
-import argparse
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -450,10 +449,10 @@ def write_gate_run(run: GateRun, executions: Sequence[Execution]) -> None:
                 end["process_start"] = run["process_start"]
             if "boot_id" in run:
                 end["boot_id"] = run["boot_id"]
-            write_gate_folder_event(end)
+            write_gate_folder_event(end, report_failure=False)
 
 
-def write_gate_folder_event(event: GateFolderStart | GateFolderEnd) -> None:
+def write_gate_folder_event(event: GateFolderStart | GateFolderEnd, *, report_failure: bool = True) -> None:
     """Append a folder start or an end without timing history."""
     kind = "gate_folder_start" if "folder" in event else "gate_folder_end"
     try:
@@ -466,7 +465,8 @@ def write_gate_folder_event(event: GateFolderStart | GateFolderEnd) -> None:
             "host": host, "at": store.utc_iso(epoch), **event,
         })
     except Exception as error:
-        report_not_written(error, record_name=kind)
+        if report_failure:
+            report_not_written(error, record_name=kind)
 
 
 @dataclass(frozen=True)
@@ -624,6 +624,8 @@ def gate_folder_status(root: Path) -> list[GateFolderStatus]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    import argparse
+
     from scripts.lib.build_folders import configured_gate_root
 
     parser = argparse.ArgumentParser(description="Read suite folders and their gate outcomes.")
