@@ -319,8 +319,8 @@ class OutsideProcessSurvived:
 
 def stop_outside_tree(run: OutsideKillCandidate) -> OutsideTreeEmpty | OutsideIdentityUnconfirmed | OutsideProcessSurvived:
     settings = conf.read("shutdown")
-    grace = float(settings.text("STOP_GRACE_SECONDS"))
-    kill_grace = float(settings.text("KILL_GRACE_SECONDS"))
+    grace = float(settings.text("stop_grace_seconds"))
+    kill_grace = float(settings.text("kill_grace_seconds"))
     root = process_stop.ProcessLifetime(run.row_pid, run.row_start)
     try:
         with ExitStack() as pins:
