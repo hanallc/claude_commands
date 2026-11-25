@@ -1029,8 +1029,8 @@ The bucket policy requires TLS and limits the scaler to the manifest and bundle 
 The gate plan checks the source bucket policy in each proposed region.
 Teardown checks the gate record against the verified deployment.
 It reads the source bucket from each saved stack, including stacks absent from the gate manifest.
-It empties each verified bucket in batches of up to 500 objects before it deletes the stack.
-If a late write blocks deletion, teardown empties the bucket again and retries up to three times.
+It empties the verified source and request buckets in batches of up to 500 objects before it deletes the stacks.
+If a late write blocks deletion, teardown reads the verified stack again and retries up to three times.
 Private gate uploads and launches hold the shared account stack lock.
 Git preparation and waits for a shared delta receipt occur outside that lock.
 Approved setup uses `git_network_timeout_s` for the Git commands that prepare its first base.
@@ -1050,7 +1050,7 @@ Otherwise, it uploads a delta for the selected base in the same region.
 Paired modules that select the same base share one regional delta.
 Recovery reuses the saved source keys and launch arguments for an uncertain launch.
 The controller checks the suite mode before it creates a gate source archive.
-It removes the archive after a failed service start when no open booking or launch record exists.
+It removes the archive after a failed or interrupted service start if no worker or launch can use it.
 It keeps the archive while recovery can use it and removes it after settlement.
 
 The controller selects bases for 14 days.

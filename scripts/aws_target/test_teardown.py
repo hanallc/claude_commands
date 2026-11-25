@@ -28,7 +28,8 @@ class SourceBucketRemovalTests(CostFixture):
             _ = removal.regional_gates()
         execute.assert_not_called()
 
-    def check_bucket_removal(self, *, home_only: bool, late_write: bool = False) -> None:
+    def check_bucket_removal(self, *, home_only: bool, late_write: bool = False, resume_delete: bool = False,
+                             request_bucket: bool = False) -> None:
         home = conf.read(self.settings).text('region')
         west = 'us-west-2'
         deployment = 'a' * 32
@@ -41,13 +42,19 @@ class SourceBucketRemovalTests(CostFixture):
         else:
             regions.append({'region': west, 'source_bucket': buckets[west], 'stack': names[west]})
         _ = (self.state / 'gate-deployment.json').write_text(json.dumps({'deployment_id': deployment, 'regions': regions}))
-        contents = {region: {'base/current.json', 'base/generation/base.bundle', 'delta/generation/delta.bundle'}
-                    for region in names}
+        contents = {bucket: {'base/current.json', 'base/generation/base.bundle', 'delta/generation/delta.bundle'}
+                    for bucket in buckets.values()}
+        requests = f'cloud-claude-gate-{deployment}'
+        if request_bucket:
+            contents[requests] = {'requests/fixture.json', 'artifacts/fixture/log'}
         deleted: list[str] = []
-        failed: set[str] = set()
+        failed: dict[str, str] = {}
         operations: list[tuple[str, str]] = []
+        emptied: list[str] = []
+        resuming = resume_delete
 
         def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            nonlocal resuming
             region = arguments[arguments.index('--region') + 1]
             operation = arguments[6]
             operations.append((region, operation))
@@ -57,31 +64,48 @@ class SourceBucketRemovalTests(CostFixture):
             elif operation == 'describe-stacks':
                 if region in deleted:
                     return subprocess.CompletedProcess(arguments, 1, '', 'ValidationError: Stack does not exist')
-                reply = {'Stacks': [{'StackName': names[region], 'StackId': names[region], 'Outputs': [
-                    {'OutputKey': 'GateSourceBucket', 'OutputValue': buckets[region]},
-                ], 'StackStatus': 'DELETE_FAILED' if region in failed else 'CREATE_COMPLETE'}]}
+                stack: dict[str, object] = {'StackName': names[region], 'StackId': names[region]}
+                if region == west and resuming:
+                    stack['StackStatus'] = 'DELETE_IN_PROGRESS'
+                else:
+                    outputs = [{'OutputKey': 'GateSourceBucket', 'OutputValue': buckets[region]}]
+                    if region == home and request_bucket:
+                        outputs.append({'OutputKey': 'GateBucket', 'OutputValue': requests})
+                    stack.update(Outputs=outputs, StackStatus='DELETE_FAILED' if region in failed else 'CREATE_COMPLETE')
+                reply = {'Stacks': [stack]}
             elif operation == 'describe-stack-events':
                 self.assertIn(region, failed)
                 reply = {'StackEvents': [
-                    {'LogicalResourceId': 'GateSourceBucket', 'ResourceStatus': 'DELETE_FAILED',
+                    {'LogicalResourceId': failed[region], 'ResourceStatus': 'DELETE_FAILED',
                      'ResourceStatusReason': 'The bucket you tried to delete is not empty'},
                 ]}
             elif operation == 'list-objects-v2':
-                self.assertEqual(arguments[arguments.index('--bucket') + 1], buckets[region])
-                if contents[region]:
-                    reply = {'Contents': [{'Key': key} for key in sorted(contents[region])]}
+                bucket = arguments[arguments.index('--bucket') + 1]
+                self.assertIn(bucket, (buckets[region], requests) if region == home and request_bucket else (buckets[region],))
+                if contents[bucket]:
+                    reply = {'Contents': [{'Key': key} for key in sorted(contents[bucket])]}
             elif operation == 'delete-objects':
-                self.assertEqual(arguments[arguments.index('--bucket') + 1], buckets[region])
-                contents[region].clear()
+                bucket = arguments[arguments.index('--bucket') + 1]
+                contents[bucket].clear()
+                emptied.append(bucket)
             elif operation == 'delete-stack':
-                self.assertFalse(contents[region])
+                self.assertFalse(contents[buckets[region]])
+                if region == home and request_bucket:
+                    self.assertFalse(contents[requests])
                 if late_write and region not in failed:
-                    contents[region].add('delta/generation/late.bundle')
-                    failed.add(region)
+                    if region == home and request_bucket:
+                        contents[requests].add('requests/late.json')
+                        failed[region] = 'GateBucket'
+                    else:
+                        contents[buckets[region]].add('delta/generation/late.bundle')
+                        failed[region] = 'GateSourceBucket'
                 else:
-                    failed.discard(region)
+                    _ = failed.pop(region, None)
                     deleted.append(region)
             elif operation == 'wait':
+                if region == west and resuming:
+                    resuming = False
+                    failed[region] = 'GateSourceBucket'
                 if region in failed:
                     return subprocess.CompletedProcess(arguments, 255, '', 'Waiter reached DELETE_FAILED')
             else:
@@ -95,11 +119,12 @@ class SourceBucketRemovalTests(CostFixture):
         self.assertTrue(removal.regional_gates())
         self.assertTrue(removal.foundation())
         self.assertEqual(deleted, [west, home])
-        tries = 2 if late_write else 1
-        self.assertEqual([(region, operation) for region, operation in operations
-                          if operation in ('delete-objects', 'delete-stack')],
-            ([(west, 'delete-objects'), (west, 'delete-stack')] * tries
-             + [(home, 'delete-objects'), (home, 'delete-stack')] * tries))
+        west_tries = 2 if late_write and not resume_delete else 1
+        home_tries = 2 if late_write else 1
+        self.assertEqual([region for region, operation in operations if operation == 'delete-stack'],
+                         [west] * west_tries + [home] * home_tries)
+        home_buckets = [buckets[home], requests, requests] if request_bucket else [buckets[home]] * home_tries
+        self.assertEqual(emptied, [buckets[west]] * west_tries + home_buckets)
 
     def test_down_empties_the_home_and_regional_source_buckets_before_stack_deletion(self) -> None:
         self.check_bucket_removal(home_only=False)
@@ -110,11 +135,16 @@ class SourceBucketRemovalTests(CostFixture):
     def test_down_retries_home_and_regional_stack_deletion_after_a_late_source_write(self) -> None:
         self.check_bucket_removal(home_only=False, late_write=True)
 
+    def test_down_reads_fresh_outputs_after_a_resumed_delete_fails(self) -> None:
+        self.check_bucket_removal(home_only=False, resume_delete=True)
+
+    def test_down_empties_the_request_bucket_and_retries_after_a_late_request(self) -> None:
+        self.check_bucket_removal(home_only=False, late_write=True, request_bucket=True)
+
     def test_source_bucket_removal_uses_at_most_500_keys_per_batch(self) -> None:
         region = conf.read(self.settings).text('region')
         deployment = 'a' * 32
         bucket = gate_source.bucket_name(deployment, region)
-        stack: dict[str, object] = {'Outputs': [{'OutputKey': 'GateSourceBucket', 'OutputValue': bucket}]}
         contents = [f'delta/g{index:020d}-{"a" * 32}/{"b" * 64}.bundle' for index in range(1001)]
         sizes: list[int] = []
 
@@ -133,6 +163,6 @@ class SourceBucketRemovalTests(CostFixture):
             del contents[:len(keys)]
             return subprocess.CompletedProcess(arguments, 0, '{}', '')
 
-        teardown.empty_gate_source_bucket(AwsCli('fixture', region, 1, execute=execute), stack, deployment)
+        teardown.empty_gate_bucket(AwsCli('fixture', region, 1, execute=execute), bucket)
         self.assertEqual(sizes, [500, 500, 1])
         self.assertFalse(contents)

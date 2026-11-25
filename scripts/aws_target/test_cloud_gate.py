@@ -4646,6 +4646,40 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         path, = archive_paths
         self.assertFalse(path.exists())
 
+    def test_private_archive_is_removed_on_interrupt_before_worker_submission(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template',
+            'source_tool_paths': ['/nix/store/' + 'a' * 32 + '-fixture']})
+        create = gate_source.archive
+        folders: list[Path] = []
+
+        def interrupt(repo: Path, folder: Path, commits: Sequence[str]) -> None:
+            create(repo, folder, commits)
+            folders.append(folder)
+            raise KeyboardInterrupt
+
+        service = mock.Mock(side_effect=AssertionError('The service must not start'))
+        with (mock.patch.object(gate_source, 'archive', side_effect=interrupt), self.assertRaises(KeyboardInterrupt)):
+            _ = cloud_gate.run(self.repo, full=True, mode=gate.SuiteMode.GATE, module_time_limit_s=1800, service=service)
+        service.assert_not_called()
+        folder, = folders
+        self.assertFalse((folder / gate_source.SOURCE_ARCHIVE).exists())
+
+        def interrupt_submission(command: Sequence[str]) -> int:
+            archive_folder = Path(command[command.index('--worker') + 1])
+            self.assertTrue((archive_folder / gate_source.SOURCE_ARCHIVE).is_file())
+            folders.append(archive_folder)
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            _ = cloud_gate.run(self.repo, full=True, mode=gate.SuiteMode.GATE, module_time_limit_s=1800,
+                               service=interrupt_submission)
+        folder = folders[-1]
+        self.assertFalse((folder / gate_source.SOURCE_ARCHIVE).exists())
+        worker = mock.Mock(side_effect=AssertionError('A worker without source must not make AWS calls'))
+        self.assertEqual(cloud_gate.execute_gate_worker(folder, worker), 0)
+        worker.assert_not_called()
+        self.assertEqual(cloud_gate.read(folder / 'outcome.json')['status'], 'fallback')
+
     def retry_fixture(self) -> CloudRouteTests:
         fixture = CloudRouteTests()
         self.addCleanup(fixture.doCleanups)

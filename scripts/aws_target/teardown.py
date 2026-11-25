@@ -20,8 +20,8 @@ from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 from scripts.mac_test import mac_test
 
 
-SOURCE_DELETE_BATCH_SIZE = 500
-SOURCE_DELETE_RETRIES = 3
+GATE_BUCKET_DELETE_BATCH_SIZE = 500
+GATE_BUCKET_DELETE_RETRIES = 3
 
 
 DRY_RUN = '''down would disable AWS routing and aws-target.service.
@@ -203,7 +203,7 @@ class TargetRemoval:
         return {} if stacks[0].get('StackStatus') == 'DELETE_COMPLETE' else stacks[0]
 
     def _outputs(self, stack: dict[str, object]) -> dict[str, str]:
-        return {ledger.text(row, 'OutputKey'): ledger.text(row, 'OutputValue') for row in ledger.rows(stack, 'Outputs')
+        return {ledger.text(row, 'OutputKey'): ledger.text(row, 'OutputValue') for row in stack_outputs(stack)
                 if row.get('OutputKey') in ('InstanceId', 'DataVolumeId', 'BudgetName', 'ComputeEnabled')}
 
     def verify(self) -> bool:
@@ -309,7 +309,7 @@ class TargetRemoval:
             return not current
 
         delete_gate_stack(self.api, stack, self.identity.stack_id, self.identity.deployment_id,
-                          lambda: self._wait(deleted, 'foundation deletion did not finish'))
+            self._stack, lambda: self._wait(deleted, 'foundation deletion did not finish'), include_requests=True)
         print('removed: foundation stack, scaler user, policies, and Budget actions')
         return True
 
@@ -437,71 +437,92 @@ class TargetRemoval:
         return True
 
 
-def empty_gate_source_bucket(api: AwsCli, stack: dict[str, object], deployment: str) -> None:
-    outputs = ledger.rows(stack, 'Outputs') if 'Outputs' in stack else ()
-    for output in outputs:
-        if output.get('OutputKey') == 'GateSourceBucket':
+def stack_outputs(stack: dict[str, object]) -> tuple[dict[str, object], ...]:
+    return ledger.rows(stack, 'Outputs') if 'Outputs' in stack else ()
+
+
+def verified_gate_buckets(api: AwsCli, stack: dict[str, object], deployment: str, *,
+                          include_requests: bool) -> dict[str, str]:
+    expected = {'GateSourceBucket': gate_source.bucket_name(deployment, api.region)}
+    if include_requests:
+        expected['GateBucket'] = f'cloud-claude-gate-{deployment}'
+    buckets: dict[str, str] = {}
+    for output in stack_outputs(stack):
+        key = output.get('OutputKey')
+        if isinstance(key, str) and key in expected:
             bucket = ledger.text(output, 'OutputValue')
-            if bucket != gate_source.bucket_name(deployment, api.region):
-                raise ValueError('The regional source bucket differs from the saved deployment')
-            break
-    else:
-        return
+            if bucket != expected[key]:
+                raise ValueError(f'The {key} bucket differs from the saved deployment')
+            buckets[key] = bucket
+    return buckets
+
+
+def empty_gate_bucket(api: AwsCli, bucket: str) -> None:
     while True:
         try:
             objects = api.call('list-objects-v2', '--bucket', bucket, '--no-paginate',
-                               '--max-keys', str(SOURCE_DELETE_BATCH_SIZE), service='s3api')
+                               '--max-keys', str(GATE_BUCKET_DELETE_BATCH_SIZE), service='s3api')
         except AwsUnavailable as error:
             if 'NoSuchBucket' in str(error):
                 return
             raise
-        batch = ledger.rows(objects, 'Contents')[:SOURCE_DELETE_BATCH_SIZE] if 'Contents' in objects else ()
+        batch = ledger.rows(objects, 'Contents')[:GATE_BUCKET_DELETE_BATCH_SIZE] if 'Contents' in objects else ()
         if not batch:
             return
         keys = [{'Key': ledger.text(row, 'Key')} for row in batch]
         removed = api.call('delete-objects', '--bucket', bucket, '--delete',
                            json.dumps({'Objects': keys, 'Quiet': True}), service='s3api')
         if removed.get('Errors'):
-            raise AwsUnavailable('The source bucket still contains objects')
+            raise AwsUnavailable(f'The gate bucket {bucket} still contains objects')
 
 
-def source_bucket_not_empty(reason: str) -> bool:
+def gate_bucket_not_empty(reason: str) -> bool:
     return 'BucketNotEmpty' in reason or 'bucket you tried to delete is not empty' in reason.lower()
 
 
-def source_bucket_delete_failed(api: AwsCli, name: str, stack: dict[str, object], error: AwsUnavailable) -> bool:
-    outputs = ledger.rows(stack, 'Outputs') if 'Outputs' in stack else ()
-    if not any(row.get('OutputKey') == 'GateSourceBucket' for row in outputs):
-        return False
-    if source_bucket_not_empty(str(error)):
-        return True
-    if 'DELETE_FAILED' not in str(error):
-        return False
-    events = api.call('describe-stack-events', '--stack-name', name, service='cloudformation')
+def gate_bucket_delete_failed(api: AwsCli, stack_id: str, buckets: dict[str, str]) -> bool:
+    pending = set(buckets)
+    events = api.call('describe-stack-events', '--stack-name', stack_id, service='cloudformation')
     for event in ledger.rows(events, 'StackEvents'):
-        if (event.get('PhysicalResourceId') == stack.get('StackId') and event.get('ResourceType') == 'AWS::CloudFormation::Stack'
+        if (event.get('PhysicalResourceId') == stack_id and event.get('ResourceType') == 'AWS::CloudFormation::Stack'
                 and event.get('ResourceStatus') == 'DELETE_IN_PROGRESS'):
             break
-        if event.get('LogicalResourceId') == 'GateSourceBucket':
-            return event.get('ResourceStatus') == 'DELETE_FAILED' and source_bucket_not_empty(
-                str(event.get('ResourceStatusReason', '')))
+        key = event.get('LogicalResourceId')
+        if isinstance(key, str) and key in pending:
+            pending.remove(key)
+            if event.get('ResourceStatus') == 'DELETE_FAILED' and gate_bucket_not_empty(str(event.get('ResourceStatusReason', ''))):
+                return True
     return False
 
 
 def delete_gate_stack(api: AwsCli, stack: dict[str, object], name: str, deployment: str,
-                      wait: Callable[[], None]) -> None:
-    for retry in range(SOURCE_DELETE_RETRIES + 1):
-        start_delete = retry > 0 or stack.get('StackStatus') != 'DELETE_IN_PROGRESS'
+                      read_stack: Callable[[], dict[str, object]], wait: Callable[[], None], *,
+                      include_requests: bool = False) -> None:
+    start_delete = stack.get('StackStatus') != 'DELETE_IN_PROGRESS'
+    buckets = verified_gate_buckets(api, stack, deployment, include_requests=include_requests) if start_delete else {}
+    for retry in range(GATE_BUCKET_DELETE_RETRIES + 1):
         if start_delete:
-            empty_gate_source_bucket(api, stack, deployment)
+            for bucket in buckets.values():
+                empty_gate_bucket(api, bucket)
         try:
             if start_delete:
                 _ = api.call('delete-stack', '--stack-name', name, service='cloudformation')
             wait()
             return
         except AwsUnavailable as error:
-            if retry == SOURCE_DELETE_RETRIES or not source_bucket_delete_failed(api, name, stack, error):
+            not_empty = gate_bucket_not_empty(str(error))
+            if retry == GATE_BUCKET_DELETE_RETRIES or not (not_empty or 'DELETE_FAILED' in str(error)):
                 raise
+            stack_id = ledger.text(stack, 'StackId')
+            stack = read_stack()
+            if not stack:
+                return
+            if stack.get('StackId') != stack_id:
+                raise ValueError('The gate stack identity changed during deletion') from error
+            buckets = verified_gate_buckets(api, stack, deployment, include_requests=include_requests)
+            if not buckets or not (not_empty or gate_bucket_delete_failed(api, stack_id, buckets)):
+                raise
+            start_delete = stack.get('StackStatus') != 'DELETE_IN_PROGRESS'
 
 
 def verified_gate_deployment(directory: Path, region: str, deployment: str) -> dict[str, object]:
@@ -542,15 +563,17 @@ def remove_regional_gates(api: AwsCli, directory: Path, deployment: str, *, incl
     for region, name in list(stacks.items()):
         target = api.in_region(region)
         try:
-            reply = target.call('describe-stacks', '--stack-name', str(name), service='cloudformation')
-            saved_stacks = ledger.rows(reply, 'Stacks')
-            if len(saved_stacks) != 1 or saved_stacks[0].get('StackName') != name:
-                raise ValueError('The regional stack differs from the saved deployment')
-            stack = saved_stacks[0]
+            def read_stack() -> dict[str, object]:
+                reply = target.call('describe-stacks', '--stack-name', str(name), service='cloudformation')
+                saved_stacks = ledger.rows(reply, 'Stacks')
+                if len(saved_stacks) != 1 or saved_stacks[0].get('StackName') != name:
+                    raise ValueError('The regional stack differs from the saved deployment')
+                return saved_stacks[0]
+
             def wait_for_stack() -> None:
                 _ = target.call('wait', 'stack-delete-complete', '--stack-name', str(name), service='cloudformation')
 
-            delete_gate_stack(target, stack, str(name), deployment, wait_for_stack)
+            delete_gate_stack(target, read_stack(), str(name), deployment, read_stack, wait_for_stack)
         except AwsUnavailable as error:
             if 'does not exist' not in str(error):
                 raise

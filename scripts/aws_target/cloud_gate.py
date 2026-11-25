@@ -2144,27 +2144,31 @@ def run_service(repo: Path, folder: Path, request: dict[str, object], command: S
     launch = folder / 'launch.json'
     result = folder / 'outcome.json'
     archive = folder / gate_source.SOURCE_ARCHIVE
-    if request.get('source_form') == 'regional-bundle' and not launch.exists() and not archive.is_file():
-        gate_source.archive(repo, folder, gate_source.request_commits(request))
+    private_source = request.get('source_form') == 'regional-bundle'
 
     def discard_unstarted_archive() -> None:
-        if not archive.is_file() or launch.exists():
+        if not archive.is_file():
             return
         try:
-            rows = book.read_snapshot().gate_reservations if book.path.exists() else ()
-            if not any(row.attempt == folder.name and ledger.gate_is_open(row) for row in rows):
-                discard_source_archive(folder)
-        except ledger.LedgerUnavailable as error:
+            with exclusive(folder / 'controller.lock', wait=False) as access:
+                if access is LockResult.BUSY or launch.exists():
+                    return
+                rows = book.read_snapshot().gate_reservations if book.path.exists() else ()
+                if not any(row.attempt == folder.name and ledger.gate_is_open(row) for row in rows):
+                    discard_source_archive(folder)
+        except (OSError, ledger.LedgerUnavailable) as error:
             print(f'Gate source archive cleanup failed. {error}', file=sys.stderr)
 
     # The service owns every AWS call. The session only reads local evidence.
     try:
+        if private_source and not launch.exists() and not archive.is_file():
+            gate_source.archive(repo, folder, gate_source.request_commits(request))
         _ = service(command)
-    except OSError:
-        discard_unstarted_archive()
-        raise
+    finally:
+        if private_source:
+            with cancellation.defer_cleanup_signals():
+                discard_unstarted_archive()
     if not result.exists():
-        discard_unstarted_archive()
         return CloudDeclined('The scaler service has no final result')
     outcome = read(result)
     if outcome.get('status') != 'complete':
@@ -2240,7 +2244,13 @@ def main() -> int:
 def execute_gate_worker(folder: Path, worker: Callable[[], GateWorker]) -> int:
     if (folder / 'outcome.json').exists() and read(folder / 'outcome.json').get('status') != 'pending':
         return 0
-    outcome = worker().execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json'))
+    request = read(folder / 'request.json')
+    outcome: dict[str, object]
+    if (request.get('source_form') == 'regional-bundle' and not (folder / 'launch.json').exists()
+            and not (folder / gate_source.SOURCE_ARCHIVE).is_file()):
+        outcome = {'status': 'fallback', 'reason': 'The gate source archive is absent'}
+    else:
+        outcome = worker().execute(folder, request, read(folder / 'deployment.json'))
     save(folder / 'outcome.json', outcome)
     return 0
 
