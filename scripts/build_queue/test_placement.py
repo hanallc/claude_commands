@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -4477,6 +4478,45 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             self.assertEqual(evidence.eligibility, ALLOWED_HOST)
             read.assert_called_once()
             self.assertEqual(conf.read(settings).text("execution_transport"), "ssh")
+
+    def test_newer_hana_free_reading_cannot_pass_a_session_block(self) -> None:
+        from scripts.aws_target import hana_spend
+        from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock
+
+        with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
+            _, higher = self.idle_hana(fixture)
+            higher = replace(higher, since=fixture.clock.now() - 60)
+            block_owner = OwningSession("hana-block-owner")
+            lower = placement_request(fixture, session=block_owner, since=fixture.clock.now() - 10)
+            lower = replace(lower, profile=higher.profile, constraints=replace(higher.constraints, session=block_owner))
+            destination = higher.constraints.candidates[0].destination
+            paths = claim_state.state_paths(destination.target)
+            paths.block.parent.mkdir(parents=True, exist_ok=True)
+            since = datetime.fromtimestamp(fixture.clock.now(), UTC)
+            mac_test.write_block(paths.block, mac_test.ActiveMacBlock(
+                "fixture", "private hold", since, since + timedelta(hours=1),
+                mac_test.RecordedSession(block_owner.session_id, "fixture"), mac_test.NO_SHOWRUNNER,
+                "off_before", mac_test.FREE_MESSAGE_NOT_NEEDED))
+
+            self.assertIsInstance(fixture.connect(higher).replies()[-1], wire.PlacementWait)
+            self.assertIsInstance(fixture.connect(lower).replies()[-1], wire.PlacementWait)
+            with hana_command_lock(fixture.root / "hana-state") as access:
+                self.assertIs(access, HanaCommandAccess.ACQUIRED)
+                held = self.read_target(fixture, higher)
+            assert isinstance(held, placement.FreshHostEvidence), held
+            fixture.server.publish_host_evidence(replace(held, observed_at=fixture.clock.now()))
+            fixture.clock.advance(1)
+            with mock.patch.object(hana_spend.HanaSpending, "preview_start",
+                                   return_value=hana_spend.StartAffordable(0)):
+                free = self.read_target(fixture, lower)
+            assert isinstance(free, placement.FreshHostEvidence), free
+            self.assertEqual(free.eligibility, ALLOWED_HOST)
+            fixture.server.publish_host_evidence(replace(free, observed_at=fixture.clock.now()))
+            _ = fixture.run_pass()
+
+            self.assertNotIn(higher.episode, fixture.server.current_assignments)
+            self.assertEqual(assignment_for(fixture, lower).destination, destination)
+            self.assertEqual(held.eligibility, placement.TemporaryExclusion("blocked"))
 
     def test_hana_probe_reports_the_path_and_key_for_duplicate_fallback_types(self) -> None:
         with PlacementFixture() as fixture, redirect_stderr(io.StringIO()):
