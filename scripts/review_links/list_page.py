@@ -403,6 +403,19 @@ def signed_item_request(entry: ListRecord, secret: str) -> tuple[str, str]:
     return request, signed_token(secret, entry.keeper, entry.item.id, request)
 
 
+class SignedTagRequest(TypedDict):
+    request: str
+    token: str
+
+
+def signed_tag_request(root: Path, keeper: staff.StaffId, identity: str) -> SignedTagRequest:
+    item = the_list.load(keeper, identity)
+    if item.state == the_list.ItemState.CLOSED:
+        raise ValueError("the List item is closed")
+    request, token = signed_item_request(ListRecord(keeper, item), form_secret(root))
+    return {"request": request, "token": token}
+
+
 def signed_form_fields(entry: ListRecord, secret: str) -> str:
     request, token = signed_item_request(entry, secret)
     fields = {"keeper": entry.keeper, "id": entry.item.id, "request": request, "token": token}
@@ -641,6 +654,63 @@ def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *,
             + '<span role="status" data-send-status></span></form>')
 
 
+TagChipAction = Literal["all", "filter", "row", "remove", "choice", "create"]
+
+
+class NoTagCount(Enum):
+    HIDDEN = "hide the count"
+
+
+class TagCountSlot(Enum):
+    TEMPLATE = "fill the count in the browser"
+
+
+def tag_chip(text: str, action: TagChipAction, count: int | NoTagCount | TagCountSlot = NoTagCount.HIDDEN) -> str:
+    value = html.escape(text, quote=True)
+    attrs = f'data-tag-{action} data-list-tag="{value}"'
+    if action in ("all", "filter", "row"):
+        attrs += f' aria-pressed="{str(action == "all").lower()}"'
+    elif action == "remove":
+        attrs += f' aria-label="Remove tag {value}"'
+    label = f'<span data-tag-label>{html.escape(text)}</span>'
+    if action == "remove":
+        label += '<span aria-hidden="true">×</span>'
+    if isinstance(count, int):
+        label += f'<b>{count}</b>'
+    elif count is TagCountSlot.TEMPLATE:
+        label += '<b></b>'
+    return f'<button type="button" class="list-tag-chip" {attrs}>{label}</button>'
+
+
+def tag_templates() -> str:
+    chips = (tag_chip("", "filter", TagCountSlot.TEMPLATE) + tag_chip("", "row") + tag_chip("", "remove")
+             + tag_chip("", "choice", TagCountSlot.TEMPLATE) + tag_chip("", "create"))
+    return ('<template id="list-tag-chips">' + chips + '</template>'
+            + '<template id="list-tag-editor"><section class="list-tag-editor" data-tag-editor><h3>Tags</h3>'
+            + '<div class="list-tag-controls">'
+            + '<div data-tag-editor-chips></div><div data-tag-undo-slot></div>'
+            + tag_field("Add tag")
+            + '</div><p data-tag-pending role="status" hidden></p>'
+            + '<p data-tag-error role="status" hidden></p></section></template>')
+
+
+def tag_field(label: str, identity: str = "") -> str:
+    attribute = f' id="{identity}"' if identity else ''
+    return (f'<div class="list-tag-field"><input type="text" data-tag-input{attribute}'
+            + f' aria-label="{label}" autocomplete="off" placeholder="+ tag">'
+            + '<div data-tag-choices role="group" aria-label="Tag suggestions" hidden></div></div>')
+
+
+def tag_filter(items: list[ListRecord]) -> str:
+    counts = the_list.tag_counts(entry.item for entry in items)
+    chips = tag_chip("All", "all", len(items)) + ''.join(
+        tag_chip(tag.text, "filter", counts[tag]) for tag in sorted(counts, key=lambda tag: tag.text))
+    return record_table.labelled_chip_row(
+        "Tag", '<div data-tag-filter-chips>' + chips + '</div>' + tag_field("Filter by tag", "list-tag-search")
+        + '<button type="button" data-tag-chip hidden></button>',
+        chip_classes="list-tag-filter", chip_id="list-tag")
+
+
 def waiting_details(entry: ListRecord, today: datetime, names: staff_names.StaffNames,
                     unread_answers: frozenset[str], secret: str,
                     reviews: ReviewDisplay, parking_label: str) -> str:
@@ -704,6 +774,11 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     title = '<strong>' + html.escape(item.title) + '</strong>'
     if item.unit:
         title += '<small>' + field_html("unit", item.unit, today, names) + '</small>'
+    if item.tags:
+        tags = html.escape(json.dumps([tag.text for tag in item.tags], ensure_ascii=False), quote=True)
+        attrs += f' data-tags="{tags}"'
+        title += '<div class="list-row-tags" data-row-tags>' + ''.join(
+            tag_chip(tag.text, "row") for tag in item.tags) + '</div>'
     tone = {the_list.ItemState.WAITING_FOR_NATE: "warning", the_list.ItemState.BLOCKED: "error",
             the_list.ItemState.WORKING: "accent", the_list.ItemState.DELIVERED: "room",
             the_list.ItemState.DONE: "room"}.get(item.state, "muted")
@@ -793,6 +868,37 @@ class ListUnparkSubmission:
         return self.outcome
 
 
+class ListTagAction(StrEnum):
+    ADD = "add-tag"
+    REMOVE = "remove-tag"
+
+
+@dataclass(frozen=True)
+class TagRemoval:
+    request: str
+    tag: the_list.Tag
+
+    def source_prefix(self) -> str:
+        fingerprint = hashlib.sha256(json.dumps((self.request, self.tag.text)).encode()).hexdigest()
+        return f"{the_list.PAGE_SOURCE} tag removal {fingerprint}."
+
+    def recover_removed_tags(self, item: the_list.ListItem) -> list[str]:
+        if self.tag in item.tags:
+            return []
+        prefix = self.source_prefix()
+        for entry in reversed(item.log):
+            if isinstance(entry.what, the_list.TagsChanged):
+                if self.tag in entry.what.tags:
+                    break
+                if entry.source.startswith(prefix):
+                    return [self.tag.text]
+        return []
+
+
+class NoTagRemoval(Enum):
+    CHECK_CURRENT_TAGS = "read current tags without checking a removal"
+
+
 ListActionSubmission = ListFeedbackDelivery | ListQuestionDelivery | ListUnparkSubmission | change_page.NoMessageDelivery
 
 
@@ -814,15 +920,23 @@ class SavedActionState(TypedDict):
     detail_html: NotRequired[str]
     detail_revision: NotRequired[str]
     detail_closed: NotRequired[bool]
+    tags: NotRequired[list[str]]
+    removed_tags: NotRequired[list[str]]
 
 
 def saved_action_state(keeper: str, identity: str, *, status: change_page.DeliveryStatus | None = None,
                        park_request: str = "",
                        review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK,
-                       include_detail: bool = False) -> SavedActionState:
+                       include_detail: bool = False,
+                       tag_removal: TagRemoval | NoTagRemoval = NoTagRemoval.CHECK_CURRENT_TAGS) -> SavedActionState:
     owner = staff.StaffId(keeper)
-    return action_state(owner, the_list.load(owner, identity), status=status,
-                        park_request=park_request, review_records=review_records, include_detail=include_detail)
+    item = the_list.load(owner, identity)
+    saved = action_state(owner, item, status=status, park_request=park_request,
+                         review_records=review_records, include_detail=include_detail)
+    saved["tags"] = [tag.text for tag in item.tags]
+    if isinstance(tag_removal, TagRemoval):
+        saved["removed_tags"] = tag_removal.recover_removed_tags(item)
+    return saved
 
 
 def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
@@ -921,18 +1035,35 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
         if not secrets.compare_digest(token, bootstrap.encode()):
             raise question_record.AnswerRefused("the List token does not match this page")
     action, words, until = fields["action"][0], fields["words"][0].strip(), fields["until"][0]
-    read_edit = None
-    if action == "read":
-        read_edit = the_list.mark_read_edit(keeper, identity, source=the_list.PAGE_SOURCE, update=prefix.seen_update,
-                                           page_request=the_list.PageRequest(request, "read", words))
-        delivery = _notice_delivery(keeper, read_edit.item, request)
+    changed_item: the_list.ListItem | None = None
+    removed_tags: list[str] = []
+    edits_tags = action in (ListTagAction.ADD, ListTagAction.REMOVE)
+    if edits_tags:
+        tag = the_list.Tag(fields["words"][0])
+        if action == ListTagAction.ADD:
+            changed_item = the_list.add_tag(keeper, identity, tag, source=the_list.PAGE_SOURCE)
+        else:
+            # The log identifies this write even if the browser loses the reply.
+            source = TagRemoval(request, tag).source_prefix() + secrets.token_hex(16)
+            changed_item = the_list.remove_tag(keeper, identity, tag, source=source)
+            if changed_item.log and changed_item.log[-1].source == source:
+                removed_tags.append(tag.text)
+        delivery = change_page.NoMessageDelivery()
+    elif action == "read":
+        changed_item = the_list.mark_read_edit(
+            keeper, identity, source=the_list.PAGE_SOURCE, update=prefix.seen_update,
+            page_request=the_list.PageRequest(request, "read", words)).item
+        delivery = _notice_delivery(keeper, changed_item, request)
     else:
         delivery = _submit_action(root, keeper, identity, request, prefix, action, words, until, status)
     if not include_detail:
         return delivery, None
     try:
-        item = read_edit.item if read_edit is not None else the_list.load(keeper, identity)
-        state = action_state(keeper, item, status=status, review_records=review_records, include_detail=True)
+        item = changed_item if changed_item is not None else the_list.load(keeper, identity)
+        state = action_state(keeper, item, status=status, review_records=review_records, include_detail=not edits_tags)
+        if edits_tags:
+            state["tags"] = [tag.text for tag in item.tags]
+            state["removed_tags"] = removed_tags
     except Exception as error:
         print(f"review-links List saved {identity}: {error}", file=sys.stderr)
         return delivery, None
@@ -1339,6 +1470,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<p data-review-refresh-error role="status" hidden></p>'
                + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
+               + f' data-tag-undo-seconds="{settings.whole("undo_seconds")}"'
                + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
@@ -1348,6 +1480,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + record_table.chip_row('Producer', staff_chips(members, producers), 'all')
                + record_table.words_box('list-search', 'Filter by number, owner, item or state')
                + '</div>'
+               + tag_filter(items)
                + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, 'all')
                + '<label class="list-unread-switch"><input type="checkbox" role="switch" id="list-unread" value="1">'
                + 'Unread only</label></div>'
@@ -1362,7 +1495,8 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<div class="list-table"><table aria-labelledby="list-linked-heading">' + columns
                + '<thead><tr>' + linked_headers + '</tr></thead></table></div></section>'
                + counts + '</div>'
-               + page_frame.CONSOLE_DIALOG_ASSETS
+               + (tag_templates() + '<div id="list-tag-notices" aria-live="polite"></div>'
+                  + page_frame.CONSOLE_DIALOG_ASSETS)
                + '<dialog data-list-review-dialog aria-label="Review card">'
                + '<button class="list-review-close" type="button" data-close autofocus>Close</button></dialog>'
                + record_table.render_inline_detail()
@@ -1370,7 +1504,44 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
 
-STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_page.QUESTION_COLOR_RULE + '''
+TAG_STYLE = """
+.list-tag-controls,.list-row-tags,.list-tag-filter,
+[data-tag-filter-chips],[data-tag-editor-chips],[data-tag-undo-slot]{
+display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-width:0;max-width:100%}
+[data-tag-editor-chips]:empty,[data-tag-undo-slot]:empty{display:none}
+.list-row-tags:not(:empty){margin-top:4px}
+.list-tag-filter{min-height:36px}
+.list-tag-chip,.list-tag-field input{
+box-sizing:border-box;padding:3px 8px;font:inherit;font-size:13px;line-height:1.35;
+border:1px solid var(--line);background:var(--card);color:var(--ink);max-width:100%}
+.list-tag-chip{display:inline-flex;align-items:center;gap:6px;margin:0;min-height:26px;
+border-radius:999px;overflow-wrap:anywhere;cursor:pointer}
+.list-tag-chip b{font-variant-numeric:tabular-nums}.list-tag-chip b:empty{display:none}
+.list-tag-chip [aria-hidden]{color:var(--ink-2)}
+.list-tag-chip:hover{border-color:var(--ink-3)}
+.list-tag-chip[aria-pressed=true]{background:var(--filter-selected-bg);border-color:var(--filter-selected-ink);
+color:var(--filter-selected-ink)}
+.list-tag-field{position:relative;max-width:100%}
+.list-tag-field input{width:8rem;min-height:26px;border-radius:8px}
+.list-tag-field input:is(:focus,:not(:placeholder-shown)){border-color:var(--accent)}
+[data-tag-choices]{position:absolute;z-index:3;inset-block-start:calc(100% + 4px);inset-inline-start:0;
+display:grid;justify-items:start;gap:4px;box-sizing:border-box;width:max-content;
+max-width:min(18rem,70vw,var(--tag-menu-width,100vw));max-height:min(14rem,var(--tag-menu-height,100vh));
+overflow:auto;padding:4px;border:1px solid var(--line);border-radius:8px;background:var(--card)}
+[data-tag-choices][data-tag-above]{inset-block-start:auto;inset-block-end:calc(100% + 4px)}
+[data-tag-choices][hidden]{display:none}
+.list-tag-editor .list-tag-controls{margin-bottom:4px}
+[data-tag-pending],[data-tag-error]{margin:4px 0 0;font-size:13px}
+[data-tag-pending]{color:var(--ink-2)}[data-tag-error]{color:var(--error)}
+[data-tag-empty]:not([aria-pressed=true]){color:var(--ink-3)}
+#list-tag-notices{position:fixed;z-index:3;inset:auto 16px 24px;display:grid;justify-items:center;pointer-events:none}
+.list-tag-notice{display:inline-flex;align-items:center;flex-wrap:wrap;gap:6px;padding:2px 8px;max-width:100%;
+border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);font-size:13px;
+overflow-wrap:anywhere;pointer-events:auto}
+.list-tag-notice button{border:none;background:none;color:var(--accent);font:inherit;cursor:pointer;padding:2px}
+"""
+
+STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + TAG_STYLE + review_page.QUESTION_COLOR_RULE + '''
 [data-list-review-dialog]{position:fixed;inset:0;margin:calc(var(--page-window-top,0px) + 16px) auto auto;
 width:min(1060px,calc(100% - 48px));
 max-width:none;max-height:none;padding:0;border:1px solid var(--line);border-radius:12px;
@@ -1482,9 +1653,365 @@ content:attr(data-label) ': ';color:var(--ink-3)}
 }
 </style>'''
 
+TAG_SCRIPT = r"""
+const tagChipTemplate=document.querySelector('#list-tag-chips').content;
+const tagEditorTemplate=document.querySelector('#list-tag-editor').content;
+const tagNotices=document.querySelector('#list-tag-notices');
+const tagDrafts=new Map(),tagErrors=new Map(),tagSaves=new Map(),tagUndos=new Map();
+const tagRequests=new Map();
+let tagCatalog=new Set(),tagCounts=new Map(),selectedTags=[],tagFilterText='';
+let savedTagFilter='',savedTagSelection=[];
+function listTagSelection(value){
+ if(value===savedTagFilter) return savedTagSelection;
+ savedTagFilter=value;
+ try{
+  const tags=JSON.parse(value || '[]');
+  savedTagSelection=Array.isArray(tags) ? tags.filter(tag=>typeof tag==='string') : [];
+ }catch{savedTagSelection=[];}
+ return savedTagSelection;
+}
+function listTags(item){return item?.dataset.tags ? JSON.parse(item.dataset.tags) : [];}
+function listTagChip(tag,kind,count){
+ const button=tagChipTemplate.querySelector('[data-tag-'+kind+']').cloneNode(true);
+ button.dataset.listTag=tag;
+ button.querySelector('[data-tag-label]').textContent=kind==='create' ? 'Create "'+tag+'"' : tag;
+ if(kind==='remove') button.setAttribute('aria-label','Remove tag '+tag);
+ if(count!==undefined) button.querySelector('b').textContent=count;
+ return button;
+}
+function showListTagSelection(active,rows,matches){
+ selectedTags=listTagSelection(active.filters.tag);
+ const selection={...active,filters:{...active.filters,tag:''}};
+ tagCatalog=new Set();tagCounts=new Map();
+ let allCount=0;
+ for(const row of rows){
+  const tags=listTags(row),included=matches(row,selection);
+  if(included) allCount++;
+  for(const tag of tags){
+   tagCatalog.add(tag);
+   if(included) tagCounts.set(tag,(tagCounts.get(tag) ?? 0)+1);
+  }
+ }
+ const chips=content.querySelector('[data-tag-filter-chips]');
+ const all=chips.querySelector('[data-tag-all]');
+ all.setAttribute('aria-pressed',String(!selectedTags.length));
+ all.querySelector('b').textContent=allCount;
+ const choices=new Set([...tagCatalog,...selectedTags]);
+ for(const chip of chips.querySelectorAll('[data-tag-filter]')){
+  if(!choices.has(chip.dataset.listTag)) chip.remove();
+ }
+ const existing=new Map([...chips.querySelectorAll('[data-tag-filter]')].map(chip=>[chip.dataset.listTag,chip]));
+ let previous=all;
+ for(const tag of [...choices].sort()){
+  const count=tagCounts.get(tag) ?? 0;
+  const chip=existing.get(tag) ?? listTagChip(tag,'filter',count);
+  if(previous.nextElementSibling!==chip) previous.after(chip);
+  previous=chip;
+  chip.querySelector('b').textContent=count;
+  chip.setAttribute('aria-pressed',String(selectedTags.includes(tag)));
+  chip.toggleAttribute('data-tag-empty',count===0);
+ }
+ for(const chip of content.querySelectorAll('[data-tag-row]')){
+  const pressed=String(selectedTags.includes(chip.dataset.listTag));
+  if(chip.getAttribute('aria-pressed')!==pressed) chip.setAttribute('aria-pressed',pressed);
+ }
+}
+function setListTagSelection(tags){
+ const control=content.querySelector('#list-tag > [data-tag-chip]');
+ control.dataset.tagChip=tags.length ? JSON.stringify(tags) : '';
+ control.click();
+}
+function normalizeListTag(value){return value.trim().toLowerCase().replace(/\s+/g,' ');}
+function bindTagField(field,{currentTags,choose,removeLast,writeText,create=false}){
+ const input=field.querySelector('[data-tag-input]'),choices=field.querySelector('[data-tag-choices]');
+ const hide=()=>{choices.hidden=true;choices.replaceChildren();};
+ const select=tag=>{hide();choose(tag);input.focus({preventScroll:true});};
+ const suggest=()=>{
+  const query=normalizeListTag(input.value);
+  const chosen=currentTags();
+  const matches=query ? [...tagCatalog.keys()].filter(tag=>tag.startsWith(query) && !chosen.includes(tag)).sort() : [];
+  const options=matches.map(tag=>{
+   const choice=listTagChip(tag,'choice',create ? undefined : (tagCounts.get(tag) ?? 0));
+   choice.addEventListener('click',()=>select(tag));
+   return choice;
+  });
+  if(create && query && query!=='none' && !query.includes(',') && !tagCatalog.has(query)){
+   const choice=listTagChip(query,'create');
+   choice.addEventListener('click',()=>select(input.value));
+   options.push(choice);
+  }
+  choices.replaceChildren(...options);
+  choices.hidden=!options.length;
+  if(options.length){
+   const card=field.closest('[data-tag-editor]')?.getBoundingClientRect();
+   const left=Math.max(8,card?.left ?? 0);
+   const right=Math.min(document.documentElement.clientWidth-8,card?.right ?? Infinity);
+   choices.style.setProperty('--tag-menu-width',Math.max(0,right-left)+'px');
+   choices.style.marginInlineStart='';
+   choices.style.removeProperty('--tag-menu-height');
+   choices.removeAttribute('data-tag-above');
+   const box=choices.getBoundingClientRect();
+   const offset=Math.max(left,Math.min(box.left,right-box.width))-box.left;
+   if(offset) choices.style.marginInlineStart=offset+'px';
+   const panel=field.closest('.list-panel')?.getBoundingClientRect();
+   if(panel && box.bottom>panel.bottom){
+    const above=field.getBoundingClientRect().top-panel.top-4;
+    const below=panel.bottom-box.top;
+    const opensAbove=above>below;
+    choices.toggleAttribute('data-tag-above',opensAbove);
+    choices.style.setProperty('--tag-menu-height',Math.max(0,opensAbove ? above : below)+'px');
+   }
+  }
+  return matches;
+ };
+ input.addEventListener('input',()=>{writeText(input.value);suggest();});
+ field.addEventListener('focusout',event=>{if(!field.contains(event.relatedTarget)) hide();});
+ field.addEventListener('keydown',event=>{
+  if(event.isComposing) return;
+  if(event.key==='Escape' && !choices.hidden){
+   event.preventDefault();event.stopPropagation();hide();input.focus({preventScroll:true});
+  }
+  if(event.target!==input) return;
+  if(event.key==='ArrowDown'){
+   if(choices.hidden) suggest();
+   const first=choices.firstElementChild;
+   if(first){event.preventDefault();first.focus();}
+  }
+  if(event.key==='Backspace' && !input.value && !event.repeat){
+   const last=currentTags().at(-1);
+   if(last!==undefined){event.preventDefault();removeLast(last);}
+  }
+  if(event.key==='Enter'){
+   event.preventDefault();
+   if(create) select(input.value);
+   else{
+    const matches=suggest();
+    const tag=matches.find(tag=>tag===normalizeListTag(input.value)) ?? matches[0];
+    if(tag!==undefined) select(tag);
+   }
+  }
+ });
+}
+function bindListTags(){
+ const filter=content.querySelector('#list-tag'),field=filter.querySelector('.list-tag-field');
+ const chips=filter.querySelector('[data-tag-filter-chips]');
+ field.querySelector('input').value=tagFilterText;
+ const choose=tag=>{
+  field.querySelector('input').value=tagFilterText='';
+  setListTagSelection([...new Set([...selectedTags,tag])]);
+ };
+ bindTagField(field,{currentTags:()=>selectedTags,choose,
+  removeLast:tag=>setListTagSelection(selectedTags.filter(value=>value!==tag)),
+  writeText:value=>tagFilterText=value});
+ chips.addEventListener('click',event=>{
+  const chip=event.target.closest('[data-tag-filter],[data-tag-all]');
+  if(!chip) return;
+  const tag=chip.dataset.listTag;
+  setListTagSelection(chip.hasAttribute('data-tag-all') ? [] : selectedTags.includes(tag)
+   ? selectedTags.filter(value=>value!==tag) : [...selectedTags,tag]);
+ });
+ content.addEventListener('click',event=>{
+  const chip=event.target.closest('[data-tag-row]');
+  if(chip) choose(chip.dataset.listTag);
+ });
+}
+function listTagEditor(item){return recordDetails(item)?.querySelector('[data-tag-editor]');}
+function tagRequest(key,keeper,id){
+ const form=recordDetails(rowIn(content,key))?.querySelector('[data-feedback-form]');
+ if(form) return {request:form.elements.request.value,token:form.elements.token.value};
+ if(!tagRequests.has(key)){
+  const query=new URLSearchParams({'tag-fields':id,keeper});
+  tagRequests.set(key,fetch(location.pathname+'?'+query,{cache:'no-store',signal:listRequestSignal()})
+   .then(response=>{
+    if(!response.ok) throw new Error('Could not prepare the tag edit.');
+    return response.json();
+   }).catch(error=>{tagRequests.delete(key);throw error;}));
+ }
+ return tagRequests.get(key);
+}
+function pendingTags(key){
+ const tags=new Set(listTags(rowIn(content,key)));
+ for(const edit of tagSaves.get(key)?.edits ?? []){
+  const tag=normalizeListTag(edit.words);
+  if(edit.action==='remove-tag') tags.delete(tag);
+  else if(tag && tag!=='none' && !/[,\r\n]/.test(edit.words)) tags.add(tag);
+ }
+ return [...tags];
+}
+function showTagEditorStatus(key,editor=listTagEditor(rowIn(content,key))){
+ if(!editor) return;
+ const status=editor.querySelector('[data-tag-error]'),pending=editor.querySelector('[data-tag-pending]');
+ const error=tagErrors.get(key) ?? '';
+ const count=tagSaves.get(key)?.edits.length ?? 0;
+ status.textContent=error;
+ status.hidden=!error;
+ pending.textContent=count===1 ? 'Saving tag…' : count ? count+' tag edits pending.' : '';
+ pending.hidden=!count;
+}
+function mountTagEditor(item){
+ if(listTagEditor(item)) return;
+ const detail=recordDetails(item),panel=detail.querySelector('[data-list-item-content]');
+ if(!panel) return;
+ const key=item.dataset.key,editor=tagEditorTemplate.firstElementChild.cloneNode(true);
+ const input=editor.querySelector('[data-tag-input]');
+ input.id='list-tag-add-'+key;
+ const status=editor.querySelector('[data-tag-error]'),pending=editor.querySelector('[data-tag-pending]');
+ status.id=input.id+'-error';pending.id=input.id+'-pending';
+ input.setAttribute('aria-describedby',status.id+' '+pending.id);
+ input.value=tagDrafts.get(key)?.text ?? '';
+ editor.querySelector('[data-tag-editor-chips]').append(...listTags(item).map(tag=>listTagChip(tag,'remove')));
+ const waiting=panel.querySelector('[data-waiting-questions]');
+ if(waiting) waiting.after(editor);else panel.prepend(editor);
+ const [keeper,id]=key.split('/');
+ void Promise.resolve(tagRequest(key,keeper,id)).catch(()=>{});
+ showTagEditorStatus(key,editor);
+ const add=tag=>void queueTagSave(key,'add-tag',tag);
+ const remove=tag=>void queueTagSave(key,'remove-tag',tag);
+ bindTagField(editor.querySelector('.list-tag-field'),{
+  currentTags:()=>pendingTags(key),choose:add,removeLast:remove,create:true,
+  writeText:text=>{
+   tagDrafts.set(key,{text});
+   tagErrors.delete(key);
+   showTagEditorStatus(key,editor);
+  }
+ });
+ editor.addEventListener('click',event=>{
+  const button=event.target.closest('[data-tag-remove]');
+  if(button) remove(button.dataset.listTag);
+ });
+}
+function updateListTags(item,tags,keepFocus){
+ if(tags.length) item.dataset.tags=JSON.stringify(tags);
+ else delete item.dataset.tags;
+ const title=item.querySelector('[data-label="Item"]');
+ let rowChips=title.querySelector('[data-row-tags]');
+ if(tags.length){
+  if(!rowChips){
+   rowChips=document.createElement('div');
+   rowChips.className='list-row-tags';
+   rowChips.dataset.rowTags='';
+   title.append(rowChips);
+  }
+  rowChips.replaceChildren(...tags.map(tag=>listTagChip(tag,'row')));
+ }else rowChips?.remove();
+ const editor=listTagEditor(item);
+ if(editor){
+  const chips=editor.querySelector('[data-tag-editor-chips]');
+  if(keepFocus && chips.contains(document.activeElement)) editor.querySelector('[data-tag-input]').focus({preventScroll:true});
+  chips.replaceChildren(...tags.map(tag=>listTagChip(tag,'remove')));
+ }
+}
+function placeTagUndos(){
+ const active=tableView.openItem;
+ const slot=active && !active.hidden ? listTagEditor(active)?.querySelector('[data-tag-undo-slot]') : null;
+ for(const [notice,key] of tagUndos){
+  const place=slot && active.dataset.key===key ? slot : tagNotices;
+  if(notice.parentNode!==place) place.append(notice);
+ }
+}
+function offerTagUndo(key,tag){
+ const duration=Number(content.dataset.tagUndoSeconds)*1000;
+ if(!duration) return;
+ const notice=document.createElement('div'),label=document.createElement('span'),button=document.createElement('button');
+ notice.className='list-tag-notice';
+ label.textContent='Removed "'+tag+'".';
+ button.type='button';button.textContent='Undo';
+ button.setAttribute('aria-label','Undo removal of '+tag);
+ notice.append(label,button);
+ tagUndos.set(notice,key);
+ placeTagUndos();
+ const fade=notice.animate([{opacity:1},{opacity:1,offset:.5},{opacity:0}],{duration,fill:'forwards'});
+ const remove=()=>{tagUndos.delete(notice);notice.remove();};
+ void fade.finished.then(remove,remove);
+ button.addEventListener('click',async()=>{
+  if(button.disabled || fade.playState==='finished') return;
+  button.disabled=true;fade.pause();
+  if(await queueTagSave(key,'add-tag',tag,{undo:true})){
+   fade.cancel();
+   return;
+  }
+  label.textContent='Could not restore "'+tag+'".';
+  button.disabled=false;fade.play();
+ });
+}
+function queueTagSave(key,action,tag,{undo=false}={}){
+ const edit={action,words:tag};
+ const draft=tagDrafts.get(key);
+ const queue=tagSaves.get(key) ?? {tail:Promise.resolve(),edits:[]};
+ tagSaves.set(key,queue);
+ queue.edits.push(edit);
+ tagErrors.delete(key);
+ startListSave();
+ showTagEditorStatus(key);
+ queue.tail=queue.tail.then(()=>saveListTag(key,edit,draft,undo)).finally(()=>{
+  queue.edits.shift();
+  if(!queue.edits.length) tagSaves.delete(key);
+  showTagEditorStatus(key);
+  saving--;
+  refreshAfterListSave(true);
+ });
+ return queue.tail;
+}
+async function readTagResult(response){
+ const result=await response.json();
+ if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
+ if(!Array.isArray(result.tags) || !result.tags.every(tag=>typeof tag==='string'))
+  throw new Error('The response has no saved tags.');
+ return result;
+}
+async function saveListTag(key,edit,draft,undo){
+ const [keeper,id]=key.split('/');
+ const {action,words}=edit;
+ const fields=tagRequest(key,keeper,id);
+ let request='',result,saved=false;
+ try{
+  const signed=fields instanceof Promise ? await fields : fields;
+  const {token}=signed;
+  request=signed.request;
+  if(action==='remove-tag'){
+   const nonce=Array.from(crypto.getRandomValues(new Uint8Array(16)),byte=>byte.toString(16).padStart(2,'0')).join('');
+   request=request.replace(/\.[a-f0-9]{32}$/,'')+'.'+nonce;
+  }
+  const body=new URLSearchParams({action,words,until:'',keeper,id,request,token});
+  result=await readTagResult(await fetch(location.pathname,{method:'POST',body,signal:listRequestSignal()}));
+  saved=true;
+ }catch(error){
+  let message=error.message;
+  if(request){
+   const query=new URLSearchParams({'item-state':id,keeper});
+   if(action==='remove-tag'){
+    query.set('tag-removal-request',request);
+    query.set('tag-removal',words);
+   }
+   try{
+    result=await readTagResult(await fetch(location.pathname+'?'+query,{cache:'no-store',signal:listRequestSignal()}));
+   }catch{
+    message+=' The current tags could not be read.';
+   }
+  }
+  if(tagSaves.get(key).edits.at(-1)===edit) tagErrors.set(key,message);
+ }
+ const tags=result?.tags;
+ const item=rowIn(content,key),editor=listTagEditor(item);
+ if(saved && action==='add-tag' && !undo && tagDrafts.get(key)===draft){
+  tagDrafts.delete(key);
+  if(editor) editor.querySelector('[data-tag-input]').value='';
+ }
+ if(item && tags) tableView.preserveRecordRowTop(()=>{
+  updateListTags(item,tags,listOwnsFocus());
+  tableView.apply();
+ });
+ if(action==='remove-tag'){
+  for(const tag of result?.removed_tags ?? []) offerTagUndo(key,tag);
+ }
+ return saved || Boolean(undo && tags?.includes(words));
+}
+"""
+
+
 SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + page_frame.MOTION_SCRIPT + record_table.SCRIPT
           + record_table.DATE_TIME_SCRIPT + '''(() => {
-''' + question_path.queue_script() + '''
+''' + question_path.queue_script() + TAG_SCRIPT + '''
 const queuesByState=''' + json.dumps(QUEUE_BY_STATE) + ''';
 const chipsByQueue=''' + json.dumps(CHIP_BY_QUEUE) + ''';
 const newAnswerMarkup=''' + json.dumps(question_path.NEW_ANSWER_HTML) + ''';
@@ -1575,6 +2102,7 @@ function syncUnread(item,form,unread,unreadSort){
 }
 function installListDetail(item){
   const detail=recordDetails(item),form=detail.querySelector('[data-feedback-form]');
+  mountTagEditor(item);
   if(form && !form.retainDraft) bindFeedbackForm(form);
   tableView.showDraftCopy(drafts.get(item.dataset.key)?.words,form?.elements.words?.type==='textarea');
 }
@@ -1607,10 +2135,11 @@ const tableView=createRecordTable({content:()=>content,
   else if((show==='open' || show==='all' || show==='unread' || !show) && Object.hasOwn(chipsByState,state))
    params.set('show',stateChip);
  },
- filters:['producer','unread'],
+ filters:['producer','unread','tag'],
  staffChipFilters:['owner','producer'],
  emptyFilters:(root,{filters})=>[
   ...activeChipLabels(root,'[data-filter-row] [aria-pressed="true"]:not([data-filter-value="all"])'),
+  ...listTagSelection(filters.tag).map(tag=>'Tag: '+tag),
   ...(filters.unread ? ['Unread only'] : []),
  ],
  firstFilter:root=>root.querySelector('#filter-owner-all'),
@@ -1618,6 +2147,7 @@ const tableView=createRecordTable({content:()=>content,
  ownsFocus:listOwnsFocus,
  keepItemOnMissingLink:true,
  rememberItem:item=>{
+  listTagEditor(item)?.remove();
   recordDetails(item).querySelector('[data-feedback-form]')?.retainDraft?.();
  },
  itemRevision:item=>item.dataset.detailRevision,
@@ -1630,9 +2160,18 @@ const tableView=createRecordTable({content:()=>content,
   if(!number) return '';
   return 'Item #'+number+(closedKeys.has(key) ? ' is closed' : ' is not on the List');
  },
+ applied:(_items,active,{rows,matches})=>{
+  showListTagSelection(active,rows,matches);
+  placeTagUndos();
+ },
  filterValues:(data,search,{filters})=>{
   const chip=chipFor(data);
   if(!chip || (filters.unread && data.unread!=='true') || !matchesWords(data,search)) return null;
+  const tags=listTagSelection(filters.tag);
+  if(tags.length){
+   const itemTags=data.tags ? JSON.parse(data.tags) : [];
+   if(!tags.every(tag=>itemTags.includes(tag))) return null;
+  }
   return {show:chip==='all' ? [] : [chip],owner:[data.owner],producer:[data.producer]};
  },
  counts:(items,count,{counts})=>{
@@ -1673,6 +2212,7 @@ function sizeListColumns(){
 }
 addEventListener('resize',sizeListColumns);
 function bindListControls(){
+ bindListTags();
  const ownerNames=content.querySelectorAll('.list-owner-name');
  ownerNameWidth=0;
  if(ownerNames.length){
