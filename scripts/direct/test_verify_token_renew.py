@@ -132,9 +132,41 @@ TOKEN_USED=1 TOKEN_HELD=0 TOKEN_WAIT_FILE="$TEST_ROOT/token-waits" TOKEN_WAITED=
 BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_WAIT_FROM=0 BUILDLOG_MEM_OUTCOME=Granted passes=0
 HOLD_WAIT_DIR="$TEST_ROOT/hold"
 mkdir -p "$HOLD_WAIT_DIR"
+hold_first_sampler_tick() {
+    mkdir "$TEST_ROOT/first-sampler" 2>/dev/null || return 1
+    "$PY" -c '
+import os, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+temporary = root / "sampler-child.tmp"
+temporary.write_text(str(os.getpid()))
+temporary.replace(root / "sampler-child")
+if sys.argv[2] == "fifo":
+    with (root / "sampler-stop").open("rb") as stop:
+        stop.read()
+else:
+    sys.stdin.buffer.read()
+' "$TEST_ROOT" "$1" >/dev/null 2>&1
+}
+eval "$(declare -f buildlog_sample_anon | sed '1s/buildlog_sample_anon/sample_anon_actual/')"
+buildlog_sample_anon() {
+    # Main uses sleep. The fixed sampler uses the stop pipe.
+    sleep() { hold_first_sampler_tick fifo || command sleep "$@"; }
+    if declare -F buildlog_wait_sample_tick >/dev/null; then
+        eval "$(declare -f buildlog_wait_sample_tick | sed '1s/buildlog_wait_sample_tick/sample_tick_actual/')"
+        buildlog_wait_sample_tick() {
+            if hold_first_sampler_tick pipe; then return 1; fi
+            sample_tick_actual
+        }
+    fi
+    sample_anon_actual "$@"
+}
 eval "$(declare -f buildlog_exec_unowned | sed '1s/buildlog_exec_unowned/buildlog_exec_actual/')"
 buildlog_exec_unowned() {
     if [[ "$TEST_LOSE_AT_LAUNCH" == 1 && ! -f "$TEST_ROOT/lost-at-launch" ]]; then
+        if [[ "$TEST_SCOPED_ATTEMPT" == 1 ]]; then
+            "$PY" "$TEST_WAIT_HELPER" "$TEST_ROOT/sampler-child"
+        fi
         : > "$TEST_ROOT/lost-at-launch"
         bash "$BOARD_HELPER" release "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$
     fi
@@ -254,6 +286,7 @@ release_token
         self.assertEqual(self.live_group_processes(process.pid), [])
 
     def test_ownership_guard_refusal_readmits_before_running_and_records_only_the_step(self) -> None:
+        os.mkfifo(self.root / "sampler-stop")
         process = self.memory_wait_process(lose_at_launch=True, scoped_attempt=True)
         self.wait_for_running(self.root / "memory-wait", process)
         (self.root / "release").touch()
@@ -271,7 +304,8 @@ release_token
         self.assertEqual(len((self.root / "scoped-attempts").read_text().splitlines()), 2)
         self.assertEqual(list(self.root.glob("attempt.*.peak")), [], "discarded scope kept its peak file")
         self.assertEqual(list(self.root.glob("attempt.*.peak.cgroup")), [])
-        self.assertEqual(self.live_group_processes(process.pid), [])
+        child = int((self.root / "sampler-child").read_text())
+        self.assertEqual(self.live_group_processes(process.pid), [], f"sampler child PID {child}")
 
     def test_unstarted_noncompiling_step_reacquires_before_its_command(self) -> None:
         process = self.memory_wait_process(lose_at_launch=True, noncompiling=True)

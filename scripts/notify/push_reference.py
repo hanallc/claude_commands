@@ -1,4 +1,4 @@
-"""Identify the question or report that a kept push concerns."""
+"""Identify the question that a kept push concerns."""
 from __future__ import annotations
 
 import json
@@ -20,15 +20,11 @@ class QuestionReference(TypedDict):
     since: str
 
 
-class ReviewWatchReference(TypedDict):
-    kind: Literal["review_watch"]
-
-
 class NoReference(TypedDict):
     kind: Literal["none"]
 
 
-PushReference = QuestionReference | ReviewWatchReference | NoReference
+PushReference = QuestionReference | NoReference
 NO_REFERENCE: NoReference = {"kind": "none"}
 
 
@@ -39,8 +35,6 @@ def read_reference(value: object) -> PushReference:
         record = cast(dict[str, object], value)
         if record.get("kind") == "none":
             return NO_REFERENCE
-        if record.get("kind") == "review_watch":
-            return ReviewWatchReference(kind="review_watch")
         path, since = record.get("path"), record.get("since")
         if record.get("kind") == "question" and isinstance(path, str) and Path(path).is_absolute() and isinstance(since, str) and since:
             return QuestionReference(kind="question", path=path, since=since)
@@ -103,6 +97,4 @@ def admission_reference(text_id: str, question: str = "", forwarded: str = "", *
                 raise ValueError(f"question reopened since the push was made: {path}")
     if text_id == "decision.choices" and reference["kind"] != "question":
         raise ValueError("decision.choices requires --question with an open question record")
-    if text_id == "review_watch.acknowledge":
-        return ReviewWatchReference(kind="review_watch")
     return reference

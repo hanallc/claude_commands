@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 import subprocess
 
 from scripts.buildlog import store
@@ -12,6 +13,24 @@ from scripts.lib import git_files
 
 GIT_TIMEOUT_S = 5
 MANIFEST_IDENTITY_PREFIX = "manifest-path:"
+LINT_COPY_FOLDER_STEM = "verify-lint-copy"
+LINT_COPY_TREE_NAME = "tree"
+LINT_COPY_REPOSITORY_KEY_FILE = "repository-key"
+LINT_COPY_ALLOCATION_FILE = "allocation-id"
+LINT_COPY_ALLOCATION_BYTES = 16
+
+
+def lint_copy_folder_names(owner: str, allocation_id: str) -> tuple[str, str, str]:
+    """Return the lint copy names in allocation order."""
+    owner_folder = f"{LINT_COPY_FOLDER_STEM}-{owner}"
+    return LINT_COPY_FOLDER_STEM, owner_folder, f"{owner_folder}-{allocation_id}"
+
+
+_LINT_COPY_ALLOCATION_TOKEN = rf"[0-9a-f]{{{2 * LINT_COPY_ALLOCATION_BYTES}}}"
+_LINT_COPY_FOLDER_NAME = re.compile("|".join(lint_copy_folder_names(
+    r"(?:0|-?[1-9][0-9]*)", _LINT_COPY_ALLOCATION_TOKEN
+)))
+
 
 def output(args: list[str], cwd: str, timeout: float) -> str | None:
     try:
@@ -46,20 +65,46 @@ def remote_identity(remote: str, directory: str) -> str:
     return str(path.resolve()).rstrip("/").removesuffix(".git")
 
 
+def _lint_copy_key(tree: Path) -> str | None:
+    copy = tree.parent
+    if tree.name != LINT_COPY_TREE_NAME or not _LINT_COPY_FOLDER_NAME.fullmatch(copy.name):
+        return None
+    marker = copy / LINT_COPY_REPOSITORY_KEY_FILE
+    allocation = copy / LINT_COPY_ALLOCATION_FILE
+    try:
+        if marker.is_symlink() or not marker.is_file():
+            return None
+        if allocation.is_symlink() or not allocation.is_file():
+            return None
+        token = allocation.read_text(encoding="utf-8")
+        if not re.fullmatch(_LINT_COPY_ALLOCATION_TOKEN, token):
+            return None
+        return marker.read_text(encoding="utf-8").removesuffix("\n") or None
+    except (OSError, UnicodeError):
+        return None
+
+
 def repository_key(directory: str) -> str:
-    """Keep Git identities or use the nearest real manifest without Git."""
+    """Find the closest Git checkout or lint copy. Use the manifest as a fallback."""
     folder = Path(directory).resolve()
-    ceilings = {Path(value).resolve() for value in os.environ.get("GIT_CEILING_DIRECTORIES", "").split(os.pathsep) if value}
-    git_parents: list[Path] = []
-    for parent in (folder, *folder.parents):
-        if parent != folder and parent in ceilings:
-            break
-        git_parents.append(parent)
-    if folder.is_dir() and not any((parent / ".git").exists() for parent in git_parents):
-        for parent in (folder, *folder.parents):
-            manifest = parent / "Cargo.toml"
-            if manifest.is_file():
-                return MANIFEST_IDENTITY_PREFIX + str(manifest.resolve())
+    ceiling_paths = os.environ.get("GIT_CEILING_DIRECTORIES", "").split(os.pathsep)
+    ceilings = {Path(value).resolve() for value in ceiling_paths if value}
+    if folder.is_dir():
+        parents = (folder, *folder.parents)
+        search_git = True
+        for parent in parents:
+            if parent != folder and parent in ceilings:
+                search_git = False
+            if search_git and (parent / GIT_DIR).exists():
+                break
+            copy_key = _lint_copy_key(parent)
+            if copy_key is not None:
+                return copy_key
+        else:
+            for parent in parents:
+                manifest = parent / "Cargo.toml"
+                if manifest.is_file():
+                    return MANIFEST_IDENTITY_PREFIX + str(manifest.resolve())
     remote = output(["git", "-C", directory, "remote", "get-url", "origin"], directory, GIT_TIMEOUT_S)
     if remote and remote.strip():
         return remote_identity(remote.strip(), directory)
