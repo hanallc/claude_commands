@@ -171,11 +171,27 @@ def run_gate_step_command(command: list[str], folder: Path, locks: tuple[int, ..
         try:
             stdout, stderr = child.communicate()
         except BaseException:
-            with suppress(OSError):
-                child.send_signal(signal.SIGINT)
+            signal_attempt_finished = False
+            drain_output = True
             while True:
                 try:
-                    _ = child.communicate()
+                    if not signal_attempt_finished:
+                        with suppress(Exception):
+                            child.send_signal(signal.SIGINT)
+                        signal_attempt_finished = True
+                    if drain_output:
+                        try:
+                            _ = child.communicate()
+                            break
+                        except Exception:
+                            drain_output = False
+                    # Close the pipes so a writer cannot block while we wait.
+                    for stream in (child.stdout, child.stderr):
+                        if stream is not None:
+                            with suppress(Exception):
+                                stream.close()
+                    with suppress(Exception):
+                        _ = child.wait()
                     break
                 except KeyboardInterrupt:
                     continue
