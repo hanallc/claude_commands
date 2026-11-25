@@ -913,22 +913,16 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 ### Phase 25 — Refuse a removed config key that main still reads  · status: done
 
-**Depends on:** Phase 24
+#### As-built
 
-#### Work Order
+- User words (nate, 12:27 PST 2026-11-25 via morty): "the item 424 check may refuse a change that removes a config key that code on main still reads, and it names the key and the file."
+- The check exits 1 when the tip removes key K from config file C and the same source path on the base and the tip reads K from C. The refused line ends with `; main reads it too: refused`. A summary line `config key check: refused <N> reads of a removed key that main still reads` follows.
+- Precision over recall for the refusal only. Refusal forms: a Python inline loader call with one positional literal file and no keywords, or a reader name with one binding in the module; a literal key. Shell: `conf_value` or `conf.py get` with a literal file and key, in a source with no `<<` and no local `conf_value` function. Every other read stays advisory.
+- A read in dead code still refuses: it is main code that names a removed key.
+- The report keeps refused reads (`RefusedKeyRead`) apart from advisory reads. One line and one count per source occurrence.
+- Base blobs are scanned only for sources with a refusal candidate; an identical blob reuses the tip result.
 
-**Goal:** The main join check exits 1 when the tip removes or renames a config key and a source on main still reads that key. It names the key, the config file and the reading file and line.
+**Files:**
+- `scripts/production/fixture_conf_keys.py`, `scripts/production/test_fixture_conf_keys.py`, `docs/production_format.md` step 3
 
-**Spec:**
-- User words (nate, 12:27 PST via morty): "the item 424 check may refuse a change that removes a config key that code on main still reads, and it names the key and the file." This yes covers this check only. Make no other refusal. Change no config key or value.
-- Refuse a tip read of a removed key (a `RemovedKeyRead` from the phase 22 scan) when the same source path on the base revision also reads that key (same read scan run on the base blob of that source; any line). Such a read is main code that the change leaves broken.
-- A tip read of a removed key that the base source does not read stays report-only. Reads of a key that no config file holds stay report-only.
-- Scan base sources only for sources that have a tip read of a removed key. With no removed key, scan nothing more. The check must stay as fast as today.
-- Output: the refused read line ends with `; main reads it too: refused`. After the summary line, print `config key check: refused <N> reads of a removed key that main still reads` when N > 0. Exit 1 when N > 0 (as for a missing fixture key). The other exit codes do not change.
-- Update the module docstring and `docs/production_format.md` step 3: the check refuses these reads; the rest of the read list is advisory.
-
-**Files:** `scripts/production/fixture_conf_keys.py`, `docs/production_format.md` (impl); `scripts/production/test_fixture_conf_keys.py` (test).
-
-**Workers:** 1 writer + 1 tester. `impl` holds `fixture_conf_keys.py` and the doc; `test` holds `test_fixture_conf_keys.py`.
-
-**Acceptance gate:** basedpyright 0/0 on each changed file; the named tests of `scripts.production.test_fixture_conf_keys` pass; new tests (written first, failing first): a rename whose old key main still reads in an unchanged source is refused with exit 1 and the named line; a reader that the change itself updates is not refused; a removed-key read only in the change's new code is reported, not refused; an absent-key read is not refused. Real case: `--base ca31f2226d~1` style probe not needed; run `--repo . --base origin/main --tip HEAD` and report its output and time.
+**Gotchas:** The advisory scan was built for recall (phase 22). Three review rounds found false refusals until the refusal got its own precision rule.
