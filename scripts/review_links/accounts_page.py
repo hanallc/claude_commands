@@ -655,18 +655,22 @@ def _count_tooltip(cell_id: str, value: str, lines: Sequence[str],
             f' {attribute}="{tooltip}"')
 
 
-def _role_count_cell(role: str, assignments: list[tuple[str, accounts.BoardRow]], key: str,
-                     *, show_breakdown: bool, after: str = "") -> tuple[str, int | None]:
+def _role_count_total(assignments: list[tuple[str, accounts.BoardRow]], key: str) -> int | None:
+    counts = [line["cells"][key][0]["text"] for _, line in assignments]
+    return sum(int(count) for count in counts) if counts and all(count.isdecimal() for count in counts) else None
+
+
+def _role_count_cell(row_id: str, assignments: list[tuple[str, accounts.BoardRow]], key: str,
+                     *, show_breakdown: bool, after: str = "") -> str:
     if not assignments:
-        return _cell(after, "right"), None
-    counts = [(label, line["cells"][key][0]["text"]) for label, line in assignments]
-    total = sum(int(value) for _, value in counts) if all(value.isdecimal() for _, value in counts) else None
+        return _cell(after, "right")
+    total = _role_count_total(assignments, key)
     value = str(total) if total is not None else "unknown" if key == "total" else ""
     attributes = ""
     if show_breakdown:
-        lines = [f"{label}: {count or 'unknown'}" for label, count in counts]
-        attributes = _count_tooltip(f"role-count-{role}-{key}", value or key, lines, "data-role-counts")
-    return f'<td class="right"{attributes}>{value}{after}</td>', total
+        lines = [f"{label}: {line['cells'][key][0]['text'] or 'unknown'}" for label, line in assignments]
+        attributes = _count_tooltip(f"role-count-{row_id}-{key}", value or key, lines, "data-role-counts")
+    return f'<td class="right"{attributes}>{value}{after}</td>'
 
 
 NotRunningNames = dict[str, list[str]]
@@ -705,6 +709,21 @@ def _not_running_slot(cell_id: str, text: str, icon: str) -> str:
     """A fixed slot after the total keeps the totals aligned; it holds the icon when sessions are not running."""
     content = _tip_target(cell_id, "not-running", ' role="img" aria-label="not running"', icon, text) if text else ""
     return f'<span class="not-running-slot">{content}</span>'
+
+
+def _role_assignment_order(assignment: tuple[str, accounts.BoardRow]) -> tuple[int, str]:
+    label, line = assignment
+    total = line["cells"]["total"][0]["text"]
+    return (-int(total) if total.isdecimal() else 0, label)
+
+
+def _role_counts(row_id: str, assignments: list[tuple[str, accounts.BoardRow]], not_running: str, icon: str,
+                 *, show_breakdown: bool) -> str:
+    cells: list[str] = []
+    for key in ROLE_COUNT_COLUMNS:
+        after = _not_running_slot(f"role-not-running-{row_id}", not_running, icon) if key == "total" else ""
+        cells.append(_role_count_cell(row_id, assignments, key, show_breakdown=show_breakdown, after=after))
+    return "".join(cells)
 
 
 def _busy_line(role: str, color: str, samples: Sequence[role_activity.RoleBusySample],
@@ -767,6 +786,7 @@ def _roles_table(reading: accounts.StatusReading, groups: dict[str, list[tuple[s
                  samples: Sequence[role_activity.RoleBusySample]) -> str:
     rows: list[str] = []
     values: list[SortValues] = []
+    placements: list[list[accounts.AccountRowPlacement]] = []
     facts = {row.label: row for row in reading.rows}
     role_names = sorted(set(groups) | set(accounts.CLAUDE_GROUPS) | {accounts.CODEX_ROLE})
     not_running = {role: _not_running(role, groups.get(role, []), facts) for role in role_names}
@@ -776,10 +796,10 @@ def _roles_table(reading: accounts.StatusReading, groups: dict[str, list[tuple[s
     all_text = _not_running_text(all_counts, all_names)
     icon = page_frame.icon_svg("triangle-alert") if all_text else ""
     for role in role_names:
-        assignments = sorted(groups.get(role, []), key=lambda item: role not in selected[item[0]])
-        role_span = (assignments[0][1]["cells"]["roles"][:1] if assignments
-                     else [accounts.board_role_span(role, colors)])
-        selected_assignment = next(((label, line) for label, line in assignments if role in selected[label]), None)
+        assignments = groups.get(role, [])
+        selected_assignment = next((item for item in assignments if role in selected[item[0]]), None)
+        role_span = (selected_assignment or assignments[0])[1]["cells"]["roles"][:1] if assignments else [
+            accounts.board_role_span(role, colors)]
         move = (accounts.account_board_next_move(selected_assignment[1], reading.first_next_moves)
                 if selected_assignment else "unselected")
         next_text = DASH if move == "unselected" else _next_text(move, labels)
@@ -790,32 +810,47 @@ def _roles_table(reading: accounts.StatusReading, groups: dict[str, list[tuple[s
             label, line = selected_assignment
             name = _spans([labels[label], *(span for span in line["cells"]["roles"][1:] if span["text"] != " ✓")])
             account_value = label.casefold()
-        selected_label = selected_assignment[0] if selected_assignment else None
-        show_breakdown = any(
-            label != selected_label and line["cells"]["total"][0]["text"] not in ("", "0")
-            for label, line in assignments
-        )
+        other_accounts = [item for item in assignments if item is not selected_assignment
+                          and item[1]["cells"]["total"][0]["text"] not in ("", "0")]
+        # Keep the account breakdown when an unassigned role uses a single row.
+        show_breakdown = selected_assignment is None and len(other_accounts) == 1
+        if selected_assignment is not None:
+            primary = [selected_assignment]
+        elif len(other_accounts) <= 1:
+            primary, other_accounts = assignments, []
+        else:
+            primary = []
+        count_cells = _role_counts(role, primary, _not_running_text(*_not_running(role, primary, facts)),
+                                   icon, show_breakdown=show_breakdown)
         values.append({"role": role.casefold(), "account": account_value,
-                       "next": _next_sort_value(move)})
-        count_cells: list[str] = []
-        for key in ROLE_COUNT_COLUMNS:
-            after = (_not_running_slot(f"role-not-running-{role}", _not_running_text(*not_running[role]), icon)
-                     if key == "total" else "")
-            cell, count = _role_count_cell(role, assignments, key, show_breakdown=show_breakdown, after=after)
-            count_cells.append(cell)
-            values[-1][key] = count
+                       "next": _next_sort_value(move),
+                       **{key: _role_count_total(assignments, key) for key in ROLE_COUNT_COLUMNS}})
         color = accounts.account_color(role_span[0].get("color", ""))
         line_color = color.css if isinstance(color, accounts.AccountColor) else ""
+        group_rows = [accounts.AccountRowPlacement(index=len(rows), details=True)]
+        placements.append(group_rows)
         rows.append("<tr>" + _cell(_spans(role_span)) + _cell(_swatch(role_span))
                     + _cell(_busy_line(role, line_color, samples, reading.checked_at, reading.zone), "left busy-cell")
-                    + _cell(name) + _cell(next_text, "left next-cell") + "".join(count_cells) + "</tr>")
+                    + _cell(name) + _cell(next_text, "left next-cell") + count_cells + "</tr>")
+        for label, line in sorted(other_accounts, key=_role_assignment_order):
+            account_span = labels[label].copy()
+            _ = account_span.pop("color_key", None)
+            row_id = f"{role}-{label}"
+            detail = [(label, line)]
+            count_cells = _role_counts(row_id, detail, _not_running_text(*_not_running(role, detail, facts)), icon,
+                                       show_breakdown=line["cells"]["total"][0]["text"] == "unknown")
+            group_rows.append(accounts.AccountRowPlacement(index=len(rows), details=False))
+            rows.append("<tr>" + _cell("") * 3 + _cell(_spans([account_span]))
+                        + _cell(_next_text("none", labels), "left next-cell") + count_cells + "</tr>")
     cells = total["cells"]
     rows.append('<tr data-summary>' + _cell(_spans(cells["label"])) + _cell("") * 4
                 + "".join(_cell(_spans(cells[key]) + (_not_running_slot("role-not-running-total", all_text, icon)
                                                       if key == "total" else ""), "right")
                           for key in ROLE_COUNT_COLUMNS) + "</tr>")
-    return _split_card("Roles", "roles", "role", ROLE_COLUMNS, rows, _sort_orders(values, ROLE_COUNT_COLUMNS),
-                       descending=ROLE_COUNT_COLUMNS, unsorted=(BUSY_LINE_HEADING,))
+    orders = {key: [row for index in order for row in placements[index]]
+              for key, order in _sort_orders(values, ROLE_COUNT_COLUMNS).items()}
+    return _split_card("Roles", "roles", "role", ROLE_COLUMNS, rows, orders,
+                       descending=ROLE_COUNT_COLUMNS, unsorted=(BUSY_LINE_HEADING,), attributes=' data-detail-columns="0,1,2"')
 
 
 def board(reading: accounts.StatusReading, alerts: Mapping[str, QuotaAlert] | None = None) -> str:

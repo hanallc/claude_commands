@@ -1246,8 +1246,17 @@ Success clears the cached page and refreshes the `next` cell.
 A refused request returns 400 and a failed write returns 503, each with its reason.
 
 The Roles table columns are role, swatch, **busy, last 24 h**, account, next, busy, idle and total.
+The selected account appears first for each role and shows its own counts.
+Other accounts with sessions appear directly below it, ordered by descending total and then by account label.
+These rows show their own counts and `none` in the next column.
+They leave the role, swatch and busy line cells empty.
+The table sorts each role as a group.
+The busy, idle and total columns sort by the sum across all accounts for the role.
+The other columns sort by the first row.
+The summary row includes counts from all accounts.
+An unassigned role with one observed account keeps its count tooltip.
 The busy line column has no sort control.
-Each role row draws its busy count from `role_activity.read()` as an inline SVG line in the role color.
+The first row of each role draws its busy history from `role_activity.read()` as an inline SVG line in the role color.
 The page reads the samples once for each render, at the reading's check time.
 The x axis is the 24-hour window. The y axis scales to the largest count of that role in the window, at least 1.
 The line has one point for each pixel column at most: 288 columns of 5 minutes each.
@@ -1258,7 +1267,7 @@ Under the line, the hours in the user's zone show as numbers every 3 hours and a
 With no samples, the cell shows only the base line and the hour marks.
 The summary row has an empty cell in this column.
 The Roles table has no paused or exited column.
-A Lucide `triangle-alert` icon in `--warning` follows a role total when that role has paused or exited sessions.
+A Lucide `triangle-alert` icon in `--warning` follows an account's total when it has paused or exited sessions of the role.
 The icon takes focus and shows a tooltip on hover and focus, for example **2 not running: 1 paused (tile), 1 exited (fix2)**.
 The icon is an image named **not running**.
 The names come from local sessions. A peer count without names shows `names unknown` for the rest.

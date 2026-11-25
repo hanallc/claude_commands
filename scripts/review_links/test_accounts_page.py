@@ -1197,9 +1197,9 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
             with self.subTest(key=key):
                 self.assertEqual(accounts_order[key], order)
         for key, order in {
-            "role": [0, 1, 2, 3], "role-reverse": [3, 2, 1, 0],
-            "busy": [0, 1, 2, 3], "busy-reverse": [3, 0, 1, 2],
-            "idle": [3, 0, 1, 2], "idle-reverse": [2, 1, 0, 3],
+            "role": [0, 1, 2, 3, 4, 5], "role-reverse": [5, 4, 3, 0, 1, 2],
+            "busy": [0, 1, 2, 3, 4, 5], "busy-reverse": [5, 0, 1, 2, 3, 4],
+            "idle": [5, 0, 1, 2, 3, 4], "idle-reverse": [4, 3, 0, 1, 2, 5],
         }.items():
             with self.subTest(key=key):
                 self.assertEqual(roles_order[key], order)
@@ -1226,30 +1226,80 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
         self.assertEqual(orders["role"], [1, 0, 2])
         self.assertEqual(orders["role-reverse"], [0, 1, 2])
 
-    def test_roles_shows_the_selected_account_and_totals_with_account_details(self) -> None:
+    def test_roles_shows_each_account_and_keeps_the_total(self) -> None:
         rows = (
             replace(status_row("claude1"), roles=("units", "producers"),
-                    role_counts=(accounts.RoleSessionCounts(7, 0, 2, 1), accounts.RoleSessionCounts(0, 0, 0, 0))),
+                    role_counts=(accounts.RoleSessionCounts(7, 0, 2, 1), accounts.RoleSessionCounts(0, 0, 0, 0)),
+                    named_sessions_by_role={"units": (accounts.NamedSession("tile", "paused"),)}),
             replace(status_row("claude2"), selected_roles=("units",),
-                    role_counts=(accounts.RoleSessionCounts(2, 3, 0, 4),)),
+                    role_counts=(accounts.RoleSessionCounts(2, 3, 0, 4),),
+                    named_sessions_by_role={"units": (accounts.NamedSession("report", "exited"),)}),
             replace(status_row("claude3"), roles=("producers",), selected_roles=("producers",),
                     role_counts=(accounts.RoleSessionCounts(8, 0, 0, 0),)),
         )
-        markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT))
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT,
+                                         first_next_moves=accounts.FirstNextMoveTargets({"units": "claude1"}))
+        markup = accounts_page.board(reading)
         roles_table = markup.split('<h2>Roles</h2>', 1)[1]
-        units = roles_table.split(">units</span>", 1)[1].split("</tr>", 1)[0]
-        self.assertIn(">claude2</span></td>", units)
-        self.assertNotIn(">claude1</span>", units)
-        cells = re.findall(r'<td class="right" [^>]*data-role-counts="([^"]+)">([0-9]+)</td>', NOT_RUNNING_SLOT.sub("", units))
-        self.assertEqual(cells, [
-            (f"claude2: {selected}\nclaude1: {observed}", str(selected + observed))
-            for selected, observed in ((2, 7), (3, 0), (9, 10))
-        ])
+        units, other, _ = roles_table.split(">units</span>", 1)[1].split("</tr>", 2)
+        self.assertIn('data-color-text="account.claude2">claude2</span></td>', units)
+        self.assertIn('<td class="left next-cell"><span class="default bold" style="color:#af875f" '
+                      + 'data-color-text="account.claude1">claude1</span></td>', units)
+        self.assertTrue(other.startswith('<tr>' + '<td class="left"></td>' * 3))
+        self.assertIn('<span class="default bold" style="color:#af875f">claude1</span>', other)
+        self.assertIn('<td class="left next-cell"><span class="next-muted">none</span></td>', other)
+        self.assertNotIn("data-color-text", other)
+        self.assertNotIn("data-role-counts", units + other)
+        self.assertIn("4 not running: 4 exited (report, 3 names unknown)", units)
+        self.assertIn("3 not running: 2 paused (tile, 1 name unknown), 1 exited (names unknown)", other)
+        for row, expected in ((units, ["2", "3", "9"]), (other, ["7", "0", "10"])):
+            self.assertEqual(re.findall(r'<td class="right">(.*?)</td>', NOT_RUNNING_SLOT.sub("", row)), expected)
+        total = roles_table.split("<tr data-summary>", 1)[1].split("</tr>", 1)[0]
+        self.assertEqual(re.findall(r'<td class="right">(.*?)</td>', NOT_RUNNING_SLOT.sub("", total)),
+                         [f'<span class="default">{value}</span>' for value in (17, 3, 27)])
         orders = rendered_sort_orders(markup, "roles")
-        self.assertEqual(orders["busy"][:2], [2, 0])
-        self.assertEqual(orders["busy-reverse"][:2], [0, 2])
+        self.assertEqual(orders["busy"][:3], [2, 3, 0])
+        self.assertEqual(orders["busy-reverse"][:3], [0, 2, 3])
         producers = roles_table.split(">producers</span>", 1)[1].split("</tr>", 1)[0]
         self.assertNotIn("data-role-counts", producers)
+
+    def test_roles_count_sorts_rank_the_whole_role(self) -> None:
+        rows = (
+            replace(status_row("claude1"), selected_roles=("units",),
+                    role_counts=(accounts.RoleSessionCounts(3, 2, 0, 0),)),
+            replace(status_row("claude2"), role_counts=(accounts.RoleSessionCounts(20, 12, 0, 0),)),
+            replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",),
+                    role_counts=(accounts.RoleSessionCounts(18, 10, 0, 0),)),
+        )
+        markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT))
+        orders = rendered_sort_orders(markup, "roles")
+        for column in ("busy", "idle", "total"):
+            with self.subTest(column=column):
+                self.assertEqual(orders[column], [2, 3, 4, 0, 1])
+                self.assertEqual(orders[column + "-reverse"], [4, 2, 3, 0, 1])
+
+    def test_roles_orders_other_accounts_by_count_then_label(self) -> None:
+        rows = tuple(replace(status_row(label), selected_roles=("units",) if label == "claude4" else (),
+                             role_counts=(accounts.RoleSessionCounts(count, 0, 0, 0),))
+                     for label, count in (("claude1", 6), ("claude2", 11), ("claude3", 6),
+                                          ("claude4", 0), ("claude5", 0)))
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT)
+        roles = accounts_page.board(reading).split('aria-label="Roles"', 1)[1].split("</table>", 1)[0]
+        self.assertEqual(re.findall(r">(claude\d+)</span>", roles), ["claude4", "claude2", "claude1", "claude3"])
+        self.assertNotIn("role-count-units-", roles)
+
+    def test_a_role_with_one_account_keeps_its_row(self) -> None:
+        reading = accounts.StatusReading((replace(status_row("claude1"), selected_roles=("units",)),), (),
+                                         (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets())
+        roles = accounts_page.board(reading).split('aria-label="Roles"', 1)[1].split("</table>", 1)[0]
+        units = roles.split(">units</span>", 1)[1].split("</tr>", 1)[0]
+        self.assertEqual(roles.count("<tr>"), 5)
+        self.assertIn('data-color-text="account.claude1">claude1</span>', units)
+        self.assertIn('data-color-key="role.unit-director"', units)
+        self.assertIn('aria-label="units busy sessions, last 24 hours"', units)
+        self.assertIn('<td class="left next-cell"><span class="next-muted">none</span></td>', units)
+        self.assertEqual(re.findall(r'<td class="right">(.*?)</td>', NOT_RUNNING_SLOT.sub("", units)), ["1", "0", "1"])
+        self.assertNotIn("data-role-counts", units)
 
     def test_unassigned_role_keeps_observed_counts(self) -> None:
         reading = accounts.StatusReading((status_row("claude1"),), (), (), timezone.utc, AT)
@@ -1267,12 +1317,11 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
         )
         markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT))
         roles_table = markup.split('aria-label="Roles"', 1)[1]
-        units = roles_table.split(">units</span>", 1)[1].split("</tr>", 1)[0]
-        cells = re.findall(r'<td class="right" [^>]*data-role-counts="([^"]+)">([^<]*)</td>', NOT_RUNNING_SLOT.sub("", units))
-        self.assertEqual(cells, [
-            (f"claude2: {count}\nclaude1: unknown", value)
-            for count, value in ((2, ""), (0, ""), (3, "unknown"))
-        ])
+        primary, other, _ = roles_table.split(">units</span>", 1)[1].split("</tr>", 2)
+        self.assertEqual(re.findall(r'<td class="right">(.*?)</td>', NOT_RUNNING_SLOT.sub("", primary)), ["2", "0", "3"])
+        cells = re.findall(r'<td class="right" [^>]*data-role-counts="([^"]+)">([^<]*)</td>',
+                           NOT_RUNNING_SLOT.sub("", other))
+        self.assertEqual(cells, [("claude1: unknown", ""), ("claude1: unknown", ""), ("claude1: unknown", "unknown")])
 
     def test_roles_next_column_shows_each_target_as_text_without_a_control(self) -> None:
         rows = (
@@ -1332,7 +1381,10 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
         for row in rows[:-1]:
             cells = cast(list[str], re.findall(r"<td[^>]*>(.*?)</td>", row, re.S))
             self.assertEqual(len(cells), 8)
-            self.assertTrue(cells[2].startswith('<svg class="busy-line" width="288" height="35" viewBox="-4 0 296 35" role="img"'))
+            if cells[0]:
+                self.assertTrue(cells[2].startswith('<svg class="busy-line" width="288" height="35" viewBox="-4 0 296 35" role="img"'))
+            else:
+                self.assertEqual(cells[:3], ["", "", ""])
         summary = cast(list[str], re.findall(r'<td class="[^"]+">(.*?)</td>', rows[-1], re.S))
         self.assertEqual(len(summary), 8)
         self.assertEqual(summary[1:5], [""] * 4)
@@ -1699,7 +1751,11 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_sort_controls_reverse_and_persist_through_refresh(self) -> None:
-        with patch.object(accounts, "read_status", return_value=sort_reading()):
+        reading = sort_reading()
+        reading = replace(reading, rows=tuple(replace(row, roles=(*row.roles, "units"),
+            role_counts=(*row.role_counts, accounts.RoleSessionCounts(9, 0, 0, 0))) if row.label == "claude2"
+            else row for row in reading.rows))
+        with patch.object(accounts, "read_status", return_value=reading):
             content = accounts_page.page()
         rendered = accounts_page.AccountsRender(content, .1, 200).with_recent_times((.1,)).decode()
         setup = '''<script>
@@ -1719,6 +1775,15 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
   .map(row=>row.cells[index].textContent).filter(Boolean).join(',');
  const direction=node=>node.getAttribute('aria-sort');
  const activate=(node,key)=>node.dispatchEvent(new KeyboardEvent('keydown',{key,bubbles:true,cancelable:true}));
+ const checkUnits=()=>{
+  const units=rows('roles').find(row=>row.cells[0].textContent==='units');
+  const other=units?.nextElementSibling;
+  check(units?.cells[3].textContent==='claude1' && units.cells[5].textContent==='2' &&
+   other?.cells[3].textContent==='claude2' && other.cells[5].textContent==='9' &&
+   [...other.cells].slice(0,3).every(cell=>!cell.firstChild),
+   'the second units account stays under the selected row');
+  check(rows('roles').at(-1).hasAttribute('data-summary'),'the roles summary remains last');
+ };
  try{
   frameElement.style.width='1280px';frameElement.style.height='520px';await flush();
   const cards=['accounts','roles','models'];
@@ -1732,6 +1797,7 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
   }
   const defaultAccounts='claude1,claude2,claude3,codex1,codex2';
   check(labels('accounts',1)===defaultAccounts,'the default shows each account label once');
+  checkUnits();
   const account=header('accounts','account');
   account.click();
   check(direction(account)==='descending' && labels('accounts',1)==='codex2,codex1,claude3,claude2,claude1',
@@ -1758,11 +1824,14 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
   check(reads>0 && table('accounts')!==oldTable,'refresh replaces the tables');
   check(labels('accounts',1)===sortedAccounts && direction(header('roles','busy'))==='ascending',
    'refresh preserves the sort in both tables');
+  checkUnits();
   for(const name of ['accounts','roles']){
    for(const node of table(name).querySelectorAll('th[aria-sort]')){
     node.click();
+    checkUnits();
     const first=direction(node);
     node.click();
+    checkUnits();
     check(first!=='none' && first!==direction(node),name+' header reverses');
     const tables=[...table(name).querySelectorAll('th[aria-sort]')];
     check(tables.filter(other=>direction(other)!=='none').length===1,name+' keeps one active sort');
@@ -1843,12 +1912,12 @@ try{
  check(!other.isConnected && restored.textContent==='2' && document.activeElement===restored &&
    !tooltip.hidden && tooltip.textContent==='high-unit\nnew-unit',
    'refresh restores focus and the tooltip for the same model, effort and column');
- const busy=document.querySelector('#role-count-units-busy');
+ const busy=document.querySelector('#role-count-workers-busy');
  busy.scrollIntoView({block:'center'});
  busy.focus({preventScroll:true});
  busy.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));
- check(busy.textContent==='13' && !tooltip.hidden && tooltip.textContent==='claude1: 6\nclaude2: 7',
-   'focus shows the count for each account');
+ check(!busy.textContent && !tooltip.hidden && tooltip.textContent==='claude1: unknown',
+   'focus explains the missing count on the unassigned role');
  check(getComputedStyle(tooltip).textAlign==='right','account counts align to the right');
 }catch(error){failures.push(String(error));}
 realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
