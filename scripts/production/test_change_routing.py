@@ -16,7 +16,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib import conf
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import copy_config_file_fixture, config_environment, write_config_fixture
 from scripts.production import change_review, change_routing, staff, unrouted_alert
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.production.test_change_review import ProducerFixture, producer_rows
@@ -555,7 +555,7 @@ class StaffRoutingTests(unittest.TestCase):
             _ = write_config_fixture(config / "scratch.conf",
                                      f"holds_file={root / 'holds.json'}")
             settings = Path(__file__).resolve().parents[2] / "config/change_review.conf"
-            _ = (config / "change_review.conf").write_text(settings.read_text())
+            _ = copy_config_file_fixture(settings, config / "change_review.conf")
             _ = write_config_fixture(config / "review_links.conf", "delivery_pause_seconds=0\n")
             environment = {**config_env, "STAFF_FILE": str(root / "staff.json"), "CHANGE_REVIEW_DIR": str(root),
                            "REVIEW_LINKS_ROOT": str(root / "links"),

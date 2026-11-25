@@ -126,7 +126,7 @@ if name == "style_sync.py":
     observed = subprocess.run(["git", "-C", repo, "ls-remote", "origin", "refs/heads/" + branch],
                               capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.split()[0]
     (state / "notified-tip").write_text(observed)
-if name == "verify.sh":
+def verify_status(args):
     # Each named test fails while its file is in the tested tree; --filter limits the run to the named tests.
     tree_rows = state / "tree-fail-rows"
     if tree_rows.exists():
@@ -136,27 +136,40 @@ if name == "verify.sh":
                 if (Path.cwd() / path).exists() and (not filters or test in filters)]
         if rows:
             print("".join(rows), end="")
-            raise SystemExit(1)
+            return 1
     fail_rows = state / "fail-rows"
     if fail_rows.exists() and "--filter" not in args:
         print(fail_rows.read_text(), end="")
-        raise SystemExit(1)
+        return 1
     key = "_".join(args).replace("/", "_")
     if args[:1] == ["test"]:
         package_key = "test-" + args[1] if len(args) > 1 else "test"
         package_marker = state / ("fail-once-" + package_key)
         if package_marker.exists():
             package_marker.unlink()
-            raise SystemExit(1)
+            return 1
         if (state / ("fail-always-" + package_key)).exists():
-            raise SystemExit(1)
+            return 1
         key = "test"
     marker = state / ("fail-once-" + key)
     if marker.exists():
         marker.unlink()
-        raise SystemExit(1)
-    if (state / ("fail-always-" + key)).exists():
-        raise SystemExit(1)
+        return 1
+    return int((state / ("fail-always-" + key)).exists())
+
+if name == "verify.sh":
+    steps = [[]]
+    for word in args:
+        if word == "+":
+            steps.append([])
+        else:
+            steps[-1].append(word)
+    for step in steps:
+        status = verify_status(step)
+        if len(steps) > 1:
+            print(f"verify.sh: step result: {' '.join(step)} exit={status}", file=sys.stderr)
+        if status:
+            raise SystemExit(status)
 if (state / ("fail-" + name)).exists():
     raise SystemExit(1)
 if name == "basedpyright":

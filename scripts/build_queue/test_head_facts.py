@@ -2,7 +2,7 @@
 
 import unittest
 
-from scripts.build_queue import admission_records as records, head_facts
+from scripts.build_queue import admission_protocol as wire, admission_records as records, head_facts
 
 
 class PriorityTextTests(unittest.TestCase):
@@ -14,6 +14,15 @@ class PriorityTextTests(unittest.TestCase):
             (({"unit": "first", "why": "urgent", "set_at": 0, "set_by": "user"},
               {"unit": "second", "why": "demo", "set_at": 0, "set_by": "user"}),
              "queue priority: first (urgent), second (demo)"),
+            (({"kind": "UnitPriorityEntry", "unit": "hana", "why": "natemerge can bump at will", "set_at": 0,
+               "set_by": "merge-session", "asker": records.StaffAsker("natemerge")},
+              {"kind": "RunPriorityEntry", "run": wire.RunIdentity(41, "900"), "unit": "cables", "step": "nextest",
+               "why": "/build:bump --run 2", "set_at": 0, "set_by": "user", "asker": records.PlainShellAsker()},
+              {"kind": "UnitPriorityEntry", "unit": "demo", "why": "/build:bump 3", "set_at": 0,
+               "set_by": "lone-session", "asker": records.UnstaffedSession("lone-session")}),
+             'queue priority: hana (natemerge: "natemerge can bump at will"), '
+             + 'cables · nextest (one run) (nate (plain shell): "/build:bump --run 2"), '
+             + 'demo (lone-session: "/build:bump 3")'),
         )
         for entries, expected in cases:
             with self.subTest(entries=entries):

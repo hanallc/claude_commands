@@ -17,9 +17,8 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, redirect_stdout, redirect_stderr
+from contextlib import AbstractContextManager, ExitStack, redirect_stdout, redirect_stderr
 from pathlib import Path
 from threading import Event, current_thread
 from typing import cast, override
@@ -204,6 +203,24 @@ class ScratchTests(unittest.TestCase):
         self.assertEqual(scratch.new("gate:other").parent, folder)
         self.assertFalse((self.base / "scratch").exists())
 
+    def test_copy_removal_rechecks_child_leases_after_writing_its_intent(self) -> None:
+        path = self.copy()
+        child = path / "late"
+        write_record = scratch.atomic_record
+
+        def allocate_late(destination: Path, fields: object) -> None:
+            write_record(destination, fields)
+            if destination == scratch.removal_mark(path):
+                child.mkdir()
+                lock = self.enterContext((path / "late.lock").open("wb"))
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        with mock.patch.object(scratch, "atomic_record", side_effect=allocate_late):
+            result = self.removal_attempt(path, "gate:copy")
+        self.assertEqual(result, scratch.KeptFolder(path, scratch.BUSY_REASON))
+        self.assertTrue(child.is_dir())
+        self.assertTrue((path / "late.lock").is_file())
+
     def test_checkout_removal_saves_outputs_before_source_deletion_and_keeps_retry_evidence(self) -> None:
         checkout = self.base / "cargo-checkout"
         checkout.mkdir()
@@ -352,19 +369,20 @@ class ScratchTests(unittest.TestCase):
         for destination in traces:
             _ = destination.write_text("previous trace\n")
         scratch.busy_path(path).touch()
-        previous_git_files = {file: file.read_bytes() for file in (path / ".git").rglob("*") if file.is_file()}
+        previous_git_files = {file.relative_to(path): file.read_bytes()
+                              for file in (path / ".git").rglob("*") if file.is_file()}
         remove = scratch.remove
 
         def check_then_remove(folder: Path) -> None:
-            self.assertEqual(fetch_head.read_text(), "previous fetch\n")
+            self.assertEqual((folder / ".git" / fetch_head.name).read_text(), "previous fetch\n")
             for destination in traces:
-                self.assertEqual(destination.read_text(), "previous trace\n")
-            self.assertNotIn("built-in: git fetch ", trace.read_text())
-            self.assertEqual({file: file.read_bytes() for file in (folder / ".git").rglob("*") if file.is_file()},
-                             previous_git_files)
+                self.assertEqual((folder / ".git" / destination.name).read_text(), "previous trace\n")
+            self.assertNotIn("built-in: git fetch ", (folder / ".git" / trace.name).read_text())
+            self.assertEqual({file.relative_to(folder): file.read_bytes()
+                              for file in (folder / ".git").rglob("*") if file.is_file()}, previous_git_files)
             with mock.patch.dict(os.environ, {"GIT_TRACE": "0", "GIT_TRACE_PACKET": "0", "GIT_TRACE2": "0",
                                               "GIT_TRACE2_EVENT": "0", "GIT_TRACE2_PERF": "0"}):
-                self.assertEqual(subprocess.check_output(refs), previous_refs)
+                self.assertEqual(subprocess.check_output([*refs[:2], str(folder), *refs[3:]]), previous_refs)
                 self.assertEqual(self.git_object_files(folder), previous_objects)
                 self.git(folder, "merge-base", "--is-ancestor", "refs/remotes/origin/main", "HEAD")
             remove(folder)
@@ -788,6 +806,82 @@ scratch.remove_task_copy(Path(sys.argv[1]), sys.argv[2], time.time())
         self.assertNotIn("built-in: git ls-remote ", trace.read_text())
         query.assert_not_called()
         self.assertTrue(path.is_dir())
+
+    def test_worktree_registration_cleanup_holds_the_transient_lease(self) -> None:
+        source, _ = self.copy_with_published_head("linked-source")
+        path = self.base / "linked"
+        self.git(source, "worktree", "add", "--detach", "-q", str(path))
+        lock = path.with_suffix(".lock")
+        checks: list[Path] = []
+
+        def check_registration_removal(*args: object, **kwargs: object) -> object:
+            if (args and args[0] == ["git", "--git-dir", str(source / ".git"), "worktree", "remove",
+                                    "--force", "--force", str(path)] and kwargs.get("check") is False):
+                with build_folders.folder_removal_lease(path, wait=False) as lease:
+                    self.assertIsInstance(lease, build_folders.RemovalLockHeld)
+                checks.append(path)
+            return cast(object, mock.DEFAULT)
+
+        self.assertFalse(lock.exists())
+        with mock.patch.object(subprocess, "run", wraps=subprocess.run, side_effect=check_registration_removal):
+            self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+
+        self.assertEqual(checks, [path])
+        self.assertFalse(path.exists())
+        self.assertFalse(lock.exists())
+        self.assertFalse((source / ".git/worktrees" / path.name).exists())
+
+    def test_retry_clears_the_git_registration_left_by_sigkill_after_staging(self) -> None:
+        source, _ = self.copy_with_published_head("linked-source")
+        path = self.base / "linked"
+        self.git(source, "worktree", "add", "-q", "-b", "side", str(path))
+        registration = source / ".git/worktrees" / path.name
+        program = """import os
+from pathlib import Path
+import signal
+import sys
+from unittest.mock import patch
+from scripts.lib import build_folders, scratch
+
+path = Path(sys.argv[1])
+rename = build_folders._rename_without_replacing
+
+def stop_after_staging(directory, source, destination):
+    rename(directory, source, destination)
+    if source == path.name:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+with patch.object(build_folders, "_rename_without_replacing", stop_after_staging):
+    scratch.remove_folder(path)
+"""
+        answer = subprocess.run([sys.executable, "-c", program, str(path)],
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(answer.returncode, -signal.SIGKILL, answer.stderr)
+        self.assertFalse(path.exists())
+        self.assertTrue(registration.is_dir())
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.git(source, "worktree", "add", "-q", str(self.base / "branch-in-use"), "side")
+        mark = scratch.removal_mark(path)
+        self.assertTrue(mark.is_file())
+        [staged] = [entry for entry in path.parent.glob(".removing-*") if entry.is_dir()]
+        checks: list[Path] = []
+
+        def check_removal(*args: object, **_kwargs: object) -> object:
+            if args and args[0] == ["git", "--git-dir", str(source / ".git"), "worktree", "remove",
+                                    "--force", "--force", str(path)]:
+                with build_folders.folder_removal_lease(path, wait=False) as lease:
+                    self.assertIsInstance(lease, build_folders.RemovalLockHeld)
+                self.assertTrue(mark.is_file())
+                checks.append(path)
+            return cast(object, mock.DEFAULT)
+
+        with mock.patch.object(subprocess, "run", wraps=subprocess.run, side_effect=check_removal):
+            self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+        self.assertEqual(checks, [path])
+        self.assertFalse(staged.exists())
+        self.assertFalse(registration.exists())
+        self.assertFalse(mark.exists())
+        self.git(source, "worktree", "add", "-q", str(path), "side")
 
     def test_retry_keeps_a_new_commit_held_only_by_a_new_tag(self) -> None:
         for reference in ("new-work", "HEAD"):
@@ -1284,6 +1378,20 @@ for descriptor in descriptors:
                 self.assert_retry_keeps_metadata(path, index)
                 self.assertTrue(index.is_dir())
 
+    def patch_metadata_scan(self, *patches: AbstractContextManager[object]) -> None:
+        inspect = git_files.check_internal_removal_entries
+
+        def inspect_with_patches(checkouts: tuple[git_files.Checkout, ...],
+                                 previous: git_files.RecordedRemovalFiles | git_files.LegacyRemovalFiles, *,
+                                 removal_root: Path) -> None:
+            with ExitStack() as stack:
+                for patch in patches:
+                    _ = stack.enter_context(patch)
+                inspect(checkouts, previous, removal_root=removal_root)
+
+        _ = self.enterContext(mock.patch.object(git_files, "check_internal_removal_entries",
+                                                side_effect=inspect_with_patches))
+
     def test_retry_keeps_a_ref_directory_replaced_by_a_symlink_during_scan(self) -> None:
         path = self.checkout_with_removal_intent("current", "ref-directory-swap")
         namespace = path / ".git/refs/heads"
@@ -1312,9 +1420,9 @@ for descriptor in descriptors:
                 replace_namespace()
             return scan(folder)
 
-        with (mock.patch.object(os, "open", side_effect=open_during_swap),
-              mock.patch.object(os, "scandir", side_effect=scan_during_swap)):
-            self.assert_retry_keeps_metadata(path, namespace)
+        self.patch_metadata_scan(mock.patch.object(os, "open", side_effect=open_during_swap),
+                                 mock.patch.object(os, "scandir", side_effect=scan_during_swap))
+        self.assert_retry_keeps_metadata(path, namespace)
         self.assertTrue(namespace.is_symlink())
         self.assertTrue((moved / "loose").is_file())
 
@@ -1359,8 +1467,8 @@ for descriptor in descriptors:
                 metadata.symlink_to(replacement, target_is_directory=True)
             return open_entry(name, flags, mode, dir_fd=dir_fd)
 
-        with (mock.patch.object(os, "open", side_effect=open_during_swap),
-              mock.patch.object(scratch, "remove", side_effect=AssertionError("source deletion started")) as delete):
+        self.patch_metadata_scan(mock.patch.object(os, "open", side_effect=open_during_swap))
+        with mock.patch.object(scratch, "remove", side_effect=AssertionError("source deletion started")) as delete:
             result = scratch.remove_folder(path)
             delete.assert_not_called()
         self.assertEqual(result, scratch.KeptFolder(path, f"{metadata}: directory changed during inspection"))
@@ -1623,6 +1731,52 @@ assert scratch.removal_mark(path).is_file()
                     run = subprocess.run([sys.executable, "-c", program, str(path)],
                                          capture_output=True, text=True, timeout=10)
                     self.assertEqual(run.returncode, 0, run.stderr)
+
+    def test_absent_source_retry_removes_the_tree_left_by_sigkill_after_staging(self) -> None:
+        path = scratch.new("gate:interrupted-stage", "interrupted")
+        _ = (path / "payload").write_text("scratch payload")
+        expected = path.stat()
+        program = """import os
+from pathlib import Path
+import signal
+import sys
+from unittest.mock import patch
+from scripts.lib import build_folders, scratch
+
+path = Path(sys.argv[1])
+rename = build_folders._rename_without_replacing
+
+def stop_after_staging(directory, source, destination):
+    rename(directory, source, destination)
+    if source == path.name:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+with patch.object(build_folders, "_rename_without_replacing", stop_after_staging):
+    scratch.remove_folder(path)
+"""
+        run = subprocess.run([sys.executable, "-c", program, str(path)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(run.returncode, -signal.SIGKILL, run.stderr)
+        self.assertFalse(path.exists())
+        [staged] = [entry for entry in path.parent.glob(".removing-*") if entry.is_dir()]
+        self.assertTrue(os.path.samestat(staged.stat(), expected))
+        self.assertEqual((staged / "payload").read_text(), "scratch payload")
+        mark = scratch.removal_mark(path)
+        record = copy_record.read_record(mark)
+        assert isinstance(record, copy_record.Registered)
+        self.assertEqual(record.fields["removal_stage"], staged.name)
+        self.assertEqual((record.fields["copy_device"], record.fields["copy_inode"]), (expected.st_dev, expected.st_ino))
+
+        with staged.with_suffix(".lock").open("rb") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(scratch.ScratchError, "staged source could not be removed"):
+                _ = scratch.remove_folder(path)
+            self.assertTrue(staged.is_dir())
+            self.assertTrue(mark.is_file())
+        self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+        self.assertFalse(staged.exists())
+        self.assertFalse(staged.with_suffix(".lock").exists())
+        self.assertFalse(build_folders.lease_path(staged).exists())
+        self.assertFalse(mark.exists())
 
     def test_retry_recovers_when_interrupted_deletion_removed_internal_head(self) -> None:
         for version in ("current", "legacy"):
@@ -1890,7 +2044,8 @@ print(scratch.target('gate:proof', 'tree'))
         result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", probe], text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(Path(result.stdout.strip()).parent, copy_record.root())
-        self.assertRegex(Path(result.stdout.strip()).name, r"^gate-proof-tree-[a-z0-9]{6}$")
+        suffix_length = conf.read("scratch").whole("suffix_length")
+        self.assertRegex(Path(result.stdout.strip()).name, rf"^gate-proof-tree-[a-z0-9]{{{suffix_length}}}$")
 
     def test_copy_record_with_a_legacy_shared_target_still_loads(self) -> None:
         path = self.copy()
@@ -2818,17 +2973,20 @@ print(scratch.target('gate:proof', 'tree'))
         self.assertRegex(path.name, r"^proof-[a-z0-9]+$")
 
     def test_no_task_lasts_a_day_and_until_ends_at_its_time(self) -> None:
-        path = scratch.new(now=1_000_000.0)
+        now = 1_000_000.0
+        expires_at = now + conf.read("scratch").whole("default_life_seconds")
+        minute_boundary = expires_at - expires_at % 60
+        path = scratch.new(now=now)
         record = scratch.task_of(path)
         self.assertIsInstance(record, copy_record.Registered)
         assert isinstance(record, copy_record.Registered)
         task = record.task
-        deadline = scratch.task_end(task, 1_000_000.0 + conf.read("scratch").whole("default_life_seconds"))
+        deadline = scratch.task_end(task, minute_boundary)
         self.assertIsInstance(deadline, scratch.Ended)
         assert isinstance(deadline, scratch.Ended)
-        self.assertEqual(deadline.at, 1_000_000.0 + conf.read("scratch").whole("default_life_seconds") - 40)
-        self.assertFalse(scratch.ended(task, 1_000_000.0))
-        self.assertTrue(scratch.ended(task, 1_000_000.0 + conf.read("scratch").whole("default_life_seconds")))
+        self.assertEqual(deadline.at, minute_boundary)
+        self.assertFalse(scratch.ended(task, minute_boundary - 1))
+        self.assertTrue(scratch.ended(task, minute_boundary))
         self.assertFalse(scratch.ended(RUN, 9e12))
         self.assertTrue(scratch.parsed_until("2026-10-28 09:30").startswith("until:2026-10-28T"))
         with self.assertRaises(scratch.ScratchError):
@@ -2873,7 +3031,8 @@ print(scratch.target('gate:proof', 'tree'))
     def test_new_makes_a_recorded_folder_for_its_task(self) -> None:
         path = scratch.new(RUN, "gate")
         self.assertEqual(path.parent, self.base / "scratch")
-        self.assertRegex(path.name, r"^run-2a858b68-0f9a-4af2-b3cf-a776e6b180cb-gate-[a-z0-9]{6}$")
+        suffix_length = conf.read("scratch").whole("suffix_length")
+        self.assertRegex(path.name, rf"^run-2a858b68-0f9a-4af2-b3cf-a776e6b180cb-gate-[a-z0-9]{{{suffix_length}}}$")
         record = cast(dict[str, object], json.loads((path / copy_record.RECORD).read_text()))
         self.assertEqual((record["task"], record["maker"]), (RUN, MAKER_ID))
 
@@ -2890,6 +3049,7 @@ print(scratch.target('gate:proof', 'tree'))
             peer_paths: list[Path] = []
             jobs = ((worker, ""), (worker, "clone"), (peer, ""))
             program = Path(__file__).resolve().parents[2] / "scripts/lib/py"
+            suffix_length = conf.read("scratch").whole("suffix_length")
 
             def create(job: tuple[staff.StaffRow, str]) -> subprocess.CompletedProcess[str]:
                 owner, name = job
@@ -2904,7 +3064,8 @@ print(scratch.target('gate:proof', 'tree'))
                     self.assertEqual(result.returncode, 0, result.stderr)
                     path = Path(result.stdout.strip())
                     self.assertEqual(path.parent, parent)
-                    self.assertRegex(path.name, rf"^sdlc-hierarchies-{owner.name}-[a-z0-9]{{6}}" + ("-clone$" if name else "$"))
+                    self.assertRegex(path.name, rf"^sdlc-hierarchies-{owner.name}-[a-z0-9]{{{suffix_length}}}"
+                                     + ("-clone$" if name else "$"))
                     record = scratch.task_of(path)
                     self.assertIsInstance(record, copy_record.Registered)
                     assert isinstance(record, copy_record.Registered)
@@ -2985,31 +3146,17 @@ print(scratch.target('gate:proof', 'tree'))
         record = (path / copy_record.RECORD).read_bytes()
         other = scratch.new(RUN, "kept")
         real_unlink = os.unlink
-        real_scandir = os.scandir
+        real_listdir = os.listdir
 
-        class RecordFirstEntries:
-            def __init__(self, entries: list[os.DirEntry[str]]) -> None:
-                self.entries: list[os.DirEntry[str]] = entries
-
-            def __iter__(self) -> Iterator[os.DirEntry[str]]:
-                return iter(self.entries)
-
-            def __enter__(self) -> Iterator[os.DirEntry[str]]:
-                return iter(self.entries)
-
-            def __exit__(self, *error: object) -> None:
-                pass
-
-        def record_first(directory: int | str | os.PathLike[str]) -> RecordFirstEntries:
-            with real_scandir(directory) as entries:
-                return RecordFirstEntries(sorted(entries, key=lambda entry: (entry.name != copy_record.RECORD, entry.name)))
+        def record_first(directory: int | str | os.PathLike[str] | None = None) -> list[str]:
+            return sorted(real_listdir(directory), key=lambda name: (name != copy_record.RECORD, name))
 
         def stop_after_child(child: str | os.PathLike[str], *, dir_fd: int | None = None) -> None:
             real_unlink(child, dir_fd=dir_fd)
             if Path(child).name == first.name:
                 raise KeyboardInterrupt
 
-        with (mock.patch.object(os, "scandir", side_effect=record_first),
+        with (mock.patch.object(os, "listdir", side_effect=record_first),
               mock.patch.object(os, "unlink", side_effect=stop_after_child),
               self.assertRaises(KeyboardInterrupt)):
             _ = self.removal_attempt(path, ROW)
@@ -3028,22 +3175,24 @@ print(scratch.target('gate:proof', 'tree'))
                 path = scratch.new(ROW, f"final-stop-{index}")
                 other = scratch.new(RUN, "kept")
                 real_unlink = os.unlink
-                real_rmdir = Path.rmdir
+                real_rmdir = os.rmdir
+                claimed = path.stat()
 
                 def stop_after_record(child: str | os.PathLike[str], *, dir_fd: int | None = None) -> None:
                     real_unlink(child, dir_fd=dir_fd)
                     if boundary == "record removed" and Path(child).name == copy_record.RECORD:
                         raise KeyboardInterrupt
 
-                def stop_at_folder(folder: Path) -> None:
-                    if folder == path and boundary == "before rmdir":
+                def stop_at_folder(folder: str | os.PathLike[str], *, dir_fd: int | None = None) -> None:
+                    source = os.path.samestat(claimed, os.stat(folder, dir_fd=dir_fd, follow_symlinks=False))
+                    if source and boundary == "before rmdir":
                         raise KeyboardInterrupt
-                    real_rmdir(folder)
-                    if folder == path and boundary == "after rmdir":
+                    real_rmdir(folder, dir_fd=dir_fd)
+                    if source and boundary == "after rmdir":
                         raise KeyboardInterrupt
 
                 with (mock.patch.object(os, "unlink", side_effect=stop_after_record),
-                      mock.patch.object(Path, "rmdir", autospec=True, side_effect=stop_at_folder),
+                      mock.patch.object(os, "rmdir", side_effect=stop_at_folder),
                       self.assertRaises(KeyboardInterrupt)):
                     _ = self.removal_attempt(path, ROW)
                 self.assertFalse((path / copy_record.RECORD).exists())

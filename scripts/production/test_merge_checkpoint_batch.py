@@ -999,12 +999,13 @@ raise SystemExit(1)
         return start, alpha, beta, [self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta)]
 
     def row_drop_gate(self, runs: list[RowDropRun], *, both_red: bool = False, survivor_red: bool = False,
-                      move_main: bool = False) -> Callable[..., subprocess.CompletedProcess[str]]:
+                      move_main: bool = False, resumed: bool = False) -> Callable[..., subprocess.CompletedProcess[str]]:
         run_test_command = checkpoint_gate.run_test_command
 
-        def run(command: list[str], folder: Path, **_options: bool) -> subprocess.CompletedProcess[str]:
+        def run(command: list[str], folder: Path, *, merge_head: str = "",
+                raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
             if not checkpoint_gate.runs_merge_gate(command):
-                return run_test_command(command, folder)
+                return run_test_command(command, folder, merge_head=merge_head, raise_start_errors=raise_start_errors)
             probe = "--module" in command
             if probe:
                 self.assertNotEqual(folder, self.checkout)
@@ -1018,7 +1019,8 @@ raise SystemExit(1)
             runs.append(RowDropRun(probe, alpha, beta, main))
             red = alpha or both_red and beta or (folder / "src/base-red.txt").exists()
             if not probe and beta and not alpha:
-                self.assertEqual(set(land_runs.running_lands().values()), {"beta 2"})
+                expected_rows = {"alpha 2", "beta 2"} if resumed else {"beta 2"}
+                self.assertEqual(set(land_runs.running_lands().values()), expected_rows)
                 if move_main and not main:
                     _ = self.push_main_change("src/main-moved.txt", "new main change\n")
                 red = red or survivor_red
@@ -1095,12 +1097,14 @@ raise SystemExit(1)
                     rows.reverse()
                 runs: list[RowDropRun] = []
                 gate = self.row_drop_gate(runs)
+                resend_gate = self.row_drop_gate(runs, survivor_red=survivors, resumed=survivors)
 
-                def interrupt(command: list[str], folder: Path, **options: bool) -> subprocess.CompletedProcess[str]:
+                def interrupt(command: list[str], folder: Path, *, merge_head: str = "",
+                              raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
                     if (checkpoint_gate.runs_merge_gate(command) and "--module" not in command
                             and (not survivors or not (folder / "src/drop-alpha.txt").exists())):
                         raise KeyboardInterrupt
-                    return gate(command, folder, **options)
+                    return gate(command, folder, merge_head=merge_head, raise_start_errors=raise_start_errors)
 
                 with patch.object(checkpoint_gate, "run_test_command", side_effect=gate):
                     with (patch.object(checkpoint_gate, "run_test_command", side_effect=interrupt),
@@ -1115,19 +1119,18 @@ raise SystemExit(1)
                     self.assertNotIn("\ndrop\t", record.read_text())
                     self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
                     runs.clear()
-                    retry = self.land_batch(rows)
+                    with patch.object(checkpoint_gate, "run_test_command", side_effect=resend_gate):
+                        retry = self.land_batch(rows)
+                    self.assertEqual(retry.returncode, 1, retry.stdout + retry.stderr)
                     if survivors:
                         self.assertIn("batch: resume — beta phase 2 is already merged", retry.stdout)
-                        self.assertIn(f"batch: dropped — alpha phase 2 ({alpha[:12]})", retry.stdout)
-                    else:
-                        self.assertEqual(retry.returncode, 1, retry.stdout + retry.stderr)
-                        self.assertNotIn("batch: dropped", retry.stdout)
-                        self.assertIn("send alpha:", retry.stdout)
-                        self.assertIn("send beta:", retry.stdout)
-                        self.assertEqual(runs, [RowDropRun(False, True, True, False)])
-                        self.assert_rolled_back(start)
-                        runs.clear()
-                        retry = self.land_batch(rows)
+                    self.assertNotIn("batch: dropped", retry.stdout)
+                    self.assertIn("send alpha:", retry.stdout)
+                    self.assertIn("send beta:", retry.stdout)
+                    self.assertEqual(runs, [RowDropRun(False, not survivors, True, False)])
+                    self.assert_rolled_back(start)
+                    runs.clear()
+                    retry = self.land_batch(rows)
                 self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
                 self.assertEqual(runs[0], RowDropRun(False, True, True, False))
                 self.assertEqual(runs[-1], RowDropRun(False, False, True, False))
@@ -1243,6 +1246,8 @@ if not trigger.is_file():
     raise SystemExit(0)
 trigger.write_text("formatted\n")
 subprocess.run(["git", "commit", "-am", "Format alpha"], check=True, timeout=TEST_HANG_GUARD_SECS)
+trigger.write_text("formatted again\n")
+subprocess.run(["git", "commit", "--amend", "-a", "--no-edit"], check=True, timeout=TEST_HANG_GUARD_SECS)
 formatter = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, timeout=TEST_HANG_GUARD_SECS)
 (state / "formatter-tip").write_text(formatter.strip())
 print("=== STEP: taplo ===", flush=True)
@@ -1255,6 +1260,7 @@ raise SystemExit(1)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         formatter = (self.state / "formatter-tip").read_text()
         self.assertEqual(self.git("show", "-s", "--format=%s", formatter), "Format alpha")
+        self.assertEqual(self.git("show", f"{formatter}:src/formatter-trigger.txt"), "formatted again")
         self.assertIn("error: invalid TOML", result.stdout)
         notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
         self.assertEqual([line.split(":", 1)[0] for line in notices], ["send alpha", "send beta"])
@@ -1263,6 +1269,64 @@ raise SystemExit(1)
         next_item = self.land_batch([self.batch_line("beta", "2", beta)])
         self.assertEqual(next_item.returncode, 0, next_item.stdout + next_item.stderr)
         _ = self.assert_landed(start, [beta])
+
+    def test_formatter_rollback_keeps_an_intervening_operator_commit(self) -> None:
+        self.push = "validate_and_push"
+        self.production_doc()
+        start = self.git("rev-parse", "HEAD")
+        alpha = self.checkpoint("src/formatter-trigger.txt", "format this\n")
+        beta = self.beta_checkpoint("src/beta.txt", "clean beta change\n")
+        self.executable(self.bin / "validate_and_push.sh", STUB + r'''
+import os
+import subprocess
+trigger = Path("src/formatter-trigger.txt")
+trigger.write_text("formatted\n")
+subprocess.run(["git", "commit", "-am", "Format alpha"], check=True, timeout=TEST_HANG_GUARD_SECS)
+operator_env = dict(os.environ)
+operator_env.pop("GIT_REFLOG_ACTION", None)
+subprocess.run(["git", "commit", "--allow-empty", "-m", "Operator commit"], env=operator_env,
+               check=True, timeout=TEST_HANG_GUARD_SECS)
+trigger.write_text("formatted again\n")
+subprocess.run(["git", "commit", "-am", "Format again"], check=True, timeout=TEST_HANG_GUARD_SECS)
+print("=== STEP: taplo ===", flush=True)
+print("error: invalid TOML", file=sys.stderr, flush=True)
+raise SystemExit(1)
+''')
+
+        result = self.land_batch([self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta)])
+
+        self.assertEqual(result.returncode, 77, result.stdout + result.stderr)
+        self.assertEqual(self.git("log", "-3", "--format=%s").splitlines(),
+                         ["Format again", "Operator commit", "Format alpha"])
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+
+    def test_formatter_rollback_requires_the_merge_branch(self) -> None:
+        for switch in ("-c operator", "--detach"):
+            with self.subTest(switch=switch):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                self.push = "validate_and_push"
+                self.production_doc()
+                start = self.git("rev-parse", "HEAD")
+                alpha = self.checkpoint("src/formatter-trigger.txt", "format this\n")
+                beta = self.beta_checkpoint("src/beta.txt", "clean beta change\n")
+                self.executable(self.bin / "validate_and_push.sh", STUB + r'''
+import subprocess
+Path("src/formatter-trigger.txt").write_text("formatted\n")
+subprocess.run(["git", "commit", "-am", "Format alpha"], check=True, timeout=TEST_HANG_GUARD_SECS)
+''' + f'''
+subprocess.run(["git", "switch", *{switch.split()!r}], check=True, timeout=TEST_HANG_GUARD_SECS)
+raise SystemExit(1)
+''')
+
+                result = self.land_batch([self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta)])
+
+                self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "production"))
+                self.assertEqual(self.git("show", "-s", "--format=%s", "HEAD"), "Format alpha")
+                self.assertEqual(self.git("branch", "--show-current"), "operator" if switch == "-c operator" else "")
+                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+                self.assertEqual(result.returncode, 77, result.stdout + result.stderr)
 
     def test_batch_stop_keeps_the_gate_failure_and_notifies_pending_rows(self) -> None:
         for case in ("invalid result log", "unrelated later row", "completed later row",
@@ -1478,8 +1542,8 @@ raise SystemExit(1)
         _ = self.interrupt_batch_before_row(rows, beta)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), alpha)
         self.write(self.checkout, "crates/damaged/Cargo.toml", "[package]\n")
-        self.executable(self.bin / "verify.sh", STUB + '''
-Path("Cargo.toml").write_text("[package]\\n")
+        self.executable(self.bin / "verify.sh", STUB + f'''
+Path({str(self.checkout / manifest)!r}).write_text("[package]\\n")
 raise SystemExit(1)
 ''')
 

@@ -11,18 +11,20 @@ import json
 import os
 import shlex
 import tempfile
+import time
 import unittest
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import cast, override
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts.production import broadcast
 from scripts.message import codex_daemon
 from scripts.message import process_table
 from scripts.message import roster
+from scripts.message import sessions
 from scripts.production import staff
 
 NO_SHOWRUNNER = roster.NoShowrunner()
@@ -165,7 +167,9 @@ class BroadcastTests(unittest.TestCase):
         self.assertEqual(scope, roster.ThisMachine())
         return local
 
-    def run_main(self, *arguments: str, here: bool = True, **environment: str) -> tuple[int, str, str]:
+    def run_main(
+        self, *arguments: str, here: bool = True, roster_reads: int = 1, **environment: str,
+    ) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
         os.environ["SSH_SNAPSHOT"] = roster.RosterSnapshot(
             roster.Roster(self.peer_rows, self.peer_problems, self.peer_warnings)).encode()
@@ -177,7 +181,10 @@ class BroadcastTests(unittest.TestCase):
               redirect_stdout(output), redirect_stderr(errors)):
             result = broadcast.main([*(["--here"] if here else []), "--from", "natedev", *arguments])
         if result != 2:
-            read_roster.assert_called_once()
+            if roster_reads == 1:
+                read_roster.assert_called_once()
+            else:
+                self.assertEqual(read_roster.call_count, roster_reads)
             read_identity.assert_called_once()
         return result, output.getvalue(), errors.getvalue()
 
@@ -863,6 +870,66 @@ class BroadcastTests(unittest.TestCase):
                     self.assertTrue(all("roster.py" in call[-1] for call in case.ssh_calls()))
                 finally:
                     case.doCleanups()
+
+    def test_production_sends_when_unreadable_records_clear_on_the_second_read(self) -> None:
+        self.problems = [roster.UnreadableSessionRecordProblem("Claude session records: cannot read /local/1.json")]
+        self.peer_problems = [roster.UnreadableSessionRecordProblem("Claude session records: cannot read /peer/2.json")]
+        self.peer_rows = [replace(self.rows[2], machine="mac", name="fps",
+                                  session=roster.ClaudeSession("peer-fps"),
+                                  reach=roster.Messageable("session:peer-fps"))]
+        recovered = entry("recovered", "session:recovered", role="unit director",
+                          showrunner=self.rows[2].showrunner, director=roster.DirectsUnit("recovered"))
+        retry_policy = replace(sessions.retry_policy(), registry_delay_seconds=0.37)
+
+        def clear_unreadable_records(_seconds: float) -> None:
+            self.problems.clear()
+            self.rows = [*self.rows, recovered]
+            os.environ["SSH_SNAPSHOT"] = roster.RosterSnapshot(roster.Roster(self.peer_rows, [])).encode()
+
+        retry_delay = Mock(side_effect=clear_unreadable_records)
+        with (patch.object(sessions, "retry_policy", return_value=retry_policy),
+              patch.object(broadcast, "time", wraps=time, sleep=retry_delay)):
+            result, output, errors = self.run_main("--production", "hana", "--units", "rule",
+                                                   here=False, roster_reads=2)
+
+        retry_delay.assert_called_once_with(retry_policy.registry_delay_seconds)
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertCountEqual([command[1] for command in self.sends()], ["session:id-trunk", "session:recovered"])
+        self.assertEqual([command[1] for command in self.peer_sends()], ["session:peer-fps"])
+        self.assertEqual(sum("roster.py" in call[-1] for call in self.ssh_calls()), 2)
+
+    def test_production_sends_nothing_when_a_record_stays_unreadable(self) -> None:
+        problem = roster.UnreadableSessionRecordProblem("Claude session records: cannot read /peer/2.json")
+        self.peer_problems = [problem]
+
+        retry_delay = Mock(return_value=None)
+        with patch.object(broadcast, "time", wraps=time, sleep=retry_delay):
+            result, output, errors = self.run_main("--production", "hana", "--units", "rule",
+                                                   here=False, roster_reads=2)
+
+        retry_delay.assert_called_once_with(sessions.retry_policy().registry_delay_seconds)
+        self.assertEqual(result, 1, output + errors)
+        self.assertIn(f"NOT sent: mac: {problem}", output)
+        self.assertEqual(self.sends() + self.peer_sends(), [])
+        self.assertEqual(len(self.ssh_calls()), 2)
+        self.assertTrue(all("roster.py" in call[-1] for call in self.ssh_calls()))
+
+    def test_production_sends_nothing_without_a_retry_for_other_problems(self) -> None:
+        self.problems = [roster.UnreadableSessionRecordProblem("Claude session records: cannot read /local/1.json")]
+        self.peer_problems = ["Claude session records: cannot read /peer/2.json"]
+
+        retry_delay = Mock(return_value=None)
+        with patch.object(broadcast, "time", wraps=time, sleep=retry_delay):
+            result, output, errors = self.run_main("--all", "all", "--production", "hana", "--units", "rule",
+                                                   here=False)
+
+        retry_delay.assert_not_called()
+        self.assertEqual(result, 1, output + errors)
+        self.assertIn("NOT sent:", output)
+        self.assertIn(f"mac: {self.peer_problems[0]}", errors)
+        self.assertEqual(self.sends() + self.peer_sends(), [])
+        self.assertEqual(len(self.ssh_calls()), 1)
+        self.assertIn("roster.py", self.ssh_calls()[0][-1])
 
     def test_refusal_advice_reports_worker_and_socketless_states_without_failure(self) -> None:
         self.rows = [

@@ -312,6 +312,16 @@ Each local Promote checkout must exist before the command pushes.
      It selects every changed path from the tip before the checkpoint merge through the prepared tip.
      Packages run through `verify.sh test`, and changed examples run through `verify.sh example`.
      Then each configured Merge tests command runs without a shell.
+     Gate commands run through `copies.py run --repo <checkout> --commit <tested tip> -- <command>`.
+     The gate uses the copy path for `--checkout` and the normal target selection.
+     The copy uses the local commit before the push.
+     AWS receives the commit in a Git bundle.
+     Admission uses `BUILDLOG_UNIT` or the calling session's unit from the staff record.
+     Before publication, check that the merge checkout and branch still point to the tested tip.
+     A moved tip cancels publication with status 77 and keeps the local changes.
+     The direct Git push uses the checked commit ID as the source.
+     A failed validation can roll back formatter commits from this run.
+     The branch reflog must show only updates from this validation since the checked commit.
      `parse_merge_tests` reads backticked entries before the first unquoted parenthesis and splits them with `shlex`.
      Each word expands home and environment variables.
      A remaining `$VAR` or an unavailable executable refuses the command by name.
@@ -319,6 +329,7 @@ Each local Promote checkout must exist before the command pushes.
      A command that cannot start has exit 127.
      A shrink runs no tests.
   7. *red*: run each failed command once alone.
+     A gate rerun uses `copies.py run` with the same commit.
      If every nextest `FAIL` row names a Known flaky test, run only those tests again.
      Use `verify.sh test [<package>] --filter <name>` per test, or `-E test(=<name>)` for other nextest commands.
      A pass alone continues with a LOG note in this case, or when Known flakes lists the package.
@@ -327,8 +338,11 @@ Each local Promote checkout must exist before the command pushes.
      A failure names the failed nextest tests or the failed gate modules (`--- <suite>/<module> exit=<rc> ---`).
      A module green on its rerun alone is not a red name. The rerun's names replace the first run's names when it names any.
   8. *base check*: merge the same `origin/main` into the restored tip, and run each red command there once.
+     A gate base check uses `copies.py run` with the prepared base commit.
      Limit the run to failed names with `--filter`, `-E test(=<name>)`, or the gate's `--module <suite>/<module>`.
-     The log gets `<name>_BASE_EXIT=<rc>` lines. The check then resets to the restored tip. A green checkpoint runs no base check.
+      The log gets `<name>_BASE_EXIT=<rc>` lines.
+      The check resets the checkout to the restored tip only if the checkout still points to the expected base commit.
+      A green checkpoint runs no base check.
      A name red on the base too goes to the merge director. The run prints `merge director: <commands and names> red on base <commit> without the checkpoint; repair the base, then run the checkpoint again; test log: <log>`.
      The unit gets a repair line only for its own red names.
      When every red name is also red on the base, the stop is `red: held`, and the unit's line tells it to send nothing.
@@ -463,7 +477,12 @@ Each local Promote checkout must exist before the command pushes.
   A directory lock protects every write without a separate lock file.
   A write commits only the list when the list is in a Git worktree.
   It never pushes the commit or changes another staged file.
-  A failed commit prints `written but not committed`; the next write commits the complete list.
+  Commits share the vault's main push lock with the other Git writers.
+  The readiness scan also runs after a merge. It tries the vault lock once per list without waiting.
+  If the lock is busy, the list stays uncommitted. The next scan tries again.
+  Each failed commit attempt gives one warning with the list path, the number of new rows, and the reason.
+  Other list writes report a commit failure immediately.
+  The next successful commit saves the complete list.
   The vault's Templater must exclude the change-review folder to prevent concurrent changes to new lists.
 
   Every new or edited visible row requires a registered image.
@@ -499,8 +518,9 @@ Each local Promote checkout must exist before the command pushes.
   A failed main push or Mac pull adds no rows.
   The next successful call adds the rows from earlier promoted merges.
 - **Overrides for tests:** `MERGE_CHECKPOINT_VERIFY`, `MERGE_CHECKPOINT_VALIDATE_AND_PUSH`, `MERGE_CHECKPOINT_REVIEW_REGIME`, `MERGE_CHECKPOINT_SCRATCH`.
-- **Unit targeted tests.** A unit runs `scripts/production/targeted_test.py --checkout TREE`.
-  It uses the shared runner with affected-module selection.
+- **Unit targeted tests.** A `claude_commands` unit runs `gate.py --affected` through `copies.py run`.
+  Use the command in `<FinalGate/>` in `docs/direct/final_gate_commit.md`.
+  The gate uses the shared runner with affected-module selection.
 - **The `~/.claude` repo's own gate.** `scripts/production/merge_gate.py` checks ancestry and checkout changes before it merges a checkpoint with `--no-ff`.
   The gate runs all test modules under a memory governor.
   Basedpyright runs only with `--nightly`.
@@ -513,7 +533,16 @@ Each local Promote checkout must exist before the command pushes.
   `--promote` sends the green merge to `~/.claude` main and the Mac.
   See [merge-gate-and-test-speed.md](merge-gate-and-test-speed.md).
 
-The showrunner still judges, before the call: the other units' overlap notice, new public items without a consumer, the design check. After it: `<ChangeReviewFeatureLog/>` for a merge in `~/rust/hana` or `~/rust/hana_catalyst` (one feature-log proposal per change-review row; `docs/as-built/feature-log.md`), then `<ClearGate/>`, `<CrossUnitChange/>`, `<CIPoint/>` and the review watch. It sends the script's `send <unit>:` line and puts every `into:` line in the user update, adding one in the same form for each unit worktree it then merges the merge branch into. A change for the user to check is never an open question: it goes on the change review list, and `<CloseChangeReview/>` takes the user's verdict for every production, with feature-log calls only where the project closes out by change review (Hana and `~/.claude`).
+Before the call, the showrunner checks the overlap notice, new public items without a consumer, and the design check.
+After the call, it runs `<ChangeReviewFeatureLog/>` for a merge in `~/rust/hana` or `~/rust/hana_catalyst`.
+It records one feature log proposal per change review row. See `docs/as-built/feature-log.md`.
+It then runs `<ClearGate/>` and `<CrossUnitChange/>`.
+It runs `<CIPoint/>` only when `ci_points.py due` reports that CI is due.
+It sends the script's `send <unit>:` line and includes each `into:` line in the user update.
+It adds an `into:` line for each unit worktree that receives the merge branch.
+It puts changes that need a user check on the change review list.
+`<CloseChangeReview/>` records the user's verdict for every production.
+It calls the feature log only for projects that close work by change review (Hana and `~/.claude`).
 
 ### Smoke launch
 
@@ -550,7 +579,7 @@ Morty's fixed staff ID selects the folder for each new item.
 The item's `owner` field names its showrunner.
 `nate` and `Not recorded` identify items without an assigned showrunner.
 The item's `producer` field stores the assigned producer's fixed staff ID.
-Old records without the field default to morty.
+Old records without the field use their record keeper.
 `record_store.NumberedRecords` supplies the folder, frontmatter, file lock, and atomic replacement for both stores.
 Both stores use `file_lock.exclusive` and the shared `record_store.state_root` function.
 `update_registration` also uses this root function.
@@ -568,10 +597,18 @@ States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`,
 Parking stores a time or a delivery condition and keeps the current item state.
 The List ends a delivery park automatically when the producer sets the item state to Delivered.
 Linked changes supply review information on the List.
-The List hides an item with unanswered questions while each send is pending or successful.
+The List shows a waiting panel while each unanswered question has a pending send or confirmed delivery.
 If a question send fails, the item shows Question not delivered.
-The `the_list.py list` command still shows the item.
-The producer uses `the_list.py answer` to save an answer and mark the item unread.
+The `the_list.py list` command still shows the item when it is in morty's folder.
+The `the_list.py answer` command accepts answers from the saved recipient, the record keeper, or morty.
+A saved answer marks the item unread.
+Use `answer --keeper` to select the item's folder.
+Without `--keeper`, `answer` uses the caller's List folder if it holds the item, or morty's folder otherwise.
+`update` uses morty's folder by default.
+For a legacy item, use `the_list.py update --keeper <keeper> --id L<N> --next-step "<step>"`.
+A producer can name any keeper in `update`, but it updates only its own fields on items it produces.
+Each command refuses a `--keeper` that has no List folder.
+In a keeper folder other than morty's, `update` refuses `--producer` and `--owner`.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
 The command selects the date nearest to today in the user's time zone.
 The record and log store a date-only ETA as an ISO date, such as `2026-11-20`, with kind `time or status`.
@@ -597,6 +634,21 @@ An empty optional time removes that time.
 6. Restore a Closed item as New with `reopen --id L<n> --source <source>`.
 7. Clear its unread time with `mark-read --id L<n> --source <source>`.
 8. Print the table with `list`.
+9. Ask nate for a Go with `ask L<n> --kind go|approval --target <staff id> --what <text> --why <text> [--config]`.
+
+`ask` adds an `Ask` to the item's `asks` field and prints `L<n> A<k>`.
+The ids are `A1`, `A2` and on for each item.
+Only the item's producer or morty can open an ask. The target must have a staff row.
+`--config` marks a settings.json, CLAUDE.md or config change. The page shows the same button for it.
+Each ask stores the kind, What, Why, the target, the config flag, the opened time, the closed time and the go id.
+The frontmatter stores the asks as JSON. Old records without the field load with no asks and are not written.
+An open ask makes the item unread, and the log gets an “Ask opened” line.
+The List page Go closes the ask with its go id and logs a “Go given” line; see review-links.md, [Asks for nate's Go](review-links.md#asks-for-nates-go).
+When no ask that shows a box stays open, the item becomes read if it has no other unread change.
+An ask whose target has no staff row shows no box.
+A Go that leaves no ask with a box on a Waiting for nate item also sets Working and asks the producer for the next step, as Mark read does.
+A Go message that does not reach a recipient adds a “Go not delivered” log line.
+nate's Go counts as his go for the one named change only after `go_check.py` prints `go ok` for the target session.
 
 Use `--include-parked` to include parked items or `--all` to include parked and closed items.
 Use `--latest-status` to show the latest status column.
@@ -610,33 +662,50 @@ The command uses the caller's staff name as the source for those items.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
-They can use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
+Producers can update their own items with `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence`.
 Their updates use the caller's staff name as the log source.
-They can also run `park`, `close`, and `reopen` on those items.
-These commands use the `--source` words as the log source.
-The command refuses each item of another producer.
+Their `add` can set `--producer` to their own name or staff ID. The item goes to the caller by default.
+The CLI refuses another producer and `--number` on their `add`.
+The CLI saves new items in morty's store on the machine where it runs. Every producer runs on natedev.
+`park`, `unpark`, `close`, and `reopen` use morty's folder. Producers can run them on their own items.
+These commands require `--source` and use its words as the log source.
+Close clears the parking time.
+The writer checks the assigned producer under the same lock as the save.
+Only morty can change the owner or producer of an existing item.
 Only morty can run `mark-read`, `clean-evidence`, `link`, and `unlink`.
 
 Morty uses `--producer <name or staff id>` on add or update to assign an item.
-Morty's new items default to morty.
-Changing the producer to someone other than morty sends two notices after the save.
+New items that morty adds without `--producer` default to morty.
+An assignment that morty makes to another producer sends two notices after the save.
+When another producer adds their own item, the CLI sends only the showrunner notice after the save.
 The producer gets the title, showrunner, and List commands.
 The current showrunner gets the title, producer, and where to send design questions.
 The sender checks the fixed staff ID, required role, and current session before each delivery attempt.
 If the recipient is offline, the notice fails and stays unsent.
-If the producer retires before the staff refresh, the CLI reports the failed producer notice.
+If a producer that morty assigned retires before the staff refresh, the CLI reports the failed producer notice.
 The showrunner gets a notice that the saved assignment needs a new producer.
 When the Owner has no current showrunner row, the CLI reports a failed showrunner notice.
-When the staff refresh fails, the CLI reports the saved item ID and both unsent notices.
+When the staff refresh fails, the CLI reports the saved item ID and the notices it could not send.
 The CLI exits nonzero if a notice fails. The saved assignment stays in place.
 An unchanged producer or an assignment to morty sends no notice.
 
 Add and update accept `--unit`, `--state`, `--next-check`, `--eta`, and `--requested-by nate|dwight`.
 They also accept `--next-step`, `--latest-status`, `--evidence`, `--add-evidence`, and `--done-when`.
+Use `--done-when` to name every result the item needs before it can close.
 `--evidence` replaces the evidence text. `--add-evidence` appends one line.
+The CLI reads character limits in `config/the_list.conf` when add or update sets the applicable field.
+
+| Config key | Limit |
+| --- | --- |
+| `max_chars.latest_status` | 200 characters for the latest status |
+| `max_chars.next_step` | 160 characters for the next step |
+| `max_chars.evidence_line` | 300 characters for each replacement or appended evidence line |
+
+The CLI refuses a write if the applicable setting is missing, invalid, or too small for the supplied text.
+The limit applies when the CLI next sets that text. Existing text stays readable at any length.
 `--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
 Either option with no values clears its field.
-References use numbers in morty's List folder.
+References use numbers in the folder of the item that the command edits.
 Add and update check references when they set dependency or related fields.
 The store refuses missing references, self-dependencies, and dependency cycles.
 Other changes, including mark-read, do not read referenced records.
@@ -896,9 +965,13 @@ Pane labels do not identify a consultation.
   Stored instants keep their offsets.
   Tests select a private zone when their assertions need one.
 
-### CI points and review watch: `ci_points.py`
+### CI points in `ci_points.py`
 
-`ci_points.py due | ci start [--cancel-prior] | ci collect | watch | notice clear <gate> | notice lift <gate> --log <path>`, each with `--production`; `due`, `ci`, `watch` take `--state-dir`; `due` and `ci` take `--no-ci`.
+`ci_points.py due | ci start [--cancel-prior] | ci collect | notice clear <gate> | notice lift <gate> --log <path>`
+
+Each command requires `--production`. The `due` and `ci` commands require `--state-dir` and accept `--no-ci`.
+
+The 2026-11-24 change removed the review watch and its push.
 
 - `due` counts distinct recorded unit checkpoints that reached the merge branch. Five checkpoints after the last CI point produce `CiDue`. A collected point saves the count and tip in `ci_points.json`. Shrink commits and child hand-offs have no unit checkpoint record.
 - `ci start`: validates the merge-branch tip with `validate_and_push.sh`, publishes it with `push_direct.sh --publish-only`, follows the CI run with `push_direct.sh --follow-published`, and writes `ci_run.json` (`repo`, `run_id`, `tip`), the only handoff to `collect`. The run's repository and head commit must match the push remote and the published commit.
@@ -911,12 +984,11 @@ Pane labels do not identify a consultation.
   - A failed run still runs the `--cancel-prior` step before `ci start` exits with the failure.
   - An `ssh.github.com` (SSH over 443) remote uses `github.com` for GitHub API calls and run links.
 - `ci collect`: takes the tip and its code-merge count before `gh run watch --exit-status`, then `gh run view --json headSha,status,conclusion,jobs`. It passes only when `headSha` equals the validated tip and the current tip, the run is `completed` and concluded `success`, job `Test Suite` succeeded, and every other job succeeded or was skipped. Then it records `{count, tip}` and prints `--ci-green <tip>` as the last line, which `promote-main` and `wrap` take as is. Anything else is `ci collect: failed — rerun <check> on <tip>: …`, with no flag; a missing or empty `headSha` is never a pass.
-- `watch` / `review_watch(production, state_dir) -> WatchFirstAlert(line, table) | WatchRepeat(line) | WatchBelowThreshold(line)`: runs `review_regime.py watch` under `fcntl.flock` on `review_watch.lock`. On the first exit 3 with no `review_watch.json`, it takes `review_regime.py report --since 2026-09-28`, appends `- HH:MM <zone>: review watch: <line>` and the table to `LOG`, then writes `review_watch.json`. It sends no phone push: a status note that asks nothing goes to the log (`docs/as-built/message-clarity.md`). The shared state prevents repeated first alerts.
 - `notice clear <gate>` requires the code merge.
   It drafts `send <waiting unit>: <gate> clear — <unit> phase <N> is on <merge branch> as <merge hash>. Merge <merge branch> and continue.`
   `notice lift <gate> --log <path>` drafts `send <waiting unit>: <gate> lifted — your tests pass without <unit> phase <N> (<log>). Continue.`
   Each gate row has the form `| <id> | <waiting unit> phase <N> | <unit> phase <N> | … |`.
-- Overrides for tests: `CI_POINTS_VALIDATE_SCRIPT`, `CI_POINTS_REVIEW_REGIME`, `CI_POINTS_REVIEW_REGIME`.
+- Tests can use `CI_POINTS_VALIDATE_SCRIPT` to select the validation script.
 
 ### Unit configuration formatting
 
@@ -1257,7 +1329,7 @@ Copied pane marks do not select rows.
   Publication never uses force.
 
 
-- One state directory: `eta_seen.json` and `review_watch.json` live in `WAITING_STATE_DIR` for every caller; a second directory forks the once-per-phase and first-alert records. The command document names this shared path.
+- All callers share `eta_seen.json` in `WAITING_STATE_DIR` to record each phase once.
 
 - `then` reaches the renderer unchanged; the renderer refuses, it never rewrites.
 
@@ -1297,9 +1369,7 @@ Copied pane marks do not select rows.
 
 - `merge_checkpoint.py` accepts a Merge tests command only with status zero.
 
-- CI point: due at 5 code merges; `ci collect` requires job `Test Suite` by name. The review table is `report --since 2026-09-28`.
-
-- `review_watch.json` is written after the LOG line: a crash between them repeats the log entry once (at least once).
+- A CI point is due at five code merges. `ci collect` requires the job named `Test Suite`.
 
 
 - The renderer exposes no list of required fields, which is why the builder names five itself.

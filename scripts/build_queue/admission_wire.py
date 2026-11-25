@@ -15,6 +15,7 @@ from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET as
 from typing import TYPE_CHECKING, Literal, TypeVar, cast
 
 from scripts.build_queue import snapshot_codec as codec
+from scripts.build_queue.execution_identity import RunIdentity as RunIdentity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, GateJobNotRecorded, NotVerifyCall,
     StepJob, VerifyStep)
@@ -76,13 +77,6 @@ class Owner:
 
 
 @dataclass(frozen=True)
-class RunIdentity:
-    """The run identity holds a process identifier and start time."""
-    pid: int
-    start_time: str
-
-
-@dataclass(frozen=True)
 class NoRun:
     """The request has no named build run."""
 
@@ -124,7 +118,7 @@ class CloudPlace:
     group: CloudGroup | NoCloudGroup = NO_CLOUD_GROUP
 
 
-def cloud_queue_order(place: CloudPlace, since: float) -> tuple[float, int, str]:
+def cloud_queue_time(place: CloudPlace, since: float) -> tuple[float, int, str]:
     """Use the trial start time for grouped requests."""
     if isinstance(group := place.group, CloudGroup):
         return group.started_at, 0, group.key
@@ -181,11 +175,13 @@ OUTSIDE_UNIT_RULES = OutsideUnitRules()
 
 @dataclass(frozen=True)
 class RunPlace:
-    """The run placement holds its identity, first owner, start time, and unit."""
+    """Keep the first place of a live run."""
     run: RunIdentity
     since: float
     first_owner: Owner
     unit: str = ""
+    move_id: str = ""
+    repository: str = ""
     unit_place: UnitPlace | OutsideUnitRules = field(default=OUTSIDE_UNIT_RULES, kw_only=True)
 
 
@@ -236,49 +232,6 @@ class AdmitRequest(CallerCode):
     route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
     # The session that owns the run; a natedev hold of this session does not hold the step.
     session: OwningSession | NoOwningSession | SessionNotSent = field(default=SessionNotSent(), kw_only=True)
-
-
-@dataclass(frozen=True)
-class RepositorySlotRequest(CallerCode):
-    """Wait for one attempt to acquire a repository slot."""
-    episode: str
-    owner: Owner
-    since: float
-    repository: str
-    machine: str
-    root: str
-    maximum: int
-    deadline: float
-    identity: Identity
-
-
-@dataclass(frozen=True)
-class RepositorySlotWaiting:
-    """The repository pool has no free slot for this waiter."""
-    repository: str
-    held: tuple[int, ...]
-    maximum: int
-    maximum_key: str
-
-    @property
-    def text(self) -> str:
-        return f"waits for a free {self.repository} slot ({len(self.held)} of {self.maximum} in use)"
-
-    @property
-    def expired_text(self) -> str:
-        held = ", ".join(f"{self.repository}-slot{number}" for number in self.held) or "none"
-        return f"slots: wait ended for {self.repository}; held slots: {held}; maximum {self.maximum} ({self.maximum_key})"
-
-
-@dataclass(frozen=True)
-class RepositorySlotReady:
-    """The first waiter can attempt to acquire a repository slot."""
-
-
-@dataclass(frozen=True)
-class RepositorySlotExpired:
-    """The repository slot wait ended before capacity became available."""
-    reason: str
 
 
 @dataclass(frozen=True)
@@ -371,20 +324,29 @@ class MineRequest(CallerCode):
 
 
 @dataclass(frozen=True)
+class WordsNotGiven:
+    """The caller gave no --words; the service refuses unless a plain shell asked."""
+
+
+WORDS_NOT_GIVEN = WordsNotGiven()
+
+
+@dataclass(frozen=True)
 class PrioritySetRequest(CallerCode):
-    """The request sets queue priority for a unit with a reason and actor."""
+    """Set queue priority for a unit and record the actor and the user's words."""
     request_id: str
     unit: str
-    why: str
+    why: str | WordsNotGiven
     actor: str
 
 
 @dataclass(frozen=True)
 class PriorityClearRequest(CallerCode):
-    """The request clears queue priority with an actor and optional unit."""
+    """The request clears queue priority with an actor, optional unit, and the user's words."""
     request_id: str
     actor: str
     unit: str = ""
+    why: str | WordsNotGiven = WORDS_NOT_GIVEN
 
 
 @dataclass(frozen=True)
@@ -701,6 +663,7 @@ class ConsumePermission(CallerCode):
     claim: placement.ProviderClaimReference
     holder: placement.ClaimHolderIdentity | placement.ClaimHolderUnconfirmed = field(
         default_factory=lambda: placement.ClaimHolderUnconfirmed("not supplied"))
+    guest_proof_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -712,6 +675,12 @@ class ExecutionReport(CallerCode):
     evidence: execution_identity.ExecutionEvidence
     outcome: placement.AttemptOutcome = field(default_factory=lambda: placement.AttemptOutcomeUnavailable("not supplied"))
     path: placement.DispatchPathState = field(default_factory=lambda: placement.DispatchPathPending("not confirmed"))
+
+
+@dataclass(frozen=True)
+class SettlementRequest:
+    """Ask the queue to confirm settlement for an exact gate attempt."""
+    assignment: placement.PlacementAssignment
 
 
 @dataclass(frozen=True)
@@ -776,20 +745,21 @@ class DispatchStatus:
     retry: placement.RetryDecision = field(default_factory=lambda: placement.DoNotRetry("attempt is not settled"))
 
 
-Request = (RepositorySlotRequest | VerifyRunSlotRequest | ServiceEstimateRequest | AdmitRequest | LaunchRequest
+Request = (VerifyRunSlotRequest | ServiceEstimateRequest | AdmitRequest | LaunchRequest
            | ReleaseRequest | WidthRequest | ViewRequest
            | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest
            | QueueMoveRequest | QueueUndoRequest | TokenWaitRequest
-           | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport | PrerequisiteReport | CancelPlacement)
+           | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport
+           | SettlementRequest | PrerequisiteReport | CancelPlacement)
 
-Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | VerifyRunSlotWaiting
+Reply = (VerifyRunSlotWaiting
          | Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
          | PlacementWait | Assignment | LocalPlacementGranted | FirstAuthorization | DispatchStatus | PlacementStatusReply
          | QueueMoved | QueueMoveConflict)
 
 _GROUPED_CLOUD_ADMIT = "cloud_group_admit"
+_UNIT_PRIORITY_ONLY = "priority applies to a unit"
 _REQUESTS: dict[str, type] = {
-    "repository_slot": RepositorySlotRequest,
     "verify_run_slot": VerifyRunSlotRequest,
     "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
     "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
@@ -797,13 +767,11 @@ _REQUESTS: dict[str, type] = {
     "queue_move": QueueMoveRequest, "queue_undo": QueueUndoRequest,
     "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,
     "placement": PlacementRequest, "placement_status": PlacementStatusRequest, "claim_failure": ClaimFailure,
-    "consume_permission": ConsumePermission, "execution_report": ExecutionReport,
+    "consume_permission": ConsumePermission, "execution_report": ExecutionReport, "settlement": SettlementRequest,
     "prerequisite": PrerequisiteReport, "cancel_placement": CancelPlacement,
     _GROUPED_CLOUD_ADMIT: AdmitRequest,
 }
 REPLY_TYPES: dict[str, type] = {
-    "repository_slot_waiting": RepositorySlotWaiting, "repository_slot_ready": RepositorySlotReady,
-    "repository_slot_expired": RepositorySlotExpired,
     "verify_run_slot_waiting": VerifyRunSlotWaiting,
     "wait": Wait, "runner_admitted": RunnerAdmitted, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
     "queue_moved": QueueMoved, "queue_move_conflict": QueueMoveConflict,
@@ -812,7 +780,8 @@ REPLY_TYPES: dict[str, type] = {
     "first_authorization": FirstAuthorization, "dispatch_status": DispatchStatus,
     "local_placement_granted": LocalPlacementGranted, "placement_status": PlacementStatusReply,
 }
-_PLACEMENT_TYPES = (PlacementStatusRequest, PlacementStatusReply, PlacementRequest, ClaimFailure, ConsumePermission, ExecutionReport, PrerequisiteReport, CancelPlacement,
+_PLACEMENT_TYPES = (PlacementStatusRequest, PlacementStatusReply, PlacementRequest, ClaimFailure, ConsumePermission,
+                    ExecutionReport, SettlementRequest, PrerequisiteReport, CancelPlacement,
                     PlacementWait, Assignment, LocalPlacementGranted, FirstAuthorization, DispatchStatus)
 T = TypeVar("T")
 
@@ -860,6 +829,8 @@ def _write_wire_record(value: object) -> object:
     # An older reader has no session field; a request with no session leaves it out.
     if record.get("kind") == "AdmitRequest" and record.get("session") == {"kind": "SessionNotSent"}:
         del record["session"]
+    if record.get("kind") == "ConsumePermission" and record.get("guest_proof_required") is False:
+        del record["guest_proof_required"]
     if record.get("kind") == "CloudPlace" and record.get("group") == codec.snapshot_value(NO_CLOUD_GROUP):
         del record["group"]
     if record.get("kind") == "CloudSlotWait" and record.get("state") == {"kind": "WaitingForCloudSlot"}:
@@ -879,6 +850,10 @@ def parse_record(text: str, schema: type[T]) -> T:
 
 
 def _parse_value(value: object, schema: type[T]) -> T:
+    if schema is PrioritySetRequest and isinstance(value, dict):
+        value = cast(dict[str, object], value)
+        if "target" in value:
+            raise ValueError(_UNIT_PRIORITY_ONLY)
     if schema in (QueueMoveRequest, QueueUndoRequest):
         if not isinstance(value, dict):
             raise ValueError("Invalid queue move request.")
@@ -909,12 +884,16 @@ def parse_envelope(line: str | bytes, variants: dict[str, type]) -> tuple[int, o
         if type(version) is not int or not 1 <= version <= VERSION:
             raise UnsupportedVersion(version)
         name = envelope.get("type")
-        if not isinstance(name, str) or name not in variants or set(envelope) != {"v", "type", "data"}:
+        if not isinstance(name, str) or set(envelope) != {"v", "type", "data"}:
             raise ValueError("invalid admission envelope")
-        data = envelope["data"]
-        if version < 3 and variants[name] in _PLACEMENT_TYPES:
+        if variants is _REQUESTS and name == "priority_run_set":
+            raise ValueError(_UNIT_PRIORITY_ONLY)
+        schema = variants.get(name)
+        if schema is None:
+            raise ValueError("invalid admission envelope")
+        if version < 3 and schema in _PLACEMENT_TYPES:
             raise ValueError("placement requires version 3")
-        return version, cast(object, _parse_value(data, variants[name]))
+        return version, cast(object, _parse_value(envelope["data"], schema))
     except (ArithmeticError, KeyError, RecursionError, TypeError, UnicodeError) as error:
         raise ValueError("invalid admission message") from error
 

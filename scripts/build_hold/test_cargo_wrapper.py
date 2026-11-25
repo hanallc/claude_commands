@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -13,8 +14,9 @@ import sys
 import tempfile
 import unittest
 from typing import override
+from unittest import mock
 
-from scripts.lib import test_hang_guard
+from scripts.lib import build_folder_lock, build_folders, test_hang_guard
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.build_hold import cargo_folder
@@ -198,6 +200,35 @@ class CargoWrapperTest(unittest.TestCase):
         self.assertEqual(self.queue_log.read_text(), json.dumps(["--", str(self.real_cargo), *args]))
         self.assertTrue(self.python_log.exists())
         self.assertFalse(self.scope_log.exists())
+
+    def test_cargo_retries_when_the_output_parent_moves_after_lock_open(self) -> None:
+        parent = self.root / "output-root" / "unit"
+        parent.mkdir(parents=True)
+        output = parent / "target"
+        former = parent.with_name("former-unit")
+        workspace = cargo_folder.CargoWorkspace(self.cwd, str(self.home), self.cwd, self.cwd)
+        open_lock = build_folder_lock.open_lock
+        module = cargo_folder.__name__
+
+        def move_parent(path: Path, directory: int, *, create: bool) -> int:
+            descriptor = open_lock(path, directory, create=create)
+            if path == output and not former.exists():
+                _ = parent.rename(former)
+            return descriptor
+
+        with (ExitStack() as locks,
+              mock.patch.object(build_folders, "build_root", return_value=parent.parent),
+              mock.patch.object(build_folder_lock, "open_lock", side_effect=move_parent),
+              mock.patch(f"{module}._workspace", return_value=workspace),
+              mock.patch.object(cargo_folder, "assigned_output", return_value=cargo_folder.LinkedOutput(output)),
+              mock.patch(f"{module}._check_paths"), mock.patch(f"{module}._stamp_assignment"),
+              mock.patch("scripts.worktree.worktrees.git_exclude.ensure_excluded")):
+            checked = cargo_folder.check_step(["check"], self.cwd, locks, self.env, enforce=True)
+            self.assertIsInstance(checked, cargo_folder.CheckedOutputLock)
+            assert isinstance(checked, cargo_folder.CheckedOutputLock)
+            self.assertTrue(former.is_dir())
+            self.assertTrue(os.path.samestat(os.fstat(checked.descriptor), output.with_suffix(".lock").stat()))
+            self.assertEqual(build_folders.build_folder_state(output), "held")
 
     def test_non_building_commands_start_with_no_python_and_no_queue_request(self) -> None:
         _ = (self.hold / "holder").write_text("held")

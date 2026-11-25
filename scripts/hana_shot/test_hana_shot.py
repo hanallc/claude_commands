@@ -2543,23 +2543,24 @@ class ShotTests(HanaShotTest):
         self.assertEqual([path.name for path in self.scratch.glob(".shot-*")], [])
 
     def test_margin_help_explains_range_and_fraction(self) -> None:
+        max_margin = conf.read("hana_shot").number("max_margin")
         result = self.run_script("shot", "--help")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         help_text = " ".join(result.stdout.split())
         margin_help = help_text.split("--margin MARGIN", 2)[-1].split("--", 1)[0]
-        self.assertIn("0 to 0.45", margin_help)
+        self.assertIn(f"0 to {max_margin}", margin_help)
         self.assertRegex(margin_help.lower(), r"fraction|proportion|percent")
         self.assertRegex(margin_help.lower(), r"frame|image|viewport|screen")
 
     def test_margin_refusal_explains_range_and_viewport_fraction_before_any_brp_call(self) -> None:
-        for margin in ("-0.1", "0.46"):
+        max_margin = conf.read("hana_shot").number("max_margin")
+        for margin in ("-0.1", str(math.nextafter(max_margin, math.inf))):
             with self.subTest(margin=margin):
                 result = self.shot("--target", "name:Log", "--margin", margin)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("--margin", result.stderr)
-                self.assertIn("0", result.stderr)
-                self.assertIn("0.45", result.stderr)
+                self.assertIn(f"0 to {max_margin}", result.stderr)
                 self.assertRegex(result.stderr.lower(), r"fraction|proportion|percent")
                 self.assertIn("viewport", result.stderr.lower())
                 self.assertIn("each side", result.stderr.lower())

@@ -1111,6 +1111,40 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(normalized_output(fixture.timed.stderr), normalized_output(fixture.standard.stderr))
         self.assertEqual(fixture.times["tests_run"], 1)
 
+    def test_failed_setup_reports_shifted_reads_from_a_child_with_a_private_environment(self) -> None:
+        checkout = str(RUNNER.parents[2])
+        for operation in ("setUpModule", "setUpClass"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                source = f"""
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+
+def fail_setup():
+    config = Path(__file__).with_name("fixture.conf")
+    config.write_text("# test config shift: 2 3\\n# whole: 1..\\nused=3\\n"
+                      "# test config shift: 4 5\\n# whole: 1..\\nunused=5\\n")
+    program = "from scripts.lib import conf; from pathlib import Path; import sys; conf.read(Path(sys.argv[1])).whole('used')"
+    subprocess.run([sys.executable, "-B", "-c", program, str(config)], check=True,
+                   env={{"PYTHONPATH": {checkout!r}}})
+    raise RuntimeError("setup failed")
+
+class FailingSetup(unittest.TestCase):
+    def test_never_runs(self):
+        raise AssertionError("unexpected test")
+
+if {operation!r} == "setUpModule":
+    setUpModule = fail_setup
+else:
+    FailingSetup.setUpClass = staticmethod(fail_setup)
+"""
+                fixture = run_fixture(Path(directory), "setup_shift", source)
+                self.assertEqual(fixture.timed.returncode, 1, fixture.timed.stderr)
+                self.assertIn(f"Shifted configuration reads for {operation}", fixture.timed.stderr)
+                self.assertIn("fixture.conf:used: 2 -> 3", fixture.timed.stderr)
+                self.assertNotIn("fixture.conf:unused", fixture.timed.stderr)
+
     def test_successful_class_fixture_has_its_own_cpu_measure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

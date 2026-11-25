@@ -68,6 +68,47 @@ A new unit or style production uses `worktree` as its main short name. The branc
   Add `--list <file>` to supply names for specific worktrees during the full switch.
   Omit `--dry-run` to apply the full plan, resume saved moves, and link main output.
   Moved worktrees of retired units have no assigned output.
+- `worktrees.py migrate --repo <word> --dry-run` prints the plan for one repository.
+  `<word>` is the repo word (`build_folders.repo_word`).
+  The plan has the main checkout, its worktrees, its scratch clones, and its saved moves, and it links the main output as `--all` does.
+  `--list <file>` supplies names, as it does for `--all`. `--repo` and `--all` do not go together.
+  This form takes no Mac claim on any machine.
+  An unknown repo word (`UnknownRepoWord`) prints one line, `migrate --repo <word>: <reason>`, and exits 2. Other errors keep their own text and exit status.
+  `--repo` exits 1 when it keeps a checkout of that repository, so a loop can see the keep. `--all` keeps its exit status.
+  Keeps that need no work do not count: `main checkout stays in place`, `already moved`, `already at the destination`, and `already moved; defer output: archive the old build root first`. A deferred main output is not a keep.
+- `worktrees.py migrate --repo <word> --host mac` runs on natedev only (`remote.local_machine()`) and migrates that repository on the Mac.
+  It holds the repository's Mac claim on natedev (`mac_run.repository_claim`, target `mac`, kind `mirror`, what `migrate --repo <word>`).
+  The claim id has the `mac-linux-` prefix, so the Mac activity watch does not release it. The holder releases it.
+  The claim identity comes from natedev's main checkout for `<word>`. Without that checkout, the command prints `migrate --repo <word>: <reason>` and exits 2.
+  Inside the claim it runs `~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py migrate --repo <word>` over ssh to the `host` of the `mac` target.
+  The ssh options are `mac_linux.SSH`, which include `ServerAliveInterval=15` and `ServerAliveCountMax=2`, so a dead link ends ssh.
+  It prints the Mac output and returns the Mac exit status.
+  ssh runs in its own session with its input from `/dev/null`, so a terminal or pane signal does not reach it.
+  natedev waits for ssh inside `cancellation.defer_cleanup_signals()`, so SIGINT, SIGTERM and SIGHUP take effect only after ssh ends.
+  ssh starts inside that block, so it inherits SIGINT, SIGTERM and SIGHUP blocked. These three signals stay pending at the ssh pid. Other signals, such as SIGQUIT or SIGKILL, end ssh. Then the claim ends while the Mac run can go on.
+  After ssh ends, SIGINT raises `KeyboardInterrupt`, and the claim block releases the claim. SIGTERM and SIGHUP end natedev without the release. The next `live_claims` read removes the claim, because its pid is dead.
+  The claim is released at the end, also when ssh fails.
+  Limit: the claim covers the Mac run only while ssh lives. If the link dies, ssh ends and the Mac run can go on without the claim.
+  Limit: SIGKILL ends natedev at once. ssh and the Mac run go on, and the claim counts as ended because its pid is dead.
+  The process scan and the Cargo flocks on the Mac always guard each target, with or without the claim.
+  A busy or refused claim prints `kept: <word>: <reason>`, for example `kept: origin: mac is busy with native Mac run`. It exits 1 with no ssh.
+  `--dry-run` takes no claim, needs no natedev main checkout, and passes `--dry-run` to the Mac.
+  `--host` needs `--repo`, takes no `--list`, and is refused on the Mac.
+- Before migration links a real `target` folder to its output, it checks the target.
+  This applies to a main checkout and to an already moved worktree whose `target` is a real folder or is missing. That worktree links to the output in its worktree record.
+  A linked moved worktree prints only `output <checkout> -> <output>`.
+  1. Migration takes a non-blocking exclusive flock on each Cargo lock (`sweep.LOCK_NAMES`) at any depth under `target`. The walk reads only folder and file names. It stops at a folder with a lock and skips Cargo output folders (`sweep.HASHED_DIRS`, `incremental`, `doc`). A held lock keeps the checkout as `kept: <lock> held`.
+  2. A process scan of the target must find no holder. A holder keeps the checkout as `target in use (pids …)`. The flocks come first, so a cargo that waits on one keeps the lock file open and the scan finds it.
+  3. Migration holds the flocks through the rename and the link.
+  Migration moves a `target` only when it was a real folder at the start of these steps. A `target` that appears after the check is not moved: migration keeps the checkout as `kept: <target>: expected a link to <output>; retain the existing path`.
+  When the output is not empty, migration moves the target to `.saved-target-<checkout name>-*/target` beside the checkout instead.
+  Migration defers SIGTERM, SIGHUP and SIGINT from each rename to its link (`cancellation.defer_cleanup_signals`), so a stop does not leave the checkout with no `target`.
+  If a new `target` appears between the move and the link, migration keeps the checkout as `rerun: …`. The reason names the folder that holds the earlier target: the output, or `.saved-target-<checkout name>-*/target` when the output was not empty. Run migration again.
+  If the link fails for another reason, migration moves the target back from the output to where it came from and keeps the checkout as `kept: <error>`. If the move back also fails, the target stays in the output, and the next run links it.
+  Each later run reports each `.saved-target-<checkout name>-*` folder as `kept for a manual removal list: …`. This applies to each selected main checkout and moved worktree, before any defer or keep.
+  It also reports each older `.saved-target-XXXXXXXX` folder beside such a checkout. That form names no checkout, so a run reports each folder once, also when many checkouts share the parent folder.
+  A held or changed build-folder lock keeps the checkout as `kept: <output>: the build folder lock is held. Rerun when idle`.
+  In each case migration goes on with the next checkout.
 - `worktrees.py old-links` lists recorded links and the live sessions that use them.
   `--remove-unused` removes a link only after a completed move with a verified destination and no possible live user.
   Unreadable session evidence or an earlier link through that path keeps the link.
@@ -118,7 +159,7 @@ They check for processes that use the source before the copy and before they mov
 They compare source entries before and after the copy. A change makes them discard the staged copy and keep the source.
 If another process creates the destination during the copy, the move stops and reports the occupied path.
 If the source is already in the backup, a retry can publish the verified stage after the destination becomes free.
-Full migration reports each legacy scratch backup that recovery still needs and exits with status 1.
+Full migration and `--repo` migration report each legacy scratch backup that recovery still needs and exit with status 1. `--repo` reports only the backups of its repository.
 For a linked checkout, Git starts repair from the saved Git entry so it can update a relative `.git` pointer.
 The copy includes only tracked files from a real `target` folder.
 The move renames an untracked `target` into an empty or missing assigned output when the paths permit a rename on the same filesystem.
@@ -155,7 +196,7 @@ The Hana AWS guest fetches verified bundles into its main checkout at `~/rust/ha
 The command uses its assigned copy number under `~/build/hana/aws-hana`.
 Each copy keeps its Cargo output under `target`.
 The guest keeps the shell cache under `~/build/hana/main/shells` and holds the main output lock during use.
-The AWS gate uses its separate slot path.
+No code makes or uses the old repository slot folders under `/build/slot` or `~/build/slot`.
 
 `lint/sweep.py --unused-folders` uses each folder's `.lint-sweep-used` stamp. The cutoff is two days. The sweep checks the stamp again under the folder lock. It keeps unstamped folders, folders in use, and CI folders. It lists eligible folders and keeps unit and repository parents. The nightly gate invokes the sweep.
 

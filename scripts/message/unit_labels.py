@@ -409,21 +409,25 @@ def recorded_owner_labels(wanted: set[str], record: staff.StaffSnapshot) -> dict
     labels: dict[str, UnitLabels] = {}
     for session_id in wanted:
         member = record.by_current_session(session_id) if session_id else None
-        if member is None:
-            continue
-        showrunner: ShowrunnerRelationship = NoShowrunner()
-        director: DirectorRelationship = NoDirector()
-        if member.kind == "showrunner":
-            showrunner = RunsProduction(member.name)
-        elif member.kind == "unit":
-            director = DirectsUnit(member.name)
-            parent = record.parent_of(member)
-            if parent is not None and parent.kind == "showrunner":
-                showrunner = ProductionWithoutRunningShowrunner(parent.name)
-        elif member.kind == "worker":
-            director, showrunner = staff_relationships(record, member, {}, {})
-        labels[session_id] = make_labels(member.name, showrunner, director)
+        if member is not None:
+            labels[session_id] = recorded_member_labels(record, member)
     return labels
+
+
+def recorded_member_labels(record: staff.StaffSnapshot, member: staff.StaffRow) -> UnitLabels:
+    """Use the staff record to label a member, including a member with no current session."""
+    showrunner: ShowrunnerRelationship = NoShowrunner()
+    director: DirectorRelationship = NoDirector()
+    if member.kind == "showrunner":
+        showrunner = RunsProduction(member.name)
+    elif member.kind == "unit":
+        director = DirectsUnit(member.name)
+        parent = record.parent_of(member)
+        if parent is not None and parent.kind == "showrunner":
+            showrunner = ProductionWithoutRunningShowrunner(parent.name)
+    elif member.kind == "worker":
+        director, showrunner = staff_relationships(record, member, {}, {})
+    return make_labels(member.name, showrunner, director)
 
 
 def live_runs(

@@ -52,6 +52,7 @@ from typing import BinaryIO, ClassVar, TYPE_CHECKING, Literal, NamedTuple, Never
 
 
 from scripts.herdr import pane_launch
+from scripts.herdr import message_proof as _message_proof
 from scripts.agents import worker_lifecycle
 from scripts.lib import conf, models_registry, operation_deadline, script_prompts, session_folder
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
@@ -1700,6 +1701,10 @@ class PaneEvidenceRun:
     lock: RLock = field(default_factory=RLock)
 
 
+class RestorePaneEvidenceRun(PaneEvidenceRun):
+    """Retain classified uncertainty for the duration of a worker restore."""
+
+
 _pane_evidence_run: ContextVar[PaneEvidenceRun | ScanAtUse] = ContextVar(
     "pane_evidence_run", default=_SCAN_AT_USE)
 
@@ -1715,6 +1720,27 @@ def pane_evidence_run() -> Generator[None]:
         yield
     finally:
         _pane_evidence_run.reset(token)
+
+
+@contextmanager
+def restore_pane_evidence_run() -> Generator[None]:
+    """Keep restore evidence in its own scope."""
+    token = _pane_evidence_run.set(RestorePaneEvidenceRun())
+    try:
+        yield
+    finally:
+        _pane_evidence_run.reset(token)
+
+
+def refresh_restore_pane_evidence() -> None:
+    """Keep only classified uncertainty for identified terminals until restore ends."""
+    run = _pane_evidence_run.get()
+    if isinstance(run, RestorePaneEvidenceRun):
+        with run.lock:
+            for key, evidence in tuple(run.sessions.items()):
+                if not key[2] or not isinstance(evidence, PaneSessionsUnknown):
+                    del run.sessions[key]
+            run.shell_processes.clear()
 
 
 @dataclass
@@ -1898,8 +1924,7 @@ class Herdr:
         run = _pane_evidence_run.get()
         if isinstance(run, PaneEvidenceRun):
             with run.lock:
-                panes = [pane for pane in panes if
-                         (self.session, str(pane.get("pane_id", "")), str(pane.get("terminal_id", ""))) not in run.sessions]
+                panes = [pane for pane in panes if self._pane_evidence_key(pane) not in run.sessions]
         def read(pane: str) -> tuple[str, dict[str, object]]:
             try:
                 return pane, self.socket_request("pane.process_info", pane_id=pane)
@@ -2050,7 +2075,7 @@ class Herdr:
                                   json_text(matches[0].get("workspace_id"), "herdr workspace id"))
         run = cast(PaneEvidenceRun, _pane_evidence_run.get())
         for pane in panes:
-            key = (self.session, str(pane.get("pane_id", "")), str(pane.get("terminal_id", "")))
+            key = self._pane_evidence_key(pane)
             with run.lock:
                 pid = run.shell_processes.get(key)
             if pid is None:
@@ -2353,14 +2378,13 @@ class Herdr:
                 return False
             saved = saved_layout(self.session)
             reorder = False
-            record = _tab_staff()
             owner: staff.StaffRow | None = None
-            if tab and saved["workspaces"]:
+            if tab and (pending := {entry["staff_id"] for space in saved["workspaces"] for entry in space["tabs"]
+                                    if entry.get("sort_after_rename")}):
+                record = _tab_staff()
                 scan = self.scan_row_panes(record, self.listed("pane"))
                 owner = _tab_members(record, scan).get(str(row.get("tab_id", "")))
-                reorder = any(entry.get("sort_after_rename")
-                    and owner is not None and entry["staff_id"] == owner.id
-                    for space in saved["workspaces"] for entry in space["tabs"])
+                reorder = owner is not None and owner.id in pending
             changed = self._retitle(row, title, tab=tab)
             if not changed and not reorder:
                 return False
@@ -2389,8 +2413,12 @@ class Herdr:
         except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
             return set()
 
+    def _pane_evidence_key(self, pane: dict[str, object]) -> tuple[str, str, str]:
+        terminal = pane.get("terminal_id")
+        return self.session, str(pane.get("pane_id", "")), terminal if isinstance(terminal, str) else ""
+
     def _row_pane_sessions(self, pane: dict[str, object], run: PaneEvidenceRun) -> PaneSessions:
-        key = (self.session, str(pane.get("pane_id", "")), str(pane.get("terminal_id", "")))
+        key = self._pane_evidence_key(pane)
         with run.lock:
             if key in run.sessions:
                 return run.sessions[key]
@@ -2436,8 +2464,16 @@ class Herdr:
                                        if isinstance(sessions, _PaneProcessNotFound)})
         for pane, sessions in observations:
             if isinstance(sessions, _PaneProcessNotFound):
-                sessions = (PaneSessionsChanging("pane closed during scan") if str(pane.get("pane_id", "")) in closed
-                            else PaneSessionsUnknown(sessions.reason))
+                key = self._pane_evidence_key(pane)
+                if key[1] in closed:
+                    sessions = PaneSessionsChanging("pane closed during scan")
+                else:
+                    uncertain = PaneSessionsUnknown(sessions.reason)
+                    if isinstance(run, RestorePaneEvidenceRun):
+                        with run.lock:
+                            if run.sessions.get(key) is sessions:
+                                run.sessions[key] = uncertain
+                    sessions = uncertain
             if isinstance(sessions, (PaneSessionsStarting, PaneSessionsChanging, PaneSessionsUnknown)):
                 reason = "starting" if isinstance(sessions, PaneSessionsStarting) else sessions.reason
                 unread = UnknownPane(str(pane.get("pane_id", "")), str(pane.get("tab_id", "")), reason)
@@ -3487,10 +3523,18 @@ class Herdr:
             if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=expected,
                                 pane_info=self.pane_row(pane), client=self):
                 raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
-            self._send_keys(pane, key)
+            try:
+                self._send_keys(pane, key)
+            except HerdrCommandNotStarted as error:
+                if index == 0:
+                    raise
+                raise HerdrFailure(f"{pane}: the answer may be partly typed: {error}") from error
             if index == 0:
                 script_prompts.record(pane, text)
-                _ = self.run("pane", "send-text", pane, text)
+                try:
+                    _ = self.run("pane", "send-text", pane, text)
+                except HerdrCommandNotStarted as error:
+                    raise HerdrFailure(f"{pane}: the answer selection key was sent: {error}") from error
 
     def _send_keys(self, pane: str, *keys: str) -> None:
         _ = self.run("pane", "send-keys", pane, *keys)
@@ -3750,14 +3794,19 @@ def _codex_foreground(foreground: list[dict[str, object]], process: dict[str, ob
 def foreground_pane_owner(info: dict[str, object], *, for_input: bool = False
                           ) -> ForegroundPaneAgent | NoForegroundAgent | UnprovedForegroundOwner:
     """Prove the pane owner. Check for Codex terminal holders when input is pending."""
+    return _foreground_pane_owner(info, for_input=for_input, message_owner=_message_proof.StrictOwnerProof.REQUIRED)
+
+
+def _foreground_pane_owner(info: dict[str, object], *, for_input: bool, message_owner: _message_proof.MessageOwnerProof
+                           ) -> ForegroundPaneAgent | NoForegroundAgent | UnprovedForegroundOwner:
     try:
-        return _prove_foreground_owner(info, for_input=for_input)
+        return _prove_foreground_owner(info, for_input=for_input, message_owner=message_owner)
     except _CodexForegroundProcessGone as error:
         if isinstance(info, _PaneProcessInfo):
             try:
                 fresh = info.read_again()
                 if _pane_process_ids(fresh, "fresh pane process info") == _pane_process_ids(info, "pane process info"):
-                    owner = _prove_foreground_owner(fresh, for_input=for_input)
+                    owner = _prove_foreground_owner(fresh, for_input=for_input, message_owner=message_owner)
                     if isinstance(owner, ProvedCodexForeground) and owner.pid == error.owner_pid:
                         return owner
                     if isinstance(owner, UnprovedForegroundOwner) and owner.kind == "codex":
@@ -3767,7 +3816,7 @@ def foreground_pane_owner(info: dict[str, object], *, for_input: bool = False
         return UnprovedForegroundOwner("codex", str(error))
 
 
-def _prove_foreground_owner(info: dict[str, object], *, for_input: bool
+def _prove_foreground_owner(info: dict[str, object], *, for_input: bool, message_owner: _message_proof.MessageOwnerProof
                             ) -> ForegroundPaneAgent | NoForegroundAgent | UnprovedForegroundOwner:
     foreground = _foreground_processes(info)
     claude: list[tuple[dict[str, object], list[str]]] = []
@@ -3814,14 +3863,28 @@ def _prove_foreground_owner(info: dict[str, object], *, for_input: bool
             if len(candidates) == 1:
                 return candidates[0]
             registered: list[ProvedClaudeForeground] = []
+            denied: _ProcessEnvironmentDenied | None = None
             for candidate in candidates:
                 try:
                     native = native_process(candidate.pid, "claude")
                 except NativeRegistryChanging:
                     continue
+                except _ProcessEnvironmentDenied as error:
+                    if for_input or isinstance(message_owner, _message_proof.StrictOwnerProof):
+                        raise
+                    denied = error
+                    continue
                 registered.append(replace(candidate, native=native))
             if len(registered) == 1:
-                return registered[0]
+                owner = registered[0]
+                if denied is None:
+                    return owner
+                if isinstance(owner.native, NativeAgentProcess) and message_owner == _message_proof.ProvedMessageOwner(
+                        conversation=owner.native.current_identity, pid=owner.pid, start=owner.native.started):
+                    return owner
+                raise denied
+            if denied is not None and not registered:
+                raise denied
         except (HerdrFailure, OSError, ValueError) as error:
             return UnprovedForegroundOwner("claude", str(error))
         return UnprovedForegroundOwner("claude", f"expected one foreground claude process, found {len(claude)}")
@@ -3841,7 +3904,7 @@ def _prove_foreground_owner(info: dict[str, object], *, for_input: bool
 def pane_foreground(place: HerdrPlace, info: dict[str, object]) -> ForegroundPaneAgent | ObservedEmpty | UnknownPaneOwner:
     """Read the foreground evidence before comparing it with a requested owner."""
     try:
-        owner = foreground_pane_owner(info)
+        owner = _foreground_pane_owner(info, for_input=False, message_owner=_message_proof.message_owner.get())
         if isinstance(owner, ClaudeForegroundWithoutArgv):
             return ClaudePaneWithoutArgv(place, owner.reason, owner.pid)
         if isinstance(owner, UnprovedForegroundOwner):
@@ -5452,11 +5515,18 @@ def running_codex_threads(*, thread_host: Callable[[list[str]], bool],
     return set(codex.live)
 
 
+class _ProcessEnvironmentDenied(PermissionError):
+    """The Linux process environment cannot be read."""
+
+
 def process_environment(pid: int) -> dict[str, str]:
     """Read a process even outside herdr; a failed observation remains an error."""
     if _platform() == "darwin":
         return darwin_process_environment(pid)
-    return _process_environment(proc_root() / str(pid))
+    try:
+        return _process_environment(proc_root() / str(pid))
+    except PermissionError as error:
+        raise _ProcessEnvironmentDenied(error.errno, error.strerror, cast(object, error.filename)) from error
 
 
 def _process_arguments(process: Path) -> list[str]:

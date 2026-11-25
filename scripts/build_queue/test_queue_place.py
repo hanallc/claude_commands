@@ -1,12 +1,13 @@
 """A queued program owns one reservation from before launch through finalization."""
 from __future__ import annotations
 
-from scripts.lib import atomic_file, cancellation
+from scripts.lib import atomic_file, build_folders, cancellation
 
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+import fcntl
 import functools
 import io
 import json
@@ -401,6 +402,24 @@ class QueuePlaceFixture(ExitStack):
 
 
 class QueuePlaceTests(unittest.TestCase):
+    def test_dead_queue_place_keeps_an_active_child_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            place = root / (build_folders.FOLDER_PREFIXES["queue-place"] + "123-456-test")
+            child = place / "child"
+            child.mkdir(parents=True)
+            with ((place / "child.lock").open("wb") as lock,
+                  mock.patch.object(build_folders, "inherited_temporary_parent", return_value=root),
+                  mock.patch.object(records, "process_start_time", return_value=None)):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                queue.cleanup_queue_place_folders()
+                self.assertTrue(child.is_dir())
+                self.assertTrue((place / "child.lock").is_file())
+            with (mock.patch.object(build_folders, "inherited_temporary_parent", return_value=root),
+                  mock.patch.object(records, "process_start_time", return_value=None)):
+                queue.cleanup_queue_place_folders()
+            self.assertFalse(place.exists())
+
     def test_wait_for_placement_uses_the_timer_after_queue_json_changes(self) -> None:
         from scripts.build_queue.test_placement import placement_request
 

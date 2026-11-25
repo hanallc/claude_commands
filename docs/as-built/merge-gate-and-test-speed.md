@@ -52,25 +52,45 @@ Order the latest run's module attempts with this query:
 buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modules WHERE run_id = (SELECT id FROM gate_runs ORDER BY started_at DESC LIMIT 1) ORDER BY module_started_at"
 ```
 
+## Module rankings
+
+`show.py top` ranks live gate modules by median CPU time.
+It keeps passed, unrestarted attempts from the selected host, checkout and time window.
+Each module uses one attempt per run, up to `TOP_RUNS`.
+The commit time of the merge base with `origin/main` orders the runs.
+The newest start time breaks ties.
+Runs with unknown commit times fill any remaining places.
+`last s` uses the latest start among the counted runs.
+`code date` shows that run's merge-base date as MM-DD in the user zone.
+If the commit time is unavailable, the column shows `unknown`.
+`unmeasured` lists modules without eligible records.
+
+The report caches merge-base times by the main commit and run commit.
+It checks commit availability in one Git batch, so a later fetch can change a run's order.
+
 ## Whole gate route
 
 The gate reads the target from the bounded assignment file at `BUILDLOG_PLACEMENT_FILE`.
 The assignment must match the gate's placement episode and submitting process.
 The queue must confirm that the saved attempt is current.
 The gate checks a supplied assignment at startup.
+For `--tests-only` and `--affected`, the assignment source key must match the resolved `--repo` checkout.
 Without a supplied assignment, a direct gate asks `first_step.admitted_run` to place the test checkout.
-The queue offers natedev and `mac-linux` for direct gate placement according to the target configuration.
+The queue offers natedev and the Mac Linux guest for eligible direct gates.
 A direct merge gate asks after it creates the merge tree.
 The nightly gate asks after it prepares the fetched checkout.
 The gate keeps merge writes, validation, push, promotion and nightly publication on natedev.
-The natedev handoff keeps its memory reservation until the suites end.
+The local runner keeps the queue grant until the suites end.
 The suites publish progress to the sidecar from the granted request.
-A `--module` run can use natedev or `mac-linux`.
-A nested named gate always reuses its live parent reservation on natedev.
-For named gates, `BUILDLOG_GATE_TARGETS` applies only to standalone runs.
+Standalone named module tests use the same default targets as full gates.
+A nested named gate reuses its live parent reservation on natedev.
+Copy wrappers apply this rule before target overrides.
 `--promote-only` runs on natedev.
+Named module results supply no pass certificate.
 If the gate cannot verify a supplied assignment, it reports the reason and starts no runner.
 An assignment to `natedev` runs the gate on natedev.
+A prepared gate with an AWS assignment runs the tests in AWS.
+The AWS route reports the result or refusal to the queue.
 An assignment to `mac-linux` runs the whole test selection in the Mac Linux guest when `enabled.mac-linux=on`.
 The nightly gate uses the guest for type checks when it finds `basedpyright` and `uv` there.
 If the guest lacks either tool, the nightly gate runs its type checks on natedev.
@@ -99,36 +119,52 @@ So the queue places no other run on the busy guest, and the Builds page shows a 
 Until the queue confirms the guest attempt, the row shows `mac-linux (not confirmed)`.
 A refused consume, or a queue that does not answer, starts nothing on the guest.
 The guest run holds a separate lock. Before it can prove the run ended, the guest checks its machine ID and the checkout path from the arm step. The route also refuses the proof when the guest account in the settings differs from the armed account.
-If the wait expires, the gate fails with `guest unreachable` and the guest alias from `ssh.hops`.
-The route sends no more cleanup requests.
+If the wait expires, the route prints `guest unreachable` with the guest alias from `ssh.hops`.
+The gate returns status 80 to the caller for that episode.
+The route saves the end result in the Mac Linux proof journal before any settlement report.
+The route stops its own cleanup requests.
+The queue can request another proof check for the saved guest attempt while the slot stays held.
 The queue currently releases the Mac claim at this deadline. The guest run keeps its lock until it ends.
 The queue's guestkeep change will retain the Mac claim until a later proof.
 If the guest starts no test run, the route returns `GuestNotStarted`.
 This covers a Mac block or busy Mac claim, a refused or unavailable launch permission, an active retry backoff, a failed guest probe and a failed arm step.
-It also covers a guest run that fails before the runner writes the `mac-linux run start` line, which comes before the gate starts its suites.
-The gate writes a claim failure to `<assignment>.claim-failure`.
-The gate prints `Mac Linux guest took no run: <cause>` and exits with status 79.
+The runner writes `mac-linux run start` before it starts the suites.
+A failure before that line can leave the start unconfirmed.
+The gate writes a claim failure to `<assignment>.claim-failure` when it can report that no tests started.
+It prints `Mac Linux guest took no run: <cause>`.
 In merge mode, it undoes the merge and reports the rollback.
-Status 80 identifies an unknown result after a guest could have started tests.
-A direct gate or `copies.py gate-step` places the run once.
-Checkpoint and bump stop after status 79 or 80.
-`copies.py gate-step` preserves both statuses if cancellation fails and prints the cleanup error on standard error.
-When `copies.py run` owns placement, it reports the claim failure to the queue on status 79 and requests placement again.
-The queue accepts a claim failure after launch permission was used if a new process read confirms the gate ended.
-The caller writes the new assignment to the same file and runs the gate on the assigned machine.
-A 180-second delay applies to another attempt on the same guest. A free named machine can take the run during that delay.
-A second decline excludes the guest for the rest of the run.
-If placement fails, the caller reports `Gate placement blocked`.
+Status 79 identifies a refusal before tests started.
+Status 80 identifies a run with no verdict or a launch that still needs settlement.
+A completed AWS run with open settlement keeps its verdict and prints one warning on standard error.
+A direct gate or `copies.py gate-step` uses one placement.
+`copies.py run` and `copies.py gate-step` preserve status 79 or 80 if cleanup fails.
+They report the cleanup error on standard error.
+Checkpoint and bump treat these statuses as blocked.
+A nightly gate reports the refusal to its production owner and records no red test result.
+When `copies.py run` owns placement, it reports the claim failure to the queue on status 79.
+The queue checks that the gate process ended before accepting a no-run report after launch permission was used.
+An attempt can still require guest proof before the queue releases it.
+On status 80, `copies.py run` requests settlement.
+For Mac Linux, the wrapper needs a no-run report before it requests a replacement.
+The wrapper writes the replacement assignment to the same file and runs the gate on the assigned machine.
+After a prelaunch refusal, another attempt on the same guest requires a fresh availability reading.
+An eligible named machine can take the run while the guest is in backoff.
+A fresh reading that still excludes the guest keeps it out of placement.
+If placement fails, the wrapper reports `Gate placement blocked`.
 A confirmed test failure gives status 1.
-Checkpoint and bump gates use `copies.py gate-step` when they have placement targets.
-A claude gate requests every enabled target that the fixed placement rules permit when the caller gives no targets.
+A gate command in Merge tests uses `copies.py run --commit <sha>` with the prepared merge commit.
+The command uses `{tree}` for its checkout or repository argument.
+A base check uses the prepared base commit.
+A copy setup failure blocks the checkpoint and reports the test log path.
+The checkpoint skips the rerun and the base check after a copy setup failure.
+Bump gates use `copies.py gate-step` when they have placement targets.
+A claude gate uses the configured targets that its placement rules permit when the caller gives no targets.
 See [Gate placement](build-targets.md#gate-placement).
-If the guest cannot return a result after a test started, the gate fails and reports the guest and the reason.
+If the guest cannot return a result after a test started, the gate reports status 80 and gives the reason.
 Each failure with a stream status names that status and the last 1200 characters of the stream standard error (`stream_report`).
 If the guest returns a failure, the gate reports the guest and the failed jobs.
 A targeted gate can reuse a certified test pass. The guest runs any requested type checks on the Mac.
-A merge gate or targeted test with a prepared copy handoff from `copies.py run` can try AWS without a placement assignment.
-If the cloud route returns a final refusal, natedev runs the selection.
+The AWS route requires a current queue assignment and the prepared gate handoff.
 
 On natedev and on the Mac Linux guest, a hand made run starts its program under `bwrap` with a read limit.
 The rule set is in `scripts/build_targets/mac_linux.py` (`limit_words`), because the guest runner can read only that module; `scripts/production/hand_made_limit.py` adds the natedev paths.
@@ -202,7 +238,7 @@ Production also downloads the request that contains the module list.
 User data contains the download links instead of the program or module paths.
 Production and trial use curl with signed HTTPS links for every box transfer.
 The guest performs no type check and installs no basedpyright package.
-A gate without a placement assignment runs any requested type checks on natedev after a cloud result.
+The gate runs requested AWS type checks on natedev after the cloud result returns.
 A cloud result that reports a time limit ends the gate before those checks.
 
 The route tries all public zones at `m7a.8xlarge`, then all zones at `m7a.4xlarge`.
@@ -212,14 +248,15 @@ A guest deadline and an independent expiry Lambda bound normal attempt lifetimes
 The route confirms termination before it releases unused cost reservation.
 A launch timeout keeps the cost reservation until reconciliation confirms the outcome.
 
-The route returns a reason for cloud setup and infrastructure failures.
+The route reports cloud setup and infrastructure failures to the queue.
+The queue can reassign after settlement.
 Capacity refusals first exhaust the configured sizes and zones.
 A connect failure at launch means AWS did not receive the request, so no box exists.
 The route then skips that region and tries the next region; it prints `Cloud gate skips <region>: <reason>`.
 A running box survives a short AWS outage: the result poll skips failed reads for up to `observe_outage_s`.
 Termination repeats an outage error until `termination_timeout_s` ends.
-An uncertain launch or termination keeps its cost reservation until reconciliation confirms the end.
-The route gives a fallback reason when an instance stops without a final result.
+The route reports pending settlement while a launch or termination is uncertain.
+A dead instance without a final result fails the AWS attempt.
 The route validates source identity, attempt, modules, host, verdict, and final log delivery.
 It imports the explicit `gate_run` record once into the one AWS place, `aws`.
 The record keeps the box host name in `host`.
@@ -231,7 +268,7 @@ Launch, refusal, fallback, and finish rows record the queue's tagged job record 
 The field contains `{"kind":"GateJobNotRecorded"}` when the job is unknown.
 Older rows can omit the field.
 A refusal prints `Cloud gate refused: <type> in <zone>: <code>`.
-The natedev fallback prints `Cloud gate uses natedev: <reason>`.
+A final AWS refusal prints `AWS gate failed: <reason>`.
 These lines contain no account, instance, or subnet identifier.
 
 The shared cost ledger includes Rust charges and all gate reservations.
@@ -364,8 +401,13 @@ The launcher fixture replaces non-Git commands; the formatter still runs real ta
 `scripts/production/gate.py` merges a checkpoint into the production's merge branch.
 It tests all modules before it pushes the merge.
 It discovers every `scripts/**/test_*.py` module outside `__pycache__`.
-`scripts/production/gate.py --affected --checkout TREE [--full]` runs a unit's targeted tests through the same runner.
-`python3 -m scripts.production.gate` accepts the same options.
+Run a unit's targeted tests with `copies.py run` and `scripts/production/gate.py --affected`.
+A direct `--affected` call prints the `copies.py run` command on standard error and exits with status 1.
+The command uses the Git worktree root and its current `HEAD` commit.
+The inner gate command always has one `--repo '{tree}'` option for the prepared checkout.
+This option replaces any `--repo` or `--checkout` options from the direct call.
+The gate requires a handoff from `copies.py run` or `copies.py gate-step` before it starts placement or tests.
+`./scripts/lib/py -m scripts.production.gate` accepts the same options.
 The former `merge_gate.py` and `targeted_test.py` entry points remain available until their removal.
 `build_steps.command_job` reads these command forms for the memory feed and copy lease names.
 It names integration, promotion, nightly tests, all tests, affected tests, or selected modules from the arguments.
@@ -442,10 +484,11 @@ Cleanup stops the confirmed groups and removes the journal, even when the tempor
 The receipt stays with a retained checkout.
 See [Mac gate cleanup](mac-test-offload.md#mac-gate-cleanup) for the queue callbacks.
 
-### Targeted tests: `scripts/production/targeted_test.py`
+### Targeted tests
 
-The entry has its own parser and description.
-It shares the suite arguments, signal wrapper, copy lock, and suite runner with `merge_gate.py`.
+Run `gate.py --affected` through `copies.py run` from the unit worktree root.
+Use the command in `<FinalGate/>` in `docs/direct/final_gate_commit.md`.
+`scripts/production/targeted_test.py` passes its arguments to `gate.py --affected`.
 `SuiteMode.TARGETED` enables selection and takes the `test-affected` admission step.
 `SuiteMode.GATE` runs all modules and takes the `gate` step.
 Both modes accept `--full` because existing repository callers use it.
@@ -467,8 +510,10 @@ This record changes no selection and refuses no run.
 ### The gate: `scripts/production/merge_gate.py`
 
 **Invocation.** `gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
-The six merge flags are required unless `--tests-only`, `--promote-only`, or `--nightly` is given.
+The six merge flags are required for a checkpoint merge.
+Use `--tests-only` for a merge-line test run and `--affected` for a unit test run.
 Use one `--module <suite>/<module>` for each module with `--tests-only` or `--affected`.
+`copies.py run` refuses a named gate without either mode before it requests placement.
 Use the module names that the gate prints.
 A standalone named run on natedev waits for the build hold to clear and takes one local admission reservation.
 A named run on natedev uses the build hold exemption for the unit in `max_runs.exempt_unit`.
@@ -481,7 +526,9 @@ Modules share the CPU slots and use the memory governor.
 A failed module can run once more alone.
 A named run on natedev has no time limit.
 On `mac-linux`, `run.time_limit_seconds` limits each module and the full run.
-Named runs create no gate record or passed-tree entry.
+Named runs on natedev or `mac-linux` create no gate record.
+The controller imports a `gate_run` record for a completed prepared named gate on AWS.
+Named runs create no pass certificate or passed-tree entry.
 The merge checkpoint uses this form to verify a failed module on its base. See [showrunner automation](showrunner-automation.md).
 `--promote-only --merge-branch B` promotes the pushed branch to main and the Mac without merging or testing.
 `--production` defaults to the calling showrunner's production, read from its update timer.
@@ -593,10 +640,12 @@ The 03:00 timer calls this path.
 Each green exit sends `nightly.result`.
 An exit before the checks start sends `nightly.not_run`.
 The result names the branch, finish time, type result and full test result.
-The failure text names the reason on one line within the message limit.
+The failure push shows `Nightly check did not run`, the reason, and the next run time in the user's time zone.
+The gate reads the schedule from `claude-nightly.timer`.
+The gate limits the reason so the next run time and footer fit in the push.
 Both pushes use need `note` and the key `nightly-result`.
-The result requires no action. The failure text includes an action.
-The gate says the next nightly run tries again. The cold credentials example directs the user to run `github-warmup`.
+The gate sends the failure push without an action line.
+The timer keeps the `github-warmup` action line when GitHub credentials are cold.
 Silence keeps only the newest push on that key and delivers it when silence ends.
 The gate reads `nightly_result_push` and `nightly_result_modules` from `config/gate.conf` at use.
 `nightly_result_push=off` disables all nightly result pushes. The default is `on`.
@@ -640,8 +689,7 @@ The command accepts a unit director of any production.
 `UNIT` accepts the staff ID, a `<production>/<unit>` path, or the name of an sdlc unit.
 The command confirms receipt if the original notice has no delivery confirmation.
 It saves the assignment before it sends `nightly.assigned`.
-The push places the receipt and assignment status before the failure list.
-The phone retains that status when it truncates a long failure list.
+The push shows the title `Nightly check failed` and one body line that names the assigned unit.
 A rerun prints `unchanged` after the sender accepts the push.
 Both automatic and manual assignment send a user push.
 The push names the assignee when the receipt is confirmed.
@@ -959,7 +1007,7 @@ A batch can contain one item.
 7. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
 
 A resumed item tests an unpushed merge or resumes promotion of a pushed merge.
-A stop during test preparation or a main conflict returns every pending item in the resumed batch.
+A stop during test preparation, a red test, or a main conflict returns every pending item in the resumed batch.
 A published merge with a promotion marker keeps its completed result.
 For other stops, the existing resume rules apply.
 
@@ -993,9 +1041,10 @@ It keeps the drop decision in memory for this run.
 It rebuilds survivors in order and runs every configured merge command.
 A red survivor gate stops the batch. The existing main advance policy also applies to survivors.
 If a survivor rebuild stops before publication, resend the same full batch.
-When a gate batch has only some rows merged locally, a matching resend merges the remaining rows before the gate.
-If that gate is red, the batch can identify and drop one row again.
-If all rows are already merged locally, a red gate uses the normal stop.
+Only a fresh batch can drop a row.
+A matching resend resumes merged rows through the single checkpoint command.
+If a resumed gate reports red, the batch returns every pending row for retry.
+If all resumed rows pass, the batch merges the remaining rows as one batch.
 Exit 0 includes a batch that publishes its survivors. Read its `send <unit>:` lines for each row's result.
 Exit 1 reports a failed batch. Exit 77 reports a tree change.
 
@@ -1411,6 +1460,7 @@ The route passes the reservation sidecar path to the scaler service.
 The service writes module progress and `CloudProgress` beside that path.
 The cloud state records the phase, vCPU count, failed module count, and update time.
 The phases are `requesting`, `setup`, `running`, and `uploading`.
+The route reports an uncertain launch to the queue as pending settlement.
 The route requests no local memory for a cloud gate.
 
 ## Verify function tests and process lifetime
