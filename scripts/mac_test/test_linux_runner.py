@@ -27,7 +27,7 @@ from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.copies_test_support import copies_environment
-from scripts.mac_test import eligibility, claim_state, floor_claims, linux_runner, mac_test, offload, test_target_slots
+from scripts.mac_test import eligibility, claim_state, floor_claims, linux_runner, mac_test, offload, test_repository_claims
 from scripts.mac_test.offload_test_commands import WORKSPACE_SWEEP_SETTINGS, WorkspaceSweepFixture
 from scripts.mac_test.offload_test_support import mirror_use_payload
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
@@ -452,7 +452,7 @@ class LinuxShellTests(unittest.TestCase):
         self.assertNotIn("BUILDLOG_REPO_IDENTITY", event["environment"])
 
 
-    def test_unchanged_inputs_reuse_exports_and_the_slot_build_folder(self) -> None:
+    def test_unchanged_inputs_reuse_exports_and_the_build_mirror(self) -> None:
         _ = self.assert_ran(self.request())
         self.write_input("src/main.rs", "fn main() { println!(\"changed\"); }\n")
 
@@ -1937,7 +1937,7 @@ class LinuxDispatchTests(unittest.TestCase):
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.fixture: test_target_slots.RepositorySlotTests = test_target_slots.RepositorySlotTests()
+        self.fixture: test_repository_claims.RepositoryClaimTests = test_repository_claims.RepositoryClaimTests()
         self.controller: offload.ProcessController = offload.ProcessController()
 
     @override

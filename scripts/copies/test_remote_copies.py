@@ -26,7 +26,7 @@ from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
 from scripts.lib import conf, file_lock, scratch
@@ -60,7 +60,7 @@ class RemoteCopiesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
-        private = private_slot_config(self.root)
+        private = private_copy_config(self.root)
         self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.source = ImmutableGitSeed.create(self.root, "main", "Copy Tests", "copy@example.invalid",
                                              {"Cargo.toml": "[workspace]\n", "source.txt": "committed\n", "stable.txt": "stable\n"}).checkout
@@ -427,7 +427,7 @@ class RemoteCopiesTests(unittest.TestCase):
         )
         for cause, status, remote_output, detail in cases:
             with self.subTest(cause=cause), mock.patch.dict(os.environ, {**copies_environment(self.root / cause),
-                    **private_slot_config(self.root / cause).environment}):
+                    **private_copy_config(self.root / cause).environment}):
                 mirrors = [self.remote(path=f"mirror/{cause}-{index}") for index in range(2)]
                 for mirror in mirrors:
                     copies.register_remote(mirror)
@@ -459,7 +459,7 @@ class RemoteCopiesTests(unittest.TestCase):
             root = self.root / action
             root.mkdir()
             with self.subTest(action=action), local_remote_transport(root), \
-                    mock.patch.dict(os.environ, private_slot_config(root).environment), \
+                    mock.patch.dict(os.environ, private_copy_config(root).environment), \
                     warm_claim_servers(), ExitStack() as contexts:
                 mirror = self.remote(path=str(root / "mirror"))
                 self.assertEqual(publish_mirror(mirror), 0)
@@ -803,7 +803,7 @@ class RemoteCopiesTests(unittest.TestCase):
         _ = python.write_text(f"#!{sys.executable}\n" + f"""import sys
 from pathlib import Path
 from scripts.copies import copies
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.mac_test import floor_claims
 log = Path({str(log)!r})
 with log.open('a') as output:
