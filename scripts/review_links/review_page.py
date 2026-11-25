@@ -230,7 +230,10 @@ class ReviewSnapshot:
             raise LookupError('This item is not in the current snapshot.')
         body = self.render_body(item, self.assets)
         if view is ReviewBodyView.TABLE:
-            return body
+            if body == CARD_ERROR:
+                return body
+            summary = index_json([card_entry(item, self.members, self.names, self.zone)])
+            return body + f'<script type="application/json" data-review-summary>{summary}</script>'.encode()
         entry = next(entry for entry in self.entries if entry['key'] == key)
         return render_card(self, entry, body.decode(), waiting_why=item.waiting_why)
 
@@ -1590,7 +1593,8 @@ function reviewCardSummary(entry,titleLimit,icon){
  const node=document.createElement('tbody'),panel=detailId(entry.key);
  Object.assign(node.dataset,{listItem:'',key:entry.key,number:entry.id.toLowerCase(),title:entry.title.toLowerCase(),
   owner:entry.owner,sourceOwner:entry.sourceOwner,sourceName:entry.sourceName,state:entry.state,type:entry.type,
-  order:entry.order,updated:entry.updated,parked:'false',sortValues:JSON.stringify(entrySortValues(entry))});
+  order:entry.order,updated:entry.updated,unreadAnswer:entry.unreadAnswer,parked:'false',
+  sortValues:JSON.stringify(entrySortValues(entry))});
  const first=entry.title.split(/\r?\n/)[0],short=first.slice(0,titleLimit);
  const stamp=entry.filed ? reviewAge(entry.filed*1000) : '';
  const typeLabel=entry.type==='for-you' ? 'For you' : entry.type[0].toUpperCase()+entry.type.slice(1);
@@ -1631,10 +1635,11 @@ function updateTitleFallback(panel){
  fallback.hidden=reviewBodyText(panel.querySelector('[data-review-body]'))
   .includes(plainReviewText(fallback.querySelector('p').textContent));
 }
-function installReviewBody(row,text){
+function installReviewBody(row,body){
  row.dataset.bodyLoaded='true';
  const detail=recordDetails(row);
- detail.innerHTML=text;
+ if(typeof body==='string') detail.innerHTML=body;
+ else detail.replaceChildren(body);
  const panel=detail.querySelector('.review-panel');
  if(panel) updateTitleFallback(panel);
  updateHandoffAges(detail);
@@ -1666,7 +1671,7 @@ function bindReviewForm(form,{zone,settings,remember=()=>rememberReviewDraft(for
   }
   submit(outcome);
  });
- if(later) bindDateTimePicker(form,{zone:zone(),settings,summaryPrefix:'Hides until '});
+ if(later) bindDateTimePicker(form,{zone,settings,summaryPrefix:'Hides until '});
 }
 function readReviewDraft(form){
  if(!form?.elements.feedback) return null;
@@ -1996,8 +2001,10 @@ const saved=new Map(),bodies=new Map(),bodyRequests=new Map();
 const pendingSaves=new Map(),recovering=new Map();
 const scrollDepartures=new Set();
 const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
+const missingReview='This review is no longer on the Review page.';
 let focusAfterLoad=null,firstRequest=firstReviewCard;
 let deferredLink=null,revealCreated=null,newItemRefresh;
+let missingCard=false;
 function allEntries(){return [...index.values()];}
 function isInvestigation(entry){return entry.type==='investigation' || entry.type==='bug';}
 function rowOwners(entry){
@@ -2120,9 +2127,16 @@ const filterRow=name=>filterControl.row(content,name);
 const showValues=filterControl.buttons(filterRow('show')).map(button=>filterControl.value(button));
 const showsByType=new Map(''' + json.dumps(tuple(SHOWS_BY_TYPE.items())) + r''');
 const showChoices=type=>showsByType.get(type) ?? showValues;
+const mountReviewRow=entry=>reviewCardSummary(entry,Number(content.dataset.titleLimit),
+ filterRow('type').querySelector('[data-filter-value="'+entry.type+'"] .review-icon').outerHTML);
 const view=createRecordTable({...reviewPlaceOptions,content:()=>content,
- entries:allEntries,mount:entry=>reviewCardSummary(entry,Number(content.dataset.titleLimit),
-  filterRow('type').querySelector('[data-filter-value="'+entry.type+'"] .review-icon').outerHTML),mounted:()=>loadBodies(),
+ entries:allEntries,mount:mountReviewRow,mounted:()=>loadBodies(),
+ retainDetailState:(previous,row)=>{
+  const version=previous.dataset.bodyVersion;
+  if(previous.dataset.bodyLoaded==='true' && version===content.dataset.version){
+   row.dataset.bodyVersion=version;row.dataset.bodyLoaded='true';
+  }
+ },
  focusKey:()=>focusAfterLoad?.key,
  pinOpenRow:key=>{
   const pending=pendingSaves.get(key);
@@ -2137,7 +2151,7 @@ const view=createRecordTable({...reviewPlaceOptions,content:()=>content,
  },
  selectShow:(show,type)=>showChoices(type).includes(show) ? show : 'open',
  persistLinkedTarget:true,
- missingItem:()=> 'This review is no longer on the Review page.',
+ missingItem:()=>missingReview,
  resolveOwner:owner=>{
   const button=filterControl.buttons(filterRow('owner')).find(button=>
    filterControl.ownerId(button)===owner || button.dataset.ownerName===owner);
@@ -2164,7 +2178,10 @@ const view=createRecordTable({...reviewPlaceOptions,content:()=>content,
     }
    })()
   });
-  content.dataset.show=show;loadBodies();
+  content.dataset.show=show;
+  if(view.openItem) missingCard=false;
+  if(missingCard) showActionFailure(content.querySelector('[data-missing-item]'),missingReview);
+  loadBodies();
   const actionNotices=content.querySelector('[data-for-you-notices]');
   actionNotices.hidden=type!=='for-you' || !actionNotices.children.length;
   updateReviewChips(rows,filters,matches,count);
@@ -2216,23 +2233,45 @@ function needsBody(row){
  const pending=saved.get(row.dataset.key);
  return !row.dataset.bodyLoaded && !pending?.retained && !(pending?.handed && pending.awaitingSnapshot);
 }
-function applyReviewDetail(key,row,detail,text){
- installReviewBody(row,text);
+function applyReviewSummary(row,entry){
+ const next=mountReviewRow({...entry,order:Number(row.dataset.order)});
+ const previous=row.querySelector('.list-row'),summary=next.querySelector('.list-row');
+ const focused=previous.querySelector('.list-toggle')===document.activeElement;
+ Object.assign(row.dataset,next.dataset);
+ summary.classList.add('open');
+ const toggle=summary.querySelector('.list-toggle');
+ toggle.setAttribute('aria-expanded','true');
+ previous.replaceWith(summary);
+ return focused ? toggle : null;
+}
+function applyReviewDetail(key,row,detail,text,bodyVersion=''){
+ let body=text,focus=null;
+ if(bodyVersion && bodyVersion!==content.dataset.version){
+  const template=document.createElement('template');
+  template.innerHTML=text;
+  const summary=template.content.querySelector('[data-review-summary]');
+  const entry=summary && readIndex(JSON.parse(summary.textContent)).get(key);
+  if(!entry) throw new Error('The item has no summary for its snapshot.');
+  focus=applyReviewSummary(row,entry);body=template.content;
+ }
+ installReviewBody(row,body);
+ row.dataset.bodyVersion=bodyVersion;
  const departure=saved.get(key);
  if(departure?.closes && departure.awaitingSnapshot)
   detail.querySelector('[data-review-form]')?.remove();
  bindForm(row);
  view.showDraftCopy(reviewDrafts.get(key)?.draft.feedback,Boolean(detail.querySelector('[name="feedback"]')));
+ focus?.focus({preventScroll:true});
 }
 function loadBodies(){
  view.opened.forEach(key=>{
   const row=view.openItem;
   if(row?.dataset.key!==key || !index.has(key) || !needsBody(row)) return;
-  const install=text=>{
+  const install=({text,version})=>{
    const current=view.openItem;
    if(current?.dataset.key!==key || !index.has(key)) return;
    const detail=recordDetails(current);
-   const apply=(row,detail)=>applyReviewDetail(key,row,detail,text);
+   const apply=(row,detail)=>applyReviewDetail(key,row,detail,text,version);
    view.itemError('');
    current.dataset.bodyLoaded='true';
    view.preserveRecordRowTop(()=>{
@@ -2241,31 +2280,42 @@ function loadBodies(){
     restoreFocus(key);
    });
   };
-  if(bodies.has(key)){install(bodies.get(key));return;}
+  const cached=bodies.get(key);
+  if(cached){install(cached);return;}
   if(bodyRequests.has(key)) return;
   drawSaveControls(recordDetails(row).querySelector('[data-review-form]'));
+  const requestedIndex=index;
   const version=content.dataset.version;
   const prefetched=firstRequest?.key===key && firstRequest.version===version;
   const result=prefetched ? firstRequest.result : requestReviewCard(key,version);
   if(prefetched) firstRequest=null;
+  const current=()=>bodyRequests.get(key)===request && view.openItem?.dataset.key===key &&
+   view.opened.has(key) && index.has(key) && !pendingSaves.has(key);
   const request=result
    .then(({response,text})=>{
-    if(bodyRequests.get(key)!==request || content.dataset.version!==version) return;
+    if(!current()) return;
     const bodyVersion=response.headers.get('X-Review-Version');
-    if(bodyVersion && bodyVersion!==version){
-     bodyRequests.delete(key);
-     void pageRefresh.refresh(true);
+    const pageVersion=content.dataset.version;
+    if(requestedIndex!==index && bodyVersion!==pageVersion){
+     bodyRequests.delete(key);loadBodies();
+     return;
+    }
+    if(response.status===404){
+     missingCard=true;view.closeCard(key);view.applyAction();
+     if(bodyVersion && bodyVersion!==pageVersion) void pageRefresh.refresh(true);
      return;
     }
     if(!response.ok) throw new Error('HTTP '+response.status);
-    if(bodyVersion!==version) throw new Error('The item has no snapshot version.');
+    if(!bodyVersion) throw new Error('The item has no snapshot version.');
     if(text.includes(' data-review-card-unavailable>')) throw new Error('The item body is unavailable.');
-    bodies.set(key,text);install(text);
+    const body={version:bodyVersion,text};
+    install(body);bodies.set(key,body);
+    if(bodyVersion!==pageVersion) void pageRefresh.refresh(true);
    }).catch(error=>{
-    const current=view.openItem;
-    if(current?.dataset.key===key && index.has(key) && bodyRequests.get(key)===request){
-     current.dataset.bodyLoaded='failed';
-     const loading=recordDetails(current).querySelector('[data-record-loading]');
+    if(current()){
+     const item=view.openItem;
+     item.dataset.bodyLoaded='failed';
+     const loading=recordDetails(item).querySelector('[data-record-loading]');
      if(loading) loading.hidden=true;
      view.itemError('The item could not refresh: '+error.message);
     }
@@ -2356,6 +2406,7 @@ function bindForm(row){
    receiver:sendActionReceiver(form,data),
    confirmedSave:()=>{
     pending.saved=true;
+    bodies.delete(key);
     if(view.currentItemRequest(request) && reviewDrafts.get(key)?.stamp===draftAtSubmit?.stamp){
      reviewDrafts.delete(key);
      form.elements.feedback.value='';
@@ -2386,9 +2437,9 @@ function bindForm(row){
      return;
     }
     const waitState=outcome==='validate' ? 'Validating' : 'Waiting';
-    const previous=index.get(key);
+    const previousUnreadAnswer=row.dataset.unreadAnswer==='true';
     const marker={updated:row.dataset.updated,previousState:row.dataset.state,
-     previousUnreadAnswer:previous?.unreadAnswer,readAnswer:outcome==='read' && previous?.unreadAnswer,
+     previousUnreadAnswer,readAnswer:outcome==='read' && previousUnreadAnswer,
      handed,state:result.state ?? (handed || outcome==='question' ? waitState : outcome==='later' ? row.dataset.state : 'Done'),
      type:result.type,
      later:result.later ?? (outcome==='later' ? Date.parse(data.get('later')) : 0),
@@ -2496,15 +2547,15 @@ async function refresh(_supersede=false,current=()=>true){
  }
 }
 async function refreshReview(current){
- if(pendingSaves.size || dateTimePickerOpen(document)) return;
- const canApply=()=>!pendingSaves.size && current();
+ const canApply=()=>!pendingSaves.size && !dateTimePickerOpen(document) && current();
+ if(!canApply()) return;
  const options={cache:'no-store',signal:reviewRequestSignal()};
  const delivery=view.deliveryRequest(),query=new URLSearchParams({version:'1'});
  if(delivery) query.set('delivery',delivery.delivery);
  const response=await fetch(location.pathname+'?'+query,options);
  if(!response.ok) throw new Error('HTTP '+response.status);
  const version=await response.json();
- if(!canApply() || dateTimePickerOpen(document)) return;
+ if(!canApply()) return;
  view.itemError('');
  const finishDelivery=async()=>{
   if(!delivery || version.delivery_pending!==false) return;
@@ -2523,7 +2574,6 @@ async function refreshReview(current){
  const fresh=await fetch(location.pathname+'?'+new URLSearchParams({index:'1',version:version.version,'for-you':'1'}),options);
  if(!fresh.ok) throw new Error('HTTP '+fresh.status);
  const payload=await fresh.json();
- if(!canApply() || dateTimePickerOpen(document)) return;
  return afterRowAnimations(async()=>{
   view.preserveRecordRowTop(()=>applyReviewIndex(payload));
   await finishDelivery();
@@ -2553,7 +2603,7 @@ function applyReviewIndex(payload){
  content.querySelector('[data-for-you-notices]').replaceChildren(...(payload.actionNotices || []).map(text=>{
   const line=document.createElement('li');line.textContent=text;return line;
  }));
- bodies.clear();bodyRequests.clear();
+ for(const [key,body] of bodies) if(body.version!==payload.version) bodies.delete(key);
  const ownerRow=filterRow('owner'),pairs=new Map();
  const focusedOwner=ownerRow.contains(document.activeElement);
  for(const entry of index.values()){
@@ -2576,6 +2626,10 @@ function applyReviewIndex(payload){
  }
  storeSavedVerdicts();
  for(const [key,result] of saved) savedEntry(key,result);
+ const openKey=view.openItem?.dataset.key;
+ if(view.opened.has(openKey) && !index.has(openKey)){
+  missingCard=true;view.closeCard(openKey);
+ }
  bind();
  const openedLink=view.retryItemLink();
  if(!openedLink) view.apply(false);

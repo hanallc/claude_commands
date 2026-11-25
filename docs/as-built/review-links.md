@@ -722,7 +722,12 @@ The index contains summary values and shared staff labels.
 The server sends card bodies on demand.
 The server sends gzip when the browser accepts it with a positive quality.
 Each body response carries its snapshot version.
-If the versions differ, the browser refreshes the index before it displays the body.
+The browser displays an available body as soon as it arrives, even if its version differs from the index.
+The body supplies the row state before the browser enables its actions.
+A version difference starts the guarded page refresh.
+If the index changes during the request, the browser accepts only a body with the current index version.
+The refresh keeps the open form when its body has the same version as the new index.
+If the body request or index reports a missing item, the browser closes the card and shows the missing item notice.
 The Show chips replace the right count text.
 All includes active Review records and all For you actions.
 Done shows completed For you actions.
