@@ -1075,6 +1075,7 @@ That command asks the worker for the DONE.
 When an ended pass still waits for DONE, `worker.py answer` checks the same receipt.
 This includes a canceled pass without a stopped hook outcome.
 If the idle worker still owes a reply, `answer` sends the director's text and names the results that need replies.
+If Codex aborts that turn after it accepts the prompt, the director can repeat `answer`.
 Each reply clears the results it names by run ID. A matching DONE follows the pass receipt rules.
 When no reply is due, `answer` queues undelivered results for the director before it releases the wait.
 The run ID identifies the notice across retries.

@@ -4448,6 +4448,16 @@ class WorkerCommandTests(unittest.TestCase):
             self.fixture.world.locations[pane]["agent_status"] = "idle"
             self.assertEqual(self.command(*answer)[0], worker.ExitCode.BUSY)
             self.assertEqual(len(self.agent.submitted), 2)
+
+            backend = staff.backend(row)
+            assert isinstance(backend, staff.CodexBackend)
+            with worker_admission.transcript_source(row, backend).open("a", encoding="utf-8") as stream:
+                _ = stream.write(json.dumps({"type": "event_msg", "payload": {"type": "turn_aborted"}}) + "\n")
+            self.assert_assign_waits_for_result_reply(assign_next)
+            self.assertEqual(self.command(*answer), (0, "done\n", ""))
+            self.assertEqual(self.agent.submitted[1:], [(pane, prompt), (pane, prompt)])
+            self.assertEqual(self.command(*answer)[0], worker.ExitCode.BUSY)
+            self.assertEqual(len(self.agent.submitted), 3)
         self.assertEqual(worker_lifecycle.read_json_object(path), saved)
 
         self.agent.without_done = True

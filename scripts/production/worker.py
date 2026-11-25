@@ -449,7 +449,8 @@ def _transcript_turn_boundary(fields: dict[str, object]) -> bool:
         return True
     if fields.get("type") == "event_msg":
         payload = fields.get("payload")
-        return isinstance(payload, dict) and cast(dict[str, object], payload).get("type") == "task_complete"
+        return (isinstance(payload, dict)
+                and cast(dict[str, object], payload).get("type") in ("task_complete", "turn_aborted"))
     return False
 
 
@@ -2287,9 +2288,7 @@ def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBacken
         if entry.startswith("user:\n"):
             body = entry.removeprefix("user:\n")
             accepted |= _answer_digest(script_prompt(body)) == saved.get("answer_digest")
-        elif accepted and (entry.startswith("assistant:\n")
-                           or fields.get("type") == "event_msg" and kind == "task_complete"
-                           or fields.get("type") == "system" and fields.get("subtype") == "turn_duration"):
+        elif accepted and (entry.startswith("assistant:\n") or _transcript_turn_boundary(fields)):
             next_request = True
     if not number or number < boundary:
         return AnswerBlocked.UNAVAILABLE
