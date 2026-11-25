@@ -1485,6 +1485,27 @@ def result_is_from_another_pass(record: Mapping[str, object], instance: object) 
             and isinstance(instance, str) and bool(instance) and linked != instance)
 
 
+def later_results_from_other_passes(runs: Path, worker: staff.StaffRow, *, pane_dispatch_id: str,
+                                   result_ids: Collection[str]) -> bool:
+    """Require a readable record from another pass for each result ID."""
+    wanted = frozenset(result_ids)
+    verified: set[str] = set()
+    for path in _run_record_paths(runs):
+        if (owner := _record_owner(path)) and owner != worker.id:
+            continue
+        try:
+            record = worker_lifecycle.read_json_object(path)
+        except worker_lifecycle.WorkerStateUnreadable as error:
+            unit_runs.report_anomaly(" ".join(f"anomaly: {error}".splitlines()))
+            continue
+        run_id = path.name.removesuffix(".json")
+        if (run_id in wanted and _is_run_record(record)
+                and record["run_id"] == run_id and record["staff_id"] == worker.id
+                and result_is_from_another_pass(record, pane_dispatch_id)):
+            verified.add(run_id)
+    return verified >= wanted
+
+
 class ResultPassOwnership(Enum):
     CURRENT = "the result belongs to the current pass"
     OTHER_PASS = "the result belongs to another pass or run folder"
