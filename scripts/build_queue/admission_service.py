@@ -5994,7 +5994,7 @@ done
 
     def _newer_remote_free_readings(self, queued: list[wire.PlacementRequest]
                                    ) -> dict[tuple[str, placement.PlacementDestination], float]:
-        """Find newer free readings for higher busy steps at the same destination."""
+        """Find newer free readings for higher busy steps at the same Mac destination."""
         free: dict[placement.PlacementDestination, float] = {}
         shared: dict[tuple[str, placement.PlacementDestination], float] = {}
         busy = placement.TemporaryExclusion("busy")
@@ -6002,7 +6002,7 @@ done
             allowed: list[placement.FreshHostEvidence] = []
             for candidate in self.placement_eligibility.get(request.episode, ()):
                 destination = candidate.destination
-                if (destination.provider in ("local", "scaler")
+                if (destination.provider != "mac"
                         or not (candidate.eligibility == busy or isinstance(candidate.eligibility, placement.AllowedHost))):
                     continue
                 pair = (request.episode, destination)

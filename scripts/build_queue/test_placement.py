@@ -4479,6 +4479,22 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             read.assert_called_once()
             self.assertEqual(conf.read(settings).text("execution_transport"), "ssh")
 
+    def test_an_ssh_busy_step_cannot_share_a_newer_lower_free_reading(self) -> None:
+        with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
+            _settings, higher, _destination = self.target_settings_fixture(fixture)
+            higher = replace(higher, since=fixture.clock.now() - 60)
+            lower_session = OwningSession("lower-session")
+            lower = placement_request(fixture, session=lower_session, since=fixture.clock.now() - 10)
+            lower = replace(lower, constraints=replace(higher.constraints, session=lower_session))
+            self.assertIsInstance(fixture.connect(higher).replies()[-1], wire.PlacementWait)
+            self.assertIsInstance(fixture.connect(lower).replies()[-1], wire.PlacementWait)
+            _ = publish_candidate(fixture, higher, placement.TemporaryExclusion("busy"))
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, lower)
+            _ = fixture.run_pass()
+            self.assertNotIn(higher.episode, fixture.server.current_assignments,
+                             "The lower SSH reading gave the busy step a slot.")
+
     def test_newer_hana_free_reading_cannot_pass_a_session_block(self) -> None:
         from scripts.aws_target import hana_spend
         from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock
@@ -5371,7 +5387,7 @@ class MacOrderTests(unittest.TestCase):
         return [request.episode for request in requests if request.episode in fixture.server.current_assignments]
 
     @mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)
-    def test_an_older_busy_step_takes_the_mac_in_the_pass_that_reads_it_free(self) -> None:
+    def test_a_first_rank_hana_step_takes_the_mac_hana_place_from_a_newer_lower_free_reading(self) -> None:
         with PlacementFixture() as fixture:
             order = self.mac_order(fixture)
             fixture.clock.advance(1)
