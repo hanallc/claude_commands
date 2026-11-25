@@ -256,6 +256,23 @@ class FolderFormTests(unittest.TestCase):
                     self.assertEqual(sweep.sweep_unused_folders(False, now=time.time(), lint_settings=lint), 0)
                     self.assertTrue(nested.is_dir())
 
+    def test_removal_keeps_a_numbered_copy_with_a_keep_file_and_no_lock(self) -> None:
+        copy = folders.copy_path("claude", "proof", 1)
+        copy.mkdir(parents=True)
+        marker = folders.copy_keep_file(copy)
+        _ = marker.write_text("checkout exit is unconfirmed")
+
+        with folders.folder_removal_lease(copy) as lease:
+            self.assertIsInstance(lease, folders.RefusedRemovalLease)
+        self.assertFalse(folders.remove_build_folder(copy, transient_lock=True))
+        self.assertFalse(copy.with_suffix(".lock").exists())
+        self.assertFalse(folders.remove_build_folder(copy.parent))
+        self.assertTrue(copy.is_dir())
+        self.assertEqual(marker.read_text(), "checkout exit is unconfirmed")
+
+        marker.unlink()
+        self.assertTrue(folders.remove_build_folder(copy.parent))
+
     def test_copy_with_an_unreadable_lock_is_unknown(self) -> None:
         path = folders.copy_path("claude", "proof", 1)
         path.mkdir(parents=True)
