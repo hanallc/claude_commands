@@ -11,7 +11,8 @@ Treat `$ARGUMENTS` as the user's message. Send it without changes. Show the comm
 
 `~/.claude/scripts/lib/py ~/.claude/scripts/production/broadcast.py --from <your session name> --all "From the user (via <your session name>): <message>"`
 
-It reaches all roster groups on both machines, including producers. Each recipient sees who received the message and a request to keep it in that group.
+It reaches all roster groups on both machines, including producers.
+The footer names the recipient groups and asks them to keep the message within those groups.
 
 Put a role flag after `--all` to give a group its own version. Omit only the part that does not concern that group.
 Use `--showrunners "<text>"`, `--units "<text>"`, or `--agents "<text>"`.

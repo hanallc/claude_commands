@@ -596,8 +596,11 @@ The roster keeps these rows for direct sends and other readers.
   The replay also requires a roster without problems before delivery.
   The internal `--all-units` spelling keeps an unscoped group independent of an earlier production scope.
 - The output uses `<shown name> [<address>] - <outcome>[: <detail>]`. Outcomes are `sent`, `kept`, `held`, `no live session`, and `NOT sent`.
-  The address appears in brackets when it differs from the shown name. The shown name includes the job.
-  An empty group prints `<group> - none on this machine` on each machine. The report ends with `<N> sent in <S> s` and the closing line.
+  The address appears in brackets when it differs from the shown name.
+  A producer's `held` line uses the staff name. Other lines use the roster name, which can include the job.
+  An empty group prints `<group> - none on this machine` on each machine.
+  If the staff read fails, `--producers` reports `producers - NOT sent` with the reason.
+  The report ends with `<N> sent in <S> s` and the closing line.
   Exit 0 when nothing is `NOT sent`, 1 on a delivery failure, and 2 on a usage error. Roster problems print as `broadcast: roster: <problem>`.
   Without a production scope, delivery to the other rows continues.
 - Library API: `broadcast(sender, texts: Mapping[BroadcastGroup, str], *, scope=ALL_MACHINES) -> list[Delivery]` runs the same orchestration as the command; `report(deliveries) -> bool`; `send(session, sender, text, *options) -> str` (empty on success). `codex_winddown.announce()` calls `broadcast.broadcast(sender, {Showrunners(): ..., UnitDirectors(): ...})` and `broadcast.report`.

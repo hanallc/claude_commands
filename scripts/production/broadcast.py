@@ -22,7 +22,7 @@ import sys
 import time
 from collections.abc import Collection, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, NamedTuple, cast
 
@@ -120,12 +120,40 @@ class Delivery(NamedTuple):
     detail: str
 
 
-def recipients() -> list[roster.RosterEntry]:
+def _producer_membership(requested: bool) -> staff.StaffSnapshot | staff.StaffUnreadable | None:
+    if not requested:
+        return None
+    try:
+        return staff.initial_snapshot()
+    except staff.StaffUnreadable as error:
+        return error
+
+
+def _read_roster(
+    scope: roster.RosterScope, membership: staff.StaffSnapshot | staff.StaffUnreadable | None,
+) -> roster.Roster:
+    if isinstance(membership, staff.StaffUnreadable):
+        peer = roster.peer_roster(os.environ) if isinstance(scope, roster.AllMachines) else roster.Roster([], [])
+        return replace(peer, problems=[f"staff membership: {membership}", *peer.problems])
+    return roster.roster(os.environ, scope, membership=membership)
+
+
+def recipients(
+    membership: staff.StaffSnapshot | staff.StaffUnreadable | None = None,
+) -> list[roster.RosterEntry]:
     """Read the roster once, retaining readable rows when a source fails."""
-    result = roster.roster(os.environ, roster.ThisMachine())
+    result = _read_roster(roster.ThisMachine(), membership)
     for problem in result.diagnostics:
         print(f"broadcast: roster: {problem}", file=sys.stderr)
     return result.entries
+
+
+def _native_id(entry: roster.RosterEntry) -> str:
+    if isinstance(entry.thread, roster.CodexThread):
+        return entry.thread.thread_id
+    if isinstance(entry.session, roster.ClaudeSession):
+        return entry.session.session_id
+    return ""
 
 
 def selects(group: BroadcastGroup, entry: roster.RosterEntry, producer_sessions: Collection[str] = ()) -> bool:
@@ -133,9 +161,7 @@ def selects(group: BroadcastGroup, entry: roster.RosterEntry, producer_sessions:
         case AllRoles():
             return True
         case Producers():
-            if isinstance(entry.thread, roster.CodexThread):
-                return entry.thread.thread_id in producer_sessions
-            return isinstance(entry.session, roster.ClaudeSession) and entry.session.session_id in producer_sessions
+            return _native_id(entry) in producer_sessions
         case Showrunners():
             return entry.role == "showrunner"
         case UnitDirectors():
@@ -202,7 +228,7 @@ def _unreachable(entry: roster.RosterEntry, reach: roster.CannotReceiveMessages)
 
 def _broadcast(
     sender: str, texts: Mapping[BroadcastGroup, str], entries: Sequence[roster.RosterEntry],
-    scope: roster.RosterScope, producer_sessions: Collection[str],
+    scope: roster.RosterScope, producer_names: Mapping[str, str],
 ) -> list[Delivery]:
     if not texts:
         return []
@@ -210,7 +236,7 @@ def _broadcast(
     chosen: list[tuple[roster.RosterEntry, str, bool]] = []
     producer_addresses: set[str] = set()
     for entry in entries:
-        groups = [group for group in texts if selects(group, entry, producer_sessions)]
+        groups = [group for group in texts if selects(group, entry, producer_names)]
         if not groups:
             continue
         is_producer = Producers() in groups
@@ -233,7 +259,7 @@ def _broadcast(
                 except OSError as error:
                     return Delivery(recipient, "NOT sent", str(error))
                 if outcome == "kept" and is_producer:
-                    return Delivery(recipient, "held", detail)
+                    return Delivery(Recipient(producer_names[_native_id(entry)], address), "held", detail)
                 return Delivery(recipient, outcome, detail)
 
     with ThreadPoolExecutor(max_workers=AT_ONCE) as pool:
@@ -245,7 +271,8 @@ def broadcast(
 ) -> list[Delivery]:
     """The same local and peer orchestration used by the command line."""
     identity = roster.sender_identity(os.environ)
-    return _orchestrate(sender, texts, recipients(), identity, scope)
+    membership = _producer_membership(Producers() in texts)
+    return _orchestrate(sender, texts, recipients(membership), identity, scope, membership)
 
 
 def report(deliveries: list[Delivery]) -> bool:
@@ -385,9 +412,14 @@ def _remote_broadcast(sender: str, texts: Mapping[BroadcastGroup, str]) -> list[
     return deliveries
 
 
+def _producer_failure(error: staff.StaffUnreadable) -> Delivery:
+    return Delivery(Recipient("producers"), "NOT sent", f"staff membership: {error}")
+
+
 def _orchestrate(
     sender: str, texts: Mapping[BroadcastGroup, str], entries: Sequence[roster.RosterEntry],
     identity: roster.SenderIdentity, scope: roster.RosterScope,
+    membership: staff.StaffSnapshot | staff.StaffUnreadable | None,
 ) -> list[Delivery]:
     if not texts:
         return []
@@ -396,19 +428,18 @@ def _orchestrate(
     candidates = [entry for entry in entries
                   if not roster.is_closed_worker(entry) and not roster.is_sender(entry, identity)]
     deliveries: list[Delivery] = []
-    producer_sessions: frozenset[str] = frozenset()
+    producer_names: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=2) as pool:
         peer = (pool.submit(_remote_broadcast, sender, peer_texts)
                 if isinstance(scope, roster.AllMachines) and peer_texts else None)
-        if Producers() in here_texts:
-            try:
-                producer_sessions = frozenset(row.current_session for row in staff.initial_snapshot().find(kind="producer"))
-            except staff.StaffUnreadable as error:
-                deliveries.append(Delivery(Recipient("producers"), "NOT sent", f"staff membership: {error}"))
-                del here_texts[Producers()]
-        deliveries.extend(_broadcast(sender, here_texts, candidates, scope, producer_sessions))
+        if isinstance(membership, staff.StaffUnreadable):
+            deliveries.append(_producer_failure(membership))
+            del here_texts[Producers()]
+        elif membership is not None:
+            producer_names = {row.current_session: row.name for row in membership.find(kind="producer")}
+        deliveries.extend(_broadcast(sender, here_texts, candidates, scope, producer_names))
         for group in here_texts:
-            if not any(selects(group, entry, producer_sessions) for entry in candidates):
+            if not any(selects(group, entry, producer_names) for entry in candidates):
                 deliveries.append(Delivery(GroupWithoutMembers(group), "no live session", ""))
         if peer is not None:
             deliveries.extend(peer.result())
@@ -445,14 +476,15 @@ def main(arguments: list[str]) -> int:
         print(USAGE, file=sys.stderr)
         return 2
     identity = roster.sender_identity(os.environ)
+    membership = _producer_membership(any(flag == "--producers" for flag, _ in pairs))
     production_scope = any(flag in ("--production", "--resolved-production") for flag, _ in pairs)
     if production_scope or any(flag == "--of" for flag, _ in pairs):
-        result = roster.roster(os.environ, scope)
+        result = _read_roster(scope, membership)
         if production_scope and result.problems and all(
             isinstance(problem, roster.UnreadableSessionRecordProblem) for problem in result.problems
         ):
             time.sleep(sessions.retry_policy().registry_delay_seconds)
-            result = roster.roster(os.environ, scope)
+            result = _read_roster(scope, membership)
         for problem in result.diagnostics:
             print(f"broadcast: roster: {problem}", file=sys.stderr)
         host = roster.remote.other_machine()
@@ -460,12 +492,15 @@ def main(arguments: list[str]) -> int:
                     [problem for problem in result.problems if problem.startswith(f"{host}: not reached:")])
         if failures:
             # Production delivery needs every row; unit name resolution needs a reachable peer.
-            _ = report([Delivery(PeerOutput(host, f"NOT sent: {failures[0]}"), "NOT sent", "")])
+            failed = [_producer_failure(membership)] if isinstance(membership, staff.StaffUnreadable) else []
+            if not failed or not production_scope:
+                failed.append(Delivery(PeerOutput(host, f"NOT sent: {failures[0]}"), "NOT sent", ""))
+            _ = report(failed)
             return 1
         unit_entries = result.entries
         entries = [entry for entry in unit_entries if entry.machine == roster.machine_name()]
     else:
-        entries = recipients()
+        entries = recipients(membership)
         unit_entries = entries
     texts: dict[BroadcastGroup, str] = {}
     workers: Workers | WorkersOfUnit = Workers()
@@ -496,7 +531,7 @@ def main(arguments: list[str]) -> int:
     except ValueError as error:
         print(f"broadcast: {error}", file=sys.stderr)
         return 2
-    deliveries = _orchestrate(sender, texts, entries, identity, scope)
+    deliveries = _orchestrate(sender, texts, entries, identity, scope, membership)
     every = report(deliveries)
     print(f"{sum(delivery.outcome == 'sent' for delivery in deliveries)} sent in {time.monotonic() - started:.0f} s")
     print(ending(texts, scope))
