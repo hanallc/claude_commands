@@ -67,7 +67,8 @@ WITHDRAWN = "withdrawn"
 WITHDRAWAL_PREFIX = "Withdrawn: "
 CHECK = "How to check"
 URGENCY = "Urgency"
-# Open rows hold the owner's fixed staff id. Reviewed rows keep their recorded production.
+SAVED_BLANKS = "Saved blank fields"
+# Open and withdrawn rows keep the owner's staff ID. Other closed rows keep the production name.
 PRODUCTION = "Production"
 PRODUCER = change_routing.PRODUCER
 IMAGE = "Image"
@@ -722,7 +723,7 @@ def _insert(lines: list[str], at: int, rows: list[str]) -> None:
 
 def queue(path: Path) -> str:
     """The name urgency.py pins this list's current row under."""
-    return f"change-{_owner(path)}"
+    return urgency.CHANGE_QUEUE_PREFIX + _owner(path)
 
 
 def _add_column(path: Path, lines: list[str], section: str, name: str) -> None:
@@ -1637,13 +1638,14 @@ def describe(row: dict[str, str], *, record: staff.StaffSnapshot | None = None) 
     record = staff.initial_snapshot() if record is None else record
     shown = dict(row)
     member = record.by_id(staff.StaffId(row.get(PRODUCTION, "")))
-    if member is not None and not row.get("Verdict"):
+    if member is not None and row.get("Verdict") in (None, "", WITHDRAWN):
         parent = record.by_id(member.parent.id) if member.kind == "unit" and isinstance(member.parent, staff.ReportsTo) else member
         shown[PRODUCTION] = parent.name if parent is not None else member.name
     producer = record.by_id(staff.StaffId(row.get(PRODUCER, "")))
     if producer is not None:
         shown[PRODUCER] = producer.name
-    rest = [f"  {column}: {value}" for column, value in shown.items() if column not in ("#", "Change", CHECK) and value]
+    rest = [f"  {column}: {value}" for column, value in shown.items()
+            if column not in ("#", "Change", CHECK, SAVED_BLANKS) and value]
     return "\n".join([f"{row.get('#', '')} {row.get('Change', '')}", f"  {CHECK}: {row.get(CHECK, '')}", *rest])
 
 
@@ -1781,11 +1783,13 @@ def row_merge(cells: dict[str, str]) -> RecordedMerge | MergeNotRecorded:
 
 def _move_to_reviewed(path: Path, lines: list[str], cells: dict[str, str], verdict: str, day: date) -> None:
     """Write a closed row with its merge, history and recorded production."""
-    identity = staff.initial_snapshot()
-    member = identity.by_id(staff.StaffId(_plain(cells.get(PRODUCTION, ""))))
-    if member is not None:
-        parent = identity.by_id(member.parent.id) if member.kind == "unit" and isinstance(member.parent, staff.ReportsTo) else member
-        cells[PRODUCTION] = _cell(parent.name if parent is not None else member.name)
+    member = None
+    if verdict != WITHDRAWN:
+        identity = staff.initial_snapshot()
+        member = identity.by_id(staff.StaffId(_plain(cells.get(PRODUCTION, ""))))
+        if member is not None:
+            parent = identity.by_id(member.parent.id) if member.kind == "unit" and isinstance(member.parent, staff.ReportsTo) else member
+            cells[PRODUCTION] = _cell(parent.name if parent is not None else member.name)
     if not any(line.strip() == REVIEWED for line in lines):
         reviewed_rows = list[str](("\n" + BODY[BODY.index(REVIEWED):]).splitlines(keepends=True))
         _insert(lines, len(lines), reviewed_rows)
@@ -1906,6 +1910,7 @@ def withdraw_row(path: Path, row: str, words: str, stamp: datetime, production: 
                 events = (*events, review_events.ReviewLog(previous_time, "nate", previous))
             cells["Review log"] = _cell(review_events.encode((*events, event)))
             if section == SECTION:
+                cells[SAVED_BLANKS] = ", ".join(field for field in (URGENCY, CHECK) if not cells.get(field))
                 del lines[index]
                 _move_to_reviewed(path, lines, cells, WITHDRAWN, stamp.date())
             else:
@@ -1923,14 +1928,22 @@ def withdraw_row(path: Path, row: str, words: str, stamp: datetime, production: 
         return _edit(path, production, stamp.date(), write, lambda _: f"withdraw {row}")
 
 
-def _closed_withdrawal(path: Path, lines: list[str], row: str) -> tuple[list[str], int, dict[str, str]]:
-    if any(line.strip() == REVIEWED for line in lines):
-        columns, first, end = _table(path, lines, REVIEWED)
-        index = next((index for index in range(first, end) if lines[index].startswith(f"| {row} |")), None)
-        if index is not None:
-            cells = dict(zip(columns, _cells(lines[index])))
-            if cells.get("Verdict") == WITHDRAWN:
-                return columns, index, cells
+def _row_locations(path: Path, lines: list[str], row: str,
+                   sections: tuple[str, ...]) -> Iterator[tuple[list[str], int, dict[str, str]]]:
+    """Find the matching rows in the selected tables."""
+    for section in sections:
+        if not any(line.strip() == section for line in lines):
+            continue
+        columns, first, end = _table(path, lines, section)
+        for index in range(first, end):
+            if lines[index].startswith(f"| {row} |"):
+                yield columns, index, dict(zip(columns, _cells(lines[index])))
+
+
+def _closed_withdrawal(path: Path, lines: list[str], row: str) -> tuple[int, dict[str, str]]:
+    for _, index, cells in _row_locations(path, lines, row, (REVIEWED,)):
+        if cells.get("Verdict") == WITHDRAWN:
+            return index, cells
     raise ChangeReviewError(f"{row} is not withdrawn")
 
 
@@ -1939,14 +1952,20 @@ def reopen_row(path: Path, row: str, words: str, stamp: datetime, production: Pa
     reason = _words("reason", words)
 
     def write(lines: list[str]) -> None:
-        _, index, cells = _closed_withdrawal(path, lines, row)
+        index, cells = _closed_withdrawal(path, lines, row)
+        saved_blanks = cells.pop(SAVED_BLANKS, "").split(", ")
+        missing = [field for field in (URGENCY, CHECK) if not cells.get(field) and field not in saved_blanks]
+        if missing:
+            raise ChangeReviewError(f"{row}: exact restoration is unavailable. Missing fields: {', '.join(missing)}.")
         del lines[index]
         _ = cells.pop("Verdict", None)
         _ = cells.pop("Date", None)
         if owner := _plain(cells.get(PRODUCTION, "")):
-            matches = [member for member in staff.initial_snapshot().find(kind="showrunner") if member.name == owner]
-            if len(matches) == 1:
-                cells[PRODUCTION] = str(matches[0].id)
+            record = staff.initial_snapshot()
+            if record.by_id(staff.StaffId(owner)) is None:
+                matches = [member for member in record.find(kind="showrunner") if member.name == owner]
+                if len(matches) == 1:
+                    cells[PRODUCTION] = str(matches[0].id)
         append_row_review_log(cells, review_events.ReviewLog(stamp, _caller_name(), "Reopened: " + reason))
         for column, value in cells.items():
             if value:
@@ -1961,18 +1980,19 @@ def reopen_row(path: Path, row: str, words: str, stamp: datetime, production: Pa
 
 
 def correct_withdraw_who(path: Path, row: str, at: str, who: str, production: Path) -> None:
-    """Correct one withdrawal event on a withdrawn row."""
+    """Correct one withdrawal event in either review table."""
     stamp = _words("at", at)
     name = _words("who", who)
 
     def write(lines: list[str]) -> None:
-        columns, index, cells = _closed_withdrawal(path, lines, row)
-        events = list(review_events.decode(_plain(cells.get("Review log", ""))))
-        matches = [index for index, event in enumerate(events)
-                   if event.time.isoformat() == stamp and event.words.startswith(WITHDRAWAL_PREFIX)]
+        matches: list[tuple[list[str], int, dict[str, str], list[review_events.ReviewLog], int]] = []
+        for columns, index, cells in _row_locations(path, lines, row, (SECTION, REVIEWED)):
+            events = list(review_events.decode(_plain(cells.get("Review log", ""))))
+            matches.extend((columns, index, cells, events, event_index) for event_index, event in enumerate(events)
+                           if event.time.isoformat() == stamp and event.words.startswith(WITHDRAWAL_PREFIX))
         if len(matches) != 1:
             raise ChangeReviewError(f"{row} needs exactly one withdrawal event at {stamp}")
-        match, = matches
+        (columns, index, cells, events, match), = matches
         if events[match].who != name:
             events[match] = replace(events[match], who=name)
             cells["Review log"] = _cell(review_events.encode(tuple(events)))

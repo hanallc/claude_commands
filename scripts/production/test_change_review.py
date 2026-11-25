@@ -3156,6 +3156,59 @@ class ActionTest(unittest.TestCase):
         self.assertEqual(run(*arguments, "--reason", "Try again"), (1, "", "C76 is not withdrawn\n"))
         self.assertEqual(self.path.read_bytes(), before)
 
+    def test_reopen_keeps_the_withdrawn_rows_unit_staff_id(self) -> None:
+        runner = showrunners.owner_for(DOC)
+        unit = fixture_member("unit", name="withdrawal-owner", parent=runner.id)
+        _ = self.path.write_text(LIST
+            .replace("How to check |\n", "How to check | Production |\n")
+            .replace("| --- | --- | --- | --- | --- |\n", "| --- | --- | --- | --- | --- | --- |\n")
+            .replace("Launch Hana |\n", f"Launch Hana | {unit.id} |\n")
+            .replace("Change a font |\n", "Change a font | |\n"), encoding="utf-8")
+        before = change_review.pending(self.path)[0]
+        self.assertTrue(change_review.withdraw_row(self.path, "C76", "Fix the result", ADD_TIME, PRODUCTION))
+        withdrawn = next(row for row in change_review.review_snapshot(self.path).reviewed if row["#"] == "C76")
+        self.assertEqual(withdrawn["Production"], unit.id)
+        shown = change_review.describe(withdrawn)
+        self.assertIn(f"  Production: {DOC}", shown)
+        self.assertNotIn(unit.id, shown)
+        self.assertNotIn("Saved blank fields", shown)
+
+        change_review.reopen_row(self.path, "C76", "The result is ready", ADD_TIME, PRODUCTION)
+        reopened = change_review.pending(self.path)[0]
+        _ = reopened.pop("Review log")
+        self.assertEqual(reopened, before)
+
+    def test_reopen_uses_saved_fields_and_names_missing_fields_on_old_rows(self) -> None:
+        target = ("--production", DOC, "--list", str(self.path), "--row", "C76")
+        for rank, check, missing in (
+            ("later", "Launch Hana", ""),
+            ("", "Launch Hana", "Urgency"),
+            ("later", "", "How to check"),
+            ("", "", "Urgency, How to check"),
+        ):
+            with self.subTest(missing=missing):
+                original = f"""## To review
+
+| # | Change | Merged | How to check |
+| --- | --- | --- | --- |
+
+## Reviewed
+
+| # | Change | Verdict | Date | Merged | Urgency | How to check |
+| --- | --- | --- | --- | --- | --- | --- |
+| C76 | Panels keep shields | withdrawn | 2026-11-13 | 2026-10-14 | {rank} | {check} |
+"""
+                _ = self.path.write_text(original, encoding="utf-8")
+                code, output, error = run("reopen", *target, "--reason", "Check the result")
+                if missing:
+                    self.assertEqual((code, output, error), (
+                        1, "", f"C76: exact restoration is unavailable. Missing fields: {missing}.\n"))
+                    self.assertEqual(self.path.read_text(encoding="utf-8"), original)
+                else:
+                    self.assertEqual((code, error), (0, ""))
+                    restored, = change_review.pending(self.path)
+                    self.assertEqual((restored["Urgency"], restored["How to check"]), (rank, check))
+
     def test_correct_withdraw_who_changes_only_the_selected_event(self) -> None:
         target = ("--production", DOC, "--list", str(self.path), "--row", "C70")
         with mock.patch.object(change_review, "now", return_value=ADD_TIME):
@@ -3172,6 +3225,25 @@ class ActionTest(unittest.TestCase):
         self.assertEqual(review_events.decode(after.pop("Review log")),
                          (events[0], replace(events[1], who="natedev")))
         _ = before.pop("Review log")
+        self.assertEqual(after, before)
+
+    def test_correct_withdraw_who_finds_a_past_event_after_reopen(self) -> None:
+        row = "C76"
+        reopen_time = ADD_TIME.replace(minute=ADD_TIME.minute + 1)
+        second_time = ADD_TIME.replace(minute=ADD_TIME.minute + 2)
+        change_review.record_review_log(self.path, row, "Keep this note", PRODUCTION, event_time=ADD_TIME)
+        self.assertTrue(change_review.withdraw_row(self.path, row, "First reason", ADD_TIME, PRODUCTION))
+        change_review.reopen_row(self.path, row, "Check again", reopen_time, PRODUCTION)
+        self.assertTrue(change_review.withdraw_row(self.path, row, "Second reason", second_time, PRODUCTION))
+        change_review.correct_withdraw_who(self.path, row, second_time.isoformat(), "fixture", PRODUCTION)
+        change_review.reopen_row(self.path, row, "Check again", second_time, PRODUCTION)
+        before = change_review.pending(self.path)[0]
+        events = review_events.decode(before.pop("Review log"))
+        self.assertEqual(events[3].who, "fixture")
+        change_review.correct_withdraw_who(self.path, row, ADD_TIME.isoformat(), "demo", PRODUCTION)
+        after = change_review.pending(self.path)[0]
+        self.assertEqual(review_events.decode(after.pop("Review log")),
+                         (events[0], replace(events[1], who="demo"), *events[2:]))
         self.assertEqual(after, before)
 
     def test_edit_and_verdict_replacement_failures_keep_the_list_and_rerun_once(self) -> None:
