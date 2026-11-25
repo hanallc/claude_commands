@@ -1795,7 +1795,7 @@ def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 
         raise ValueError("slot must be positive")
     name = build_folders.repository_key_for(repository.policy_name, repository.key or repository.name)
     return str(build_folders.build_folder_path(build_folders.BuildFolderSpec(
-        kind="mirror", parent=linux_mirror_root(), repository=name, owner=target, slot=slot, suffix_length=0)))
+        kind="mirror", parent=linux_mirror_root(), repository=name, owner=target, number=slot, suffix_length=0)))
 
 
 def mirror_target(repository: KnownRepository, target: str, slot: int) -> str:

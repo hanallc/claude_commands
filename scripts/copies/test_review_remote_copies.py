@@ -23,12 +23,12 @@ import unittest
 from unittest import mock
 
 from scripts.build_hold.owning_session import NoOwningSession
-from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
+from scripts.build_queue import admission_client, admission_wire as wire, execution_identity, placement
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.copies import copies
 from scripts.copies.workspace_test_support import registered_workspace
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.copies.copies_test_support import mirror_arguments, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
 from scripts.lint import sweep
@@ -86,7 +86,7 @@ class RemoteEntryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(local_remote_transport(self.root))
-        private = private_slot_config(self.root)
+        private = private_copy_config(self.root)
         self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.enterContext(warm_claim_servers())
@@ -736,7 +736,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         _ = write_config_fixture(settings, "offload=on\n", template="mac_test")
         target = target_config.SshTarget("linux", "linux", settings)
         config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
-                                      1, 1, 1, "1", {})
+                                      1, 1, 1, "1", {"mirror_busy_backoff_s": "120"})
         request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
                                         target="linux", owner="new-owner", holder_session="new-session")
         controller = offload.ProcessController()
@@ -853,6 +853,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             consume.assert_called_once()
             self.assertFalse(legacy.exists())
         self.assertIsInstance(result, offload.PassedOnTarget)
+        self.assertEqual(controller.attempt_evidence.slot, 2)
         self.assertEqual(copies.owned_remote_mirrors("first-owner"), [first])
         self.assertEqual([record.path for record in copies.owned_remote_mirrors("new-owner")], [second.path])
         self.assertEqual(json.loads((Path(first.path) / ".copy-record.json").read_text())["owner"], "first-owner")

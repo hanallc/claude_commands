@@ -13,7 +13,7 @@ from unittest import mock
 
 from scripts.build_queue import queue_place
 from scripts.build_queue import first_step
-from scripts.lib.build_slots import SlotQueuePosition
+from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lint.memory_test_support import admission_configuration_fixture
 
 
@@ -94,7 +94,7 @@ class StyleQueueFake:
         """Keep fake verification at the same admission boundary as fake compiler children."""
         self.first_commands.append((tuple(command), source))
         with mock.patch.dict(os.environ, {"UNIT_DETACHED_RUN": "1"}):
-            yield first_step.FirstStepAdmission(SlotQueuePosition("private-style-step", 0.0),
+            yield first_step.FirstStepAdmission(CopyQueuePosition("private-style-step", 0.0),
                 first_step.HandedOff(), source / "private-assignment.json")
 
     @contextmanager

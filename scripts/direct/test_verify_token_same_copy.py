@@ -1,4 +1,4 @@
-"""Real verify.sh token same slot behavior."""
+"""Test two Verify calls for the same checkout and board role."""
 from __future__ import annotations
 
 import json
@@ -9,8 +9,23 @@ from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwners
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-class VerifyTokenSameSlotTests(VerifyTokenOwnershipFixture):
-    def test_same_slot_reclaim_preserves_new_step_and_old_result(self) -> None:
+class VerifyTokenSameCopyTests(VerifyTokenOwnershipFixture):
+    def test_same_copy_can_take_the_token_after_release(self) -> None:
+        board = self.root / "board"
+        lock = board / "locks" / "cargo.d"
+        environment = {**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "holder"}
+        command = ["bash", str(VERIFY), "check", "sample"]
+        first = subprocess.run(command, cwd=self.root, env=environment, capture_output=True,
+                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertFalse(lock.exists())
+
+        second = subprocess.run(command, cwd=self.root, env=environment, capture_output=True,
+                                text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertFalse(lock.exists())
+
+    def test_same_copy_reclaim_preserves_new_step_and_old_result(self) -> None:
         board = self.root / "board"
         lock = board / "locks" / "cargo.d"
         first_release = self.root / "first-release"
