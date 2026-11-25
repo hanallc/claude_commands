@@ -47,8 +47,8 @@ class LiveRootsGuardTests(unittest.TestCase):
             self.assertFalse(any(base.is_relative_to(parent) for parent in caller_roots), caller_roots)
             guarded = base / "guarded"
             root = base / "private"
-            protected = private_slot_config(guarded, repository="origin")
-            private = private_slot_config(root, repository="origin")
+            protected = private_slot_config(guarded)
+            private = private_slot_config(root)
             for fixture in (protected, private):
                 _ = write_config_fixture(Path(fixture.environment["COPIES_CONFIG"]),
                                          "git_timeout_seconds=30\nguard_timeout_seconds=30\n")

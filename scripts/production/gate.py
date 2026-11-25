@@ -93,7 +93,7 @@ from scripts.production import (  # noqa: E402
     affected_modules, change_review, land_runs, nightly_schedule, session_staff, showrunners, staff,
     unit_config, unit_lookup, unit_names,
 )
-from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
+from scripts.production.gate_modules import GateRefused, discover_test_modules, is_test_module, test_module_name
 from scripts.production.gate_routes import (
     ALL_MODULES as ALL_MODULES, AllModules as AllModules, GatePlacementIncomplete, GateResultUnknown, GateTookNoRun,
     GateJobKind as GateJobKind, GateJobResult as GateJobResult, GateRun as GateRun, GuestGateBlocked,
@@ -1302,10 +1302,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         captured += f"\n{job.module}: a test attempted to write live configuration at {path or '(path unavailable)'}\n"
     times = (gate_record.TimingNotApplicable() if job.kind is GateJobKind.TYPE_CHECK
              else gate_record.read_module_times(job.log.parent / "test-times.json"))
-    try:
-        build_folders.remove_folder(job.log.parent)
-    finally:
-        job.folder_cleanup.close()
+    job.folder_cleanup.close()
     if job.killed_for:
         captured = f"{job.killed_for}\n{captured}"
     # Python 3.13 returns 5 for empty helper modules; import errors still return 1.
@@ -3184,8 +3181,8 @@ def nightly(args: GateArguments, target: GateTarget = "natedev") -> int:
         raise
 
 
-def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
-    _ = parser.add_argument("--repo", "--checkout", default=str(Path.cwd()))
+def add_suite_arguments(parser: argparse.ArgumentParser, *, repo_default: str) -> None:
+    _ = parser.add_argument("--repo", "--checkout", default=repo_default)
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
                             help="stop a module after this many seconds (default: 1800). "
                                  + "Named modules on natedev have no time limit. "
@@ -3769,26 +3766,22 @@ def _sweep_nightly_build_folders() -> None:
                       + " ".join(str(notice_error).splitlines()), flush=True)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    prepared = os.environ.get("BUILDLOG_PREPARED_COPY")
-    handed_off = copies.take_prepared_gate_handoff()
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
-        nightly_parser = argparse.ArgumentParser(prog=f"gate.py {arguments[0]}", allow_abbrev=False)
-        if arguments[0] == "nightly-assigned":
-            _ = nightly_parser.add_argument("--unit", required=True)
-            _ = nightly_parser.add_argument("--result", default="")
-        class NightlyArguments(argparse.Namespace):
-            unit: str = ""
-            result: str = ""
-        options = nightly_parser.parse_args(arguments[1:], namespace=NightlyArguments())
-        try:
-            return assign_nightly_red(options.unit, options.result) if arguments[0] == "nightly-assigned" else check_nightly_assignments()
-        except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
-            print(f"REFUSED: {error}", file=sys.stderr, flush=True)
-            return 1
-    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    add_suite_arguments(parser)
+class NightlyArguments(argparse.Namespace):
+    unit: str = ""
+    result: str = ""
+
+
+def parse_nightly_arguments(arguments: Sequence[str], parser: argparse.ArgumentParser) -> NightlyArguments:
+    if arguments[0] == "nightly-assigned":
+        _ = parser.add_argument("--unit", required=True)
+        _ = parser.add_argument("--result", default="")
+    return parser.parse_args(arguments[1:], namespace=NightlyArguments())
+
+
+def parse_gate_arguments(arguments: Sequence[str], parser: argparse.ArgumentParser, *,
+                         repo_default: str) -> GateArguments:
+    parser.description = __doc__
+    add_suite_arguments(parser, repo_default=repo_default)
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--body", default="The full suite verified this checkpoint.")
@@ -3806,9 +3799,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--promote-only", action="store_true",
                             help="only promote origin/<merge-branch> to main and the Mac (needs --merge-branch)")
     args = cast(GateArguments, parser.parse_args(arguments))
-    args.command = ("gate.py", *arguments)
-    args.gate_job = gate_job_for_command(args.command)
-    args.prepared_copy = bool(handed_off and prepared and Path(prepared) == Path(args.repo).expanduser().resolve())
     if args.affected and (args.tests_only or args.nightly or args.promote_only or args.promote):
         parser.error("--affected cannot be combined with --tests-only, --nightly or promotion")
     if args.promote_only and not args.merge_branch:
@@ -3827,6 +3817,66 @@ def main(argv: Sequence[str] | None = None) -> int:
         missing = [name.replace("_", "-") for name in required if not getattr(args, name)]
         if missing:
             parser.error(f"required: {', '.join('--' + name for name in missing)}")
+    for name in args.modules:
+        if name.startswith("scripts/"):
+            parser.error(f"--module {name!r} needs a path under scripts/, for example lib/test_x.py")
+    return args
+
+
+def check_named_modules(repo: Path, names: Sequence[str]) -> None:
+    scripts = repo / "scripts"
+    for name in names:
+        relative = Path(name)
+        path = scripts / relative
+        if (len(relative.parts) < 2 or relative.is_absolute() or relative.as_posix() != name
+                or ".." in relative.parts or "__pycache__" in relative.parts[:-1]
+                or not is_test_module(name)
+                or any((scripts / parent).is_symlink() for parent in relative.parents if parent != Path("."))
+                or not path.is_file()):
+            raise GateRefused(f"--module {name!r} does not name a test module in {repo}. "
+                              + "Use a path under scripts/, for example lib/test_x.py.")
+
+
+def check_prepared_gate_source(arguments: Sequence[str], parser: argparse.ArgumentParser, source: Path) -> None:
+    """Check the gate arguments and named modules in the prepared source."""
+    if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
+        _ = parse_nightly_arguments(arguments, parser)
+        return
+    args = parse_gate_arguments(arguments, parser, repo_default=".")
+    if args.nightly and args.unit:
+        try:
+            _ = _nightly_unit(args)
+        except copies.CopyError as error:
+            print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+            raise SystemExit(1) from None
+    if not args.modules:
+        return
+    repo = (source / Path(args.repo).expanduser()).resolve()
+    if not repo.is_relative_to(source):
+        parser.error("The gate --repo must stay in the prepared source. Use --repo '{tree}'.")
+    try:
+        check_named_modules(repo, args.modules)
+    except GateRefused as error:
+        parser.error(str(error))
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    prepared = os.environ.get("BUILDLOG_PREPARED_COPY")
+    handed_off = copies.take_prepared_gate_handoff()
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
+        nightly_parser = argparse.ArgumentParser(prog=f"gate.py {arguments[0]}", allow_abbrev=False)
+        options = parse_nightly_arguments(arguments, nightly_parser)
+        try:
+            return assign_nightly_red(options.unit, options.result) if arguments[0] == "nightly-assigned" else check_nightly_assignments()
+        except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+            return 1
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    args = parse_gate_arguments(arguments, parser, repo_default=str(Path.cwd()))
+    args.command = ("gate.py", *arguments)
+    args.gate_job = gate_job_for_command(args.command)
+    args.prepared_copy = bool(handed_off and prepared and Path(prepared) == Path(args.repo).expanduser().resolve())
     try:
         if args.affected and not args.prepared_copy:
             try:
@@ -3866,6 +3916,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def run_gate_command(args: GateArguments, target: GateTarget) -> int:
     if args.affected or args.tests_only:
         source = Path(args.repo).expanduser().resolve()
+        check_named_modules(source, args.modules)
         mode = SuiteMode.TARGETED if args.affected else SuiteMode.GATE
         with gate_cleanup_scope(test_run_folder() if args.affected else nullcontext()) as cleanup:
             assigned = cleanup.enter_context(gate_suite_target(args, source, target))

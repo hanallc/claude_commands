@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import enum
+import html
 import json
 import os
 import subprocess
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 
 from scripts.build_queue import memory_files
-from scripts.lib import conf, file_lock
+from scripts.lib import conf, file_lock, session_folder
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import console_theme, page_frame, review_link
 from scripts.review_links import staff_names
@@ -49,9 +50,6 @@ class PageSettings(TypedDict):
     cache_seconds: int
     poll_seconds: int
     wait_seconds: int
-    # The Builds page data file, relative to this page; a slot in use shows its step tooltip from it.
-    builds_data: str
-    builds_max_age_seconds: int
     names: dict[str, str]
 
 
@@ -72,14 +70,7 @@ def page_settings() -> PageSettings:
     return {"slider_min_gib": settings.number("slider.min_gib"), "slider_default_gib": settings.number("slider.default_gib"),
             "cache_seconds": settings.whole("cache_seconds"), "poll_seconds": settings.whole("page.poll_seconds"),
             "wait_seconds": settings.whole("measure.timeout_seconds") * len(drives),
-            "builds_data": builds_data_url(), "builds_max_age_seconds": settings.whole("page.builds_max_age_seconds"),
             "names": names}
-
-
-def builds_data_url() -> str:
-    """The Builds page data file as a link from the Disks page folder; both folders are under the review root."""
-    builds = memory_files.configured_output_folder(conf.read("memory_feed")) / memory_files.DATA_NAME
-    return Path(os.path.relpath(builds, output_folder())).as_posix()
 
 
 def shared_step_tip(source: str) -> StepTip:
@@ -96,6 +87,27 @@ def shared_step_tip(source: str) -> StepTip:
     return StepTip(parts[0], parts[1])
 
 
+def _session_name_registry(names: staff_names.StaffNames) -> dict[str, str]:
+    """Color session folder names by their recorded owner."""
+    registry = names.registry()
+    try:
+        root = session_folder.session_root()
+        folders = sorted(root.iterdir()) if root is not None else []
+    except (OSError, conf.Unusable):
+        return registry
+    for folder in folders:
+        if folder.name.startswith('.') or folder.is_symlink() or not folder.is_dir():
+            continue
+        record = session_folder.read_record(folder)
+        if record is not None:
+            owner = names.members.by_member_reference(record['owner'])
+            if owner is not None:
+                registry[folder.name] = names.html(owner.id, folder.name)
+            elif folder.name in registry:
+                registry[folder.name] = html.escape(folder.name)
+    return registry
+
+
 def publish(folder: Path, settings: PageSettings) -> Path:
     source = Path(__file__).with_name(PAGE_NAME).read_text(encoding="utf-8")
     tip = shared_step_tip(memory_files.PAGE_SOURCE.read_text(encoding="utf-8"))
@@ -110,7 +122,7 @@ def publish(folder: Path, settings: PageSettings) -> Path:
             .replace("__STEP_TIP_STYLE__", tip.style).replace("__STEP_TIP_SCRIPT__", tip.script)
             .replace("__DISKS_SETTINGS__", json.dumps(settings).replace("</", "<\\/")))
     names = staff_names.read()
-    page = page.replace('</head>', staff_names.script(names.registry(), names.role_labels()) + '</head>', 1)
+    page = page.replace('</head>', staff_names.script(_session_name_registry(names), names.role_labels()) + '</head>', 1)
     folder.mkdir(parents=True, exist_ok=True)
     page_path = folder / PAGE_NAME
     try:

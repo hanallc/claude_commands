@@ -168,10 +168,10 @@ The Unit group control uses the role color before selection.
 An open AWS day applies role and staff-name color changes on the next Builds data reading.
 The refresh keeps focus on the same control in the open day.
 The Builds page uses the saved staff ID to color the name in the bump mark and tooltip.
-Disks uses the same spans for slot holders, sessions, and shared tooltip fields.
-The slot tooltip colors the Showrunner label.
-Current Builds rows carry their name parts through `slotStep` to the Disks slot label.
-Its Builds refresh updates the name spans and role colors without a new timer.
+Disks colors staff session names in the Sessions table and its tooltips.
+The page uses the saved owner to color a session folder with a generated name.
+Each page render reads the current role colors.
+Held folder names and task names stay plain.
 The console navigation shows no staff name fields.
 The Units board emits Markdown through `unit_phases.py`; this checkout has no Units console route.
 
@@ -308,6 +308,7 @@ Accounts preferences, News polls, and Disks polls keep the snapshot.
 Builds revalidates `memory.json` at its feed interval.
 The server uses only `If-None-Match` to decide whether to return HTTP 304 for a static file.
 The server sends static JSON with gzip when the client accepts gzip.
+Disks shows the drive cards and the session list.
 Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
 Disks shows Paused with the reason **Measuring…** while a measure runs and reads succeed.
 The loader result carries `busy:'Measuring…'` while the measure runs within `wait_seconds`.

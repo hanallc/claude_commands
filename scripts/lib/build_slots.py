@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 import fcntl
 import os
 from pathlib import Path
-import shutil
 import stat
 import subprocess
 import sys
@@ -96,12 +95,6 @@ def source_checkout(source: Path) -> Path:
     configured = _git(source, "--git-dir", common, "config", "--default", str(checkout),
                       "--get", "core.worktree").strip()
     return (Path(common) / configured).resolve()
-
-
-def configured_maximum(settings: conf.ConfigRead, machine: str, repository: str) -> int:
-    """Read the Mac claim limit for the repository, or the machine's default limit."""
-    key = f"slots.{machine}.{repository}.max"
-    return settings.whole(key if key in settings.values() else f"slots.{machine}.default_max")
 
 
 def _persistent_source(source: Path) -> Path:
@@ -305,7 +298,8 @@ def limit_copy_size(copy: LeasedCopy, limit: int) -> None:
     """Discard Cargo output when a held copy exceeds its size limit."""
     size = _size(copy.path)
     if size > limit:
-        shutil.rmtree(copy.cargo_dir)
+        if not build_folders.reset_numbered_copy_cargo(copy.path):
+            raise BlockingIOError(f"{copy.cargo_dir}: the build output or a child lease is held")
         copy.cargo_dir.mkdir()
         print(f"slots: {copy.path} was {size / 2**30:g} GiB, over its {limit / 2**30:g} GiB limit. "
               + "The maker deleted its Cargo output.")

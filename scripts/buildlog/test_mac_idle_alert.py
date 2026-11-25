@@ -24,6 +24,23 @@ use_test_log()
 
 
 class SavedAlertTests(unittest.TestCase):
+    def test_unreachable_alert_describes_the_last_failure_after_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_idle_config(Path(directory))
+            path = write_idle_alert(Path(directory), 1600)
+            row = cast(dict[str, object], json.loads(path.read_text()))
+            row.update(state="unreachable", cause="", until=1560, waiting=2)
+            _ = path.write_text(json.dumps(row))
+
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
+                zone = ZoneInfo("UTC")
+                self.assertEqual(mac_idle_alert.alert_line(path, 1559, zone),
+                                 "MAC UNREACHABLE until 00:26: 2 steps wait for the Mac.")
+                for now in (1560, 1600):
+                    with self.subTest(now=now):
+                        self.assertEqual(mac_idle_alert.alert_line(path, now, zone),
+                                         "MAC UNREACHABLE: the last probe failed: 2 steps wait for the Mac.")
+
     def test_free_alert_names_kept_claims_and_uses_the_waiting_count(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = write_idle_config(Path(directory))

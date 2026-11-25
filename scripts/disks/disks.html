@@ -84,18 +84,6 @@ td.path { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.8
 .tree td:first-child { white-space: normal; overflow-wrap: anywhere; }
 td.dim, .dim { color: var(--ink-3); }
 tbody tr:not([aria-expanded]):hover td { background: var(--hover); }
-.slots col.size { width: 80px; } .slots col.used { width: 120px; }
-.slots td:first-child, .slots td.use { white-space: normal; overflow-wrap: break-word; }
-.slots .tag { white-space: nowrap; }
-.slots .narrow { display: none; margin-top: 2px; font-family: system-ui, sans-serif; }
-/* A repository is a band that opens and closes; its slots sit indented below it. */
-.slots tr.group th { padding: 7px 10px 7px 6px; border-top: 4px solid var(--card); background: color-mix(in srgb, var(--accent) 12%, var(--card));
-  background-clip: padding-box; color: var(--ink); white-space: normal; cursor: pointer; }
-.slots tr.group .name { font-weight: 700; }
-.slots tr.group .sum { color: var(--ink-2); font-weight: 400; margin-left: 8px; }
-.slots tr.group .folder { display: inline-flex; margin-right: 6px; color: var(--accent); vertical-align: -2px; }
-.slots tr.group .folder svg { width: 15px; height: 15px; }
-.slots tbody td:first-child { padding-left: 26px; }
 [aria-expanded]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .sessions col.who { width: 200px; }
 .sessions col.size { width: 80px; } .sessions col.share { width: 14%; } .sessions col.state { width: 96px; }
@@ -110,7 +98,6 @@ tbody tr:not([aria-expanded]):hover td { background: var(--hover); }
 .tree tr[aria-expanded] > td { cursor: pointer; }
 .twist { display: inline-flex; width: 14px; text-indent: 0; color: var(--ink-3); vertical-align: -2px; }
 .twist svg { width: 14px; height: 14px; }
-.slots .twist { width: 18px; }
 tr[aria-expanded="true"] .twist svg { transform: rotate(90deg); }
 .walk { position: relative; height: 10px; }
 .walk .span { position: absolute; top: 0; bottom: 0; background: var(--track); border-radius: 3px; }
@@ -125,11 +112,6 @@ tr[aria-expanded="true"] .twist svg { transform: rotate(90deg); }
   .limit output { margin-inline-start: auto; }
   .tree col.place { width: auto; } .tree col.size { width: 64px; } .tree col.pct { width: 0; } .tree col.walk { width: 64px; }
   .tree .pct { display: none; }
-  /* On a phone the holder goes under the slot name, so each column keeps its width. */
-  .slots col.used { width: 96px; } .slots col.use { width: 0; }
-  .slots td:nth-child(3) { white-space: normal; }
-  .slots .wide { display: none; }
-  .slots .narrow { display: block; }
   .sessions col.who { width: 24%; }
   .sessions col.size { width: 64px; } .sessions col.share { width: 0; } .sessions col.state { width: 72px; }
   .sessions .held .line { gap: 6px; }
@@ -144,7 +126,6 @@ tr[aria-expanded="true"] .twist svg { transform: rotate(90deg); }
   __PAGE_TITLE__
   <div class="grid" id="drives"></div>
   <div class="grid" id="cards">
-    <section class="card" id="slots" hidden></section>
     <section class="card" id="sessions" hidden></section>
   </div>
 </main>
@@ -153,18 +134,17 @@ tr[aria-expanded="true"] .twist svg { transform: rotate(90deg); }
 <script>
 const GIB = 1024 ** 3;
 const SLIDER_STEPS = 1000;
-// Lucide 0.468.0 icons (ISC license): the chevron turns down on an open row; the folder marks a repository.
+// Lucide 0.468.0 chevron (ISC license) for open rows.
 const icon = path => '<svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor"'
   + ` stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="${path}"/></svg>`;
 const CHEVRON = icon("m9 18 6-6-6-6");
-const FOLDER = icon("M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z");
 // Lucide 0.468.0 "info": the mark on a card title that has a definition.
 const INFO = icon("M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20M12 16v-4M12 8h.01");
 
-// The Builds page's step tooltip code, as it is (disks_page.shared_step_tip). Its names stay inside this function.
+// Use the shared style and controls for session tooltips.
 const stepTip = (() => {
 __STEP_TIP_SCRIPT__
-  return {field, staffField, staffTitle, tooltipHtml, tipRowsHtml, hoverTips, roleName, nameParts};
+  return {field, staffTitle, tipRowsHtml, hoverTips, staffName};
 })();
 
 function size(bytes) {
@@ -351,57 +331,17 @@ function esc(text) {
   return String(text).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"})[c]);
 }
 
-// A slot or session size as text: a size below the measure's least folder shows as below it; no size shows "—".
+// Show "—" for an unknown size. Show sizes below the measure limit as less than the limit.
 function measuredSize(bytes, keepBytes) {
   return bytes == null ? "—" : keepBytes && bytes < keepBytes ? `< ${size(keepBytes)}` : size(bytes);
 }
 
-function lastUsedText(row, now) {
-  return row.used_by ? "now" : row.last_used == null ? "—" : age(Math.max(0, now - row.last_used));
-}
-
-function slotTotal(rows) {
+function sessionTotal(rows) {
   return rows.some(row => row.size != null) ? rows.reduce((sum, row) => sum + (row.size || 0), 0) : null;
 }
 
 function cardTitle(name, about, root) {
   return `<h2 data-tip="about:${about}">${name}<span class="about">${INFO}</span><span class="path">${esc(root)}</span></h2>`;
-}
-
-// The Slots card: one band per repository; an open band lists its slots with size, last use and holder.
-// A slot below the measure's least folder shows as below it; a slot on no measured drive shows no size.
-// step gives the Builds step in a held slot, or null.
-function slotsHtml(report, keepBytes, now, opened, step = () => null) {
-  const slotSize = bytes => esc(measuredSize(bytes, keepBytes));
-  const usedBy = row => {
-    if (row.used_by) {
-      // The name of the Builds step in the slot, else the lease's work with the Builds names; then the showrunner.
-      const current = step(row);
-      const name = current?.name || row.used_by.name;
-      const parts = current?.name ? current.name_parts : row.used_by.name_parts;
-      return (name ? `<span class="tag run">${parts ? stepTip.nameParts(parts) : esc(name)}</span>` : "")
-        + (row.used_by.showrunner ? `<span class="dim">${stepTip.roleName(row.used_by.showrunner)}</span>` : "");
-    }
-    return row.needs_review ? '<span class="tag go">review</span>' : "";
-  };
-  const slotRow = row => {
-    const use = usedBy(row);
-    return `<tr data-tip="slot:${esc(row.key ?? row.name)}"><td class="path">${esc(row.name)}${use ? `<div class="narrow">${use}</div>` : ""}</td>`
-      + `<td class="n">${slotSize(row.size)}</td><td>${lastUsedText(row, now)}</td>`
-      + (use ? `<td class="use wide">${use}</td>` : '<td class="dim wide">—</td>') + "</tr>";
-  };
-  const groups = report.groups.map(group => {
-    const count = group.maximum ? `${group.slots.length} of ${group.maximum} slots`
-      : `${group.slots.length} slot${group.slots.length === 1 ? "" : "s"}`;
-    const open = opened.has(group.repository);
-    return `<tr class="group" tabindex="0" aria-expanded="${open}" data-group="${esc(group.repository)}" data-tip="group:${esc(group.repository)}"><th colspan="4">`
-      + `<span class="twist">${CHEVRON}</span><span class="folder">${FOLDER}</span><span class="name">${esc(group.repository)}</span>`
-      + `<span class="sum">${count} · ${slotSize(slotTotal(group.slots))}</span></th></tr>` + (open ? group.slots.map(slotRow).join("") : "");
-  }).join("");
-  const body = groups ? `<table class="slots"><colgroup><col><col class="size"><col class="used"><col class="use"></colgroup>`
-    + `<thead><tr><th>Slot</th><th class="n">Size</th><th>Last used</th><th class="wide">Used by</th></tr></thead><tbody>${groups}</tbody></table>`
-    : '<p class="problem">No slots yet.</p>';
-  return cardTitle("Slots", "slots", report.root) + body;
 }
 
 // The Sessions card rows: each session folder of at least the limit, largest first, with its held folders and whether
@@ -418,12 +358,12 @@ function sessionRows(report, keepBytes, limit) {
   };
   const state = row => row.state === "ended" ? '<span class="tag go">ended</span>'
     : `<span class="dim">${row.state === "running" ? "running" : "—"}</span>`;
-  const sessionRow = row => `<tr data-tip="session:${esc(row.name)}"><td class="path">${stepTip.roleName(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
+  const sessionRow = row => `<tr data-tip="session:${esc(row.name)}"><td class="path">${stepTip.staffName(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
     + `<td class="share">${row.size && largest ? `<i style="width:${(100 * row.size / largest).toFixed(1)}%"></i>` : ""}</td>`
     + `<td class="held">${held(row)}</td><td>${state(row)}</td></tr>`;
   const {shown, smaller} = sessionsAtLeast(report, limit);
   const rest = smaller.length ? `<tr data-tip="smaller:sessions"><td class="dim">${smaller.length} smaller</td>`
-    + `<td class="n dim">${folderSize(slotTotal(smaller))}</td><td class="share"></td><td></td><td></td></tr>` : "";
+    + `<td class="n dim">${folderSize(sessionTotal(smaller))}</td><td class="share"></td><td></td><td></td></tr>` : "";
   return shown.map(sessionRow).join("") + rest;
 }
 
@@ -446,16 +386,14 @@ const settings = JSON.parse(document.getElementById("disks-settings").textConten
 const DATA_FILE = "disks.json";
 const MEASURE = "measure";
 const states = new Map();
-// Open folders and slot repositories, kept across new data and reloads. Every row starts closed.
+// Keep open folders across data updates and page reloads.
 const OPEN_KEY = "disks-open";
 const opened = readOpen();
 const driveViews = new Map();
 let data = null;
-let slotReport = null;
 let sessionReport = null;
 // The least session size the Sessions card shows; 0 shows every session.
 let sessionLimit = 0;
-let builds = null;
 let measuring = null;
 let measureTimer;
 
@@ -490,32 +428,28 @@ function stateFor(drive, range) {
 function readOpen() {
   try {
     const saved = JSON.parse(localStorage.getItem(OPEN_KEY) || "{}");
-    return {folders: new Set(saved.folders || []), groups: new Set(saved.groups || [])};
+    return {folders: new Set(saved.folders || [])};
   } catch {
-    return {folders: new Set(), groups: new Set()};
+    return {folders: new Set()};
   }
 }
 
 function saveOpen() {
   try {
-    localStorage.setItem(OPEN_KEY, JSON.stringify({folders: [...opened.folders], groups: [...opened.groups]}));
+    localStorage.setItem(OPEN_KEY, JSON.stringify({folders: [...opened.folders]}));
   } catch {
     // The open rows then last until the page closes.
   }
 }
 
-// Drop each kept key whose folder or repository is gone, so the store holds only rows the data still has.
+// Remove entries for folders that no longer exist.
 function forgetGone() {
-  const before = opened.folders.size + opened.groups.size;
+  const before = opened.folders.size;
   if (data) {
     const known = knownFolders(data.drives, opened.folders);
     for (const path of opened.folders) if (!known.has(path)) opened.folders.delete(path);
   }
-  if (slotReport) {
-    const repositories = new Set(slotReport.groups.map(group => group.repository));
-    for (const repository of opened.groups) if (!repositories.has(repository)) opened.groups.delete(repository);
-  }
-  if (opened.folders.size + opened.groups.size !== before) saveOpen();
+  if (opened.folders.size !== before) saveOpen();
 }
 
 function toggleOpen(set, key) {
@@ -643,19 +577,8 @@ function sessionsView(card) {
   };
 }
 
-let slotsShown = "";
-function renderSlots() {
-  const card = document.getElementById("slots");
-  card.hidden = !slotReport;
-  if (!slotReport) return;
-  const html = slotsHtml(slotReport, data ? data.keep_bytes : 0, Date.now() / 1000, opened.groups, slotStep);
-  // New Builds data comes every few seconds; the card changes only when its text does.
-  if (html !== slotsShown) refill(card, "data-group", slotsShown = html);
-}
-
 function renderCards() {
   forgetGone();
-  renderSlots();
   const card = document.getElementById("sessions");
   card.hidden = !sessionReport;
   if (sessionReport) updateSessions(sessionReport, data ? data.keep_bytes : 0);
@@ -677,36 +600,10 @@ function render() {
   renderCards();
 }
 
-// The Builds step that runs or waits in a held slot, from Builds data that is current; null for any other slot.
-function slotStep(slot) {
-  const age = builds ? Date.now() / 1000 - builds.read_at : NaN;
-  // A missing read time gives NaN, which fails this check.
-  if (!slot.used_by || !(age <= settings.builds_max_age_seconds)) return null;
-  const here = row => row.key && row.slot_folder === (slot.key ?? slot.name) && row.slot_machine === slotReport.machine;
-  const run = builds.walk?.find(here);
-  if (run) return {tip: "row:" + run.key, name: run.name, name_parts:run.name_parts};
-  const wait = builds.waiters?.find(here);
-  return wait ? {tip: "wait:" + wait.key, name: wait.name, name_parts:wait.name_parts} : null;
-}
-
-// The tooltip of each Disks row and card title. A slot that a Builds page step runs or waits in shows that step's tooltip.
 function tipFor(key) {
   const at = key.indexOf(":"), kind = key.slice(0, at), name = key.slice(at + 1);
   const keepBytes = data ? data.keep_bytes : 0;
-  if (kind === "about") return stepTip.tipRowsHtml(name === "slots" ? slotsAbout(slotReport) : SESSIONS_ABOUT);
-  if (kind === "group" && slotReport) {
-    const group = slotReport.groups.find(group => group.repository === name);
-    return group ? stepTip.tipRowsHtml(groupTip(group, keepBytes)) : "";
-  }
-  if (kind === "slot" && slotReport) {
-    for (const group of slotReport.groups) {
-      const slot = group.slots.find(slot => (slot.key ?? slot.name) === name);
-      if (!slot) continue;
-      const step = slotStep(slot);
-      return step ? stepTip.tooltipHtml(step.tip, builds)
-        : stepTip.tipRowsHtml(slotTip(slot, group, keepBytes, Date.now() / 1000, slotReport.unused_days));
-    }
-  }
+  if (kind === "about") return stepTip.tipRowsHtml(SESSIONS_ABOUT);
   if (kind === "session" && sessionReport) {
     const row = sessionReport.sessions.find(row => row.name === name);
     if (!row) return "";
@@ -717,37 +614,11 @@ function tipFor(key) {
   return "";
 }
 
-function slotsAbout(report) {
-  const field = stepTip.field;
-  return [field("Test copies", "", "title"),
-    field("", "A test takes the lowest free copy number in its unit and checks out the commit.", "long"),
-    field("", "If all copies are in use, the test takes the smallest missing number.", "long"),
-    field("", "The copy keeps its build output for the next test.", "long"),
-    field("", `The nightly sweep lists a free copy for review after ${report ? report.unused_days : "some"} days without use.`, "long")];
-}
-
 const SESSIONS_ABOUT = [stepTip.field("Session folders", "", "title"),
   stepTip.field("", "A session folder holds the temporary files of one Claude session: its TMPDIR, its scratch folders and its run folders.", "long"),
   stepTip.field("", "The folder has the staff name, so a new conversation of the same staff member uses the same folder.", "long"),
   stepTip.field("", "A held folder is a scratch folder that a task keeps until the task ends. Unsaved work means that the task ended and the folder keeps its work.", "long"),
   stepTip.field("", "Running means that a live session uses the folder. Ended means that no live session uses it.", "long")];
-
-function groupTip(group, keepBytes) {
-  const field = stepTip.field, inUse = group.slots.filter(slot => slot.used_by).length;
-  return [field(group.repository, `${group.slots.length} slot${group.slots.length === 1 ? "" : "s"}`, "title"),
-    field("Size", measuredSize(slotTotal(group.slots), keepBytes)), field("In use", `${inUse} of ${group.slots.length}`),
-    field("Limit", group.maximum ? `${group.maximum} slots` : "not set")];
-}
-
-function slotTip(slot, group, keepBytes, now, unusedDays) {
-  const field = stepTip.field;
-  const rows = [field(slot.name, slot.used_by ? "in use" : slot.needs_review ? "review" : "free", "title"),
-    field("Repository", group.repository), field("Size", measuredSize(slot.size, keepBytes)), field("Last used", lastUsedText(slot, now))];
-  if (slot.used_by) rows.push({...field("Used by", slot.used_by.name || "—"), valueParts:slot.used_by.name_parts},
-    stepTip.staffField("Showrunner", [slot.used_by.showrunner || "—"], "showrunner"));
-  if (slot.needs_review) rows.push(field("", `The nightly sweep lists this folder after ${unusedDays} days without use.`, "long", true));
-  return rows;
-}
 
 const SESSION_TIP_FOLDER_LIMIT = 30;
 const moreHeldFolders = count => `+${count} more folders`;
@@ -784,25 +655,8 @@ function fitSessionTip(tip, maxHeight) {
 
 function smallerTip(rows, limit, keepBytes) {
   const field = stepTip.field;
-  return [field(`${rows.length} smaller session${rows.length === 1 ? "" : "s"}`, measuredSize(slotTotal(rows), keepBytes), "title"),
+  return [field(`${rows.length} smaller session${rows.length === 1 ? "" : "s"}`, measuredSize(sessionTotal(rows), keepBytes), "title"),
     field("", `Each is below ${limitLabel(limit)}. Move the size filter to the left to show them.`, "long")];
-}
-
-// The Builds page data, read again while the page shows, so a slot in use shows its step as it is now.
-// A superseded refresh keeps the newer data.
-async function readBuilds(current) {
-  if (document.visibilityState === "hidden") return;
-  let next = null;
-  try {
-    const response = await fetch(settings.builds_data + "?" + Date.now(), {cache: "no-store"});
-    next = response.ok ? await response.json() : null;
-  } catch {
-    next = null;
-  }
-  if (!current()) return;
-  builds = next;
-  if (builds?.staff_names) globalThis.staffNames?.set(builds.staff_names, undefined, builds.role_labels);
-  renderSlots();
 }
 
 async function readData(current) {
@@ -837,22 +691,21 @@ function finishMeasure(next) {
   if(measuring && measuring.target!==null && next && (next.generation ?? 0)>=measuring.target) setMeasuring(null);
 }
 
-// Ask for a measure and the current slots and sessions. Keep the old sizes until the data file changes.
+// Request a measure and the current sessions. Keep the old sizes until the data file changes.
 async function askMeasure(current,force=false) {
   const response=await fetch(MEASURE,{method:"POST",body:force ? "force=1" : "",
     headers:{"Content-Type":"application/x-www-form-urlencoded"}});
   const answer=await response.json();
   if(!current()) return;
   if(!response.ok) throw new Error(answer.reason || `HTTP ${response.status}`);
-  slotReport=answer.slots || null;sessionReport=answer.sessions || null;renderCards();
+  sessionReport=answer.sessions || null;renderCards();
   if(force) measuring.target=answer.target;
   else if(answer.state!=="current" && !measuring)
     setMeasuring({since:Date.now()/1000,target:answer.target});
   finishMeasure(data);
 }
 async function loadDisks(supersede=false,current=()=>true){
-  // The page reads the Builds data on each page refresh.
-  await Promise.all([readData(current),readBuilds(current)]);
+  await readData(current);
   if(!current()) return;
   let failure='';
   try{if(!measuring) await askMeasure(current);}
@@ -863,10 +716,6 @@ async function loadDisks(supersede=false,current=()=>true){
 }
 const updateSessions = sessionsView(document.getElementById("sessions"));
 stepTip.hoverTips(document.getElementById("tip"), tipFor, fitSessionTip);
-onToggle(document.getElementById("slots"), "tr[data-group]", row => {
-  toggleOpen(opened.groups, row.dataset.group);
-  renderSlots();
-});
 __PAGE_REFRESH_SCRIPT__
 const pageRefresh=createPageRefresh(loadDisks,()=>settings.poll_seconds);
 document.getElementById("measure-now").addEventListener("click",async()=>{

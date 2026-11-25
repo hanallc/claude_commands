@@ -24,7 +24,7 @@ import tempfile
 from textwrap import dedent
 import time
 from typing import cast, final, override
-from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Generator, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, tzinfo
@@ -42,7 +42,7 @@ from scripts.lib.build_steps import (
 from scripts.lib.process_start import Gone
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, gate, staff
-from scripts.production.gate_modules import GateRefused
+from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import (
     build_fixture_sessions, fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, source_environment,
@@ -357,6 +357,9 @@ class DirectGatePlacementTests(unittest.TestCase):
     def test_named_gate_refuses_an_inherited_assignment_for_a_different_source(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             source = self.checkout(folder)
+            test = source / "scripts/lib/test_fixture.py"
+            test.parent.mkdir(parents=True)
+            test.touch()
             path = source / ".git" / "assignment.json"
             key = treekey.tree_key(str(source))
             assert key is not None
@@ -390,6 +393,37 @@ class DirectGatePlacementTests(unittest.TestCase):
                         self.assertEqual(result, 1)
                     self.assertIn("source does not match", errors.getvalue())
                     run.assert_not_called()
+
+    def test_direct_gate_refuses_a_missing_module_before_admission(self) -> None:
+        with (tempfile.TemporaryDirectory() as folder,
+              mock.patch.dict(os.environ, {}, clear=True),
+              mock.patch.object(first_step, "admitted_run") as admit,
+              mock.patch.object(gate, "run_tests_only") as run,
+              redirect_stderr(io.StringIO()) as errors):
+            status = gate.main(["--tests-only", "--repo", folder, "--module", "lib/test_missing.py"])
+        self.assertEqual(status, 1)
+        self.assertIn("--module 'lib/test_missing.py' does not name a test module", errors.getvalue())
+        admit.assert_not_called()
+        run.assert_not_called()
+
+    def test_direct_gate_accepts_a_symlinked_module_that_discovery_accepts(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            source = base / "checkout"
+            shared = base / "sibling/test_shared.py"
+            shared.parent.mkdir()
+            shared.touch()
+            module = "lib/test_shared.py"
+            link = source / "scripts" / module
+            link.parent.mkdir(parents=True)
+            link.symlink_to(shared)
+            self.assertEqual(discover_test_modules(source), [("lib", link)])
+            with (mock.patch.dict(os.environ, {}, clear=True),
+                  mock.patch.object(gate, "checked_gate_target", return_value="natedev"),
+                  mock.patch.object(gate, "run_tests_only", return_value=0) as run):
+                self.assertEqual(gate.main(["--tests-only", "--repo", str(source), "--module", module]), 0)
+            args, mode, target = cast(tuple[gate.GateArguments, gate.SuiteMode, gate.GateTarget], run.call_args.args)
+            self.assertEqual((args.modules, mode, target), ([module], gate.SuiteMode.GATE, "natedev"))
 
     def test_direct_gate_refuses_an_assignment_for_a_different_source(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -751,6 +785,24 @@ class MergeGateCheckpointTests(MergeGateFixture):
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(folders)
                 self.assertTrue(all(not folder.exists() for folder in folders), folders)
+
+    def test_finished_module_keeps_a_held_child_folder(self) -> None:
+        prepare = gate.test_module_environment
+        children: list[Path] = []
+
+        def hold_child(root: Path, environment: dict[str, str]) -> dict[str, str]:
+            child = root / "active-child"
+            child.mkdir()
+            lock = self.enterContext((root / "active-child.lock").open("wb"))
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            children.append(child)
+            return prepare(root, environment)
+
+        with mock.patch.object(gate, "test_module_environment", side_effect=hold_child):
+            result = self.run_gate("--tests-only", "--full")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(children)
+        self.assertTrue(all(child.is_dir() for child in children), children)
 
     def test_nested_modules_run_and_retry_from_their_own_folder_under_the_top_suite(self) -> None:
         nested = self.checkout / "scripts" / "hooks" / "tests" / "test_first.py"
@@ -1256,14 +1308,15 @@ class GateRecoveryTests(MergeGateFixture):
 class LiveConfigTripwireTests(unittest.TestCase):
     def test_live_config_violation_uses_the_nonrerunnable_tripwire(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        job_root = root / "job"
-        job_root.mkdir()
+        folders = self.enterContext(ExitStack())
+        spec = build_folders.BuildFolderSpec(kind="tool", parent=root, purpose="job", suffix_length=0)
+        job_root = folders.enter_context(build_folders.temporary_build_folder(spec))
         marker = job_root / "live-config-writes"
         _ = marker.write_text("/fixture/config/console.conf\n")
         log = job_root / "output.log"
         process = cast(subprocess.Popen[str], mock.Mock(spec=subprocess.Popen))
         job = gate.RunningGateJob("hooks", Path("test_fixture.py"), process, time.monotonic(),
-                                  time.time(), log.open("w+"), log, "test_fixture.py")
+                                  time.time(), log.open("w+"), log, "test_fixture.py", folder_cleanup=folders)
         self.addCleanup(job.output.close)
         with mock.patch.object(gate, "kill_job_group"):
             result = gate.finish_gate_job(job, 0)
