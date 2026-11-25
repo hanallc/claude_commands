@@ -1122,6 +1122,11 @@ When the record has no usable email, the title says **No email in the login reco
 It shows a dash for Codex accounts and when the cache has no current Fable window.
 The role swatch column is between **role** and **next**.
 After **next**, **weekly reset** shows the weekly reset time.
+A running account uses green. This includes a Claude account with an unassigned session.
+Claude accounts with weekly quota left use green. Codex accounts use green when current quota or enabled credits permit work.
+The color ignores Codex quota and credit readings from the future or older than the configured age limit.
+For exhausted accounts with no running session, the reset color uses steps from the nearest reset to the furthest one.
+The first step differs from green. The furthest reset uses orange.
 **resets** shows the reset count from the Codex account note or a dash when the count is missing.
 Claude accounts show a dash in **resets**.
 Select a named header or press Enter to sort.

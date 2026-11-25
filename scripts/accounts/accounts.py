@@ -4683,6 +4683,9 @@ class StatusRow:
     named_sessions_by_role: dict[str, tuple[NamedSession, ...]] = field(default_factory=dict)
     fable_left_percent: float | StatusUnavailable = field(default_factory=StatusUnavailable)
     limit_reset_count: int | StatusUnavailable = field(default_factory=StatusUnavailable)
+    codex_work_readiness: agent_accounts.CodexWorkReadiness = field(
+        default_factory=lambda: agent_accounts.CodexWorkUnknown("no stored Codex reading"))
+    has_running_claude_session: bool = False
 
 
 def weekly_quotas(rows: Iterable[StatusRow]) -> dict[str, WeeklyQuota]:
@@ -4821,6 +4824,27 @@ def _credit_reading(
     return ("no" if "weekly" in usage and len(current) == len(windows) else "unavailable", left)
 
 
+def _stored_codex_work_readiness(usage: usage_store.StoredUsage, now: datetime,
+                                 credits_setting: agent_accounts.CodexCreditsSetting, *,
+                                 account_config: conf.ConfigRead) -> agent_accounts.CodexWorkReadiness:
+    stale_after = timedelta(minutes=account_config.whole("usage_stale_minutes"))
+
+    def is_fresh(at: str) -> bool:
+        observed = _stored_time(at)
+        return observed is not None and timedelta(0) <= now - observed <= stale_after
+
+    def quota(label: str, window: usage_store.StoredWindow) -> agent_accounts.Quota:
+        if is_fresh(window["at"]) and _is_current(window, now):
+            return agent_accounts.Quota(label, 100 - window["left"], _stored_time(window["resets"]))
+        return agent_accounts.Quota(label, None, None)
+
+    report = agent_accounts.Report("Codex",
+        quotas=[quota("Weekly", usage["weekly"])] if "weekly" in usage else [],
+        five_hour=quota("5-hour", usage["five_hour"]) if "five_hour" in usage else None,
+        credit_balance=usage["credits"]["balance"] if "credits" in usage and is_fresh(usage["credits"]["at"]) else None)
+    return agent_accounts.codex_can_work(report, now, credits_setting)
+
+
 def _status_row(
     status: AccountStatus | CodexStatus, usage: usage_store.StoredUsage | None, now: datetime,
     roles: tuple[str, ...],
@@ -4833,6 +4857,8 @@ def _status_row(
     read_at: datetime | StatusUnavailable = StatusUnavailable()
     on_credits = NO_VALUE
     fable_left: float | StatusUnavailable = StatusUnavailable()
+    codex_readiness: agent_accounts.CodexWorkReadiness = agent_accounts.CodexWorkUnknown("no stored Codex reading")
+    credits_setting = agent_accounts.codex_credits_setting(status.label) if tool == "codex" else agent_accounts.CreditsOff()
     login = status.login if status.is_set_up and status.account_is_safe_to_inspect else ""
     if login:
         read_at = _read_at(usage) or StatusUnavailable()
@@ -4852,17 +4878,18 @@ def _status_row(
                 weekly = WeeklyNotReadSince(read_at, usage_store.weekly_read_skip(held))
             if tool == "codex":
                 on_credits, credits = _credit_reading(held, now, account_config=account_config)
+                codex_readiness = _stored_codex_work_readiness(held, now, credits_setting, account_config=account_config)
             elif (fable := held.get("weekly_fable")) is not None and 0 <= fable["left"] <= 100 and _is_current(fable, now):
                 fable_left = fable["left"]
     return StatusRow(status.label, tool, status.folder, login, roles,
         weekly, resets, credits, on_credits,
-        tool == "codex" and isinstance(agent_accounts.codex_credits_setting(status.label), agent_accounts.CreditsOn),
+        isinstance(credits_setting, agent_accounts.CreditsOn),
         read_at, usage_store.latest_read_outcome(usage or usage_store.StoredUsage()) if login
         else agent_accounts.UsageReadOutcome.OK,
         _stored_time((usage or {}).get("attempted_at", "")) or StatusUnavailable(),
         login_ends_at=agent_accounts.login_end_from_iso((usage or {}).get("login_ends_at"))
         if login and tool == "claude" else agent_accounts.LoginEndUnknown(),
-        fable_left_percent=fable_left)
+        fable_left_percent=fable_left, codex_work_readiness=codex_readiness)
 
 
 def _codex_limit_reset_count(label: str) -> int | StatusUnavailable:
@@ -6214,6 +6241,7 @@ class LocalRoleSessions:
     running_claude_sessions: frozenset[str]
     models: dict[tuple[Path, str], ObservedSessionModel] = field(default_factory=dict)
     model_session_names: dict[tuple[Path, str], str] = field(default_factory=dict)
+    running_claude_folders: frozenset[Path] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -6894,9 +6922,14 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
 
     registry = sessions.read_registry(dependencies=inputs.add)
     live = {session["sessionId"]: session for session in sessions.running_sessions(registry=registry)}
+    running_claude_folders: set[Path] = set()
     session_lines: list[str] = []
     members: dict[ClaudeGroup, list[LiveGroupMember]] = {group: [] for group in CLAUDE_GROUPS}
     for identity, session in live.items():
+        setting = _session_config_dir(session["pid"])
+        directory = setting.path if isinstance(setting, account.ConfiguredClaudeFolder) else None
+        if directory is not None:
+            running_claude_folders.add(directory)
         owner = membership.by_current_session(identity)
         candidates = [launch for reference, launch in launches.items()
                       if owner is not None and reference in (owner.id, owner.current_session)]
@@ -6919,8 +6952,6 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
             settings = producer_settings(owner)
             role = ("producers" if isinstance(settings, models_registry.LaunchSettings) and settings.kind == "claude"
                     else "")
-        setting = _session_config_dir(session["pid"])
-        directory = setting.path if isinstance(setting, account.ConfiguredClaudeFolder) else None
         label = claude_config_label(directory) if directory is not None else "account unreadable"
         suffix = _moving_role_suffix(role, label, groups)
         session_lines.append(f"session {identity} ({session['name']}): {label}{suffix}")
@@ -7025,7 +7056,8 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
             record_name(directory, member.current_session, member.name)
             record_codex_model(directory, member.current_session, process.pid if process else 0)
     return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
-                             tuple(session_lines), (), bool(registry.unreadable), frozenset(live), models, names)
+                             tuple(session_lines), (), bool(registry.unreadable), frozenset(live), models, names,
+                             frozenset(running_claude_folders))
 
 
 def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSessions) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
@@ -7056,6 +7088,7 @@ def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSession
             if role_named:
                 named[role] = tuple(role_named)
         counted.append(replace(row, roles=roles,
+            has_running_claude_session=row.tool == "claude" and directory in observed.running_claude_folders,
             sessions=tuple(AccountSessionDocument(session=identity, state=state) for identity, state in sorted(members.items())),
             selected_roles=tuple(role for role in row.roles if role != "spare"),
             models_by_role=models,
