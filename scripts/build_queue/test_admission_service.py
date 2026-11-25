@@ -6248,9 +6248,9 @@ class QueueLifecycleTests(unittest.TestCase):
             self.assertTrue(rows[later.owner.pid]["is_head"])
 
     def test_admitted_event_records_the_room_and_growth_loan_from_the_walk(self) -> None:
+        _ = self.enterContext(mock.patch.object(store, "host_name", return_value="natedev"))
         for need, fit in ((GIB, "free"), (2 * GIB, "loan")):
             with self.subTest(fit=fit), AdmissionFixture() as fixture:
-                self.assertEqual(fixture.server.host, "natedev")
                 fixture.configure(build_reserve_share_percent=80)
                 owner = fixture.proc.spawn()
                 sidecar = fixture.scope(owner)
@@ -6264,6 +6264,7 @@ class QueueLifecycleTests(unittest.TestCase):
                 self.assertEqual((row["need"], row["room"], row["loan"], row["fit"]), (need, 2 * GIB, GIB, fit))
 
     def test_loan_calculation_failure_keeps_the_grant(self) -> None:
+        _ = self.enterContext(mock.patch.object(store, "host_name", return_value="natedev"))
         with AdmissionFixture() as fixture:
             with (mock.patch.object(records, "growth_loan_bytes", side_effect=RuntimeError("fixture fault")) as loan,
                   redirect_stderr(io.StringIO()) as journal):
@@ -6276,6 +6277,7 @@ class QueueLifecycleTests(unittest.TestCase):
             self.assertFalse({"room", "loan", "fit"} & row.keys())
 
     def test_continuation_grant_omits_fit_when_memory_is_unavailable(self) -> None:
+        _ = self.enterContext(mock.patch.object(store, "host_name", return_value="natedev"))
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()
             grant = only_admitted(fixture.server.handle_request(fixture.request(run=run, need=6 * GIB)))
@@ -6288,6 +6290,17 @@ class QueueLifecycleTests(unittest.TestCase):
             self.assertIsInstance(result.policy.room, records.ReadingUnavailable)
             row = self.events(fixture, "admitted")[-1]
             self.assertEqual(row["reservation_id"], continuation.reservation)
+            self.assertFalse({"room", "loan", "fit"} & row.keys())
+
+    def test_admitted_event_omits_fit_on_another_host(self) -> None:
+        _ = self.enterContext(mock.patch.object(store, "host_name", return_value="linux-guest"))
+        with AdmissionFixture() as fixture:
+            grant = only_admitted(fixture.server.handle_request(fixture.request(step="lint")))
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            self.assertIsInstance(result.policy.room, records.MemoryRoom)
+            row, = self.events(fixture, "admitted")
+            self.assertEqual(row["reservation_id"], grant.reservation)
             self.assertFalse({"room", "loan", "fit"} & row.keys())
 
     def test_outbox_admission_loads_with_and_without_telemetry(self) -> None:
