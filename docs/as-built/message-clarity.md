@@ -146,10 +146,9 @@ The drain prints and flushes each completed result before it removes the entry.
 - `commands/message_style.md` runs the loader on the whole guide and confirms the rule count. `/alert_user`, `/message`, `/message_review` and the `<Notify>` section of `commands/showrunner/produce.md` load it before their first message to the user in a session.
 - Push form:
   - The first line is `Action: <what the user does>` or `No action needed.`, with an optional `Session: <name>` line above it. Every order rule in the guide applies after these lines.
-  - On the phone, one empty line separates the action or no-action header from the body.
   - The title is under 45 characters, names what is at stake and has no fixed prefix.
   - The first 150 characters make sense on their own.
-  - The phone message is under 500 characters before the footer. The count includes the action, separator, and body.
+  - The header plus body is under 500 characters.
   - The two approved decision templates can use up to 1024 characters.
 - `ask-once-then-count` limits only the end-of-reply reminder, never an answer the user asked for.
 
@@ -241,20 +240,9 @@ The gate permits only an exact match. A missing template id or failed gate check
 
   - `Sent by` is `sender_name(source)`: the source on one line, at most 80 characters. A `send.py in <session>` source (`send.py`'s `default_sender()`) shows only the session; any other source (`stall-watch`, `rca`, `natedev`, `build-followups`, `send.py`, or the parent command line when there is no `--source`) shows as it is.
   - `Template` is the `--text-id`, or `none (free text)` for a push with no text id.
-  - `post_message()` adds the empty line before it sends the request to Pushover. It counts the newlines and footer in the 1024-character limit.
-    It cuts the body if necessary. It refuses the push if the action, separator, and footer cannot fit.
-    Delivery checks the same limit before silence saves the push.
-  - The catalog phone preview uses the same formatter. The internal message keeps one newline after the action.
-    Review, holds, silence records, Mac payloads, and sender previews use this internal form.
-    Mac payloads and silence records carry the action length in the delivery detail.
-    If the length is unknown, the formatter keeps the original spacing.
+  - The footer always fits in 1024 characters: a long message is cut at the end first, never the footer.
   - An empty sender is refused: nothing is posted, the log outcome is `refused before sending: no sender`, and the exit is 2.
-  - `pushover.jsonl` records the title and message in the API request.
-    The log includes the action end and leading body newlines when available.
-    Replay uses the saved header state. Replay uses the original session and action parser for records without this state.
-    Replay preserves the body in the log. It restores saved leading newlines when the reconstructed draft fits within 1,024 characters.
-    If a refreshed paid-credit action exceeds the phone budget, release posts the saved action and logs the reason.
-    A push saved during silence has a log entry without the footer.
+  - `pushover.jsonl` logs the posted message, footer included. A kept push logs its message without the footer when kept, and with it when posted.
   - Only `pushover.py` holds `api.pushover.net` under `scripts/` (`test_push_texts_sources.py`), so no path posts round the footer.
 - An emergency push (priority 2) repeats every 300 s for 3 h until the user taps Acknowledge. Deleting it on the phone does not stop it. With `--key`, the post carries `tags=push_tag(KEY)` (`key-` and the first 16 hex digits of the key's SHA-256: the same key gives the same tag). Below priority 2, or with no key, there is no tag. Priority 2 is never kept during silence, and `post_kept()` passes the kept key, so a tag is never lost.
 - `pushover.py cancel [--source NAME] KEY` posts `token` to `receipts/cancel_by_tag/<tag>.json`, which stops every emergency push with the key's tag. It logs to `pushover.jsonl` with title `cancel emergency push` and outcome `cancel: cancelled N`, `cancel: nothing to cancel`, `cancel: refused: …`, `cancel: unreachable: …` or `cancel: keys missing`. It prints `pushover: cancelled N` or `pushover: nothing to cancel` and exits 0; it exits 1 when Pushover refused it or could not be reached, and 2 on usage or keys missing. No receipt is stored. (2026-10-23: a stall-watch prompt push kept repeating after the user answered the prompt.)
@@ -650,7 +638,7 @@ The `start` and `fixed` commands send no follow-up push.
 
 | Path (`~/.local/state/notify/`; `NOTIFY_STATE_DIR` names another base for review.py, send.py's marker and the gate) | Role |
 | --- | --- |
-| `pushover.jsonl` (fixed path) | Time, source, priority, title, message, and outcome. API attempts record the phone message and footer. |
+| `pushover.jsonl` (fixed path) | Each post or refusal: time, source, priority, title, posted message, outcome and detail |
 | `review.jsonl` | Each review verdict |
 | `review.lock` | Hold state lock |
 | `review_off` | The user's switch |
